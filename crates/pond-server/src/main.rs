@@ -1065,14 +1065,28 @@ fn report_acceleration() {
     #[cfg(not(feature = "local-inference"))]
     let cuda_build = false;
 
-    let model = std::fs::read_to_string("/proc/device-tree/model").ok();
+    // A device profile answers for the host when one is active, so a Mac can
+    // reach this table's other cells. Inert unless POND_DEVICE_PROFILE is set,
+    // which nothing in production or in deploy.sh sets.
+    let profile = pond_core::models::domain::device_profile::active();
+
+    let probed = std::fs::read_to_string("/proc/device-tree/model").ok();
     // The device tree pads with NULs; a trailing NUL would defeat a `contains`
     // on some readers and costs nothing to strip.
-    let model = model.as_deref().map(|m| m.trim_end_matches('\0').trim());
-    let accelerated = host_is_accelerated(
-        model,
-        std::path::Path::new("/etc/nv_tegra_release").exists(),
-    );
+    let probed = probed.as_deref().map(|m| m.trim_end_matches('\0').trim());
+
+    let (model, tegra_release) = match profile {
+        Some(p) => (p.device_tree_model.as_deref(), p.has_tegra_release),
+        None => (
+            probed,
+            std::path::Path::new("/etc/nv_tegra_release").exists(),
+        ),
+    };
+    let accelerated = host_is_accelerated(model, tegra_release);
+    // An emulated CUDA build is a claim about the binary, not the host, so it is
+    // OR-ed rather than substituted: a real CUDA build must never be talked out
+    // of reporting itself by a profile.
+    let cuda_build = cuda_build || profile.is_some_and(|p| p.pretend_cuda);
 
     match warning(classify(accelerated, cuda_build)) {
         Some(w) => tracing::error!("{w}"),

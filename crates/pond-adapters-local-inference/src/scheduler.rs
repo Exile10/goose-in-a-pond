@@ -1,23 +1,7 @@
-//! Memory-aware model scheduler for GIAP on resource-constrained devices.
-//!
-//! ## Design
-//!
-//! Only one LLM is resident in RAM at a time (Jetson Orin Nano, 8 GB unified).
-//! The scheduler tracks which model is currently hot and signals wake-word
-//! detection so a background task can begin pre-loading the chat model while
-//! the user is still speaking.
-//!
-//! Goose's `InferenceRuntime` already implements evict-then-load: when
-//! `LocalInferenceProvider::complete()` is called for a different model, it
-//! sets all other model slots to `None` (RAII drop → llama.cpp free). The
-//! scheduler wraps this with:
-//! - Live memory reporting via `/proc/meminfo` (Linux/Jetson) or a zero fallback.
-//! - A `tokio::sync::watch` channel so the server can spawn a pre-loader task.
-//!
-//! ## NoopScheduler
-//!
-//! For llamafile and Ollama backends, use `NoopScheduler`. Those providers
-//! manage their own memory externally; GIAP does not control their eviction.
+//! Memory-aware model scheduler: only one LLM is resident at a time (Jetson Orin Nano, 8 GB
+//! unified). Goose's `InferenceRuntime` already evicts the other model slots on a switch; this
+//! adds live memory reporting from `/proc/meminfo` and a `watch` channel so wake-word detection
+//! can pre-load the chat model. llamafile and Ollama self-manage memory, so use `NoopScheduler`.
 
 use std::sync::Mutex;
 
@@ -28,20 +12,10 @@ use pond_core::models::ports::model_scheduler::{MemoryStatus, ModelScheduler};
 
 // ── Jetson / Linux memory constants ──────────────────────────────────────────
 
-/// Total device RAM on a Jetson Orin Nano 8 GB (MB), as the KERNEL reports it.
-///
-/// The board is sold as 8 GB and this said 8192 for a long time, but `free -m`
-/// on the Orin reports **7620** total: the carveouts (framebuffer, firmware
-/// reservations) are taken before Linux ever sees the memory. Naming the
-/// marketing figure here handed every derivation built on `LLM_BUDGET_MB` a
-/// phantom 572 MB, and that phantom is spent silently -- an over-large context
-/// does not fail to allocate, it swaps, so the symptom is a model that feels
-/// slow rather than one that reports being out of memory.
-///
-/// Measured on the device 2026-08-16: E4B Q4_K_M at n_ctx 2048 already peaks at
-/// 7,133 MB of 7,620 with the service stopped. Under the old 8192 the
-/// derivation awarded it 16384, whose KV is a further 784 MiB -- i.e. past
-/// physical RAM, served out of the 12 GB swap.
+/// Total device RAM on a Jetson Orin Nano 8 GB (MB), as the KERNEL reports it: `free -m` on the
+/// Orin says 7620, not the marketed 8192, because carveouts are taken before Linux sees the
+/// memory. Any phantom MB here is spent silently, since an over-large context does not fail to
+/// allocate, it swaps: the symptom is slowness, not an out-of-memory error.
 pub const JETSON_TOTAL_RAM_MB: u64 = 7620;
 /// Approximate headroom used by OS + GIAP server + UI at idle (MB).
 const SYSTEM_OVERHEAD_MB: u64 = 1500;
@@ -52,6 +26,30 @@ const TTS_RESERVED_MB: u64 = 100;
 /// Approximate MB available for a single LLM slot.
 pub const LLM_BUDGET_MB: u64 =
     JETSON_TOTAL_RAM_MB - SYSTEM_OVERHEAD_MB - STT_RESERVED_MB - TTS_RESERVED_MB;
+
+/// Everything the LLM slot does not get: OS, GIAP server, UI, STT, TTS.
+///
+/// Named separately from [`LLM_BUDGET_MB`] because the budget is derived twice, once as a
+/// constant and once at runtime from the device profile; both subtract the same reservation.
+const RESERVED_MB: u64 = SYSTEM_OVERHEAD_MB + STT_RESERVED_MB + TTS_RESERVED_MB;
+
+/// Total RAM of the device this process should believe it is.
+///
+/// [`JETSON_TOTAL_RAM_MB`] unless a device profile overrides it, deliberately not a host probe:
+/// reading a developer Mac's real 64 GB makes every derivation downstream trivially satisfiable.
+pub fn total_ram_mb() -> u64 {
+    pond_core::models::domain::device_profile::active()
+        .map(|p| p.total_ram_mb)
+        .unwrap_or(JETSON_TOTAL_RAM_MB)
+}
+
+/// MB available for a single LLM slot on the device we believe we are.
+///
+/// The runtime twin of [`LLM_BUDGET_MB`]; identical to it when no profile is
+/// active, which is the case in production, in `deploy.sh` and in CI.
+pub fn llm_budget_mb() -> u64 {
+    total_ram_mb().saturating_sub(RESERVED_MB)
+}
 
 // ── ResourceAwareModelScheduler ──────────────────────────────────────────────
 
@@ -120,16 +118,18 @@ impl ModelScheduler for ResourceAwareModelScheduler {
     fn memory_status(&self) -> MemoryStatus {
         let loaded_model = self.currently_hot.lock().ok().and_then(|g| g.clone());
 
+        let total = total_ram_mb();
+        let budget = llm_budget_mb();
         let (total_mb, available_for_llm_mb) = match Self::read_free_ram_mb() {
-            Some(free_mb) => (JETSON_TOTAL_RAM_MB, free_mb.min(LLM_BUDGET_MB)),
+            Some(free_mb) => (total, free_mb.min(budget)),
             None => {
                 // Fallback: estimate based on whether a model is loaded.
                 let used = if loaded_model.is_some() {
-                    LLM_BUDGET_MB / 2 // rough midpoint
+                    budget / 2 // rough midpoint
                 } else {
                     0
                 };
-                (JETSON_TOTAL_RAM_MB, LLM_BUDGET_MB.saturating_sub(used))
+                (total, budget.saturating_sub(used))
             }
         };
 
@@ -207,8 +207,28 @@ mod tests {
     fn memory_status_total_matches_jetson_constant() {
         let (sched, _rx) = ResourceAwareModelScheduler::new();
         let status = sched.memory_status();
-        // total_mb is always JETSON_TOTAL_RAM_MB regardless of platform
-        assert_eq!(status.total_mb, JETSON_TOTAL_RAM_MB);
+        // total_mb is the device we BELIEVE we are: the constant unless a device
+        // profile is emulating another board. Asserted against the profile so
+        // this test still means something under `scripts/jetson-emu.sh test`.
+        assert_eq!(status.total_mb, total_ram_mb());
+        match pond_core::models::domain::device_profile::active() {
+            None => assert_eq!(status.total_mb, JETSON_TOTAL_RAM_MB),
+            Some(p) => assert_eq!(
+                status.total_mb, p.total_ram_mb,
+                "under emulation the scheduler must report the emulated board, or the profile is \
+                 not reaching it and an emulated run proves nothing"
+            ),
+        }
+    }
+
+    /// The runtime budget and the compile-time one agree when nothing is being
+    /// emulated. This is the safety property of the device-profile mechanism.
+    #[test]
+    fn the_runtime_budget_equals_the_constant_when_nothing_is_emulated() {
+        if pond_core::models::domain::device_profile::active().is_none() {
+            assert_eq!(llm_budget_mb(), LLM_BUDGET_MB);
+            assert_eq!(total_ram_mb(), JETSON_TOTAL_RAM_MB);
+        }
     }
 
     #[test]
@@ -221,10 +241,10 @@ mod tests {
         // On Linux (CI) /proc/meminfo is available and the value varies —
         // just check it's within the sane range.
         assert!(
-            status.available_for_llm_mb <= LLM_BUDGET_MB,
+            status.available_for_llm_mb <= llm_budget_mb(),
             "available should not exceed budget: {} > {}",
             status.available_for_llm_mb,
-            LLM_BUDGET_MB
+            llm_budget_mb()
         );
     }
 

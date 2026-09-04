@@ -1,40 +1,12 @@
-//! In-process GGUF inference adapter and memory-aware model scheduler.
-//!
-//! Wraps Goose's [`LocalInferenceProvider`] so GIAP can load model weights
-//! directly into the process — no llamafile/Ollama subprocess required.
-//!
-//! # Hardware acceleration
-//! - **macOS**: Metal activated automatically via `llama-cpp-2` cfg flags.
-//! - **Jetson Orin Nano (NVIDIA)**: Requires `--features cuda` at build time.
-//!   CUDA settings are applied to the model registry at init time:
-//!   - `n_gpu_layers = 99` — full offload into unified 8 GB DRAM (no separate VRAM)
-//!   - `context_size = 16384` — the ~3.2K-token turn-1 prompt plus real history
-//!     room; measured KV cost is ~18 KiB/token, so this is ~288 MiB
-//!   - `n_batch = 512` — maximise GPU throughput on Ampere (sm_87)
-//!   - `n_threads = 4` — 6-core A78AE; leave headroom for OS + voice pipeline
-//!   - `flash_attention = true` — reduces KV-cache memory by ~40 % on Ampere
-//!   - `use_mlock = false` — unified memory; mlock causes kernel page faults
-//!
-//! # Usage
-//! ```no_run
-//! # async fn example() -> anyhow::Result<()> {
-//! use pond_adapters_local_inference::LocalInferenceLlmAdapter;
-//! use std::sync::Arc;
-//!
-//! let llm = Arc::new(LocalInferenceLlmAdapter::new(
-//!     LocalInferenceLlmAdapter::DEFAULT_MODEL,
-//! ).await?);
-//! # Ok(())
-//! # }
-//! ```
+//! In-process GGUF inference adapter and memory-aware model scheduler: wraps Goose's
+//! [`LocalInferenceProvider`] so GIAP loads model weights into this process, with no llamafile
+//! or Ollama subprocess. macOS gets Metal automatically; the Jetson Orin Nano needs
+//! `--features cuda` at build time, and `apply_jetson_settings` stamps its registry entry.
 
 /// Whether this build can reach CUDA at all.
 ///
-/// The one fact `pond-server` cannot work out for itself: `cuda` is a feature of
-/// THIS crate, passed on the command line by `scripts/jetson/deploy.sh`, so a
-/// `cfg!` in the binary would always read false. Exported as a const rather than
-/// a function so it is a compile-time constant at the call site and cannot drift
-/// from the feature that produced it.
+/// `cuda` is a feature of THIS crate, passed on the command line by `scripts/jetson/deploy.sh`,
+/// so a `cfg!` in `pond-server` always reads false. A const, so it cannot drift from that.
 pub const CUDA_ENABLED: bool = cfg!(feature = "cuda");
 
 pub mod scheduler;
@@ -75,24 +47,12 @@ impl LocalInferenceLlmAdapter {
 
     /// Build the adapter for the given model identifier.
     ///
-    /// The `model_id` can be a HuggingFace repo+filename such as
-    /// `"bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"`, a local file path,
-    /// or any identifier accepted by Goose's `LocalInferenceProvider`.
-    ///
-    /// Model weights are **not** loaded here — they load on the first
-    /// `complete()` call via `InferenceRuntime::get_or_init()` (global
-    /// singleton, thread-safe `StdMutex<Weak<>>`).
+    /// `model_id` is anything Goose's `LocalInferenceProvider` accepts: a HuggingFace repo plus
+    /// quant, or a local path. Weights load on the first `complete()` call, not here.
     pub async fn new(model_id: &str) -> Result<Self> {
         let model_config = ModelConfig::new(model_id);
 
-        // On Jetson Orin Nano (CUDA build) apply hardware-specific settings to
-        // the model registry entry so llama-cpp-2 picks them up at load time.
-        // Jetson has unified 8 GB DRAM (CPU + GPU share the same pool), an
-        // Ampere GPU (sm_87) with 1024 CUDA cores, and CUDA 12.6 on JetPack 6.2.
-        #[cfg(feature = "cuda")]
-        Self::apply_jetson_settings(model_id);
-        #[cfg(not(feature = "cuda"))]
-        Self::apply_platform_settings(model_id);
+        Self::apply_model_settings(model_id);
 
         tracing::info!(
             "initialising LocalInferenceProvider for model: {}",
@@ -109,16 +69,10 @@ impl LocalInferenceLlmAdapter {
         })
     }
 
-    /// Build the adapter, registering the model path in GIAP's data directory.
-    ///
-    /// Unlike `new()`, this method registers the model's `local_path` in Goose's
-    /// global model registry so that `LocalInferenceProvider` can find the GGUF
-    /// file at `$data_dir/models/gguf/{filename}` instead of Goose's default
-    /// `~/.local/share/goose/models/` location.
-    ///
-    /// Accepts two formats:
-    /// - HuggingFace: `"bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"`
-    /// - Raw filename: `"gemma-4-E2B-it-Q4_K_M.gguf"` (file must exist in `$data_dir/models/gguf/`)
+    /// Build the adapter, registering the model's `local_path` in Goose's global registry so
+    /// `LocalInferenceProvider` finds the GGUF under `$data_dir/models/gguf/` instead of its own
+    /// `~/.local/share/goose/models/`. `model_id` is either a HuggingFace `repo:QUANT` id or a
+    /// raw `.gguf` filename, which must already exist in that directory.
     pub async fn new_with_data_dir(model_id: &str, data_dir: &std::path::Path) -> Result<Self> {
         use goose::providers::local_inference::local_model_registry::{
             get_registry, model_id_from_repo, LocalModelEntry, LocalModelStorage, ModelSettings,
@@ -126,11 +80,9 @@ impl LocalInferenceLlmAdapter {
 
         let gguf_dir = data_dir.join("models").join("gguf");
 
-        // ── Filename stem (e.g. "gemma-4-E2B-it-Q4_K_M") ───────────────────
-        // Detected when: no '/', no ':', no ".gguf" extension.
-        // The model catalog stores name = stem (without extension); the file on
-        // disk is {stem}.gguf in the gguf directory.  Normalise by appending
-        // ".gguf" and falling through to the raw filename path below.
+        // Filename stem (no '/', no ':', no ".gguf"): the model catalog stores the name without
+        // the extension while the file on disk is {stem}.gguf. Normalise by appending ".gguf"
+        // and falling through to the raw-filename path below.
         let owned_with_ext;
         let model_id =
             if !model_id.contains('/') && !model_id.contains(':') && !model_id.ends_with(".gguf") {
@@ -271,11 +223,26 @@ impl LocalInferenceLlmAdapter {
         Self::new(model_id).await
     }
 
+    /// Stamp the model registry so llama-cpp-2 picks up device settings at load time.
+    ///
+    /// A device profile lets a non-CUDA build take the Jetson branch on purpose: otherwise
+    /// `jetson_context_size`, the arithmetic that can OOM the board, has no caller off-device.
+    fn apply_model_settings(model_id: &str) {
+        #[cfg(feature = "cuda")]
+        Self::apply_jetson_settings(model_id);
+
+        #[cfg(not(feature = "cuda"))]
+        if pond_core::models::domain::device_profile::stamping_device_model_settings() {
+            Self::apply_jetson_settings(model_id);
+        } else {
+            Self::apply_platform_settings(model_id);
+        }
+    }
+
     /// Apply platform-optimised model settings for non-CUDA builds (macOS Metal, CPU).
     ///
-    /// On Apple Silicon (M1-M4), enables full Metal GPU offload, flash attention,
-    /// and sets a reasonable 8K context window. Without this, ALL inference runs
-    /// on CPU despite Metal being available — `n_gpu_layers` defaults to `None`.
+    /// On Apple Silicon this enables full Metal GPU offload and flash attention. Without it
+    /// `n_gpu_layers` defaults to `None` and ALL inference runs on the CPU despite Metal.
     #[cfg(not(feature = "cuda"))]
     fn apply_platform_settings(model_id: &str) {
         use goose::providers::local_inference::local_model_registry::{
@@ -322,12 +289,9 @@ impl LocalInferenceLlmAdapter {
             // ForceEmulated instead of declarations with nowhere to go.
             tool_calling: tools,
             enable_thinking: thinking,
-            // `enable_thinking` is set above from the template rather than
-            // left to inherit goose's `default_true()`. It said "Thinking OFF"
-            // here for a long time while the code set nothing and the registry
-            // on the device read `true` -- the comment described an intention
-            // the code never carried out.
-            // Let llama.cpp auto-detect thread count (good on Apple Silicon).
+            // `enable_thinking` is set above from the template rather than left to inherit
+            // goose's `default_true()`. Thread count is left for llama.cpp to auto-detect,
+            // which is the right choice on Apple Silicon.
             ..Default::default()
         };
 
@@ -343,10 +307,9 @@ impl LocalInferenceLlmAdapter {
                     tracing::info!(
                         "{} settings applied to model '{}' (n_gpu_layers=99, ctx=dynamic, flash_attn=true)",
                         // On aarch64 Linux this branch means the `cuda` feature
-                        // was NOT compiled in, so the n_gpu_layers=99 below is a
-                        // request no backend will honour — inference runs on the
-                        // CPU. Saying "Metal" there sent me hunting a settings
-                        // bug for an hour when the binary was simply built wrong.
+                        // was NOT compiled in, so n_gpu_layers=99 is a request no
+                        // backend honours and inference runs on the CPU. Saying
+                        // "Metal" here disguises a wrongly built binary.
                         if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
                             "CPU-ONLY (built without the cuda feature) —"
                         } else {
@@ -365,57 +328,10 @@ impl LocalInferenceLlmAdapter {
         }
     }
 
-    /// Patch the Goose model registry with Jetson Orin Nano–optimised settings.
-    ///
-    /// These settings are applied at startup and saved to `~/.local/share/goose/
-    /// models/registry.json` so they persist across restarts on Jetson.
-    ///
-    /// The function silently ignores errors (model not yet downloaded, registry
-    /// lock poisoned) — defaults will be used in that case.
-    ///
-    /// ## Memory-fit fail-closed (Phase 6 — FUTURE on-Jetson work, NOT done here)
-    ///
-    /// `n_gpu_layers = 99` requests full GPU residency. On the 8 GB Jetson this
-    /// SILENTLY partial-offloads to CPU when the model exceeds the unified-memory
-    /// budget (e.g. the ~5.6 GB `gemma3n:e2b`), collapsing decode to single-digit
-    /// tok/s. The UI-side memory-fit guard now WARNS about this before load
-    /// (`FitBadge` / `warn_if_model_spills`), but the loader itself does not yet
-    /// fail closed. The recommended on-device enforcement, to add here when it can
-    /// be validated on real Jetson hardware:
-    ///
-    ///   1. Before requesting `-ngl 99`, compare the model's on-disk size against
-    ///      `MemAvailable` (see `ResourceAwareModelScheduler::memory_status`),
-    ///      reserving ~1 GB headroom for KV cache + system.
-    ///   2. If it will not fit, run `echo 3 > /proc/sys/vm/drop_caches` (root) to
-    ///      free the page cache first — otherwise the `-ngl` allocation hits the
-    ///      NvMap OOM wall (error 12). See `scripts/jetson/llama-optimization`.
-    ///   3. Re-check after dropping caches; if it STILL won't fit, refuse the
-    ///      full-GPU load (fail closed) and surface the spill to the UI rather
-    ///      than silently degrading to a CPU/GPU split.
-    ///
-    /// This is intentionally NOT implemented in the cross-platform loader: it is
-    /// unsafe to change from the macOS Metal build and cannot be tested here.
-    /// The tool mode and thinking flag a GGUF at `path` should be registered
-    /// with, read from its own chat template.
-    ///
-    /// Registration happens in `new_with_data_dir`, before any
-    /// `apply_*_settings` runs, and it used to hardcode `ForceNative` in four
-    /// places. Two of those only fired when the stored mode was `Auto`, which
-    /// meant an entry already persisted as `ForceNative` was never revisited --
-    /// so a model registered before the probe existed kept a mode its template
-    /// cannot honour, forever.
-    ///
-    /// That is not hypothetical. DeepSeek-R1-Distill ended up with two registry
-    /// rows: the quant-tagged id read `force_emulated` from the probe while the
-    /// canonical stem still read `force_native`, and the stem is what the turn
-    /// resolved to. The model was handed native tool declarations by a template
-    /// with no `tools` variable, saw none of them, and invented an "MCP" tool
-    /// interface out of the system prompt instead.
-    ///
-    /// So this re-stamps rather than upgrading, which matches what
-    /// `apply_*_settings` already does to the same rows at every provider init.
-    /// A file that cannot be read yields `Auto`, leaving goose its own
-    /// judgement rather than a guess of ours.
+    /// The tool mode and thinking flag a GGUF at `path` should be registered with, read from its
+    /// own chat template by `new_with_data_dir` before any `apply_*_settings` runs. It re-stamps
+    /// rather than upgrading, matching `apply_*_settings`: an entry once persisted as
+    /// `ForceNative` would otherwise keep a mode its template cannot honour forever.
     fn registration_settings(
         path: &std::path::Path,
     ) -> (
@@ -429,39 +345,10 @@ impl LocalInferenceLlmAdapter {
         }
     }
 
-    /// What the registry should say for a model, given what its own file says
-    /// it can do.
+    /// What the registry should say for a model, given what its own file says it can do.
     ///
-    /// Kept as a pure function over [`ModelProbe`] on purpose: the two callers
-    /// are `apply_jetson_settings` (CUDA-gated, compiles only on the device) and
-    /// `apply_platform_settings`. A decision buried in either would be tested by
-    /// neither on a developer machine, and the CUDA one is compiled by nothing
-    /// in CI.
-    ///
-    /// # Tools
-    ///
-    /// Both callers used to set `ForceNative` unconditionally. That is right for
-    /// Gemma and wrong for the first model whose template takes no `tools`
-    /// variable -- DeepSeek-R1-Distill, already on the development machine,
-    /// renders no declarations at all, so forcing native puts them nowhere.
-    ///
-    /// - `Native`  -> `ForceNative`, as before.
-    /// - `Absent`  -> `ForceEmulated`: the template cannot carry tools, so they
-    ///   have to be described in the system prompt or not offered.
-    /// - `Unknown` -> `Auto`: no template was readable, so leave goose its own
-    ///   judgement rather than overriding it with a guess.
-    ///
-    /// # Thinking
-    ///
-    /// `enable_thinking` was never set, so it inherited goose's `default_true()`
-    /// while the comment above it claimed "Thinking OFF". The registry on the
-    /// device sided with the code. This states the value instead of inheriting
-    /// it, and does not change what any currently-reasoning model does: a gated
-    /// thinker still gets `true`.
-    ///
-    /// A model with no reasoning markers gets `false`, which is the only case
-    /// this changes, and it changes it from "flag set for a model that has
-    /// nothing to flag" to "off".
+    /// Pure over [`ModelProbe`] so both callers share one decision; the CUDA one is compiled by
+    /// nothing in CI. A template with no `tools` variable renders no declarations to force into.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn tool_and_thinking_for(
         probe: &pond_core::models::domain::model_probe::ModelProbe,
@@ -486,10 +373,8 @@ impl LocalInferenceLlmAdapter {
 
     /// Read a model's own account of itself, for the settings above.
     ///
-    /// Walks far enough to reach `tokenizer.chat_template`, which sits 3.8-15 MB
-    /// into a GGUF, behind the token array. Costs a few hundred kilobytes of
-    /// real reading and about 40 ms, because everything between the keys it
-    /// wants is stepped over rather than read.
+    /// Walks far enough to reach `tokenizer.chat_template`, 3.8-15 MB into a GGUF behind the
+    /// token array: about 40 ms, because everything between the wanted keys is stepped over.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn probe_model(
         path: &std::path::Path,
@@ -499,26 +384,10 @@ impl LocalInferenceLlmAdapter {
         parse_gguf_file(path).map(|info| ModelProbe::from_gguf(&info))
     }
 
-    /// The model's KV cost per token, read from its own GGUF header, or `None`
-    /// when the header cannot settle it.
-    ///
-    /// `pond_core::models::domain::gguf` does the arithmetic and is exact for a
-    /// dense model. The one thing the header does NOT carry is the split
-    /// between full-attention and sliding-window layers, and that split is
-    /// worth a factor of two: assume more SWA layers than a model really has
-    /// and the cost comes out LOW, which is the direction that OOMs a board.
-    ///
-    /// So the rule is asymmetric on purpose:
-    ///
-    /// - **No `key_length_swa`** — the model is dense, every owning layer pays
-    ///   the same width, and the pattern cannot change the answer. Trust it for
-    ///   any architecture.
-    /// - **`key_length_swa` present** — the answer depends on a ratio the file
-    ///   does not state. Trust it only for an architecture whose pattern has
-    ///   been confirmed against a real allocation on the device.
-    ///
-    /// Anything else returns `None` and the caller keeps the measured constant,
-    /// so an unfamiliar model behaves exactly as it did before this existed.
+    /// The model's KV cost per token from its own GGUF header, or `None` when the header cannot
+    /// settle it and the caller must keep the measured constant. Exact for a dense model; where
+    /// `key_length_swa` is present the global-to-SWA layer ratio the header omits is worth a
+    /// factor of two in the direction that OOMs a board, so trust only confirmed architectures.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn kv_cost_from_header(path: &std::path::Path) -> Option<u64> {
         use pond_core::models::domain::gguf::parse_gguf_header;
@@ -558,123 +427,33 @@ impl LocalInferenceLlmAdapter {
         info.kv_kib_per_token(*swa_per_global)
     }
 
-    /// Context size that fits THIS model in the Jetson's LLM budget.
-    ///
-    /// A single hardcoded constant is wrong, and shipping one OOM-killed a
-    /// device: 16384 derived from E2B applied to E4B exceeds the budget and the
-    /// kernel kills the server (it took gnome-shell with it).
-    ///
-    /// # The cost model, measured ON THE DEVICE 2026-08-12
-    ///
-    /// | model | first cache | second cache | total |
-    /// |---|---|---|---|
-    /// | E2B | 3 layers, 6 KiB/tok | 12 layers, 12 KiB/tok | **18 KiB/token** |
-    /// | E4B | 4 layers, 16 KiB/tok | 20 layers, 40 KiB/tok | **56 KiB/token** |
-    ///
-    /// Read off `llama_kv_cache ... size = N MiB (C cells, L layers)` with the
-    /// service stopped: E4B at n_ctx 8192 gives 128 MiB + 320 MiB, E2B at 16384
-    /// gives 96 MiB + 192 MiB. **Both caches carry `n_ctx` cells**, so the cost
-    /// is linear with no constant term.
-    ///
-    /// # A correction, because the first attempt was wrong in the unsafe direction
-    ///
-    /// I measured this on a Mac first (brew llama.cpp b9110, Metal) and got a
-    /// different SHAPE: E4B's second cache sat at a fixed 1024 cells / 40 MiB
-    /// whatever `n_ctx` was, implying 16 KiB/token plus a constant -- about a
-    /// third of the real cost. I then checked the device's vendored source,
-    /// found `llama-kv-cache-iswa.cpp` and the `sliding_window_pattern` key being
-    /// read for `gemma4`, and concluded the device took the same path.
-    ///
-    /// **It does, and that was not enough.** `llama-cpp-sys-2 =0.1.146` builds
-    /// the two caches but sizes BOTH to `n_ctx`; shrinking the SWA cache to the
-    /// sliding window is a later llama.cpp change. A source grep cannot tell
-    /// "the code path exists" from "the allocation is smaller" -- only the
-    /// allocation can.
-    ///
-    /// So the figures this comment carried before any of this -- E2B ~18
-    /// KiB/token, E4B ~86 -- were right for the device, and E2B's was exact. The
-    /// commit that called them both wrong was itself wrong; the Mac numbers
-    /// describe a newer llama.cpp we do not ship.
-    ///
-    /// The lesson is the one this constant already encoded: it can OOM a board,
-    /// so it moves on a measurement from the hardware that runs it and nothing
-    /// less. Declining to move it on the Mac numbers is the only reason this is
-    /// a comment rather than an incident.
-    ///
-    /// # What this allows, and what binds instead
-    ///
-    /// Corrected 2026-08-16, when `JETSON_TOTAL_RAM_MB` stopped claiming the
-    /// marketing 8192 and started naming the kernel's real 7620. That removed a
-    /// phantom 572 MB the budget had been spending, and the two models parted
-    /// company:
-    ///
-    /// - **E2B (2,962 MB) gets 16,384**, still `MAX_CTX`-bound with ~2,258 MB of
-    ///   KV budget against the ~288 MiB it actually uses.
-    /// - **E4B (4,746 MB) gets 8,192**, using 448 MiB of KV -- measured, not
-    ///   estimated -- against 474 MB free. It is budget-bound with ~26 MB spare.
-    ///
-    /// E4B at 16,384 was never real: its 896 MiB of KV lands the process near
-    /// 7.9 GB on a 7,620 MB board, so it was being served out of swap. The
-    /// device measurement that caught it is in `JETSON_TOTAL_RAM_MB`.
-    ///
-    /// 8,192 is the smallest window that still holds E4B's own turn-1 prompt
-    /// (4,678 tokens measured) with room for a reply and some history; 4,096 --
-    /// what the old padded slope would now give it -- does not.
-    ///
-    /// Raising `MAX_CTX` still moves E2B and not E4B, and remains a LATENCY
-    /// decision there: a cold prefix costs 4.19 s at 4,096 and 19.97 s at
-    /// 16,384, with prefill throughput FALLING as depth grows (976 -> 820
-    /// tok/s).
-    ///
-    /// `apply_jetson_settings` re-stamps the registry at every provider init,
-    /// so this cannot be worked around by editing registry.json — it has to be
-    /// right here.
-    ///
-    /// Derived rather than tabulated so a model we have never seen is still
-    /// safe: KV budget is the LLM budget minus the weights and the compute
-    /// buffers, divided by a per-token cost chosen for the widest attention
-    /// geometry we ship. Rounded DOWN to a multiple of `CTX_GRANULARITY` and
-    /// clamped, because being a little conservative costs history and being
-    /// wrong costs the box -- but only a little, which is why that granularity
-    /// is 1024 and no longer a power of two.
-    ///
-    /// The deeper fix belongs in the engine: `context_cap` gives a pinned
-    /// `context_size` and a host `GOOSE_CONTEXT_LIMIT` priority over its own
-    /// `estimate_max_context_for_memory`, so the one function that knows the
-    /// real geometry is the one that never gets consulted. Capping those two
-    /// branches by the memory estimate would make this helper unnecessary.
-    ///
-    /// Compiled on every platform even though only the CUDA build calls it: the
-    /// arithmetic is pure, it is the part that can kill a board, and gating it
-    /// meant neither it nor its tests ever ran on a developer machine or in CI.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    /// Context size that fits THIS model in the Jetson's LLM budget: the budget less the weights
+    /// and the compute buffers, divided by a measured per-token KV cost, floored to
+    /// `CTX_GRANULARITY`. A single hardcoded constant OOM-killed a board, so only a measurement
+    /// from the Orin may move it. `apply_jetson_settings` re-stamps the registry at every init.
     fn jetson_context_size(model_bytes: u64, kv_kib_per_token: Option<u64>) -> u32 {
-        /// Per-token KV cost for the widest geometry we ship, measured on the
-        /// DEVICE: E4B is 56 KiB/token across both caches, E2B 18.
-        ///
-        /// This is the MEASURED cost, not a padded one, and that changed on
-        /// 2026-08-16. It was 64 -- 56 measured plus headroom for a wider model
-        /// -- which was free while `JETSON_TOTAL_RAM_MB` claimed the marketing
-        /// 8192. Once that was corrected to the kernel's real 7620, the two
-        /// paddings compounded: at 64, E4B's budget allows only 7,584 tokens and
-        /// rounds to **4096**, which is smaller than E4B's own turn-1 prompt
-        /// (4,678 tokens measured from `turn_metrics`). A window that cannot
-        /// hold the preamble is not conservative, it is broken -- it thrashes
-        /// compaction against tokens that cannot be compacted.
-        ///
-        /// So the padding moved out of here and into the budget, which is where
-        /// it was actually needed. There is NO constant term -- both caches
-        /// carry `n_ctx` cells on this llama.cpp.
-        ///
-        /// What still guards a model we have never seen is `COMPUTE_BUFFER_MB`
-        /// (600 against a measured 522) and the clamps -- thinner than before.
-        /// A model materially wider than E4B's 56 KiB/token wants the real fix
-        /// named below: cap this by the engine's own geometry estimate rather
-        /// than guessing a slope here.
-        ///
-        /// This is the constant that can OOM the board. It moves on a
-        /// measurement from the Orin and nothing less; see the correction above,
-        /// where the Mac said 16 and the device said 56.
+        // The budget of the device we BELIEVE we are: the constant unless a
+        // device profile is emulating another board. See `scripts/jetson-emu.sh`.
+        Self::context_size_for_budget(
+            crate::scheduler::llm_budget_mb(),
+            model_bytes,
+            kv_kib_per_token,
+        )
+    }
+
+    /// The derivation itself, against an explicit budget.
+    ///
+    /// Split from [`Self::jetson_context_size`] so another board's budget can be asked for
+    /// without touching the process environment, a data race in a threaded test binary.
+    fn context_size_for_budget(
+        budget_mb: u64,
+        model_bytes: u64,
+        kv_kib_per_token: Option<u64>,
+    ) -> u32 {
+        /// Per-token KV cost for the widest geometry we ship, MEASURED on the Orin (the Mac said
+        /// 16): E4B is 56 KiB/token across both caches, E2B 18. No padding here (it lives in the
+        /// budget) and no constant term, since both caches carry `n_ctx` cells on this llama.cpp.
+        /// Padding to 64 floored E4B to 4096, under its own 4,678-token turn-1 prompt.
         const KV_KIB_PER_TOKEN: u64 = 56;
         /// llama.cpp's compute buffers. Nearly flat in `n_ctx` -- measured
         /// 522 MiB at both 4096 and 16384, rising to 582 MiB at 32768 -- so 600
@@ -682,33 +461,19 @@ impl LocalInferenceLlmAdapter {
         const COMPUTE_BUFFER_MB: u64 = 600;
         const MIN_CTX: u32 = 2048;
         const MAX_CTX: u32 = 16384;
-        /// Round the answer DOWN to a multiple of this.
-        ///
-        /// This was a power of two until 2026-08-16, and the difference is not
-        /// cosmetic: powers of two are 2x apart, so flooring to one discards up
-        /// to HALF of a window the budget has already proved affordable. E4B
-        /// IQ4_XS (4,496 MB) is allowed 13,220 tokens and was handed 8,192 --
-        /// 5,028 tokens thrown away, which is the difference between a window
-        /// that holds a conversation and one that compacts from turn one.
-        ///
-        /// Nothing needed the power of two. `n_ctx` has no such constraint in
-        /// llama.cpp (it pads to `n_ubatch` internally), both KV caches simply
-        /// carry `n_ctx` cells, and the safety here has never come from the
-        /// rounding -- it comes from `KV_KIB_PER_TOKEN`, `COMPUTE_BUFFER_MB` and
-        /// the budget, all of which are untouched. Flooring to 1024 is the same
-        /// "round down, stay under" rule at a resolution that does not throw
-        /// away what the board can afford.
+        /// Round the answer DOWN to a multiple of this. Not a power of two: those are 2x apart,
+        /// so flooring to one discards up to HALF of a window the budget already proved
+        /// affordable (E4B IQ4_XS: 13,220 allowed, 8,192 handed out). `n_ctx` needs no power of
+        /// two in llama.cpp; safety comes from the slope, the compute buffer and the budget.
         const CTX_GRANULARITY: u32 = 1024;
 
         let model_mb = model_bytes / (1024 * 1024);
-        let kv_mb = crate::scheduler::LLM_BUDGET_MB
+        let kv_mb = budget_mb
             .saturating_sub(model_mb)
             .saturating_sub(COMPUTE_BUFFER_MB);
-        // The model's own header, when it could answer; the conservative
-        // fallback when it could not. `kv_cost_from_header` returns None rather
-        // than guessing, so this is a strict improvement and never a new risk:
-        // an unreadable or unfamiliar model gets exactly the behaviour it had
-        // before this existed.
+        // The model's own header when it could answer, else the conservative fallback.
+        // `kv_cost_from_header` returns None rather than guessing, so an unreadable or unfamiliar
+        // model gets exactly the fallback behaviour and this is never a new risk.
         let slope = kv_kib_per_token
             .filter(|k| *k > 0)
             .unwrap_or(KV_KIB_PER_TOKEN);
@@ -722,7 +487,10 @@ impl LocalInferenceLlmAdapter {
         floored.min(MAX_CTX as u64).max(MIN_CTX as u64) as u32
     }
 
-    #[cfg(feature = "cuda")]
+    /// Patch the Goose model registry with Jetson Orin Nano settings; errors (model not yet
+    /// downloaded, poisoned lock) are ignored and defaults apply. Not yet fail-closed on memory
+    /// fit: `n_gpu_layers = 99` silently partial-offloads to CPU past the budget. An on-device
+    /// guard must drop the page cache before the `-ngl` load or NvMap fails with error 12.
     fn apply_jetson_settings(model_id: &str) {
         use goose::providers::local_inference::local_model_registry::{
             get_registry, ModelSettings, ToolCallingMode,
@@ -778,25 +546,10 @@ impl LocalInferenceLlmAdapter {
             // Full GPU offload: Jetson unified memory means all layers fit in
             // the same 8 GB pool — no split between CPU and GPU DRAM.
             n_gpu_layers: Some(99),
-            // 16384-token context.
-            //
-            // 4096 was chosen when the KV cost was assumed rather than measured,
-            // and it left a fresh turn at 80% before the user had said anything:
-            // the turn-1 prompt (system prefix + native tools JSON for every
-            // giap extension) measures ~3,250 tokens. Two turns in, a `thinking`
-            // block would overrun the window mid-generation and goose would
-            // compact the conversation away to recover.
-            //
-            // The real cost, read from llama.cpp's own allocation on this board:
-            // 24 MiB non-SWA + 48 MiB SWA = 72 MiB for 4096 cells, i.e. ~18 KiB
-            // per token, because Gemma 4 E2B has n_head_kv = 1. 16384 therefore
-            // costs ~288 MiB against ~5.5 GiB free with the model resident, and
-            // the two buffers (96 + 192 MiB) stay clear of the ~586 MiB NvMap
-            // single-allocation wall.
-            //
-            // This is affordable now in a way it was not before: the prompt-
-            // session KV cache means a longer window buys history that is
-            // re-used rather than re-prefilled every turn.
+            // The turn-1 prompt (system prefix plus native tools JSON) measures ~3,250 tokens, so
+            // a 4096 window starts a fresh turn at 80% full and goose compacts mid-generation.
+            // Measured on this board, Gemma 4 E2B costs ~18 KiB/token, so 16384 is ~288 MiB in
+            // two buffers (96 + 192) that stay clear of the ~586 MiB NvMap allocation wall.
             context_size: Some(context_size),
             // Batch size 512 keeps Ampere SMs saturated during prefill without
             // exceeding the available memory bandwidth (68 GB/s).
@@ -807,13 +560,10 @@ impl LocalInferenceLlmAdapter {
             // Flash attention halves KV-cache memory on Ampere (native support).
             // Also a hard prerequisite for `type_v` below.
             flash_attention: Some(true),
-            // KV cache at q8_0. Measured on this board (gemma-4 E4B, ctx 16384):
-            // KV 296 -> 157 MiB, peak footprint 437 -> 307 MB. Quality-neutral by
-            // two independent tests: greedy output is byte-identical to f16, and a
-            // paired per-chunk wikitext-2 run (n = 100) gives dNLL -0.000987 +/-
-            // 0.000551, t = -1.79 — indistinguishable from f16 at 95%.
-            // q4_0 saves ~75 MiB more but its per-chunk variance is 6.4x higher,
-            // so it is not used here.
+            // KV cache at q8_0. Measured on this board (gemma-4 E4B, ctx 16384): KV 296 -> 157
+            // MiB, peak footprint 437 -> 307 MB. Quality-neutral: greedy output byte-identical to
+            // f16 and paired wikitext-2 dNLL -0.000987 +/- 0.000551 (n = 100, t = -1.79). q4_0
+            // saves ~75 MiB more but its per-chunk variance is 6.4x higher, so it is not used.
             type_k: Some("q8_0".to_string()),
             type_v: Some("q8_0".to_string()),
             // Physical batch. The compute buffer is the second-largest allocation
@@ -856,17 +606,10 @@ impl LocalInferenceLlmAdapter {
     }
 }
 
-/// Strip thinking-token preambles emitted by reasoning-capable models.
-///
-/// Handles two formats:
-///
-/// 1. **Gemma 4**: `<|channel>thought … <channel|>ACTUAL REPLY`
-///    Everything after the last `<channel|>` is the real response.
-///
-/// 2. **Qwen3 / DeepSeek-R1 / QwQ**: `<think>…</think>ACTUAL REPLY`
-///    Everything inside `<think>…</think>` tags is stripped.
-///
-/// If neither pattern is present the original text is returned unchanged.
+/// Strip thinking-token preambles emitted by reasoning-capable models: Gemma 4's
+/// `<|channel>thought ... <channel|>REPLY` (keep everything after the last `<channel|>`) and
+/// Qwen3 / DeepSeek-R1 / QwQ's `<think>...</think>REPLY` (drop the tag contents). Text with
+/// neither pattern is returned unchanged.
 fn strip_thinking_tokens(text: &str) -> String {
     // Gemma 4 format — return everything after the last <channel|>.
     // If nothing follows the tag, return empty (the tag was the entire text).
@@ -962,20 +705,14 @@ impl LocalInferenceLlmAdapter {
 #[cfg(test)]
 mod tests {
 
-    /// Both shipped models, against the DEVICE-measured cost.
-    ///
-    /// No longer `#[cfg(feature = "cuda")]`: this is pure arithmetic, it is the
-    /// part that can kill a board, and gating it meant it never ran on a
-    /// developer machine or in CI -- the only places it CAN run, since the
-    /// device build is `cargo check`-only.
+    /// Both shipped models, against the DEVICE-measured cost. Not `#[cfg(feature = "cuda")]`:
+    /// this is pure arithmetic that can kill a board, and a developer machine or CI is the only
+    /// place it CAN run, since the device build is `cargo check`-only.
     #[test]
     fn jetson_context_fits_each_model_in_the_budget() {
-        // The EXACT sizes of the two GGUFs on the device (`stat -Lc %s`,
-        // 2026-08-16), not round numbers: this function's answer is a step
-        // function of weight size, so a test fed approximations can land on a
-        // different step than the board does. E4B in particular was carrying
-        // 4_640_000_000 here against a real 4_977_171_584 -- a 336 MB gap, over
-        // half of the free KV budget it now has.
+        // The EXACT sizes of the two GGUFs on the device (`stat -Lc %s`, 2026-08-16): the answer
+        // is a step function of weight size, so approximations can land on a different step than
+        // the board does (a 336 MB gap once hid over half of E4B's free KV budget).
         let e2b = LocalInferenceLlmAdapter::jetson_context_size(3_106_738_272, None);
         let e4b = LocalInferenceLlmAdapter::jetson_context_size(4_977_171_584, None);
         assert_eq!(e2b, 16384, "E2B should keep the full window");
@@ -991,14 +728,65 @@ mod tests {
         );
     }
 
-    /// E4B at its window fits the MEASURED budget with real headroom, and
-    /// doubling again does not fit at all.
-    ///
-    /// Both halves matter. The first is the safety claim; the second is why
-    /// 8192 is the honest ceiling for E4B on memory grounds and not merely
-    /// because `MAX_CTX` says so. Arithmetic is redone here rather than copied
-    /// from the function, so a test that recomputed it the same way cannot agree
-    /// with the same mistake.
+    /// The emulator's whole claim, as arithmetic: a different device budget produces a different
+    /// window for the same weights. If the budget stopped reaching the derivation,
+    /// `scripts/jetson-emu.sh` would still announce it was emulating while testing the Mac, and
+    /// that failure is silent by construction.
+    #[test]
+    fn a_different_device_budget_produces_a_different_window() {
+        /// E4B Q4_K_M, `stat -Lc %s` on the device.
+        const E4B: u64 = 4_977_171_584;
+        // Budgets computed the way the scheduler computes them: total RAM less
+        // the fixed OS/STT/TTS reservation.
+        let nano = 7620 - (1500 + 200 + 100);
+        let nx = 15564 - (1500 + 200 + 100);
+
+        let on_nano = LocalInferenceLlmAdapter::context_size_for_budget(nano, E4B, None);
+        let on_nx = LocalInferenceLlmAdapter::context_size_for_budget(nx, E4B, None);
+
+        assert_eq!(on_nano, 8192, "the board we actually have");
+        assert!(
+            on_nx > on_nano,
+            "twice the RAM must buy E4B a wider window, got {on_nx} against {on_nano} -- if these \
+             are equal the profile is not reaching the derivation and the emulator is theatre"
+        );
+    }
+
+    /// The emulated path and the device path are the same code, so the profile
+    /// for the board we own must reproduce the board's own answers exactly.
+    /// This is what makes a tier-1 result worth anything.
+    #[test]
+    fn the_orin_profile_reproduces_the_devices_own_windows() {
+        let budget = 7620 - (1500 + 200 + 100);
+        assert_eq!(
+            LocalInferenceLlmAdapter::context_size_for_budget(budget, 3_106_738_272, None),
+            16384,
+            "E2B"
+        );
+        assert_eq!(
+            LocalInferenceLlmAdapter::context_size_for_budget(budget, 4_977_171_584, None),
+            8192,
+            "E4B"
+        );
+    }
+
+    /// A budget smaller than the weights must clamp, not underflow into a huge
+    /// window. Reachable from a Mac now that POND_DEVICE_TOTAL_RAM_MB exists,
+    /// and previously reachable only by shipping a bigger model to the board.
+    #[test]
+    fn an_impossible_budget_clamps_instead_of_wrapping() {
+        assert_eq!(
+            LocalInferenceLlmAdapter::context_size_for_budget(512, 4_977_171_584, None),
+            2048,
+            "a budget the model cannot fit must land on MIN_CTX; a saturating_sub that wrapped \
+             would hand llama.cpp a window of billions of tokens"
+        );
+    }
+
+    /// E4B at its window fits the MEASURED budget with real headroom, and doubling again does not
+    /// fit at all, which is why 8192 is E4B's honest ceiling on memory grounds and not merely
+    /// because `MAX_CTX` says so. The arithmetic is redone here rather than copied from the
+    /// function, so a test cannot agree with the same mistake.
     #[test]
     fn e4b_fits_its_window_and_could_not_take_another_doubling() {
         /// Measured on the Orin: 128 MiB + 320 MiB at n_ctx 8192, both caches
@@ -1024,35 +812,10 @@ mod tests {
         );
     }
 
-    /// The two models reach the same window for DIFFERENT reasons, and a reader
-    /// changing either constant should know which one they are moving.
-    ///
-    /// E2B is capped by `MAX_CTX` with enormous room to spare; E4B is capped by
-    /// its budget, which happens to round to the same number. Raising `MAX_CTX`
-    /// would move E2B and not E4B.
-    /// The slope itself, pinned where the ceiling cannot hide it.
-    ///
-    /// This used to be the ONLY guard on the slope: both shipped models landed
-    /// on 16,384, E2B because `MAX_CTX` capped it and E4B because its budget
-    /// rounded there, so reverting the slope to the Mac's 16 KiB/token left
-    /// every other test green. That mutation was run and passed, which is why
-    /// this test exists.
-    ///
-    /// Since the budget was corrected to the kernel's real 7620 MB, E4B is
-    /// budget-bound at 8,192 and guards the slope directly -- lowering it to 16
-    /// would hand E4B 16,384 and fail the first test in this file. This one now
-    /// earns its place as defence in depth, and as the guard that survives
-    /// somebody changing which models ship.
-    ///
-    /// A model around 4.5 GB sits where the BUDGET decides the answer below the
-    /// ceiling, so the slope stays observable: 12,288 at the measured cost,
-    /// 16,384 (the clamp) at the Mac's.
-    ///
-    /// The size is chosen to land MID-BAND -- it affords 12,800 tokens, 512
-    /// clear of both 12,288 and 13,312. The previous 4_770_000_000 sat 19
-    /// tokens from a boundary and flipped the expected value the moment the
-    /// rounding granularity changed, which is a test measuring the floor rather
-    /// than the slope it is named for.
+    /// The slope itself, pinned where the ceiling cannot hide it. E4B is budget-bound and guards
+    /// it too, but this survives somebody changing which models ship: a ~4.5 GB model sits where
+    /// the BUDGET decides below the ceiling, giving 12,288 at the measured cost and 16,384 (the
+    /// clamp) at the Mac's. The size lands MID-BAND (12,800 tokens, 512 clear of both floors).
     #[test]
     fn the_per_token_slope_is_observable_on_a_model_the_ceiling_does_not_cap() {
         let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_739_563_520, None);
@@ -1065,13 +828,9 @@ mod tests {
         );
     }
 
-    /// The granularity itself, because throwing away affordable context is what
-    /// this function did for weeks without any test noticing.
-    ///
-    /// E4B IQ4_XS is the case that exposed it: 4,496 MB of weights leave a KV
-    /// budget that affords 13,220 tokens, and the old power-of-two floor handed
-    /// back 8,192 -- under the 4,678-token preamble plus growth, so compaction
-    /// fired on turn one. Any rounding coarser than this reintroduces that.
+    /// The granularity itself: E4B IQ4_XS (4,496 MB of weights) affords 13,220 tokens, and a
+    /// power-of-two floor handed back 8,192, under the 4,678-token preamble plus growth, so
+    /// compaction fired on turn one. Any rounding coarser than this reintroduces that.
     #[test]
     fn rounding_does_not_discard_context_the_budget_affords() {
         // The real IQ4_XS file on the device: 4,715,416,704 bytes.
@@ -1127,12 +886,9 @@ mod tests {
         );
     }
 
-    /// Wiring the header-derived cost in must not move either shipped model.
-    ///
-    /// That is the whole reason this could land without the device: E2B
-    /// computes 18 KiB/token but is `MAX_CTX`-bound either way, and both E4B
-    /// quants compute exactly the 56 the constant already carried. A diff that
-    /// changes nothing today changes only models nobody has loaded yet.
+    /// Wiring the header-derived cost in must not move either shipped model, which is why it
+    /// could land without the device: E2B computes 18 KiB/token but is `MAX_CTX`-bound either
+    /// way, and both E4B quants compute exactly the 56 the constant already carries.
     #[test]
     fn header_derived_cost_is_a_no_op_for_the_shipped_models() {
         // (weights, computed KiB/token, expected window)
@@ -1155,14 +911,10 @@ mod tests {
         }
     }
 
-    /// A cheaper model gets the context its own geometry affords, which is the
-    /// point of reading the header at all.
-    ///
-    /// The size has to be chosen with care: a light model is `MAX_CTX`-bound at
-    /// BOTH costs and the comparison proves nothing. At 4,500 MB the KV budget
-    /// is 720 MB, which affords 13,166 tokens at 56 KiB (budget-bound, floors
-    /// to 12,288) and 26,331 at 28 (ceiling-bound at 16,384). That gap is the
-    /// context a blanket constant was quietly charging for.
+    /// A cheaper model gets the context its own geometry affords, which is the point of reading
+    /// the header. The size matters: a light model is `MAX_CTX`-bound at BOTH costs and proves
+    /// nothing. At 4,500 MB the KV budget is 720 MB: 13,166 tokens at 56 KiB (floors to 12,288)
+    /// against 26,331 at 28 (ceiling-bound at 16,384).
     #[test]
     fn a_cheaper_model_is_no_longer_charged_the_widest_geometry() {
         let bytes = 4_500u64 * 1024 * 1024;
@@ -1174,11 +926,9 @@ mod tests {
         );
     }
 
-    /// The direction that matters: a WIDER model must be charged more and get
-    /// less, rather than inheriting a constant that flatters it.
-    ///
-    /// 168 KiB/token is the figure this file once carried for E4B before the
-    /// device corrected it -- a real number from a real mistake.
+    /// The direction that matters: a WIDER model must be charged more and get less, rather than
+    /// inheriting a constant that flatters it. 168 KiB/token is the figure this file once carried
+    /// for E4B before the device corrected it.
     #[test]
     fn a_wider_model_is_charged_for_it() {
         let bytes = 4_000_000_000u64;
@@ -1202,20 +952,10 @@ mod tests {
         );
     }
 
-    /// The decision the two `apply_*_settings` paths share, tested here because
-    /// the CUDA one is compiled by nothing on a developer machine or in CI.
-    /// The adapter's own path, end to end, against the real files.
-    ///
-    /// The unit tests above build a `ModelProbe` by hand and check the
-    /// decision. This checks that `probe_model` actually reads one off a GGUF
-    /// and that the decision it produces differs across the collection -- the
-    /// failure mode being a probe that quietly returns the same answer for
-    /// everything and looks like it works.
-    ///
-    /// ```text
-    /// GIAP_TEST_GGUF_DIR="$HOME/Library/Application Support/goose-in-a-pond/models/gguf" \
-    ///   cargo test -p pond-adapters-local-inference --lib -- --ignored --nocapture
-    /// ```
+    /// The adapter's probe path end to end against real GGUFs: `probe_model` must read a
+    /// `ModelProbe` off each file and the decisions must differ across the collection (a probe
+    /// returning one answer for everything looks like it works). Set `GIAP_TEST_GGUF_DIR` to a
+    /// `models/gguf` dir, then `cargo test -p pond-adapters-local-inference --lib -- --ignored`.
     #[test]
     #[ignore = "needs real GGUF files; set GIAP_TEST_GGUF_DIR"]
     fn probe_model_reads_real_files_and_separates_them() {
@@ -1348,14 +1088,9 @@ mod tests {
             2048
         );
     }
-    /// Integration tests that require a real model are marked `#[ignore]` and
-    /// gated on the `GIAP_TEST_MODEL_PATH` environment variable.
-    ///
-    /// Run with:
-    /// ```bash
-    /// GIAP_TEST_MODEL_PATH=/path/to/model.gguf \
-    ///   cargo test -p pond-adapters-local-inference -- --ignored
-    /// ```
+    /// Tests needing a real model are `#[ignore]` and gated on `GIAP_TEST_MODEL_PATH`. Run with
+    /// `GIAP_TEST_MODEL_PATH=/path/to/model.gguf` set and
+    /// `cargo test -p pond-adapters-local-inference -- --ignored`.
     use super::*;
 
     #[test]
@@ -1387,11 +1122,9 @@ mod tests {
 
     // ── data_dir path-construction logic (no model weights required) ──────────
 
-    /// Exercise the filename-derivation logic inside `new_with_data_dir` without
-    /// touching the filesystem or loading a model.  We cannot call
-    /// `new_with_data_dir` directly (it eventually calls `LocalInferenceProvider::
-    /// from_env` which tries to download weights), so we replicate the pure
-    /// filename logic here and assert the expected result.
+    /// Exercise the filename derivation inside `new_with_data_dir` without the filesystem or a
+    /// model: calling it directly reaches `LocalInferenceProvider::from_env`, which downloads
+    /// weights, so the pure filename logic is replicated here.
     #[test]
     fn data_dir_filename_derivation_strips_gguf_suffix() {
         let model_id = "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M";
@@ -1496,22 +1229,10 @@ mod tests {
         assert_eq!(quantization, "Q4_K_M");
     }
 
-    /// The Jetson tuning block, type-checked on a machine that cannot build it.
-    ///
-    /// `apply_jetson_settings` is `#[cfg(feature = "cuda")]`, so it is compiled
-    /// by no developer machine and by no CI job — `cargo check -p pond-server`
-    /// does not pass that feature. Everything it writes is therefore reviewed
-    /// rather than compiled, and that gap has already cost a real breakage:
-    /// the parent set `type_k`, `type_v` and `n_ubatch` from fe68ccdd against
-    /// `ModelSettings` fields that existed only in the goose submodule's
-    /// WORKING TREE, so the pinned commit could not build for CUDA and nothing
-    /// on any Mac or in CI could notice.
-    ///
-    /// This constructs the same struct literal, with the same field names and
-    /// the same types, on whatever platform is running the tests. It cannot
-    /// check the VALUES are right for the Orin — only hardware can — but it
-    /// fails the build the moment the submodule stops carrying a field the
-    /// device code sets.
+    /// The Jetson tuning block, type-checked off-device. `apply_jetson_settings` is
+    /// `#[cfg(feature = "cuda")]`, so no developer machine or CI job compiles it; it once set
+    /// `ModelSettings` fields that existed only in the submodule's working tree and nothing
+    /// noticed. This builds the same struct literal everywhere; only hardware can check VALUES.
     #[test]
     fn the_jetson_settings_block_still_type_checks_off_device() {
         use goose::providers::local_inference::local_model_registry::{

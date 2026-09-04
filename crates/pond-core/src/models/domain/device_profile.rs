@@ -1,40 +1,7 @@
-//! Which device this process should believe it is running on.
-//!
-//! # Why this exists
-//!
-//! The Jetson-specific behaviour in this workspace is not one switch. It is a
-//! handful of independent reads — a device-tree file, a JetPack marker file, a
-//! RAM constant, and a cargo feature — each consulted in a different crate, and
-//! **none of them is true on a MacBook**. The consequence is not that the Mac
-//! behaves a little differently: it is that entire branches are unreachable
-//! there. `LocalInferenceLlmAdapter::apply_jetson_settings` is
-//! `#[cfg(feature = "cuda")]`, so every context-sizing decision the Orin makes
-//! has, until now, only ever executed on the Orin.
-//!
-//! That is the exact shape of the defect recorded in the Jetson context-mismatch
-//! note: a cfg branch that was dead for months while the tests around it stayed
-//! green, because the tests were testing the arithmetic and nobody was running
-//! the caller.
-//!
-//! A profile lets the Mac take the decisions the board takes.
-//!
-//! # What this is NOT
-//!
-//! This emulates what the board **decides**, not what the board **survives**.
-//! It cannot make a 64 GB Mac run out of memory at 7,620 MB, it does not change
-//! codegen, and it must never be used to source a performance or KV-cost
-//! number — the Mac has reported a third of the device's real per-token KV cost
-//! for the same model. Memory ceilings and throughput come from the aarch64
-//! container tier or from the board itself. See `scripts/jetson-emu.sh`.
-//!
-//! # The safety property
-//!
-//! **With no profile set, every accessor here returns `None` and every call
-//! site falls back to exactly what it did before.** A profile is opt-in through
-//! `POND_DEVICE_PROFILE` and nothing sets that in production, in `deploy.sh`, or
-//! in CI. This is why the call sites take an `Option` rather than a profile with
-//! a "host" default: a default is something that can be got wrong silently, and
-//! this is a knob that reaches the code that can OOM a board.
+//! Which device this process should believe it is running on: a profile lets the Mac take the
+//! decisions the board takes, since `apply_jetson_settings` is `#[cfg(feature = "cuda")]` and
+//! only ever ran on the Orin. Opt-in via `POND_DEVICE_PROFILE`; unset, every accessor returns
+//! `None`. Emulates decisions, not survival: no KV or perf numbers, see scripts/jetson-emu.sh.
 
 use std::sync::OnceLock;
 
@@ -74,9 +41,8 @@ pub struct DeviceProfile {
 impl DeviceProfile {
     /// Look up a built-in profile by name. `None` for anything unrecognised.
     ///
-    /// Pure, so the table is testable without a Jetson and without an
-    /// environment. Unrecognised names return `None` rather than a host
-    /// default: a typo in `POND_DEVICE_PROFILE` must be loud, not inert.
+    /// Pure, so the table is testable without a Jetson. An unrecognised name returns `None`
+    /// rather than a host default: a typo in `POND_DEVICE_PROFILE` must be loud, not inert.
     pub fn builtin(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             // The deployment. Every figure here was read off the board; see
@@ -129,10 +95,8 @@ impl DeviceProfile {
 
     /// Apply the per-field environment overrides to a base profile.
     ///
-    /// Split from [`Self::from_env`] and taking its lookups as a closure so the
-    /// override precedence is testable without mutating the process
-    /// environment — which is a data race in a threaded test binary, and in
-    /// recent Rust an `unsafe` one.
+    /// Takes its lookups as a closure so override precedence is testable without mutating the
+    /// process environment, which is a data race in a threaded test binary.
     pub fn with_overrides(mut self, lookup: impl Fn(&str) -> Option<String>) -> Self {
         if let Some(mb) = lookup(TOTAL_RAM_ENV).and_then(|v| v.trim().parse::<u64>().ok()) {
             self.total_ram_mb = mb;
@@ -170,10 +134,8 @@ impl DeviceProfile {
 
 /// The profile this process is emulating, or `None` to be honest about the host.
 ///
-/// Read from the environment once. Emulation is a property of a run, not of a
-/// moment in one: a profile that could change underneath a running process
-/// would let the model registry be stamped for one device and the memory
-/// budget computed for another.
+/// Read from the environment once: emulation is a property of a run, or the model registry
+/// could be stamped for one device while the memory budget is computed for another.
 pub fn active() -> Option<&'static DeviceProfile> {
     static ACTIVE: OnceLock<Option<DeviceProfile>> = OnceLock::new();
     ACTIVE
@@ -304,17 +266,10 @@ mod tests {
         assert_eq!(p.total_ram_mb, 7620);
     }
 
-    /// `scripts/jetson-emu.sh` carries its own copy of the profile table,
-    /// because it has to size a container before any Rust has run. This is the
-    /// guard that makes the copy safe: a profile added on one side and not the
-    /// other fails the build here rather than producing an emulator that
-    /// refuses a profile the binary knows, or sizes a container for a board
-    /// with different memory.
-    ///
-    /// Text-matching a shell script is a weak instrument and is chosen
-    /// deliberately — `pond-core` cannot depend on the script, and the
-    /// alternative is the duplication rotting in silence, which is the failure
-    /// this whole module exists to prevent applied one level up.
+    /// `scripts/jetson-emu.sh` carries its own copy of the profile table because it has to size
+    /// a container before any Rust has run. A profile added on one side and not the other fails
+    /// here rather than producing an emulator that refuses a known profile or sizes a container
+    /// for the wrong memory. Text-matching is weak, but `pond-core` cannot depend on the script.
     #[test]
     fn shell_and_rust_agree_about_the_profiles() {
         let script =
