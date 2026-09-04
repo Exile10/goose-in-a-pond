@@ -1,32 +1,7 @@
-//! Passive presentation-attack detection (PAD).
-//!
-//! Addresses the "printed photo / phone screen in front of the camera"
-//! failure mode the user reported.  A full PAD model (MiniFASNet ONNX) is
-//! a future addition; in the meantime we use three lightweight passive
-//! heuristics computed on the already-aligned 112×112 crop:
-//!
-//! 1. **Saturation variance** — natural skin under real lighting shows
-//!    noticeable chroma variation across the face (warmer around cheeks,
-//!    cooler around forehead / brow).  Flat prints and LCD captures tend
-//!    to present a more uniform chroma because they're a two-step tone
-//!    reproduction.  A collapsed S-channel is a strong cue.
-//!
-//! 2. **Highlight density** — real skin has microscale specular
-//!    reflections (from subtle oils, curvature).  Those show up on a
-//!    webcam as scattered bright-and-low-saturation pixels in the crop.
-//!    A photo of a photo almost never shows them (the printing / LCD
-//!    pipeline has already averaged them out).  We count how many pixels
-//!    satisfy `V > 0.85` AND `S < 0.20` and require a minimum density.
-//!
-//! 3. **Edge-density skew** — screens and low-quality prints exhibit
-//!    strong horizontal banding from scanline and halftone patterns.
-//!    We measure the ratio of horizontal to vertical Sobel gradients; a
-//!    value far from 1.0 suggests a non-real surface.
-//!
-//! Each heuristic contributes to a combined [0, 1] `spoof_score`.  The
-//! caller can turn the gate off or adjust the threshold via
-//! `POND_FACE_ANTISPOOF_THRESHOLD` (default 0.65 — permissive enough
-//! that real users rarely trip but prints / screens do).
+//! Passive presentation-attack detection (PAD) for printed photos and phone screens.
+//! Saturation variance, specular-highlight density (`V > 0.85 && S < 0.20`) and the horizontal
+//! to vertical Sobel ratio on the aligned 112×112 crop combine into a [0, 1] `spoof_score`.
+//! `POND_FACE_ANTISPOOF_THRESHOLD` (default 0.65) sets the gate; the caller may turn it off.
 
 use image::RgbImage;
 

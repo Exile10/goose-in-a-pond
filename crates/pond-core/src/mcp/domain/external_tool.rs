@@ -2,11 +2,8 @@
 //!
 //! Pure domain type — no external dependencies.
 
-/// Description of a tool available in the agent pipeline.
-///
-/// Built-in GIAP tools (wikipedia, weather, memory, etc.) and tools
-/// from external MCP extensions share the same description type so
-/// they can be rendered together in the system prompt.
+/// Description of a tool available in the agent pipeline. Built-in GIAP tools and tools from
+/// external MCP extensions share this type so they render together in the system prompt.
 #[derive(Debug, Clone)]
 pub struct ExternalToolDescription {
     /// Tool name as it appears in the MCP schema (e.g. "wikipedia", "get_weather").

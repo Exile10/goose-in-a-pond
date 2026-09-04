@@ -1,10 +1,4 @@
-//! The real first-run path: install the controller from the shipped sources and
-//! talk to it over the protocol. No mock anywhere.
-//!
-//! `#[ignore]` because it runs `npm ci` against the network and takes tens of
-//! seconds — CI's coverage is the mock suite, which needs neither. Run it by
-//! hand when the controller, the install, or the protocol changes:
-//!
+//! The first-run path, `#[ignore]`d because `npm ci` hits the network; CI uses the mock suite.
 //! ```text
 //! cargo test -p pond-adapters-matter --test end_to_end_install -- --ignored --nocapture
 //! ```
@@ -97,22 +91,10 @@ async fn a_fresh_pond_installs_a_controller_and_talks_to_it() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
-/// Asking for BLE must never cost the controller.
-///
-/// On macOS the OS SIGKILLs a process that touches CoreBluetooth without an
-/// `NSBluetoothAlwaysUsageDescription` in its bundle's Info.plist — and the
-/// controller is a bare `node`, which has no bundle. The kill cannot be caught
-/// in-process, so `ble.ts`'s try/catch does not help: the process is gone.
-/// Without the fallback the supervisor would respawn it and the OS would kill it
-/// again, forever, and Matter would be unusable BECAUSE a transport was switched
-/// on.
-///
-/// This test asserts the property, not the platform: wherever the request cannot
-/// be honoured — no `@stoprocent/noble`, no `cap_net_raw` on Linux, no bundle on
-/// macOS — `ensure_matter_server` must still hand back a controller that speaks
-/// the protocol, with `ble: false` in its greeting. Where BLE DOES work it is
-/// honoured on the first attempt and the greeting says `true`; both are a pass,
-/// because both are the controller telling the truth about what it can reach.
+/// Asking for BLE must never cost the controller: macOS SIGKILLs a bare `node` that touches
+/// CoreBluetooth with no `NSBluetoothAlwaysUsageDescription`, uncatchable, so a respawn loop
+/// follows. Either greeting passes, as long as `ensure_matter_server` still returns a controller
+/// that speaks the protocol and reports `ble` truthfully.
 #[tokio::test]
 #[ignore = "runs npm ci against the network"]
 async fn asking_for_ble_never_costs_the_controller() {

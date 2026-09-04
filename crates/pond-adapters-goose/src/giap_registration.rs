@@ -1,8 +1,6 @@
 //! Registers GIAP's modular MCP servers into Goose's builtin extension registry.
-//!
-//! Call `register_giap_extensions(...)` once at startup before creating any GooseAdapter.
-//! The returned `Vec<String>` is the list of actually-registered extension names,
-//! which depends on the `ext_*_enabled` settings toggles.
+//! Call `register_giap_extensions(...)` once at startup before creating any GooseAdapter; it
+//! returns the names actually registered, which depend on the `ext_*_enabled` settings toggles.
 
 use anyhow::Result;
 use goose::builtin_extension::register_builtin_extension;
@@ -33,13 +31,9 @@ pub fn registered_extensions() -> &'static [String] {
         .unwrap_or(&[])
 }
 
-/// Register GIAP MCP servers as Goose builtin extensions, respecting settings toggles.
-///
-/// Must be called once at process startup before any GooseAdapter session.
-/// Returns the list of extension names that were actually registered.
-///
-/// The `giap-draft` extension is always registered (safety feature — not toggleable).
-/// Other extensions are gated by the corresponding `ext_*_enabled` settings.
+/// Register GIAP MCP servers as Goose builtin extensions, respecting the `ext_*_enabled` toggles.
+/// Must be called once at process startup before any GooseAdapter session; returns the names
+/// actually registered. `giap-draft` is always on (safety feature, not toggleable).
 pub fn register_giap_extensions(
     settings: &Settings,
     memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
@@ -65,13 +59,9 @@ pub fn register_giap_extensions(
     registered.push("giap-draft".into());
 
     // ── Always-on: toolkit server (Phase D2 escape hatch) ───────────────────
-    // Not toggleable, for the same reason giap-draft is not: it is what makes
-    // tool-relevance narrowing safe. With `tool_selection_mode = "relevant"` the
-    // model sees a reduced set of extension schemas; these two tools are how it
-    // discovers and loads a group nobody predicted. Its `ToolSelectionControl`
-    // handle is installed separately (`init_toolkit_deps` in pond-server) because
-    // the implementor is the agent adapter, which is built after this call — and
-    // without the handle both tools truthfully report "everything is loaded".
+    // Not toggleable: under `tool_selection_mode = "relevant"` its two tools let the model load a
+    // group nobody predicted. Its `ToolSelectionControl` handle is set by `init_toolkit_deps`
+    // in pond-server (the adapter is built after this call); without it both report all loaded.
     register_builtin_extension(
         pond_core::mcp::domain::tool_group::TOOLKIT_EXTENSION,
         pond_mcp_server::spawn_toolkit_server,
@@ -178,21 +168,10 @@ pub fn register_giap_extensions(
         registered.push("giap-sensors".into());
     }
 
-    // Personal context (PAI-8 P2). Read-only: `search_context` and
-    // `get_recent_context`, both scoped to whoever is speaking by the engine
-    // session id in `_meta`. There is no `ingest_context` tool and there will
-    // not be one -- the corpus is written by the ingest pipeline from sources
-    // the household connected, and a tool that let the model write into it
-    // would let a prompt injection plant a memo the assistant later quotes as
-    // fact.
-    //
-    // OFF by default, for a reason the other toggles do not have. Registering
-    // puts two tool schemas into EVERY turn's prompt, and until somebody
-    // connects a source they can only ever answer "nothing found" -- so on the
-    // target hardware, where tool schemas are already ~88% of a 4 096-token
-    // window, this would be a per-turn cost forever for nothing. Its deps are
-    // installed separately (`init_context_deps` in pond-server), like
-    // giap-audit's and giap-vision's.
+    // Personal context (PAI-8 P2): read-only `search_context` and `get_recent_context`, scoped to
+    // the speaker by the engine session id in `_meta`; deps: `init_context_deps` in pond-server.
+    // Never add an `ingest_context` tool: prompt injection could plant a memo later quoted as fact.
+    // OFF by default: two schemas cost every turn yet say "nothing found" until a source exists.
     if settings.ext_context_enabled {
         register_builtin_extension(
             "giap-context",
@@ -201,16 +180,10 @@ pub fn register_giap_extensions(
         registered.push("giap-context".into());
     }
 
-    // Orchestration / delegation (PAI-6 P5). OFF by default -- and it was the
-    // only `ext_*` toggle that was until PAI-8 P2, because turning it on means an autonomous
-    // multi-turn agent running under `GooseMode::Auto`, which is not something
-    // an install should acquire by upgrading. `Settings::default_ext_orchestrator_enabled`
-    // returns false; reusing `default_ext_enabled` here would flip that.
-    //
-    // Like giap-audit and giap-vision, the handles it needs are installed
-    // separately -- `init_orchestrator_deps` in pond-server. Unlike them, the
-    // reason is ordering rather than scope: the orchestrator wraps the very
-    // adapter this registration runs before.
+    // Orchestration / delegation (PAI-6 P5). OFF by default: turning it on means an autonomous
+    // multi-turn agent under `GooseMode::Auto`, which an install must not acquire by upgrading.
+    // `Settings::default_ext_orchestrator_enabled` is false; `default_ext_enabled` would flip it.
+    // Handles come from `init_orchestrator_deps` in pond-server: it wraps the adapter built later.
     if settings.ext_orchestrator_enabled {
         register_builtin_extension(
             pond_core::mcp::domain::tool_group::ORCHESTRATOR_EXTENSION,

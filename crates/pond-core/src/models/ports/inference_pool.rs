@@ -1,8 +1,6 @@
-//! InferencePool port — concurrent LLM task submission.
-//!
-//! Abstracts concurrent access to a shared LLM provider. Implementations
-//! control concurrency via semaphores: HTTP providers (Ollama, llamafile)
-//! allow 3+ concurrent requests, while local GGUF serializes to 1.
+//! InferencePool port — concurrent access to a shared LLM provider. Implementations control
+//! concurrency with semaphores: HTTP providers (Ollama, llamafile) allow 3 or more concurrent
+//! requests, while local GGUF serializes to 1.
 
 use crate::models::domain::message::ChatMessage;
 use anyhow::Result;
@@ -29,11 +27,9 @@ pub struct InferenceResult {
     pub response: ChatMessage,
 }
 
-/// Driven port: submit LLM completion tasks for concurrent execution.
-///
-/// The pool shares a single `LlmProvider` across all submitted tasks.
-/// Concurrency is bounded by the adapter's semaphore — HTTP providers
-/// allow parallel requests, GGUF serializes behind Goose's model mutex.
+/// Driven port: submit LLM completion tasks for concurrent execution. The pool shares one
+/// `LlmProvider` across every task, bounded by the adapter's semaphore: HTTP providers allow
+/// parallel requests, GGUF serializes behind Goose's model mutex.
 #[async_trait]
 pub trait InferencePool: Send + Sync {
     /// Submit a completion request. Returns when inference completes.

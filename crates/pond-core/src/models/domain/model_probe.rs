@@ -1,41 +1,7 @@
-//! What a model can be asked to do, read from the model.
-//!
-//! Three mechanisms decide this today and none of them looks at the model: GIAP
-//! forces `ToolCallingMode::ForceNative` on every model, goose matches a
-//! hardcoded table of featured repos, and `ModelCapabilities::from_model_name`
-//! substring-matches the filename. A model none of them has heard of gets
-//! native tool calling forced onto it whether or not its template can render
-//! tools, and thinking enabled whether or not it has any.
-//!
-//! The answer is in the file. A GGUF carries the model's own Jinja chat
-//! template, and that template is the thing the tokens are actually rendered
-//! through — so whether it accepts a `tools` variable, and whether it gates
-//! reasoning, are facts rather than inferences.
-//!
-//! # What the evidence looked like
-//!
-//! Read off the eleven GGUFs on the development machine, five architectures:
-//!
-//! | model | arch | `tools` in control flow | gate | marker |
-//! |---|---|---|---|---|
-//! | Gemma 4 E2B/E4B/12B | gemma4 | yes | `enable_thinking` | `<\|think\|>` |
-//! | Nemotron3-Nano-4B | nemotron_h | yes | `enable_thinking` | `<think>` |
-//! | Nanbeige4.2-3B | nanbeige | yes | `enable_thinking` | `<think>` |
-//! | DeepSeek-R1-Distill-Qwen | qwen2 | **no** | none | `<think>` |
-//! | gemma-4-*-assistant (MTP) | gemma4_mtp | no template at all | — | — |
-//!
-//! Two of those rows are the reason this exists. **DeepSeek-R1-Distill has no
-//! `tools` variable**, so forcing native tool calling on it puts declarations
-//! nowhere. And the MTP drafts carry no template at all, which is a third state
-//! rather than an error.
-//!
-//! # Why counting substrings is not enough
-//!
-//! DeepSeek's template mentions `tool_call` once while supporting no tools, so
-//! a `contains("tool")` test calls it a tool user. The distinction that holds is
-//! between template *control flow* — `{%- if tools -%}`, `{%- for tool in
-//! tools %}` — and an identifier appearing in emitted text. This module looks
-//! only inside `{% ... %}` blocks, and only for the whole word.
+//! What a model can be asked to do, read from the model's own Jinja chat template rather than
+//! from a name table: DeepSeek-R1-Distill has no `tools` variable, so forcing native tool calling
+//! on it puts the declarations nowhere, and the MTP drafts carry no template at all — a third
+//! state, not an error. Only whole words inside `{% ... %}` count; emitted text is not evidence.
 
 use super::gguf::GgufInfo;
 
@@ -88,9 +54,8 @@ const THINKING_MARKERS: &[&str] = &["<|think|>", "<think>", "<|channel|>", "<rea
 impl ModelProbe {
     /// Read a probe from a parsed GGUF header.
     ///
-    /// A header with no `chat_template` yields `Unknown` rather than `Absent`:
-    /// "this file did not say" and "this model cannot" are different, and only
-    /// the second justifies withholding tools.
+    /// A header with no `chat_template` yields `Unknown`, not `Absent`: only "this model
+    /// cannot" justifies withholding tools.
     pub fn from_gguf(info: &GgufInfo) -> Self {
         let Some(template) = info.chat_template.as_deref() else {
             return Self {
@@ -130,10 +95,8 @@ impl ModelProbe {
 
     /// Can tool declarations be handed to this model natively?
     ///
-    /// `Unknown` answers no. Forcing native tool calling on a model whose
-    /// template turns out not to take a `tools` variable is the failure this
-    /// module exists to prevent, and a file that would not say is not evidence
-    /// that it would have said yes.
+    /// `Unknown` answers no: a file that would not say is not evidence it would have said yes,
+    /// and forcing native tools on a template with no `tools` variable is the failure here.
     pub fn supports_native_tools(&self) -> bool {
         matches!(self.tools, ToolSupport::Native)
     }
@@ -155,30 +118,10 @@ impl ModelProbe {
     }
 }
 
-/// Read a probe from a GGUF on disk, remembering the answer.
-///
-/// # Why this is memoised rather than simply called
-///
-/// The prompt side asks this question on EVERY turn, from a synchronous block,
-/// and the answer feeds `PromptState` -- so it lands inside the static prefix
-/// that the engine's KV prompt-session cache keys on. Two properties follow,
-/// and both are load-bearing:
-///
-/// - **Cheap.** [`parse_gguf_file`] steps over the token array rather than
-///   reading it, so a template 15 MB in costs a few hundred kilobytes and about
-///   40 ms. That is fine once and not fine every turn.
-/// - **Stable.** The answer must be identical on turn 1 and turn 2. This is the
-///   exact failure `thinking_section_applies` was written around: a capability
-///   cache that filled in mid-session rendered a prompt without the `<thinking>`
-///   section on turn 1 and with it on turn 2, moved `prefix_hash`, and cost
-///   every session a full re-prefill on its second turn -- 3.7 s on the Orin,
-///   for the turn the cache exists to make nearly free.
-///
-/// Keying on `(path, mtime, len)` rather than path alone means a model file
-/// replaced in place is re-read rather than answered from a stale entry. A
-/// `None` is cached too: a file that cannot be parsed will not start parsing
-/// because it was asked twice, and re-walking it every turn is the cost this
-/// exists to avoid.
+/// Read a probe from a GGUF on disk, remembering the answer. It is asked every turn from a
+/// synchronous block and feeds `PromptState`, so it must be cheap (~40 ms a parse) and identical
+/// on every turn: an answer that changes mid-session moves `prefix_hash` and costs a full
+/// re-prefill, 3.7 s on the Orin. Keyed on `(path, mtime, len)`; a `None` is cached too.
 pub fn probe_cached(path: &std::path::Path) -> Option<ModelProbe> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -214,11 +157,8 @@ pub fn probe_cached(path: &std::path::Path) -> Option<ModelProbe> {
 
 /// Does `ident` appear as a whole word inside a Jinja control block?
 ///
-/// The scan is over `{% ... %}` only. Text outside a control block is what the
-/// template *emits*, and an identifier there says nothing about whether the
-/// template consumes a variable of that name -- which is exactly how
-/// DeepSeek-R1's single mention of `tool_call` reads as tool support to a
-/// substring test.
+/// The scan covers `{% ... %}` only: an identifier in emitted text says nothing about what the
+/// template consumes, which is how DeepSeek-R1's one `tool_call` mention fools a substring test.
 fn mentions_in_control_flow(template: &str, ident: &str) -> bool {
     let mut rest = template;
     while let Some(open) = rest.find("{%") {
@@ -359,15 +299,9 @@ mod tests {
         );
     }
 
-    /// The probe against every real GGUF on the machine, not excerpts.
-    ///
-    /// Excerpt fixtures prove the rules; only the files prove the rules survive
-    /// contact with 19 KB of real Jinja. Run with
-    ///
-    /// ```text
-    /// GIAP_TEST_GGUF_DIR="$HOME/Library/Application Support/goose-in-a-pond/models/gguf" \
-    ///   cargo test -p pond-core --lib model_probe -- --ignored --nocapture
-    /// ```
+    /// The probe against every real GGUF on the machine, not excerpts. Excerpt fixtures prove
+    /// the rules; only the files prove they survive 19 KB of real Jinja. Point
+    /// `GIAP_TEST_GGUF_DIR` at the gguf models directory and run with `--ignored`.
     #[test]
     #[ignore = "needs real GGUF files; set GIAP_TEST_GGUF_DIR"]
     fn probes_every_model_on_disk() {

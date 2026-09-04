@@ -1,11 +1,7 @@
 //! InstantActivation — StreamingWakeWordDetector for keyboard / stdin mode.
 //!
-//! Returns immediately from `wait_for_activation_with_audio()` so the workflow loop
-//! transitions straight from Wait to Listen without pausing.
-//! Used as the default in `ChatService` and in all tests.
-//!
-//! Implements `StreamingWakeWordDetector`; the blanket impl provides `WakeWordDetector`
-//! automatically.
+//! `wait_for_activation_with_audio()` returns immediately, so the workflow loop goes
+//! straight from Wait to Listen. The default in `ChatService` and in all tests.
 
 use crate::models::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
 use anyhow::Result;
@@ -25,20 +21,18 @@ impl StreamingWakeWordDetector for InstantActivation {
         })
     }
 
-    /// Nothing to prompt for: this detector never waits, so there is no
-    /// moment to describe. It said "Type your message" for both callers, but
-    /// `--no-wake-word` pairs it with a *microphone* — so a voice session
-    /// announced a keyboard, twice per turn, next to the real "listening"
-    /// prompt. `run_loop` skips an empty prompt.
+    /// Nothing to prompt for: this detector never waits. A keyboard prompt here
+    /// would be announced twice per turn by a `--no-wake-word` microphone
+    /// session, next to the real "listening" prompt. `run_loop` skips an empty
+    /// prompt.
     fn activation_prompt(&self) -> &str {
         ""
     }
 
-    /// `InstantActivation` resolves immediately, so it must NOT participate in
-    /// `run_loop`'s interrupt race — otherwise the wake future would win before
-    /// any turn completes and every turn would be aborted. Returning `false`
-    /// makes `run_loop` await the turn directly in stdin / `--no-wake-word` /
-    /// whisper-load-failure fallback modes.
+    /// `InstantActivation` resolves immediately, so it must NOT join `run_loop`'s
+    /// interrupt race: the wake future would win before any turn completed and
+    /// abort every turn. `false` makes `run_loop` await the turn directly in
+    /// stdin, `--no-wake-word` and whisper-load-failure modes.
     fn supports_interruption(&self) -> bool {
         false
     }

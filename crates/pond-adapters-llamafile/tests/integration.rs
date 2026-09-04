@@ -1,8 +1,5 @@
-//! Integration tests for LlamafileProvider.
-//!
-//! Mocks the llamafile HTTP server with wiremock — no real binary needed.
-//!
-//! Run: cargo test -p pond-adapters-llamafile
+//! Integration tests for LlamafileProvider. Mocks the llamafile HTTP server with wiremock, so
+//! no real binary is needed: `cargo test -p pond-adapters-llamafile`.
 
 use futures::StreamExt;
 use pond_adapters_llamafile::{LlamafileProvider, DEFAULT_MODEL};
@@ -459,9 +456,8 @@ async fn stream_complete_request_includes_temperature_and_max_tokens() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Task-role: tool-use dispatch (via ModelRouter + TaskProvider)
-//  These tests verify LlamafileProvider behaves correctly when used
-//  as the `task` provider in ModelRouter for agentic/tool-use prompts.
+//  Task-role: tool-use dispatch — LlamafileProvider as ModelRouter's `task`
+//  provider for agentic/tool-use prompts.
 // ═══════════════════════════════════════════════════════════════════
 
 #[tokio::test]

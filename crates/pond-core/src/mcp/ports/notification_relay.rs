@@ -1,10 +1,7 @@
-//! Driven port: background push relay (#99, Phase 2 scaffold).
-//!
-//! Delivers a notification to a backgrounded device via its platform push
-//! service (FCM for Android, APNs for iOS), resolving the device's stored push
-//! token (#95). Best-effort: a device with no token, or a transient relay
-//! failure, must not break foreground delivery. The real FCM/APNs HTTP client
-//! lands in a follow-up; today a stub logs the intent.
+//! Driven port: background push relay (#99, Phase 2 scaffold). Delivers a notification to a
+//! backgrounded device via FCM or APNs, resolving the device's stored push token (#95).
+//! Best-effort: a missing token or a transient failure must not break foreground delivery.
+//! The real FCM/APNs HTTP client lands in a follow-up; today a stub logs the intent.
 
 use anyhow::Result;
 use async_trait::async_trait;

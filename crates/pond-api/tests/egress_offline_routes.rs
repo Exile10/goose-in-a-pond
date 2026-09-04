@@ -1,36 +1,7 @@
-//! PAI-2 P6b: `routes.rs` is the worst case the egress classification has, and
-//! this file is the coverage that makes listing it `EGRESS_TRACKED` honest.
-//!
-//! `egress_guard.rs :: egress_tracked_files_reach_the_tracker` looks for ONE
-//! tracker call per FILE. `routes.rs` holds SIXTEEN `.send()` sites, so gating
-//! one of them turns that guard green while fifteen still phone out. That guard
-//! says so in its own doc comment; this file is the other half.
-//!
-//! Two kinds of assertion, because neither alone is enough:
-//!
-//! * [`every_send_in_routes_rs_pairs_with_its_own_gate`] -- source-level, and
-//!   the one that catches the regression a real person writes. It pairs each
-//!   `.send()` with a DISTINCT preceding gate in the same function, so a second
-//!   send copy-pasted below a gated one fails even though the function still
-//!   contains a gate. The three ungated sends are named individually, not
-//!   inferred, and each has to keep containing the loopback literal that is the
-//!   reason it is exempt.
-//! * The behavioural tests -- `Offline` installed, real routers, real HTTP
-//!   through `oneshot`, asserting a REFUSAL and not merely a failure. A network
-//!   error and a refusal both leave the user without a model list; only one of
-//!   them names the setting to change.
-//!
-//! Why the source guard is not redundant: four of the gated sites cannot be
-//! reached from a router test at all. Two live inside a `tokio::spawn`ed
-//! download task, and both OAuth token exchanges need a live provider redirect
-//! or an internal-extension bearer token. A guard that only covered what
-//! `oneshot` can drive would leave those four with nothing.
-//!
-//! NOTE ON PARALLELISM: `set_network_mode` is a process-global. Every test in
-//! this binary installs `Offline` and none of them ever installs anything else,
-//! so they cannot race each other. Do not add a test here that needs `Open`.
-//!
-//! Run: cargo test -p pond-api --test egress_offline_routes
+//! PAI-2 P6b: `routes.rs` holds sixteen `.send()` sites while `egress_guard.rs` only demands
+//! one gated call per file, so this file is the other half: every send is paired with its own
+//! gate in source, and under `Offline` the routes must REFUSE rather than merely fail. NOTE:
+//! `set_network_mode` is process-global: every test here installs `Offline`, none may use `Open`.
 
 use std::sync::Arc;
 
@@ -56,29 +27,15 @@ use tower::ServiceExt;
 
 const ROUTES_RS: &str = "src/routes.rs";
 
-/// Any of these, called in code, opens a gated hop.
-///
-/// CALL forms with the opening paren, and the source has its comments stripped
-/// before the search -- the same two-part fix `egress_guard.rs :: TRACKER_SYMBOLS`
-/// needed after a review found the bare-symbol version was satisfied by comment
-/// prose. Every comment in this phase's diff mentions `egress::begin`; without
-/// the strip, this guard would certify the comments.
-///
-/// The entries MUST NOT overlap each other. The first version of this list also
-/// carried `shared::services::egress::begin(`, which is a superstring of the
-/// first entry -- so one real call produced two distinct byte offsets, every
-/// function counted twice as many gates as it had, and deleting the Spotify
-/// retry's gate left all eight tests in this file GREEN. That is the exact
-/// vacuity shape this file exists to prevent, found by mutation-testing the
-/// guard rather than by reading it.
+/// Any of these, called in code, opens a gated hop. Call forms with the opening paren, and
+/// the source has its comments stripped first, or the guard certifies comment prose that
+/// merely mentions `egress::begin`. The entries MUST NOT overlap: a superstring entry counts
+/// one real call twice, which left every test here green with a real gate deleted.
 const GATE_CALLS: &[&str] = &["egress::begin(", "egress::check_egress("];
 
-/// The sends that are deliberately ungated, each with the loopback literal that
-/// is the reason.
-///
-/// Named individually and pinned by count. The `run_models` lesson: a heuristic
-/// exemption does not merely miss a new hole, it LOCKS IT OUT of the question.
-/// A fourth ungated send joins this list only by someone writing it down.
+/// The sends that are deliberately ungated, each with the loopback literal that is the
+/// reason. Named individually and pinned by count: a heuristic exemption does not merely
+/// miss a new hole, it LOCKS IT OUT of the question.
 struct UngatedSend {
     /// Prefix of the enclosing top-level `fn` line.
     function: &'static str,
@@ -105,11 +62,10 @@ const UNGATED_LOOPBACK_SENDS: &[UngatedSend] = &[
 /// if the detector breaks, the pairing loop finds nothing and reports success.
 const EXPECTED_SENDS: usize = 16;
 
-/// Remove every `#[cfg(test)]` ITEM. Line-based for the same reason
-/// `egress_guard.rs` is: a `format!("{{")` inside a test desynchronises a brace
-/// counter, and rustfmt guarantees an item's closing brace sits at its own
-/// indentation. Truncating at the FIRST `#[cfg(test)]` would be wrong -- this
-/// file has several, with production code between them.
+/// Remove every `#[cfg(test)]` ITEM. Line-based for the same reason `egress_guard.rs` is: a
+/// `format!("{{")` inside a test desynchronises a brace counter, and rustfmt guarantees an
+/// item's closing brace sits at its own indentation. Truncating at the FIRST `#[cfg(test)]`
+/// would be wrong -- this file has several, with production code between them.
 fn production_source(src: &str) -> String {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = String::with_capacity(src.len());
@@ -192,15 +148,10 @@ fn offsets_of(hay: &str, needle: &str) -> Vec<usize> {
     out
 }
 
-/// Every `.send()` in `routes.rs` is preceded by a gate of its OWN.
-///
-/// The important word is OWN. "This function contains a gate somewhere" is the
-/// weaker claim, and it is exactly the claim that stays true when someone
-/// copy-pastes a second request under an existing gated one -- which is how the
-/// Spotify post-401 retry got written in the first place. So the pairing is
-/// sequential: walking the function, the Nth send must be preceded by at least
-/// N gates. Two gates at the top and two sends at the bottom still passes, and
-/// that is fine: both sends were checked before either was made.
+/// Every `.send()` in `routes.rs` is preceded by a gate of its OWN. "This function contains a
+/// gate somewhere" is the weaker claim, and it stays true when a second request is
+/// copy-pasted under an existing gated one. So the pairing is sequential: walking a function,
+/// the Nth send must be preceded by at least N gates.
 #[test]
 fn every_send_in_routes_rs_pairs_with_its_own_gate() {
     let chunks = routes_fn_chunks();
@@ -331,14 +282,10 @@ impl DeviceRegistry for NoDevices {
     }
 }
 
-/// A secret store that already holds a Spotify token pair, so `spotify_api_call`
-/// gets past its "not connected" early returns and reaches the gate.
-///
-/// This matters more than it looks. The recorded failure this programme keeps
-/// repeating is a test whose FIXTURE is unreachable: without a stored token the
-/// Spotify routes return "not connected" before touching the network, and a
-/// test asserting "no request left the pond" would pass against a handler that
-/// has no gate at all.
+/// A secret store that already holds a Spotify token pair, so `spotify_api_call` gets past
+/// its "not connected" early returns and reaches the gate. Without a stored token the routes
+/// return "not connected" before touching the network, and a test asserting "no request left
+/// the pond" would pass against a handler that has no gate at all.
 struct ConnectedSpotify;
 
 #[async_trait::async_trait]
@@ -609,11 +556,9 @@ async fn spotify_control_is_refused_offline() {
 }
 
 /// The diagnostics probe, and with it the whole `voice_whisper_url` question.
-///
-/// `/api/v1/test` probes three URLs. Two are 127.0.0.1 literals and must stay
-/// unaffected under `Offline` -- a privacy control that reports the local model
-/// server as blocked is one that gets switched off. The third is the setting,
-/// and it is the one that has to be refused.
+/// `/api/v1/test` probes three URLs: the two 127.0.0.1 literals must stay unaffected under
+/// `Offline`, since a privacy control that reports the local model server as blocked gets
+/// switched off, and the third, the setting, is the one that has to be refused.
 #[tokio::test]
 async fn the_diagnostics_probe_refuses_a_remote_whisper_and_leaves_loopback_alone() {
     let (app, _tmp) = offline_app().await;

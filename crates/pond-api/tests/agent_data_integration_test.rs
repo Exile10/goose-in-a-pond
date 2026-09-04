@@ -1,19 +1,6 @@
-//! Integration tests for the agent data management REST API.
-//!
-//! Covers:
-//! - GET/PUT/DELETE /api/v1/prompts/{name}   (prompt templates)
-//! - GET/POST       /api/v1/agent/extras     (prompt extras)
-//! - DELETE         /api/v1/agent/extras/{key}
-//! - GET/POST       /api/v1/memories          (memory fragments)
-//! - DELETE         /api/v1/memories/{id}
-//! - GET/POST       /api/v1/skills            (user skills)
-//! - PUT/DELETE     /api/v1/skills/{id}
-//! - GET/POST       /api/v1/recipes           (agent recipes)
-//! - PUT/DELETE     /api/v1/recipes/{id}
-//!
-//! All tests use a real SQLite database in a tempdir — no mocking of persistence.
-//!
-//! Run: cargo test -p pond-api --test agent_data_integration_test
+//! Integration tests for the agent data management REST API: the /api/v1 routes for prompt
+//! templates, prompt extras, memory fragments, user skills and agent recipes. Every test
+//! uses a real SQLite database in a tempdir, with no mocking of persistence.
 
 use std::sync::Arc;
 
@@ -127,12 +114,9 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     make_app_with_dispatcher(None).await
 }
 
-/// Same app, plus a handle on session storage.
-///
-/// Sessions have no create endpoint -- they are born from a chat turn -- so a
-/// test about session attribution has to seed one through the port. Profiles
-/// do have one, and these tests use it, so the foreign key is exercised the
-/// way production exercises it.
+/// Same app, plus a handle on session storage. Sessions have no create endpoint -- they are
+/// born from a chat turn -- so a test about session attribution seeds one through the port.
+/// Profiles do have one, so the foreign key is exercised the way production exercises it.
 async fn make_app_with_sessions() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempDir) {
     make_app_full(None).await
 }
@@ -348,18 +332,10 @@ async fn prompt_templates_upsert_then_get_then_list() {
     assert_eq!(list.as_array().unwrap().len(), 1);
 }
 
-/// A save returns the saved row, and an omitted description keeps the stored one.
-///
-/// Both halves are one bug seen from two sides. The handler returned
-/// `{"name","status":"ok"}` while the desktop client typed it
-/// `Promise<PromptTemplate>` and read `updated.content` from it — `undefined`, so
-/// a SUCCESSFUL save blanked the editor. And `description` was a
-/// `#[serde(default)] String`, so the client's `{ content }` body arrived as
-/// `""` and overwrote the stored description.
-///
-/// Together they made the Prompts tab destructive: the edit appeared to vanish,
-/// and the obvious recovery is Reset, which hands the row back to the factory and
-/// discards the edit for real.
+/// A save returns the saved row, and an omitted description keeps the stored one. The handler
+/// must not answer `{"name","status":"ok"}` when the desktop client types it
+/// `Promise<PromptTemplate>` and reads `updated.content`, and an omitted `description` must
+/// not blank the stored one. Either makes the Prompts tab destructive: the edit vanishes.
 #[tokio::test]
 async fn saving_a_template_returns_it_and_keeps_the_description() {
     let (app, _tmp) = make_app().await;
@@ -1160,9 +1136,8 @@ async fn invoke_tool_400_when_tool_missing() {
 
 // ── Session identity (PAI-1 P2) ──────────────────────────────────────────────
 //
-// These go through the router, not the repository, because the thing P2
-// replaced was an in-memory map that the repository layer never saw. A test
-// below the HTTP boundary would have passed against the old code too.
+// These go through the router, not the repository: P2 replaced an in-memory map the
+// repository layer never saw, so a test below the HTTP boundary proves nothing.
 
 /// Create a household member through the API and return their generated id.
 async fn seed_profile(app: &axum::Router, display_name: &str) -> String {
@@ -1425,11 +1400,10 @@ async fn deleting_a_member_reports_what_went_and_what_stayed() {
     // Sessions are RELEASED, never deleted -- a conversation is not solely the
     // speaker's. Reporting it under "deleted" would misdescribe what happened.
     assert_eq!(body["released"]["sessions"], 1);
-    // Deliberately no equality assertion here: this fixture wires
-    // MockMemoryRepository, which does not override `count_for_profile`, so it
-    // returns the port default of 0 whatever the state. Asserting 0 would pass
-    // against a repository that cannot answer. The real count is covered in
-    // pond-infra, against SQL.
+    // No equality assertion here: the fixture wires MockMemoryRepository, which does not
+    // override `count_for_profile` and returns the port default of 0 whatever the state, so
+    // asserting 0 would pass against a repository that cannot answer. The real count is
+    // covered in pond-infra, against SQL.
     assert!(body["deleted"]["memories"].is_number());
 
     // and the session itself survived, unattributed
@@ -1607,12 +1581,9 @@ async fn identifying_a_session_is_permitted_in_the_default_audit_mode() {
     assert_eq!(body_json(resp).await["bound"], true);
 }
 
-/// The gate actually bites. Without this the policy is a check nobody has ever
-/// seen fire, which is indistinguishable from one that cannot.
-///
-/// Nothing links a paired device to a member, so no remote caller can prove the
-/// identity it asserts -- which is exactly why the shipped default is `audit`
-/// and not this.
+/// The gate actually bites: a check nobody has seen fire is indistinguishable from one that
+/// cannot. Nothing links a paired device to a member, so no remote caller can prove the
+/// identity it asserts, which is why the shipped default is `audit` and not this.
 #[tokio::test]
 async fn identifying_a_session_is_refused_in_enforce_mode() {
     let (app, storage, _tmp) = make_app_with_sessions().await;
@@ -1658,15 +1629,9 @@ async fn identifying_a_session_is_refused_in_enforce_mode() {
 }
 
 // ── PAI-1 P4 / PAI-2 P1: the policy's first production call site ────────────
-//
-// `PUT /sessions/{id}/user` took a profile_id from the request BODY and bound
-// it at Explicit strength with no ownership check, so any paired device could
-// declare itself any household member and have that member's memories injected
-// into every later turn.
-//
-// These go through the router because the check lives between the auth
-// middleware (which supplies the Principal) and the handler. A test below HTTP
-// would have no principal at all and would prove nothing about either.
+// `PUT /sessions/{id}/user` binds a profile_id from the request BODY, so without an ownership
+// check any paired device could claim any member's memories. Driven through the router: the
+// check sits between the auth middleware, which supplies the Principal, and the handler.
 
 /// The gate bites. Without this test the check is a rule nobody has watched
 /// fire — and a `SecurityPolicy` that has never denied anything is exactly the

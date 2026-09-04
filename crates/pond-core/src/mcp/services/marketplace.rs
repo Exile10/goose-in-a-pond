@@ -32,22 +32,10 @@ impl BundledMarketplace {
         }
     }
 
-    /// Same as [`Self::new`], but rewrites repo-relative script arguments into
-    /// absolute paths anchored at `root`.
-    ///
-    /// Some registry entries launch a script that ships with GIAP rather than a
-    /// published npm package — `["-y", "tsx", "extensions/music/src/server.ts"]`.
-    /// A relative arg like that is resolved by the MCP child against *its* cwd,
-    /// which is inherited from whatever directory pond-server was launched in.
-    /// Launch the server from anywhere but the repo root and the child dies with
-    /// `ERR_MODULE_NOT_FOUND` before it can complete the MCP handshake.
-    ///
-    /// Anchoring the path here — once, at construction — fixes every consumer of
-    /// the marketplace at the same time: the install handler, the post-OAuth
-    /// restart, and the persisted config that startup auto-connect replays.
-    ///
-    /// `root` is the directory that *contains* `extensions/`. Discovering it is
-    /// the caller's job; this crate stays free of filesystem probing.
+    /// Same as [`Self::new`], but rewrites repo-relative script arguments into absolute
+    /// paths anchored at `root`, the directory that *contains* `extensions/`. A relative
+    /// arg resolves against the MCP child's inherited cwd, so launching pond-server from
+    /// anywhere but the repo root kills the child with `ERR_MODULE_NOT_FOUND`.
     pub fn with_asset_root(root: impl AsRef<Path>) -> Self {
         let root = root.as_ref();
         let mut this = Self::new();
@@ -60,9 +48,8 @@ impl BundledMarketplace {
 
 /// Rewrites every `extensions/…` arg in `args` to an absolute path under `root`.
 ///
-/// Exposed because configs persisted by an earlier install carry the original
-/// relative args; startup auto-connect re-anchors them rather than requiring the
-/// user to remove and reinstall the extension. Returns `true` if anything changed.
+/// Public because configs persisted by an earlier install carry the original relative
+/// args; startup auto-connect re-anchors them. Returns `true` if anything changed.
 pub fn anchor_asset_args(args: &mut [String], root: impl AsRef<Path>) -> bool {
     let root = root.as_ref();
     let mut changed = false;
@@ -77,9 +64,7 @@ pub fn anchor_asset_args(args: &mut [String], root: impl AsRef<Path>) -> bool {
 
 /// Returns the absolute form of `arg` when it names a path under the bundled
 /// `extensions/` directory, or `None` when it should be passed through untouched.
-///
-/// Deliberately narrow: flags (`-y`), bare package names (`tsx`), scoped npm
-/// packages (`@modelcontextprotocol/server-filesystem`) and absolute paths (`/`)
+/// Deliberately narrow: flags, bare and scoped npm package names, and absolute paths
 /// are all left exactly as the registry wrote them.
 fn anchor_asset_arg(arg: &str, root: &Path) -> Option<String> {
     if arg.starts_with('-') {

@@ -1,32 +1,7 @@
 //! PAI-8 P1: a household member can connect a sensor or camera as personal
-//! context, and nobody else can.
-//!
-//! Until these routes existed nothing could create a `ContextSource`, so
-//! `context_items` was empty on every pond however well the pipeline worked --
-//! `upsert_source` had no caller at all. `context_pipeline_is_not_wired_yet.rs`
-//! asserted that and this file is part of what ended it.
-//!
-//! The claims here are all refusals, and one of them is the phase's whole
-//! security decision:
-//!
-//! * **The owner is RESOLVED, never supplied.** There is no `profile_id` field
-//!   in the request body to send. A body-supplied owner would be a client
-//!   naming whose data this is -- the hole PAI-1 P4 closed on
-//!   `PUT /sessions/{id}/user`, and worse here, because every item the source
-//!   ever produces inherits that owner and migration 0044 refuses to let it
-//!   change afterwards.
-//! * **A `Guest` connects nothing and sees nothing** (invariant 2), and so does
-//!   `Household`: it is not a weaker address than `Owner`, it is the broadcast.
-//! * **A source kind whose connector does not exist is refused up front**, with
-//!   the domain's own sentence, rather than stored looking connected.
-//! * **Disconnecting says how many items went** (invariant 6). The count is the
-//!   return value of `disconnect_source` precisely so a caller cannot satisfy
-//!   the invariant without reporting it.
-//!
-//! Scopes are reached the way production reaches them -- two members plus an
-//! unidentified session is `Guest`, one member plus an unidentified session is
-//! `Household`, a session with a stored identity is `Owner`. No test here
-//! constructs a `ProfileScope`.
+//! context, and nobody else can. The phase's security decision is that the owner
+//! is RESOLVED, never supplied: no `profile_id` in the body, because every item
+//! inherits it and migration 0044 refuses to let it change afterwards.
 
 use std::sync::Arc;
 
@@ -483,16 +458,10 @@ async fn the_whole_household_is_not_an_owner() {
     );
 }
 
-/// The same scope, and the opposite answer, because the household is one person.
-///
-/// This test used to assert the refusal above with a SINGLE member, and that
-/// was the wrong line to draw. `Household` and `Owner(the-only-member)` denote
-/// the same set of people when there is only one, so refusing established
-/// nothing and made connecting a calendar require identifying yourself to a
-/// pond that had exactly one possible answer.
-///
-/// The multi-member refusal above is the part of that reasoning that survives,
-/// and it is why this is a sole-member rule rather than a Household rule.
+/// The same scope, and the opposite answer, because the household is one person:
+/// `Household` and `Owner(the-only-member)` denote the same set of people, so
+/// there is nothing to refuse. This is a sole-member rule, not a Household rule;
+/// the multi-member refusal above is the part that survives.
 #[tokio::test]
 async fn a_one_member_household_is_that_member() {
     let h = make_app().await;
@@ -513,16 +482,10 @@ async fn a_one_member_household_is_that_member() {
     );
 }
 
-// There is deliberately no "a guest is refused in a one-member household" test
-// here, because that state cannot be reached: `identity_resolution::resolve`
-// answers `Guest` only when the household has MORE than one member, and
-// `Household` otherwise. In a one-member pond an unidentified speaker and the
-// member are the same scope by construction.
-//
-// That is the residual exposure of the rule above, and it is a property of
-// identity resolution rather than of this route — writing a test that pretended
-// otherwise would assert a scope the pond never produces. What limits it in
-// practice is that the caller still needs an authenticated, paired device.
+// No "a guest is refused in a one-member household" test exists because that
+// state is unreachable: `identity_resolution::resolve` answers `Guest` only above
+// one member and `Household` otherwise. The residual exposure is bounded by the
+// caller still needing an authenticated, paired device.
 
 // ── A connector that does not exist is refused up front ────────────────────
 

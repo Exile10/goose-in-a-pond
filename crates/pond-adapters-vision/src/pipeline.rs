@@ -1,8 +1,7 @@
 //! The vision pipeline (#130): frames → motion → (optional classifier) →
 //! `CameraEvent` persisted via [`CameraStorage`] and published on the
-//! [`EventBus`] — the exact same persist-then-publish contract as the external
-//! `POST /api/v1/camera/events` route, so everything downstream (activity API,
-//! #92 rules, dashboards) reacts identically to on-device detections.
+//! [`EventBus`] — the same persist-then-publish contract as the external
+//! `POST /api/v1/camera/events` route, so downstream consumers react identically.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

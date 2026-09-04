@@ -1,11 +1,7 @@
-//! Integration tests for GET/PUT /api/v1/settings
+//! Integration tests for GET/PUT /api/v1/settings.
 //!
-//! Verifies:
-//! 1. PUT returns the FULL Settings object (not {"status":"ok"}).
-//! 2. Partial patch preserves unmodified fields.
-//! 3. GET returns the current settings after a PUT.
-//!
-//! Run: cargo test -p pond-api --test settings_integration_test
+//! PUT must return the full Settings object rather than a status stub, a partial patch must
+//! preserve unmodified fields, and a following GET must show what the PUT wrote.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -369,14 +365,10 @@ async fn get_weather_reports_disabled_without_provider() {
     assert_eq!(json.get("enabled").and_then(|v| v.as_bool()), Some(false));
 }
 
-/// PAI-2 P2: no credential material may come back out of `GET /settings`.
-///
-/// The handler is `serde_json::to_value(settings)` with no DTO and no
-/// redaction, so this is a property of the struct, not of the handler. The
-/// pond-core guard `no_settings_field_is_secret_shaped` asserts the same thing
-/// against `Settings::default()`; this one asserts it over real HTTP, after a
-/// write, which is the only version that would have caught a redaction that
-/// applied to the default but not to a configured value.
+/// PAI-2 P2: no credential material may come back out of `GET /settings`. The handler is
+/// `serde_json::to_value(settings)` with no DTO and no redaction, so this is a property of
+/// the struct. The pond-core guard `no_settings_field_is_secret_shaped` asserts it against
+/// the default; this asserts it over real HTTP after a write, on a configured value.
 #[tokio::test]
 async fn settings_response_never_carries_a_secret_shaped_key() {
     let (app, _tmp) = make_app().await;
@@ -475,13 +467,10 @@ async fn settings_response_never_carries_a_secret_shaped_key() {
     );
 }
 
-/// PAI-2 P5. `NetworkMode::parse` widens on an unrecognised value, on purpose --
-/// a typo must not silently take a home assistant off the internet. That makes
-/// this 422 the only thing standing between a typo and a gate that is quietly
-/// off, so it is asserted here rather than left to the parser.
-///
-/// The status code is asserted BEFORE any body predicate: a body-shape check
-/// alone passes against an error payload, where every lookup returns `None`.
+/// PAI-2 P5. `NetworkMode::parse` widens on an unrecognised value, on purpose -- a typo must
+/// not silently take a home assistant off the internet. So this 422 is the only thing between
+/// a typo and a gate that is quietly off. The status code is asserted BEFORE any body
+/// predicate: a body-shape check alone passes against an error payload.
 #[tokio::test]
 async fn put_settings_refuses_an_unrecognised_network_mode() {
     let (app, _tmp) = make_app().await;
@@ -554,24 +543,10 @@ async fn put_settings_refuses_an_unrecognised_network_mode() {
     assert_eq!(restore.status(), StatusCode::OK);
 }
 
-/// PAI-5 P4. `ReasoningEffort::parse` narrows on an unrecognised value -- the
-/// opposite direction to `network_mode`, and for the same reason: on failure,
-/// access narrows. That makes the fallback SAFE but SILENT, which is exactly
-/// why the 422 exists: without it, a typo saved from a client leaves the user
-/// with the smallest think and no way to tell why.
-///
-/// WHAT THIS DELIBERATELY DOES NOT PROVE, because it cannot: that the value
-/// reaches disk. `make_app()` wires `MockSettingsRepository`, whose
-/// `build_settings`/`update` carry a HAND-MAINTAINED SUBSET of the fields —
-/// `reasoning_effort` is not among them, so a `GET` after a `PUT` here returns
-/// the default no matter what the SQLite adapter does. A round-trip assertion
-/// against this harness would be measuring the mock. The real persistence guard
-/// is `roundtrip_persists_every_field` in `pond-infra/src/sqlite_settings.rs`,
-/// which perturbs every serialized field and fails on any that does not come
-/// back — that is what covers the `upsert!` line and the `apply_key` arm.
-///
-/// So this asserts the two things the API layer owns: the refusal, and that a
-/// recognised value survives the merge into the returned `Settings`.
+/// PAI-5 P4. `ReasoningEffort::parse` narrows on an unrecognised value, so the fallback is
+/// safe but silent: without this 422 a typo leaves the user on the smallest think with no
+/// way to tell why. Persistence is out of scope here — `MockSettingsRepository` carries a
+/// hand-maintained subset — and is guarded by `roundtrip_persists_every_field` in pond-infra.
 #[tokio::test]
 async fn put_settings_refuses_an_unrecognised_reasoning_effort() {
     let (app, _tmp) = make_app().await;

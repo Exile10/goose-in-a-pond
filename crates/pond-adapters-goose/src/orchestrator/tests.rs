@@ -1,19 +1,7 @@
-//! PAI-6 P2/P3 guards.
-//!
-//! The engine drive itself (`GooseAdapter::run_child_agent`) still cannot be
-//! run here: it needs a real provider and a real Goose session store. What IS
-//! covered is everything that DECIDES — the plan, the turn assembly, the
-//! concurrency permit, the outcome classification, the registry and the
-//! invariant-2 audit — driven through the real [`GooseOrchestrator::spawn`]
-//! against a fake [`ChildRunner`]. The `ChildPlan` the fake receives is produced
-//! by production code, so the assertions are about the artifact that actually
-//! reaches the engine.
-//!
-//! The one decision that was NOT out here was how a child's message stream
-//! becomes turns and an answer, and that is precisely the one that shipped
-//! broken: it lived inline in the drain loop, where nothing without a provider
-//! could reach it. [`ChildTurns`] is now beside `classify_outcome` for the same
-//! stated reason, and the tests below drive it from a `Vec` of fragments.
+//! PAI-6 P2/P3 guards. `GooseAdapter::run_child_agent` needs a real provider and session store, so
+//! what is covered is everything that DECIDES (plan, turn assembly, concurrency permit, outcome,
+//! registry, invariant-2 audit) through the real [`GooseOrchestrator::spawn`] against a fake
+//! [`ChildRunner`]; [`ChildTurns`] sits beside `classify_outcome` so these tests can reach it.
 
 use super::*;
 use pond_core::models::services::context::model_class::ON_DEVICE_PROVIDERS;
@@ -24,16 +12,10 @@ use pond_core::shared::services::turn_authority::TurnAuthorityLease;
 use pond_core::user_data::domain::profile::ProfileScope;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Every test that drives [`GooseOrchestrator::spawn`] takes this first.
-///
-/// The subagent semaphore is process-wide on purpose — invariant 3 is a
-/// property of the device, not of an instance — and `cargo test` runs this file
-/// in ONE process with a thread per test. Without serialising,
-/// `the_overlap_detector_can_actually_see_overlap` competes for the same three
-/// permits as the on-device tests, and its assertion (a REMOTE provider is
-/// allowed to overlap) fails whenever an on-device test happens to be holding
-/// all three. A vacuity control that fails at random gets deleted, and then the
-/// assertion it was protecting proves nothing.
+/// Every test that drives [`GooseOrchestrator::spawn`] takes this first. The subagent semaphore is
+/// process-wide on purpose (invariant 3 is a property of the device), and `cargo test` runs this
+/// file in ONE process with a thread per test, so without serialising the REMOTE-overlap control
+/// fails at random whenever on-device tests hold all three permits.
 static ONE_RUN_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -42,14 +24,9 @@ fn role(name: &str, groups: &[&str]) -> AgentRole {
     role_with_fraction(name, groups, 0.3)
 }
 
-/// A role that states a `context_fraction` of its own.
-///
-/// Every fixture in this file used to state 0.3, and the one assertion that
-/// observed the reserved value also said 0.3 — so replacing
-/// `spec.context_fraction()` with the literal `0.3` in `spawn` left the whole
-/// suite green. A guard that cannot tell "reads the role's fraction" from
-/// "restates the fixture's constant" is this programme's recorded shapes 3 and
-/// 6 together, and a role authored at 0.8 would have reserved 0.3 forever.
+/// A role that states a `context_fraction` of its own. With every fixture at 0.3 and the one
+/// observing assertion at 0.3, a literal `0.3` in `spawn` in place of `spec.context_fraction()`
+/// leaves the suite green (recorded shapes 3 and 6), and a role authored at 0.8 reserves 0.3.
 fn role_with_fraction(name: &str, groups: &[&str], context_fraction: f32) -> AgentRole {
     AgentRole::new(
         name,
@@ -94,14 +71,10 @@ fn spec_for_parent(role: &AgentRole, parent_groups: &[&str], parent: &str) -> Ta
 /// The GIAP session id every fixture spec names as its parent.
 const PARENT_SESSION: &str = "parent-session";
 
-/// An orchestrator whose parent turn is LIVE, published the way
-/// `GooseAdapter::chat_stream` publishes one.
-///
-/// PAI-6 P3 made this mandatory rather than incidental: `spawn` refuses a spec
-/// whose parent turn has ended, because the authority behind it is then stale.
-/// The lease has to be held by the caller for exactly as long as the parent's
-/// stream closure holds its own — which is why it comes back rather than being
-/// dropped here.
+/// An orchestrator whose parent turn is LIVE, published the way `GooseAdapter::chat_stream`
+/// publishes one. `spawn` refuses a spec whose parent turn has ended (PAI-6 P3), because the
+/// authority behind it is then stale. The lease is returned rather than dropped here: the caller
+/// must hold it exactly as long as the parent's stream closure holds its own.
 fn live_turn(runner: Arc<dyn ChildRunner>) -> (Arc<GooseOrchestrator>, TurnAuthorityLease) {
     let (orchestrator, lease, _token) = live_turn_with_token(runner);
     (orchestrator, lease)
@@ -295,10 +268,8 @@ impl ChildRunner for FakeRunner {
 
 // ── A turn is a run of messages, not a message ──────────────────────────────
 //
-// The regression these exist for made EVERY successful delegation come back
-// `TurnBudgetExhausted` with no result, on every streaming provider, which is
-// all of them. Goose yields one `AgentEvent::Message` per provider chunk; P2's
-// drain loop counted one turn per message and assigned `last_text` per message.
+// Goose yields one `AgentEvent::Message` per provider chunk; counting one turn per message made
+// EVERY successful streaming delegation come back `TurnBudgetExhausted` with no result.
 
 /// One `AgentEvent::Message` as the drain loop sees it.
 enum Frag<'a> {
@@ -309,15 +280,10 @@ enum Frag<'a> {
     ToolResponse,
 }
 
-/// Drive the reduction the way the drain loop drives it: ROLE-TAGGED, through
-/// `child_stream_step`.
-///
-/// It used to call `assistant_message` and `other_role_message` itself, which
-/// meant the tests below asserted on `ChildTurns` while the mapping from a
-/// message's role to one of those two methods — the mapping that shipped
-/// broken, and the only part of it a defect can live in — was reachable
-/// nowhere but inside `run_child_agent`. Two mutations restoring the original
-/// defect kept all 165 tests green.
+/// Drive the reduction the way the drain loop drives it: ROLE-TAGGED, through `child_stream_step`.
+/// Calling `assistant_message` and `other_role_message` directly would leave the role-to-method
+/// mapping, the only part a defect can live in, reachable nowhere but `run_child_agent`; two
+/// mutations restoring the original defect kept the suite green that way.
 fn assemble(stream: &[Frag<'_>]) -> (Option<String>, u32) {
     let mut turns = ChildTurns::default();
     for fragment in stream {
@@ -417,13 +383,10 @@ fn an_empty_final_turn_does_not_erase_the_answer_before_it() {
     );
 }
 
-/// **The regression that would have shipped**, at the size the Jetson headline
-/// configuration actually produces: local/gguf emits one `AgentEvent::Message`
-/// per token piece. Forty of them is a short answer.
-///
-/// Carried through `classify_outcome` deliberately — the count is not the
-/// interesting part on its own, the STATUS is. With one turn per fragment this
-/// is 40 > 6 and the user is told their delegation ran out of turns.
+/// The regression that would have shipped, at the size the Jetson headline configuration produces:
+/// local/gguf emits one `AgentEvent::Message` per token piece, and forty is a short answer. Carried
+/// through `classify_outcome` because the STATUS is the point: one turn per fragment is 40 > 6 and
+/// the user is told their delegation ran out of turns.
 #[test]
 fn a_per_token_stream_of_forty_fragments_is_one_turn_and_completes() {
     let words: Vec<String> = (0..40).map(|n| format!("w{n} ")).collect();
@@ -512,11 +475,9 @@ fn goose_still_accumulates_its_own_assistant_text_per_message() {
 
 // ── Invariant 3: concurrency 1 on anything that runs on this device ─────────
 
-/// The predicate, pinned against `ON_DEVICE_PROVIDERS` rather than against the
-/// two names PAI-6's invariant text used to say. A test written as
-/// `subagent_permits("local") == 3` would be a vacuity control pinning the
-/// wrong number: it stays green while `ollama` — the same GPU, over
-/// `127.0.0.1` — quietly gets three concurrent children.
+/// The predicate, pinned against `ON_DEVICE_PROVIDERS` rather than two names. A test written as
+/// `subagent_permits("local") == 3` pins the wrong number: it stays green while `ollama`, the same
+/// GPU over `127.0.0.1`, quietly gets three concurrent children.
 #[test]
 fn every_provider_that_runs_on_this_device_takes_the_whole_semaphore() {
     for provider in ON_DEVICE_PROVIDERS {
@@ -604,14 +565,10 @@ async fn the_overlap_detector_can_actually_see_overlap() {
     );
 }
 
-/// **The instance axis, which every test above is blind to.**
-///
-/// P2 built a `Semaphore` inside `GooseOrchestrator::new`, so the limit was
-/// per-instance while the module doc, the commit message and the PAI-6 document
-/// all said process-wide. Every concurrency test built exactly one orchestrator
-/// and none could see the difference. The first wiring that constructs one per
-/// request — the obvious shape for a handler — would have restored unbounded
-/// on-device concurrency silently.
+/// The instance axis, which every test above is blind to. The limit must be process-wide, as the
+/// module doc and the PAI-6 document say, not a `Semaphore` built per `GooseOrchestrator`: every
+/// other concurrency test builds one orchestrator, and a handler constructing one per request
+/// would restore unbounded on-device concurrency silently.
 #[tokio::test]
 async fn two_orchestrators_cannot_both_run_an_on_device_child() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
@@ -680,11 +637,9 @@ async fn two_orchestrators_on_a_remote_provider_do_overlap() {
     );
 }
 
-/// `TaskStatus::Queued` is "authorised, waiting for a concurrency permit", and
-/// before this it was never constructed: `spawn` inserted the run as `Running`
-/// before acquiring the permit, so a child queued behind an on-device sibling —
-/// which is every child after the first — was reported `Running` by `poll` and
-/// `list`.
+/// `TaskStatus::Queued` is "authorised, waiting for a concurrency permit". `spawn` must insert the
+/// run as `Queued` before acquiring the permit, or a child queued behind an on-device sibling,
+/// which is every child after the first, is reported `Running` by `poll` and `list`.
 #[tokio::test]
 async fn a_child_waiting_for_a_permit_is_queued_rather_than_running() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
@@ -851,31 +806,10 @@ fn the_stripped_builtins_are_still_these_ten() {
     );
 }
 
-/// A fixture production can actually produce — which the version of this test
-/// that shipped with P2 was not, while its own doc comment asserted that it was.
-///
-/// The premise is right: the parent's strip is a best-effort
-/// `remove_extension(...).ok()`, so a parent whose strip failed really is still
-/// listing a stripped builtin's tools. The fixture was wrong. It used
-/// `developer__shell` and `summon__delegate`, and `PLATFORM_EXTENSIONS` marks
-/// both of those extensions `unprefixed_tools: true` — `extension_manager.rs`'s
-/// `is_unprefixed_extension` then exposes their tools as bare `shell` and
-/// `delegate`, never prefixed, so [`split_extension_tool`] drops them before
-/// `parent_tools` exists and this function was never reached with such a name.
-/// That is this programme's recorded shape 6, a fixture no code path can
-/// produce, and it means the test was proving nothing about `grants_tool`.
-///
-/// `todo`, `orchestrator`, `apps`, `extensionmanager`, `summarize`,
-/// `computercontroller` and `tom` are the stripped builtins whose tools ARE
-/// prefixed, so those are what a failed strip actually leaves in `list_tools`.
-/// Pinned against the submodule by
-/// [`the_goose_builtins_that_expose_bare_tool_names_are_still_these`].
-///
-/// What does the work here is `TaskSpec::grants_tool`, not a second
-/// stripped-builtin check — I wrote one, found that deleting it left this test
-/// green because a name the spec does not grant is dropped anyway, and removed
-/// it rather than keep a guard something else was silently satisfying.
-/// Defeating `grants_tool` is what makes this test fail.
+/// A fixture production can actually produce: the parent's strip is a best-effort
+/// `remove_extension(...).ok()`, but `developer` and `summon` are `unprefixed_tools`, so their bare
+/// names never reach `parent_tools`. Only prefixed builtins (pinned by the bare-names test below)
+/// model a failed strip. `TaskSpec::grants_tool` does the work; defeating it is what fails this.
 #[test]
 fn a_parent_whose_strip_failed_does_not_hand_its_builtins_to_a_child() {
     let role = role("researcher", &["giap-weather"]);
@@ -933,13 +867,9 @@ fn a_bare_tool_name_belongs_to_no_extension_and_cannot_enter_a_plan() {
     assert_eq!(split_extension_tool("__orphan"), None);
 }
 
-/// Which stripped builtins expose BARE tool names, read from the submodule
-/// rather than remembered.
-///
-/// The fixture two tests up models a failed strip, and whether it models one
-/// depends entirely on this. If a Goose sync flips `unprefixed_tools` on any of
-/// these, the fixture silently stops being producible again — which is the
-/// defect this test exists to make loud.
+/// Which stripped builtins expose BARE tool names, read from the submodule rather than remembered.
+/// The failed-strip fixture two tests up is producible only while this holds: if a Goose sync flips
+/// `unprefixed_tools` on any of these, the fixture silently stops being producible again.
 #[test]
 fn the_goose_builtins_that_expose_bare_tool_names_are_still_these() {
     let source = std::fs::read_to_string(concat!(
@@ -1294,17 +1224,10 @@ fn the_child_prompt_is_giaps_own_and_states_the_limits_the_child_runs_under() {
     assert_eq!(plan.user_message, "what is the weather");
 }
 
-/// The child gets the answer rule, from the same constant the chat path uses.
-///
-/// A delegated child is the one agent that cannot receive it the way a chat turn
-/// does. `child_user_message` is the task and nothing else — no
-/// `<system-context>`, so no per-turn note — and its whole system prompt is
-/// `base_system_prefix` plus the envelope. Anything the chat path adds to the
-/// envelope around a user message simply does not exist here.
-///
-/// Asserted against `ANSWER_RULE` itself rather than a quoted copy, so rewording
-/// the rule cannot leave the child on the old text: that drift is exactly what
-/// `BUILTIN_PROMPT_TEMPLATES` was created to stop one layer up.
+/// The child gets the answer rule, from the same constant the chat path uses. A delegated child
+/// cannot receive it the way a chat turn does: `child_user_message` is the task and nothing else,
+/// and its system prompt is `base_system_prefix` plus the envelope. Asserted against `ANSWER_RULE`
+/// itself rather than a quoted copy, so rewording the rule cannot leave the child on the old text.
 #[test]
 fn the_child_is_told_to_return_a_finding_not_a_travelogue() {
     use pond_core::models::services::answer_contract::ANSWER_RULE;
@@ -1330,24 +1253,10 @@ fn the_child_is_told_to_return_a_finding_not_a_travelogue() {
     );
 }
 
-/// **Half of a two-half fix, and said plainly rather than dressed up.**
-///
-/// A role's stored `instructions` are its persona. `AgentRole` validates them as
-/// REQUIRED — there is a `MissingInstructions` error for their absence — and
-/// then nothing outside one `pond-core` unit test reads them, so a role has been
-/// a name plus a tool list plus a turn budget, and the envelope printed the
-/// name. The guard next door could not see that: `contains("researcher")` is
-/// satisfied by the name alone.
-///
-/// The adapter half is here and is real: given a persona, the envelope renders
-/// it under the heading the child is already told to read. The other half is
-/// carrying it onto `TaskSpec`, which is a `pond-core` change this commit does
-/// not own, so `GooseOrchestrator::spawn` passes `None` and this fixture is one
-/// production cannot yet produce — recorded shape 6, named here so nobody reads
-/// this as proof that a role's persona reaches a child today. It does not. What
-/// makes it survivable is that the missing half is one accessor
-/// (`TaskSpec::role_instructions`), not an unwritten design, and this test
-/// becomes the guard for the whole path the moment that accessor exists.
+/// Half of a two-half fix. A role's `instructions` are its persona; `AgentRole` requires them and
+/// nothing else reads them, and `contains("researcher")` next door is satisfied by the name alone.
+/// The adapter half is real: given a persona, the envelope renders it under the child's heading.
+/// `spawn` still passes `None` (recorded shape 6) until `TaskSpec::role_instructions` exists.
 #[test]
 fn the_envelope_renders_a_roles_persona_when_it_is_given_one() {
     let role = role("researcher", &["giap-weather"]);
@@ -1529,12 +1438,9 @@ async fn the_same_delegation_runs_while_its_parent_turn_is_live() {
     assert_eq!(run.status, TaskStatus::Completed);
 }
 
-/// PAI-6 invariant 5's other half, which P2 left open because the parent turn's
-/// token was a stack local in a stream closure with no accessor. The child's
-/// token is DERIVED from the parent's rather than minted fresh, so cancelling
-/// the turn — a voice interrupt, a dropped stream, a client hanging up —
-/// reaches the child without anything having to remember to call
-/// `cancel_children_of`.
+/// PAI-6 invariant 5's other half. The child's token is DERIVED from the parent's rather than
+/// minted fresh, so cancelling the turn (a voice interrupt, a dropped stream, a client hanging up)
+/// reaches the child without anything having to remember to call `cancel_children_of`.
 #[tokio::test]
 async fn cancelling_the_parents_turn_cancels_a_child_derived_from_it() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
@@ -1615,19 +1521,10 @@ fn the_plans_allowed_tool_names_are_its_available_tools_and_nothing_else() {
     );
 }
 
-/// The "test the INPUT, not just the gate" guard.
-///
-/// `DelegationAuthority::delegate` intersects with whatever the root authority
-/// holds, so every assertion in `pond-core` about narrowing is only worth
-/// something if the root is built from the turn's REAL post-selection,
-/// post-guest-subtraction allow-set. That construction lives inside
-/// `chat_stream`, which needs a live engine, so this reads the source: it fails
-/// if the publish is moved above the guest subtraction, if it stops using the
-/// same `allowed_tools` binding that is published to the shim, or if the scope
-/// stops coming from `turn_scope`.
-///
-/// PAI-1 P5 shipped inert for exactly the first of those reasons, and PAI-5 P1
-/// leaked for the second: the gate was right and one of its inputs was not.
+/// The "test the INPUT, not just the gate" guard. `DelegationAuthority::delegate` intersects with
+/// the root authority, so pond-core's narrowing assertions only matter if the root is built from
+/// the turn's REAL post-selection, post-guest-subtraction allow-set. That lives in `chat_stream`,
+/// so this reads the source. PAI-1 P5 shipped inert and PAI-5 P1 leaked for exactly these reasons.
 #[test]
 fn the_turn_authority_is_built_from_the_published_allow_set() {
     let source =
@@ -1678,11 +1575,10 @@ fn the_turn_authority_is_built_from_the_published_allow_set() {
         call.contains("turn_scope.clone()"),
         "the child's profile scope no longer comes from the turn's resolved scope"
     );
-    // The ENTITLEMENT, falling back to the allow-set in "all" mode where the two
-    // are the same set. Narrowing is a decision about this turn's prompt budget;
-    // a child gets its own prompt, and the parent can reach any permitted group
-    // itself via `enable_tool_group`, so `allowed_tools` was never the boundary.
-    // What must never appear here is a set that skipped section 6d.
+    // The ENTITLEMENT, falling back to the allow-set in "all" mode where the two are the same set.
+    // Narrowing is a decision about this turn's prompt budget; a child gets its own prompt, and the
+    // parent can reach any permitted group via `enable_tool_group`, so `allowed_tools` was never
+    // the boundary. What must never appear here is a set that skipped section 6d.
     assert!(
         call.contains("entitled_tools") && call.contains("unwrap_or(&allowed_tools)"),
         "the authority's tool set is no longer the turn's entitlement falling back to its \
@@ -1728,30 +1624,13 @@ fn the_child_agent_publishes_its_boundary_before_it_replies() {
 
 // ── Tripwires over the child loop ───────────────────────────────────────────
 //
-// These read source text, and that is a weak shape this programme has recorded:
-// a grep catches a textual revert and nothing subtler. They are here because
-// `run_child_agent` needs a provider and a Goose session store, so the facts
-// below cannot be observed any other way, and each of them was WRONG in the
-// version that shipped.
-//
-// **They used to claim more than that, and the claim was false.** "The
-// behaviour they stand for is covered by the ChildTurns tests" was written when
-// those tests built a `Vec<Frag>` and called `ChildTurns` directly, so the
-// role-to-method mapping in the loop was covered by nothing: two mutations
-// restoring the original defect — closing the run after every message, and
-// accumulating the empty string — kept the whole suite green while satisfying
-// every string this file looked for. The mapping now lives in
-// `child_stream_step` and IS driven by those tests. What is left here is the
-// residue that cannot be lifted, and it is asserted as arguments to a call
-// rather than as the presence of a token.
+// Source-text reads, a weak shape (a grep catches only a textual revert), kept because
+// `run_child_agent` needs a live engine; the residue is asserted as call arguments, not tokens.
 
-/// Every event must be reduced by [`child_stream_step`], with the two
-/// expressions only a live engine can produce.
-///
-/// The argument check is the point. `child_stream_step(&mut turns, true, "")`
-/// type-checks, reads plausibly, and makes every child answer nothing;
-/// `msg.as_concat_text()` is also what drops `MessageContent::Thinking`, so
-/// replacing it can hand the parent a child's reasoning as its result.
+/// Every event must be reduced by [`child_stream_step`], with the two expressions only a live
+/// engine can produce. The argument check is the point: `child_stream_step(&mut turns, true, "")`
+/// type-checks and makes every child answer nothing, and `msg.as_concat_text()` is what drops
+/// `MessageContent::Thinking`, so replacing it can hand the parent a child's reasoning as a result.
 #[test]
 fn the_child_drain_loop_reduces_every_event_through_the_tested_step() {
     let drain = child_drain_loop();
@@ -1785,16 +1664,10 @@ fn the_child_drain_loop_reduces_every_event_through_the_tested_step() {
     );
 }
 
-/// Invariant 2's audit has to see the state the child RAN with. Read before
-/// `reply`, it can only report what `add_extension` was handed one line
-/// earlier — which `child_extensions` had already refused — so it was an audit
-/// structurally incapable of failing.
-///
-/// The window is narrowed to the text between the reply and the returned
-/// `ChildOutcome`, and the assertion is that the post-run READ is what feeds
-/// the audited set. Asserting the call's position instead is satisfied by a
-/// read whose result is discarded — applied, and the suite stayed green with
-/// `loaded_extensions` back to being the pre-run snapshot.
+/// Invariant 2's audit has to see the state the child RAN with. Read before `reply`, it can only
+/// report what `add_extension` was handed, which `child_extensions` had already refused, so it
+/// could never fail. The window is the text between the reply and the returned `ChildOutcome`, and
+/// the assertion is that the post-run READ feeds the audited set (a discarded read would pass).
 #[test]
 fn the_invariant_two_audit_reads_the_child_after_it_has_run() {
     let child_loop = child_loop_source();
@@ -1826,12 +1699,9 @@ fn the_invariant_two_audit_reads_the_child_after_it_has_run() {
     );
 }
 
-/// The argument text of the one call to `callee` in `source`, by paren depth.
-///
-/// `callee` includes its opening paren. Used instead of "the source contains
-/// this token somewhere" so a tripwire says which expression is passed WHERE,
-/// which is the difference between catching a textual revert and catching a
-/// changed argument.
+/// The argument text of the one call to `callee` in `source`, by paren depth. `callee` includes
+/// its opening paren. Used so a tripwire says which expression is passed WHERE, which is the
+/// difference between catching a textual revert and catching a changed argument.
 fn call_args(source: &str, callee: &str) -> String {
     let at = source
         .find(callee)
@@ -1934,19 +1804,10 @@ fn chat_stream_source() -> String {
     body
 }
 
-/// The one production call site of invariant 3's PARENT half — vacuity shape 2,
-/// a gate whose input is unguarded.
-///
-/// Every P4 device test either calls `parent_turn_permits` as a pure function
-/// or calls `claim_device_for_turn` from its own body, so none of them observes
-/// whether the LIVE turn takes a claim at all. Deleting this call left 177
-/// tests green while every on-device turn stopped holding the device — which is
-/// the only part of P4 that changes behaviour on every install today.
-///
-/// A source tripwire is the right weight here for the same reason it is for
-/// `turn_profile`: `chat_stream` needs a provider, a session store and a
-/// settings repo, and the claim's whole effect is a permit held for the
-/// lifetime of a stream nothing here can drive.
+/// The one production call site of invariant 3's PARENT half (vacuity shape 2, a gate whose input
+/// is unguarded). Every P4 device test calls `parent_turn_permits` or `claim_device_for_turn` from
+/// its own body, so none observes whether the LIVE turn takes a claim; deleting this call left 177
+/// tests green. A source tripwire is the right weight because `chat_stream` needs a live engine.
 #[test]
 fn the_live_turn_claims_the_device_before_it_streams_anything() {
     let body = chat_stream_source();
@@ -1995,11 +1856,9 @@ fn the_live_turn_claims_the_device_before_it_streams_anything() {
 
 // ── PAI-6 P4: the budget, and the other half of invariant 3 ─────────────────
 
-/// The parent's turn asks for exactly what an on-device child asks for: all of
-/// it. Pinned against `ON_DEVICE_PROVIDERS` rather than against two names, for
-/// the reason the sibling test next to `subagent_permits` records — a test
-/// naming `local` and `gguf` stays green while ollama, which is the same GPU
-/// over `127.0.0.1`, quietly runs a child alongside a parent turn.
+/// The parent's turn asks for exactly what an on-device child asks for: all of it. Pinned against
+/// `ON_DEVICE_PROVIDERS` rather than two names: a test naming `local` and `gguf` stays green while
+/// ollama, the same GPU over `127.0.0.1`, quietly runs a child alongside a parent turn.
 #[test]
 fn a_parent_turn_on_this_device_takes_the_whole_semaphore() {
     for provider in ON_DEVICE_PROVIDERS {
@@ -2037,12 +1896,9 @@ fn a_parent_turn_on_a_hosted_provider_claims_nothing() {
     );
 }
 
-/// Releasing must subtract exactly what was added, and return to zero.
-///
-/// A running `f32` sum does not: add 0.3 three times and subtract it three
-/// times and the total is not 0.0, so a parent's budget would come back a
-/// little short and stay short for the rest of the conversation, silently, with
-/// nothing to blame.
+/// Releasing must subtract exactly what was added and return to zero. A running `f32` sum does
+/// not: add 0.3 three times and subtract it three times and the total is not 0.0, so a parent's
+/// budget would come back a little short and stay short for the rest of the conversation.
 #[test]
 fn a_reservation_is_released_exactly_and_the_budget_comes_back_whole() {
     let ledger = process_device_ledger();
@@ -2103,19 +1959,10 @@ fn a_reservation_belongs_to_the_conversation_that_made_it() {
     );
 }
 
-/// The claim exists while the child is RUNNING, is the ROLE's own fraction,
-/// and is gone afterwards.
-///
-/// Asserted from inside the fake engine, because after `spawn` returns the
-/// answer is zero either way — which is how a reservation that was never taken
-/// would look identical to one that was taken and released.
-///
-/// **Two fractions, neither of them the fixture default.** Every role in this
-/// file used to state 0.3 and this assertion used to say 0.3, so replacing
-/// `spec.context_fraction()` with the literal `0.3` in `spawn` left the suite
-/// green: the guard could not tell reading the role's fraction from restating
-/// the fixture's constant, and a role authored at 0.8 would have reserved 0.3
-/// forever. No single literal satisfies both cases below.
+/// The claim exists while the child is RUNNING, is the ROLE's own fraction, and is gone afterwards.
+/// Asserted from inside the fake engine, because after `spawn` returns the answer is zero either
+/// way. Two fractions, neither the fixture default of 0.3: with the fixture and the assertion both
+/// at 0.3, a literal `0.3` in `spawn` in place of `spec.context_fraction()` left the suite green.
 #[tokio::test]
 async fn while_a_child_runs_its_parents_history_budget_is_reserved() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
@@ -2187,15 +2034,10 @@ async fn a_delegation_that_is_refused_still_gives_the_budget_back() {
     );
 }
 
-/// **The deadlock this phase could have shipped.**
-///
-/// A synchronous delegation runs inside its parent's turn, and that turn now
-/// holds every permit on this device. A child that queued for them would wait
-/// for a parent that is waiting for the child — forever — while holding one of
-/// `main.rs`'s four `sse_semaphore` permits, so four delegating turns would
-/// take the interactive chat pool down until the process restarted. Nothing
-/// calls `spawn` until P5, so this would not have surfaced in this phase at
-/// all.
+/// The deadlock this phase could have shipped. A synchronous delegation runs inside its parent's
+/// turn, which holds every permit on this device; a child that queued for them would wait forever
+/// on a parent waiting for the child, holding one of `main.rs`'s four `sse_semaphore` permits, so
+/// four delegating turns would take the interactive chat pool down until restart.
 #[tokio::test]
 async fn a_child_runs_under_its_parents_device_claim_rather_than_deadlocking_behind_it() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
@@ -2235,22 +2077,10 @@ async fn a_child_runs_under_its_parents_device_claim_rather_than_deadlocking_beh
     );
 }
 
-/// **The regression the inheritance pass introduced**, and the reason an
-/// inherited claim is a semaphore of one rather than a free pass.
-///
-/// `session_holds_device` is a property of the SESSION, so P4's
-/// `needed = if inherited { 0 }` gave EVERY child of the delegating turn a free
-/// pass, and `acquire_many_owned(0)` never blocks. Three delegations issued in
-/// one parent turn therefore ran three abreast on the one GPU — invariant 3
-/// with its on-device half deleted, by the pass written to avoid the deadlock.
-/// Run against that code this test reports `left: 3`, the same number P4's own
-/// mutation produced in `only_one_on_device_child_runs_at_a_time` and read as a
-/// test-only artefact.
-///
-/// Not a hypothetical state: `DeviceLedger` holds a `Vec` of live children per
-/// session, and `children_cannot_reserve_more_of_a_window_than_it_has` reserves
-/// three children of one session. The meter this asserts on is the same one
-/// `the_overlap_detector_can_actually_see_overlap` proves can see three.
+/// Why an inherited claim is a semaphore of one rather than a free pass. `session_holds_device` is
+/// a property of the SESSION, so `needed = if inherited { 0 }` gave every child of the delegating
+/// turn a free pass (`acquire_many_owned(0)` never blocks) and three delegations in one turn ran
+/// three abreast on the one GPU. Against that code this test reports `left: 3`.
 #[tokio::test]
 async fn siblings_of_one_delegating_turn_still_run_one_at_a_time() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
@@ -2309,13 +2139,9 @@ async fn siblings_of_one_delegating_turn_still_run_one_at_a_time() {
     drop(claim);
 }
 
-/// Vacuity control for the test above, and the assertion that inheritance is
-/// keyed on the SESSION rather than granted to everyone: a child whose parent
-/// is not the turn holding the device really does wait for it.
-///
-/// Without this, `a_child_runs_under_its_parents_device_claim...` passes
-/// against a `spawn` that acquires nothing at all, which is invariant 3
-/// deleted.
+/// Vacuity control for the test above, and the assertion that inheritance is keyed on the SESSION:
+/// a child whose parent is not the turn holding the device really does wait for it. Without this,
+/// `a_child_runs_under_its_parents_device_claim...` passes against a `spawn` that acquires nothing.
 #[tokio::test]
 async fn a_child_of_another_session_waits_for_the_turn_that_holds_the_device() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
@@ -2368,14 +2194,10 @@ async fn a_child_of_another_session_waits_for_the_turn_that_holds_the_device() {
     );
 }
 
-/// The INPUT guard, which is the half PAI-1 P5 lacked when it shipped a
-/// correct gate nothing could reach.
-///
-/// Everything above is about a reservation the trimmer would honour. This is
-/// about whether the live path ever asks for one. `turn_profile` is the single
-/// producer of every budget in the adapter (PAI-3 P5 made it so), so this reads
-/// its body and fails if it stops consulting the ledger, or if a second profile
-/// is minted somewhere that would bypass it.
+/// The INPUT guard, the half PAI-1 P5 lacked when it shipped a correct gate nothing could reach.
+/// Everything above is about a reservation the trimmer would honour; this is about whether the
+/// live path ever asks for one. `turn_profile` is the single producer of every budget in the
+/// adapter (PAI-3 P5), so this reads its body and fails if it stops consulting the ledger.
 #[test]
 fn the_turn_profile_reads_the_live_child_ledger() {
     let source = strip_line_comments(include_str!("../goose_agent.rs"));
@@ -2387,11 +2209,10 @@ fn the_turn_profile_reads_the_live_child_ledger() {
     let end = body.find("\n    }").expect("unterminated turn_profile");
     let body = &body[..end];
 
-    // What the ledger read DOES is covered behaviourally next door, by
-    // `a_parents_budget_shrinks_for_its_own_sessions_children_and_for_nobody_elses`
-    // in goose_agent.rs's own test module, which can run `profile_for_session`.
-    // What is left here is the one line that needs a live adapter: which key
-    // this turn hands it.
+    // What the ledger read DOES is covered behaviourally by
+    // `a_parents_budget_shrinks_for_its_own_sessions_children_and_for_nobody_elses` in
+    // goose_agent.rs's own test module. What is left here is the one line that needs a live
+    // adapter: which key this turn hands it.
     let args = call_args(body, "Self::profile_for_session(");
     assert!(
         args.contains("process_device_ledger()"),
@@ -2433,16 +2254,10 @@ fn the_turn_profile_reads_the_live_child_ledger() {
     );
 }
 
-/// Every non-test source file in this crate, comments and inline test modules
-/// stripped.
-///
-/// A hardcoded pair of file names is this programme's recorded vacuity shape 4:
-/// an assertion window too narrow for the natural regression, which for a
-/// single-producer count is a THIRD adapter file. The count guard above read
-/// `goose_agent.rs` alone while its failure message spoke about "this adapter",
-/// and a second `CompactionProfile::for_windows` producer added to
-/// `orchestrator.rs` passed it. The directory is walked instead, so a file
-/// added tomorrow is covered on the day it is added.
+/// Every non-test source file in this crate, comments and inline test modules stripped. A
+/// hardcoded pair of file names is vacuity shape 4, a window too narrow for the natural
+/// regression, which for a single-producer count is a THIRD adapter file. The directory is walked
+/// so a file added tomorrow is covered on the day it is added.
 fn adapter_sources() -> Vec<(String, String)> {
     fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
         let entries = std::fs::read_dir(dir)
@@ -2488,22 +2303,15 @@ fn adapter_sources() -> Vec<(String, String)> {
     out
 }
 
-/// Depth is P1's, not P4's — this phase verifies it rather than reimplementing
-/// it, and the verification worth having is that the cap is still STRUCTURAL.
-///
-/// The bullet says "depth capped at 1", and the way that stops being true is
-/// not the constant changing (pond-core pins that) but a second way to
-/// construct a depth appearing on this side of the boundary. There is none:
-/// `DelegationDepth` has no public constructor from a number, no `Default` and
-/// no `Deserialize`, so this crate cannot make one, and the only depth in an
-/// adapter-side plan is whatever `TaskSpec::child_authority` handed it.
+/// Depth is P1's; this phase verifies the cap is still STRUCTURAL. "Depth capped at 1" stops being
+/// true not when the constant changes (pond-core pins that) but when a second way to construct a
+/// depth appears on this side of the boundary. `DelegationDepth` has no public constructor, no
+/// `Default` and no `Deserialize`; the only adapter-side depth is `TaskSpec::child_authority`'s.
 #[test]
 fn nothing_in_this_adapter_can_construct_a_delegation_depth() {
-    // Every production file in the crate, not the two that happen to be its
-    // delegation surface today: a third one would be exactly where somebody
-    // would put a constructor this canary is meant to forbid. Test files are
-    // excluded by the walk, because this one names the type in the very
-    // assertion that forbids it.
+    // Every production file in the crate, not the two that are its delegation surface today: a
+    // third one is exactly where a forbidden constructor would go. Test files are excluded by the
+    // walk, because this one names the type in the very assertion that forbids it.
     for (path, source) in adapter_sources() {
         assert!(
             !source.contains("DelegationDepth("),
@@ -2524,22 +2332,10 @@ fn nothing_in_this_adapter_can_construct_a_delegation_depth() {
 
 // ── PAI-6 P6: what a child may say, and how it reaches its parent ───────────
 
-/// A child's message contributes its TOOL NAMES to the parent's stream and
-/// nothing else whatsoever.
-///
-/// This is PAI-5's reasoning gate re-applied, and the reason it is a test rather
-/// than a comment. The child drain reduces messages with `as_concat_text()`,
-/// which drops `MessageContent::Thinking` — the accidental gate this path has
-/// been relying on, because PAI-5 P1 gates once at the `GooseAdapter` producer
-/// and a child does not go through it. P6 has to read `msg.content` directly to
-/// see a tool call, so the fixture below carries all three things a message can
-/// leak at once: reasoning, answer text, and a tool call whose ARGUMENTS are a
-/// household memory query (PAI-2 minimisation).
-///
-/// The assertions are on the WHOLE output, not on the tool name alone. A guard
-/// that only checked the name would stay green against a version that returned
-/// the name AND appended the reasoning, which is the natural shape of the
-/// regression — "while I am here, put the thinking in the detail".
+/// A child's message contributes its TOOL NAMES to the parent's stream and nothing else: PAI-5's
+/// reasoning gate re-applied, because P6 reads `msg.content` directly and a child never passes the
+/// `GooseAdapter` producer gate. The fixture carries reasoning, answer text and a tool call whose
+/// arguments are a household memory query (PAI-2), and the assertions are on the WHOLE output.
 #[test]
 fn a_progress_frame_carries_the_tool_name_and_nothing_else() {
     const REASONING: &str = "her blood-pressure medication is in the household memory";
@@ -2561,11 +2357,9 @@ fn a_progress_frame_carries_the_tool_name_and_nothing_else() {
 
     let names = child_tool_names(&msg);
 
-    // The leak assertions come FIRST, and the ordering is the lesson: with the
-    // equality below in front of them, a version that returned the reasoning
-    // AND the name failed on a diff that says only "left != right", and the
-    // three assertions written to name the leak never ran. That mutation was
-    // applied and is what moved these lines.
+    // The leak assertions come FIRST: with the equality below in front of them, a version that
+    // returned the reasoning AND the name failed on a bare "left != right" diff and the three
+    // assertions written to name the leak never ran.
     let everything = names.join(" ");
     for (what, leaked) in [
         ("the child's REASONING", REASONING),
@@ -2587,14 +2381,10 @@ fn a_progress_frame_carries_the_tool_name_and_nothing_else() {
     );
 }
 
-/// Vacuity control for the test above.
-///
-/// Its "nothing else" assertions all hold trivially against a function that
-/// returns an empty vector for every message, which is also what a broken
-/// `MessageContent` match arm would do. A message that is PURE reasoning must
-/// produce nothing, and one carrying a tool call must produce exactly one name —
-/// so emptiness is pinned as a real answer to one input rather than as the
-/// answer to all of them.
+/// Vacuity control for the test above: its "nothing else" assertions hold trivially against a
+/// function returning an empty vector for every message, which is what a broken `MessageContent`
+/// arm would do. Pure reasoning must produce nothing and a tool call exactly one name, so emptiness
+/// is pinned as the answer to one input rather than all of them.
 #[test]
 fn a_message_with_no_tool_call_contributes_no_frame() {
     let thinking_only = goose::conversation::message::Message::assistant()
@@ -2618,14 +2408,10 @@ fn a_message_with_no_tool_call_contributes_no_frame() {
     );
 }
 
-/// A delegation tells the parent that authorised it where it has got to.
-///
-/// Driven through the real `spawn` against the fake runner, so the frames are
-/// the ones production emits and their `task_id` is the registry's own. The
-/// sequence matters as much as the contents: `Queued` has to arrive BEFORE the
-/// device permit is acquired, because on-device that acquisition is where a
-/// second delegation from the same turn spends its whole life, and a client with
-/// no `queued` node draws nothing for it.
+/// A delegation tells the parent that authorised it where it has got to. Driven through the real
+/// `spawn`, so the frames and their `task_id` are production's own. Sequence matters: `Queued` must
+/// arrive BEFORE the device permit is acquired, because on-device that acquisition is where a
+/// second delegation from the same turn spends its whole life.
 #[tokio::test]
 async fn a_delegation_reports_its_lifecycle_to_the_parent_that_authorised_it() {
     let _serialised = ONE_RUN_AT_A_TIME.lock().await;
@@ -2675,13 +2461,9 @@ async fn a_delegation_reports_its_lifecycle_to_the_parent_that_authorised_it() {
     }
 }
 
-/// A frame reaches the parent it belongs to and no other live turn.
-///
-/// The routing property, and the one whose failure would be visible to a person:
-/// two members of a household chatting at once, one of them delegating, and the
-/// other's screen growing a tree for a task they did not ask for. The second
-/// subscriber is the control — it proves the bus was live and the first
-/// assertion is not passing because nothing was published at all.
+/// A frame reaches the parent it belongs to and no other live turn: two household members chatting
+/// at once, one delegating, must not grow a tree on the other's screen. The second subscriber is
+/// the control proving the bus was live and the first assertion is not passing vacuously.
 #[tokio::test]
 async fn a_frame_reaches_only_the_parent_it_belongs_to() {
     let _serialised = ONE_RUN_AT_A_TIME.lock().await;
@@ -2712,14 +2494,10 @@ async fn a_frame_reaches_only_the_parent_it_belongs_to() {
     );
 }
 
-/// A turn that ends after a newer turn of the same session started must take its
-/// own channel with it and not the newer one's.
-///
-/// The map is keyed by session, so the second subscription replaces the first.
-/// The obvious `Drop` — "remove my session's entry" — then unsubscribes the LIVE
-/// turn as the stale one is dropped, and every delegation after that publishes
-/// into nothing. Silently, because publishing to nobody is the ordinary case for
-/// a CLI or recipe run and cannot be an error.
+/// A turn that ends after a newer turn of the same session started must take its own channel with
+/// it and not the newer one's. The map is keyed by session, so the obvious `Drop` ("remove my
+/// session's entry") unsubscribes the LIVE turn, and every later delegation publishes into
+/// nothing, silently, because publishing to nobody is the ordinary case for a CLI or recipe run.
 #[tokio::test]
 async fn a_subscription_that_ends_takes_only_its_own_channel() {
     const SESSION: &str = "progress-restamp-session";
@@ -2759,20 +2537,10 @@ async fn a_subscription_that_ends_takes_only_its_own_channel() {
     );
 }
 
-/// The parent's drain loses no engine event to a progress frame.
-///
-/// The cancel-safety half. Losing the select race drops a `Next` future, not the
-/// stream: `StreamExt::next` borrows, and an `async_stream` generator's state
-/// lives inside the stream itself, so the dropped poll resumes rather than
-/// restarts. If that were wrong, an engine event would vanish every time a frame
-/// arrived — and the fixture publishes from INSIDE the engine's own poll and
-/// then awaits, which is exactly what a real child does: it runs underneath that
-/// poll and its next step is provider I/O.
-///
-/// The ordering here is the good one and worth stating: with the engine parked,
-/// the frames it just produced are delivered immediately rather than waiting for
-/// its next event. That is the whole point of the phase — during a delegation
-/// the engine is parked for minutes.
+/// The parent's drain loses no engine event to a progress frame (the cancel-safety half). Losing
+/// the select race drops a `Next` future, not the stream: `StreamExt::next` borrows and an
+/// `async_stream` generator's state lives in the stream, so the dropped poll resumes. The fixture
+/// publishes from INSIDE the engine's poll, as a real child does; frames arrive while it is parked.
 #[tokio::test]
 async fn an_engine_item_survives_a_progress_frame() {
     const SESSION: &str = "progress-interleave-session";
@@ -2819,24 +2587,10 @@ async fn an_engine_item_survives_a_progress_frame() {
     );
 }
 
-/// A frame does not wait for the engine to run out of things to say.
-///
-/// The starvation half, and the reason `next_parent_step` is `biased` with
-/// progress FIRST. This engine never goes idle: every poll has an item ready, so
-/// an engine-first bias wins every race and the frames sit in the queue until
-/// the stream ends — at which point the drain breaks and they are never
-/// delivered at all. That is precisely the shipped behaviour this phase removes,
-/// a delegating turn that says nothing until the child has finished, and it is
-/// what the mutation reproduces: swapping the two branches leaves this
-/// assertion looking at three items and no tools.
-///
-/// The fixture is deliberately a shape a SYNCHRONOUS delegation cannot produce
-/// — the engine is blocked awaiting the tool result for the whole of a child's
-/// run, so it never has an event ready while frames arrive. It is the shape P8's
-/// background tasks would make, and it is pinned now because the bias is written
-/// now. Said out loud because "a fixture production cannot produce" is on this
-/// programme's list of vacuous shapes: this one is not the guard's only case,
-/// its sibling above drives the real one.
+/// A frame does not wait for the engine to run out of things to say: the reason `next_parent_step`
+/// is `biased` with progress FIRST. This engine never idles, so an engine-first bias wins each race
+/// and frames sit queued until the stream ends. A synchronous delegation cannot produce this shape
+/// (the engine blocks on the tool result); it is P8's shape. The sibling above drives the real one.
 #[tokio::test]
 async fn a_frame_does_not_wait_for_the_engine_to_go_idle() {
     const SESSION: &str = "progress-hot-engine-session";
@@ -2875,16 +2629,10 @@ async fn a_frame_does_not_wait_for_the_engine_to_go_idle() {
     );
 }
 
-/// The drain reads a child's message through [`child_tool_names`] and touches
-/// its content list nowhere else — PAI-6 P6.
-///
-/// This is the tripwire half of the reasoning gate, and it is deliberately an
-/// ABSENCE plus a call shape rather than a presence check. The regression that
-/// needs catching is not "somebody deleted the progress frame"; it is somebody
-/// writing `for content in &msg.content` in this loop to get at one more thing,
-/// because that is the line at which `MessageContent::Thinking` becomes
-/// reachable again. The unit test next door proves the producer cannot leak;
-/// this proves the loop still goes through the producer.
+/// The drain reads a child's message through [`child_tool_names`] and touches its content list
+/// nowhere else (PAI-6 P6). Deliberately an ABSENCE plus a call shape: the regression to catch is
+/// someone writing `for content in &msg.content` in this loop, the line at which
+/// `MessageContent::Thinking` becomes reachable again; the unit test next door covers the producer.
 #[test]
 fn the_child_drain_loop_reads_message_content_only_through_the_named_producer() {
     let drain = child_drain_loop();
@@ -2932,24 +2680,10 @@ fn the_child_drain_loop_reads_message_content_only_through_the_named_producer() 
     );
 }
 
-/// The live turn subscribes to its OWN delegations, and folds the two sources
-/// through the tested select — PAI-6 P6.
-///
-/// Two arguments and one absence, all of which are silent when wrong:
-///
-/// - The subscription key. A `TaskSpec` names the GIAP session id as its
-///   parent, so subscribing with the engine session id instead compiles, runs,
-///   and delivers nothing ever. That is this programme's signature failure —
-///   a mechanism that is correct and unreachable — and it has no symptom other
-///   than the spinner P6 exists to remove.
-/// - The select's operands. `next_parent_step` is what makes the engine's poll
-///   and the progress channel share a task without either starving; a drain
-///   that awaited `goose_stream.next()` on its own would park for the whole of
-///   a child's run again.
-/// - What the Progress arm must NOT do. It is not an engine event: folding it
-///   into `total_output_chars` corrupts the fallback usage estimate for the
-///   turn, and setting `produced_visible` would tell the empty-turn recovery
-///   that a turn which produced only a delegation frame had answered the user.
+/// The live turn subscribes to its OWN delegations and folds both sources through the tested
+/// select (PAI-6 P6). All silent when wrong: subscribing with the engine session id, not the GIAP
+/// one, delivers nothing ever; awaiting `goose_stream.next()` alone parks for a child's whole run;
+/// and the Progress arm must not touch `total_output_chars` or `produced_visible`.
 #[test]
 fn the_live_turn_subscribes_to_its_own_delegations() {
     let stream = chat_stream_source();
@@ -3002,12 +2736,8 @@ fn the_live_turn_subscribes_to_its_own_delegations() {
 
 // ── PAI-6 P7: the role's model ──────────────────────────────────────────────
 //
-// The refusal is the phase. A per-role model on this device is a second GGUF
-// load plus a full re-prefill, on a decode path that is memory-bandwidth-bound,
-// against the one retained KV prefix the parent's next turn is hoping to be
-// served off. A feature that silently makes the headline configuration slower is
-// worse than no feature, so on-device the role's request is refused and the
-// child runs on the resident model.
+// On this device a per-role model is a second GGUF load plus a full re-prefill against the one
+// retained KV prefix, so the role's request is refused and the child runs on the resident model.
 
 /// A role that asks for a model of its own.
 fn role_wanting_model(name: &str, groups: &[&str], model: &str) -> AgentRole {
@@ -3016,12 +2746,9 @@ fn role_wanting_model(name: &str, groups: &[&str], model: &str) -> AgentRole {
         .expect("a non-blank model is valid")
 }
 
-/// A `ModelConfig` shaped like a parent's: a model, a resolved window, and the
-/// settings a swap must not quietly drop.
-///
-/// `request_headers` is set because it is `#[serde(skip)]` — the JSON comparison
-/// below cannot see it, so a swap that dropped a provider's auth headers would
-/// otherwise look identical.
+/// A `ModelConfig` shaped like a parent's: a model, a resolved window, and the settings a swap must
+/// not quietly drop. `request_headers` is set because it is `#[serde(skip)]`: the JSON comparison
+/// cannot see it, so a swap that dropped a provider's auth headers would otherwise look identical.
 fn parent_model_config() -> goose_providers::model::ModelConfig {
     goose_providers::model::ModelConfig::new("parent-model")
         .with_context_limit(Some(8192))
@@ -3178,14 +2905,10 @@ fn a_role_that_names_no_model_leaves_the_parents_config_alone() {
     }
 }
 
-/// The residue the pure function cannot own: WHICH expression `run_child_agent`
-/// hands the engine, and WHEN.
-///
-/// Both natural regressions are ordering or argument changes rather than
-/// deletions — applying the swap after `update_provider` has already persisted
-/// the session's model config makes it a no-op, and passing the parent's config
-/// straight through makes P7 inert — so this asserts arguments and order, not
-/// presence.
+/// The residue the pure function cannot own: WHICH config `run_child_agent` hands the engine, and
+/// WHEN. Both natural regressions are ordering or argument changes, not deletions: swapping after
+/// `update_provider` has persisted the session's model config is a no-op, and passing the parent's
+/// config straight through makes P7 inert. So this asserts arguments and order, not presence.
 #[test]
 fn the_child_is_given_the_config_the_plan_decided_before_the_provider_is_set() {
     let body = child_loop_source();
@@ -3244,9 +2967,8 @@ fn the_child_loop_slice_is_the_child_loop() {
 
 // ── PAI-6 P8: background delegations ────────────────────────────────────────
 //
-// Two things decide whether this is real: that it is REFUSED where the model is
-// on this device, and that cancellation still reaches a run which by definition
-// outlives the turn that asked for it.
+// Two things make this real: it is REFUSED where the model is on this device, and cancellation
+// still reaches a run that by definition outlives the turn that asked for it.
 
 /// A spec that asked to run in the background, for a named parent session.
 fn background_spec_for(role: &AgentRole, parent_groups: &[&str], parent: &str) -> TaskSpec {
@@ -3274,14 +2996,10 @@ fn weather_env(provider: &str) -> ChildEnvironment {
     )
 }
 
-/// **The refusal, against a local provider fixture.** Quantified over the shared
-/// list, and asserted on the message rather than on the error type, because what
-/// has to be true is that a 2-4B model reads it and does something else.
-///
-/// The unrecognised names are in the same loop rather than in a second test:
-/// `spawn` asks one question — `BackgroundAvailability::for_provider(&env.provider_name)` —
-/// and every provider it cannot place must reach the same three assertions, or
-/// the composition has a second reading of the provider name in it.
+/// The refusal, against a local provider fixture: quantified over the shared list and asserted on
+/// the message, since a 2-4B model has to read it and do something else. Unrecognised names are in
+/// the same loop because `spawn` asks one question, `BackgroundAvailability::for_provider`, and
+/// every provider it cannot place must reach the same assertions.
 #[tokio::test]
 async fn a_background_run_is_refused_on_every_provider_that_runs_on_this_device() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
@@ -3333,25 +3051,10 @@ async fn a_background_run_is_refused_on_every_provider_that_runs_on_this_device(
     }
 }
 
-/// Vacuity control for the refusal, and the half that makes P8 a feature: the
-/// same call on a hosted provider RETURNS before the child has finished, with a
-/// non-terminal run the caller can poll.
-///
-/// **It also asserts PAI-6 P4's reservation from OUTSIDE the child, which is the
-/// one thing only this case can do.** `while_a_child_runs_its_parents_history_budget_is_reserved`
-/// has to read the claim from inside the fake engine, because a synchronous
-/// `spawn` has already released it by the time it returns. A background `spawn`
-/// returns with the child still running, so the caller's own thread can see the
-/// claim standing — and P8 is exactly what makes that claim outlive a turn.
-/// Without this, `reserve(parent, if background { 0.0 } else { fraction })` —
-/// which is a plausible thing to write, on the argument that a background child
-/// should not shrink the parent's live window — passes the whole adapter suite:
-/// the post-run `== 0.0` check below cannot tell "held then released" from
-/// "never held".
-///
-/// The fraction is 0.6, which is neither the file's 0.3 default nor either value
-/// the synchronous test uses, so no single literal in `spawn` satisfies all
-/// three.
+/// Vacuity control for the refusal: on a hosted provider `spawn` returns before the child is done,
+/// with a non-terminal run the caller can poll. It also observes PAI-6 P4's reservation from
+/// OUTSIDE the child, which only a background run can do; `reserve(parent, 0.0)` for background
+/// would pass every other test. The fraction is 0.6 so no single literal in `spawn` satisfies all.
 #[tokio::test]
 async fn a_background_run_returns_before_the_child_finishes_and_can_be_polled() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;

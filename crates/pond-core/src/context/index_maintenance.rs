@@ -1,32 +1,7 @@
-//! Keeping the personal-context index honest (phase D).
-//!
-//! The index is derived data, and derived data drifts. Four things go wrong on
-//! their own, and this is the one pass that repairs all of them:
-//!
-//! * **Rows that were never indexed** — a memory embedded before the index
-//!   existed, or written while the index file was missing.
-//! * **Rows embedded by a different model** — someone changed
-//!   `embedding_provider`. Those vectors are unusable and, until they are
-//!   replaced, invisible to retrieval by design.
-//! * **Summaries that have been rewritten** — the vector describes an older
-//!   conversation while still being present.
-//! * **Orphans** — a source row deleted while the index was not looking. Under
-//!   WAL a cross-file delete cannot be atomic, so this is expected rather than
-//!   exceptional.
-//!
-//! # Why this is a sweep and not a queue
-//!
-//! Everything above is discovered by a `LEFT JOIN` against the live stores, so
-//! the pass is crash-safe, restartable, and self-healing: interrupt it anywhere
-//! and the next run recomputes exactly what is still outstanding. A durable
-//! queue fails the other way — a dropped entry is a row that is never searchable
-//! again, with nothing left to notice.
-//!
-//! # Why it yields
-//!
-//! On a Jetson the embedder competes with the chat model for CPU. Every step is
-//! batched with a pause, and the whole pass is cancellable, so a member's turn
-//! always wins.
+//! Keeping the personal-context index honest (phase D). One sweep repairs every way derived data
+//! drifts: never-indexed rows, vectors from a different `embedding_provider`, rewritten summaries,
+//! and orphans left by a cross-file delete that WAL cannot make atomic. A `LEFT JOIN` against the
+//! live stores makes it restartable; batches pause and cancel so a member's turn beats the embed.
 
 use std::sync::Arc;
 
@@ -55,20 +30,10 @@ pub struct MaintenanceReport {
     pub mismatched: u64,
 }
 
-/// Run one full maintenance pass. Never fails: every step is best-effort and
-/// logged, because a repair pass that aborts the process it runs in is worse
-/// than one that leaves work for the next run.
-/// How much of the backlog one pass is allowed to work through.
-///
-/// A scheduled pass is background work and takes a bite: embedding is the most
-/// expensive thing this process does, and a household's next turn must not
-/// queue behind the whole mailbox.
-///
-/// A pass somebody ASKED for is not background work. One bite of 64 against a
-/// backlog of 986 means the reindex button indexes a fifteenth of the corpus
-/// and reports success, and the scheduled passes that would finish the job
-/// refuse until somebody chats -- so on a pond used through its own UI the
-/// remainder is never indexed at all.
+/// How much of the backlog one pass is allowed to work through. A pass never fails: every step is
+/// best-effort and logged, because aborting the process is worse than leaving work for next time.
+/// A scheduled pass takes one bite, so a household's next turn never queues behind the whole
+/// mailbox; a pass somebody ASKED for runs to completion, or the reindex button reports a lie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexBudget {
     /// One batch, then stop.
@@ -82,9 +47,8 @@ pub enum IndexBudget {
 pub struct SweepTick {
     /// Whether this tick may run on a pond that has served no turn since boot.
     ///
-    /// Handed to the lane as THIS job's exemption, which the lane ORs with the
-    /// household-wide activity flag. It is deliberately not that flag: one job
-    /// relaxing a lane-wide value qualifies every other job registered with it.
+    /// This job's own exemption, ORed by the lane with the household-wide activity flag, and
+    /// deliberately not that flag: relaxing it would qualify every other job on the lane.
     pub exempt_from_activity_gate: bool,
     /// How much of the backlog this tick may work through.
     pub budget: IndexBudget,
@@ -92,20 +56,8 @@ pub struct SweepTick {
 
 /// Decide whether a sweep tick may run, and how much it may do.
 ///
-/// The lane refuses every background job until somebody has used the pond since
-/// boot. For most chores that is right -- there is nothing to consolidate on a
-/// pond nobody has talked to. For the index it deadlocks: mail arrives from a
-/// connector rather than a conversation, so a pond that is synced and browsed
-/// but never CHATTED with accumulates unindexed items forever, and the only
-/// thing that ever indexes them is somebody pressing Reindex.
-///
-/// So the first pass after boot is exempt, and it is exhaustive: an exemption
-/// that indexed 64 of 986 items and then went back to being gated would leave
-/// the same pond unsearchable, just less obviously.
-///
-/// Every later scheduled pass is gated again, and takes one bite. This is not
-/// a way around the gate; it is one pass, once per boot, on a pond that would
-/// otherwise never index at all.
+/// The lane gates background jobs on activity since boot, which deadlocks the index: mail arrives
+/// from a connector, not a conversation. So the first pass after boot is exempt and exhaustive.
 pub fn plan_sweep(asked: bool, indexed_since_boot: bool) -> SweepTick {
     let first_post_boot = !indexed_since_boot;
     SweepTick {
@@ -164,12 +116,9 @@ pub async fn run_index_maintenance(
         .await;
     }
 
-    // 2b. Context items that arrived WITHOUT a vector. Adoption cannot help
-    //     them -- it only copies vectors that already exist -- and nothing else
-    //     ever embedded them, so the whole corpus was silently unsearchable. A
-    //     probe against the live agent is what found it: a planted sensor event
-    //     was never indexed and the assistant answered "no recorded activity",
-    //     which is a wrong answer rather than an absent one.
+    // 2b. Context items that arrived WITHOUT a vector. Adoption only copies vectors that already
+    //     exist, so without this step the corpus stays silently unsearchable and the assistant
+    //     answers "no recorded activity" -- a wrong answer rather than an absent one.
     let mut batches = 0usize;
     while !cancel.is_cancelled() && batches < MAX_BATCHES {
         batches += 1;
@@ -197,11 +146,8 @@ pub async fn run_index_maintenance(
             if text.trim().is_empty() {
                 continue;
             }
-            // Chunked, because a context item now carries a mail body
-            // and one vector over the whole of it describes the
-            // signature block as much as the point. A short item is one
-            // chunk, so this is the same work it always was for a
-            // sensor event.
+            // Chunked because a mail body's single vector would describe the signature block as
+            // much as the point. A short item is one chunk, so nothing changes for a sensor event.
             let spans = crate::context::chunking::chunk(
                 &text,
                 crate::context::chunking::DEFAULT_CHUNK_BYTES,
@@ -381,11 +327,9 @@ mod tests {
         }
         async fn health(&self, _m: &str) -> Result<IndexHealth> {
             self.calls.lock().unwrap().push("health".into());
-            // The totals are the per-corpus sums, as a real index reports them,
-            // and Summary is the wholly-dead corpus: qualifying rows zero
-            // against a table full of sessions. A stub whose numbers did not add
-            // up would let a caller that quietly stopped reading one of them
-            // still pass.
+            // Totals are the per-corpus sums, as a real index reports them, with Summary as the
+            // wholly-dead corpus. A stub whose numbers did not add up would let a caller that
+            // quietly stopped reading one of them still pass.
             Ok(IndexHealth {
                 matching: 5,
                 mismatched: 3,

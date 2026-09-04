@@ -1,21 +1,7 @@
-//! `/api/v1/rules` drives the same store as `/api/v1/schedules`, and these are
-//! the two things that must stay true of that (PAI-7 P8).
-//!
-//! **A rule id is not a schedule id.** `find_rule` filters on `rule_view`, and
-//! that filter is the ONLY thing stopping `DELETE /rules/{id}` and
-//! `POST /rules/{id}/pause` from reaching the household's nightly backup by
-//! guessing its id. It was guarded by a unit test over `rule_view` alone, which
-//! is the gate and not its consumer: deleting `&& rule_view(t).is_some()` from
-//! `find_rule` left the whole `pond-api` lib suite green.
-//!
-//! **A rule that can never fire is refused before it is stored.** That was
-//! guarded by a source-order test, which a call whose result is DISCARDED
-//! satisfies — it only asks that `rule_spec_rejection(` appear before
-//! `create_task(`. So the check is exercised here through the router instead,
-//! with a scheduler that validates nothing, which is what makes a 400 a
-//! statement about the handler.
-//!
-//! Run: cargo test -p pond-api --test rules_surface_test
+//! `/api/v1/rules` drives the same store as `/api/v1/schedules` (PAI-7 P8). A rule
+//! id is not a schedule id: `find_rule`'s `rule_view` filter is the only thing
+//! stopping `DELETE /rules/{id}` reaching the household's nightly backup. An
+//! unfireable rule is refused by the handler, proved with a scheduler validating nothing.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

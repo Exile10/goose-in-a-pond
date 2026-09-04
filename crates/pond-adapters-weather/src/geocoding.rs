@@ -1,10 +1,7 @@
 //! Geocoding via [Open-Meteo Geocoding API](https://geocoding-api.open-meteo.com).
 //!
-//! Resolves city/place names to latitude + longitude.  Free, no API key.
-//!
-//! ```text
-//! GET https://geocoding-api.open-meteo.com/v1/search?name=Kisumu&count=1&language=en
-//! ```
+//! Resolves place names to latitude and longitude; free, no API key. Requests go to
+//! `https://geocoding-api.open-meteo.com/v1/search?name=Kisumu&count=1&language=en`.
 
 use anyhow::{Context, Result};
 use std::time::Duration;
@@ -188,10 +185,8 @@ mod tests {
 
 /// This geocoder as the core's [`PlaceLookup`].
 ///
-/// The trait lives in `pond-core` and knows nothing about Open-Meteo; this is
-/// the one place the two meet. Detection asks for a `&dyn PlaceLookup`, so the
-/// cascade can be tested without a network and this crate stays the only thing
-/// that has to know what a geocoding URL looks like.
+/// The trait lives in `pond-core` and knows nothing about Open-Meteo; this is the
+/// one place the two meet, so detection can be tested against a `&dyn PlaceLookup`.
 #[async_trait::async_trait]
 impl pond_core::user_data::ports::place_lookup::PlaceLookup for Geocoder {
     async fn by_name(

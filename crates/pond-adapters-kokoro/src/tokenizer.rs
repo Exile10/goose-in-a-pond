@@ -1,23 +1,7 @@
-//! Text → phonemes → token ids, the way Kokoro expects them.
-//!
-//! ## Why espeak is enough
-//!
-//! Kokoro was trained on misaki G2P output. Its vocab reserves single-character
-//! tokens (`A`, `I`, `O`, `Q`, `W`, `Y`) for diphthongs espeak spells with two
-//! characters. So espeak IPA is *not* the reference tokenization.
-//!
-//! The reference JS/Python runtimes take the pragmatic path anyway: phonemize
-//! with espeak (stress marks kept), then drop anything outside the vocab. On a
-//! corpus of ordinary chat text — numbers, dates, acronyms, hard consonant
-//! clusters — that drops **zero** characters, because espeak's English IPA
-//! already lands inside Kokoro's alphabet. See [`Vocab::encode`]'s `dropped`
-//! count, which exists so a regression here is measurable rather than merely
-//! audible.
-//!
-//! ## Why the vocab is loaded, not embedded
-//!
-//! A hand-transcribed vocab is how you get a phoneme silently deleted from
-//! every utterance. `tokenizer.json` ships beside the weights; read it.
+//! Text → phonemes → token ids, the way Kokoro expects them. Kokoro was trained on misaki
+//! G2P, but espeak IPA (stress kept) lands inside its vocab on ordinary English chat text, so
+//! anything outside the vocab is dropped and counted by [`Vocab::encode`] to keep regressions
+//! measurable. The vocab is read from `tokenizer.json` beside the weights, never hand-embedded.
 
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
@@ -107,12 +91,9 @@ impl Vocab {
         self.map.contains_key(&c)
     }
 
-    /// Encode a phoneme string, dropping anything outside the vocab.
-    ///
-    /// Returns the ids, the phonemes that survived, and how many characters
-    /// were dropped. The drop count is the R2 canary: on English it should be
-    /// zero, and a non-zero count means espeak has started emitting something
-    /// this model was never trained to read.
+    /// Encode a phoneme string, dropping anything outside the vocab. Returns the ids, the
+    /// surviving phonemes, and the drop count. That count is the R2 canary: on English it must
+    /// be zero, and non-zero means espeak is emitting something this model was never trained on.
     pub fn encode(&self, phonemes: &str) -> (Vec<i64>, String, usize) {
         let mut ids = Vec::with_capacity(phonemes.len());
         let mut kept = String::with_capacity(phonemes.len());
@@ -130,21 +111,16 @@ impl Vocab {
     }
 }
 
-/// Phonemize `text` into one IPA string per sentence.
-///
-/// espeak advances clause by clause and terminates a sentence on `.`/`?`/`!`,
-/// so this is already the sentence split the streaming path wants — no
-/// separate sentence splitter, and no risk of the two disagreeing.
+/// Phonemize `text` into one IPA string per sentence. espeak terminates a sentence on
+/// `.`/`?`/`!`, so this is already the split the streaming path wants; do not add a separate
+/// sentence splitter that could disagree with it.
 pub fn phonemize(text: &str) -> Result<Vec<String>> {
     espeak_rs::text_to_phonemes(text, "en-us", None)
         .map_err(|e| anyhow!("espeak phonemization failed: {e}"))
 }
 
-/// Phonemize and tokenize `text` into forward-pass-sized chunks.
-///
-/// Sentences are the natural unit. A sentence longer than [`MAX_PHONEME_TOKENS`]
-/// is split further at a phoneme-space boundary — Piper had no such limit, so
-/// this is the one piece of chunking logic Kokoro genuinely adds.
+/// Phonemize and tokenize `text` into forward-pass-sized chunks. Sentences are the unit; a
+/// sentence longer than [`MAX_PHONEME_TOKENS`] is split further at a phoneme-space boundary.
 pub fn chunk(text: &str, vocab: &Vocab) -> Result<(Vec<Chunk>, usize)> {
     let mut out = Vec::new();
     let mut dropped_total = 0usize;

@@ -1,11 +1,7 @@
-//! Integration tests for per-session token tracking:
-//!   - Session token accumulation via increment_usage
-//!   - list_sessions includes token counts
-//!   - /api/v1/usage/summary aggregates correctly
-//!
-//! Uses a REAL SQLite database (temp dir) with all migrations.
-//!
-//! Run: cargo test -p pond-api --test token_usage_integration_test
+//! Integration tests for per-session token tracking: accumulation through
+//! `increment_usage`, the counts `list_sessions` reports, and the aggregation in
+//! /api/v1/usage/summary. Uses a real SQLite database in a temp dir with all
+//! migrations. Run: cargo test -p pond-api --test token_usage_integration_test
 
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};

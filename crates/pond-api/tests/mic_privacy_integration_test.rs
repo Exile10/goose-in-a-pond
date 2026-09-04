@@ -1,17 +1,7 @@
-//! `mic_enabled` end to end, from the HTTP surface to the capture gate.
-//!
-//! This setting shipped as a privacy control and, until 2026-08, was enforced
-//! **nowhere** — a workspace grep found only its definition, its persistence,
-//! and the UI toggle. Flipping it off changed nothing: the wake-word detector,
-//! both capture paths and the barge-in listener all kept opening the device.
-//!
-//! The gap was invisible from either end. The frontend test asserts the toggle
-//! sends the right payload; the settings round-trip test asserts the value
-//! persists. Both passed the whole time. Nothing joined the two halves and
-//! asked whether the microphone actually closed.
-//!
-//! This test is that join: drive the real router with a real `PUT /settings`
-//! and assert the capture gate observed it.
+//! `mic_enabled` end to end, from the HTTP surface to the capture gate. This
+//! privacy control once shipped enforced nowhere: the wake-word detector, both
+//! capture paths and the barge-in listener all kept opening the device. Payload
+//! and round-trip tests cannot see that; only this join can.
 
 use std::sync::Arc;
 

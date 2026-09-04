@@ -1,40 +1,19 @@
-//! Stateful streaming filter that strips reasoning/thinking markup from
-//! token streams before they reach the user (TTS or display).
-//!
-//! Handles all known tag formats:
-//!   1. `<|channel>thought ... <channel|>` (Gemma 4)
-//!   2. `<|tool_call> ... <tool_call|>`   (Harmony tool markup)
-//!   3. `<think> ... </think>`            (Qwen3, DeepSeek-R1)
-//!   4. `<thought> ... </thought>`        (alternate)
-//!
-//! Also strips standalone sentinels: `<eos>`, `<|eos|>`, `<end_of_turn>`,
-//! and orphaned close tags (`</think>`, `</thought>`).
-//!
-//! Reuse a single instance across all chunks of one response.
-//!
-//! The holdback is *conditional*: only the longest suffix of the buffer that is
-//! a proper prefix of some marker is withheld, so ordinary prose is forwarded
-//! the instant it arrives. An earlier version withheld a fixed 16 bytes on
-//! every push regardless of content, which made spoken and displayed text
-//! trail generation by that much. `ordinary_text_is_emitted_with_no_holdback`
-//! is the guard.
+//! Stateful streaming filter stripping reasoning and tool markup from token streams before TTS
+//! or display: Gemma 4 channel tags, Harmony tool markup, `<think>`/`<thinking>`/`<thought>`
+//! (Qwen3, DeepSeek-R1), sentinels such as `<eos>` and `<end_of_turn>`, and orphan close tags.
+//! Reuse one instance across a whole response. Holdback is conditional, see `safe_emit_len`.
 
 /// Paired tags whose entire contents (and the tags themselves) are dropped.
 ///
-/// PUBLIC because there is a second streaming filter at the SSE seam
-/// (`pond_api::thought_filter`) that needs exactly this list. The two tables
-/// were separate copies and they drifted: `<thinking>` was added here, for a
-/// model whose whole reasoning was otherwise spoken aloud in voice mode, and
-/// the copy in `pond-api` never got it. One table, two filters.
+/// Public because the second streaming filter at the SSE seam (`pond_api::thought_filter`)
+/// needs exactly this list: one table, two filters, or the copies drift.
 pub const PAIRED_TAGS: &[(&str, &str)] = &[
     ("<|channel>thought", "<channel|>"),
     ("<|tool_call>", "<tool_call|>"),
     ("<think>", "</think>"),
-    // `<thinking>` is a DISTINCT literal, not a prefix match for `<think>` —
-    // the closing `>` makes them disjoint, so order here does not matter.
-    // goose's own ThinkFilter handles both spellings; this one handled only
-    // `<think>`, so a model using the longer form had its entire reasoning
-    // spoken aloud in voice mode.
+    // `<thinking>` is a distinct literal, not a prefix match for `<think>`: the closing `>`
+    // makes them disjoint, so order here does not matter. Drop it and a model using the longer
+    // spelling has its whole reasoning spoken aloud in voice mode.
     ("<thinking>", "</thinking>"),
     ("<thought>", "</thought>"),
 ];
@@ -158,22 +137,10 @@ fn strip_standalones(s: &str) -> String {
     out
 }
 
-/// Byte index up to which `s` can be emitted right now.
-///
-/// Withholds only the longest suffix of `s` that is a *proper* prefix of some
-/// marker in `markers` -- the only bytes that could still turn into a marker
-/// once more tokens arrive. Returns `s.len()` when no suffix could begin a
-/// marker, which is the common case for ordinary prose.
-///
-/// A complete marker is deliberately not a match. In `State::Normal` a complete
-/// open tag has already been found by `buf.find` and a complete sentinel is
-/// removed by [`strip_standalones`], so treating a whole marker as a partial
-/// would withhold it forever.
-///
-/// Every marker is ASCII, so a matching suffix can never begin inside a
-/// multi-byte character; the returned index is always a char boundary. Cost is
-/// bounded by the longest marker times the marker count, independent of buffer
-/// length -- this runs per token.
+/// Byte index up to which `s` can be emitted right now: only a tail that is a *proper* prefix
+/// of a marker is withheld, so ordinary prose returns `s.len()`. A complete marker must not
+/// match, or it would be withheld forever. Every marker is ASCII, so the returned index is
+/// always a char boundary.
 fn safe_emit_len(s: &str, markers: &[&str]) -> usize {
     let longest = markers.iter().map(|m| m.len()).max().unwrap_or(0);
     let earliest = s.len().saturating_sub(longest.saturating_sub(1));
@@ -283,11 +250,8 @@ mod tests {
 
     /// Voice regression: reasoning read aloud.
     ///
-    /// The engine-side filter is a PASS-THROUGH when thinking is disabled
-    /// (`ThinkingOutputFilter::push_text` returns the text untouched), and
-    /// voice mode disables thinking. Disabling it does not stop the model
-    /// reasoning — it only stops the engine stripping it — so the tags reach
-    /// this filter, which is the last thing standing between them and TTS.
+    /// Voice disables thinking, making `ThinkingOutputFilter::push_text` a pass-through without
+    /// stopping the model reasoning, so this filter is the last guard before TTS.
     #[test]
     fn every_thinking_spelling_is_stripped_before_speech() {
         for (open, close) in [
@@ -321,9 +285,8 @@ mod tests {
     }
     // ── Holdback behaviour ─────────────────────────────────────────────────
     //
-    // The bug these pin: the lookahead used to withhold a fixed 16 bytes on
-    // every push regardless of content, so displayed and spoken text trailed
-    // generation by that much and froze mid-word when generation slowed.
+    // These pin that the lookahead is conditional: a fixed-size holdback makes displayed and
+    // spoken text trail generation by that much and freeze mid-word when generation slows.
 
     #[test]
     fn ordinary_text_is_emitted_with_no_holdback() {

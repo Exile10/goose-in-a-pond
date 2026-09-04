@@ -1,12 +1,6 @@
-//! AnswerReviewer port — driven port for post-inference adversarial review.
-//!
-//! Runs AFTER the main LLM generates an answer. An adversarial "critic"
-//! evaluates whether the answer is complete, accurate, and helpful.
-//! If the answer scores below threshold, the critique is sent back to
-//! the main LLM for revision.
-//!
-//! The reviewer uses the SAME model as the main LLM — different behavior
-//! comes from a different system prompt, not a different model.
+//! AnswerReviewer port — driven port for post-inference adversarial review. A critic evaluates
+//! the generated answer; below threshold its critique goes back to the main LLM for revision.
+//! The reviewer uses the SAME model: the difference is the system prompt, not the model.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -41,21 +35,13 @@ pub struct ReviewResult {
     pub rounds: u32,
 }
 
-/// Driven Port: post-inference adversarial answer reviewer.
-///
-/// Reviews a completed answer against the original question. Uses the
-/// same underlying LlmProvider with a critic system prompt to evaluate
-/// completeness, accuracy, and depth. Optionally triggers revision.
-///
-/// Returns `ReviewResult` with the final (possibly revised) answer.
-/// Callers should use `final_answer` for persistence and delivery.
+/// Driven Port: post-inference adversarial answer reviewer. Reviews a completed answer against
+/// the original question using the same LlmProvider with a critic system prompt, and may trigger
+/// a revision. Callers use `ReviewResult::final_answer` for persistence and delivery.
 #[async_trait]
 pub trait AnswerReviewer: Send + Sync {
-    /// Review a completed answer against the original question.
-    ///
-    /// `question` — the user's original message.
-    /// `answer` — the main LLM's generated response.
-    /// `tool_context` — any tool-retrieved data that was injected (Wikipedia, weather, etc.).
+    /// Review a completed answer against the original question. `question` is the user's message,
+    /// `answer` the main LLM's response, `tool_context` any tool-retrieved data that was injected.
     async fn review(
         &self,
         question: &str,

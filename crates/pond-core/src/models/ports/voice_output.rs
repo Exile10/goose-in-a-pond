@@ -1,11 +1,6 @@
-//! Driven Port: VoiceOutput
-//!
-//! Abstracts text-to-speech output so the Speak state of the workflow loop
-//! does not depend on any specific synthesis backend.
-//!
-//! Implementations:
-//! - `PrintOutput` — prints to stdout (default; no audio hardware required)
-//! - `PiperOutput` — spawns the Piper TTS subprocess and plays through speaker
+//! Driven Port: VoiceOutput. Abstracts text-to-speech so the Speak state of the workflow loop
+//! does not depend on a synthesis backend. `PrintOutput` prints to stdout (the default, needing
+//! no audio hardware); `PiperOutput` spawns the Piper subprocess and plays through the speaker.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,11 +11,9 @@ pub trait VoiceOutput: Send + Sync {
     /// Synthesise and deliver `text` (speak aloud or print).
     async fn speak(&self, text: &str) -> Result<()>;
 
-    /// Synthesize text to audio bytes WITHOUT playing.
-    ///
-    /// Enables pipelined TTS: synthesize the next sentence while the current
-    /// one is still playing. Returns `None` when the implementation doesn't
-    /// support split synthesis/playback (chat loop falls back to `speak()`).
+    /// Synthesize text to audio bytes WITHOUT playing, so the next sentence can be prepared while
+    /// the current one plays. `None` means split synthesis is unsupported and the chat loop falls
+    /// back to `speak()`.
     async fn synthesize(&self, _text: &str) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
@@ -31,16 +24,10 @@ pub trait VoiceOutput: Send + Sync {
         Ok(())
     }
 
-    /// Mark the start of one turn's speech, clearing any prior interrupt.
-    ///
-    /// Interrupt state belongs to the TURN, not to an individual utterance.
-    /// `speak()` and `play_audio()` used to clear it on entry, so a barge-in
-    /// that fired during sentence one was forgotten by sentence two and the
-    /// rest of the reply played on regardless — the user had to interrupt
-    /// once per sentence and it still never stopped.
-    ///
-    /// Call once, before the first `speak()`/`play_audio()` of a turn.
-    /// Idempotent. Default is a no-op (PrintOutput / tests).
+    /// Mark the start of one turn's speech, clearing any prior interrupt. Interrupt state belongs
+    /// to the TURN, not one utterance: clear it per utterance and a barge-in during sentence one
+    /// is forgotten by sentence two. Call once before the turn's first `speak()`/`play_audio()`.
+    /// Idempotent; the default is a no-op (PrintOutput, tests).
     fn begin_utterance(&self) {}
 
     /// Immediately stop any in-progress speech playback.

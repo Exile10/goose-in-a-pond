@@ -1,66 +1,7 @@
 //! The two chat stream handlers agree about persistence, extraction and scope.
-//!
-//! PAI-5 P7. `/chat/stream` and `/agent/chat/stream` both run the live
-//! `GooseAdapter`, both write to `session_messages`, and both are supposed to
-//! hand the turn to `ChatService`. They drifted: `agent_chat_stream` persisted
-//! its turns and never extracted memory from them, so an entire conversation
-//! held on that route contributed nothing, and nothing in the suite objected.
-//!
-//! # Half of this file reads source, and half of it drives the route
-//!
-//! The ORDERING facts below cannot be observed from outside. A drained SSE body
-//! shows the frames a turn produced; it cannot show that the `ChatService` was
-//! built after the scope was resolved, or that the `done` frame was yielded
-//! after persistence rather than before it. Those are the two defects P7 was one
-//! line away from shipping, and for them a source guard is the honest
-//! instrument -- the same judgement as `pond-adapters-goose`'s
-//! `the_turn_authority_is_built_from_the_published_allow_set`.
-//!
-//! **What a source guard is NOT an excuse for is the behaviour itself.**
-//! `chat_integration_test.rs` shows that this crate's world stands up in
-//! process: a `MockAgent`, a tempdir SQLite database and `build_router` are the
-//! whole cost. So the claim that `/agent/chat/stream` still *works* -- that it
-//! answers, that it terminates the stream it opened, that the turn reaches
-//! `session_messages` -- is asserted by driving the route, at the bottom of this
-//! file. It was not, and deleting that route's entire `done` frame left every
-//! suite in the workspace green while a browser on it waited forever.
-//!
-//! **But a source guard that asserts PRESENCE is nearly worthless**, and this
-//! programme has the scar to prove it: the child drain loop's tripwire checked
-//! that five strings appeared in a function, and two production-shaped mutations
-//! restored the original defect in full with every test still green, because
-//! neither mutation moved any of the five strings. So these assertions are about
-//! ORDER and ARGUMENTS, which is where the defect actually lives.
-//!
-//! # The ordering is the safety property, not a tidiness preference
-//!
-//! `ChatService`'s default scope is `ProfileScope::Household`, and the scope is
-//! what memory extraction is attributed to. `agent_chat_stream` resolves the
-//! turn's real scope *after* the session row exists, which it must. If the
-//! `ChatService` is built before that resolution, it keeps the household
-//! default -- and the moment extraction is switched on, which is precisely what
-//! P7 does, a Guest's turn or one member's turn is written into the whole
-//! household's memory. That default was harmless only while extraction was off.
-//!
-//! A widening default reached by ordering is still a widening default, and it is
-//! invisible to any test that only checks the calls are present.
-//!
-//! # What the unification half added
-//!
-//! Both handlers now fold engine events through one `TurnAccumulator::absorb`
-//! rather than each carrying its own exhaustive match. That is guarded here in
-//! two directions, and it needs both. As an ABSENCE -- no handler destructures
-//! an engine event itself -- because the defect it prevents is a new variant
-//! written into one copy and not the other. And as a PRESENCE, that each
-//! handler still calls the translator, because an absence assertion is equally
-//! satisfied by a route that stopped folding altogether, which is the larger
-//! regression of the two.
-//!
-//! The frames that come out of the translator are guarded behaviourally, in
-//! `routes.rs`'s own test module, where real `AgentStreamEvent` values go in and
-//! the JSON a browser receives comes out. Neither test is worth much without the
-//! other: this one proves there is a single answer, that one proves the answer
-//! is right.
+//! Half of this file reads `routes.rs`, because order and arguments -- scope
+//! resolved before `ChatService` is built, `done` yielded after persistence --
+//! are invisible in a drained SSE body; the other half drives the route for real.
 
 use std::sync::Arc;
 
@@ -83,42 +24,23 @@ use tower::ServiceExt;
 
 const ROUTES: &str = include_str!("../src/routes.rs");
 
-/// The two functions that actually hold the streaming bodies.
-///
-/// **They are not symmetrical, and that asymmetry is part of what P7 is about.**
-/// `chat_stream` is a thin wrapper that takes an SSE permit and delegates
-/// onwards; `agent_chat_stream` carries its body inline with no inner. Pointing
-/// this guard at `chat_stream` finds thirty lines of preamble and none of the
-/// persistence, which is exactly the false pass the vacuity control below exists
-/// to catch -- it caught it while this file was being written, and it caught the
-/// move described next.
-///
-/// # Why this is `drive_turn` and no longer `chat_stream_inner`
-///
-/// The turn stopped being a response body. It is now a task driving a
-/// `RunHandle`, so that a reload no longer kills the answer mid-sentence, and
-/// `chat_stream_inner` shrank to the wrapper that starts it. The guard followed
-/// the code rather than the name: pointed at the wrapper it found 560 bytes and
-/// went vacuous, which is precisely what the control below is for.
-///
-/// The wrapper's NAME is still asserted to exist, in `production()` -- both this
-/// file's slicer and `run_recipe` depend on it.
+/// The two functions that hold the streaming bodies. They are not symmetrical:
+/// `chat_stream_inner` is a wrapper that starts the `RunHandle` task and the turn
+/// itself lives in `drive_turn`, so pointing this guard at the wrapper goes
+/// vacuous. `production()` still asserts the wrapper's name exists.
 const CHAT: &str = "drive_turn";
 const AGENT: &str = "agent_chat_stream";
 
-/// The one function that turns an engine event into an SSE frame.
-///
-/// It is a method on `TurnAccumulator`, so `handler_body` is the wrong slicer
-/// for it -- see [`method_body`], which exists because the wrong slicer let a
-/// mutation of this very constant pass.
+/// The one function that turns an engine event into an SSE frame. It is a method
+/// on `TurnAccumulator`, so `handler_body` is the wrong slicer -- see
+/// [`method_body`], which exists because the wrong slicer let a mutation of this
+/// constant pass.
 const TRANSLATOR: &str = "absorb";
 
-/// `routes.rs` with its test module removed.
-///
-/// Every count below has to be over production code. The unit tests for the
-/// translator construct `AgentStreamEvent` values by the dozen, and a guard that
-/// counted those would report a second match on the day somebody wrote a test
-/// for the first one.
+/// `routes.rs` with its test module removed: every count below has to be over
+/// production code. The translator's own unit tests construct
+/// `AgentStreamEvent` values by the dozen, and counting those would report a
+/// second match the day somebody tested the first one.
 fn production() -> &'static str {
     let code = ROUTES
         .split_once("#[cfg(test)]")
@@ -144,11 +66,9 @@ fn production() -> &'static str {
 }
 
 /// The body of one function, from its signature to the start of the next
-/// top-level item.
-///
-/// Panics rather than returning an empty string on a miss. A slicer that
-/// silently finds nothing turns every assertion below into a vacuous pass, which
-/// is the failure shape this file exists to avoid.
+/// top-level item. Panics rather than returning an empty string on a miss: a
+/// slicer that silently finds nothing turns every assertion below into a
+/// vacuous pass.
 fn handler_body(name: &str) -> &'static str {
     let src = production();
     let (sig, start) = [format!("async fn {name}("), format!("fn {name}(")]
@@ -167,21 +87,10 @@ fn handler_body(name: &str) -> &'static str {
     &rest[..end]
 }
 
-/// The body of one INDENTED method, from its signature to its own closing
-/// brace.
-///
-/// `handler_body` cannot do this job, and finding out why is the reason this
-/// function exists. Its region ends at the next item at column zero, and a
-/// method sits inside an `impl` -- so pointing it at `tool_result_frame`, the
-/// top-level helper immediately above `TurnAccumulator`, returned a region that
-/// swallowed the whole `impl` and therefore the translator itself. The mutation
-/// "point the guard at the wrong function" passed with five green tests.
-///
-/// Ending at `\n    }` works because rustfmt puts an item's closing brace at its
-/// own indentation, which `egress_offline_routes.rs` leans on for the same
-/// reason. Applied to a top-level `fn` it stops at the first four-space brace
-/// INSIDE it, which is why the caller's size floor now catches that mutation
-/// twice over.
+/// The body of one INDENTED method, from its signature to its own closing brace.
+/// `handler_body` ends at the next column-zero item, so on a method it swallows
+/// the whole `impl`. Ending at `\n    }` works because rustfmt puts an item's
+/// closing brace at its own indentation; the caller's size floor catches misuse.
 fn method_body(name: &str) -> &'static str {
     let src = production();
     let sig = format!("fn {name}(");
@@ -193,12 +102,10 @@ fn method_body(name: &str) -> &'static str {
     &rest[..end]
 }
 
-/// Line comments removed, so that a count below is a count of CODE.
-///
-/// Rule one of this programme's vacuous-test list is a guard satisfied by
-/// comment prose. Without this, ten `// AgentStreamEvent::Whatever` lines in the
-/// translator would clear its vacuity floor with no match present at all, and a
-/// single one in a handler would fail this file for a comment.
+/// Line comments removed, so a count below is a count of CODE. Without this, ten
+/// `// AgentStreamEvent::Whatever` lines would clear the translator's vacuity
+/// floor with no match present, and a single one in a handler would fail this
+/// file for a comment.
 fn strip_line_comments(src: &str) -> String {
     src.lines()
         .map(|l| match l.find("//") {
@@ -209,13 +116,10 @@ fn strip_line_comments(src: &str) -> String {
         .join("\n")
 }
 
-/// Does `body` use `word` as a whole identifier, rather than as a fragment of a
-/// longer one?
-///
-/// `str::contains("Status")` cannot tell `AgentStreamEvent::Status` from
-/// `StatusCode::OK`, and a guard that forbids the enum's variant names would
-/// then fail on any handler that returns an HTTP status. The two live variant
-/// names most at risk of that are checked by the vacuity control below.
+/// Does `body` use `word` as a whole identifier rather than a fragment of a
+/// longer one? `str::contains("Status")` cannot tell `AgentStreamEvent::Status`
+/// from `StatusCode::OK`, so a guard forbidding variant names would fail on any
+/// handler returning an HTTP status. The vacuity control below pins both ways.
 fn mentions_identifier(body: &str, word: &str) -> bool {
     let is_ident = |c: Option<char>| matches!(c, Some(c) if c.is_alphanumeric() || c == '_');
     body.match_indices(word).any(|(at, _)| {
@@ -224,12 +128,10 @@ fn mentions_identifier(body: &str, word: &str) -> bool {
     })
 }
 
-/// Vacuity control for [`mentions_identifier`].
-///
-/// It is the search this file's strongest assertion rests on, and a search that
-/// answers `true` to everything makes that assertion fail for the wrong reason
-/// while a search that answers `false` to everything makes it vacuous. Both
-/// directions are pinned, against the exact strings that would produce each.
+/// Vacuity control for [`mentions_identifier`], the search this file's strongest
+/// assertion rests on. A search answering `true` to everything fails that
+/// assertion for the wrong reason; one answering `false` makes it vacuous, so
+/// both directions are pinned.
 #[test]
 fn the_identifier_search_can_tell_a_name_from_a_longer_one() {
     assert!(
@@ -255,11 +157,9 @@ fn position(body: &str, needle: &str, handler: &str) -> usize {
 }
 
 /// Both handlers hand the turn to `ChatService` for persistence AND extraction.
-///
-/// `persist_assistant_turn_with_extraction` is one call that owns both concerns
-/// on purpose: there is no separate extraction call for a later refactor to drop.
-/// A handler that calls the plain `persist_assistant_turn` has silently opted out
-/// of memory, which is what `/agent/chat/stream` did.
+/// `persist_assistant_turn_with_extraction` owns both concerns on purpose, so
+/// there is no separate extraction call to drop. A handler calling the plain
+/// `persist_assistant_turn` has silently opted out of memory.
 #[test]
 fn both_stream_handlers_extract_memory_from_the_turn() {
     for handler in [CHAT, AGENT] {
@@ -277,12 +177,10 @@ fn both_stream_handlers_extract_memory_from_the_turn() {
     }
 }
 
-/// Vacuity control for the test above.
-///
-/// If `handler_body` ever slices wrongly -- picks the whole file, or an empty
-/// range -- the assertions above pass or fail for reasons that have nothing to do
-/// with parity. This pins that the two bodies are found, are different, and are
-/// each a plausible size for a handler rather than the whole 13k-line file.
+/// Vacuity control for the test above. If `handler_body` slices wrongly -- the
+/// whole file, or an empty range -- the assertions above pass or fail for reasons
+/// unrelated to parity. This pins that the two bodies are found, differ, and are
+/// each a plausible size for a handler.
 #[test]
 fn the_two_handler_bodies_are_really_two_different_handlers() {
     let chat = handler_body(CHAT);
@@ -316,11 +214,8 @@ fn the_two_handler_bodies_are_really_two_different_handlers() {
 
 /// The scope must be resolved BEFORE the `ChatService` is built, or extraction is
 /// attributed to `ProfileScope::Household` whoever was actually speaking.
-///
-/// This is the assertion that would have caught the defect P7 was one line away
-/// from shipping. Presence of both calls is not enough and never was: before this
-/// change `agent_chat_stream` contained `resolve_turn_scope` and a `ChatService`
-/// and was still wrong, because the resolution came thirty lines too late.
+/// Presence of both calls is not enough: a handler can contain
+/// `resolve_turn_scope` and a `ChatService` and still resolve too late.
 #[test]
 fn agent_chat_stream_knows_who_is_speaking_before_it_builds_the_service() {
     let body = handler_body(AGENT);
@@ -340,40 +235,16 @@ fn agent_chat_stream_knows_who_is_speaking_before_it_builds_the_service() {
     );
 }
 
-/// The match on `AgentStreamEvent` lives in EXACTLY ONE place.
-///
-/// This is the property the unification half of P7 bought, and the only thing
-/// that keeps it: two exhaustive matches over an enum that is still growing is a
-/// standing promise to write every new variant twice. PAI-6 P6 added one --
-/// `SubagentProgress` -- and wrote its arm ONCE, which is what P7 bought and is
-/// the reason this guard exists rather than a note in a document. When
-/// the second copy exists, the cheap thing to do is write the arm into whichever
-/// handler you were looking at -- which is how these two came to disagree about
-/// tool timing, and how `/agent/chat/stream` came to stream reasoning it never
-/// offered to its `ChatService`.
-///
-/// The "is there a second one" half is deliberately phrased as "none outside"
-/// rather than "ten inside": a guard naming today's variants cannot see the one
-/// added tomorrow, which is the assertion-window failure this programme keeps
-/// re-learning.
-///
-/// It is not phrased as a search for the string `AgentStreamEvent::` ALONE,
-/// which is what it used to be and which an import defeats:
-/// `use ...::AgentStreamEvent as Ev;` and a `match &event { Ev::… }` fold
-/// reintroduces the whole defect with this guard green. That mutation was run.
-/// So the absence is checked three ways -- the qualified name, the `match` on
-/// the event binding, and the variant names themselves, which no aliasing can
-/// avoid spelling -- and, more importantly, the POSITIVE half is checked too: a
-/// handler that stopped folding through the translator altogether was equally
-/// invisible to a guard that only asserts an absence.
+/// The match on `AgentStreamEvent` lives in EXACTLY ONE place: two exhaustive
+/// matches over a growing enum is a promise to write each new variant twice.
+/// Absence is checked three ways (qualified name, `match` on the event binding,
+/// variant names, which no import alias avoids spelling) and presence as well.
 #[test]
 fn the_engine_event_match_lives_in_exactly_one_place() {
     // The variants whose names cannot plausibly appear in a handler for an
     // unrelated reason. `Status`, `Text`, `Done` and `Error` are left out on
-    // purpose: `anyhow::Error` in a handler is not a second match, and a guard
-    // that says it is gets deleted rather than obeyed. Any second fold has to
-    // name the six below -- exhaustively if it is a copy, and at least one of
-    // them if it is a partial `match … _ => {}` bolted on beside the real one.
+    // purpose: `anyhow::Error` in a handler is not a second match. Any second
+    // fold has to name at least one of the variants below.
     const DISTINCTIVE_VARIANTS: [&str; 7] = [
         "Thinking",
         "ToolCall",
@@ -479,11 +350,9 @@ fn the_engine_event_match_lives_in_exactly_one_place() {
 }
 
 /// Both handlers scope the service from the turn's RESOLVED identity, not from a
-/// default and not from a literal.
-///
-/// The input half of the gate. `with_profile_scope` taking the wrong argument
-/// fails nothing else in the suite: the call is present, the handler compiles, and
-/// the misattribution is silent.
+/// default and not from a literal. `with_profile_scope` taking the wrong argument
+/// fails nothing else in the suite: the call is present, the handler compiles,
+/// and the misattribution is silent.
 #[test]
 fn neither_handler_scopes_its_service_from_a_literal() {
     for handler in [CHAT, AGENT] {
@@ -499,20 +368,10 @@ fn neither_handler_scopes_its_service_from_a_literal() {
     }
 }
 
-/// `/chat/stream` sends its `done` AFTER it has persisted the turn.
-///
-/// This is why the translator hands back `TurnComplete` rather than emitting a
-/// frame of its own: if `done` came out of the fold, this route would close the
-/// stream before `persist_assistant_turn_with_extraction` had run, and a client
-/// that reloads the session when the stream ends -- which the desktop does --
-/// would read back a conversation with the answer it just watched arrive
-/// missing from it.
-///
-/// It is the one half of the `done` contract that reads source, because it is
-/// the one half a drained SSE body cannot show: collecting the frames says
-/// nothing about what else had already happened when each was yielded. The other
-/// half -- that `/agent/chat/stream` sends a `done` at all -- is driven for real
-/// at the bottom of this file.
+/// `/chat/stream` sends its `done` AFTER it has persisted the turn. This is why
+/// the translator hands back `TurnComplete` instead of emitting the frame: a
+/// `done` from the fold closes the stream before persistence, and the desktop
+/// reloads the session on close and reads back a conversation missing the answer.
 #[test]
 fn chat_stream_persists_the_turn_before_it_closes_the_stream() {
     let body = handler_body(CHAT);
@@ -534,12 +393,9 @@ fn chat_stream_persists_the_turn_before_it_closes_the_stream() {
 }
 
 // ── The other half: the route, driven ────────────────────────────────────────
-//
-// Everything above reads text. What follows runs `/agent/chat/stream` for real:
-// through `build_router`, through the auth middleware, against a tempdir SQLite
-// database, with the `MockAgent` standing in for `GooseAdapter`. `AppState` has
-// no `Default`, so every integration test in this crate spells the fixture out
-// and this one is no exception.
+// Everything above reads text. What follows runs `/agent/chat/stream` for real,
+// through `build_router` and the auth middleware, against a tempdir SQLite
+// database with `MockAgent` standing in for `GooseAdapter`.
 
 /// Onboarding always reports completed, so its gate never stands between the
 /// request and the handler under test.
@@ -750,14 +606,10 @@ async fn drive_agent_stream(app: &axum::Router, session_id: &str, message: &str)
     frames
 }
 
-/// `/agent/chat/stream` ends the turn it opened.
-///
-/// The desktop's reader loop ends on `{"done": true}` and on nothing else. Before
-/// this test existed, deleting the entire body of this route's
-/// `StreamStep::TurnComplete` arm -- the arm PAI-5 P7 rewrote -- left
-/// `cargo test -p pond-api` green in full, because no test in the workspace drove
-/// the route at all. A refactor whose claim is "both routes now behave
-/// identically" has to assert somewhere that the second route still behaves.
+/// `/agent/chat/stream` ends the turn it opened. The desktop's reader loop ends
+/// on `{"done": true}` and on nothing else, and deleting this route's
+/// `StreamStep::TurnComplete` arm once left the whole crate green because no
+/// test drove the route at all.
 #[tokio::test]
 async fn the_agent_route_ends_the_turn_it_opened() {
     let (app, _tmp) = make_app().await;
@@ -800,14 +652,10 @@ async fn the_agent_route_ends_the_turn_it_opened() {
     );
 }
 
-/// The turn reaches `session_messages`, which is what `GET /sessions/{id}/messages`
-/// serves and what the next turn's history is read back from.
-///
-/// `both_stream_handlers_extract_memory_from_the_turn` asserts this route calls
-/// `persist_assistant_turn_with_extraction`; this asserts the call arrives
-/// somewhere. A persistence call inside a generator nobody polls, or made against
-/// a session row that was never created, is a call that reads as present and
-/// stores nothing.
+/// The turn reaches `session_messages`, which `GET /sessions/{id}/messages`
+/// serves and the next turn's history is read back from. The source guard proves
+/// the call is written; this proves it arrives, because a call inside a generator
+/// nobody polls stores nothing.
 #[tokio::test]
 async fn the_agent_route_persists_the_turn_it_streamed() {
     let (app, _tmp) = make_app().await;

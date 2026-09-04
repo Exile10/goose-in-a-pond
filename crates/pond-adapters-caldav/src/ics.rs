@@ -1,18 +1,5 @@
-//! Just enough iCalendar to turn a VEVENT into a [`RawItem`].
-//!
-//! Deliberately not a general iCalendar implementation. This reads the seven
-//! properties a person would recognise on a calendar entry and ignores the rest,
-//! because the corpus test is "would a member recognise this row as something
-//! that happened, six months from now" and VALARM triggers do not pass it.
-//!
-//! # Why there is no recurrence handling here
-//!
-//! RRULE expansion is the hard half of iCalendar and this module does none of
-//! it, on purpose. The `calendar-query` REPORT asks the server to expand
-//! recurrences (RFC 4791 §9.6.5), so what arrives is already one VEVENT per
-//! occurrence. That also fixes time zones for free: the same section requires an
-//! expanding server to return UTC. Doing it here instead would mean shipping a
-//! time zone database to a device that is already fighting for disk.
+//! Just enough iCalendar to turn a VEVENT into a [`RawItem`]. No RRULE expansion on purpose:
+//! the `calendar-query` REPORT has the server expand recurrences in UTC (RFC 4791 §9.6.5).
 //!
 //! [`RawItem`]: pond_core::context::ingest::RawItem
 
@@ -29,9 +16,8 @@ struct Line<'a> {
 
 /// Undo RFC 5545 line folding.
 ///
-/// A line beginning with a space or tab continues the previous one, and the
-/// break can fall anywhere -- including mid-word and mid-escape -- so this must
-/// happen before anything else looks at the text.
+/// A line beginning with a space or tab continues the previous one, and the break can fall
+/// mid-word or mid-escape, so this must run before anything else looks at the text.
 fn unfold(body: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in body.split('\n') {
@@ -100,11 +86,8 @@ fn parse_line(line: &str) -> Option<Line<'_>> {
 
 /// Read a `DATE-TIME` or `DATE` value.
 ///
-/// `Z` means UTC and is what an expanding server returns. A naive value is
-/// taken AS UTC rather than refused: dropping the event entirely would lose a
-/// real entry over a timezone offset, and the request asks for expansion
-/// precisely so this branch stays rare. A date-only value is midnight UTC,
-/// which is what an all-day event actually is.
+/// A naive value is taken AS UTC rather than refused: dropping the event would lose a real
+/// entry over an offset, and server-side expansion keeps that branch rare. DATE is midnight UTC.
 fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
     let v = value.trim();
     if let Some(stripped) = v.strip_suffix('Z') {
@@ -123,9 +106,8 @@ fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
 
 /// A calendar address, reduced to something a person would recognise.
 ///
-/// `CN=Liz Adera:mailto:liz@example.org` becomes `Liz Adera`, falling back to
-/// the address. Participants are shown to a household, so a `mailto:` prefix is
-/// noise and a raw URI is worse.
+/// The `CN=` parameter wins, falling back to the address with its `mailto:` prefix
+/// stripped: participants are shown to a household, so a raw URI is noise.
 fn participant(line: &Line<'_>) -> Option<String> {
     for part in line.params.split(';') {
         if let Some(cn) = part.strip_prefix("CN=") {
@@ -145,9 +127,8 @@ fn participant(line: &Line<'_>) -> Option<String> {
 
 /// Every VEVENT in an iCalendar document, as items the pipeline can ingest.
 ///
-/// A VEVENT with no UID or no start is skipped rather than defaulted: the UID
-/// is the idempotency key for re-sync, and an event with an invented one would
-/// be re-created as a duplicate on every single sync.
+/// A VEVENT with no UID or no start is skipped, not defaulted: the UID is the idempotency
+/// key for re-sync, and an invented one would be re-created as a duplicate on every sync.
 pub fn events_from_ics(body: &str) -> Vec<RawItem> {
     let mut items = Vec::new();
     let mut in_event = false;
@@ -229,10 +210,8 @@ pub fn events_from_ics(body: &str) -> Vec<RawItem> {
 
 /// The prose half of the item, and therefore half of what gets embedded.
 ///
-/// `ContextItem::embedding_text` is `title\nbody`, so this text IS the
-/// retrieval surface -- which is why it is written as sentences a person would
-/// say rather than as a field dump. "Where: the clinic" retrieves for a question
-/// about the clinic; `LOCATION;X-TITLE=...` does not.
+/// `ContextItem::embedding_text` is `title\nbody`, so this text IS the retrieval surface;
+/// write it as sentences a person would say, not a field dump, or location queries miss.
 fn event_body(
     start: DateTime<Utc>,
     end: Option<DateTime<Utc>>,

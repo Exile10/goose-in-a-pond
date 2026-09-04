@@ -1,32 +1,15 @@
-//! Where a household's calendar actually lives, and what that implies.
-//!
-//! CalDAV is one protocol with four commercially important dialects, and the
-//! differences are entirely in setup rather than in the wire format. Encoding
-//! them here means the household picks a name from a list instead of finding a
-//! URL, which is the difference between a source somebody connects and a source
-//! somebody means to connect.
-//!
-//! Every one of these needs an **app-specific password**, not the account
-//! password, because all four require it once two-factor is on and two of them
-//! require it unconditionally. That is a setup instruction rather than a
-//! protocol detail, so it travels with the preset.
+//! Where a household's calendar lives. CalDAV is one protocol with four commercially important
+//! dialects that differ only in setup, so the household picks a name from a list instead of
+//! finding a URL. Every preset needs an app-specific password, not the account password (all
+//! four require it once two-factor is on, two unconditionally), so the instruction lives here.
 
 /// A calendar host this pond knows how to reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CalDavProvider {
-    /// Google Calendar over CalDAV.
-    ///
-    /// **Cannot be connected by this pond, and it is not a configuration
-    /// problem.** Google's CalDAV v2 guide is explicit: "The CalDAV server
-    /// refuses to authenticate a request unless it arrives over HTTPS with
-    /// OAuth 2.0 authentication of a Google Account. Attempting to connect over
-    /// HTTP or using Basic Authentication results in an HTTP 401 Unauthorized
-    /// status code." An app password IS Basic auth, so this preset shipped
-    /// unable to work and returned a 401 that read like a wrong password.
-    ///
-    /// The variant stays so rows already stored against it remain readable and
-    /// disconnectable; [`is_connectable`](Self::is_connectable) is what refuses
-    /// new ones. Gmail over IMAP is unaffected — app passwords work there.
+    /// Google Calendar over CalDAV. **Cannot be connected by this pond**: Google's CalDAV v2 guide
+    /// allows only HTTPS with OAuth 2.0; an app password IS Basic auth, hence a 401 that reads
+    /// like a wrong password. The variant stays so stored rows stay readable and disconnectable;
+    /// [`is_connectable`](Self::is_connectable) refuses new ones. Gmail over IMAP is unaffected.
     Google,
     /// iCloud. `SourceKind::Calendar` over CalDAV is the honest ceiling here --
     /// there is no general iCloud API, so this is not a stepping stone to one.
@@ -41,12 +24,9 @@ pub enum CalDavProvider {
 }
 
 impl CalDavProvider {
-    /// The URL discovery starts from.
-    ///
-    /// Returns the well-known entry point rather than a calendar: RFC 6764 says
-    /// a client discovers the principal and then the calendar home, and hard
-    /// coding a calendar path is how a connector breaks the first time somebody
-    /// has two calendars.
+    /// The URL discovery starts from: the well-known entry point rather than a calendar, since
+    /// RFC 6764 discovers the principal, then the calendar home; a hard-coded calendar path breaks
+    /// the first time somebody has two calendars.
     pub fn discovery_url(&self) -> String {
         match self {
             Self::Google => "https://apidata.googleusercontent.com/caldav/v2/".to_string(),
@@ -72,11 +52,8 @@ impl CalDavProvider {
         }
     }
 
-    /// What the household has to go and do before this can work.
-    ///
-    /// Carried in the type so the connect surface can show it at the moment it
-    /// is needed, rather than in documentation nobody reads while looking at a
-    /// password box.
+    /// What the household has to go and do before this can work. Carried in the type so the
+    /// connect surface can show it at the moment it is needed, next to the password box.
     pub fn setup_hint(&self) -> &'static str {
         match self {
             Self::Google => {
@@ -103,21 +80,16 @@ impl CalDavProvider {
         }
     }
 
-    /// Whether a NEW source may be connected for this provider.
-    ///
-    /// Separate from the variant existing at all, because a pond that already
-    /// stored a Google source needs to read and disconnect it, and deleting the
-    /// variant would leave a row nothing could resolve. Refusing at connect
-    /// stops anybody else acquiring one.
+    /// Whether a NEW source may be connected. Separate from the variant existing at all: a pond
+    /// that already stored a Google source must still read and disconnect it, so the variant
+    /// stays and only new connections are refused.
     pub fn is_connectable(&self) -> bool {
         !matches!(self, Self::Google)
     }
 
-    /// Rebuild a provider from what was stored, for a source being re-synced.
-    ///
-    /// `base_url` is only consulted for the two variants that carry one; a
-    /// stored `google` row cannot be turned into a custom host by editing a
-    /// column, which is the point.
+    /// Rebuild a provider from what was stored, for a source being re-synced. `base_url` is only
+    /// consulted for the two variants that carry one, so a stored `google` row cannot be turned
+    /// into a custom host by editing a column.
     pub fn from_stored(provider: &str, base_url: Option<&str>) -> Option<Self> {
         match provider {
             "google" => Some(Self::Google),

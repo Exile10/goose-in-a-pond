@@ -684,15 +684,9 @@ mod tests {
         assert!(checked > 0, "no model files found under {dir}");
     }
 
-    /// The seek fix, against real files: the walk must now reach a key that
-    /// lives megabytes past the token array.
-    ///
-    /// Run with
-    ///
-    /// ```text
-    /// GIAP_TEST_GGUF_DIR="$HOME/Library/Application Support/goose-in-a-pond/models/gguf" \
-    ///   cargo test -p pond-core --lib gguf -- --ignored --nocapture
-    /// ```
+    /// The seek fix, against real files: the walk must reach a key that lives megabytes past
+    /// the token array. Point `GIAP_TEST_GGUF_DIR` at the gguf models directory and run with
+    /// `--ignored`.
     #[test]
     #[ignore = "needs real GGUF files; set GIAP_TEST_GGUF_DIR"]
     fn reaches_the_chat_template_past_the_token_array() {

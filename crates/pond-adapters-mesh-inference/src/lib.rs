@@ -1,27 +1,7 @@
-//! Mesh inference (#132 Milestone 3): the piece that makes the private mesh
-//! (`pond-adapters-mesh-libp2p`) actually serve requests instead of just
-//! connecting peers.
-//!
-//! Every Pond in a Circle is symmetric — it can borrow a trusted peer's
-//! compute *and* lend its own — so this crate has two roles, not one:
-//!
-//! - **Client role** (`MeshInferenceProvider`): the `LlmProvider` used when
-//!   this Pond wants to borrow. Picks a trusted, connected, funded peer,
-//!   sends an `InferenceRequest`, and streams the reply back as
-//!   `StreamToken`s.
-//! - **Server role**: a background task that listens for inbound
-//!   `InferenceRequest`s from trusted peers and serves them using whatever
-//!   `LlmProvider` this Pond already has active locally.
-//!
-//! Both roles share one `MeshInferenceService`, because `MeshTransport::recv()`
-//! is a single flat "next frame from any peer" queue — only one consumer can
-//! own it. `v1` deliberately routes to a single peer, no sharding across
-//! multiple lenders (see the #132 issue's "throughput-aware chain routing" —
-//! that's future work once the basic mechanism is proven).
-//!
-//! v1 is also text-only: no image attachments, no tool-call passthrough.
-//! Mesh inference is a plain chat completion, not a full agentic/multimodal
-//! relay across peers (see `pond-mesh-protocol::wire::ChatMessageWire`).
+//! Mesh inference (#132 Milestone 3): borrow and lend compute over the private
+//! mesh in `pond-adapters-mesh-libp2p`. The client (`MeshInferenceProvider`) and
+//! server roles share one `MeshInferenceService` because `MeshTransport::recv()`
+//! is one flat queue with a single consumer. v1 is single-peer and text-only.
 
 mod provider;
 mod service;

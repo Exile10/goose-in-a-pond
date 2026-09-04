@@ -40,13 +40,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 # One statement, in `rebuild_context_index`: emptying the personal-context index
-# so the maintenance sweep refills it. The `VectorIndex` port can drop one row by
-# id and can prune orphans, and neither empties an index whose source rows are
-# all still present — which is every rebuild there will ever be. This is not a
-# new coupling: `AppState.db` is already a `pond_infra::db::Database` holding
-# `Pool<Sqlite>`, so the dependency was transitive and unstated rather than
-# absent. If a third caller appears, that is the signal the port needs the
-# method instead.
+# so the maintenance sweep refills it. The `VectorIndex` port cannot empty an
+# index whose source rows all still exist. Not a new coupling — `AppState.db` is
+# already a `pond_infra::db::Database`. A third caller means the port needs this.
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

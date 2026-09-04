@@ -1,81 +1,14 @@
 //! Which compaction mechanisms a model can afford — the gate PAI-4 dispatches on.
-//!
-//! [`CompactionProfile`](super::context_budget::CompactionProfile) already varies
-//! the *budgets* by window size. It does not vary the *strategy*, so a 20 tok/s
-//! model sharing a Jetson's GPU with the next turn's prefill and a hosted 128K
-//! model are compacted by exactly the same code. This module is the missing
-//! axis: given who is serving the model and how big its window resolved to, it
-//! says which of the three compaction mechanisms are affordable.
-//!
-//! # Two axes, not one
-//!
-//! `docs/architecture/pai/04-smart-compaction.md` section 3.1 states the tiers as
-//! three rows — "small on-device (`local`/`gguf`, <= 12K)", "medium (32K,
-//! Ollama/llamafile)", "large / HTTP (>= 64K)". Read as written, each row mixes a
-//! window size with a provider, and two real configurations fall through the
-//! gaps: an 8K *hosted* model, and a 131K *Ollama* model on the Orin (which
-//! `OllamaCatalogProvider` can now genuinely resolve, since PAI-3 P3 taught it to
-//! read `context_length` from `/api/show`).
-//!
-//! So the table is implemented as the two independent questions it is really
-//! made of:
-//!
-//! - **How big is the window?** [`SMALL_WINDOW_CEILING`] and
-//!   [`LARGE_WINDOW_FLOOR`] bracket it. Both are anchors on the budget curve, not
-//!   new numbers: 12,288 is `use_compact_prompt`'s boundary and `PROFILE_ANCHORS`'
-//!   third point, and 65,536 is its fifth.
-//! - **Whose GPU pays for a summarisation call?** [`runs_on_this_device`]. This is
-//!   NOT the same predicate as `ContextGovernor`'s `is_local_provider`, and the
-//!   difference is the point of this module. That one asks whether the *preamble*
-//!   is re-prefilled locally every turn, which is true for the in-process engine
-//!   and false for Ollama. This one asks whether an *extra* model call competes
-//!   with the turn the user is waiting on, which is true for Ollama and llamafile
-//!   too: on the Orin they are HTTP to `127.0.0.1` and the tokens come off the
-//!   same 102 GB/s of memory bandwidth.
-//!
-//! Every row of the design's table is reproduced by the pair, and the two
-//! undefined cells now have answers.
-//!
-//! # The one dangerous direction
-//!
-//! Only [`ModelClass::Large`] unlocks a mechanism (LLM re-summarisation), so
-//! mis-classifying *upward* is the failure that costs something — a Jetson
-//! stalling its own next prefill to re-summarise. Every fallback here therefore
-//! resolves downward: an unrecognised provider is still barred from `Large` until
-//! its window clears 64K, and no window at all classifies as `Small`.
-//!
-//! **That last clause is a real fail-open above 64K and it is stated rather than
-//! hidden**: an unrecognised provider reporting a 128K window is classified
-//! `Large` and may spend a model call, even though nothing here knows whose GPU
-//! pays for it. It is left as PAI-4 decided it — the cost is one summarisation
-//! call, off the critical path — and [`ProviderLocality`] now makes narrowing it
-//! a one-line change (`Hosted` rather than `!OnDevice` in [`ModelClass::classify`])
-//! for whoever owns PAI-4 next.
-//!
-//! # Two questions, not one predicate
-//!
-//! PAI-6 asks the OPPOSITE question of the same string: not "is this my GPU?"
-//! but "is this model somebody else's to hold?", because it decides whether to
-//! honour a per-role model and whether a background delegation may run. There
-//! the safe answer to an unrecognised provider is the other one, so negating
-//! [`runs_on_this_device`] would have made every unknown name a permission.
-//! [`provider_locality`] is what lets both callers take their own narrow side of
-//! the same input; see [`HOSTED_PROVIDERS`].
-//!
-//! `WindowResolution::is_exact()` is deliberately *not* consulted. Exactness
-//! decides whether budget arithmetic can be trusted to the token; it says nothing
-//! about which mechanisms are affordable, and the one direction where being wrong
-//! would hurt is already closed by the provider set.
+//! Two axes, not the three rows of `docs/architecture/pai/04-smart-compaction.md` 3.1:
+//! window size, and whether [`runs_on_this_device`]. Only [`ModelClass::Large`] unlocks an
+//! LLM call, so fallbacks resolve downward — an unknown provider above 64K is a fail-open.
 
 use super::context_governor::WindowResolution;
 
 /// Windows at or below this are the small tier.
 ///
-/// 12,288 rather than a round 12,000 because it is already a boundary in this
-/// module's neighbours: `CompactionProfile::use_compact_prompt` steps here, and
-/// `PROFILE_ANCHORS` carries it as the top of the old tier-2 plateau. A tier
-/// system with two nearly-equal boundaries would be a second copy of the same
-/// decision, which is what PAI-3 exists to stop.
+/// 12,288 tokens rather than a round 12,000 because it is already a boundary next door:
+/// `CompactionProfile::use_compact_prompt` steps here and `PROFILE_ANCHORS` carries it.
 pub const SMALL_WINDOW_CEILING: usize = 12_288;
 
 /// Windows at or below this stay out of the large tier however they are served.
@@ -86,40 +19,14 @@ pub const LARGE_WINDOW_FLOOR: usize = 65_536;
 
 /// Providers whose inference consumes THIS box's compute.
 ///
-/// `ollama` and `llamafile` are in the set even though they speak HTTP, because
-/// on a GIAP pond they speak it to `127.0.0.1`. A summarisation call to them is
-/// not free work happening elsewhere; it is the same GPU the next turn needs.
-///
-/// The set is a deny-list for the large tier, so it is safe when it is too
-/// *wide* and unsafe when it is too narrow. A provider that could point at
-/// another machine (`OLLAMA_HOST`) is kept in it for that reason: assuming the
-/// work is local is the narrowing assumption.
+/// `ollama` and `llamafile` count: on a pond they speak HTTP to `127.0.0.1`, so a call
+/// takes the GPU the next turn needs. A deny-list for the large tier, so too wide is safe.
 pub const ON_DEVICE_PROVIDERS: [&str; 4] = ["local", "gguf", "ollama", "llamafile"];
 
 /// Providers this pond knows are served from somebody else's machine.
 ///
-/// **This is not the complement of [`ON_DEVICE_PROVIDERS`], and the difference
-/// is the whole reason it exists.** "Not known to run here" and "known to run
-/// elsewhere" are different claims about an open string domain, and
-/// `settings.chat_provider` is an open string domain: it is a flat settings row
-/// written by the settings UI, by onboarding and by `--provider` on the CLI,
-/// with no allow-list on the write path. `mock` is a shipped GIAP provider that
-/// is in neither list; goose itself ships `lmstudio`, `llama_swap` and `omlx`
-/// declarative providers, every one of which serves from localhost.
-///
-/// So a caller that needs "this model is somebody else's to hold" must ask for
-/// positive membership HERE, via [`provider_locality`], rather than negating the
-/// deny-set. PAI-6 P7 and P8 do exactly that.
-///
-/// Membership is a positive claim and omission is cheap: a genuinely hosted
-/// provider that is missing from this list loses a background delegation and a
-/// per-role model, which is the direction this programme requires on an unknown
-/// input. Adding a name is the decision; leaving one out is not.
-///
-/// The one direction no list can see is a hosted NAME pointed at localhost by a
-/// base-URL override (`OPENAI_HOST` and friends). That is unchanged by this
-/// list, and is the mirror of the `OLLAMA_HOST` caveat on
-/// [`ON_DEVICE_PROVIDERS`].
+/// Not the complement of [`ON_DEVICE_PROVIDERS`]: `chat_provider` is an open settings
+/// string, so "somebody else's to hold" needs positive membership here. Omission is safe.
 pub const HOSTED_PROVIDERS: [&str; 6] = [
     "anthropic",
     "openai",
@@ -131,12 +38,8 @@ pub const HOSTED_PROVIDERS: [&str; 6] = [
 
 /// Where a provider's inference actually happens — three answers, not two.
 ///
-/// The third one is the point. Every gate in this tree that reads a provider
-/// name is really asking one of two opposite questions, and an unrecognised name
-/// has to answer BOTH of them with "no": no, this is not known to be your GPU,
-/// and no, this is not known to be somebody else's either. A `bool` cannot say
-/// that, so whichever question was written as the `if` got the unknown case as
-/// its `else` — which is a widening default reached by not recognising an input.
+/// An unrecognised name must answer "no" to both opposite questions: not known to be
+/// your GPU, not known to be somebody else's. A `bool` gives one of them a widening else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderLocality {
     /// In [`ON_DEVICE_PROVIDERS`]: a call to it competes with this pond's own
@@ -162,9 +65,8 @@ impl ProviderLocality {
 
 /// Classify `provider` against the two lists.
 ///
-/// Trimmed as well as case-folded, because `chat_provider` is a settings string
-/// a human can type and `"ollama "` must not be the thing that escapes the
-/// on-device answer.
+/// Trimmed as well as case-folded: `chat_provider` is a settings string a human can
+/// type, and `"ollama "` must not be the thing that escapes the on-device answer.
 pub fn provider_locality(provider: &str) -> ProviderLocality {
     let provider = provider.trim();
     if ON_DEVICE_PROVIDERS
@@ -183,22 +85,17 @@ pub fn provider_locality(provider: &str) -> ProviderLocality {
 }
 
 /// Whether a summarisation call to `provider` would compete with this pond's own
-/// inference. See [`ON_DEVICE_PROVIDERS`].
-///
-/// **Its negation is not "runs elsewhere".** `!runs_on_this_device("mock")` is
-/// true and says nothing about where `mock` runs. A caller whose safe answer is
-/// "refuse" wants [`provider_locality`] and a positive test for
-/// [`ProviderLocality::Hosted`].
+/// inference. See [`ON_DEVICE_PROVIDERS`]. Its negation is not "runs elsewhere":
+/// a caller whose safe answer is "refuse" wants a positive [`ProviderLocality::Hosted`]
+/// test via [`provider_locality`].
 pub fn runs_on_this_device(provider: &str) -> bool {
     provider_locality(provider) == ProviderLocality::OnDevice
 }
 
 /// What a compaction path may do for a given [`ModelClass`].
 ///
-/// Three flags rather than an opaque enum because the tiers differ by *which
-/// mechanisms are added*, not by having unrelated implementations — and because
-/// a caller asking "may I summarise here?" should not have to match on a tier
-/// name to find out.
+/// Three flags rather than an opaque enum because the tiers differ by which mechanisms
+/// are added, and asking "may I summarise here?" should not mean matching on a tier name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionStrategy {
     /// The deterministic trimmer (`super::turn_trimmer`). On for every class and
@@ -216,26 +113,19 @@ pub struct CompactionStrategy {
 
 /// How expensive an extra model call is for this model, on this box.
 ///
-/// Ordered: a bigger variant is strictly more permissive, which is what makes
-/// "a local provider can never reach the top" checkable as a comparison rather
-/// than as a match arm somebody has to keep in sync.
+/// Ordered: a bigger variant is strictly more permissive, so "a local provider can never
+/// reach the top" is checkable as a comparison rather than a match arm kept in sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ModelClass {
     /// Window at or below [`SMALL_WINDOW_CEILING`], however it is served.
     ///
-    /// The design names this row "small on-device", and on a pond it nearly
-    /// always is. A small *hosted* window lands here too, and that is right for
-    /// a different reason: at 12K there is no span worth summarising a summary
-    /// of, so the mechanism the large tier unlocks would spend a model call to
-    /// reclaim almost nothing.
+    /// A small hosted window lands here too: at 12K there is no span worth summarising a
+    /// summary of, so the mechanism the large tier unlocks would reclaim almost nothing.
     Small,
     /// Everything between the two boundaries, plus anything above
-    /// [`LARGE_WINDOW_FLOOR`] that is served from this box.
-    ///
-    /// This is today's behaviour, and the second half is the cell the design's
-    /// table did not have: a 131K Ollama model on the Orin gets the large tier's
-    /// budgets from `CompactionProfile` and the medium tier's *strategy*, because
-    /// the window is generous and the compute is not.
+    /// [`LARGE_WINDOW_FLOOR`] that is served from this box: a 131K Ollama model on the
+    /// Orin gets the large tier's budgets from `CompactionProfile` and the medium tier's
+    /// strategy, because the window is generous and the compute is not.
     Medium,
     /// Window at or above [`LARGE_WINDOW_FLOOR`], served from another box.
     ///
@@ -271,39 +161,16 @@ impl ModelClass {
 
     /// Classify from a [`WindowResolution`] rather than a bare token count.
     ///
-    /// The preferred entry point: it makes the governor the single source of the
-    /// window here too, instead of letting a caller classify against a number it
-    /// worked out some other way. That is the four-paths-disagree shape PAI-3
-    /// removed, and it would come straight back if this only took a `usize`.
+    /// Preferred entry point: it keeps the governor the single source of the window,
+    /// instead of letting a caller classify against a number it worked out elsewhere.
     pub fn from_resolution(provider: &str, resolution: &WindowResolution) -> Self {
         Self::classify(provider, resolution.tokens)
     }
 
-    /// Which compaction mechanisms this class may use.
-    ///
-    /// # Why `idle_rolling_summary` is true on the small tier
-    ///
-    /// The design's table says the small tier is "deterministic trim only. No LLM
-    /// in the compaction path", and invariant 3 repeats it. Its stated reason is
-    /// that "a summarisation stall at 20 tok/s is a user-visible hang" — but the
-    /// rolling summary is the one model call in this system that structurally
-    /// cannot produce that hang. It runs only after `summary_idle_secs` of
-    /// inactivity, it is cancelled by a new turn, and a turn reads whatever is in
-    /// `sessions.rolling_summary` without ever awaiting it (section 1.1, and
-    /// invariant 5 says the same thing).
-    ///
-    /// Setting it false here would therefore remove the rolling summary from the
-    /// exact device that needs it most — the one whose window runs out first — to
-    /// prevent a stall that path cannot cause. The phase brief is explicit that
-    /// P1 preserves today's behaviour for the small and medium tiers, and today
-    /// the idle summary runs regardless of tier, so it stays.
-    ///
-    /// There *is* a real on-device cost, and it is a different one: an idle
-    /// summarisation warms the GPU and evicts the prefix cache, so the next turn
-    /// after it pays a prefill it would not otherwise have paid. That is a
-    /// PAI-4 P5 question — it is cache-age arithmetic, measurable, and it applies
-    /// to the medium tier just as much. It is not the hang the design cites, and
-    /// it should not be settled by leaving a flag flipped the wrong way here.
+    /// Which compaction mechanisms this class may use. `idle_rolling_summary` stays true
+    /// on the small tier despite the table in `docs/architecture/pai/04-smart-compaction.md`:
+    /// it is idle-only, is cancelled by a new turn, and no turn ever awaits it, so it cannot
+    /// produce the stall that table cites.
     pub fn strategy(&self) -> CompactionStrategy {
         CompactionStrategy {
             deterministic_trim: true,
@@ -312,12 +179,10 @@ impl ModelClass {
         }
     }
 
-    /// Whether any compaction mechanism for this class is allowed to call a
-    /// model as part of *reshaping history* — that is, the re-summarisation the
-    /// large tier unlocks, not the idle summary that produces the input to it.
-    ///
-    /// This is the question PAI-4 P2 asks, hoisted onto the class so P2's gate is
-    /// one call rather than a match it has to keep aligned with this table.
+    /// Whether a compaction mechanism for this class may call a model to reshape history
+    /// — the re-summarisation the large tier unlocks, not the idle summary feeding it.
+    /// Hoisted onto the class so PAI-4 P2's gate is one call rather than a match arm it
+    /// has to keep aligned with this table.
     pub fn permits_compaction_model_call(&self) -> bool {
         self.strategy().llm_resummarisation
     }
@@ -463,15 +328,10 @@ mod tests {
         );
     }
 
-    /// The three-way answer, and the reason it is three-way: a name in neither
-    /// list must not be readable as either claim.
-    ///
-    /// `mock` and `lmstudio` are not decoration. `mock` is a shipped GIAP
-    /// provider (`--provider mock`, `ModelCategory::for_chat_provider`) that
-    /// serves in-process; `lmstudio`, `llama_swap` and `omlx` are goose
-    /// declarative providers that serve from localhost. Every one of them is
-    /// `Unknown` here, which is why a caller that needs "somebody else's
-    /// machine" must ask for `Hosted` rather than for `!OnDevice`.
+    /// The three-way answer: a name in neither list must not be readable as either claim.
+    /// `mock` is a shipped GIAP provider serving in-process; `lmstudio`, `llama_swap` and
+    /// `omlx` are goose declarative providers serving from localhost. All are `Unknown`,
+    /// so a caller needing "somebody else's machine" must ask `Hosted`, not `!OnDevice`.
     #[test]
     fn a_provider_in_neither_list_supports_neither_claim() {
         for provider in ON_DEVICE_PROVIDERS {
@@ -539,13 +399,10 @@ mod tests {
         );
     }
 
-    /// A provider nobody has heard of gets the narrowing answer at every window
-    /// below the large floor, and is only trusted with the large tier once its
-    /// window says it is a hosted model.
-    ///
-    /// **The last assertion is the fail-open the module doc admits to**, kept as
-    /// PAI-4 decided it and pinned here so that narrowing it is a deliberate
-    /// edit to a named test rather than a silent behaviour change.
+    /// A provider nobody has heard of gets the narrowing answer at every window below the
+    /// large floor, and reaches the large tier only once its window clears that floor. The
+    /// last assertion is the fail-open the module doc admits to, pinned here so narrowing
+    /// it is a deliberate edit to a named test rather than a silent behaviour change.
     #[test]
     fn an_unknown_provider_narrows_below_the_large_floor() {
         assert_eq!(ModelClass::classify("", 4_096), ModelClass::Small);
@@ -671,27 +528,10 @@ mod tests {
         );
     }
 
-    /// The whole reason `runs_on_this_device` is not `is_local_provider`: an
-    /// on-device provider must not unlock a blocking summarisation call however
-    /// big its window is.
-    ///
-    /// **This test used to reach that state through rung 3, and it was reading a
-    /// bug.** It asserted a 131,072-token *catalog* resolution for Ollama and
-    /// noted that "rung 3 does not clamp it because Ollama is not a local
-    /// provider by the governor's preamble-cost definition". That was true and it
-    /// was the defect: the governor's `is_local_provider` covered only
-    /// local/gguf, so the declared maximum Ollama reports from `/api/show` went
-    /// unbounded, while the same weights through `local` were held to the
-    /// ceiling. This phase compensated for it here instead of fixing it there,
-    /// which left the tier right and the *window* four times too big for every
-    /// budget downstream. Rung 3 now clamps anything that runs on this device.
-    ///
-    /// So the fixture moved to rung 1. An engine-reported window IS an
-    /// allocation and is deliberately never clamped — a big box really can give
-    /// Ollama 131,072 — which makes it the honest way to reach a large window on
-    /// an on-device provider, and it keeps this test exercising the provider
-    /// guard rather than the window bracket. Through rung 3 it would now resolve
-    /// to 32,768 and land in Medium on width alone, proving nothing.
+    /// The whole reason `runs_on_this_device` is not `is_local_provider`: an on-device
+    /// provider must not unlock a blocking summarisation call however big its window is.
+    /// The fixture uses rung 1 because an engine-reported window is never clamped; through
+    /// rung 3 it would resolve to 32,768 and land in Medium on width alone, proving nothing.
     #[test]
     fn a_large_window_on_an_on_device_provider_stays_out_of_the_large_tier() {
         let inputs = ContextInputs {
