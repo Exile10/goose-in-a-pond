@@ -239,9 +239,19 @@ mod tests {
     const IDLE_THRESHOLD: Duration = Duration::from_secs(900);
     const LONG_IDLE: Duration = Duration::from_secs(3600);
 
+    /// `false` for the exemption: these tests are about the shared gate and the
+    /// tie-break between jobs, both of which an exempt job skips entirely.
     async fn ask(lane: &InferenceLane, job: LaneJob) -> Option<LaneSlot<'_>> {
-        lane.acquire(job, true, Duration::ZERO, true, LONG_IDLE, IDLE_THRESHOLD)
-            .await
+        lane.acquire(
+            job,
+            true,
+            Duration::ZERO,
+            true,
+            LONG_IDLE,
+            IDLE_THRESHOLD,
+            false,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -339,6 +349,7 @@ mod tests {
                 true,
                 Duration::from_secs(5), // user active 5s ago
                 IDLE_THRESHOLD,
+                false, // not exempt — the gate is the subject
             )
             .await;
         assert!(slot.is_none());

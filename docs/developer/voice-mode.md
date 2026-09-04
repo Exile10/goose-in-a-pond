@@ -7,7 +7,7 @@ spawns exactly this command as a child process.
 ## Running it
 
 ```bash
-cargo run -p pond-server -- chat --input whisper --tts piper
+cargo run -p pond-server -- chat --voice
 ```
 
 On the Jetson, `bash scripts/giap.sh` and the desktop app both take this path;

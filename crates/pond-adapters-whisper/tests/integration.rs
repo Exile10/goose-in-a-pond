@@ -1,9 +1,12 @@
-//! Integration tests for `WhisperInput` and `WhisperKeywordDetector`.
-//! `WhisperInput` is the legacy HTTP backend and compiles only under
-//! `--features legacy-subprocess`, so its tests are gated. The detector tests
-//! use a mock `WhisperBackend`, exercising the no-feature path.
+//! Integration tests for `WhisperKeywordDetector`.
+//!
+//! The detector is driven through a small mock `WhisperBackend` that returns a
+//! canned transcript, so these exercise the detection state machine without a
+//! model or a microphone. The `WhisperInput` half of this file's original
+//! subject — the HTTP backend behind `--features legacy-subprocess` — was
+//! deleted in 2026-08.
 
-// ── Mock backend (default build) ──────────────────────────────────────────────
+// ── Mock backend ──────────────────────────────────────────────────────────────
 
 use anyhow::Result;
 use pond_adapters_whisper::{WhisperBackend, WhisperKeywordDetector};

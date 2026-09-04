@@ -330,7 +330,7 @@ pub struct GooseAdapter {
     /// These are preserved across turns (not stripped in the extension cleanup loop).
     user_extensions: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// When true, prompt templates include voice-mode instructions (keep responses
-    /// short, conversational, no formatting). Set by the CLI when `--input whisper`.
+    /// short, conversational, no formatting). Set by the CLI when `--voice` is passed.
     voice_mode: std::sync::atomic::AtomicBool,
     /// Runtime capabilities of the currently loaded model.
     model_capabilities: Mutex<pond_core::models::domain::model_capabilities::ModelCapabilities>,
@@ -658,7 +658,16 @@ impl GooseAdapter {
         let mut state = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
         let served = state.turns_served;
         state.invalidate(reason);
-        tracing::debug!(
+        // INFO, not DEBUG. The production filter is `info,{GIAP_VERBOSE},…`
+        // and `giap::trace` is not one of the verbose targets, so at DEBUG this
+        // event — the one built to answer "why did the KV prefix go cold" —
+        // has never been recorded on any pond. Its sibling `prefix_prewarm` is
+        // INFO and does appear, which is what made the gap findable at all.
+        //
+        // One line per invalidation is not chatty: a prefix that is working
+        // invalidates rarely, and a prefix that is not is the thing being
+        // diagnosed.
+        tracing::info!(
             target: "giap::trace",
             kind = "prefix_cache_invalidated",
             reason = reason.as_str(),
@@ -701,10 +710,27 @@ impl GooseAdapter {
 
     /// Record that this turn is being served off the existing prefix.
     fn note_prefix_served(&self) {
-        self.prefix_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .serve_turn();
+        let (hash, turns_served) = {
+            let mut state = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+            state.serve_turn();
+            (state.hash, state.turns_served)
+        };
+        // The counterpart to `prefix_cache_invalidated`, and it did not exist:
+        // a miss traced at a level the filter dropped, and a hit traced
+        // nothing at all. Between them the KV hit rate was unobservable in
+        // production — which is how a cache that misses most turns goes
+        // unnoticed for as long as it takes somebody to read a database of
+        // prefill timings and work backwards.
+        //
+        // `turns_served` is the number that matters: 1 means the prefix took
+        // for one turn, a rising count means it is actually being reused.
+        tracing::info!(
+            target: "giap::trace",
+            kind = "prefix_cache_served",
+            hash = %hash,
+            turns_served,
+            "KV prefix reused"
+        );
     }
 
     /// Returns an `GiapGooseExtensionManager` for managing Goose extensions on a session.
@@ -1722,7 +1748,7 @@ impl GooseAdapter {
     /// the section is pure prompt cost there — the same trade `thinking` already
     /// makes in voice mode.
     ///
-    /// `voice` is the INSTANCE-level flag (CLI `--input whisper`), not the
+    /// `voice` is the INSTANCE-level flag (CLI `--voice`), not the
     /// per-request one, for two reasons. It is the only signal `capabilities()`
     /// can see, so keying off it is what makes the two agree on every input. And
     /// it is fixed for the life of the process, so it cannot flip the static
@@ -1793,7 +1819,7 @@ impl GooseAdapter {
     /// `AgentStreamEvent::Thinking`'s own doc comment already claims ("only
     /// emitted when `show_thinking` is enabled").
     ///
-    /// `voice` is the OR of the instance flag (CLI `--input whisper`) and the
+    /// `voice` is the OR of the instance flag (CLI `--voice`) and the
     /// per-request one (the desktop voice pipeline), unlike
     /// `vision_section_applies` — this value never reaches `PromptState`, so it
     /// cannot move the static prefix between turns, and the per-request flag is
@@ -3466,7 +3492,7 @@ impl GooseAdapter {
 
         // Voice detection is shared by prompt construction (disables thinking)
         // and the session turn cap (#105 — voice_max_turns). Check both the
-        // instance-level flag (CLI --input whisper) and the per-request flag
+        // instance-level flag (CLI --voice) and the per-request flag
         // (desktop voice pipeline sends voice_mode: true).
         let voice_instance = self.voice_mode.load(std::sync::atomic::Ordering::Relaxed);
         let is_voice = Self::voice_turn(voice_instance, request.voice_mode);
@@ -6326,7 +6352,7 @@ mod tests {
         );
         assert!(
             GooseAdapter::voice_turn(true, false),
-            "the CLI `--input whisper` instance flag must still count on its own"
+            "the CLI `--voice` instance flag must still count on its own"
         );
         assert!(GooseAdapter::voice_turn(true, true));
         assert!(
