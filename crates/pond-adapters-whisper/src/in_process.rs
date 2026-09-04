@@ -6,6 +6,7 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use pond_core::models::ports::voice_input::{SpeculativeSignal, VoiceInput};
+use pond_voice::dsp::{RmsDetector, SpeechDetector};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -33,6 +34,9 @@ enum SpeechCapture {
 const DEFAULT_DURATION_SECS: u32 = 30;
 /// Silence (ms) after speech to declare end-of-utterance.
 const DEFAULT_SILENCE_MS: u64 = 800;
+/// The energy level below which a frame is silence, for the default detector.
+/// Unchanged from the value both capture loops used inline.
+const END_OF_SPEECH_RMS: f32 = 0.005;
 /// Wait window for speech onset before giving up.
 const DEFAULT_ONSET_WAIT_SECS: u32 = 10;
 
@@ -63,12 +67,54 @@ pub struct WhisperRsInput {
     /// call goes through it, so this adapter's follow-up VAD listen can never
     /// race the wake-word detector for the device.
     mic: pond_audio::MicHandle,
+    /// What decides that a frame is speech, for both capture paths.
+    ///
+    /// One instance, shared, and long-lived. Both matter:
+    ///
+    /// *Shared*, because a turn takes one of two capture paths depending on
+    /// whether the wake-word detector already had audio, and a detector chosen
+    /// in settings that governed only one of them would be worse than none.
+    ///
+    /// *Long-lived*, because a model detector loads an ONNX session, and
+    /// building one per utterance is the mistake that made a 3 ms model
+    /// measure 1222 ms in the ASR lab. It outlives the turn, which is why
+    /// `reset()` has to be called at the start of each capture rather than
+    /// relied on happening by construction.
+    ///
+    /// `Arc<Mutex<..>>` rather than a bare `Box`: capture runs inside
+    /// `spawn_blocking`, whose closure must be `'static + Send`, and
+    /// `listen_inner` only holds `&self`.
+    detector: Arc<std::sync::Mutex<Box<dyn SpeechDetector + Send>>>,
 }
 
 impl WhisperRsInput {
-    /// Load the ggml model at `model_path` and prepare the in-process context;
-    /// `mic` is the process's single shared microphone owner. Returns `Err` if
-    /// the file is missing or the load fails, a caught whisper-rs panic included.
+    /// Replace the speech detector both capture paths use.
+    ///
+    /// Takes a constructed detector rather than a name or a path on purpose:
+    /// this crate is in CI's fast-crate set — the crates that pull neither the
+    /// Goose submodule nor a heavy native library — and that list is how the
+    /// hexagonal split is enforced rather than merely described. Building a
+    /// Silero detector here would put `ort` in a crate whose whole job is to be
+    /// buildable without one. So the composition root builds it and hands it
+    /// over, and this crate only ever knows the trait.
+    ///
+    /// `&self` because the adapter is already inside an `Arc` by the time the
+    /// composition root knows which backend was configured.
+    pub fn set_speech_detector(&self, detector: Box<dyn SpeechDetector + Send>) {
+        match self.detector.lock() {
+            Ok(mut slot) => *slot = detector,
+            // A poisoned lock means a capture thread panicked mid-turn. The
+            // detector is replaceable state, not something to recover, so take
+            // it anyway rather than leaving the pond on the old one forever.
+            Err(poisoned) => *poisoned.into_inner() = detector,
+        }
+    }
+
+    /// Load the ggml model at `model_path` and prepare the in-process context.
+    /// `mic` is the process's single shared microphone owner.
+    ///
+    /// Returns `Err` if the file does not exist or whisper-rs fails to load
+    /// it. A whisper-rs panic during load is caught and converted to `Err`.
     pub fn new(model_path: PathBuf, mic: pond_audio::MicHandle) -> Result<Self> {
         if !model_path.exists() {
             return Err(anyhow!(
@@ -90,6 +136,7 @@ impl WhisperRsInput {
             wake_words: std::sync::RwLock::new(Vec::new()),
             audio_level_sink: None,
             mic,
+            detector: Arc::new(Mutex::new(Box::new(RmsDetector::new(END_OF_SPEECH_RMS)))),
         })
     }
 
@@ -436,11 +483,21 @@ impl WhisperRsInput {
         let ctx_for_speculative = ctx_arc.clone();
         let spec_wake_words = self.wake_words_snapshot();
         let mic = self.mic.clone();
+        let detector = Arc::clone(&self.detector);
         let capture_result = tokio::task::spawn_blocking(move || -> Result<SpeechCapture> {
+            // One lock for the whole capture: both paths below need the same
+            // instance, and nothing else touches it while a turn is in flight.
+            let mut detector = detector
+                .lock()
+                .map_err(|_| anyhow!("speech detector mutex poisoned"))?;
+            // Start clean. The detector outlives the utterance, so without this
+            // the previous turn's recurrent state and its buffered leftover
+            // both bias the first windows of this one.
+            detector.reset();
             if let Some(wav) = captured {
                 let (captured_samples, _captured_rate) = decode_wav_mono_f32(&wav)?;
                 let (fresh_samples, fresh_rate) =
-                    record_mono_f32_until_silence(&mic, max_record, silence_ms)?;
+                    record_mono_f32_until_silence(&mic, max_record, silence_ms, &mut **detector)?;
                 let fresh_16k = resample_to_16k(&fresh_samples, fresh_rate);
                 let mut combined = captured_samples;
                 // Skip the leading ~200 ms of the fresh recording — the mic
@@ -472,6 +529,7 @@ impl WhisperRsInput {
                     Some(&*speculative_spawn),
                     on_speculative_event.as_deref(),
                     audio_level_sink.as_deref(),
+                    &mut **detector,
                 )?;
                 if samples.is_empty() {
                     return Ok(SpeechCapture::Empty);

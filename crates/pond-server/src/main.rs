@@ -3,7 +3,7 @@
 //! Usage:
 //!   pond-server setup [--model tiny|base|small]
 //!   pond-server serve [--port PORT] [--open]
-//!   pond-server chat  [--provider mock|llamafile|ollama] [--model MODEL] [--input stdin|whisper] [--whisper-url URL]
+//!   pond-server chat  [--voice] [--provider mock|llamafile|ollama] [--model MODEL]
 //!   pond-server status
 //!
 //! # TODO — Setup Script
@@ -152,11 +152,16 @@ enum Commands {
         #[arg(short = 'M', long)]
         model: Option<String>,
 
-        /// Input source: stdin (text) or whisper (microphone → ASR)
-        #[arg(short = 'I', long, default_value = "stdin")]
-        input: String,
+        /// Listen on the microphone instead of the keyboard.
+        ///
+        /// One flag turns on the whole stack — wake word, speech detection,
+        /// recognition, spoken reply — and fetches whatever part of it is not
+        /// on disk yet. It replaces `--input stdin|whisper`, which asked the
+        /// operator to name a component in order to choose a mode.
+        #[arg(long)]
+        voice: bool,
 
-        /// Enable voice-based wake word detection (requires --input whisper).
+        /// Enable voice-based wake word detection (requires --voice).
         /// Say the trigger phrase to activate the assistant before each turn.
         /// Defaults to the wake word stored in Settings.
         #[arg(long)]
@@ -166,8 +171,9 @@ enum Commands {
         #[arg(long)]
         no_wake_word: bool,
 
-        /// Text-to-speech engine: piper, or none (print only).
-        /// Defaults to the active TTS model stored in Settings.
+        /// Text-to-speech engine: kokoro, or none (print only).
+        /// Defaults to kokoro, which is the only engine there is — the help
+        /// said `piper` for two releases after Piper stopped being wired.
         #[arg(long)]
         tts: Option<String>,
 
@@ -539,7 +545,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Chat {
             provider,
             model,
-            input,
+            voice,
             wake_word,
             no_wake_word,
             tts,
@@ -560,7 +566,7 @@ async fn async_main() -> Result<()> {
             run_chat(
                 provider.as_deref(),
                 model.as_deref(),
-                &input,
+                voice,
                 wake_word.as_deref(),
                 no_wake_word,
                 tts.as_deref(),
@@ -595,7 +601,7 @@ async fn async_main() -> Result<()> {
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
             let _log = tracing_setup::init_tracing(false, &data_dir);
-            run_chat(None, None, "stdin", None, true, Some("none"), None, false).await
+            run_chat(None, None, false, None, true, Some("none"), None, false).await
         }
     }
 }
@@ -901,7 +907,7 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("     and assign model roles (chat / think / task).");
     println!();
     println!("  Or run interactive CLI chat (configure voice + TTS via Settings first):");
-    println!("       pond-server chat --input whisper");
+    println!("       pond-server chat --voice");
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(())
@@ -4544,11 +4550,91 @@ fn write_ndjson_line(ev: &pond_core::shared::domain::agent::WorkflowEvent) {
     }
 }
 
+/// Build the speech detector the capture loops should use, or `None` to keep
+/// the energy gate.
+///
+/// Diagnostics go to stderr rather than through `out!`: that macro is a no-op
+/// under `--json-events`, which is the only mode the desktop shell uses, so a
+/// warning printed with it would reach nobody in the case that matters most.
+///
+/// The composition root owns this choice because `pond-adapters-whisper` is in
+/// CI's fast-crate set and must stay buildable without an ONNX Runtime; it
+/// knows the trait and nothing else.
+///
+/// Every failure degrades to `None` rather than propagating — a missing model,
+/// a dead download, an ONNX Runtime that will not load. A pond that cannot load
+/// its VAD should be a pond with a worse VAD, not a deaf one, and the energy
+/// gate it falls back to is the one that shipped for a year.
+async fn build_speech_detector(
+    vad_backend: &str,
+    data_dir: &std::path::Path,
+) -> Option<Box<dyn pond_voice::dsp::SpeechDetector + Send>> {
+    if vad_backend.eq_ignore_ascii_case("rms") {
+        // The escape hatch, for a board whose ONNX Runtime is broken.
+        return None;
+    }
+    if !vad_backend.eq_ignore_ascii_case("silero") {
+        // Validation rejects anything outside `VAD_BACKENDS` at the API, but
+        // `apply_key` stores whatever is in the row verbatim, so a hand-edited
+        // database can still land here. Say so rather than silently choosing.
+        eprintln!("  Listen   unknown vad_backend \"{vad_backend}\" — using the energy gate.");
+        return None;
+    }
+
+    // This DOES download, in front of `ready`, which is the opposite of what
+    // the Kokoro engine does a few hundred lines below — and deliberately.
+    // Kokoro's weights are 92 MB and `serve` has already fetched them, so the
+    // voice child can refuse and report a diagnostic. These are 2 MB, and
+    // `chat --voice` has to work as a standalone command with no server ever
+    // having run: refusing here would mean the detector is only ever on for
+    // people who happened to start the desktop first. The whisper model on the
+    // same path is 142 MB and fetches here too, so on the run where this is
+    // slow it is not what is making it slow.
+    let path = model_download::ensure_silero_model(data_dir).await?;
+
+    // Bounded, because a broken ONNX Runtime does not fail — it HANGS.
+    // `load-dynamic` with no dylib to open blocks forever inside ort's init,
+    // and an unbounded wait here is a permanently silent startup with nothing
+    // in the log. Kokoro's engine load is guarded the same way, for the same
+    // reason.
+    const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    let loading = tokio::time::timeout(
+        LOAD_TIMEOUT,
+        tokio::task::spawn_blocking(move || pond_adapters_silero::SileroDetector::new(&path)),
+    )
+    .await;
+
+    match loading {
+        Ok(Ok(Ok(detector))) => {
+            tracing::info!("silero VAD active");
+            Some(Box::new(detector) as Box<dyn pond_voice::dsp::SpeechDetector + Send>)
+        }
+        Ok(Ok(Err(e))) => {
+            eprintln!("  Listen   silero VAD failed to load: {e}");
+            eprintln!("           Using the energy gate.");
+            None
+        }
+        Ok(Err(e)) => {
+            eprintln!("  Listen   silero VAD load panicked: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "  Listen   silero VAD load timed out after {}s — the ONNX Runtime is \
+                 probably missing or version-incompatible.",
+                LOAD_TIMEOUT.as_secs()
+            );
+            eprintln!("           Using the energy gate.");
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_chat(
     provider: Option<&str>,
     model: Option<&str>,
-    input: &str,
+    voice_mode: bool,
     wake_word: Option<&str>,
     no_wake_word: bool,
     tts: Option<&str>,
@@ -4741,10 +4827,10 @@ async fn run_chat(
         }
     };
 
-    // Resolve the whisper ggml model path (used by both the in-process backend
-    // and the legacy HTTP subprocess). When voice input is not requested we
-    // still resolve the path to surface a clear download-needed message.
-    let whisper_model_path: Option<std::path::PathBuf> = if input == "whisper" {
+    // Resolve the whisper ggml model path for the in-process backend. Only
+    // under --voice: outside it there is no microphone and no reason to make a
+    // text session wait on a 142 MB download.
+    let whisper_model_path: Option<std::path::PathBuf> = if voice_mode {
         match voice_models.whisper.as_ref() {
             None => {
                 let name = settings.active_whisper_model.as_str();
@@ -4978,7 +5064,7 @@ async fn run_chat(
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             Some(trim_storage), // powers the trimmer's summary splice
             Some(chat_model_repo.clone()),
-            input == "whisper",                       // voice_mode
+            voice_mode,
             Arc::new(tokio::sync::RwLock::new(None)), // mesh_provider — CLI chat doesn't build the mesh stack (server-only for now)
         )
         .await;
@@ -5172,7 +5258,7 @@ async fn run_chat(
     // Build a shared in-process Whisper backend once per session. It powers
     // both the `VoiceInput` adapter and the wake-word detector — no separate
     // KWS subprocess needed any more.
-    let whisper_backend: Option<Arc<WhisperRsInput>> = if input == "whisper" {
+    let whisper_backend: Option<Arc<WhisperRsInput>> = if voice_mode {
         match &whisper_model_path {
             Some(p) => match WhisperRsInput::new(p.clone(), mic_handle.clone()) {
                 Ok(w) => {
@@ -5224,8 +5310,18 @@ async fn run_chat(
         None
     };
 
-    let voice: Arc<dyn VoiceInput> = match (input, &whisper_backend) {
-        ("whisper", Some(backend)) => {
+    // Swap in the configured detector, if there is one and it loads. Done after
+    // construction rather than passed to `new` because both the VoiceInput
+    // adapter and the wake-word detector share this one instance, and the
+    // choice is a setting rather than a property of the model file.
+    if let Some(backend) = &whisper_backend {
+        if let Some(detector) = build_speech_detector(&settings.vad_backend, &data_dir).await {
+            backend.set_speech_detector(detector);
+        }
+    }
+
+    let voice: Arc<dyn VoiceInput> = match &whisper_backend {
+        Some(backend) => {
             out!(
                 "  Listen   {}",
                 voice_models
@@ -5237,7 +5333,7 @@ async fn run_chat(
             );
             backend.clone() as Arc<dyn VoiceInput>
         }
-        _ => {
+        None => {
             out!("  Listen   typed input (no speech model)");
             Arc::new(StdinInput::new())
         }
@@ -5245,7 +5341,7 @@ async fn run_chat(
     chat_service = chat_service.with_voice_input(voice);
 
     // ── Wire wake word detector ──
-    if no_wake_word || input != "whisper" || whisper_backend.is_none() {
+    if no_wake_word || whisper_backend.is_none() {
         chat_service = chat_service.with_wake_word_detector(Arc::new(InstantActivation));
     } else {
         let backend = whisper_backend.clone().expect("checked above");
@@ -7067,7 +7163,7 @@ async fn run_calibrate(
     }
     println!();
     println!("  The wake-word detector will now match any of these variants.");
-    println!("  Run `pond-server chat --input whisper` to test it.");
+    println!("  Run `pond-server chat --voice` to test it.");
     println!();
 
     mic_handle.shutdown();
@@ -7381,7 +7477,7 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat(None, None, "stdin", None, true, Some("none"), None, false).await?;
+                run_chat(None, None, false, None, true, Some("none"), None, false).await?;
             }
             "2" => {
                 let data_dir = default_data_dir();

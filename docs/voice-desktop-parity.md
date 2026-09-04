@@ -1,7 +1,7 @@
 # Desktop Voice Mode — Functional Parity with CLI
 
 This document covers the changes that brought the desktop Tauri app's voice pipeline to
-functional parity with the CLI's `pond-server chat --input whisper` experience.
+functional parity with the CLI's `pond-server chat --voice` experience.
 
 ---
 

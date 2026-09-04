@@ -1,7 +1,25 @@
-//! Whisper ASR adapter: `WhisperRsInput` (in-process `VoiceInput`),
-//! `WhisperKeywordDetector` (`WakeWordDetector`, polls the mic for the trigger
-//! phrase) and the `WhisperBackend` trait between them. Loads a ggml `.bin` via
-//! whisper.cpp, sharing the ggml CUDA primary context with `llama-cpp-2` on Jetson.
+//! Whisper ASR adapter for Goose In A Pond.
+//!
+//! Exports:
+//! - `WhisperRsInput`         — in-process `VoiceInput` port (whisper-rs, default)
+//! - `WhisperKeywordDetector` — `WakeWordDetector` port: poll mic until trigger phrase heard
+//! - `WhisperBackend`         — backend trait the detector uses to transcribe windows
+//!
+//! ## In-process (`WhisperRsInput`)
+//!
+//! Loads a ggml `.bin` model directly via the whisper.cpp bindings. No port,
+//! no subprocess, no multipart HTTP. Shares the ggml CUDA primary context with
+//! `llama-cpp-2` on Jetson. The HTTP `WhisperInput` this replaced was deleted
+//! in 2026-08; nothing here is selectable any more, so there is no default to
+//! name.
+//!
+//! ## Where the speech/silence decision comes from
+//!
+//! Not from here. Both capture paths take a `&mut dyn SpeechDetector` and the
+//! composition root decides which one — Silero by default, the energy gate
+//! when its model or the ONNX Runtime cannot be had. This crate is in CI's
+//! fast-crate set and must stay buildable without an ONNX Runtime, so it knows
+//! the trait and nothing else.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -51,8 +69,13 @@ fn play_wake_ping() {
 
 /// Synchronous transcription backend.
 ///
-/// `WhisperKeywordDetector` holds an `Arc<dyn WhisperBackend>` and calls it on each
-/// window from inside `tokio::task::spawn_blocking`, so blocking here is fine.
+/// The `WhisperKeywordDetector` holds an `Arc<dyn WhisperBackend>` and calls
+/// `transcribe_pcm_blocking` on each window during the wake-word detection
+/// loop. `WhisperRsInput` is the only implementor in the tree; the trait earns
+/// its keep by letting the detector's tests run against a canned transcript,
+/// and by being the seam a different recogniser would arrive through.
+///
+/// Called from inside `tokio::task::spawn_blocking`, so a blocking call is fine.
 pub trait WhisperBackend: Send + Sync {
     /// Transcribe 16 kHz mono f32 PCM. Implementations should pass the result
     /// through `strip_whisper_artifacts`. Returns an empty string for silence /
@@ -109,8 +132,8 @@ pub(crate) fn record_mono_f32_until_silence(
     mic: &MicHandle,
     max_record_secs: u32,
     silence_ms: u64,
+    detector: &mut dyn SpeechDetector,
 ) -> Result<(Vec<f32>, u32)> {
-    const SILENCE_RMS: f32 = 0.005;
     const POLL_MS: u64 = 30;
 
     // Privacy gate: refuse to OPEN the device, so the OS microphone indicator
@@ -135,9 +158,8 @@ pub(crate) fn record_mono_f32_until_silence(
 
         let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
         let start = samples.len().saturating_sub(recent);
-        let rms = rms_energy(&samples[start..]);
 
-        if rms < SILENCE_RMS {
+        if !detector.is_speech(&samples[start..]) {
             silent_for += POLL_MS;
             if silent_for >= silence_ms {
                 tracing::debug!(
@@ -158,7 +180,7 @@ pub(crate) fn record_mono_f32_until_silence(
 
 use pond_voice::dsp::VadEvent;
 
-use pond_voice::dsp::SpeculativeVad;
+use pond_voice::dsp::{SpeculativeVad, SpeechDetector};
 
 /// Spawns a background transcription of `samples` at `sample_rate`, returning
 /// a handle the caller can join once end-of-speech is confirmed.
@@ -177,9 +199,14 @@ pub(crate) fn record_mono_f32_vad(
     speculative_spawn: Option<&SpeculativeSpawn>,
     on_speculative_event: Option<&(dyn Fn(SpeculativeSignal) + Send + Sync)>,
     audio_level_sink: Option<&ThrottledAudioLevelSink>,
+    detector: &mut dyn SpeechDetector,
 ) -> Result<(Vec<f32>, u32, Option<String>)> {
+    // Onset only. The end-of-speech threshold moved into `detector`, which is
+    // why these are no longer a matched pair: onset stays an energy question on
+    // purpose. A model detector needs a window or two of context before it is
+    // trustworthy, so it under-reports at exactly the moment onset is decided
+    // and would clip the first word.
     const SPEECH_RMS: f32 = 0.010; // onset threshold — lowered for better sensitivity
-    const SILENCE_RMS: f32 = 0.005; // end-of-speech threshold (hysteresis)
     const POLL_MS: u64 = 30;
 
     // Privacy gate: refuse to OPEN the device, so the OS microphone indicator
@@ -239,12 +266,15 @@ pub(crate) fn record_mono_f32_vad(
 
         let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
         let start = samples.len().saturating_sub(recent);
-        let rms = rms_energy(&samples[start..]);
+        let frame = &samples[start..];
+        // The level meter wants a number and the detector wants the samples, so
+        // this frame is walked twice. At 30 ms that is ~480 floats per poll —
+        // far below the cost of the branch that decides whether to say so.
         if let Some(sink) = audio_level_sink {
-            sink.maybe_emit(rms);
+            sink.maybe_emit(rms_energy(frame));
         }
 
-        match vad.on_rms(rms, SILENCE_RMS) {
+        match vad.on_speech(detector.is_speech(frame)) {
             VadEvent::SpawnSpeculative => {
                 if let Some(spawn) = speculative_spawn {
                     let snapshot = samples.clone();
@@ -750,6 +780,7 @@ fn detection_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pond_voice::dsp::RmsDetector;
 
     // ── Detection tuning ──────────────────────────────────────────────────
     //
@@ -997,56 +1028,77 @@ mod tests {
     fn vad_does_nothing_while_speech_continues() {
         let mut vad = SpeculativeVad::new(360, 30);
         for _ in 0..10 {
-            assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::None);
+            assert_eq!(vad.on_speech(SPEECH >= THRESHOLD), VadEvent::None);
         }
     }
 
     #[test]
     fn vad_spawns_once_on_first_silent_poll_then_goes_quiet() {
         let mut vad = SpeculativeVad::new(360, 30);
-        vad.on_rms(SPEECH, THRESHOLD);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::SpawnSpeculative);
+        vad.on_speech(SPEECH >= THRESHOLD);
+        assert_eq!(
+            vad.on_speech(QUIET >= THRESHOLD),
+            VadEvent::SpawnSpeculative
+        );
         // Subsequent silent polls before confirmation: no repeat spawn.
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::None);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::None);
+        assert_eq!(vad.on_speech(QUIET >= THRESHOLD), VadEvent::None);
+        assert_eq!(vad.on_speech(QUIET >= THRESHOLD), VadEvent::None);
     }
 
     #[test]
     fn vad_confirms_after_silence_ms_elapses() {
         let mut vad = SpeculativeVad::new(90, 30); // 3 polls to confirm
-        vad.on_rms(SPEECH, THRESHOLD);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::SpawnSpeculative); // 30ms
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::None); // 60ms
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::Confirmed); // 90ms
+        vad.on_speech(SPEECH >= THRESHOLD);
+        assert_eq!(
+            vad.on_speech(QUIET >= THRESHOLD),
+            VadEvent::SpawnSpeculative
+        ); // 30ms
+        assert_eq!(vad.on_speech(QUIET >= THRESHOLD), VadEvent::None); // 60ms
+        assert_eq!(vad.on_speech(QUIET >= THRESHOLD), VadEvent::Confirmed); // 90ms
     }
 
     #[test]
     fn vad_discards_speculative_on_resumed_speech() {
         let mut vad = SpeculativeVad::new(360, 30);
-        vad.on_rms(SPEECH, THRESHOLD);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::SpawnSpeculative);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::None);
+        vad.on_speech(SPEECH >= THRESHOLD);
+        assert_eq!(
+            vad.on_speech(QUIET >= THRESHOLD),
+            VadEvent::SpawnSpeculative
+        );
+        assert_eq!(vad.on_speech(QUIET >= THRESHOLD), VadEvent::None);
         // False pause — speech resumes before confirmation.
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::DiscardSpeculative);
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::None);
+        assert_eq!(
+            vad.on_speech(SPEECH >= THRESHOLD),
+            VadEvent::DiscardSpeculative
+        );
+        assert_eq!(vad.on_speech(SPEECH >= THRESHOLD), VadEvent::None);
     }
 
     #[test]
     fn vad_spawns_a_fresh_job_for_each_new_silence_run() {
         let mut vad = SpeculativeVad::new(360, 30);
-        vad.on_rms(SPEECH, THRESHOLD);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::SpawnSpeculative);
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::DiscardSpeculative);
+        vad.on_speech(SPEECH >= THRESHOLD);
+        assert_eq!(
+            vad.on_speech(QUIET >= THRESHOLD),
+            VadEvent::SpawnSpeculative
+        );
+        assert_eq!(
+            vad.on_speech(SPEECH >= THRESHOLD),
+            VadEvent::DiscardSpeculative
+        );
         // New silence run after the false pause — spawns again, independent
         // of the discarded one.
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::SpawnSpeculative);
+        assert_eq!(
+            vad.on_speech(QUIET >= THRESHOLD),
+            VadEvent::SpawnSpeculative
+        );
     }
 
     #[test]
     fn vad_repeated_speech_after_speech_is_a_noop() {
         let mut vad = SpeculativeVad::new(360, 30);
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::None);
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::None);
+        assert_eq!(vad.on_speech(SPEECH >= THRESHOLD), VadEvent::None);
+        assert_eq!(vad.on_speech(SPEECH >= THRESHOLD), VadEvent::None);
     }
 
     // ── wake-word cancellation ───────────────────────────────────────────
@@ -1155,7 +1207,8 @@ mod tests {
         // The detector's `mic.close()` and this follow-up `mic.open()` race
         // exactly the way `run_loop` races them between turns.
         let result = tokio::task::spawn_blocking(move || {
-            record_mono_f32_vad(&mic, 1, 1, 200, None, None, None)
+            let mut detector = RmsDetector::new(0.005);
+            record_mono_f32_vad(&mic, 1, 1, 200, None, None, None, &mut detector)
         })
         .await
         .expect("capture thread must not panic");
