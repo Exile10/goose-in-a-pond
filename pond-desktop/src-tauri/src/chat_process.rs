@@ -113,6 +113,14 @@ pub fn classify_line(line: &str) -> Result<LineClass, String> {
     };
 
     let mapped = match event {
+        // Prefix warm-up progress at session start: `warming` while the model
+        // loads and the prompt prefix prefills, then ready/skipped/failed. The
+        // child also SPEAKS these transitions; this event lets the UI label
+        // the stretch where the mic is not yet listening.
+        "warmup" => VoiceEvent {
+            name: "voice-warmup",
+            payload: serde_json::Value::String(string_field("state")),
+        },
         "ready" => VoiceEvent {
             name: "voice-ready",
             payload: serde_json::json!({ "session_id": string_field("session_id") }),

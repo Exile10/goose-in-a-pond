@@ -179,8 +179,23 @@ impl IngestPipeline {
 
         // Embedded from the item, which means from the REDACTED text: there is
         // no point in this function at which the raw body is still reachable.
-        let item = match &self.embedder {
-            Some(embedder) => match embedder.embed(&item.embedding_text()).await {
+        //
+        // Only the FIRST passage is embedded here, and that is deliberate. An
+        // item whose text fits one chunk — a sensor event, a calendar entry, a
+        // short mail — is completely described by it, and this is the whole
+        // job. A long mail body is not, and its remaining passages are the
+        // maintenance sweep's work: chunking a 20 KB message inline would put
+        // dozens of embeds on the path an ingest waits for, and a mailbox sync
+        // of a thousand messages would stall behind them.
+        //
+        // What matters is that the sweep can TELL the difference, which is why
+        // the item is left unembedded when its text spills past one chunk: an
+        // item carrying a vector looks indexed, and would never be picked up
+        // for the rest of its passages.
+        let text = item.embedding_text();
+        let one_chunk = text.len() <= crate::context::chunking::DEFAULT_CHUNK_BYTES;
+        let item = match (&self.embedder, one_chunk) {
+            (Some(embedder), true) => match embedder.embed(&text).await {
                 Ok(vector) => item.with_embedding(vector),
                 Err(e) => {
                     // Not fatal. `search_unembedded` + `update_embedding` are the
@@ -189,7 +204,9 @@ impl IngestPipeline {
                     item
                 }
             },
-            None => item,
+            // Long enough to chunk: stored now, passages embedded by the sweep.
+            (Some(_), false) => item,
+            (None, _) => item,
         };
 
         self.repo.save_item(&item).await?;
@@ -398,8 +415,12 @@ mod tests {
                         message.contains(kind.as_str()),
                         "the refusal does not say which kind: {message}"
                     );
+                    // See the sibling guard in `producer.rs`: this asserts the
+                    // mechanism that is missing, not the phase that was going to
+                    // supply it, because the phase citation for the connector
+                    // kinds expired while the refusal stayed correct.
                     assert!(
-                        message.contains("PAI-8 P3") || message.contains("PAI-2 P6b"),
+                        message.contains("ingest route") || message.contains("connector"),
                         "the refusal does not name what has to land first: {message}"
                     );
                 }

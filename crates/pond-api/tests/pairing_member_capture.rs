@@ -69,6 +69,7 @@ async fn make_app() -> Harness {
     let profiles = Arc::new(SqliteProfileRepository::new(pool.clone()));
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db,
         onboarding_repo: Arc::new(pond_infra::onboarding::SqlxOnboardingRepository::new(
             pool.clone(),
@@ -94,6 +95,7 @@ async fn make_app() -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,

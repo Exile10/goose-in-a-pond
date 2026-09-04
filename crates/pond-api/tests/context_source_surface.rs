@@ -95,19 +95,64 @@ struct Harness {
     app: axum::Router,
     storage: Arc<SqliteSessionStorage>,
     profiles: Arc<SqliteProfileRepository>,
+    secrets: Option<Arc<MemorySecrets>>,
     _tmp: tempfile::TempDir,
 }
 
+/// A secret store that only remembers, so a test can assert what was written
+/// WITHOUT reaching into the encrypted file adapter. What matters here is that
+/// the route stores the password somewhere the source can find it again, and
+/// that it never comes back out of the API.
+#[derive(Default)]
+struct MemorySecrets {
+    inner: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+#[async_trait::async_trait]
+impl pond_core::security::ports::secret::SecretRepository for MemorySecrets {
+    async fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.inner.lock().await.get(key).cloned())
+    }
+    async fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.inner
+            .lock()
+            .await
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.lock().await.remove(key);
+        Ok(())
+    }
+    async fn list_keys(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.inner.lock().await.keys().cloned().collect())
+    }
+    async fn has(&self, key: &str) -> anyhow::Result<bool> {
+        Ok(self.inner.lock().await.contains_key(key))
+    }
+}
+
 async fn make_app() -> Harness {
+    make_app_inner(false).await
+}
+
+/// The same pond, with somewhere to keep an account password.
+async fn make_app_with_secrets() -> Harness {
+    make_app_inner(true).await
+}
+
+async fn make_app_inner(with_secrets: bool) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
     let storage = Arc::new(SqliteSessionStorage::new(pool.clone()));
     let profiles = Arc::new(SqliteProfileRepository::new(pool.clone()));
+    let secrets = with_secrets.then(|| Arc::new(MemorySecrets::default()));
     let hs = MockHandshake::new();
     hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(hs),
@@ -128,6 +173,7 @@ async fn make_app() -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -142,7 +188,9 @@ async fn make_app() -> Harness {
         mcp_server_repo: None,
         tool_registry: None,
         marketplace: None,
-        secret_repo: None,
+        secret_repo: secrets.clone().map(|s| {
+            s as Arc<dyn pond_core::security::ports::secret::SecretRepository + Send + Sync>
+        }),
         download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         piper_http_port: None,
         model_catalog_provider: None,
@@ -199,6 +247,7 @@ async fn make_app() -> Harness {
         app: build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
         storage,
         profiles,
+        secrets,
         _tmp: tmp,
     }
 }
@@ -415,7 +464,9 @@ async fn a_guest_cannot_connect_a_source_and_sees_none() {
 #[tokio::test]
 async fn the_whole_household_is_not_an_owner() {
     let h = make_app().await;
-    let _liz = member(&h, "Liz").await; // ONE member: unidentified is Household
+    // TWO members, so `Household` genuinely names more than one person.
+    let _liz = member(&h, "Liz").await;
+    let _jerry = member(&h, "Jerry").await;
     let session = unidentified_session(&h, "chat-anon").await;
 
     let (status, body) = post_json(
@@ -431,6 +482,47 @@ async fn the_whole_household_is_not_an_owner() {
          broadcast, and a source it owned would file one member's camera under everybody: {body}"
     );
 }
+
+/// The same scope, and the opposite answer, because the household is one person.
+///
+/// This test used to assert the refusal above with a SINGLE member, and that
+/// was the wrong line to draw. `Household` and `Owner(the-only-member)` denote
+/// the same set of people when there is only one, so refusing established
+/// nothing and made connecting a calendar require identifying yourself to a
+/// pond that had exactly one possible answer.
+///
+/// The multi-member refusal above is the part of that reasoning that survives,
+/// and it is why this is a sole-member rule rather than a Household rule.
+#[tokio::test]
+async fn a_one_member_household_is_that_member() {
+    let h = make_app().await;
+    let jerry = member(&h, "Jerry").await;
+    let session = unidentified_session(&h, "chat-anon").await;
+
+    let (status, body) = post_json(
+        &h.app,
+        "/api/v1/context/sources",
+        connect_body("camera", "front-door", &session),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["profile_id"].as_str(),
+        Some(jerry.as_str()),
+        "the one member should own it: {body}"
+    );
+}
+
+// There is deliberately no "a guest is refused in a one-member household" test
+// here, because that state cannot be reached: `identity_resolution::resolve`
+// answers `Guest` only when the household has MORE than one member, and
+// `Household` otherwise. In a one-member pond an unidentified speaker and the
+// member are the same scope by construction.
+//
+// That is the residual exposure of the rule above, and it is a property of
+// identity resolution rather than of this route — writing a test that pretended
+// otherwise would assert a scope the pond never produces. What limits it in
+// practice is that the caller still needs an authenticated, paired device.
 
 // ── A connector that does not exist is refused up front ────────────────────
 
@@ -543,4 +635,98 @@ async fn one_member_never_sees_another_members_sources() {
         Some(0),
         "Ada was shown Liz's camera"
     );
+}
+
+// ── PAI-8 P4: connecting an account ──────────────────────────────────────────
+
+/// A calendar source with no credentials would be a row that looks connected
+/// and can never sync -- the empty-source shape `availability` exists to
+/// prevent, arriving through the front door instead of around it.
+#[tokio::test]
+async fn a_calendar_without_a_password_is_refused() {
+    let h = make_app_with_secrets().await;
+    let jerry = member(&h, "Jerry").await;
+    let session = session_of(&h, "s-cal-1", &jerry).await;
+
+    let (status, body) = post_json(
+        &h.app,
+        "/api/v1/context/sources",
+        connect_body("calendar", "fastmail", &session),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("app password"),
+        "the refusal should say what is needed: {body}"
+    );
+}
+
+/// The mirror. A sensor is already on the pond, so sign-in details for one are
+/// a sign the caller has confused two things, and storing them would put a
+/// credential in the store that nothing will ever read or delete.
+#[tokio::test]
+async fn a_sensor_with_a_password_is_refused_too() {
+    let h = make_app_with_secrets().await;
+    let jerry = member(&h, "Jerry").await;
+    let session = session_of(&h, "s-cal-2", &jerry).await;
+
+    let mut body = connect_body("sensor", "hall-pir", &session);
+    body["credentials"] = serde_json::json!({"username": "a", "password": "b"});
+    let (status, resp) = post_json(&h.app, "/api/v1/context/sources", body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+}
+
+#[tokio::test]
+async fn a_connected_calendar_keeps_its_password_in_the_secret_store_and_not_in_the_reply() {
+    let h = make_app_with_secrets().await;
+    let jerry = member(&h, "Jerry").await;
+    let session = session_of(&h, "s-cal-3", &jerry).await;
+
+    let mut body = connect_body("calendar", "fastmail", &session);
+    body["credentials"] =
+        serde_json::json!({"username": "jerry@example.org", "password": "app-secret-xyz"});
+    let (status, resp) = post_json(&h.app, "/api/v1/context/sources", body).await;
+    assert_eq!(status, StatusCode::OK, "body: {resp}");
+
+    // The owner is in the id, so two members can each connect their own account
+    // instead of the second colliding with the first.
+    let id = resp["id"].as_str().expect("id");
+    assert!(
+        id.contains(&jerry),
+        "the source id should carry its owner: {id}"
+    );
+
+    // The password is in the store...
+    let secrets = h.secrets.clone().expect("secret store");
+    use pond_core::security::ports::secret::SecretRepository as _;
+    let stored = secrets
+        .get(&pond_core::context::domain::secret_key_for(id))
+        .await
+        .unwrap()
+        .expect("the credentials were not stored where the sync will look for them");
+    assert!(stored.contains("app-secret-xyz"));
+
+    // ...and nowhere in what the API said back.
+    let rendered = resp.to_string();
+    assert!(
+        !rendered.contains("app-secret-xyz"),
+        "the reply echoed the password: {rendered}"
+    );
+}
+
+/// A pond with no encrypted store must refuse rather than drop the password
+/// (a source that can never sync) or put it somewhere unencrypted (invariant 4).
+#[tokio::test]
+async fn a_pond_with_no_secret_store_refuses_to_hold_a_password() {
+    let h = make_app().await;
+    let jerry = member(&h, "Jerry").await;
+    let session = session_of(&h, "s-cal-4", &jerry).await;
+
+    let mut body = connect_body("calendar", "fastmail", &session);
+    body["credentials"] = serde_json::json!({"username": "a", "password": "b"});
+    let (status, resp) = post_json(&h.app, "/api/v1/context/sources", body).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {resp}");
 }

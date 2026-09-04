@@ -49,12 +49,118 @@ pub struct GgufInfo {
     pub parameter_count: Option<u64>,
     /// Tensors in the file. Always present in a well-formed header.
     pub tensor_count: Option<u64>,
+
+    // ── Attention geometry, for KV-cache arithmetic ─────────────────────────
+    //
+    // These sit in the first ~2 KB of every file measured (offsets 924-1,829
+    // on gemma-4-E2B), i.e. long before `tokenizer.ggml.tokens`, so a short
+    // head read reaches all of them.
+    /// `{arch}.attention.head_count_kv` — KV heads, the multiplier on cache size.
+    pub head_count_kv: Option<u32>,
+    /// `{arch}.attention.key_length` — K width per head, full-attention layers.
+    pub key_length: Option<u32>,
+    /// `{arch}.attention.value_length` — V width per head, full-attention layers.
+    pub value_length: Option<u32>,
+    /// `{arch}.attention.key_length_swa` — K width on sliding-window layers,
+    /// where present. Gemma 4 halves it (256 against 512).
+    pub key_length_swa: Option<u32>,
+    /// `{arch}.attention.value_length_swa`, where present.
+    pub value_length_swa: Option<u32>,
+    /// `tokenizer.chat_template` — the model's own Jinja template, and the
+    /// only ground truth about what it can be asked to do. Whether it renders
+    /// tool declarations, and whether it gates reasoning, are properties of
+    /// this string and of nothing in the filename.
+    ///
+    /// Only populated by a walk that reaches it: it sits 3.8-15 MB into the
+    /// files measured, after `tokenizer.ggml.tokens`. `parse_gguf_header` on a
+    /// short slice leaves it `None`; [`parse_gguf_file`] finds it.
+    pub chat_template: Option<String>,
+    /// `{arch}.attention.shared_kv_layers` — layers that share another layer's
+    /// KV and therefore allocate none of their own. Gemma 4 E4B shares 18 of
+    /// 42; E2B shares 20 of 35.
+    pub shared_kv_layers: Option<u32>,
 }
 
 impl GgufInfo {
     /// Did the header yield anything worth showing?
     pub fn is_empty(&self) -> bool {
         *self == GgufInfo::default()
+    }
+
+    /// Bytes of KV cache this model needs per token of context, computed from
+    /// its own header.
+    ///
+    /// # Why this is worth having
+    ///
+    /// `jetson_context_size` divides the memory budget by a per-token KV cost
+    /// to decide a context window, and that constant carries a comment saying
+    /// it "moves on a measurement from the Orin and nothing less" -- because
+    /// getting it wrong OOM-killed the board once, and because a figure
+    /// measured on a Mac understated the real cost by roughly three times.
+    ///
+    /// It does not have to be measured. It is arithmetic over four keys that
+    /// sit in the first two kilobytes of the file, and it reproduces both
+    /// device measurements exactly (see the tests): E2B 18 KiB/token, E4B 56.
+    /// That turns "measure every new model on the hardware or risk the board"
+    /// into something answerable before the weights are read.
+    ///
+    /// # The shape of the sum
+    ///
+    /// Only layers that own KV allocate any: `block_count - shared_kv_layers`.
+    /// Of those, sliding-window layers use the narrower `*_swa` widths where
+    /// the architecture declares them. Each layer stores K and V for every KV
+    /// head at two bytes an element (f16, the default cache type).
+    ///
+    /// # The part that is inferred rather than read
+    ///
+    /// The split between full-attention and sliding-window layers is **not**
+    /// in these headers. Both Gemma 4 models measured 1 global to 5 SWA
+    /// (E4B 4+20 of 24, E2B 3+12 of 15), and that ratio is assumed here via
+    /// `swa_per_global`. An architecture with a different pattern needs its own
+    /// value, so this returns `None` rather than guessing when the widths that
+    /// would make the answer wrong are absent.
+    ///
+    /// Returns `None` when the header lacks what the sum needs -- callers keep
+    /// their conservative fallback rather than receiving a confident wrong
+    /// number.
+    pub fn kv_bytes_per_token(&self, swa_per_global: u32) -> Option<u64> {
+        const BYTES_PER_ELEMENT: u64 = 2; // f16 cache
+
+        let blocks = self.block_count?;
+        let kv_heads = u64::from(self.head_count_kv?);
+        let k = u64::from(self.key_length?);
+        let v = u64::from(self.value_length?);
+
+        let owning = blocks.saturating_sub(self.shared_kv_layers.unwrap_or(0));
+        if owning == 0 || kv_heads == 0 {
+            return None;
+        }
+
+        // No SWA widths declared: every owning layer pays the full width.
+        let (Some(k_swa), Some(v_swa)) = (
+            self.key_length_swa.or(self.key_length),
+            self.value_length_swa.or(self.value_length),
+        ) else {
+            return Some(u64::from(owning) * (k + v) * kv_heads * BYTES_PER_ELEMENT);
+        };
+
+        let group = swa_per_global.saturating_add(1);
+        let (global, swa) = if group <= 1 || self.key_length_swa.is_none() {
+            (owning, 0)
+        } else {
+            let g = owning.div_ceil(group);
+            (g, owning.saturating_sub(g))
+        };
+
+        let per_global = (k + v) * kv_heads * BYTES_PER_ELEMENT;
+        let per_swa = (u64::from(k_swa) + u64::from(v_swa)) * kv_heads * BYTES_PER_ELEMENT;
+        Some(u64::from(global) * per_global + u64::from(swa) * per_swa)
+    }
+
+    /// [`Self::kv_bytes_per_token`] in KiB, which is the unit the context
+    /// arithmetic actually works in.
+    pub fn kv_kib_per_token(&self, swa_per_global: u32) -> Option<u64> {
+        self.kv_bytes_per_token(swa_per_global).map(|b| b / 1024)
     }
 
     /// A one-line description, in the order a person reads a model name.
@@ -125,18 +231,144 @@ fn file_type_name(v: u32) -> Option<&'static str> {
     })
 }
 
-/// A cursor that refuses to read past the end.
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
+/// Where a GGUF walk gets its bytes.
+///
+/// The parser used to take a `&[u8]`, which is fine for the geometry keys —
+/// they sit in the first two kilobytes — and useless for the chat template,
+/// which sits **3.8 to 15 MB in**, immediately after `tokenizer.ggml.tokens`.
+///
+/// It is tempting to reach it by computing where the token array ends and
+/// reading from there. That does not work: the array is variable-length
+/// strings, so the only way past it is to walk its per-element length
+/// prefixes. There is no offset to seek to.
+///
+/// What a source buys instead is that **skipping stops requiring the bytes**.
+/// A scalar or a whole string is stepped over with position arithmetic and no
+/// read at all, and a string array costs one 8-byte length read per element
+/// rather than materialising a `String` for each of a quarter-million tokens.
+pub trait GgufSource {
+    /// Fill `out` from `offset`. `false` if the source cannot satisfy it in
+    /// full — a short read is indistinguishable from truncation here, and both
+    /// end the walk.
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> bool;
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let slice = self.buf.get(self.pos..end)?;
-        self.pos = end;
-        Some(slice)
+impl GgufSource for &[u8] {
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> bool {
+        let Ok(start) = usize::try_from(offset) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(out.len()) else {
+            return false;
+        };
+        match self.get(start..end) {
+            Some(src) => {
+                out.copy_from_slice(src);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// A file read through a small sliding window.
+///
+/// The walk is essentially sequential, so a modest buffer turns a quarter of a
+/// million 8-byte length reads into a few hundred real ones.
+pub struct FileSource {
+    file: std::fs::File,
+    buf: Vec<u8>,
+    /// Absolute offset of `buf[0]`.
+    base: u64,
+    /// Valid bytes in `buf`.
+    len: usize,
+}
+
+impl FileSource {
+    const WINDOW: usize = 64 * 1024;
+
+    /// Open a file for walking. `None` if it cannot be opened at all.
+    pub fn open(path: &std::path::Path) -> Option<Self> {
+        Some(Self {
+            file: std::fs::File::open(path).ok()?,
+            buf: vec![0u8; Self::WINDOW],
+            base: 0,
+            len: 0,
+        })
+    }
+
+    fn refill(&mut self, offset: u64) -> bool {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        if self.file.seek(SeekFrom::Start(offset)).is_err() {
+            return false;
+        }
+        let mut filled = 0;
+        while filled < self.buf.len() {
+            match self.file.read(&mut self.buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return false,
+            }
+        }
+        self.base = offset;
+        self.len = filled;
+        filled > 0
+    }
+}
+
+impl GgufSource for FileSource {
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> bool {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        if out.len() > Self::WINDOW {
+            return self.file.seek(SeekFrom::Start(offset)).is_ok()
+                && self.file.read_exact(out).is_ok();
+        }
+        let end = match offset.checked_add(out.len() as u64) {
+            Some(e) => e,
+            None => return false,
+        };
+        let hit = offset >= self.base && end <= self.base + self.len as u64;
+        if !hit && !self.refill(offset) {
+            return false;
+        }
+        let Ok(start) = usize::try_from(offset.saturating_sub(self.base)) else {
+            return false;
+        };
+        let Some(src) = self.buf.get(start..start.saturating_add(out.len())) else {
+            return false;
+        };
+        out.copy_from_slice(src);
+        true
+    }
+}
+
+/// A cursor that refuses to read past the end.
+struct Reader<S> {
+    src: S,
+    pos: u64,
+}
+
+/// The widest string this parser will materialise.
+///
+/// A length field is 64 bits wide and comes from the file; refusing an absurd
+/// one is what stops a corrupt header asking for a 16 EB allocation. Chat
+/// templates run to about 19 KB, so 4 MiB is generous cover.
+const MAX_STRING_BYTES: u64 = 4 * 1024 * 1024;
+
+impl<S: GgufSource> Reader<S> {
+    fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        let mut out = vec![0u8; n];
+        if !self.src.read_at(self.pos, &mut out) {
+            return None;
+        }
+        self.pos = self.pos.checked_add(n as u64)?;
+        Some(out)
+    }
+    /// Step over `n` bytes without reading them. This is the point of the
+    /// source abstraction: the token array costs position arithmetic.
+    fn skip(&mut self, n: u64) -> Option<()> {
+        self.pos = self.pos.checked_add(n)?;
+        Some(())
     }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
@@ -145,25 +377,28 @@ impl<'a> Reader<'a> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
     fn string(&mut self) -> Option<String> {
-        let len = self.u64()? as usize;
-        // A length field is 64 bits wide and comes from the file. Refusing an
-        // absurd one here is what stops a corrupt header asking for a 16 EB
-        // allocation.
-        if len > self.buf.len() {
+        let len = self.u64()?;
+        if len > MAX_STRING_BYTES {
             return None;
         }
-        Some(String::from_utf8_lossy(self.take(len)?).into_owned())
+        let bytes = self.take(usize::try_from(len).ok()?)?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+    /// A string we do not want: read its length, step over its bytes.
+    fn skip_string(&mut self) -> Option<()> {
+        let len = self.u64()?;
+        self.skip(len)
     }
 }
 
 /// Fixed widths for the scalar value types, so a value we do not care about
 /// can be stepped over without interpreting it.
-fn scalar_width(kind: u32) -> Option<usize> {
+fn scalar_width(kind: u32) -> Option<u64> {
     Some(match kind {
-        0 | 1 | 7 => 1,    // u8, i8, bool
-        2 | 3 => 2,        // u16, i16
-        4 | 5 | 6 => 4,    // u32, i32, f32
-        10 | 11 | 12 => 8, // u64, i64, f64
+        0 | 1 | 7 => 1, // u8, i8, bool
+        2 | 3 => 2,     // u16, i16
+        4..=6 => 4,     // u32, i32, f32
+        10..=12 => 8,   // u64, i64, f64
         _ => return None,
     })
 }
@@ -176,9 +411,13 @@ enum Value {
     Other,
 }
 
-fn read_value(r: &mut Reader<'_>, kind: u32) -> Option<Value> {
+fn read_value<S: GgufSource>(r: &mut Reader<S>, kind: u32, want_string: bool) -> Option<Value> {
     match kind {
-        8 => Some(Value::Str(r.string()?)),
+        8 if want_string => Some(Value::Str(r.string()?)),
+        8 => {
+            r.skip_string()?;
+            Some(Value::Other)
+        }
         4 => Some(Value::U32(r.u32()?)),
         10 => Some(Value::U64(r.u64()?)),
         9 => {
@@ -186,33 +425,31 @@ fn read_value(r: &mut Reader<'_>, kind: u32) -> Option<Value> {
             // collected — nothing here needs one, and skipping keeps the walk
             // going so later keys are still read.
             let elem = r.u32()?;
-            let count = r.u64()? as usize;
+            let count = r.u64()?;
             if elem == 8 {
+                // Variable-length: the only way past is one length per element.
                 for _ in 0..count {
-                    r.string()?;
+                    r.skip_string()?;
                 }
             } else {
-                let w = scalar_width(elem)?;
-                r.take(w.checked_mul(count)?)?;
+                r.skip(scalar_width(elem)?.checked_mul(count)?)?;
             }
             Some(Value::Other)
         }
         other => {
-            r.take(scalar_width(other)?)?;
+            r.skip(scalar_width(other)?)?;
             Some(Value::Other)
         }
     }
 }
 
-/// Read what a GGUF header says about its model.
+/// Read what a GGUF header says about its model, from any source.
 ///
-/// `head` need only be the first slice of the file — a megabyte is far more
-/// than any real header. A short read simply yields fewer fields.
-///
-/// Returns `None` when the bytes are not GGUF at all, so a caller can tell
-/// "not this kind of file" from "a header with little in it".
-pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
-    let mut r = Reader { buf: head, pos: 0 };
+/// The walk is identical whatever the bytes come from; only how far it gets
+/// differs. A short slice stops when it runs out and returns what it
+/// understood, which is the geometry. A file source reaches everything.
+fn walk<S: GgufSource>(src: S) -> Option<GgufInfo> {
+    let mut r = Reader { src, pos: 0 };
     if r.take(4)? != b"GGUF" {
         return None;
     }
@@ -230,13 +467,20 @@ pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
     for _ in 0..kv_count.min(4096) {
         let Some(key) = r.string() else { break };
         let Some(kind) = r.u32() else { break };
-        let Some(value) = read_value(&mut r, kind) else {
+        // Only materialise the strings we actually keep. Everything else is
+        // stepped over, which matters most for the token array.
+        let want_string = matches!(
+            key.as_str(),
+            "general.architecture" | "general.name" | "tokenizer.chat_template"
+        );
+        let Some(value) = read_value(&mut r, kind, want_string) else {
             break;
         };
 
         match (key.as_str(), value) {
             ("general.architecture", Value::Str(s)) => info.architecture = Some(s),
             ("general.name", Value::Str(s)) => info.name = Some(s),
+            ("tokenizer.chat_template", Value::Str(s)) => info.chat_template = Some(s),
             ("general.file_type", Value::U32(v)) => {
                 info.quantization = file_type_name(v).map(str::to_string)
             }
@@ -251,11 +495,49 @@ pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
                 info.embedding_length = Some(v)
             }
             (k, Value::U32(v)) if k.ends_with(".block_count") => info.block_count = Some(v),
+            (k, Value::U32(v)) if k.ends_with(".attention.head_count_kv") => {
+                info.head_count_kv = Some(v)
+            }
+            (k, Value::U32(v)) if k.ends_with(".attention.key_length_swa") => {
+                info.key_length_swa = Some(v)
+            }
+            (k, Value::U32(v)) if k.ends_with(".attention.value_length_swa") => {
+                info.value_length_swa = Some(v)
+            }
+            (k, Value::U32(v)) if k.ends_with(".attention.key_length") => info.key_length = Some(v),
+            (k, Value::U32(v)) if k.ends_with(".attention.value_length") => {
+                info.value_length = Some(v)
+            }
+            (k, Value::U32(v)) if k.ends_with(".attention.shared_kv_layers") => {
+                info.shared_kv_layers = Some(v)
+            }
             _ => {}
         }
     }
 
     Some(info)
+}
+
+/// Read what a GGUF header says about its model, from a slice.
+///
+/// `head` need only be the first slice of the file. The geometry keys live in
+/// the first two kilobytes, so a small read answers everything the context
+/// arithmetic needs — but **not** `chat_template`, which is megabytes in. Use
+/// [`parse_gguf_file`] when that matters.
+///
+/// Returns `None` when the bytes are not GGUF at all, so a caller can tell
+/// "not this kind of file" from "a header with little in it".
+pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
+    walk(head)
+}
+
+/// Read a GGUF file's header from disk, walking far enough to reach every key
+/// including the chat template.
+///
+/// Costs a few hundred kilobytes of real reading regardless of model size,
+/// because everything between the keys is stepped over rather than read.
+pub fn parse_gguf_file(path: &std::path::Path) -> Option<GgufInfo> {
+    walk(FileSource::open(path)?)
 }
 
 /// "4.3B", "270M" — parameter counts as they are spoken.
@@ -300,6 +582,230 @@ fn title_case(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The two Gemma 4 models as their headers describe them, read off the
+    /// real files on 2026-08-16 (`gemma4.attention.*`, offsets 924-1,829).
+    fn gemma_e2b() -> GgufInfo {
+        GgufInfo {
+            architecture: Some("gemma4".into()),
+            block_count: Some(35),
+            head_count_kv: Some(1),
+            key_length: Some(512),
+            value_length: Some(512),
+            key_length_swa: Some(256),
+            value_length_swa: Some(256),
+            shared_kv_layers: Some(20),
+            ..Default::default()
+        }
+    }
+
+    fn gemma_e4b() -> GgufInfo {
+        GgufInfo {
+            architecture: Some("gemma4".into()),
+            block_count: Some(42),
+            head_count_kv: Some(2),
+            key_length: Some(512),
+            value_length: Some(512),
+            key_length_swa: Some(256),
+            value_length_swa: Some(256),
+            shared_kv_layers: Some(18),
+            ..Default::default()
+        }
+    }
+
+    /// The claim this whole function exists to make: the header alone
+    /// reproduces what the device measured, so the constant in
+    /// `jetson_context_size` does not have to be measured per model.
+    ///
+    /// Measured on the Orin 2026-08-12 by reading llama.cpp's own
+    /// `llama_kv_cache ... size = N MiB (C cells, L layers)` lines:
+    /// E2B 96 + 192 MiB at n_ctx 16384 = 18 KiB/token; E4B 128 + 320 MiB at
+    /// n_ctx 8192 = 56 KiB/token. Both caches carry `n_ctx` cells, so the cost
+    /// is linear with no constant term.
+    #[test]
+    fn kv_cost_reproduces_the_device_measurements() {
+        assert_eq!(
+            gemma_e2b().kv_kib_per_token(5),
+            Some(18),
+            "E2B: 15 owning layers (35 - 20), 3 global at 2 KiB + 12 SWA at 1 KiB"
+        );
+        assert_eq!(
+            gemma_e4b().kv_kib_per_token(5),
+            Some(56),
+            "E4B: 24 owning layers (42 - 18), 4 global at 4 KiB + 20 SWA at 2 KiB"
+        );
+    }
+
+    /// The same claim, against real files rather than transcribed numbers.
+    ///
+    /// `#[ignore]` and env-gated, following the convention the local-inference
+    /// crate uses: the GGUFs are gigabytes and are not in the repo. Run with
+    ///
+    /// ```text
+    /// GIAP_TEST_GGUF_DIR="$HOME/Library/Application Support/goose-in-a-pond/models/gguf" \
+    ///   cargo test -p pond-core --lib gguf -- --ignored --nocapture
+    /// ```
+    ///
+    /// Transcribing header values into a fixture and asserting on the
+    /// transcription proves the arithmetic, not the reading. This proves both.
+    #[test]
+    #[ignore = "needs real GGUF files; set GIAP_TEST_GGUF_DIR"]
+    fn kv_cost_from_the_real_files_on_disk() {
+        let Ok(dir) = std::env::var("GIAP_TEST_GGUF_DIR") else {
+            eprintln!("GIAP_TEST_GGUF_DIR unset");
+            return;
+        };
+        // Geometry lives in the first ~2 KB, long before the token array.
+        const HEAD: usize = 64 * 1024;
+        let expected = [
+            ("gemma-4-E2B-it-Q4_K_M.gguf", 18u64),
+            ("gemma-4-E4B-it-Q4_K_M.gguf", 56),
+        ];
+
+        let mut checked = 0;
+        for (file, want) in expected {
+            let path = std::path::Path::new(&dir).join(file);
+            let Ok(bytes) = std::fs::read(&path) else {
+                eprintln!("skip (absent): {}", path.display());
+                continue;
+            };
+            let head = &bytes[..bytes.len().min(HEAD)];
+            let info = parse_gguf_header(head).expect("real GGUF should parse");
+            let got = info.kv_kib_per_token(5);
+            eprintln!(
+                "{file}: blocks={:?} shared={:?} kv_heads={:?} k={:?} k_swa={:?} -> {got:?} KiB/token",
+                info.block_count, info.shared_kv_layers, info.head_count_kv,
+                info.key_length, info.key_length_swa
+            );
+            assert_eq!(got, Some(want), "{file} KV cost");
+            checked += 1;
+        }
+        assert!(checked > 0, "no model files found under {dir}");
+    }
+
+    /// The seek fix, against real files: the walk must now reach a key that
+    /// lives megabytes past the token array.
+    ///
+    /// Run with
+    ///
+    /// ```text
+    /// GIAP_TEST_GGUF_DIR="$HOME/Library/Application Support/goose-in-a-pond/models/gguf" \
+    ///   cargo test -p pond-core --lib gguf -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs real GGUF files; set GIAP_TEST_GGUF_DIR"]
+    fn reaches_the_chat_template_past_the_token_array() {
+        let Ok(dir) = std::env::var("GIAP_TEST_GGUF_DIR") else {
+            eprintln!("GIAP_TEST_GGUF_DIR unset");
+            return;
+        };
+        let mut checked = 0;
+        let mut with_template = 0;
+        for entry in std::fs::read_dir(&dir).expect("dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+                continue;
+            }
+            let Some(info) = parse_gguf_file(&path) else {
+                continue;
+            };
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let tpl = info.chat_template.as_deref().unwrap_or("");
+            eprintln!(
+                "{name}: arch={:?} ctx={:?} template={} chars kv={:?} KiB/tok",
+                info.architecture,
+                info.context_length,
+                tpl.len(),
+                info.kv_kib_per_token(5),
+            );
+            // Geometry must agree between the two walks; the slice must NOT
+            // have reached the template, which is the whole reason the file
+            // walk exists.
+            if let Ok(all) = std::fs::read(&path) {
+                let head = &all[..all.len().min(65536)];
+                let short = parse_gguf_header(head).expect("parses");
+                assert!(
+                    short.chat_template.is_none(),
+                    "{name}: a 64 KiB slice reached the template, so this test proves nothing"
+                );
+                assert_eq!(
+                    short.block_count, info.block_count,
+                    "{name}: geometry must agree between the slice and file walks"
+                );
+            }
+            // A template is not universal: `gemma-4-E4B-it-assistant.Q8_0` is a
+            // 95 MB draft model and carries none at all. That is a real state
+            // the capability probe has to represent (a model with no template
+            // cannot be asked to render tools), not a parse failure.
+            if !tpl.is_empty() {
+                with_template += 1;
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no GGUF files under {dir}");
+        assert!(
+            with_template >= 3,
+            "only {with_template} of {checked} models yielded a chat template; the walk is \
+             not getting past the token array"
+        );
+    }
+
+    /// Shared layers allocate nothing, and forgetting that is a 1.75x
+    /// overestimate on E4B -- which reads as "this model does not fit" and
+    /// silently costs context.
+    #[test]
+    fn shared_layers_allocate_no_cache() {
+        let mut all_owning = gemma_e4b();
+        all_owning.shared_kv_layers = None;
+        let shared = gemma_e4b().kv_bytes_per_token(5).expect("computed");
+        let unshared = all_owning.kv_bytes_per_token(5).expect("computed");
+        assert!(
+            unshared > shared,
+            "ignoring shared_kv_layers must cost more, got {unshared} vs {shared}"
+        );
+    }
+
+    /// An architecture with no sliding window pays full width on every layer.
+    /// This is the conservative direction, which is the right one to be wrong in.
+    #[test]
+    fn no_swa_widths_means_full_width_everywhere() {
+        let dense = GgufInfo {
+            block_count: Some(28),
+            head_count_kv: Some(2),
+            key_length: Some(128),
+            value_length: Some(128),
+            ..Default::default()
+        };
+        // 28 layers x (128+128) x 2 heads x 2 bytes = 28,672 bytes = 28 KiB.
+        assert_eq!(dense.kv_kib_per_token(5), Some(28));
+    }
+
+    /// A header missing what the sum needs must yield nothing, so the caller
+    /// keeps its measured fallback instead of acting on a confident guess.
+    /// This is the constant that can OOM a board.
+    #[test]
+    fn incomplete_headers_refuse_rather_than_guess() {
+        assert_eq!(GgufInfo::default().kv_kib_per_token(5), None);
+
+        let no_heads = GgufInfo {
+            block_count: Some(35),
+            key_length: Some(512),
+            value_length: Some(512),
+            ..Default::default()
+        };
+        assert_eq!(no_heads.kv_kib_per_token(5), None);
+
+        let zero_heads = GgufInfo {
+            block_count: Some(35),
+            head_count_kv: Some(0),
+            key_length: Some(512),
+            value_length: Some(512),
+            ..Default::default()
+        };
+        assert_eq!(zero_heads.kv_kib_per_token(5), None);
+    }
+
     use super::*;
 
     /// Build a GGUF header the way a writer would, so the parser is tested

@@ -122,7 +122,6 @@ impl LocalInferenceLlmAdapter {
     pub async fn new_with_data_dir(model_id: &str, data_dir: &std::path::Path) -> Result<Self> {
         use goose::providers::local_inference::local_model_registry::{
             get_registry, model_id_from_repo, LocalModelEntry, LocalModelStorage, ModelSettings,
-            ToolCallingMode,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
@@ -165,12 +164,14 @@ impl LocalInferenceLlmAdapter {
                 gguf_dir.join(&filename)
             };
 
+            let (tool_mode, thinking) = Self::registration_settings(&local_path);
             {
                 match get_registry().lock() {
                     Ok(mut registry) => {
                         if !registry.has_model(&stem) {
                             let mut settings = ModelSettings::default();
-                            settings.tool_calling = ToolCallingMode::ForceNative;
+                            settings.tool_calling = tool_mode;
+                            settings.enable_thinking = thinking;
                             let entry = LocalModelEntry {
                                 id: stem.clone(),
                                 repo_id: format!("local/{}", stem),
@@ -193,8 +194,9 @@ impl LocalInferenceLlmAdapter {
                             }
                         } else if let Some(entry) = registry.get_model(&stem) {
                             let mut s = entry.settings.clone();
-                            if s.tool_calling == ToolCallingMode::Auto {
-                                s.tool_calling = ToolCallingMode::ForceNative;
+                            if s.tool_calling != tool_mode || s.enable_thinking != thinking {
+                                s.tool_calling = tool_mode;
+                                s.enable_thinking = thinking;
                                 let _ = registry.update_model_settings(&stem, s);
                             }
                         }
@@ -225,12 +227,14 @@ impl LocalInferenceLlmAdapter {
 
         // Register / update local_path in Goose's global registry.
         // The lock is dropped before calling Self::new() to avoid deadlock.
+        let (tool_mode, thinking) = Self::registration_settings(&local_path);
         {
             match get_registry().lock() {
                 Ok(mut registry) => {
                     if !registry.has_model(&id) {
                         let mut settings = ModelSettings::default();
-                        settings.tool_calling = ToolCallingMode::ForceNative;
+                        settings.tool_calling = tool_mode;
+                        settings.enable_thinking = thinking;
                         let entry = LocalModelEntry {
                             id: id.clone(),
                             repo_id: repo_id.to_string(),
@@ -253,8 +257,9 @@ impl LocalInferenceLlmAdapter {
                         }
                     } else if let Some(entry) = registry.get_model(&id) {
                         let mut s = entry.settings.clone();
-                        if s.tool_calling == ToolCallingMode::Auto {
-                            s.tool_calling = ToolCallingMode::ForceNative;
+                        if s.tool_calling != tool_mode || s.enable_thinking != thinking {
+                            s.tool_calling = tool_mode;
+                            s.enable_thinking = thinking;
                             let _ = registry.update_model_settings(&id, s);
                         }
                     }
@@ -277,6 +282,27 @@ impl LocalInferenceLlmAdapter {
             get_registry, ModelSettings, ToolCallingMode,
         };
 
+        // Ask the model what it can do. A file we cannot read leaves goose its
+        // own judgement (`Auto`) rather than inheriting the old blanket
+        // ForceNative.
+        let probe = get_registry()
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get_model(model_id).map(|e| e.local_path.clone()))
+            .and_then(|p| Self::probe_model(&p));
+        let (tools, thinking) = match &probe {
+            Some(p) => Self::tool_and_thinking_for(p),
+            None => (ToolCallingMode::Auto, true),
+        };
+        if let Some(p) = &probe {
+            tracing::info!(
+                model = model_id,
+                tools = ?p.tools,
+                thinking = ?p.thinking,
+                "model capabilities read from its chat template"
+            );
+        }
+
         let settings = ModelSettings {
             // Full GPU offload — Apple Silicon has unified memory so all layers
             // fit without any CPU/GPU split.
@@ -290,14 +316,17 @@ impl LocalInferenceLlmAdapter {
             flash_attention: Some(true),
             // Unified memory — mlock is unnecessary and can cause issues.
             use_mlock: false,
-            // Native tool calling forced ON — Gemma 4 produces
-            // <|tool_call>call:NAME{...}<tool_call|> in its trained format. The
-            // GGUF's embedded (Jinja) chat template renders tool declarations;
-            // ChatTemplate::Embedded is the default so no override is needed.
-            tool_calling: ToolCallingMode::ForceNative,
-            // Thinking OFF — GIAP handles thinking display through its own
-            // PromptState + ThoughtFilter pipeline, not llama.cpp's native
-            // reasoning_format which causes Gemma 4 E2B to produce immediate EOS.
+            // Tool calling and thinking now come from the model's own chat
+            // template rather than being forced. Gemma renders declarations and
+            // keeps ForceNative; a template with no `tools` variable gets
+            // ForceEmulated instead of declarations with nowhere to go.
+            tool_calling: tools,
+            enable_thinking: thinking,
+            // `enable_thinking` is set above from the template rather than
+            // left to inherit goose's `default_true()`. It said "Thinking OFF"
+            // here for a long time while the code set nothing and the registry
+            // on the device read `true` -- the comment described an intention
+            // the code never carried out.
             // Let llama.cpp auto-detect thread count (good on Apple Silicon).
             ..Default::default()
         };
@@ -366,6 +395,169 @@ impl LocalInferenceLlmAdapter {
     ///
     /// This is intentionally NOT implemented in the cross-platform loader: it is
     /// unsafe to change from the macOS Metal build and cannot be tested here.
+    /// The tool mode and thinking flag a GGUF at `path` should be registered
+    /// with, read from its own chat template.
+    ///
+    /// Registration happens in `new_with_data_dir`, before any
+    /// `apply_*_settings` runs, and it used to hardcode `ForceNative` in four
+    /// places. Two of those only fired when the stored mode was `Auto`, which
+    /// meant an entry already persisted as `ForceNative` was never revisited --
+    /// so a model registered before the probe existed kept a mode its template
+    /// cannot honour, forever.
+    ///
+    /// That is not hypothetical. DeepSeek-R1-Distill ended up with two registry
+    /// rows: the quant-tagged id read `force_emulated` from the probe while the
+    /// canonical stem still read `force_native`, and the stem is what the turn
+    /// resolved to. The model was handed native tool declarations by a template
+    /// with no `tools` variable, saw none of them, and invented an "MCP" tool
+    /// interface out of the system prompt instead.
+    ///
+    /// So this re-stamps rather than upgrading, which matches what
+    /// `apply_*_settings` already does to the same rows at every provider init.
+    /// A file that cannot be read yields `Auto`, leaving goose its own
+    /// judgement rather than a guess of ours.
+    fn registration_settings(
+        path: &std::path::Path,
+    ) -> (
+        goose::providers::local_inference::local_model_registry::ToolCallingMode,
+        bool,
+    ) {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        match Self::probe_model(path) {
+            Some(probe) => Self::tool_and_thinking_for(&probe),
+            None => (ToolCallingMode::Auto, true),
+        }
+    }
+
+    /// What the registry should say for a model, given what its own file says
+    /// it can do.
+    ///
+    /// Kept as a pure function over [`ModelProbe`] on purpose: the two callers
+    /// are `apply_jetson_settings` (CUDA-gated, compiles only on the device) and
+    /// `apply_platform_settings`. A decision buried in either would be tested by
+    /// neither on a developer machine, and the CUDA one is compiled by nothing
+    /// in CI.
+    ///
+    /// # Tools
+    ///
+    /// Both callers used to set `ForceNative` unconditionally. That is right for
+    /// Gemma and wrong for the first model whose template takes no `tools`
+    /// variable -- DeepSeek-R1-Distill, already on the development machine,
+    /// renders no declarations at all, so forcing native puts them nowhere.
+    ///
+    /// - `Native`  -> `ForceNative`, as before.
+    /// - `Absent`  -> `ForceEmulated`: the template cannot carry tools, so they
+    ///   have to be described in the system prompt or not offered.
+    /// - `Unknown` -> `Auto`: no template was readable, so leave goose its own
+    ///   judgement rather than overriding it with a guess.
+    ///
+    /// # Thinking
+    ///
+    /// `enable_thinking` was never set, so it inherited goose's `default_true()`
+    /// while the comment above it claimed "Thinking OFF". The registry on the
+    /// device sided with the code. This states the value instead of inheriting
+    /// it, and does not change what any currently-reasoning model does: a gated
+    /// thinker still gets `true`.
+    ///
+    /// A model with no reasoning markers gets `false`, which is the only case
+    /// this changes, and it changes it from "flag set for a model that has
+    /// nothing to flag" to "off".
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn tool_and_thinking_for(
+        probe: &pond_core::models::domain::model_probe::ModelProbe,
+    ) -> (
+        goose::providers::local_inference::local_model_registry::ToolCallingMode,
+        bool,
+    ) {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        use pond_core::models::domain::model_probe::{Thinking, ToolSupport};
+
+        let tools = match probe.tools {
+            ToolSupport::Native => ToolCallingMode::ForceNative,
+            ToolSupport::Absent => ToolCallingMode::ForceEmulated,
+            ToolSupport::Unknown => ToolCallingMode::Auto,
+        };
+        let thinking = matches!(
+            probe.thinking,
+            Thinking::Gated { .. } | Thinking::Always { .. }
+        );
+        (tools, thinking)
+    }
+
+    /// Read a model's own account of itself, for the settings above.
+    ///
+    /// Walks far enough to reach `tokenizer.chat_template`, which sits 3.8-15 MB
+    /// into a GGUF, behind the token array. Costs a few hundred kilobytes of
+    /// real reading and about 40 ms, because everything between the keys it
+    /// wants is stepped over rather than read.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn probe_model(
+        path: &std::path::Path,
+    ) -> Option<pond_core::models::domain::model_probe::ModelProbe> {
+        use pond_core::models::domain::gguf::parse_gguf_file;
+        use pond_core::models::domain::model_probe::ModelProbe;
+        parse_gguf_file(path).map(|info| ModelProbe::from_gguf(&info))
+    }
+
+    /// The model's KV cost per token, read from its own GGUF header, or `None`
+    /// when the header cannot settle it.
+    ///
+    /// `pond_core::models::domain::gguf` does the arithmetic and is exact for a
+    /// dense model. The one thing the header does NOT carry is the split
+    /// between full-attention and sliding-window layers, and that split is
+    /// worth a factor of two: assume more SWA layers than a model really has
+    /// and the cost comes out LOW, which is the direction that OOMs a board.
+    ///
+    /// So the rule is asymmetric on purpose:
+    ///
+    /// - **No `key_length_swa`** — the model is dense, every owning layer pays
+    ///   the same width, and the pattern cannot change the answer. Trust it for
+    ///   any architecture.
+    /// - **`key_length_swa` present** — the answer depends on a ratio the file
+    ///   does not state. Trust it only for an architecture whose pattern has
+    ///   been confirmed against a real allocation on the device.
+    ///
+    /// Anything else returns `None` and the caller keeps the measured constant,
+    /// so an unfamiliar model behaves exactly as it did before this existed.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn kv_cost_from_header(path: &std::path::Path) -> Option<u64> {
+        use pond_core::models::domain::gguf::parse_gguf_header;
+
+        /// Architectures whose global:SWA layer ratio has been confirmed against
+        /// llama.cpp's own `llama_kv_cache ... size = N MiB (C cells, L layers)`
+        /// lines on the Orin. Gemma 4: 1 global per 5 sliding, verified at both
+        /// sizes (E4B 4+20 of 24 owning layers, E2B 3+12 of 15).
+        const CONFIRMED_SWA_PATTERNS: &[(&str, u32)] = &[("gemma4", 5)];
+
+        // Geometry sits in the first ~2 KB of every file measured -- offsets
+        // 924-1,829 on gemma-4-E2B, well before `tokenizer.ggml.tokens` at
+        // 2,061. 64 KiB is generous cover for that without reading the token
+        // array, let alone the 15 MB it takes to reach the chat template.
+        const HEAD_BYTES: usize = 64 * 1024;
+
+        let mut buf = vec![0u8; HEAD_BYTES];
+        let n = {
+            use std::io::Read as _;
+            let mut f = std::fs::File::open(path).ok()?;
+            f.read(&mut buf).ok()?
+        };
+        buf.truncate(n);
+
+        let info = parse_gguf_header(&buf)?;
+        let arch = info.architecture.as_deref().unwrap_or_default();
+
+        if info.key_length_swa.is_none() {
+            // Dense: exact whatever the architecture. The ratio argument is
+            // unused on this path.
+            return info.kv_kib_per_token(0);
+        }
+
+        let (_, swa_per_global) = CONFIRMED_SWA_PATTERNS
+            .iter()
+            .find(|(name, _)| *name == arch)?;
+        info.kv_kib_per_token(*swa_per_global)
+    }
+
     /// Context size that fits THIS model in the Jetson's LLM budget.
     ///
     /// A single hardcoded constant is wrong, and shipping one OOM-killed a
@@ -456,7 +648,7 @@ impl LocalInferenceLlmAdapter {
     /// arithmetic is pure, it is the part that can kill a board, and gating it
     /// meant neither it nor its tests ever ran on a developer machine or in CI.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    fn jetson_context_size(model_bytes: u64) -> u32 {
+    fn jetson_context_size(model_bytes: u64, kv_kib_per_token: Option<u64>) -> u32 {
         /// Per-token KV cost for the widest geometry we ship, measured on the
         /// DEVICE: E4B is 56 KiB/token across both caches, E2B 18.
         ///
@@ -512,7 +704,15 @@ impl LocalInferenceLlmAdapter {
         let kv_mb = crate::scheduler::LLM_BUDGET_MB
             .saturating_sub(model_mb)
             .saturating_sub(COMPUTE_BUFFER_MB);
-        let tokens = (kv_mb * 1024) / KV_KIB_PER_TOKEN;
+        // The model's own header, when it could answer; the conservative
+        // fallback when it could not. `kv_cost_from_header` returns None rather
+        // than guessing, so this is a strict improvement and never a new risk:
+        // an unreadable or unfamiliar model gets exactly the behaviour it had
+        // before this existed.
+        let slope = kv_kib_per_token
+            .filter(|k| *k > 0)
+            .unwrap_or(KV_KIB_PER_TOKEN);
+        let tokens = (kv_mb * 1024) / slope;
 
         // Largest multiple of CTX_GRANULARITY that fits, clamped. Saturating at
         // MAX_CTX before the cast keeps a huge allowance (E2B's is ~41k) from
@@ -542,13 +742,37 @@ impl LocalInferenceLlmAdapter {
                     .map(|m| m.len())
             })
             .unwrap_or(ASSUMED_LARGEST_MODEL_BYTES);
-        let context_size = Self::jetson_context_size(model_bytes);
+        let kv_kib = get_registry()
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get_model(model_id).map(|e| e.local_path.clone()))
+            .and_then(|p| Self::kv_cost_from_header(&p));
+        let context_size = Self::jetson_context_size(model_bytes, kv_kib);
         tracing::info!(
             model = model_id,
             model_mb = model_bytes / (1024 * 1024),
+            kv_kib_per_token = kv_kib.map_or("fallback".to_string(), |k| k.to_string()),
             context_size,
             "Jetson context sized to fit this model's KV cache in the LLM budget"
         );
+
+        let probe = get_registry()
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get_model(model_id).map(|e| e.local_path.clone()))
+            .and_then(|p| Self::probe_model(&p));
+        let (tools, thinking) = match &probe {
+            Some(p) => Self::tool_and_thinking_for(p),
+            None => (ToolCallingMode::Auto, true),
+        };
+        if let Some(p) = &probe {
+            tracing::info!(
+                model = model_id,
+                tools = ?p.tools,
+                thinking = ?p.thinking,
+                "model capabilities read from its chat template"
+            );
+        }
 
         let jetson_settings = ModelSettings {
             // Full GPU offload: Jetson unified memory means all layers fit in
@@ -581,15 +805,29 @@ impl LocalInferenceLlmAdapter {
             // Leaving 2 cores free for the OS, audio pipeline, and GIAP services.
             n_threads: Some(4),
             // Flash attention halves KV-cache memory on Ampere (native support).
+            // Also a hard prerequisite for `type_v` below.
             flash_attention: Some(true),
+            // KV cache at q8_0. Measured on this board (gemma-4 E4B, ctx 16384):
+            // KV 296 -> 157 MiB, peak footprint 437 -> 307 MB. Quality-neutral by
+            // two independent tests: greedy output is byte-identical to f16, and a
+            // paired per-chunk wikitext-2 run (n = 100) gives dNLL -0.000987 +/-
+            // 0.000551, t = -1.79 — indistinguishable from f16 at 95%.
+            // q4_0 saves ~75 MiB more but its per-chunk variance is 6.4x higher,
+            // so it is not used here.
+            type_k: Some("q8_0".to_string()),
+            type_v: Some("q8_0".to_string()),
+            // Physical batch. The compute buffer is the second-largest allocation
+            // after the weights: 522 MiB at the 512 default, 129 MiB at 128, for
+            // no measured loss (decode 14.4 vs 14.3 tok/s, prefill 38.3 vs 35.6).
+            n_ubatch: Some(128),
             // mlock pins pages in RAM; on unified memory this triggers kernel
             // page faults for every GPU access. Disable for correct performance.
             use_mlock: false,
-            // Native tool calling forced ON — Gemma 4 produces tool calls in its
-            // trained format; the GGUF's embedded (Jinja) chat template renders the
-            // declarations (ChatTemplate::Embedded is the default).
-            tool_calling: ToolCallingMode::ForceNative,
-            // Thinking OFF — GIAP handles thinking via PromptState + ThoughtFilter.
+            // From the model's own template, not forced. See
+            // `tool_and_thinking_for`.
+            tool_calling: tools,
+            enable_thinking: thinking,
+            // `enable_thinking` is set above from the template, not inherited.
             ..Default::default()
         };
 
@@ -738,8 +976,8 @@ mod tests {
         // different step than the board does. E4B in particular was carrying
         // 4_640_000_000 here against a real 4_977_171_584 -- a 336 MB gap, over
         // half of the free KV budget it now has.
-        let e2b = LocalInferenceLlmAdapter::jetson_context_size(3_106_738_272);
-        let e4b = LocalInferenceLlmAdapter::jetson_context_size(4_977_171_584);
+        let e2b = LocalInferenceLlmAdapter::jetson_context_size(3_106_738_272, None);
+        let e4b = LocalInferenceLlmAdapter::jetson_context_size(4_977_171_584, None);
         assert_eq!(e2b, 16384, "E2B should keep the full window");
         assert_eq!(
             e4b, 8192,
@@ -769,7 +1007,7 @@ mod tests {
         let weights_mb = 4_640_000_000u64 / (1024 * 1024);
         let free_mb = crate::scheduler::LLM_BUDGET_MB - weights_mb - 600;
 
-        let chosen = LocalInferenceLlmAdapter::jetson_context_size(4_640_000_000) as u64;
+        let chosen = LocalInferenceLlmAdapter::jetson_context_size(4_640_000_000, None) as u64;
         let needed_mb = (chosen * MEASURED_KIB_PER_TOKEN) / 1024;
         assert!(
             needed_mb < free_mb,
@@ -817,7 +1055,7 @@ mod tests {
     /// than the slope it is named for.
     #[test]
     fn the_per_token_slope_is_observable_on_a_model_the_ceiling_does_not_cap() {
-        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_739_563_520);
+        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_739_563_520, None);
         assert_eq!(
             ctx, 12288,
             "a 4.5 GB model got {ctx} tokens. At the device-measured cost it should get 12288; \
@@ -837,7 +1075,7 @@ mod tests {
     #[test]
     fn rounding_does_not_discard_context_the_budget_affords() {
         // The real IQ4_XS file on the device: 4,715,416,704 bytes.
-        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_715_416_704);
+        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_715_416_704, None);
         assert_eq!(
             ctx, 12288,
             "E4B IQ4_XS got {ctx}. Its budget affords 13,220 tokens, so anything at or below \
@@ -847,7 +1085,7 @@ mod tests {
 
         // And the floor still rounds DOWN, never up, at every offset.
         for bytes in [4_600_000_000u64, 4_700_000_000, 4_800_000_000] {
-            let ctx = LocalInferenceLlmAdapter::jetson_context_size(bytes) as u64;
+            let ctx = LocalInferenceLlmAdapter::jetson_context_size(bytes, None) as u64;
             let model_mb = bytes / (1024 * 1024);
             let kv_mb = crate::scheduler::LLM_BUDGET_MB
                 .saturating_sub(model_mb)
@@ -889,10 +1127,224 @@ mod tests {
         );
     }
 
+    /// Wiring the header-derived cost in must not move either shipped model.
+    ///
+    /// That is the whole reason this could land without the device: E2B
+    /// computes 18 KiB/token but is `MAX_CTX`-bound either way, and both E4B
+    /// quants compute exactly the 56 the constant already carried. A diff that
+    /// changes nothing today changes only models nobody has loaded yet.
+    #[test]
+    fn header_derived_cost_is_a_no_op_for_the_shipped_models() {
+        // (weights, computed KiB/token, expected window)
+        let cases = [
+            (3_106_738_272u64, 18u64, 16384u32), // E2B Q4_K_M
+            (4_977_171_584, 56, 8192),           // E4B Q4_K_M
+            (4_715_416_704, 56, 12288),          // E4B IQ4_XS
+        ];
+        for (bytes, kv, want) in cases {
+            let fallback = LocalInferenceLlmAdapter::jetson_context_size(bytes, None);
+            let derived = LocalInferenceLlmAdapter::jetson_context_size(bytes, Some(kv));
+            assert_eq!(
+                derived, want,
+                "{bytes} bytes at {kv} KiB/token should give {want}, got {derived}"
+            );
+            assert_eq!(
+                derived, fallback,
+                "{bytes} bytes: header-derived {derived} must match the fallback {fallback}                  for a model we already ship -- if this moved, the wiring changed behaviour                  on hardware nobody re-measured"
+            );
+        }
+    }
+
+    /// A cheaper model gets the context its own geometry affords, which is the
+    /// point of reading the header at all.
+    ///
+    /// The size has to be chosen with care: a light model is `MAX_CTX`-bound at
+    /// BOTH costs and the comparison proves nothing. At 4,500 MB the KV budget
+    /// is 720 MB, which affords 13,166 tokens at 56 KiB (budget-bound, floors
+    /// to 12,288) and 26,331 at 28 (ceiling-bound at 16,384). That gap is the
+    /// context a blanket constant was quietly charging for.
+    #[test]
+    fn a_cheaper_model_is_no_longer_charged_the_widest_geometry() {
+        let bytes = 4_500u64 * 1024 * 1024;
+        let blanket = LocalInferenceLlmAdapter::jetson_context_size(bytes, None);
+        let real = LocalInferenceLlmAdapter::jetson_context_size(bytes, Some(28));
+        assert!(
+            real > blanket,
+            "a 28 KiB/token model should get more than the 56 KiB/token fallback allows,              got {real} against {blanket}"
+        );
+    }
+
+    /// The direction that matters: a WIDER model must be charged more and get
+    /// less, rather than inheriting a constant that flatters it.
+    ///
+    /// 168 KiB/token is the figure this file once carried for E4B before the
+    /// device corrected it -- a real number from a real mistake.
+    #[test]
+    fn a_wider_model_is_charged_for_it() {
+        let bytes = 4_000_000_000u64;
+        let blanket = LocalInferenceLlmAdapter::jetson_context_size(bytes, None);
+        let real = LocalInferenceLlmAdapter::jetson_context_size(bytes, Some(168));
+        assert!(
+            real < blanket,
+            "a 168 KiB/token model must get LESS than the 56 fallback grants, got {real}              against {blanket}; this is the direction that OOMs the board"
+        );
+    }
+
+    /// A zero or absent slope must fall back, never divide by zero and never
+    /// hand out an unbounded window.
+    #[test]
+    fn a_useless_slope_falls_back_rather_than_dividing_by_zero() {
+        let bytes = 4_977_171_584u64;
+        let fallback = LocalInferenceLlmAdapter::jetson_context_size(bytes, None);
+        assert_eq!(
+            LocalInferenceLlmAdapter::jetson_context_size(bytes, Some(0)),
+            fallback
+        );
+    }
+
+    /// The decision the two `apply_*_settings` paths share, tested here because
+    /// the CUDA one is compiled by nothing on a developer machine or in CI.
+    /// The adapter's own path, end to end, against the real files.
+    ///
+    /// The unit tests above build a `ModelProbe` by hand and check the
+    /// decision. This checks that `probe_model` actually reads one off a GGUF
+    /// and that the decision it produces differs across the collection -- the
+    /// failure mode being a probe that quietly returns the same answer for
+    /// everything and looks like it works.
+    ///
+    /// ```text
+    /// GIAP_TEST_GGUF_DIR="$HOME/Library/Application Support/goose-in-a-pond/models/gguf" \
+    ///   cargo test -p pond-adapters-local-inference --lib -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs real GGUF files; set GIAP_TEST_GGUF_DIR"]
+    fn probe_model_reads_real_files_and_separates_them() {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+
+        let Ok(dir) = std::env::var("GIAP_TEST_GGUF_DIR") else {
+            eprintln!("GIAP_TEST_GGUF_DIR unset");
+            return;
+        };
+        let mut modes = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(&dir).expect("dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+                continue;
+            }
+            let (mode, thinking) = match LocalInferenceLlmAdapter::probe_model(&path) {
+                Some(p) => LocalInferenceLlmAdapter::tool_and_thinking_for(&p),
+                None => (ToolCallingMode::Auto, true),
+            };
+            eprintln!(
+                "{:<44} {:?} thinking={}",
+                path.file_name().unwrap().to_string_lossy(),
+                mode,
+                thinking
+            );
+            *modes.entry(format!("{mode:?}")).or_insert(0) += 1;
+        }
+        assert!(!modes.is_empty(), "no GGUF files under {dir}");
+        assert!(
+            modes.len() > 1,
+            "every model resolved to the same tool mode ({modes:?}); a probe that cannot \
+             tell them apart is the blanket ForceNative with extra steps"
+        );
+        assert!(
+            modes.contains_key("ForceEmulated"),
+            "expected at least one model whose template carries no `tools` variable; \
+             got {modes:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_using_model_keeps_native_calling() {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        use pond_core::models::domain::model_probe::{ModelProbe, Thinking, ToolSupport};
+
+        let gemma = ModelProbe {
+            tools: ToolSupport::Native,
+            thinking: Thinking::Gated {
+                marker: "<|think|>".into(),
+            },
+            context_window_tokens: Some(131072),
+            architecture: Some("gemma4".into()),
+        };
+        let (tools, thinking) = LocalInferenceLlmAdapter::tool_and_thinking_for(&gemma);
+        assert_eq!(tools, ToolCallingMode::ForceNative);
+        assert!(
+            thinking,
+            "a gated thinker must still get true -- this wiring must not change what \
+             a currently-reasoning model does"
+        );
+    }
+
+    /// The case the blanket ForceNative gets wrong, and the reason any of this
+    /// exists. DeepSeek-R1-Distill's template takes no `tools` variable.
+    #[test]
+    fn a_model_whose_template_cannot_carry_tools_is_not_forced_native() {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        use pond_core::models::domain::model_probe::{ModelProbe, Thinking, ToolSupport};
+
+        let deepseek = ModelProbe {
+            tools: ToolSupport::Absent,
+            thinking: Thinking::Always {
+                marker: "<think>".into(),
+            },
+            context_window_tokens: Some(131072),
+            architecture: Some("qwen2".into()),
+        };
+        let (tools, thinking) = LocalInferenceLlmAdapter::tool_and_thinking_for(&deepseek);
+        assert_eq!(
+            tools,
+            ToolCallingMode::ForceEmulated,
+            "forcing native on a template with no `tools` variable renders declarations \
+             nowhere at all"
+        );
+        assert!(
+            thinking,
+            "it reasons unconditionally; there is no flag to clear"
+        );
+    }
+
+    /// A file we could not read is not evidence of anything, so goose keeps its
+    /// own judgement rather than inheriting our guess.
+    #[test]
+    fn an_unreadable_model_defers_rather_than_forcing() {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        use pond_core::models::domain::model_probe::{ModelProbe, Thinking, ToolSupport};
+
+        let unknown = ModelProbe {
+            tools: ToolSupport::Unknown,
+            thinking: Thinking::Unknown,
+            context_window_tokens: None,
+            architecture: None,
+        };
+        let (tools, thinking) = LocalInferenceLlmAdapter::tool_and_thinking_for(&unknown);
+        assert_eq!(tools, ToolCallingMode::Auto);
+        assert!(!thinking, "nothing said it reasons");
+    }
+
+    /// A tool user with no reasoning markers gets the flag cleared. This is the
+    /// only case the thinking half changes, and it changes it from "set for a
+    /// model with nothing to set" to off.
+    #[test]
+    fn a_model_with_no_reasoning_markers_does_not_get_the_flag() {
+        use pond_core::models::domain::model_probe::{ModelProbe, Thinking, ToolSupport};
+
+        let plain = ModelProbe {
+            tools: ToolSupport::Native,
+            thinking: Thinking::Absent,
+            context_window_tokens: Some(32768),
+            architecture: Some("gemma3".into()),
+        };
+        let (_, thinking) = LocalInferenceLlmAdapter::tool_and_thinking_for(&plain);
+        assert!(!thinking);
+    }
+
     #[test]
     fn jetson_context_floors_for_an_oversized_model() {
         assert_eq!(
-            LocalInferenceLlmAdapter::jetson_context_size(9_000_000_000),
+            LocalInferenceLlmAdapter::jetson_context_size(9_000_000_000, None),
             2048
         );
     }
@@ -1042,5 +1494,50 @@ mod tests {
         let model_id = "some-model-without-quant";
         let (_repo_id, quantization) = model_id.rsplit_once(':').unwrap_or((model_id, "Q4_K_M"));
         assert_eq!(quantization, "Q4_K_M");
+    }
+
+    /// The Jetson tuning block, type-checked on a machine that cannot build it.
+    ///
+    /// `apply_jetson_settings` is `#[cfg(feature = "cuda")]`, so it is compiled
+    /// by no developer machine and by no CI job — `cargo check -p pond-server`
+    /// does not pass that feature. Everything it writes is therefore reviewed
+    /// rather than compiled, and that gap has already cost a real breakage:
+    /// the parent set `type_k`, `type_v` and `n_ubatch` from fe68ccdd against
+    /// `ModelSettings` fields that existed only in the goose submodule's
+    /// WORKING TREE, so the pinned commit could not build for CUDA and nothing
+    /// on any Mac or in CI could notice.
+    ///
+    /// This constructs the same struct literal, with the same field names and
+    /// the same types, on whatever platform is running the tests. It cannot
+    /// check the VALUES are right for the Orin — only hardware can — but it
+    /// fails the build the moment the submodule stops carrying a field the
+    /// device code sets.
+    #[test]
+    fn the_jetson_settings_block_still_type_checks_off_device() {
+        use goose::providers::local_inference::local_model_registry::{
+            ModelSettings, ToolCallingMode,
+        };
+
+        let settings = ModelSettings {
+            n_gpu_layers: Some(99),
+            context_size: Some(16384),
+            n_batch: Some(512),
+            n_threads: Some(4),
+            flash_attention: Some(true),
+            type_k: Some("q8_0".to_string()),
+            type_v: Some("q8_0".to_string()),
+            n_ubatch: Some(128),
+            use_mlock: false,
+            tool_calling: ToolCallingMode::ForceNative,
+            enable_thinking: true,
+            ..Default::default()
+        };
+
+        assert_eq!(settings.n_ubatch, Some(128));
+        assert_eq!(settings.type_k.as_deref(), Some("q8_0"));
+        assert_eq!(settings.type_v.as_deref(), Some("q8_0"));
+        // Quantising V without flash attention is refused by llama.cpp, so the
+        // pairing is part of what this pins.
+        assert_eq!(settings.flash_attention, Some(true));
     }
 }

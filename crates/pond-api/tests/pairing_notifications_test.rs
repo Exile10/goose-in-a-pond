@@ -99,6 +99,7 @@ async fn make_app(handshake: Arc<dyn Handshake>) -> Harness {
 
     let db = Arc::new(db);
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db,
         onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
         handshake,
@@ -119,6 +120,7 @@ async fn make_app(handshake: Arc<dyn Handshake>) -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,

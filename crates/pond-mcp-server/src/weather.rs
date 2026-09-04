@@ -58,9 +58,8 @@ impl WeatherMcpServer {
     }
 
     #[tool(description = "\
-Get current weather. Omit location to use the user's configured home — call it \
-that way rather than asking which city. Never guess weather data or use shell \
-commands for it.")]
+Current weather. Omit location for the configured home rather than asking \
+which city. Never guess weather or shell out for it.")]
     async fn get_current_weather(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -123,9 +122,8 @@ commands for it.")]
     }
 
     #[tool(description = "\
-Multi-day forecast: highs/lows, rain chance, UV, sunrise/sunset. \
-days 1-7 (default 3). Omit location to use the user's configured home rather \
-than asking which city. Never guess data.")]
+Forecast, days 1-7 (default 3): highs/lows, rain chance, UV, sun times. Omit \
+location for the configured home. Never guess data.")]
     async fn get_weather_forecast(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -301,7 +299,16 @@ pub fn init_weather_deps(weather: Option<Arc<dyn WeatherProvider>>) {
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_weather_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = WEATHER_DEPS.get().expect("init_weather_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = WEATHER_DEPS.get() else {
+        tracing::error!(
+            "spawn_weather_server called before init_weather_deps — extension will not start"
+        );
+        return;
+    };
     let server = WeatherMcpServer::new(deps.weather.clone());
     crate::serve_builtin("giap-weather", server, reader, writer);
 }

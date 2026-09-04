@@ -78,6 +78,21 @@ pub struct VectorEntry {
     pub corpus: Corpus,
     /// The source row's primary key in its own database.
     pub row_id: String,
+    /// Which passage of the row this vector describes. 0 for a row embedded
+    /// whole, and 0..n for a chunked one.
+    ///
+    /// Part of the identity: a row's vectors are `(corpus, row_id, chunk_ix)`,
+    /// so writing chunk 3 does not overwrite chunk 2. Defaulting it to 0 keeps
+    /// every existing caller writing exactly one vector per row, which is
+    /// correct for memories and summaries — they are short and whole.
+    pub chunk_ix: i64,
+    /// Byte span of the passage within the source text. `None` means the
+    /// vector is of the whole text.
+    ///
+    /// A SPAN rather than the words: the index holds no text, so retrieval
+    /// reads the passage back out of the live row. An orphan span resolves to
+    /// nothing, where an orphan snippet would be deleted data that survived.
+    pub chunk_span: Option<(i64, i64)>,
     /// The embedder that produced `vector`. Never inferred at read time.
     pub model_id: String,
     pub vector: Vec<f32>,
@@ -85,6 +100,31 @@ pub struct VectorEntry {
     /// is overwritten in place, so this is what tells a sweep the stored vector
     /// now describes an older conversation.
     pub source_rev: Option<String>,
+}
+
+impl VectorEntry {
+    /// A vector describing the WHOLE of a row's text.
+    ///
+    /// The right shape for memories and summaries, which are short enough that
+    /// one vector says what they mean. Chunked corpora build entries directly
+    /// so the span is never accidentally omitted.
+    pub fn whole(
+        corpus: Corpus,
+        row_id: String,
+        model_id: String,
+        vector: Vec<f32>,
+        source_rev: Option<String>,
+    ) -> Self {
+        Self {
+            corpus,
+            row_id,
+            chunk_ix: 0,
+            chunk_span: None,
+            model_id,
+            vector,
+            source_rev,
+        }
+    }
 }
 
 /// One retrieval result: identity and score, never content.

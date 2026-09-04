@@ -157,11 +157,13 @@ function VoiceModeChildProcess() {
 
   const stateLabel = serverDown
     ? "Server offline"
-    : isConnecting
-      ? "Starting voice session…"
-      : isError && state.voiceError
-        ? state.voiceError
-        : STATE_LABELS[voiceState] ?? "Tap to talk";
+    : session.warmingUp
+      ? "Warming up…"
+      : isConnecting
+        ? "Starting voice session…"
+        : isError && state.voiceError
+          ? state.voiceError
+          : STATE_LABELS[voiceState] ?? "Tap to talk";
 
   const stateColor = isConnecting
     ? STATE_COLORS.connecting

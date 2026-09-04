@@ -13,6 +13,7 @@ build = "build.rs"
 local-inference = ["dep:pond-adapters-local-inference"]
 
 [dependencies]
+pond-adapters-caldav = { workspace = true }
 pond-core = { workspace = true }
 pond-hf-cache = { workspace = true }
 pond-infra = { workspace = true }
