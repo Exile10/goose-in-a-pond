@@ -120,7 +120,11 @@ fn build_local_handshake(
 /// what the test suite's dynamic ports need) since `0 + 1 = 1` is a
 /// privileged port no test process can bind.
 fn ws_port_for(tcp_port: u16) -> u16 {
-    if tcp_port == 0 { 0 } else { tcp_port + 1 }
+    if tcp_port == 0 {
+        0
+    } else {
+        tcp_port + 1
+    }
 }
 
 async fn build_swarm(
@@ -136,10 +140,9 @@ async fn build_swarm(
             _ => None,
         })
         .unwrap_or(0);
-    let ws_listen_addr: Multiaddr =
-        format!("/ip4/0.0.0.0/tcp/{}/ws", ws_port_for(tcp_port))
-            .parse()
-            .expect("valid multiaddr literal");
+    let ws_listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}/ws", ws_port_for(tcp_port))
+        .parse()
+        .expect("valid multiaddr literal");
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(libp2p_keypair)
         .with_tokio()
@@ -446,8 +449,9 @@ impl EventLoop {
         let mut opts = DialOpts::peer_id(libp2p_peer)
             .condition(PeerCondition::Always)
             .addresses(vec![addr.clone()]);
-        if same_machine_dev_mesh_enabled(std::env::var("POND_DEV_SAME_MACHINE_MESH").ok().as_deref())
-        {
+        if same_machine_dev_mesh_enabled(
+            std::env::var("POND_DEV_SAME_MACHINE_MESH").ok().as_deref(),
+        ) {
             opts = opts.allocate_new_port();
         }
         match self.swarm.dial(opts.build()) {

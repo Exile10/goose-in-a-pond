@@ -20,8 +20,6 @@ use pond_core::mesh::mocks::mock_payment_rail::MockPaymentRail;
 use pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory;
 use pond_core::mesh::mocks::mock_usage_tally::MockUsageTally;
 use pond_core::mesh::ports::credit_ledger::CreditLedger;
-use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
-use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::mesh::ports::mesh_transport::MeshTransport;
 use pond_core::mesh::ports::payment_rail::PaymentRail;
 use pond_core::mesh::ports::peer_capability_query::PeerCapabilityQuery;
@@ -29,6 +27,8 @@ use pond_core::mesh::ports::peer_directory::PeerDirectory;
 use pond_core::mesh::ports::usage_tally::UsageTally;
 use pond_core::models::mocks::mock_provider::MockProvider;
 use pond_core::models::ports::provider::{LlmProvider, StreamToken};
+use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_mesh_protocol::identity::MeshKeypair;
 
 const PRODUCTION_LIKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -491,7 +491,8 @@ async fn lend_window_refuses_once_the_ceiling_is_crossed_then_resets() {
 
     // A rolling throttle, not a permanent ban — succeeds again once the window rolls over.
     tokio::time::sleep(Duration::from_millis(2_200)).await;
-    ask().await
+    ask()
+        .await
         .expect("request timed out")
         .expect("expected the request to succeed again once the window rolled over");
 }
@@ -869,9 +870,7 @@ impl LlmProvider for EmptyThenRealProvider {
         _system_prompt: &'a str,
         _messages: Vec<pond_core::models::domain::message::ChatMessage>,
     ) -> pond_core::models::ports::provider::TokenStream<'a> {
-        let call = self
-            .calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let chunks: Vec<anyhow::Result<StreamToken>> = if call < self.fail_first_n {
             vec![Ok(StreamToken::Text(
                 "<think>reasoning, no answer follows</think>".to_string(),
@@ -932,9 +931,10 @@ async fn a_lend_side_empty_completion_is_retried_and_the_real_answer_reaches_the
 
     let response = tokio::time::timeout(
         Duration::from_secs(5),
-        b_service
-            .provider()
-            .complete("sys", vec![pond_core::models::domain::message::ChatMessage::user("hi")]),
+        b_service.provider().complete(
+            "sys",
+            vec![pond_core::models::domain::message::ChatMessage::user("hi")],
+        ),
     )
     .await
     .expect("request timed out")
