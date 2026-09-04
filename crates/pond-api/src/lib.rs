@@ -141,6 +141,10 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Agent used as fallback when no LLM provider is configured.
     pub agent: Arc<dyn Agent>,
+    /// Prefix warm-up status — written by [`spawn_prefix_prewarm`], read by
+    /// `GET /api/v1/warmup`. Std (not tokio) lock: the writer is a sync
+    /// callback inside the agent's progress reporting.
+    pub warmup: Arc<std::sync::RwLock<WarmupStatus>>,
     /// LLM provider for AI-generated responses, wrapped in a RwLock so the
     /// ModelRouter can be hot-swapped when the user changes role assignments.
     /// `None` inside the lock → echo via agent.
@@ -203,6 +207,15 @@ pub struct AppState {
     /// The route still clears, because clearing is what makes the next process
     /// rebuild from scratch.
     pub index_reindex: Option<Arc<tokio::sync::Notify>>,
+    /// Pull every connected account now, instead of waiting for the timer.
+    ///
+    /// The half-hourly sweep is right for a calendar that changes a few times a
+    /// week and wrong for somebody who has just typed in a password and wants
+    /// to know whether it worked. This is what makes that answerable.
+    ///
+    /// `None` where nothing can sync — no secret store, or a CLI process — and
+    /// the route says so rather than reporting a sync that never ran.
+    pub account_sync: Option<Arc<dyn pond_core::context::ports::AccountSync>>,
     /// IoT sensor reading storage (uses logs DB).
     pub sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
     /// Camera event storage (uses logs DB).
@@ -463,6 +476,76 @@ impl AppState {
             cancel.cancel();
         }
     }
+}
+
+/// Live status of the boot/model-change prefix warm-up (`Agent::prewarm`).
+///
+/// One process-wide record, not per-session: the warmed prefix serves every
+/// chat session equally, and the UI question it answers is "is the pond ready
+/// for a first message yet".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WarmupStatus {
+    #[serde(flatten)]
+    pub phase: pond_core::models::ports::agent::WarmupPhase,
+    /// The chat model the warm-up ran (or is running) against.
+    pub model: String,
+    pub started_unix_ms: u64,
+    pub finished_unix_ms: Option<u64>,
+}
+
+impl Default for WarmupStatus {
+    fn default() -> Self {
+        Self {
+            phase: pond_core::models::ports::agent::WarmupPhase::Skipped {
+                reason: "not yet run".to_string(),
+            },
+            model: String::new(),
+            started_unix_ms: 0,
+            finished_unix_ms: None,
+        }
+    }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Run the prefix warm-up in the background, mirroring its phases into
+/// `state.warmup` for the UI. Called at serve startup and again whenever the
+/// settings handler sees the chat provider or model change. Never blocks the
+/// caller and never fails it — a pond that could not warm behaves exactly as
+/// it did before warm-up existed.
+pub fn spawn_prefix_prewarm(state: Arc<AppState>, voice_mode: bool) {
+    tokio::spawn(async move {
+        let model = state
+            .settings_repo
+            .get()
+            .await
+            .map(|s| s.chat_model)
+            .unwrap_or_default();
+        {
+            let mut w = state.warmup.write().unwrap_or_else(|e| e.into_inner());
+            *w = WarmupStatus {
+                phase: pond_core::models::ports::agent::WarmupPhase::Warming,
+                model,
+                started_unix_ms: unix_ms(),
+                finished_unix_ms: None,
+            };
+        }
+        let warm = state.warmup.clone();
+        let progress = Arc::new(move |phase: pond_core::models::ports::agent::WarmupPhase| {
+            let mut w = warm.write().unwrap_or_else(|e| e.into_inner());
+            use pond_core::models::ports::agent::WarmupPhase as P;
+            if !matches!(phase, P::Warming) {
+                w.finished_unix_ms = Some(unix_ms());
+            }
+            w.phase = phase;
+        });
+        state.agent.prewarm(voice_mode, progress).await;
+    });
 }
 
 /// Keep going.

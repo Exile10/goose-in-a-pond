@@ -120,6 +120,21 @@ pub trait MemoryRepository: Send + Sync {
     }
 
     /// Update the lifecycle status of a memory.
+    /// Replace a memory's text in place, keeping its identity.
+    ///
+    /// The desktop used to edit by ADDING the new text and DELETING the old
+    /// row, which changes the id, resets `created_at` and `access_count`, and
+    /// orphans the vector and any edge pointing at it — so a corrected memory
+    /// came back as a brand-new one that had never been used. It also leaves a
+    /// duplicate behind if the delete half fails.
+    ///
+    /// The embedding is CLEARED rather than kept: it describes the old words,
+    /// and a vector that no longer matches its text is worse than no vector,
+    /// because it still scores. The maintenance sweep re-embeds it.
+    async fn update_content(&self, _id: &str, _content: &str) -> Result<()> {
+        anyhow::bail!("this store cannot edit a memory's text")
+    }
+
     async fn update_lifecycle(&self, _id: &str, _lifecycle: MemoryLifecycle) -> Result<()> {
         Ok(())
     }

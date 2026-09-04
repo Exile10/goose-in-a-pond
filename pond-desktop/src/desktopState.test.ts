@@ -30,7 +30,12 @@ describe("desktopState", () => {
     expect(normalizeGuiSection("devices")).toBe("devices");
     expect(normalizeGuiSection("pairing")).toBe("pairing");
     expect(normalizeGuiSection("schedules")).toBe("schedules");
-    expect(normalizeGuiSection("memory")).toBe("memory");
+    // The Memories tab became Context. Somebody whose app was last left there
+    // lands on the renamed screen rather than on the dashboard, or the rename
+    // reads as the app losing their place.
+    expect(normalizeGuiSection("memory")).toBe("context");
+    expect(normalizeGuiSection("connections")).toBe("context");
+    expect(normalizeGuiSection("not-a-section")).toBe("dashboard");
     expect(normalizeGuiSection("skills")).toBe("skills");
     // Unknown sections fall back to "dashboard"
     expect(normalizeGuiSection("unexpected")).toBe("dashboard");
@@ -39,8 +44,10 @@ describe("desktopState", () => {
   });
 
   it("DESKTOP_SECTIONS is a flat ordered list of all sidebar items", () => {
-    // 14 = dashboard, chat, devices, mesh, pairing, schedules, memory, skills,
-    // recipes, logs, models, prompts, settings, extensions.
+    // 14 = dashboard, chat, devices, mesh, pairing, schedules, context,
+    // skills, recipes, logs, models, prompts, settings, extensions.
+    // ("context" is the tab that used to be "memory"; `RENAMED_SECTIONS` in
+    // desktopState.ts lands anyone sitting on the old id.)
     // (canvas, faces, hub are routable but hidden from the sidebar, so they are
     // in GUI_SECTIONS and not here — see HIDDEN_SECTIONS in desktopState.ts)
     expect(DESKTOP_SECTIONS).toHaveLength(14);
@@ -51,7 +58,7 @@ describe("desktopState", () => {
     expect(sectionKeys).toContain("mesh");
     expect(sectionKeys).toContain("pairing");
     expect(sectionKeys).toContain("schedules");
-    expect(sectionKeys).toContain("memory");
+    expect(sectionKeys).toContain("context");
     expect(sectionKeys).toContain("skills");
     expect(sectionKeys).toContain("recipes");
     expect(sectionKeys).toContain("extensions");

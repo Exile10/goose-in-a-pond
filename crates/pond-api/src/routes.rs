@@ -111,6 +111,18 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/onboard/reset", post(reset_onboarding))
         // Settings write is public so onboarding steps can save before completion
         .route("/settings", put(update_settings))
+        // Prefix warm-up status: is the pond ready for a first message yet.
+        // Read-only, and open for the same window /settings write is open --
+        // the wizard shows the banner before onboarding-gated auth exists, and
+        // the client sends a token once it has one. See PUBLIC_ROUTES.
+        .route("/warmup", get(get_warmup))
+        // ── Time and place ────────────────────────────────────────────────
+        // One catalogue and one detection, so the three screens that ask
+        // "where is this pond" stop each answering it differently. Public
+        // because the wizard sets location up before any device has paired;
+        // see PUBLIC_ROUTES for what each of the two exposes.
+        .route("/time/zones", get(list_time_zones))
+        .route("/location/detect", post(detect_location))
         // TTS synthesis is public so the onboarding voice-preview can play a
         // sample before onboarding completes. Text→audio via local Piper is not
         // privileged and leaks no user data.
@@ -290,6 +302,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(list_context_sources).post(connect_context_source),
         )
         .route("/context/sources/{id}", delete(disconnect_context_source))
+        .route("/context/sync", post(sync_context_sources))
+        .route("/context/items", get(list_context_items))
         // ── The index's own health, and the way to repair it ───────────────
         // Protected, and deliberately absent from `middleware::PUBLIC_ROUTES`:
         // these counts say how much of a household's memory exists and how
@@ -372,7 +386,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/logs/export", get(export_logs_csv))
         // ── Memories ──────────────────────────────────────────────────────────
         .route("/memories", get(list_memories).post(save_memory))
-        .route("/memories/{id}", delete(delete_memory))
+        .route("/memories/{id}", delete(delete_memory).put(update_memory))
         // ── Memory Consolidation ─────────────────────────────────────────────
         .route("/memory/consolidate", post(start_consolidation))
         .route("/memory/consolidate/stop", post(stop_consolidation))
@@ -773,7 +787,7 @@ struct IssuePairingCodeRequest {
     ///
     /// Omitted or `null` no longer means "unattributed" on its own: a
     /// one-member household defaults to that member, per
-    /// [`pairing_attribution::owner_for_new_code`]. Set `unattributed` to ask
+    /// [`member_attribution::owner_for_new_code`]. Set `unattributed` to ask
     /// for a code that binds to nobody.
     #[serde(default)]
     profile_id: Option<String>,
@@ -841,7 +855,7 @@ async fn handshake_issue_pairing_code(
             Vec::new()
         }
     };
-    let owner = pond_core::user_data::services::pairing_attribution::owner_for_new_code(
+    let owner = pond_core::user_data::services::member_attribution::owner_for_new_code(
         request.profile_id.as_deref(),
         request.unattributed,
         &member_ids,
@@ -5250,7 +5264,7 @@ async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Json(patch) = body.map_err(|e| {
+    let Json(mut patch) = body.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("Invalid settings body: {}", e)})),
@@ -5265,45 +5279,32 @@ async fn update_settings(
         )
     })?;
 
-    // Reject an unrecognised network_mode. `NetworkMode::parse` deliberately
-    // falls back to "open" rather than to a restrictive mode, so a typo that
-    // reached the store would silently be no gate at all. Refusing it here is
-    // the narrowing half of that bargain -- and refusing at the edge is also
-    // the only place a user finds out, since the parse fallback is a log line.
-    if let Some(mode) = patch.get("network_mode").and_then(|v| v.as_str()) {
-        if !pond_core::user_data::domain::settings::NETWORK_MODES.contains(&mode) {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({
-                    "error": format!(
-                        "network_mode {:?} is not one of {:?}",
-                        mode,
-                        pond_core::user_data::domain::settings::NETWORK_MODES
-                    )
-                })),
-            ));
-        }
-    }
-
-    // Reject an unrecognised reasoning_effort, for the same reason and in the
-    // same direction as network_mode above. `ReasoningEffort::parse` falls back
-    // to "brief" -- the SMALLEST thinking budget -- so a typo that reached the
-    // store would quietly shrink the model's think rather than widen it. That
-    // is the safe failure, which is exactly why it must not be the silent one:
-    // refusing here is the only place the user ever finds out.
-    if let Some(effort) = patch.get("reasoning_effort").and_then(|v| v.as_str()) {
-        if !pond_core::user_data::domain::settings::REASONING_EFFORTS.contains(&effort) {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({
-                    "error": format!(
-                        "reasoning_effort {:?} is not one of {:?}",
-                        effort,
-                        pond_core::user_data::domain::settings::REASONING_EFFORTS
-                    )
-                })),
-            ));
-        }
+    // Validate and canonicalise every ruled field, in pond-core.
+    //
+    // Three arms used to live here by hand — timezone, network_mode and
+    // reasoning_effort — and they were the ONLY server-side rules the pond had.
+    // The rest of the real rules were in the desktop's `validation.ts`, which
+    // meant the backend stored what the browser rejected, and any writer that
+    // was not the catalogue met no rule at all.
+    //
+    // `validate_patch` reports EVERY failing field rather than the first, and
+    // canonicalises in place: `africa/nairobi` is stored as `Africa/Nairobi`,
+    // `9:05` as `09:05`. A refused patch is left exactly as it arrived.
+    if let Err(errors) =
+        pond_core::user_data::domain::settings_validation::validate_patch(&mut patch)
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": pond_core::user_data::domain::settings_validation::render_errors(&errors),
+                // Named per field as well, so a form can mark the box rather
+                // than showing one sentence above the whole page.
+                "fields": errors
+                    .iter()
+                    .map(|e| json!({ "field": e.field, "message": e.message }))
+                    .collect::<Vec<_>>(),
+            })),
+        ));
     }
 
     // Reject agent_backend="pond" — backend is quarantined (Q2-05, not production-ready).
@@ -5552,6 +5553,13 @@ async fn update_settings(
         }
     }
 
+    // A provider or model change makes the engine's warmed prefix stale, so
+    // re-run the warm-up in the background. Fire-and-forget: the save must not
+    // wait on a model load.
+    if current.chat_provider != merged.chat_provider || current.chat_model != merged.chat_model {
+        crate::spawn_prefix_prewarm(state.clone(), false);
+    }
+
     // Return the full merged Settings so the frontend can sync its local state
     // without a second GET request.
     //
@@ -5566,6 +5574,29 @@ async fn update_settings(
     Ok(Json(
         serde_json::to_value(&merged).unwrap_or(json!({ "status": "ok" })),
     ))
+}
+
+/// Prefix warm-up status for the boot banner and voice greeting gate.
+async fn get_warmup(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let snapshot = state
+        .warmup
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let elapsed_ms = match (snapshot.started_unix_ms, snapshot.finished_unix_ms) {
+        (0, _) => 0,
+        (s, Some(f)) => f.saturating_sub(s),
+        (s, None) => now.saturating_sub(s),
+    };
+    let mut v = serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("elapsed_ms".into(), json!(elapsed_ms));
+    }
+    Json(v)
 }
 
 /// Current conditions + short forecast for the dashboard weather widget.
@@ -13345,6 +13376,42 @@ async fn save_memory(
     }
 }
 
+#[derive(Deserialize)]
+struct UpdateMemoryRequest {
+    content: String,
+}
+
+/// `PUT /api/v1/memories/{id}` -- correct a memory's wording in place.
+///
+/// In place, keeping its id. The desktop used to do this by adding the new text
+/// and deleting the old row, which reset the memory's age and usage, orphaned
+/// its vector, and left a duplicate behind whenever the delete half failed. A
+/// correction should not turn a long-held fact into a brand-new one.
+async fn update_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateMemoryRequest>,
+) -> impl axum::response::IntoResponse {
+    let content = body.content.trim();
+    if content.is_empty() {
+        // Emptying a memory is a deletion wearing an edit's clothes, and the
+        // caller has a route for that which reports what it removed.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "a memory cannot be blank -- delete it instead"})),
+        )
+            .into_response();
+    }
+    match state.memory_repo.update_content(&id, content).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn delete_memory(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -16042,6 +16109,25 @@ struct ConnectSourceRequest {
     /// Which conversation the caller is speaking in. The OWNER is resolved from
     /// this and the caller's proven device; see below.
     session_id: String,
+    /// Sign-in details, for a kind that reaches an account.
+    ///
+    /// REQUIRED for `calendar` and refused for the on-pond kinds. A calendar
+    /// source without them would be a row that looks connected and can never
+    /// sync — the empty-source shape `availability` exists to prevent, arriving
+    /// through the door instead of around it.
+    #[serde(default)]
+    credentials: Option<ConnectCredentials>,
+}
+
+/// App-password sign-in for an account source. Never echoed back.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectCredentials {
+    username: String,
+    password: String,
+    /// Only for the self-hosted presets (`nextcloud`, `custom`).
+    #[serde(default)]
+    base_url: Option<String>,
 }
 
 /// The owner of a source is resolved, never supplied.
@@ -16063,17 +16149,50 @@ async fn context_source_owner(
     device: &ProvenDevice,
 ) -> Result<String, (StatusCode, Json<Value>)> {
     let scope = resolve_turn_scope(state, session_id, device).await;
-    match scope.owner_id() {
-        Some(id) => Ok(id.to_string()),
-        None => Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "a context source belongs to one household member, and this caller \
-                          could not be resolved to one",
-                "scope": format!("{scope:?}"),
-            })),
-        )),
+    if let Some(id) = scope.owner_id() {
+        return Ok(id.to_string());
     }
+
+    // `Household` in a ONE-MEMBER pond resolves to that member.
+    //
+    // Without this, connecting a calendar required first starting a
+    // conversation AND being on an attributed device, to establish something
+    // the pond only ever had one possible answer to. Same shape as the pairing
+    // default: refusing to write down the only answer does not make a
+    // single-member pond safer, it makes the feature unreachable.
+    //
+    // Deliberately NOT extended to `Guest`, and not to a household with two or
+    // more members — there, picking one would attribute an account by row
+    // order. Both still refuse.
+    //
+    // The residual exposure, stated plainly: in a one-member pond an
+    // unidentified caller on an authenticated-but-unattributed device can
+    // connect an account that becomes the member's. The sharper fix is devices
+    // being attributed at pairing, which they now are; this covers the ones
+    // paired before that landed.
+    if matches!(scope, ProfileScope::Household) {
+        let members: Vec<String> = state
+            .profile_repo
+            .list()
+            .await
+            .map(|profiles| profiles.into_iter().map(|p| p.id).collect())
+            .unwrap_or_default();
+        if let Some(only) =
+            pond_core::user_data::services::member_attribution::sole_member(&members)
+        {
+            return Ok(only);
+        }
+    }
+
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "a context source belongs to one household member, and this caller could \
+                      not be resolved to one. Identify yourself in this conversation, or pair \
+                      this device to a member.",
+            "scope": format!("{scope:?}"),
+        })),
+    ))
 }
 
 /// `POST /api/v1/context/sources` -- connect a sensor or camera as personal context.
@@ -16104,10 +16223,95 @@ async fn connect_context_source(
         ));
     }
 
+    // A provider that cannot possibly authenticate is refused HERE, with the
+    // reason, rather than stored and left to fail every half hour with a 401
+    // that reads like a mistyped password. Google Calendar over CalDAV is the
+    // case: its own guide requires OAuth 2.0 and rejects Basic auth.
+    if kind == SourceKind::Calendar {
+        if let Some(provider) =
+            pond_adapters_caldav::CalDavProvider::from_stored(body.provider.trim(), Some("x"))
+        {
+            if !provider.is_connectable() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": provider.setup_hint(),
+                        "provider": body.provider.trim(),
+                    })),
+                ));
+            }
+        }
+    }
+
     let now = chrono::Utc::now();
     // Deterministic id, so connecting the same device twice is an update rather
     // than a second source racing the first for the same events.
-    let id = format!("{}:{}", kind.as_str(), body.provider.trim());
+    //
+    // An account kind carries the OWNER in its id as well. Two members each
+    // connecting their own Google calendar is the ordinary case in a household,
+    // and `calendar:google` alone would make the second one collide with the
+    // first — which migration 0044 correctly refuses, leaving a member unable
+    // to connect for a reason that is not their fault. The profile id is
+    // already on the row, so this adds no new personal data to the key.
+    let id = if kind.needs_credentials() {
+        format!("{}:{}:{}", kind.as_str(), body.provider.trim(), owner)
+    } else {
+        format!("{}:{}", kind.as_str(), body.provider.trim())
+    };
+
+    // Credentials, before the source row exists. Storing them second would
+    // leave a source that cannot sync if the secret write failed, which is the
+    // same empty-source outcome by a slower route.
+    let secret_ref = match (kind.needs_credentials(), body.credentials.as_ref()) {
+        (true, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "this source signs in to an account, so it needs a username and an \
+                              app password",
+                })),
+            ))
+        }
+        (false, Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "this source is already on the pond and needs no sign-in details",
+                })),
+            ))
+        }
+        (false, None) => None,
+        (true, Some(creds)) => {
+            // No secret store means no credentials, and REFUSING is the only
+            // safe answer: the alternatives are dropping the password (a source
+            // that can never sync) or putting it somewhere unencrypted, and
+            // invariant 4 exists to rule out the second.
+            let Some(secrets) = state.secret_repo.as_ref() else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "this pond has no encrypted secret store, so it cannot hold \
+                                  an account password",
+                    })),
+                ));
+            };
+            let key = pond_core::context::domain::secret_key_for(&id);
+            let blob = json!({
+                "username": creds.username,
+                "password": creds.password,
+                "base_url": creds.base_url,
+            })
+            .to_string();
+            secrets.set(&key, &blob).await.map_err(|e| {
+                tracing::warn!(error = %e, "could not store calendar credentials");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not store the sign-in details"})),
+                )
+            })?;
+            Some(key)
+        }
+    };
     let source = ContextSource::from_parts(SourceParts {
         id: id.clone(),
         kind,
@@ -16117,7 +16321,7 @@ async fn connect_context_source(
         cursor: None,
         last_sync: None,
         status: SourceStatus::Connected,
-        secret_ref: None,
+        secret_ref,
         created_at: now,
     })
     .map_err(|e| {
@@ -16159,6 +16363,109 @@ async fn connect_context_source(
     ))
 }
 
+/// `GET /api/v1/context/items?session_id=X&q=…` -- what the pond has read.
+///
+/// Scoped like every other read of this corpus: the caller sees their own items
+/// and nobody else's, decided in the SQL rather than filtered afterwards.
+///
+/// Keyword search rather than semantic, deliberately. Somebody scrolling a list
+/// of what their pond collected is looking for a message they remember the
+/// words of, and a cosine ranking would bury an exact title match under three
+/// things that are merely about the same subject. The semantic path is what the
+/// assistant uses; this is what a person uses.
+async fn list_context_items(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let session_id = params.get("session_id").cloned().unwrap_or_default();
+    let device = proven_device(principal.as_ref());
+    let scope = resolve_turn_scope(&state, &session_id, &device).await;
+
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(200)
+        .clamp(1, 500);
+
+    let query = params.get("q").map(|q| q.trim()).unwrap_or_default();
+    let repo = context_repo(&state);
+    let items = if query.is_empty() {
+        repo.recent_items(&scope, limit).await
+    } else {
+        // Split on whitespace: the store's keyword search takes terms, and
+        // handing it the whole phrase would match only items containing that
+        // exact string.
+        let terms: Vec<String> = query.split_whitespace().map(|t| t.to_string()).collect();
+        repo.search_items(&terms, &scope, limit).await
+    };
+
+    let items = items.map_err(|e| {
+        tracing::warn!(error = %e, "could not read context items");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "could not read what the pond has collected"})),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "items": items
+            .iter()
+            .map(|i| json!({
+                "id": i.id(),
+                "source_id": i.source_id(),
+                "source_kind": i.source_kind().as_str(),
+                "kind": i.kind().as_str(),
+                "title": i.title(),
+                "body": i.body(),
+                "occurred_at": i.occurred_at().to_rfc3339(),
+                "participants": i.participants(),
+                // Whether retrieval can currently reach it. The list is also
+                // the place somebody asks "why did search not find this", and
+                // the answer is usually this flag.
+                "searchable": i.embedding().is_some(),
+            }))
+            .collect::<Vec<_>>()
+    })))
+}
+
+/// `POST /api/v1/context/sync` -- pull every connected account now.
+///
+/// The half-hourly sweep is right for a calendar that changes a few times a
+/// week and wrong for somebody who has just typed a password in and wants to
+/// know whether it worked. So this answers with what the pass actually did:
+/// "checked, nothing new" and "checked, found eleven things" are both successes
+/// and somebody who pressed a button deserves to know which one they got.
+///
+/// Held open for the duration rather than returning a job id. A household sync
+/// is a handful of HTTP round trips, and a progress API for something that
+/// takes seconds is more moving parts than the answer is worth.
+async fn sync_context_sources(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(syncer) = state.account_sync.as_ref() else {
+        // Distinguished from "synced, found nothing": this pond CANNOT sync,
+        // and reporting a zero would read as a working account with no news.
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "this pond cannot reach connected accounts -- it has no encrypted \
+                          secret store to read their sign-in details from",
+            })),
+        ));
+    };
+    match syncer.sync_now().await {
+        Ok(summary) => Ok(Json(json!(summary))),
+        Err(e) => {
+            tracing::warn!(error = %e, "a requested account sync failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "the sync could not run"})),
+            ))
+        }
+    }
+}
+
 /// `GET /api/v1/context/sources?session_id=X` -- the sources this caller may see.
 async fn list_context_sources(
     State(state): State<Arc<AppState>>,
@@ -16180,16 +16487,41 @@ async fn list_context_sources(
             )
         })?;
 
+    // One grouped query for every source, so the counts cost the same whether a
+    // household has one account or six. A failure here loses the counts and
+    // keeps the list: knowing what is connected matters more than knowing how
+    // much each one brought.
+    let stats = context_repo(&state)
+        .item_stats_by_source()
+        .await
+        .unwrap_or_default();
+
     Ok(Json(json!({
         "sources": sources
             .iter()
-            .map(|s| json!({
+            .map(|s| {
+                let stat = stats.iter().find(|st| st.source_id == s.id());
+                json!({
                 "id": s.id(),
                 "kind": s.kind().as_str(),
                 "provider": s.provider(),
                 "profile_id": s.profile_id(),
                 "status": s.status().as_str(),
-            }))
+                // When the pond last reached this account. `null` means it has
+                // not run yet, which a household reads very differently from
+                // "checked, found nothing" -- the surface needs to tell them
+                // apart or a source that has never synced looks healthy.
+                "last_sync": s.last_sync().map(|t| t.to_rfc3339()),
+                "needs_credentials": s.kind().needs_credentials(),
+                // What this source has actually produced, and how much of it
+                // retrieval can reach. Reported separately because a source can
+                // be perfectly connected and still half-invisible while the
+                // index catches up, and that gap is what needs explaining when
+                // a search comes up short.
+                "items": stat.map(|st| st.items).unwrap_or(0),
+                "awaiting_index": stat.map(|st| st.awaiting_index).unwrap_or(0),
+            })
+            })
             .collect::<Vec<_>>()
     })))
 }
@@ -16270,6 +16602,92 @@ fn index_coverage(indexed: u64, rows: u64) -> Option<f64> {
 /// two healthy corpora hid a third that could never populate at all; the shape
 /// that makes that visible is a row each, which is what
 /// [`pond_core::context::vector_index::CorpusHealth`] is for.
+/// Every IANA zone, with the offset it is on today.
+///
+/// Exists so the desktop stops carrying its own list. There were three of them
+/// — 16, 18 and 13 zones, no two alike — which is how a household in
+/// `Africa/Kampala` came to have no way of saying so. Offsets are computed here
+/// rather than in the client because an offset depends on the date, and a
+/// client that cached one would be wrong for whichever half of the year its
+/// zone observes daylight saving.
+async fn list_time_zones() -> Json<Value> {
+    use pond_core::user_data::services::location::zone_catalogue;
+    let now = chrono::Utc::now();
+    let zones: Vec<Value> = zone_catalogue(now)
+        .into_iter()
+        .map(|c| json!({ "zone": c.zone, "offset": c.offset, "place": c.place }))
+        .collect();
+    Json(json!({ "zones": zones }))
+}
+
+/// What the client already knows, offered to the cascade as hints.
+#[derive(Debug, Default, serde::Deserialize)]
+struct DetectLocationRequest {
+    /// The zone this device is set to — `Intl.DateTimeFormat()` on the desktop.
+    #[serde(default)]
+    system_zone: Option<String>,
+    /// A name the household typed, which beats anything derived.
+    #[serde(default)]
+    typed_name: Option<String>,
+    /// Coordinates a real browser answered with, when one did.
+    #[serde(default)]
+    latitude: Option<f64>,
+    #[serde(default)]
+    longitude: Option<f64>,
+}
+
+/// Work out where this pond is, from several sources, cheapest first.
+///
+/// Server-side so onboarding and Settings share ONE implementation. They had
+/// two, and neither worked: onboarding split the zone string and returned no
+/// coordinates at all, while Settings asked a Tauri webview for a browser
+/// geolocation it does not reliably provide.
+///
+/// The network source — the one that would reveal this household's address — is
+/// deliberately not wired here. Everything this returns comes from the device's
+/// own zone and a geocoding call for a place NAME, which tells the far end what
+/// town was asked about and nothing about who asked.
+async fn detect_location(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<DetectLocationRequest>>,
+) -> Json<Value> {
+    use pond_core::user_data::ports::place_lookup::PlaceLookup;
+    use pond_core::user_data::services::place_detection::{detect, Hints};
+
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let geocoder = pond_adapters_weather::Geocoder::new(state.http_client.clone());
+    let lookup: &dyn PlaceLookup = &geocoder;
+
+    let device_coords = match (req.latitude, req.longitude) {
+        (Some(lat), Some(lon)) => Some((lat, lon)),
+        _ => None,
+    };
+
+    let found = detect(
+        Hints {
+            system_zone: req.system_zone.as_deref(),
+            typed_name: req.typed_name.as_deref(),
+            device_coords,
+        },
+        Some(lookup),
+        // See the note above: not wired.
+        None,
+    )
+    .await;
+
+    Json(json!({
+        "name": found.name,
+        "latitude": found.latitude,
+        "longitude": found.longitude,
+        "timezone": found.timezone,
+        "source": found.source.as_str(),
+        // Whether this is a fact or a good guess, so the screen can say which.
+        "certain": found.source.is_certain(),
+        "has_coordinates": found.has_coordinates(),
+        "note": found.note,
+    }))
+}
+
 async fn context_index_health(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -17909,13 +18327,10 @@ mod tests {
         );
     }
 
-    /// The reasoning comes back so the HANDLER can offer it to its own
-    /// `ChatService`, which holds the `persist_thinking` gate.
-    ///
-    /// The translator is handed no service on purpose. If it recorded, both
-    /// routes would inherit a decision neither could see at its call site, and
-    /// the gate PAI-5 P6 put in one place would be reached from a function that
-    /// does not know whose turn it is.
+    /// The reasoning comes back so the HANDLER can offer it to its own `ChatService`, which holds
+    /// the `persist_thinking` gate. The translator is handed no service on purpose: recording here
+    /// would let both routes inherit a decision neither can see at its call site, reaching the
+    /// PAI-5 P6 gate from a function that does not know whose turn it is.
     #[test]
     fn a_reasoning_passage_comes_back_whole_for_the_persistence_owner() {
         let mut turn = accumulator();
@@ -17939,13 +18354,9 @@ mod tests {
         );
     }
 
-    /// `Done` is the one variant the two routes disagree about, so it must not
-    /// arrive as a frame.
-    ///
-    /// If the translator emitted one, `/chat/stream` would send a `done` before
-    /// it had persisted anything -- and its real `done`, the one carrying the
-    /// usage totals, would then be the second -- while `/agent/chat/stream`
-    /// would send two.
+    /// `Done` is the one variant the two routes disagree about, so it must not arrive as a frame:
+    /// `/chat/stream` would send a `done` before persisting anything, ahead of its real `done`
+    /// carrying the usage totals, while `/agent/chat/stream` would send two.
     #[test]
     fn the_engines_done_is_numbers_for_the_route_to_report_not_a_frame() {
         let mut turn = accumulator();
@@ -17974,15 +18385,10 @@ mod tests {
         assert!(stats.is_none());
     }
 
-    /// Every remaining variant is a frame carrying the `type` the desktop
-    /// switches on, and the payload that type promises.
-    ///
-    /// The `type` alone is not the contract. `review_revision` carries two
-    /// adjacent integers that mean opposite things -- a quality score and a
-    /// count of rounds -- and the fixture uses 4 and 2 rather than one number
-    /// twice so that transposing them fails here. That is the shape of defect a
-    /// `["type"]`-only assertion is blind to, in the one variant where the
-    /// compiler cannot help either.
+    /// Every remaining variant is a frame carrying the `type` the desktop switches on and the
+    /// payload that type promises. The `type` alone is not the contract: `review_revision` carries
+    /// two adjacent integers meaning opposite things (score, rounds), so the fixture uses 4 and 2
+    /// rather than one number twice, and transposing them fails here.
     #[test]
     fn the_status_shaped_variants_keep_the_type_the_client_switches_on() {
         let mut turn = accumulator();
@@ -18036,20 +18442,10 @@ mod tests {
         assert!(err.get("type").is_none());
     }
 
-    /// PAI-6 P6 / invariant 4: a subagent's activity reaches the CLIENT and
-    /// never the parent's history.
-    ///
-    /// The accumulator's three top fields are what both handlers persist --
-    /// `full_text` becomes the assistant message and `tool_results` become its
-    /// tool rows. A progress frame that touched either would put a child's
-    /// conversation into `session_messages`, which is the one thing this
-    /// workstream is not allowed to do; the parent takes back exactly one
-    /// string, the `delegate` tool's result, through the `ToolResult` arm.
-    ///
-    /// The tool-timing fields are asserted too, and that is not padding: the
-    /// obvious way to write the `Tool` arm is to reuse the `ToolCall` arm, and
-    /// doing so would report the CHILD's tool as this turn's last tool in
-    /// `TurnMetrics` -- a plausible-looking number about the wrong agent.
+    /// PAI-6 P6 / invariant 4: a subagent's activity reaches the CLIENT and never the parent's
+    /// history. `full_text` and `tool_results` are what both handlers persist, so a progress frame
+    /// touching either puts a child's conversation into `session_messages`. Tool timing is
+    /// asserted too: reusing the `ToolCall` arm reports the CHILD's tool in `TurnMetrics`.
     #[test]
     fn absorb_progress_leaves_the_turn_untouched() {
         let mut turn = accumulator();
@@ -18144,12 +18540,6 @@ mod tests {
     /// An UNATTRIBUTED turn must not. `ProfileScope::Household` falls back to
     /// `primary_profile_id`, so without this the pond announces the primary
     /// member's name and birthday while somebody else is talking.
-    ///
-    /// This was inert until 2026-08-12 for a reason that makes it worse rather
-    /// than better: the desktop app saved these fields to browser
-    /// `localStorage` while the server read them from SQLite, so they were
-    /// always empty. Wiring the writer is exactly what would have made a
-    /// household turn start disclosing them.
     #[test]
     fn a_household_turn_states_no_ones_particulars() {
         let ctx = particulars_for(false, &full_prefs());
@@ -18169,14 +18559,10 @@ mod tests {
         );
     }
 
-    /// The one field that deliberately crosses into an unattributed turn.
-    ///
-    /// "Be patient, never correct speech patterns, interpret incomplete
-    /// sentences charitably" discloses nothing about anybody, and a household
+    /// The one field that deliberately crosses into an unattributed turn: the
+    /// speech accommodation discloses nothing about anybody, and a household
     /// that configured it wants it applied precisely when the pond cannot tell
-    /// who is speaking. Asserted separately from the test above so that
-    /// tightening the scope to nothing at all is a visible decision rather than
-    /// a side effect.
+    /// who is speaking. Asserted separately so narrowing it is a visible choice.
     #[test]
     fn the_speech_accommodation_survives_an_unattributed_turn() {
         assert!(
@@ -18198,12 +18584,10 @@ mod tests {
         assert!(!ctx.atypical_speech);
     }
 
-    /// The camelCase trap, stated as a test.
-    ///
-    /// The desktop app holds these as `preferredName` / `atypicalSpeech`. If a
-    /// writer ever stores those spellings, `PATCH /profiles/{id}` returns 200,
-    /// the row looks populated, and the prompt still says nothing -- which is
-    /// indistinguishable from the bug this replaced.
+    /// The camelCase trap, stated as a test. The desktop app holds these as
+    /// `preferredName` / `atypicalSpeech`; if a writer stores those spellings,
+    /// `PATCH /profiles/{id}` returns 200 and the row looks populated while the
+    /// prompt still says nothing.
     #[test]
     fn camel_case_keys_are_not_read_and_that_is_the_point() {
         let camel: std::collections::HashMap<String, String> =

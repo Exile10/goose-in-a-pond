@@ -105,6 +105,7 @@ async fn make_app_with_real_memory(
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -125,6 +126,7 @@ async fn make_app_with_real_memory(
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,

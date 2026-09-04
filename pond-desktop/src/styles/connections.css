@@ -1,0 +1,196 @@
+/* ─── Connected accounts ───────────────────────────────────────────────────
+ *
+ * Every colour here comes from the design tokens, which carry their own dark
+ * values. The first version of this file invented names — `--surface`,
+ * `--border`, `--text-muted`, `--input-bg` — none of which exist, so every
+ * `var(name, fallback)` fell through to a LIGHT fallback and painted white
+ * inputs with near-white text on the dark theme.
+ *
+ * That failure is silent by construction: a fallback makes a missing token look
+ * like a working one, and it only shows up in the theme the fallback was not
+ * written for. Hence no fallbacks below — a token that goes missing should look
+ * broken in both themes rather than in one.
+ */
+
+.connections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  max-width: 44rem;
+}
+
+.connections-intro { display: flex; flex-direction: column; gap: var(--space-2); }
+.connections-intro h3,
+.connections-form h3 {
+  margin: 0;
+  font-size: var(--text-base, 15px);
+  font-weight: var(--weight-bold);
+  color: var(--color-text);
+}
+.connections-intro p {
+  margin: 0;
+  color: var(--color-text-secondary);
+  line-height: 1.6;
+  font-size: 14px;
+}
+
+.connections-muted { margin: 0; color: var(--color-text-secondary); font-size: 13px; }
+
+.connections-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.connections-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: var(--space-3);
+  align-items: start;
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg, 12px);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+.connections-icon { color: var(--color-text-secondary); display: flex; padding-top: 2px; }
+.connections-item-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.connections-item-head { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.connections-detail { margin: 0; font-size: 13px; line-height: 1.5; color: var(--color-text); }
+
+.connections-pill {
+  font-size: 11px;
+  font-weight: var(--weight-bold);
+  letter-spacing: 0.03em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.connections-pill-ok    { background: var(--color-success-soft);     color: var(--color-success-fg); }
+.connections-pill-warn  { background: var(--color-warning-soft);     color: var(--color-warning-fg); }
+.connections-pill-muted { background: var(--color-border);           color: var(--color-text-secondary); }
+
+.connections-disconnect,
+.connections-submit {
+  font: inherit;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+  color: var(--color-text);
+  padding: 7px 12px;
+}
+.connections-disconnect:hover:not(:disabled) {
+  border-color: var(--color-destructive);
+  color: var(--color-destructive-fg);
+}
+.connections-disconnect:disabled,
+.connections-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.connections-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg, 12px);
+  background: var(--color-surface);
+}
+
+.connections-field { display: flex; flex-direction: column; gap: 5px; }
+.connections-field > span {
+  font-size: 12px;
+  font-weight: var(--weight-bold);
+  color: var(--color-text);
+}
+
+/* `--color-bg` rather than `--color-surface`: the field sits ON a surface, so
+   it needs to read as recessed from it. On the light theme both are near-white
+   and the border carries the edge; on dark the difference is visible. */
+.connections-field input,
+.connections-field select {
+  font: inherit;
+  font-size: 14px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+.connections-field input::placeholder { color: var(--color-text-secondary); opacity: 1; }
+.connections-field input:focus-visible,
+.connections-field select:focus-visible,
+.connections-disconnect:focus-visible,
+.connections-submit:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.connections-hint {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--color-text);
+  padding: 10px 12px;
+  border-left: 2px solid var(--color-accent);
+  background: var(--color-accent-subtle);
+  border-radius: 0 var(--radius-md, 8px) var(--radius-md, 8px) 0;
+}
+
+.connections-submit {
+  align-self: flex-start;
+  font-weight: var(--weight-bold);
+  border-width: 2px;
+  border-color: var(--color-text);
+}
+
+.connections-error,
+.connections-notice { margin: 0; font-size: 13px; line-height: 1.5; }
+.connections-error { color: var(--color-destructive-fg); }
+.connections-notice { color: var(--color-success-fg); }
+
+.connections-spin { animation: connections-spin 1s linear infinite; }
+@keyframes connections-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .connections-spin { animation: none; }
+}
+
+.connections-introHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.connections-sync {
+  font: inherit;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+  color: var(--color-text);
+  cursor: pointer;
+}
+.connections-sync:hover:not(:disabled) { border-color: var(--color-accent); }
+.connections-sync:disabled { opacity: 0.5; cursor: not-allowed; }
+.connections-sync:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
+.connections-ran {
+  margin: 0;
+  font-size: 12px;
+  font-weight: var(--weight-bold);
+  color: var(--color-accent);
+}

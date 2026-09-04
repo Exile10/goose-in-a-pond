@@ -262,9 +262,27 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
         "/onboard/reset",
         Exposure::UntilOnboardedThenHostOnly,
     ),
+    // The IANA zone catalogue. `Always`, and it is the rare route where that
+    // needs no argument: it is the same few hundred strings for every pond on
+    // earth and says nothing whatever about this one. The wizard needs it
+    // before pairing, and Settings needs it after.
+    (Method::GET, "/time/zones", Exposure::Always),
+    // Detection, which is a different matter: it makes an outbound geocoding
+    // call and answers with a guess about where the caller is. The wizard
+    // cannot do without it -- location is set up before any device has paired
+    // -- so it is open until onboarding finishes and shut afterwards, by which
+    // point Settings is authenticated and does not need the exemption.
+    (Method::POST, "/location/detect", Exposure::UntilOnboarded),
     // Write-only, and only while the wizard is running. GET /settings is NOT
     // here at all: it serialises the whole Settings struct.
     (Method::PUT, "/settings", Exposure::UntilOnboarded),
+    // Prefix warm-up status, so the desktop can say "getting ready" instead of
+    // looking hung while the first prompt's KV cache compiles. The wizard shows
+    // the banner before any device has paired, which is the whole exemption --
+    // afterwards `getWarmupStatus` goes through `PondApiClient.get`, which
+    // attaches the bearer token, so the route does not need to stay open. Same
+    // reasoning as /voice/calibrate below, and checked the same way.
+    (Method::GET, "/warmup", Exposure::UntilOnboarded),
     // Local Piper; text -> audio, leaks no user data. This LOOKS like an
     // onboarding hole -- the wizard's voice preview is why it is public -- and
     // it is deliberately not classified as one, because two shipped callers
@@ -945,7 +963,29 @@ mod tests {
 
         let expected = vec![
             "DELETE /voice/calibrate = UntilOnboarded".to_string(),
+            // The warm-up banner's data source, added with the prefix
+            // pre-compile. It answers with a phase, the chat model's name, and
+            // two timestamps -- the model name is the only thing here that says
+            // anything about this pond, and it is a name the household chose
+            // from a catalogue, not a secret. Open during the wizard because
+            // the first warm-up is the boot one, which is exactly when there is
+            // no token and exactly when a household is most likely to read a
+            // silent screen as a hang. It does not need to stay open: every
+            // later warm-up (a model change) is read through
+            // `PondApiClient.get`, which attaches the bearer token -- checked
+            // in the client, the way the /voice/calibrate entry was.
+            "GET /warmup = UntilOnboarded".to_string(),
             "PATCH /profiles/{id} = UntilOnboarded".to_string(),
+            // Detection reaches the network -- one geocoding call for a place
+            // NAME -- and answers with a guess about where the caller is. Open
+            // during the wizard because location is configured before any
+            // device has paired, and the alternative was the wizard's own
+            // Auto-detect button 401ing. It sends no household data outward:
+            // the query is a town, not an identity, and the source that WOULD
+            // reveal the address (a lookup on the connection itself) is
+            // deliberately not wired into this route. Closes with the rest of
+            // this list the moment onboarding completes.
+            "POST /location/detect = UntilOnboarded".to_string(),
             "POST /onboard = UntilOnboarded".to_string(),
             "POST /onboard/complete = UntilOnboarded".to_string(),
             "POST /onboard/reset = UntilOnboardedThenHostOnly".to_string(),

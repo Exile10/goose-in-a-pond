@@ -213,6 +213,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     let scheduler: Option<Arc<dyn SchedulerPort>> = Some(Arc::new(InMemoryScheduler::new()));
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -233,6 +234,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,

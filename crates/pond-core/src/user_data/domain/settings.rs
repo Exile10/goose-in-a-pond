@@ -87,6 +87,48 @@ pub const NETWORK_MODES: &[&str] = &[
 /// grows a value alone.
 pub const REASONING_EFFORTS: &[&str] = &["brief", "balanced", "thorough"];
 
+// ── The remaining closed vocabularies ───────────────────────────────────────
+//
+// Written down here, beside the three that already were, because a value set
+// that lives only in the desktop's `catalogue.ts` is a value set the server
+// does not enforce — and every writer that is not the catalogue (a raw PUT, the
+// CLI, a future mobile client) bypassed it entirely. See
+// `settings_validation::FIELD_RULES`, which is what actually applies them.
+
+/// How many tools a turn is offered. See `tool_selection_mode`.
+pub const TOOL_SELECTION_MODES: &[&str] = &[TOOL_SELECTION_MODE_ALL, TOOL_SELECTION_MODE_RELEVANT];
+
+/// The agent loop that serves turns.
+///
+/// One value, and that is the point: `pond` is quarantined (Q2-05) and the API
+/// refuses it. It was refused by NAME, though — a denylist of exactly one
+/// string — so `gosse` or `ollama` was accepted, stored, survived the startup
+/// heal, and then failed the `!= "goose"` test that selects the real agent,
+/// leaving every request answered by `MockAgent` with no error anywhere.
+pub const AGENT_BACKENDS: &[&str] = &["goose"];
+
+/// Backends that exist but must never be selected. Named separately so the
+/// refusal can say *why* rather than only listing what is allowed.
+pub const QUARANTINED_AGENT_BACKENDS: &[&str] = &["pond"];
+
+/// Built-in system-prompt templates.
+pub const PROMPT_STYLES: &[&str] = &["balanced", "concise", "technical", "warm"];
+
+/// Whether the model is asked to think before answering.
+pub const THINKING_MODES: &[&str] = &["auto", "on", "off"];
+
+/// Whether a turn's answer is reviewed before it is shown.
+pub const REVIEW_MODES: &[&str] = &["off", "on", "auto"];
+
+/// How memory consolidation is run.
+pub const CONSOLIDATION_MODES: &[&str] = &["single", "adversarial"];
+
+/// Which engine computes embeddings.
+pub const EMBEDDING_PROVIDERS: &[&str] = &["fastembed", "gguf", "none"];
+
+/// Kokoro quality tiers, smallest first.
+pub const TTS_QUALITIES: &[&str] = &["q4", "q4f16", "q8", "q8f16", "fp16", "fp32"];
+
 /// One factory default that CHANGED after installs already existed.
 ///
 /// Settings are a flat key-value table and a default only applies when the key
@@ -2792,13 +2834,22 @@ mod tests {
     #[test]
     fn only_the_deliberate_extension_toggles_ship_switched_off() {
         let value = serde_json::to_value(Settings::default()).expect("serialize Settings");
-        let off: Vec<&str> = value
+        let mut off: Vec<&str> = value
             .as_object()
             .expect("Settings serializes to a JSON object")
             .iter()
             .filter(|(k, v)| k.starts_with("ext_") && *v == &serde_json::Value::Bool(false))
             .map(|(k, _)| k.as_str())
             .collect();
+        // Sorted, because the map's own order is not this test's business and
+        // is not even stable across builds: something in the workspace enables
+        // `serde_json/preserve_order`, so a `Value::Object` iterates in STRUCT
+        // DECLARATION order under a workspace build and ALPHABETICALLY when
+        // pond-core is built alone. This assertion is about the set that ships
+        // off; comparing an unsorted vec made the whole gate red on `cargo test
+        // -p pond-core -p pond-api …` and green on `-p pond-core --lib`, which
+        // reads as a flake and trains a reader to re-run rather than look.
+        off.sort_unstable();
         assert_eq!(
             off,
             vec!["ext_context_enabled", "ext_orchestrator_enabled"],

@@ -26,34 +26,14 @@
 //! chat mid-word whenever generation slowed. `plain_text_is_emitted_with_no_holdback`
 //! is the guard.
 
-/// Paired tags whose entire contents (and the tags themselves) are dropped.
-/// Each pair = (open marker, close marker). The first pair encountered wins
-/// — we don't expect nesting in practice.
-const PAIRED_TAGS: &[(&str, &str)] = &[
-    ("<|channel>thought", "<channel|>"),
-    ("<|tool_call>", "<tool_call|>"),
-    ("<think>", "</think>"),
-    // `<thinking>` is a DISTINCT literal, not a prefix match for `<think>` --
-    // the closing `>` makes them disjoint, so order here does not matter.
-    // `pond-core`'s twin filter has carried this pair for a while; this one did
-    // not, so a model using the longer spelling had its entire reasoning block
-    // rendered to the user as the answer.
-    ("<thinking>", "</thinking>"),
-    ("<thought>", "</thought>"),
-];
-
-/// Standalone sentinels that get silently dropped wherever they appear in
-/// the stream. Some models (Gemma-family especially) keep emitting `<eos>`
-/// after the real reply ends; the chat UI then renders them literally.
-const STANDALONE_SENTINELS: &[&str] = &[
-    "<eos>",
-    "<|eos|>",
-    "<end_of_turn>",
-    // Orphaned close tags (model emitted close without a matching open):
-    "</think>",
-    "</thinking>",
-    "</thought>",
-];
+/// The marker tables, owned by `pond-core` and used by both filters.
+///
+/// This file kept its own copies, and they drifted: `pond-core` grew the
+/// `<thinking>`/`</thinking>` pair after a model using the longer spelling had
+/// its whole reasoning block spoken aloud in voice mode, and this copy carried
+/// only `<think>` for a while afterwards. Two streaming filters over one
+/// vocabulary is one table, so a marker learned once is learned in both.
+use pond_core::models::services::thought_filter::{PAIRED_TAGS, STANDALONE_SENTINELS};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {

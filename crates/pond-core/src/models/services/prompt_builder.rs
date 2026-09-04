@@ -170,47 +170,10 @@ pub fn build_prompt_partition(
     }
 
     // Profile context lines (same logic as build_system_prompt_from_template_full)
-    if let Some(ctx) = profile {
-        let user = sanitize_field(&settings.user_name, 50);
-
-        if let Some(ref pname) = ctx.preferred_name {
-            let pname = sanitize_field(pname, 50);
-            if !pname.is_empty() && pname != user {
-                dynamic_parts.push(format!("The user prefers to be called {}.", pname));
-            }
-        }
-        if let Some(ref lang) = ctx.language {
-            let lang = sanitize_field(lang, 20);
-            if !lang.is_empty() && lang != "en" {
-                let lang_label = match lang.as_str() {
-                    "fr" => "French",
-                    "es" => "Spanish",
-                    "de" => "German",
-                    "sw" => "Swahili",
-                    "ar" => "Arabic",
-                    "pt" => "Portuguese",
-                    "zh" => "Chinese",
-                    "ja" => "Japanese",
-                    "ko" => "Korean",
-                    other => other,
-                };
-                dynamic_parts.push(format!("Always respond in {}.", lang_label));
-            }
-        }
-        if let Some(ref bday) = ctx.birthday {
-            let bday = sanitize_field(bday, 20);
-            if !bday.is_empty() {
-                dynamic_parts.push(format!("The user's birthday is {}.", bday));
-            }
-        }
-        if ctx.atypical_speech {
-            dynamic_parts.push(
-                "The user may have atypical speech — be patient, never correct speech \
-                 patterns, and interpret incomplete sentences charitably."
-                    .to_string(),
-            );
-        }
-    }
+    dynamic_parts.extend(crate::prompts::profile_context_lines(
+        profile,
+        &settings.user_name,
+    ));
 
     // Prompt addendum
     let addendum = sanitize_field(&settings.prompt_addendum, 500);
@@ -827,6 +790,55 @@ mod tests {
         assert!(
             partition.static_prefix.contains("<voice-mode>"),
             "Voice mode section must be in static prefix"
+        );
+    }
+
+    /// The prose tool listing must be suppressed by `native_tools_json`
+    /// REGARDLESS of whether the model reasons.
+    ///
+    /// Observed on the Mac 2026-08-24: the system prompt handed to the provider
+    /// was 30,848 chars for Llama 3.2 and Nemotron-before-the-thinking-fix, and
+    /// ~2,000-2,400 for gemma-4 and Nemotron-after. The two groups differ in
+    /// exactly one thing -- `thinking_enabled` -- and the size gap is 28,534
+    /// chars, which is precisely the tool JSON. A model that does not reason was
+    /// being handed the entire tool surface twice: once as prose in the system
+    /// prompt and once as native declarations through its chat template.
+    ///
+    /// `native_tools_json` is set from the PROVIDER (`local`/`gguf`) and has
+    /// nothing to do with reasoning, so the two flags must be independent here.
+    #[test]
+    fn a_model_that_does_not_reason_is_not_handed_the_tools_twice() {
+        let settings = Settings::default();
+        let tools = vec![
+            "wikipedia — Look up factual info".to_string(),
+            "weather — Current conditions".to_string(),
+        ];
+
+        let mut sizes = Vec::new();
+        for thinking in [true, false] {
+            let state = PromptState {
+                available_tools: tools.clone(),
+                native_tools_json: true,
+                thinking_enabled: thinking,
+                ..default_state()
+            };
+            let partition = build_prompt_partition(&settings, None, &state, PROMPT_BALANCED);
+            assert!(
+                !partition.static_prefix.contains("wikipedia"),
+                "native_tools_json must suppress the prose listing (thinking={thinking})"
+            );
+            sizes.push(partition.static_prefix.len());
+        }
+
+        // The thinking section is a real and small difference; a tool listing
+        // appearing on one side is not.
+        let gap = sizes[0].abs_diff(sizes[1]);
+        assert!(
+            gap < 2_000,
+            "thinking should change the prefix by a section, not by a tool \
+             listing: {} vs {} ({gap} chars apart)",
+            sizes[0],
+            sizes[1]
         );
     }
 

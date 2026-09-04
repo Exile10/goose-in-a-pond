@@ -625,6 +625,67 @@ export interface ContextCorpusCleared {
  * The result of emptying the index. Every corpus is listed, including the ones
  * at zero, so a corpus that was never populated is still visible afterwards.
  */
+/** What one sync pass did. Counts, not a success flag: "nothing new" and
+ *  "found eleven things" are both successes and are not the same answer. */
+export interface AccountSyncSummary {
+  sources: number;
+  unchanged: number;
+  ingested: number;
+  needs_reauth: number;
+  failed: number;
+  paused: number;
+  /** What each account did. The totals say whether anything happened; this
+   *  says where from, which is the question somebody with two accounts has. */
+  per_source?: SourceSyncOutcome[];
+}
+
+/** One account's result from a sync pass. */
+export interface SourceSyncOutcome {
+  source_id: string;
+  provider: string;
+  kind: string;
+  /** `ingested` | `unchanged` | `needs_reauth` | `failed` | `paused` */
+  outcome: string;
+  ingested: number;
+}
+
+/** One thing the pond read from a connected source. */
+export interface ContextItem {
+  id: string;
+  source_id: string;
+  /** `calendar`, `mail`, `camera`, `sensor`. */
+  source_kind: string;
+  /** `event`, `message`, `document`, `location`, `task`. */
+  kind: string;
+  title: string;
+  body: string;
+  occurred_at: string;
+  participants: string[];
+  /** Whether retrieval can currently reach it. Usually the answer to
+   *  "why did search not find this". */
+  searchable: boolean;
+}
+
+/** A connected personal-context source, as the sources API reports it. */
+export interface ContextSource {
+  id: string;
+  /** `calendar`, `mail`, `camera`, `sensor`. */
+  kind: string;
+  /** `google`, `icloud`, `fastmail`, `nextcloud`, `custom`, or a device id. */
+  provider: string;
+  profile_id: string;
+  /** `connected` | `needs_reauth` | `error` | `paused` */
+  status: string;
+  /** RFC3339, or null when the pond has not reached this account yet. */
+  last_sync: string | null;
+  /** Whether this kind signs in to an account, as opposed to being on-pond. */
+  needs_credentials: boolean;
+  /** Everything stored from this source. */
+  items: number;
+  /** Of those, the ones still waiting to become searchable by meaning. */
+  awaiting_index: number;
+}
+
 export interface ContextIndexRebuild {
   indexed: boolean;
   reason?: string;
@@ -678,6 +739,19 @@ export interface ModelEntry {
   asr_size?: string;
   tts_engine?: string;
   config_filename?: string;
+}
+
+/** GET /api/v1/warmup — the boot/model-change prefix warm-up (see Agent::prewarm). */
+export interface WarmupStatus {
+  /** warming | ready | skipped | failed */
+  state: "warming" | "ready" | "skipped" | "failed";
+  /** Present on skipped/failed. */
+  reason?: string;
+  /** Chat model the warm-up ran against ("" before the first run). */
+  model: string;
+  started_unix_ms: number;
+  finished_unix_ms: number | null;
+  elapsed_ms: number;
 }
 
 export interface ModelMemoryStatus {
@@ -1306,3 +1380,31 @@ export interface ProposalList {
 
 /** Approve or reject. The server accepts no third value. */
 export type ProposalDecision = "approve" | "reject";
+
+// ── Time and place ──────────────────────────────────────────
+
+/** A zone, the offset it is on today, and the place its name implies. */
+export interface ZoneChoice {
+  zone: string;
+  /** e.g. "+03:00". Resolved for today — an offset is not fixed per zone. */
+  offset: string;
+  /** e.g. "Nairobi". Empty for zones like UTC that are not places. */
+  place: string;
+}
+
+/** How the pond worked out where it is. */
+export type PlaceSource = "timezone" | "geocoded" | "device" | "network";
+
+/** The result of one detection pass. */
+export interface DetectedPlace {
+  name: string;
+  latitude: number;
+  longitude: number;
+  timezone: string;
+  source: PlaceSource;
+  /** Whether this is a fact rather than a good guess. */
+  certain: boolean;
+  has_coordinates: boolean;
+  /** Why there are no coordinates, when there are none. Shown as-is. */
+  note: string | null;
+}

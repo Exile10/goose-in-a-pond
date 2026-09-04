@@ -596,7 +596,16 @@ pub fn init_memory_deps(
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_memory_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = MEMORY_DEPS.get().expect("init_memory_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = MEMORY_DEPS.get() else {
+        tracing::error!(
+            "spawn_memory_server called before init_memory_deps — extension will not start"
+        );
+        return;
+    };
     let server = MemoryMcpServer::new(deps.memory_repo.clone(), deps.embedding_provider.clone());
     crate::serve_builtin("giap-memory", server, reader, writer);
 }

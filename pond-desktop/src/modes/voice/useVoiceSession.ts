@@ -108,6 +108,13 @@ export interface VoiceSessionAPI {
   sessionActive: boolean;
   /** True while the shell has started spawning but before voice-ready fires. */
   connecting: boolean;
+  /**
+   * True from voice-warmup "warming" until its terminal state — the stretch
+   * where the child is alive but the model is still loading and the prompt
+   * prefix precompiling. The child speaks "Warming up." at the start and
+   * greets by name when done; this flag lets the orb say it visually too.
+   */
+  warmingUp: boolean;
   /** Start the persistent child-process session. Returns the session uuid. */
   startSession(): Promise<string | null>;
   /** Close child stdin to request clean exit; kills after 3s if still alive. */
@@ -125,6 +132,7 @@ export function useVoiceSession(): VoiceSessionAPI {
 
   const [sessionActive, setSessionActive] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [warmingUp, setWarmingUp] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
 
   // Track the session id for stale-event filtering (finding 14-consumer).
@@ -187,11 +195,19 @@ export function useVoiceSession(): VoiceSessionAPI {
       );
     }
 
+    // voice-warmup: warming | ready | skipped | failed. Precedes voice-ready.
+    register(
+      listen<string>("voice-warmup", (e) => {
+        setWarmingUp(e.payload === "warming");
+      }),
+    );
+
     // voice-ready: child is fully initialised and entering the wait loop.
     // Emitted once per session after models are loaded.
     register(
       listen<{ session_id: string }>("voice-ready", (e) => {
         setConnecting(false);
+        setWarmingUp(false);
         setSessionActive(true);
         if (e.payload?.session_id) {
           activeSessionIdRef.current = e.payload.session_id;
@@ -426,5 +442,6 @@ export function useVoiceSession(): VoiceSessionAPI {
     dispatch({ type: "CLEAR_CONTEXT_CARDS" });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { sessionActive, connecting, startSession, stopSession, clearConversation, audioLevel };
+  return { sessionActive, connecting,
+    warmingUp, startSession, stopSession, clearConversation, audioLevel };
 }

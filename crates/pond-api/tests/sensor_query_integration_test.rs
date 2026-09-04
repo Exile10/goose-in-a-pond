@@ -56,6 +56,7 @@ async fn make_harness() -> Harness {
     let bus = Arc::new(InProcessEventBus::new());
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db,
         onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
         handshake: Arc::new(mock_hs),
@@ -87,6 +88,7 @@ async fn make_harness() -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         // The real store, so the aggregate SQL and the TEXT range comparison
         // are what the assertions actually exercise.
         sensor_storage: Arc::new(SqliteSensorStorage::new(logs.clone())),

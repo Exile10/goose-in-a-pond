@@ -58,11 +58,80 @@ pub struct MaintenanceReport {
 /// Run one full maintenance pass. Never fails: every step is best-effort and
 /// logged, because a repair pass that aborts the process it runs in is worse
 /// than one that leaves work for the next run.
+/// How much of the backlog one pass is allowed to work through.
+///
+/// A scheduled pass is background work and takes a bite: embedding is the most
+/// expensive thing this process does, and a household's next turn must not
+/// queue behind the whole mailbox.
+///
+/// A pass somebody ASKED for is not background work. One bite of 64 against a
+/// backlog of 986 means the reindex button indexes a fifteenth of the corpus
+/// and reports success, and the scheduled passes that would finish the job
+/// refuse until somebody chats -- so on a pond used through its own UI the
+/// remainder is never indexed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexBudget {
+    /// One batch, then stop.
+    OneBatch,
+    /// Keep going until nothing is missing, or until cancelled.
+    UntilDone,
+}
+
+/// What one tick of the sweep is allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepTick {
+    /// Whether this tick may run on a pond that has served no turn since boot.
+    ///
+    /// Handed to the lane as THIS job's exemption, which the lane ORs with the
+    /// household-wide activity flag. It is deliberately not that flag: one job
+    /// relaxing a lane-wide value qualifies every other job registered with it.
+    pub exempt_from_activity_gate: bool,
+    /// How much of the backlog this tick may work through.
+    pub budget: IndexBudget,
+}
+
+/// Decide whether a sweep tick may run, and how much it may do.
+///
+/// The lane refuses every background job until somebody has used the pond since
+/// boot. For most chores that is right -- there is nothing to consolidate on a
+/// pond nobody has talked to. For the index it deadlocks: mail arrives from a
+/// connector rather than a conversation, so a pond that is synced and browsed
+/// but never CHATTED with accumulates unindexed items forever, and the only
+/// thing that ever indexes them is somebody pressing Reindex.
+///
+/// So the first pass after boot is exempt, and it is exhaustive: an exemption
+/// that indexed 64 of 986 items and then went back to being gated would leave
+/// the same pond unsearchable, just less obviously.
+///
+/// Every later scheduled pass is gated again, and takes one bite. This is not
+/// a way around the gate; it is one pass, once per boot, on a pond that would
+/// otherwise never index at all.
+pub fn plan_sweep(asked: bool, indexed_since_boot: bool) -> SweepTick {
+    let first_post_boot = !indexed_since_boot;
+    SweepTick {
+        exempt_from_activity_gate: asked || first_post_boot,
+        budget: if asked || first_post_boot {
+            IndexBudget::UntilDone
+        } else {
+            IndexBudget::OneBatch
+        },
+    }
+}
+
+/// How many items one batch embeds. Also the step size of an exhaustive pass,
+/// which stays batched so cancellation is honoured promptly.
+const CONTEXT_BATCH: usize = 64;
+
+/// A bound on an exhaustive pass, so a corpus that never drains -- an item that
+/// fails to embed every time and stays "missing" -- cannot spin forever.
+const MAX_BATCHES: usize = 500;
+
 pub async fn run_index_maintenance(
     index: &Arc<dyn VectorIndex>,
     storage: &dyn SessionStorage,
     embedder: &dyn EmbeddingProvider,
     cancel: &CancellationToken,
+    budget: IndexBudget,
 ) -> MaintenanceReport {
     let mut report = MaintenanceReport::default();
     let model_id = embedder.model_id();
@@ -101,42 +170,87 @@ pub async fn run_index_maintenance(
     //     probe against the live agent is what found it: a planted sensor event
     //     was never indexed and the assistant answered "no recorded activity",
     //     which is a wrong answer rather than an absent one.
-    if !cancel.is_cancelled() {
-        match index
-            .needs_embedding_with_text(Corpus::Context, &model_id, 64)
+    let mut batches = 0usize;
+    while !cancel.is_cancelled() && batches < MAX_BATCHES {
+        batches += 1;
+        // `needs_embedding_with_text` is re-asked each time rather than paged:
+        // a row just embedded stops being returned, so the next call is the
+        // next batch. Paging by offset over a shrinking set would skip rows.
+        let batch = match index
+            .needs_embedding_with_text(Corpus::Context, &model_id, CONTEXT_BATCH)
             .await
         {
-            Ok(rows) => {
-                for (row_id, text) in rows {
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    if text.trim().is_empty() {
-                        continue;
-                    }
-                    match embedder.embed(&text).await {
-                        Ok(vector) => {
-                            let entry = crate::context::vector_index::VectorEntry {
-                                corpus: Corpus::Context,
-                                row_id,
-                                model_id: model_id.clone(),
-                                vector,
-                                // Left None: the adapter's own write-through
-                                // stamps the ingest time, and a rev invented here
-                                // could disagree with it and re-stale forever.
-                                source_rev: None,
-                            };
-                            if let Err(e) = index.upsert(&entry).await {
-                                tracing::warn!("[context-index] store failed: {e}");
-                            } else {
-                                report.context_indexed += 1;
-                            }
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("[context-index] fetch failed: {e}");
+                break;
+            }
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let worked = batch.len();
+        for (row_id, text) in batch {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if text.trim().is_empty() {
+                continue;
+            }
+            // Chunked, because a context item now carries a mail body
+            // and one vector over the whole of it describes the
+            // signature block as much as the point. A short item is one
+            // chunk, so this is the same work it always was for a
+            // sensor event.
+            let spans = crate::context::chunking::chunk(
+                &text,
+                crate::context::chunking::DEFAULT_CHUNK_BYTES,
+                crate::context::chunking::DEFAULT_OVERLAP_BYTES,
+            );
+            // Stale chunks first: a re-chunked item has a different
+            // number of passages, and leaving the old ones would keep
+            // scoring spans that no longer describe anything.
+            if let Err(e) = index.remove(Corpus::Context, &row_id).await {
+                tracing::warn!("[context-index] could not clear old chunks: {e}");
+            }
+            let mut stored = 0usize;
+            for (ix, span) in spans.iter().enumerate() {
+                let Some(passage) = span.slice(&text) else {
+                    continue;
+                };
+                match embedder.embed(passage).await {
+                    Ok(vector) => {
+                        let entry = crate::context::vector_index::VectorEntry {
+                            corpus: Corpus::Context,
+                            row_id: row_id.clone(),
+                            chunk_ix: ix as i64,
+                            chunk_span: Some((span.start as i64, span.len as i64)),
+                            model_id: model_id.clone(),
+                            vector,
+                            // Left None: the adapter's own write-through
+                            // stamps the ingest time, and a rev invented here
+                            // could disagree with it and re-stale forever.
+                            source_rev: None,
+                        };
+                        if let Err(e) = index.upsert(&entry).await {
+                            tracing::warn!("[context-index] store failed: {e}");
+                        } else {
+                            stored += 1;
                         }
-                        Err(e) => tracing::warn!("[context-index] embed failed: {e}"),
                     }
+                    Err(e) => tracing::warn!("[context-index] embed failed: {e}"),
                 }
             }
-            Err(e) => tracing::warn!("[context-index] fetch failed: {e}"),
+            if stored > 0 {
+                // Counted per ITEM, not per chunk: the report answers
+                // "how much of the corpus is reachable", and a reader
+                // comparing it against the item count would otherwise
+                // see more indexed than exist.
+                report.context_indexed += 1;
+            }
+        }
+        if budget == IndexBudget::OneBatch || worked < CONTEXT_BATCH {
+            break;
         }
     }
 
@@ -203,6 +317,10 @@ mod tests {
     #[derive(Default)]
     struct SpyIndex {
         calls: Mutex<Vec<String>>,
+        /// Rows still wanting a vector. Drained by each `needs_embedding_with_text`
+        /// so the spy behaves like the real index: an embedded row stops being
+        /// returned, which is what makes re-asking a valid way to page.
+        backlog: Mutex<usize>,
     }
 
     #[async_trait]
@@ -241,9 +359,14 @@ mod tests {
             &self,
             _c: Corpus,
             _m: &str,
-            _l: usize,
+            l: usize,
         ) -> Result<Vec<(String, String)>> {
-            Ok(vec![])
+            let mut left = self.backlog.lock().unwrap();
+            let take = (*left).min(l);
+            *left -= take;
+            Ok((0..take)
+                .map(|i| (format!("row-{i}"), "the invoice is attached".to_string()))
+                .collect())
         }
         async fn backfill_from_source(&self, c: Corpus, _m: &str, _d: usize) -> Result<u64> {
             self.calls
@@ -327,6 +450,7 @@ mod tests {
             &InMemorySessionStorage::new(),
             &StubEmbedder,
             &CancellationToken::new(),
+            IndexBudget::OneBatch,
         )
         .await;
 
@@ -345,6 +469,103 @@ mod tests {
         assert_eq!(report.still_missing, 1);
     }
 
+    /// Measured on a real pond: 986 items wanting a vector, a batch of 64, and
+    /// scheduled passes that refuse until somebody chats. Pressing Reindex
+    /// cleared 480 vectors and put 64 back.
+    #[tokio::test]
+    async fn a_requested_pass_drains_a_backlog_bigger_than_one_batch() {
+        let spy = Arc::new(SpyIndex {
+            backlog: Mutex::new(CONTEXT_BATCH * 3 + 7),
+            ..Default::default()
+        });
+        let index: Arc<dyn VectorIndex> = spy.clone();
+        let report = run_index_maintenance(
+            &index,
+            &InMemorySessionStorage::new(),
+            &StubEmbedder,
+            &CancellationToken::new(),
+            IndexBudget::UntilDone,
+        )
+        .await;
+        assert_eq!(
+            report.context_indexed,
+            CONTEXT_BATCH * 3 + 7,
+            "an asked-for pass must finish the corpus, not take one bite"
+        );
+        assert_eq!(*spy.backlog.lock().unwrap(), 0);
+    }
+
+    /// The background pass stays small, or a household's next turn queues
+    /// behind the whole mailbox.
+    #[tokio::test]
+    async fn a_scheduled_pass_takes_one_bite() {
+        let spy = Arc::new(SpyIndex {
+            backlog: Mutex::new(CONTEXT_BATCH * 3),
+            ..Default::default()
+        });
+        let index: Arc<dyn VectorIndex> = spy.clone();
+        let report = run_index_maintenance(
+            &index,
+            &InMemorySessionStorage::new(),
+            &StubEmbedder,
+            &CancellationToken::new(),
+            IndexBudget::OneBatch,
+        )
+        .await;
+        assert_eq!(report.context_indexed, CONTEXT_BATCH);
+    }
+
+    /// The deadlock this exemption exists for: mail arrives from a connector,
+    /// not a conversation, so a pond that is synced and browsed but never
+    /// chatted with never satisfies the lane's activity gate.
+    #[test]
+    fn an_idle_pond_indexes_itself_once_after_boot() {
+        let tick = plan_sweep(false, false);
+        assert!(
+            tick.exempt_from_activity_gate,
+            "a pond nobody has chatted with would never index at all"
+        );
+        assert_eq!(
+            tick.budget,
+            IndexBudget::UntilDone,
+            "an exemption that indexed one batch would leave the pond unsearchable anyway"
+        );
+    }
+
+    /// Once, not every tick. After the first pass the gate applies again.
+    #[test]
+    fn a_later_scheduled_pass_is_gated_again_and_takes_one_bite() {
+        let tick = plan_sweep(false, true);
+        assert!(
+            !tick.exempt_from_activity_gate,
+            "the exemption is per boot, not per tick"
+        );
+        assert_eq!(tick.budget, IndexBudget::OneBatch);
+    }
+
+    #[test]
+    fn a_busy_pond_still_takes_one_bite_per_scheduled_pass() {
+        // A used pond satisfies the lane's own gate; the sweep needs no
+        // exemption and must not claim one.
+        let tick = plan_sweep(false, true);
+        assert!(!tick.exempt_from_activity_gate);
+        assert_eq!(
+            tick.budget,
+            IndexBudget::OneBatch,
+            "background work must not queue a household's turn behind the mailbox"
+        );
+    }
+
+    /// Somebody watching an empty panel gets the whole corpus, always.
+    #[test]
+    fn a_requested_pass_is_always_exhaustive() {
+        for indexed in [false, true] {
+            let tick = plan_sweep(true, indexed);
+            assert!(tick.exempt_from_activity_gate);
+            assert_eq!(tick.budget, IndexBudget::UntilDone);
+        }
+    }
+
     /// A member's turn must be able to take the CPU back mid-pass.
     #[tokio::test]
     async fn a_cancelled_pass_does_no_work() {
@@ -357,6 +578,7 @@ mod tests {
             &InMemorySessionStorage::new(),
             &StubEmbedder,
             &cancel,
+            IndexBudget::OneBatch,
         )
         .await;
         assert_eq!(report, MaintenanceReport::default());

@@ -230,8 +230,9 @@ impl SystemMcpServer {
     }
 
     #[tool(
-        description = "Run an allow-listed shell command only: ls, cat, echo, date, uptime, df, free, \
-        whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, which, env, printenv. 10s timeout."
+        description = "Run an allow-listed command only (10s timeout): ls, cat, echo, date, \
+        uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, \
+        which, env, printenv."
     )]
     async fn run_shell_command(
         &self,

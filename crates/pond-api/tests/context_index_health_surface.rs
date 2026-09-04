@@ -138,6 +138,7 @@ async fn make_app(wire_index: bool, wire_embedder: bool) -> Harness {
     hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(hs),
@@ -165,6 +166,7 @@ async fn make_app(wire_index: bool, wire_embedder: bool) -> Harness {
         // `if let Some(provider)`. Wiring it whenever the index is present would
         // make this harness claim a refill on a pond where nothing can refill.
         index_reindex: (wire_index && wire_embedder).then(|| reindex.clone()),
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -297,6 +299,8 @@ async fn add_vector(h: &Harness, corpus: Corpus, row_id: &str, model_id: &str) {
         .upsert(&VectorEntry {
             corpus,
             row_id: row_id.to_string(),
+            chunk_ix: 0,
+            chunk_span: None,
             model_id: model_id.to_string(),
             vector: vec![0.1, 0.2, 0.3, 0.4],
             source_rev: None,

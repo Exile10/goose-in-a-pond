@@ -102,11 +102,33 @@ pub enum SourceAvailability {
     /// reaches out for these — a paired client pushes them — so no egress gate
     /// is involved, only an authenticated route that does not exist yet.
     AwaitingIngestRoute,
-    /// Waiting on PAI-2 P6b: the draft gate for outbound connector actions, and
-    /// redaction chokepoint 3 (before a body leaves the pond). Both are
-    /// unfinished, and chokepoint 3 has no call site until the first connector
-    /// exists — which is why neither side may be built assuming the other.
-    AwaitingEgressGate,
+    /// Waiting on a connector that reaches out to the account and only READS.
+    ///
+    /// **This arm used to name PAI-2 P6b — the draft gate and redaction
+    /// chokepoint 3 — and both halves of that reason have since expired.**
+    /// Chokepoint 3 is discharged: `IngestPipeline::new` takes a `Redactor`
+    /// that is deliberately not an `Option`, and P1 wired a pipeline, so it is
+    /// present AND reached. The draft gate is not a prerequisite at all: it
+    /// exists to approve outbound *actions on an account* — sending mail,
+    /// posting to a channel — and PAI-8 §0 puts write-back out of scope for v1.
+    /// An ingest-only connector takes no such action, so there is nothing for
+    /// that gate to approve.
+    ///
+    /// What a read-only connector actually needs is already in the tree:
+    /// egress tracking (`UNGATED_SENDERS` is empty, `MAX_UNGATED` is 0),
+    /// `network_mode` governance, encrypted credentials in
+    /// `SecretRepository`, and redaction before persistence.
+    ///
+    /// So this is no longer a security gate. It is the plain statement that
+    /// nothing fetches this kind yet, and it lifts per kind as each connector
+    /// lands — not all at once, because a connector is per protocol.
+    ///
+    /// The refusal is KEPT rather than removed. Accepting a kind nothing can
+    /// produce would let `upsert_source` mint a source that stays empty
+    /// forever, which is the reader-with-no-writer shape this programme keeps
+    /// recording. When the CalDAV adapter lands, `Calendar` moves to
+    /// [`Landed`](Self::Landed) and this doc loses a sentence.
+    AwaitingReadConnector,
 }
 
 impl SourceAvailability {
@@ -118,10 +140,9 @@ impl SourceAvailability {
                 "this source kind is pushed to the pond by a paired client, and the ingest \
                  route it would arrive on (PAI-8 P3) does not exist yet"
             }
-            Self::AwaitingEgressGate => {
-                "this source kind needs a connector that reaches out to an account, and the \
-                 gate every outbound body must pass (PAI-2 P6b: the draft gate for connector \
-                 actions, and redaction chokepoint 3) is unfinished"
+            Self::AwaitingReadConnector => {
+                "this source kind needs a connector that signs in to the account and reads \
+                 it, and no connector for this protocol exists yet"
             }
         }
     }
@@ -168,9 +189,25 @@ impl SourceKind {
             // Data the pond already holds. Ingesting it adds no egress.
             Self::Sensor | Self::Camera | Self::Voice => SourceAvailability::Landed,
             Self::Mobile => SourceAvailability::AwaitingIngestRoute,
-            Self::Mail | Self::Calendar | Self::Files | Self::Chat => {
-                SourceAvailability::AwaitingEgressGate
-            }
+            // The CalDAV adapter reads it, the connect route stores its
+            // credentials and `calendar_sync` pulls it on a schedule. All three
+            // had to exist before this line could move: a `Landed` kind with no
+            // sync is a source that looks connected and stays empty.
+            Self::Calendar | Self::Mail => SourceAvailability::Landed,
+            Self::Files | Self::Chat => SourceAvailability::AwaitingReadConnector,
+        }
+    }
+
+    /// Whether connecting this kind means signing in to an account.
+    ///
+    /// The two on-pond kinds are already here and need nothing; the account
+    /// kinds cannot work without an app password. Stated on the kind rather
+    /// than checked at the route, because the connect surface and the sync
+    /// sweep both have to agree and a second copy is how they stop agreeing.
+    pub fn needs_credentials(&self) -> bool {
+        match self {
+            Self::Sensor | Self::Camera | Self::Voice | Self::Mobile => false,
+            Self::Mail | Self::Calendar | Self::Files | Self::Chat => true,
         }
     }
 
@@ -331,6 +368,16 @@ pub struct ContextSource {
     status: SourceStatus,
     secret_ref: Option<String>,
     created_at: DateTime<Utc>,
+}
+
+/// Where a source's sign-in details live in the secret store.
+///
+/// Derived from the source id rather than stored beside it, so the two cannot
+/// drift and a disconnect knows what to delete without reading the row it has
+/// just removed. Both the connect route and the sync sweep call this; a second
+/// copy of the format string is how a credential becomes unreachable.
+pub fn secret_key_for(source_id: &str) -> String {
+    format!("caldav:{source_id}")
 }
 
 /// The parts a [`ContextSource`] is built from, on both the connect path and the
@@ -821,16 +868,21 @@ mod tests {
     /// would let the pipeline accept a connector's data before the gate that is
     /// supposed to govern it exists.
     #[test]
-    fn only_the_on_pond_kinds_are_landed() {
+    fn only_kinds_with_a_working_path_are_landed() {
         let landed: Vec<&str> = SourceKind::ALL
             .into_iter()
             .filter(|k| k.availability() == SourceAvailability::Landed)
             .map(|k| k.as_str())
             .collect();
+        // `calendar` joined the on-pond three when its connector landed, and it
+        // is the whole test: a kind may only be `Landed` when something can
+        // actually produce items for it. Adding a name here before the adapter,
+        // the credential path and the sync all exist mints sources that look
+        // connected and stay empty.
         assert_eq!(
             landed,
-            vec!["sensor", "camera", "voice"],
-            "PAI-8 P1 is on-pond sources only; anything else needs a phase that has not landed"
+            vec!["sensor", "camera", "voice", "mail", "calendar"],
+            "a kind is Landed only once an adapter, a credential path and a sync exist for it"
         );
         for kind in SourceKind::ALL {
             if kind.availability() != SourceAvailability::Landed {

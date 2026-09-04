@@ -170,6 +170,7 @@ async fn make_app(agent: Arc<dyn Agent>) -> Harness {
     hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(hs),
@@ -190,6 +191,7 @@ async fn make_app(agent: Arc<dyn Agent>) -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
