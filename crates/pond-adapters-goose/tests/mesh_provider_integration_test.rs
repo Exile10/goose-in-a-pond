@@ -87,6 +87,7 @@ async fn a_chat_turn_over_an_unavailable_mesh_surfaces_a_clean_error() {
         canvas_mode: false,
         profile_scope: ProfileScope::Household,
         profile_context: None,
+        tool_group_allowlist: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();
