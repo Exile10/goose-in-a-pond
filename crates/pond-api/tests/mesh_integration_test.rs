@@ -589,15 +589,24 @@ async fn capabilities_route_is_unavailable_without_mesh_configured() {
 
 // ── GET /api/v1/mesh/settlement ──────────────────────────────────────────────
 
+/// The rate is a compile-time constant, so the endpoint reports it verbatim.
+/// Read it from the constant rather than restating 30: this asserts the
+/// endpoint surfaces whatever the software settles at, not one baked-in number
+/// that a rate change would turn into a false failure.
+const RATE: u64 = pond_core::mesh::domain::settlement::MESH_SETTLEMENT_MILLISATS_PER_TOKEN;
+
 #[tokio::test]
-async fn settlement_status_reports_unconfigured_by_default() {
+async fn settlement_status_reports_the_built_in_rate() {
     let (app, _usage_tally, _settings_repo, _peer_directory, _tmp) =
         make_app_with_settlement_deps().await;
 
     let (status, body) = json_request(&app, Method::GET, "/api/v1/mesh/settlement", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["configured"], false);
-    assert_eq!(body["millisats_per_token"], 0);
+    // Every install settles at the same non-zero rate, so there is no
+    // "unconfigured" state to report — `configured` is a property of the
+    // software, not of this pond's setup.
+    assert_eq!(body["configured"], true);
+    assert_eq!(body["millisats_per_token"], RATE);
     assert_eq!(body["peers"].as_array().unwrap().len(), 0);
 }
 
@@ -624,17 +633,21 @@ async fn settlement_status_reports_pending_usage_per_peer() {
 
     let (status, body) = json_request(&app, Method::GET, "/api/v1/mesh/settlement", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["configured"], false, "rate still 0 by default");
     let peers = body["peers"].as_array().unwrap();
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0]["peer_id"], peer.to_string());
     assert_eq!(peers[0]["pending_tokens"], 250);
-    // Rate is 0, so the millisats estimate is 0 too — not "unknown", just honest.
-    assert_eq!(peers[0]["pending_millisats"], 0);
+    assert_eq!(peers[0]["pending_millisats"], 250 * RATE);
 }
 
+/// `Settings::mesh_settlement_millisats_per_token` is vestigial, and its being
+/// ignored is a security property rather than an oversight: a borrower that
+/// could set its own rate could decide to pay less than the lender expects.
+/// That is what makes "circle" trust enough for payment — the peer has to
+/// trust your model use, not your local settings file. This test is the guard
+/// on it, so a well-meaning change that wires the setting back up fails here.
 #[tokio::test]
-async fn settlement_status_reflects_a_real_rate_once_set() {
+async fn a_pond_cannot_talk_down_its_own_settlement_rate() {
     let (app, usage_tally, settings_repo, _peer_directory, _tmp) =
         make_app_with_settlement_deps().await;
     let peer = PeerId::from([10u8; 32]);
@@ -654,15 +667,26 @@ async fn settlement_status_reflects_a_real_rate_once_set() {
         .await
         .unwrap();
 
+    // A rate this pond would rather pay. Deliberately far below the real one.
     let mut settings = settings_repo.get().await.unwrap();
     settings.mesh_settlement_millisats_per_token = 5;
     settings_repo.update(&settings).await.unwrap();
+    assert!(
+        5 < RATE,
+        "the test rate has to undercut the real one to mean anything"
+    );
 
     let (status, body) = json_request(&app, Method::GET, "/api/v1/mesh/settlement", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["configured"], true);
-    assert_eq!(body["millisats_per_token"], 5);
+    assert_eq!(
+        body["millisats_per_token"], RATE,
+        "the local setting must not move the rate"
+    );
     let peers = body["peers"].as_array().unwrap();
     assert_eq!(peers[0]["pending_tokens"], 100);
-    assert_eq!(peers[0]["pending_millisats"], 500); // 100 tokens * 5 msat/token
+    assert_eq!(
+        peers[0]["pending_millisats"],
+        100 * RATE,
+        "what is owed follows the built-in rate, not the local setting"
+    );
 }
