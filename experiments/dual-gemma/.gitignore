@@ -1,0 +1,6 @@
+logs/
+__pycache__/
+*.pyc
+
+# keep results/*.txt summaries, drop the bulky per-case JSON
+results/*.json

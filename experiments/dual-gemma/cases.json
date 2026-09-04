@@ -1,0 +1,244 @@
+[
+ {
+  "id": "weather_direct",
+  "question": "What's the weather in Nairobi?",
+  "expect_tool": "get_weather",
+  "expect_args": {
+   "city": "Nairobi"
+  },
+  "answer_contains": [
+   "21"
+  ]
+ },
+ {
+  "id": "weather_indirect",
+  "question": "Should I take a jacket in Eldoret today?",
+  "expect_tool": "get_weather",
+  "expect_args": {
+   "city": "Eldoret"
+  }
+ },
+ {
+  "id": "timer_minutes",
+  "question": "Wake me in 10 minutes for the standup",
+  "expect_tool": "set_timer",
+  "expect_args": {
+   "seconds": 600
+  }
+ },
+ {
+  "id": "timer_compound",
+  "question": "Set a timer for an hour and a half to check the oven",
+  "expect_tool": "set_timer",
+  "expect_args": {
+   "seconds": 5400
+  }
+ },
+ {
+  "id": "math_words",
+  "question": "How much is a fifth of eighteen thousand?",
+  "expect_tool": "calculate",
+  "answer_contains": [
+   "3600"
+  ]
+ },
+ {
+  "id": "math_direct",
+  "question": "What is 1234 times 17?",
+  "expect_tool": "calculate",
+  "answer_contains": [
+   "20978"
+  ]
+ },
+ {
+  "id": "convert_distance",
+  "question": "How many miles is 340 km?",
+  "expect_tool": "convert_units",
+  "expect_args": {
+   "value": 340,
+   "from_unit": "km",
+   "to_unit": "mi"
+  },
+  "answer_contains": [
+   "211"
+  ]
+ },
+ {
+  "id": "convert_temp",
+  "question": "Is 29 degrees Celsius hot in Fahrenheit?",
+  "expect_tool": "convert_units",
+  "expect_args": {
+   "value": 29,
+   "from_unit": "c",
+   "to_unit": "f"
+  },
+  "answer_contains": [
+   "84"
+  ]
+ },
+ {
+  "id": "convert_mass_vs_calc",
+  "question": "What's 2 kg in pounds?",
+  "expect_tool": "convert_units",
+  "expect_args": {
+   "value": 2,
+   "from_unit": "kg",
+   "to_unit": "lb"
+  },
+  "answer_contains": [
+   "4.4"
+  ]
+ },
+ {
+  "id": "notes_search",
+  "question": "Do I have any notes about the Jetson?",
+  "expect_tool": "search_notes",
+  "alt_tools": [
+   "read_note"
+  ]
+ },
+ {
+  "id": "notes_read",
+  "question": "What does my standup note say?",
+  "expect_tool": "read_note",
+  "alt_tools": [
+   "search_notes"
+  ],
+  "answer_contains": [
+   "09:15"
+  ]
+ },
+ {
+  "id": "notes_then_convert",
+  "question": "My travel note has the road distance to Kisumu. How far is that in miles?",
+  "expect_tool": "read_note",
+  "alt_tools": [
+   "search_notes"
+  ],
+  "answer_contains": [
+   "211"
+  ]
+ },
+ {
+  "id": "zero_arg_tool",
+  "question": "What timers do I have set right now?",
+  "expect_tool": "list_timers"
+ },
+ {
+  "id": "time_timezone",
+  "question": "What time is it in Tokyo?",
+  "expect_tool": "get_time"
+ },
+ {
+  "id": "unknown_city",
+  "question": "What's the weather in Atlantis?",
+  "expect_tool": "get_weather",
+  "expect_args": {
+   "city": "Atlantis"
+  }
+ },
+ {
+  "id": "timer_then_list",
+  "question": "Set a 5 minute timer for tea",
+  "expect_tool": "set_timer",
+  "expect_args": {
+   "seconds": 300
+  }
+ },
+ {
+  "id": "no_tool_greeting",
+  "question": "Hello, what sort of things can you help me with?",
+  "expect_tool": null
+ },
+ {
+  "id": "no_tool_knowledge",
+  "question": "In one sentence, what does the acronym GGUF stand for?",
+  "expect_tool": null
+ },
+ {
+  "id": "multi_weather_two",
+  "question": "What's the weather in Nairobi and Mombasa?",
+  "expect_calls": [
+   {
+    "tool": "get_weather",
+    "args": {
+     "city": "Nairobi"
+    }
+   },
+   {
+    "tool": "get_weather",
+    "args": {
+     "city": "Mombasa"
+    }
+   }
+  ],
+  "answer_contains": [
+   "21",
+   "31"
+  ]
+ },
+ {
+  "id": "multi_weather_timer",
+  "question": "Check the weather in Kisumu and set a 5 minute timer for tea",
+  "expect_calls": [
+   {
+    "tool": "get_weather",
+    "args": {
+     "city": "Kisumu"
+    }
+   },
+   {
+    "tool": "set_timer",
+    "args": {
+     "seconds": 300
+    }
+   }
+  ],
+  "answer_contains": [
+   "29"
+  ]
+ },
+ {
+  "id": "multi_convert_calc",
+  "question": "How many miles is 340 km, and what is a fifth of eighteen thousand?",
+  "expect_calls": [
+   {
+    "tool": "convert_units",
+    "args": {
+     "value": 340,
+     "from_unit": "km",
+     "to_unit": "mi"
+    }
+   },
+   {
+    "tool": "calculate",
+    "args": {}
+   }
+  ],
+  "answer_contains": [
+   "211",
+   "3600"
+  ]
+ },
+ {
+  "id": "multi_note_weather",
+  "question": "Read my jetson note and tell me the weather in Eldoret",
+  "expect_calls": [
+   {
+    "tool": "read_note",
+    "args": {
+     "name": "jetson"
+    }
+   },
+   {
+    "tool": "get_weather",
+    "args": {
+     "city": "Eldoret"
+    }
+   }
+  ],
+  "answer_contains": [
+   "17"
+  ]
+ }
+]
