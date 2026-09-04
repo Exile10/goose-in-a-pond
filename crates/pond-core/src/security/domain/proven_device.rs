@@ -1,39 +1,7 @@
-//! The device a request was **proved** to come from, and what that proves
-//! about who is speaking.
-//!
-//! [PAI-1](../../../../../docs/architecture/pai/01-identity-and-profile-boundaries.md)
-//! P9's identity half. `identity_resolution::resolve` has honoured
-//! `paired_device_profile` since 2026-08-04 and every caller fed it `None`,
-//! because a turn did not carry a device id. This is the type that carries one.
-//!
-//! # Why a newtype and not a `String`
-//!
-//! `IdentificationSource::PairedDevice` is the **strongest** rung of the
-//! resolver: it outranks face and explicit identification, so whatever fills it
-//! outranks every proof the pond can actually make. A `&str` parameter would be
-//! satisfied by `headers.get("X-Device-Id")` as readily as by the token lookup,
-//! and the two are not remotely the same claim — one is a fact the pond wrote
-//! down at pairing, the other is a sentence the caller typed.
-//!
-//! So the field is private and there are exactly two public constructors:
-//! [`ProvenDevice::from_principal`], which can only read what the auth layer
-//! put on the request from the token the pond issued, and
-//! [`ProvenDevice::none`], which names no device at all. **There is no
-//! constructor that takes a caller-supplied string**, so honouring a header
-//! would require adding one to this file — a visible change to a security type,
-//! rather than an invisible change to a handler.
-//!
-//! # Why the fall-through is a type and not an `Option`
-//!
-//! [`DeviceRung`] mirrors
-//! [`TargetedDelivery`](crate::user_data::ports::device_attribution::TargetedDelivery)
-//! deliberately. Four different things can happen when the pond asks whose
-//! device this is, three of them mean "fall through to the next rung", and the
-//! shortest way to write that with an `Option` is `.unwrap_or_default()` on the
-//! attribution read — which turns a failed database read into "unattributed"
-//! and makes a broken pond indistinguishable, in a log, from a shared tablet.
-//! [`DeviceRung::from_attribution`] consumes the `Result` so the distinction
-//! cannot be dropped, and only one variant carries a member.
+//! The device a request was proved to come from (PAI-1 P9's identity half; see
+//! docs/architecture/pai/01-identity-and-profile-boundaries.md). `PairedDevice` is the
+//! strongest resolver rung, so the id is private and no constructor takes a caller string.
+//! [`DeviceRung`] is a type, not an `Option`, so a failed read never reads as unattributed.
 
 use anyhow::Result;
 
@@ -47,25 +15,18 @@ use crate::security::ports::policy::Principal;
 pub struct ProvenDevice(Option<String>);
 
 impl ProvenDevice {
-    /// The device the authenticated principal presented — the **only**
-    /// constructor that can name one.
-    ///
-    /// `Principal::device_id` is populated in exactly one place, the API's auth
-    /// middleware, from `Handshake::caller_for_token`. That is the token the
-    /// pond issued at pairing, so the chain from here back to a
-    /// `devices.profile_id` written by the operator is unbroken and contains
-    /// nothing the client said about itself.
+    /// The device the authenticated principal presented, the only constructor
+    /// that can name one. `Principal::device_id` is set in exactly one place,
+    /// the API auth middleware, from `Handshake::caller_for_token`: the token
+    /// the pond issued at pairing, not anything the client said about itself.
     pub fn from_principal(principal: &Principal) -> Self {
         Self(principal.device_id.clone())
     }
 
-    /// No device on this request.
-    ///
-    /// The honest answer for an in-process caller, for the loopback dev bypass
-    /// (which returns before a token is ever read), and for a request that
-    /// reached a handler with no `Principal` attached at all. Every rung below
-    /// the paired-device one still applies, so this narrows rather than
-    /// refusing.
+    /// No device on this request: an in-process caller, the loopback dev bypass
+    /// (which returns before a token is read), or a handler reached with no
+    /// `Principal`. Every rung below the paired-device one still applies, so
+    /// this narrows rather than refuses.
     pub fn none() -> Self {
         Self(None)
     }
@@ -76,13 +37,9 @@ impl ProvenDevice {
     }
 
     /// Turn this request's attribution read into the resolver's strongest rung.
-    ///
-    /// Takes the `Result` rather than the `Option` for the reason
-    /// `TargetedDelivery::plan` does: handing the caller a `Result` puts the
-    /// failed read where the shortest thing to write is `.unwrap_or_default()`.
-    ///
-    /// The read is only performed when this device names one, so a caller with
-    /// [`ProvenDevice::none`] passes `Ok(None)` — or never calls at all.
+    /// Takes the `Result`, not the `Option`, as `TargetedDelivery::plan` does, so
+    /// a failed read cannot be spelled away. A [`ProvenDevice::none`] caller
+    /// passes `Ok(None)`.
     pub fn rung(&self, attribution: Result<Option<String>>) -> DeviceRung {
         if self.0.is_none() {
             // Belt and braces: an attribution read that happened for some
@@ -129,13 +86,10 @@ impl DeviceRung {
         }
     }
 
-    /// The member this rung resolves, if it resolves one.
-    ///
-    /// This is the value
-    /// [`ResolutionInputs::paired_device_profile`](crate::user_data::services::identity_resolution::ResolutionInputs::paired_device_profile)
-    /// wants. Three of the four variants answer `None`, which is the whole
-    /// safety property: every way of failing to identify a device falls through
-    /// to the next rung.
+    /// The member this rung resolves, if it resolves one — the value
+    /// `identity_resolution::ResolutionInputs::paired_device_profile` wants.
+    /// Three of the four variants answer `None`: every way of failing to
+    /// identify a device falls through to the next rung.
     pub fn profile_id(&self) -> Option<&str> {
         match self {
             Self::Member(id) => Some(id),
@@ -268,11 +222,10 @@ mod tests {
         }
     }
 
-    /// Structural, and the reason this is a newtype at all. The field is
-    /// private and these are the only two public constructors, so a handler
-    /// that wanted to honour `X-Device-Id` has nothing to call: there is no
-    /// `From<String>`, no `new(&str)`, no `Default`. This test is the executable
-    /// note that adding one is the change to argue about.
+    /// Structural, and the reason this is a newtype: the field is private and
+    /// these are the only two public constructors, so a handler wanting to
+    /// honour `X-Device-Id` has nothing to call — no `From<String>`, no
+    /// `new(&str)`, no `Default`. Adding one is the change to argue about.
     #[test]
     fn the_only_way_to_name_a_device_is_from_a_principal() {
         let from_client_input = "attacker-chosen-device-id";

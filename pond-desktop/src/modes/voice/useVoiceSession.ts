@@ -23,7 +23,7 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useAppDispatch } from "../../state/AppContext";
+import { useAppDispatch, useAppState } from "../../state/AppContext";
 import { nextTranscriptId, nextCardId } from "../../state/reducer";
 
 // ── Contract state-string mapping (contract section 4) ──────────────────────
@@ -108,6 +108,13 @@ export interface VoiceSessionAPI {
   sessionActive: boolean;
   /** True while the shell has started spawning but before voice-ready fires. */
   connecting: boolean;
+  /**
+   * True from voice-warmup "warming" until its terminal state — the stretch
+   * where the child is alive but the model is still loading and the prompt
+   * prefix precompiling. The child speaks "Warming up." at the start and
+   * greets by name when done; this flag lets the orb say it visually too.
+   */
+  warmingUp: boolean;
   /** Start the persistent child-process session. Returns the session uuid. */
   startSession(): Promise<string | null>;
   /** Close child stdin to request clean exit; kills after 3s if still alive. */
@@ -123,8 +130,23 @@ export interface VoiceSessionAPI {
 export function useVoiceSession(): VoiceSessionAPI {
   const dispatch = useAppDispatch();
 
+  // The conversation the chat view is on, read at call time.
+  //
+  // Held in a ref rather than put in `startSession`'s dependency array so the
+  // callback keeps a stable identity: it is depended on by effects elsewhere,
+  // and re-creating it whenever the session id changed would re-run them.
+  //
+  // `useAppState()` subscribes this hook to the whole app state, so it now
+  // re-renders on every `APPEND_AGENT_TOKEN` batch too. Accepted: it already
+  // re-renders at roughly 30 Hz from the local `audioLevel` state while
+  // listening, so the token batches are not the thing driving this component.
+  const appSessionId = useAppState().sessionId;
+  const appSessionIdRef = useRef<string | null>(appSessionId);
+  appSessionIdRef.current = appSessionId;
+
   const [sessionActive, setSessionActive] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [warmingUp, setWarmingUp] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
 
   // Track the session id for stale-event filtering (finding 14-consumer).
@@ -187,11 +209,19 @@ export function useVoiceSession(): VoiceSessionAPI {
       );
     }
 
+    // voice-warmup: warming | ready | skipped | failed. Precedes voice-ready.
+    register(
+      listen<string>("voice-warmup", (e) => {
+        setWarmingUp(e.payload === "warming");
+      }),
+    );
+
     // voice-ready: child is fully initialised and entering the wait loop.
     // Emitted once per session after models are loaded.
     register(
       listen<{ session_id: string }>("voice-ready", (e) => {
         setConnecting(false);
+        setWarmingUp(false);
         setSessionActive(true);
         if (e.payload?.session_id) {
           activeSessionIdRef.current = e.payload.session_id;
@@ -382,8 +412,14 @@ export function useVoiceSession(): VoiceSessionAPI {
       dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
       // start_voice_session: stops the shell wake listener, sets the
       // VoiceChildActive flag, spawns the child, starts the stdout reader.
-      // Returns the generated session uuid.
-      const sessionId = await invoke<string>("start_voice_session");
+      //
+      // Passing the session the chat view is on makes voice a continuation of
+      // that conversation rather than a new one — same history, same Goose
+      // engine session, same agent mid-thought. `null` (no chat has happened
+      // yet) still starts fresh, and the child returns whichever id it used.
+      const sessionId = await invoke<string>("start_voice_session", {
+        sessionId: appSessionIdRef.current,
+      });
       // Track for stale-ended filtering (finding 14-consumer).
       activeSessionIdRef.current = sessionId ?? null;
       // Session id is set here for optimistic UI; the voice-ready event
@@ -426,5 +462,6 @@ export function useVoiceSession(): VoiceSessionAPI {
     dispatch({ type: "CLEAR_CONTEXT_CARDS" });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { sessionActive, connecting, startSession, stopSession, clearConversation, audioLevel };
+  return { sessionActive, connecting,
+    warmingUp, startSession, stopSession, clearConversation, audioLevel };
 }

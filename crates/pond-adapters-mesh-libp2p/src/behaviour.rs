@@ -1,8 +1,6 @@
 //! The composed libp2p `NetworkBehaviour` for a mesh node, and the
-//! request/response message shapes carried over it.
-//!
-//! Scoped to what Circle-only trust actually needs (see the module docs on
-//! each field below) — no public/OpenLane discovery anywhere in this stack.
+//! request/response message shapes carried over it. Scoped to what Circle-only
+//! trust needs: no public/OpenLane discovery anywhere in this stack.
 
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{dcutr, gossipsub, identify, kad, ping, relay, request_response};
@@ -25,14 +23,9 @@ pub enum MeshRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MeshResponse {
     /// Carries the RESPONDER's own prost-encoded `Handshake`, so the exchange
-    /// authenticates both directions.
-    ///
-    /// It used to be a bare unit variant, and that made the acceptance
-    /// criterion one-sided: the dialer sent its handshake, the listener
-    /// checked it, and the dialer then trusted a peer whose harness hash,
-    /// model hash and key it had never seen. "A peer presenting a mismatched
-    /// harness or model hash is refused" held in one direction only, and the
-    /// direction it did not hold in is the one where we hand out frames.
+    /// authenticates both directions. A bare unit variant would leave the dialer
+    /// trusting a peer whose harness hash, model hash and key it never saw, in
+    /// the direction where this Pond hands out frames.
     HandshakeAccepted(Vec<u8>),
     /// Harness/model hash mismatch, a signature that doesn't verify, an
     /// identity that doesn't match the connection, or a peer this Pond does
@@ -65,11 +58,8 @@ pub struct MeshBehaviour {
     /// Attempts to upgrade a relayed connection to a direct one.
     pub dcutr: dcutr::Behaviour,
     pub mesh_rr: request_response::cbor::Behaviour<MeshRequest, MeshResponse>,
-    /// Keeps an idle connection alive. With no periodic traffic, libp2p's
-    /// default idle-connection timeout closes a peer link shortly after its
-    /// last request — `connected_peers()` then flips back to "disconnected"
-    /// between mesh calls even though the peer is reachable and about to be
-    /// re-dialed anyway. A steady ping heartbeat keeps the link (and
-    /// `connected`) accurate instead of flapping.
+    /// Keeps an idle connection alive. Without periodic traffic libp2p's default
+    /// idle-connection timeout closes a peer link shortly after its last request,
+    /// and `connected_peers()` then flaps to "disconnected" between mesh calls.
     pub ping: ping::Behaviour,
 }

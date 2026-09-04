@@ -1,8 +1,7 @@
 //! #90 acceptance: the sensor read-out surface answers correctly, and readings
-//! produced by an adapter (not just POSTed over HTTP) become queryable.
-//!
-//! Wires a real `SqliteSensorStorage` into `AppState` so the aggregate SQL and
-//! the time-range bounds run for real rather than through an in-memory mock.
+//! produced by an adapter rather than POSTed over HTTP become queryable. Wires a
+//! real `SqliteSensorStorage` into `AppState` so the aggregate SQL and the
+//! time-range bounds run for real rather than through an in-memory mock.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +55,7 @@ async fn make_harness() -> Harness {
     let bus = Arc::new(InProcessEventBus::new());
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db,
         onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
         handshake: Arc::new(mock_hs),
@@ -87,6 +87,7 @@ async fn make_harness() -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         // The real store, so the aggregate SQL and the TEXT range comparison
         // are what the assertions actually exercise.
         sensor_storage: Arc::new(SqliteSensorStorage::new(logs.clone())),
@@ -412,13 +413,9 @@ async fn http_post_is_written_exactly_once() {
 }
 
 /// An aggregate without a `sensor_type` is refused, not silently downgraded.
-///
-/// `agg`, `since` and `until` are parsed and validated before the
-/// no-`sensor_type` branch, and have nowhere to go on it — so "the average
-/// since January" came back 200 with an unaggregated, unbounded list of the
-/// device's last 20 readings across every type it reports. A caller cannot tell
-/// that apart from a real answer, which is the same "answers a question that was
-/// not asked" defect the rest of this endpoint's hardening removes.
+/// `agg`, `since` and `until` are parsed before the no-`sensor_type` branch and
+/// have nowhere to go on it, so the request would answer 200 with an
+/// unaggregated, unbounded list a caller cannot tell from a real answer.
 #[tokio::test]
 async fn an_aggregate_without_a_sensor_type_is_refused() {
     let h = make_harness().await;

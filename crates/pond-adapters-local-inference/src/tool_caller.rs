@@ -1,8 +1,6 @@
-//! Tool-calling specialist engine — uses a small GGUF model to generate
-//! structured tool-call arguments when the main LLM sends empty `{}`.
-//!
-//! The specialist sees ONLY the tool schema + user query (no conversation
-//! history). This keeps inference fast (<100ms for a 270M model) and reliable.
+//! Tool-calling specialist engine: a small GGUF model generates structured tool-call arguments
+//! when the main LLM sends empty `{}`. The specialist sees ONLY the tool schema and the user
+//! query, never conversation history, which keeps inference under 100ms for a 270M model.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -16,9 +14,8 @@ use std::sync::Arc;
 
 /// In-process GGUF specialist for tool-call argument generation.
 ///
-/// Loaded once at startup (~200MB for FunctionGemma 270M), kept resident
-/// permanently. Uses the same `InferenceRuntime` singleton as the main model
-/// but in a separate model slot.
+/// Loaded once at startup (~200MB for FunctionGemma 270M) and kept resident. Shares the
+/// `InferenceRuntime` singleton with the main model but occupies a separate model slot.
 pub struct ToolCallerEngine {
     provider: Arc<dyn GooseProvider>,
     model_config: ModelConfig,
@@ -60,16 +57,10 @@ impl ToolCaller for ToolCallerEngine {
         tool_schema_json: &str,
         user_query: &str,
     ) -> Result<serde_json::Map<String, serde_json::Value>> {
-        // Build FunctionGemma's exact prompt format.
+        // Build FunctionGemma's native prompt format, bypassing Goose's template rendering
+        // entirely: no Jinja, no rmcp Tool objects. The model answers with
+        // <start_function_call>call:NAME{key:<escape>val<escape>}<end_function_call>.
         // Ref: https://ai.google.dev/gemma/docs/functiongemma/formatting-and-best-practices
-        //
-        // We bypass Goose's template rendering entirely — no Jinja, no rmcp Tool
-        // objects. The prompt is constructed in FunctionGemma's native format:
-        //   <start_of_turn>developer ... <start_function_declaration>declaration:NAME{...}<end_function_declaration><end_of_turn>
-        //   <start_of_turn>user ... <end_of_turn>
-        //   <start_of_turn>model\n
-        //
-        // The model outputs: <start_function_call>call:NAME{key:<escape>val<escape>}<end_function_call>
 
         let declaration = build_functiongemma_declaration(tool_name, tool_schema_json);
 
@@ -287,10 +278,8 @@ fn parse_functiongemma_call(text: &str) -> Option<serde_json::Map<String, serde_
 
 /// Parse the specialist model's output into a tool-call arguments map.
 ///
-/// Handles multiple output formats:
-/// - `{"name": "tool", "arguments": {"key": "value"}}`
-/// - `{"key": "value"}` (bare arguments object)
-/// - JSON embedded in markdown code fences
+/// Accepts `{"name": ..., "arguments": {...}}`, a bare arguments object, and either of those
+/// embedded in markdown code fences.
 fn parse_tool_call_json(
     text: &str,
     tool_name: &str,

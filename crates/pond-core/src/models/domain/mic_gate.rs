@@ -1,28 +1,7 @@
-//! Process-wide microphone permission.
-//!
-//! `Settings::mic_enabled` has shipped as a privacy control since it was added
-//! and has never been enforced anywhere: a workspace grep found only its
-//! definition, its persistence, and the UI toggle. Turning it off changed
-//! nothing — the wake-word detector, both capture paths and the barge-in
-//! listener all kept opening the device. For a privacy-first product that is
-//! worse than not offering the switch.
-//!
-//! ## Closing, not filtering
-//!
-//! Enforcement means refusing to OPEN the input device. Capturing audio and
-//! discarding it would leave the OS microphone indicator lit, and a user who
-//! sees that indicator is right not to believe the toggle. Every call site
-//! therefore checks this gate *before* `default_input_device()`.
-//!
-//! ## Why a process global
-//!
-//! Two adapter crates need it (`pond-adapters-whisper` for capture and
-//! wake-word, `pond-adapters-piper` for the barge-in listener) and neither
-//! depends on the other; the capture entry points are free functions, not
-//! methods with a config to thread through. Phase 4 folds all four call sites
-//! into a single microphone owner, at which point this becomes one field on
-//! that owner and this module goes away. The codebase already uses this shape
-//! for process-scoped state (`shared::services::egress::CURRENT_SESSION_ID`).
+//! Process-wide microphone permission: the enforcement of `Settings::mic_enabled`. It is a
+//! global because two adapter crates need it and the capture entry points are free functions.
+//! Enforcement means refusing to OPEN the device — capturing and discarding still lights the OS
+//! mic indicator — so every call site checks this gate before `default_input_device()`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -1,12 +1,7 @@
-//! Integration tests against an in-process mock controller (a real WebSocket
-//! server speaking `giap-matter`), so the whole adapter is CI-green with no
-//! controller installed and no hardware.
-//!
-//! What is asserted here is the adapter's half of the contract: which op it
-//! sends for a verb, what it does with the answer, how it behaves when the
-//! connection drops, and how the runtime converges. Which Matter cluster a verb
-//! becomes is the controller's business now and is tested in
-//! `matter-server/test/control.test.ts` against the same recorded devices.
+//! Integration tests against an in-process mock controller (a real WebSocket server speaking
+//! `giap-matter`), so the adapter is CI-green with no controller installed and no hardware. They
+//! assert the adapter's half of the contract only; which cluster a verb becomes is the
+//! controller's, tested in `matter-server/test/control.test.ts`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -61,20 +56,10 @@ fn greeting() -> Message {
 /// How the mock should answer one op.
 type Answer = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
 
-/// A mock controller. It greets, answers `subscribe` with `snapshot`, pushes
-/// `events` right after, and answers everything else with `answer` (success and
-/// an empty result by default).
-///
-/// It accepts connections in a loop, and a connection that never completes a
-/// WebSocket handshake is dropped rather than fatal. Both matter: `is_running`
-/// probes the port with a bare TCP connect before the runtime connects properly,
-/// so a mock that accepted once, or that unwrapped the handshake, would spend
-/// its only connection on the probe and then fail the test it was set up for.
 /// `apply` with BLE off, which is what every test here means.
 ///
-/// A helper rather than a `MatterConfig { .. }` literal at thirteen call sites:
-/// none of these tests is about the transport, and the noise would bury what
-/// they are about.
+/// A helper rather than a `MatterConfig { .. }` literal at thirteen call sites: none of these
+/// tests is about the transport.
 fn ip_only(url: impl Into<String>) -> MatterConfig {
     MatterConfig {
         url: url.into(),
@@ -82,6 +67,10 @@ fn ip_only(url: impl Into<String>) -> MatterConfig {
     }
 }
 
+/// A mock controller: greets, answers `subscribe` with `snapshot`, pushes `events`, and answers
+/// everything else with `answer`. Accepts in a loop and tolerates a failed handshake, because
+/// `is_running` probes the port with a bare TCP connect first and would otherwise consume the
+/// mock's only connection.
 async fn mock_controller(
     snapshot: Value,
     events: Vec<Value>,
@@ -384,11 +373,8 @@ async fn the_bridge_syncs_the_fabric_into_the_device_registry() {
 
 #[tokio::test]
 async fn a_device_nobody_touches_keeps_reading_as_present() {
-    // `is_online` is derived from `last_seen` being fresher than five minutes, and
-    // the bridge only said "still here" when an event arrived. An idle Matter device
-    // sends none, so a washer nobody touched went offline five minutes after the
-    // server started, with a "last seen" frozen at the moment it was synced -- which
-    // read like a commissioning timestamp, because that is effectively what it was.
+    // `is_online` means `last_seen` fresher than five minutes, and an idle Matter device sends no
+    // events, so without a liveness tick it reads offline five minutes after the server started.
     let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
     let (_control, registry, _bus, _rx) = start_adapter(&url).await;
 
@@ -410,13 +396,9 @@ async fn a_device_nobody_touches_keeps_reading_as_present() {
 
 #[tokio::test]
 async fn a_device_the_controller_has_lost_stops_being_vouched_for_until_it_says_otherwise() {
-    // The other half: once the controller says a device is gone, the bridge must
-    // stop saying it is here, or `last_seen` never ages and the card never turns
-    // offline. Letting it age out is what makes one mechanism decide this.
-    //
-    // "Until it says otherwise" is the part that was missing, and it is covered by
-    // the test below: this used to be a latch, and a device recorded offline once had
-    // no route back short of a full reconnect.
+    // Once the controller says a device is gone the bridge must stop vouching for it, or
+    // `last_seen` never ages and the card never turns offline. The test below covers the
+    // "until it says otherwise" half: being marked offline must not be a latch.
     let (url, _) = mock_controller(
         snapshot(vec![light()], vec![]),
         vec![json!({
@@ -441,15 +423,9 @@ async fn a_device_the_controller_has_lost_stops_being_vouched_for_until_it_says_
 
 #[tokio::test]
 async fn a_device_the_controller_can_see_again_is_vouched_for_again() {
-    // The bug this exists for. `present.remove` was a latch: a single `online:
-    // false` -- from a subscription lapse, or from a `subscribe` snapshot taken
-    // before matter.js had a CASE session -- dropped the device for good.
-    // `lifecycle.online` fires on a TRANSITION matter.js may never make again, so
-    // nothing said otherwise, `last_seen` aged past five minutes, and the card went
-    // offline while readings kept arriving from the controller's cache.
-    //
-    // The controller now reports availability as a repeated LEVEL rather than an
-    // edge, which only helps if the bridge treats a later `true` as a recovery.
+    // `present.remove` must not latch: a single `online: false`, from a subscription lapse or a
+    // snapshot taken before matter.js had a CASE session, would drop the device for good while
+    // readings kept arriving. Availability is a repeated level, so a later `true` is a recovery.
     let (url, _) = mock_controller(
         snapshot(vec![light()], vec![]),
         vec![
@@ -479,14 +455,9 @@ async fn a_device_the_controller_can_see_again_is_vouched_for_again() {
 
 #[tokio::test]
 async fn a_device_the_snapshot_reports_offline_is_not_given_a_reprieve() {
-    // `sync_device` heartbeated every device in the snapshot, including the ones the
-    // controller reported as offline -- so each connect and reconnect handed an
-    // absent device a fresh five minutes of looking present. A second mechanism
-    // vouching for what the first had already given up on.
-    //
-    // Registered first, because that spurious heartbeat is on the known-device
-    // branch: a device the registry has never seen is registered instead, and
-    // registration writes a fresh `last_seen` of its own by design.
+    // A heartbeat for a device the snapshot reports offline would hand it a fresh five minutes of
+    // looking present at every connect. Registered first, because that heartbeat is on the
+    // known-device branch: an unknown device is registered instead, which writes `last_seen`.
     let mut absent = light();
     absent["online"] = json!(false);
     let (url, _) = mock_controller(snapshot(vec![absent], vec![]), vec![], None).await;
@@ -1017,11 +988,8 @@ fn runtime_for() -> Arc<MatterRuntime> {
 
 /// A runtime nobody has asked for anything sits still.
 ///
-/// The regression this pins: the reconciler's first pass ran with an empty URL,
-/// failed to connect to it, and parked in `Unreachable` before any `apply`. That
-/// is a lie about a subsystem nobody had configured yet, and startup's bounded
-/// wait read it as "settled" and stopped waiting — which is why the Matter log
-/// lines appeared before the banner on some runs and after it on others.
+/// The regression this pins: the reconciler's first pass ran with an empty URL, failed to connect
+/// and parked in `Unreachable` before any `apply`, which startup's bounded wait read as "settled".
 #[tokio::test]
 async fn a_runtime_that_has_been_asked_for_nothing_does_nothing() {
     let runtime = runtime_for();
@@ -1240,15 +1208,10 @@ async fn a_matter_device_is_refused_while_matter_is_off_but_others_fall_back() {
 
 #[tokio::test]
 async fn a_matter_id_never_falls_back_to_the_stub_however_malformed() {
-    // The property, stated so it cannot quietly change. Routing used to ask "does
-    // this id parse as a node id", which answers `false` for any Matter id the
-    // grammar cannot read — and `false` means the stub, which reports success for
-    // every verb. So a malformed Matter id produced a confident lie rather than an
-    // error, which is the exact failure the test above exists to prevent, reached by
-    // a different route.
-    //
-    // It matters now because the grammar is about to grow an endpoint component for
-    // bridged devices, and every id shape it has not learned yet lands here.
+    // The property, stated so it cannot quietly change: routing that asks "does this id parse as
+    // a node id" answers `false` for any Matter id the grammar cannot read, and `false` means the
+    // stub, which reports success for every verb. The grammar is about to grow an endpoint
+    // component for bridged devices, so every id shape it has not learned lands here.
     let fallback = Arc::new(RecordingControl::default());
     let runtime = runtime_for();
     let control = runtime.device_control(fallback.clone());
@@ -1282,17 +1245,10 @@ async fn control_switches_to_matter_once_connected() {
     assert!(fallback.calls().is_empty());
 }
 
-/// The bridge dedupes readings so a level-based rule does not re-fire on a
-/// steady sensor. The cache that does it has to outlive one connection, because
-/// re-subscribing is exactly when the same values arrive again — and the
-/// supervisor re-runs the bridge on every reconnect.
-///
-/// This drives two full bridge runs against a controller that serves the same
-/// snapshot both times, which is what a controller restart looks like from
-/// here. The cache lived inside `run_matter_bridge` until this was written, so
-/// each run started empty and every reconnect republished the lot; the existing
-/// unit test did not catch it because it calls `publish_reading` directly with
-/// one cache and never actually re-subscribes.
+/// The bridge dedupes readings so a level-based rule does not re-fire on a steady sensor. The
+/// cache doing it must outlive one connection, since re-subscribing is exactly when the same
+/// values arrive again. Two full bridge runs against a controller serving the same snapshot
+/// twice, which is what a controller restart looks like from here.
 #[tokio::test]
 async fn a_reconnect_does_not_republish_a_reading_that_has_not_changed() {
     let (url, _) = mock_controller(

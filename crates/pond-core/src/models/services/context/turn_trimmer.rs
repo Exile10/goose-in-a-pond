@@ -76,28 +76,10 @@ pub const DEFAULT_VERBATIM_DAYS: u32 = 3;
 /// worth more than nothing, which is what dropping its turn would leave.
 pub const AGED_TOOL_RESULT_MAX_BYTES: usize = TOOL_RESULT_MAX_BYTES / 4;
 
-/// Length at or below which a tool result is treated as already aged, and the
-/// P3 rung leaves it alone.
-///
-/// This exists because `truncate_head_tail` is **not a fixed point of itself**:
-/// it keeps `cap` characters of content and then appends an elision marker, so
-/// its output is always longer than the cap it was given, and handed its own
-/// output it cuts again — a little more content each time, for a saving of a
-/// few dozen characters.
-///
-/// P3 never noticed, because its rung only ran when the conversation was over
-/// budget and one aged cut usually brought it under. PAI-4 P5 runs the same rung
-/// on cold turns that are comfortably within budget, so without this the rung
-/// would fire on every cold turn of a long session and grind one tool result
-/// away by degrees. Section 7's "compaction is idempotent on an unchanged
-/// conversation" is the property that forbids it.
-///
-/// The 64-character allowance is a deliberate over-estimate of the marker
-/// (`"\n[... truncated N chars ...]\n"`, at most ~36 characters even for an
-/// absurd N) and `the_aged_cap_is_a_fixed_point_after_one_cut` fails if the
-/// marker ever outgrows it. Being generous costs at most 64 characters left
-/// uncut on an already-degraded result — which is precisely the "marginal token
-/// saving" invariant 4 says not to move a prefix for.
+/// Length at or below which a tool result counts as already aged, so the P3 rung leaves
+/// it alone. `truncate_head_tail` is not a fixed point of itself — it appends an elision
+/// marker — and P5 runs the rung on cold in-budget turns, so without this it grinds a
+/// result away by degrees. `the_aged_cap_is_a_fixed_point_after_one_cut` guards the 64.
 const AGED_FIXED_POINT_BYTES: usize = AGED_TOOL_RESULT_MAX_BYTES + 64;
 
 /// Convert a stored `compaction_verbatim_days` into the horizon
@@ -128,14 +110,10 @@ pub struct TrimMessage {
     pub text: String,
     /// True for the spliced `<conversation-summary>` message.
     pub is_summary: bool,
-    /// How old this message is, in seconds, measured by the CALLER at trim
-    /// time. `None` means the caller could not establish an age.
-    ///
-    /// `None` is treated as *recent* everywhere, which is the narrowing
-    /// direction: an unknown age never earns a message extra degradation. Only
-    /// the live Goose turn path populates this today (from
-    /// `goose::conversation::message::Message::created`); the hydration replay
-    /// does not, and says so.
+    /// How old this message is, in seconds, measured by the CALLER at trim time. `None`
+    /// means no age could be established and is treated as recent everywhere — the
+    /// narrowing direction, since an unknown age never earns extra degradation. Only the
+    /// live Goose turn path populates it, from `Message::created`.
     pub age_secs: Option<u64>,
 }
 
@@ -151,32 +129,17 @@ pub struct TrimOutcome {
     /// False when the input already fit and nothing was modified — the
     /// adapter can skip rewriting the engine conversation entirely.
     pub changed: bool,
-    /// True when age weighting ran on a conversation that was still WITHIN
-    /// budget, purely because the prefix cache was already cold (PAI-4 P5).
-    ///
-    /// This is the one observable the recompact-when-cold rule produces, and
-    /// it exists so the rule can be asserted rather than inferred from a
-    /// message length. It is false on every warm turn, including warm turns
+    /// True when age weighting ran on a conversation still WITHIN budget, purely because
+    /// the prefix cache was already cold (PAI-4 P5). The one observable the
+    /// recompact-when-cold rule produces. False on every warm turn, including warm turns
     /// that degraded plenty of material because they were over budget.
     pub cold_recompaction: bool,
 }
 
 /// Whether the current turn's user message is already in the slice handed to
-/// [`trim_history`].
-///
-/// This is the only thing that decides which user messages carry a *stale*
-/// `<system-context>`, and it was previously assumed rather than passed — the
-/// trimmer always spared the last user message on the grounds that it was the
-/// current turn's fresh injection. In production it never is: the Goose adapter
-/// calls `trim_goose_history` *before* `Agent::reply` appends anything, so the
-/// last user message present is the PREVIOUS turn's, and sparing it re-prefilled
-/// a stale block — wrong date, the previous message's selected memories, the
-/// previous turn-budget note — on the one turn where it was about to matter, and
-/// handed the model two conflicting `<system-context>` blocks.
-///
-/// It also made `TrimOutcome::changed` true on every turn from the third
-/// onwards, which defeated the adapter's `if !changed { return; }` and forced a
-/// whole-table rewrite of the engine conversation every single turn.
+/// [`trim_history`]. It is the only thing deciding which user messages carry a STALE
+/// `<system-context>`: the Goose adapter trims before `Agent::reply` appends, so the last
+/// user message present is the PREVIOUS turn's and sparing it re-prefills a stale block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurrentTurn {
     /// The caller trims before appending this turn. Every user message present
@@ -235,19 +198,9 @@ pub struct HistoryBudget {
     pub overshoot_corrected: bool,
 }
 
-/// What history may spend this turn, after both corrections to the profile's
-/// declared allowance.
-///
-/// Extracted from [`trim_history`] rather than inlined so PAI-6 P4's budget
-/// assertion has something to assert on. It had nowhere: the number lived as a
-/// local inside a 200-line function and the only observable downstream of it is
-/// how many turns got dropped, which is a function of the messages as much as
-/// of the budget. A phase whose whole claim is "the parent's budget shrinks by
-/// the reservation" cannot be verified through a proxy that also moves for four
-/// other reasons.
-///
-/// **This is the only place the effective budget is computed.** `trim_history`
-/// calls it; nothing else recomputes the clamp. A second copy would be the
+/// What history may spend this turn, after both corrections to the profile's declared
+/// allowance. This is the ONLY place the effective budget is computed — `trim_history`
+/// calls it and nothing else recomputes the clamp, because a second copy would be the
 /// four-paths-disagree shape PAI-3 exists to remove.
 pub fn effective_history_budget(
     profile: &CompactionProfile,
@@ -276,29 +229,10 @@ pub fn effective_history_budget(
     }
 }
 
-/// Deterministically trim `messages` to fit within the profile's history
-/// budget. `rolling_summary`, when present, is spliced (or refreshed) as a
-/// summary message at the front. `last_real_prompt_tokens` is the previous
-/// turn's engine-reported prompt size, used to tighten `counter`'s estimate.
-///
-/// `verbatim_horizon` is PAI-4 P3's age weighting: material older than it may
-/// be degraded harder than fresh material *once the conversation is already
-/// over budget*. `None` disables it and reproduces the pre-P3 behaviour
-/// exactly.
-///
-/// `cache` is PAI-4 P5's cache-age axis, and it moves exactly one guard in one
-/// direction — see step 4. [`CachePosture::Warm`] reproduces the pre-P5
-/// behaviour exactly, and it is what every caller that cannot see the engine's
-/// prefix must pass (`PrefixCacheState::posture_of(None)` returns it, so there
-/// is one place that decision is made rather than one per call site).
-///
-/// Eight positional arguments is over clippy's threshold and the allow below
-/// is deliberate rather than lazy: every one of them is a distinct axis the
-/// caller genuinely knows and this function genuinely must not guess (budget,
-/// summary, feedback, counter, turn position, age, cache). Bundling them into
-/// an options struct would give each a `Default`, and a default for
-/// `CurrentTurn` or `CachePosture` is exactly the silent-wrong-answer failure
-/// both of those types were introduced to stop.
+/// Deterministically trim `messages` to fit the profile's history budget. `rolling_summary`
+/// is spliced or refreshed at the front; `last_real_prompt_tokens` is the previous turn's
+/// engine-reported prompt size, which tightens `counter`'s estimate. `verbatim_horizon` is
+/// P3's age weighting and `cache` P5's cache axis; `None` and `Warm` are the narrowing values.
 #[allow(clippy::too_many_arguments)]
 pub fn trim_history(
     messages: Vec<TrimMessage>,
@@ -312,32 +246,10 @@ pub fn trim_history(
 ) -> TrimOutcome {
     let mut changed = false;
 
-    // Effective budget.
-    //
-    // Two corrections to the declared history budget, both aimed at the same
-    // failure: a prompt that fills the window leaves the model no room to
-    // answer, the engine raises ContextLengthExceeded mid-generation, and goose
-    // reacts by compacting the conversation out from under us (a path that
-    // ignores GOOSE_AUTO_COMPACT_THRESHOLD, so it cannot be turned off).
-    //
-    // 1. Never promise more history than fits alongside the output reserve AND
-    //    the preamble. This clamp used to subtract only the reserve, which was
-    //    never sufficient and PAI-3 P4 said so before deferring the fix to P5:
-    //    at an 8,192 window the profile declares 1,024 + 3,000 + 500 + 4,000 =
-    //    8,524 tokens, and a reserve-only clamp let history claim 7,168 of them
-    //    on top of a preamble that was still going to be sent. The preamble
-    //    allowance is now subtracted here, via `usable_history_tokens`, which on
-    //    a local provider is the CLAMPED allowance — see
-    //    `CompactionProfile::for_windows`. Floored at MIN_HISTORY_TOKENS so a
-    //    preamble wider than the window squeezes history rather than erasing the
-    //    message being answered.
-    // 2. When the engine's real prompt count for the LAST turn overshot the
-    //    usable ceiling, subtract that overshoot. This is measured, not
-    //    estimated, so it corrects the counter's approximation in the direction
-    //    that matters and converges within one turn. The comparison stays
-    //    against `usable_prompt_tokens` — the engine reports the WHOLE prompt,
-    //    preamble included, so the history-only ceiling would report an
-    //    overshoot on every turn that merely used its budget.
+    // Effective budget. Two corrections, both against the same failure: a prompt that
+    // fills the window makes goose compact the conversation out from under us
+    // mid-generation, by a path that ignores GOOSE_AUTO_COMPACT_THRESHOLD. Clamp history
+    // to what fits beside preamble and reserve, then subtract the last turn's overshoot.
     let HistoryBudget {
         tokens: budget,
         overshoot_corrected,
@@ -366,11 +278,9 @@ pub fn trim_history(
         }
     }
 
-    // 2. Truncate oversized tool results, head+tail. The adapter applies the
-    //    SAME helper to the structured tool response it rebuilds, so this
-    //    estimate matches what the model actually receives — for a long time it
-    //    did not, and a 50K-char result was re-prefilled verbatim every turn
-    //    while the estimate believed it was 1.5K.
+    // 2. Truncate oversized tool results, head+tail. The adapter applies the SAME helper
+    //    to the structured tool response it rebuilds, so this estimate matches what the
+    //    model actually receives.
     for m in msgs.iter_mut() {
         if m.role == TrimRole::ToolResult {
             if let Some(truncated) = truncate_head_tail(&m.text, TOOL_RESULT_MAX_BYTES) {
@@ -407,52 +317,10 @@ pub fn trim_history(
         }
     }
 
-    // 4. Age-weighted degradation (PAI-4 P3). One rung, inserted between "leave
-    //    it alone" and "drop the whole turn": a tool result older than the
-    //    verbatim horizon is re-truncated at AGED_TOOL_RESULT_MAX_BYTES, which
-    //    is a quarter of the flat cap step 2 already applied.
-    //
-    //    THREE GUARDS, and each is the narrowing direction on a different axis.
-    //
-    //    a. It fires only when the conversation is ALREADY over budget, OR the
-    //       prefix cache is already cold. Invariant 4 forbids perturbing a
-    //       WARM prefix for a marginal token saving, and this edit is at the
-    //       FRONT of the conversation — it invalidates the KV prefix exactly
-    //       as dropping a turn would. Doing it unconditionally would spend a
-    //       full re-prefill to save tokens nobody needed.
-    //
-    //       PAI-4 P5 is the second half of that disjunction, and it is the
-    //       whole of the recompact-when-cold rule at this seam. P3 wrote the
-    //       guard with only "over budget" available, using it as a proxy for
-    //       "the prefix was moving anyway" — which is sound but strictly
-    //       narrower than the real condition. A turn whose provider was
-    //       rebuilt, whose model was swapped, whose session was just resumed,
-    //       or that carries an image is paying a full re-prefill regardless of
-    //       what this function does, so degrading aged material in the same
-    //       breath costs nothing and buys headroom the following WARM turns
-    //       get to keep. `CachePosture::Warm` is the narrowing value and the
-    //       one every caller that cannot see the engine passes, so this reads
-    //       as pre-P5 behaviour everywhere the signal is absent.
-    //    b. The LAST turn is spared. That is the design's "current session,
-    //       recent turns: verbatim" row made real, and it matters most in the
-    //       case age weighting is aimed at: a session reopened after a week has
-    //       every message past the horizon, including the one the model is
-    //       about to answer.
-    //    c. `age_secs: None` is never aged. A caller that cannot establish an
-    //       age gets today's behaviour rather than a guess.
-    //
-    //    What this rung deliberately does NOT do is drop aged turns outright,
-    //    which is what 3.2's table ("older than compaction_verbatim_days:
-    //    represented by the rolling summary only") asks for. The trimmer cannot
-    //    honour that claim: the summary's coverage is a through-pointer into
-    //    `session_messages` (`SessionSummaryService`), the trimmer sees the
-    //    ENGINE conversation with positional indices, and there is no mapping
-    //    between them here. Worse, the summariser always leaves the newest
-    //    KEEP_RECENT_MESSAGES = 6 uncovered by construction, so "the summary
-    //    represents it" is provably false for the tail. Dropping on that
-    //    premise would lose messages nothing had recorded, silently. Degrading
-    //    them instead keeps the head and tail of every aged result and loses
-    //    nothing that was not already being lost when the turn was dropped.
+    // 4. Age-weighted degradation (PAI-4 P3/P5): a tool result past the verbatim horizon
+    //    is re-truncated at AGED_TOOL_RESULT_MAX_BYTES. Three narrowing guards: only when
+    //    already over budget or the prefix is cold (invariant 4 forbids perturbing a warm
+    //    prefix), never the last turn, and never when `age_secs` is None.
     let mut aged_truncations = 0usize;
     let mut cold_recompaction = false;
     if let Some(horizon) = verbatim_horizon {
@@ -478,12 +346,10 @@ pub fn trim_history(
         }
     }
 
-    // 5. Drop oldest complete turns (never the summary, never the last turn)
-    //    until within budget. Age needs no say in the ORDER here and is given
-    //    none: age is monotonic with position in a conversation, so
-    //    "oldest-first" already is "most-aged-first", and re-deriving it from
-    //    timestamps would be a second implementation of the same ordering with
-    //    a clock skew failure mode the current one cannot have.
+    // 5. Drop oldest complete turns (never the summary, never the last turn) until
+    //    within budget. Age gets no say in the order: it is monotonic with position, so
+    //    oldest-first already is most-aged-first, and re-deriving it from timestamps
+    //    would add a clock-skew failure mode this ordering cannot have.
     let mut dropped_turns = 0usize;
     loop {
         let estimated = estimate_tokens(&msgs, counter);
@@ -524,28 +390,10 @@ pub fn trim_history(
     }
 }
 
-/// Shape a conversation read back from durable storage for replay into a FRESH
-/// engine session, budgeted exactly like a live conversation would have been.
-///
-/// This is the hydration half of history durability: engines keep their own
-/// conversation store, so a restart (or a wiped engine store) can leave an
-/// existing chat pointing at an empty engine session while the durable store
-/// still holds every message. [`trim_history`] alone cannot cover it — it runs
-/// against the engine's conversation and returns early when that is empty.
-///
-/// Two rules beyond plain trimming:
-///
-/// 1. Empty-text messages are dropped: providers reject empty turns.
-/// 2. TRAILING user messages are dropped. The caller persists the incoming user
-///    message BEFORE starting the turn, so the tail of durable history is the
-///    very message the engine is about to append — replaying it would duplicate
-///    it. Dropping the trailing run also leaves the replay ending on an
-///    assistant turn, the correct shape to append a user message to.
-///
-/// Tool results are the caller's problem: a durable store generally cannot
-/// reconstruct a provider-valid tool request/response pair, and an orphaned tool
-/// response breaks the provider, so callers should filter them out before
-/// calling this.
+/// Shape a conversation read back from durable storage for replay into a FRESH engine
+/// session. Empty messages are dropped (providers reject empty turns) and TRAILING user
+/// messages are dropped (the caller already persisted this turn's message, and the replay
+/// must end on an assistant turn). Callers must filter tool results out first.
 pub fn plan_replay(
     messages: Vec<(TrimRole, String)>,
     profile: &CompactionProfile,
@@ -571,13 +419,10 @@ pub fn plan_replay(
             role,
             text,
             is_summary: false,
-            // Age weighting is NOT wired on the hydration path, deliberately.
-            // This function's input is `(role, text)` pairs; the durable rows do
-            // carry timestamps, but threading them here widens the tuple through
-            // the adapter's own pre-filtering (which assigns the indices this
-            // function relies on) to buy a rung that only fires when a replay is
-            // over budget — at which point the drop loop already handles it.
-            // PAI-4 P3 leaves this `None` rather than inventing an age.
+            // Age weighting is deliberately not wired on the hydration path: the input
+            // is `(role, text)` pairs, and threading timestamps through would buy a rung
+            // that fires only when a replay is over budget, where the drop loop already
+            // handles it. PAI-4 P3 leaves this `None` rather than inventing an age.
             age_secs: None,
         })
         .collect();
@@ -591,11 +436,9 @@ pub fn plan_replay(
         counter,
         CurrentTurn::NotYetAppended,
         None,
-        // A replay exists precisely because the engine session is brand new,
-        // so there is no prefix to protect. This is the honest value rather
-        // than a load-bearing one: `verbatim_horizon` is `None` on this path
-        // (see the `age_secs` comment above), so the guard the posture moves
-        // cannot fire here either way.
+        // A replay exists precisely because the engine session is brand new, so there
+        // is no prefix to protect. Honest rather than load-bearing: `verbatim_horizon`
+        // is `None` on this path, so the guard this posture moves cannot fire either way.
         CachePosture::Cold,
     )
     .messages
@@ -606,14 +449,10 @@ mod tests {
     use super::*;
     use crate::models::services::context::token_counting::HeuristicTokenCounter;
 
-    /// Every test below this line was written against the pre-P5 trimmer and
-    /// asserts WARM-cache behaviour, which is what `CachePosture::Warm`
-    /// reproduces exactly. Rather than append that argument to thirty call
-    /// sites, this shadows [`super::trim_history`] with the warm-cache
-    /// specialisation. The P5 tests at the bottom of the module call
-    /// `super::trim_history` directly and are the only ones that pass a
-    /// posture — so a reader can tell at a glance which tests the cache-age
-    /// axis is live in.
+    /// Shadows [`super::trim_history`] with the warm-cache specialisation, since every
+    /// test above the P5 block asserts WARM behaviour. The P5 tests call
+    /// `super::trim_history` directly and are the only ones that pass a posture, so a
+    /// reader can tell at a glance where the cache-age axis is live.
     #[allow(clippy::too_many_arguments)]
     fn trim_history(
         messages: Vec<TrimMessage>,
@@ -711,13 +550,10 @@ mod tests {
         );
     }
 
-    /// PAI-3 P5. The declared history budget is capped by what is left once the
-    /// preamble has been paid for, not merely by what is left once the output
-    /// reserve has been. Without this, a real 8,192-token profile lets history
-    /// claim 7,168 tokens on top of a 3,500-token preamble it is also going to
-    /// send — 10,668 against an 8,192-token window, which is the mid-generation
-    /// overrun `output_reserve_tokens` exists to prevent, arriving by the other
-    /// door.
+    /// PAI-3 P5. The declared history budget is capped by what is left once the preamble
+    /// is paid for, not merely by what is left after the output reserve. Without it a real
+    /// 8,192-token profile lets history claim 7,168 tokens on top of a 3,500-token
+    /// preamble, which is the mid-generation overrun `output_reserve_tokens` prevents.
     #[test]
     fn the_history_clamp_subtracts_the_preamble_not_just_the_output_reserve() {
         // The real 8,192 profile, not a hand-built fixture: the point is that
@@ -839,22 +675,10 @@ mod tests {
 
     // ── PAI-6 P4: a subagent is a second claim on one window ────────────────
 
-    /// PAI-6 section 7's budget assertion, in the conditional form that section
-    /// says is the only correct one.
-    ///
-    /// With a child live the parent's effective budget, the child's
-    /// reservation and the preamble must fit inside `usable_prompt_tokens` —
-    /// **or** the parent's budget must be exactly `MIN_HISTORY_TOKENS`, because
-    /// `effective_history_budget` floors there on purpose and at that point the
-    /// declared sum legitimately overshoots by exactly the floor.
-    ///
-    /// Swept over every window the profile curve has an opinion about and every
-    /// fraction a role may state, because the failure this guards is a
-    /// particular *arithmetic* one: reserving out of the DECLARED
-    /// `history_token_budget` instead of out of `min(declared, usable)` passes
-    /// at small fractions and breaks at large ones on exactly the windows where
-    /// the declared budget exceeds the clamp — which includes 8,192, the most
-    /// executed window in the system.
+    /// PAI-6 section 7's budget assertion in its conditional form: with a child live the
+    /// parent's budget, the child's reservation and the preamble fit `usable_prompt_tokens`,
+    /// OR the parent sits exactly on `MIN_HISTORY_TOKENS`. Swept over windows and fractions
+    /// because reserving out of the DECLARED budget passes at small fractions and breaks.
     #[test]
     fn a_parents_budget_and_its_childs_reservation_fit_the_window_or_hit_the_floor() {
         let mut floored = 0usize;
@@ -902,13 +726,10 @@ mod tests {
         );
     }
 
-    /// The floor case, named and pinned, with the proof that the unconditional
-    /// form of the assertion above is WRONG rather than merely unnecessary.
-    ///
-    /// 8,192 is `ContextGovernor::prompt_window`'s clamp and the most executed
-    /// window in the system. A role that reserves all of it leaves the parent
-    /// on the floor, and the declared sum then exceeds the usable prompt by
-    /// exactly `MIN_HISTORY_TOKENS`.
+    /// The floor case, with the proof that the unconditional form of the assertion above
+    /// is wrong rather than merely unnecessary. 8,192 is the most executed window in the
+    /// system; a role reserving all of it leaves the parent on the floor, and the declared
+    /// sum then exceeds the usable prompt by exactly `MIN_HISTORY_TOKENS`.
     #[test]
     fn a_child_that_takes_the_whole_budget_leaves_the_parent_exactly_on_the_floor() {
         let parent = CompactionProfile::from_context_window(8_192);
@@ -943,13 +764,10 @@ mod tests {
         );
     }
 
-    /// The seam, end to end: a live child does not merely change a struct
-    /// field, it makes the trimmer keep less.
-    ///
-    /// Without this, every assertion above is about arithmetic that
-    /// `trim_history` might not be using. The vacuity control is inline — the
-    /// unreserved run must NOT drop everything, or "reserved drops more" would
-    /// hold against a trimmer that ignores the budget entirely.
+    /// The seam, end to end: a live child does not merely change a struct field, it
+    /// makes the trimmer keep less. The vacuity control is inline — the unreserved run
+    /// must NOT drop everything, or "reserved drops more" would hold against a trimmer
+    /// that ignores the budget entirely.
     #[test]
     fn a_live_child_makes_the_trimmer_keep_less_of_the_parents_history() {
         let parent = CompactionProfile::from_context_window(8_192);
@@ -1051,14 +869,10 @@ mod tests {
     const DAY: u64 = 24 * 60 * 60;
 
     #[test]
-    /// The production shape: the adapter trims before the turn is appended, so
-    /// EVERY user message present is history and every block in it is stale.
-    ///
-    /// This test used to assert the opposite — that `msgs[2]` kept its block —
-    /// with a fixture whose last message was the current turn's. Nothing in
-    /// production ever built that input: `trim_goose_history` runs before
-    /// `Agent::reply`. It was a green test for a state that could not occur,
-    /// which is the unreachable-fixture trap AGENTS.md warns about.
+    /// The production shape: the adapter trims before the turn is appended, so EVERY
+    /// user message present is history and every block in it is stale. A fixture whose
+    /// last message is the current turn's cannot occur in production — `trim_goose_history`
+    /// runs before `Agent::reply`.
     #[test]
     fn every_user_message_is_stale_when_the_turn_has_not_been_appended_yet() {
         let wrapped =
@@ -1418,20 +1232,14 @@ mod tests {
     }
 
     // ── PAI-4 P3: age-weighted retention ────────────────────────────────────
-    //
-    // Budgets here are chosen so the rung is REACHABLE. It only fires when the
-    // conversation is already over budget, so a test written against a generous
-    // budget asserts `aged_truncations == 0` about a mechanism that was never
-    // invited to run -- which is how the first draft of three of these passed
-    // while proving nothing. Each test below either forces an overflow or
-    // states, in the same test, that the aged case does fire at that budget.
+    // Budgets here are chosen so the rung is REACHABLE: it fires only when the
+    // conversation is already over budget, so each test below either forces an overflow
+    // or states, in the same test, that the aged case does fire at that budget.
 
-    /// A conversation whose old tool results are the reason it overflows now
-    /// survives with its turns intact: the aged results shrink to a quarter of
-    /// the flat cap and the drop loop has less work, or none.
-    ///
-    /// THIS IS THE PHASE'S MAIN GUARD. Without the rung, the same input loses
-    /// whole turns.
+    /// A conversation whose old tool results are the reason it overflows survives with
+    /// its turns intact: the aged results shrink to a quarter of the flat cap and the
+    /// drop loop has less work, or none. The phase's main guard — without the rung the
+    /// same input loses whole turns.
     #[test]
     fn an_aged_tool_result_is_degraded_before_its_turn_is_dropped() {
         let big = "y".repeat(4_000);
@@ -1842,11 +1650,10 @@ mod tests {
         }
     }
 
-    /// The convergence guard behind [`AGED_FIXED_POINT_BYTES`]. If
-    /// `truncate_head_tail`'s elision marker ever outgrows the 64-character
-    /// allowance, the aged rung stops being a one-shot and starts nibbling a
-    /// cold session's tool results away turn by turn. That would be invisible
-    /// in every other test here, so it is pinned directly.
+    /// The convergence guard behind [`AGED_FIXED_POINT_BYTES`]. If `truncate_head_tail`'s
+    /// elision marker ever outgrows the 64-character allowance, the aged rung stops being
+    /// a one-shot and nibbles a cold session's tool results away turn by turn. That is
+    /// invisible in every other test here, so it is pinned directly.
     #[test]
     fn the_aged_cap_is_a_fixed_point_after_one_cut() {
         let huge = "y".repeat(100_000);

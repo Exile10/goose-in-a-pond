@@ -1,10 +1,7 @@
 //! Geocoding via [Open-Meteo Geocoding API](https://geocoding-api.open-meteo.com).
 //!
-//! Resolves city/place names to latitude + longitude.  Free, no API key.
-//!
-//! ```text
-//! GET https://geocoding-api.open-meteo.com/v1/search?name=Kisumu&count=1&language=en
-//! ```
+//! Resolves place names to latitude and longitude; free, no API key. Requests go to
+//! `https://geocoding-api.open-meteo.com/v1/search?name=Kisumu&count=1&language=en`.
 
 use anyhow::{Context, Result};
 use std::time::Duration;
@@ -23,6 +20,10 @@ struct GeoResult {
     longitude: f64,
     country: Option<String>,
     admin1: Option<String>,
+    /// Open-Meteo reports the zone it believes this point is in. Worth having:
+    /// it is a second opinion on the one piece of setup a household is most
+    /// likely to get wrong when it has moved and the laptop has not caught up.
+    timezone: Option<String>,
 }
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -34,6 +35,8 @@ pub struct GeoLocation {
     pub latitude: f64,
     pub longitude: f64,
     pub country: String,
+    /// The zone the geocoder believes this point is in, when it says.
+    pub timezone: Option<String>,
 }
 
 // ── Geocoder ─────────────────────────────────────────────────────────────────
@@ -106,6 +109,7 @@ impl Geocoder {
             latitude: result.latitude,
             longitude: result.longitude,
             country: result.country.unwrap_or_default(),
+            timezone: result.timezone,
         })
     }
 }
@@ -174,5 +178,27 @@ mod tests {
 
         let geocoder = Geocoder::with_base_url(reqwest::Client::new(), server.uri());
         assert!(geocoder.geocode("xyznonexistent").await.is_err());
+    }
+}
+
+// ── The port ─────────────────────────────────────────────────────────────────
+
+/// This geocoder as the core's [`PlaceLookup`].
+///
+/// The trait lives in `pond-core` and knows nothing about Open-Meteo; this is the
+/// one place the two meet, so detection can be tested against a `&dyn PlaceLookup`.
+#[async_trait::async_trait]
+impl pond_core::user_data::ports::place_lookup::PlaceLookup for Geocoder {
+    async fn by_name(
+        &self,
+        query: &str,
+    ) -> Result<pond_core::user_data::ports::place_lookup::PlaceFix> {
+        let g = self.geocode(query).await?;
+        Ok(pond_core::user_data::ports::place_lookup::PlaceFix {
+            name: g.name,
+            latitude: g.latitude,
+            longitude: g.longitude,
+            timezone: g.timezone,
+        })
     }
 }

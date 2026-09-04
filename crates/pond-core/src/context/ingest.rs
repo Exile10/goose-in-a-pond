@@ -1,33 +1,7 @@
-//! The ingest pipeline (PAI-8 P1).
-//!
-//! ```text
-//! source adapter  ->  RawItem  ->  redact (PAI-2)  ->  classify sensitivity  ->
-//!       ->  persist (context_items, retention-governed)
-//!       ->  embed (the same MiniLM the memory corpus uses)
-//! ```
-//!
-//! Section 3.2 of the design has one more line — `publish BusEvent::Ingest`, so
-//! PAI-7's proposer wakes. That is PAI-8 P8 and it is **not** here: `BusEvent`
-//! has no `Ingest` variant, and adding one is a change to
-//! `shared/ports/event_bus.rs`. The pipeline is shaped so the publish is a call
-//! after `save_item` and nothing has to be rearranged for it.
-//!
-//! # What this refuses, and why refusing is the phase
-//!
-//! P1 is on-pond sources only. Not as a convention: [`IngestPipeline::ingest`]
-//! reads [`SourceKind::availability`] and refuses anything that is not
-//! [`SourceAvailability::Landed`], with a message naming the thing that has to
-//! land first. A connector built before its egress gate exists would be the
-//! single most expensive mistake available in this workstream, and "we agreed
-//! not to" is not a control.
-//!
-//! # Redaction
-//!
-//! There is no redaction step in this file, and that is deliberate.
-//! [`ContextItem::from_parts`] takes the [`Redactor`] as a parameter, so the
-//! redaction happens inside the only constructor that exists. A pipeline that
-//! held the redaction itself could be bypassed by any other caller that built an
-//! item; this one cannot be, because there is no other way to build one.
+//! The ingest pipeline (PAI-8 P1): source adapter, RawItem, redact, classify, persist, embed.
+//! [`IngestPipeline::ingest`] refuses any kind that is not [`SourceAvailability::Landed`], which
+//! is what keeps P1 to on-pond sources. Redaction is not a step here: it happens inside the only
+//! constructor, [`ContextItem::from_parts`], so no other caller can bypass it.
 
 use std::sync::Arc;
 
@@ -45,11 +19,8 @@ use crate::security::ports::redactor::Redactor;
 
 /// One thing a source produced, before this pond has touched it.
 ///
-/// `PartialEq` so a producer's answer can be asserted whole rather than field by
-/// field. That matters more than it sounds: an assertion written as a handful of
-/// `assert_eq!`s on individual fields silently stops covering a field the moment
-/// one is added, which is the shape three of this programme's recorded vacuous
-/// tests had.
+/// `PartialEq` so a producer's answer can be asserted whole: per-field `assert_eq!`s silently
+/// stop covering a field the moment one is added.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawItem {
     /// The upstream's own id. What makes a re-sync idempotent.
@@ -90,11 +61,8 @@ pub struct IngestPipeline {
 }
 
 impl IngestPipeline {
-    /// The redactor is not optional.
-    ///
-    /// It could have been an `Option` with a "no redactor wired" fallback, and
-    /// that fallback would be the whole of invariant 3 gone on any pond whose
-    /// wiring order changed. A pipeline that cannot redact does not exist.
+    /// The redactor is not optional: an `Option` with a "no redactor wired" fallback would lose
+    /// invariant 3 entirely on any pond whose wiring order changed.
     pub fn new(repo: Arc<dyn ContextRepository>, redactor: Arc<dyn Redactor>) -> Self {
         Self {
             repo,
@@ -116,23 +84,16 @@ impl IngestPipeline {
 
     /// The id an item is stored under, derived from the pair that identifies it.
     ///
-    /// Deterministic on purpose. `UNIQUE (source_id, external_id)` already makes
-    /// the write idempotent, but a random id would mean a re-sync writing a
-    /// second row's worth of id churn through any index built on it, and would
-    /// make the idempotency depend entirely on one constraint being present.
-    /// With this, re-ingesting the same upstream item addresses the same row
-    /// even by primary key.
+    /// Deterministic so re-ingesting the same upstream item addresses the same row by primary
+    /// key, rather than resting idempotency entirely on `UNIQUE (source_id, external_id)`.
     pub fn item_id(source_id: &str, external_id: &str) -> String {
         format!("{source_id}:{external_id}")
     }
 
     /// Ingest one item.
     ///
-    /// The owner is taken from the SOURCE and never from the caller. That is
-    /// invariant 1 at the one place it could be got wrong: a payload that
-    /// carried its own `profile_id` would let whatever pushed it decide whose
-    /// data this is, which is the same hole PAI-1 P4 closed on
-    /// `PUT /sessions/{id}/user`.
+    /// The owner is taken from the SOURCE, never from the caller (invariant 1): a payload
+    /// carrying its own `profile_id` would let whatever pushed it decide whose data this is.
     pub async fn ingest(
         &self,
         source: &ContextSource,
@@ -177,10 +138,14 @@ impl IngestPipeline {
             );
         }
 
-        // Embedded from the item, which means from the REDACTED text: there is
-        // no point in this function at which the raw body is still reachable.
-        let item = match &self.embedder {
-            Some(embedder) => match embedder.embed(&item.embedding_text()).await {
+        // Embedded from the REDACTED text; the raw body is unreachable here. Only text that fits
+        // one chunk is embedded inline, because chunking a long body would put dozens of embeds
+        // on the path an ingest waits for. Longer text is left UNEMBEDDED on purpose: an item
+        // carrying a vector looks indexed and the maintenance sweep would never pick it up.
+        let text = item.embedding_text();
+        let one_chunk = text.len() <= crate::context::chunking::DEFAULT_CHUNK_BYTES;
+        let item = match (&self.embedder, one_chunk) {
+            (Some(embedder), true) => match embedder.embed(&text).await {
                 Ok(vector) => item.with_embedding(vector),
                 Err(e) => {
                     // Not fatal. `search_unembedded` + `update_embedding` are the
@@ -189,7 +154,9 @@ impl IngestPipeline {
                     item
                 }
             },
-            None => item,
+            // Long enough to chunk: stored now, passages embedded by the sweep.
+            (Some(_), false) => item,
+            (None, _) => item,
         };
 
         self.repo.save_item(&item).await?;
@@ -203,9 +170,8 @@ impl IngestPipeline {
 
     /// Ingest a batch, reporting per-item outcomes in order.
     ///
-    /// One bad item does not abandon the rest: a sync that stopped at the first
-    /// malformed message would never get past it, and the cursor would never
-    /// advance.
+    /// One bad item does not abandon the rest: stopping at the first malformed message would
+    /// leave the cursor stuck on it forever.
     pub async fn ingest_all(
         &self,
         source: &ContextSource,
@@ -322,11 +288,8 @@ mod tests {
 
     /// The vector must be computed from the REDACTED text.
     ///
-    /// `the_stored_row_is_the_redacted_one` only proves the stored *body* is
-    /// clean, and would stay green if the embed moved above the redaction — the
-    /// row would still be redacted while the vector became a durable derivative
-    /// of a secret, which is the one thing a vector cannot be audited for later.
-    /// This pins the ORDER by recording what the embedder was actually given.
+    /// `the_stored_row_is_the_redacted_one` checks only the stored body, so it stays green if the
+    /// embed moves above the redaction. This pins the ORDER by recording what the embedder got.
     #[tokio::test]
     async fn the_vector_is_computed_from_the_redacted_text() {
         let repo = Arc::new(MockContextRepository::new());
@@ -398,8 +361,12 @@ mod tests {
                         message.contains(kind.as_str()),
                         "the refusal does not say which kind: {message}"
                     );
+                    // See the sibling guard in `producer.rs`: this asserts the
+                    // mechanism that is missing, not the phase that was going to
+                    // supply it, because the phase citation for the connector
+                    // kinds expired while the refusal stayed correct.
                     assert!(
-                        message.contains("PAI-8 P3") || message.contains("PAI-2 P6b"),
+                        message.contains("ingest route") || message.contains("connector"),
                         "the refusal does not name what has to land first: {message}"
                     );
                 }

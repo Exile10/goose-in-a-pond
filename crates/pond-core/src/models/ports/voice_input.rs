@@ -1,24 +1,13 @@
-//! Driving Port: VoiceInput
-//!
-//! Abstracts text/voice input acquisition so the workflow loop does not
-//! depend directly on stdin, a microphone, or any specific ASR backend.
-//!
-//! `listen()` blocks until a complete utterance is available, then returns
-//! the transcribed text.  Returns `Ok(None)` on EOF / end-of-stream to
-//! signal that the loop should terminate cleanly.
+//! Driving Port: VoiceInput. Abstracts input acquisition so the workflow loop does not depend on
+//! stdin, a microphone or a specific ASR backend. `listen()` blocks until a complete utterance is
+//! available; `Ok(None)` means EOF, and the loop should then terminate cleanly.
 
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Q2-26: signal emitted by `listen_with_speculative` before the final
-/// transcript is confirmed.
-///
-/// Implementations that overlap ASR with the silence-confirmation wait
-/// (e.g. `WhisperRsInput`) fire `Ready` the moment a provisional transcript
-/// is available, and `Invalidated` if speech resumes afterward (the
-/// provisional transcript covered a too-short clip). Callers may use
-/// `Ready` to speculatively start downstream work (e.g. the LLM call) and
-/// must cancel/discard that work on `Invalidated`.
+/// Q2-26: signal emitted by `listen_with_speculative` before the final transcript is confirmed.
+/// `Ready` carries a provisional transcript; `Invalidated` says speech resumed, so that transcript
+/// covered too short a clip. Start downstream work on `Ready`, but discard it on `Invalidated`.
 #[derive(Clone)]
 pub enum SpeculativeSignal {
     Ready(String),
@@ -54,12 +43,8 @@ pub trait VoiceInput: Send + Sync {
         "> "
     }
 
-    /// Pre-load captured audio that `listen()` should transcribe instead of
-    /// recording a fresh microphone clip.
-    ///
-    /// Call this before `listen()` when the wake-word detector has already
-    /// recorded the user's command in the same breath as the wake word.
-    /// The default implementation is a no-op — implementors that support
-    /// audio hand-off (e.g. `WhisperInput`) override this method.
+    /// Pre-load captured audio that `listen()` should transcribe instead of recording a fresh
+    /// clip. Call before `listen()` when the wake-word detector already caught the command in the
+    /// same breath. The default is a no-op; implementors supporting hand-off override it.
     fn prime_with_captured(&self, _wav: Vec<u8>) {}
 }

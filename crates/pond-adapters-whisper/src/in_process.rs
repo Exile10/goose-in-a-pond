@@ -1,28 +1,12 @@
-//! In-process Whisper ASR via `whisper-rs` (whisper.cpp bindings).
-//!
-//! `WhisperRsInput` is the default `VoiceInput` adapter — loads a ggml model
-//! file once at startup and transcribes captured PCM directly, with no HTTP
-//! subprocess on port 9000.
-//!
-//! Shares the ggml CUDA primary context with `llama-cpp-2`, eliminating the
-//! second CUDA context on Jetson (one of the goals in `.ai/scratchpad.md`).
-//!
-//! ## Crash isolation
-//!
-//! Every call into `whisper-rs` (model load, transcription) is wrapped in
-//! `catch_unwind` so a C-side panic returns `Err` instead of aborting the
-//! whole pond-server process.
-//!
-//! ## Hot-swap
-//!
-//! `rebuild_with(new_model_path)` atomically replaces the loaded context
-//! under a `tokio::sync::RwLock`, mirroring `LocalInferenceLlmAdapter`.
-//! Concurrent in-flight `listen()` calls finish on the old context; new
-//! ones see the new context.
+//! In-process Whisper ASR via `whisper-rs`. `WhisperRsInput` is the default
+//! `VoiceInput` adapter and shares the ggml CUDA primary context with
+//! `llama-cpp-2`, so Jetson keeps one CUDA context. Every call into whisper-rs is
+//! wrapped in `catch_unwind`; `rebuild_with` swaps the model under a `RwLock`.
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use pond_core::models::ports::voice_input::{SpeculativeSignal, VoiceInput};
+use pond_voice::dsp::{RmsDetector, SpeechDetector};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -50,6 +34,9 @@ enum SpeechCapture {
 const DEFAULT_DURATION_SECS: u32 = 30;
 /// Silence (ms) after speech to declare end-of-utterance.
 const DEFAULT_SILENCE_MS: u64 = 800;
+/// The energy level below which a frame is silence, for the default detector.
+/// Unchanged from the value both capture loops used inline.
+const END_OF_SPEECH_RMS: f32 = 0.005;
 /// Wait window for speech onset before giving up.
 const DEFAULT_ONSET_WAIT_SECS: u32 = 10;
 
@@ -70,18 +57,9 @@ pub struct WhisperRsInput {
     /// Pre-captured WAV bytes from the wake-word detector (one-breath path).
     captured: Mutex<Option<Vec<u8>>>,
     /// Normalized wake-word variants, stripped off the front of a command
-    /// transcript. The detector's capture reaches back past the trigger, so
-    /// the clip contains the wake word and the transcript would otherwise
-    /// open with the assistant's own name.
-    ///
-    /// Behind a lock only because it is populated after construction: this
-    /// instance is already an `Arc` (it is both the `VoiceInput` and the
-    /// detector's backend) by the time the detector has resolved its trigger
-    /// list, and the two must strip and match the same words.
-    ///
-    /// A `std` lock, not tokio's: this is set once during startup, from inside
-    /// the runtime, where tokio's `blocking_write` panics outright. Nothing
-    /// awaits while holding it.
+    /// transcript because the detector's capture reaches back past the trigger.
+    /// Locked because it is populated after construction, and a `std` lock, not
+    /// tokio's, because it is set from inside the runtime where the latter panics.
     wake_words: std::sync::RwLock<Vec<String>>,
     /// Optional live mic-level reporter, fed from the VAD recording loop.
     audio_level_sink: Option<Arc<ThrottledAudioLevelSink>>,
@@ -89,9 +67,49 @@ pub struct WhisperRsInput {
     /// call goes through it, so this adapter's follow-up VAD listen can never
     /// race the wake-word detector for the device.
     mic: pond_audio::MicHandle,
+    /// What decides that a frame is speech, for both capture paths.
+    ///
+    /// One instance, shared, and long-lived. Both matter:
+    ///
+    /// *Shared*, because a turn takes one of two capture paths depending on
+    /// whether the wake-word detector already had audio, and a detector chosen
+    /// in settings that governed only one of them would be worse than none.
+    ///
+    /// *Long-lived*, because a model detector loads an ONNX session, and
+    /// building one per utterance is the mistake that made a 3 ms model
+    /// measure 1222 ms in the ASR lab. It outlives the turn, which is why
+    /// `reset()` has to be called at the start of each capture rather than
+    /// relied on happening by construction.
+    ///
+    /// `Arc<Mutex<..>>` rather than a bare `Box`: capture runs inside
+    /// `spawn_blocking`, whose closure must be `'static + Send`, and
+    /// `listen_inner` only holds `&self`.
+    detector: Arc<std::sync::Mutex<Box<dyn SpeechDetector + Send>>>,
 }
 
 impl WhisperRsInput {
+    /// Replace the speech detector both capture paths use.
+    ///
+    /// Takes a constructed detector rather than a name or a path on purpose:
+    /// this crate is in CI's fast-crate set — the crates that pull neither the
+    /// Goose submodule nor a heavy native library — and that list is how the
+    /// hexagonal split is enforced rather than merely described. Building a
+    /// Silero detector here would put `ort` in a crate whose whole job is to be
+    /// buildable without one. So the composition root builds it and hands it
+    /// over, and this crate only ever knows the trait.
+    ///
+    /// `&self` because the adapter is already inside an `Arc` by the time the
+    /// composition root knows which backend was configured.
+    pub fn set_speech_detector(&self, detector: Box<dyn SpeechDetector + Send>) {
+        match self.detector.lock() {
+            Ok(mut slot) => *slot = detector,
+            // A poisoned lock means a capture thread panicked mid-turn. The
+            // detector is replaceable state, not something to recover, so take
+            // it anyway rather than leaving the pond on the old one forever.
+            Err(poisoned) => *poisoned.into_inner() = detector,
+        }
+    }
+
     /// Load the ggml model at `model_path` and prepare the in-process context.
     /// `mic` is the process's single shared microphone owner.
     ///
@@ -118,14 +136,13 @@ impl WhisperRsInput {
             wake_words: std::sync::RwLock::new(Vec::new()),
             audio_level_sink: None,
             mic,
+            detector: Arc::new(Mutex::new(Box::new(RmsDetector::new(END_OF_SPEECH_RMS)))),
         })
     }
 
-    /// Wake-word variants to strip from the front of a command transcript.
-    ///
-    /// Pass the detector's own resolved trigger list, so the words that fire
-    /// detection are exactly the words removed afterwards. Empty leaves
-    /// transcripts untouched.
+    /// Wake-word variants to strip from the front of a command transcript. Pass
+    /// the detector's own resolved trigger list, so the words that fire detection
+    /// are exactly the words removed afterwards. Empty leaves transcripts alone.
     pub fn set_wake_words(&self, variants: &[String]) {
         let normalized: Vec<String> = variants
             .iter()
@@ -155,11 +172,9 @@ impl WhisperRsInput {
         self
     }
 
-    /// Hot-swap the loaded ggml model. Returns `Err` and keeps the previous
-    /// context intact if the new model fails to load.
-    ///
+    /// Hot-swap the loaded ggml model, keeping the previous context on `Err`.
     /// Mirrors `LocalInferenceLlmAdapter::rebuild_provider`: any in-flight
-    /// `listen()` call finishes on the old context; the next call uses the new.
+    /// `listen()` call finishes on the old context; the next uses the new one.
     pub async fn rebuild_with(&self, new_model_path: PathBuf) -> Result<()> {
         if !new_model_path.exists() {
             return Err(anyhow!(
@@ -204,11 +219,10 @@ impl WhisperRsInput {
         Self::transcribe_samples(ctx, samples_16k)
     }
 
-    /// Run inference on raw 16 kHz mono f32 PCM. Returns the joined transcript,
-    /// already passed through `strip_whisper_artifacts`.
-    ///
-    /// Wraps the C-side call in `catch_unwind`, so a whisper-rs panic returns
-    /// `Err`. Empty input returns `Ok(String::new())` — never panics.
+    /// Run inference on raw 16 kHz mono f32 PCM, returning the joined transcript
+    /// already passed through `strip_whisper_artifacts`. Wraps the C-side call in
+    /// `catch_unwind`, so a whisper-rs panic returns `Err`; empty input returns
+    /// `Ok(String::new())`.
     fn transcribe_samples(ctx: Arc<WhisperContext>, samples: Vec<f32>) -> Result<String> {
         Self::transcribe_samples_with(ctx, samples, TranscribeOpts::accurate())
     }
@@ -256,11 +270,9 @@ impl WhisperRsInput {
             params.set_temperature_inc(opts.temperature_step);
             params.set_n_threads(n_threads);
             // whisper.cpp pads every input to 30 s of mel (1500 frames) and
-            // encodes all of it, whatever the clip length. Capping the context
-            // to the audio actually supplied is the difference between a
-            // wake-word window costing a full 30 s encode and costing its own
-            // 2.5 s. Left unset for command transcription, where the clip is
-            // longer and accuracy matters more than latency.
+            // encodes all of it. Capping the context to the audio supplied makes
+            // a wake-word window cost its own 2.5 s, not 30 s. Left unset for
+            // command transcription, where accuracy matters more than latency.
             if let Some(ctx_frames) = audio_ctx {
                 params.set_audio_ctx(ctx_frames);
             }
@@ -294,26 +306,17 @@ impl WhisperRsInput {
 }
 
 /// Route whisper.cpp's own logging into `log`, and from there into tracing.
-///
-/// Until this is installed, whisper.cpp writes straight to stderr and the
-/// tracing filter cannot see it, let alone quieten it — which is where the
-/// `whisper_full_with_state: decoder 0: score = ...` wall over the voice UI
-/// came from. Once installed the lines become ordinary records under the
-/// `whisper_rs` target, filtered like everything else: off the console,
-/// still in the session log at debug.
-///
-/// Installed on first model load rather than in `main` so it cannot be
-/// forgotten by a binary that uses this adapter.
+/// Uninstalled, whisper.cpp writes straight to stderr where the tracing filter
+/// cannot quieten it and its decoder lines bury the voice UI. Called on first
+/// model load, not in `main`, so no binary using this adapter can forget it.
 fn install_whisper_logging() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(whisper_rs::install_logging_hooks);
 }
 
-/// Remove a leading wake word from a command transcript.
-///
-/// Free-standing so the speculative worker thread and the ordinary path can
-/// share it without either needing a `&self`. Both must apply it, or the two
-/// transcripts they produce for the same audio will not compare equal.
+/// Remove a leading wake word from a command transcript. Free-standing so the
+/// speculative worker thread and the ordinary path can share it without a
+/// `&self`. Both must apply it, or their transcripts for one clip differ.
 fn strip_wake_words(transcript: String, wake_words: &[String]) -> String {
     if wake_words.is_empty() || transcript.is_empty() {
         return transcript;
@@ -376,40 +379,29 @@ fn apply_platform_params(params: &mut WhisperContextParameters) {
     tracing::info!("WhisperRsInput: CPU backend (no GPU feature compiled in)");
 }
 
-/// Per-call cost/accuracy tuning for whisper inference.
-///
-/// The two callers want opposite things. Wake-word detection runs several
-/// times a second forever and only has to recognise one known word, so it
-/// optimises for cost. Command transcription runs once per turn and its output
-/// becomes the model's prompt, so a word lost there is the whole request
-/// misunderstood — it optimises for accuracy, and can afford to.
+/// Per-call cost/accuracy tuning for whisper inference. The two callers want
+/// opposite things: wake-word detection runs several times a second against one
+/// known word and optimises for cost; command transcription runs once a turn and
+/// its output becomes the model's prompt, so it optimises for accuracy.
 #[derive(Debug, Clone, Copy)]
 pub struct TranscribeOpts {
     /// Threads for this call; `None` uses [`default_threads`].
     pub n_threads: Option<std::os::raw::c_int>,
     /// Cap the encoder's mel context to the clip length instead of padding to 30 s.
     pub fit_audio_ctx: bool,
-    /// Beam width. `None` decodes greedily.
-    ///
-    /// Greedy decoding commits to the highest-probability token at every step
-    /// and cannot revisit it, which is where whisper's characteristic
-    /// confidently-wrong short phrase comes from. A beam carries several
-    /// candidate transcripts and scores them whole, so a word that only makes
-    /// sense given the next three survives. It is the single largest accuracy
-    /// lever available here, and it costs roughly the beam width in compute —
-    /// affordable once per turn, not affordable several times a second.
+    /// Beam width; `None` decodes greedily. A beam scores whole candidate
+    /// transcripts, so a word that only makes sense given the next three
+    /// survives — the largest accuracy lever here. It costs roughly the beam
+    /// width in compute: affordable once a turn, not several times a second.
     pub beam_size: Option<std::os::raw::c_int>,
     /// Suppress non-speech tokens — `[BLANK_AUDIO]`, `(wind blowing)`, and the
     /// rest of the annotations whisper emits for ambient noise. They are never
     /// part of a request, and left in they reach the model as if they were.
     pub suppress_non_speech: bool,
-    /// Temperature step used when a decode falls below whisper's confidence
-    /// floor. `0.0` disables the retry.
-    ///
-    /// At temperature zero the decoder is deterministic, and on hard audio it
-    /// deterministically produces the same garbage — most visibly the repeated
-    /// phrase loop. Stepping the temperature up re-rolls only those failed
-    /// segments, and only when they fail, so clean audio never pays for it.
+    /// Temperature step for a decode that falls below whisper's confidence
+    /// floor; `0.0` disables the retry. At temperature zero the decoder is
+    /// deterministic and repeats the same garbage on hard audio, so the step
+    /// re-rolls only the failed segments and clean audio never pays for it.
     pub temperature_step: f32,
 }
 
@@ -425,16 +417,10 @@ impl TranscribeOpts {
         }
     }
 
-    /// What continuous wake-word detection gets.
-    ///
-    /// Two threads, not six. The command model already claims the cores when a
-    /// turn runs, and wake-word detection is not allowed to be the thing that
-    /// starves it — on a 6-core Orin the shared 6-thread profile meant KWS and
-    /// inference fought over every core. Paired with `fit_audio_ctx`, which is
-    /// the larger saving of the two.
-    ///
-    /// Greedy on purpose: matching one known word against a short window does
-    /// not need a beam, and this path runs on a loop.
+    /// What continuous wake-word detection gets: two threads, not six, so KWS
+    /// cannot fight the command model for all six Orin cores. `fit_audio_ctx`
+    /// is the larger saving of the two. Greedy on purpose — matching one known
+    /// word against a short window needs no beam, and this path runs on a loop.
     pub fn wake_word() -> Self {
         Self {
             n_threads: Some(2),
@@ -446,11 +432,10 @@ impl TranscribeOpts {
     }
 }
 
-/// Mel frames to encode for `sample_count` samples of 16 kHz audio.
-///
-/// whisper produces 50 mel frames per second and pads to 1500 (30 s). 20%
-/// headroom keeps the tail of the clip inside the window; the floor avoids
-/// starving the encoder on very short bursts.
+/// Mel frames to encode for `sample_count` samples of 16 kHz audio. whisper
+/// produces 50 mel frames per second and pads to 1500 (30 s); the 20% headroom
+/// keeps the clip's tail inside the window, and the floor avoids starving the
+/// encoder on very short bursts.
 fn audio_ctx_for(sample_count: usize) -> std::os::raw::c_int {
     const SAMPLE_RATE: f32 = 16_000.0;
     const MEL_FRAMES_PER_SEC: f32 = 50.0;
@@ -462,11 +447,9 @@ fn audio_ctx_for(sample_count: usize) -> std::os::raw::c_int {
     frames.clamp(MIN_CONTEXT, FULL_CONTEXT) as std::os::raw::c_int
 }
 
-/// Reasonable default thread count for whisper inference.
-///
-/// Whisper benefits from 4–6 threads on the 6-core Jetson A78AE and similar
-/// from Apple Silicon performance cores. We cap at 6 to avoid starving the
-/// audio pipeline and other GIAP services.
+/// Default thread count for whisper inference. 4-6 threads suit the 6-core
+/// Jetson A78AE and Apple Silicon performance cores; capped at 6 so the audio
+/// pipeline and other GIAP services are not starved.
 fn default_threads() -> std::os::raw::c_int {
     let total = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -493,23 +476,28 @@ impl WhisperRsInput {
         // the context out from under us mid-inference.
         let ctx_arc = self.context.read().await.clone();
 
-        // Capture PCM (already in-process via cpal) on a blocking thread, then
-        // hand the samples to whisper-rs without an intermediate WAV round-trip.
-        //
-        // The non-captured (normal VAD) path overlaps whisper inference with
-        // the silence-confirmation wait: `record_mono_f32_vad` fires inference
-        // on the first silent poll rather than after `silence_ms` confirms it,
-        // so by the time silence is confirmed the transcript is often already
-        // done — cutting whisper's inference time out of time-to-first-token
-        // instead of paying for it serially afterward (Q2-26).
+        // Capture PCM on a blocking thread and hand the samples to whisper-rs
+        // with no intermediate WAV round-trip. The normal VAD path fires
+        // inference on the first silent poll rather than after `silence_ms`
+        // confirms it, so the transcript is usually done first (Q2-26).
         let ctx_for_speculative = ctx_arc.clone();
         let spec_wake_words = self.wake_words_snapshot();
         let mic = self.mic.clone();
+        let detector = Arc::clone(&self.detector);
         let capture_result = tokio::task::spawn_blocking(move || -> Result<SpeechCapture> {
+            // One lock for the whole capture: both paths below need the same
+            // instance, and nothing else touches it while a turn is in flight.
+            let mut detector = detector
+                .lock()
+                .map_err(|_| anyhow!("speech detector mutex poisoned"))?;
+            // Start clean. The detector outlives the utterance, so without this
+            // the previous turn's recurrent state and its buffered leftover
+            // both bias the first windows of this one.
+            detector.reset();
             if let Some(wav) = captured {
                 let (captured_samples, _captured_rate) = decode_wav_mono_f32(&wav)?;
                 let (fresh_samples, fresh_rate) =
-                    record_mono_f32_until_silence(&mic, max_record, silence_ms)?;
+                    record_mono_f32_until_silence(&mic, max_record, silence_ms, &mut **detector)?;
                 let fresh_16k = resample_to_16k(&fresh_samples, fresh_rate);
                 let mut combined = captured_samples;
                 // Skip the leading ~200 ms of the fresh recording — the mic
@@ -526,15 +514,10 @@ impl WhisperRsInput {
                     std::thread::spawn(move || -> Result<String> {
                         let resampled = resample_to_16k(&samples, rate);
                         let transcript = Self::transcribe_samples(ctx, resampled)?;
-                        // Strip HERE, not at the call site. This transcript is
-                        // published twice — once as the speculative signal that
-                        // fires the LLM early, and again as the confirmed
-                        // transcript — and the caller only reuses that early
-                        // work if the two are byte-identical. Stripping one and
-                        // not the other made them differ on any turn containing
-                        // the wake word, so the speculative turn was always
-                        // discarded, and its half-spoken reply overlapped the
-                        // real one.
+                        // Strip HERE, not at the call site: this transcript is
+                        // published twice, as the speculative signal and as the
+                        // confirmed one, and the caller reuses the early work
+                        // only when the two are byte-identical.
                         Ok(strip_wake_words(transcript, &wake_words))
                     })
                 });
@@ -546,6 +529,7 @@ impl WhisperRsInput {
                     Some(&*speculative_spawn),
                     on_speculative_event.as_deref(),
                     audio_level_sink.as_deref(),
+                    &mut **detector,
                 )?;
                 if samples.is_empty() {
                     return Ok(SpeechCapture::Empty);
@@ -637,15 +621,10 @@ impl WhisperBackend for WhisperRsInput {
 mod tests {
     use super::*;
 
-    /// The speculative job fires the LLM on a provisional transcript, and the
-    /// caller only reuses that work if the confirmed transcript is
-    /// byte-identical. Any transform applied to one and not the other breaks
-    /// the comparison silently: the speculative turn is discarded, a second
-    /// turn runs, and the user hears the tail of the first reply underneath
-    /// the second.
-    ///
-    /// Stripping the wake word is such a transform, so it lives in one shared
-    /// function that both paths call.
+    /// The caller reuses the speculative turn only when the confirmed transcript
+    /// is byte-identical, so a transform applied to one and not the other
+    /// silently discards it and the user hears two overlapping replies. Wake-word
+    /// stripping is such a transform: both paths call the one shared function.
     #[test]
     fn both_transcripts_for_one_clip_get_identical_wake_word_treatment() {
         let wake = vec!["goose".to_string()];
@@ -705,13 +684,8 @@ mod tests {
         );
     }
 
-    /// Real-model integration test. Gated by `WHISPER_TEST_MODEL` env var.
-    ///
-    /// To run:
-    /// ```bash
-    /// WHISPER_TEST_MODEL=/path/to/ggml-tiny.en.bin \
-    ///   cargo test -p pond-adapters-whisper --features metal -- --ignored
-    /// ```
+    /// Real-model integration test, gated by the `WHISPER_TEST_MODEL` env var
+    /// pointing at a ggml model. Run with `--ignored`.
     #[test]
     #[ignore]
     fn loads_real_model_and_transcribes_silence() {
@@ -734,15 +708,10 @@ mod tests {
         );
     }
 
-    /// Q2-26 evidence: measures real whisper-rs inference wall time on a
-    /// known speech sample, to show how much of `DEFAULT_SILENCE_MS` (800ms)
-    /// the speculative-overlap change actually hides.
-    ///
-    /// To run:
-    /// ```bash
-    /// WHISPER_TEST_MODEL=/path/to/ggml-base.bin \
-    ///   cargo test -p pond-adapters-whisper --lib -- --ignored --nocapture speculative_overlap
-    /// ```
+    /// Q2-26 evidence: real whisper-rs inference wall time on a known speech
+    /// sample, showing how much of `DEFAULT_SILENCE_MS` (800 ms) the
+    /// speculative-overlap change hides. Needs `WHISPER_TEST_MODEL` pointing at
+    /// a ggml model.
     #[test]
     #[ignore]
     fn speculative_overlap_hides_inference_time_within_default_silence_window() {
@@ -785,12 +754,10 @@ mod tests {
         assert!(samples.is_empty());
     }
 
-    // ── wake-word inference cost ─────────────────────────────────────────
-    //
-    // whisper.cpp pads every input to 30 s of mel (1500 frames) and encodes
-    // all of it. Continuous wake-word detection re-ran that full encode every
-    // slide, on all six cores, sharing the command model. audio_ctx caps the
-    // encode to the clip; the thread split stops KWS starving inference.
+    // Wake-word inference cost: whisper.cpp pads every input to 30 s of mel
+    // (1500 frames) and encodes all of it. audio_ctx caps the encode to the clip
+    // length; the two-thread KWS profile stops continuous detection starving the
+    // command model on the six-core Orin.
 
     #[test]
     fn audio_ctx_tracks_the_clip_not_the_30_second_pad() {
@@ -838,14 +805,10 @@ mod tests {
         );
     }
 
-    /// Does `audio_ctx` destroy wake-word detection?
-    ///
-    /// The KWS path sets it to ~1/10th of whisper's trained 1500-frame
-    /// context. That is a large accuracy trade, taken to cut encoder cost.
-    /// This measures the trade against a real model instead of assuming.
-    ///
-    /// WHISPER_TEST_MODEL=~/Library/Application\ Support/goose-in-a-pond/models/ggml-base.en.bin \
-    ///   cargo test -p pond-adapters-whisper audio_ctx_sweep -- --ignored --nocapture
+    /// Does `audio_ctx` destroy wake-word detection? The KWS path sets it to
+    /// ~1/10th of whisper's trained 1500-frame context, a large accuracy trade
+    /// taken to cut encoder cost. Measures that trade against a real model
+    /// instead of assuming it; needs `WHISPER_TEST_MODEL`.
     #[test]
     #[ignore]
     fn audio_ctx_sweep() {
@@ -908,16 +871,10 @@ mod tests {
     }
 }
 
-/// Measurements against a real model, run by hand.
+/// Measurements against a real model, run by hand with `WHISPER_TEST_MODEL` set.
 ///
-/// Ignored because they need a `.bin` on disk and take seconds. They are the
-/// only way to check an accuracy claim — every other test here asserts that
-/// parameters were *set*, not that the transcript got better.
-///
-/// ```bash
-/// WHISPER_TEST_MODEL=~/Library/Application\ Support/goose-in-a-pond/models/ggml-base.en.bin \
-///   cargo test -p pond-adapters-whisper --features metal decode_profiles -- --ignored --nocapture
-/// ```
+/// Ignored: they need a ggml `.bin` on disk. The only checks here of an accuracy
+/// claim — every other test asserts a parameter was set, not that output improved.
 #[cfg(test)]
 mod decode_profiles {
     use super::*;

@@ -1,15 +1,7 @@
 //! `FallbackVoiceOutput` — try the primary TTS engine; if it errors, use the fallback.
 //!
-//! Mirrors `FallbackProvider` for LLM — the pattern is identical:
-//! attempt primary, log a warning on failure, retry with fallback.
-//!
-//! Typical wiring:
-//! ```ignore
-//! let tts = Arc::new(FallbackVoiceOutput::new(
-//!     Arc::new(PiperOutput::new(primary_bin, primary_model)),
-//!     Arc::new(PiperOutput::new(bin, model)), // fallback
-//! ));
-//! ```
+//! Mirrors `FallbackProvider` for LLMs: attempt primary, log a warning on
+//! failure, retry with the fallback so a TTS error never aborts a turn.
 
 use crate::models::ports::voice_output::VoiceOutput;
 use anyhow::Result;

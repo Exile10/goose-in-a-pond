@@ -1,11 +1,7 @@
-//! Integration tests for per-session token tracking:
-//!   - Session token accumulation via increment_usage
-//!   - list_sessions includes token counts
-//!   - /api/v1/usage/summary aggregates correctly
-//!
-//! Uses a REAL SQLite database (temp dir) with all migrations.
-//!
-//! Run: cargo test -p pond-api --test token_usage_integration_test
+//! Integration tests for per-session token tracking: accumulation through
+//! `increment_usage`, the counts `list_sessions` reports, and the aggregation in
+//! /api/v1/usage/summary. Uses a real SQLite database in a temp dir with all
+//! migrations. Run: cargo test -p pond-api --test token_usage_integration_test
 
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
@@ -186,6 +182,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -206,6 +203,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,

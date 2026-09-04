@@ -66,3 +66,12 @@ llama.log
 pond-desktop/playwright-report/
 pond-desktop/test-results/
 __pycache__/
+
+# Python virtualenvs under experiments/ — regenerable from the pipeline's own
+# requirements, and the MLX/tokenizers native libraries alone are ~420 MB
+**/.venv/
+
+# Fine-tuning corpora emitted by experiments/dual-gemma/finetune/gen_data.py.
+# Derived output, rebuilt by the generator, never reviewed by hand.
+experiments/**/finetune/data/train.jsonl
+experiments/**/finetune/data/valid.jsonl

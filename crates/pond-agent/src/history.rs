@@ -6,11 +6,9 @@
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::user_data::ports::session_storage::SessionStorage;
 
-/// Load the most recent `limit` messages for a session.
-///
-/// Returns an empty vec if the session doesn't exist or has no messages.
-/// Messages are returned in chronological order (oldest first), matching
-/// the order expected by inference providers.
+/// Load the most recent `limit` messages for a session, in chronological order
+/// (oldest first) as inference providers expect. Empty when the session does not
+/// exist or has no messages.
 pub async fn load_history(
     storage: &dyn SessionStorage,
     session_id: &str,

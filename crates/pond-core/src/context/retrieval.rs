@@ -1,35 +1,7 @@
-//! Retrieval — the second `<system-context>` corpus (PAI-8 P2).
-//!
-//! Context items are **not** written into `memories`. Memory is a curated store
-//! with decay, consolidation and importance; a mailbox would drown it. So the
-//! retrieval path gains a second corpus, ranked on its own blend and rendered
-//! into its own block under its own budget line, so it can be cut without
-//! touching the memory block.
-//!
-//! # The budget is a SPLIT, not an addition
-//!
-//! [`split_preamble_budget`] partitions the memory budget the turn already had
-//! rather than asking for tokens on top of it. That is not tidiness. The
-//! preamble is re-prefilled every turn on local inference, `CompactionProfile`'s
-//! history budget is computed by subtracting the preamble it promised, and a
-//! block that appears in the prompt without appearing in that arithmetic is the
-//! defect `output_reserve_tokens` was added to fix, one layer up. A split cannot
-//! produce it.
-//!
-//! It also means a pond with no context sources pays **nothing**: with no items,
-//! the memory block keeps every token it has today.
-//!
-//! # Why the blend is not `memory_relevance`'s verbatim
-//!
-//! Memory blends similarity, stored importance and recency-of-writing. A context
-//! item has no importance — nothing scores an e-mail's worth — and its
-//! `occurred_at` can be in the **future**, which is the whole point of ingesting
-//! a calendar. `memory_relevance::recency_score` answers `1.0` for any
-//! non-positive age, so a meeting in the year 3000 would score exactly as well as
-//! one in ten minutes. The three terms here keep memory's weights and
-//! substitute two honest ones: how near the item's moment is to now (symmetric,
-//! so the far future decays like the far past), and how recently the pond
-//! learned of it.
+//! Retrieval — the second `<system-context>` corpus (PAI-8 P2). Context items are not written into
+//! `memories`; a mailbox would drown a curated store. [`split_preamble_budget`] SPLITS the memory
+//! budget rather than adding, so no block escapes `CompactionProfile`'s arithmetic. The blend is
+//! not memory's: an item has no importance, and its `occurred_at` may be in the future.
 
 use chrono::{DateTime, Utc};
 
@@ -48,23 +20,16 @@ pub const INGEST_RECENCY_WEIGHT: f32 = 0.2;
 /// one a fortnight away scores 0.5.
 pub const HALF_LIFE_DAYS: f32 = 14.0;
 
-/// Share of the preamble's memory budget that goes to context when there is any
-/// context to show.
+/// Share of the preamble's memory budget that goes to context when there is any context to show.
 ///
-/// A third, not a half: memory is the curated store and the one the assistant's
-/// core promise rests on. This is the number to turn down first if the preamble
-/// needs to shrink, which is exactly why it is a named constant with its own
-/// block rather than an implicit share of a merged one.
+/// A third, not a half: memory is the curated store. This is the number to turn down first when
+/// the preamble has to shrink.
 pub const CONTEXT_BUDGET_SHARE: f32 = 1.0 / 3.0;
 
-/// The XML tag the context block rides in, inside the user message's
-/// `<system-context>`.
+/// The XML tag the context block rides in, inside the user message's `<system-context>`.
 ///
-/// Distinct from `<memories>` so the model can tell "something you were told"
-/// from "something that arrived". Note that `prompts.rs` currently names only
-/// `<system-context>` and `<memories>` when it teaches the model what those tags
-/// mean; adding this one to that instruction is owed by whoever wires the block
-/// into the adapter.
+/// Distinct from `<memories>` so the model can tell what it was told from what arrived. Whoever
+/// wires the block into the adapter also owes this tag an entry in `prompts.rs`.
 pub const CONTEXT_BLOCK_TAG: &str = "personal-context";
 
 /// Decay in `[0, 1]` for a gap of `days`, in either direction.
@@ -91,9 +56,8 @@ pub fn ingest_recency_score(item: &ContextItem, now: DateTime<Utc>) -> f32 {
 
 /// Blended score for one candidate.
 ///
-/// `similarity` is `None` for a candidate that arrived by recency alone; it
-/// forfeits the term rather than being given a neutral value, for the reason
-/// `memory_relevance::relevance_score` records.
+/// `similarity` is `None` for a candidate that arrived by recency alone, and forfeits the term
+/// rather than taking a neutral value; see `memory_relevance::relevance_score`.
 pub fn relevance_score(item: &ContextItem, similarity: Option<f32>, now: DateTime<Utc>) -> f32 {
     let sim = similarity.unwrap_or(0.0).clamp(0.0, 1.0);
     SIMILARITY_WEIGHT * sim
@@ -146,9 +110,8 @@ pub fn estimated_tokens(item: &ContextItem) -> usize {
 
 /// Take items best-first until the budget is spent.
 ///
-/// Keeps the first item even when it alone exceeds the budget — a block of one
-/// over-long item is more useful than an empty block, and it is what the memory
-/// loop does.
+/// Keeps the first item even when it alone exceeds the budget, as the memory loop does: one
+/// over-long item beats an empty block.
 pub fn select_within_budget<'a>(
     ranked: &'a [(ContextItem, Option<f32>)],
     token_budget: usize,
@@ -168,9 +131,8 @@ pub fn select_within_budget<'a>(
 
 /// One item as the model sees it.
 ///
-/// The date is written out because the model has no other way to know when a
-/// thing happened, and "tomorrow" in an ingested body is relative to a moment
-/// the model cannot see.
+/// The date is written out because "tomorrow" in an ingested body is relative to a moment the
+/// model cannot see.
 pub fn render_line(item: &ContextItem) -> String {
     let when = item.occurred_at().format("%Y-%m-%d %H:%M");
     let who = if item.participants().is_empty() {

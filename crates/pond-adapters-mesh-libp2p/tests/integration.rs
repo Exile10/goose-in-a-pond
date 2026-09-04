@@ -198,21 +198,14 @@ async fn relay_mediated_connect() {
 }
 
 // ── What the handshake is actually for ───────────────────────────────────
-//
-// The three tests below are the ones that fail if the authentication work is
-// reverted. They are written as behaviour at the port, not as unit tests of
-// `verify_handshake`, because the defect they cover was never in that
-// function's arithmetic -- it was in what the function was never asked.
+// The three tests below fail if the authentication work is reverted. They are
+// behaviour at the port, not unit tests of `verify_handshake`: the defect was in
+// what that function was never asked, not in its arithmetic.
 
 /// An untrusted peer is refused, even though it is running exactly this build
-/// and exactly this model.
-///
-/// This is the distinction the whole feature rests on. The handshake proves
-/// "same harness, same model, holds the key it claims" -- all three of which
-/// are true of every GIAP pond on the internet running this release. Trust is
-/// what makes a mesh private, and `PeerDirectory`'s port doc has always said
-/// the transport consults it: "a peer absent from the directory is not trusted
-/// at all".
+/// and exactly this model. The handshake only proves "same harness, same model,
+/// holds the key it claims", which is true of every GIAP pond on this release.
+/// Trust is what makes a mesh private, and it lives in `PeerDirectory`.
 #[tokio::test]
 async fn an_untrusted_peer_is_refused_even_on_a_matching_build() {
     let a = spawn_node(model()).await;
@@ -238,13 +231,10 @@ async fn an_untrusted_peer_is_refused_even_on_a_matching_build() {
     );
 }
 
-/// Trust is directional, and the listener enforces its own.
-///
-/// Written separately from the test above because a gate that only ran on the
-/// dialer would pass that one: A refuses to finish, and both sides end up
-/// empty. Here A trusts B and B does not trust A, so the only thing that can
-/// keep B's peer list empty is B applying its own directory to an inbound
-/// handshake.
+/// Trust is directional, and the listener enforces its own. A gate that ran only
+/// on the dialer would still pass the test above, since both sides end up empty.
+/// Here A trusts B and B does not trust A, so only B applying its own directory
+/// to an inbound handshake can keep B's peer list empty.
 #[tokio::test]
 async fn the_listener_refuses_a_peer_it_does_not_trust_itself() {
     let a = spawn_node(model()).await;
@@ -262,13 +252,10 @@ async fn the_listener_refuses_a_peer_it_does_not_trust_itself() {
     );
 }
 
-/// Revoking trust means the peer cannot come back.
-///
-/// The handshake carries no nonce and no timestamp, so it is a static blob
-/// that is byte-identical on every connection -- and every peer this Pond has
-/// ever dialled holds a copy. If the transport did not re-consult the
-/// directory, a revoked peer could reconnect by replaying the exchange it
-/// already knows how to complete, and revocation would be advisory.
+/// Revoking trust means the peer cannot come back. The handshake carries no
+/// nonce and no timestamp, so every peer this Pond has ever dialled holds a
+/// replayable copy; unless the transport re-consults the directory, revocation
+/// is advisory.
 #[tokio::test]
 async fn a_revoked_peer_cannot_reconnect() {
     let a = spawn_node(model()).await;

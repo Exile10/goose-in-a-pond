@@ -1,11 +1,6 @@
-//! llamafile LLM provider adapter.
-//!
-//! llamafile runs a local server on `http://127.0.0.1:8080` that serves a
-//! `POST /v1/chat/completions` endpoint compatible with the OpenAI API.
-//!
-//! This crate implements the GIAP `LlmProvider` port against that endpoint
-//! using a plain `reqwest` HTTP client — no Goose dependency, no linker
-//! conflicts with Goose's v8/llama-cpp-2 combo on Windows.
+//! llamafile LLM provider adapter. Implements the GIAP `LlmProvider` port over llamafile's
+//! OpenAI-compatible `POST /v1/chat/completions` at `http://127.0.0.1:8080` using plain
+//! `reqwest`: no Goose dependency, no linker conflicts with Goose's v8/llama-cpp-2 on Windows.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;

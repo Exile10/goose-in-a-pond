@@ -1,26 +1,7 @@
-//! The index's coverage leaves the process, and can be repaired from outside it.
-//!
-//! `IndexHealth` was computed from phase A onwards and written to a `tracing`
-//! line and nowhere else. That is not a surface: an index populated at roughly
-//! 2% survived six landed phases, because the pond kept answering -- slightly
-//! worse -- and the one component that knew was a log nobody reads while things
-//! look fine. These two routes are the end of that, and the claims here are:
-//!
-//! * **A pond with embeddings switched off answers, rather than failing.** It is
-//!   a legitimate configuration -- retrieval falls back to recency -- so a 500
-//!   would make a healthy pond indistinguishable from a broken one at exactly
-//!   the moment somebody is trying to tell those apart.
-//! * **Every corpus is its own row.** The averaged figure is what hid the
-//!   defect: two populated corpora carried a third that could never populate at
-//!   all. A corpus with no qualifying rows has to appear, at zero, with no
-//!   coverage fraction -- not be absent, and not be rounded into somebody
-//!   else's number.
-//! * **Rebuild says what it cleared.** An operator affordance that reports
-//!   nothing cannot be checked, and this one exists for the one-way doors: a
-//!   changed embedder leaves rows that score plausibly and are wrong, and the
-//!   sweep only re-embeds what is ABSENT.
-//! * **Both routes require a token.** The counts describe how much of a
-//!   household's memory exists.
+//! The index's coverage leaves the process, and can be repaired from outside it. Embeddings
+//! off must answer, not 500; every corpus is its own row, at zero with no coverage fraction
+//! when nothing qualifies, because an average hid one that could never populate; rebuild
+//! reports what it cleared, since the sweep re-embeds only ABSENT rows; both need a token.
 
 use std::sync::Arc;
 
@@ -138,6 +119,7 @@ async fn make_app(wire_index: bool, wire_embedder: bool) -> Harness {
     hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(hs),
@@ -165,6 +147,7 @@ async fn make_app(wire_index: bool, wire_embedder: bool) -> Harness {
         // `if let Some(provider)`. Wiring it whenever the index is present would
         // make this harness claim a refill on a pond where nothing can refill.
         index_reindex: (wire_index && wire_embedder).then(|| reindex.clone()),
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -273,13 +256,10 @@ async fn add_memory(h: &Harness, id: &str, profile: &str) {
     .unwrap();
 }
 
-/// A session carrying a real rolling summary and NO owner.
-///
-/// This is the shape that made the whole surface necessary and then very nearly
-/// defeated it: `liveness_sql(Summary)` requires `profile_id IS NOT NULL`, so
-/// such a session is excluded from every count that uses the predicate. On the
-/// live pond 27 of these existed and the corpus reported zero qualifying rows,
-/// which reads exactly like an empty corpus.
+/// A session carrying a real rolling summary and NO owner. `liveness_sql(Summary)` requires
+/// `profile_id IS NOT NULL`, so such a session is excluded from every count that uses the
+/// predicate: on the live pond 27 of them existed and the corpus reported zero qualifying
+/// rows, which reads exactly like an empty corpus.
 async fn add_unattributed_summary(h: &Harness, id: &str) {
     sqlx::query(
         "INSERT INTO sessions (id, created_at, profile_id, rolling_summary, \
@@ -297,6 +277,8 @@ async fn add_vector(h: &Harness, corpus: Corpus, row_id: &str, model_id: &str) {
         .upsert(&VectorEntry {
             corpus,
             row_id: row_id.to_string(),
+            chunk_ix: 0,
+            chunk_span: None,
             model_id: model_id.to_string(),
             vector: vec![0.1, 0.2, 0.3, 0.4],
             source_rev: None,
@@ -447,13 +429,10 @@ async fn the_coverage_number_leaves_the_process() {
     assert_eq!(corpus_row(&body, "context")["rows"], 0);
 }
 
-/// Clearing the index is only half of "reindex". The other half is refilling it,
-/// and the sweep that does that is idle-gated — so it will not normally run
-/// while the person who just pressed the button is still there.
-///
-/// Without the wake this route is a button that empties the panel and leaves it
-/// empty until the next scheduled pass, which on a pond nobody restarts is
-/// indistinguishable from the button doing nothing.
+/// Clearing the index is only half of "reindex"; the other half is the refilling sweep,
+/// which is idle-gated and so will not normally run while the person who pressed the button
+/// is still there. Without the wake, the route empties the panel and leaves it empty until
+/// the next scheduled pass, which on a pond nobody restarts looks like doing nothing.
 #[tokio::test]
 async fn rebuilding_wakes_the_sweep_that_refills_it() {
     let h = make_app(true, true).await;
@@ -480,11 +459,9 @@ async fn rebuilding_wakes_the_sweep_that_refills_it() {
         .expect("waiter task panicked");
 }
 
-/// A pond with no sweep to wake still clears, and says it did not refill.
-///
-/// This is the CLI shape, and reporting `refilling: true` there would be a lie
-/// that reads as success — the caller would wait for a rebuild that nothing in
-/// the process is going to perform.
+/// A pond with no sweep to wake still clears, and says it did not refill. This is the CLI
+/// shape, where `refilling: true` would be a lie that reads as success: the caller would
+/// wait for a rebuild that nothing in the process is going to perform.
 #[tokio::test]
 async fn a_pond_with_no_sweep_clears_and_admits_nothing_will_refill_it() {
     let h = make_app(true, false).await;
@@ -498,19 +475,10 @@ async fn a_pond_with_no_sweep_clears_and_admits_nothing_will_refill_it() {
     );
 }
 
-/// An empty corpus and an EXCLUDED corpus both report zero qualifying rows, and
-/// they need opposite fixes. The surface has to tell them apart.
-///
-/// This is the defect that survived the first cut of this route, and it survived
-/// because every test built a pond with no sessions at all — where the two cases
-/// are genuinely identical. Measured against the real pond afterwards, the route
-/// reported the index **100% covered** while 27 sessions held a rolling summary
-/// that no query could ever reach: memory read 18 of 18, summary read 0 of 0,
-/// and 0/0 does not drag an average down.
-///
-/// So the assertion is not "summary is at zero" — the test above already says
-/// that, on a pond where zero is the truth. It is that a full table behind an
-/// excluding predicate is DISTINGUISHABLE from an empty one.
+/// An empty corpus and an EXCLUDED corpus both report zero qualifying rows and need opposite
+/// fixes, so the surface has to tell them apart. A pond with no sessions at all cannot show
+/// the difference: 27 sessions held a rolling summary no query could reach and the route
+/// still read 100% covered, because 0 of 0 does not drag an average down.
 #[tokio::test]
 async fn a_corpus_excluded_by_its_predicate_is_not_reported_as_an_empty_one() {
     let h = make_app(true, true).await;

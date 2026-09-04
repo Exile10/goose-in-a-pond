@@ -1,8 +1,6 @@
-//! In-memory [`ContextRepository`] for tests.
-//!
-//! It implements the scope rule rather than ignoring it, because half the
-//! guards in this workstream are about which rows a scope may see, and a mock
-//! that returned everything would make all of them pass.
+//! In-memory [`ContextRepository`] for tests. It implements the scope rule rather than ignoring
+//! it: half the guards here are about which rows a scope may see, and a mock that returned
+//! everything would make all of them pass.
 
 use std::sync::Mutex;
 
@@ -20,12 +18,9 @@ use crate::user_data::domain::profile::ProfileScope;
 pub struct MockContextRepository {
     sources: Mutex<Vec<ContextSource>>,
     items: Mutex<Vec<ContextItem>>,
-    /// When set, every read of the source list fails with this message.
-    ///
-    /// A store that cannot be read is not the same thing as a store with no
-    /// rows, and the difference is the whole of the failure-direction rule: a
-    /// caller that treated an unreadable source list as "no sources" would
-    /// carry on, which is the permissive answer.
+    /// When set, every read of the source list fails with this message. An unreadable store is not
+    /// a store with no rows: a caller that treated the two alike would carry on, which is the
+    /// permissive answer.
     unreadable_sources: Mutex<Option<String>>,
     /// When set, every item write fails with this message.
     unwritable_items: Mutex<Option<String>>,
