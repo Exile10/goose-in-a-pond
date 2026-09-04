@@ -1,9 +1,6 @@
-//! Where a household's mail lives.
-//!
-//! The same shape as the CalDAV presets and for the same reason: the protocol
-//! is uniform and the setup is not. Every one of these needs an app-specific
-//! password, and the household meets that requirement while looking at a
-//! password box rather than while reading documentation.
+//! Where a household's mail lives. The same shape as the CalDAV presets: the protocol is
+//! uniform and the setup is not, and every preset needs an app-specific password, so the
+//! hint is shown at the password box rather than in documentation.
 
 /// A mail host this pond knows how to reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,11 +71,9 @@ impl ImapProvider {
         }
     }
 
-    /// Rebuild from what was stored, for a source being re-synced.
-    ///
-    /// `host_port` is `host:port`, and only the custom variant carries one — a
-    /// stored `gmail` row cannot be pointed at another server by editing a
-    /// column.
+    /// Rebuild from what was stored, for a source being re-synced. `host_port` is `host:port`
+    /// and only the custom variant reads it: a stored `gmail` row cannot be pointed at another
+    /// server by editing a column.
     pub fn from_stored(provider: &str, host_port: Option<&str>) -> Option<Self> {
         match provider {
             "gmail" => Some(Self::Gmail),

@@ -1,17 +1,7 @@
-//! Lightning settlement for the private mesh (#132), via Breez SDK
-//! (`breez-sdk-spark`, the nodeless/Spark backend — no channel-liquidity
-//! management, matching the SDK choice made for a small team building a
-//! household-scale feature, not a payment company).
-//!
-//! `issue_invoice`/`verify_preimage` are real: invoices *we* issue, for
-//! usage owed *to* us, need nothing beyond this crate and the SDK.
-//! `batch_settle` — actually *paying* a peer what we owe *them* — takes
-//! *their* invoice as a parameter (`PaymentRail::batch_settle`'s doc
-//! comment); the caller obtains it via
-//! `pond_adapters_mesh_inference::MeshInferenceService::request_invoice`,
-//! the mesh-side `InvoiceRequest`/`InvoiceResponse` exchange (#132
-//! Milestone 5 wire protocol) — this crate has no transport of its own to
-//! ask a peer for anything.
+//! Lightning settlement for the private mesh (#132) via `breez-sdk-spark`, the nodeless
+//! backend with no channel-liquidity management. `issue_invoice`/`verify_preimage` need only
+//! the SDK; `batch_settle` takes the peer's invoice as a parameter because this crate has no
+//! transport. Obtain it via `pond_adapters_mesh_inference::MeshInferenceService::request_invoice`.
 
 use std::sync::Arc;
 
@@ -30,12 +20,9 @@ use breez_sdk_spark::{
     ReceivePaymentRequest, Seed, SendPaymentRequest,
 };
 
-/// Where to source the wallet seed and API key from — env vars only, never
-/// hardcoded, never logged. `mnemonic: None` means "generate one and the
-/// caller is responsible for persisting it" (mirrors `build_mesh_transport`'s
-/// existing generate-once-and-persist-via-settings-KV pattern for
-/// `mesh_identity_secret`; this crate doesn't own settings persistence
-/// itself, so it just hands the freshly generated phrase back once).
+/// Wallet seed and API key, sourced from env vars only: never hardcoded, never logged.
+/// `mnemonic: None` means generate one and hand it back once; the caller must persist it, as
+/// `build_mesh_transport` does for `mesh_identity_secret`, because this crate owns no settings.
 pub struct LightningConfig {
     pub api_key: String,
     pub mnemonic: Option<String>,
@@ -70,13 +57,9 @@ pub struct LightningPaymentRail {
 }
 
 impl LightningPaymentRail {
-    /// Connects to the Spark network. If `config.mnemonic` is `None`, a
-    /// fresh 24-word BIP-39 mnemonic is generated — the caller must persist
-    /// it (e.g. via `SettingsRepository::set_key`, the same mechanism
-    /// `build_mesh_transport` uses for `mesh_identity_secret`) or the
-    /// wallet is unrecoverable after restart. The generated phrase, when
-    /// one was generated, is returned alongside the connected rail so the
-    /// caller can do that — this crate does not persist secrets itself.
+    /// Connects to the Spark network. If `config.mnemonic` is `None`, a fresh 24-word BIP-39
+    /// mnemonic is generated and returned beside the rail; the caller must persist it (e.g. via
+    /// `SettingsRepository::set_key`) or the wallet is unrecoverable after restart.
     pub async fn connect(config: LightningConfig) -> anyhow::Result<(Self, Option<String>)> {
         let (mnemonic, generated) = match config.mnemonic {
             Some(m) => (m, None),
@@ -109,11 +92,8 @@ impl LightningPaymentRail {
 #[async_trait]
 impl PaymentRail for LightningPaymentRail {
     async fn issue_invoice(&self, amount: Millisats) -> Result<String, PaymentRailError> {
-        // Breez's amount is whole sats; Millisats carries sub-sat precision
-        // GIAP doesn't otherwise use. Rounding down means the issued invoice
-        // can undercharge by up to 999 msat — acceptable for a v1 that
-        // settles in batches of thousands of tokens, not worth a µ-payment
-        // scheme to avoid.
+        // Breez takes whole sats, so rounding Millisats down can undercharge an invoice by up
+        // to 999 msat. Acceptable when settling batches of thousands of tokens.
         let amount_sats = amount.value() / 1000;
         let response = self
             .sdk
@@ -135,11 +115,8 @@ impl PaymentRail for LightningPaymentRail {
         invoice: &str,
         preimage: &str,
     ) -> Result<bool, PaymentRailError> {
-        // ReceivePaymentResponse carries no payment id/hash to remember, so
-        // rather than keep our own bookkeeping map, scan received payments
-        // for the one whose embedded Lightning invoice matches — correct
-        // and simple at mesh scale (a household's occasional settlements,
-        // not a payment processor's transaction volume).
+        // ReceivePaymentResponse carries no payment id/hash to remember, so scan received
+        // payments for the one whose embedded invoice matches. Fine at a household's volume.
         let response = self
             .sdk
             .list_payments(ListPaymentsRequest {
@@ -177,11 +154,9 @@ impl PaymentRail for LightningPaymentRail {
         }
     }
 
-    /// Pays `invoice` — the caller is responsible for having obtained it
-    /// from `peer` beforehand (this crate has no mesh transport of its own).
-    /// `amount` is cross-checked against what the invoice actually asks for
-    /// before any funds move, so a caller passing a stale or mismatched
-    /// amount fails loudly instead of over/under-paying.
+    /// Pays `invoice`, which the caller must already have obtained from `peer` (this crate has
+    /// no mesh transport). `amount` is cross-checked against the invoice before any funds move,
+    /// so a stale or mismatched amount fails loudly instead of over- or under-paying.
     async fn batch_settle(
         &self,
         peer: PeerId,
@@ -255,11 +230,9 @@ mod tests {
         assert_eq!(phrase.split_whitespace().count(), 24);
     }
 
-    /// `std::env` is process-global, so tests touching `BREEZ_API_KEY`/
-    /// `LIGHTNING_NETWORK` would race each other under cargo's default
-    /// parallel harness — same class of bug `mic_privacy_integration_test.rs`
-    /// already hit and fixed the same way. One lock, held for the duration
-    /// of each test that touches these vars.
+    /// `std::env` is process-global, so tests touching `BREEZ_API_KEY`/`LIGHTNING_NETWORK`
+    /// race under cargo's parallel harness. Hold this lock for the duration of each such test
+    /// (same fix as `mic_privacy_integration_test.rs`).
     static ENV_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]

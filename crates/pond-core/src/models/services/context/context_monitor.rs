@@ -151,27 +151,10 @@ impl ContextMonitor {
         }
     }
 
-    /// Claim the right to run one compaction pass for this session, or decline.
-    ///
-    /// PAI-4 P6 — the *acting* half of `should_compact`, and the reason it is a
-    /// method rather than a caller-side `if`. Three things have to be true at
-    /// once and they have to be true under one lock:
-    ///
-    /// 1. the session is genuinely under pressure (`should_compact`, recomputed
-    ///    here rather than passed in, so a stale snapshot cannot authorise a
-    ///    pass);
-    /// 2. [`COMPACTION_COOLDOWN_TURNS`] recorded turns have passed since the
-    ///    last claim;
-    /// 3. nobody else is claiming concurrently — two turns of one session can
-    ///    finish at once, and both would otherwise queue a summarisation ahead
-    ///    of the user's next turn on a serial on-device engine.
-    ///
-    /// The cooldown is stamped on the **claim**, not on completion. What is
-    /// being rationed is the model call, and that is spent whether or not the
-    /// pass finds anything to summarise.
-    ///
-    /// Returns `false` for a session with no recorded turns — a pass needs
-    /// something to compact.
+    /// Claim the right to run one compaction pass for this session, or decline (PAI-4 P6). All
+    /// three conditions hold under one lock: `should_compact` recomputed here rather than passed
+    /// in, [`COMPACTION_COOLDOWN_TURNS`] recorded turns since the last claim, and no concurrent
+    /// claim. The cooldown is stamped on the claim, not on completion; no turns means false.
     pub fn claim_compaction(&self, session_id: &str) -> bool {
         let mut sessions = self
             .session_contexts
@@ -196,42 +179,10 @@ impl ContextMonitor {
         true
     }
 
-    /// Claim a compaction pass on behalf of a person who asked for one.
-    ///
-    /// PAI-4 P7b-fix. This exists because the manual axis and the pressure axis
-    /// shared one quota *and the pressure axis always took it first*. In the
-    /// chat-stream generator the `context_warning` frame is yielded and
-    /// `spawn_pressure_compaction` is called inside the same `if
-    /// health.should_compact` block, one statement later; the button that frame
-    /// renders only appears after `done`. So by the time a human could press it
-    /// the claim was already gone, [`claim_compaction`](Self::claim_compaction)
-    /// refused, and the endpoint answered `cooling_down` — measured at six
-    /// consecutive pressured turns, six refusals, never one pass. The success
-    /// path was unreachable rather than uncommon.
-    ///
-    /// **What is different, and it is exactly one thing.** The
-    /// [`COMPACTION_COOLDOWN_TURNS`] check is skipped. Both other conditions
-    /// hold unchanged: the session must exist, and `should_compact` is still
-    /// recomputed here under this lock, so a person cannot compact a session
-    /// that is not under pressure. That limb is not what made the button dead
-    /// and relaxing it would be the scope widening this programme calls a bug.
-    ///
-    /// **It still stamps the cooldown, and that is the design rather than an
-    /// oversight.** A manual press *consumes* the quota without *checking* it.
-    /// The two axes therefore cannot double-spend the summariser: a press
-    /// rations the automatic axis for [`COMPACTION_COOLDOWN_TURNS`] recorded
-    /// turns afterwards, exactly as an automatic pass would have. The manual
-    /// axis gains nothing the pressure axis did not already have — it only
-    /// stops being refused by a claim the pressure axis took on its behalf one
-    /// statement earlier.
-    ///
-    /// **What bounds repeated presses is not this method.** It is the rolling
-    /// summary's through-pointer: `SessionSummaryService::refresh` decides
-    /// `NothingToDo` from that pointer and the message count *before* it calls
-    /// the provider, so a second press with no new turns between costs a
-    /// database read and no model call. The caller additionally refuses while a
-    /// pass is in flight, which is what actually protects a serial on-device
-    /// engine.
+    /// Claim a compaction pass for a person who asked (PAI-4 P7b-fix). One thing differs from
+    /// [`claim_compaction`](Self::claim_compaction): [`COMPACTION_COOLDOWN_TURNS`] is skipped,
+    /// though a press still stamps it so the axes cannot double-spend. `should_compact` is still
+    /// recomputed under this lock; repeated presses stop at the summary's through-pointer.
     pub fn claim_manual_compaction(&self, session_id: &str) -> bool {
         let mut sessions = self
             .session_contexts
@@ -250,24 +201,10 @@ impl ContextMonitor {
         true
     }
 
-    /// Record that a compaction pass changed the shape of this session's
-    /// history, without pretending its context window went back to zero.
-    ///
-    /// This is deliberately **not** [`reset_session`](Self::reset_session), and
-    /// the difference is the one thing in this phase that could not be taken
-    /// from the design bullet as written. `reset_session` drops the whole entry,
-    /// which is right when the session is gone. After a rolling-summary refresh
-    /// the session is very much still here and its window did not shrink: the
-    /// next turn reports the same utilisation to `record_turn`, so a full reset
-    /// would clear the cooldown stamp and let the pass fire again immediately —
-    /// exactly the between-every-pair-of-turns model call the cooldown exists to
-    /// prevent.
-    ///
-    /// What is genuinely stale is the growth window: those samples measured a
-    /// differently-shaped history. Dropping them takes
-    /// `estimated_turns_remaining` back to "unknown" until fresh samples
-    /// accumulate, which quiets that limb of `should_compact` while leaving the
-    /// utilisation limb — the honest one — untouched.
+    /// Record that a compaction pass changed the shape of this session's history, without
+    /// pretending its context window went back to zero. NOT `reset_session`: a full reset would
+    /// clear the cooldown stamp and let the pass fire again immediately. Only the growth window
+    /// is stale, so dropping it quiets `estimated_turns_remaining` and leaves utilisation alone.
     pub fn note_compacted(&self, session_id: &str) {
         let mut sessions = self
             .session_contexts
@@ -280,10 +217,8 @@ impl ContextMonitor {
 
     /// Clear all tracking state for the given session.
     ///
-    /// Call this when the session itself goes away. Until PAI-4 P6 this had no
-    /// production caller at all, so every session ever seen stayed in the map
-    /// for the life of the process, and a deleted session that came back under
-    /// the same id inherited the growth history of the conversation it replaced.
+    /// Call this when the session itself goes away, or the map grows for the life of the process
+    /// and a session reusing a deleted id inherits the growth history of its predecessor.
     pub fn reset_session(&self, session_id: &str) {
         let mut sessions = self
             .session_contexts
@@ -295,9 +230,8 @@ impl ContextMonitor {
 
 /// Derive a health snapshot from one session's recorded state.
 ///
-/// Shared by [`ContextMonitor::check_context_health`] and
-/// [`ContextMonitor::claim_compaction`] so the predicate that reports pressure
-/// and the predicate that acts on it cannot drift apart.
+/// Shared by [`ContextMonitor::check_context_health`] and [`ContextMonitor::claim_compaction`]
+/// so the predicate that reports pressure and the one that acts on it cannot drift apart.
 fn health_of(state: &ContextState) -> ContextHealth {
     let utilization_pct = if state.context_limit == 0 {
         0.0

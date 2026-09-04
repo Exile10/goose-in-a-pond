@@ -1,15 +1,7 @@
-//! Integration tests for the enhanced memory system:
-//!   - Memory segments, importance, tier, lifecycle (DB round-trip)
-//!   - Memory REST API with segment metadata
-//!   - Memory decay effective score computation
-//!   - Memory cleanup (archive/prune)
-//!   - Access tracking (record_access increments count)
-//!   - Segment-based search filtering
-//!
-//! These tests use a REAL SQLite database (temp dir) with all migrations applied.
-//! No running server or LLM required.
-//!
-//! Run: cargo test -p pond-api --test memory_integration_test
+//! Integration tests for the enhanced memory system: segment, importance, tier
+//! and lifecycle round-trips, the REST API's segment metadata, decay scoring,
+//! archive and prune cleanup, access tracking, and segment-filtered search. Uses
+//! a real SQLite database in a temp dir with all migrations; no server or LLM.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

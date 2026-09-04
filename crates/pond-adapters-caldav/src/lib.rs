@@ -1,31 +1,7 @@
-//! CalDAV as a personal-context source: sign in, read the calendar, ingest.
-//!
-//! The first connector in this pond that reaches out to somebody's account, so
-//! it is also the first place several of PAI-2's rules acquire a call site.
-//! What it does, and equally what it does not:
-//!
-//! * **Read-only, always.** No `PUT`, no `POST` to the account, no scheduling,
-//!   no replying. PAI-8 §0 puts write-back out of scope for v1, and this crate
-//!   contains no method that could perform one -- which is a stronger statement
-//!   than a policy, because there is nothing to call.
-//! * **Every request is gated and tracked.** `check_egress` before the send and
-//!   `record_egress` after it, per the `pond-adapters-weather` template, so an
-//!   `offline` pond stops asking a third party about the household's day and
-//!   every request appears in the activity feed.
-//! * **Nothing goes out but the query.** No prompt, no memory, no conversation
-//!   text is ever put in a request. Invariant 7, and the only body this crate
-//!   ever sends is a `calendar-query` naming a date range.
-//! * **Credentials are handed in, never held on disk here.** They come from
-//!   `SecretRepository` at the call site; this crate keeps them only for the
-//!   lifetime of the adapter and never logs, serialises or returns them.
-//!
-//! # Why the server expands recurrences and this crate does not
-//!
-//! The `calendar-query` asks for `<C:expand>`, so a weekly meeting arrives as
-//! one VEVENT per occurrence. That removes RRULE handling, and RFC 4791 §9.6.5
-//! also requires an expanding server to answer in UTC, which removes the
-//! timezone database. Both would otherwise have to ship to a device already
-//! short of disk.
+//! CalDAV as a read-only personal-context source (PAI-8 §0: no write method exists). Every
+//! request is gated by `check_egress` and tracked by `record_egress`; the only body ever sent is
+//! a `calendar-query` naming a date range (invariant 7). Credentials come from `SecretRepository`
+//! and are never logged. `<C:expand>` (RFC 4791 §9.6.5) leaves RRULE and timezones to the server.
 
 mod ics;
 mod provider;
@@ -41,11 +17,8 @@ use chrono::{DateTime, Duration, Utc};
 use pond_core::context::ingest::RawItem;
 use std::time::Duration as StdDuration;
 
-/// How long any single CalDAV request may take.
-///
-/// Explicit because the default is none: a hung server would otherwise hold a
-/// sync task open indefinitely, and on a scheduled sync that is a task that
-/// never comes back rather than an error somebody can see.
+/// How long any single CalDAV request may take. Explicit because the default is none: a hung
+/// server would otherwise hold a scheduled sync task open forever, with no error anybody sees.
 const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 /// A calendar this pond can read.
@@ -61,10 +34,8 @@ pub struct Calendar {
 
 /// Everything needed to reach one household member's calendar account.
 ///
-/// `password` is an app-specific password in every supported provider. It is
-/// not `Debug`-printable by accident: the manual impl below redacts it, because
-/// a struct that logs its own credential when someone adds `{:?}` to a trace
-/// line is a leak waiting for a bad day.
+/// `password` is an app-specific password in every supported provider. The manual `Debug` impl
+/// below redacts it so a `{:?}` in a trace line cannot leak the credential.
 #[derive(Clone)]
 pub struct CalDavConfig {
     pub provider: CalDavProvider,
@@ -146,11 +117,9 @@ impl CalDavAdapter {
         )
     }
 
-    /// Send a WebDAV request, gated and tracked.
-    ///
-    /// The gate is checked BEFORE the send and the record written after, so an
-    /// `offline` pond refuses without a packet leaving and the refusal names
-    /// the host rather than surfacing as a timeout.
+    /// Send a WebDAV request, gated and tracked. The gate is checked BEFORE the send and the
+    /// record written after, so an `offline` pond refuses with no packet leaving, and the
+    /// refusal names the host rather than surfacing as a timeout.
     async fn dav(
         &self,
         method: &str,
@@ -247,11 +216,8 @@ impl CalDavAdapter {
             .collect())
     }
 
-    /// Events in a window, as items the ingest pipeline can take.
-    ///
-    /// A window rather than everything: a calendar of ten years is mostly rows
-    /// nobody will ask about, and §3's volume argument is what keeps this corpus
-    /// inside brute-force retrieval.
+    /// Events in a window, as items the ingest pipeline can take. A window, not everything,
+    /// because §3's volume argument is what keeps this corpus inside brute-force retrieval.
     pub async fn events_in_window(
         &self,
         calendar_url: &str,
@@ -278,12 +244,8 @@ impl CalDavAdapter {
         Ok(items)
     }
 
-    /// The default sync window: recent past, near future.
-    ///
-    /// Asymmetric on purpose. "What did I agree to last week" is a real
-    /// question and "what is happening in eleven months" is not, so the past
-    /// side is short enough to stay relevant and the future side long enough to
-    /// cover anything already planned.
+    /// The default sync window: recent past, near future. Asymmetric on purpose: "what did I
+    /// agree to last week" is a real question and "what is happening in eleven months" is not.
     pub fn default_window(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
         (now - Duration::days(30), now + Duration::days(90))
     }

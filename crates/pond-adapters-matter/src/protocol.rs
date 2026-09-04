@@ -1,19 +1,7 @@
-//! The `giap-matter` wire protocol — types and pure functions, so every mapping
-//! is unit-testable without a WebSocket.
-//!
-//! `docs/matter-protocol.md` is the specification; `matter-server/src/protocol.ts`
-//! is the other implementation. The protocol is domain-level on purpose: it
-//! carries devices, readings and control verbs, and never endpoints, clusters or
-//! attribute paths. All the Matter vocabulary lives in the controller, which has
-//! matter.js's typed cluster models to do it with — so nothing in this crate has
-//! to know what a cluster is.
-//!
-//! ```text
-//! → {"id": "giap-1", "op": "control", "params": {…}}
-//! ← {"id": "giap-1", "ok": true,  "result": {…}}
-//! ← {"id": "giap-1", "ok": false, "error": {"code": "…", "message": "…"}}
-//! ← {"event": "reading", "payload": {…}}
-//! ```
+//! The `giap-matter` wire protocol — types and pure functions, so every mapping is unit-testable
+//! without a WebSocket. `docs/matter-protocol.md` is the specification and
+//! `matter-server/src/protocol.ts` the other implementation. Domain-level on purpose: devices,
+//! readings and control verbs only, never endpoints, clusters or attribute paths.
 
 use crate::client::ControllerCode;
 use chrono::{DateTime, Utc};
@@ -46,23 +34,18 @@ pub struct Greeting {
     pub fabric_id: Option<u64>,
     #[serde(default)]
     pub matter_js: String,
-    /// Whether the controller loaded a BLE transport, so a device that has
-    /// never been on the network can be paired.
+    /// Whether the controller loaded a BLE transport, so a device never on the network can pair.
     ///
-    /// `default` means a controller predating the field reads as "no BLE",
-    /// which is what such a controller has — so no `PROTOCOL_VERSION` bump is
-    /// owed, by that rule's own terms.
+    /// `default` means a controller predating the field reads as "no BLE", which is what it has,
+    /// so no `PROTOCOL_VERSION` bump is owed.
     #[serde(default)]
     pub ble: bool,
 }
 
 /// Check a greeting frame, naming what was found when it is not ours.
 ///
-/// The failure this exists for is an address pointing at a server that is not
-/// this controller: without the check the first `subscribe` fails somewhere
-/// inside serde with a message about an unexpected field, which tells the user
-/// nothing they can act on. A server reachable on the right path and speaking
-/// the wrong protocol is exactly the case the name and version are for.
+/// Guards an address pointing at some other server: without it the first `subscribe` fails inside
+/// serde with an unexpected-field message the user cannot act on.
 pub fn check_greeting(raw: &str) -> Result<Greeting, String> {
     let greeting: Greeting = serde_json::from_str(raw).map_err(|_| {
         "the controller's greeting was not JSON this version understands".to_string()
@@ -189,11 +172,8 @@ pub struct WireDevice {
     pub device_type: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
-    /// Required, unlike `capabilities`. `bool::default()` is `false`, so a
-    /// defaulted `online` means "offline" — and a field the controller stopped
-    /// sending, or renamed, would mark every device on the fabric unreachable
-    /// with no error raised anywhere. An absent capability list is a device with
-    /// nothing to drive, which is a real thing; an absent reachability is not.
+    /// Required, unlike `capabilities`: `bool::default()` is `false`, so a field the controller
+    /// renamed or stopped sending would silently mark every device on the fabric unreachable.
     pub online: bool,
 }
 
@@ -302,10 +282,8 @@ pub struct WireLog {
 impl WireLog {
     /// Re-emit this record into `tracing` at the level it names.
     ///
-    /// The whole reason the controller logs NDJSON rather than prose: a relay
-    /// that cannot tell an error from a debug line has to flatten everything to
-    /// one level, and a controller whose failures arrive at `debug` is most of
-    /// the way back to being silent.
+    /// The reason the controller logs NDJSON rather than prose: a relay that cannot tell an error
+    /// from a debug line flattens everything to one level, and failures at `debug` are silence.
     pub fn relay(&self) {
         let fields = self.rendered_fields();
         let message = if fields.is_empty() {
@@ -369,15 +347,8 @@ pub struct DeviceRemovedEvent {
 
 // ── Ids ──────────────────────────────────────────────────────────────────────
 
-// One grammar, one definition. This crate had its own copy of
-// `matter-<node_id>` parsing and `pond-core` had another, in a different crate,
-// with nothing tying them together and separate tests for each. Two
-// implementations of one string format is a defect waiting for the format to
-// change — and it is about to, since a bridged device needs an endpoint in its id.
-//
-// `pond-core` keeps the definition because the generic delete path in `pond-api`
-// needs it and must not depend on this adapter. This crate already depends on
-// `pond-core`, so the duplicate goes and the names stay where callers expect them.
+// One grammar, one definition for `matter-<node_id>` ids. `pond-core` keeps it because the generic
+// delete path in `pond-api` needs it and must not depend on this adapter; this crate re-exports.
 pub use pond_core::user_data::ports::device_commissioning::{
     is_matter_device_id, matter_bridged_endpoint, matter_device_id, matter_node_id,
 };
@@ -388,24 +359,10 @@ pub use pond_core::user_data::ports::device_commissioning::{
 /// so a redacted string looks the same whichever side redacted it.
 const REDACTED: &str = "[redacted:setup-code]";
 
-/// Strip Matter setup codes out of anything on its way to a log line, an error
-/// message, or the API.
+/// Strip Matter setup codes from anything on its way to a log line, an error message, or the API.
 ///
-/// A pairing code grants fabric access: it is a credential, and one in
-/// `pond.log.<date>` or in `pond_logs.db` is a working credential for anyone who
-/// reads the file. There is no `Redactor` on the tracing pipeline — the
-/// `RedactingEventLog` decorator covers the durable event log and egress, not
-/// `tracing` — so this is applied at the call site, in the same spirit as
-/// `wolfram.rs`'s `redact_appid`.
-///
-/// It matters most for errors, which are the strings nobody writes deliberately:
-/// matter.js and the CHIP layer beneath it echo what they were given, and
-/// `MatterState::Unreachable { error }` is **served over HTTP** by
-/// `GET /api/v1/matter/status`.
-///
-/// Deliberately over-eager on the digit forms: redacting a run that happened not
-/// to be a code costs a vaguer log line, while missing one writes a credential to
-/// disk. Idempotent, so a string already redacted by the controller is unchanged.
+/// A pairing code is a fabric credential and there is no `Redactor` on the `tracing` pipeline, so
+/// this is applied at the call site. Deliberately over-eager on digit forms, and idempotent.
 pub fn redact_setup_code(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
@@ -453,19 +410,8 @@ fn is_qr_char(c: char) -> bool {
 
 /// Render an error for a human: the whole cause chain, redacted, prose only.
 ///
-/// `anyhow::Error`'s plain `Display` prints only the OUTERMOST context, so
-/// `error = %e` on a failure like "connecting to the controller at ws://…"
-/// showed the attempt and threw away the reason — which is the one thing the
-/// reader needs. Walking the chain fixes that, and this is the only way any
-/// error in this crate should reach a log, an API response, or the model.
-///
-/// The [`ControllerCode`] frame is skipped, because it is not prose. It sits at
-/// the bottom of the chain deliberately — the code is the SOURCE and the message
-/// the context, so [`code_of`](crate::code_of) can still reach it — but `{:#}`
-/// renders every frame, which is how a rejected setup code reached the user as
-/// "commissioning failed: Invalid pairing code: commission_failed". Two of those
-/// three fragments were bookkeeping. Callers that want the code ask for it by
-/// name and put it in a field of its own.
+/// `anyhow::Error`'s plain `Display` prints only the outermost context, so only the walked chain
+/// carries the reason. The [`ControllerCode`] frame is skipped as bookkeeping, not prose.
 pub fn describe(error: &anyhow::Error) -> String {
     let prose: Vec<String> = error
         .chain()

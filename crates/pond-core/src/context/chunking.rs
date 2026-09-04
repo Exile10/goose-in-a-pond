@@ -1,26 +1,7 @@
-//! Splitting a long text into passages worth embedding on their own.
-//!
-//! A single vector over a whole email describes its signature block as much as
-//! its point, and the longer the body the less the subject survives in it. So a
-//! body is cut into overlapping passages and each is embedded separately;
-//! retrieval then matches the passage that actually answers the question and
-//! rolls the hit back up to the message it came from.
-//!
-//! # What a chunk is, and is not
-//!
-//! A [`Chunk`] is a SPAN — a byte offset and a length into the source text —
-//! not a copy of it. Nothing here holds words, because the index that stores
-//! these holds no text either: under WAL a source row and its vector cannot be
-//! deleted atomically, so an orphan is inevitable, and an orphan carrying a
-//! snippet is deleted data that outlived its deletion. An orphan carrying an
-//! offset resolves to nothing.
-//!
-//! # Boundaries
-//!
-//! Cuts prefer, in order: a blank line, a line break, a sentence end, a space.
-//! A mid-word cut is the last resort rather than the default, because a passage
-//! that begins "…ptember invoice is attached" embeds worse than one that begins
-//! "The September invoice is attached" and reads worse when shown to a person.
+//! Splitting a long text into passages worth embedding on their own: one vector over a whole mail
+//! describes its signature block as much as its point. A [`Chunk`] is a SPAN, never a copy — an
+//! orphaned index row carrying a snippet is deleted data that outlived its deletion. Cuts prefer,
+//! in order, a blank line, a line break, a sentence end, a space; mid-word is the last resort.
 
 /// A passage of a source text, addressed by where it is rather than by content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,9 +15,8 @@ pub struct Chunk {
 impl Chunk {
     /// The passage itself, for a caller that has the source text in hand.
     ///
-    /// Returns `None` when the span does not land on character boundaries —
-    /// which means the text has changed since the chunk was computed, and a
-    /// stale span is better refused than sliced into invalid UTF-8.
+    /// `None` when the span misses a character boundary, which means the text changed since the
+    /// chunk was computed: a stale span is better refused than sliced into invalid UTF-8.
     pub fn slice<'a>(&self, text: &'a str) -> Option<&'a str> {
         text.get(self.start..self.start.checked_add(self.len)?)
     }
@@ -44,34 +24,25 @@ impl Chunk {
 
 /// Target passage size in bytes.
 ///
-/// 500 is chosen for short-form mail: long enough that a passage carries an
-/// argument rather than a fragment, short enough that one message yields
-/// several and a match points at the paragraph that answered rather than the
-/// whole thread.
+/// 500 is chosen for short-form mail: long enough to carry an argument rather than a fragment,
+/// short enough that one message yields several passages.
 pub const DEFAULT_CHUNK_BYTES: usize = 500;
 
 /// How much of the previous passage each one repeats.
 ///
-/// Without overlap a sentence that straddles a cut belongs to neither passage
-/// and is findable from neither. 50 bytes is a sentence or so — enough to keep
-/// a straddler whole, small enough that the corpus does not double.
+/// Without overlap a sentence straddling a cut is findable from neither passage. 50 bytes is
+/// about a sentence: enough to keep a straddler whole, small enough not to double the corpus.
 pub const DEFAULT_OVERLAP_BYTES: usize = 50;
 
 /// Split `text` into overlapping passages.
 ///
-/// Text shorter than one chunk yields a single chunk covering all of it, so a
-/// caller never has to special-case short input. Empty or whitespace-only text
-/// yields nothing: there is no passage there to find.
+/// Text shorter than one chunk yields one chunk covering all of it, so callers need no special
+/// case. Empty or whitespace-only text yields nothing.
 pub fn chunk(text: &str, size: usize, overlap: usize) -> Vec<Chunk> {
     let size = size.max(1);
-    // Overlap is capped at HALF the chunk, which bounds the output at roughly
-    // `2 * len / size` passages.
-    //
-    // `size - 1` would also terminate, and that is the trap: it advances one
-    // byte per step, so a 5 KB body became 4,901 chunks instead of ~100 —
-    // terminating and useless, which is worse than looping because nothing
-    // fails. Half the chunk is the smallest cap that keeps progress
-    // proportional to size.
+    // Overlap is capped at HALF the chunk, which bounds the output at roughly `2 * len / size`
+    // passages. A cap of `size - 1` also terminates but advances one byte per step: a 5 KB body
+    // yields 4,901 chunks instead of about 100, useless without ever failing.
     let overlap = overlap.min(size / 2);
 
     if text.trim().is_empty() {

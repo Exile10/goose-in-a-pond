@@ -1,9 +1,7 @@
 //! The mesh's trust dial (#132).
 //!
-//! v1 ships `SelfOwned` and `Circle` only — the issue explicitly defers the
-//! `OpenLane` (public, zero-trust) capability, so it is not represented here.
-//! Add it when that capability is actually built rather than carrying an
-//! unused variant through every match arm until then.
+//! v1 ships `SelfOwned` and `Circle` only; #132 defers the `OpenLane` (public,
+//! zero-trust) capability, so add that variant when the capability is built.
 
 use serde::{Deserialize, Serialize};
 

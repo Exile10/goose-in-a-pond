@@ -1,11 +1,7 @@
 //! Reading a WebDAV `multistatus` without pretending to implement WebDAV.
 //!
-//! CalDAV replies are XML in two namespaces (`DAV:` and
-//! `urn:ietf:params:xml:ns:caldav`) and servers disagree about prefixes -- the
-//! same property arrives as `d:href`, `D:href` or `href` depending on who is
-//! answering. So everything here matches on the LOCAL name and ignores the
-//! prefix, which is what the namespace rules mean in practice and what stops a
-//! working connector breaking on a different server.
+//! Servers disagree about namespace prefixes (`d:href`, `D:href`, `href`), so everything here
+//! matches on the LOCAL name and ignores the prefix; a different server must not break it.
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -35,9 +31,8 @@ fn local(name: &[u8]) -> String {
 
 /// Parse a `multistatus` document into its responses.
 ///
-/// Unknown elements are skipped rather than refused. A server that sends extra
-/// properties is behaving correctly, and a parser that fails on them would make
-/// this connector work against exactly the servers it was tested on.
+/// Unknown elements are skipped rather than refused: a server that sends extra properties
+/// is behaving correctly, and failing on them would tie the connector to the servers tested.
 pub fn parse_multistatus(xml: &str) -> anyhow::Result<Vec<DavResponse>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -115,11 +110,9 @@ pub fn parse_multistatus(xml: &str) -> anyhow::Result<Vec<DavResponse>> {
                 }
             }
             Ok(Event::Eof) => {
-                // quick-xml is a pull parser: it reports Eof on a TRUNCATED
-                // document rather than an error, so an interrupted response
-                // would parse as a short list. For a calendar sync that reads
-                // as "you have no events" -- a wrong answer, not a missing one,
-                // and the caller cannot tell it from an empty calendar.
+                // quick-xml reports Eof on a TRUNCATED document rather than an error, so an
+                // interrupted reply would parse as a short list that the caller cannot tell
+                // from an empty calendar. Refuse it instead.
                 if !stack.is_empty() || current.is_some() {
                     return Err(anyhow::anyhow!(
                         "the calendar server's reply ended early, with {} element(s) unclosed",

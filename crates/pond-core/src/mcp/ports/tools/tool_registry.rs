@@ -1,8 +1,5 @@
-//! Port trait for the dynamic tool registry.
-//!
-//! Provides a unified view of all available tools (built-in GIAP tools
-//! and external MCP extension tools) for system prompt construction
-//! and tool resolution.
+//! Port trait for the dynamic tool registry: a unified view of every available tool, built-in GIAP
+//! and external MCP extension alike, for system-prompt construction and tool resolution.
 
 use async_trait::async_trait;
 
@@ -17,12 +14,9 @@ pub trait ToolRegistryPort: Send + Sync {
     /// Return all registered tool descriptions (built-in + external).
     async fn all_tools(&self) -> Vec<ExternalToolDescription>;
 
-    /// Return formatted description lines suitable for system prompt injection.
-    ///
-    /// Built-in tools: `"tool_name -- description"`
-    /// External tools: `"extension/tool_name -- description"`
-    ///
-    /// When `compact` is true, descriptions are truncated to 80 characters.
+    /// Formatted description lines for system prompt injection: `"tool_name -- description"` for
+    /// built-ins, `"extension/tool_name -- description"` for external tools. When `compact` is
+    /// true, descriptions are truncated to 80 characters.
     async fn prompt_description_lines(&self, compact: bool) -> Vec<String>;
 
     /// Register tools from an external MCP extension.

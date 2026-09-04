@@ -1,14 +1,7 @@
-//! Speaker-side audio for GIAP's TTS engines.
-//!
-//! One persistent output device ([`AudioKeeper`]), one interruptible playback
-//! routine ([`play_wav`]), and the ambient working tone ([`start_thinking_tone_thread`]).
-//!
-//! Every TTS adapter shares these. The engine differs; what it means to play a
-//! turn's audio and stop when the user cuts in does not.
-//!
-//! Moved out of `pond-adapters-piper` when a second engine (Kokoro) needed the
-//! same behaviour. The turn-generation logic in [`play_wav`] in particular is
-//! the product of two real bugs — read its comments before changing it.
+//! Speaker-side audio shared by every GIAP TTS engine: one persistent output
+//! device ([`AudioKeeper`]), one interruptible playback routine ([`play_wav`]),
+//! and the ambient working tone ([`start_thinking_tone_thread`]). The
+//! turn-generation logic in [`play_wav`] covers two real bugs; read it first.
 
 use anyhow::{Context, Result};
 use pond_core::shared::domain::agent::ThrottledAudioLevelSink;
@@ -29,18 +22,10 @@ const TONE_CHIME_MS: u64 = 1_100;
 /// Generations start at 1, so zero can never collide with a real turn.
 pub const TONE_OFF: u64 = 0;
 
-/// Build one cycle of the working tone: a chime followed by silence.
-///
-/// The old tone was a bare 440 Hz sine, one second on and one second off,
-/// forever. A pure tone at concert A with a hard cycle is about the most
-/// fatiguing thing a speaker can produce, and it played through every wait.
-///
-/// This is a major sixth (E5 over G4) — a consonant interval, so the two
-/// partials beat slowly rather than clashing — with the upper voice softer
-/// than the lower, a gentle attack so it fades in instead of clicking, and an
-/// exponential decay that lets it ring out. Then it rests. The silence is most
-/// of the cycle, which is what makes it something you can sit through: it
-/// reads as breathing rather than as an alarm.
+/// Build one cycle of the working tone: a chime followed by silence. The chime is
+/// a major sixth (E5 over G4), a consonant interval whose partials beat slowly,
+/// with the upper voice softer, a gentle attack and an exponential decay. Silence
+/// is most of the cycle, which is what makes it something to sit through.
 fn working_tone_cycle() -> Vec<f32> {
     let chime_samples = (TONE_RATE as u64 * TONE_CHIME_MS / 1000) as usize;
     let cycle_samples = (TONE_RATE as u64 * TONE_CYCLE_MS / 1000) as usize;
@@ -64,22 +49,10 @@ fn working_tone_cycle() -> Vec<f32> {
     out
 }
 
-/// Spawn the background working-tone thread for turn `mine`.
-///
-/// `thinking_for` names the turn the tone belongs to. The thread exits as soon
-/// as it stops being that turn — because it was stopped ([`TONE_OFF`]) or
-/// because a newer turn took over. Polled every 50 ms, so the tone ends
-/// promptly when the first sentence of the answer is ready; a tone that
-/// outlives its wait is worse than no tone.
-///
-/// This replaces a plain "is a tone playing" bool. Two turns can be alive at
-/// once — the speculative job fired on a provisional transcript, and the
-/// confirmed one — and against a bool their start/stop calls interleaved into
-/// a state that belonged to neither: a turn ending could silence the tone of
-/// the turn that had just started, and a turn starting inside the old thread's
-/// poll window could revive a thread that had already been told to stop,
-/// leaving a tone playing with no turn behind it. A generation is owned by
-/// exactly one turn, so neither is expressible.
+/// Spawn the background working-tone thread for turn `mine`. `thinking_for` names
+/// the turn the tone belongs to; the thread exits once it stops being that turn,
+/// polled every 50 ms. A generation rather than a bool, because two turns can be
+/// alive at once and their start/stop calls would interleave into neither's state.
 pub fn start_thinking_tone_thread(thinking_for: Arc<AtomicU64>, mine: u64) {
     std::thread::spawn(move || {
         use rodio::{OutputStream, Sink};
@@ -134,16 +107,10 @@ struct SendableStream(rodio::OutputStream);
 // there until the keeper is dropped. No other thread touches it.
 unsafe impl Send for SendableStream {}
 
-/// Keeps a `rodio::OutputStream` alive on a dedicated background thread.
-///
-/// `rodio::OutputStream` is `!Send`, so it cannot be stored in a `Send` struct
-/// directly. We park it on a named thread that sleeps until the keeper is
-/// dropped, then expose the `Send + Clone` `OutputStreamHandle` for creating
-/// sinks from any thread.
-///
-/// Reusing one `OutputStreamHandle` across all TTS calls avoids the repeated
-/// CoreAudio AudioUnit open/close cycle that causes progressive audio
-/// degradation after several voice turns on macOS.
+/// Keeps a `rodio::OutputStream` alive on a dedicated background thread, because
+/// it is `!Send` and cannot live in a `Send` struct; the `Send + Clone`
+/// `OutputStreamHandle` is exposed instead. Reusing one handle avoids the macOS
+/// CoreAudio AudioUnit open/close cycle that degrades audio over voice turns.
 pub struct AudioKeeper {
     pub handle: rodio::OutputStreamHandle,
     stop: Arc<AtomicBool>,
@@ -182,15 +149,9 @@ impl Drop for AudioKeeper {
 // ── Playback ──────────────────────────────────────────────────────────────────
 
 /// Per-window RMS amplitude envelope from an `encode_wav_pcm16`-produced buffer
-/// (44-byte header + 16-bit LE mono PCM), one value per `window_ms`.
-///
-/// rodio's `Sink`/cpal callback offers no per-sample hook once `append()` is
-/// called, so live-synced amplitude isn't available *during* playback the
-/// way mic-input RMS is available during capture. Instead this precomputes
-/// the envelope from the exact PCM about to be played, and the caller
-/// replays one value per poll tick — since the poll loop already runs for
-/// the playback's full duration at a fixed cadence, elapsed ticks map
-/// directly onto elapsed playback position.
+/// (44-byte header, 16-bit LE mono PCM), one value per `window_ms`. rodio offers
+/// no per-sample hook once `append()` is called, so the caller replays one value
+/// per poll tick; that fixed cadence maps elapsed ticks onto playback position.
 fn compute_audio_envelope(wav: &[u8], window_ms: u64) -> Vec<f32> {
     const HEADER_LEN: usize = 44;
     if wav.len() <= HEADER_LEN {
@@ -220,15 +181,9 @@ fn compute_audio_envelope(wav: &[u8], window_ms: u64) -> Vec<f32> {
 }
 
 /// Play WAV audio on an already-open `OutputStreamHandle` with interrupt support.
-///
-/// Reuses the caller's stream instead of opening a new `OutputStream`, which
-/// avoids the repeated CoreAudio AudioUnit churn that degrades audio across
-/// voice turns.
-///
-/// `audio_level_sink`, if given, is fed one amplitude reading per poll tick
-/// from `wav`'s own precomputed envelope (see `compute_audio_envelope`) —
-/// the `speaking` state's UI-facing analog of the mic-input RMS reported
-/// during `wait`/`recording`.
+/// Reusing the caller's stream avoids the repeated CoreAudio AudioUnit churn that
+/// degrades audio across voice turns. `audio_level_sink`, if given, gets one
+/// amplitude reading per poll tick from `compute_audio_envelope`.
 pub fn play_wav(
     wav: Vec<u8>,
     handle: &rodio::OutputStreamHandle,
@@ -257,15 +212,10 @@ pub fn play_wav(
             tracing::debug!("TTS playback interrupted by barge-in");
             return Ok(());
         }
-        // A newer turn has begun, so this audio answers a question that is no
-        // longer the one being asked.
-        //
-        // The interrupt flag alone cannot cover this. `begin_utterance` CLEARS
-        // it for the incoming turn — so when a turn was cancelled by setting
-        // that flag and the next turn started within the 50 ms poll window,
-        // the cancellation was wiped before this loop ever saw it and the old
-        // audio played on underneath the new one. Two voices at once. The
-        // generation cannot be cleared by a later turn, only advanced past.
+        // A newer turn has begun, so this audio answers a stale question. The
+        // interrupt flag alone cannot cover it: `begin_utterance` CLEARS the flag
+        // for the incoming turn, wiping a cancellation raised inside the 50 ms
+        // poll window. A generation can only be advanced past, never cleared.
         if utterance.load(Ordering::Relaxed) != mine {
             sink.stop();
             tracing::debug!("TTS playback dropped: it belongs to a superseded turn");
@@ -416,10 +366,8 @@ mod working_tone_tests {
 }
 
 /// Tests for the turn-generation rules, driven directly against the atomics.
-///
-/// These need no audio device: the bug they cover is entirely in *when* the
-/// playback and tone loops decide to stop, and both decisions are pure
-/// functions of two atomics.
+/// They need no audio device: the bug is entirely in *when* the playback and tone
+/// loops decide to stop, and both decisions are pure functions of two atomics.
 #[cfg(test)]
 mod utterance_generation_tests {
     use super::*;
@@ -429,12 +377,10 @@ mod utterance_generation_tests {
         !interrupted.load(Ordering::Relaxed) && utterance.load(Ordering::Relaxed) == mine
     }
 
-    /// The reported bug, end to end.
-    ///
-    /// A speculative turn is speaking. It is cancelled by setting the interrupt
-    /// flag. The confirmed turn begins, and `begin_utterance` CLEARS that flag —
-    /// which, before the generation existed, resurrected the cancelled audio and
-    /// the user heard both replies at once.
+    /// A speculative turn is speaking and is cancelled by setting the interrupt
+    /// flag; the confirmed turn then begins and `begin_utterance` CLEARS it.
+    /// Without the generation counter that resurrects the cancelled audio and the
+    /// user hears both replies at once.
     #[test]
     fn cancelled_audio_stays_cancelled_when_the_next_turn_begins() {
         let interrupted = AtomicBool::new(false);

@@ -1,8 +1,5 @@
-//! ToolDispatcher port — dispatches tool calls to MCP servers.
-//!
-//! Used by `PondAgent` to execute tool calls detected in the LLM's output.
-//! The implementation routes calls to the appropriate MCP server based on
-//! tool name prefix (e.g. "giap-weather__get_current_weather").
+//! ToolDispatcher port — dispatches the tool calls `PondAgent` detects in the LLM's output,
+//! routing by tool name prefix (e.g. "giap-weather__get_current_weather") to the owning MCP server.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,11 +13,8 @@ pub struct ToolCallResult {
     pub success: bool,
 }
 
-/// Driven port: dispatches tool calls to registered MCP tool servers.
-///
-/// Implementations route by tool name to the correct MCP server and
-/// return the tool's response as text content for injection into the
-/// conversation history.
+/// Driven port: dispatches tool calls to registered MCP tool servers. Implementations route by
+/// tool name and return the tool's response as text content for the conversation history.
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
     /// Dispatch a tool call and return its result.
@@ -47,16 +41,9 @@ pub trait ToolDispatcher: Send + Sync {
             .collect()
     }
 
-    /// Return tool definitions pre-formatted as OpenAI-compatible JSON string.
-    ///
-    /// This produces the EXACT same format as Goose's `format_tools()`:
-    /// ```json
-    /// [{"type":"function","function":{"name":"...","description":"...","parameters":{...}}}]
-    /// ```
-    ///
-    /// The string is ready to be passed directly to `apply_chat_template_oaicompat()`
-    /// as `tools_json`. This bypasses any intermediate conversion that could alter
-    /// the schema structure.
+    /// Tool definitions pre-formatted as an OpenAI-compatible JSON string, byte-identical to what
+    /// Goose's `format_tools()` produces and ready to pass to `apply_chat_template_oaicompat()` as
+    /// `tools_json`, bypassing any conversion that could alter the schema structure.
     async fn tools_json(&self) -> Option<String> {
         let defs = self.available_tool_definitions().await;
         if defs.is_empty() {

@@ -1,32 +1,7 @@
-//! Which job a model has been given, and what that implies.
-//!
-//! This file held a three-variant enum (`Chat`, `Think`, `Task`) that nothing
-//! imported, while the role vocabulary the pond actually runs on — seven
-//! strings — lived as `match` arms in five other places that had drifted apart:
-//!
-//! - `model_record::category_matches_role` validated all seven,
-//! - the activate route mirrored five to settings (no `think`, no `task`),
-//! - the boot sync mirrored seven but with different keys and a `tts_piper`
-//!   branch that made its own tail unreachable,
-//! - the settings-PUT reverse sweep rewrote three on every qualifying save and
-//!   hardcoded the TTS category to `tts_piper`,
-//! - `get_active_roles` reported five, so a `think` or `task` assignment could
-//!   be made and then never read back over HTTP.
-//!
-//! The enum is widened rather than replaced so the name and the first three
-//! variants stay put, and every one of those sites now asks here.
-//!
-//! # The mirror is the load-bearing part
-//!
-//! [`ModelRole::settings_mirror`] answers one question — given a role, a
-//! category and a model name, which settings keys must be written — and an
-//! EMPTY answer is a real answer. `Think` and `Task` select no model today
-//! (`models/services/providers/mod.rs` records that the router which would have
-//! used them was deleted), and a legacy Piper voice must not be written into a
-//! settings mirror at all: a Kokoro voice lives at `tts_kokoro/<name>`, so
-//! writing `tts_piper/<name>` produced an id no catalogue row has, and every
-//! guard comparing an assignment against the catalogue silently stopped
-//! matching.
+//! Which job a model has been given: the single source for the seven role strings that five
+//! sites used to match on separately. [`ModelRole::settings_mirror`] is load-bearing, and an
+//! empty answer is a real answer; a Piper voice must never be mirrored, since `tts_piper/<name>`
+//! is an id no catalogue row has and every guard against the catalogue then stops matching.
 
 use crate::models::domain::model_record::ModelCategory;
 
@@ -118,11 +93,8 @@ impl ModelRole {
 
     /// True only for the role whose model the live provider actually serves.
     ///
-    /// Distinct from [`Self::is_llm`], and the distinction saves real work:
-    /// assigning `think` or `task` used to rebuild the provider, which unloads
-    /// and reloads the chat GGUF with unchanged settings and discards the KV
-    /// prompt cache — a full prefill on the next turn, for a setting the
-    /// serving path does not read.
+    /// Distinct from [`Self::is_llm`]: rebuilding the provider for `think` or `task` would
+    /// discard the KV prompt cache and force a full prefill for a setting nothing reads.
     pub fn rebuilds_llm_provider(&self) -> bool {
         matches!(self, Self::Chat)
     }
@@ -151,24 +123,10 @@ impl ModelRole {
             .find(|r| r.settings_keys().contains(&key))
     }
 
-    /// The ONE role-to-settings mapping: every key/value a writer must upsert
-    /// when `model_name` of `category` takes this role.
-    ///
-    /// Empty is a legitimate answer, and two cases rely on it. `Think` and
-    /// `Task` select no model. A legacy Piper voice writes nothing: its
-    /// `voice_tts_voice` is a filename (`en_US-ryan-high.onnx`) rather than a
-    /// catalogue name, and writing the name here would give the resolver a
-    /// third spelling to guess at.
-    ///
-    /// Kokoro writes both keys because they answer different questions:
-    /// `active_tts_model` names the catalogue row, `voice_tts_voice` is what
-    /// the engine resolves `<voice>.bin` from. Writing only the first left a
-    /// household activating a voice in Models while the pond kept speaking in
-    /// the one before it.
-    ///
-    /// `embedding_provider` is deliberately absent: which model to use and
-    /// which engine loads it are separate choices, and writing the category
-    /// name into that field silently selected the fastembed arm.
+    /// The ONE role-to-settings mapping: which keys a writer upserts when `model_name` of
+    /// `category` takes this role. Empty is legitimate: `Think`/`Task` select no model, and a
+    /// legacy Piper voice is a filename, not a catalogue name. Kokoro writes both keys, or the
+    /// spoken voice lags the picker. `embedding_provider` is absent: writing it selects fastembed.
     pub fn settings_mirror(
         &self,
         category: &ModelCategory,

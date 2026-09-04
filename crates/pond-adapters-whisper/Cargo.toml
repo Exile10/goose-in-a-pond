@@ -6,10 +6,9 @@ authors.workspace = true
 license.workspace = true
 
 # ── Build note ────────────────────────────────────────────────────────────────
-# Default build is CPU-only `whisper-rs`. To enable hardware acceleration:
-#   macOS:   cargo build -p pond-adapters-whisper --features metal
-#   Jetson:  cargo build -p pond-adapters-whisper --features cuda
-# On macOS targets `metal` is auto-enabled below via a target-specific dep entry.
+# Default build is CPU-only `whisper-rs`. Hardware acceleration: `--features metal`
+# on macOS (auto-enabled below by a target-specific dep entry) or `--features cuda`
+# on Jetson.
 
 [features]
 default = []

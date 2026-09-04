@@ -1,10 +1,7 @@
 //! The whole connector against a server that behaves like a real one.
 //!
-//! Unit tests cover the parsers; this covers the thing they are parts of --
-//! discovery walking three hops, a `calendar-query` coming back as expanded
-//! VEVENTs, and those becoming items the ingest pipeline would accept. A
-//! connector whose pieces all pass and whose flow was never run is the shape
-//! this programme keeps recording.
+//! Unit tests cover the parsers; this covers the flow they are parts of: discovery walking
+//! three hops, a `calendar-query` returning expanded VEVENTs, and those becoming ingest items.
 
 use chrono::{TimeZone, Utc};
 use pond_adapters_caldav::{CalDavAdapter, CalDavConfig, CalDavProvider};

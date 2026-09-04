@@ -1,32 +1,7 @@
-//! GIAP's last-mile veto over everything Goose sends to the model.
-//!
-//! Goose owns the reply loop, but between `override_system_prompt` and the
-//! provider it still authors content of its own: an `# Additional
-//! Instructions:` extras block (hints files, chat-mode text, recipe/final
-//! -output extras), a `<turn-context>` block injected into the latest user
-//! message on every call (time, working dir, turn budget), a silent
-//! "created by Block" fallback when the override fails its minijinja
-//! re-render, and conditional self-injected tools
-//! (`platform__manage_schedule`, `recipe__final_output`).
-//!
-//! [`GiapProviderShim`] wraps the real provider at the one boundary where the
-//! FINAL `(system, messages, tools)` is visible verbatim
-//! (`Provider::stream`), and enforces GIAP ownership:
-//!
-//! - **System prompt**: when the incoming system derives from GIAP's static
-//!   prefix (or is Goose's default/fallback prompt), it is rebuilt as exactly
-//!   `prefix [+ GIAP's own extension appendix]` — every Goose-appended extra
-//!   is dropped. Systems that do NOT derive from GIAP's prefix (Goose's
-//!   auxiliary calls, e.g. compaction) pass through untouched so those flows
-//!   keep working.
-//! - **Messages**: `<turn-context>` blocks (Goose's per-turn MOIM injection)
-//!   are stripped, recognised with Goose's own `is_turn_context_text`.
-//! - **Tools**: when GIAP has published this turn's allow-set, tools not in
-//!   it are vetoed — covering Goose's self-injected tools and anything else
-//!   GIAP did not register.
-//!
-//! The shim is pure pass-through when no controls are set, so auxiliary
-//! provider users (model listing, compaction) see no behaviour change.
+//! GIAP's last-mile veto over everything Goose sends to the model. [`GiapProviderShim`] wraps the
+//! real provider at `Provider::stream`, the one boundary where the FINAL `(system, messages,
+//! tools)` is visible: a system derived from GIAP's prefix is rebuilt as prefix plus appendix,
+//! `<turn-context>` is stripped, tools outside the allow-set are vetoed; else pure pass-through.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -44,21 +19,14 @@ use rmcp::model::Tool;
 /// GIAP's prompt was lost and must be restored.
 const GOOSE_DEFAULT_MARKER: &str = "general-purpose AI agent called goose";
 
-/// How many Goose sessions keep live per-turn control state.
-///
-/// Goose exposes no session-end hook, so entries are evicted in insertion order
-/// once the map exceeds this. Evicting a live session's entry only costs the
-/// veto for that turn (the adapter republishes on every turn), so a generous
-/// bound is enough — this exists to stop a long-lived server accumulating an
-/// entry per session forever, not to be a tight cache.
+/// How many Goose sessions keep live per-turn control state. Goose has no session-end hook, so
+/// entries are evicted in insertion order past this bound. Evicting a live session only costs
+/// the veto for one turn (the adapter republishes every turn), so the bound is generous.
 const MAX_TRACKED_SESSIONS: usize = 64;
 
-/// Per-turn control state for ONE Goose session.
-///
-/// Split out of [`ShimControls`] because tool selection (Phase D2) makes these
-/// values differ between sessions. While every session got an identical set the
-/// single global slot was benign; the moment sets diverge, a shared slot means
-/// session A's provider call reads session B's allow-set.
+/// Per-turn control state for ONE Goose session. Split out of [`ShimControls`] because tool
+/// selection (Phase D2) makes these values differ between sessions; a shared slot would let
+/// session A's provider call read session B's allow-set.
 #[derive(Default)]
 pub struct SessionControls {
     /// Per-turn GIAP-owned appendix (prompt extras + skills), rebuilt fresh
@@ -68,19 +36,10 @@ pub struct SessionControls {
     /// Exact (prefixed) tool names allowed for this session. `None` disables
     /// tool filtering entirely.
     allowed_tools: Mutex<Option<HashSet<String>>>,
-    /// The complete system prompt this session owns, bypassing the
-    /// prefix-plus-appendices rebuild.
-    ///
-    /// PAI-6 P3. Set for SUBAGENT sessions only. Without it a child's prompt is
-    /// silently destroyed: the child's system prompt is the parent's static
-    /// prefix followed by GIAP's delegation envelope, so `enforce_system`'s
-    /// `incoming.starts_with(prefix)` matches, the rebuild throws the envelope
-    /// away and substitutes the GLOBAL extension appendix — and because the
-    /// rebuild "succeeded", the `system_appendix_dropped` warning does not fire
-    /// either. The envelope is where a child is told its turn budget, that it
-    /// cannot delegate, and the exact tool names it holds. Losing it silently is
-    /// the failure mode this programme keeps hitting: the gate looks enforced
-    /// while its input never arrives.
+    /// The complete system prompt this session owns, bypassing the prefix-plus-appendices
+    /// rebuild. PAI-6 P3, SUBAGENT sessions only: a child's prompt starts with the parent's
+    /// static prefix, so the rebuild would silently replace its delegation envelope (turn budget,
+    /// no-delegation rule, exact tool names) with the GLOBAL extension appendix and warn nothing.
     system_override: Mutex<Option<String>>,
 }
 
@@ -93,12 +52,9 @@ impl SessionControls {
         *self.allowed_tools.lock().unwrap_or_else(|e| e.into_inner()) = Some(tools);
     }
 
-    /// Widen the allow-set in place (the `enable_tool_group` escape hatch).
-    ///
-    /// Takes effect on the next provider call — including the next call of the
-    /// turn that triggered it, because Goose re-reads the provider each
-    /// iteration and the shim filters on every call. A no-op when no allow-set
-    /// is published (nothing is being filtered, so nothing needs widening).
+    /// Widen the allow-set in place (the `enable_tool_group` escape hatch). Takes effect on the
+    /// next provider call, including later calls of the same turn, since the shim filters on
+    /// every call. A no-op when no allow-set is published (nothing is being filtered).
     pub fn extend_allowed_tools<I: IntoIterator<Item = String>>(&self, tools: I) {
         let mut guard = self.allowed_tools.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(set) = guard.as_mut() {
@@ -140,22 +96,10 @@ impl SessionControls {
     }
 }
 
-/// Mutable controls shared between [`GooseAdapter`] and the shim.
-///
-/// The adapter writes these while assembling a chat turn; the shim reads them
-/// inside `Provider::stream`, resolving the session via
-/// [`goose::session_context::current_session_id`]. All `None` means "no
-/// enforcement" (pass-through).
-///
-/// ## Global vs per-session
-///
-/// `system_prefix` and `extension_appendix` are deliberately GLOBAL. The prefix
-/// IS the KV prompt prefix: it must be byte-identical across turns AND across
-/// sessions, because `override_system_prompt` is agent-wide and
-/// `last_prefix_hash` is a single slot — a per-session prefix would re-issue the
-/// override on every session switch and destroy prefix reuse. The corollary is
-/// that anything session-specific must ride the user message's
-/// `<system-context>`, which is where the dormant-tool-group listing goes.
+/// Mutable controls shared between [`GooseAdapter`] (writer, while assembling a turn) and the
+/// shim (reader, inside `Provider::stream`, session from `current_session_id`); all `None` means
+/// pass-through. `system_prefix` and `extension_appendix` are GLOBAL: the prefix IS the KV prefix
+/// and a per-session one would churn `last_prefix_hash`; session text rides `<system-context>`.
 #[derive(Default)]
 pub struct ShimControls {
     /// GIAP's authoritative static system prefix for the current chat model —
@@ -188,11 +132,9 @@ impl ShimControls {
             .unwrap_or_else(|e| e.into_inner()) = appendix;
     }
 
-    /// The control entry for a Goose session, created on first use.
-    ///
-    /// Returned as an `Arc` so a caller (the chat stream's tool-call guard, the
-    /// escape hatch) can hold it and observe live updates without re-locking the
-    /// map.
+    /// The control entry for a Goose session, created on first use. Returned as an `Arc` so a
+    /// caller (the chat stream's tool-call guard, the escape hatch) can observe live updates
+    /// without re-locking the map.
     pub fn session(&self, goose_session_id: &str) -> Arc<SessionControls> {
         if let Some(existing) = self
             .sessions
@@ -232,14 +174,10 @@ impl ShimControls {
             .cloned()
     }
 
-    /// Drop a session's entry outright.
-    ///
-    /// PAI-6 P3. Every subagent run mints an entry, and this map evicts
-    /// OLDEST-FIRST regardless of whether an entry is live — so sixty-four
-    /// delegations would silently evict a long-running parent's allow-set, after
-    /// which that parent's turns become pass-through and a Guest's
-    /// `subtract_guest_denied_tools` result goes with them. A child's entry is
-    /// therefore released the moment its run ends rather than left to age out.
+    /// Drop a session's entry outright. PAI-6 P3: every subagent run mints an entry and the map
+    /// evicts OLDEST-FIRST regardless of liveness, so a stream of delegations would evict a
+    /// long-running parent's allow-set and make its turns pass-through (taking a Guest's
+    /// `subtract_guest_denied_tools` result with them). Release a child the moment its run ends.
     pub fn forget_session(&self, goose_session_id: &str) {
         let mut map = self.sessions.write().unwrap_or_else(|e| e.into_inner());
         if map.entries.remove(goose_session_id).is_some() {
@@ -257,27 +195,19 @@ impl ShimControls {
     }
 }
 
-/// The last minification, kept so an unchanged tool set is not re-minified on
-/// every provider call.
-///
-/// `input` is retained deliberately, and not just as a key: identity is compared
-/// by `Arc::ptr_eq` on each tool's `input_schema`, which is only sound while the
-/// pointers we compared against are still alive. Holding the inputs keeps those
-/// allocations from being freed and their addresses reused by a different
-/// schema, which is the one way pointer identity could lie. The clone is cheap —
-/// `Tool::input_schema` is an `Arc`, so this is a refcount bump per tool, not a
-/// copy of the schema.
+/// The last minification, kept so an unchanged tool set is not re-minified on every call.
+/// `input` is retained deliberately: identity is compared by `Arc::ptr_eq` on `input_schema`,
+/// which is only sound while the compared allocations stay alive. Holding them prevents address
+/// reuse by a different schema. The clone is a refcount bump per tool, not a schema copy.
 struct MinifyCache {
     input: Vec<Tool>,
     output: Option<Vec<Tool>>,
 }
 
 impl MinifyCache {
-    /// Whether `tools` is the same set, tool for tool, that produced `output`.
-    ///
-    /// Deliberately conservative: two structurally identical schemas behind
-    /// different allocations miss, and simply re-minify. A false miss costs one
-    /// minification; a false hit would send the model the wrong tool set.
+    /// Whether `tools` is the same set, tool for tool, that produced `output`. Conservative:
+    /// structurally identical schemas behind different allocations miss and re-minify. A false
+    /// miss costs one minification; a false hit would send the model the wrong tool set.
     fn matches(&self, tools: &[Tool]) -> bool {
         self.input.len() == tools.len()
             && self
@@ -295,22 +225,10 @@ pub struct GiapProviderShim {
     /// Guarded by a plain `Mutex` rather than an async one: the critical section
     /// is a pointer comparison and a `Vec` clone, and it never awaits.
     minify_cache: Mutex<Option<MinifyCache>>,
-    /// Where the wrapped provider sends its HTTP, when it sends any.
-    ///
-    /// This is PAI-2's blind spot made visible. The inner provider is Goose
-    /// submodule code holding its own reqwest client, so the workspace's
-    /// egress guard cannot see it send, and `OLLAMA_HOST` can name any box on
-    /// the network — meaning a pond with `chat_provider = ollama` and
-    /// `GIAP_OLLAMA_URL` pointed off-box shipped every conversation, extracted
-    /// memories included, with no gate, no record, and offline mode not
-    /// stopping it. The shim is the one chokepoint every provider call already
-    /// passes, so the gate lives here.
-    ///
-    /// `None` means the provider does not leave the process (in-process GGUF
-    /// inference), and nothing is gated or recorded. A constructor parameter
-    /// rather than a builder so every future construction site is forced to
-    /// answer "where does this send?" — an optional setter would default new
-    /// call sites to ungated silently.
+    /// Where the wrapped provider sends its HTTP, when it sends any. The inner provider is Goose
+    /// submodule code with its own reqwest client, invisible to the workspace egress guard, so
+    /// the PAI-2 gate lives here at the one chokepoint. `None` means in-process inference, nothing
+    /// gated. A constructor parameter, not a setter, so every construction site must answer it.
     endpoint: Option<String>,
 }
 
@@ -328,14 +246,10 @@ impl GiapProviderShim {
         }
     }
 
-    /// Gate one outbound provider call, PAI-2 style: refused before a packet
-    /// leaves, recorded after.
-    ///
-    /// The denial maps to [`ProviderError::RequestFailed`] deliberately.
-    /// `NetworkError` is in goose's retryable class, and a policy refusal is
-    /// not transient — retrying it three times with backoff would turn a
-    /// clear "offline mode refused this host" into thirty seconds of apparent
-    /// hang before the same message.
+    /// Gate one outbound provider call, PAI-2 style: refused before a packet leaves, recorded
+    /// after. The denial maps to [`ProviderError::RequestFailed`] deliberately: `NetworkError` is
+    /// in goose's retryable class, and retrying a policy refusal with backoff would turn a clear
+    /// "offline mode refused this host" into thirty seconds of apparent hang.
     fn begin_egress(
         &self,
     ) -> Result<Option<pond_core::shared::services::egress::EgressCall>, ProviderError> {
@@ -350,21 +264,10 @@ impl GiapProviderShim {
         }
     }
 
-    /// `minify_tools`, memoised on the tool set it was last given.
-    ///
-    /// The uncached call ran on EVERY provider call, and it is not cheap for
-    /// something whose answer almost never changes: a deep
-    /// `(*t.input_schema).clone()` per tool, a recursive walk of `properties`,
-    /// `$defs`, `items`, `anyOf`, `oneOf` and `allOf`, a structural inequality
-    /// compare, and a second `Tool` clone — on the order of a thousand small
-    /// allocations per call, for a tool set that changes only when an extension
-    /// is added or a session's allow-set moves.
-    ///
-    /// Note the allow-set is NOT part of the key, and must not be: this runs on
-    /// the output of `enforce_tools`, so a narrowed set arrives here as a
-    /// different, shorter slice and misses on length alone. Keying on the
-    /// published allow-set instead would be wrong — `set_allowed_tools` carries
-    /// names only, and says nothing about the schemas.
+    /// `minify_tools`, memoised on the tool set it was last given. The uncached call deep-clones
+    /// and walks every schema on EVERY provider call (about a thousand small allocations) for an
+    /// answer that changes only when an extension or allow-set does. The allow-set is NOT part of
+    /// the key: this runs on `enforce_tools` output, so a narrowed set already misses on length.
     fn minify_tools_cached(&self, tools: &[Tool]) -> Option<Vec<Tool>> {
         let mut cache = self.minify_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = cache.as_ref().filter(|c| c.matches(tools)) {
@@ -387,23 +290,10 @@ fn enforce_system(
     appendices: &[&Option<String>],
 ) -> Option<String> {
     let prefix = prefix.as_ref()?;
-    // Recognise OUR prompt ignoring trailing whitespace.
-    //
-    // This was `incoming.starts_with(prefix)`, and it failed by a few
-    // characters in the one direction that matters. GIAP's static prefix ends
-    // `</output-quality>\n\n\n\n`; goose appends its own block after
-    // `</output-quality>\n\n`, so the two diverge inside GIAP's own trailing
-    // newlines. `starts_with` said false, the veto concluded the prompt was
-    // somebody else's and passed it through untouched — carrying the ~28 KB of
-    // "# Additional Instructions / ### Project Hints" this function exists to
-    // remove, into a household assistant's prompt.
-    //
-    // Measured on the Mac 2026-08-24: the prompts were byte-identical for 1,986
-    // characters of a 2,002-character prefix. The failure was silent, it was
-    // model-dependent (whichever prompt shape happened to end in a newline run),
-    // and `system_rebuilt = false` reported it identically to the healthy
-    // "already exactly right" case — which is why it survived so long and why
-    // the provenance trace below now distinguishes the two.
+    // Recognise OUR prompt ignoring trailing whitespace. GIAP's static prefix ends
+    // `</output-quality>\n\n\n\n` and goose appends its block after `</output-quality>\n\n`, so
+    // a plain `starts_with(prefix)` diverges inside GIAP's own newlines, calls the prompt somebody
+    // else's, and passes ~28 KB of "# Additional Instructions" through with no warning fired.
     let anchor = prefix.trim_end();
     let giap_owned = !anchor.is_empty() && incoming.starts_with(anchor);
     let goose_default = incoming.contains(GOOSE_DEFAULT_MARKER);
@@ -452,39 +342,17 @@ fn strip_turn_context(messages: &[Message]) -> Option<Vec<Message>> {
     )
 }
 
-/// Provider names whose format layer already relocates tool-result images
-/// correctly, so promotion must NOT run for them.
-///
-/// `formats/openai.rs`, `formats/google.rs` and `formats/databricks.rs` each
-/// pull an image out of a tool response and re-host it as a following user
-/// message. Promoting on top of that would send every camera frame twice.
+/// Provider names whose format layer already relocates tool-result images, so promotion must
+/// NOT run for them: `formats/openai.rs`, `formats/google.rs` and `formats/databricks.rs` each
+/// re-host a tool-response image as a following user message, so promoting would send it twice.
 fn provider_relocates_tool_images(provider_name: &str) -> bool {
     !matches!(provider_name, "local" | "gguf")
 }
 
-/// Lift images out of tool responses into a top-level user message (phase F3).
-///
-/// # Why this is here and not in the engine
-///
-/// A GIAP MCP tool CAN return `rmcp` image content — that part of the protocol
-/// works. Two things in the goose local-inference engine stop it reaching the
-/// model, and both are fork-side:
-///
-/// 1. `goose-local-inference/src/multimodal.rs` matches only a TOP-LEVEL
-///    `MessageContent::Image`. `MessageContent::ToolResponse(_)` falls into its
-///    catch-all arm, so images nested in a tool result are never extracted for
-///    mtmd.
-/// 2. `goose-local-inference/src/lib.rs` calls `strip_image_parts_from_messages`
-///    unconditionally — with no vision guard — replacing the `image_url` part
-///    that `formats/openai.rs` helpfully relocates with an apology string.
-///
-/// The shim is the one boundary that sees the final `(system, messages, tools)`
-/// before the provider does, so promoting here puts the image exactly where the
-/// engine's extractor looks, without touching the submodule. When the fork gains
-/// a proper tool-result image path this function becomes a no-op and can go.
-///
-/// Returns `None` when there is nothing to promote, so the common case does not
-/// clone the conversation.
+/// Lift images out of tool responses into a top-level user message (phase F3). Two fork-side gaps
+/// in the goose local-inference engine stop nested images reaching mtmd: `multimodal.rs` extracts
+/// only top-level `MessageContent::Image`, and `lib.rs` strips `image_url` parts with no vision
+/// guard. A no-op once the fork handles tool-result images; `None` means nothing to promote.
 fn promote_tool_result_images(messages: &[Message], max_images: usize) -> Option<Vec<Message>> {
     use goose::conversation::message::MessageContent;
     use rmcp::model::RawContent;
@@ -547,16 +415,10 @@ fn enforce_tools(tools: &[Tool], allowed: &Option<HashSet<String>>) -> Option<Ve
     )
 }
 
-/// Strip mechanical schemars/serde boilerplate from a tool's input schema.
-/// Every char here is re-prefilled by the local model on every turn:
-/// - `"$schema"` draft URI and struct-name `"title"` — zero instruction value;
-/// - integer-width artifacts: `"format": "uintN"/"intN"` plus the
-///   `minimum: 0` / power-of-two `maximum` bounds pairs serde derives from
-///   Rust integer types (a real, hand-written bound is kept).
-///
-/// Walks nested schema objects (`properties` values, `items`, `$defs`,
-/// `anyOf`/`oneOf`/`allOf`) without ever touching `properties` KEYS, so a
-/// parameter genuinely named "title" survives.
+/// Strip mechanical schemars/serde boilerplate from a tool's input schema, since every char is
+/// re-prefilled by the local model each turn: the `"$schema"` URI, the struct-name `"title"`, and
+/// integer-width artifacts (`"format": "uintN"/"intN"` with the `minimum: 0` / power-of-two
+/// `maximum` pair serde derives). Walks nested objects but never touches `properties` KEYS.
 fn minify_schema_object(obj: &mut serde_json::Map<String, serde_json::Value>) {
     obj.remove("$schema");
     obj.remove("title");
@@ -643,16 +505,9 @@ impl Provider for GiapProviderShim {
         let egress = self.begin_egress()?;
 
         // Which session is this call for? Goose wraps every provider call in
-        // `session_context::with_session_id` (reply_parts.rs) — the task-local it
-        // already uses to stamp the `agent-session-id` header on provider HTTP
-        // requests. That is the only session identity reaching `stream()`:
-        // `Provider::stream` takes no session argument, and Goose holds ONE
-        // agent-wide provider slot, so a shim INSTANCE per session would not
-        // work either (session B's `update_provider` would hijack session A's
-        // in-flight reply).
-        //
-        // `None` — an auxiliary call made outside the scope — stays pure
-        // pass-through for the per-session controls, which is exactly right.
+        // `session_context::with_session_id` (reply_parts.rs), the only session identity that
+        // reaches `stream()`; Goose holds ONE agent-wide provider slot, so a shim per session
+        // cannot work. `None` (an auxiliary call outside the scope) stays pass-through.
         let session = goose::session_context::current_session_id()
             .and_then(|sid| self.controls.existing_session(&sid));
 
@@ -682,32 +537,19 @@ impl Provider for GiapProviderShim {
             None => (None, None, None),
         };
 
-        // PAI-6 P3. A session that owns its whole system prompt (a subagent)
-        // skips the prefix-plus-appendices rebuild entirely. Without this the
-        // rebuild throws away the delegation envelope -- the child's turn
-        // budget, its "you cannot delegate" rule and the exact tool names it
-        // holds -- and substitutes the GLOBAL extension appendix, which
-        // describes tools the child does not have. It matched silently, because
-        // a child's prompt starts with the same GIAP prefix the parent's does.
+        // PAI-6 P3. A session that owns its whole system prompt (a subagent) skips the
+        // prefix-plus-appendices rebuild: a child's prompt starts with the same GIAP prefix as
+        // the parent's, so the rebuild would silently swap its delegation envelope for the GLOBAL
+        // extension appendix, which describes tools the child does not have.
         let enforced_system = match &owned_system {
             Some(owned) => (owned.as_str() != system).then(|| owned.clone()),
             None => enforce_system(system, &prefix, &[&turn_apx, &ext_apx]),
         };
 
-        // The shim is the only thing that delivers GIAP's appendix now — the
-        // parallel `Agent::extend_system_prompt` calls are gone, because Goose
-        // rebuilt them into a block this function discards. That makes a
-        // pass-through here load-bearing rather than merely permissive: it means
-        // the incoming system did not start with GIAP's prefix, so the appendix
-        // is not being attached to anything.
-        //
-        // A pass-through with NO session appendix is the ordinary auxiliary call
-        // (compaction, model listing) and is silent. A pass-through that drops a
-        // real per-turn appendix is the failure this warns about: the prefix
-        // match is a byte comparison, and anything that perturbs the rendered
-        // prefix — a device or assistant name containing `{{`, which
-        // `sanitize_field` does not strip and the minijinja re-render will
-        // mangle — breaks it for that install and takes the skills with it.
+        // The shim is the only thing that delivers GIAP's appendix, so a pass-through here is
+        // load-bearing: the incoming system did not start with GIAP's prefix and the appendix is
+        // attached to nothing. Silent for auxiliary calls with no session appendix; a warning when
+        // a real per-turn appendix is dropped, e.g. a name containing `{{` that minijinja mangles.
         if enforced_system.is_none() && turn_apx.is_some() && owned_system.is_none() {
             tracing::warn!(
                 target: "giap::trace",
@@ -738,21 +580,10 @@ impl Provider for GiapProviderShim {
             .as_deref()
             .or(vetoed_tools.as_deref())
             .unwrap_or(tools);
-        // Order the tools so a KV prefix can survive a changed selection.
-        //
-        // The schemas are the bulk of the preamble and the template renders them
-        // in the order given, so two turns share a prompt prefix only up to their
-        // first differing tool. Under `tool_selection_mode = "relevant"` the
-        // selection differs per conversation, and in an arbitrary order that
-        // truncates the shared run at the first difference -- discarding tools
-        // the two turns agreed on completely.
-        //
-        // Sorting core-first makes the always-loaded groups a genuine common
-        // prefix. Measured against the real Gemma template: two chats differing
-        // in half their tools shared 70% of the preamble with the differing ones
-        // early and 85% with them last, which is the difference between falling
-        // under the on-disk snapshot threshold and clearing it. See
-        // `tool_group::prefix_sort_key`.
+        // Order the tools so a KV prefix can survive a changed selection: the template renders
+        // schemas in the order given, so two turns share a prefix only up to their first differing
+        // tool. Sorting core-first makes the always-loaded groups a common prefix (measured 70% vs
+        // 85% shared preamble against the real Gemma template). See `tool_group::prefix_sort_key`.
         let ordered_tools = {
             let mut v = selected.to_vec();
             v.sort_by(|a, b| {
@@ -797,15 +628,10 @@ impl Provider for GiapProviderShim {
                 session_scoped = session.is_some(),
                 "provider payload size"
             );
-            // WHY the veto did or did not fire, which the size alone cannot say.
-            //
-            // `system_rebuilt = false` is two different states wearing one flag:
-            // "the incoming prompt was already exactly GIAP's" and "GIAP did not
-            // recognise it, so it was passed through untouched". The second is a
-            // silent hole in the ownership guarantee, and telling them apart
-            // needed the prefix and the incoming head side by side — which is
-            // what cost an evening when a model's prompt turned out to be 28.5 KB
-            // larger than GIAP builds and nothing logged said whose it was.
+            // WHY the veto did or did not fire, which the size alone cannot say:
+            // `system_rebuilt = false` covers both "already exactly GIAP's" and "not recognised,
+            // passed through untouched". The second is a silent hole in the ownership guarantee,
+            // and telling them apart needs the prefix and the incoming head side by side.
             let prefix_snapshot = self
                 .controls
                 .system_prefix
@@ -908,19 +734,10 @@ impl Provider for GiapProviderShim {
 mod tests {
     use super::*;
 
-    /// The veto declining by four newlines.
-    ///
-    /// GIAP's static prefix ends `</output-quality>\n\n\n\n`. Goose appends
-    /// its own "# Additional Instructions / ### Project Hints" block after
-    /// `</output-quality>\n\n`, so the two diverge INSIDE GIAP's own trailing
-    /// whitespace -- 1,986 characters into a 2,002-character prefix, measured on
-    /// the Mac 2026-08-24.
-    ///
-    /// `starts_with` therefore said "not ours", the veto passed the prompt
-    /// through untouched, and ~28 KB of goose's developer-agent hints reached a
-    /// household assistant. It was silent, it was model-dependent -- only prompt
-    /// shapes ending in a newline run were affected -- and `system_rebuilt =
-    /// false` reported it exactly like the healthy "already correct" case.
+    /// The veto declining by four newlines: GIAP's static prefix ends `</output-quality>\n\n\n\n`
+    /// and goose appends its hints block after `</output-quality>\n\n`, so the two diverge INSIDE
+    /// GIAP's own trailing whitespace. `starts_with` said "not ours" and ~28 KB of developer-agent
+    /// hints reached a household assistant, logged just like the healthy "already correct" case.
     #[test]
     fn goose_extras_are_vetoed_even_when_our_prefix_ends_in_blank_lines() {
         let prefix = "<identity>\nYou are Goose.\n</output-quality>\n\n\n\n".to_string();
@@ -1460,12 +1277,10 @@ mod tests {
 
     // ── PAI-6 P3 ────────────────────────────────────────────────────────────
 
-    /// Every subagent run mints an entry in a map that evicts oldest-first with
-    /// no regard for whether an entry is live. Releasing a child's entry when
-    /// its run ends is what stops a stream of delegations quietly taking a
-    /// long-running PARENT's allow-set with them — after which that parent's
-    /// turns are pass-through and a Guest's `subtract_guest_denied_tools`
-    /// result goes with them.
+    /// Every subagent run mints an entry in a map that evicts oldest-first regardless of liveness.
+    /// Releasing a child's entry when its run ends is what stops a stream of delegations taking
+    /// a long-running PARENT's allow-set, after which its turns are pass-through and a Guest's
+    /// `subtract_guest_denied_tools` result goes with them.
     #[test]
     fn releasing_children_keeps_a_live_parents_allow_set() {
         let controls = ShimControls::default();
@@ -1532,13 +1347,10 @@ mod tests {
         assert_eq!(controls.tracked_sessions(), 1);
     }
 
-    /// Captures what actually reached the inner provider.
-    ///
-    /// These two tests drive the REAL `Provider::stream`, not `enforce_system`,
-    /// because the subagent override is resolved inside `stream` and the direct
-    /// `enforce_system` tests above cannot see it. That distinction is the whole
-    /// point: the defect this fixes was invisible to every existing test for
-    /// exactly that reason.
+    /// Captures what actually reached the inner provider. These tests drive the REAL
+    /// `Provider::stream`, not `enforce_system`, because the subagent override is resolved inside
+    /// `stream` and the direct `enforce_system` tests cannot see it; the defect was invisible to
+    /// every existing test for exactly that reason.
     struct Capturing {
         seen: Arc<Mutex<Option<(String, Vec<String>)>>>,
     }
@@ -1602,10 +1414,9 @@ mod tests {
     }
 
     // ── The egress gate (PAI-2) ─────────────────────────────────────────
-    //
-    // These tests are the gate's only guard: the inner provider is submodule
-    // code sending its own reqwest HTTP, so the workspace's egress_guard test
-    // cannot see it and would not fail if the gate were deleted. These do.
+    // These tests are the gate's only guard: the inner provider is submodule code sending its
+    // own reqwest HTTP, so the workspace's egress_guard test cannot see it and would not fail
+    // if the gate were deleted. These do.
 
     /// `network_mode` is process-global, so the tests that set it take this
     /// lock and restore Open before releasing — without it, parallel test
@@ -1741,12 +1552,10 @@ mod tests {
         );
     }
 
-    /// A child's system prompt is the parent's static prefix plus GIAP's
-    /// delegation envelope -- so `incoming.starts_with(prefix)` matches, and
-    /// without an override the rebuild throws the envelope away and splices in
-    /// the GLOBAL extension appendix instead. The envelope is where the child
-    /// is told its turn budget, that it cannot delegate, and the exact tools it
-    /// holds.
+    /// A child's system prompt is the parent's static prefix plus GIAP's delegation envelope, so
+    /// `incoming.starts_with(prefix)` matches; without an override the rebuild throws the
+    /// envelope (turn budget, no-delegation rule, exact tools held) away and splices in the
+    /// GLOBAL extension appendix instead.
     #[tokio::test]
     async fn a_subagent_sessions_system_prompt_reaches_the_provider_intact() {
         let controls = Arc::new(ShimControls::default());
@@ -1779,11 +1588,9 @@ mod tests {
         );
     }
 
-    /// Vacuity control, and the proof that the defect was real: the same child
-    /// prompt, the same session, with no override -- the envelope is destroyed
-    /// and the global appendix arrives in its place. If this ever stops
-    /// happening, the override has become decoration and the test above is
-    /// asserting nothing.
+    /// Vacuity control, and proof the defect was real: the same child prompt and session with no
+    /// override has its envelope destroyed and the global appendix arrives instead. If this ever
+    /// stops happening, the override has become decoration and the test above asserts nothing.
     #[tokio::test]
     async fn without_the_override_the_shim_destroys_a_childs_prompt() {
         let controls = Arc::new(ShimControls::default());

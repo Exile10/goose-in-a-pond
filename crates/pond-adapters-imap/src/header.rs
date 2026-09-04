@@ -1,16 +1,11 @@
-//! Decoding the two header fields this connector keeps.
-//!
-//! A subject is the whole payload of a mail context item — `embedding_text` is
-//! `title\nbody` and the title is the subject — so a subject left as
-//! `=?UTF-8?B?...?=` is not a cosmetic problem. It is a corpus row that reads
-//! as line noise to a person and embeds as line noise to a retriever.
+//! Decoding the header fields this connector keeps. The subject is the title of a mail
+//! context item and `embedding_text` is `title\nbody`, so a subject left as `=?UTF-8?B?...?=`
+//! embeds as line noise to the retriever and reads as line noise to a person.
 
 use base64::Engine;
 
-/// Decode RFC 2047 encoded-words in a header value.
-///
-/// Handles both `B` (base64) and `Q` (quoted-printable) encodings, leaves
-/// anything it cannot decode exactly as it found it, and joins adjacent
+/// Decode RFC 2047 encoded-words in a header value. Handles `B` (base64) and `Q`
+/// (quoted-printable), leaves anything it cannot decode exactly as found, and joins adjacent
 /// encoded-words without the separating whitespace the RFC says to drop.
 pub fn decode_rfc2047(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -25,15 +20,10 @@ pub fn decode_rfc2047(raw: &str) -> String {
         if !(prev_was_encoded && before.trim().is_empty()) {
             out.push_str(before);
         }
-        // charset ? encoding ? text ?=
-        // An encoded-word is `=?charset?encoding?text?=`, and the terminator
-        // must be looked for AFTER the encoding field — not from the start.
-        //
-        // Searching from the start finds the wrong `?=` whenever the text
-        // begins with `=`, which quoted-printable does constantly: `?Q?=E2…`
-        // contains `?=` at the encoding separator, so the word was cut before
-        // its text began and the whole subject came through raw. Found on real
-        // mail — `=?UTF-8?Q?=E2=9A=A1_$10.5K…?=` decoded to nothing.
+        // An encoded-word is `=?charset?encoding?text?=`, and the terminator must be looked
+        // for AFTER the encoding field: quoted-printable text begins with `=` constantly, so
+        // `?Q?=E2…` contains `?=` at the encoding separator and a search from the start cuts
+        // the word before its text begins, handing the whole subject back raw.
         let after_marker = &tail[2..];
         let Some(charset_end) = after_marker.find('?') else {
             out.push_str(tail);
@@ -157,13 +147,9 @@ mod tests {
         );
     }
 
-    /// Found on real mail, not by reading the RFC.
-    ///
-    /// Quoted-printable text begins with `=` constantly — `=E2` is the first
-    /// byte of a UTF-8 emoji — so `?Q?=E2…` contains `?=` at the ENCODING
-    /// separator. A terminator search that starts from the charset finds that
-    /// one, cuts the word before its text begins, and hands the whole subject
-    /// back raw. Every emoji-prefixed marketing subject in the corpus hit it.
+    /// Quoted-printable text begins with `=` constantly, so `?Q?=E2…` contains `?=` at the
+    /// encoding separator. A terminator search that starts from the charset finds that one,
+    /// cuts the word before its text begins, and hands the whole subject back raw.
     #[test]
     fn text_that_starts_with_an_equals_sign_does_not_end_the_word_early() {
         assert_eq!(

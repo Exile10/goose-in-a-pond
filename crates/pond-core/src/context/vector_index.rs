@@ -1,44 +1,17 @@
-//! The personal-context vector index — domain types and port (phase A).
-//!
-//! One semantic retrieval surface over the three things this pond knows about a
-//! household: extracted **memories**, ingested **context items**, and
-//! conversation **summaries**. They keep their own stores and their own
-//! lifecycles; only the *index* is shared.
-//!
-//! # One index, separate stores
-//!
-//! An index is rebuildable; a merged store cannot be unmerged. The three corpora
-//! genuinely differ — context items are redacted at construction and mirror an
-//! external system by `external_id`, memories are a workspace with consolidation
-//! and decay, summaries are overwritten in place — so merging them would destroy
-//! guarantees that took real work to establish. Sharing retrieval costs nothing.
-//!
-//! # What this port deliberately does not do
-//!
-//! It stores no text. See the migration for why: under WAL a source row and its
-//! vector cannot be deleted atomically, so orphans are inevitable, and an orphan
-//! that holds a snippet is deleted data that survived a deletion promise.
-//! [`VectorHit`] therefore returns identity and score, never content — the
-//! caller reads the live row from its own store, which is also what keeps scope
-//! and sensitivity filtering honest.
+//! The personal-context vector index — domain types and port. One retrieval surface over three
+//! corpora (memories, context items, summaries) that keep their own stores: an index is
+//! rebuildable, a merged store is not. It holds no text — under WAL a source row and its vector
+//! cannot be deleted atomically, and an orphan holding a snippet is data that survived deletion.
 
 use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::user_data::domain::profile::ProfileScope;
 
-/// Which corpus a vector belongs to.
+/// Which corpus a vector belongs to, so retrieval can label provenance.
 ///
-/// Carried on every row and every hit so retrieval can label provenance — "you
-/// told me" versus "your calendar says" are different claims and a member is
-/// entitled to know which one they are being given.
-///
-/// **Declaration order is the tie-break policy.** `Ord` is derived, and equal
-/// scores are broken by this order: a memory outranks a context item outranks a
-/// summary. That is the design's "memory wins ties" — a summary is a model's
-/// compression, not a claim, so it must never outrank the precise version of the
-/// same thing. Reordering these variants silently changes what the assistant
-/// prefers to tell a member, which is why a test pins it.
+/// Declaration order IS the tie-break policy: `Ord` is derived, so memory outranks context
+/// outranks summary. Reordering these variants changes what a member is told; a test pins it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Corpus {
     /// `memory_fragments` — things extracted from conversation.
@@ -78,20 +51,15 @@ pub struct VectorEntry {
     pub corpus: Corpus,
     /// The source row's primary key in its own database.
     pub row_id: String,
-    /// Which passage of the row this vector describes. 0 for a row embedded
-    /// whole, and 0..n for a chunked one.
+    /// Which passage of the row this vector describes: 0 when embedded whole, 0..n when chunked.
     ///
-    /// Part of the identity: a row's vectors are `(corpus, row_id, chunk_ix)`,
-    /// so writing chunk 3 does not overwrite chunk 2. Defaulting it to 0 keeps
-    /// every existing caller writing exactly one vector per row, which is
-    /// correct for memories and summaries — they are short and whole.
+    /// Part of the identity — a row's vectors are `(corpus, row_id, chunk_ix)` — so writing
+    /// chunk 3 does not overwrite chunk 2.
     pub chunk_ix: i64,
-    /// Byte span of the passage within the source text. `None` means the
-    /// vector is of the whole text.
+    /// Byte span of the passage within the source text; `None` means the whole text.
     ///
-    /// A SPAN rather than the words: the index holds no text, so retrieval
-    /// reads the passage back out of the live row. An orphan span resolves to
-    /// nothing, where an orphan snippet would be deleted data that survived.
+    /// A span rather than the words: an orphan span resolves to nothing, where an orphan
+    /// snippet would be deleted data that survived its deletion.
     pub chunk_span: Option<(i64, i64)>,
     /// The embedder that produced `vector`. Never inferred at read time.
     pub model_id: String,
@@ -105,9 +73,8 @@ pub struct VectorEntry {
 impl VectorEntry {
     /// A vector describing the WHOLE of a row's text.
     ///
-    /// The right shape for memories and summaries, which are short enough that
-    /// one vector says what they mean. Chunked corpora build entries directly
-    /// so the span is never accidentally omitted.
+    /// The right shape for memories and summaries, which are short. Chunked corpora build
+    /// entries directly so the span is never accidentally omitted.
     pub fn whole(
         corpus: Corpus,
         row_id: String,
@@ -138,9 +105,8 @@ pub struct VectorHit {
 
 /// A hit with its text resolved from the live source row.
 ///
-/// The index stores no text; this is read back through the same `JOIN` that
-/// enforces scope and liveness, so what a caller sees is always the CURRENT row
-/// — never a denormalised copy that outlived a deletion or an archive.
+/// The index stores no text; this is read back through the same `JOIN` that enforces scope and
+/// liveness, so a caller always sees the CURRENT row, never a copy that outlived a deletion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedHit {
     pub corpus: Corpus,
@@ -153,50 +119,20 @@ pub struct ResolvedHit {
 
 /// How much of ONE corpus is usable for a given model.
 ///
-/// The three totals on [`IndexHealth`] cannot show a corpus that is structurally
-/// at zero, and that is not hypothetical. On a live pond the global figure read
-/// about 2% missing while the summary corpus could never populate at all — its
-/// liveness predicate requires an attributed session and every session's
-/// `profile_id` was NULL — because two healthy corpora averaged the dead one
-/// away. An average over corpora is the wrong shape for a question that is
-/// really "is each of these three working"; a row per corpus is the right one.
+/// The totals on [`IndexHealth`] cannot show a corpus that is structurally at zero: two healthy
+/// corpora average the dead one away, so a row per corpus is the only shape that answers it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorpusHealth {
     pub corpus: Corpus,
-    /// Source rows that **qualify** — that pass this corpus's liveness
-    /// predicate — not the raw table count.
-    ///
-    /// This choice is the whole point of the type, so it is stated rather than
-    /// left to be discovered: coverage here means "of the rows that COULD be
-    /// indexed, how many are". Counting raw table rows instead would report
-    /// every archived memory and every unattributed session as permanently
-    /// missing, so a perfectly healthy pond could never reach full coverage and
-    /// the number would rightly be ignored.
-    ///
-    /// The cost of the choice is that a corpus whose predicate excludes
-    /// everything reports `rows == 0` rather than a large missing count. That
-    /// is the signal wanted, not a loss of one: zero qualifying rows against a
-    /// table full of sessions says "nothing here can ever be indexed", which is
-    /// a different defect from "nothing here has been indexed yet" and needs a
-    /// different fix.
-    ///
-    /// That argument only works if the reader can SEE the table is full, which
-    /// is what [`source_rows`](Self::source_rows) is for. Without it this field
-    /// reproduces the very blindness it was added to remove — measured on a live
-    /// pond, `rows == 0` for the summary corpus while 27 sessions carried a real
-    /// rolling summary, and the surface reported the index 100% covered.
+    /// Source rows that qualify — that pass this corpus's liveness predicate — not the raw
+    /// table count, so coverage means "of the rows that COULD be indexed, how many are".
+    /// A corpus whose predicate excludes everything reports `rows == 0`, which
+    /// [`source_rows`](Self::source_rows) is there to distinguish from an empty table.
     pub rows: u64,
     /// Every row in the source table, ignoring the liveness predicate.
     ///
-    /// The denominator of coverage is [`rows`](Self::rows), never this. It
-    /// exists for one question that `rows` alone cannot answer: **is this
-    /// corpus empty, or is it excluded?** Both report zero qualifying rows, and
-    /// they need opposite fixes — one waits for data, the other is a predicate
-    /// bug that no amount of embedding will repair.
-    ///
-    /// `source_rows > rows` is normal and healthy in itself: archived and merged
-    /// memories are meant to fall out. It is `rows == 0 && source_rows > 0` that
-    /// says something is structurally wrong.
+    /// The denominator of coverage is [`rows`](Self::rows), never this; this answers "is the
+    /// corpus empty, or excluded?". `rows == 0 && source_rows > 0` is the structural failure.
     pub source_rows: u64,
     /// Of `rows`, those carrying a vector from the model asked about — the only
     /// ones retrieval can actually return.
@@ -210,16 +146,10 @@ pub struct CorpusHealth {
     pub mismatched: u64,
 }
 
-/// How much of the index is usable for a given model.
+/// How much of the index is usable for a given model, so "silently incomplete" is a number
+/// somebody can read rather than a thing inferred from bad answers.
 ///
-/// Exists so "the index is silently incomplete" is a number somebody can read
-/// rather than a thing that has to be inferred from bad answers.
-///
-/// The three totals are the sums of [`per_corpus`](Self::per_corpus), so they
-/// describe rows that qualify for indexing — an orphaned vector, or one hanging
-/// off an archived memory, is counted nowhere here. That is deliberate: those
-/// are the prune sweep's business, and adding them to a coverage figure makes it
-/// describe the index file rather than what retrieval can reach.
+/// The totals sum [`per_corpus`](Self::per_corpus) over qualifying rows; orphans count nowhere.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IndexHealth {
     /// Vectors produced by the model currently configured.
@@ -231,46 +161,37 @@ pub struct IndexHealth {
     pub missing: u64,
     /// The same counts again, one row per corpus, in [`Corpus::ALL`] order.
     ///
-    /// Alongside the totals rather than instead of them: the totals are what a
-    /// maintenance pass logs and what a caller compares between runs, and the
-    /// rows are what tells anybody WHICH corpus moved.
+    /// Alongside the totals rather than instead: the totals are what a maintenance pass logs,
+    /// the rows are what says WHICH corpus moved.
     pub per_corpus: Vec<CorpusHealth>,
 }
 
 /// Driven port: the shared vector index.
 ///
-/// Writes go to this file; reads `JOIN` against the authoritative databases, so
-/// scope and sensitivity are filtered against **live** rows rather than against
-/// a denormalised copy that can go stale.
+/// Writes go to this file; reads `JOIN` against the authoritative databases, so scope and
+/// sensitivity are filtered against live rows rather than a denormalised copy that can go stale.
 #[async_trait]
 pub trait VectorIndex: Send + Sync {
     /// Insert or replace the vector for `(corpus, row_id)`.
     ///
-    /// Upsert rather than append, because a rolling summary is rewritten in
-    /// place: appending would leave a vector describing a conversation that no
-    /// longer exists, scoring against a query as if it were current.
+    /// Upsert rather than append: a rolling summary is rewritten in place, so appending would
+    /// leave a vector describing a conversation that no longer exists but still scores.
     async fn upsert(&self, entry: &VectorEntry) -> Result<()>;
 
     /// Drop the vector for a source row that has been deleted.
     ///
-    /// Best-effort by nature — this cannot be atomic with the source delete, so
-    /// [`Self::prune_orphans`] is the reconciliation that makes it eventually
-    /// true.
+    /// Best-effort: this cannot be atomic with the source delete, so [`Self::prune_orphans`] is
+    /// the reconciliation that makes it eventually true.
     async fn remove(&self, corpus: Corpus, row_id: &str) -> Result<()>;
 
     /// Read one vector back. Roundtrip verification, and the cheap way to assert
     /// a write landed without a full search.
     async fn get(&self, corpus: Corpus, row_id: &str) -> Result<Option<VectorEntry>>;
 
-    /// Top-`limit` hits for `query`, restricted to `model_id` and to what
-    /// `scope` may see.
+    /// Top-`limit` hits for `query`, restricted to `model_id` and to what `scope` may see.
     ///
-    /// **Vectors from another model are excluded, not scored.** Cosine over two
-    /// different embedding spaces returns a plausible number that means nothing,
-    /// and a plausible wrong answer is worse than a missing one. Scope is
-    /// applied in the SQL — never by filtering the results afterwards, which
-    /// would let invisible rows consume the top-K slots and quietly degrade
-    /// retrieval for the members who share a pond.
+    /// Vectors from another model are excluded, not scored: cosine across two embedding spaces
+    /// is meaningless. Scope is applied in the SQL, or invisible rows take the top-K slots.
     async fn search(
         &self,
         query: &[f32],
@@ -279,13 +200,9 @@ pub trait VectorIndex: Send + Sync {
         limit: usize,
     ) -> Result<Vec<VectorHit>>;
 
-    /// Like [`Self::search`], but with each hit's text read back from its live
-    /// source row in the same query.
-    ///
-    /// One round trip rather than N: the `ATTACH` makes the text available to
-    /// the same `JOIN` that already filters scope and liveness, so there is no
-    /// window in which a row could be archived or deleted between being scored
-    /// and being read.
+    /// Like [`Self::search`], but with each hit's text read back from its live source row in the
+    /// same query. The `ATTACH` puts the text in the same `JOIN` that filters scope and liveness,
+    /// so no row can be archived or deleted between being scored and being read.
     async fn search_resolved(
         &self,
         query: &[f32],
@@ -296,10 +213,8 @@ pub trait VectorIndex: Send + Sync {
 
     /// Source rows that have no vector for `model_id`, or whose vector is stale.
     ///
-    /// A `LEFT JOIN` rather than a durable queue, deliberately: it is crash-safe,
-    /// restartable and self-healing, and the index file can be deleted and
-    /// rebuilt from it. A queue fails the other way — a dropped entry is an item
-    /// that is never searchable, with nothing left to notice.
+    /// A `LEFT JOIN` rather than a durable queue: crash-safe and restartable, and the index file
+    /// can be rebuilt from it. A dropped queue entry would be an item nothing is left to notice.
     async fn needs_embedding(
         &self,
         corpus: Corpus,
@@ -307,14 +222,10 @@ pub trait VectorIndex: Send + Sync {
         limit: usize,
     ) -> Result<Vec<String>>;
 
-    /// Like [`Self::needs_embedding`], but with each row's text, so a sweep can
-    /// embed without a second read through another port.
-    ///
-    /// Exists because **context items had no embedding path at all**: adoption
-    /// only copies vectors that already exist, and nothing ever embedded an item
-    /// that arrived without one. A probe against the live agent found it -- a
-    /// planted sensor event was never indexed and the assistant answered "no
-    /// recorded activity", which is a wrong answer rather than a missing one.
+    /// Like [`Self::needs_embedding`], but with each row's text, so a sweep can embed without a
+    /// second read through another port. Context items otherwise have no embedding path at all:
+    /// backfill only copies vectors that already exist, so an item that arrived without one is
+    /// never indexed and the assistant answers "no recorded activity" — wrong, not missing.
     async fn needs_embedding_with_text(
         &self,
         corpus: Corpus,
@@ -322,25 +233,10 @@ pub trait VectorIndex: Send + Sync {
         limit: usize,
     ) -> Result<Vec<(String, String)>>;
 
-    /// Copy vectors that already exist in a source store into the index,
-    /// without re-embedding anything. Returns how many were copied.
-    ///
-    /// **This is what makes the index genuinely rebuildable.** Memories and
-    /// context items keep their own vector in their own table, and the sweeps
-    /// that produce those vectors are driven by *that* column being NULL — so
-    /// once a row is embedded, nothing ever calls the write-through for it
-    /// again. Delete this file and those rows would be absent from the index
-    /// forever, silently, while the store looks perfectly healthy. Found by
-    /// deleting `pond_vectors.db` on a live pond: the summary corpus came back
-    /// and the memories did not.
-    ///
-    /// `expected_dims` is a filter, not a hint: a stored vector of another width
-    /// came from another model and must NOT be stamped with this one, which
-    /// would launder a stale vector into the current space where nothing could
-    /// detect it.
-    ///
-    /// Corpora with no vector of their own (summaries) copy nothing and are
-    /// served by their own embedding sweep instead.
+    /// Copy existing source-store vectors into the index without re-embedding; returns the count.
+    /// What makes it rebuildable: the sweeps minting those vectors fire only on a NULL column, so
+    /// deleting this file loses already-embedded rows forever. `expected_dims` is a filter, not a
+    /// hint — another width came from another model and must not be restamped as this one.
     async fn backfill_from_source(
         &self,
         corpus: Corpus,
@@ -351,11 +247,8 @@ pub trait VectorIndex: Send + Sync {
     /// Delete index rows whose source row is gone. Returns how many.
     async fn prune_orphans(&self) -> Result<u64>;
 
-    /// Counts for a health surface, globally and per corpus. See
-    /// [`IndexHealth`] and [`CorpusHealth`].
-    ///
-    /// Every corpus must be represented, including one with no qualifying rows:
-    /// a corpus that is absent from the answer is a corpus nobody can see is
-    /// broken, which is the failure the per-corpus shape exists to end.
+    /// Counts for a health surface, globally and per corpus. See [`IndexHealth`] and
+    /// [`CorpusHealth`]. Every corpus must be represented, including one with no qualifying
+    /// rows: a corpus absent from the answer is a corpus nobody can see is broken.
     async fn health(&self, model_id: &str) -> Result<IndexHealth>;
 }

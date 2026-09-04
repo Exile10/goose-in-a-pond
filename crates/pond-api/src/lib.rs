@@ -1,40 +1,7 @@
-//! Pond API — REST routes for Goose In A Pond
+//! Pond API — REST routes for Goose In A Pond, all versioned under `/api/v1/`.
 //!
-//! All routes are versioned under `/api/v1/`.
-//!
-//! # Route plan
-//!
-//! ## Onboarding
-//! - `POST /api/v1/handshake`  — GIAP ↔ GOTG handshake
-//! - `POST /api/v1/onboard`    — Start onboarding flow
-//! - `GET  /api/v1/onboard/status` — Check onboarding state
-//!
-//! ## Chat / Agent
-//! - `POST /api/v1/chat`       — Send a message, get a response
-//! - `GET  /api/v1/sessions`   — List sessions
-//!
-//! ## System
-//! - `GET  /api/v1/health`     — Health check
-//! - `GET  /api/v1/system/info` — System info (hostname, version, etc.)
-//!
-//! ## Devices
-//! - `GET  /api/v1/devices`    — List registered devices
-//! - `POST /api/v1/devices`    — Register a new device
-//!
-//! ## Settings
-//! - `GET  /api/v1/settings`   — Get current settings
-//! - `PUT  /api/v1/settings`   — Update settings
-//!
-//! # Authentication
-//! Protected routes require a bearer token in the Authorization header:
-//! ```text
-//! Authorization: Bearer <token>
-//! ```
-//!
-//! Get a token via POST /api/v1/handshake
-//!
-//! # Rate Limiting
-//! All clients are rate limited to 600 requests per 60 seconds (10 req/s burst).
+//! Protected routes need `Authorization: Bearer <token>`, obtained from `POST /api/v1/handshake`.
+//! Clients are rate limited to 600 requests per 60 seconds; `routes.rs` holds the route list.
 
 pub mod cleanup;
 pub mod middleware;
@@ -52,22 +19,17 @@ pub mod tool_context;
 pub trait LlamafileManager: Send + Sync {
     /// Ensure the llamafile server is running, starting it if necessary.
     ///
-    /// `model_name` hints which model to start; the implementation resolves
-    /// it from the model catalog if `None` or empty.
-    ///
-    /// Returns the base URL (`http://127.0.0.1:<port>`) the server is
-    /// reachable at (even if startup is still in progress).
+    /// `model_name` hints which model to start; an empty or `None` value is resolved from the model
+    /// catalog. Returns the base URL (`http://127.0.0.1:<port>`), even if startup is still running.
     async fn ensure_started(&self, model_name: Option<&str>) -> String;
 
     /// Returns `true` if the llamafile server is currently answering requests.
     async fn is_running(&self) -> bool;
 
-    /// Ensure the llamafile server is running AND block until it is ready,
-    /// up to `timeout_secs` seconds.
+    /// Ensure the llamafile server is running and block until it is ready, up to `timeout_secs`.
     ///
-    /// Returns `(url, true)` when the server becomes ready within the timeout,
-    /// or `(url, false)` if it did not become ready in time.
-    /// `url` is always the base URL (`http://127.0.0.1:<port>`) regardless of outcome.
+    /// Returns `(url, ready)`; `url` is the base URL (`http://127.0.0.1:<port>`) either way, and
+    /// `ready` is false when the timeout expired first.
     async fn ensure_started_and_wait(
         &self,
         model_name: Option<&str>,
@@ -164,57 +126,30 @@ pub struct AppState {
     pub profile_repo: Arc<dyn ProfileRepository + Send + Sync>,
     /// Device registry for GOTG devices and other connected hardware.
     pub device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
-    /// The Matter integration, reconciled at runtime from the `matter_enabled`
-    /// setting. `None` only in builds and tests that wire no Matter support at
-    /// all — "switched off" is a state of the runtime, not the absence of one,
-    /// so that an unreachable controller can be reported as such instead of
-    /// being mistaken for "Matter is not enabled".
+    /// The Matter integration, reconciled at runtime from the `matter_enabled` setting. `None` only
+    /// in builds and tests that wire no Matter support at all: "switched off" is a state of the
+    /// runtime, not the absence of one, so an unreachable controller is reported as unreachable
+    /// rather than as "Matter is not enabled".
     pub matter: Option<Arc<dyn pond_core::user_data::ports::matter_runtime::MatterRuntimePort>>,
     /// Memory fragment repository for semantic/recency-based retrieval.
     pub memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
     /// Embedding provider — `None` until a real embedding model is configured.
     /// Retained for Phase 3 memory vector search.
     pub embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
-    /// The shared personal-context index — the one surface retrieval reads.
-    ///
-    /// `None` on the CLI paths and in tests, which serve no retrieval at all;
-    /// a route asked about the health of an index that does not exist has to
-    /// say so rather than invent one.
-    ///
-    /// It is here so that **coverage can leave the process**. `IndexHealth` has
-    /// been computed since phase A and written to a `tracing` line, which is not
-    /// a surface: an index populated at roughly 2% survived six landed phases
-    /// because nothing rendered the number and nobody reads a log that says
-    /// everything is fine the rest of the time.
-    ///
-    /// The model that stamped those vectors is deliberately NOT a second field.
-    /// [`Self::embedding_provider`] above already answers `model_id()` and
-    /// `dimensions()`, and it is the same provider whose id the writers stamp
-    /// onto every row — a copy kept here could disagree with it, and a health
-    /// figure computed against the wrong model reads as a catastrophically
-    /// broken index when nothing is wrong at all.
+    /// The shared personal-context index, the one surface retrieval reads; `None` on CLI paths and
+    /// in tests. It lives here so `IndexHealth` can leave the process: while that number only
+    /// reached a `tracing` line, a 2%-full index survived six landed phases. Do not copy the model
+    /// id here; [`Self::embedding_provider`] owns it and a drifted copy misreads health.
     pub vector_index: Option<Arc<dyn VectorIndex>>,
-    /// Fired when somebody asks for the index to be rebuilt.
-    ///
-    /// The rebuild route only CLEARS; refilling is the maintenance sweep's job,
-    /// and the sweep is idle-gated so it will not normally run while the person
-    /// who pressed the button is still there pressing buttons. Without this the
-    /// honest description of the feature would be "empties the index, refills it
-    /// within the quarter-hour, maybe" — so the route wakes the sweep instead,
-    /// and a requested pass skips the quiet it would otherwise wait for.
-    ///
-    /// `None` on a pond with no sweep to wake (no embedder, or a CLI process).
-    /// The route still clears, because clearing is what makes the next process
-    /// rebuild from scratch.
+    /// Fired when somebody asks for the index to be rebuilt. The rebuild route only CLEARS;
+    /// refilling is the idle-gated maintenance sweep's job, so the route wakes it and a requested
+    /// pass skips the quiet period it would otherwise wait for. `None` when there is no sweep to
+    /// wake (no embedder, or a CLI process); the route still clears, so the next process refills.
     pub index_reindex: Option<Arc<tokio::sync::Notify>>,
-    /// Pull every connected account now, instead of waiting for the timer.
-    ///
-    /// The half-hourly sweep is right for a calendar that changes a few times a
-    /// week and wrong for somebody who has just typed in a password and wants
-    /// to know whether it worked. This is what makes that answerable.
-    ///
-    /// `None` where nothing can sync — no secret store, or a CLI process — and
-    /// the route says so rather than reporting a sync that never ran.
+    /// Pull every connected account now instead of waiting for the timer. The half-hourly sweep
+    /// suits a calendar that changes weekly, not somebody who has just entered a password and
+    /// wants to know whether it worked. `None` where nothing can sync (no secret store, or a CLI
+    /// process), and the route says so rather than reporting a sync that never ran.
     pub account_sync: Option<Arc<dyn pond_core::context::ports::AccountSync>>,
     /// IoT sensor reading storage (uses logs DB).
     pub sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
@@ -382,11 +317,9 @@ pub struct AppState {
     /// so the UI that started a flow can tell whether it actually succeeded
     /// rather than inferring it from the token key's existence.
     pub oauth_outcomes: crate::oauth_callback::OAuthOutcomes,
-    /// Authorization + audit hook at the privacy/security boundary.
-    ///
-    /// A hook, not a gate: the default implementation allows everything and
-    /// only records audits. Routes opt in by calling `allow`/`audit`; until a
-    /// route does, behaviour is unchanged. `None` in tests.
+    /// Authorization and audit hook at the privacy/security boundary. A hook, not a gate: the
+    /// default implementation allows everything and only records audits, and routes opt in by
+    /// calling `allow`/`audit`. `None` in tests.
     pub security_policy: Option<Arc<dyn SecurityPolicy>>,
     /// The port the API server is actually listening on.
     /// Used to construct OAuth redirect URIs dynamically (the server may bind
@@ -404,72 +337,41 @@ pub struct AppState {
     pub credit_ledger: Arc<dyn pond_core::mesh::ports::credit_ledger::CreditLedger + Send + Sync>,
     /// Private mesh (#132): metered token usage pending settlement per peer.
     pub usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync>,
-    /// Private mesh (#132): real libp2p connectivity to trusted peers. `None`
-    /// inside the lock unless both the `mesh` Cargo feature is compiled in
-    /// and `settings.mesh_enabled` is true — real networking, real cost,
-    /// unlike the three ports above. Wrapped in a `RwLock` (not a fixed
-    /// `Option`) so `PUT /api/v1/settings` can hot-enable mesh via
-    /// `mesh_rebuild` below, without a restart — mirrors `llm_provider`'s
-    /// hot-swap discipline above.
+    /// Private mesh (#132): real libp2p connectivity to trusted peers, so unlike the three ports
+    /// above it costs real networking. `None` inside the lock unless the `mesh` Cargo feature is
+    /// compiled in and `settings.mesh_enabled` is true. The `RwLock` is what lets
+    /// `PUT /api/v1/settings` hot-enable mesh through `mesh_rebuild` without a restart.
     pub mesh_transport: Arc<
         tokio::sync::RwLock<Option<Arc<dyn pond_core::mesh::ports::mesh_transport::MeshTransport>>>,
     >,
-    /// Private mesh (#132 Milestone 3.5): an `LlmProvider` that routes
-    /// completions to a trusted peer instead of a local model. `None` inside
-    /// the lock unless `mesh_transport` is also populated — same
-    /// feature/settings gating. Shares construction discipline with
-    /// `mesh_transport`: only ever built once per mesh-enable (constructing
-    /// more than one `MeshInferenceService` would spawn a second consumer of
-    /// `mesh_transport`'s single `recv()` queue), but now that "once" can
-    /// happen at runtime via `mesh_rebuild` instead of only at startup.
+    /// Private mesh (#132 Milestone 3.5): an `LlmProvider` routing completions to a trusted peer
+    /// instead of a local model. `None` inside the lock unless `mesh_transport` is populated, same
+    /// feature and settings gating. Build it at most once per mesh-enable: a second
+    /// `MeshInferenceService` would be a second consumer of `mesh_transport`'s one `recv()` queue.
     pub mesh_provider:
         Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::models::ports::provider::LlmProvider>>>>,
-    /// Private mesh (#132 Milestone 5): live "what does this peer offer
-    /// right now" queries, so the UI can show what a trusted peer actually
-    /// provides instead of guessing from trust scope alone. `None` inside
-    /// the lock unless `mesh_transport` is also populated — same
-    /// singleton-construction gating as `mesh_provider` (both are handles
-    /// into the same `MeshInferenceService`).
+    /// Private mesh (#132 Milestone 5): live "what does this peer offer right now" queries, so the
+    /// UI shows what a trusted peer provides instead of guessing from trust scope. `None` inside
+    /// the lock unless `mesh_transport` is populated, under the same singleton-construction gating
+    /// as `mesh_provider` (both are handles into one `MeshInferenceService`).
     pub peer_capability_query: Arc<
         tokio::sync::RwLock<
             Option<Arc<dyn pond_core::mesh::ports::peer_capability_query::PeerCapabilityQuery>>,
         >,
     >,
-    /// Private mesh (#132): (re)builds `mesh_transport`/`mesh_provider`/
-    /// `peer_capability_query` at runtime when `settings.mesh_enabled` flips
-    /// on after startup, so enabling mesh from the UI takes effect
-    /// immediately instead of requiring a restart. Set by `pond-server` at
-    /// startup — the concrete `Libp2pMeshTransport`/`MeshInferenceService`
-    /// types live behind the `mesh` Cargo feature, which this crate does not
-    /// depend on (`pond-api` only knows the `pond_core` port traits above).
-    /// `None` when the binary lacks the `mesh` feature entirely; calling it
-    /// otherwise is always safe — it no-ops when mesh is already built or
-    /// still disabled. Does not tear anything down on disable: mesh_enabled
-    /// has only ever gated construction here, never the behaviour of an
-    /// already-built stack, and this keeps that contract.
+    /// Private mesh (#132): rebuilds `mesh_transport`, `mesh_provider` and `peer_capability_query`
+    /// at runtime when `settings.mesh_enabled` flips on, so the UI toggle needs no restart. `None`
+    /// when the binary lacks the `mesh` feature; calling it otherwise is always safe, it no-ops
+    /// when mesh is already built or still disabled, and it never tears a built stack back down.
     pub mesh_rebuild:
         Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
 }
 
 impl AppState {
-    /// Record that the user just did something, and get out of the way.
-    ///
-    /// Every route that starts real work on the user's behalf must call this
-    /// **first**. It does two things that must always happen together:
-    ///
-    /// 1. Resets the inactivity clock the consolidation scheduler reads, so a
-    ///    background pass is not started while the user is mid-interaction.
-    /// 2. Cancels any consolidation already in flight. On the Jetson there is a
-    ///    single inference slot; a running three-stage pass would otherwise sit
-    ///    in front of the user's turn.
-    ///
-    /// Exists as one helper precisely so a new route cannot half-remember the
-    /// pair — the two blocks used to be copy-pasted into each handler, and the
-    /// voice and plain-`/chat` paths were missing them.
-    ///
-    /// Note: the terminal voice loop runs in a *separate process* and never
-    /// reaches this. It is covered instead by the scheduler's second activity
-    /// source, the newest `sessions.updated_at` in `pond_system.db`.
+    /// Record that the user just did something. Every route that starts real work on the user's
+    /// behalf must call this FIRST: it resets the inactivity clock the consolidation scheduler
+    /// reads and cancels any consolidation in flight, which would otherwise hold the Jetson's one
+    /// inference slot. The separate-process voice loop is covered by `sessions.updated_at`.
     pub async fn note_user_activity(&self) {
         *self.last_user_activity.write().await = std::time::Instant::now();
         if let Some(cancel) = self.consolidation_cancel.read().await.as_ref() {
@@ -478,11 +380,9 @@ impl AppState {
     }
 }
 
-/// Live status of the boot/model-change prefix warm-up (`Agent::prewarm`).
-///
-/// One process-wide record, not per-session: the warmed prefix serves every
-/// chat session equally, and the UI question it answers is "is the pond ready
-/// for a first message yet".
+/// Live status of the boot/model-change prefix warm-up (`Agent::prewarm`). One process-wide record
+/// rather than one per session: the warmed prefix serves every chat session, and the question it
+/// answers is whether the pond is ready for a first message.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WarmupStatus {
     #[serde(flatten)]
@@ -513,11 +413,9 @@ fn unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
-/// Run the prefix warm-up in the background, mirroring its phases into
-/// `state.warmup` for the UI. Called at serve startup and again whenever the
-/// settings handler sees the chat provider or model change. Never blocks the
-/// caller and never fails it — a pond that could not warm behaves exactly as
-/// it did before warm-up existed.
+/// Run the prefix warm-up in the background, mirroring its phases into `state.warmup` for the UI.
+/// Called at serve startup and again whenever the settings handler sees the chat provider or model
+/// change. Never blocks or fails the caller: a pond that could not warm just starts cold.
 pub fn spawn_prefix_prewarm(state: Arc<AppState>, voice_mode: bool) {
     tokio::spawn(async move {
         let model = state
@@ -568,13 +466,10 @@ pub struct DownloadEntry {
     /// `None` while still downloading. Used to evict stale entries.
     #[serde(skip)]
     pub finished_at: Option<std::time::Instant>,
-    /// What this download has been told to do — [`DL_RUN`], [`DL_PAUSE`] or
-    /// [`DL_CANCEL`].
+    /// What this download has been told to do: [`DL_RUN`], [`DL_PAUSE`] or [`DL_CANCEL`].
     ///
-    /// Shared with the transfer, which reads it between chunks. That is the
-    /// only place a download that is already streaming can be stopped: the
-    /// task is inside `resp.chunk().await` the rest of the time, and nothing
-    /// outside it can interrupt that without dropping the connection.
+    /// The transfer reads it between chunks, which is the only point a streaming download can be
+    /// stopped; the rest of the time the task sits inside `resp.chunk().await`.
     #[serde(skip)]
     pub control: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// The source, so a paused transfer can be asked for again. Hugging Face
@@ -605,14 +500,10 @@ pub struct ModelStatusEntry {
     pub ram_estimate_mb: Option<u64>,
     /// Suggested role assignment: "chat" | "think" | "task". None = general purpose.
     pub recommended_role: Option<String>,
-    /// Maximum context tokens this model declares. LLM rows only; `None` for
-    /// ASR/TTS/embedding, and for LLM rows whose catalog provider could not
-    /// answer.
-    ///
-    /// This is rung 3 of the context governor
-    /// (`docs/architecture/pai/03-context-governor.md`), surfaced so the Models
-    /// UI stops inferring the window from the model's NAME — a third copy of a
-    /// heuristic the backend already replaced with a real number.
+    /// Maximum context tokens this model declares. LLM rows only; `None` for ASR/TTS/embedding and
+    /// for LLM rows whose catalog provider could not answer. Rung 3 of the context governor
+    /// (`docs/architecture/pai/03-context-governor.md`), surfaced so the Models UI stops inferring
+    /// the window from the model's NAME.
     pub context_length: Option<u32>,
     /// ASR language ("en", "multilingual"). Whisper models only.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -646,14 +537,10 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
         600,
         std::time::Duration::from_secs(60),
     ));
-    // Pairing gets its own, separate budget. Sharing one bucket with ordinary
-    // API traffic meant a single chatty or wedged client could spend the whole
-    // per-IP allowance and lock the device out of `/handshake` — and re-pairing
-    // is precisely the recovery path you reach for when a client is
-    // misbehaving. Keeping the budgets independent means API abuse can never
-    // take pairing down with it. Pairing is inherently low-volume, so a much
-    // smaller allowance is ample; `/handshake/verify` keeps its own stricter
-    // limiter on top of this (see `routes::verify_limiter`).
+    // Pairing keeps its own budget: sharing one bucket with API traffic lets a chatty client spend
+    // the whole per-IP allowance and lock the device out of `/handshake`, the recovery path you
+    // reach for when a client misbehaves. Pairing is low-volume, so this allowance is small;
+    // `/handshake/verify` keeps a stricter limiter on top (see `routes::verify_limiter`).
     let handshake_limiter = Arc::new(middleware::RateLimiter::new(
         30,
         std::time::Duration::from_secs(60),
@@ -681,11 +568,9 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
             let handshake_limiter = handshake_limiter.clone();
             rate_limit_with_limiter(req, next, limiter, handshake_limiter)
         }))
-        // CORS — scoped to the first-party Tauri desktop origins (#94). Browser
-        // requests from other origins are rejected. Native GOTG mobile clients
-        // don't send a browser `Origin` header, so they're unaffected. Operators
-        // can allow-list extra origins via `POND_CORS_ALLOWED_ORIGINS`
-        // (comma-separated, e.g. a LAN dashboard URL).
+        // CORS scoped to the first-party Tauri desktop origins (#94); other browser origins are
+        // rejected. Native GOTG mobile clients send no `Origin` header, so they are unaffected.
+        // Operators can allow-list more origins via `POND_CORS_ALLOWED_ORIGINS` (comma-separated).
         .layer(build_cors_layer())
         .with_state(state)
 }

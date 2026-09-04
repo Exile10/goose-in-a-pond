@@ -1,22 +1,12 @@
-//! The per-request reasoning-budget note shown to the model.
-//!
-//! The agent engine caps a request at N provider calls ("turns") but never
-//! tells the model — and GIAP's provider shim strips the engine's own
-//! turn-context block, because that block is not byte-stable across turns and
-//! would break KV prefix reuse. So GIAP states the budget itself.
-//!
-//! Placement is the whole reason this is a per-REQUEST note and not a per-turn
-//! one: it rides the `<system-context>` block of the user message, which the
-//! trimmer strips from prior turns, so the system prefix stays byte-identical
-//! across a session. The adapter builds the user message once, before the agent
-//! loop starts, so a live "turn 7 of 50" counter is not available here without
-//! a seam inside the engine's loop.
+//! The per-request reasoning-budget note shown to the model. The engine caps a request
+//! at N provider calls but never says so, and the provider shim strips its turn-context
+//! block (not byte-stable, breaks KV prefix reuse). Per-request, not per-turn: it rides
+//! the user message `<system-context>` the trimmer strips, keeping the system prefix stable.
 
 /// The note to place inside `<system-context>` for a request whose budget is
-/// `max_steps` tool-calling steps, or `None` when reasoning is uncapped.
-///
-/// Wrapped in a `<turn-budget>` element to match the v2 tag skeleton the
-/// prompt templates use, so a small model can tell it apart from the request.
+/// `max_steps` tool-calling steps, or `None` when reasoning is uncapped. Wrapped
+/// in a `<turn-budget>` element to match the v2 tag skeleton the prompt templates
+/// use, so a small model can tell it apart from the request.
 pub fn turn_budget_note(max_steps: Option<u32>) -> String {
     let body = match max_steps {
         // Uncapped: the failure mode to guard against is the model stopping
@@ -26,27 +16,10 @@ pub fn turn_budget_note(max_steps: Option<u32>) -> String {
                  early to ask whether you should keep going — finish the task, \
                  then answer."
             .to_string(),
-        // Capped. The budget is a CEILING, not a target to economise against,
-        // and this note used to read as the latter: "Pace yourself: if you are
-        // running out of steps, stop gathering and answer with what you have."
-        //
-        // That is written into every default install, because the default
-        // `agent_max_turns` is 50 and only `0` takes the uncapped branch. So the
-        // shipped configuration told the model that a partial answer was
-        // acceptable, while the non-default one told it the opposite. Measured
-        // 2026-08-12 on "what time is it in the first 10 states alphabetically?":
-        // gemma-4-E2B made ZERO tool calls and asserted one time for all ten
-        // states, and nothing in the pipeline objected.
-        //
-        // Two things this must still do, which is why it is not simply the
-        // uncapped text:
-        //
-        // * Not promise room the engine will not give. The cap is real; a model
-        //   cut off mid-plan at step 50 with no instruction produces nothing
-        //   usable.
-        // * Make an incomplete answer SAY it is incomplete. That is the actual
-        //   remedy for the failure above -- the danger was never that the answer
-        //   was partial, it was that a partial answer read as a whole one.
+        // Capped. The budget is a CEILING, not a target to economise against:
+        // pacing language here licenses a partial answer in every default install
+        // (`agent_max_turns` is 50; only `0` is uncapped). It must not promise room
+        // the engine will not give, and must make a partial answer say it is partial.
         Some(steps) => format!(
             "You may take up to {steps} tool-calling steps for this request. Use as \
              many as the task genuinely needs — do not stop early, and do not ask \
@@ -83,19 +56,10 @@ mod tests {
         assert!(note.contains("do not stop"), "{note}");
     }
 
-    /// Neither branch may tell the model that stopping short is acceptable.
-    ///
-    /// The capped branch used to, and it is the branch every default install
-    /// takes — `agent_max_turns` defaults to 50, and only `0` reaches the
-    /// uncapped text. So the shipped prompt said "if you are running out of
-    /// steps, stop gathering and answer with what you have" while the
-    /// non-default one said "finish the task, then answer". Measured on
-    /// 2026-08-12: asked for the time in the first ten US states alphabetically,
-    /// gemma-4-E2B made zero tool calls and asserted a single time for all ten.
-    ///
-    /// Quantified over BOTH branches on purpose. A guard written against only
-    /// the capped one would pass again the moment somebody "helpfully" restored
-    /// the pacing language to the other.
+    /// Neither branch may tell the model that stopping short is acceptable, and
+    /// the check is quantified over BOTH so restoring pacing language to either
+    /// one fails. The capped branch is what every default install takes:
+    /// `agent_max_turns` defaults to 50 and only `0` reaches the uncapped text.
     #[test]
     fn no_budget_note_licenses_a_partial_answer() {
         for (label, note) in [

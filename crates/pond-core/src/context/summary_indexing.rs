@@ -1,27 +1,7 @@
-//! Indexing conversation summaries into the personal-context index (phase B).
-//!
-//! Memories and context items reach the index for free: both already hold a
-//! vector by the time they are stored, so their write-through just mirrors what
-//! is in hand. **Summaries do not.** Nothing in this pond has ever embedded
-//! `sessions.rolling_summary`, so this is genuinely new inference and is the
-//! only part of phase B with a cost.
-//!
-//! That cost decides the shape. This is a SWEEP, not a write-through:
-//!
-//! * The two writers of that column, [`SessionSummaryService::refresh`] and
-//!   `::resummarise`, are already expensive — each is an LLM call — and one of
-//!   them runs on the compaction path. Embedding inside them would stack a
-//!   second model's work onto a path that is already the slow one.
-//! * A summary is rewritten IN PLACE, so a write-through would have to be an
-//!   upsert anyway; the index already keys on `(corpus, row_id)` and
-//!   `needs_embedding` already compares `source_rev` against
-//!   `rolling_summary_updated_at`. The sweep therefore detects a re-summarised
-//!   session with no help from the writer, which is the property phase B is
-//!   asked to demonstrate: **a re-summarised session's vector changes.**
-//! * A sweep is restartable and self-healing. A write-through that fails leaves
-//!   a summary permanently unsearchable with nothing to notice.
-//!
-//! [`SessionSummaryService::refresh`]: crate::shared::services::session_summary::SessionSummaryService::refresh
+//! Indexing conversation summaries into the personal-context index (phase B). Memories and context
+//! items already hold a vector when stored; `sessions.rolling_summary` never has, so this is a
+//! restartable sweep rather than a write-through: its writers are already LLM calls, and the index
+//! re-detects a re-summarised session by comparing `source_rev` to `rolling_summary_updated_at`.
 
 use std::sync::Arc;
 
@@ -39,15 +19,10 @@ pub const SUMMARY_BATCH_SIZE: usize = 16;
 /// Pause between batches, in milliseconds.
 pub const SUMMARY_BATCH_PAUSE_MS: u64 = 250;
 
-/// Embed and index every session summary that has no current vector.
-///
-/// "No current vector" is whatever [`VectorIndex::needs_embedding`] says, which
-/// covers three cases with one query: never embedded, embedded by a different
-/// model, and embedded before the summary was rewritten.
-///
-/// Cancellable, because it is driven from the same idle path as the summary
-/// refresh itself and a user turn must be able to take the CPU back. Returns how
-/// many summaries were indexed.
+/// Embed and index every session summary that has no current vector, meaning whatever
+/// [`VectorIndex::needs_embedding`] says: never embedded, embedded by a different model, or
+/// embedded before the summary was rewritten. Cancellable because it runs on the idle path and a
+/// user turn must be able to take the CPU back. Returns how many summaries were indexed.
 pub async fn run_summary_indexing(
     storage: &dyn SessionStorage,
     embedder: &dyn EmbeddingProvider,
@@ -80,11 +55,9 @@ pub async fn run_summary_indexing(
             if cancel.is_cancelled() {
                 break;
             }
-            // Read the summary text and its revision together, so the vector is
-            // stamped with the revision it was actually computed from. Reading
-            // them separately would race the summary service and stamp a vector
-            // with a newer revision than the text it embedded — which would make
-            // a stale vector look current and never be repaired.
+            // Read the summary text and its revision together so the vector is stamped with the
+            // revision it was computed from. Reading them separately races the summary service
+            // and stamps a newer revision than the embedded text, so a stale vector looks current.
             let (summary, rev) = match storage.get_rolling_summary_with_revision(session_id).await {
                 Ok(pair) => pair,
                 Err(e) => {

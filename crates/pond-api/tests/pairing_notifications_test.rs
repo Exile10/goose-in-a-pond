@@ -1,14 +1,7 @@
 //! #164 follow-up: pairing outcomes reach connected devices as security
-//! notifications AND land in the unified event log (category `Auth`).
-//!
-//! Drives the real router with a live `BroadcastNotificationSender` and a real
-//! `SqliteEventLog`: a failed `/handshake/verify` broadcasts an "alert" and
-//! records `auth.pairing_verify_failed`; a successful one broadcasts an "info"
-//! notification naming the device and records `auth.device_paired`.
-//!
-//! NOTE: failure alerts are debounced process-wide (one per 10-minute window,
-//! by design — a brute-force burst must not spam the phone), so this binary
-//! contains exactly one failure-path test.
+//! notifications and land in the unified event log under category `Auth`, as
+//! `auth.pairing_verify_failed` or `auth.device_paired`. Failure alerts are
+//! debounced process-wide to one per 10 minutes, so this binary has one such test.
 
 use std::sync::Arc;
 

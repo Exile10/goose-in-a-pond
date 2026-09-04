@@ -1,19 +1,7 @@
-//! Unified observability event (#108).
+//! Unified append-only observability event (#108) the whole pipeline emits into.
 //!
-//! One append-only event type the whole pipeline emits into, replacing four
-//! disjoint silos (`event_log`, `TurnMetrics`, sensors, camera) that had no
-//! correlation keys and an untyped `metadata` TEXT blob.
-//!
-//! Two design choices carry the security/privacy bar:
-//! - **Typed [`attributes`]** (not an opaque JSON/TEXT blob) — emitters attach
-//!   structured values, so downstream redaction/aggregation never has to parse
-//!   arbitrary text.
-//! - **[`PrivacySensitivity`]** on every event — emitters must classify the
-//!   data, which lets retention/export (Q2-40) drop or mask sensitive events by
-//!   policy instead of leaking PII by default.
-//!
-//! [`attributes`]: Event::attributes
-//! Pure domain — no framework imports.
+//! Attributes are typed, not an opaque blob, and every event carries a
+//! [`PrivacySensitivity`] so retention and export (Q2-40) can mask by policy.
 
 use std::collections::BTreeMap;
 

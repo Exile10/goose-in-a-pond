@@ -1,33 +1,7 @@
-//! PAI-4 P7 / P7b-fix — `POST /api/v1/sessions/:id/compact`, the manual axis.
-//!
-//! What these tests are for, in order of how much they matter:
-//!
-//! 1. **The button works at all.** P7 refused the press unless P6's shared
-//!    `claim_compaction` granted, and the pressure axis takes that claim one
-//!    statement after the frame that renders the button — so the claim was gone
-//!    before the control existed and every press answered `cooling_down`. The
-//!    original guard here, `a_second_press_is_refused_by_the_cooldown`, asserted
-//!    precisely the behaviour that made it dead, and passed while doing so.
-//!    `a_press_after_the_pressure_axis_already_claimed_still_compacts`
-//!    reproduces that production ordering and is the replacement.
-//! 2. **And it is still not a bypass.** Three separate limbs stand in for the
-//!    cooldown, each with its own test: a press consumes the automatic axis's
-//!    quota (`a_press_rations_the_automatic_axis_afterwards`), a press while a
-//!    pass runs is refused (`a_press_while_a_pass_is_in_flight_is_refused`), and
-//!    a second press spends no second model call, because the rolling summary's
-//!    through-pointer decides `NothingToDo` before it reaches the provider
-//!    (`a_second_press_spends_no_second_model_call`).
-//! 3. **The endpoint reports rather than no-ops.** Every refusal carries a reason
-//!    and the session's real utilisation, so a control that declines is
-//!    diagnosable instead of looking broken.
-//! 4. **A session id that does not exist is a 404**, not a healthy window.
-//!
-//! These are wiring tests. The claim arithmetic itself is unit-tested in
-//! `pond-core`'s `context_monitor`; what no unit test can reach is whether the
-//! route actually goes through it, and the whole of P7b-fix is that it went
-//! through the wrong one.
-//!
-//! Run: cargo test -p pond-api --test manual_compaction_test
+//! PAI-4 P7 / P7b-fix — `POST /api/v1/sessions/:id/compact`, the manual axis. The press must
+//! work even though the pressure axis has already taken `claim_compaction`, while still not
+//! being a bypass: it rations the automatic axis, is refused mid-pass, and spends no second
+//! model call. Wiring only; the claim arithmetic is unit-tested in pond-core `context_monitor`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -104,20 +78,10 @@ impl DeviceRegistry for MockDeviceRegistry {
     }
 }
 
-/// A summariser that counts its calls and can be held open on demand.
-///
-/// Two things `MockProvider` cannot do, and both are load-bearing here now that
-/// the turn cooldown no longer rations the manual axis:
-///
-/// - **Counting.** What bounds a person hammering the button is the rolling
-///   summary's through-pointer, and the only honest way to assert that is to
-///   count the model calls rather than to read the status string — a second pass
-///   that answers `NothingToDo` and a second pass that ran are both reported as
-///   `skipped`.
-/// - **Holding.** `already_running` is the guard that survives this phase, and
-///   racing two requests against `MockProvider`'s 100 ms sleep would be a timing
-///   assertion. `entered`/`release` make it deterministic: the second request is
-///   issued only once the first is provably inside the model call.
+/// A summariser that counts its calls and can be held open on demand. Counting is the only
+/// honest assertion of the through-pointer bound, since a pass that answered `NothingToDo`
+/// and one that ran are both reported `skipped`. Holding makes the `already_running` guard
+/// deterministic: the second request goes out once the first is provably in the model call.
 struct CountingProvider {
     calls: Arc<AtomicUsize>,
     entered: Arc<tokio::sync::Notify>,
@@ -329,19 +293,10 @@ fn saturate(state: &Arc<AppState>, session_id: &str) {
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
-/// THE GUARD, and the whole of PAI-4 P7b-fix.
-///
-/// This reproduces the production ordering rather than an idealised one. In the
-/// chat-stream generator the `context_warning` frame is yielded and
-/// `spawn_pressure_compaction` is called one statement later inside the SAME
-/// `if health.should_compact` block; that spawn takes `claim_compaction`. The
-/// note the frame renders only appears once the message stops streaming, i.e.
-/// strictly after `done`, i.e. after the spawn. So on every real press the quota
-/// is already spent — not sometimes, not as a race the user could win, always.
-///
-/// The claim below is therefore the fixture, not a contrivance: a test that
-/// pressed the button without it would exercise a state the app cannot be in,
-/// which is the shape that let this ship broken the first time.
+/// THE GUARD of PAI-4 P7b-fix: it reproduces the production ordering. The chat-stream
+/// generator yields `context_warning` and calls `spawn_pressure_compaction` one statement
+/// later, taking `claim_compaction`, while the button appears only after `done`. So the quota
+/// is always already spent when a real press arrives, and the claim below is the fixture.
 #[tokio::test]
 async fn a_press_after_the_pressure_axis_already_claimed_still_compacts() {
     let (app, state, _tmp) = make_app().await;
@@ -374,12 +329,9 @@ async fn a_press_after_the_pressure_axis_already_claimed_still_compacts() {
     );
 }
 
-/// The non-widening control, and the reason the manual claim is not `true`.
-///
-/// A press CONSUMES the automatic axis's quota without CHECKING it. Without
-/// that, a person pressing the button costs the pressure axis nothing and the
-/// two together summarise more often than either alone ever could — which is the
-/// widening P7's stamp argued against, and it is still not allowed.
+/// The non-widening control, and the reason the manual claim is not `true`: a press CONSUMES
+/// the automatic axis's quota without CHECKING it. Otherwise the two axes together summarise
+/// more often than either alone could, which is the widening P7's stamp argued against.
 #[tokio::test]
 async fn a_press_rations_the_automatic_axis_afterwards() {
     let (app, state, _tmp) = make_app().await;
@@ -405,12 +357,9 @@ async fn a_press_rations_the_automatic_axis_afterwards() {
     );
 }
 
-/// The guard that survives the phase. `compaction_in_flight` is what actually
-/// protects a serial on-device engine, and it is read BEFORE the claim so a
-/// refusal here does not spend one.
-///
-/// Deterministic rather than timed: the second request is issued only once the
-/// first is provably inside `provider.complete`.
+/// `compaction_in_flight` is what protects a serial on-device engine, and it is read BEFORE
+/// the claim so a refusal here does not spend one. Deterministic rather than timed: the
+/// second request is issued only once the first is provably inside `provider.complete`.
 #[tokio::test]
 async fn a_press_while_a_pass_is_in_flight_is_refused() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -462,15 +411,10 @@ async fn a_press_while_a_pass_is_in_flight_is_refused() {
     );
 }
 
-/// What bounds a person hammering the button, now that the turn cooldown does
-/// not. `SessionSummaryService::refresh` decides `NothingToDo` from the rolling
-/// summary's through-pointer and the message count BEFORE it reaches
-/// `provider.complete`, so a second press with no new turns in between costs a
-/// database read and nothing else.
-///
-/// Counted, not read off the status string: a second pass that answered
-/// `NothingToDo` and a second pass that actually ran are BOTH reported as
-/// `skipped`, so a status assertion would pass against either.
+/// What bounds a person hammering the button, now the turn cooldown does not:
+/// `SessionSummaryService::refresh` decides `NothingToDo` from the rolling summary's
+/// through-pointer before it reaches `provider.complete`. Counted, not read off the status
+/// string, because a pass that ran and one that did nothing are both reported `skipped`.
 #[tokio::test]
 async fn a_second_press_spends_no_second_model_call() {
     let calls = Arc::new(AtomicUsize::new(0));

@@ -1,8 +1,7 @@
 //! In-memory [`EventLog`] test double (#108).
 //!
-//! Append-only `Vec` with filtered, newest-first querying — lets Core tests and
-//! emitters exercise the unified event model before the durable SQLite adapter
-//! (Q2-32) exists.
+//! Append-only `Vec` with filtered, newest-first querying, standing in for the
+//! durable SQLite adapter (Q2-32).
 
 use std::sync::Mutex;
 

@@ -1,13 +1,6 @@
-//! Integration tests for the scheduler REST routes:
-//!   GET    /api/v1/schedules
-//!   POST   /api/v1/schedules
-//!   GET    /api/v1/schedules/upcoming
-//!   DELETE /api/v1/schedules/:id
-//!   POST   /api/v1/schedules/:id/pause
-//!   POST   /api/v1/schedules/:id/resume
-//!   POST   /api/v1/schedules/:id/run-now
-//!   GET    /api/v1/schedules/:id/runs
-//!
+//! Integration tests for the scheduler REST routes under /api/v1/schedules: list,
+//! create, upcoming, delete, and the per-id actions pause, resume, run-now and
+//! runs.
 //! Run: cargo test -p pond-api --test schedule_integration_test
 
 use axum::body::Body;

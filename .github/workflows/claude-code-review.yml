@@ -2,12 +2,8 @@ name: Claude Code Review
 
 on:
   pull_request:
-    # `synchronize` is deliberately absent. With it, every push to an open PR
-    # bought a fresh full review — a five-commit afternoon paid for five reviews
-    # of largely the same diff, and the later ones mostly restated the first.
-    # Reviewing when a PR is opened or marked ready is where the reading is worth
-    # most; a re-review afterwards is a comment away (`@claude review`, handled by
-    # claude.yml) and is then a choice rather than a default.
+    # `synchronize` is deliberately absent: every push to an open PR would buy a fresh full
+    # review of largely the same diff. Re-review on demand with `@claude review` (claude.yml).
     types: [opened, ready_for_review, reopened]
     # Prose changes do not need a code review.
     paths-ignore:
@@ -50,13 +46,9 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          # `medium` rather than the default. The levels trade breadth for
-          # confidence: low/medium report fewer, higher-confidence findings,
-          # while high and above widen coverage and admit uncertain ones. On a
-          # PR that a person is going to read anyway, a short list they trust
-          # is worth more than a long list they triage — and it is markedly
-          # cheaper. Ask for more on a specific PR with `@claude /code-review
-          # high` when a change earns it.
+          # `medium` rather than the default: low/medium report fewer, higher-confidence findings;
+          # high and above widen coverage and admit uncertain ones, at markedly higher cost. Ask
+          # for more on a specific PR with `@claude /code-review high`.
           prompt: '/code-review:code-review medium ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options

@@ -1,25 +1,7 @@
-//! Prompts and persona definitions for GIAP.
-//!
-//! ## Priority chain (highest to lowest)
-//! 1. File at `$DATA_DIR/prompts/system.md` — deployment-level override, rendered by callers
-//! 2. `Settings.custom_system_prompt` — per-user full override stored in DB
-//! 3. Template fetched from DB (`PromptTemplateRepository`) — call `build_system_prompt_from_template`
-//! 4. Built-in template selected by `Settings.prompt_style` ("balanced" | "concise" | "technical" | "warm")
-//! 5. `SYSTEM_PROMPT` constant — static fallback when Settings are unavailable
-//!
-//! ## Which function to call
-//! - `build_system_prompt_from_template_full(settings, profile, state, content)` — preferred;
-//!   GooseAdapter fetches `content` from DB and populates `PromptState` from DeviceRegistry.
-//! - `build_system_prompt_from_template(settings, content)` — backwards-compat; no state/profile.
-//! - `build_system_prompt(settings)` — legacy; uses hard-coded `PROMPT_*` constants (routes, main, tests)
-//! - `SYSTEM_PROMPT` — in tests and absolute last-resort fallback
-//!
-//! ## Temporal context
-//! Goose's own prompt system exposes an hourly-resolution `current_date_time`
-//! template variable. GIAP templates deliberately do NOT use it: minute-level
-//! date/time lives in the per-turn `<system-context>` block of the user message
-//! (assembled by `GooseAdapter`), keeping the system prompt stable for KV-cache
-//! prefix reuse.
+//! Prompts and persona definitions for GIAP. `build_system_prompt_from_template_full` is the
+//! preferred entry point; the prompt is chosen in this order: `$DATA_DIR/prompts/system.md`,
+//! `Settings.custom_system_prompt`, the DB template, the built-in for `Settings.prompt_style`,
+//! then `SYSTEM_PROMPT`. Date and time stay in the per-turn `<system-context>`, for KV reuse.
 
 use crate::user_data::domain::settings::Settings;
 
@@ -70,44 +52,26 @@ pub struct PromptState {
     /// True when the model supports thinking/reasoning (Gemma 4, Qwen3, etc.)
     /// and thinking_mode is not "off".
     pub thinking_enabled: bool,
-    /// True when the PROMPT-side context window is small enough that the system
-    /// prompt should use a compact format (skip verbose tool descriptions and
-    /// detailed instructions to save tokens).  Derived from
-    /// [`CompactionProfile::use_compact_prompt()`], which reads the clamped
-    /// prompt window rather than the full context window — growing the KV cache
-    /// must not buy a more verbose prefix.
+    /// True when the PROMPT-side context window is small enough to want the compact system
+    /// prompt. From [`CompactionProfile::use_compact_prompt()`], which reads the clamped prompt
+    /// window rather than the full context window: growing the KV cache must not buy a more
+    /// verbose prefix.
     pub compact_prompt: bool,
     /// True when the provider injects the full tools JSON via the model's chat
     /// template (local llama.cpp native tool calling) — the template must then
     /// NOT render its own tool list, which would double-feed every schema.
     pub native_tools_json: bool,
-    /// Hash of the static prefix portion of the system prompt.
-    ///
-    /// When this value matches the previous turn's hash, the static prefix
-    /// has not changed and callers can skip `override_system_prompt()`,
-    /// allowing local inference providers to reuse their KV-cache.
-    ///
-    /// Set by `services::prompt_builder::build_prompt_partition()`.
-    /// `None` means partitioning was not used (backwards compatibility).
+    /// Hash of the static prefix portion of the system prompt. When it matches the previous
+    /// turn's, callers can skip `override_system_prompt()` and local inference providers keep
+    /// their KV cache. Set by `services::prompt_builder::build_prompt_partition()`; `None`
+    /// means partitioning was not used.
     pub prefix_hash: Option<u64>,
 }
 
-// `giap_tool_definitions` / `giap_tool_description_lines` used to live here: 13
-// hardcoded (name, description) pairs rendered into the prompt as an "Available
-// tools:" list. Only four of the names existed. The rest named nothing the
-// dispatcher would answer to -- `weather` for `get_current_weather`,
-// `shell_command` for `run_shell_command` -- while 48 real tools were absent,
-// and the block measured 2,931 chars (~732 tokens) at every prompt style and at
-// BOTH compaction tiers, since the compact tier never shortened it.
-//
-// It was also unreachable: production always passes a registry, so the adapter
-// took the registry branch and this static fallback rendered only in tests. That
-// is the more useful half of the finding -- the prose list production actually
-// renders comes from `InMemoryToolRegistry`, which nothing seeds with the 61
-// builtin `giap-*` tools, so it is empty unless the user has added an external
-// MCP extension. The model is told about builtins through native tool schemas
-// instead, which every live provider supports, so an empty section is correct
-// and a hardcoded one could only ever drift back out of date.
+// There is deliberately no hardcoded tool list here. The prose "Available tools:" list that
+// production renders comes from `InMemoryToolRegistry`, which nothing seeds with the builtin
+// `giap-*` tools, so it is empty unless an external MCP extension is added. Builtins reach the
+// model as native tool schemas instead, so an empty section is correct rather than a bug.
 
 /// Estimate how many tokens the model should generate based on query complexity.
 ///
@@ -155,41 +119,10 @@ pub fn estimate_response_budget(message: &str, base_max_tokens: u32) -> u32 {
 
 // ── Adversarial Review Prompts ────────────────────────────────────────────────
 
-/// System prompt for the adversarial answer reviewer.
-///
-/// The reviewer evaluates answers against a rubric and outputs a structured
-/// JSON verdict. Uses the SAME model as the main LLM with a critic persona.
-///
-/// # Why the shape example is a FAILING verdict
-///
-/// It used to be `{"pass": true, "score": 4, ...}` — a filled-in passing
-/// verdict, offered as a schema illustration to a model that at this size
-/// copies worked examples verbatim. This repo has the receipts: the answer
-/// contract's Nairobi example was emitted as a real answer by a 4B model on
-/// 2026-08-25.
-///
-/// Copying a PASSING verdict here is worse than copying a wrong sentence,
-/// because it is not visible as an error. `GiapAnswerReviewer::review`
-/// short-circuits on `verdict.pass || verdict.score >= threshold`, returns the
-/// original answer unrevised, and the UI then tells the user "Answer verified
-/// (score: 4/5)". The adversarial gate meant to catch fabrications becomes a
-/// no-op that reports success — and it reports it about an answer nobody
-/// checked. The copied JSON is schema-valid, so nothing downstream can reject
-/// it.
-///
-/// The example was also contradicting its own instructions: the prompt says
-/// "Be HARSH … only give 4-5 for genuinely good answers" and then handed the
-/// model a pre-filled 4 with an empty critique.
-///
-/// So the example now FAILS. A model that copies it asks for a revision it did
-/// not need, which costs one extra turn and is visible; the previous failure
-/// cost nothing and was invisible. When an example will be copied, make the
-/// copy fail closed.
-///
-/// The `expectations` and `critique` slots carry instructions rather than
-/// sample prose, because `expectations` is joined verbatim into the revision
-/// prompt — a copied placeholder became a literal requirement handed to the
-/// model as if the reviewer had asked for it.
+/// System prompt for the adversarial answer reviewer, which scores an answer against a rubric
+/// and returns a JSON verdict. The shape example FAILS on purpose: a model this size copies
+/// examples verbatim, and a copied passing verdict short-circuits `GiapAnswerReviewer::review`
+/// into reporting an unchecked answer as verified. Its slots hold instructions, not sample prose.
 pub const REVIEW_SYSTEM_PROMPT: &str = "\
 You are a strict quality reviewer for an AI assistant's answers. Your job is to \
 evaluate whether an answer is COMPLETE, CORRECT, and HELPFUL for the user's question.
@@ -249,49 +182,16 @@ brackets, the tools you called and any reminder the system gives you are plumbin
 stay out of it. If you fell short, say which part you could not do, in ordinary words. \
 Asked outright how you know something, say so plainly.";
 
-// `TITLE_GENERATION_PROMPT` used to live here. It asked for "3 to 6 words" and
-// was used only when naming a conversation from its first exchange, while the
-// idle re-titling pass asked for ten. Two prompts for one job is how the two
-// paths drift into disagreeing about what a title is, so both now use
-// `shared::services::session_title::TITLE_SYSTEM_PROMPT`, which lives beside
-// the normaliser that enforces the same rules on whatever comes back.
+// Both first-exchange naming and the idle re-titling pass use
+// `shared::services::session_title::TITLE_SYSTEM_PROMPT`, which sits beside the normaliser that
+// enforces the same rules on whatever comes back. Two prompts for one job drift apart.
 
 // ── Built-in prompt style templates ──────────────────────────────────────────
-//
-// These are Jinja2/Tera templates processed by render_jinja_template().
-//
-// Variables substituted:
-//   String: {{assistant_name}}, {{user_name}}, {{personality}}, {{timezone}},
-//           {{location}}, {{current_date}}, {{current_time}}, {{online_device_names}}
-//   usize:  {{device_count}}, {{reasoning_budget_words}}
-//   bool:   {{has_home_devices}}, {{atypical_speech}}, {{has_tools}},
-//           {{voice_mode}}, {{canvas_mode}}, {{thinking_enabled}},
-//           {{compact_prompt}}, {{native_tools_json}}
-//   list:   {{tools}} — available Tool Agent capabilities (human-readable lines)
-//
-// ## Prompt schema v2 — unified tag skeleton
-// All four styles share the SAME ordered tag skeleton (no XML attributes —
-// small models do better with flat consistent sections):
-//   <identity>, <instructions>, <context-handling>, <tool-usage>
-//   (with <schema-rules>, <multi-tool>, <tool-chaining>, <tool-synthesis>),
-//   <memory-rules>, <output-quality>,
-//   then conditionally: <home-devices> ({% if has_home_devices %}),
-//   <thinking> ({% if thinking_enabled %}), <voice-mode> ({% if voice_mode %}),
-//   <canvas-mode> ({% if canvas_mode %}).
-//
-// {{compact_prompt}} gates a 1-2 line compact variant inside <context-handling>,
-// <tool-usage>, <memory-rules>, and <output-quality> so the compact static
-// prefix stays within ~600 tokens on small-context platforms.
-//
-// {{native_tools_json}} suppresses the "Available tools:" listing when the
-// provider already injects the full tools JSON via the model's chat template
-// (local llama.cpp native tool calling) — rendering both would double-feed
-// every schema.
-//
-// Home-control sections are gated behind {% if has_home_devices %} so the prompt
-// adapts automatically when no devices are configured. Extension injection is
-// handled by GooseAdapter's extend_system_prompt() calls after override_system_prompt()
-// and does NOT require {% if extensions %} blocks here.
+
+// Jinja2/Tera templates rendered by render_jinja_template(); its ctx.insert calls are the
+// variable list. All four styles share one ordered, attribute-free tag skeleton, because small
+// models do better with flat consistent sections. {{compact_prompt}} selects 1-2 line variants
+// so the compact prefix stays near 600 tokens; {{native_tools_json}} drops the tool listing.
 
 /// Balanced — warm, practical, general-purpose. Default for most users.
 pub const PROMPT_BALANCED: &str = "\
@@ -614,11 +514,9 @@ user asks about a camera, a room, or what is happening somewhere right now — n
 answer a question about an image that is already attached.
 </vision>";
 
-/// Vision section for the compact prompt tier (small-context, on-device).
-///
-/// Same two rules as [`VISION_SECTION`], roughly half the tokens: the compact
-/// tier targets a ~600-token static prefix and every line competes with the
-/// tool schemas.
+/// Vision section for the compact prompt tier (small-context, on-device). The same two rules as
+/// [`VISION_SECTION`] in roughly half the tokens: that tier targets a ~600-token static prefix
+/// and every line competes with the tool schemas.
 pub const VISION_SECTION_COMPACT: &str = "\
 <vision>
 You can see images. One attached to a message is visible to you — describe what is \
@@ -626,33 +524,10 @@ actually there, never say you are text-only. Camera frames are not attached and 
 a camera tool; never call one to answer about an attached image.
 </vision>";
 
-/// The `<vision>` section to append to a rendered template, or `None` when the
-/// active model cannot see.
-///
-/// # Why this is needed at all
-///
-/// Nothing else in the prompt tells the model it is multimodal. Measured on a
-/// production turn with Gemma-4-E4B and a fully encoded 252-token image in
-/// context, the reply was "I cannot directly describe the content of an image
-/// you provide. I am a text-based assistant." The pixels were there; the
-/// self-model was not.
-///
-/// # Why it must be conditional
-///
-/// Telling a text-only model that it can see manufactures a confident
-/// hallucination out of nothing. The caller decides, from the model registry
-/// (does this GGUF declare an mmproj?) rather than a name heuristic.
-///
-/// # Capability is DECLARED, not downloaded
-///
-/// The vision encoder is fetched in the background (~941 MB), so "the bytes are
-/// on disk" flips mid-session. This section deliberately keys off the model's
-/// *declaration* instead, which is fixed for the life of a model selection:
-/// keying off the download would rewrite the system prefix mid-session and
-/// throw away the engine's KV prompt-session cache for every turn after it. A
-/// turn that actually needs the encoder and does not have it is refused up
-/// front, with a precise "still downloading" message, so the model is never
-/// handed an image it cannot decode.
+/// The `<vision>` section to append to a rendered template, or `None` when the active model
+/// cannot see. Nothing else tells the model it is multimodal, and telling a text-only model it
+/// can see manufactures hallucinations, so the caller decides from the registry's mmproj
+/// declaration -- never from the downloaded bytes, which would move the prefix mid-session.
 #[must_use]
 pub fn vision_capability_section(compact: bool) -> &'static str {
     if compact {
@@ -664,22 +539,10 @@ pub fn vision_capability_section(compact: bool) -> &'static str {
 
 // ── Built-in template lookup ─────────────────────────────────────────────
 
-/// Every built-in prompt template, as `(name, content, description)`.
-///
-/// This is the ONE table. Five call sites used to carry a copy of it — `run_setup`,
-/// the boot reseed, the chat-CLI reseed, `pond prompts reset`, and
-/// [`builtin_template_content`] — and they had already drifted apart: three said
-/// balanced was *"Warm, practical, complete behaviour rules. Default for most
-/// households."* and two said *"Warm, practical, general-purpose. Default."*.
-///
-/// That drift was not cosmetic, because the two disagreeing sets were written by
-/// paths that run in sequence. `seed_system_template` upserts
-/// `description = excluded.description` for any row that is not customized, so
-/// `pond prompts reset` wrote one description and the very next boot silently
-/// replaced it with the other. A user could watch the field change without
-/// touching anything.
-///
-/// Order is catalog order and is relied on by nothing; look rows up by name.
+/// Every built-in prompt template, as `(name, content, description)`. The ONE table: copies in
+/// the reseed paths drift, and because `seed_system_template` upserts
+/// `description = excluded.description` for any row that is not customized, `pond prompts reset`
+/// and the next boot then overwrite each other. Order is catalog order; look rows up by name.
 pub const BUILTIN_PROMPT_TEMPLATES: &[(&str, &str, &str)] = &[
     (
         "balanced",
@@ -703,11 +566,9 @@ pub const BUILTIN_PROMPT_TEMPLATES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Return the original (factory-default) content and description for a built-in
-/// prompt template name.
-///
-/// Returns `None` for unknown or user-created template names.
-/// Used by both the CLI `prompts reset` command and `POST /api/v1/prompts/{name}/reset`.
+/// Return the original (factory-default) content and description for a built-in prompt template
+/// name, or `None` for unknown or user-created names. Used by the CLI `prompts reset` command
+/// and `POST /api/v1/prompts/{name}/reset`.
 pub fn builtin_template_content(name: &str) -> Option<(&'static str, &'static str)> {
     BUILTIN_PROMPT_TEMPLATES
         .iter()
@@ -717,39 +578,10 @@ pub fn builtin_template_content(name: &str) -> Option<(&'static str, &'static st
 
 // ── Sanitization ──────────────────────────────────────────────────────────────
 
-/// Sanitize a user-supplied prompt field so it cannot inject prompt-breaking
-/// sequences into the system prompt sent to the LLM.
-///
-/// Rules applied (in order):
-/// 1. Replace every ASCII control character (0x00–0x1F, 0x7F) with a space —
-///    prevents newline-injection attacks like `\nUser: ignore everything`.
-/// 2. Collapse every run of whitespace into a single space and trim both ends.
-/// 3. Truncate to `max_len` *characters* (not bytes) to prevent oversized prompts.
-/// The prompt lines describing WHO the pond is talking to.
-///
-/// One owner for four sites that each held a copy: two builders in this file
-/// (the second admitting in a comment that it was "same logic as" the first),
-/// the partitioned builder in `models/services/prompt_builder.rs`, and — by
-/// omission — the legacy branch in the Goose adapter, which passed no profile
-/// at all and so silently dropped every line below whenever
-/// `prefix_cache_prompt` was off.
-///
-/// The three real copies produced byte-identical strings, so gathering them
-/// here changes no rendered prompt and cannot move a KV prefix. That was worth
-/// establishing before writing this: a prompt-text change invalidates every
-/// cached prefix on the pond, which is a performance cliff disguised as a
-/// refactor.
-///
-/// # Why a language MAP and not the raw code
-///
-/// A small model reads "Always respond in French." reliably and "Always respond
-/// in fr." poorly. Unknown codes pass through unchanged rather than being
-/// dropped: a household that set `sw-KE` gets a slightly awkward line instead of
-/// silently losing its language.
-///
-/// `user_name` is taken so a preferred name identical to the account name adds
-/// no line — repeating what the prompt already said above costs tokens and
-/// tells the model nothing.
+/// The prompt lines describing WHO the pond is talking to, owned here so the Goose adapter and
+/// `models/services/prompt_builder.rs` cannot drift: any change to this text invalidates every
+/// cached KV prefix. A language MAP, because a small model reads "French" and not "fr", and
+/// unknown codes pass through. `user_name` is taken so a matching preferred name adds no line.
 pub fn profile_context_lines(profile: Option<&ProfileContext>, user_name: &str) -> Vec<String> {
     let Some(ctx) = profile else {
         return Vec::new();
@@ -805,6 +637,9 @@ fn language_label(code: &str) -> &str {
     }
 }
 
+/// Sanitize a user-supplied prompt field so it cannot inject prompt-breaking sequences into the
+/// system prompt: ASCII control characters become spaces, which is what blocks newline injection
+/// such as `\nUser: ignore everything`; whitespace runs collapse; `max_len` counts characters.
 pub fn sanitize_field(s: &str, max_len: usize) -> String {
     let decontrolled: String = s
         .chars()
@@ -819,13 +654,9 @@ pub fn sanitize_field(s: &str, max_len: usize) -> String {
 
 // ── Template rendering ────────────────────────────────────────────────────────
 
-/// Substitute `{{key}}` placeholders in `template` with values from `vars`.
-///
-/// - Unknown placeholders are left unchanged.
-/// - Values are NOT automatically sanitized — callers must pass sanitized values.
-///
-/// This is the legacy simple-substitution path. Prefer `render_jinja_template()`
-/// for new code, which supports Jinja2 conditionals and loops via Tera.
+/// Substitute `{{key}}` placeholders in `template` with values from `vars`. Unknown
+/// placeholders are left unchanged and values are NOT sanitized: callers must pass sanitized
+/// values. Legacy path; prefer `render_jinja_template()`, which supports conditionals and loops.
 pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
     let mut result = template.to_string();
     for (key, value) in vars {
@@ -834,27 +665,10 @@ pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
     result
 }
 
-/// Render a Jinja2 template using Tera with context built from `settings`,
-/// an optional `PromptState`, and an optional `ProfileContext`.
-///
-/// Uses `Tera::one_off()` — in-memory only, no filesystem access.
-///
-/// ## Context variables provided
-/// - `String`:  `assistant_name`, `user_name`, `personality`, `timezone`, `location`,
-///              `current_date`, `current_time`, `online_device_names`
-/// - `usize`:   `device_count`, `reasoning_budget_words`
-/// - `bool`:    `has_home_devices`, `atypical_speech`, `has_tools`, `voice_mode`,
-///              `canvas_mode`, `thinking_enabled`, `compact_prompt`,
-///              `native_tools_json`
-/// - `list`:    `tools`
-///
-/// On any Tera render error the function logs a warning and falls back to the plain
-/// `render_template()` substitution so the system prompt is never silenced.
-///
-/// ## Extension blocks
-/// The new built-in prompt constants do NOT include `{% if extensions %}` blocks.
-/// Extension injection is handled by `GooseAdapter`'s `extend_system_prompt()` calls
-/// which run after `override_system_prompt()` and are not template-based.
+/// Render a Jinja2 template using Tera with context built from `settings`, an optional
+/// `PromptState` and an optional `ProfileContext`. `Tera::one_off()`, so in-memory only; the
+/// `ctx.insert` calls below are the variable list. Extensions are not templated: `GooseAdapter`
+/// injects them with `extend_system_prompt()` after `override_system_prompt()`.
 pub fn render_jinja_template(
     template: &str,
     settings: &Settings,
@@ -865,13 +679,10 @@ pub fn render_jinja_template(
     let user = sanitize_field(&settings.user_name, 50);
     let persona = sanitize_field(&settings.assistant_personality, 200);
     let tz = sanitize_field(&settings.timezone, 50);
-    // Stating the location is not enough: a small model reads it as trivia and
-    // still asks "which city?" when a location-aware tool needs one. Say what
-    // to DO with it. Static per install, so the prefix stays KV-stable.
-    // Asked, not read. `location::resolve` is the one place that decides what
-    // "where is this pond" means — including the fall back to the time zone,
-    // which this used to skip, leaving the line out of the prompt for a pond
-    // that knew perfectly well it was in Nairobi.
+    // Stating the location is not enough: a small model reads it as trivia and still asks
+    // "which city?", so say what to DO with it. Static per install, so the prefix stays
+    // KV-stable. `location::resolve` is the one place that decides where this pond is,
+    // including the fall back to the time zone.
     let location = match crate::user_data::services::location::resolve(settings).describe() {
         None => String::new(),
         Some(place) => format!(
@@ -923,19 +734,10 @@ pub fn render_jinja_template(
         &state.map(|s| s.thinking_enabled).unwrap_or(false),
     );
 
-    // How LONG the thinking may run, in words. `thinking_enabled` above says
-    // WHETHER; this says how much, and it is only ever rendered inside the
-    // `{% if thinking_enabled %}` block, so `off` stays off.
-    //
-    // Words rather than tokens because the model cannot count its own tokens.
-    // Derived here, from the two inputs that already reach this function --
-    // `settings.reasoning_effort` (the preference) and `state.compact_prompt`
-    // (the profile signal) -- rather than carried on `PromptState`, so that
-    // nothing new has to resolve inside the adapter. That matters for the KV
-    // prefix: this value is a pure function of the same `settings` that already
-    // chooses `prompt_style` and `custom_system_prompt`, so it resolves in the
-    // same place they do and cannot differ between turn one and turn two the
-    // way a lazily-warmed capability cache did (see PAI-5 invariant 1).
+    // How LONG the thinking may run, in words (the model cannot count its own tokens); only
+    // rendered inside `{% if thinking_enabled %}`, so `off` stays off. Derived here from the
+    // same `settings` that chooses `prompt_style`, so it resolves where they do and cannot
+    // shift between turn one and turn two the way a lazily-warmed cache did (PAI-5 rule 1).
     let reasoning_budget_words =
         crate::models::services::context::context_budget::reasoning_budget_words(
             crate::models::services::context::context_budget::ReasoningEffort::parse(
@@ -989,13 +791,8 @@ pub fn render_jinja_template(
 // ── Dynamic prompt builder ────────────────────────────────────────────────────
 
 /// Build a personalised system prompt from `Settings` and an optional `ProfileContext`.
-///
-/// Priority:
-/// 1. `settings.custom_system_prompt` (Some) → render with all vars
-/// 2. Built-in template selected by `settings.prompt_style`
-/// Then: append profile context lines, then `settings.prompt_addendum`.
-///
-/// Uses Jinja2/Tera rendering — supports `{% if has_home_devices %}` etc.
+/// `settings.custom_system_prompt` wins, otherwise the built-in template named by
+/// `settings.prompt_style`; then profile context lines, then `settings.prompt_addendum`.
 /// All user-supplied strings are sanitized before substitution.
 pub fn build_system_prompt(settings: &Settings) -> String {
     build_system_prompt_with_profile(settings, None)
@@ -1501,12 +1298,9 @@ mod tests {
         "canvas-mode",
     ];
 
-    /// Extract structural tags from a RAW template constant.
-    ///
-    /// A structural tag is a line whose trimmed content is exactly `<name>` or
-    /// `</name>` — prose mentions like `<system-context>` or
-    /// `<conversation-summary>` sit mid-sentence and are ignored. Returns
-    /// `(tag_name, is_open)` in document order.
+    /// Extract structural tags from a RAW template constant: a line whose trimmed content is
+    /// exactly `<name>` or `</name>`, so prose mentions sitting mid-sentence are ignored.
+    /// Returns `(tag_name, is_open)` in document order.
     fn structural_tags(raw: &str) -> Vec<(String, bool)> {
         raw.lines()
             .filter_map(|line| {
@@ -1552,24 +1346,10 @@ mod tests {
         }
     }
 
-    /// A live tool result must outrank a stored memory, in every style.
-    ///
-    /// The four styles used to call `<memories>` "authoritative" — meaning "this
-    /// is context, not a question you should ask about" — while
-    /// `<tool-synthesis>` separately called a tool result "the authoritative
-    /// answer". Two authorities and no precedence between them.
-    ///
-    /// Observed in the desktop app on 2026-08-25, NVIDIA-Nemotron3-Nano-4B: the
-    /// weather tool returned 18 degrees and Overcast, a stale memory said
-    /// "Because there was no precipitation, the user does not need to wear an
-    /// umbrella", and the model spent 2m48s visibly arguing with itself before
-    /// siding with the memory. A stronger model resolves the ambiguity the way
-    /// a person would; a 4B model resolves it by picking whichever source the
-    /// prompt praised most recently.
-    ///
-    /// So the precedence has to be stated, not implied. Asserted across every
-    /// style and both compact and full, because a rule that decides a factual
-    /// answer cannot be present in only some renderings.
+    /// A live tool result must outrank a stored memory, in every style. `<memories>` and
+    /// `<tool-synthesis>` each called their own source authoritative with no precedence between
+    /// them, and a 4B model then argued with itself for 2m48s before siding with a stale memory
+    /// over live weather. Asserted in every style and tier: this rule decides factual answers.
     #[test]
     fn a_tool_result_outranks_a_memory_in_every_style() {
         let settings = Settings::default();
@@ -1698,27 +1478,14 @@ mod tests {
         }
     }
 
-    /// The style's OWN text, in the plainest pond there is: no devices, no
-    /// thinking, no vision. ~600 tokens at the chars/4 heuristic.
-    ///
-    /// This is the number the prompt author controls, and it is the original
-    /// budget — kept unchanged, now applied to the shape it actually describes.
+    /// The style's OWN text, in the plainest pond there is: no devices, no thinking, no vision.
+    /// ~600 tokens at the chars/4 heuristic, and the number the prompt author controls.
     const COMPACT_BASE_BUDGET: usize = 2400;
 
-    /// Any reachable shape, once the pond's configuration is added. ~800 tokens.
-    ///
-    /// Separate from [`COMPACT_BASE_BUDGET`] because the two are driven by
-    /// different people. A household with four devices and a vision model pays
-    /// for `<home-devices>` and `<vision>`; that is the configuration it chose,
-    /// not verbosity the prompt author can edit away. Holding one global number
-    /// over both meant a pond was penalised for owning a lock.
-    ///
-    /// 800 tokens is defensible on the Orin's own arithmetic: the prompt window
-    /// is clamped to `LOCAL_PROMPT_CLAMP` = 8192, and at `tool_selection_mode =
-    /// "relevant"` the tool schemas measured 2,386 tokens — so 800 of preamble
-    /// leaves roughly 5,000 for history and memories. At `"all"` the schemas are
-    /// ~6,500 tokens and nothing fits whatever the prefix does, which is an
-    /// argument for `"relevant"` rather than for shaving this further.
+    /// Any reachable shape, once the pond's configuration is added. ~800 tokens. Separate from
+    /// [`COMPACT_BASE_BUDGET`] because `<home-devices>` and `<vision>` are the household's
+    /// choice, not verbosity the author can edit away. 800 fits the Orin's 8192
+    /// `LOCAL_PROMPT_CLAMP` beside the 2,386 tokens of schemas that "relevant" mode costs.
     const COMPACT_SHAPE_CEILING: usize = 3200;
 
     /// A shape a pond can actually be in, and the flags that put it there.
@@ -1731,15 +1498,10 @@ mod tests {
         canvas: bool,
     }
 
-    /// Every reachable compact configuration.
-    ///
-    /// ENUMERATED, NOT SWEPT AS A PRODUCT, and that is the point of the whole
-    /// test: two of the flags are not free. `thinking_section_applies` returns
-    /// false for voice before it looks at anything else, and
-    /// `vision_section_applies` is handed the same voice flag — so
-    /// `voice && (thinking || vision)` cannot occur. A blind 2^5 sweep would
-    /// have put the unreachable-fixture trap back in one level down, which is
-    /// exactly the defect this list exists to remove.
+    /// Every reachable compact configuration, enumerated rather than swept as a product:
+    /// `thinking_section_applies` returns false for voice before looking at anything else, and
+    /// `vision_section_applies` is handed the same voice flag, so `voice && (thinking ||
+    /// vision)` cannot occur. A blind 2^5 sweep would reintroduce unreachable fixtures.
     const REACHABLE_SHAPES: &[Shape] = &[
         Shape {
             what: "text, no devices, thinking off",
@@ -1794,20 +1556,10 @@ mod tests {
         },
     ];
 
-    /// The compact static prefix fits its budget in every shape a pond can be
-    /// in — not just the one the fixture happened to describe.
-    ///
-    /// The previous version of this test rendered with `..Default::default()`,
-    /// which means thinking OFF, zero devices and no vision section. Production
-    /// defaults `thinking_mode` to "auto" (settings.rs), which resolves TRUE for
-    /// Gemma-4; a household has registered devices; and E4B declares an mmproj,
-    /// so `apply_vision_section` appends `<vision>`. The configuration this
-    /// guard measured was therefore one no Orin has ever booted into. It
-    /// reported roughly 2,200 chars and passed while the prefix those devices
-    /// actually receive was roughly 3,300.
-    ///
-    /// `turn_trimmer.rs` names this failure mode directly: a test whose FIXTURE
-    /// is unreachable tests a system that does not exist.
+    /// The compact static prefix fits its budget in every shape a pond can be in, not just the
+    /// one a fixture happens to describe: production defaults `thinking_mode` to "auto" (true
+    /// for Gemma-4), a household has devices, and E4B declares an mmproj so `<vision>` is
+    /// appended. As `turn_trimmer.rs` puts it, an unreachable fixture tests nothing real.
     #[test]
     fn compact_static_prefix_within_budget_in_every_reachable_shape() {
         use crate::models::services::prompt_builder::build_prompt_partition;
@@ -1965,16 +1717,10 @@ mod tests {
         }
     }
 
-    /// THE guard. Two claims, and the second is the one that is easy to lose:
-    ///
-    /// 1. The setting BITES — the three efforts render three DIFFERENT thinking
-    ///    sections, in every style and on both compaction tiers. Asserting that
-    ///    the identifier `reasoning_effort` appears somewhere would pass while
-    ///    the rendered cap was a constant; this compares the rendered text.
-    /// 2. The setting bites NOWHERE ELSE — the rest of the static prefix is
-    ///    byte-identical across all three. A reasoning preference that moved
-    ///    any other part of the prefix would re-prefill the KV cache for a
-    ///    reason unrelated to reasoning.
+    /// THE guard, in two claims. The setting BITES: three efforts render three different
+    /// `<thinking>` sections in every style and both tiers, compared as rendered text rather
+    /// than by looking for the identifier. And it bites NOWHERE ELSE: the rest of the static
+    /// prefix is byte-identical, or a reasoning preference would re-prefill the KV cache.
     #[test]
     fn reasoning_effort_changes_the_thinking_section_and_nothing_else() {
         for (name, raw) in ALL_STYLES {
@@ -2224,14 +1970,9 @@ mod tests {
         }
     }
 
-    /// Retry after a fruitless tool call was inconsistent because the prompt
-    /// only licensed a follow-up when the tool result itself suggested one, and
-    /// exactly one tool in the whole server did that. Every style, in BOTH
-    /// tiers, must now say that an empty result is not an answer and that
-    /// another tool should be tried — the compact tier especially, since
-    /// `ContextGovernor::prompt_window` clamps local/gguf to 8192 and the
-    /// on-device model never sees the verbose branch. (Named `prompt_budget_ctx`
-    /// until PAI-3 P1 moved it into `pond-core`.)
+    /// Every style, in BOTH tiers, must say that an empty tool result is not an answer and that
+    /// another tool should be tried. The compact tier especially: the on-device model never sees
+    /// the verbose branch, since `ContextGovernor::prompt_window` clamps local/gguf to 8192.
     #[test]
     fn every_style_and_tier_says_an_empty_result_is_not_an_answer() {
         let s = Settings::default();
@@ -2252,15 +1993,10 @@ mod tests {
         }
     }
 
-    /// Every style must say what this assistant IS, and whose pond it is.
-    ///
-    /// "Personal agentic assistant" rather than "AI assistant" is the product
-    /// framing and it is also operative: a model told it can ACT reaches for
-    /// tools, and a model told it answers questions explains why it cannot.
-    /// The ownership line matters for a household appliance — the pond belongs
-    /// to somebody, and `user_name` is the only pond-level name available in the
-    /// static prefix (a profile's preferred name is per-speaker and rides the
-    /// user message, so it cannot go here without breaking KV prefix reuse).
+    /// Every style must say what this assistant IS, and whose pond it is. "Personal agentic
+    /// assistant" is operative, not just framing: a model told it can act reaches for tools.
+    /// `user_name` is the only pond-level name available in the static prefix -- a profile's
+    /// preferred name is per-speaker and rides the user message, so it would break KV reuse.
     #[test]
     fn every_style_says_it_is_agentic_and_whose_pond_it_is() {
         let s = Settings::default();
@@ -2296,45 +2032,10 @@ mod tests {
         }
     }
 
-    /// The harness must not appear in the conversation.
-    ///
-    /// Measured on 2026-08-12, immediately after the goal-completeness check was
-    /// wired: the models began answering in the harness's own vocabulary --
-    /// "I could not fully meet your goal", "The goal has not been fully met",
-    /// "The goal is not fully met because I was unable to retrieve accurate time
-    /// zone information". That is an internal nudge, injected as an invisible
-    /// user message, being read back to the household verbatim.
-    ///
-    /// This is about VOCABULARY, not candour, and the distinction is the whole
-    /// point: `turn_budget_note` requires an incomplete answer to name what it
-    /// could not finish. What this forbids is describing the shortfall in
-    /// process terms ("the goal was not met") instead of domain terms ("I could
-    /// not find their birth dates"). A prompt that suppressed the admission
-    /// rather than the jargon would be a worse bug than the one it replaced.
-    ///
-    /// This rule was necessary and NOT on its own sufficient: with it in place,
-    /// E2B and E4B both still leaked the word "goal" on a capped fan-out turn.
-    ///
-    /// THE SECOND HALF LANDED 2026-08-14, and it is why this test no longer
-    /// requires the word "goal". The leak had a mechanical cause that no prompt
-    /// could outrank: `goose/crates/goose/src/agents/agent.rs` appended the
-    /// completeness check as an INVISIBLE USER MESSAGE reading `**Goal:** {goal}`
-    /// -- bolded, the noun repeated around it, and positioned after the system
-    /// prompt, the whole tool schema and the entire history. It was the last
-    /// thing in the context. `format.rs` had already written down what that costs
-    /// on these models: a competing suggestion beats a buried one.
-    ///
-    /// Fork patch seven reworded all three injected messages so none carries the
-    /// noun, and `pond-adapters-goose/src/goose_nudges.rs` pins that. Keeping the
-    /// old assertion would now REQUIRE the prompt to introduce a word the harness
-    /// never says -- making the prompt the only place the model ever sees it,
-    /// which is the pink-elephant version of the bug it was written to catch.
-    ///
-    /// What replaces it is a GENERAL rule rather than a named one: every style
-    /// says that anything in angle brackets is plumbing. See
-    /// [`the_plumbing_rule_covers_every_injected_block`] -- an enumeration goes
-    /// stale, and this one already had: `<tool-groups>` joined the envelope after
-    /// this test was written and nothing here noticed.
+    /// The harness must not appear in the conversation: no describing a shortfall in process
+    /// terms ("the goal was not met") instead of domain terms. This is vocabulary, not candour
+    /// -- `turn_budget_note` still requires naming what could not be finished, so the admission
+    /// is asserted beside the prohibition. The injected wording is pinned by `goose_nudges.rs`.
     #[test]
     fn every_style_forbids_narrating_the_harness() {
         let s = Settings::default();
@@ -2352,15 +2053,10 @@ mod tests {
                     "style '{name}' (compact={compact}): does not forbid mentioning internal \
                      scaffolding. Rendered:\n{out}"
                 );
-                // The admission must survive, and it must be part of THIS rule
-                // rather than anywhere in the prompt.
-                //
-                // Checked in a window from the prohibition, because the first
-                // version of this assertion searched the whole rendered prompt
-                // and passed with the clause deleted: `<tool-failure>` already
-                // contains "before telling the user you could not find
-                // something", so it was matching an unrelated sentence and
-                // reporting that the admission was intact.
+                // The admission must survive beside THIS rule, not anywhere in the prompt:
+                // searching the whole rendered prompt passes with the clause deleted,
+                // because `<tool-failure>` already contains "before telling the user you
+                // could not find something". So check a window from the prohibition.
                 let at = lower
                     .find("never mention")
                     .or_else(|| lower.find("never quote"))
@@ -2382,17 +2078,10 @@ mod tests {
         }
     }
 
-    /// The covertness rule is general, so it reaches blocks nobody has written yet.
-    ///
-    /// Every block the runtime wraps around a turn is an angle-bracket element,
-    /// and every style says angle brackets are plumbing. That is one sentence
-    /// covering six producers -- and, unlike an enumeration, the seventh.
-    ///
-    /// The enumeration is not a hypothetical failure. The rule this replaces
-    /// named "goal reminders, budgets, retries, system notes"; `<tool-groups>`
-    /// was added to the envelope by PAI-8's tool-selection work and appears in
-    /// none of those four categories, so a model quoting it would have broken no
-    /// rule the prompt stated.
+    /// The covertness rule is general, so it reaches blocks nobody has written yet: every block
+    /// the runtime wraps around a turn is an angle-bracket element, and every style says angle
+    /// brackets are plumbing. An enumeration goes stale -- `<tool-groups>` joined the envelope
+    /// with PAI-8's tool-selection work and matched none of the four categories then named.
     #[test]
     fn the_plumbing_rule_covers_every_injected_block() {
         use crate::mcp::services::tool_selection::dormant_groups_note;
@@ -2450,20 +2139,10 @@ mod tests {
         }
     }
 
-    /// The model may answer without a tool -- and the licence is never alone.
-    ///
-    /// Everything else in `<tool-usage>` pushes one way: "MUST trigger the
-    /// matching tool", "do not stop after one call", "continue calling tools".
-    /// A model with no permission to answer directly calls something for "hello".
-    ///
-    /// The licence is deliberately phrased as a narrow exception ADJACENT to the
-    /// obligation it qualifies, never as a standalone sentence, because this repo
-    /// has measured what a detached permissive clause does to a 2B model three
-    /// times: `turn_budget_note`'s "pace yourself" wording produced ZERO tool
-    /// calls on a ten-item question, and `format.rs` records a parenthetical
-    /// beating the instruction it was attached to. So this asserts BOTH halves
-    /// are present -- an obligation without its exception is the old prompt, and
-    /// an exception without its obligation is the regression.
+    /// The model may answer without a tool, and the licence is never alone: phrase it as a
+    /// narrow exception adjacent to the obligation it qualifies. A detached permissive clause
+    /// has cost this repo its tool calls three times (`turn_budget_note`'s "pace yourself"
+    /// produced zero on a ten-item question), so both halves are asserted here.
     #[test]
     fn every_style_licenses_answering_without_a_tool_beside_the_obligation() {
         let s = Settings::default();
@@ -2473,19 +2152,10 @@ mod tests {
                     render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
                 let lower = out.to_lowercase();
 
-                // The licence must be RESTRICTIVE, and that has to be checked
-                // structurally rather than by keyword.
-                //
-                // The first version of this assertion looked for "have changed"
-                // anywhere and was VACUOUS: the obligation says "anything that
-                // could have changed: call the tool", so deleting the licence
-                // outright still left a match. Proven by mutation -- warm's
-                // licence was replaced with nonsense and this test passed.
-                //
-                // What separates the two is the restriction. The obligation is
-                // open ("anything that could have changed"); the licence is
-                // narrow ("only when it cannot have changed", "the only
-                // exceptions"). So require a restrictive marker close in front.
+                // The licence must be RESTRICTIVE, checked structurally rather than by
+                // keyword: the obligation itself says "anything that could have changed",
+                // so a bare "have changed" match stays green with the licence deleted.
+                // Require a restrictive marker ("only", "exception") close in front.
                 const LOOKBACK: usize = 130;
                 let licensed = lower.match_indices("have changed").any(|(at, _)| {
                     let from = at.saturating_sub(LOOKBACK);
@@ -2511,17 +2181,10 @@ mod tests {
         }
     }
 
-    /// The model may skip the reasoning pass when there is nothing to reason about.
-    ///
-    /// The `<thinking>` section only ever leaned one way ("take time to think
-    /// when the question deserves it"), with no counterpart for a question that
-    /// deserves none. On the Orin that is pure latency: decode is a flat
-    /// 30.35 tok/s, so a needless 150-word pass is about five seconds of silence.
-    ///
-    /// Prompting cannot make this reliable -- the literature that makes adaptive
-    /// thinking work (AdaptThink, and router approaches like Ares) trains or
-    /// routes it rather than asking. This is a bias, and `thinking_mode` remains
-    /// the actual switch.
+    /// The model may skip the reasoning pass when there is nothing to reason about. On the Orin
+    /// decode is a flat 30.35 tok/s, so a needless 150-word pass is about five seconds of
+    /// silence. Prompting only biases this (AdaptThink and router approaches train or route it
+    /// instead), so `thinking_mode` remains the actual switch.
     #[test]
     fn every_style_licenses_skipping_the_reasoning_pass() {
         let s = Settings::default();
@@ -2556,19 +2219,10 @@ mod tests {
         }
     }
 
-    /// Covert is not dishonest.
-    ///
-    /// The requirement is silence by default, not denial: never volunteer a tool
-    /// name or a step count, and answer truthfully when the user asks outright.
-    /// Those are different properties and only the first is about noise.
-    ///
-    /// Building the second as concealment would have the assistant lie to its
-    /// owner about their own hardware, which contradicts
-    /// `pai/02-privacy-and-security-guardrails.md`: the privacy property GIAP
-    /// offers is that the model runs on your machine, explicitly NOT that the
-    /// model is blindfolded. It would also contradict `<vision>`, which forbids
-    /// the model claiming a capability it does not have -- the same honesty rule
-    /// pointing the other way.
+    /// Covert is not dishonest. The requirement is silence by default, not denial: never
+    /// volunteer a tool name or a step count, but answer truthfully when asked outright.
+    /// Concealment would contradict `pai/02-privacy-and-security-guardrails.md` -- the model
+    /// runs on your machine, it is not blindfolded -- and `<vision>`'s honesty rule.
     #[test]
     fn every_style_stays_honest_when_asked_outright() {
         let s = Settings::default();

@@ -1,8 +1,7 @@
 //! Stable identifier for a mesh peer (#132).
 //!
-//! A 32-byte newtype (matches an ed25519 public key / libp2p peer key length)
-//! rather than a bare `String` so a peer id can't be silently confused with
-//! any other identifier at a call site.
+//! A 32-byte newtype (an ed25519 public key / libp2p peer key length) rather than a
+//! bare `String`, so a peer id can't be confused with another identifier at a call site.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

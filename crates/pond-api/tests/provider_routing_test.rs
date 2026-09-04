@@ -1,11 +1,7 @@
-//! Universal loop routing integration tests for POST /api/v1/chat/stream.
-//!
-//! Verifies that classification metadata remains correct for chat/think/task
-//! messages while all requests execute through the Agent port.
-//!
-//! All tests use a wiremock server as the llamafile backend — no live services needed.
-//!
-//! Run: cargo test -p pond-api --test provider_routing_test
+//! Universal loop routing tests for POST /api/v1/chat/stream: classification
+//! metadata stays correct for chat, think and task messages while every request
+//! executes through the Agent port. A wiremock server stands in for the llamafile
+//! backend. Run: cargo test -p pond-api --test provider_routing_test
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

@@ -1,9 +1,7 @@
 //! Integration tests for `WhisperInput` and `WhisperKeywordDetector`.
-//!
-//! `WhisperInput` is the legacy HTTP backend (whisper-server multipart POST).
-//! It only compiles when `--features legacy-subprocess` is on, so this whole
-//! file is gated. The detector tests construct a small mock backend that
-//! implements `WhisperBackend`, exercising the no-feature path.
+//! `WhisperInput` is the legacy HTTP backend and compiles only under
+//! `--features legacy-subprocess`, so its tests are gated. The detector tests
+//! use a mock `WhisperBackend`, exercising the no-feature path.
 
 // ── Mock backend (default build) ──────────────────────────────────────────────
 

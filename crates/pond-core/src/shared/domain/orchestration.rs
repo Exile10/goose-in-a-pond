@@ -1683,22 +1683,10 @@ mod scope_inheritance_tests {
         );
     }
 
-    /// Every scope shape, plus a SECOND owner.
-    ///
-    /// Two members are INCOMPARABLE — neither contains the other — and that is
-    /// the pair [`ChildScope`] exists for, so a fixture with one `Owner` cannot
-    /// produce the input the clamp is being tested on.
-    ///
-    /// The second id is [`SECOND_EXEMPLAR_OWNER_ID`] rather than a string
-    /// written out here. It was written out here, and the two copies could
-    /// silently converge: replacing this literal with [`EXEMPLAR_OWNER_ID`]
-    /// deleted the incomparable pair from the sweep below and left all 899
-    /// tests green (verified by mutation, 2026-08-09). Sharing the constant
-    /// puts both fixtures under one distinctness guard,
-    /// `profile::scope_lattice_tests::the_second_owner_really_is_a_different_member`.
-    ///
-    /// [`SECOND_EXEMPLAR_OWNER_ID`]: crate::user_data::domain::profile::SECOND_EXEMPLAR_OWNER_ID
-    /// [`EXEMPLAR_OWNER_ID`]: crate::user_data::domain::profile::EXEMPLAR_OWNER_ID
+    /// Every scope shape, plus a SECOND owner: two members are INCOMPARABLE,
+    /// the input class [`ChildScope`] exists for and one a single-`Owner`
+    /// fixture cannot produce. The id is the shared `SECOND_EXEMPLAR_OWNER_ID`,
+    /// guarded by `profile::scope_lattice_tests::the_second_owner_really_is_a_different_member`.
     fn candidate_scopes() -> Vec<ProfileScope> {
         let mut scopes = ProfileScope::every_shape();
         scopes.push(ProfileScope::Owner(
@@ -1707,19 +1695,10 @@ mod scope_inheritance_tests {
         scopes
     }
 
-    /// The enforcement of PAI-6 invariant 1 on the profile axis, quantified
-    /// over every ordered pair of scope shapes rather than over the pairs
-    /// today's [`RolePersonalData`] happens to produce.
-    ///
-    /// That distinction is the whole reason the clamp is a pure function rather
-    /// than three lines inside `delegate`. The guards next door iterate
-    /// [`RolePersonalData::ALL`], and a variant carrying `#[serde(skip)]` never
-    /// enters that array: it widened a `Guest` parent to `Household` with all
-    /// 893 tests green. This test does not need to know what variants exist.
-    ///
-    /// It reaches the clamp through [`ChildScope::clamp_unpaired`], which is
-    /// `#[cfg(test)]`: production has no two-argument constructor, on purpose.
-    /// See [`ChildScope`].
+    /// PAI-6 invariant 1 on the profile axis, over every ordered pair of scope
+    /// shapes rather than the pairs today's [`RolePersonalData`] produces — a
+    /// variant carrying `#[serde(skip)]` never reaches `ALL`. It calls
+    /// [`ChildScope::clamp_unpaired`]; production has no such constructor.
     #[test]
     fn no_candidate_scope_survives_a_parent_that_does_not_contain_it() {
         let mut clamped_incomparable_owners = 0;
@@ -1756,17 +1735,10 @@ mod scope_inheritance_tests {
                 }
             }
         }
-        // Vacuity controls, both directions, stated as "at least one" rather
-        // than as a count: a count would have to be recomputed every time
-        // `every_shape()` grows, and would then be pinned to whatever the code
-        // did that day.
-        //
-        // The narrowing side is counted at the resolution that matters rather
-        // than as a bare `clamped > 0`. Two DIFFERENT owners are the one input
-        // class this clamp exists for, and `clamped > 0` is satisfied without
-        // it by Household-under-Guest and Owner-under-Guest — so the sweep
-        // could stop seeing the incomparable pair entirely and still pass,
-        // which is exactly what collapsing the two owner ids did.
+        // Vacuity controls, both directions, as "at least one" rather than a
+        // count that `every_shape()` growing would invalidate. The narrowing
+        // side counts DIFFERENT owners specifically: a bare `clamped > 0` is
+        // satisfied by Household-under-Guest even if that pair stops appearing.
         assert!(
             clamped_incomparable_owners > 0,
             "the sweep never clamped a pair of DIFFERENT owners, so it did not exercise the \
@@ -1797,26 +1769,10 @@ mod scope_inheritance_tests {
         assert_eq!(clamp(jerry.clone(), &ProfileScope::Household), jerry);
     }
 
-    /// The WIRE, which is the thing every other test in this module cannot
-    /// see.
-    ///
-    /// The sweep above proves the clamp clamps. Nothing proved that `delegate`
-    /// still calls it: replacing
-    /// `ChildScope::for_role(role.personal_data, &self.scope)` with
-    /// `role.personal_data.narrow(&self.scope)` left all 899 pond-core tests
-    /// green (verified by mutation, 2026-08-09), and no behavioural test could
-    /// have caught it, because for both variants that exist today the clamp is
-    /// the identity. That is recorded vacuity shape 2 — a gate tested while its
-    /// wiring is unguarded — and it is the shape that shipped PAI-1 P5 inert
-    /// for a whole phase.
-    ///
-    /// So the wire is held by the TYPE, and this test is how that fact fails
-    /// loudly rather than silently. `only_compiles_while_the_field_is_clamped`
-    /// borrows [`TaskSpec`]'s scope field as a [`ChildScope`]. Widen the field
-    /// back to `ProfileScope` — the edit that makes the mutation above compile
-    /// again — and this stops compiling, so the revert is a build break naming
-    /// this test, not a green diff. The runtime half is a control: it fails if
-    /// the field and the accessor ever stop being the same value.
+    /// The WIRE: no behavioural test can see whether `delegate` still calls the
+    /// clamp, since for both variants that exist today the clamp is the
+    /// identity. So the TYPE holds it — widening [`TaskSpec`]'s field back to
+    /// `ProfileScope` stops this test compiling. The runtime half is a control.
     #[test]
     fn the_specs_scope_can_only_be_a_value_that_went_through_the_clamp() {
         fn only_compiles_while_the_field_is_clamped(spec: &TaskSpec) -> &ChildScope {
@@ -1840,14 +1796,10 @@ mod scope_inheritance_tests {
         }
     }
 
-    /// PAI-6 invariant 1, for the profile axis. Exhaustive over both the enum
-    /// and every scope shape — the scope half through
-    /// [`ProfileScope::every_shape`] rather than a count written into this
-    /// sentence, and the enum half because it
-    /// iterates [`RolePersonalData::ALL`] rather than an array literal of the
-    /// variants that happened to exist the day it was written — which is what
-    /// it used to do, and which is why a third variant returning
-    /// `ProfileScope::Household` could widen a Guest parent and fail nothing.
+    /// PAI-6 invariant 1, for the profile axis. Exhaustive over both axes, and
+    /// it must stay so: [`ProfileScope::every_shape`] and
+    /// [`RolePersonalData::ALL`] rather than array literals, or a variant added
+    /// tomorrow can widen a Guest parent and fail nothing.
     #[test]
     fn no_role_setting_can_widen_the_parents_scope() {
         for personal_data in RolePersonalData::ALL {
@@ -1905,17 +1857,10 @@ mod scope_inheritance_tests {
         }
     }
 
-    /// The narrowing happens in `delegate`, but the value a running child
-    /// actually holds comes from `TaskSpec::child_authority` — a second copy,
-    /// and therefore a second chance to widen.
-    ///
-    /// The only test that read `child_authority(...).profile_scope()` used a
-    /// HOUSEHOLD parent, and Household is the widest scope there is, so its
-    /// fixture could not tell a copied scope from a hardcoded maximal one:
-    /// replacing `self.scope.clone()` with `ProfileScope::Household` handed
-    /// every subagent the whole household and left the suite green. Every
-    /// parent shape here is one that answer fails, and the claim is stated with
-    /// [`ProfileScope::is_within`] rather than by writing the lattice out again.
+    /// `delegate` narrows, but a running child holds what
+    /// `TaskSpec::child_authority` returns — a second copy, so a second chance
+    /// to widen. A Household parent cannot tell a copied scope from a hardcoded
+    /// maximal one, so sweep every parent shape and state it with `is_within`.
     #[test]
     fn a_childs_own_authority_is_the_specs_and_never_wider() {
         // Deliberately wider than the role asks for, so the tool assertion
@@ -2037,13 +1982,10 @@ mod tool_narrowing_tests {
         assert!(!spec.grants_tool("some-user-mcp-server__do_it"));
     }
 
-    /// PAI-6 P3, and the sharpest defect it fixes. `personal_data: deny` drops
-    /// the child to `Guest`; before P3 the tool set was computed from the
-    /// PARENT's scope, so a Household parent produced a Guest child still
-    /// holding `giap-memory` -- whose MCP tools carry no session at all and
-    /// read the household's memory regardless of what the scope says. A scope
-    /// that says Guest while the tools say Household is a laundering route, not
-    /// a narrowing.
+    /// PAI-6 P3: the tool set is computed from the CHILD's scope. `giap-memory`
+    /// tools carry no session and read the household's memory whatever the scope
+    /// says, so a child dropped to `Guest` that still holds them is a laundering
+    /// route, not a narrowing.
     #[test]
     fn a_child_dropped_to_guest_loses_the_groups_a_guest_is_denied() {
         let spec = parent(&["giap-memory", "giap-weather", "giap-vision"])
@@ -2102,17 +2044,10 @@ mod tool_narrowing_tests {
         }
     }
 
-    /// The half the test above cannot do. It iterates
-    /// `groups_denied_to_subagents()`, so **removing** an entry removes the
-    /// assertion with it — deleting `giap-system`, and separately
-    /// `giap-schedule`, each left the whole suite green. This one drives the
-    /// same behaviour from [`GROUPS_NO_SUBAGENT_MAY_HOLD`], which the shared
-    /// list cannot edit.
-    ///
-    /// It asserts the BEHAVIOUR, not the contents of a list: a Household parent
-    /// that holds the group, and a role that asks for it, must still produce a
-    /// child that does not have it. A source-text tripwire would pass against
-    /// any renaming of the same defect.
+    /// The half the test above cannot do: it iterates the shared denylist, so
+    /// removing an entry removes the assertion with it. This one drives the same
+    /// behaviour from [`GROUPS_NO_SUBAGENT_MAY_HOLD`], and asserts behaviour
+    /// rather than list contents so a rename of the defect still fails it.
     #[test]
     fn the_named_groups_never_reach_a_child_however_wide_the_parent() {
         for (group, mechanism) in GROUPS_NO_SUBAGENT_MAY_HOLD {
@@ -2139,14 +2074,10 @@ mod tool_narrowing_tests {
         }
     }
 
-    /// The two lists must stay the same set, so that adding a group to the
-    /// shared denylist forces somebody to record the mechanism it exists for,
-    /// and removing one is an edit to a failing test rather than a quiet
-    /// deletion.
-    ///
-    /// `tool_group.rs :: a_subagent_keeps_the_read_only_research_groups` is the
-    /// anti-over-denial control on the other side, so pinning equality here
-    /// cannot ratchet the list towards denying everything.
+    /// The two lists must stay the same set: adding a group to the shared
+    /// denylist forces the mechanism to be recorded, and removing one is an edit
+    /// to a failing test. `tool_group.rs ::
+    /// a_subagent_keeps_the_read_only_research_groups` guards over-denial.
     #[test]
     fn the_independently_named_groups_are_exactly_the_shared_denylist() {
         let named: BTreeSet<&str> = GROUPS_NO_SUBAGENT_MAY_HOLD
@@ -2163,12 +2094,10 @@ mod tool_narrowing_tests {
         );
     }
 
-    /// The draft half of PAI-6 P3, stated as the thing it actually prevents.
-    /// `approve_draft` is gated by `is_draft_decision_permitted`, which
-    /// resolves its actor through `engine_session_map` -- a table no subagent's
-    /// engine session is in. The gate therefore answers
-    /// `REASON_UNRESOLVED_ACTOR`, which under the DEFAULT `PolicyMode::Audit`
-    /// PROCEEDS. Withholding the group is the enforcement.
+    /// The draft half of PAI-6 P3. `is_draft_decision_permitted` resolves its
+    /// actor through `engine_session_map`, which holds no subagent, so it
+    /// answers `REASON_UNRESOLVED_ACTOR` and the default `PolicyMode::Audit`
+    /// PROCEEDS. Withholding the group is therefore the only enforcement.
     #[test]
     fn a_subagent_can_never_reach_a_draft_decision_tool() {
         // `every_shape()`, not a literal of today's three -- the literal that
@@ -2239,17 +2168,10 @@ mod tool_narrowing_tests {
             .collect()
     }
 
-    /// The failure this phase is most likely to ship: a turn whose allow-set was
-    /// already guest-subtracted must not have `giap-memory` reappear in its
-    /// authority.
-    ///
-    /// The fixture is built the way PRODUCTION builds it -- the full surface
-    /// put through `subtract_guest_denied_tools`, the same call `chat_stream`
-    /// makes at section 6d -- rather than by hand-writing a list that has
-    /// already had memory taken out of it. This programme's `ProfileScope::Owner`
-    /// incident was exactly a hand-built fixture that no code path could
-    /// produce; a hand-built post-subtraction list here would assert that
-    /// memory is absent from a list I removed it from myself.
+    /// A turn whose allow-set was already guest-subtracted must not have
+    /// `giap-memory` reappear in its authority. The fixture goes through
+    /// `subtract_guest_denied_tools`, the call `chat_stream` makes at section
+    /// 6d; a hand-written post-subtraction list would assert nothing.
     #[test]
     fn a_guest_turns_authority_cannot_contain_what_the_turn_was_denied() {
         let full = a_full_turns_tools();
@@ -2273,12 +2195,10 @@ mod tool_narrowing_tests {
         assert!(spec.grants_tool("giap-weather__get_forecast"));
     }
 
-    /// Vacuity control for the test above, and the reason it is worth having:
-    /// the SAME full surface, NOT guest-subtracted, does produce an authority
-    /// holding `giap-memory`. So the assertion is about the subtraction being
-    /// carried through, not about the catalog never having contained memory
-    /// and not about `for_turn` dropping personal-data groups on its own --
-    /// which it must not do, because a Household turn is entitled to them.
+    /// Vacuity control for the test above: the SAME full surface, NOT
+    /// guest-subtracted, does produce an authority holding `giap-memory`. So
+    /// the claim is that the subtraction carries through, not that `for_turn`
+    /// drops personal-data groups itself — a Household turn is entitled to them.
     #[test]
     fn the_same_surface_without_the_subtraction_does_carry_memory() {
         let full = a_full_turns_tools();
@@ -2479,18 +2399,10 @@ giap_role:
         }
     }
 
-    /// The test above does not test `deny_unknown_fields`, and I only found
-    /// that out by deleting the attribute and watching all four of its cases
-    /// stay green. Every one of them fails on `tool_groups` being REQUIRED —
-    /// including the `toolgroups:` typo, which errors on the missing
-    /// `tool_groups` rather than on the unknown one.
-    ///
-    /// These cases keep `tool_groups` valid and misspell one of the four
-    /// OPTIONAL fields, which is the only shape the attribute is load-bearing
-    /// for. Without it `personaldata: deny` parses as
-    /// `RolePersonalData::Inherit` — the child silently keeping the parent's
-    /// entire personal scope, on exactly the input a human got wrong. That is
-    /// the widening default this whole module exists to refuse.
+    /// The only shape `deny_unknown_fields` is load-bearing for: `tool_groups`
+    /// valid, one of the four OPTIONAL fields misspelled. The test above cannot
+    /// see it, because every case there fails on `tool_groups` being required.
+    /// Without the attribute `personaldata: deny` silently parses as `Inherit`.
     #[test]
     fn a_typo_on_an_optional_field_refuses_rather_than_silently_defaulting() {
         for (typo, field, consequence) in [
@@ -2574,14 +2486,9 @@ giap_role:
     }
 
     /// The turn budget and its cap, pinned to the literals the way
-    /// `depth_tests::the_depth_cap_is_one` pins its own.
-    ///
-    /// Every other assertion about these two numbers is self-referential —
-    /// `MAX_ROLE_MAX_TURNS + 1` for the refusal, `== DEFAULT_ROLE_MAX_TURNS`
-    /// for the default — so they follow the constants wherever the constants
-    /// go. 6 -> 25 and 12 -> 100 together left the whole file green, and the
-    /// comment next door claiming the default is "not Goose's 25" could not
-    /// see 25.
+    /// `depth_tests::the_depth_cap_is_one` pins its own. Every other assertion
+    /// about these two numbers is self-referential and follows the constants
+    /// wherever they go, so only this pin can see 6 -> 25 or 12 -> 100.
     #[test]
     fn the_role_turn_budget_and_its_cap_are_the_numbers_the_design_chose() {
         assert_eq!(
@@ -2602,17 +2509,10 @@ giap_role:
         );
     }
 
-    /// The default share of the parent's window, pinned to its literal and
-    /// wired to the behaviour that reads it — nothing read
-    /// `DEFAULT_CONTEXT_FRACTION` at all, so 0.5 -> 1.0 was green.
-    ///
-    /// The consequence in the failure message is now real, and was not when
-    /// this pin was written: PAI-6 P4 made `TaskSpec::context_fraction` the
-    /// argument to `DeviceLedger::reserve`, which `GooseAdapter::turn_profile`
-    /// spends through `CompactionProfile::with_history_reserved`. Stated with
-    /// the symbol chain rather than a `file:line`, and worth re-grepping —
-    /// a pin whose message describes a consequence no code implements is worse
-    /// than no pin, because a reader believes it.
+    /// The default share of the parent's window, pinned to its literal and to
+    /// the behaviour that spends it: `TaskSpec::context_fraction` ->
+    /// `DeviceLedger::reserve` -> `GooseAdapter::turn_profile` ->
+    /// `CompactionProfile::with_history_reserved`. Re-grep that chain if it moves.
     #[test]
     fn an_unstated_context_fraction_is_half_the_parents_budget() {
         assert!(
@@ -2677,10 +2577,9 @@ giap_role:
     }
 
     /// The role block rides a recipe that `pond-api`'s `RecipePrompt` and
-    /// Goose's own `Recipe` both still have to be able to read, which is the
-    /// whole basis of "no new persistence". Neither sets
-    /// `deny_unknown_fields`, so this asserts the shape they see: a document
-    /// whose other keys are untouched and whose prompt is still there.
+    /// Goose's own `Recipe` must both still read — the basis of "no new
+    /// persistence". Neither sets `deny_unknown_fields`, so assert the shape
+    /// they see: other keys untouched and the prompt still present.
     #[test]
     fn the_role_block_leaves_the_rest_of_the_recipe_readable() {
         let doc: serde_yaml::Value = serde_yaml::from_str(ROLE_YAML).unwrap();
@@ -2788,11 +2687,9 @@ mod concurrency_tests {
     use super::*;
     use crate::models::services::context::model_class::ON_DEVICE_PROVIDERS;
 
-    /// The trap this test exists for: invariant 3 is WORDED as "local/gguf",
-    /// and pinning only those two leaves `ollama` and `llamafile` -- which on a
-    /// pond talk to 127.0.0.1 and contend for the same GPU -- free to run
-    /// subagents in parallel. Iterating the shared constant means a provider
-    /// added to it later is covered without anyone remembering this file.
+    /// Invariant 3 is worded as "local/gguf", but `ollama` and `llamafile` talk
+    /// to 127.0.0.1 and contend for the same GPU, so they get no parallelism
+    /// either. Iterate `ON_DEVICE_PROVIDERS` so a later addition is covered.
     #[test]
     fn nothing_that_runs_on_this_device_gets_parallelism() {
         for provider in ON_DEVICE_PROVIDERS {
@@ -2842,12 +2739,10 @@ mod concurrency_tests {
         assert_eq!(provider_locality(" ollama "), ProviderLocality::OnDevice);
     }
 
-    /// **The fail-open this function shipped with.** It was
-    /// `if runs_on_this_device(provider) { 1 } else { REMOTE }`, so every
-    /// provider name the deny-set had not been taught was handed three children
-    /// on one GPU. None of these is hypothetical: `mock` is a shipped GIAP
-    /// provider (`--provider mock`), and `lmstudio`, `llama_swap` and `omlx` are
-    /// goose declarative providers that serve from localhost.
+    /// An unrecognised provider name gets one permit, never the remote limit.
+    /// None of these names is hypothetical: `mock` is a shipped GIAP provider
+    /// (`--provider mock`), and `lmstudio`, `llama_swap` and `omlx` are goose
+    /// declarative providers that serve from localhost onto the one GPU.
     #[test]
     fn a_provider_this_pond_cannot_place_gets_no_parallelism() {
         for provider in [
@@ -2962,17 +2857,10 @@ mod child_model_tests {
         );
     }
 
-    /// **The fail-open this resolver shipped with**, and the reason the request
-    /// is granted against a positive claim rather than against the absence of a
-    /// deny-list entry.
-    ///
-    /// As first written it was
-    /// `if runs_on_this_device { refuse } else { assign }`, so every one of
-    /// these names — `mock` is a shipped GIAP provider serving in-process, and
-    /// `lmstudio`, `llama_swap` and `omlx` are goose declarative providers
-    /// serving from localhost — got the role's model honoured, which on this
-    /// device is a second set of weights in the one slot plus the re-prefill the
-    /// parent's next turn pays for.
+    /// A role's model is honoured against a positive remote claim, never against
+    /// the absence of a deny-list entry. `mock` serves in-process and
+    /// `lmstudio`, `llama_swap` and `omlx` serve from localhost, so honouring a
+    /// model there is a second set of weights in the one slot plus a re-prefill.
     #[test]
     fn a_model_is_not_honoured_for_a_provider_this_pond_cannot_place() {
         for provider in [
@@ -3149,11 +3037,10 @@ mod background_tests {
         }
     }
 
-    /// **The fail-open this gate shipped with.** `for_provider` refused only
-    /// what `runs_on_this_device` recognised, so a background delegation was
-    /// PERMITTED on `mock` and on goose's localhost-serving declarative
-    /// providers — where "background" means the household's next reply is
-    /// queueing behind it.
+    /// A provider neither list recognises must be refused, not permitted:
+    /// `mock` and goose's localhost-serving declarative providers all serve
+    /// on this device, where a background child queues the household's next
+    /// reply behind it.
     #[test]
     fn background_is_refused_for_a_provider_this_pond_cannot_place() {
         for provider in [
@@ -3188,10 +3075,8 @@ mod background_tests {
     }
 
     /// The predicate is the semaphore's own number, not a second reading of
-    /// `runs_on_this_device`. Pinning the two together is what stops them
-    /// drifting into a state where one permit is enforced and background is
-    /// offered anyway — and it now spans all three localities, so a future
-    /// disagreement about the UNKNOWN case fails here too.
+    /// `runs_on_this_device`. Pinning the two together stops one permit being
+    /// enforced while background is offered anyway, across all three localities.
     #[test]
     fn availability_agrees_with_the_concurrency_limit_it_is_derived_from() {
         for provider in ON_DEVICE_PROVIDERS.iter().chain(

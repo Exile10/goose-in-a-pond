@@ -18,11 +18,8 @@ use crate::AppState;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::services::onboarding::OnboardingService;
 
-/// Checks whether onboarding is complete.
-/// If onboarding is NOT completed:
-///     returns HTTP 403
-/// If onboarding IS completed:
-///     request proceeds to next handler
+/// Checks whether onboarding is complete: HTTP 403 until it is, otherwise the
+/// request proceeds to the next handler.
 pub async fn require_onboarding_complete(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,

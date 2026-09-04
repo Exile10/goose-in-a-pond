@@ -1,38 +1,11 @@
-//! Streaming filter that strips two flavours of Harmony-style markup from
-//! token streams before they reach the SSE consumer:
-//!
-//!   1. Reasoning-channel preambles: `<|channel>thought ... <channel|>...`
-//!   2. Inline tool-call markup:     `<|tool_call> ... <tool_call|>`
-//!      (and the Gemma-style end-of-sequence sentinel `<eos>` that some
-//!      models keep emitting after they stop generating useful tokens)
-//!
-//! Rationale: Llamafile + Ollama implement `LlmProvider::stream_complete`
-//! natively, so the per-token output bypasses the post-`complete()` strip in
-//! `pond-adapters-local-inference::strip_thinking_tokens`. Reasoning-capable
-//! models (Gemma 4, gpt-oss, similar Harmony-channel families) leak their
-//! thinking preamble — and now their inline tool-call gibberish — straight
-//! to the user.
-//!
-//! This filter withholds only the bytes that could still turn out to be the
-//! start of a marker -- the longest suffix of its buffer that is a proper
-//! prefix of some open tag or sentinel. Ordinary prose matches nothing, so it
-//! is forwarded the instant it arrives; a marker split across chunks is still
-//! caught on the next push. Everything between a matched pair is suppressed,
-//! and whatever remains (post-close-tag) is flushed on stream end.
-//!
-//! The holdback being *conditional* is the whole point. An earlier version
-//! withheld a fixed 16 bytes on every push regardless of content, which made
-//! the visible answer permanently trail generation by that much and froze the
-//! chat mid-word whenever generation slowed. `plain_text_is_emitted_with_no_holdback`
-//! is the guard.
+//! Streaming filter that strips Harmony-style reasoning-channel preambles, inline `<|tool_call>`
+//! markup and stray `<eos>` sentinels before tokens reach SSE: llamafile and ollama implement
+//! `stream_complete` natively, so per-token output bypasses `strip_thinking_tokens`. The holdback
+//! must stay conditional on content, or the visible answer trails generation and freezes mid-word.
 
-/// The marker tables, owned by `pond-core` and used by both filters.
-///
-/// This file kept its own copies, and they drifted: `pond-core` grew the
-/// `<thinking>`/`</thinking>` pair after a model using the longer spelling had
-/// its whole reasoning block spoken aloud in voice mode, and this copy carried
-/// only `<think>` for a while afterwards. Two streaming filters over one
-/// vocabulary is one table, so a marker learned once is learned in both.
+/// The marker tables, owned by `pond-core` and shared by both streaming filters.
+/// Never keep a local copy here: the two vocabularies drift, and a marker learned once has to be
+/// learned by both filters.
 use pond_core::models::services::thought_filter::{PAIRED_TAGS, STANDALONE_SENTINELS};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,11 +21,9 @@ enum State {
 pub struct ThoughtFilter {
     state: State,
     buf: String,
-    /// Per-block accumulator for the body of a paired-tag envelope.  The
-    /// `<|channel>thought ...` block is discarded; the `<|tool_call> ...`
-    /// block is captured here so the SSE handler can surface a "the model
-    /// tried to call X but didn't use the proper protocol" notice instead
-    /// of silently dropping it.
+    /// Per-block accumulator for a paired-tag envelope body. A `<|channel>thought ...` block is
+    /// discarded; a `<|tool_call> ...` block is kept here so the SSE handler can report an
+    /// off-protocol tool call instead of dropping it silently.
     block_body: String,
     /// Open tag of the block we are currently inside, so we can decide
     /// whether to keep the body (tool_call) or discard it (channel/thought).
@@ -176,11 +147,8 @@ impl ThoughtFilter {
         match self.state {
             State::Normal => strip_standalones(&pending),
             State::InsideBlock(close) => {
-                // Dropping model output, so say so. The stream ended with a
-                // reasoning or tool-call envelope still open, which means either
-                // the model was cut off or it emitted an open marker it never
-                // closed. Either way bytes are being discarded, and discarding
-                // them silently is what made this class of bug invisible.
+                // The stream ended with an envelope still open, so bytes are being discarded.
+                // Warn: dropping model output silently is what made this class of bug invisible.
                 tracing::warn!(
                     close_marker = close,
                     dropped_bytes = pending.len() + self.block_body.len(),
@@ -207,17 +175,9 @@ impl ThoughtFilter {
     }
 }
 
-/// Best-effort parser for the body of a Harmony-style `<|tool_call>...
-/// <tool_call|>` envelope. Common shapes seen in the wild:
-///
-///   `call:NAME{ARGS_JSON}`
-///   `NAME{ARGS_JSON}`
-///   `NAME(ARGS_JSON)`
-///   `{"name": "NAME", "arguments": {...}}`
-///
-/// Returns `(tool_name, args_json_str)` when a recognised shape parses;
-/// otherwise `None`. The args string is left as-is so callers can pass it
-/// straight to a JSON parser or surface the raw text in a UI message.
+/// Best-effort parser for the body of a Harmony-style `<|tool_call>...<tool_call|>` envelope.
+/// Recognises `call:NAME{ARGS}`, `NAME{ARGS}`, `NAME(ARGS)`, `{"name": ..., "arguments": {...}}`,
+/// returning `(tool_name, args_json_str)` with the args left as raw text for the caller to parse.
 pub fn parse_tool_envelope(body: &str) -> Option<(String, String)> {
     let s = body.trim();
     // Strip an optional `call:` prefix.
@@ -253,13 +213,10 @@ pub fn parse_tool_envelope(body: &str) -> Option<(String, String)> {
     None
 }
 
-/// Every marker that can begin in `State::Normal`: the paired-tag OPEN markers
-/// plus the standalone sentinels. Close markers are absent on purpose -- inside
-/// a block only one close marker matters and it is already known.
-///
-/// Derived from the two tables rather than written out again, so adding a tag
-/// cannot leave a stale copy behind. Built once: `push` runs per token, so a
-/// per-call `Vec` here would be a per-token allocation.
+/// Every marker that can begin in `State::Normal`: paired-tag OPEN markers plus the standalone
+/// sentinels. Close markers are absent on purpose; inside a block only the one known close matters.
+/// Derived from the two tables so adding a tag cannot leave a stale copy, and built once because
+/// `push` runs per token.
 static NORMAL_MARKERS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
     PAIRED_TAGS
         .iter()
@@ -280,23 +237,10 @@ fn strip_standalones(s: &str) -> String {
     out
 }
 
-/// Byte index up to which `s` can be emitted right now.
-///
-/// Withholds only the longest suffix of `s` that is a *proper* prefix of some
-/// marker in `markers`. That suffix is the only thing which could still turn
-/// into a marker once more tokens arrive, so holding it back is sufficient to
-/// catch a marker split across chunk boundaries -- and holding back anything
-/// more is what stalls the stream. Returns `s.len()` when no suffix could begin
-/// a marker, which is the common case for ordinary prose.
-///
-/// A complete marker is deliberately *not* a match: proper prefixes only. In
-/// `State::Normal` a complete open tag has already been found by `buf.find`,
-/// and a complete sentinel is removed by [`strip_standalones`], so treating a
-/// whole marker as a partial would withhold it forever.
-///
-/// The returned index is always a UTF-8 char boundary, so callers can slice at
-/// it. Cost is bounded by the longest marker (17 bytes) times the marker count,
-/// per push -- this runs per token, including on a Jetson Orin Nano.
+/// Byte index up to which `s` can be emitted now: everything but the longest suffix that is a
+/// *proper* prefix of some marker, the only text that could still become one. Complete markers must
+/// not match, or they would be withheld forever; `buf.find` and [`strip_standalones`] handle those.
+/// The index is always a UTF-8 char boundary, and this runs per token, so keep it cheap.
 fn safe_emit_len(s: &str, markers: &[&str]) -> usize {
     let longest = markers.iter().map(|m| m.len()).max().unwrap_or(0);
     // A proper prefix is at most `longest - 1` bytes, so nothing before this
@@ -546,10 +490,8 @@ mod tests {
         assert_eq!(total, "hi");
     }
     // ── Holdback behaviour ─────────────────────────────────────────────────
-    //
-    // The bug these pin: `safe_emit_len` used to withhold a fixed 16 bytes on
-    // every push regardless of content, so the visible answer trailed
-    // generation by that much and froze the chat mid-word.
+    // These pin that `safe_emit_len` withholds only bytes that could still become a marker: a
+    // fixed holdback makes the visible answer trail generation and freezes the chat mid-word.
 
     #[test]
     fn ordinary_text_is_emitted_with_no_holdback_on_the_very_first_push() {

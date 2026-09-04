@@ -1,13 +1,6 @@
-//! A turn that outlives the connection that asked for it.
-//!
-//! Every test here drives the real router against a tempdir SQLite database,
-//! with a stub agent standing in for `GooseAdapter`. What they are actually
-//! about is what happens when the READER goes away: the shared `MockAgent`
-//! yields its three events with no delay, so a test that drops the body
-//! mid-turn would race it. `SlowAgent` below exists to make "still answering" a
-//! real state rather than a hope. It is local on purpose — roughly thirty
-//! suites depend on `MockAgent`'s timing.
-//!
+//! A turn that outlives the connection that asked for it, driven through the real
+//! router against a tempdir database. `SlowAgent` is local because the shared
+//! `MockAgent` yields with no delay and some thirty suites depend on that timing.
 //! Run: cargo test -p pond-api --test detached_run_resume
 
 use std::sync::Arc;
@@ -204,12 +197,10 @@ struct SlowAgent {
     gap: Duration,
     /// Says nothing at all before finishing. For the orphan-repair case.
     silent: bool,
-    /// Quiet time AFTER the last chunk, before `Done`.
-    ///
-    /// This is what makes "cancel it mid-turn" a window rather than a race. SSE
-    /// frames batch, so a test reading "two payloads" can already be most of the
-    /// way through a turn whose only delays are between chunks — which is
-    /// exactly how the first version of these tests flaked.
+    /// Quiet time AFTER the last chunk, before `Done`, which makes "cancel it
+    /// mid-turn" a window rather than a race: SSE frames batch, so a test reading
+    /// two payloads can already be most of the way through a turn whose only
+    /// delays sit between chunks.
     tail: Duration,
 }
 
@@ -572,13 +563,10 @@ write any of it down until much later, which is how most records begin.";
 
 #[tokio::test]
 async fn cancelling_keeps_what_was_already_said() {
-    // Long enough to actually reach the wire, then three seconds of nothing.
-    //
-    // The length is not padding. The thought filter holds text back until it
-    // passes a safe-emit threshold, so a four-character answer is still sitting
-    // in its buffer when the cancel lands — and a cancelled turn keeps what it
-    // STREAMED, not what it was about to. `cancelling_a_run_that_never_spoke...`
-    // below covers the other side of that line.
+    // The answer must be long enough to pass the thought filter's safe-emit
+    // threshold, or it is still buffered when the cancel lands: a cancelled turn
+    // keeps what it STREAMED. `cancelling_a_run_that_never_spoke...` below covers
+    // the other side of that line.
     let (app, _tmp) = make_app(SlowAgent::with_tail(&[SPOKEN], 50, 3_000)).await;
     let session = "sess-cancel";
 
@@ -590,12 +578,10 @@ async fn cancelling_keeps_what_was_already_said() {
         ))
         .await
         .unwrap();
-    // Only the opening frame is read. Waiting for the ANSWER would be waiting on
-    // something that does not come: the thought filter holds short text back
-    // until the turn ends, so a test that reads "two payloads" is really waiting
-    // for the whole turn and then cancels nothing. Cancel on elapsed time
-    // instead — the agent has said its piece by 50ms and is then quiet for three
-    // seconds, which is the window this is aiming at.
+    // Read only the opening frame: the thought filter holds short text back until
+    // the turn ends, so waiting for two payloads waits for the whole turn and
+    // cancels nothing. Cancel on elapsed time instead, inside the three-second
+    // quiet window that opens once the agent has spoken at 50ms.
     let seen = read_then_drop(res.into_body(), 1).await;
     let run_id = parse(&seen)[0]["run_id"].as_str().unwrap().to_string();
     tokio::time::sleep(Duration::from_millis(300)).await;

@@ -1,40 +1,7 @@
-//! The engine's own nudges must not be quotable.
-//!
-//! Goose appends invisible USER messages to steer a turn: a completeness check
-//! when a turn ends without a tool call, a grind reminder, and a kickoff for the
-//! `/goal` command. "Invisible" means invisible to the *person* — the model sees
-//! them as ordinary user text, appended after the system prompt, the whole tool
-//! schema and the entire history. They are the last thing in the context before
-//! generation.
-//!
-//! That position is the problem. Measured 2026-08-12 on gemma-4-E2B and E4B, the
-//! models answered in the harness's vocabulary: *"I could not fully meet your
-//! goal"*, *"The goal has not been fully met"*. The wording handed them the noun:
-//! `**Goal:** {goal}`, bolded, with "goal" said three more times around it.
-//!
-//! GIAP's system prompt forbids exactly this, and the prohibition was not enough.
-//! `crates/pond-mcp-server/src/format.rs` had already written down why, from an
-//! unrelated measurement on the same models: *"a competing suggestion beats a
-//! buried one."* The prohibition sits in the static prefix, thousands of tokens
-//! back; the nudge sits at position −1.
-//!
-//! So the fix is the nudge's wording, and this guard pins it. **It is deliberately
-//! not a test of GIAP's prompt** — `every_style_forbids_narrating_the_harness` in
-//! `pond-core` covers that half, and its doc records that the half it could not
-//! cover was this one.
-//!
-//! WHY THIS CRATE. `include_str!` over the submodule makes the including crate
-//! unbuildable without `git submodule update --init`. `pond-core` is in CI's
-//! "fast crates" set precisely because it does not pull goose, and putting this
-//! guard there would quietly end that split. `pond-adapters-goose` already owns
-//! the goose relationship and is already excluded from the fast set.
-//!
-//! WHAT IS NOT GUARDED, and why. `stop_hook_denial_context_message` builds a
-//! nudge naming a plugin and a "policy hook denial". It is the same category of
-//! harness vocabulary, and it is left alone: GIAP never arms a stop hook, so no
-//! measurement here could show the wording mattering, and every line changed in
-//! the fork is a line to re-apply at every upstream rebase. It is included in the
-//! scan below and passes on its own merits — it happens to name no goal.
+//! Pins the wording of the user nudges goose appends last in the context (completeness check,
+//! grind, `/goal` kickoff): on gemma-4 E2B/E4B a bolded `**Goal:**` there leaked into answers
+//! despite the prompt's ban (`every_style_forbids_narrating_the_harness` covers that half). Lives
+//! here, not in `pond-core`: `include_str!` over the goose submodule would cost it CI's fast set.
 
 #![cfg(test)]
 
@@ -45,11 +12,9 @@ const AGENT_RS: &str = include_str!("../../../goose/crates/goose/src/agents/agen
 /// goal/grind/kickoff injections plus the stop-hook one.
 const FLOOR_NUDGES: usize = 4;
 
-/// The source with `//` line comments removed, string literals intact.
-///
-/// Load-bearing: the comments this change added to `agent.rs` quote the old
-/// wording verbatim in order to explain it, so without the strip this guard
-/// would fail on the documentation of its own fix.
+/// The source with `//` line comments removed, string literals intact. Load-bearing: comments
+/// in `agent.rs` quote the old wording verbatim, so without the strip this guard would fail
+/// on the documentation of its own fix.
 fn strip_line_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     for line in src.lines() {
@@ -75,21 +40,14 @@ fn strip_line_comments(src: &str) -> String {
     out
 }
 
-/// The text of every message the engine appends to the model's context.
-///
-/// Anchored on the bindings rather than on `Message::user()`, because the text is
-/// built into a variable one statement earlier and a windowed search around the
-/// constructor would either miss it or drag in the neighbouring notification.
-///
-/// Returns `(anchor, literal_text)` with `{...}` interpolations removed — the
-/// variable is *named* `goal`, and `{goal}` is a value, not vocabulary.
+/// The text of every message the engine appends to the model's context, returned as
+/// `(anchor, literal_text)` with `{...}` interpolations removed (`{goal}` is a value, not a word).
+/// Anchored on the bindings, not `Message::user()`: the text is built one statement earlier,
+/// and a window around the constructor would miss it or drag in the neighbouring notification.
 fn injected_message_texts(src: &str) -> Vec<(String, String)> {
-    // `fn goal_nudge` joined the list when the fork extracted the completeness
-    // nudge into a named helper (fix/goal-check-narrated-aloud) -- the binding
-    // became `let nudge = goal_nudge(&goal)` and the text moved into the fn,
-    // where the old anchors could not see it. The helper body is a single
-    // `format!` expression, so the statement-to-first-semicolon walk below
-    // captures exactly its string.
+    // `fn goal_nudge` is anchored because the fork moved the completeness nudge's text into
+    // that helper; its body is a single `format!`, so the statement-to-first-semicolon walk
+    // below captures exactly its string.
     const ANCHORS: &[&str] = &[
         "let nudge = format!(",
         "let kickoff = Message::user()",
@@ -178,11 +136,8 @@ fn no_injected_nudge_carries_a_quotable_label() {
     }
 }
 
-/// The exact string that produced the measured leak, pinned by itself.
-///
-/// Separate from the loop above because it is the specific regression, and a
-/// specific regression deserves a test that names it rather than one that
-/// catches it as a side effect of a general rule.
+/// The exact string that produced the measured leak, pinned by itself so the specific
+/// regression has a test that names it rather than one that catches it as a side effect.
 #[test]
 fn the_bolded_goal_label_is_gone_from_the_whole_file() {
     let code = strip_line_comments(AGENT_RS);

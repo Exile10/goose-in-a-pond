@@ -1,33 +1,7 @@
-//! Whether this binary can use the accelerator the host actually has.
-//!
-//! # The failure this exists to make impossible
-//!
-//! On a Jetson, CUDA is not a build convenience — it is the difference between
-//! a usable pond and an unusable one. Measured on an Orin Nano with the same
-//! model and the same prompt: **696 tokens/second of prefill with CUDA, 26
-//! without**. A 1,200-token preamble is 1.7 seconds one way and 46 seconds the
-//! other.
-//!
-//! And nothing tells you which one you have. CUDA reaches llama.cpp through a
-//! five-link feature chain —
-//! `pond-adapters-local-inference/cuda` -> `goose/cuda` -> `goose-providers/cuda`
-//! -> `goose-local-inference/cuda` -> `llama-cpp-2/cuda` — that is passed on the
-//! COMMAND LINE by one deploy script. Build the same source any other way and
-//! every link silently evaluates to "off": the binary compiles, starts, loads
-//! the model, answers correctly, and is roughly thirty times slower. There is no
-//! error, no missing symbol, and no line in any log.
-//!
-//! That is not hypothetical. `scripts/jetson/build-docker.sh` builds with
-//! `--features local-inference` and no `cuda`, so a container built from it is a
-//! CPU binary that looks exactly like the right one.
-//!
-//! # Why a warning and not a refusal
-//!
-//! A CPU build on a Jetson is wrong, but it is not unsafe, and refusing to start
-//! would turn a slow pond into no pond — including on a host where somebody is
-//! deliberately running without the accelerator to test something. The
-//! obligation this module discharges is that the situation is **stated**, in a
-//! form nobody has to already suspect in order to notice.
+//! Whether this binary can use the accelerator the host actually has. Without CUDA a Jetson
+//! prefills at 26 tok/s against 696, and the five-link feature chain (local-inference/cuda down
+//! to llama-cpp-2/cuda) silently evaluates to "off" with no error in any log — as
+//! `scripts/jetson/build-docker.sh` does. Warn, never refuse: a CPU pond beats no pond.
 
 /// What this binary can do with this host's accelerator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,10 +17,8 @@ pub enum Acceleration {
 
 /// Decide what this pair of facts means.
 ///
-/// Deliberately takes both as plain `bool` rather than reading the host or a
-/// `cfg!` itself: the host probe and the build flag live in two different crates
-/// (one is `pond-server`, the other is the adapter that owns the feature), and a
-/// policy that reached for either could not be tested at all.
+/// Both arrive as plain `bool` rather than being read here: the host probe lives in
+/// `pond-server` and the build flag in the adapter, so reading either would make this untestable.
 pub fn classify(host_is_accelerated: bool, cuda_build: bool) -> Acceleration {
     match (host_is_accelerated, cuda_build) {
         (_, true) => Acceleration::CudaBuild,
@@ -57,9 +29,8 @@ pub fn classify(host_is_accelerated: bool, cuda_build: bool) -> Acceleration {
 
 /// What to tell the operator, or `None` when there is nothing wrong.
 ///
-/// Carries the rebuild command, because a warning that says only "this is slow"
-/// leaves the reader to rediscover a five-link feature chain that is passed on
-/// one command line in one script.
+/// Carries the rebuild command: the CUDA feature chain is five links long and is passed on
+/// one command line in one script, so nothing else would lead the reader to it.
 pub fn warning(acceleration: Acceleration) -> Option<&'static str> {
     match acceleration {
         Acceleration::CudaBuild | Acceleration::CpuElsewhere => None,
@@ -77,17 +48,9 @@ pub fn warning(acceleration: Acceleration) -> Option<&'static str> {
 }
 
 /// Whether a host looks like it has an NVIDIA accelerator GIAP should be using.
-///
-/// Takes the evidence rather than reading it, so the decision is testable
-/// without a Jetson. `model` is the contents of `/proc/device-tree/model`, which
-/// is what `scripts/giap.sh` already reads for the same question — matching it
-/// deliberately, so the shell and the binary cannot disagree about what host
-/// they are on.
-///
-/// `has_tegra_release` is `/etc/nv_tegra_release`, present on a JetPack install.
-/// Either signal alone is enough: the device tree names the board on a Jetson,
-/// and the release file survives on hosts whose device tree is unreadable in a
-/// container.
+/// Evidence is passed in, not read, so this is testable off-device: `model` is
+/// `/proc/device-tree/model`, the same file `scripts/giap.sh` reads; `has_tegra_release` is
+/// `/etc/nv_tegra_release`. Either signal alone is enough.
 pub fn host_is_accelerated(model: Option<&str>, has_tegra_release: bool) -> bool {
     if has_tegra_release {
         return true;

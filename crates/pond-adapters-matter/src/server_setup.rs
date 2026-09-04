@@ -1,29 +1,7 @@
-//! Local controller lifecycle — GIAP installs and runs the controller itself.
-//!
-//! The controller is a Node process: `matter-server/`, shipped beside the
-//! binary, running matter.js. Requiring the user to hand-build a runtime before
-//! a single bulb works is the wrong first-run experience for an appliance, so
-//! when Matter is enabled and nothing is serving the configured port, GIAP sets
-//! one up:
-//!
-//! 1. probe the port — if a controller is already there (the user runs their
-//!    own, or a previous Pond left one up), use it and change nothing;
-//! 2. otherwise copy the controller into the data dir and `npm ci` its pinned
-//!    dependencies there;
-//! 3. spawn it with its storage inside the data dir, so the commissioned fabric
-//!    (and every paired device) survives restarts and upgrades;
-//! 4. wait for the port to accept connections before the adapter connects.
-//!
-//! Only loopback URLs are auto-started: a remote `matter_ws_url` is someone
-//! else's controller and GIAP must not try to manage it.
-//!
-//! # Why the app is copied rather than run in place
-//!
-//! `npm ci` writes `node_modules/` next to the `package.json` it reads, and the
-//! asset root may be a read-only install directory or an app bundle. Copying the
-//! sources into `<data_dir>/matter-server/app/` puts the dependency tree
-//! somewhere writable, and lets Node resolve `node_modules` as a plain sibling of
-//! the entrypoint — no `NODE_PATH`, no ESM resolution games.
+//! Local controller lifecycle — GIAP installs and runs the controller itself: a Node
+//! process (matter.js) shipped beside the binary. It adopts an existing controller on the
+//! port, else copies the sources to a writable `<data_dir>/matter-server/app/` so `npm ci`
+//! works, and spawns them with storage in the data dir. Only loopback URLs are auto-started.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -41,23 +19,16 @@ use tokio_tungstenite::connect_async;
 use crate::notify::MatterNotifier;
 use crate::protocol::{check_greeting, PROTOCOL_NAME};
 
-/// The controller GIAP started, if any. Shared rather than owned outright
-/// because two places have to agree on which process is current: the reconciler
-/// kills it on teardown, and the reconnect supervisor replaces it when it finds
-/// the process dead. `None` means GIAP did not start one — the user runs their
-/// own controller, or Matter is off.
+/// The controller GIAP started, if any. Shared rather than owned outright because two
+/// places must agree on which process is current: the reconciler kills it on teardown, and
+/// the reconnect supervisor replaces it when it finds the process dead. `None` means GIAP
+/// started none — the user runs their own controller, or Matter is off.
 pub type SharedServerChild = Arc<AsyncMutex<Option<Child>>>;
 
 /// matter.js 0.17's own engine range, verbatim: `>=20.19.0 <22.0.0 || >=22.13.0`.
 ///
-/// It is a range with a HOLE in it, not a floor, and that is the whole point of
-/// spelling it out here: Node 22.0 through 22.12 satisfies "20.19 or newer" and
-/// does NOT satisfy matter.js. Treated as a floor, GIAP installed a controller
-/// onto a Node it cannot run on, and the failure arrived as whatever the runtime
-/// happened to throw first rather than as "this Node is not supported".
-///
-/// `MIN_NODE` is still the number the guidance quotes, because it is the oldest
-/// Node that works and "install 20.19+" is the sentence a person can act on.
+/// A range with a HOLE in it, not a floor: Node 22.0 through 22.12 satisfies "20.19 or
+/// newer" and does NOT satisfy matter.js. `MIN_NODE` is the number the guidance quotes.
 pub const MIN_NODE: (u32, u32) = (20, 19);
 
 /// The excluded range: 22.0 up to, but not including, 22.13.
@@ -65,11 +36,8 @@ const EXCLUDED_NODE: ((u32, u32), (u32, u32)) = ((22, 0), (22, 13));
 
 /// How many lines of the controller's stderr to keep.
 ///
-/// A child that dies before it is ready writes its reason only to stderr, and
-/// with the output going to a file nobody reads, the most GIAP could say was
-/// that the port never opened. The tail is attached to the readiness-timeout
-/// error so the reason travels with the failure. Twenty lines is enough for a
-/// Node stack trace without holding a log in memory.
+/// A child that dies before it is ready writes its reason only to stderr, so the tail is
+/// attached to the readiness-timeout error. Twenty lines fits a Node stack trace.
 const STDERR_TAIL_LINES: usize = 20;
 
 /// Parse `"v20.19.4"` into `(20, 19)`. Pure so the version gate is testable
@@ -96,9 +64,8 @@ pub fn meets_min_node(version: (u32, u32)) -> bool {
 
 /// Why this Node will not do, in a sentence a person can act on.
 ///
-/// The excluded range needs its own wording: "Node 22.5 is on PATH but the
-/// controller needs 20.19+" reads as a contradiction, and a user who checks
-/// their version against that sentence concludes GIAP is broken.
+/// The excluded range needs its own wording: "Node 22.5 is on PATH but the controller needs
+/// 20.19+" reads as a contradiction, and a user checking against it concludes GIAP is broken.
 fn node_version_objection(version: (u32, u32)) -> String {
     let (from, until) = EXCLUDED_NODE;
     if version >= from && version < until {
@@ -157,11 +124,8 @@ pub fn storage_dir(data_dir: &Path) -> PathBuf {
 
 /// Is something accepting connections on the controller port?
 ///
-/// A bare TCP probe, and only used to wait for a controller GIAP has just
-/// spawned — where what is listening is not in question. Deciding whether to
-/// ADOPT a listener is [`probe_controller`]'s job, because "something answers"
-/// and "our controller answers" are different questions, and conflating them let
-/// any process holding the port be adopted forever.
+/// A bare TCP probe, used only to wait for a controller GIAP just spawned. Deciding whether
+/// to ADOPT a listener is [`probe_controller`]'s job; the two questions are different.
 pub async fn is_running(port: u16) -> bool {
     tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
@@ -186,12 +150,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Find out what is on `port` by speaking to it.
 ///
-/// The TCP probe alone is not enough to decide whether to reuse a listener, and
-/// getting that wrong is not a small matter. A different server holding the port
-/// answers TCP, so it was adopted; it does not serve `/giap`, so every connection
-/// then failed; and because it had been "reused", GIAP never started a controller
-/// of its own. Permanently broken, and the log said only that it was reusing a
-/// controller and then could not reach it.
+/// A TCP probe alone cannot decide whether to reuse a listener: a different server holding
+/// the port answers TCP, is adopted, does not serve `/giap`, and every connection fails.
 pub async fn probe_controller(port: u16, url: &str) -> Occupant {
     if !is_running(port).await {
         return Occupant::Free;
@@ -297,10 +257,8 @@ async fn find_node() -> Result<PathBuf> {
 
 /// Directories never worth copying into the install.
 ///
-/// `node_modules` is the one that matters: in a dev checkout the source tree has
-/// one, and `npm ci` deletes and rebuilds it anyway — so copying it is a hundred
-/// megabytes of work to produce something immediately thrown away. The others
-/// are simply not runtime inputs.
+/// `node_modules` is the one that matters: `npm ci` deletes and rebuilds it anyway, so
+/// copying a dev checkout's tree is a hundred megabytes of immediately discarded work.
 const NOT_COPIED: &[&str] = &["node_modules", "test", ".git"];
 
 /// Replace the installed sources while leaving `node_modules` where it is.
@@ -363,17 +321,10 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// What the installed tree was built from: its dependencies, and its sources.
-///
-/// TWO fingerprints, because they answer different questions and have very
-/// different costs. Dependencies change rarely and cost minutes (`npm ci`);
-/// sources change with every release and cost a file copy.
-///
-/// The marker used to be the lockfile alone, which silently made every
-/// source-only change a no-op: a controller fix would ship in the binary, the
-/// installed copy under the data dir would keep running the old code, and
-/// nothing anywhere would say so. That is how a fixed bug comes back on the one
-/// machine that already had the software.
+/// What the installed tree was built from: its dependencies, and its sources. TWO
+/// fingerprints, because they answer different questions at different costs: dependencies
+/// change rarely and cost minutes (`npm ci`); sources change every release. A lockfile-only
+/// marker makes every source-only change a silent no-op.
 #[derive(PartialEq, Eq)]
 struct Fingerprint {
     deps: String,
@@ -396,9 +347,8 @@ impl Fingerprint {
 
 /// Hash `bytes` into a short hex string.
 ///
-/// `DefaultHasher` rather than a cryptographic digest: this detects change, it
-/// does not defend against a forged one, and the alternative was a new
-/// dependency for something a std hasher does adequately.
+/// `DefaultHasher` rather than a cryptographic digest: this detects change, it does not
+/// defend against a forged one.
 fn digest(bytes: &[u8]) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -460,15 +410,10 @@ fn fingerprint(dir: &Path) -> Result<Fingerprint> {
     })
 }
 
-/// Install the controller into the data dir. Idempotent: if the installed tree
-/// was built from the lockfile that ships now, this is a no-op.
 /// Turn what node printed into something a person can act on.
 ///
-/// A crashing controller prints a JavaScript stack trace, and passing that through
-/// verbatim asks the reader to parse a loader backtrace to find out that a directory
-/// needs reinstalling. The failures worth naming are the ones with a specific remedy;
-/// anything else keeps node's own words, because an unrecognised fault said plainly
-/// is better than a guess said confidently.
+/// The failures worth naming are the ones with a specific remedy; anything else keeps
+/// node's own words, because an unrecognised fault said plainly beats a confident guess.
 fn explain_startup_failure(stderr: &str, app: &Path) -> String {
     if stderr.contains("ERR_MODULE_NOT_FOUND") {
         // Which module is missing decides whether the dependencies or the sources
@@ -503,30 +448,18 @@ fn explain_startup_failure(stderr: &str, app: &Path) -> String {
     format!("The Matter controller said:\n{stderr}")
 }
 
-/// Is this install actually runnable?
-///
-/// The marker records what was *asked* for, not what survived. A cancelled or raced
-/// `npm ci` leaves a tree that satisfies every check above -- marker current,
-/// `node_modules` present -- and still cannot start, because the loader needs `tsx`
-/// and the entry file. Checking the two things node will reach for turns a silent
-/// corrupt install into one clear failure at setup, instead of a stack trace on
-/// every boot from then on.
+/// Is this install actually runnable? The marker records what was *asked* for, not what
+/// survived: a cancelled or raced `npm ci` leaves a current marker and a tree that still
+/// cannot start, because the loader needs `tsx` and the entry file. Check the two things
+/// node will actually reach for.
 fn install_is_runnable(app: &Path) -> bool {
     app.join("src/server.ts").is_file() && app.join("node_modules/tsx").is_dir()
 }
 
-/// Serialises installs.
-///
-/// `ensure_installed` is reached from the reconciler, from the revive path, and
-/// from a plain start, and nothing stopped two of them running at once. They race
-/// destructively rather than merely wastefully: one clears the tree while the other
-/// is halfway through `npm ci` into it, and the survivor then writes the "installed"
-/// marker over a half-built install that every later start trusts. Observed as a
-/// controller that had 7 of its 51 packages and reported `Cannot find package 'tsx'`
-/// on every boot, from a marker claiming the install was complete.
-///
-/// Held across the whole install, `npm ci` included, so the second caller waits and
-/// then finds the marker already current rather than redoing it.
+/// Serialises installs. `ensure_installed` is reached from the reconciler, the revive path
+/// and a plain start, and two at once race destructively: one clears the tree while the
+/// other is halfway through `npm ci`, and the survivor writes the "installed" marker over a
+/// half-built tree. Held across the whole install, so the second caller finds it current.
 static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn ensure_installed(data_dir: &Path, notifier: &MatterNotifier) -> Result<()> {
@@ -582,15 +515,10 @@ async fn ensure_installed(data_dir: &Path, notifier: &MatterNotifier) -> Result<
         .with_context(|| format!("creating {}", controller_dir(data_dir).display()))?;
     copy_tree(&source, &app)?;
 
-    // `kill_on_drop` because this future is cancellable: the reconciler races
-    // `connect()` against a settings change, so toggling Matter off mid-install
-    // drops us here. Without it the child keeps running after the runtime has
-    // reported `Disabled`, keeps writing into the tree, and survives process
-    // exit -- `shutdown()` never sees it. Re-enabling before it finishes then
-    // finds a half-written tree and starts a second install into it.
-    //
-    // `npm ci` is the multi-minute part, so it is where a cancellation almost
-    // always lands.
+    // `kill_on_drop` because this future is cancellable: the reconciler races `connect()`
+    // against a settings change, so toggling Matter off mid-install drops us here. Without
+    // it the child keeps writing into the tree and survives process exit, and re-enabling
+    // finds a half-written tree. `npm ci` is where a cancellation almost always lands.
     let output = Command::new("npm")
         .args(["ci", "--omit=dev", "--no-audit", "--no-fund"])
         .current_dir(&app)
@@ -782,11 +710,9 @@ fn spawn_server(data_dir: &Path, port: u16, ble: bool) -> Result<(Child, StderrT
     Ok((child, tail))
 }
 
-/// Re-emit one controller stderr line into `tracing`.
-///
-/// Structured records keep their level and their fields; anything else — a Node
-/// stack trace, matter.js's own output — is relayed at debug, where it is
-/// available when someone goes looking without filling the log by default.
+/// Re-emit one controller stderr line into `tracing`. Structured records keep their level
+/// and fields; anything else (a Node stack trace, matter.js's own output) goes at debug, so
+/// it is there when someone looks without filling the log by default.
 fn relay(line: &str) {
     match serde_json::from_str::<crate::protocol::WireLog>(line) {
         Ok(record) if !record.level.is_empty() => record.relay(),
@@ -799,15 +725,10 @@ pub(crate) fn clear_pidfile(data_dir: &Path) {
     let _ = std::fs::remove_file(pidfile(data_dir));
 }
 
-/// Classify the pid in the pidfile, reading its command line via `ps` (portable
-/// across macOS and Linux):
-///
-///   * `Some(true)`  — alive, and still our controller: safe to kill.
-///   * `Some(false)` — `ps` ran and reported no such process, or a live but
-///     UNRELATED one (the pid was reused). Never kill; clear the file.
-///   * `None`        — `ps` could not be run, so liveness is indeterminate. The
-///     caller must not treat this as dead, or a real orphan loses the only
-///     record of itself.
+/// Classify the pid in the pidfile, reading its command line via `ps` (portable across
+/// macOS and Linux). `Some(true)` is alive and ours, so safe to kill; `Some(false)` is gone
+/// or a live UNRELATED pid, so never kill and clear the file; `None` means `ps` could not
+/// run, and the caller must not treat that as dead or a real orphan loses its only record.
 async fn pid_is_our_controller(pid: u32, data_dir: &Path) -> Option<bool> {
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
@@ -832,18 +753,10 @@ async fn pid_is_our_controller(pid: u32, data_dir: &Path) -> Option<bool> {
     }
 }
 
-/// Kill a controller left behind by a Pond that did not exit cleanly.
-///
-/// The graceful path already kills the controller (`stop_controller`, on the
-/// signal handler), and `kill_on_drop` covers an unwinding exit. Neither fires
-/// on `SIGKILL`, a panic under `panic = "abort"`, or an OOM kill. In practice
-/// the controller usually dies anyway — its stderr is a pipe to the Pond, so the
-/// next line it writes fails — but that is luck, not design: an idle controller
-/// with nothing to say survives, and being reachable it would then be ADOPTED by
-/// the next start and never owned by anyone, since nothing holds its handle.
-///
-/// So it is reaped rather than adopted. "When the Pond dies, everything dies
-/// with it" is only true if something enforces it on the way back up.
+/// Kill a controller left behind by a Pond that did not exit cleanly. `stop_controller` and
+/// `kill_on_drop` cover the graceful and unwinding exits; neither fires on `SIGKILL`, a
+/// panic under `panic = "abort"`, or an OOM kill. An idle orphan stays reachable and would
+/// be ADOPTED by the next start and owned by no one, so it is reaped instead.
 async fn reap_orphan(data_dir: &Path) {
     let path = pidfile(data_dir);
     let Some(pid) = std::fs::read_to_string(&path)
@@ -930,18 +843,10 @@ pub async fn ensure_running(
 
     match start_and_wait(data_dir, port, ready_timeout, ble).await {
         Ok(child) => Ok(Some(child)),
-        // BLE is optional, and asking for it must never cost the controller.
-        //
-        // On macOS the OS KILLS a process that touches CoreBluetooth without an
-        // `NSBluetoothAlwaysUsageDescription` in its bundle's Info.plist -- SIGKILL,
-        // from TCC, with the reason only in a crash report. The controller cannot
-        // catch that, so `ble.ts`'s try/catch does not help: the process is simply
-        // gone. Left alone, the supervisor would respawn it and it would be killed
-        // again, forever, and Matter would be unusable BECAUSE a transport was
-        // switched on.
-        //
-        // So the second attempt drops it. IP-only is the behaviour every install had
-        // before BLE existed, and it is strictly better than a crash loop.
+        // BLE is optional, and asking for it must never cost the controller. On macOS
+        // TCC SIGKILLs a process that touches CoreBluetooth without an
+        // `NSBluetoothAlwaysUsageDescription` in its bundle's Info.plist, which no
+        // try/catch can see, so the second attempt drops BLE and runs IP-only.
         Err(first) if ble => {
             tracing::warn!(
                 target: "giap::trace",
@@ -1046,15 +951,10 @@ pub enum Revival {
     Restarted,
 }
 
-/// Re-run [`ensure_running`] for a controller GIAP manages itself, parking any
-/// freshly spawned child in `child` so teardown still kills the process that is
-/// actually running.
-///
-/// The reconnect supervisor calls this once reconnecting alone has stopped
-/// working: a controller whose process has exited will never answer a reconnect,
-/// no matter how long the loop runs. Idempotent by construction —
-/// [`ensure_running`] reuses a live port — so it is safe to call repeatedly, and
-/// it never puts a second controller onto a fabric that already has one.
+/// Re-run [`ensure_running`] for a controller GIAP manages itself, parking any freshly
+/// spawned child in `child` so teardown still kills the process actually running. The
+/// supervisor calls it once reconnecting alone has stopped working. Idempotent, because
+/// [`ensure_running`] reuses a live port, so it never puts a second controller on a fabric.
 pub async fn revive_local_controller(
     data_dir: &Path,
     url: &str,
@@ -1184,13 +1084,9 @@ mod tests {
         assert!(!meets_min_node((18, 20)));
     }
 
-    /// matter.js's engine range has a HOLE in it, and the gate treated it as a
-    /// floor: `>=20.19.0 <22.0.0 || >=22.13.0` excludes 22.0 through 22.12.
-    ///
-    /// Node 22 is what NodeSource's `setup_22.x` installs — the very command
-    /// GIAP's own guidance tells a user to run — so an early 22 is not a
-    /// contrived case. It was green-lit, the controller was installed onto it,
-    /// and the failure surfaced as whatever matter.js threw first.
+    /// matter.js's engine range has a HOLE in it and must not be read as a floor:
+    /// `>=20.19.0 <22.0.0 || >=22.13.0` excludes 22.0 through 22.12. Node 22 is what
+    /// NodeSource's `setup_22.x` installs, so an early 22 is not a contrived case.
     #[test]
     fn the_hole_in_matter_js_engine_range_is_not_a_floor() {
         assert!(!meets_min_node((22, 0)), "22.0 is excluded");
@@ -1262,20 +1158,10 @@ mod tests {
 
         drop(listener);
 
-        // A port with nothing on it must not read as running. That is what decides
-        // whether GIAP spawns its own controller: a false "running" leaves a pond
-        // waiting forever for a controller nobody started.
-        //
-        // Asking about a port we just released is a race that cannot be won outright.
-        // Several tests here bind ephemeral ports at once, and the OS is free to hand
-        // ours straight to one of them between the drop and the question -- which is
-        // what made this fail roughly one run in two.
-        //
-        // So a positive answer is retried with a fresh port rather than trusted. The
-        // check stays honest: an `is_running` that answered "running" for everything
-        // would exhaust every attempt and fail, which is the regression worth
-        // catching. Losing a port to a sibling costs one more attempt instead of a
-        // red build, and losing eight in a row is not a race any more.
+        // A port with nothing on it must not read as running: a false "running" leaves a
+        // pond waiting forever for a controller nobody started. Asking about a port just
+        // released races sibling tests, so a positive answer is retried with a fresh port;
+        // exhausting every attempt is the regression worth catching.
         assert!(
             a_port_that_reads_as_free().await.is_some(),
             "no unbound port read as free in {PORT_ATTEMPTS} attempts, so is_running \
@@ -1287,20 +1173,10 @@ mod tests {
     /// rather than merely unlucky.
     const PORT_ATTEMPTS: usize = 8;
 
-    /// A port that is bound to nothing and that `is_running` agrees is free.
-    ///
-    /// Asking about a port we just released is a race that cannot be won
-    /// outright: several tests in this binary bind ephemeral ports at once, and
-    /// the OS may hand ours straight to one of them between the drop and the
-    /// question. That made these tests fail roughly one run in two.
-    ///
-    /// So a positive answer is retried with a fresh port rather than trusted,
-    /// and `None` after every attempt is a real finding, not a shrug — an
-    /// `is_running` that answered "running" for everything would exhaust the
-    /// attempts and the caller asserts on that. The alternative shape, an early
-    /// `return` on the first positive answer, also stops the flake but passes
-    /// forever once `is_running` regresses, which is the one thing these tests
-    /// exist to catch.
+    /// A port that is bound to nothing and that `is_running` agrees is free. Asking about
+    /// a just-released port is a race: sibling tests bind ephemeral ports and the OS may
+    /// hand ours to one of them. A positive answer is retried rather than trusted, and
+    /// `None` after every attempt is a real finding the caller asserts on, not a shrug.
     async fn a_port_that_reads_as_free() -> Option<u16> {
         for _ in 0..PORT_ATTEMPTS {
             let free = {
@@ -1330,11 +1206,9 @@ mod tests {
         assert_eq!(tail("", 5), "");
     }
 
-    /// The regression this whole probe exists for. Another server holding the
-    /// port answers TCP, so the old check adopted it; it does not serve `/giap`,
-    /// so every connection then failed; and having "reused" it, GIAP never
-    /// started a controller of its own. Permanently broken, with a log that said
-    /// only that it was reusing a controller and then could not reach it.
+    /// The regression this whole probe exists for. Another server holding the port
+    /// answers TCP, so a bare check adopts it; it does not serve `/giap`, so every
+    /// connection then fails, and GIAP never starts a controller of its own.
     #[tokio::test]
     async fn a_listener_that_is_not_ours_is_named_rather_than_adopted() {
         // A plain TCP listener that never speaks: the shape of anything on the
@@ -1440,11 +1314,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The regression that broke a working install: the marker was the lockfile
-    /// alone, so a change to the controller's SOURCES left the installed copy
-    /// untouched. The fix shipped in the binary, the data dir kept running the
-    /// old code, and nothing said so — which is how a fixed bug comes back on
-    /// the one machine that already had the software.
+    /// The marker was once the lockfile alone, so a change to the controller's SOURCES
+    /// left the installed copy untouched: the fix shipped in the binary while the data
+    /// dir kept running the old code, and nothing said so.
     #[test]
     fn a_source_change_changes_the_fingerprint() {
         let dir = std::env::temp_dir().join(format!("giap-fp-{}", std::process::id()));

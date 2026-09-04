@@ -1,19 +1,7 @@
-//! Live synthesis against real Kokoro weights.
-//!
-//! `#[ignore]` by default, like the rest of GIAP's hardware-dependent tests —
-//! it needs the model on disk and a working ONNX Runtime. Point it at a model
-//! directory and run:
-//!
-//! ```bash
-//! KOKORO_DIR=~/Documents/Jarida/kokoro-lab/models \
-//!   cargo test -p pond-adapters-kokoro -- --ignored --nocapture
-//! ```
-//!
-//! The directory must contain `model_quantized.onnx`, `tokenizer.json`, and
-//! `voices/af_heart.bin`.
-//!
-//! This doubles as the Stage 0 bench: it prints the real-time factor for
-//! native `ort`, which is the number the browser lab explicitly cannot give.
+//! Live synthesis against real Kokoro weights; `#[ignore]` like every hardware-dependent test.
+//! Run `KOKORO_DIR=<dir> cargo test -p pond-adapters-kokoro -- --ignored --nocapture`, where
+//! `<dir>` holds `model_quantized.onnx`, `tokenizer.json` and `voices/af_heart.bin`. This is
+//! also the Stage 0 bench: it prints the native `ort` real-time factor the browser lab cannot.
 
 use pond_adapters_kokoro::{engine::duration_secs, tokenizer, Engine, StyleTable, Vocab};
 use std::path::{Path, PathBuf};
@@ -24,15 +12,9 @@ fn model_dir() -> Option<PathBuf> {
     dir.join("tokenizer.json").exists().then_some(dir)
 }
 
-/// Intra-op threads for the session under test.
-///
-/// Defaults to what `pond-server` will actually use, for the same reason
-/// [`model_file`] does: a bench that measures a configuration the pond never
-/// runs answers the wrong question. This was pinned at a literal 2 and kept
-/// printing 1.35 on a Jetson after the server had moved to 4 — the number was
-/// real and described nothing shipping.
-///
-/// `KOKORO_THREADS` overrides it, so the choice can still be swept.
+/// Intra-op threads for the session under test. Defaults to what `pond-server` actually uses,
+/// never a literal: a bench measuring a configuration the pond never runs answers the wrong
+/// question. `KOKORO_THREADS` overrides it so the choice can still be swept.
 fn intra_threads() -> Option<usize> {
     match std::env::var("KOKORO_THREADS") {
         Ok(s) => s.parse().ok(),
@@ -40,13 +22,10 @@ fn intra_threads() -> Option<usize> {
     }
 }
 
-/// Weights file to load from `KOKORO_DIR`.
-///
-/// Defaults to the tier this host would actually start on, so the RTF printed
-/// below is the number the household gets rather than one for a tier the pond
-/// would never pick here. `KOKORO_MODEL` overrides it — file size does not
-/// predict speed (q4f16 is larger than q8 and far faster on aarch64), so
-/// comparing tiers has to be possible on one board.
+/// Weights file to load from `KOKORO_DIR`. Defaults to the tier this host would actually start
+/// on, so the printed RTF is the household's number. `KOKORO_MODEL` overrides it: file size does
+/// not predict speed (q4f16 is larger than q8 yet far faster on aarch64), so tiers must be
+/// comparable on one board.
 fn model_file() -> String {
     std::env::var("KOKORO_MODEL").unwrap_or_else(|_| {
         pond_adapters_kokoro::model_filename(pond_adapters_kokoro::host_default_quality())
@@ -54,12 +33,9 @@ fn model_file() -> String {
     })
 }
 
-/// Any installed voice that is not the default.
-///
-/// Naming a second voice outright is a trap: `voices_to_fetch` guarantees only
-/// `DEFAULT_VOICE`, and which others exist depends on what the household has
-/// picked. This test used to hardcode `am_michael`, which nothing fetches — so
-/// it failed on every machine that had not chosen that exact voice by hand.
+/// Any installed voice that is not the default. Never name a second voice outright:
+/// `voices_to_fetch` guarantees only `DEFAULT_VOICE`, and which others exist depends on what
+/// the household has picked.
 fn second_voice(voices: &Path) -> Option<String> {
     let mut names: Vec<String> = std::fs::read_dir(voices)
         .ok()?

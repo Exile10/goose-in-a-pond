@@ -1,25 +1,7 @@
-//! IMAP as a personal-context source: sign in, read subjects, ingest.
-//!
-//! The sibling of `pond-adapters-caldav` and bound by the same rules, with one
-//! extra restriction that is the whole design:
-//!
-//! **Subjects, senders, dates AND bodies** — the bodies chunked, so a passage
-//! is what gets embedded rather than a whole message. A single vector over an
-//! entire email describes its signature block as much as its point; that is
-//! the problem chunking exists to solve, and solving it is what makes bodies
-//! affordable. The volume argument in §1.4 was about VECTOR count and holds
-//! fine: ~1,300 messages at a few passages each is a few thousand vectors,
-//! which brute-force cosine crosses in under a millisecond.
-//!
-//! The body is fetched with `BODY.PEEK[TEXT]`, never `BODY[TEXT]`: the latter
-//! sets `\Seen` and would mark a household's mail read merely because the pond
-//! read it. A test pins the PEEK.
-//!
-//! Read-only otherwise, exactly as CalDAV is: no APPEND, no STORE, no flag is
-//! ever set.
-//!
-//! Implicit TLS on 993 only. STARTTLS on 143 begins in the clear and a
-//! downgrade there is invisible to a household, so it is not offered.
+//! IMAP as a personal-context source, the read-only sibling of `pond-adapters-caldav`: no
+//! APPEND, no STORE, no flag ever set. Bodies are fetched with `BODY.PEEK[TEXT]`, never
+//! `BODY[TEXT]` (which sets `\Seen`), and chunked so a passage is what gets embedded. Implicit
+//! TLS on 993 only; STARTTLS on 143 begins in the clear and a downgrade there is invisible.
 
 mod body;
 mod header;
@@ -35,26 +17,17 @@ use pond_core::context::domain::ItemKind;
 use pond_core::context::ingest::RawItem;
 use std::sync::Arc;
 
-/// How long a whole IMAP conversation may take.
-///
-/// Generous because ONE call is now many batches: a first sync over a 30-day
-/// window reads every body in it, and 45 seconds killed that mid-way. Later
-/// syncs resume above the stored UID and finish in a second or two, so this
-/// ceiling only ever applies to the first one.
+/// How long a whole IMAP conversation may take. Generous because a first sync over a 30-day
+/// window reads every body in it and 45 seconds killed that mid-way; later syncs resume above
+/// the stored UID and finish in seconds, so the ceiling only ever binds the first one.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// How much of one message is worth reading.
-///
-/// A marketing email can be a megabyte of inlined HTML and tracking pixels, and
-/// nothing a household would ask about is in the last 900 KB of it. Cutting
-/// before the MIME parse bounds both memory and the work `body_to_text` does.
+/// How much of one message is worth reading. A marketing email can be a megabyte of inlined
+/// HTML; cutting before the MIME parse bounds both memory and the work `body_to_text` does.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// Everything needed to reach one household member's mailbox.
-///
-/// `Debug` redacts the password by hand, because a struct that prints its own
-/// credential the first time somebody adds `{:?}` to a trace line is a leak
-/// waiting for a bad day.
+/// Everything needed to reach one household member's mailbox. `Debug` redacts the password
+/// by hand, so a `{:?}` on a trace line cannot leak the credential.
 #[derive(Clone)]
 pub struct ImapConfig {
     pub provider: ImapProvider,
@@ -81,37 +54,25 @@ impl ImapAdapter {
         Self { config }
     }
 
-    /// The default sync window.
-    ///
-    /// Short, and shorter than the calendar's, because mail volume is the thing
-    /// that decides whether this corpus stays in brute-force range. Thirty days
-    /// of subjects is a few hundred rows; a year is thousands and answers no
-    /// question the household actually asks.
+    /// The default sync window. Shorter than the calendar's because mail volume decides
+    /// whether this corpus stays in brute-force range: thirty days is a few hundred rows, a
+    /// year is thousands and answers no question the household asks.
     pub fn default_window(now: DateTime<Utc>) -> DateTime<Utc> {
         now - Duration::days(30)
     }
 
-    /// Recent messages, as items the ingest pipeline can take.
-    ///
-    /// One connection, one `SEARCH SINCE`, one `FETCH ENVELOPE`, then logout.
-    /// A long-lived IDLE connection would be lower latency and is deliberately
-    /// not here: a home server holding open sockets to several providers is a
-    /// reliability problem before it is a feature (PAI-8 §3.5).
+    /// Recent messages, as items the ingest pipeline can take. One connection, one search,
+    /// one fetch, then logout: a long-lived IDLE connection is deliberately absent, because a
+    /// home server holding open sockets to several providers is a reliability problem before
+    /// it is a feature (PAI-8 §3.5).
     pub async fn recent_messages(&self, since: DateTime<Utc>) -> Result<Vec<RawItem>> {
         Ok(self.fetch_since(since, None).await?.0)
     }
 
-    /// Recent messages, plus the cursor a later sync should resume from.
-    ///
-    /// The cursor is `UIDVALIDITY:MAXUID`. Passing the previous one asks the
-    /// server for messages ABOVE that UID, which is what makes an ongoing sync
-    /// cheap: without it every pass re-downloads the whole window, and with
-    /// bodies that is the entire mailbox every thirty minutes.
-    ///
-    /// `UIDVALIDITY` is carried because a mailbox may renumber. When the server
-    /// reports a different one the stored UID means nothing, so the window is
-    /// read again from the start rather than resuming from a number that now
-    /// points somewhere else.
+    /// Recent messages, plus the cursor a later sync should resume from. The cursor is
+    /// `UIDVALIDITY:MAXUID`; passing it back asks only for messages above that UID, without
+    /// which every pass re-downloads the whole window, bodies included. A changed
+    /// `UIDVALIDITY` means the mailbox renumbered, so the window is read again from the start.
     pub async fn messages_since_cursor(
         &self,
         since: DateTime<Utc>,
@@ -164,19 +125,10 @@ impl ImapAdapter {
 
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        // The provider is NAMED, not inferred.
-        //
-        // `ClientConfig::builder()` asks rustls to work the provider out from
-        // crate features, and it PANICS when it cannot -- which is this
-        // workspace's normal state: `aws_lc_rs` comes from the root Cargo.toml
-        // and `ring` from hyper-rustls via reqwest, so both are enabled and
-        // there is no single answer to infer. That ambiguity predates this
-        // crate; being the first code to call the inferring constructor is what
-        // turned it into a crash on a background worker.
-        //
-        // A library has no business depending on the host process having
-        // installed a default either, so this one says which provider it wants
-        // and stops caring.
+        // The crypto provider is named, not inferred: `ClientConfig::builder()` panics when
+        // both `aws_lc_rs` (root Cargo.toml) and `ring` (hyper-rustls via reqwest) are enabled,
+        // which is this workspace's normal state, and a library must not depend on the host
+        // process having installed a default.
         let tls_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))
@@ -215,11 +167,9 @@ impl ImapAdapter {
             .context("could not open the INBOX")?;
         let uid_validity = mailbox.uid_validity.unwrap_or(0);
 
-        // Resume above the last UID this pond saw, but only if the mailbox has
-        // not renumbered. A changed UIDVALIDITY makes the stored number point
-        // at a different message, so the window is read again from the start —
-        // re-reading is idempotent (Message-ID is the key), resuming from a
-        // stale number silently skips mail.
+        // Resume above the last UID seen, but only if UIDVALIDITY is unchanged: after a
+        // renumbering the stored UID points at a different message. Re-reading the window is
+        // idempotent (Message-ID is the key); resuming from a stale number silently skips mail.
         let resume_from = cursor.and_then(|c| c.split_once(':')).and_then(|(v, u)| {
             match (v.parse::<u32>().ok(), u.parse::<u32>().ok()) {
                 (Some(v), Some(u)) if v == uid_validity => Some(u),
@@ -238,26 +188,15 @@ impl ImapAdapter {
         let highest = uids.iter().copied().max();
 
         let mut items = Vec::new();
-        // Counted, because both ways a message can vanish below are a silent
-        // `continue`. A sync that returns 21 of 1,345 and a sync that returns
-        // 21 because the mailbox holds 21 look identical from the outside, and
-        // the first one is a mail server throttling a client that just pulled
-        // every body twice.
+        // Counted, because both ways a message can vanish below are a silent `continue`, and
+        // 21 of 1,345 returned looks identical from outside to a mailbox that holds 21. The
+        // first is a mail server throttling a client that just pulled every body twice.
         let mut unreadable = 0usize;
         let mut envelopeless = 0usize;
-        // BATCHED, and this is not a tuning knob — it is the difference between
-        // working and taking the pond down.
-        //
-        // Asking for every message in the window in ONE fetch was fine while
-        // this read envelopes: a thousand headers is a few hundred kilobytes.
-        // With bodies it streams the whole mailbox — measured at 769 MB
-        // resident on a 1,300-message window — and the process stopped
-        // answering its own health check for long enough that the desktop
-        // watchdog restarted it, killing the sync, which then began again.
-        //
-        // A batch bounds what is in flight to roughly `BATCH * message size`,
-        // and yielding between batches gives the runtime a chance to serve
-        // everything else the pond is doing.
+        // Batched, and not a tuning knob: one fetch of every body in a 1,300-message window
+        // measured 769 MB resident and stalled the health check until the desktop watchdog
+        // restarted the pond mid-sync. A batch bounds what is in flight to roughly
+        // `BATCH * message size`, and yielding between batches lets the runtime serve the rest.
         const BATCH: usize = 50;
         for window in uids.iter().copied().collect::<Vec<_>>().chunks(BATCH) {
             let set = window
@@ -265,13 +204,9 @@ impl ImapAdapter {
                 .map(|u| u.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            // ENVELOPE for the headers, BODY.PEEK[TEXT] for the words.
-            //
-            // PEEK is the whole of the read-only claim at the fetch level:
-            // plain `BODY[TEXT]` sets \Seen, so reading a mailbox would mark
-            // it read. `EXAMINE` above already refuses flag changes, so this is
-            // the belt to that braces — and the one a future edit is most
-            // likely to drop by shortening the atom.
+            // ENVELOPE for the headers, BODY.PEEK[TEXT] for the words. PEEK is the read-only
+            // claim at the fetch level: plain `BODY[TEXT]` sets \Seen and marks the mailbox
+            // read. `EXAMINE` above is the other half; a test pins this one.
             let mut stream = session
                 .uid_fetch(set, "(ENVELOPE BODY.PEEK[TEXT])")
                 .await
@@ -285,14 +220,9 @@ impl ImapAdapter {
                         continue;
                     }
                 };
-                // The body is the message's own words, cleaned of quoted
-                // replies and signatures — text that belongs to other messages
-                // would otherwise be the most repeated, and therefore most
-                // findable, thing in the mailbox.
-                //
-                // Capped before parsing: a newsletter can carry a megabyte of
-                // inlined HTML, and no answer a household wants is in the last
-                // 900 KB of it.
+                // The body is the message's own words, cleaned of quoted replies and
+                // signatures, which would otherwise be the most repeated and findable text in
+                // the mailbox. Capped at MAX_BODY_BYTES before parsing to bound memory.
                 let body = message
                     .text()
                     .map(|raw| {
@@ -340,11 +270,9 @@ impl ImapAdapter {
     }
 }
 
-/// Turn an IMAP `ENVELOPE` into a context item.
-///
-/// Skipped rather than defaulted when there is no Message-ID or no date: the
-/// Message-ID is the idempotency key for re-sync, and inventing one re-creates
-/// the mail as a duplicate on every sweep forever.
+/// Turn an IMAP `ENVELOPE` into a context item. Skipped rather than defaulted when there is
+/// no Message-ID or no date: the Message-ID is the idempotency key for re-sync, and inventing
+/// one re-creates the mail as a duplicate on every sweep forever.
 fn envelope_to_item(
     envelope: Option<&async_imap::imap_proto::Envelope<'_>>,
     body_text: &str,
@@ -432,11 +360,8 @@ fn envelope_to_item(
 mod tests {
     use super::*;
 
-    /// This crate's own production source, with whole-line comments removed.
-    ///
-    /// The comments have to go or the guards below trip on the prose EXPLAINING
-    /// the rule -- a doc line saying "no BODY, no BODYSTRUCTURE" reads exactly
-    /// like a violation. Only whole-line comments are dropped, so a real
+    /// This crate's production source with whole-line comments removed, so the guards below
+    /// do not trip on prose explaining the rule. Only whole-line comments go, so a real
     /// `session.fetch(set, "BODY[]")` with a trailing comment is still caught.
     fn production_code() -> String {
         include_str!("lib.rs")
@@ -471,11 +396,9 @@ mod tests {
     #[test]
     fn the_body_fetch_never_marks_mail_as_read() {
         let production = production_code();
-        // Bodies ARE fetched now — chunked and embedded per passage, which is
-        // what a vector store is for. What must never appear is the NON-PEEK
-        // form: `BODY[TEXT]` sets \Seen and marks a household's mail read
-        // merely because the pond looked at it. That is one dropped atom away
-        // from the correct line, so it is pinned.
+        // Bodies are fetched, but only in the PEEK form: plain `BODY[TEXT]` sets \Seen and
+        // marks a household's mail read because the pond looked. One dropped atom away from
+        // the correct line, so it is pinned.
         assert!(
             production.contains("BODY.PEEK[TEXT]"),
             "the body fetch must use PEEK, or reading the mailbox marks it read"
