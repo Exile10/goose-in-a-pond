@@ -1,14 +1,7 @@
-//! Kokoro voice style vectors.
-//!
-//! Each voice is one `voices/<name>.bin` in the model repo: a raw
-//! little-endian `f32` array of shape `[510, 256]`, 522,240 bytes, no
-//! container. Row `n` is the style to use for a sequence of `n` phoneme
-//! tokens — the model was trained with length-conditioned style, so picking
-//! the wrong row makes the prosody drift rather than failing outright.
-//!
-//! Only the selected voice is ever resident. That is deliberate: 28 voices
-//! held at once would be 14 MB of style tables to save a 522 KB read on the
-//! rare occasion someone changes voice.
+//! Kokoro voice style vectors. Each voice is `voices/<name>.bin`: a raw little-endian `f32`
+//! array of shape `[510, 256]` (522,240 bytes, no container). Row `n` is the style for `n`
+//! phoneme tokens; the wrong row drifts the prosody rather than failing. Only the selected
+//! voice is resident, since all 28 at once would be 14 MB to save a 522 KB read on a change.
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -59,11 +52,9 @@ impl StyleTable {
         &self.name
     }
 
-    /// The style row for a sequence of `token_count` phoneme tokens.
-    ///
-    /// Clamped rather than checked: a chunk is capped at 510 tokens upstream,
-    /// and an out-of-range index here should degrade prosody, never panic in
-    /// the middle of speaking.
+    /// The style row for a sequence of `token_count` phoneme tokens. Clamped rather than
+    /// checked: chunks are capped at 510 tokens upstream, and an out-of-range index should
+    /// degrade prosody, never panic mid-speech.
     pub fn style_for(&self, token_count: usize) -> &[f32] {
         let row = token_count.min(STYLE_ROWS - 1);
         &self.rows[row * STYLE_DIM..(row + 1) * STYLE_DIM]

@@ -1,0 +1,25 @@
+{"query": "when are Amara's school fees due", "relevant": ["fees-statement-t3", "fees-deadline-event", "fees-task", "fees-reminder-t3"]}
+{"query": "how much do we owe the school this term", "relevant": ["fees-statement-t3", "fees-structure-doc", "fees-reminder-t3"]}
+{"query": "how do I pay the school, paybill or bank", "relevant": ["fees-statement-t3", "fees-task"]}
+{"query": "what did the landlord say about the water tank", "relevant": ["landlord-tank-reply", "plumber-dm", "tenancy-doc"]}
+{"query": "when is the plumber coming", "relevant": ["plumber-visit-event", "plumber-dm", "landlord-tank-reply"]}
+{"query": "who pays for the float valve", "relevant": ["landlord-tank-reply", "plumber-dm", "tenancy-doc"]}
+{"query": "where is the tenancy agreement", "relevant": ["tenancy-doc"]}
+{"query": "what is happening with the Mombasa consignment", "relevant": ["consignment-held", "consignment-released", "demurrage-invoice", "q3-reconciliation", "rebook-nakuru"]}
+{"query": "has the container been released", "relevant": ["consignment-released", "consignment-held"]}
+{"query": "what do we owe on demurrage", "relevant": ["demurrage-invoice", "q3-reconciliation"]}
+{"query": "what time does my flight leave", "relevant": ["flight-changed", "flight-event", "flight-confirmed"]}
+{"query": "did my flight time change", "relevant": ["flight-changed", "flight-confirmed", "flight-event"]}
+{"query": "what is my booking reference", "relevant": ["flight-confirmed", "flight-changed", "boarding-pass-doc"]}
+{"query": "when is the dentist", "relevant": ["dentist-event", "dentist-mail"]}
+{"query": "what time is Amara's swim practice", "relevant": ["swim-timetable-doc"]}
+{"query": "what is outstanding on the marking", "relevant": ["marking-due", "marking-task", "marksheet-doc"]}
+{"query": "who do I contact about the exam marking", "relevant": ["marking-due"]}
+{"query": "did we ever book the generator service", "relevant": ["voice-turn-00"]}
+{"query": "what did we decide about the generator", "relevant": ["voice-turn-00"]}
+{"query": "was anyone at the gate yesterday", "relevant": ["voice-turn-04"]}
+{"query": "is there a secret checked into the marks portal", "relevant": ["env-file-doc"]}
+{"query": "when is the estate AGM", "relevant": ["fp-bait-00"]}
+{"query": "what are the meter readings for August", "relevant": ["fp-bait-03"]}
+{"query": "what address is the pond on", "relevant": ["fp-bait-04"]}
+{"query": "what is the inverter serial number", "relevant": ["fp-bait-05"]}

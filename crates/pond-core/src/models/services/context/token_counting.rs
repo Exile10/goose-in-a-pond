@@ -1,9 +1,7 @@
 //! The chars-per-token fallback, and the per-message envelope constant.
 //!
-//! This is the counter used when no model-aware tokenizer is reachable — which
-//! today is every path that is not the live Goose adapter. It is deliberately
-//! the same arithmetic the trimmer has always used, so adopting the
-//! [`TokenCounter`] port changed no behaviour on its own.
+//! Used when no model-aware tokenizer is reachable, which is every path that is
+//! not the live Goose adapter. Deliberately the same arithmetic the trimmer uses.
 
 use crate::models::ports::token_counter::TokenCounter;
 
@@ -53,11 +51,10 @@ mod tests {
         assert_eq!(HeuristicTokenCounter.name(), "chars/4");
     }
 
-    /// `len()` is bytes, not characters, so multi-byte text is over-counted
-    /// rather than under-counted. Over-counting is the safe direction here —
-    /// it shrinks the history budget rather than overflowing the window — and
-    /// this test exists so nobody "fixes" it to `chars().count()` without
-    /// realising they are removing a margin the Jetson relies on.
+    /// `len()` is bytes, not characters, so multi-byte text is over-counted.
+    /// Over-counting is the safe direction: it shrinks the history budget rather
+    /// than overflowing the window. Do not "fix" this to `chars().count()`, which
+    /// removes a margin the Jetson relies on.
     #[test]
     fn multibyte_text_is_over_counted_which_is_the_safe_direction() {
         let ascii = HeuristicTokenCounter.count("aaaaaaaa");

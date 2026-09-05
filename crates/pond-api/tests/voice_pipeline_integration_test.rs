@@ -1,13 +1,7 @@
-//! Integration tests for POST /api/v1/chat/stream — the SSE streaming chat endpoint
-//! that drives the voice pipeline in pond-desktop.
-//!
-//! Verifies:
-//! 1. Events carry BOTH {"type":"text","content":"..."} AND {"token":"..."} fields.
-//! 2. A final {"done":true,"session_id":"...","model_role":"..."} event is emitted.
-//! 3. Session is created and messages persisted after stream completes.
-//! 4. PUT /api/v1/settings returns the full Settings object (not just {"status":"ok"}).
-//!
-//! Run: cargo test -p pond-api --test voice_pipeline_integration_test
+//! POST /api/v1/chat/stream, the SSE endpoint driving pond-desktop's voice
+//! pipeline: every event carries both the `type`/`content` and `token` fields, a
+//! final `done` event names the session and model role, the session and its
+//! messages persist, and PUT /api/v1/settings returns the whole Settings object.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -94,6 +88,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -114,6 +109,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,

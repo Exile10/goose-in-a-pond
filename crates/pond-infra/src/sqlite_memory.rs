@@ -86,6 +86,10 @@ impl SqliteMemoryRepository {
                     .upsert(&VectorEntry {
                         corpus: Corpus::Memory,
                         row_id: id.to_string(),
+                        // A memory is a sentence or two. Chunking one would
+                        // split a fact in half.
+                        chunk_ix: 0,
+                        chunk_span: None,
                         model_id: model_id.to_string(),
                         vector: vector.to_vec(),
                         // A memory's content is stable once extracted —
@@ -551,6 +555,19 @@ impl MemoryRepository for SqliteMemoryRepository {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn update_content(&self, id: &str, content: &str) -> Result<()> {
+        // The vector goes with the words it described. Keeping it would leave a
+        // row that still scores against the OLD text -- worse than no vector,
+        // because nothing would notice. `search_unembedded` picks it up next
+        // sweep.
+        sqlx::query("UPDATE memory_fragments SET content = ?, embedding = NULL WHERE id = ?")
+            .bind(content)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

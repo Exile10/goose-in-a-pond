@@ -1,15 +1,7 @@
-//! PAI-4 P6 — `ContextMonitor::reset_session` is wired to the one route where a
-//! session stops existing.
-//!
-//! This is a wiring test, not a logic test: the cooldown and growth-window rules
-//! are unit-tested in `pond-core`'s `context_monitor`. What no unit test can
-//! reach is whether `DELETE /api/v1/sessions/:id` actually calls the reset. It
-//! did not, for the whole life of the method — `reset_session` had zero
-//! production callers, so the growth map only ever grew and a recycled session
-//! id inherited the utilisation, growth samples and compaction cooldown of the
-//! conversation it replaced.
-//!
-//! Run: cargo test -p pond-api --test context_monitor_reset_test
+//! PAI-4 P6: `ContextMonitor::reset_session` is wired to `DELETE
+//! /api/v1/sessions/:id`, the one route where a session stops existing. A wiring
+//! test, not a logic test: without the call the growth map only grows, and a
+//! recycled session id inherits the utilisation and cooldown of its predecessor.
 
 use std::sync::Arc;
 
@@ -100,6 +92,7 @@ async fn make_app() -> (axum::Router, Arc<AppState>, tempfile::TempDir) {
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -120,6 +113,7 @@ async fn make_app() -> (axum::Router, Arc<AppState>, tempfile::TempDir) {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,

@@ -1,39 +1,7 @@
-//! The single answer to "how big is this model's context window?"
-//!
-//! Four code paths used to answer that question independently, and they did not
-//! agree. The worst of them was the live history trimmer, which read
-//! `GOOSE_CONTEXT_LIMIT` from the process environment and fell back to a
-//! hardcoded 8192 — so a Jetson whose engine had actually allocated 4096 could
-//! be budgeting history against a window twice the real size, and a Mac that had
-//! allocated 32K could be throwing away history it had room for.
-//!
-//! This module owns the precedence. Callers supply what they know; the governor
-//! decides. Nothing here reads the environment: configuration arrives as an
-//! argument or it does not arrive at all (see `PAI-3` invariant 5 in
-//! `docs/architecture/pai/03-context-governor.md`).
-//!
-//! # Precedence
-//!
-//! 1. [`WindowSource::EngineReported`] — what the engine says it actually
-//!    allocated. Ground truth, because it is the allocation rather than a
-//!    prediction of it. Only accepted when it is tagged with the model it was
-//!    measured for (see [`EngineWindow`]).
-//! 2. [`WindowSource::Registry`] — a pinned `context_size` in Goose's local
-//!    model registry. Authoritative for GGUF because the engine ranks it above
-//!    its own memory estimate, which makes it the allocation too.
-//! 3. [`WindowSource::CatalogRecord`] — `ModelRecord.context_length`, for
-//!    HTTP and Ollama models where no registry entry exists. A declared
-//!    maximum rather than an allocation, so it is bounded both by the local
-//!    ceiling and by any user override that is LOWER than it.
-//! 4. [`WindowSource::Override`] — the user's `context_window_override`. An
-//!    escape hatch for deployments whose real limit is neither the model's max
-//!    nor the engine's estimate.
-//! 5. [`WindowSource::Heuristic`] — last resort, from the model name.
-//!
-//! Rungs 1 and 2 outrank the user override deliberately. An override is a
-//! preference; an allocation is a fact, and budgeting above it only makes the
-//! engine truncate. Rung 3 does NOT outrank it in the widening direction: the
-//! catalog knows what the model supports, not what this box can afford.
+//! The single answer to "how big is this model's context window?" Precedence, highest first:
+//! EngineReported, Registry, CatalogRecord, Override, Heuristic; PAI-3 invariant 5 in
+//! `docs/architecture/pai/03-context-governor.md` is authoritative and forbids reading the
+//! environment. Rungs 1 and 2 outrank the override: an allocation is a fact, not a preference.
 
 use crate::models::domain::model_capabilities::ModelCapabilities;
 
@@ -89,14 +57,10 @@ impl WindowSource {
     }
 }
 
-/// A context window the engine reported, tagged with the model it was measured
-/// for.
+/// A context window the engine reported, tagged with the model it was measured for.
 ///
-/// The tag is not decoration. `TurnStats.context_limit_tokens` is recorded per
-/// turn, so after a model swap the most recent value describes the *previous*
-/// model. Feeding that into the next turn's budget is exactly the kind of
-/// silent, occasional over-budgeting this module exists to remove, so the
-/// governor discards a reading whose model does not match the active one.
+/// `TurnStats.context_limit_tokens` is recorded per turn, so after a model swap the latest value
+/// describes the PREVIOUS model. The governor discards a reading whose model does not match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineWindow {
     pub tokens: u32,
@@ -114,9 +78,8 @@ impl EngineWindow {
 
 /// Everything the governor needs to resolve a window.
 ///
-/// Fields a caller cannot answer are `None`; the governor falls through. A
-/// caller that knows nothing at all still gets a defensible number from the
-/// name heuristic.
+/// Fields a caller cannot answer are `None` and the governor falls through; a caller that knows
+/// nothing at all still gets a defensible number from the name heuristic.
 #[derive(Debug, Clone, Default)]
 pub struct ContextInputs<'a> {
     pub provider: &'a str,
@@ -130,12 +93,9 @@ pub struct ContextInputs<'a> {
     pub catalog_context_length: Option<u32>,
     /// The engine's own report from a previous turn of this session.
     pub engine_reported: Option<EngineWindow>,
-    /// A live capability-reported window, when the caller holds one.
-    ///
-    /// Used at the heuristic rung in place of re-deriving from the model name.
-    /// It is the same *kind* of answer — a declared window rather than an
-    /// allocation — but a better-informed one, since the adapter populates
-    /// capabilities from the active model rather than from a substring match.
+    /// A live capability-reported window, when the caller holds one. Used at the heuristic rung
+    /// instead of re-deriving from the model name: still a declared window rather than an
+    /// allocation, but the adapter populates it from the active model, not a substring match.
     pub capability_window: Option<u32>,
 }
 
@@ -180,41 +140,16 @@ impl ContextGovernor {
             };
         }
 
-        // 3. Catalog metadata, for models with no registry entry.
-        //
-        // A catalog `context_length` is the model's DECLARED maximum, not an
-        // allocation, so for a local provider it is clamped by the same
-        // ceiling the heuristic rung applies. Gemma 4 declares 131,072
-        // (verified against Ollama's `model_info`); an unpinned Mac that
-        // allocated 32K would otherwise budget history for four times the
-        // room the engine has, and the engine answers that by truncating the
-        // prompt. Rungs 1 and 2 are allocations and are never clamped.
-        //
-        // A user override is the same KIND of bound as the local ceiling, only
-        // stated by hand, so it clamps this rung too -- see
-        // `a_lower_override_bounds_the_catalog_maximum`. Rungs 1 and 2 still
-        // outrank it, because those are allocations (invariant 3).
+        // 3. Catalog metadata, for models with no registry entry. A `context_length` is the
+        // model's DECLARED maximum, not an allocation, so for a local provider it is clamped by
+        // the heuristic rung's ceiling and by any LOWER user override (see
+        // `a_lower_override_bounds_the_catalog_maximum`). Rungs 1 and 2 are allocations, unclamped.
         if let Some(catalog) = inputs.catalog_context_length.filter(|c| *c > 0) {
             let mut tokens = catalog as usize;
-            // `runs_on_this_device`, NOT `is_local_provider`. The question this
-            // rung asks is "can this box afford the number the catalog printed",
-            // and that is about where the weights run, not which provider string
-            // named them. `is_local_provider` covers only local/gguf, which left
-            // ollama and llamafile -- the two providers this rung exists for --
-            // taking a declared maximum unbounded.
-            //
-            // It mattered the moment P3a made the rung reachable: it taught
-            // OllamaCatalogProvider to read the declared window from /api/show,
-            // where a Gemma 4 model reports 131072. The same weights through the
-            // `local` provider were held to 32768, so the history budget was 4x
-            // apart depending only on which string arrived here.
-            //
-            // The other two `is_local_provider` call sites are deliberately left
-            // alone. `heuristic_window` answers a different question (what to
-            // guess when nothing is known) and `prompt_window` a third (how much
-            // preamble a locally-prefilled turn can afford). Widening those is a
-            // behaviour change on every Ollama turn and wants its own phase and
-            // its own TTFT measurement, not a ride along with a clamp fix.
+            // `runs_on_this_device`, NOT `is_local_provider`: the question is whether this box
+            // can afford the number the catalog printed, which is about where the weights run,
+            // not which provider string named them. `is_local_provider` covers only local/gguf,
+            // leaving ollama and llamafile -- the providers this rung exists for -- unbounded.
             if super::model_class::runs_on_this_device(inputs.provider) {
                 tokens = tokens.min(UNPINNED_LOCAL_CEILING);
             }
@@ -265,17 +200,10 @@ impl ContextGovernor {
         }
     }
 
-    /// The window that PROMPT-side budgets (system prompt tier, memory
-    /// injection) should be derived from — as opposed to history budgets, which
-    /// use the full resolved window.
-    ///
-    /// This is the asymmetry that makes "use the window to the fullest" safe on
-    /// this hardware. For local in-process inference every preamble token is
-    /// re-prefilled on every turn, so a bigger window must buy HISTORY room, not
-    /// a more verbose preamble: an unclamped 32K profile on the Mac selected the
-    /// full template tier plus a 1.5K memory budget and produced a 9.4K-token
-    /// prompt (~17 s TTFT) for a one-line question. HTTP providers keep the raw
-    /// window — their preamble is not paid for in local prefill.
+    /// The window PROMPT-side budgets (system prompt tier, memory injection) derive from;
+    /// history budgets use the full resolved window. Locally every preamble token is re-prefilled
+    /// each turn, so a bigger window must buy HISTORY room: an unclamped 32K profile on the Mac
+    /// gave a 9.4K-token prompt (~17 s TTFT) for one line. HTTP providers keep the raw window.
     pub fn prompt_window(provider: &str, resolved: usize) -> usize {
         if is_local_provider(provider) {
             resolved.min(LOCAL_PROMPT_CLAMP)
@@ -357,17 +285,10 @@ mod tests {
 
     #[test]
     fn a_lower_override_bounds_the_catalog_maximum() {
-        // Corrected when PAI-3 P3b made rung 3 reachable. The documented
-        // precedence put CatalogRecord above Override, and while rung 3 was
-        // dead that cost nothing. Live, it inverts the one case the override
-        // exists for, named in `goose_agent.rs`'s own doc comment: a Jetson
-        // running Ollama with a hand-tuned KV cache. Populating the catalog
-        // would have replaced that user's 8192 with gemma4's declared 131072
-        // and the engine would have truncated every prompt.
-        //
-        // Rungs 1 and 2 still outrank the override -- they are allocations
-        // (invariant 3). A catalog value is not; it says what the MODEL
-        // supports, not what this box allocated.
+        // A lower override must bound rung 3, or a Jetson running Ollama with a hand-tuned KV
+        // cache has its 8192 replaced by gemma4's declared 131072 and every prompt truncates.
+        // Rungs 1 and 2 still outrank the override: they are allocations (invariant 3), while a
+        // catalog value says what the MODEL supports, not what this box allocated.
         let mut i = inputs("ollama", "gemma4:e2b");
         i.catalog_context_length = Some(131_072);
         i.override_tokens = 8_192;
@@ -411,12 +332,9 @@ mod tests {
 
     #[test]
     fn a_catalog_length_cannot_widen_an_unpinned_local_window() {
-        // The catalog carries the model's DECLARED maximum. Gemma 4 declares
-        // 131,072; the engine on an unpinned local install allocates from its
-        // own memory estimate, and the heuristic rung caps that expectation at
-        // UNPINNED_LOCAL_CEILING. Rung 3 must not be the one rung that escapes
-        // it, or populating the catalog silently hands the trimmer a 128K
-        // history budget on a machine with 32K.
+        // The catalog carries the model's DECLARED maximum: Gemma 4 declares 131,072. Rung 3
+        // must not be the one rung that escapes UNPINNED_LOCAL_CEILING, or populating the
+        // catalog silently hands the trimmer a 128K history budget on a machine with 32K.
         let mut i = inputs("local", "gemma-4-e2b");
         i.catalog_context_length = Some(131_072);
 
@@ -435,17 +353,10 @@ mod tests {
         small.catalog_context_length = Some(8_192);
         assert_eq!(ContextGovernor::resolve(&small).tokens, 8_192);
 
-        // Ollama is NOT the exception, and this assertion used to say it was.
-        //
-        // It read "HTTP providers pay no local prefill, so they keep the raw
-        // declared window", with `ollama` as the fixture. Ollama serves over
-        // HTTP and runs on this box -- `model_class::ON_DEVICE_PROVIDERS` lists
-        // it alongside local, gguf and llamafile -- so it pays the prefill in
-        // full. Believing otherwise let a Gemma 4 model on the Orin take the
-        // 131,072 its /api/show declares, four times the ceiling the same
-        // weights get through the `local` provider, decided by nothing but
-        // which string arrived here. The test asserted the defect, so it passed
-        // throughout.
+        // Ollama is NOT the exception. It serves over HTTP but runs on this box --
+        // `model_class::ON_DEVICE_PROVIDERS` lists it alongside local, gguf and llamafile -- so
+        // it pays local prefill in full, and the 131,072 its /api/show declares must be clamped
+        // like any other on-device provider.
         let mut ollama = inputs("ollama", "gemma4:e2b");
         ollama.catalog_context_length = Some(131_072);
         let o = ContextGovernor::resolve(&ollama);

@@ -1,36 +1,14 @@
-//! Per-turn limits for image attachments (phase F1).
-//!
-//! # Why a hard cap exists at all
-//!
-//! An image turn is the most expensive thing this system can be asked to do on
-//! an 8 GB Jetson Orin Nano:
-//!
-//! 1. Vision turns bypass the engine's retained KV prompt-session cache
-//!    (`inference_engine.rs` drops the retained session before a multimodal
-//!    prefill), so every image turn pays a FULL prefill — there is no
-//!    amortisation across turns.
-//! 2. Each image is decoded to RGB and run through the mmproj vision encoder
-//!    before tokenisation. A 12 MP phone photo is ~36 MB of RGB in a device
-//!    that has ~1 GB of headroom left after the model and KV cache.
-//! 3. Every image expands into a few hundred prompt tokens, and prefill on the
-//!    Orin runs at roughly 0.9K tok/s.
-//!
-//! So an unbounded request is not "slow", it is an OOM. The caps below are
-//! deliberately generous for a home-assistant use case and deliberately far
-//! below what a phone camera produces unaided — clients are expected to
-//! downscale before encoding (longest edge 1024 px, see
-//! `pond-desktop/src/lib/imageAttach.ts`), and these caps are the server-side
-//! backstop for clients that do not.
+//! Per-turn limits for image attachments (phase F1). An image turn bypasses the retained KV
+//! prompt-session cache so it pays a full prefill, and a 12 MP photo decodes to ~36 MB of RGB in
+//! the ~1 GB an 8 GB Orin has spare: unbounded is an OOM, not just slow. Clients downscale to
+//! 1024 px longest edge (`pond-desktop/src/lib/imageAttach.ts`); these caps are the backstop.
 
 use super::message::ImageAttachment;
 
 /// Maximum number of images accepted in a single chat turn.
 ///
-/// Four is the point where a 2B-class vision encoder still finishes in a couple
-/// of seconds on the Orin and the added prompt tokens stay inside the 4096-token
-/// context the Jetson tuning block pins. It is also the frame cap used by the
-/// video sampler (phase F5) so a sampled clip and a manual attachment cost the
-/// same worst case.
+/// Four keeps the vision encoder to a couple of seconds on the Orin and the added prompt tokens
+/// inside the pinned 4096-token context. The video sampler uses the same frame cap.
 pub const MAX_IMAGES_PER_TURN: usize = 4;
 
 /// Maximum decoded (post-base64) size of a single image, in bytes.
@@ -41,37 +19,20 @@ pub const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum decoded size of ALL images in one turn, in bytes.
 ///
-/// Bounds the peak transient allocation for a single request independently of
-/// the per-image cap, so `MAX_IMAGES_PER_TURN` images at `MAX_IMAGE_BYTES` each
-/// cannot be combined into a 16 MiB spike.
+/// Bounds peak transient allocation per request, so `MAX_IMAGES_PER_TURN` images at
+/// `MAX_IMAGE_BYTES` each cannot combine into a 16 MiB spike.
 pub const MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Request-body ceiling for the chat routes, in bytes.
-///
-/// Axum's `DefaultBodyLimit` is 2 MiB, which is SMALLER than a legal attachment
-/// set: a request carrying `MAX_TOTAL_IMAGE_BYTES` of images is ~4/3 that size
-/// once base64-encoded. Without raising it, a perfectly legal 3 MB attachment is
-/// rejected by the framework with "length limit exceeded" and the caller never
-/// reaches the checks in this module, which are the ones that can say something
-/// useful. This is the framework backstop; [`validate_turn_images`] is the
-/// policy, and it should be what a user actually hits.
-///
-/// Sized so that EVERY rejection in this module is reachable, not just the
-/// per-image one: `MAX_IMAGES_PER_TURN` images that are each individually legal
-/// must get through the framework so `TotalTooLarge` can explain the aggregate
-/// budget. That is a larger transient buffer than the budget itself
-/// (`4 x 4 MiB` base64-inflated, ~22 MiB), which is the deliberate cost of a
-/// good error message; it is bounded, short-lived, and the concurrency of these
-/// routes is already capped by the SSE semaphore.
+/// Request-body ceiling for the chat routes, in bytes. Axum's 2 MiB `DefaultBodyLimit` is below
+/// a legal attachment set (base64 inflates by 4/3), so this is sized to keep every rejection in
+/// [`validate_turn_images`] reachable, `TotalTooLarge` included; the ~22 MiB transient that
+/// costs is bounded by the SSE semaphore.
 pub const MAX_CHAT_BODY_BYTES: usize =
     (MAX_IMAGES_PER_TURN * MAX_IMAGE_BYTES) * 4 / 3 + 1024 * 1024;
 
-// The backstop must sit above EVERY policy limit, or the policy never runs and
-// the caller gets Axum's "length limit exceeded" instead of an actionable
-// message. Compile-time rather than a test: it is a relationship between
-// constants, so a violation should not build. The first version of
-// MAX_CHAT_BODY_BYTES was sized off MAX_TOTAL_IMAGE_BYTES and made
-// `TotalTooLarge` unreachable over HTTP; this is the guard against that.
+// The backstop must sit above EVERY policy limit, or the policy never runs and the caller gets
+// Axum's "length limit exceeded" instead of an actionable message. Compile-time rather than a
+// test because it is a relationship between constants, so a violation should not build.
 const _: () = assert!(MAX_CHAT_BODY_BYTES > MAX_TOTAL_IMAGE_BYTES * 4 / 3);
 const _: () = assert!(MAX_CHAT_BODY_BYTES > (MAX_IMAGES_PER_TURN * MAX_IMAGE_BYTES) * 4 / 3);
 // Axum's own default is 2 MiB, which is below a single legal image.
@@ -166,11 +127,8 @@ impl ImageLimitError {
 
 /// Decoded byte length of a base64 payload, without decoding it.
 ///
-/// Standard base64 encodes 3 bytes per 4 characters; each trailing `=` removes
-/// one output byte. Whitespace (which some clients insert every 76 chars) is
-/// not counted. This is an estimate only in the sense that it trusts the input
-/// to be well-formed base64 — it is exact for valid input, and the point is to
-/// reject an oversized payload BEFORE allocating a decode buffer for it.
+/// Exact for well-formed base64 (3 bytes per 4 characters, each trailing `=` one byte less),
+/// and whitespace is ignored. Rejects an oversized payload before a decode buffer is allocated.
 #[must_use]
 pub fn decoded_len(base64: &str) -> usize {
     let mut chars = 0usize;

@@ -5,7 +5,7 @@ child process instead of re-implementing the pipeline over HTTP. The shell
 spawns:
 
 ```
-pond-server chat --input whisper --json-events --session-id <uuid>
+pond-server chat --voice --json-events --session-id <uuid>
 ```
 
 The child exclusively owns the microphone and speaker: wake-word detection,

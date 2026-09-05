@@ -9,20 +9,50 @@ import { useOnboarding } from "../OnboardingContext";
 import { FormLabel } from "../primitives/FormLabel";
 import { ToggleRow } from "../primitives/ToggleRow";
 import { Lead } from "../primitives/StepShell";
-import { LANGUAGES, TIMEZONES } from "../onboarding.constants";
+import { LANGUAGES } from "../onboarding.constants";
+import { detectPlace } from "../../../lib/place";
+import { ZonePicker } from "../../ZonePicker";
 
 export function StepLocale() {
   const { draft, patch } = useOnboarding();
   const [detecting, setDetecting] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
 
-  function detect() {
+  /**
+   * The same cascade Settings runs, on the server.
+   *
+   * What was here before did not detect anything: it split the time-zone
+   * string on "/", waited 400ms so it looked like work, and produced NO
+   * COORDINATES — then switched weather on regardless, so setup finished with
+   * a forecast that could never be fetched.
+   */
+  async function detect() {
     setDetecting(true);
-    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-    const city = tz.split("/").pop()?.replace(/_/g, " ") || "";
-    setTimeout(() => {
-      patch({ locationName: city, timezone: tz, enableWeather: true });
+    setNote(null);
+    try {
+      const at = await detectPlace(draft.locationName);
+      patch({
+        locationName: at.name || draft.locationName,
+        timezone: at.timezone,
+        latitude: at.latitude,
+        longitude: at.longitude,
+        // Only offer weather when there is something to ask about. Turning it
+        // on with no coordinates and no name is how the old button left every
+        // onboarded pond with weather enabled and permanently unconfigured.
+        enableWeather: at.has_coordinates || Boolean(at.name),
+      });
+      setNote(
+        at.note
+          ? at.note
+          : at.certain
+            ? `Found ${at.name}.`
+            : `Guessed ${at.name} from your time zone.`,
+      );
+    } catch {
+      setNote("Could not work that out. Type the nearest town instead.");
+    } finally {
       setDetecting(false);
-    }, 400);
+    }
   }
 
   return (
@@ -46,17 +76,12 @@ export function StepLocale() {
         </div>
         <div>
           <FormLabel>Timezone</FormLabel>
-          <select
+          <ZonePicker
             value={draft.timezone}
-            onChange={(e) => patch({ timezone: e.target.value })}
+            onChange={(timezone) => patch({ timezone })}
             className="ob-select"
-          >
-            {TIMEZONES.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
+            aria-label="Timezone"
+          />
         </div>
       </div>
 
@@ -79,6 +104,7 @@ export function StepLocale() {
             {detecting ? "Detecting\u2026" : "Auto-detect"}
           </button>
         </div>
+        {note && <p className="ob-field-hint">{note}</p>}
       </div>
 
       <ToggleRow

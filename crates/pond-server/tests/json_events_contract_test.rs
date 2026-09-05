@@ -68,8 +68,6 @@ fn json_events_stdin_turn_emits_contract_ndjson() {
     let mut child = Command::new(bin)
         .args([
             "chat",
-            "--input",
-            "stdin",
             "--json-events",
             "--session-id",
             "test-contract",

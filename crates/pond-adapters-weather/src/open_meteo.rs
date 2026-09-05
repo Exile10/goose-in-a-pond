@@ -1,31 +1,7 @@
-//! `OpenMeteoWeatherAdapter` — fetches current weather and forecasts from the
-//! free [Open-Meteo](https://open-meteo.com) API (no API key required).
-//!
-//! Results are cached for `cache_ttl` (default 15 minutes) so every chat
-//! message doesn't trigger an upstream HTTP call.
-//!
-//! **Current weather API:**
-//! ```text
-//! GET https://api.open-meteo.com/v1/forecast
-//!   ?latitude={lat}&longitude={lon}
-//!   &current=temperature_2m,relative_humidity_2m,apparent_temperature,
-//!            precipitation,weather_code,wind_speed_10m,wind_direction_10m,
-//!            wind_gusts_10m,cloud_cover,is_day
-//!   &daily=sunrise,sunset
-//!   &forecast_days=1&timezone=auto
-//!   &temperature_unit=celsius&wind_speed_unit=kmh&precipitation_unit=mm
-//! ```
-//!
-//! **Daily forecast API:**
-//! ```text
-//! GET https://api.open-meteo.com/v1/forecast
-//!   ?latitude={lat}&longitude={lon}
-//!   &daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,
-//!          uv_index_max,precipitation_sum,precipitation_probability_max,
-//!          wind_speed_10m_max
-//!   &forecast_days={days}&timezone=auto
-//!   &temperature_unit=celsius&wind_speed_unit=kmh&precipitation_unit=mm
-//! ```
+//! `OpenMeteoWeatherAdapter` — current weather and forecasts from the free
+//! [Open-Meteo](https://open-meteo.com) API, no key required. Both the current and
+//! the daily call hit `GET https://api.open-meteo.com/v1/forecast` with
+//! `timezone=auto` and celsius/kmh/mm units. Results cached for `cache_ttl` (15 min).
 
 use crate::geocoding::Geocoder;
 use crate::wmo;
@@ -151,13 +127,10 @@ impl OpenMeteoWeatherAdapter {
 
     // ── Internal fetch helpers ───────────────────────────────────────────
 
-    /// Coordinates for the configured default location.
-    ///
-    /// Uses the explicit `latitude`/`longitude` when they were set. Otherwise —
-    /// onboarding stores a place *name* but no coordinates (both default to 0) —
-    /// it geocodes the name. Geocoding only runs on a weather-cache miss (the
-    /// callers check their 15-minute cache first), so this adds no per-call
-    /// network cost in the common case.
+    /// Coordinates for the configured default location, geocoding `location_name`
+    /// when latitude and longitude are both 0 (onboarding stores a name only).
+    /// Callers check their 15-minute weather cache first, so this adds no network
+    /// cost in the common case.
     async fn default_location(&self) -> Result<(f64, f64, String)> {
         if self.latitude != 0.0 || self.longitude != 0.0 {
             return Ok((self.latitude, self.longitude, self.location_name.clone()));

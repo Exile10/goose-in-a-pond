@@ -1,8 +1,7 @@
-//! Frame → YOLOX input tensor. Pure (no ONNX runtime), unit-tested.
-//!
-//! YOLOX's released COCO models expect a square BGR image letterboxed onto a
-//! grey (114) canvas, as raw 0–255 floats in CHW order — **no** mean/std
-//! normalisation (removed upstream in v0.1.1).
+//! Frame → YOLOX input tensor. Pure (no ONNX runtime), unit-tested. YOLOX's
+//! released COCO models expect a square BGR image letterboxed onto a grey (114)
+//! canvas, as raw 0–255 floats in CHW order, with NO mean/std normalisation
+//! (removed upstream in v0.1.1).
 
 use anyhow::{bail, Result};
 use ndarray::Array4;

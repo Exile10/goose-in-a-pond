@@ -1472,19 +1472,10 @@ impl TaskRegistry {
     }
 }
 
-/// Run one authorised child to completion and record what it was — PAI-6 P2,
-/// lifted out of `spawn` by P8.
-///
-/// It takes owned handles rather than `&self` for exactly one reason: a
-/// background run outlives the `spawn` call that started it, so the future has
-/// to be `'static`. A synchronous delegation awaits it inline and is unchanged
-/// by the move — the same permit, the same frames, the same classification, in
-/// the same order.
-///
-/// `_reservation` is a parameter and not a local because ownership is the whole
-/// mechanism: PAI-6 P4's claim on the parent's history budget is released by
-/// `Drop`, so passing it in is what makes a background child's claim last
-/// exactly as long as the child does, including when the future is dropped.
+/// Run one authorised child to completion and record what it was (PAI-6 P2). Owned handles,
+/// not `&self`: a background run outlives the `spawn` that started it, so the future must be
+/// `'static`. `_reservation` is a parameter so the PAI-6 P4 history-budget claim, released by
+/// `Drop`, lasts exactly as long as the child does, including when the future is dropped.
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     runner: Arc<dyn ChildRunner>,
@@ -1499,27 +1490,10 @@ async fn drive_run(
 ) -> Result<TaskRun> {
     let parent_session_id = run.parent_session_id.clone();
     let plan_child_session_id = plan.child_session_id.clone();
-    // Invariant 3, on the only path that can start a child. The permit is
-    // acquired BEFORE the engine is touched and held until the run ends, so
-    // there is no window in which two on-device children are both replying.
-    //
-    // **Unless the parent's own turn is already holding the device**, which
-    // is the ordinary case for a synchronous delegation: the parent is
-    // blocked inside a tool call, not talking to the provider, so there is
-    // exactly one thing using the model and the child is it. Acquiring
-    // again would deadlock the parent against its own child forever, and
-    // because that turn is also holding one of `main.rs`'s four
-    // `sse_semaphore` permits, four of them would take the interactive chat
-    // pool down until the process restarts. Inheriting is not a relaxation
-    // of invariant 3 — the parent cannot reply while its child runs.
-    //
-    // What inheriting must NOT mean is `needed = 0`, which is what P4
-    // wrote. A device hold belongs to the SESSION, so every child of the
-    // delegating turn inherited it and `acquire_many_owned(0)` never
-    // blocks: three delegations issued in one parent turn ran three
-    // abreast on the one GPU. The parent's hold therefore carries a
-    // semaphore of ONE for its children to share — a child skips its
-    // parent's claim and still queues behind its siblings.
+    // Invariant 3: the permit is acquired BEFORE the engine is touched and held until the run
+    // ends. A parent turn already holding the device must not acquire again or it deadlocks
+    // against its own child (and pins one of `main.rs`'s four `sse_semaphore` permits), so its
+    // children share the hold's semaphore of ONE: never `needed = 0`, or siblings run abreast.
     let (device, needed) = match ledger.inherited_child_permits(&parent_session_id) {
         Some(siblings) => (siblings, 1),
         None => (permits, subagent_permits(&provider_name)),
@@ -1567,20 +1541,10 @@ async fn drive_run(
 
     let (status, result, error) = match outcome {
         Ok(outcome) => {
-            // Invariant 2, audited after the fact. The plan builder refuses
-            // to ASK for a stripped builtin; this asks what the child
-            // actually ended up holding, because `add_extension` is not the
-            // only way one can arrive (a Goose sync could re-arm a
-            // `default_enabled` platform extension, which is exactly what
-            // `EnabledExtensionsState::extensions_or_default` does).
-            //
-            // `run_child_agent` reads `list_extensions()` AFTER the drain
-            // and unions it with the pre-run read, so this set is what the
-            // child ran with rather than an echo of what it was handed. P2
-            // read it before `reply` and could therefore only ever report
-            // back what `add_extension` had just been given -- which
-            // `child_extensions` had already refused, so the audit was
-            // structurally incapable of failing.
+            // Invariant 2, audited after the fact: the plan builder refuses to ASK for a
+            // stripped builtin, but a Goose sync can re-arm a `default_enabled` platform
+            // extension (`EnabledExtensionsState::extensions_or_default`). `run_child_agent`
+            // reads `list_extensions()` AFTER the drain, so this is what the child ran with.
             let smuggled = stripped_builtins_present(&outcome.loaded_extensions);
             if !smuggled.is_empty() {
                 tracing::error!(
@@ -1652,12 +1616,9 @@ pub struct GooseOrchestrator {
     /// that started it, so the part of this struct it keeps using has to be
     /// something it can own a handle to. Nothing else about it changed.
     tasks: Arc<Mutex<TaskRegistry>>,
-    /// The same registry `GooseAdapter` publishes each turn's authority into.
-    ///
-    /// PAI-6 P3. Two things depend on it, and both are refusals rather than
-    /// conveniences: a spec whose parent turn is no longer live does not run at
-    /// all, and a child that does run gets a token DERIVED from the parent's, so
-    /// cancelling the parent cancels its children (invariant 5's other half).
+    /// The same registry `GooseAdapter` publishes each turn's authority into (PAI-6 P3).
+    /// A spec whose parent turn is no longer live is refused, and a synchronous child gets a
+    /// token DERIVED from the parent's, so cancelling the parent cancels its children.
     authorities: Arc<TurnAuthorityRegistry>,
     /// PAI-6 P4. Written here, read by `GooseAdapter::turn_profile`. Also
     /// process-wide, and for the same reason as `permits` — see
@@ -1684,28 +1645,10 @@ impl GooseOrchestrator {
 #[async_trait]
 impl Orchestrator for GooseOrchestrator {
     async fn spawn(&self, spec: TaskSpec) -> Result<TaskRun> {
-        // PAI-6 P3, and the first thing checked because it is the cheapest
-        // refusal. A `TaskSpec` was authorised by a parent turn; if that turn is
-        // over, the authority behind it is stale and the only safe answer is no.
-        // This is also what makes the registry load-bearing rather than
-        // decorative: there is no `spawn` path that runs without a live parent.
-        //
-        // For a SYNCHRONOUS run the token is DERIVED from the parent's rather
-        // than minted fresh, which is invariant 5's other half. Goose's own
-        // background path mints an unrelated root token and relies on a `Drop`
-        // sweep at shutdown; `child_token()` is unused anywhere in the engine.
-        //
-        // PAI-6 P8 splits that in two, and the split is a decision rather than
-        // an omission. A background run outlives the turn that asked for it by
-        // definition, and the parent turn's token is cancelled by the
-        // `DropGuard` the chat stream holds — so a background child that
-        // inherited would die the moment its parent's reply finished, which is
-        // not a background child, it is a synchronous one with a race. It
-        // therefore gets its OWN token, whose owner is the parent SESSION, and
-        // the cascade for it is `cancel_children_of` (plus `cancel` by id).
-        // Both are on the port and both are implemented below; what invariant 5
-        // is owed and has not got is a PRODUCTION caller for the first, on
-        // session deletion and on shutdown, which lives outside this crate.
+        // PAI-6 P3, checked first: a spec whose parent turn has ended carries stale authority
+        // and is refused, so no `spawn` path runs without a live parent. Invariant 5: a
+        // synchronous child's token DERIVES from the parent's; a background child gets its OWN
+        // (the chat stream's `DropGuard` would kill an inherited one) and `cancel_children_of`.
         let parent_turn = self
             .authorities
             .parent_turn_token(spec.parent_session_id())
@@ -1717,37 +1660,20 @@ impl Orchestrator for GooseOrchestrator {
                 )
             })?;
 
-        // PAI-6 P4. The child's claim on its parent's history budget, taken the
-        // moment the delegation is AUTHORISED rather than when it starts
-        // replying. A child the parent has committed to is a second claim on
-        // the window whether it is queueing for the device, being planned, or
-        // talking; shrinking the parent's budget a little early costs recall it
-        // was going to lose anyway, and shrinking it late means a concurrent
-        // parent turn trims as though it still owned the whole window.
-        //
-        // Held to the end of `spawn` by `Drop`, which is what makes every exit
-        // below correct without any of them saying so — a refused plan, a
-        // runner that errored, a cancellation while queued and an ordinary
-        // completion all give the budget back on the way out. It is deliberately
-        // ABOVE the plan builder: a first version sat below it, so the refusal
-        // path never held a reservation at all and the test asserting that the
-        // refusal releases one passed without ever exercising a release.
+        // PAI-6 P4. The child's claim on its parent's history budget, taken when the delegation
+        // is AUTHORISED, not when it starts replying: taken late, a concurrent parent turn trims
+        // as though it owned the whole window. Released by `Drop`, so every exit below gives the
+        // budget back. It must sit ABOVE the plan builder so the refusal path holds one too.
         let reservation = self
             .ledger
             .reserve(spec.parent_session_id(), spec.context_fraction());
 
         let env = self.runner.environment(spec.parent_session_id()).await?;
 
-        // PAI-6 P8, refused here: after the provider is known and BEFORE the
-        // engine is touched, so a refused background call leaves no child
-        // session behind to release.
-        //
-        // The refusal is invariant 3 in different clothes. Where only one agent
-        // may hold the model at a time, a background child does not run beside
-        // the conversation — it runs INSTEAD of it, and the parent's next turn
-        // waits for it and then pays a re-prefill. Silently running it in the
-        // foreground was the alternative and is worse: the caller was told its
-        // turn would return immediately, and it would not.
+        // PAI-6 P8, refused after the provider is known and BEFORE the engine is touched, so a
+        // refused background call leaves no child session to release. This is invariant 3:
+        // where one agent holds the model at a time, a background child runs INSTEAD of the
+        // conversation, and the parent's next turn would wait for it and pay a re-prefill.
         if spec.background() {
             if let Some(refusal) =
                 BackgroundAvailability::for_provider(&env.provider_name).refusal()
@@ -1783,14 +1709,9 @@ impl Orchestrator for GooseOrchestrator {
             }
         };
 
-        // PAI-6 P7, traced from one place so the two outcomes are read together.
-        //
-        // The refusal is not silent: it is a role's stated intent going unmet,
-        // and the person who authored the role is the only one who can decide
-        // what to do about it. It is a WARN rather than an error because the
-        // delegation itself is fine -- the child runs, on the resident model,
-        // with the tools, the budget and the persona the role asked for, all of
-        // which is where a role's value actually is.
+        // PAI-6 P7, traced from one place so the two outcomes are read together. The refusal
+        // is a WARN, not an error: the role's author is the only one who can act on it, and the
+        // delegation itself is fine -- the child still runs with the role's tools and persona.
         match (plan.model.assigned(), plan.model.refusal()) {
             (Some(model), _) => tracing::info!(
                 target: "giap::trace",
@@ -1810,25 +1731,17 @@ impl Orchestrator for GooseOrchestrator {
             (None, None) => {}
         }
 
-        // Queued, not Running: the permit is acquired below and on an on-device
-        // provider every child after the first waits for it. `TaskRun::started`
-        // is the only constructor `pond-core` offers and it stamps `Running`, so
-        // the status is corrected here rather than by building the struct field
-        // by field — a `TaskRun::queued` constructor over there would say it
-        // once instead of twice, and is requested rather than written because
-        // this change does not own `pond-core`.
+        // Queued, not Running: the permit is acquired in `drive_run`, and on an on-device
+        // provider every child after the first waits for it. `TaskRun::started` is the only
+        // constructor `pond-core` offers and it stamps `Running`, so the status is fixed here.
         let mut run = TaskRun::started(&spec, chrono::Utc::now());
         run.status = TaskStatus::Queued;
         self.with_registry(|registry| registry.insert(run.clone(), cancel.clone()));
 
-        // PAI-6 P6. The first frame the parent's stream can draw a node from,
-        // and it is emitted BEFORE the permit is acquired on purpose: on-device
-        // that acquisition is where a second delegation from the same turn
-        // spends its time, and a child that is queueing is the state most in
-        // need of saying so. Every frame in this method is derived from the
-        // registry's own status, so a run that reaches a state the stream never
-        // hears about is a missing `report_child_progress` next to a
-        // `registry` call rather than a second lifecycle to keep in step.
+        // PAI-6 P6. The first frame the parent's stream can draw a node from, emitted BEFORE
+        // the permit is acquired: on-device, queueing for it is where a second delegation spends
+        // its time. Every frame derives from the registry's status; a state the stream never
+        // hears about is a missing `report_child_progress` next to a `registry` call.
         report_child_progress(
             spec.parent_session_id(),
             &run.id,
@@ -1837,17 +1750,9 @@ impl Orchestrator for GooseOrchestrator {
             None,
         );
 
-        // PAI-6 P8. The fork, and it is deliberately the LAST thing: everything
-        // above — the live-turn check, the background refusal, the reservation,
-        // the plan and its refusals, the registry entry and the first frame —
-        // happens for both kinds of run, synchronously, so a background call
-        // that cannot proceed says so to the caller's face instead of failing
-        // somewhere nobody is listening.
-        //
-        // What differs after this line is only who awaits. `Orchestrator::poll`
-        // existed before there was anything to poll precisely so this could be
-        // added without touching the port, and `TaskStatus` already had the
-        // terminal states, so there is no second lifecycle here.
+        // PAI-6 P8. The fork is deliberately LAST: every check, refusal, reservation, registry
+        // entry and first frame above runs synchronously for both kinds of run, so a background
+        // call that cannot proceed fails to the caller's face. Only who awaits differs below.
         let drive = drive_run(
             self.runner.clone(),
             self.tasks.clone(),
@@ -1909,20 +1814,10 @@ impl Orchestrator for GooseOrchestrator {
         }))
     }
 
-    /// PAI-6 invariant 5's other half, and since P8 it is the ONLY half for a
-    /// background run.
-    ///
-    /// A synchronous child holds a token derived from its parent turn's, so the
-    /// chat stream's `DropGuard` already reaches it and this method is for the
-    /// explicit cases. A BACKGROUND child holds its own — it has to, or it would
-    /// die with the turn that asked for it — so this is what stands between a
-    /// deleted session and a helper still working on its behalf.
-    ///
-    /// **It still has no production caller, and P8 did not add one**: session
-    /// deletion and shutdown live in `pond-api`'s routes and `pond-server`'s
-    /// `main.rs`. That is stated here rather than implied by the absence,
-    /// because the absence is exactly what a reader would otherwise take for
-    /// "nothing needs to call it".
+    /// PAI-6 invariant 5's other half, and the ONLY cancellation path for a background run: a
+    /// synchronous child's token derives from its parent turn's, but a background child owns
+    /// its token, so nothing else stops it when its session is deleted. It still has no
+    /// production caller; session deletion and shutdown live in `pond-api` and `pond-server`.
     async fn cancel_children_of(&self, parent_session_id: &str) -> Result<usize> {
         Ok(self.with_registry(|registry| {
             let mut stopped = 0usize;
@@ -1943,10 +1838,8 @@ impl Orchestrator for GooseOrchestrator {
 
 /// [`ChildRunner`] over the live [`GooseAdapter`].
 ///
-/// A thin delegation on purpose: the four methods need `agent`,
-/// `session_manager`, `current_provider`, `settings_repo` and `template_repo`,
-/// which are private fields, so the bodies live next to them in
-/// `goose_agent.rs`. What lives here is the shape the orchestrator depends on.
+/// A thin delegation on purpose: the method bodies need `GooseAdapter`'s private fields, so
+/// they live next to them in `goose_agent.rs`; this is only the shape the orchestrator uses.
 pub struct GooseChildRunner {
     adapter: Arc<crate::goose_agent::GooseAdapter>,
 }

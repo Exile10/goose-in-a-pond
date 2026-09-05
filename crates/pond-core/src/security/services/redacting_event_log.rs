@@ -1,10 +1,7 @@
 //! PAI-2 P3, chokepoint 2: redact event attributes before they reach the log.
 //!
-//! A decorator rather than five edits. `EventLog::append` has five production
-//! call sites (pairing outcomes, the bus bridge, the policy audit sink, turn
-//! activity, egress) and all of them resolve to an `Arc` built in `run_server`.
-//! Wrapping the Arc covers a call site nobody has written yet, which is the
-//! only kind of coverage that survives a refactor.
+//! A decorator, not edits at each call site: every `EventLog::append` caller resolves
+//! to the one `Arc` built in `run_server`, so wrapping it also covers future ones.
 
 use std::sync::Arc;
 

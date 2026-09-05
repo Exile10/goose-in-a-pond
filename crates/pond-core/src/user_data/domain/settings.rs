@@ -87,6 +87,56 @@ pub const NETWORK_MODES: &[&str] = &[
 /// grows a value alone.
 pub const REASONING_EFFORTS: &[&str] = &["brief", "balanced", "thorough"];
 
+// ── The remaining closed vocabularies ───────────────────────────────────────
+//
+// Written down here, beside the three that already were, because a value set
+// that lives only in the desktop's `catalogue.ts` is a value set the server
+// does not enforce — and every writer that is not the catalogue (a raw PUT, the
+// CLI, a future mobile client) bypassed it entirely. See
+// `settings_validation::FIELD_RULES`, which is what actually applies them.
+
+/// How many tools a turn is offered. See `tool_selection_mode`.
+pub const TOOL_SELECTION_MODES: &[&str] = &[TOOL_SELECTION_MODE_ALL, TOOL_SELECTION_MODE_RELEVANT];
+
+/// The agent loop that serves turns.
+///
+/// One value, and that is the point: `pond` is quarantined (Q2-05) and the API
+/// refuses it. It was refused by NAME, though — a denylist of exactly one
+/// string — so `gosse` or `ollama` was accepted, stored, survived the startup
+/// heal, and then failed the `!= "goose"` test that selects the real agent,
+/// leaving every request answered by `MockAgent` with no error anywhere.
+pub const AGENT_BACKENDS: &[&str] = &["goose"];
+
+/// Backends that exist but must never be selected. Named separately so the
+/// refusal can say *why* rather than only listing what is allowed.
+pub const QUARANTINED_AGENT_BACKENDS: &[&str] = &["pond"];
+
+/// Built-in system-prompt templates.
+pub const PROMPT_STYLES: &[&str] = &["balanced", "concise", "technical", "warm"];
+
+/// Whether the model is asked to think before answering.
+pub const THINKING_MODES: &[&str] = &["auto", "on", "off"];
+
+/// Whether a turn's answer is reviewed before it is shown.
+pub const REVIEW_MODES: &[&str] = &["off", "on", "auto"];
+
+/// How memory consolidation is run.
+pub const CONSOLIDATION_MODES: &[&str] = &["single", "adversarial"];
+
+/// Which engine computes embeddings.
+pub const EMBEDDING_PROVIDERS: &[&str] = &["fastembed", "gguf", "none"];
+
+/// Kokoro quality tiers, smallest first.
+pub const TTS_QUALITIES: &[&str] = &["q4", "q4f16", "q8", "q8f16", "fp16", "fp32"];
+
+/// Which detector decides that a frame is speech.
+///
+/// `rms` is the energy gate that has always shipped: cheap, and unable to tell
+/// a fridge from a voice. `silero` runs a 2 MB ONNX model that can — measured,
+/// steady noise at twice the energy threshold scores 0.08 where speech averages
+/// 0.945 — at about 1.6% of one core on a Jetson.
+pub const VAD_BACKENDS: &[&str] = &["rms", "silero"];
+
 /// One factory default that CHANGED after installs already existed.
 ///
 /// Settings are a flat key-value table and a default only applies when the key
@@ -162,6 +212,24 @@ pub const DEFAULT_ADOPTIONS: &[DefaultAdoption] = &[
         old_default: "false",
         new_default: "true",
         migration: "0035",
+    },
+    // The energy gate cannot tell a fridge from a voice, so it holds the
+    // microphone open on room noise until the hard cap. Opt-in, it was never
+    // going to be on anywhere it mattered.
+    DefaultAdoption {
+        key: "vad_backend",
+        old_default: "rms",
+        new_default: "silero",
+        migration: "0052",
+    },
+    // Voice held the tightest turn budget in the pond while text was raised to
+    // 50 for exactly the requests a household speaks rather than types. The
+    // same ask finished when typed and gave up six turns in when spoken.
+    DefaultAdoption {
+        key: "voice_max_turns",
+        old_default: "8",
+        new_default: "0",
+        migration: "0053",
     },
 ];
 
@@ -310,6 +378,23 @@ pub struct Settings {
     /// a mistyped tier must not leave the pond unable to speak.
     #[serde(default = "Settings::default_tts_quality")]
     pub voice_tts_quality: String,
+
+    /// Which detector decides that a frame is speech (`rms` | `silero`).
+    ///
+    /// Only the *endpoint* — deciding the user has stopped talking — goes
+    /// through this. Speech onset stays on the energy gate, deliberately: a
+    /// freshly reset Silero scores 0.27 on a window of unambiguous speech
+    /// because its recurrent state needs a window or two of context, which is
+    /// harmless when looking for silence and would clip the first word when
+    /// looking for the start of one.
+    ///
+    /// Defaults to `silero`, which fetches its 2 MB model on first use, and
+    /// falls back to `rms` whenever that cannot be had — no network, no ONNX
+    /// runtime, a load that times out. `rms` remains selectable as the escape
+    /// hatch for a board whose runtime is broken. An unknown value falls back
+    /// too, and says so: a mistyped backend must not leave the pond deaf.
+    #[serde(default = "Settings::default_vad_backend")]
+    pub vad_backend: String,
 
     /// Whether the soft ambient tone plays while the model is working.
     ///
@@ -665,12 +750,13 @@ pub struct Settings {
     #[serde(default = "Settings::default_agent_max_turns")]
     pub agent_max_turns: u32,
 
-    /// Maximum agentic loop turns for VOICE requests (#105). Voice trades
-    /// completeness for latency: every extra turn is another full LLM round
-    /// the user waits through in silence before hearing anything. The default
-    /// (8) still fits a chained command — two or three tool rounds plus the
-    /// spoken summary — while capping the worst case well below the text-chat
-    /// limit. Never raised above `agent_max_turns`; 0 = no voice-specific cap.
+    /// Maximum agentic loop turns for VOICE requests (#105).
+    ///
+    /// Defaults to `0` — no voice-specific cap, so a spoken request gets the
+    /// same `agent_max_turns` budget a typed one does. See
+    /// `default_voice_max_turns` for why the 8 it used to be was making voice
+    /// look unreliable. A non-zero value restores the trade — completeness for
+    /// latency — and is never raised above `agent_max_turns`.
     #[serde(default = "Settings::default_voice_max_turns")]
     pub voice_max_turns: u32,
 
@@ -1183,6 +1269,7 @@ impl Default for Settings {
             voice_tts_voice: Self::default_tts_voice(),
             voice_tts_speed: Self::default_tts_speed(),
             voice_tts_quality: Self::default_tts_quality(),
+            vad_backend: Self::default_vad_backend(),
             voice_thinking_tone_enabled: Self::default_voice_thinking_tone_enabled(),
             voice_recording_duration_secs: Self::default_recording_duration(),
             voice_whisper_url: Self::default_whisper_url(),
@@ -1364,6 +1451,13 @@ impl Settings {
     fn default_tts_quality() -> String {
         "q8".to_string()
     }
+    /// `silero`. See the field docs. It was `rms` for exactly one commit, on
+    /// the theory that a download should be opt-in; but the download is 2 MB
+    /// and happens once, and leaving it opt-in meant every pond shipped with
+    /// the detector that cannot tell a fridge from a voice.
+    fn default_vad_backend() -> String {
+        "silero".to_string()
+    }
     /// ON. See the field docs: a household that dislikes the tone can switch it
     /// off, but one that never hears it has nothing to go looking for.
     fn default_voice_thinking_tone_enabled() -> bool {
@@ -1519,12 +1613,28 @@ impl Settings {
     fn default_agent_max_turns() -> u32 {
         50
     }
-    // 8 turns ≈ 2-3 chained tool rounds + the spoken summary. Chosen against
-    // the #105 harness (command_chaining_live_test.rs): chained two-action
-    // utterances complete in 3-5 turns, so 8 leaves headroom for a retry
-    // without letting a runaway loop keep the speaker silent for 20 rounds.
+    /// `0` — no voice-specific cap. Voice gets the same budget as text.
+    ///
+    /// It was 8, chosen against the #105 harness on the reasoning that chained
+    /// two-action utterances complete in 3-5 turns and a runaway loop must not
+    /// keep the speaker silent for 20 rounds. Both halves were true; the
+    /// conclusion stopped being. `agent_max_turns` moved 20 -> 50 in migration
+    /// 0035 precisely because "the 20-turn cap stranded multi-step research and
+    /// home-automation requests mid-task" — and voice, where the household
+    /// actually asks for those, kept the tightest budget in the pond. The same
+    /// request that finishes when typed gives up six times sooner when spoken,
+    /// which reads as the assistant being unreliable rather than as a setting.
+    ///
+    /// The latency worry is now covered by things that bound the wait directly
+    /// rather than by proxy: `agent_timeout_secs` stops a stalled turn, the
+    /// thinking tone means the wait is not silent, and a spoken barge-in stops
+    /// a turn that has gone wrong. Capping *steps* to bound *time* also priced
+    /// a cheap tool round the same as an expensive one.
+    ///
+    /// Still settable: a household that would rather be cut off than wait can
+    /// put a number back, and it is still clamped to `agent_max_turns`.
     fn default_voice_max_turns() -> u32 {
-        8
+        0
     }
 
     /// The agent-loop turn cap for a request, honouring the voice-specific
@@ -2105,16 +2215,40 @@ mod tests {
         assert!(s.searxng_url.is_none());
     }
 
-    /// #105: voice requests get the tighter turn cap; text keeps the full budget.
+    /// Out of the box, a spoken request gets the same budget as a typed one.
+    ///
+    /// This asserted `8` for voice against `50` for text — #105's trade of
+    /// completeness for latency. The trade is still available (see the test
+    /// below) but is no longer the default: the same multi-step request
+    /// completing when typed and stopping six turns in when spoken is
+    /// indistinguishable, from the room, from the assistant being unreliable.
     #[test]
-    fn effective_max_turns_prefers_voice_cap_for_voice_requests() {
+    fn a_spoken_request_gets_the_same_budget_as_a_typed_one() {
         let s = Settings::default();
         assert_eq!(
             s.effective_max_turns(false),
             50,
             "text uses agent_max_turns"
         );
-        assert_eq!(s.effective_max_turns(true), 8, "voice uses voice_max_turns");
+        assert_eq!(
+            s.effective_max_turns(true),
+            s.effective_max_turns(false),
+            "voice must not be quietly given a smaller budget than text"
+        );
+    }
+
+    /// The voice cap still works — it is defaulted off, not removed.
+    ///
+    /// A household that would rather be cut off than wait can set one, and it
+    /// must still bind. Without this, defaulting the value to 0 could silently
+    /// become "the voice cap is ignored" and nobody would notice until someone
+    /// set it and nothing changed.
+    #[test]
+    fn a_configured_voice_cap_still_binds() {
+        let mut s = Settings::default();
+        s.voice_max_turns = 8;
+        assert_eq!(s.effective_max_turns(true), 8);
+        assert_eq!(s.effective_max_turns(false), 50, "text is unaffected");
     }
 
     /// B1: `agent_max_turns = 0` means uncapped reasoning — the engine gets the
@@ -2437,6 +2571,11 @@ mod tests {
             // Vision classifier model file (#130 follow-up): an operator knob
             // that also requires a `vision-onnx` build; UI wiring comes with
             // the Models-tab vision section, not before.
+            // No control yet: the model is a download and the backend is opt-in,
+            // so this ships headless and moves to UI_WIRED in the same change
+            // that adds the switch. Claiming a control that does not exist is
+            // how twenty-two switches came to render without being operable.
+            "vad_backend",
             "vision_classifier_model",
             // PAI-8's on-pond producer, headless for the same reason and owing
             // a UI for a sharper one: this switch decides whether what the
@@ -2792,13 +2931,22 @@ mod tests {
     #[test]
     fn only_the_deliberate_extension_toggles_ship_switched_off() {
         let value = serde_json::to_value(Settings::default()).expect("serialize Settings");
-        let off: Vec<&str> = value
+        let mut off: Vec<&str> = value
             .as_object()
             .expect("Settings serializes to a JSON object")
             .iter()
             .filter(|(k, v)| k.starts_with("ext_") && *v == &serde_json::Value::Bool(false))
             .map(|(k, _)| k.as_str())
             .collect();
+        // Sorted, because the map's own order is not this test's business and
+        // is not even stable across builds: something in the workspace enables
+        // `serde_json/preserve_order`, so a `Value::Object` iterates in STRUCT
+        // DECLARATION order under a workspace build and ALPHABETICALLY when
+        // pond-core is built alone. This assertion is about the set that ships
+        // off; comparing an unsorted vec made the whole gate red on `cargo test
+        // -p pond-core -p pond-api …` and green on `-p pond-core --lib`, which
+        // reads as a flake and trains a reader to re-run rather than look.
+        off.sort_unstable();
         assert_eq!(
             off,
             vec!["ext_context_enabled", "ext_orchestrator_enabled"],

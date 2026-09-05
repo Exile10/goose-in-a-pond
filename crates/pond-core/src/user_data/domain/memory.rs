@@ -242,6 +242,24 @@ pub enum FactDefect {
     /// Written from the user's point of view ("my mother"). Injected into the
     /// assistant's context, "my" reads as the *assistant's* mother.
     FirstPerson,
+    /// A verbatim copy of the extraction prompt's own worked example.
+    ///
+    /// `EXTRACTION_PROMPT` teaches the JSON shape with a demonstration — "my
+    /// mom florence lives in kisumu" mapping to two facts about Florence and
+    /// Kisumu. A model at this size copies worked examples: the answer
+    /// contract's Nairobi example was emitted verbatim as a real answer by a 4B
+    /// model on 2026-08-25, and the same class of failure here writes invented
+    /// family facts into the user's memory store, permanently and silently.
+    ///
+    /// Nothing else catches it. The example's facts are third person,
+    /// well-formed, self-contained and long enough — they pass every other
+    /// check in `fact_defect`, because they were written to.
+    ///
+    /// So the demonstration stays (it is what carries format compliance at this
+    /// size) and its own output is refused deterministically. A guard the model
+    /// cannot argue with is the only kind worth having against a model copying
+    /// text.
+    EchoedExample,
 }
 
 impl FactDefect {
@@ -250,6 +268,7 @@ impl FactDefect {
             Self::TooShort => "too short",
             Self::UnresolvedReference => "unresolved reference",
             Self::FirstPerson => "first person",
+            Self::EchoedExample => "echoed the prompt's own example",
         }
     }
 }
@@ -468,7 +487,32 @@ pub fn fact_defect(content: &str) -> Option<FactDefect> {
     if has_unresolved_reference(&tokens) {
         return Some(FactDefect::UnresolvedReference);
     }
+    if is_extraction_example(trimmed) {
+        return Some(FactDefect::EchoedExample);
+    }
     None
+}
+
+/// The facts the extraction prompt's own worked example produces.
+///
+/// Compared case-insensitively and ignoring surrounding whitespace, not by
+/// fuzzy similarity: a real user really might have a mother called Florence,
+/// and refusing every fact that merely resembles the example would silently
+/// lose true memories. Only a VERBATIM echo is refused, which is what a copying
+/// model produces.
+///
+/// Kept next to `fact_defect` rather than in the extractor because it is a
+/// property of a fact, and both the LLM extractor and any future one have to
+/// answer to it.
+const EXTRACTION_EXAMPLE_FACTS: &[&str] = &[
+    "The user's mother Florence lives in Kisumu.",
+    "The user moved to Kisumu in 2019.",
+];
+
+fn is_extraction_example(content: &str) -> bool {
+    EXTRACTION_EXAMPLE_FACTS
+        .iter()
+        .any(|ex| ex.trim().eq_ignore_ascii_case(content.trim()))
 }
 
 /// Drop a trailing plural "s" so a singular-only word list matches either form.
@@ -727,6 +771,58 @@ pub struct MemoryEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extraction prompt's own example must never become a memory.
+    ///
+    /// `EXTRACTION_PROMPT` demonstrates the JSON shape with "my mom florence
+    /// lives in kisumu, i moved there in 2019" mapping to two facts. A model at
+    /// this size copies worked examples — a 4B model emitted the answer
+    /// contract's Nairobi example as a real answer on 2026-08-25 — and here the
+    /// consequence is invented family facts written to the user's memory store,
+    /// permanently, with no conversation around them to reveal the mistake.
+    ///
+    /// These two strings pass every other check in `fact_defect`: third person,
+    /// self-contained, no bare pronoun, well over the length floor. They were
+    /// written to be exemplary, which is exactly what makes them undetectable
+    /// by the ordinary rules.
+    #[test]
+    fn the_extraction_examples_own_facts_are_refused() {
+        for content in [
+            "The user's mother Florence lives in Kisumu.",
+            "The user moved to Kisumu in 2019.",
+            // Case and padding must not get a copy through.
+            "  the user's mother florence lives in kisumu.  ",
+        ] {
+            assert_eq!(
+                fact_defect(content),
+                Some(FactDefect::EchoedExample),
+                "{content:?} is the prompt's own demonstration, not a fact about \
+                 this user"
+            );
+        }
+    }
+
+    /// The guard must be an EXACT match, not a resemblance.
+    ///
+    /// Someone really can have a mother called Florence, or move to Kisumu.
+    /// Refusing anything that merely looks like the example would quietly lose
+    /// true memories — a worse failure than the one being prevented, because it
+    /// is invisible to the user and to us.
+    #[test]
+    fn a_real_fact_that_resembles_the_example_still_passes() {
+        for content in [
+            "The user's mother Florence lives in Nakuru.",
+            "The user's sister Florence lives in Kisumu.",
+            "The user moved to Kisumu in 2021.",
+            "The user's mother is called Florence.",
+        ] {
+            assert_eq!(
+                fact_defect(content),
+                None,
+                "{content:?} is a real fact that merely resembles the example"
+            );
+        }
+    }
 
     /// The subject test that the write gate never had. Every one of these
     /// strings was in the device store, filed in a segment that means "about

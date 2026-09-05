@@ -9,7 +9,7 @@ use goose::session::SessionManager;
 use pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort;
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
 use pond_core::models::ports::agent::{
-    Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent,
+    Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent, WarmupPhase,
 };
 use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::models::ports::model_repository::ModelRepository;
@@ -330,7 +330,7 @@ pub struct GooseAdapter {
     /// These are preserved across turns (not stripped in the extension cleanup loop).
     user_extensions: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// When true, prompt templates include voice-mode instructions (keep responses
-    /// short, conversational, no formatting). Set by the CLI when `--input whisper`.
+    /// short, conversational, no formatting). Set by the CLI when `--voice` is passed.
     voice_mode: std::sync::atomic::AtomicBool,
     /// Runtime capabilities of the currently loaded model.
     model_capabilities: Mutex<pond_core::models::domain::model_capabilities::ModelCapabilities>,
@@ -658,7 +658,16 @@ impl GooseAdapter {
         let mut state = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
         let served = state.turns_served;
         state.invalidate(reason);
-        tracing::debug!(
+        // INFO, not DEBUG. The production filter is `info,{GIAP_VERBOSE},…`
+        // and `giap::trace` is not one of the verbose targets, so at DEBUG this
+        // event — the one built to answer "why did the KV prefix go cold" —
+        // has never been recorded on any pond. Its sibling `prefix_prewarm` is
+        // INFO and does appear, which is what made the gap findable at all.
+        //
+        // One line per invalidation is not chatty: a prefix that is working
+        // invalidates rarely, and a prefix that is not is the thing being
+        // diagnosed.
+        tracing::info!(
             target: "giap::trace",
             kind = "prefix_cache_invalidated",
             reason = reason.as_str(),
@@ -701,10 +710,27 @@ impl GooseAdapter {
 
     /// Record that this turn is being served off the existing prefix.
     fn note_prefix_served(&self) {
-        self.prefix_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .serve_turn();
+        let (hash, turns_served) = {
+            let mut state = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+            state.serve_turn();
+            (state.hash, state.turns_served)
+        };
+        // The counterpart to `prefix_cache_invalidated`, and it did not exist:
+        // a miss traced at a level the filter dropped, and a hit traced
+        // nothing at all. Between them the KV hit rate was unobservable in
+        // production — which is how a cache that misses most turns goes
+        // unnoticed for as long as it takes somebody to read a database of
+        // prefill timings and work backwards.
+        //
+        // `turns_served` is the number that matters: 1 means the prefix took
+        // for one turn, a rising count means it is actually being reused.
+        tracing::info!(
+            target: "giap::trace",
+            kind = "prefix_cache_served",
+            hash = %hash,
+            turns_served,
+            "KV prefix reused"
+        );
     }
 
     /// Returns an `GiapGooseExtensionManager` for managing Goose extensions on a session.
@@ -1722,7 +1748,7 @@ impl GooseAdapter {
     /// the section is pure prompt cost there — the same trade `thinking` already
     /// makes in voice mode.
     ///
-    /// `voice` is the INSTANCE-level flag (CLI `--input whisper`), not the
+    /// `voice` is the INSTANCE-level flag (CLI `--voice`), not the
     /// per-request one, for two reasons. It is the only signal `capabilities()`
     /// can see, so keying off it is what makes the two agree on every input. And
     /// it is fixed for the life of the process, so it cannot flip the static
@@ -1738,31 +1764,46 @@ impl GooseAdapter {
     /// Voice mode always says no: reasoning tokens waste TTS time and leak as
     /// spoken text if any filter layer misses them.
     ///
-    /// In `"auto"` the answer comes from the model NAME, deliberately, and not
-    /// from the `model_capabilities` cache. That cache is only refreshed inside
-    /// the provider-SWAP branch of `ensure_provider_current`, which runs LATER
-    /// in the same turn that builds the prompt. On the first turn of a process
-    /// it therefore still holds `ModelCapabilities::default()`, whose `thinking`
-    /// is false — so turn 1 rendered a prompt without the section and turn 2
-    /// rendered one with it, 78 characters appearing at the top of the static
-    /// prefix. That moved `prefix_hash`, and with it the engine's KV
-    /// prompt-session prefix, so every session paid one full re-prefill on its
-    /// second turn: 3.7 s on the Orin, for the turn the cache exists to make
-    /// nearly free. `from_model_name` is pure and cheap, and agrees with the
-    /// cache the moment the cache is right.
-    fn thinking_section_applies(mode: &str, model: &str, voice: bool) -> bool {
+    /// In `"auto"` the answer comes from the model's own FILE — its embedded
+    /// chat template — and not from the `model_capabilities` cache. That cache
+    /// is only refreshed inside the provider-SWAP branch of
+    /// `ensure_provider_current`, which runs LATER in the same turn that builds
+    /// the prompt. On the first turn of a process it therefore still holds
+    /// `ModelCapabilities::default()`, whose `thinking` is false — so turn 1
+    /// rendered a prompt without the section and turn 2 rendered one with it, 78
+    /// characters appearing at the top of the static prefix. That moved
+    /// `prefix_hash`, and with it the engine's KV prompt-session prefix, so every
+    /// session paid one full re-prefill on its second turn: 3.7 s on the Orin,
+    /// for the turn the cache exists to make nearly free.
+    ///
+    /// The template read has the same three properties that made the name
+    /// heuristic safe here — synchronous, cheap, and identical on turn 1 and
+    /// turn 2 — because `probe_cached` memoises on `(path, mtime, len)`. What it
+    /// does not share is the name heuristic's blind spot. That heuristic knows
+    /// `gemma-4`, `qwen3`, `qwq` and `deepseek-r1`; for any other reasoning
+    /// model it answered false while the ENGINE, which reads the template
+    /// through `ModelProbe`, set `enable_thinking = true`. Nemotron was switched
+    /// into reasoning mode and given no prompt section telling it what to do
+    /// with it: measured 2026-08-24, it produced an empty first turn, was
+    /// re-engaged with `EMPTY_TURN_STEER`, and fabricated a weather report
+    /// instead of calling the weather tool.
+    ///
+    /// The name heuristic remains the answer for HTTP providers, where there is
+    /// no file and the name genuinely is all there is.
+    fn thinking_section_applies(
+        mode: &str,
+        provider: &str,
+        model: &str,
+        data_dir: Option<&std::path::Path>,
+        voice: bool,
+    ) -> bool {
         if voice {
             return false;
         }
         match mode {
             "on" => true,
             "off" => false,
-            _ => {
-                pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
-                    model,
-                )
-                .thinking
-            }
+            _ => crate::model_traits::model_reasons(provider, model, data_dir),
         }
     }
 
@@ -1778,7 +1819,7 @@ impl GooseAdapter {
     /// `AgentStreamEvent::Thinking`'s own doc comment already claims ("only
     /// emitted when `show_thinking` is enabled").
     ///
-    /// `voice` is the OR of the instance flag (CLI `--input whisper`) and the
+    /// `voice` is the OR of the instance flag (CLI `--voice`) and the
     /// per-request one (the desktop voice pipeline), unlike
     /// `vision_section_applies` — this value never reaches `PromptState`, so it
     /// cannot move the static prefix between turns, and the per-request flag is
@@ -2131,184 +2172,191 @@ impl GooseAdapter {
         // ModelConfig construction reads the context limit) and on every turn, so
         // a settings toggle takes effect without a model switch or restart.
 
-        let provider: Option<(Arc<dyn Provider>, goose_providers::model::ModelConfig)> =
-            match settings.chat_provider.as_str() {
-                // Private mesh (#132 Milestone 4): route to a trusted peer's
-                // compute via MeshProvider (mesh_provider.rs), reading the
-                // same lock AppState.mesh_provider also holds — live, on
-                // every turn, so enabling mesh from Settings takes effect
-                // here with no adapter rebuild. No MCP tool-calling over
-                // mesh yet — see that module's doc comment for why. `None`
-                // (keep whatever provider is already active) on
-                // unavailability matches this function's own established
-                // failure mode for every other arm below.
-                "mesh" => match self.mesh_provider.read().await.clone() {
-                    Some(provider) => {
-                        let cfg = goose_providers::model::ModelConfig::new("mesh");
-                        Some((
-                            Arc::new(crate::mesh_provider::MeshProvider::new(provider))
-                                as Arc<dyn Provider>,
-                            cfg,
-                        ))
-                    }
-                    None => {
-                        tracing::warn!(
-                            "[model-switch] chat_provider=mesh but no mesh_provider wired into \
-                             GooseAdapter — keeping current provider"
-                        );
-                        None
-                    }
-                },
-
-                // In-process GGUF inference via llama.cpp — no HTTP server needed.
-                // Registers the model in Goose's local_model_registry so
-                // LocalInferenceProvider can locate the .gguf file on disk.
-                "local" | "gguf" => {
-                    let model_name = if settings.chat_model.is_empty() {
-                        "llamafile".to_string()
-                    } else {
-                        settings.chat_model.clone()
-                    };
-                    // Register the GGUF model path in Goose's global registry
-                    // Register the model and get back its CANONICAL registry
-                    // key: "gemma-4-E2B-it" and "gemma-4-E2B-it-Q4_K_M" both
-                    // name the same GGUF file, and letting them fork into two
-                    // registry ids splits sessions across identities and can
-                    // keep two multi-GB copies of one model resident in the
-                    // engine's per-id model cache.
-                    let registry_key = match self.data_dir {
-                        Some(ref dd) => Self::register_gguf_model(&model_name, dd),
-                        None => model_name.trim_end_matches(".gguf").to_string(),
-                    };
-                    // Phase F1. `register_gguf_model` leaves `mmproj_path: None`
-                    // (GIAP registers a bare stem, which goose's featured-model
-                    // lookup cannot match), and the engine's vision gate is
-                    // exactly that field. Attach the encoder if it is on disk;
-                    // otherwise start fetching it in the background and stamp the
-                    // registry when it lands — `resolve_model_path` runs on every
-                    // generation, so no restart is needed. Non-blocking on
-                    // purpose: the encoder is ~1 GB.
-                    if let Some(ref dd) = self.data_dir {
-                        crate::vision_encoder::ensure_mmproj_available(dd, &registry_key);
-                    }
-                    let cfg = goose_providers::model::ModelConfig::new(&registry_key);
-                    tracing::debug!(
-                        "[model-switch] building LocalInferenceProvider for '{}'...",
-                        model_name
-                    );
-                    // Wire the HF-token / config resolvers before first use — the
-                    // ProviderDef path does this; the direct constructor does not.
-                    goose::providers::local_inference::configure_local_inference();
-                    match goose::providers::local_inference::LocalInferenceProvider::from_env()
-                        .await
-                    {
-                        Ok(p) => {
-                            tracing::debug!(
-                                "[model-switch] LocalInferenceProvider ready for '{}'",
-                                model_name
-                            );
-                            tracing::info!(
-                                "Built LocalInferenceProvider for model '{}'",
-                                model_name
-                            );
-                            Some((Arc::new(p), cfg))
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                            "[model-switch] FAILED to build LocalInferenceProvider for '{}': {e}",
-                            model_name
-                        );
-                            tracing::warn!(
-                                "Failed to build local inference provider for '{}': {e}",
-                                model_name
-                            );
-                            None
-                        }
-                    }
+        // The third element is where that provider SENDS: the resolved base URL
+        // for the HTTP-backed arms, `None` for in-process inference. Captured
+        // here — the same instant the env vars are set — because this is the
+        // one moment the binding between provider and destination is explicit;
+        // the shim gates and records against it (see `GiapProviderShim`).
+        let provider: Option<(
+            Arc<dyn Provider>,
+            goose_providers::model::ModelConfig,
+            Option<String>,
+        )> = match settings.chat_provider.as_str() {
+            // Private mesh (#132 Milestone 4): route to a trusted peer's
+            // compute via MeshProvider (mesh_provider.rs), reading the
+            // same lock AppState.mesh_provider also holds — live, on
+            // every turn, so enabling mesh from Settings takes effect
+            // here with no adapter rebuild. No MCP tool-calling over
+            // mesh yet — see that module's doc comment for why. `None`
+            // (keep whatever provider is already active) on
+            // unavailability matches this function's own established
+            // failure mode for every other arm below.
+            "mesh" => match self.mesh_provider.read().await.clone() {
+                Some(provider) => {
+                    let cfg = goose_providers::model::ModelConfig::new("mesh");
+                    Some((
+                        Arc::new(crate::mesh_provider::MeshProvider::new(provider))
+                            as Arc<dyn Provider>,
+                        cfg,
+                        // No endpoint: mesh leaves over libp2p rather than HTTP, so the
+                        // shim's egress gate has no URL to check against.
+                        None,
+                    ))
                 }
-                // llamafile uses the Ollama wire protocol over HTTP.
-                "llamafile" => {
-                    std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
-                    std::env::set_var("OLLAMA_TIMEOUT", "600");
-                    let model_name = if settings.chat_model.is_empty() {
-                        "llamafile".to_string()
-                    } else {
-                        settings.chat_model.clone()
-                    };
-                    let cfg = goose_providers::model::ModelConfig::new(&model_name);
-                    tracing::debug!(
-                        "[model-switch] building llamafile OllamaProvider for '{}'...",
-                        model_name
-                    );
-                    match goose::providers::ollama_def::from_env(None).await {
-                        Ok(p) => {
-                            tracing::debug!(
-                                "[model-switch] llamafile provider ready for '{}'",
-                                model_name
-                            );
-                            Some((Arc::new(p), cfg))
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "[model-switch] FAILED to build llamafile provider for '{}': {e}",
-                                model_name
-                            );
-                            tracing::warn!("Failed to build llamafile provider: {e}");
-                            None
-                        }
-                    }
-                }
-                "ollama" => {
-                    let ollama_host = std::env::var("GIAP_OLLAMA_URL")
-                        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
-                    std::env::set_var("OLLAMA_HOST", &ollama_host);
-                    std::env::set_var("OLLAMA_TIMEOUT", "600");
-                    let model_name = if settings.chat_model.is_empty() {
-                        "llama3.2".to_string()
-                    } else {
-                        settings.chat_model.clone()
-                    };
-                    tracing::debug!(
-                        "[model-switch] building Ollama provider for '{}'...",
-                        model_name
-                    );
-                    let cfg = goose_providers::model::ModelConfig::new(&model_name);
-                    match goose::providers::ollama_def::from_env(None).await {
-                        Ok(p) => {
-                            tracing::debug!(
-                                "[model-switch] Ollama provider ready for '{}'",
-                                model_name
-                            );
-                            Some((Arc::new(p), cfg))
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "[model-switch] FAILED to build Ollama provider for '{}': {e}",
-                                model_name
-                            );
-                            tracing::warn!("Failed to build ollama provider: {e}");
-                            None
-                        }
-                    }
-                }
-                _ => {
-                    tracing::debug!(
-                        "[model-switch] unknown provider '{}', keeping current",
-                        settings.chat_provider
+                None => {
+                    tracing::warn!(
+                        "[model-switch] chat_provider=mesh but no mesh_provider wired into \
+                         GooseAdapter — keeping current provider"
                     );
                     None
                 }
-            };
+            },
+            // In-process GGUF inference via llama.cpp — no HTTP server needed.
+            // Registers the model in Goose's local_model_registry so
+            // LocalInferenceProvider can locate the .gguf file on disk.
+            "local" | "gguf" => {
+                let model_name = if settings.chat_model.is_empty() {
+                    "llamafile".to_string()
+                } else {
+                    settings.chat_model.clone()
+                };
+                // Register the GGUF model path in Goose's global registry
+                // Register the model and get back its CANONICAL registry
+                // key: "gemma-4-E2B-it" and "gemma-4-E2B-it-Q4_K_M" both
+                // name the same GGUF file, and letting them fork into two
+                // registry ids splits sessions across identities and can
+                // keep two multi-GB copies of one model resident in the
+                // engine's per-id model cache.
+                let registry_key = match self.data_dir {
+                    Some(ref dd) => Self::register_gguf_model(&model_name, dd),
+                    None => model_name.trim_end_matches(".gguf").to_string(),
+                };
+                // Phase F1. `register_gguf_model` leaves `mmproj_path: None`
+                // (GIAP registers a bare stem, which goose's featured-model
+                // lookup cannot match), and the engine's vision gate is
+                // exactly that field. Attach the encoder if it is on disk;
+                // otherwise start fetching it in the background and stamp the
+                // registry when it lands — `resolve_model_path` runs on every
+                // generation, so no restart is needed. Non-blocking on
+                // purpose: the encoder is ~1 GB.
+                if let Some(ref dd) = self.data_dir {
+                    crate::vision_encoder::ensure_mmproj_available(dd, &registry_key);
+                }
+                let cfg = goose_providers::model::ModelConfig::new(&registry_key);
+                tracing::debug!(
+                    "[model-switch] building LocalInferenceProvider for '{}'...",
+                    model_name
+                );
+                // Wire the HF-token / config resolvers before first use — the
+                // ProviderDef path does this; the direct constructor does not.
+                goose::providers::local_inference::configure_local_inference();
+                match goose::providers::local_inference::LocalInferenceProvider::from_env().await {
+                    Ok(p) => {
+                        tracing::debug!(
+                            "[model-switch] LocalInferenceProvider ready for '{}'",
+                            model_name
+                        );
+                        tracing::info!("Built LocalInferenceProvider for model '{}'", model_name);
+                        Some((Arc::new(p), cfg, None))
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "[model-switch] FAILED to build LocalInferenceProvider for '{}': {e}",
+                            model_name
+                        );
+                        tracing::warn!(
+                            "Failed to build local inference provider for '{}': {e}",
+                            model_name
+                        );
+                        None
+                    }
+                }
+            }
+            // llamafile uses the Ollama wire protocol over HTTP.
+            "llamafile" => {
+                std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
+                std::env::set_var("OLLAMA_TIMEOUT", "600");
+                let model_name = if settings.chat_model.is_empty() {
+                    "llamafile".to_string()
+                } else {
+                    settings.chat_model.clone()
+                };
+                let cfg = goose_providers::model::ModelConfig::new(&model_name);
+                tracing::debug!(
+                    "[model-switch] building llamafile OllamaProvider for '{}'...",
+                    model_name
+                );
+                match goose::providers::ollama_def::from_env(None).await {
+                    Ok(p) => {
+                        tracing::debug!(
+                            "[model-switch] llamafile provider ready for '{}'",
+                            model_name
+                        );
+                        Some((Arc::new(p), cfg, Some(self.llamafile_url.clone())))
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "[model-switch] FAILED to build llamafile provider for '{}': {e}",
+                            model_name
+                        );
+                        tracing::warn!("Failed to build llamafile provider: {e}");
+                        None
+                    }
+                }
+            }
+            "ollama" => {
+                let ollama_host = std::env::var("GIAP_OLLAMA_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+                std::env::set_var("OLLAMA_HOST", &ollama_host);
+                std::env::set_var("OLLAMA_TIMEOUT", "600");
+                let model_name = if settings.chat_model.is_empty() {
+                    "llama3.2".to_string()
+                } else {
+                    settings.chat_model.clone()
+                };
+                tracing::debug!(
+                    "[model-switch] building Ollama provider for '{}'...",
+                    model_name
+                );
+                let cfg = goose_providers::model::ModelConfig::new(&model_name);
+                match goose::providers::ollama_def::from_env(None).await {
+                    Ok(p) => {
+                        tracing::debug!(
+                            "[model-switch] Ollama provider ready for '{}'",
+                            model_name
+                        );
+                        Some((Arc::new(p), cfg, Some(ollama_host.clone())))
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "[model-switch] FAILED to build Ollama provider for '{}': {e}",
+                            model_name
+                        );
+                        tracing::warn!("Failed to build ollama provider: {e}");
+                        None
+                    }
+                }
+            }
+            _ => {
+                tracing::debug!(
+                    "[model-switch] unknown provider '{}', keeping current",
+                    settings.chat_provider
+                );
+                None
+            }
+        };
 
-        if let Some((p, model_cfg)) = provider {
+        if let Some((p, model_cfg, endpoint)) = provider {
             let model_cfg =
                 Self::with_thinking_param(&settings.chat_provider, model_cfg, enable_thinking);
             // Every provider Goose sees is wrapped in the GIAP shim — the
             // last-mile veto over system prompt, message injections, and the
-            // tools list (see provider_shim.rs).
+            // tools list, and (for the HTTP-backed arms) the PAI-2 egress gate
+            // on the endpoint resolved above (see provider_shim.rs).
             let p: Arc<dyn Provider> = Arc::new(crate::provider_shim::GiapProviderShim::new(
                 p,
                 self.shim_controls.clone(),
+                endpoint,
             ));
             tracing::debug!(
                 "[model-switch] swapping Goose provider to {}:{} for session {}",
@@ -2371,13 +2419,54 @@ impl GooseAdapter {
                 "exported the global goose provider fallback"
             );
 
-            // Update model capabilities from the new model name
+            // Update model capabilities for the new model. The name heuristic
+            // supplies the axes nothing else can answer; the three that CAN be
+            // read are then overridden from evidence, because this cache is
+            // what other layers ask and it must not contradict what the prompt
+            // was built from.
+            //
+            // `thinking` and `context_window_tokens` come from the model's own
+            // chat template and metadata for a local GGUF, the same source
+            // `thinking_section_applies` uses — so the cache and the prompt
+            // agree by construction rather than by both happening to guess the
+            // same way. They did not: for Nemotron the name heuristic said no
+            // reasoning and 4096 tokens, while the file says gated `<think>`
+            // and 1,048,576.
             let mut caps =
                 pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
                     &settings.chat_model,
                 );
             caps.vision =
                 Self::model_supports_vision(&settings.chat_provider, &settings.chat_model);
+            caps.thinking = crate::model_traits::model_reasons(
+                &settings.chat_provider,
+                &settings.chat_model,
+                self.data_dir.as_deref(),
+            );
+            caps.tool_calling = crate::model_traits::model_uses_native_tools(
+                &settings.chat_provider,
+                &settings.chat_model,
+                self.data_dir.as_deref(),
+            );
+            if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
+                // Every GGUF served through llama.cpp can be constrained with a
+                // GBNF grammar. The name rule looked for a quant tag in the
+                // model string (`q4_k`, `q8_0`, ...) and so answered "no" for
+                // any model whose configured name omits one -- which is how the
+                // catalogue spells the canonical stem.
+                caps.structured_output = true;
+            }
+            if let Some(trained) = crate::model_traits::trained_context_window(
+                &settings.chat_provider,
+                &settings.chat_model,
+                self.data_dir.as_deref(),
+            ) {
+                // What the WEIGHTS were trained for, which is an upper bound and
+                // not an allocation. `ContextGovernor` ranks a registry pin and
+                // the engine's memory cap above this; it exists to stop the
+                // 4096 default from being mistaken for a real answer.
+                caps.context_window_tokens = trained;
+            }
             tracing::debug!(
                 "[model-switch] capabilities: thinking={}, vision={}, context={}k",
                 caps.thinking,
@@ -3118,7 +3207,7 @@ impl GooseAdapter {
     /// key. Idempotent: skips registration if the model is already known.
     fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) -> String {
         use goose::providers::local_inference::local_model_registry::{
-            get_registry, LocalModelEntry, LocalModelStorage, ToolCallingMode,
+            get_registry, LocalModelEntry, LocalModelStorage,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
@@ -3170,9 +3259,15 @@ impl GooseAdapter {
                         .get_model(&stem)
                         .map(|entry| entry.settings.clone())
                         .unwrap_or_default();
-                    // GIAP's local GGUFs (gemma family) support llama.cpp native
-                    // tool calling; force it rather than relying on Auto detection.
-                    settings.tool_calling = ToolCallingMode::ForceNative;
+                    // What THIS model's chat template can actually carry, not
+                    // what the gemma family can. This line read
+                    // `ToolCallingMode::ForceNative` with the comment "GIAP's
+                    // local GGUFs (gemma family) support llama.cpp native tool
+                    // calling" — and it is the row the live turn resolves to,
+                    // because `ensure_provider_current` builds its `ModelConfig`
+                    // from the key this function returns. The probe's answer was
+                    // going to the OTHER id the same file is registered under.
+                    settings.tool_calling = crate::model_traits::tool_mode_for_gguf(&local_path);
                     let entry = LocalModelEntry {
                         id: stem.clone(),
                         repo_id: format!("local/{}", stem),
@@ -3199,9 +3294,18 @@ impl GooseAdapter {
                         Err(e) => tracing::warn!("Could not register GGUF model '{}': {}", stem, e),
                     }
                 } else if let Some(entry) = registry.get_model(&stem) {
+                    // RE-STAMP rather than upgrade. This used to move `Auto` to
+                    // `ForceNative` and leave everything else alone, so a row
+                    // persisted as `ForceNative` before the probe existed kept a
+                    // mode its template cannot honour, forever — the same
+                    // never-revisited shape `registration_settings` was fixed
+                    // for. Re-reading the file every time is what
+                    // `apply_*_settings` already does to these rows, and the
+                    // read is a memoised hashmap hit after the first.
                     let mut s = entry.settings.clone();
-                    if s.tool_calling == ToolCallingMode::Auto {
-                        s.tool_calling = ToolCallingMode::ForceNative;
+                    let mode = crate::model_traits::tool_mode_for_gguf(&local_path);
+                    if s.tool_calling != mode {
+                        s.tool_calling = mode;
                         let _ = registry.update_model_settings(&stem, s);
                     }
                 }
@@ -3388,7 +3492,7 @@ impl GooseAdapter {
 
         // Voice detection is shared by prompt construction (disables thinking)
         // and the session turn cap (#105 — voice_max_turns). Check both the
-        // instance-level flag (CLI --input whisper) and the per-request flag
+        // instance-level flag (CLI --voice) and the per-request flag
         // (desktop voice pipeline sends voice_mode: true).
         let voice_instance = self.voice_mode.load(std::sync::atomic::Ordering::Relaxed);
         let is_voice = Self::voice_turn(voice_instance, request.voice_mode);
@@ -3402,8 +3506,13 @@ impl GooseAdapter {
         // engine-level `enable_thinking` request-param (B4). Previously only the
         // prompt knew, so the engine kept its registry default of `true` and the
         // ThoughtFilter had to mop up the leakage.
-        let thinking_enabled =
-            Self::thinking_section_applies(&settings.thinking_mode, &settings.chat_model, is_voice);
+        let thinking_enabled = Self::thinking_section_applies(
+            &settings.thinking_mode,
+            &settings.chat_provider,
+            &settings.chat_model,
+            self.data_dir.as_deref(),
+            is_voice,
+        );
 
         // The turn's budget profile, built once from the resolution
         // `apply_goose_env_knobs` cached at the top of this function.
@@ -3583,10 +3692,18 @@ impl GooseAdapter {
             // user message — NOT the system prompt. Keeps prefix token-stable.
             dynamic_suffix_for_user_msg = partition.dynamic_suffix;
         } else {
-            // Legacy path: rebuild full system prompt every turn
+            // Legacy path: rebuild full system prompt every turn.
+            //
+            // The profile is passed here for the same reason the partitioned
+            // branch above passes it: without it the prompt loses the user's
+            // preferred name, response language, birthday and the
+            // atypical-speech instruction. This branch used to hand over
+            // `None`, so turning `prefix_cache_prompt` off silently changed WHO
+            // the pond thought it was talking to — a settings toggle with an
+            // undocumented second effect.
             let system_prompt = pond_core::prompts::build_system_prompt_from_template_full(
                 &settings,
-                None,
+                request.profile_context.as_ref(),
                 Some(&prompt_state),
                 &template_content,
             );
@@ -4856,6 +4973,117 @@ impl GooseAdapter {
 
 #[async_trait]
 impl AgentPort for GooseAdapter {
+    /// Precompile the static prefix: one throwaway generation through the
+    /// REAL turn path (shim-enforced system, session-loaded tools, the
+    /// engine's own chat template), so the retained `SessionKv` afterwards
+    /// holds exactly the tokens turn 1 will open with. `prefill_plan` then
+    /// grants `ReusePrefix` at the first real message and the user pays only
+    /// the suffix.
+    ///
+    /// A fresh session id per call keeps the warm-up conversation empty —
+    /// reusing one id would replay its own past markers into the prompt and
+    /// prefill garbage that matches nothing.
+    ///
+    /// Skips unless the active provider is `local`/`gguf` (nothing to warm
+    /// elsewhere) or when `POND_DISABLE_PREWARM=1`.
+    async fn prewarm(
+        &self,
+        voice_mode: bool,
+        progress: std::sync::Arc<dyn Fn(WarmupPhase) + Send + Sync>,
+    ) {
+        if std::env::var("POND_DISABLE_PREWARM").as_deref() == Ok("1") {
+            progress(WarmupPhase::Skipped {
+                reason: "POND_DISABLE_PREWARM=1".to_string(),
+            });
+            return;
+        }
+        let settings = self.settings_repo.get().await.unwrap_or_default();
+        if !matches!(settings.chat_provider.as_str(), "local" | "gguf") {
+            progress(WarmupPhase::Skipped {
+                reason: format!(
+                    "provider '{}' keeps no local prefix cache",
+                    settings.chat_provider
+                ),
+            });
+            return;
+        }
+
+        progress(WarmupPhase::Warming);
+        let started = std::time::Instant::now();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
+        let request = AgentRequest {
+            message: "Warm-up ping. Reply with only: ok".to_string(),
+            session_id: format!("prewarm-{stamp}"),
+            model_role: "chat".to_string(),
+            images: Vec::new(),
+            voice_mode,
+            canvas_mode: false,
+            // Household scope + no profile: the static prefix is
+            // speaker-independent by design (per-speaker context rides the
+            // user message), so this warm prefix serves every member.
+            profile_scope: ProfileScope::household(),
+            profile_context: None,
+            // No allowlist. The warm-up exists to compile the static prefix's KV
+            // cache, and that prefix is built from the FULL tool set — narrowing
+            // it here would warm a prefix no real turn goes on to use, which is
+            // the one outcome that makes the warm-up worse than not running it.
+            tool_group_allowlist: None,
+        };
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            let mut stream = self.chat_stream(request).await?;
+            use futures::StreamExt;
+            while let Some(event) = stream.next().await {
+                // Errors mid-stream end the warm-up; events themselves are
+                // discarded — the point is the prefill, not the reply.
+                event?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match outcome {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "prefix_prewarm",
+                    elapsed_ms,
+                    voice_mode,
+                    model = %settings.chat_model,
+                    "static prefix precompiled; first turn will reuse it"
+                );
+                progress(WarmupPhase::Ready);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "prefix_prewarm",
+                    elapsed_ms,
+                    error = %e,
+                    "prefix warm-up failed; first turn pays the full prefill"
+                );
+                progress(WarmupPhase::Failed {
+                    reason: e.to_string(),
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "prefix_prewarm",
+                    elapsed_ms,
+                    "prefix warm-up timed out; the prefill may still have landed"
+                );
+                progress(WarmupPhase::Failed {
+                    reason: "timed out after 300s".to_string(),
+                });
+            }
+        }
+    }
+
     fn capabilities(&self) -> pond_core::models::domain::model_capabilities::ModelCapabilities {
         let mut caps = self
             .model_capabilities
@@ -5534,7 +5762,7 @@ fn truncate_tool_response_text(
 ///    deterministic (lexicographically first) so repeated runs agree;
 /// 4. failing all that, the naive `{name}.gguf`, so the caller's
 ///    file-not-found warning still fires.
-fn resolve_gguf_filename(model_name: &str, gguf_dir: &std::path::Path) -> String {
+pub(crate) fn resolve_gguf_filename(model_name: &str, gguf_dir: &std::path::Path) -> String {
     if model_name.ends_with(".gguf") {
         return model_name.to_string();
     }
@@ -5961,20 +6189,43 @@ mod tests {
     // ── thinking section stability ────────────────────────────────────────
 
     /// The regression that cost a full re-prefill on every session's second
-    /// turn: in "auto", turn 1 and turn 2 must agree, which they only do if the
-    /// answer comes from the model name rather than a cache filled in later.
+    /// turn: in "auto", turn 1 and turn 2 must agree. They do because the
+    /// answer is a pure function of bytes that are not changing mid-session --
+    /// a memoised read of the model's own chat template -- rather than a cache
+    /// that fills in later.
+    ///
+    /// Asserted here for an HTTP provider, where there is no file and the name
+    /// heuristic answers. The local-GGUF path is exercised against real files
+    /// in `model_traits`, and its stability comes from `probe_cached`.
     #[test]
-    fn auto_thinking_is_decided_by_the_model_name_alone() {
+    fn auto_thinking_is_decided_without_a_cache_that_fills_in_later() {
         assert!(GooseAdapter::thinking_section_applies(
             "auto",
+            "ollama",
             "gemma-4-E2B-it",
+            None,
             false
         ));
         assert!(!GooseAdapter::thinking_section_applies(
             "auto",
+            "ollama",
             "llama-3.2-3b",
+            None,
             false
         ));
+    }
+
+    /// Two calls must agree, which is the property the KV prefix depends on.
+    /// A cheap direct check: the same inputs asked twice, as turn 1 and turn 2
+    /// would ask them.
+    #[test]
+    fn auto_thinking_gives_the_same_answer_twice() {
+        for model in ["gemma-4-E2B-it", "llama-3.2-3b", "NVIDIA-Nemotron3-Nano-4B"] {
+            let first = GooseAdapter::thinking_section_applies("auto", "local", model, None, false);
+            let second =
+                GooseAdapter::thinking_section_applies("auto", "local", model, None, false);
+            assert_eq!(first, second, "{model} answered differently on turn 2");
+        }
     }
 
     // ── PAI-4 P5: which reason a provider swap records ────────────────────
@@ -6025,17 +6276,27 @@ mod tests {
     fn explicit_thinking_modes_ignore_the_model_and_voice_always_wins() {
         assert!(GooseAdapter::thinking_section_applies(
             "on",
+            "ollama",
             "llama-3.2-3b",
+            None,
             false
         ));
         assert!(!GooseAdapter::thinking_section_applies(
             "off",
+            "ollama",
             "gemma-4-E2B-it",
+            None,
             false
         ));
         for mode in ["on", "off", "auto"] {
             assert!(
-                !GooseAdapter::thinking_section_applies(mode, "gemma-4-E2B-it", true),
+                !GooseAdapter::thinking_section_applies(
+                    mode,
+                    "ollama",
+                    "gemma-4-E2B-it",
+                    None,
+                    true
+                ),
                 "voice mode must suppress <thinking> regardless of mode ({mode})"
             );
         }
@@ -6091,7 +6352,7 @@ mod tests {
         );
         assert!(
             GooseAdapter::voice_turn(true, false),
-            "the CLI `--input whisper` instance flag must still count on its own"
+            "the CLI `--voice` instance flag must still count on its own"
         );
         assert!(GooseAdapter::voice_turn(true, true));
         assert!(
