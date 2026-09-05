@@ -1,27 +1,7 @@
-//! Unified personal-context retrieval (phase C).
-//!
-//! One question, one answer, across all three of the things this pond knows
-//! about a household: what a member **said** (`memory`), what the pond
-//! **observed** (`context`), and what a conversation was **compressed to**
-//! (`summary`).
-//!
-//! # What this owns, and what it deliberately does not
-//!
-//! Policy lives here; mechanism lives in the adapter. This service decides *what
-//! a query means* — that a query is embedded as a QUERY rather than as a
-//! document, that ties go to the more precise corpus, that a caller gets
-//! provenance with every hit. The SQL that filters scope and liveness against
-//! live rows lives in [`VectorIndex`], because that is a storage concern and it
-//! is the thing that would have to be rewritten if the store changed.
-//!
-//! # Why the results are labelled
-//!
-//! "You told me your bill is eighty pounds", "your camera saw the door open" and
-//! "we discussed the garden last week" are different KINDS of claim, and a
-//! member is entitled to know which one they are being handed. A summary in
-//! particular is a model's compression: lossy, and not something anybody said.
-//! Presenting it as if it were a remembered fact is the failure this labelling
-//! exists to prevent.
+//! Unified personal-context retrieval (phase C): one answer over what a member said (`memory`),
+//! what the pond observed (`context`) and what was compressed to a `summary`. Scope and liveness
+//! SQL belongs to [`VectorIndex`]; policy is here: queries embed as queries, ties go to the more
+//! precise corpus, and each hit carries its corpus because a summary is lossy, not a said fact.
 
 use std::sync::Arc;
 
@@ -70,13 +50,9 @@ impl PersonalContextRetrieval {
         Self { index, embedder }
     }
 
-    /// Recall up to `limit` things relevant to `query`, within `scope`.
-    ///
-    /// Returns an empty vec rather than an error when there is nothing to say —
-    /// a failed recall must never fail the turn that asked. A retrieval error is
-    /// logged and answered as "nothing found", because the caller's fallback
-    /// (keyword search, or simply not injecting anything) is always better than
-    /// propagating.
+    /// Recall up to `limit` things relevant to `query`, within `scope`. Returns an empty vec rather
+    /// than an error: a failed recall must never fail the turn that asked, so a retrieval error is
+    /// logged and answered as "nothing found" and the caller falls back to keyword search.
     pub async fn recall(
         &self,
         query: &str,

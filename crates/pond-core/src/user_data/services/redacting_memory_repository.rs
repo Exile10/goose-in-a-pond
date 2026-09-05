@@ -128,6 +128,30 @@ impl MemoryRepository for RedactingMemoryRepository {
         self.inner.record_access(id).await
     }
 
+    /// Redacted before it is stored, exactly as `add` is.
+    ///
+    /// An edit is new text arriving from a person, so it goes through the same
+    /// chokepoint the original did — forwarding it raw would let a secret enter
+    /// by being typed into a correction, which is the one door `add` closes.
+    /// The adapter clears the embedding, so the vector is rebuilt from the
+    /// redacted words rather than describing what was removed.
+    async fn update_content(&self, id: &str, content: &str) -> Result<()> {
+        let result = self.redactor.redact(content, Self::LEVEL);
+        if !result.findings.is_empty() {
+            let kinds: Vec<&str> = result.findings.iter().map(|k| k.as_str()).collect();
+            tracing::info!(
+                target: "giap::trace",
+                memory_id = %id,
+                kinds = %kinds.join(","),
+                "[redaction] removed credential-shaped material before storing a memory edit"
+            );
+        }
+        // No embedding to drop here: the adapter clears it on every content
+        // change, so the vector is always rebuilt from whatever text this call
+        // stored — which is the redacted string.
+        self.inner.update_content(id, &result.text).await
+    }
+
     async fn update_lifecycle(&self, id: &str, lifecycle: MemoryLifecycle) -> Result<()> {
         self.inner.update_lifecycle(id, lifecycle).await
     }

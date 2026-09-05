@@ -152,7 +152,7 @@ bash scripts/install.sh --llamafile
 cargo run -p pond-server --release -- serve --open
 
 # Voice mode (requires whisper-server running on port 9000)
-cargo run -p pond-server --release -- chat --input whisper
+cargo run -p pond-server --release -- chat --voice
 
 # Desktop app
 cd pond-desktop && npm run tauri dev

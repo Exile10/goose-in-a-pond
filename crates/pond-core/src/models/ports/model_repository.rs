@@ -5,11 +5,9 @@ use async_trait::async_trait;
 
 use crate::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
 
-/// Driven port for persisting the model catalog and role assignments.
-///
-/// Implementations: `SqliteModelRepository` (pond-infra).
-/// The model catalog survives restarts; role assignments are the source of truth
-/// (the settings KV table is a hot-cache, synced from here on startup).
+/// Driven port for persisting the model catalog and role assignments, implemented by
+/// `SqliteModelRepository` (pond-infra). Role assignments here are the source of truth: the
+/// settings KV table is a hot cache synced from this on startup.
 #[async_trait]
 pub trait ModelRepository: Send + Sync {
     // ── Catalog ───────────────────────────────────────────────────────────────

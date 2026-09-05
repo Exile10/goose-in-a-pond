@@ -1,0 +1,20 @@
+{
+  "corpus_now": "2026-09-04T18:30:00Z",
+  "expectations": 14,
+  "generator": "scripts/gen-personal-context.py",
+  "items": 403,
+  "items_by_source_kind": {
+    "calendar": 125,
+    "camera": 24,
+    "chat": 9,
+    "files": 55,
+    "mail": 116,
+    "mobile": 11,
+    "sensor": 58,
+    "voice": 5
+  },
+  "queries": 25,
+  "seed": 20260904,
+  "sources": 13,
+  "span_days": 42
+}

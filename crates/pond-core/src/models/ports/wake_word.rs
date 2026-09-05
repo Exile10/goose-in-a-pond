@@ -1,13 +1,6 @@
-//! Driving Port: Wake-word detection
-//!
-//! `StreamingWakeWordDetector` is the primary interface. Implement it to plug in any
-//! wake-word backend. The blanket impl provides `WakeWordDetector` automatically so
-//! existing code that calls `wait_for_activation()` continues to compile unchanged.
-//!
-//! Implementations:
-//! - `InstantActivation` — returns immediately (keyboard / stdin mode, tests)
-//! - `WhisperKeywordDetector` — continuous ring-buffer + sliding window via whisper.cpp
-//! - (future) `PorcupineDetector` — Picovoice Porcupine native KWS
+//! Driving Port: Wake-word detection. `StreamingWakeWordDetector` is the primary interface and a
+//! blanket impl supplies the deprecated `WakeWordDetector`. Implemented by `InstantActivation`
+//! (stdin and tests) and `WhisperKeywordDetector` (ring buffer plus sliding window, whisper.cpp).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,24 +9,17 @@ use async_trait::async_trait;
 
 /// Audio captured during and after the wake word, ready to transcribe as a command.
 ///
-/// When `captured_audio` is `Some`, the Listen state can transcribe this buffer
-/// instead of starting a fresh microphone recording — enabling the "one-breath"
-/// flow: "Hey Goose, what's the weather?" is handled in a single utterance.
+/// When `captured_audio` is `Some`, the Listen state transcribes this buffer instead of
+/// starting a fresh recording, so "Hey Goose, what's the weather?" is one utterance.
 pub struct WakeWordActivation {
     /// WAV-encoded bytes (16-bit mono 16 kHz) captured after the wake word,
     /// or `None` if the detector does not support audio hand-off.
     pub captured_audio: Option<Vec<u8>>,
 }
 
-/// **Primary wake-word port.**
-///
-/// Implement this trait to add a new wake-word detection backend. It returns
-/// `WakeWordActivation` alongside the activation signal so callers can use
-/// audio captured during the wake word utterance as the command audio — enabling
-/// "Hey Goose, what's the weather?" to be handled in one breath.
-///
-/// A blanket impl of the deprecated `WakeWordDetector` is provided automatically,
-/// so this trait works everywhere the old one was expected.
+/// **Primary wake-word port.** Returns `WakeWordActivation` alongside the activation signal so
+/// audio captured during the wake word can serve as the command audio. A blanket impl supplies
+/// the deprecated `WakeWordDetector`, so this trait works everywhere the old one was expected.
 #[async_trait]
 pub trait StreamingWakeWordDetector: Send + Sync {
     /// Block until the wake word is heard, then return any captured command audio.
@@ -44,20 +30,9 @@ pub trait StreamingWakeWordDetector: Send + Sync {
         "Waiting for activation..."
     }
 
-    /// Whether this detector can meaningfully interrupt an in-flight turn.
-    ///
-    /// `run_loop` races the streaming agent turn against
-    /// `wait_for_activation_with_audio()` so a spoken wake word can barge in
-    /// mid-inference/mid-TTS. That race is only correct for detectors that
-    /// actually **wait** for real audio.
-    ///
-    /// A detector that resolves *immediately* (e.g. [`InstantActivation`] in
-    /// stdin / `--no-wake-word` / whisper-load-failure fallback) would win the
-    /// race before any turn could complete, aborting every turn. Such detectors
-    /// return `false` so `run_loop` awaits the turn directly without the
-    /// interrupt race. Real streaming detectors keep the default `true`.
-    ///
-    /// [`InstantActivation`]: crate::models::services::instant_activation::InstantActivation
+    /// Whether this detector can meaningfully interrupt an in-flight turn. `run_loop` races the
+    /// turn against `wait_for_activation_with_audio()`, so a detector that resolves immediately
+    /// (`InstantActivation`, stdin or fallback) must return `false` or it aborts every turn.
     fn supports_interruption(&self) -> bool {
         true
     }
@@ -67,9 +42,8 @@ pub trait StreamingWakeWordDetector: Send + Sync {
 
 /// Simplified wake-word port: activates but does not capture audio.
 ///
-/// **Deprecated** — implement `StreamingWakeWordDetector` instead.
-/// This trait is retained only for blanket-impl compatibility and will be
-/// removed in a future release.
+/// **Deprecated** — implement `StreamingWakeWordDetector` instead; retained only for
+/// blanket-impl compatibility.
 #[async_trait]
 #[deprecated(
     since = "0.2.0",

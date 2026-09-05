@@ -185,12 +185,9 @@ cargo run -p pond-server -- chat --provider ollama
 # With llamafile running on port 8080
 cargo run -p pond-server -- chat --provider llamafile
 
-# Voice mode (requires whisper.cpp server on port 9000)
-cargo run -p pond-server -- chat --input whisper
-
-# Voice + TTS (requires Piper binary and model)
-cargo run -p pond-server -- chat --input whisper --tts piper \
-  --tts-model /path/to/en_US-lessac-medium.onnx
+# Voice mode — wake word, speech detection, recognition, spoken reply.
+# Downloads whatever it needs on the first run; nothing to install first.
+cargo run -p pond-server -- chat --voice
 ```
 
 ### 6. Desktop app
@@ -226,7 +223,7 @@ cmake -B build && cmake --build build --config Release --target server
 
 Then start GIAP in voice mode:
 ```bash
-cargo run -p pond-server -- chat --input whisper
+cargo run -p pond-server -- chat --voice
 ```
 
 ---

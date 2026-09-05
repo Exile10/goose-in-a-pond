@@ -42,26 +42,10 @@ pub enum InvoiceRequestError {
     Timeout(PeerId),
 }
 
-/// Owns the *only* consumer of `MeshTransport::recv()` for a mesh-enabled
-/// Pond. Dispatches every inbound frame by decoded kind:
-///
-/// - `InferenceRequest` → serve it with `backing_provider` (server role) and
-///   stream the reply back.
-/// - `InferenceChunk` → route to whichever in-flight outbound request
-///   (`MeshInferenceProvider::stream_complete`) it answers (client-role demux).
-/// - `InvoiceRequest` → issue an invoice via `payment_rail` (server role) and
-///   send it back, or an error chunk if no `payment_rail` is configured.
-/// - `InvoiceResponse` → route to whichever in-flight `request_invoice` call
-///   it answers, same demux shape as `InferenceChunk`.
-/// - `CapabilityRequest` → answer with what this Pond currently offers
-///   (inference: always, since `backing_provider` always exists; Lightning:
-///   `payment_rail.is_some()`).
-/// - `CapabilityResponse` → route to whichever in-flight `capabilities_of`
-///   call it answers, same demux shape as `InvoiceResponse`.
-///
-/// If anything else on this Pond ever needs to consume `recv()`, it has to
-/// go through here too — a second independent `recv()` loop would silently
-/// steal frames from this one.
+/// Owns the *only* consumer of `MeshTransport::recv()` for a mesh-enabled Pond. Inbound frames
+/// are dispatched by kind: `*Request`s are served here (inference via `backing_provider`,
+/// invoices via `payment_rail`, capabilities) and `*Response`/`InferenceChunk` frames are routed
+/// to the in-flight outbound call they answer. A second `recv()` loop would silently steal frames.
 pub struct MeshInferenceService {
     pub(crate) transport: Arc<dyn MeshTransport>,
     pub(crate) peer_directory: Arc<dyn PeerDirectory>,
@@ -69,18 +53,14 @@ pub struct MeshInferenceService {
     pub(crate) usage_tally: Arc<dyn UsageTally>,
     /// Read live at debit time, never cached — the rate can change without a restart.
     pub(crate) settings_repo: Arc<dyn SettingsRepository>,
-    /// How long `MeshInferenceProvider::stream_complete` waits for each next
-    /// chunk (reset on every chunk received, not an overall stream deadline)
-    /// before giving up on a peer that's gone silent. A constructor
-    /// parameter rather than a hardcoded constant so tests can use a short
-    /// one instead of waiting out a real multi-second production timeout.
+    /// How long `MeshInferenceProvider::stream_complete` waits for each next chunk (reset on
+    /// every chunk, not an overall deadline) before giving up on a silent peer. A constructor
+    /// parameter so tests can use a short one instead of a multi-second production timeout.
     pub(crate) chunk_timeout: std::time::Duration,
     backing_provider: Arc<dyn LlmProvider>,
-    /// This Pond's own Lightning wallet, used to answer inbound
-    /// `InvoiceRequest`s from peers who want to pay us. `None` when
-    /// Lightning isn't configured (off by default) — inbound invoice
-    /// requests then get an `InvoiceResponseKind::Error` reply rather than
-    /// being silently dropped.
+    /// This Pond's own Lightning wallet, used to answer inbound `InvoiceRequest`s. `None` when
+    /// Lightning is not configured (off by default); inbound invoice requests then get an
+    /// `InvoiceResponseKind::Error` reply rather than being silently dropped.
     payment_rail: Option<Arc<dyn PaymentRail>>,
     pending: Mutex<HashMap<u64, mpsc::UnboundedSender<InferenceChunk>>>,
     pending_invoices: Mutex<HashMap<u64, mpsc::UnboundedSender<InvoiceResponse>>>,
@@ -325,11 +305,9 @@ impl MeshInferenceService {
         }
     }
 
-    /// Client role: ask `peer` for an invoice covering `amount`, so
-    /// `PaymentRail::batch_settle` has something real to pay. Callers (the
-    /// settlement job) are expected to call this once per settlement attempt,
-    /// not cache the result — a Lightning invoice from `issue_invoice` isn't
-    /// necessarily reusable.
+    /// Client role: ask `peer` for an invoice covering `amount`, so `PaymentRail::batch_settle`
+    /// has something real to pay. Call once per settlement attempt and never cache the result:
+    /// a Lightning invoice from `issue_invoice` is not necessarily reusable.
     pub async fn request_invoice(
         &self,
         peer: PeerId,
@@ -367,17 +345,10 @@ impl MeshInferenceService {
         result
     }
 
-    /// How many times a completion producing no visible text (pure
-    /// reasoning, or genuinely empty) is retried locally before the lender
-    /// gives up and reports it anyway.
-    ///
-    /// `backing_provider` is a bare completion call with none of Goose's own
-    /// harness on this side — no empty-turn detection, no re-engagement, no
-    /// thinking/content split. Every one of those had to happen on the
-    /// BORROWER instead, and each retry there is a full mesh round trip on
-    /// top of whatever this lender's hardware takes to generate nothing.
-    /// Retrying here first is strictly cheaper: one extra local completion
-    /// beats a wire round trip plus the borrower's own re-engagement.
+    /// How many times a completion producing no visible text is retried locally before the
+    /// lender reports it anyway. `backing_provider` has none of Goose's harness (no empty-turn
+    /// detection or re-engagement), so without this every retry happens on the BORROWER as a
+    /// full mesh round trip. One extra local completion is strictly cheaper.
     const MAX_EMPTY_COMPLETION_ATTEMPTS: u32 = 2;
 
     /// Server role: run `backing_provider` against the borrower's request and
@@ -410,12 +381,9 @@ impl MeshInferenceService {
 
         let messages: Vec<_> = request.messages.iter().map(from_wire_message).collect();
 
-        // Tokens spent on attempts discarded for producing no visible text —
-        // still real local compute, so still charged against the lend
-        // window, even though nothing from them reached the wire. The FINAL
-        // (sent) attempt's tokens are added separately below, from whichever
-        // figure actually gets reported in its usage chunk — the accurate
-        // provider-reported count when available, not this same estimate.
+        // Tokens spent on attempts discarded for producing no visible text are still real local
+        // compute, so they count against the lend window. The sent attempt's tokens are added
+        // separately below from the figure reported in its usage chunk.
         let mut discarded_tokens_total: u32 = 0;
         let mut sent_usage: Option<pond_mesh_protocol::wire::UsageWire> = None;
 
@@ -425,14 +393,10 @@ impl MeshInferenceService {
                 .backing_provider
                 .stream_complete(&request.system_prompt, messages.clone());
 
-            // Buffered, not sent, until this attempt proves it has visible
-            // content — a chunk already on the wire can't be un-sent, and
-            // "was this attempt empty" isn't knowable from the first chunk
-            // alone (a `<think>` block can still be followed by a real
-            // answer). Once `seen_visible` flips, buffering stops and the
-            // rest of this attempt streams through normally: real content
-            // still reaches the borrower incrementally, not all at once at
-            // the end.
+            // Buffered, not sent, until this attempt proves it has visible content: a chunk on
+            // the wire cannot be un-sent, and a `<think>` block can still be followed by a real
+            // answer. Once `seen_visible` flips, the rest of the attempt streams through so real
+            // content still reaches the borrower incrementally.
             let mut pending: Vec<InferenceChunk> = Vec::new();
             let mut filter = ThoughtFilter::new();
             let mut seen_visible = false;
@@ -607,16 +571,10 @@ impl PeerCapabilityQuery for MeshInferenceService {
     }
 }
 
-/// Bridges the inherent `request_invoice` (above) to `pond-core`'s
-/// `InvoiceRequester` port, so a caller outside this crate (the settlement
-/// job in `pond-server`) can hold this service behind `Arc<dyn
-/// InvoiceRequester>` without depending on this concrete type. The
-/// fully-qualified call below is deliberate, not decorative: this type has
-/// both an inherent `request_invoice` and this trait's `request_invoice` in
-/// scope, and `self.request_invoice(...)` would still resolve to the
-/// inherent one (dot-call syntax always prefers inherent methods) — but
-/// spelling it out means a future reader never has to know that rule to be
-/// sure this isn't infinite recursion.
+/// Bridges the inherent `request_invoice` to `pond-core`'s `InvoiceRequester` port so the
+/// settlement job in `pond-server` can hold this service as `Arc<dyn InvoiceRequester>`.
+/// The fully-qualified call below is deliberate: dot-call syntax would resolve to the inherent
+/// `request_invoice`, and spelling it out makes clear this is not infinite recursion.
 #[async_trait]
 impl pond_core::mesh::ports::invoice_requester::InvoiceRequester for MeshInferenceService {
     async fn request_invoice(

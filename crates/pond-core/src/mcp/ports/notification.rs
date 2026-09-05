@@ -1,12 +1,7 @@
-//! Driven Port: Notification
+//! Driven port: push events from GIAP to connected clients (GOTG mobile app, etc.).
 //!
-//! Push events from GIAP to connected clients (GOTG mobile app, etc.)
-//!
-//! # TODO
-//! - [ ] Define notification categories (alert, info, action_required)
-//! - [ ] Add notification acknowledgement
-//! - [ ] Add notification history / persistence
-//! - [ ] WebSocket or SSE transport for real-time push
+//! TODO: notification categories (alert, info, action_required), acknowledgement, history and
+//! persistence, and a WebSocket or SSE transport for real-time push.
 
 use anyhow::Result;
 use async_trait::async_trait;

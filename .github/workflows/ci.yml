@@ -31,21 +31,17 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # .cargo/config.toml sets `-C target-cpu=native` for on-device (Jetson) perf.
-  # On CI that flag is a SIGILL landmine: the target/ cache is shared across a
-  # heterogeneous runner fleet, so proc-macros compiled with one runner's CPU
-  # features crash (illegal instruction) when loaded on another. An explicitly
-  # set (empty) RUSTFLAGS takes precedence over config-file rustflags, giving
-  # portable codegen on CI; it also keys the rust-cache separately and changes
-  # crate fingerprints, so previously-poisoned caches are rebuilt, not loaded.
+  # .cargo/config.toml sets `-C target-cpu=native` for Jetson perf. On CI that is a SIGILL
+  # landmine: target/ is cached across heterogeneous runners, so proc-macros built with one CPU's
+  # features crash on another. An explicitly set (empty) RUSTFLAGS overrides config-file
+  # rustflags, keys rust-cache separately and changes fingerprints, so poisoned caches rebuild.
   RUSTFLAGS: ""
 
 jobs:
   # 1: Rust ─────────────────────────────────────────────────────────────
-  # Checks formatting, lints, and runs the fast test suite.
-  # Excludes crates that depend on the Goose submodule or native system libs
-  # (pond-adapters-goose, pond-adapters-local-inference, pond-adapters-face-onnx,
-  # pond-server) to keep compile time reasonable.
+  # Formatting, lints and the fast test suite. Excludes crates that pull the Goose submodule or
+  # native system libs (pond-adapters-goose, pond-adapters-local-inference,
+  # pond-adapters-face-onnx, pond-server) to keep compile time reasonable.
   rust:
     name: Rust — fmt / clippy / test
     runs-on: ubuntu-latest
@@ -65,13 +61,10 @@ jobs:
           sudo apt-get clean || true
           df -h /
 
-      # Clone goose directly at the fork's main branch HEAD.
-      # Bypasses submodule SHA pinning. jarida-io/Goose:main is upstream main
-      # (2026-07 sync) + the GIAP patch set (see docs/goose-patch-management.md).
-      # NOTE: parent main's ci.yml still names giap-patches-rmcp-1.5 until this
-      # branch merges — a BREAKING future sync must be staged on a side branch
-      # and only fast-forwarded into fork main together with the parent-side
-      # port, or older parent branches fail CI on fresh runs.
+      # Clone goose at the fork's main HEAD, bypassing submodule SHA pinning. jarida-io/Goose:main
+      # is upstream main + the GIAP patch set (docs/goose-patch-management.md). A BREAKING future
+      # sync must be staged on a side branch and fast-forwarded into fork main together with the
+      # parent-side port, or older parent branches fail CI on fresh runs.
       - name: Checkout goose submodule
         run: |
           rm -rf goose
@@ -112,6 +105,8 @@ jobs:
             -p pond-adapters-matter \
             -p pond-adapters-vision \
             -p pond-adapters-weather \
+            -p pond-adapters-caldav \
+            -p pond-adapters-imap \
             -p pond-adapters-mcp-memory \
             -p pond-mesh-protocol \
             -p pond-mcp-server
@@ -132,25 +127,16 @@ jobs:
             -p pond-adapters-matter \
             -p pond-adapters-vision \
             -p pond-adapters-weather \
+            -p pond-adapters-caldav \
+            -p pond-adapters-imap \
             -p pond-adapters-mcp-memory \
             -p pond-mesh-protocol \
             -p pond-mcp-server
 
-      # Gate the PRODUCTION binary's compilation (pulls the Goose submodule).
-      # Without this, a path/API break in pond-server or the Goose adapter — the
-      # exact failure mode that motivated CI — passes unnoticed. Slow on a cold
-      # cache; rust-cache makes subsequent runs fast.
-      #
-      # `--all-targets` is load-bearing, not tidiness. Without a target selector
-      # cargo builds lib + bins ONLY, so these crates' tests/ and examples/ were
-      # compiled by nothing in this pipeline — they are excluded from the fast
-      # test job by definition. `pond-server/tests/live_feature_test.rs` sat
-      # broken for a whole phase because `MemoryExtractionService::run` grew a
-      # `scope` parameter: production call sites were compiler-forced to update,
-      # the test call sites were not, and CI was green throughout. Prefer
-      # `--all-targets` over `--tests`: `--tests` rebuilds the bins in cfg(test)
-      # mode, so a break inside a `#[cfg(not(test))]` block in main.rs would
-      # still slip past. This covers lib + bins + tests + examples.
+      # Gate the PRODUCTION binary's compilation (pulls the Goose submodule); slow on a cold cache.
+      # `--all-targets` is load-bearing: without a target selector cargo builds lib + bins ONLY, so
+      # these crates' tests/ and examples/ (excluded from the fast test job) would be compiled by
+      # nothing. Not `--tests`: that builds bins in cfg(test) mode and misses `#[cfg(not(test))]`.
       - name: cargo check (production binary + its test targets — pond-server + goose adapter)
         run: cargo check -p pond-server -p pond-adapters-goose --all-targets
 
@@ -159,24 +145,16 @@ jobs:
       - name: cargo check (production binary with mesh feature — matches the staged sidecar build)
         run: cargo check -p pond-server --features mesh --all-targets
 
-      # The quarantined PondAgent stack (Q2-05). It is no longer in pond-server's
-      # default features, so the gate above stops reaching it — and AGENTS.md's
-      # promise is that the code "compiles and can be enabled when the engine is
-      # production-ready". A quarantined crate whose own unit tests no longer
-      # compile has quietly broken that promise, which is why this one is
-      # `--all-targets` too. It moved off the fast lint/test pass because it
-      # builds llama-cpp-2, which is exactly what that list is defined to exclude.
+      # The quarantined PondAgent stack (Q2-05). Off pond-server's default features, so the gate
+      # above never reaches it, yet AGENTS.md promises it "compiles and can be enabled"; hence
+      # `--all-targets` here too. It is off the fast pass because it builds llama-cpp-2.
       - name: cargo check (quarantined PondAgent + its test targets — pond-agent + pond-inference)
         run: cargo check -p pond-agent -p pond-inference --all-targets
 
-      # `cargo check --all-targets` above COMPILES pond-inference's tests and never
-      # RUNS them, which for a while meant the GGUF embedder's guards were
-      # decoration: `no_giap_code_calls_llama_backend_init` and
-      # `the_backend_handle_is_held_strongly_and_never_freed` protect against a
-      # process-wide panic when GIAP and Goose both claim the llama backend, and
-      # neither could have fired here. The crate is already built by the step
-      # above, so this costs linking the test binaries and nothing else; the live
-      # embed test is `#[ignore]`d and needs no model.
+      # `cargo check --all-targets` above COMPILES pond-inference's tests but never RUNS them.
+      # `no_giap_code_calls_llama_backend_init` and
+      # `the_backend_handle_is_held_strongly_and_never_freed` guard against a process-wide panic
+      # when GIAP and Goose both claim the llama backend; the live embed test is `#[ignore]`d.
       - name: cargo test (in-process GGUF engine + embedder — pond-inference)
         run: cargo test -p pond-inference
 
@@ -186,11 +164,9 @@ jobs:
       - name: cargo test (vision classifier — pond-adapters-vision-onnx)
         run: cargo test -p pond-adapters-vision-onnx
 
-      # Isolated like vision-onnx above: full-feature libp2p
-      # (kad+gossipsub+relay+dcutr+identify+noise+yamux) is a materially
-      # heavier compile than the rest of the fast-crates list, and this
-      # crate doesn't touch Goose so it doesn't belong in the production
-      # binary check either.
+      # Isolated like vision-onnx above: full-feature libp2p (kad+gossipsub+relay+dcutr+identify+
+      # noise+yamux) is a materially heavier compile than the fast-crates list, and the crate does
+      # not touch Goose so it does not belong in the production binary check either.
       - name: cargo clippy (mesh transport — pond-adapters-mesh-libp2p)
         run: cargo clippy -p pond-adapters-mesh-libp2p --all-targets
 

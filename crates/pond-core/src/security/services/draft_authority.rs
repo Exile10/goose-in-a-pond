@@ -1,9 +1,7 @@
 //! Repository-backed [`DraftAuthority`].
 //!
-//! Deliberately reuses [`identity_resolution::resolve`] rather than re-deriving
-//! a scope. A second resolution that disagreed with the one the turn already
-//! made would silently win here, which is the failure `resolve_turn_scope`'s
-//! doc comment warns about.
+//! Reuses [`identity_resolution::resolve`] rather than re-deriving a scope: a second
+//! resolution disagreeing with the one the turn already made would silently win here.
 
 use std::sync::Arc;
 

@@ -1,0 +1,37 @@
+/* WarmupBanner — status chrome, so hairline and slate, never the ink offset
+   (DESIGN.md rule 3: the edge marks content, never chrome). */
+.warmup-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-hairline, rgba(23, 22, 22, 0.12));
+  border-radius: 8px;
+  background: var(--bg-brand-soft, #f4ecff);
+  color: var(--color-text-secondary, #566178); /* slate, 5.97:1 on ground */
+  font-size: 13px;
+  margin: 8px 12px;
+}
+
+.warmup-elapsed {
+  margin-left: auto;
+  font-family: "JetBrains Mono", monospace; /* data wears mono */
+  font-variant-numeric: tabular-nums;
+}
+
+.warmup-spin {
+  animation: warmup-rotate 1s linear infinite;
+  color: var(--color-accent, #8c4bff); /* accent as edge/motion, never a sentence */
+}
+
+@keyframes warmup-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .warmup-spin {
+    animation: none;
+  }
+}

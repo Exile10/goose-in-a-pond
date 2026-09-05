@@ -66,9 +66,9 @@ impl DeviceMcpServer {
     }
 
     #[tool(
-        description = "List registered devices with their online status and what each can \
-                       be told to do. For the specific values a device accepts (fan modes, \
-                       temperature limits, what a sensor measures), use describe_device."
+        description = "List registered devices, online status, and what each can be told to \
+                       do. For exact accepted values (modes, limits, sensor units): \
+                       describe_device."
     )]
     async fn list_registered_devices(
         &self,
@@ -337,7 +337,16 @@ pub fn init_device_deps(
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_device_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = DEVICE_DEPS.get().expect("init_device_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = DEVICE_DEPS.get() else {
+        tracing::error!(
+            "spawn_device_server called before init_device_deps — extension will not start"
+        );
+        return;
+    };
     let server = DeviceMcpServer::new(
         deps.device_registry.clone(),
         deps.settings_repo.clone(),

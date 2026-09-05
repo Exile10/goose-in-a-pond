@@ -221,8 +221,14 @@ Look up a food product by barcode or name: nutrition, ingredients, allergens, Nu
 
         if barcode.is_none() && name.is_none() {
             return Ok(CallToolResult::success(vec![Content::text(
-                "I need a product barcode or name. Retry with a 'barcode' parameter \
-                 (e.g. '3017620422003') or 'name' parameter (e.g. 'nutella').",
+                // No sample VALUES here on purpose. This used to offer
+                // '3017620422003' and 'nutella' — a real EAN for a real product —
+                // and a model that retries with the example gets a real, correct
+                // lookup for something the user never asked about. The failure
+                // then looks like a successful answer. Name the parameters, not
+                // values to reuse.
+                "I need a product barcode or name. Retry with the barcode or the \
+                 product name the user actually gave.",
             )]));
         }
 
@@ -1222,9 +1228,16 @@ pub fn init_discovery_deps(
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_discovery_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = DISCOVERY_DEPS
-        .get()
-        .expect("init_discovery_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = DISCOVERY_DEPS.get() else {
+        tracing::error!(
+            "spawn_discovery_server called before init_discovery_deps — extension will not start"
+        );
+        return;
+    };
     let server = DiscoveryMcpServer::new(deps.http_client.clone(), deps.settings_repo.clone());
     crate::serve_builtin("giap-discovery", server, reader, writer);
 }

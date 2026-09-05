@@ -307,3 +307,99 @@ pub fn init_tracing_with_console(
 
     LogDrainHandle { rx, file_guard }
 }
+
+#[cfg(test)]
+mod tests {
+    /// A `giap::trace` event emitted at `debug!` is never recorded.
+    ///
+    /// The production file filter is `info,{GIAP_VERBOSE},{NOISY}`, and
+    /// `giap::trace` is deliberately not one of the verbose targets — the note
+    /// above `NOISY` explains why adding a `giap*=` directive would be a
+    /// mistake. The consequence is easy to miss when writing a new event:
+    /// `info!` is kept, `debug!` is silently dropped, and the author sees
+    /// nothing wrong because the code compiles and the event exists.
+    ///
+    /// It cost real time. `kind = "prefix_cache_invalidated"` carries the
+    /// reason a KV prefix went cold — the single most useful number for
+    /// diagnosing voice-turn latency — and was emitted at `debug!`, so it had
+    /// never been recorded on any pond. The cache-hit side emitted nothing at
+    /// all. Between them the KV hit rate was unobservable, which is how a
+    /// cache that misses most turns stays unnoticed.
+    ///
+    /// This scans for the mistake rather than describing it. The three
+    /// grandfathered events below are still invisible; they are listed so the
+    /// next person to touch them makes that a decision instead of a discovery.
+    #[test]
+    fn no_giap_trace_event_is_emitted_at_a_level_the_filter_drops() {
+        const GRANDFATHERED: &[&str] = &[
+            // Frequent and user-initiated; promote if a Matter fault ever needs
+            // diagnosing from a log somebody else captured.
+            "matter_device_command",
+            "matter_sources_refreshed",
+            // Per-turn, and its INFO sibling `turn_device_*` covers the case
+            // anyone has needed so far.
+            "turn_device_identified",
+            // Per-turn context-trim decision. Worth promoting alongside the
+            // next piece of compaction work rather than on its own.
+            "history_trim_skipped",
+        ];
+
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/ is the parent of this crate");
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![crates_dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // `target/` holds generated copies of the same sources.
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let Ok(src) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let lines: Vec<&str> = src.lines().collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        if !line.contains("target: \"giap::trace\"") {
+                            continue;
+                        }
+                        // The macro name sits on the line above the target.
+                        let emitted_at_debug = i
+                            .checked_sub(1)
+                            .is_some_and(|p| lines[p].contains("tracing::debug!"));
+                        if !emitted_at_debug {
+                            continue;
+                        }
+                        // Which event is it? The `kind` follows the target.
+                        let kind = lines[i + 1..]
+                            .iter()
+                            .take(3)
+                            .find_map(|l| l.split("kind = \"").nth(1))
+                            .and_then(|k| k.split('"').next())
+                            .unwrap_or("<unknown>")
+                            .to_string();
+                        if !GRANDFATHERED.contains(&kind.as_str()) {
+                            offenders.push(format!("{}:{} kind={kind:?}", path.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these `giap::trace` events are emitted at `debug!`, which the \
+             production filter drops — they will never appear in a log. Use \
+             `info!`, or add the kind to GRANDFATHERED with a reason:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+}

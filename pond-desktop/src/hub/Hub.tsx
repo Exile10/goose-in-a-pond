@@ -16,6 +16,7 @@ import { LogsDetail } from "./views/settings/Logs";
 import { PrivacyDetail } from "./views/settings/Privacy";
 import { RoomsDetail } from "./views/settings/Rooms";
 import { CamerasDetail } from "./views/settings/Cameras";
+import { ConnectionsDetail } from "./views/settings/Connections";
 import { NotificationsDetail } from "./views/settings/Notifications";
 // Appearance owns its own state via useTheme(); it does not navigate, so the
 // wrapper below silently drops the `go` prop.
@@ -44,6 +45,7 @@ const SETTINGS_VIEWS: Record<SettingsRowId, DetailComponent> = {
   privacy:       PrivacyDetail,
   rooms:         RoomsDetail,
   cameras:       CamerasDetail,
+  connections:   ConnectionsDetail,
   notifications: NotificationsDetail,
   // AppearanceView doesn't accept a go prop — wrap it so the prop is silently dropped
   appearance:    (_props: { go: (r: string) => void }) => <AppearanceView />,

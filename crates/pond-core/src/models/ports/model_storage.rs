@@ -1,8 +1,6 @@
-//! Driven port: resolve on-disk paths for model files and tool binaries.
-//!
-//! This is the single place that knows the directory layout under `data_dir`.
-//! The implementation in `pond-server` maps each `ModelCategory` to its
-//! subdirectory.  Tests can use an in-memory stub.
+//! Driven port: resolve on-disk paths for model files and tool binaries. This is the single place
+//! that knows the directory layout under `data_dir`; the `pond-server` implementation maps each
+//! `ModelCategory` to its subdirectory, and tests can use an in-memory stub.
 
 use std::path::PathBuf;
 
