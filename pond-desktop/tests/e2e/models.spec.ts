@@ -21,8 +21,10 @@ async function goToModels(page: Parameters<typeof mockAllApiRoutes>[0]) {
     .or(page.locator('[title="Models"]'))
     .first();
   await modelsBtn.click({ timeout: 10_000 });
-  // Models defaults to "Set up" view; switch to "Manage" where roles/memory/downloads live
-  await page.getByRole("button", { name: "Manage" }).click({ timeout: 5_000 });
+  // No tab hop any more. The screen used to open on a guided-setup wizard with
+  // the real view behind a "Manage" tab; that split was removed deliberately —
+  // see the header comment in `src/sections/Models.tsx` — so roles, memory and
+  // downloads are on the section itself now.
 }
 
 test.describe("Models section", () => {
@@ -152,12 +154,18 @@ test.describe("Models section", () => {
 
     await goToModels(page);
 
-    // The spill warning badge appears for the too-large model.
-    await expect(page.locator(".fit-badge").first()).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator(".fit-badge").first()).toContainText(/too large/i);
+    // The fit meter is now inline on every row rather than a badge that only
+    // appears on a spill, and it carries its verdict in `title` (see
+    // `fitReading` in src/sections/models/modelsView.ts). So the assertion is
+    // no longer "how many badges" but "what does each row's meter say".
+    const meters = page.locator(".mdl-row__fit");
+    await expect(meters.first()).toBeVisible({ timeout: 10_000 });
 
-    // Exactly one badge — the fitting model must NOT be flagged.
-    await expect(page.locator(".fit-badge")).toHaveCount(1);
+    // The too-large model reports a spill; the fitting one must not.
+    await expect(
+      page.locator(".mdl-row__fit[title*='Bigger than']"),
+    ).toHaveCount(1);
+    await expect(page.locator(".mdl-row__fit[title*='Uses']")).toHaveCount(1);
   });
 
   test("memory-fit guard: no warning when budget is unavailable (Mac/dev)", async ({ page }) => {
@@ -191,9 +199,15 @@ test.describe("Models section", () => {
 
     await goToModels(page);
 
-    // The model list renders, but no spill badge appears (budget unknown).
+    // The model list renders, and the meter declines to give a verdict rather
+    // than drawing a confident bar from nothing — "a confident bar drawn from
+    // nothing is worse than no bar" (src/sections/Models.tsx). The element is
+    // present either way now, so the claim is about what it says.
     await expect(page.getByText(/gemma3n e2b/i).first()).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator(".fit-badge")).toHaveCount(0);
+    await expect(
+      page.locator(".mdl-row__fit[title*='Size unknown']"),
+    ).toHaveCount(1);
+    await expect(page.locator(".mdl-row__fit[title*='Bigger than']")).toHaveCount(0);
   });
 
   test("download progress bar visible when download in progress", async ({ page }) => {
