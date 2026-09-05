@@ -1,20 +1,7 @@
-//! Ollama LLM provider adapter.
-//!
-//! Implements the GIAP `LlmProvider` port against a local Ollama instance
-//! at `http://localhost:11434` using the `/api/chat` endpoint.
-//!
-//! ## Auto-Pull
-//!
-//! When a model is not yet downloaded in Ollama, `complete()` automatically
-//! calls `POST /api/pull` to download it, then retries inference. This makes
-//! the system fully autonomous — no manual `ollama pull` needed.
-//!
-//! ## Running Ollama
-//!
-//! ```bash
-//! ollama serve
-//! pond-server chat --provider ollama --model llama3.2
-//! ```
+//! Ollama LLM provider adapter: the GIAP `LlmProvider` port against a local
+//! Ollama instance at `http://localhost:11434` via `/api/chat`. A model that is
+//! not downloaded yet makes `complete()` call `POST /api/pull` and then retry,
+//! so no manual `ollama pull` is needed.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;

@@ -1,8 +1,6 @@
 //! In-memory implementation of [`TelemetryPort`] for testing and lightweight
-//! deployments.
-//!
-//! Production deployments can later swap this for a SQLite-backed adapter
-//! writing to `pond_logs.db` without changing any consumer code.
+//! deployments. A SQLite-backed adapter writing to `pond_logs.db` can replace it
+//! without changing any consumer.
 
 use crate::security::domain::turn_metrics::{TelemetrySummary, TurnMetrics};
 use crate::security::ports::telemetry::TelemetryPort;

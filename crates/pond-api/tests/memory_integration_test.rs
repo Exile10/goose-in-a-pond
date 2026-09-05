@@ -1,15 +1,7 @@
-//! Integration tests for the enhanced memory system:
-//!   - Memory segments, importance, tier, lifecycle (DB round-trip)
-//!   - Memory REST API with segment metadata
-//!   - Memory decay effective score computation
-//!   - Memory cleanup (archive/prune)
-//!   - Access tracking (record_access increments count)
-//!   - Segment-based search filtering
-//!
-//! These tests use a REAL SQLite database (temp dir) with all migrations applied.
-//! No running server or LLM required.
-//!
-//! Run: cargo test -p pond-api --test memory_integration_test
+//! Integration tests for the enhanced memory system: segment, importance, tier
+//! and lifecycle round-trips, the REST API's segment metadata, decay scoring,
+//! archive and prune cleanup, access tracking, and segment-filtered search. Uses
+//! a real SQLite database in a temp dir with all migrations; no server or LLM.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -105,6 +97,7 @@ async fn make_app_with_real_memory(
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -125,6 +118,7 @@ async fn make_app_with_real_memory(
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,

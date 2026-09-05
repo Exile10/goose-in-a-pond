@@ -180,10 +180,7 @@ mod tests {
             tally.pending_borrowed(peer).await.unwrap(),
             TokenCount::new(0)
         );
-        assert_eq!(
-            tally.pending_lent(peer).await.unwrap(),
-            TokenCount::new(0)
-        );
+        assert_eq!(tally.pending_lent(peer).await.unwrap(), TokenCount::new(0));
     }
 
     #[tokio::test]
@@ -200,10 +197,7 @@ mod tests {
             tally.pending_borrowed(peer).await.unwrap(),
             TokenCount::new(30)
         );
-        assert_eq!(
-            tally.pending_lent(peer).await.unwrap(),
-            TokenCount::new(70)
-        );
+        assert_eq!(tally.pending_lent(peer).await.unwrap(), TokenCount::new(70));
 
         // Settling the borrowed side must not touch what we're owed.
         tally.mark_settled(peer, TokenCount::new(30)).await.unwrap();
@@ -211,9 +205,6 @@ mod tests {
             tally.pending_borrowed(peer).await.unwrap(),
             TokenCount::new(0)
         );
-        assert_eq!(
-            tally.pending_lent(peer).await.unwrap(),
-            TokenCount::new(70)
-        );
+        assert_eq!(tally.pending_lent(peer).await.unwrap(), TokenCount::new(70));
     }
 }

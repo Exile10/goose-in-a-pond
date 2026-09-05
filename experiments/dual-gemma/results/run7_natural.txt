@@ -1,0 +1,31 @@
+
+== natural ==
+  weather_direct         tool  ok  args  ok  ans  ok   12.7s  get_weather({"city": "Nairobi"})
+  weather_indirect       tool  ok  args  ok  ans  -    15.8s  get_weather({"city": "Eldoret"})
+  timer_minutes          tool  ok  args MISS  ans  -    40.3s  set_timer({"seconds": 100, "label": "standup"})
+  timer_compound         tool  ok  args  ok  ans  -    16.5s  set_timer({"seconds": 5400, "label": "check the oven"})
+  math_words             tool  ok  args  ok  ans  ok   10.4s  calculate({"expression": "18000 / 5"})
+  math_direct            tool  ok  args  ok  ans  ok    9.1s  calculate({"expression": "1234 * 17"})
+  convert_distance       tool  ok  args  ok  ans  ok    8.9s  convert_units({"from_unit": "km", "to_unit": "mi", "value": 340})
+  convert_temp           tool  ok  args  ok  ans  ok   24.4s  convert_units({"from_unit": "c", "to_unit": "f", "value": 29})
+  convert_mass_vs_calc   tool  ok  args  ok  ans  ok    8.7s  convert_units({"from_unit": "kg", "to_unit": "lb", "value": 2})
+  notes_search           tool  ok  args  ok  ans  -    13.6s  search_notes({"query": "Jetson"})
+  notes_read             tool  ok  args  ok  ans MISS   32.8s  read_note({"name": "standup note"})
+  notes_then_convert     tool  ok  args  ok  ans MISS   46.0s  search_notes({"query": "road distance to Kisumu"})
+  zero_arg_tool          tool  ok  args  ok  ans  -     5.8s  list_timers({})
+  time_timezone          tool MISS  args MISS  ans  -    26.6s  read_note({"name": "get_time"})
+  unknown_city           tool  ok  args  ok  ans  -     6.3s  get_weather({"city": "Atlantis"})
+  timer_then_list        tool  ok  args MISS  ans  -    10.9s  set_timer({"seconds": 0, "label": "tea"})
+  no_tool_greeting       tool  ok  args  ok  ans  -    27.9s  (no call)
+  no_tool_knowledge      tool  ok  args  ok  ans  -    10.0s  (no call)
+  multi_weather_two      tool  ok  args  ok  ans  ok    9.4s  get_weather({"city": "Nairobi"})
+  multi_weather_timer    tool  ok  args  ok  ans  ok   13.4s  get_weather({"city": "Kisumu"})
+  multi_convert_calc     tool  ok  args  ok  ans  ok   20.3s  convert_units({"from_unit": "km", "to_unit": "mi", "value": 340})
+  multi_note_weather     tool  ok  args MISS  ans  ok   17.4s  read_note({"name": "jetson note"})
+
+========================================================================
+
+  natural   tool  21/22  ( 95%)   args  18/22  ( 82%)   answer  10/12  ( 83%)   malformed 0     17.6s/case
+            picker honoured the tool the planner named: 19/25 (76%)
+========================================================================
+wrote results/run7_natural.json

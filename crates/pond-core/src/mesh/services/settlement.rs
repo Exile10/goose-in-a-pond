@@ -1,11 +1,7 @@
-//! Settlement service (#132 Milestone 6): turns accumulated per-peer usage
-//! into a real, batched Lightning payment.
+//! Settlement service (#132 Milestone 6): turns accumulated per-peer usage into a
+//! batched Lightning payment.
 //!
-//! Deliberately off the inference hot path — nothing in the request/response
-//! path calls this, only a periodic caller (`pond-server`'s settlement job).
-//! Pure port-mediated logic, no I/O of its own beyond the four ports it's
-//! given, so it's fully unit-testable with mocks and needs no running
-//! server or network to exercise.
+//! Off the inference hot path — the only caller is `pond-server`'s periodic settlement job.
 
 use std::sync::Arc;
 
@@ -63,18 +59,10 @@ impl SettlementService {
         }
     }
 
-    /// Runs one settlement pass over every trusted peer with pending usage:
-    /// tally → ask the peer for an invoice → pay it → mark that usage
-    /// settled. Never called per-request — a periodic caller owns the
-    /// interval.
-    ///
-    /// `millisats_per_token` is the not-yet-decided exchange rate (#132) —
-    /// `0` means "settlement isn't configured yet" and this is a deliberate
-    /// no-op, not a bug: it must never guess a rate nobody signed off on.
-    ///
-    /// `Err` here means the pass couldn't even start (e.g. the trust
-    /// directory itself is unreadable) — distinct from a per-peer
-    /// `SettlementOutcome::Failed`, which always names the peer it's about.
+    /// One settlement pass over every trusted peer with pending usage: tally, ask the peer
+    /// for an invoice, pay it, mark that usage settled. A periodic caller owns the interval.
+    /// `millisats_per_token` of `0` means settlement is not configured yet (#132) and the
+    /// pass is a deliberate no-op. `Err` means the pass could not start at all.
     pub async fn run_once(
         &self,
         millisats_per_token: u64,

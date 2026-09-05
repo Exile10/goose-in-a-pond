@@ -1,0 +1,9 @@
+
+== dual ==
+
+========================================================================
+
+  dual      tool  17/18  ( 94%)   args  17/18  ( 94%)   answer   7/8   ( 88%)   malformed 0     14.8s/case
+            picker honoured the tool the planner named: 15/17 (88%)
+========================================================================
+wrote results/cooperation.json

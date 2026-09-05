@@ -1,9 +1,7 @@
 //! Configurable mock implementation of `ModelStorage` for tests.
 //!
-//! Three modes:
-//! - `AlwaysPresent`  — `is_present` always returns `true`  (skip all downloads)
-//! - `NeverPresent`   — `is_present` always returns `false` (force all downloads)
-//! - `FileSystemBacked` — returns real paths inside a temp dir; `is_present` checks disk
+//! Modes: `AlwaysPresent` skips every download, `NeverPresent` forces them all, and
+//! `FileSystemBacked` returns real paths inside a temp dir with `is_present` checking disk.
 
 use std::path::PathBuf;
 

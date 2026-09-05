@@ -1,8 +1,7 @@
 //! Bridges our domain [`PeerId`] (a raw 32-byte ed25519 public key) and
-//! [`pond_mesh_protocol::identity::MeshKeypair`] to libp2p's own identity
-//! types. Both are deterministic functions of the same ed25519 key material,
-//! so a Pond's mesh identity is the same key on both sides — just wrapped
-//! differently.
+//! [`pond_mesh_protocol::identity::MeshKeypair`] to libp2p's own identity types.
+//! Both are deterministic functions of the same ed25519 key material, so a Pond's
+//! mesh identity is one key wrapped two ways.
 
 use libp2p::identity::{ed25519, Keypair, PublicKey};
 use libp2p::PeerId as Libp2pPeerId;

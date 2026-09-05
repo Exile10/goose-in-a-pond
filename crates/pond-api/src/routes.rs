@@ -111,6 +111,18 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/onboard/reset", post(reset_onboarding))
         // Settings write is public so onboarding steps can save before completion
         .route("/settings", put(update_settings))
+        // Prefix warm-up status: is the pond ready for a first message yet.
+        // Read-only, and open for the same window /settings write is open --
+        // the wizard shows the banner before onboarding-gated auth exists, and
+        // the client sends a token once it has one. See PUBLIC_ROUTES.
+        .route("/warmup", get(get_warmup))
+        // ── Time and place ────────────────────────────────────────────────
+        // One catalogue and one detection, so the three screens that ask
+        // "where is this pond" stop each answering it differently. Public
+        // because the wizard sets location up before any device has paired;
+        // see PUBLIC_ROUTES for what each of the two exposes.
+        .route("/time/zones", get(list_time_zones))
+        .route("/location/detect", post(detect_location))
         // TTS synthesis is public so the onboarding voice-preview can play a
         // sample before onboarding completes. Text→audio via local Piper is not
         // privileged and leaks no user data.
@@ -290,6 +302,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(list_context_sources).post(connect_context_source),
         )
         .route("/context/sources/{id}", delete(disconnect_context_source))
+        .route("/context/sync", post(sync_context_sources))
+        .route("/context/items", get(list_context_items))
         // ── The index's own health, and the way to repair it ───────────────
         // Protected, and deliberately absent from `middleware::PUBLIC_ROUTES`:
         // these counts say how much of a household's memory exists and how
@@ -372,7 +386,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/logs/export", get(export_logs_csv))
         // ── Memories ──────────────────────────────────────────────────────────
         .route("/memories", get(list_memories).post(save_memory))
-        .route("/memories/{id}", delete(delete_memory))
+        .route("/memories/{id}", delete(delete_memory).put(update_memory))
         // ── Memory Consolidation ─────────────────────────────────────────────
         .route("/memory/consolidate", post(start_consolidation))
         .route("/memory/consolidate/stop", post(stop_consolidation))
@@ -773,7 +787,7 @@ struct IssuePairingCodeRequest {
     ///
     /// Omitted or `null` no longer means "unattributed" on its own: a
     /// one-member household defaults to that member, per
-    /// [`pairing_attribution::owner_for_new_code`]. Set `unattributed` to ask
+    /// [`member_attribution::owner_for_new_code`]. Set `unattributed` to ask
     /// for a code that binds to nobody.
     #[serde(default)]
     profile_id: Option<String>,
@@ -841,7 +855,7 @@ async fn handshake_issue_pairing_code(
             Vec::new()
         }
     };
-    let owner = pond_core::user_data::services::pairing_attribution::owner_for_new_code(
+    let owner = pond_core::user_data::services::member_attribution::owner_for_new_code(
         request.profile_id.as_deref(),
         request.unattributed,
         &member_ids,
@@ -5250,7 +5264,7 @@ async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Json(patch) = body.map_err(|e| {
+    let Json(mut patch) = body.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("Invalid settings body: {}", e)})),
@@ -5265,45 +5279,32 @@ async fn update_settings(
         )
     })?;
 
-    // Reject an unrecognised network_mode. `NetworkMode::parse` deliberately
-    // falls back to "open" rather than to a restrictive mode, so a typo that
-    // reached the store would silently be no gate at all. Refusing it here is
-    // the narrowing half of that bargain -- and refusing at the edge is also
-    // the only place a user finds out, since the parse fallback is a log line.
-    if let Some(mode) = patch.get("network_mode").and_then(|v| v.as_str()) {
-        if !pond_core::user_data::domain::settings::NETWORK_MODES.contains(&mode) {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({
-                    "error": format!(
-                        "network_mode {:?} is not one of {:?}",
-                        mode,
-                        pond_core::user_data::domain::settings::NETWORK_MODES
-                    )
-                })),
-            ));
-        }
-    }
-
-    // Reject an unrecognised reasoning_effort, for the same reason and in the
-    // same direction as network_mode above. `ReasoningEffort::parse` falls back
-    // to "brief" -- the SMALLEST thinking budget -- so a typo that reached the
-    // store would quietly shrink the model's think rather than widen it. That
-    // is the safe failure, which is exactly why it must not be the silent one:
-    // refusing here is the only place the user ever finds out.
-    if let Some(effort) = patch.get("reasoning_effort").and_then(|v| v.as_str()) {
-        if !pond_core::user_data::domain::settings::REASONING_EFFORTS.contains(&effort) {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({
-                    "error": format!(
-                        "reasoning_effort {:?} is not one of {:?}",
-                        effort,
-                        pond_core::user_data::domain::settings::REASONING_EFFORTS
-                    )
-                })),
-            ));
-        }
+    // Validate and canonicalise every ruled field, in pond-core.
+    //
+    // Three arms used to live here by hand — timezone, network_mode and
+    // reasoning_effort — and they were the ONLY server-side rules the pond had.
+    // The rest of the real rules were in the desktop's `validation.ts`, which
+    // meant the backend stored what the browser rejected, and any writer that
+    // was not the catalogue met no rule at all.
+    //
+    // `validate_patch` reports EVERY failing field rather than the first, and
+    // canonicalises in place: `africa/nairobi` is stored as `Africa/Nairobi`,
+    // `9:05` as `09:05`. A refused patch is left exactly as it arrived.
+    if let Err(errors) =
+        pond_core::user_data::domain::settings_validation::validate_patch(&mut patch)
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": pond_core::user_data::domain::settings_validation::render_errors(&errors),
+                // Named per field as well, so a form can mark the box rather
+                // than showing one sentence above the whole page.
+                "fields": errors
+                    .iter()
+                    .map(|e| json!({ "field": e.field, "message": e.message }))
+                    .collect::<Vec<_>>(),
+            })),
+        ));
     }
 
     // Reject agent_backend="pond" — backend is quarantined (Q2-05, not production-ready).
@@ -5552,6 +5553,13 @@ async fn update_settings(
         }
     }
 
+    // A provider or model change makes the engine's warmed prefix stale, so
+    // re-run the warm-up in the background. Fire-and-forget: the save must not
+    // wait on a model load.
+    if current.chat_provider != merged.chat_provider || current.chat_model != merged.chat_model {
+        crate::spawn_prefix_prewarm(state.clone(), false);
+    }
+
     // Return the full merged Settings so the frontend can sync its local state
     // without a second GET request.
     //
@@ -5566,6 +5574,29 @@ async fn update_settings(
     Ok(Json(
         serde_json::to_value(&merged).unwrap_or(json!({ "status": "ok" })),
     ))
+}
+
+/// Prefix warm-up status for the boot banner and voice greeting gate.
+async fn get_warmup(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let snapshot = state
+        .warmup
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let elapsed_ms = match (snapshot.started_unix_ms, snapshot.finished_unix_ms) {
+        (0, _) => 0,
+        (s, Some(f)) => f.saturating_sub(s),
+        (s, None) => now.saturating_sub(s),
+    };
+    let mut v = serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("elapsed_ms".into(), json!(elapsed_ms));
+    }
+    Json(v)
 }
 
 /// Current conditions + short forecast for the dashboard weather widget.
@@ -13422,6 +13453,42 @@ async fn save_memory(
     }
 }
 
+#[derive(Deserialize)]
+struct UpdateMemoryRequest {
+    content: String,
+}
+
+/// `PUT /api/v1/memories/{id}` -- correct a memory's wording in place.
+///
+/// In place, keeping its id. The desktop used to do this by adding the new text
+/// and deleting the old row, which reset the memory's age and usage, orphaned
+/// its vector, and left a duplicate behind whenever the delete half failed. A
+/// correction should not turn a long-held fact into a brand-new one.
+async fn update_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateMemoryRequest>,
+) -> impl axum::response::IntoResponse {
+    let content = body.content.trim();
+    if content.is_empty() {
+        // Emptying a memory is a deletion wearing an edit's clothes, and the
+        // caller has a route for that which reports what it removed.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "a memory cannot be blank -- delete it instead"})),
+        )
+            .into_response();
+    }
+    match state.memory_repo.update_content(&id, content).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn delete_memory(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -16095,11 +16162,8 @@ fn proven_device(
 /// `AppState` already holds because `lib.rs` and `main.rs` were owned by other
 /// work. It takes the redactor because storage redacts on the way in.
 fn context_repo(state: &Arc<AppState>) -> pond_infra::sqlite_context::SqliteContextRepository {
-    // `RuleRedactor` is deterministic and stateless -- the same rules over the
-    // same text -- so constructing one here cannot disagree with the one
-    // `main.rs` holds. That is the only reason this is acceptable rather than a
-    // second source of truth; if it ever grows configuration, it belongs on
-    // `AppState` beside the rest.
+    // `RuleRedactor` is deterministic and stateless, so constructing one here cannot disagree with
+    // the one `main.rs` holds. If it ever grows configuration it belongs on `AppState` instead.
     pond_infra::sqlite_context::SqliteContextRepository::new(
         state.db.system.clone(),
         std::sync::Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
@@ -16119,38 +16183,66 @@ struct ConnectSourceRequest {
     /// Which conversation the caller is speaking in. The OWNER is resolved from
     /// this and the caller's proven device; see below.
     session_id: String,
+    /// Sign-in details, for a kind that reaches an account.
+    ///
+    /// REQUIRED for `calendar` and refused for the on-pond kinds: a calendar source without them
+    /// would look connected and never sync, the empty-source shape `availability` prevents.
+    #[serde(default)]
+    credentials: Option<ConnectCredentials>,
 }
 
-/// The owner of a source is resolved, never supplied.
-///
-/// **This is the whole security decision of these routes.** A `profile_id` in
-/// the request body would be a client naming whose data this is -- the same hole
-/// PAI-1 P4 closed on `PUT /sessions/{id}/user`, and worse here, because every
-/// item the source ever produces inherits the owner and migration 0044 refuses
-/// to let it change afterwards. So the body has no `profile_id` field to send,
-/// and the owner comes from `resolve_turn_scope`, which is PAI-1's whole lattice.
-///
-/// `Household` and `Guest` are refused rather than defaulted to anybody:
-/// invariant 1 says every item has an owner, and invariant 2 says a `Guest` sees
-/// no context at all -- a guest who could CREATE a source would be writing into
-/// a member's corpus.
+/// App-password sign-in for an account source. Never echoed back.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectCredentials {
+    username: String,
+    password: String,
+    /// Only for the self-hosted presets (`nextcloud`, `custom`).
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+/// The owner of a source is resolved, never supplied: the body has no `profile_id` field, and the
+/// owner comes from `resolve_turn_scope`. Every item the source produces inherits that owner and
+/// migration 0044 refuses to let it change. `Household` and `Guest` are refused rather than
+/// defaulted -- a guest who could CREATE a source would be writing into a member's corpus.
 async fn context_source_owner(
     state: &Arc<AppState>,
     session_id: &str,
     device: &ProvenDevice,
 ) -> Result<String, (StatusCode, Json<Value>)> {
     let scope = resolve_turn_scope(state, session_id, device).await;
-    match scope.owner_id() {
-        Some(id) => Ok(id.to_string()),
-        None => Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "a context source belongs to one household member, and this caller \
-                          could not be resolved to one",
-                "scope": format!("{scope:?}"),
-            })),
-        )),
+    if let Some(id) = scope.owner_id() {
+        return Ok(id.to_string());
     }
+
+    // `Household` in a ONE-MEMBER pond resolves to that member. Deliberately NOT extended to
+    // `Guest` or to a household with two or more members, where picking one would attribute an
+    // account by row order. Residual exposure: in a one-member pond an unidentified caller on an
+    // authenticated-but-unattributed device can connect an account that becomes the member's.
+    if matches!(scope, ProfileScope::Household) {
+        let members: Vec<String> = state
+            .profile_repo
+            .list()
+            .await
+            .map(|profiles| profiles.into_iter().map(|p| p.id).collect())
+            .unwrap_or_default();
+        if let Some(only) =
+            pond_core::user_data::services::member_attribution::sole_member(&members)
+        {
+            return Ok(only);
+        }
+    }
+
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "a context source belongs to one household member, and this caller could \
+                      not be resolved to one. Identify yourself in this conversation, or pair \
+                      this device to a member.",
+            "scope": format!("{scope:?}"),
+        })),
+    ))
 }
 
 /// `POST /api/v1/context/sources` -- connect a sensor or camera as personal context.
@@ -16181,10 +16273,90 @@ async fn connect_context_source(
         ));
     }
 
+    // A provider that cannot possibly authenticate is refused HERE, with the
+    // reason, rather than stored and left to fail every half hour with a 401
+    // that reads like a mistyped password. Google Calendar over CalDAV is the
+    // case: its own guide requires OAuth 2.0 and rejects Basic auth.
+    if kind == SourceKind::Calendar {
+        if let Some(provider) =
+            pond_adapters_caldav::CalDavProvider::from_stored(body.provider.trim(), Some("x"))
+        {
+            if !provider.is_connectable() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": provider.setup_hint(),
+                        "provider": body.provider.trim(),
+                    })),
+                ));
+            }
+        }
+    }
+
     let now = chrono::Utc::now();
-    // Deterministic id, so connecting the same device twice is an update rather
-    // than a second source racing the first for the same events.
-    let id = format!("{}:{}", kind.as_str(), body.provider.trim());
+    // Deterministic id, so connecting the same device twice is an update rather than a second
+    // source racing the first. An account kind carries the OWNER too: two members each connecting
+    // their own Google calendar would collide on `calendar:google`, which migration 0044 refuses.
+    // The profile id is already on the row, so this adds no new personal data to the key.
+    let id = if kind.needs_credentials() {
+        format!("{}:{}:{}", kind.as_str(), body.provider.trim(), owner)
+    } else {
+        format!("{}:{}", kind.as_str(), body.provider.trim())
+    };
+
+    // Credentials, before the source row exists. Storing them second would
+    // leave a source that cannot sync if the secret write failed, which is the
+    // same empty-source outcome by a slower route.
+    let secret_ref = match (kind.needs_credentials(), body.credentials.as_ref()) {
+        (true, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "this source signs in to an account, so it needs a username and an \
+                              app password",
+                })),
+            ))
+        }
+        (false, Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "this source is already on the pond and needs no sign-in details",
+                })),
+            ))
+        }
+        (false, None) => None,
+        (true, Some(creds)) => {
+            // No secret store means no credentials, and REFUSING is the only
+            // safe answer: the alternatives are dropping the password (a source
+            // that can never sync) or putting it somewhere unencrypted, and
+            // invariant 4 exists to rule out the second.
+            let Some(secrets) = state.secret_repo.as_ref() else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "this pond has no encrypted secret store, so it cannot hold \
+                                  an account password",
+                    })),
+                ));
+            };
+            let key = pond_core::context::domain::secret_key_for(&id);
+            let blob = json!({
+                "username": creds.username,
+                "password": creds.password,
+                "base_url": creds.base_url,
+            })
+            .to_string();
+            secrets.set(&key, &blob).await.map_err(|e| {
+                tracing::warn!(error = %e, "could not store calendar credentials");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not store the sign-in details"})),
+                )
+            })?;
+            Some(key)
+        }
+    };
     let source = ContextSource::from_parts(SourceParts {
         id: id.clone(),
         kind,
@@ -16194,7 +16366,7 @@ async fn connect_context_source(
         cursor: None,
         last_sync: None,
         status: SourceStatus::Connected,
-        secret_ref: None,
+        secret_ref,
         created_at: now,
     })
     .map_err(|e| {
@@ -16236,6 +16408,96 @@ async fn connect_context_source(
     ))
 }
 
+/// `GET /api/v1/context/items?session_id=X&q=…` -- what the pond has read.
+///
+/// Scoped in the SQL rather than filtered afterwards: the caller sees their own items and nobody
+/// else's. Keyword search rather than semantic, because a cosine ranking buries an exact match.
+async fn list_context_items(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let session_id = params.get("session_id").cloned().unwrap_or_default();
+    let device = proven_device(principal.as_ref());
+    let scope = resolve_turn_scope(&state, &session_id, &device).await;
+
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(200)
+        .clamp(1, 500);
+
+    let query = params.get("q").map(|q| q.trim()).unwrap_or_default();
+    let repo = context_repo(&state);
+    let items = if query.is_empty() {
+        repo.recent_items(&scope, limit).await
+    } else {
+        // Split on whitespace: the store's keyword search takes terms, and
+        // handing it the whole phrase would match only items containing that
+        // exact string.
+        let terms: Vec<String> = query.split_whitespace().map(|t| t.to_string()).collect();
+        repo.search_items(&terms, &scope, limit).await
+    };
+
+    let items = items.map_err(|e| {
+        tracing::warn!(error = %e, "could not read context items");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "could not read what the pond has collected"})),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "items": items
+            .iter()
+            .map(|i| json!({
+                "id": i.id(),
+                "source_id": i.source_id(),
+                "source_kind": i.source_kind().as_str(),
+                "kind": i.kind().as_str(),
+                "title": i.title(),
+                "body": i.body(),
+                "occurred_at": i.occurred_at().to_rfc3339(),
+                "participants": i.participants(),
+                // Whether retrieval can currently reach it. The list is also
+                // the place somebody asks "why did search not find this", and
+                // the answer is usually this flag.
+                "searchable": i.embedding().is_some(),
+            }))
+            .collect::<Vec<_>>()
+    })))
+}
+
+/// `POST /api/v1/context/sync` -- pull every connected account now.
+///
+/// Answers with what the pass actually did, because "checked, nothing new" and "found eleven
+/// things" are both successes. Held open for the duration rather than returning a job id.
+async fn sync_context_sources(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(syncer) = state.account_sync.as_ref() else {
+        // Distinguished from "synced, found nothing": this pond CANNOT sync,
+        // and reporting a zero would read as a working account with no news.
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "this pond cannot reach connected accounts -- it has no encrypted \
+                          secret store to read their sign-in details from",
+            })),
+        ));
+    };
+    match syncer.sync_now().await {
+        Ok(summary) => Ok(Json(json!(summary))),
+        Err(e) => {
+            tracing::warn!(error = %e, "a requested account sync failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "the sync could not run"})),
+            ))
+        }
+    }
+}
+
 /// `GET /api/v1/context/sources?session_id=X` -- the sources this caller may see.
 async fn list_context_sources(
     State(state): State<Arc<AppState>>,
@@ -16257,26 +16519,48 @@ async fn list_context_sources(
             )
         })?;
 
+    // One grouped query for every source, so the counts cost the same whether a
+    // household has one account or six. A failure here loses the counts and
+    // keeps the list: knowing what is connected matters more than knowing how
+    // much each one brought.
+    let stats = context_repo(&state)
+        .item_stats_by_source()
+        .await
+        .unwrap_or_default();
+
     Ok(Json(json!({
         "sources": sources
             .iter()
-            .map(|s| json!({
+            .map(|s| {
+                let stat = stats.iter().find(|st| st.source_id == s.id());
+                json!({
                 "id": s.id(),
                 "kind": s.kind().as_str(),
                 "provider": s.provider(),
                 "profile_id": s.profile_id(),
                 "status": s.status().as_str(),
-            }))
+                // When the pond last reached this account. `null` means it has
+                // not run yet, which a household reads very differently from
+                // "checked, found nothing" -- the surface needs to tell them
+                // apart or a source that has never synced looks healthy.
+                "last_sync": s.last_sync().map(|t| t.to_rfc3339()),
+                "needs_credentials": s.kind().needs_credentials(),
+                // What this source has produced and how much of it retrieval can
+                // reach, reported separately: a source can be perfectly connected
+                // and still half-invisible while the index catches up, and that gap
+                // is what explains a search coming up short.
+                "items": stat.map(|st| st.items).unwrap_or(0),
+                "awaiting_index": stat.map(|st| st.awaiting_index).unwrap_or(0),
+            })
+            })
             .collect::<Vec<_>>()
     })))
 }
 
 /// `DELETE /api/v1/context/sources/{id}?session_id=X` -- disconnect, and say how many items went.
 ///
-/// PAI-8 invariant 6 is "disconnecting a source deletes its items by default,
-/// **and says how many**". `disconnect_source` returns the count for exactly
-/// that reason, so the number is in the response body rather than a log line: a
-/// caller that cannot report it cannot satisfy the invariant.
+/// PAI-8 invariant 6: disconnecting a source deletes its items by default AND says how many, so
+/// the count is in the response body rather than a log line.
 async fn disconnect_context_source(
     State(state): State<Arc<AppState>>,
     principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
@@ -16300,16 +16584,9 @@ async fn disconnect_context_source(
 }
 
 // ── The coverage number leaves the process ─────────────────────────────────
-//
-// `IndexHealth` has been computed since phase A and written to a `tracing` line
-// and nowhere else -- no route, no TypeScript type, nothing rendered. That is
-// how an index populated at roughly 2% survived six landed phases: the pond
-// answered every question, slightly worse, and the one place that knew was a log
-// nobody reads while things look fine.
-//
-// Two routes, because a number nobody can act on is only a better-informed kind
-// of stuck: one to read what retrieval can reach, one to force the re-embed that
-// repairs it.
+// `IndexHealth` is computed but was only ever written to a `tracing` line, which is how an index
+// populated at roughly 2% survived six phases. Two routes: one to read what retrieval can reach,
+// one to force the re-embed that repairs it.
 
 /// Said by both routes below, so they cannot tell different stories about the
 /// same pond. "No index" from one and a cleared count from the other would leave
@@ -16321,32 +16598,87 @@ const NO_EMBEDDING_MODEL: &str = "no embedding model is configured, so nothing h
 
 /// Coverage as a fraction, or `null` when there is nothing to cover.
 ///
-/// `0/0` is neither 0% nor 100%, and BOTH readings actively mislead. Rendered as
-/// zero, a pond that has simply never stored a memory shows a permanent red
-/// figure and the number gets ignored, which is the state this whole surface
-/// exists to leave. Rendered as one, a corpus whose liveness predicate excludes
-/// every row -- the summary corpus on a pond where no session has been
-/// attributed, a real state on real hardware -- shows a green 100% while being
-/// structurally unable to answer anything. `null` says "no qualifying rows",
-/// which is the same thing the row's own `rows: 0` says.
+/// `0/0` is neither 0% nor 100% and both readings mislead: zero paints a pond that never stored a
+/// memory permanently red, one paints a structurally empty corpus green. `null` says no rows.
 fn index_coverage(indexed: u64, rows: u64) -> Option<f64> {
     (rows > 0).then(|| indexed as f64 / rows as f64)
 }
 
-/// `GET /api/v1/context/index/health` -- how much of each corpus retrieval can
-/// actually reach, for the model currently configured.
+/// Every IANA zone, with the offset it is on today.
 ///
-/// Answers **200 with `indexed: false`** rather than an error when this pond has
-/// no index or no embedder. Embeddings switched off is a legitimate
-/// configuration -- retrieval falls back to recency and the pond works -- so the
-/// UI has to be able to render it, and a 500 would make a healthy state
-/// indistinguishable from a fault at exactly the moment somebody is trying to
-/// tell those two apart.
-///
-/// The per-corpus rows are the point, not decoration. Averaged into one figure,
-/// two healthy corpora hid a third that could never populate at all; the shape
-/// that makes that visible is a row each, which is what
-/// [`pond_core::context::vector_index::CorpusHealth`] is for.
+/// Exists so the desktop stops carrying its own divergent lists. Offsets are computed here rather
+/// than in the client because an offset depends on the date and a cached one goes wrong at DST.
+async fn list_time_zones() -> Json<Value> {
+    use pond_core::user_data::services::location::zone_catalogue;
+    let now = chrono::Utc::now();
+    let zones: Vec<Value> = zone_catalogue(now)
+        .into_iter()
+        .map(|c| json!({ "zone": c.zone, "offset": c.offset, "place": c.place }))
+        .collect();
+    Json(json!({ "zones": zones }))
+}
+
+/// What the client already knows, offered to the cascade as hints.
+#[derive(Debug, Default, serde::Deserialize)]
+struct DetectLocationRequest {
+    /// The zone this device is set to — `Intl.DateTimeFormat()` on the desktop.
+    #[serde(default)]
+    system_zone: Option<String>,
+    /// A name the household typed, which beats anything derived.
+    #[serde(default)]
+    typed_name: Option<String>,
+    /// Coordinates a real browser answered with, when one did.
+    #[serde(default)]
+    latitude: Option<f64>,
+    #[serde(default)]
+    longitude: Option<f64>,
+}
+
+/// Work out where this pond is, from several sources, cheapest first. Server-side so onboarding
+/// and Settings share ONE implementation. The network source, the one that would reveal this
+/// household's address, is deliberately not wired: everything returned comes from the device's own
+/// zone and a geocoding call for a place NAME, which tells the far end nothing about who asked.
+async fn detect_location(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<DetectLocationRequest>>,
+) -> Json<Value> {
+    use pond_core::user_data::ports::place_lookup::PlaceLookup;
+    use pond_core::user_data::services::place_detection::{detect, Hints};
+
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let geocoder = pond_adapters_weather::Geocoder::new(state.http_client.clone());
+    let lookup: &dyn PlaceLookup = &geocoder;
+
+    let device_coords = match (req.latitude, req.longitude) {
+        (Some(lat), Some(lon)) => Some((lat, lon)),
+        _ => None,
+    };
+
+    let found = detect(
+        Hints {
+            system_zone: req.system_zone.as_deref(),
+            typed_name: req.typed_name.as_deref(),
+            device_coords,
+        },
+        Some(lookup),
+        // See the note above: not wired.
+        None,
+    )
+    .await;
+
+    Json(json!({
+        "name": found.name,
+        "latitude": found.latitude,
+        "longitude": found.longitude,
+        "timezone": found.timezone,
+        "source": found.source.as_str(),
+        // Whether this is a fact or a good guess, so the screen can say which.
+        "certain": found.source.is_certain(),
+        "has_coordinates": found.has_coordinates(),
+        "note": found.note,
+    }))
+}
+
 async fn context_index_health(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -16364,11 +16696,10 @@ async fn context_index_health(
     let Some(index) = state.vector_index.as_ref() else {
         return Ok(no_index(NO_VECTOR_INDEX));
     };
-    // The health query asks "how many rows carry a vector from THIS model", so
-    // with no embedder there is no model to ask about. Reporting every row as
-    // missing instead would be true and useless: it describes a pond that has
-    // switched embeddings off exactly as it describes one whose index has been
-    // wiped, and those need opposite responses.
+    // The health query asks "how many rows carry a vector from THIS model", so with no embedder
+    // there is no model to ask about. Reporting every row as missing would describe a pond that
+    // switched embeddings off exactly as it describes one whose index was wiped, and those two
+    // need opposite responses.
     let Some(embedder) = state.embedding_provider.as_ref() else {
         return Ok(no_index(NO_EMBEDDING_MODEL));
     };
@@ -16407,36 +16738,20 @@ async fn context_index_health(
                 "missing_rows": c.missing_rows,
                 "mismatched": c.mismatched,
                 "coverage": index_coverage(c.indexed_rows, c.rows),
-                // The one flag worth deriving here rather than in every client:
-                // rows exist in the table and NONE of them qualify. That is not
-                // an empty corpus waiting for data, it is a predicate excluding
-                // everything, and no amount of embedding repairs it. Measured on
-                // a live pond: 27 sessions carried a rolling summary, zero
-                // qualified, and coverage read 100%.
+                // Rows exist in the table and NONE of them qualify: not an empty
+                // corpus waiting for data but a predicate excluding everything, which
+                // no amount of embedding repairs. Measured live: 27 sessions carried a
+                // rolling summary, zero qualified, and coverage read 100%.
                 "structurally_excluded": c.rows == 0 && c.source_rows > 0,
             }))
             .collect::<Vec<_>>(),
     })))
 }
 
-/// `POST /api/v1/context/index/rebuild` -- empty the index so the maintenance
-/// sweep fills it again, and say what went.
-///
-/// This is the operator affordance behind every one-way door in this workstream.
-/// A changed embedder, a changed width, a changed task prefix: each leaves rows
-/// that score plausibly and are wrong, and each is repaired by re-embedding
-/// rather than by anything the sweep will notice on its own, because the sweep
-/// is driven by a row's vector being ABSENT. Emptying the table is what makes
-/// them absent.
-///
-/// Nothing is lost. Migration `0001_vectors.sql` says it in the schema: this
-/// file is derived data, every row recomputable from the authoritative stores,
-/// and being deletable-and-rebuildable is the property it was designed around.
-///
-/// Unlike the health route this does **not** require an embedder. Health cannot
-/// ask "how many vectors came from this model" without a model; clearing is
-/// about the table, and a pond that has just switched embeddings off is
-/// precisely one that may want the now-unreadable vectors gone.
+/// `POST /api/v1/context/index/rebuild` -- empty the index so the maintenance sweep fills it
+/// again. The sweep is driven by a row's vector being ABSENT, so emptying the table is the only
+/// repair after a changed embedder, width or task prefix. Nothing is lost: `0001_vectors.sql`
+/// makes every row recomputable. Unlike the health route this does NOT require an embedder.
 async fn rebuild_context_index(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -16459,12 +16774,10 @@ async fn rebuild_context_index(
         )
     };
 
-    // Raw SQL against the vectors pool, and this is the one thing here worth
-    // justifying: `VectorIndex` can drop ONE row by id and can prune orphans,
-    // and neither empties an index whose source rows are all still present --
-    // which is every rebuild there will ever be. Rather than widen the port for
-    // a single caller, the route deletes from the table the port owns, which is
-    // the same pool `AppState` already holds for every other adapter built here.
+    // Raw SQL against the vectors pool: `VectorIndex` can drop ONE row by id and prune orphans,
+    // and neither empties an index whose source rows are all still present, which is every
+    // rebuild there will ever be. Rather than widen the port for one caller, the route deletes
+    // from the table the port owns, on the pool `AppState` already holds.
     let mut tx = state.db.vectors.begin().await.map_err(db_error)?;
 
     // Counted BEFORE the delete and inside the same transaction, because the
@@ -16483,11 +16796,9 @@ async fn rebuild_context_index(
         .rows_affected();
     tx.commit().await.map_err(db_error)?;
 
-    // Every corpus is listed even at zero, mirroring the port's own rule that a
-    // corpus absent from an answer is a corpus nobody can see is broken. The
-    // total comes from the DELETE rather than from summing these, so a row
-    // written under some corpus name a later build stopped using is still
-    // counted as cleared instead of vanishing from both numbers.
+    // Every corpus is listed even at zero: a corpus absent from an answer is a corpus nobody can
+    // see is broken. The total comes from the DELETE rather than from summing these, so a row
+    // written under a corpus name a later build stopped using is still counted as cleared.
     let corpora: Vec<Value> = Corpus::ALL
         .iter()
         .map(|corpus| {
@@ -16502,16 +16813,10 @@ async fn rebuild_context_index(
 
     tracing::info!(cleared, "personal-context index cleared for rebuild");
 
-    // Clearing without this is a button that empties the panel and leaves it
-    // empty: the sweep that refills is idle-gated, and the person who just
-    // pressed Reindex is by definition not idle. Waking it here is what makes
-    // the two halves one action -- and a requested pass skips the quiet it would
-    // otherwise wait for, because the person asking IS the reason to run.
-    //
-    // `notify_one` rather than `notify_waiters`: there is one sweep, and this
-    // variant also holds a permit if the sweep happens to be mid-pass, so a
-    // rebuild landing during a pass still gets a fresh one afterwards instead of
-    // being silently dropped.
+    // The sweep that refills is idle-gated and the person who just pressed Reindex is not idle, so
+    // clearing without this wake leaves the panel empty; a requested pass skips the quiet gate.
+    // `notify_one` rather than `notify_waiters`: there is one sweep, and this variant holds a
+    // permit through a mid-pass rebuild so it still gets a fresh pass afterwards.
     let refilling = match state.index_reindex.as_ref() {
         Some(notify) => {
             notify.notify_one();
@@ -16531,54 +16836,20 @@ async fn rebuild_context_index(
     })))
 }
 
-/// PAI-1 P9's attribution repository, built from the pool `AppState` already
-/// holds -- the same story as [`proposal_repo`].
-///
-/// It belongs on `AppState` as an injected `Arc<dyn DeviceAttribution>`, next to
-/// `profile_repo` and the rest, and it is not there because `lib.rs` and
-/// `main.rs` were owned by other work this round. Everything that needs it goes
-/// through this one function precisely so the swap is a one-line change here and
-/// no change in any handler.
+/// PAI-1 P9's attribution repository, built from the pool `AppState` already holds, the same
+/// story as [`proposal_repo`]. It belongs on `AppState` as an injected
+/// `Arc<dyn DeviceAttribution>`; everything needing it goes through this one function so that
+/// swap is a one-line change here and no change in any handler.
 fn device_attribution(
     state: &Arc<AppState>,
 ) -> pond_infra::sqlite_device_attribution::SqliteDeviceAttribution {
     pond_infra::sqlite_device_attribution::SqliteDeviceAttribution::new(state.db.system.clone())
 }
 
-/// The speaking member's own preferences, for the prompt.
-///
-/// PAI-1 P6. Built from the scope [`resolve_turn_scope`] produced, so the
-/// assistant addresses whoever is actually talking:
-///
-/// - `Owner(id)` -- that member's preferences.
-/// - `Household` -- `settings.primary_profile_id`, the historical behaviour and
-///   the only sensible answer when nobody in particular has been identified.
-/// - `Guest` -- **`None`**. A visitor gets no personal context at all, which is
-///   the prompt half of guest degradation. Falling back to the primary member
-///   here would greet a stranger by the owner's name.
-///
-/// Returns `None` rather than an error throughout: a missing profile means no
-/// personal context, which is a safe prompt, not a failed turn.
-/// The profile particulars a turn may state, for the scope it resolved to.
-///
-/// # Personal particulars are OWNER-scoped
-///
-/// A preferred name, a birthday and a language are facts about ONE member. The
-/// `Household` fallback resolves `primary_profile_id`, so returning them there
-/// means any unattributed turn asserts the primary member's particulars — "the
-/// user prefers to be called Jerry", "the user's birthday is …" — while somebody
-/// else is talking. That was inert only because nothing had ever written those
-/// keys (the UI saved them to browser localStorage and the server reads them
-/// from SQLite, so they were always empty); wiring the writer is exactly what
-/// would have made it live, which is why the scoping is fixed in the same
-/// change.
-///
-/// `atypical_speech` deliberately DOES survive into `Household`. It is not a
-/// disclosure about anybody — it renders as "be patient, never correct speech
-/// patterns, interpret incomplete sentences charitably" — and a household that
-/// configured it wants it applied when it cannot tell who is speaking. Being
-/// patient with the wrong person costs nothing; announcing the wrong person's
-/// birthday does.
+/// The speaking member's own preferences, for the prompt (PAI-1 P6), from the scope
+/// [`resolve_turn_scope`] produced: `Owner(id)` uses that member's preferences, `Household` falls
+/// back to `settings.primary_profile_id`, and `Guest` gets `None`. A missing profile is `None`,
+/// not an error. Name, birthday and language are Owner-scoped; `atypical_speech` is not.
 async fn profile_context_for(
     state: &Arc<AppState>,
     scope: &ProfileScope,
@@ -16601,20 +16872,10 @@ async fn profile_context_for(
     Some(particulars_for(attributed, &profile.preferences))
 }
 
-/// The pure half of [`profile_context_for`]: given a member's stored
-/// preferences and whether the turn is attributed to that ONE member, what may
-/// the prompt state?
-///
-/// Split out so the scoping rule can be tested exhaustively without an
-/// `AppState`, a database or a router. The rule is the whole point of the
-/// function and it was previously reachable only through all three, which is
-/// why it went unexamined until the writer was traced.
-///
-/// **The key names are the contract with the writer.** They are what
-/// `PATCH /api/v1/profiles/{id}` must store, and the desktop app holds the same
-/// fields in camelCase (`preferredName`, `atypicalSpeech`). A camelCase key
-/// reaching the database reads as a successful write and changes nothing here —
-/// which is the failure this whole change exists to fix, in a new disguise.
+/// The pure half of [`profile_context_for`]: given a member's stored preferences and whether the
+/// turn is attributed to that ONE member, what may the prompt state? Split out so the scoping rule
+/// is testable without an `AppState`. The key names are the contract with the writer:
+/// `PATCH /api/v1/profiles/{id}` must store them, and a camelCase key changes nothing here.
 fn particulars_for(
     attributed: bool,
     prefs: &std::collections::HashMap<String, String>,
@@ -16638,10 +16899,8 @@ fn particulars_for(
 
 /// Map a session-storage failure from an identity write onto a status code.
 ///
-/// Only a genuinely missing session is a 404. Everything else -- a locked
-/// database, a foreign key naming a profile that no longer exists -- is a
-/// server fault, and reporting it as "no such session" would send whoever is
-/// debugging it looking in the wrong place.
+/// Only a genuinely missing session is a 404. A locked database or a foreign key naming a gone
+/// profile is a server fault; reporting it as "no such session" misdirects whoever debugs it.
 fn identity_write_error(e: SessionStorageError) -> (StatusCode, Json<Value>) {
     let status = match e {
         SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
@@ -16652,14 +16911,8 @@ fn identity_write_error(e: SessionStorageError) -> (StatusCode, Json<Value>) {
 
 /// POST /api/v1/sessions/:session_id/identify-user — wake-on-face hook.
 ///
-/// Accepts the same multipart payload as `/faces/identify` (plus optional
-/// `bbox` field).  On a confident match the identified `profile_id` is
-/// written to the session's own row, so the binding survives a restart and is
-/// readable by everything that can reach session storage.
-///
-/// Returns the same body as `/faces/identify`, plus the `session_id` and
-/// whether the binding was actually applied.  `identified=false` leaves it
-/// untouched, and so does a match that would downgrade a stronger one.
+/// Same multipart payload and body as `/faces/identify`, plus optional `bbox` and `session_id`.
+/// A match writes `profile_id` onto the session row; no match or a downgrade leaves it untouched.
 async fn identify_session_user_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -16678,16 +16931,10 @@ async fn identify_session_user_handler(
         )
     })?;
 
-    // A face match is the WEAKEST source that can bind a session, so it must
-    // not silently take over one bound by a paired device or by the member
-    // saying so. Read, compare in the domain, then write.
-    //
-    // This is a read-modify-write and is therefore racy in principle. Two
-    // concurrent identifications of the same session would have to interleave
-    // inside a few milliseconds, and the loser is a competing face match on the
-    // same camera frame -- an outcome indistinguishable from either one winning
-    // cleanly. Locking the row for that is not worth the contention on a table
-    // every chat turn writes.
+    // A face match is the WEAKEST source that can bind a session, so it must not silently take
+    // over one bound by a paired device or by the member saying so. The remaining race is two
+    // concurrent identifications of the same camera frame interleaving within milliseconds, whose
+    // outcome is indistinguishable from either winning cleanly.
     let mut bound = false;
     if result.identified {
         if let Some(pid) = result.profile_id.clone() {
@@ -16696,11 +16943,10 @@ async fn identify_session_user_handler(
                 source: IdentificationSource::Face,
                 confidence: result.confidence,
             };
-            // One atomic conditional write, not read-compare-write. Two
-            // requests could both read `Unknown` and both pass `supersedes`,
-            // after which the later write won whatever its rank -- so a face
-            // match landing a millisecond after somebody tapped "this is Liz"
-            // took the session, for a different person, on weaker evidence.
+            // One atomic conditional write, not read-compare-write: two requests could both read
+            // `Unknown`, both pass `supersedes`, and the later write would win whatever its rank,
+            // so a face match landing after somebody tapped "this is Liz" takes the session for a
+            // different person on weaker evidence.
             bound = state
                 .session_storage
                 .set_session_identity_if_stronger(&session_id, &proposed)
@@ -16725,28 +16971,10 @@ struct SetSessionUserRequest {
     profile_id: String,
 }
 
-/// PUT /api/v1/sessions/:session_id/user — say who is talking.
-///
-/// The deliberate counterpart to the wake-on-face hook: a household member
-/// picking themselves in the UI, or telling the assistant "this is Liz". That
-/// is stronger evidence than a face match and weaker than a device that signed
-/// the request, and [`IdentificationSource::Explicit`] records exactly that.
-///
-/// Without this route `Explicit` had no producer at all, so the resolution
-/// chain in `identity_resolution` could only ever reach its face rung.
-/// Evaluate, record, and report whether a caller may claim a session belongs to
-/// a named member.
-///
-/// The mode comes from settings on every call rather than being cached: an
-/// operator flipping `security_policy_mode` is doing it precisely because
-/// something is wrong, and a cached value would make the flip take effect at
-/// some unpredictable later point.
-///
-/// **The audit entry records the verdict, not merely the effect.** In `audit`
-/// mode a refusal still proceeds, so `ok` is `true` for exactly the requests
-/// `enforce` would have blocked; a log that carried only `ok` would read
-/// "permitted" for all of them and could not answer what flipping the mode
-/// would break. `verdict` distinguishes `allow` from `would_deny`.
+/// Evaluate, record, and report whether a caller may claim a session belongs to a named member,
+/// binding at [`IdentificationSource::Explicit`] strength. The mode is read from settings on every
+/// call, never cached. In `audit` mode a refusal still proceeds and `ok` is `true` for exactly the
+/// requests `enforce` would block, so the `verdict` field carries `would_deny`.
 async fn evaluate_identity_assertion(
     state: &Arc<AppState>,
     principal: Option<pond_core::security::ports::policy::Principal>,
@@ -16771,12 +16999,10 @@ async fn evaluate_identity_assertion(
         pol::PolicyDecision::refuse(mode, pol::REASON_UNPROVEN_IDENTITY)
     };
 
-    // Tallied at the decision site, not inside an `audit` implementation, and
-    // not conditionally on a policy adapter being installed: this counts what
-    // the policy decided. `POLICY_COUNTERS` is the half of the telemetry that
-    // survives log retention and the "clear my activity" button; the event log
-    // is the half that survives a restart. Neither is trustworthy alone, which
-    // is why `GET /security/policy-report` reports them separately.
+    // Tallied at the decision site, not inside an `audit` implementation and not conditionally on
+    // an installed policy adapter: this counts what the policy decided. `POLICY_COUNTERS` survives
+    // log retention and the "clear my activity" button; the event log survives a restart. Neither
+    // is trustworthy alone, so `GET /security/policy-report` reports them separately.
     pol::POLICY_COUNTERS.record(&decision);
     if let Some(policy) = &state.security_policy {
         policy
@@ -16817,20 +17043,9 @@ async fn set_session_user_handler(
     }
 
     // ── PAI-1 P4 / PAI-2 P1: the policy's first production call site ────────
-    //
-    // This route takes a profile_id from the request BODY and binds it at
-    // Explicit strength. Afterwards every turn in the session resolves to that
-    // member's scope and their memories are injected. There was no ownership
-    // check of any kind, so any paired device could declare itself any
-    // household member and read their data -- cross-profile access laundered
-    // through the session row rather than through a query parameter.
-    //
-    // Nothing can PROVE an identity yet: no schema links a paired device to a
-    // member. So in `enforce` this refuses every remote explicit
-    // identification, which is why the mode ships as `audit` -- it records who
-    // asserted what, which is exactly the evidence needed before anyone flips
-    // it. See is_identity_assertion_proven for why this rule, and not a
-    // scope-by-principal-kind matrix.
+    // Binds a profile_id from the request BODY at Explicit strength, after which every turn in the
+    // session resolves to that member's scope. Nothing can PROVE an identity yet, so `enforce`
+    // refuses every remote assertion; the mode ships as `audit`. See is_identity_assertion_proven.
     let decision = evaluate_identity_assertion(&state, principal.map(|e| e.0), &req.profile_id)
         .await
         .map_err(|_| {
@@ -16892,9 +17107,8 @@ async fn set_session_user_handler(
 
 /// GET /api/v1/sessions/:session_id/user — read the bound profile.
 ///
-/// Reports the evidence alongside the id. A caller deciding what to show a
-/// speaker needs to know whether "this is Jerry" came from his phone's token or
-/// from a 0.6 face match, and a bare profile id cannot say.
+/// Reports the evidence alongside the id: a caller needs to know whether "this is Jerry" came
+/// from a phone's token or from a 0.6 face match, and a bare profile id cannot say.
 async fn get_session_user_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -16919,9 +17133,8 @@ async fn get_session_user_handler(
 
 /// DELETE /api/v1/sessions/:session_id/user — release the binding.
 ///
-/// Always available, whatever bound the session. Releasing an attribution
-/// narrows what the session may reach, so unlike setting one it needs no
-/// strength check -- there is no such thing as a downgrade to nobody.
+/// Always available, whatever bound the session: releasing an attribution narrows what the
+/// session may reach, so unlike setting one it needs no strength check.
 async fn clear_session_user_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -17040,11 +17253,9 @@ mod tests {
             assert_eq!(snap["album_art"], "https://example.com/cover.jpg");
         }
 
-        /// The bug this whole thing exists for: Spotify reports
-        /// `currently_playing_type: "episode"` and `is_playing: true` with
-        /// `item: null` — a real, observed gap in Spotify's own API, not a
-        /// parse failure. Track/artist must read as an honest explanation,
-        /// never a blank field a user reads as "the widget is broken".
+        /// Spotify reports `currently_playing_type: "episode"` and `is_playing: true` with
+        /// `item: null` -- a real gap in Spotify's own API, not a parse failure. Track/artist
+        /// must read as an honest explanation, never a blank field read as a broken widget.
         #[test]
         fn an_episode_with_a_null_item_says_so_instead_of_going_blank() {
             let body = json!({
@@ -17092,11 +17303,9 @@ mod tests {
 
     // ── direct tool dispatch allowlist ───────────────────────────
 
-    /// The tools this path must never expose. Each one either decides something
-    /// on the caller's behalf, executes, or reads household data — and the
-    /// direct-dispatch routes carry no caller identity to check any of it
-    /// against. `approve_draft` is the sharpest: it is the confirmation step
-    /// that `save_draft` exists to force.
+    /// The tools this path must never expose. Each one decides on the caller's behalf, executes,
+    /// or reads household data, and the direct-dispatch routes carry no caller identity to check
+    /// it against. `approve_draft` is the sharpest: the confirmation step `save_draft` forces.
     const MUST_NEVER_BE_DIRECTLY_DISPATCHABLE: &[&str] = &[
         "giap-draft__approve_draft",
         "giap-draft__reject_draft",
@@ -17106,14 +17315,10 @@ mod tests {
         "giap-memory__recall_memories",
         "giap-memory__save_memory",
         "giap-schedule__create_schedule",
-        // PAI-6 P5. Direct dispatch runs a tool with no chat turn, so there is
-        // no engine session in `_meta` and therefore no `DelegationAuthority` to
-        // resolve. `delegate` would refuse every such call today -- but the
-        // reason it must never be ALLOWLISTED is stronger than that: an entry
-        // here is reachable by any paired client and by any sandboxed MCP App
-        // iframe, and a delegation is a multi-turn autonomous agent run on the
-        // household's own hardware. The thing that decides what it may do is the
-        // caller's authority, and this path has no caller.
+        // PAI-6 P5. Direct dispatch runs a tool with no chat turn, so no engine session in
+        // `_meta` and no `DelegationAuthority` to resolve. An allowlist entry here is reachable
+        // by any paired client and any sandboxed MCP App iframe, and a delegation is a multi-turn
+        // autonomous run on household hardware decided by an authority this path does not have.
         "giap-orchestrator__delegate",
     ];
 
@@ -17190,16 +17395,10 @@ mod tests {
 
         #[test]
         fn a_cron_schedule_is_not_a_rule() {
-            // The whole point of the id resolution: `/rules/{id}` must not be a
-            // second door onto `/schedules`.
-            //
-            // This is the PROJECTION and only the projection. It said it
-            // covered deleting and pausing "too", on the grounds that
-            // `find_rule` asks the same function — and it does not: dropping
-            // `&& rule_view(t).is_some()` from `find_rule` leaves this test,
-            // and the whole of this crate's lib suite, green while PUT at a
-            // cron schedule's id answers 200. The consumers are covered in
-            // `tests/rules_surface_test.rs`, through the router.
+            // The whole point of the id resolution: `/rules/{id}` must not be a second door onto
+            // `/schedules`. This is the PROJECTION only: dropping `&& rule_view(t).is_some()` from
+            // `find_rule` leaves this crate's lib suite green while PUT at a cron schedule's id
+            // answers 200. Consumers: `tests/rules_surface_test.rs`, through the router.
             let backup = schedule(
                 "nightly-backup",
                 TaskKind::AgentPrompt {
@@ -17264,19 +17463,10 @@ mod tests {
             assert!(req.spec.validate().is_ok());
         }
 
-        /// This file, for the ORDER guard below.
-        ///
-        /// The guard is a TRIPWIRE, not the coverage, and the difference is
-        /// worth stating because this said the opposite: the three handlers do
-        /// not need a live pond, they need an `AppState` with a scheduler in
-        /// it, and `tests/schedule_integration_test.rs` had been building one
-        /// with `build_router` + `oneshot` since before this surface existed.
-        /// What refuses a rule that can never fire is asserted through the
-        /// router in `tests/rules_surface_test.rs`, on the status code and on
-        /// the store afterwards. This only asks that each handler still calls
-        /// the check, still calls it BEFORE the store, and still RETURNS what
-        /// it answers — the last of those because a call whose result is
-        /// discarded satisfies an offset comparison perfectly.
+        /// This file, for the ORDER guard below. The guard is a TRIPWIRE, not the coverage:
+        /// `tests/rules_surface_test.rs` asserts through the router what refuses a rule that can
+        /// never fire. This asks only that each handler calls the check, BEFORE the store, and
+        /// RETURNS its answer -- a discarded result would still pass an offset comparison.
         const ROUTES_SRC: &str = include_str!("routes.rs");
 
         /// The source of one handler: from its signature to the next `async fn`.
@@ -17363,11 +17553,10 @@ mod tests {
 
         #[test]
         fn the_return_window_is_the_arm_and_not_the_handler() {
-            // Vacuity control for the RETURN assertion: it searches the span
-            // BETWEEN the check and the store. Every one of these handlers
-            // returns a `(status, Json(body))` tuple somewhere further down, so
-            // a window that grew to the whole body would be satisfied by that
-            // and pass against a rejection whose answer is discarded.
+            // Vacuity control for the RETURN assertion: it searches the span BETWEEN the check
+            // and the store. Every handler returns a `(status, Json(body))` tuple further down,
+            // so a window grown to the whole body would be satisfied by that and pass against a
+            // rejection whose answer is discarded.
             let arm = rejection_arm("async fn create_rule(", "create_task(");
             let body = handler_body("async fn create_rule(");
             assert!(
@@ -17684,17 +17873,10 @@ mod tests {
         assert_eq!(ui["data"]["temp"], 64);
     }
 
-    /// A real `giap-knowledge__compute_answer` result, captured verbatim from
-    /// `pond-mcp-server`'s `print_a_real_rendered_result` (an `#[ignore]`d test
-    /// that exists to regenerate this fixture — `pond-api` does not depend on
-    /// that crate, so this side of the contract can only be pinned by copy).
-    ///
-    /// Worth its own case because the Wolfram payload is the first one that is
-    /// awkward for this parser rather than merely long: the marker is ended by
-    /// the FIRST `]]]` and split on the FIRST `:`, and this payload carries a
-    /// `https://` URL full of colons, percent escapes, and nested objects. A
-    /// result whose own text contained `]]]` would cut the marker short, which
-    /// is why the producing side substitutes it.
+    /// A real `giap-knowledge__compute_answer` result, captured verbatim from `pond-mcp-server`'s
+    /// `print_a_real_rendered_result`. The marker ends at the FIRST `]]]` and splits on the FIRST
+    /// `:`, and this payload carries a `https://` URL full of colons and nested objects; a result
+    /// whose own text contained `]]]` would cut the marker short, so the producer substitutes it.
     #[test]
     fn extract_ui_hint_parses_a_real_wolfram_result() {
         let input = concat!(
@@ -17776,23 +17958,9 @@ mod tests {
     }
 
     // ── The stream translator ────────────────────────────────────────────
-    //
-    // PAI-5 P7. `TurnAccumulator::absorb` is now the only place an
-    // `AgentStreamEvent` becomes an SSE frame, which makes it the only place a
-    // frame's shape can regress -- for BOTH routes at once. These are
-    // behavioural: the inputs are the values the live `GooseAdapter` yields,
-    // and the assertions are on the JSON a browser receives and on the state
-    // the handler persists and reports afterwards. `stream_handler_parity.rs`
-    // covers the other half, that no second match appears.
-    //
-    // Frames are compared WHOLE rather than key by key, and that is the
-    // difference between this suite and the one it replaced. A frame's `type`
-    // is the cheapest thing about it: transposing `tool` and `id` in the
-    // `tool_result` frame leaves the type untouched, and those two keys are
-    // exactly how `Chat.tsx` attaches a result to the card its call opened --
-    // `(c.callId && c.callId === evId) || (evTool && c.tool === evTool)`. A
-    // swap there matches no card, so every card keeps its spinner and shows
-    // nothing, and a suite that only read `["type"]` stayed green through it.
+    // PAI-5 P7. `TurnAccumulator::absorb` is the only place an `AgentStreamEvent` becomes an SSE
+    // frame, for BOTH routes; `stream_handler_parity.rs` covers that no second match appears.
+    // Compare frames WHOLE: a `tool`/`id` swap in `tool_result` keeps the type, matching no card.
 
     use pond_core::models::ports::agent::AgentStreamEvent;
     use pond_core::models::ports::provider::UsageStats;
@@ -17986,13 +18154,10 @@ mod tests {
         );
     }
 
-    /// The reasoning comes back so the HANDLER can offer it to its own
-    /// `ChatService`, which holds the `persist_thinking` gate.
-    ///
-    /// The translator is handed no service on purpose. If it recorded, both
-    /// routes would inherit a decision neither could see at its call site, and
-    /// the gate PAI-5 P6 put in one place would be reached from a function that
-    /// does not know whose turn it is.
+    /// The reasoning comes back so the HANDLER can offer it to its own `ChatService`, which holds
+    /// the `persist_thinking` gate. The translator is handed no service on purpose: recording here
+    /// would let both routes inherit a decision neither can see at its call site, reaching the
+    /// PAI-5 P6 gate from a function that does not know whose turn it is.
     #[test]
     fn a_reasoning_passage_comes_back_whole_for_the_persistence_owner() {
         let mut turn = accumulator();
@@ -18016,13 +18181,9 @@ mod tests {
         );
     }
 
-    /// `Done` is the one variant the two routes disagree about, so it must not
-    /// arrive as a frame.
-    ///
-    /// If the translator emitted one, `/chat/stream` would send a `done` before
-    /// it had persisted anything -- and its real `done`, the one carrying the
-    /// usage totals, would then be the second -- while `/agent/chat/stream`
-    /// would send two.
+    /// `Done` is the one variant the two routes disagree about, so it must not arrive as a frame:
+    /// `/chat/stream` would send a `done` before persisting anything, ahead of its real `done`
+    /// carrying the usage totals, while `/agent/chat/stream` would send two.
     #[test]
     fn the_engines_done_is_numbers_for_the_route_to_report_not_a_frame() {
         let mut turn = accumulator();
@@ -18051,15 +18212,10 @@ mod tests {
         assert!(stats.is_none());
     }
 
-    /// Every remaining variant is a frame carrying the `type` the desktop
-    /// switches on, and the payload that type promises.
-    ///
-    /// The `type` alone is not the contract. `review_revision` carries two
-    /// adjacent integers that mean opposite things -- a quality score and a
-    /// count of rounds -- and the fixture uses 4 and 2 rather than one number
-    /// twice so that transposing them fails here. That is the shape of defect a
-    /// `["type"]`-only assertion is blind to, in the one variant where the
-    /// compiler cannot help either.
+    /// Every remaining variant is a frame carrying the `type` the desktop switches on and the
+    /// payload that type promises. The `type` alone is not the contract: `review_revision` carries
+    /// two adjacent integers meaning opposite things (score, rounds), so the fixture uses 4 and 2
+    /// rather than one number twice, and transposing them fails here.
     #[test]
     fn the_status_shaped_variants_keep_the_type_the_client_switches_on() {
         let mut turn = accumulator();
@@ -18113,20 +18269,10 @@ mod tests {
         assert!(err.get("type").is_none());
     }
 
-    /// PAI-6 P6 / invariant 4: a subagent's activity reaches the CLIENT and
-    /// never the parent's history.
-    ///
-    /// The accumulator's three top fields are what both handlers persist --
-    /// `full_text` becomes the assistant message and `tool_results` become its
-    /// tool rows. A progress frame that touched either would put a child's
-    /// conversation into `session_messages`, which is the one thing this
-    /// workstream is not allowed to do; the parent takes back exactly one
-    /// string, the `delegate` tool's result, through the `ToolResult` arm.
-    ///
-    /// The tool-timing fields are asserted too, and that is not padding: the
-    /// obvious way to write the `Tool` arm is to reuse the `ToolCall` arm, and
-    /// doing so would report the CHILD's tool as this turn's last tool in
-    /// `TurnMetrics` -- a plausible-looking number about the wrong agent.
+    /// PAI-6 P6 / invariant 4: a subagent's activity reaches the CLIENT and never the parent's
+    /// history. `full_text` and `tool_results` are what both handlers persist, so a progress frame
+    /// touching either puts a child's conversation into `session_messages`. Tool timing is
+    /// asserted too: reusing the `ToolCall` arm reports the CHILD's tool in `TurnMetrics`.
     #[test]
     fn absorb_progress_leaves_the_turn_untouched() {
         let mut turn = accumulator();
@@ -18221,12 +18367,6 @@ mod tests {
     /// An UNATTRIBUTED turn must not. `ProfileScope::Household` falls back to
     /// `primary_profile_id`, so without this the pond announces the primary
     /// member's name and birthday while somebody else is talking.
-    ///
-    /// This was inert until 2026-08-12 for a reason that makes it worse rather
-    /// than better: the desktop app saved these fields to browser
-    /// `localStorage` while the server read them from SQLite, so they were
-    /// always empty. Wiring the writer is exactly what would have made a
-    /// household turn start disclosing them.
     #[test]
     fn a_household_turn_states_no_ones_particulars() {
         let ctx = particulars_for(false, &full_prefs());
@@ -18246,14 +18386,10 @@ mod tests {
         );
     }
 
-    /// The one field that deliberately crosses into an unattributed turn.
-    ///
-    /// "Be patient, never correct speech patterns, interpret incomplete
-    /// sentences charitably" discloses nothing about anybody, and a household
+    /// The one field that deliberately crosses into an unattributed turn: the
+    /// speech accommodation discloses nothing about anybody, and a household
     /// that configured it wants it applied precisely when the pond cannot tell
-    /// who is speaking. Asserted separately from the test above so that
-    /// tightening the scope to nothing at all is a visible decision rather than
-    /// a side effect.
+    /// who is speaking. Asserted separately so narrowing it is a visible choice.
     #[test]
     fn the_speech_accommodation_survives_an_unattributed_turn() {
         assert!(
@@ -18275,12 +18411,10 @@ mod tests {
         assert!(!ctx.atypical_speech);
     }
 
-    /// The camelCase trap, stated as a test.
-    ///
-    /// The desktop app holds these as `preferredName` / `atypicalSpeech`. If a
-    /// writer ever stores those spellings, `PATCH /profiles/{id}` returns 200,
-    /// the row looks populated, and the prompt still says nothing -- which is
-    /// indistinguishable from the bug this replaced.
+    /// The camelCase trap, stated as a test. The desktop app holds these as
+    /// `preferredName` / `atypicalSpeech`; if a writer stores those spellings,
+    /// `PATCH /profiles/{id}` returns 200 and the row looks populated while the
+    /// prompt still says nothing.
     #[test]
     fn camel_case_keys_are_not_read_and_that_is_the_point() {
         let camel: std::collections::HashMap<String, String> =

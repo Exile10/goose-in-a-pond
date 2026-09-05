@@ -23,6 +23,7 @@ const HP_HOME = "M3 11l9-8 9 8M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10
 
 // ─── SettingsRowId ─────────────────────────────────────────────
 export type SettingsRowId =
+  | "connections"
   | "models"
   | "prompts"
   | "voice"
@@ -87,6 +88,16 @@ export const SETTINGS: SettingsGroup[] = [
         label: "Voice",
         sub: "Whisper speech · Piper TTS",
         value: "en-lessac",
+      },
+      {
+        id: "connections",
+        iconPath:
+          "M4 7h16a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1zM3 9l9 5 9-5M8 3v4M16 3v4",
+        color: "#1F6F63",
+        bg: "#D7EDE8",
+        label: "Accounts",
+        sub: "Calendar and mail the pond can read",
+        value: "",
       },
       {
         id: "memory",

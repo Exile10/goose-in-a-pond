@@ -1,22 +1,7 @@
-//! The authoritative capture buffer.
-//!
-//! One rolling window of normalised audio that every subscriber reads from.
-//!
-//! ## Why not broadcast frames
-//!
-//! The obvious design — a `broadcast` channel of frames, one receiver per
-//! subscriber — is wrong here twice over. At 48 kHz with N subscribers it
-//! allocates per frame per subscriber, and `tokio::sync::broadcast` silently
-//! drops for slow receivers: tolerable for an RMS gate, silently corrupting for
-//! the transcript buffer. So the frames live in exactly one place and
-//! subscribers read a snapshot of what they need.
-//!
-//! ## Normalisation happens once, here
-//!
-//! Callers get 16 kHz mono f32 and nothing else. Previously three capture sites
-//! each did their own format matching, and they disagreed — the wake-word
-//! detector handled F32 and I16 but not U16, so on a U16-only device wake-word
-//! detection returned an error while ordinary capture worked fine.
+//! The authoritative capture buffer: one rolling window of normalised audio that every
+//! subscriber reads a snapshot of. Frames live in one place rather than a per-subscriber
+//! broadcast, which allocates per frame and drops silently for slow receivers. Normalisation
+//! happens only here: callers get 16 kHz mono f32, whatever format the device offers.
 
 use std::collections::VecDeque;
 
@@ -79,11 +64,8 @@ impl Ring {
         self.written
     }
 
-    /// Drop everything buffered, keeping the write counter.
-    ///
-    /// Used when a turn ends so the next capture does not begin with the tail
-    /// of the previous one — the buffer is shared, so stale audio would
-    /// otherwise leak across turn boundaries.
+    /// Drop everything buffered, keeping the write counter. Used when a turn ends: the buffer
+    /// is shared, so stale audio would otherwise leak into the next capture.
     pub fn clear(&mut self) {
         self.samples.clear();
     }

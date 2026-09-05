@@ -8,6 +8,7 @@ pub mod goose_agent;
 mod goose_nudges;
 pub mod logging;
 pub mod mesh_provider;
+pub mod model_traits;
 pub mod orchestrator;
 pub mod provider_adapter;
 pub mod provider_shim;

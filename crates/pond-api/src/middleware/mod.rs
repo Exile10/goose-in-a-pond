@@ -72,11 +72,8 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AuthError> {
 
 /// Per-client fixed-window rate limiter.
 ///
-/// Note this is a fixed window, not a token bucket: a client can spend its
-/// whole allowance at the end of one window and again at the start of the
-/// next, so the true worst-case burst is 2x `max_requests`. That is
-/// acceptable here — the limiter exists to stop runaway clients and online
-/// guessing, not to shape traffic precisely.
+/// Fixed window, not a token bucket: spending the allowance at the end of one
+/// window and the start of the next makes the worst-case burst 2x `max_requests`.
 pub struct RateLimiter {
     clients: Arc<RwLock<HashMap<String, ClientRateLimit>>>,
     max_requests: usize,
@@ -105,10 +102,8 @@ impl RateLimiter {
     }
 
     /// As [`Self::check_rate_limit`], but on rejection reports how long the
-    /// caller should wait before retrying, for the `Retry-After` header.
-    /// Without that signal a client has nothing to base a backoff on, and a
-    /// naive one retries as fast as it can — which is exactly how a single
-    /// wedged client burns the whole per-IP budget.
+    /// caller should wait, for the `Retry-After` header. Without that signal a
+    /// naive client retries as fast as it can and burns the whole per-IP budget.
     pub async fn check_rate_limit_detailed(&self, client_id: &str) -> Result<(), Duration> {
         let mut clients = self.clients.write().await;
         let now = Instant::now();
@@ -149,9 +144,6 @@ pub fn retry_after_secs(remaining: Duration) -> u64 {
     remaining.as_secs().max(1)
 }
 
-/// Routes that don't require authentication.
-///
-/// Must stay in sync with the public route set in `routes::api_routes()`.
 /// Whether to allow unauthenticated loopback clients (local-dev escape hatch).
 /// Off unless `POND_DEV_ALLOW_LOOPBACK` is set to a truthy value.
 fn dev_allow_loopback() -> bool {
@@ -164,13 +156,10 @@ fn loopback_flag_enabled(value: Option<&str>) -> bool {
     matches!(value, Some("1") | Some("true") | Some("TRUE"))
 }
 
-/// When a route stops answering a caller with no bearer token.
-///
-/// P0 made the allowlist method-scoped. This is the second axis, and it exists
-/// because the wizard's writes had no reason to stay open one request longer
-/// than the wizard: an unauthenticated caller on the LAN could rewrite settings
-/// and edit any household member's preferences on a pond that finished setting
-/// itself up months ago.
+/// When a route stops answering a caller with no bearer token. The wizard's
+/// writes have no reason to stay open one request longer than the wizard: an
+/// unauthenticated LAN caller could otherwise rewrite settings and edit any
+/// household member's preferences on a pond set up months ago.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exposure {
     /// Public in every state. Pairing, health, the one question a client must
@@ -180,56 +169,16 @@ enum Exposure {
     /// Public only while onboarding is incomplete. The wizard's own surface.
     UntilOnboarded,
     /// As [`Exposure::UntilOnboarded`], and once the pond is set up it still
-    /// answers a **loopback** caller with no token.
-    ///
-    /// Exactly one route needs this and the reason is worth stating in full.
-    /// `POST /onboard/reset` is the recovery lever for a misconfigured pond,
-    /// and getting back out of a reset requires `PUT /settings` +
-    /// `POST /profiles` + `POST /onboard/complete` -- all `UntilOnboarded`,
-    /// all open again precisely because the reset made the pond
-    /// not-onboarded. So reset cannot be shut outright.
-    ///
-    /// Nor can it stay unconditionally public: an anonymous caller who can
-    /// reset the pond can reopen every hole this class exists to close, and
-    /// the closure would be decorative.
-    ///
-    /// Loopback is the resolution, and it is not a new trust boundary. A pond
-    /// that has lost every token can only be re-paired from the host already:
-    /// `handshake_pairing_code` and `handshake_issue_pairing_code` both refuse
-    /// a non-loopback peer inside the handler, and
-    /// `is_identity_assertion_proven` records the same rule -- whoever is at
-    /// the console already has the box. This adds no requirement that recovery
-    /// did not already have.
+    /// answers a loopback caller with no token. `POST /onboard/reset` is the only
+    /// route in this class: it must stay reachable to repair a pond, and loopback
+    /// is no new trust boundary -- re-pairing already requires being at the host.
     UntilOnboardedThenHostOnly,
 }
 
-/// Every `(method, path, exposure)` triple reachable with no bearer token.
-///
-/// **Method-scoped, and that is the entire point.** This table replaced a
-/// path-only `matches!` whose arms were already *written* as though they were
-/// method-scoped -- `"PUT /settings is public"`, `"POST -- create profile"`,
-/// `"PATCH /profiles/:id"` -- while the function only ever saw the path. Every
-/// other method on those paths was public too, and `routes::api_routes` merges
-/// the public and protected routers into one tree behind this single check, so
-/// there was nothing downstream to catch it. Reproduced against a running
-/// server with no token (PAI-2 P0): `GET /settings` returned the API keys in
-/// plaintext, `GET /profiles` listed the household, and `DELETE /profiles/{id}`
-/// deleted a member and returned 204.
-///
-/// `{brace}` segments are wildcards matching exactly one path segment, so
-/// `PATCH /profiles/{id}` no longer implies `DELETE /profiles/{id}` -- which is
-/// precisely what the old `path.starts_with("/profiles/")` prefix test did.
-///
-/// **State-scoped, which is the second half (PAI-2 P7).** Every entry also
-/// declares *when* it stops being public. `Exposure::Always` is for routes that
-/// must answer before a client can authenticate at all, or that were never
-/// justified by onboarding; anything the setup wizard needs is
-/// `UntilOnboarded`, so it closes the moment the pond is set up.
-///
-/// Keep this in step with the public router in `routes::api_routes`.
-/// `public_router_and_allowlist_agree` fails the build when they drift, and
-/// `the_public_route_classification_is_pinned` fails it when an entry changes
-/// class without anybody saying so out loud.
+/// Every `(method, path, exposure)` triple reachable with no bearer token, both
+/// method-scoped (`{brace}` matches exactly one segment) and state-scoped (each
+/// entry says when it stops being public). Keep it in step with the public router
+/// in `routes::api_routes` -- `public_router_and_allowlist_agree` fails the build.
 const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::GET, "/health", Exposure::Always),
     // Pairing handshake (#93): a device has no token until this completes, and
@@ -262,38 +211,40 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
         "/onboard/reset",
         Exposure::UntilOnboardedThenHostOnly,
     ),
+    // The IANA zone catalogue. `Always`, and it is the rare route where that
+    // needs no argument: it is the same few hundred strings for every pond on
+    // earth and says nothing whatever about this one. The wizard needs it
+    // before pairing, and Settings needs it after.
+    (Method::GET, "/time/zones", Exposure::Always),
+    // Detection is a different matter: an outbound geocoding call answering with
+    // a guess at where the caller is. Location is set up before any device has
+    // paired, so it is open until onboarding finishes; Settings is authenticated
+    // afterwards and does not need the exemption.
+    (Method::POST, "/location/detect", Exposure::UntilOnboarded),
     // Write-only, and only while the wizard is running. GET /settings is NOT
     // here at all: it serialises the whole Settings struct.
     (Method::PUT, "/settings", Exposure::UntilOnboarded),
-    // Local Piper; text -> audio, leaks no user data. This LOOKS like an
-    // onboarding hole -- the wizard's voice preview is why it is public -- and
-    // it is deliberately not classified as one, because two shipped callers
-    // speak through it with no Authorization header long after setup:
-    // `playTtsSentence` in pond-desktop/src/modes/voice/WebVoiceBackend.ts and
-    // `fetch_tts_bytes` in pond-desktop/src-tauri/src/commands/audio_cmd.rs.
-    // Closing it would leave the assistant mute on a set-up pond. That those
-    // two callers are unauthenticated is a real finding, and the fix is to give
-    // them the token -- a client change, not an allowlist change. Until then,
-    // narrowing here breaks the product rather than the attack.
+    // Prefix warm-up status, so the desktop can say "getting ready" while the
+    // first prompt's KV cache compiles. The wizard shows the banner before any
+    // device has paired; afterwards `getWarmupStatus` goes through
+    // `PondApiClient.get`, which attaches the bearer token.
+    (Method::GET, "/warmup", Exposure::UntilOnboarded),
+    // Local Piper; text -> audio, leaks no user data. Not an onboarding hole:
+    // two shipped callers speak through it with no Authorization header long
+    // after setup -- `playTtsSentence` in WebVoiceBackend.ts and
+    // `fetch_tts_bytes` in audio_cmd.rs. Closing it mutes a set-up pond.
     (Method::POST, "/tts", Exposure::Always),
-    // The onboarding WakeWord step calibrates before a device has paired. The
-    // Settings "Re-calibrate" control goes through `calibrateWakeWord` in
-    // PondApiClient.ts, which DOES attach the bearer token when it has one --
-    // checked, not assumed, because that is the difference between this entry
-    // and the /tts entry above.
-    // Onboarding's voice step chooses a voice before there is a device token,
-    // and choosing one now applies it to the running engine (and fetches it if
-    // the household does not have it yet). Same window as calibration: open
-    // until onboarding completes, closed after.
+    // Onboarding calibrates wake word and chooses a voice before any device has
+    // paired. Afterwards the Settings controls go through PondApiClient.ts,
+    // which attaches the bearer token -- checked, not assumed, which is the
+    // difference between these entries and the /tts entry above.
     (Method::POST, "/voice/tts/apply", Exposure::UntilOnboarded),
     (Method::POST, "/voice/calibrate", Exposure::UntilOnboarded),
     (Method::DELETE, "/voice/calibrate", Exposure::UntilOnboarded),
-    // Diagnostics. These are NOT onboarding holes -- none of them is public
-    // because the wizard needed it, so P7 leaves them where P0 left them. That
-    // they are unauthenticated at all is a separate question this phase did not
-    // answer: /transcribe accepts audio and returns text, /test serves a
-    // browser page that drives it, /dev/goose reports agent status, and
-    // /system/info reports host details.
+    // Diagnostics, not onboarding holes: none of them is public because the
+    // wizard needed it. That they are unauthenticated at all is still an open
+    // question -- /transcribe takes audio, /test drives it from a browser page,
+    // /dev/goose reports agent status and /system/info reports host details.
     (Method::POST, "/transcribe", Exposure::Always),
     (Method::GET, "/system/info", Exposure::Always),
     (Method::GET, "/test", Exposure::Always),
@@ -357,14 +308,9 @@ fn route_exposure(method: &Method, path: &str) -> Option<Exposure> {
 }
 
 /// Does this route answer a caller with no token, given the pond's state and
-/// where the caller is?
-///
-/// Pure on purpose. Every input is passed in, so the whole matrix is unit
-/// testable and there is nowhere for a cached "this pond has been onboarded
-/// before" latch to hide. A latch here would make `POST /onboard/reset` a
-/// one-way door: the reset succeeds, the pond drops back to the wizard, and the
-/// three routes the wizard needs stay shut forever. The only repair would be
-/// reflashing the device. `reset_never_becomes_a_one_way_door` is the guard.
+/// where the caller is? Pure on purpose: every input is passed in, so no cached
+/// "already onboarded" latch can hide here and make `POST /onboard/reset` a
+/// one-way door. `reset_never_becomes_a_one_way_door` is the guard.
 fn public_without_token(exposure: Exposure, onboarded: bool, peer_is_loopback: bool) -> bool {
     match exposure {
         Exposure::Always => true,
@@ -373,35 +319,19 @@ fn public_without_token(exposure: Exposure, onboarded: bool, peer_is_loopback: b
     }
 }
 
-/// Could this route EVER answer a caller with no token, in some state?
-///
-/// This is what the compile-time drift guards must ask. They parse `routes.rs`
-/// through `include_str!` and run with no database and no pond, so they cannot
-/// evaluate "public only while onboarding is incomplete" -- and a guard that
-/// picked one state would report the other state's answer as safety. The only
-/// question a static check can answer honestly is the worst case.
-///
-/// `cfg(test)` because the drift guards are its only callers and must stay so:
-/// production has a pond to read, and answering a live request from the worst
-/// case would re-open every hole this phase closes.
+/// Could this route EVER answer a caller with no token, in some state? The
+/// worst case is the only question the drift guards can answer: they parse
+/// `routes.rs` with no database to read. `cfg(test)` because answering a live
+/// request from the worst case would reopen every hole this phase closes.
 #[cfg(test)]
 fn reachable_without_token_in_some_state(method: &Method, path: &str) -> bool {
     route_exposure(method, path).is_some()
 }
 
-/// Whether the pond is set up, read LIVE, on every request that needs it.
-///
-/// Deliberately not cached, not memoised and not a flag on `Settings`. See
-/// [`public_without_token`] for why a latch turns reset into a one-way door.
-/// `require_onboarding_complete` already reads this state per request, so this
-/// is the same cost model, and only the two state-dependent exposure classes
-/// pay it -- `Exposure::Always` short-circuits before the call.
-///
-/// **A read that fails is treated as onboarded, i.e. closed.** On failure,
-/// access narrows: the alternative is that a transient `SQLITE_BUSY` re-opens
-/// every onboarding write hole on a pond that finished setting up long ago.
-/// This is why the port has `is_complete` at all -- `get_current_step` reports
-/// an unreadable table as "not started", which is the widest possible answer.
+/// Whether the pond is set up, read LIVE on every request that needs it: never
+/// cached, because a latch turns reset into a one-way door (see
+/// [`public_without_token`]). A read that FAILS is treated as onboarded, so a
+/// transient `SQLITE_BUSY` narrows access instead of reopening the write holes.
 async fn pond_is_onboarded(state: &crate::AppState) -> bool {
     // `--skip-onboarding` means "this pond is not running the wizard". Reading
     // it as "the wizard is still running" would leave the holes open, so it
@@ -424,15 +354,8 @@ async fn pond_is_onboarded(state: &crate::AppState) -> bool {
 
 /// Debug request/response logging middleware.
 ///
-/// Emits one `DEBUG` span for each incoming request and one for the outgoing
-/// response. Because both use [`tracing::debug!`], they are only visible when
-/// the active log filter includes the `debug` level — i.e. when the server is
-/// started with `pond-server serve --debug`. At the default `info` level this
-/// middleware is a zero-cost pass-through; no branching or allocation occurs.
-///
-/// Logged fields:
-/// - `-->` line: HTTP method, path, and query string (empty string when absent)
-/// - `<--` line: HTTP method, path, response status code, elapsed time in ms
+/// One [`tracing::debug!`] line per request and per response, so it is visible
+/// only under `pond-server serve --debug` and a pass-through at `info`.
 pub async fn log_requests(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -460,10 +383,8 @@ pub async fn log_requests(req: Request, next: Next) -> Response {
 
 /// Global token-based authentication middleware.
 ///
-/// Uses `from_fn_with_state` so it can access `AppState::handshake` to
-/// validate the Bearer token against the in-memory token store.
-/// Public routes (health, handshake, onboarding, static assets) bypass
-/// token validation entirely.
+/// Uses `from_fn_with_state` to reach `AppState::handshake` and validate the
+/// Bearer token. Routes in `PUBLIC_ROUTES` bypass token validation entirely.
 pub async fn auth_middleware(
     State(state): State<Arc<crate::AppState>>,
     headers: axum::http::HeaderMap,
@@ -487,12 +408,10 @@ pub async fn auth_middleware(
         let onboarded = exposure != Exposure::Always && pond_is_onboarded(state.as_ref()).await;
         if public_without_token(exposure, onboarded, peer_is_loopback) {
             let mut req = req;
-            // `onboarded` can only be true here for the host-recovery class:
-            // every other class that passes does so because the pond is still
-            // being set up. So this names the one privileged anonymous caller
-            // this middleware grants -- the operator standing at the pond,
-            // resetting it -- and leaves the wizard's own requests
-            // unattributed, exactly as before.
+            // `onboarded` is true here only for the host-recovery class, so this
+            // names the one privileged anonymous caller the middleware grants:
+            // the operator standing at the pond, resetting it. The wizard's own
+            // requests stay unattributed.
             if onboarded {
                 req.extensions_mut().insert(Principal::loopback());
             }
@@ -500,23 +419,10 @@ pub async fn auth_middleware(
         }
     }
 
-    // Local-dev convenience: same-device clients (loopback 127.0.0.1 / ::1)
-    // MAY skip token validation, but ONLY when the operator explicitly opts in
-    // with `POND_DEV_ALLOW_LOOPBACK=1`. This is OFF by default (#94): the old
-    // blanket loopback bypass meant any process on the host — not just the
-    // desktop app — reached every protected route unauthenticated. With it off,
-    // even loopback clients (including the desktop app) must present a valid
-    // token obtained via the handshake.
-    //
-    // PAI-1 P9: this returns EARLY, before a token is read, so the principal it
-    // inserts carries no device and the paired-device rung is unreachable on
-    // this path. That is deliberate and it is the narrowing answer. There is no
-    // token here to look a device up by, and the two tempting substitutes are
-    // both wrong in the direction this programme exists to prevent: the most
-    // recently paired device would make every local request speak as whoever
-    // last paired a phone, and a client-supplied id would outrank every proof
-    // the pond can make. A loopback caller falls through to explicit, then
-    // face, then guest -- exactly as it did before this rung existed.
+    // Local-dev only: loopback clients skip token validation, and ONLY when the
+    // operator opts in with `POND_DEV_ALLOW_LOOPBACK=1` (#94) -- otherwise any
+    // process on the host reaches every protected route. This returns before a
+    // token is read, so the principal carries no device and no paired-device rung.
     if dev_allow_loopback() && peer_is_loopback {
         let mut req = req;
         req.extensions_mut().insert(Principal::loopback());
@@ -535,37 +441,10 @@ pub async fn auth_middleware(
         return Err(AuthError::InvalidToken);
     }
 
-    // Name the caller for anything downstream that has to make an authorization
-    // decision. Until now `validate_token` answered only yes/no, so a handler
-    // could know a request was authenticated and still not know who sent it --
-    // which is why no `Principal` was ever constructed in production and
-    // `SecurityPolicy::allow` had no call site it could reason from.
-    //
-    // An adapter that cannot name the caller returns None, and the principal
-    // says so rather than guessing.
-    //
-    // -- PAI-1 P9: the device rides here, and only from here -----------------
-    //
-    // `caller_for_token` is the ONE door the device id comes through. It is the
-    // token THIS POND ISSUED at pairing, so the chain
-    // device -> devices.profile_id -> member is unbroken and contains nothing
-    // the client said about itself. `IdentificationSource::PairedDevice`
-    // outranks face and explicit identification, so reading the device from a
-    // header, a body field or a query parameter would let a client outrank
-    // every proof the pond can make. Nothing in `headers` is consulted below
-    // except the bearer token already extracted above, and
-    // `device_rung_wiring.rs` asserts that by reading this line's ARGUMENT
-    // rather than by checking that some device is set somewhere.
-    //
-    // A failed lookup NARROWS: no client id, no device, and therefore no
-    // paired-device rung. The request is still authenticated -- `validate_token`
-    // said so -- it is simply unattributed, which is what every request was
-    // before this rung existed.
-    //
-    // `proven_profile_id` stays None on every path here. The device is the
-    // proof; turning it into a member is `resolve_turn_scope`'s job, through
-    // `DeviceAttribution`, where a failed read is a distinguishable outcome
-    // rather than an `unwrap_or_default`.
+    // Name the caller for downstream authorization. `caller_for_token` is the ONE
+    // door the device id may come through -- the token this pond issued at pairing.
+    // A client-supplied device would outrank every proof the pond can make, since
+    // `PairedDevice` beats face and explicit id; `device_rung_wiring.rs` guards it.
     let mut principal = match state.handshake.caller_for_token(&token).await {
         Ok(Some(caller)) => Principal::token(caller.client_id).with_device(caller.device_id),
         _ => Principal::token("unknown".to_string()),
@@ -694,13 +573,10 @@ mod tests {
         assert_eq!(clients.len(), 1, "only the fresh entry should remain");
     }
 
-    /// The middleware's decision, minus the database read: would this request
-    /// answer with no token, on a pond in this state, from this peer?
-    ///
-    /// Deliberately assembled from the same two functions the middleware calls,
-    /// rather than restated -- a test that reimplements the rule proves the
-    /// reimplementation. The wiring is proved separately over real HTTP in
-    /// `onboarding_integration_test`.
+    /// The middleware's decision, minus the database read. Assembled from the
+    /// same two functions the middleware calls rather than restated, because a
+    /// test that reimplements the rule proves the reimplementation. The wiring
+    /// is proved over real HTTP in `onboarding_integration_test`.
     fn answers_without_token(
         method: &Method,
         path: &str,
@@ -766,20 +642,15 @@ mod tests {
     }
 
     /// The four (method, path) pairs PAI-2 P0 reproduced against a live server,
-    /// restated with the state axis P7 added.
-    ///
-    /// Each was public only because the allowlist matched on path while its
-    /// entries were written as though method-scoped. They are the regression
-    /// test for the defect itself, stated as the HTTP requests that leaked.
+    /// with the state axis P7 added. Each was public only because the allowlist
+    /// matched on path while its entries were written as though method-scoped;
+    /// this is the regression test, stated as the requests that leaked.
     #[test]
     fn the_pai2_p0_leaks_are_closed() {
-        // GET /settings serialises the whole Settings struct -- it returned
-        // api_key_gnews and api_key_finnhub in plaintext, with no token.
-        // Those fields no longer exist: PAI-2 P2 moved every credential to the
-        // SecretRepository, so grepping for them here finds only this note.
-        // The route stays protected regardless -- the struct still carries
-        // personal configuration, and P0's defect was the allowlist, not the
-        // payload. In no state, and not even from the host.
+        // GET /settings serialises the whole Settings struct, which leaked API
+        // keys in plaintext with no token. Credentials now live in the
+        // SecretRepository, but the struct still carries personal
+        // configuration, so the route stays protected in every state.
         assert!(!answers_without_token(
             &Method::GET,
             "/api/v1/settings",
@@ -874,13 +745,10 @@ mod tests {
         ));
     }
 
-    /// The trap this phase is really about.
-    ///
-    /// Reset is the recovery lever for a misconfigured pond, and it stays
-    /// reachable after onboarding. If the closure were a latch rather than a
-    /// live read, reset would be the last useful request the pond ever
-    /// accepted: it drops the pond back to the wizard, and the wizard needs
-    /// three routes a latch would keep shut. The fix would be reflashing.
+    /// Reset is the recovery lever for a misconfigured pond and stays reachable
+    /// after onboarding. If the closure were a latch rather than a live read,
+    /// reset would drop the pond back to a wizard whose own routes stay shut,
+    /// and the only repair would be reflashing.
     #[test]
     fn reset_never_becomes_a_one_way_door() {
         // An anonymous phone on the LAN cannot factory-reset the pond. Without
@@ -929,11 +797,9 @@ mod tests {
         }
     }
 
-    /// The classification, restated as the list it is.
-    ///
-    /// Which routes are state-dependent is a security decision. It has to show
-    /// up as an edit to this test, not as a third tuple field somebody adjusted
-    /// while adding a route.
+    /// The classification, restated as the list it is. Which routes are
+    /// state-dependent is a security decision, so it must show up as an edit to
+    /// this test rather than as a third tuple field adjusted in passing.
     #[test]
     fn the_public_route_classification_is_pinned() {
         let mut state_dependent: Vec<String> = PUBLIC_ROUTES
@@ -945,21 +811,27 @@ mod tests {
 
         let expected = vec![
             "DELETE /voice/calibrate = UntilOnboarded".to_string(),
+            // The warm-up banner's data source: a phase, the chat model's name
+            // and two timestamps, nothing secret. Open during the wizard
+            // because the boot warm-up runs before any token exists; later
+            // warm-ups go through `PondApiClient.get`, which attaches one.
+            "GET /warmup = UntilOnboarded".to_string(),
             "PATCH /profiles/{id} = UntilOnboarded".to_string(),
+            // Detection makes one outbound geocoding call for a place NAME and
+            // answers with a guess at where the caller is. Open during the
+            // wizard because location is configured before any device pairs; no
+            // household data goes outward. Closes when onboarding completes.
+            "POST /location/detect = UntilOnboarded".to_string(),
             "POST /onboard = UntilOnboarded".to_string(),
             "POST /onboard/complete = UntilOnboarded".to_string(),
             "POST /onboard/reset = UntilOnboardedThenHostOnly".to_string(),
             "POST /onboard/step/{name} = UntilOnboarded".to_string(),
             "POST /profiles = UntilOnboarded".to_string(),
             "POST /voice/calibrate = UntilOnboarded".to_string(),
-            // Added when choosing a voice started taking effect immediately
-            // rather than on the next restart. Onboarding's voice step runs
-            // before there is a device token, and the alternative was letting
-            // the wizard write a voice setting it could not apply — a control
-            // that appears to work and does not. It reads and applies the
+            // Onboarding's voice step runs before there is a device token, and
+            // choosing a voice applies it immediately. It reads and applies the
             // household's own saved voice settings and returns which files it
-            // fetched; it exposes nothing else, and closes with the rest of
-            // this list the moment onboarding completes.
+            // fetched; it closes when onboarding completes.
             "POST /voice/tts/apply = UntilOnboarded".to_string(),
             "PUT /settings = UntilOnboarded".to_string(),
         ];
@@ -985,12 +857,9 @@ mod tests {
     }
 
     // ── Drift guards ────────────────────────────────────────────────────────
-    //
-    // `routes.rs` is parsed at COMPILE time. Both tests below therefore fail
-    // the build the moment somebody adds a route without deciding whether it
-    // is public -- which is the failure mode that produced P0, since
-    // `public_routes.merge(protected_routes)` puts every route in one tree
-    // behind one check and nothing downstream can catch a wrong answer.
+    // `routes.rs` is parsed at COMPILE time, so both tests below fail the build
+    // when somebody adds a route without deciding whether it is public. That is
+    // the failure mode that produced P0: one merged tree, one check.
 
     const ROUTES_RS: &str = include_str!("../routes.rs");
 
@@ -1062,11 +931,9 @@ mod tests {
     }
 
     /// PAI-2 P0's acceptance test: every route in the protected router requires
-    /// a token.
-    ///
-    /// The two exceptions are real and each is guarded by something other than
-    /// a bearer token. They are listed individually rather than skipped by
-    /// prefix so that a third `/oauth/*` route cannot join them silently.
+    /// a token. The two exceptions are each guarded by something other than a
+    /// bearer token, and are listed individually rather than skipped by prefix
+    /// so a third `/oauth/*` route cannot join them silently.
     #[test]
     fn every_protected_route_requires_a_token() {
         let allowed_without_token: &[(Method, &str)] = &[
@@ -1110,11 +977,10 @@ mod tests {
         );
     }
 
-    /// The allowlist and the public router must describe the same set.
-    ///
-    /// Drift in either direction is a defect: a public route missing from the
-    /// allowlist 401s during onboarding, and an allowlist entry with no public
-    /// route is an unreachable exemption that outlives the reason for it.
+    /// The allowlist and the public router must describe the same set. Drift in
+    /// either direction is a defect: a public route missing from the allowlist
+    /// 401s during onboarding, and an allowlist entry with no public route is an
+    /// unreachable exemption that outlives its reason.
     #[test]
     fn public_router_and_allowlist_agree() {
         let router: std::collections::BTreeSet<String> = routes_in(block_between(
@@ -1125,11 +991,9 @@ mod tests {
         .map(|(m, p)| format!("{m} {p}"))
         .collect();
 
-        // The two oauth entries live in the protected router by design; they
-        // are covered by every_protected_route_requires_a_token instead.
-        // The union of every exposure class: a route in the public router must
-        // be on this table whatever its class, and a table entry with no route
-        // is an unreachable exemption whatever its class.
+        // The two oauth entries live in the protected router by design and are
+        // covered by every_protected_route_requires_a_token instead. The rest
+        // compares the union of every exposure class, in both directions.
         let allowlist: std::collections::BTreeSet<String> = PUBLIC_ROUTES
             .iter()
             .filter(|(_, p, _)| !p.starts_with("/oauth/"))

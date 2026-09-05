@@ -1,9 +1,7 @@
 //! Model catalog domain types.
 //!
-//! `ModelRecord` is the single source of truth for a model's metadata,
-//! covering all five families: LLM (gguf/llamafile/ollama), ASR (whisper),
-//! TTS (piper/http), and Embedding (ONNX sentence encoders).
-//! Family-specific fields are `Option<_>`.
+//! `ModelRecord` is the single source of truth for a model's metadata across the LLM
+//! (gguf/llamafile/ollama), ASR, TTS and Embedding families; family-specific fields are `Option`.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,18 +21,13 @@ pub enum ModelCategory {
     Whisper,
     /// Piper TTS — ONNX binary + config file. **Legacy.**
     ///
-    /// Kokoro replaced Piper as the engine and nothing seeds these any more.
-    /// The variant stays so installs that predate the swap can still read their
-    /// existing catalogue rows and the voices sitting in `models/tts/`:
-    /// dropping it would make `from_str("tts_piper")` return `None` and those
-    /// rows would fail to load rather than simply being unused.
+    /// Kokoro replaced Piper and nothing seeds these any more. Dropping the variant would make
+    /// `from_str("tts_piper")` return `None`, so pre-swap catalogue rows would fail to load.
     TtsPiper,
     /// Kokoro TTS voice — a 522 KB style vector (`<voice>.bin`).
     ///
-    /// Unlike Piper, a Kokoro "voice" is not a model: every voice shares one
-    /// set of engine weights and differs only by a style table. That is why a
-    /// voice here costs half a megabyte, and why the quality tier (which picks
-    /// the shared `.onnx`) is a separate setting rather than another voice.
+    /// A voice is not a model: all voices share one set of engine weights and differ only by a
+    /// style table, so the quality tier that picks the shared `.onnx` is a separate setting.
     TtsKokoro,
     /// HTTP TTS server (OpenAI-compatible /v1/audio/speech).
     TtsHttp,
@@ -72,21 +65,25 @@ impl ModelCategory {
 
     /// The catalog category an LLM `chat_provider` string names.
     ///
-    /// `Settings.chat_provider` is a provider identifier ("local", "gguf",
-    /// "ollama", "llamafile"); `ModelRecord.id` is keyed by category. Anything
-    /// that wants to find the active chat model's catalog row has to bridge the
-    /// two, and until this existed each caller wrote the mapping again — which
-    /// is how the row lookup and the role-assignment sync could disagree about
-    /// where the same model lives.
-    ///
-    /// `llamafile` is the fallback because it is the only remaining LLM
-    /// category, and an unknown provider string is far more likely to be a
-    /// llamafile spelling than a GGUF one.
+    /// `Settings.chat_provider` is a provider id ("local", "gguf", "ollama", "llamafile") while
+    /// `ModelRecord.id` is keyed by category; `llamafile` is the fallback for unknown strings.
     pub fn for_chat_provider(provider: &str) -> Self {
         match provider {
             "local" | "gguf" => Self::Gguf,
             "ollama" => Self::Ollama,
             _ => Self::Llamafile,
+        }
+    }
+
+    /// The runtime provider name that serves this category — the inverse of
+    /// [`Self::for_chat_provider`], whose catch-all this matches so the pair round-trips for
+    /// every LLM category. Meaningful only for [`Self::is_llm`] categories: nothing loads a
+    /// Whisper or Kokoro model through a chat provider.
+    pub fn runtime_provider(&self) -> &'static str {
+        match self {
+            Self::Gguf => "local",
+            Self::Ollama => "ollama",
+            _ => "llamafile",
         }
     }
 
@@ -242,15 +239,13 @@ pub struct ModelRoleAssignment {
 }
 
 impl ModelRoleAssignment {
-    /// Returns true if `model_category` is a legal match for `role`.
+    /// Whether a model of `category` may take `role`.
+    ///
+    /// Delegates to [`ModelRole`], which owns the role vocabulary. A free function because
+    /// `role` arrives as a free-form API/CLI string, and an unknown one must answer `false`.
     pub fn category_matches_role(category: &ModelCategory, role: &str) -> bool {
-        match role {
-            "chat" | "think" | "task" | "tool" => category.is_llm(),
-            "asr" => category.is_asr(),
-            "tts" => category.is_tts(),
-            "embedding" => category.is_embedding(),
-            _ => false,
-        }
+        crate::models::domain::model_role::ModelRole::from_str(role)
+            .is_some_and(|r| r.accepts(category))
     }
 }
 

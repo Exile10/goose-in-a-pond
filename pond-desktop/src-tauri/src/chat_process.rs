@@ -1,7 +1,7 @@
 //! Manager for the terminal-voice child process.
 //!
 //! Architecture A of the terminal-voice-in-desktop contract: the Tauri shell
-//! spawns and owns a `pond-server chat --input whisper --json-events
+//! spawns and owns a `pond-server chat --voice --json-events
 //! --session-id <uuid>` child that exclusively owns the microphone and speaker
 //! (wake word, VAD, ASR, TTS, barge-in all in-child). The shell parses the
 //! child's stdout NDJSON stream and re-emits it as Tauri events.
@@ -113,6 +113,14 @@ pub fn classify_line(line: &str) -> Result<LineClass, String> {
     };
 
     let mapped = match event {
+        // Prefix warm-up progress at session start: `warming` while the model
+        // loads and the prompt prefix prefills, then ready/skipped/failed. The
+        // child also SPEAKS these transitions; this event lets the UI label
+        // the stretch where the mic is not yet listening.
+        "warmup" => VoiceEvent {
+            name: "voice-warmup",
+            payload: serde_json::Value::String(string_field("state")),
+        },
         "ready" => VoiceEvent {
             name: "voice-ready",
             payload: serde_json::json!({ "session_id": string_field("session_id") }),
@@ -299,7 +307,21 @@ impl VoiceChatProcess {
     /// verified the child is not active. Generates and returns the session
     /// uuid. Reuses the same binary-resolution logic as `ServerProcess`
     /// (including the `POND_SERVER_BIN` override).
-    pub fn spawn(&self, app: &AppHandle, resource_dir: &std::path::Path) -> Result<String, String> {
+    /// `resume` is the GIAP session the voice turn should continue.
+    ///
+    /// `None` starts a new conversation. Passing the session the chat view is
+    /// already on is what makes voice and text one conversation rather than
+    /// two: the child hands it to `--session-id`, the adapter maps it to a
+    /// Goose session via `resolve_goose_session`, and a Goose session created
+    /// fresh for an existing GIAP conversation is hydrated with its history
+    /// before the first turn. All of that already worked — nothing ever passed
+    /// it an id that had any history.
+    pub fn spawn(
+        &self,
+        app: &AppHandle,
+        resource_dir: &std::path::Path,
+        resume: Option<String>,
+    ) -> Result<String, String> {
         // Never spawn a second child.
         if self.is_active() {
             return Err("voice session already active".to_string());
@@ -319,18 +341,23 @@ impl VoiceChatProcess {
             )
         })?;
 
-        let session_id = uuid::Uuid::new_v4().to_string();
+        let session_id = session_to_join(resume);
 
         tracing::info!(
-            "Spawning voice child: {} chat --input whisper --json-events --session-id {}",
+            "Spawning voice child: {} chat --voice --json-events --session-id {}",
             binary_path.display(),
             session_id
         );
 
+        // `--voice` replaced `--input whisper`. A staged sidecar older than
+        // that rename dies on clap's "unexpected argument" before it emits a
+        // single NDJSON line — the same symptom as a sidecar older than the
+        // database's migrations, and the same fix: re-run
+        // `scripts/stage-server-sidecar.sh`. The stderr tail attached to
+        // `voice-session-ended` carries clap's message, which names the flag.
         let mut cmd = Command::new(&binary_path);
         cmd.arg("chat")
-            .arg("--input")
-            .arg("whisper")
+            .arg("--voice")
             .arg("--json-events")
             .arg("--session-id")
             .arg(&session_id)
@@ -856,6 +883,24 @@ fn pid_is_voice_child(pid: u32) -> Option<bool> {
 /// Pure predicate: does a process command line identify our voice child?
 /// Requires both the `pond-server` binary token and the `chat` subcommand so a
 /// bare `pond-server serve` (the dashboard server) is not mistaken for it.
+/// Which conversation the voice child should join.
+///
+/// `Some(id)` continues that conversation; anything else starts a new one. A
+/// fresh uuid unconditionally — which is what `spawn` did — gave every voice
+/// session an empty history, so the assistant could not refer to anything said
+/// in the chat view a moment earlier, nor to the previous voice session. It was
+/// a different agent every time, and from the room that reads as unreliability.
+///
+/// Blank and whitespace-only are treated as absent rather than passed through:
+/// the frontend has more than one way to spell "no session yet" (`null` and a
+/// field initialised to `""`), and a blank `--session-id` reaching the child
+/// would name a session nothing can ever look up.
+fn session_to_join(resume: Option<String>) -> String {
+    resume
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
 fn cmdline_is_voice_child(cmdline: &str) -> bool {
     cmdline.contains("pond-server") && cmdline.split_whitespace().any(|tok| tok == "chat")
 }
@@ -1142,15 +1187,54 @@ mod tests {
 
     // ── Pidfile identity validation (kill -9 orphan recovery, finding 53) ──
 
+    // ── which conversation voice joins ───────────────────────────────────
+
+    #[test]
+    fn a_named_session_is_continued_rather_than_replaced() {
+        assert_eq!(
+            session_to_join(Some("chat-session-7".to_string())),
+            "chat-session-7"
+        );
+    }
+
+    #[test]
+    fn no_session_starts_a_new_conversation() {
+        let id = session_to_join(None);
+        assert_eq!(id.len(), 36, "expected a uuid, got {id:?}");
+        assert_ne!(
+            session_to_join(None),
+            id,
+            "each new conversation is its own"
+        );
+    }
+
+    /// A blank id must not reach `--session-id`. It would name a session that
+    /// nothing can look up, which is worse than starting fresh: the history
+    /// would be silently empty AND the id would be unusable afterwards.
+    #[test]
+    fn a_blank_session_id_starts_fresh_rather_than_being_passed_through() {
+        for blank in ["", "   ", "\t", "\n"] {
+            let id = session_to_join(Some(blank.to_string()));
+            assert_eq!(id.len(), 36, "{blank:?} produced {id:?}");
+        }
+    }
+
     #[test]
     fn cmdline_matches_only_a_pond_server_chat_process() {
         // The exact production invocation must match.
         assert!(cmdline_is_voice_child(
-            "/opt/app/pond-server chat --input whisper --json-events --session-id abc"
+            "/opt/app/pond-server chat --voice --json-events --session-id abc"
         ));
         // A bare macOS bundle sidecar path with the chat subcommand matches.
         assert!(cmdline_is_voice_child(
-            "/Applications/Goose In A Pond.app/Contents/MacOS/pond-server chat --input whisper"
+            "/Applications/Goose In A Pond.app/Contents/MacOS/pond-server chat --voice"
+        ));
+        // And the pre-rename invocation still matches, because orphan recovery
+        // has to reap a child spawned by the shell that was running before an
+        // upgrade. The matcher keys on the binary and the subcommand, never on
+        // the flags, which is what makes that survivable.
+        assert!(cmdline_is_voice_child(
+            "/opt/app/pond-server chat --input whisper --json-events --session-id abc"
         ));
     }
 

@@ -18,11 +18,10 @@ pub struct Libp2pMeshTransportConfig {
     pub harness_hash: HarnessHash,
     pub model_hash: ModelHash,
     pub keypair: MeshKeypair,
-    /// Who this Pond trusts. Required, not optional: `PeerDirectory`'s port
-    /// documentation says the transport consults it before connecting and
-    /// that "a peer absent from the directory is not trusted at all", and an
-    /// `Option` here would let a caller silently opt out of the only check
-    /// that distinguishes a trust circle from the open internet.
+    /// Who this Pond trusts. Required, not optional: `PeerDirectory`'s port docs
+    /// say a peer absent from the directory is not trusted at all, and an
+    /// `Option` would let a caller opt out of the only check that separates a
+    /// trust circle from the open internet.
     pub peer_directory: Arc<dyn PeerDirectory>,
 }
 

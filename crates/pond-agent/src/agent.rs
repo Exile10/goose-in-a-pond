@@ -1,15 +1,7 @@
-//! PondAgent — the core agent loop with sustained tool calling.
-//!
-//! Implements the [`Agent`] trait from `pond-core`. The agent:
-//!
-//! 1. Loads settings and hot-swaps the provider if the model changed
-//! 2. Builds a system prompt (via `PromptBuilder` or a simple default)
-//! 3. Loads conversation history from `SessionStorage`
-//! 4. Enters a streaming loop: call LLM, emit text tokens, detect tool calls
-//! 5. When tool calls are detected, emits ToolCall/ToolResult events and
-//!    appends results to the message history, then loops back to step 4
-//! 6. Terminates when the model produces a final text answer (no tool calls)
-//!    or the iteration guard fires (max 10 rounds)
+//! PondAgent — the core agent loop with sustained tool calling, implementing the
+//! [`Agent`] trait from `pond-core`. A request hot-swaps the provider if the
+//! model changed, builds the system prompt and history, then streams LLM and
+//! tool rounds until a final text answer or the 10-round guard fires.
 
 use crate::ollama_provider::OllamaInferenceProvider;
 use anyhow::{anyhow, Result};
@@ -46,11 +38,9 @@ const MAX_TOOL_ITERATIONS: u32 = 10;
 /// The actual cut-off is determined by `CompactionProfile::history_token_budget`.
 const HISTORY_LIMIT: usize = 60;
 
-/// The core GIAP agent with sustained tool-calling support.
-///
-/// Wraps an `InferenceProvider` (hot-swappable via `RwLock`) and executes
-/// a multi-turn tool loop against it. Uses `PromptBuilder` for system
-/// prompt construction when template repositories are available.
+/// The core GIAP agent with sustained tool-calling support. Wraps a
+/// hot-swappable `InferenceProvider` behind a `RwLock` and runs a multi-turn
+/// tool loop, using `PromptBuilder` when template repositories are available.
 pub struct PondAgent {
     /// The active inference provider (hot-swappable at runtime).
     provider: RwLock<Arc<dyn InferenceProvider>>,
@@ -376,16 +366,10 @@ impl Agent for PondAgent {
             (vec![], None, None)
         };
 
-        // 5. Calculate dynamic context budget for history injection.
-        //    Profile is keyed off the provider's effective context window; the
-        //    history budget gets whatever is left after the system prompt and
-        //    tool-schema overhead are accounted for.
-        // Precedence lives in pond-core's ContextGovernor so this loop cannot
-        // drift from the live path (PAI-3). Note this REPLACES a `min(override,
-        // caps)` rule: the governor lets the override win outright, because an
-        // override exists precisely for deployments where the capability number
-        // is wrong. Safe to change here — this crate is quarantined (Q2-05) and
-        // not activatable at runtime.
+        // 5. Context budget for history injection: whatever is left after the
+        //    system prompt and tool-schema overhead. Precedence lives in
+        //    pond-core's ContextGovernor so this loop cannot drift from the live
+        //    path (PAI-3); an explicit override wins outright over the caps.
         let context_tokens = ContextGovernor::resolve(&ContextInputs {
             provider: &settings.chat_provider,
             model: &settings.chat_model,
@@ -627,12 +611,10 @@ impl Agent for PondAgent {
                 // Loop back for next LLM call with tool results.
             }
 
-            // ── Persist this turn to SessionStorage ────────────────────────
-            // Capture everything appended during this request: the current user
-            // message (pushed before the loop) and every assistant/tool message
-            // produced inside the loop. The synthesis nudge is an internal
-            // loop artifact — skip it so it never shows as a YOU bubble in
-            // history. Spawn fire-and-forget so persistence never blocks SSE.
+            // Persist this turn to SessionStorage: the user message pushed
+            // before the loop and every assistant/tool message from inside it.
+            // Skip the synthesis nudge, an internal artifact that would show as
+            // a user bubble. Fire-and-forget so persistence never blocks SSE.
             const SYNTHESIS_NUDGE: &str =
                 "Using the tool results above, provide a helpful answer to the user's question.";
             let turn_messages: Vec<ChatMessage> = messages[history_messages_len..]

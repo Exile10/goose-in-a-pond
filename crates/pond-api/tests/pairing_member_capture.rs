@@ -1,33 +1,7 @@
-//! PAI-1 P9's HTTP half: a pairing code can be bound to a household member, and
-//! the binding happens at ISSUANCE.
-//!
-//! P9 landed the domain, the migration and the repository, and left the HTTP
-//! half unwired. This file drives the real router — `build_router`, the auth
-//! middleware, a real `SqliteHandshakeAdapter` over a tempdir database — and
-//! asserts the four things the security argument rests on:
-//!
-//! 1. A member named at issuance reaches `pairing_codes.profile_id`, so the
-//!    device that pairs with that code becomes that member's.
-//! 2. The route still refuses a non-loopback peer, **with a member named**. The
-//!    whole reason capture-at-issuance is safe is that the answer comes from
-//!    somebody standing at the pond; a body-carrying request that slipped past
-//!    the loopback check would make it a client assertion again, which is what
-//!    `IdentificationSource::PairedDevice` must never be.
-//! 3. A member that does not exist is refused and no code is minted. Migration
-//!    0043's foreign key is what refuses it; without this, an operator would be
-//!    handed a code for a ghost and a phone would pair to nobody.
-//! 4. A body this route cannot understand — including a `profileId` typo — is
-//!    refused rather than defaulted to an unattributed code. Defaulting narrows,
-//!    and it also lies: the operator is told "issued".
-//!
-//! # What this file deliberately does not test
-//!
-//! The code → `devices.profile_id` step. That is
-//! `sqlite_handshake::tests::the_pairing_client_cannot_name_its_own_member` and
-//! its siblings, which drive `verify_handshake` with a real MAC. Repeating it
-//! here would need the challenge/MAC dance and would prove the adapter twice
-//! while proving the route once. What is missing at the HTTP edge is only the
-//! capture, so that is what this asserts.
+//! PAI-1 P9's HTTP half: a pairing code is bound to a household member at ISSUANCE. The code
+//! must reach `pairing_codes.profile_id`; a non-loopback peer is refused even with a member
+//! named; an unknown member mints nothing (migration 0043's foreign key); an unparsable body
+//! is refused, not defaulted. The code to `devices.profile_id` step lives in sqlite_handshake.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -69,6 +43,7 @@ async fn make_app() -> Harness {
     let profiles = Arc::new(SqliteProfileRepository::new(pool.clone()));
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db,
         onboarding_repo: Arc::new(pond_infra::onboarding::SqlxOnboardingRepository::new(
             pool.clone(),
@@ -94,6 +69,7 @@ async fn make_app() -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -200,12 +176,10 @@ async fn issue(router: &axum::Router, body: Option<&str>) -> (StatusCode, Value)
     (status, json)
 }
 
-/// The live pairing code as `GET /handshake/pairing-code` reports it.
-///
-/// This is a genuine read-back and not an echo: `current_pairing_code` runs a
-/// fresh `SELECT` over `pairing_codes`, so `profile_id` here is the value the
-/// row holds — the same value `verify_handshake` will later copy onto the
-/// device. `code: null` means nothing was minted.
+/// The live pairing code as `GET /handshake/pairing-code` reports it. A genuine read-back,
+/// not an echo: `current_pairing_code` runs a fresh `SELECT`, so `profile_id` is the value
+/// the row holds and the one `verify_handshake` later copies onto the device. `code: null`
+/// means nothing was minted.
 async fn live_code(router: &axum::Router) -> Value {
     let resp = router
         .clone()
@@ -292,13 +266,10 @@ async fn a_code_issued_with_no_body_at_all_is_unattributed_as_it_always_was() {
 
 // ── The sole-member default ──────────────────────────────────────────────────
 
-/// The writer for a path that was complete and undriven.
-///
-/// `issue_pairing_code_for` has taken a member since P9 and no shipped caller
-/// ever passed one, so every device on a real pond paired unattributed --
-/// twelve of twelve, measured. That falls through the paired-device rung on
-/// every turn, which is also why `sessions.profile_id` is never written and the
-/// summary corpus can never be retrieved.
+/// `issue_pairing_code_for` takes a member, and a caller that passes none leaves every device
+/// on the pond paired unattributed. Such a device falls through the paired-device rung on
+/// every turn, so `sessions.profile_id` is never written and the summary corpus is
+/// unretrievable.
 #[tokio::test]
 async fn a_sole_member_household_binds_the_code_without_being_asked() {
     let h = make_app().await;
@@ -318,11 +289,9 @@ async fn a_sole_member_household_binds_the_code_without_being_asked() {
     assert_eq!(stored["profile_id"].as_str(), Some(jerry.as_str()));
 }
 
-/// The escape hatch, and the reason the default above is safe to have.
-///
-/// Without it a one-member pond could not pair a guest's phone without that
-/// phone becoming the member's, and every turn it sent would inherit an
-/// identity nobody claimed.
+/// The escape hatch, and the reason the default above is safe to have. Without it a
+/// one-member pond could not pair a guest's phone without that phone becoming the member's,
+/// and every turn it sent would inherit an identity nobody claimed.
 #[tokio::test]
 async fn a_sole_member_household_can_still_pair_a_guests_phone() {
     let h = make_app().await;
@@ -418,12 +387,9 @@ async fn a_blank_member_is_refused_rather_than_stored() {
     assert!(live_code(&h.loopback).await["code"].is_null());
 }
 
-/// The typo case, which is the one that would have been silent.
-///
-/// `deny_unknown_fields` is what turns "you spelled it `profileId`" into a 400.
-/// Without it the operator is told the code was issued, the code is
-/// unattributed, and nothing surfaces that until somebody wonders why a paired
-/// phone gets no proposals.
+/// The typo case, the one that would otherwise be silent. `deny_unknown_fields` turns a
+/// misspelt `profileId` into a 400; without it the operator is told the code was issued,
+/// the code is unattributed, and nothing surfaces until a paired phone gets no proposals.
 #[tokio::test]
 async fn a_body_this_route_does_not_understand_is_refused_not_defaulted() {
     let h = make_app().await;

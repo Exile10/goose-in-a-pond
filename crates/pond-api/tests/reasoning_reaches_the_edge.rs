@@ -1,36 +1,7 @@
-//! PAI-5 P2's tail: the reasoning count reaches a client.
-//!
-//! P2 landed the producer and the store on 2026-08-06 and said in its own stamp
-//! that it had not landed the two display surfaces, because `routes.rs` was held
-//! by other work: the `turn_stats` SSE frame is built by hand from a `TurnStats`,
-//! so widening the struct did not widen the frame, and `GET /usage/summary`
-//! carried no reasoning figure at all. The number was produced, reached
-//! `AgentStreamEvent::Done`, and stopped there.
-//!
-//! What this file asserts, in the order the defects would appear:
-//!
-//! 1. `reasoning_tokens` is in the `turn_stats` frame on **both** stream routes.
-//!    Both are live `GooseAdapter` paths and both fold through one
-//!    `TurnAccumulator::absorb`; only one of them was emitting the frame.
-//! 2. It is reported ALONGSIDE `completion_tokens` and never deducted from it,
-//!    and it does not move the decode rate.
-//! 3. `null` is not `0`. A turn nobody counted must not read as a turn that
-//!    thought nothing — PAI-5 P5 sizes `output_reserve_tokens` from the second.
-//! 4. `/agent/chat/stream` emits the stats BEFORE it closes the stream. A frame
-//!    after `done` is a frame no client reads.
-//! 5. `/usage/summary` totals the persisted counts, and reports how many turns
-//!    contributed one, so a zero can be told from an absence.
-//!
-//! # The fixtures are ones production can produce
-//!
-//! The `Done` this file's agent emits is shaped like `GooseAdapter`'s: both of
-//! that adapter's `UsageStats` build arms carry `turn_stats.reasoning_tokens`,
-//! and `count_reasoning_tokens` accumulates it outside the display gate. The
-//! persisted rows in the summary test are written with
-//! `SessionMessage::with_reasoning_tokens`, which is exactly what
-//! `ChatService::persist_assistant_response` calls on the `pond chat` and
-//! terminal-voice paths. A fixture production cannot produce tests a system that
-//! does not exist, and this programme has one recorded case of exactly that.
+//! PAI-5 P2's tail: the reasoning count reaches a client. Asserts that
+//! `reasoning_tokens` rides the `turn_stats` frame on both stream routes and
+//! before `done`, sits alongside `completion_tokens` rather than inside it, and
+//! that `/usage/summary` reports counted turns so `null` can be told from `0`.
 
 use std::sync::Arc;
 
@@ -170,6 +141,7 @@ async fn make_app(agent: Arc<dyn Agent>) -> Harness {
     hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(hs),
@@ -190,6 +162,7 @@ async fn make_app(agent: Arc<dyn Agent>) -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -369,10 +342,9 @@ async fn a_turn_nobody_counted_reads_as_null_and_not_as_zero() {
         let stats = turn_stats_of(&frames, route);
 
         // The key must be PRESENT and null, not missing. `Value::index` returns
-        // `Null` for an absent key, so `is_null()` alone is equally satisfied by
-        // a frame that dropped the field altogether -- which is the regression
-        // the test above exists for, and this one would have passed straight
-        // through it. It did, on the first mutation run.
+        // `Null` for an absent key, so `is_null()` alone is equally satisfied by a
+        // frame that dropped the field altogether, which is the regression the
+        // test above exists for.
         let reported = stats
             .as_object()
             .and_then(|o| o.get("reasoning_tokens"))
@@ -393,18 +365,10 @@ async fn a_turn_nobody_counted_reads_as_null_and_not_as_zero() {
     }
 }
 
-/// The other half of what thinking cost.
-///
-/// `inference_count` already says how many times the engine ran, and it is why
-/// this needed its own field rather than a derivation: a turn that ran twice
-/// because it called a tool and a turn that ran twice because it thought, said
-/// nothing, and had to be steered back with `EMPTY_TURN_STEER` are the same
-/// number there. Only `reengagements` separates them, and the second one is a
-/// whole extra turn paid at full price — prefill, tools and all.
-///
-/// Until this landed the only trace was a WARN, so nobody could answer how
-/// often the pond goes silent, which is the question the fork patch that made
-/// goose treat a thinking-only turn as empty was written to answer.
+/// The other half of what thinking cost. `inference_count` cannot derive it: a
+/// turn that ran twice for a tool call and one steered back by `EMPTY_TURN_STEER`
+/// read the same there. Only `reengagements` separates them, and the second is a
+/// whole extra turn paid at full price, prefill and tools included.
 #[tokio::test]
 async fn both_stream_routes_report_what_the_empty_turn_recovery_cost() {
     for (i, route) in STREAM_ROUTES.iter().enumerate() {
@@ -595,12 +559,10 @@ async fn the_usage_summary_totals_reasoning_and_says_how_many_turns_counted_one(
     );
 }
 
-/// The other half of the same claim, and the one that makes a zero readable: on
-/// a pond where nothing has ever counted, both figures are zero TOGETHER.
-///
-/// Without `counted_reasoning_turns` this state is indistinguishable from a
-/// pond whose models genuinely never think, which is the reading PAI-5 P5 must
-/// not take from an empty corpus.
+/// The half that makes a zero readable: where nothing has ever counted, both
+/// figures are zero TOGETHER. Without `counted_reasoning_turns` that state is
+/// indistinguishable from a pond whose models never think, which is the reading
+/// PAI-5 P5 must not take from an empty corpus.
 #[tokio::test]
 async fn a_pond_where_nothing_counted_reports_zero_turns_not_just_zero_tokens() {
     let h = make_app(Arc::new(StatsAgent {

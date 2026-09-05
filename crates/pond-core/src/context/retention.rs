@@ -1,24 +1,7 @@
-//! How long the pond keeps a context item (PAI-8 P1).
-//!
-//! PAI-8 section 3.1 says retention is governed by `retention_events_by_category`
-//! and `retention_sensitive_days`, both of which already exist on [`Settings`]
-//! and are both classified `HEADLESS_BY_DESIGN`. This module is the domain half
-//! of honouring them. The document also says this workstream gives them a UI,
-//! because "how long does GIAP keep my e-mail" is not a setting to hide — that
-//! half is not here and is owed; see the phase stamp.
-//!
-//! # The trap in this file
-//!
-//! `0` means **keep forever** in every one of these settings, which is the
-//! existing convention (`retention_events_days`'s doc comment, and
-//! `prune_events`'s `if config.events_sensitive_days > 0`). So the effective
-//! window is a `min` over values where `0` is not the smallest thing but the
-//! largest, and a plain `u32::min` gets it exactly backwards: it would answer
-//! "delete immediately" for "keep forever", which is the direction that destroys
-//! a household's data rather than the direction that merely keeps it too long.
-//!
-//! [`Window`] exists so the arithmetic cannot be done on a bare `u32`, and
-//! [`Window::stricter`] is the only combinator.
+//! How long the pond keeps a context item (PAI-8 P1), honouring the `HEADLESS_BY_DESIGN` settings
+//! `retention_events_by_category` and `retention_sensitive_days` (PAI-8 3.1); the UI half is owed.
+//! Trap: `0` means keep forever in these settings, so a plain `u32::min` answers "delete now" for
+//! "keep forever" and destroys data. Use [`Window`] and [`Window::stricter`] instead of a `u32`.
 
 use std::collections::HashMap;
 
@@ -28,12 +11,9 @@ use crate::context::domain::SourceKind;
 use crate::security::domain::event::{EventCategory, PrivacySensitivity};
 use crate::user_data::domain::settings::Settings;
 
-/// Ceiling on a retention window, in days.
-///
-/// Copied from `pruning.rs`'s `MAX_RETENTION_DAYS` and for its reason:
-/// `Utc::now() - Duration::days(n)` **panics** rather than erroring when the
-/// result leaves chrono's representable range, and these numbers come from
-/// user-editable settings. ~100 years is "forever" for any real deployment.
+/// Ceiling on a retention window, in days. Matches `pruning.rs`'s `MAX_RETENTION_DAYS`, because
+/// `Utc::now() - Duration::days(n)` panics rather than erroring outside chrono's range and these
+/// numbers come from user-editable settings. ~100 years is forever for any real deployment.
 pub const MAX_RETENTION_DAYS: i64 = 36_500;
 
 /// A retention window: some number of days, or forever.
@@ -56,12 +36,9 @@ impl Window {
         }
     }
 
-    /// The stricter of two windows — the one that deletes sooner.
-    ///
-    /// `Forever` is the identity, not the zero. Two windows apply to an item
-    /// (its category's, and the cap on sensitive data) and the shorter must win:
-    /// a per-category setting of 90 days must not extend the 7-day sensitive cap
-    /// the user set precisely to bound it.
+    /// The stricter of two windows, the one that deletes sooner. `Forever` is the identity, not
+    /// the zero: an item's category window and the sensitive-data cap both apply, and a
+    /// per-category setting of 90 days must not extend a 7-day sensitive cap set to bound it.
     pub fn stricter(self, other: Window) -> Window {
         match (self, other) {
             (Window::Forever, w) | (w, Window::Forever) => w,
@@ -108,12 +85,9 @@ impl ContextRetention {
         )
     }
 
-    /// The settings key an [`EventCategory`] is stored under.
-    ///
-    /// Derived through serde rather than written out, exactly as `pruning.rs`'s
-    /// `category_key` does. A hand-written table here could disagree with the
-    /// keys the settings map actually holds, and the disagreement would present
-    /// as "the retention I configured is being ignored".
+    /// The settings key an [`EventCategory`] is stored under, derived through serde as
+    /// `pruning.rs`'s `category_key` does. A hand-written table could disagree with the keys the
+    /// settings map holds, and would present as "the retention I configured is being ignored".
     pub fn category_key(category: EventCategory) -> String {
         serde_json::to_value(category)
             .ok()
@@ -137,13 +111,9 @@ impl ContextRetention {
         }
     }
 
-    /// Every (kind, sensitivity-class) bucket a purge has to sweep, with the
-    /// cutoff for each. `None` cutoff means "keep forever" and the caller skips
-    /// it.
-    ///
-    /// Quantified over [`SourceKind::ALL`] and both sensitivity classes so a new
-    /// source kind is swept the day it is added, rather than the day somebody
-    /// remembers to add it to a list in the storage adapter.
+    /// Every (kind, sensitivity-class) bucket a purge has to sweep, with its cutoff. A `None`
+    /// cutoff means keep forever and the caller skips it. Quantified over [`SourceKind::ALL`] and
+    /// both sensitivity classes so a new source kind is swept the day it is added.
     pub fn sweep_plan(&self, now: DateTime<Utc>) -> Vec<RetentionBucket> {
         let mut plan = Vec::new();
         for kind in SourceKind::ALL {

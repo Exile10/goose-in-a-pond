@@ -22,12 +22,19 @@ use crate::process::ServerProcess;
 /// Returns the generated session uuid. The child exclusively owns the mic and
 /// speaker for its lifetime; the shell's own wake listener and mic pipeline are
 /// suspended (the child does its own wake-word + barge-in in-process).
+///
+/// `session_id` is the conversation to continue — the one the chat view is on.
+/// Voice and text then share one session, one history and one Goose engine
+/// session, which is the whole point: the assistant that answers by voice is
+/// the same agent, mid-conversation, not a stranger starting fresh. Omit it
+/// (or pass null) to begin a new conversation.
 #[tauri::command]
 pub async fn start_voice_session(
     app: AppHandle,
     voice: State<'_, VoiceChatProcess>,
     wake_state: State<'_, WakeListenerState>,
     server: State<'_, ServerProcess>,
+    session_id: Option<String>,
 ) -> Result<String, String> {
     // Serialize with any concurrent start/stop.
     let _guard = voice.lifecycle_guard().await;
@@ -72,7 +79,7 @@ pub async fn start_voice_session(
         .resource_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
-    match voice.spawn(&app, &resource_dir) {
+    match voice.spawn(&app, &resource_dir, session_id) {
         Ok(session_id) => {
             tracing::info!("voice session started: {session_id}");
             Ok(session_id)

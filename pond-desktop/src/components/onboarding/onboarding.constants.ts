@@ -81,15 +81,6 @@ export const LANGUAGES: LangOption[] = [
   { key: "zh", label: "\u4e2d\u6587" },
 ];
 
-// ── Timezones ──────────────────────────────────────────────
-
-export const TIMEZONES = [
-  "Africa/Nairobi", "Europe/London", "Europe/Berlin", "Europe/Paris",
-  "America/New_York", "America/Los_Angeles", "America/Chicago",
-  "Asia/Tokyo", "Asia/Singapore", "Asia/Dubai",
-  "Australia/Sydney", "Pacific/Auckland", "UTC",
-];
-
 // ── Prompt styles ──────────────────────────────────────────
 
 /** Prompt style metadata — icons are rendered via lucide-react in StepPersonality. */
@@ -126,6 +117,8 @@ export const DEFAULT_DRAFT: OnboardingDraft = {
   language: "en",
   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
   locationName: "",
+  latitude: 0,
+  longitude: 0,
   enableWeather: false,
   promptStyle: "balanced",
   personality: "friendly and helpful",

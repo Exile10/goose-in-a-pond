@@ -1,20 +1,7 @@
-//! Redaction domain (PAI-2 P3): what counts as personal data, what replaces
-//! it, and the rules that decide whether a candidate really is the thing it
-//! looks like.
-//!
-//! Everything here is policy. The adapter that finds candidates
-//! (`pond_infra::rule_redactor`) owns a regex engine; nothing in this file
-//! does. Swap the engine and every decision below is unchanged.
-//!
-//! A redactor that eats ordinary prose is worse than none, because the user
-//! stops trusting the transcript. Every rule is therefore a *validator* over a
-//! deliberately permissive candidate: the adapter over-matches and these
-//! functions say no.
-//!
-//! Redaction composes with [`PrivacySensitivity`] rather than duplicating it:
-//! each [`RedactionKind`] declares the sensitivity of what it detects, and
-//! [`RedactionLevel`] is defined in terms of that mapping, so there is one
-//! ordering of "how bad is this to leak" in the codebase and not two.
+//! Redaction policy (PAI-2 P3). The regex engine lives in the adapter
+//! (`pond_infra::rule_redactor`); every rule here is a validator that rejects the
+//! adapter's deliberately over-permissive candidates, so ordinary prose survives.
+//! [`RedactionLevel`] derives from each [`RedactionKind`]'s [`PrivacySensitivity`].
 
 use serde::{Deserialize, Serialize};
 

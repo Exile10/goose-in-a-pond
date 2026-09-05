@@ -1,23 +1,7 @@
-//! The catalog of GIAP tool GROUPS — one entry per `giap-*` MCP extension.
-//!
-//! A group is the unit of tool-relevance selection (Phase D). Selection scores
-//! the session's opening context against one short natural-language description
-//! per group, not per tool: 15 comparisons instead of 59, and the descriptions
-//! read like the sentences a user would actually say.
-//!
-//! ## Why groups and not tools
-//!
-//! Tool schemas are indivisible in the prompt — a model that can see
-//! `create_schedule` but not `list_schedules` is worse off than one that sees
-//! neither, because it will invent the missing call. Extensions are already the
-//! cohesive unit (one MCP server, one capability area), so they are the unit
-//! that goes in or stays out.
-//!
-//! ## Cost
-//!
-//! Every tool schema costs roughly 100 tokens through the Gemma chat template,
-//! re-prefilled on every fresh turn. The full 59-tool surface is ~5.9K prompt
-//! tokens against an 8K-class on-device budget, which is why this exists.
+//! The catalog of GIAP tool GROUPS — one entry per `giap-*` MCP extension, and the unit of
+//! tool-relevance selection (Phase D): 15 comparisons instead of 59, scored against one short
+//! natural-language description per group. Groups rather than tools because a tool schema is
+//! indivisible in the prompt and costs ~100 tokens re-prefilled per turn on an 8K-class budget.
 
 /// A selectable group of tools, backed by exactly one `giap-*` MCP extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,40 +17,19 @@ pub struct ToolGroup {
     pub core: bool,
 }
 
-/// Why each core group is core — kept next to the data so the decision is
-/// reviewable rather than folklore.
-///
-/// - `giap-draft`: the confirmation/safety surface. It is the one extension
-///   registered unconditionally (not behind an `ext_*_enabled` toggle), and a
-///   model that can start a risky action but cannot route it through a draft is
-///   strictly less safe. Never selectable away.
-/// - `giap-memory`: cross-cutting. "remember that…" / "what did I say about…"
-///   can attach to ANY topic, so no opening message reliably predicts it, and
-///   losing it degrades the assistant's core promise.
-/// - `giap-system`: contains `get_current_time`. Time is asked constantly, in
-///   passing, mid-conversation, and is not predictable from the first message of
-///   a session.
-/// - `giap-toolkit`: the escape hatch itself. Removing it would make narrowing
-///   irreversible within a session, which is the one thing that would make this
-///   feature unsafe.
+/// Why each core group is core, kept next to the data so the decision is reviewable.
+/// `giap-draft` is the confirmation/safety surface, the one extension registered unconditionally;
+/// `giap-memory` is cross-cutting and no opening message predicts it; `giap-system` holds
+/// `get_current_time`; `giap-toolkit` is the escape hatch that keeps narrowing reversible.
 pub const CORE_RATIONALE: &str = "draft=safety, memory=cross-cutting, system=time, toolkit=escape";
 
 /// The extension providing the discovery / enable escape hatch.
 pub const TOOLKIT_EXTENSION: &str = "giap-toolkit";
 
-/// The extension carrying the `delegate` tool — PAI-6 P5.
-///
-/// A const rather than a bare literal for the same reason [`TOOLKIT_EXTENSION`]
-/// is one: three crates spell this name (the catalog here, the registration in
-/// `pond-adapters-goose`, the server's own `get_info` in `pond-mcp-server`) and a
-/// typo in any of them is silent — an extension name that matches no catalog
-/// entry is treated as a user-added MCP server, which selection never narrows.
-///
-/// Note that consts are also what made this programme's extension count wrong
-/// twice: `grep -c '"giap-[a-z-]*"'` cannot see one. The cross-check in
-/// `crates/pond-core/tests/registration_matches_the_catalog.rs` resolves the
-/// known consts by name and FAILS on any argument it cannot resolve, rather than
-/// skipping it.
+/// The extension carrying the `delegate` tool (PAI-6 P5). A const because three crates spell this
+/// name and a typo is silent: an extension matching no catalog entry is treated as a user-added
+/// MCP server, which selection never narrows. `tests/registration_matches_the_catalog.rs` resolves
+/// the known consts by name and fails on any argument it cannot resolve.
 pub const ORCHESTRATOR_EXTENSION: &str = "giap-orchestrator";
 
 /// Separator between the extension name and the tool name in a prefixed tool
@@ -204,28 +167,10 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     },
 ];
 
-/// Sort key that puts the tools every turn carries before the ones it might not.
-///
-/// # Why the ORDER of the tool list matters
-///
-/// The tool schemas are rendered into the prompt after the system text, and they
-/// are the bulk of it. Two turns share a prompt prefix only up to their first
-/// difference, so a single tool that differs early truncates everything after it
-/// — including tools the two turns agree on completely.
-///
-/// That is what decides whether an on-disk KV snapshot can serve chat at all.
-/// With `tool_selection_mode = "relevant"` the selected set differs per
-/// conversation (30 distinct sets across 84 sessions on my own pond), so an
-/// arbitrary order leaves almost nothing in common. Measured against the real
-/// Gemma template: two chats differing in half their tools shared 70% of the
-/// preamble when the differing tools came early, and 85% when they came last —
-/// the difference between falling under the snapshot threshold and clearing it.
-///
-/// Core groups are the stable block: `core` means always loaded, never scored,
-/// never removable, so every turn has them. Putting them first makes them a
-/// genuine common prefix. Within each tier the sort is by name, because a
-/// deterministic order is the other half of the property — a set that renders in
-/// a different order on two turns shares nothing either.
+/// Sort key putting the tools every turn carries before the ones it might not. Two turns share a
+/// prompt prefix only up to their first difference, and tool schemas are the bulk of it: on the
+/// Gemma template, chats differing in half their tools shared 70% of the preamble with those tools
+/// first and 85% with them last. Core groups sort first, then by name: order must be deterministic.
 pub fn prefix_sort_key(tool_name: &str) -> (u8, &str) {
     // Tool names are `<extension>__<tool>`; the extension is what maps to a
     // group. An unknown prefix (a user-added MCP server) ranks with the
@@ -244,23 +189,9 @@ pub fn find_group(extension: &str) -> Option<&'static ToolGroup> {
 }
 
 /// Extension names of the always-on core groups.
-/// Groups an unidentified speaker must never be given, whatever the scorer says.
-///
-/// PAI-1 P5. Suppressing memory *injection* for a guest is only half a boundary:
-/// the model can be asked to call `recall_memories` and read the household's
-/// memory directly, or `forget_memory` and destroy it. Neither tool has any
-/// notion of a session, so the only place to stop it is before the guest's
-/// session is given the group at all.
-///
-/// `giap-memory` and `giap-draft` are both `core`, so `select_groups` will
-/// always put them back -- the caller has to subtract this list *after*
-/// selection, not filter the candidates going in.
-///
-/// Deliberately a denylist, not an allowlist. A new group is far more likely to
-/// be neutral (weather, news, a unit converter) than personal, and a new
-/// *personal* group is exactly the kind of change whose author should have to
-/// think about this list. An allowlist would silently deny every new group to
-/// guests and be discovered as a bug report.
+/// Groups an unidentified speaker must never be given (PAI-1 P5): a guest can still ask for
+/// `recall_memories` or `forget_memory`, and neither tool knows about sessions. `select_groups`
+/// puts `core` groups back, so subtract this list AFTER selection; a denylist, so new groups pass.
 pub fn groups_denied_to_guests() -> &'static [&'static str] {
     &[
         // Reads and deletes the household's long-term memory.
@@ -274,73 +205,30 @@ pub fn groups_denied_to_guests() -> &'static [&'static str] {
         "giap-vision",
         // Sensor history: when the house was empty, when somebody came home.
         "giap-sensors",
-        // PAI-8. A member's own connected sources -- what their camera saw,
-        // what their sensor recorded. Invariant 2 is "a Guest sees no context
-        // items. None.", and the tool layer already enforces it by scope, so
-        // this entry is belt AND braces: it stops the tool being OFFERED, which
-        // on a small model is the difference between a refusal and a turn spent
-        // discovering one.
+        // PAI-8. A member's own connected sources. Invariant 2 is that a Guest sees no context
+        // items, and the tool layer enforces that by scope; this entry stops the tool being
+        // OFFERED, which on a small model saves a turn spent discovering the refusal.
         "giap-context",
-        // PAI-6 P5, and the one entry on this list that is not about reading
-        // personal data. `delegate` starts an autonomous multi-turn agent under
-        // `GooseMode::Auto` on the household's own hardware, and on a Jetson
-        // that is the single GPU the household's next turn needs. An
-        // unidentified speaker asking a question is one turn; an unidentified
-        // speaker delegating is minutes of unattended work nobody in the house
-        // asked for. The child inherits the guest's scope, so no personal data
-        // leaks -- what is being withheld here is the household's device, not
-        // its memory.
+        // PAI-6 P5, and the only entry here not about reading personal data. `delegate` starts an
+        // autonomous multi-turn agent under `GooseMode::Auto` on the household's own hardware,
+        // which on a Jetson is the single GPU the household's next turn needs. The child inherits
+        // the guest's scope, so what is withheld is the device, not the memory.
         ORCHESTRATOR_EXTENSION,
     ]
 }
 
-/// Groups a SUBAGENT must never be given, whatever role asked for it and
-/// however wide its parent was.
-///
-/// PAI-6 P3. This is the same move PAI-1 P5 made for guests, for the same
-/// reason: **when the thing you want to check has no identity, move the check
-/// to the layer that hands it out.** A subagent has no identity two separate
-/// controls need:
-///
-/// - Its tool calls carry the CHILD's engine session id in `agent-session-id`,
-///   and nothing writes that id into `engine_session_map`. So
-///   `RepoDraftAuthority::actor_for_engine_session` returns `None`,
-///   `is_draft_decision_permitted` answers `REASON_UNRESOLVED_ACTOR`, and under
-///   the DEFAULT `PolicyMode::Audit` that **proceeds and logs**. A subagent
-///   could approve any staged action on a default install.
-/// - It runs under `GooseMode::Auto`, which is mandatory rather than chosen:
-///   any approval-requiring mode hangs forever on the child's
-///   `confirmation_rx`, because nothing forwards an ActionRequired message to a
-///   parent. So a subagent cannot be gated by approval at all, and its tool set
-///   is its only boundary.
-///
-/// Withholding is therefore the enforcement, not a substitute for it.
-/// Deliberately a denylist for the same reason as the guest one, and
-/// deliberately applied to the derived set rather than to the role's request:
-/// `giap-draft`, `giap-system` and `giap-toolkit` are all `core`, so anything
-/// that re-runs selection would put them straight back.
-///
-/// The cost is real and is accepted: a subagent has no clock, because
-/// `get_current_time` lives in `giap-system` next to `write_file`. A role that
-/// needs the date should be given it in its instructions.
+/// Groups a SUBAGENT must never be given, whatever role asked and however wide its parent was.
+/// PAI-6 P3: a subagent has no identity, so the draft gate answers `REASON_UNRESOLVED_ACTOR` and
+/// the default `PolicyMode::Audit` proceeds, and mandatory `GooseMode::Auto` has no approval path.
+/// The tool set is the only boundary, so subtract this from the DERIVED set or core groups return.
 pub fn groups_denied_to_subagents() -> &'static [&'static str] {
     &[
         // `approve_draft`/`reject_draft` DECIDE, and the gate that would check
         // who decided cannot resolve a subagent (see above).
         "giap-draft",
-        // `enable_tool_group` WIDENS an allow-set. It now resolves the caller
-        // from `_meta` rather than the process-global `current_session_id()`, so
-        // the old reason for this entry -- a child widening its parent's
-        // narrowing -- is closed at the source, and a child calling it gets a
-        // refusal rather than somebody else's session.
-        //
-        // It stays denied for a different and simpler reason: a child has
-        // nothing to widen. Its allow-set is its whole grant, published up front
-        // by `narrow_child_groups`, and its grant is bounded by the parent's
-        // ENTITLEMENT rather than by whatever the parent happened to have
-        // loaded. So the hatch has no work to do here, and offering a 2-4B model
-        // a tool whose every call is a refusal is not a harmless schema -- see
-        // the note on ORCHESTRATOR_EXTENSION below, which is the same argument.
+        // `enable_tool_group` WIDENS an allow-set, and a child has nothing to widen: its whole
+        // grant is published up front by `narrow_child_groups` and bounded by the parent's
+        // entitlement. Offering a 2-4B model a tool whose every call is refused is not harmless.
         TOOLKIT_EXTENSION,
         // Actuates the house. There is no approval path for a subagent, and the
         // one it would otherwise take -- staging a draft -- is denied above.
@@ -351,14 +239,9 @@ pub fn groups_denied_to_subagents() -> &'static [&'static str] {
         // Schedules future work that will run with the household's authority,
         // long after the delegation that created it has ended.
         "giap-schedule",
-        // PAI-6 P5. `DelegationAuthority::may_delegate()` already answers no at
-        // depth 1 and `delegate()` refuses with `DepthExceeded`, so this entry
-        // is not what stops a subagent spawning a subagent. It is what stops the
-        // tool being OFFERED to one: a role that names `giap-orchestrator` under
-        // a parent that holds it would otherwise put a tool in a child's prompt
-        // whose every call is refused. On a 2-4B model that is not a harmless
-        // schema -- it is an invitation to spend the turn budget discovering
-        // that it does not work.
+        // PAI-6 P5. Depth already refuses a subagent's `delegate` with `DepthExceeded`; this
+        // entry stops the tool being OFFERED, because a 2-4B model handed a tool whose every
+        // call is refused spends its turn budget discovering that.
         ORCHESTRATOR_EXTENSION,
     ]
 }
@@ -586,15 +469,10 @@ mod guest_denylist_tests {
         }
     }
 
-    /// The three the list exists for, named individually so removing one is a
-    /// deliberate edit with a failing test rather than a quiet deletion.
-    ///
-    /// Each is here for a mechanism, not a vibe: `giap-draft` because the draft
-    /// gate cannot resolve a subagent actor and audit mode proceeds;
-    /// `giap-toolkit` because `enable_tool_group` widens an allow-set keyed by
-    /// the process-global session id; `giap-device-control` because a subagent
-    /// is forced to `GooseMode::Auto` and has no approval path left once draft
-    /// is gone.
+    /// The three the list exists for, named individually so removing one fails a test rather than
+    /// passing quietly. `giap-draft` because the draft gate cannot resolve a subagent actor and
+    /// audit mode proceeds; `giap-toolkit` because `enable_tool_group` widens an allow-set;
+    /// `giap-device-control` because a subagent is forced to `GooseMode::Auto` with no approval.
     #[test]
     fn the_subagent_denylist_covers_deciding_widening_and_actuating() {
         let denied = groups_denied_to_subagents();
@@ -607,16 +485,10 @@ mod guest_denylist_tests {
         }
     }
 
-    /// PAI-6 P5. The delegation surface itself is withheld from both a guest
-    /// and a subagent, for two different mechanisms, and neither list is the
-    /// other's backstop -- so both are named here.
-    ///
-    /// Removing either entry is legal code that this test turns into a failure
-    /// with the reason attached. Neither removal would break any other test:
-    /// a subagent's `delegate` call is refused by `DelegationDepth` anyway, and
-    /// a guest's is refused by nothing at all today except the handler's own
-    /// scope check, which is deliberately a SECOND enforcement rather than the
-    /// only one.
+    /// PAI-6 P5. The delegation surface is withheld from both a guest and a subagent for two
+    /// different mechanisms, and neither list backstops the other, so both are named here.
+    /// Removing either entry breaks no other test: depth already refuses a subagent's `delegate`,
+    /// and only the handler's own scope check refuses a guest's.
     #[test]
     fn neither_a_guest_nor_a_subagent_is_offered_the_delegation_tool() {
         assert!(

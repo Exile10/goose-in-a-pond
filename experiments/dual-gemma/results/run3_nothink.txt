@@ -1,0 +1,49 @@
+
+== dual ==
+  weather_direct         tool  ok  args  ok  ans  ok    1.9s  get_weather({"city": "Nairobi"})
+  weather_indirect       tool  ok  args  ok  ans  -     2.5s  get_weather({"city": "Eldoret"})
+  timer_minutes          tool  ok  args  ok  ans  -     2.6s  set_timer({"seconds": 600, "label": "standup"})
+  timer_compound         tool  ok  args MISS  ans  -     2.5s  set_timer({"seconds": 90, "label": "Set timer for 90 seconds"})
+  math_words             tool  ok  args  ok  ans  ok    2.1s  calculate({"expression": "1/5 * 18000"})
+  math_direct            tool  ok  args  ok  ans  ok    2.8s  calculate({"expression": "1234 * 17"})
+  convert_distance       tool  ok  args  ok  ans  ok    3.4s  convert_units({"from_unit": "km", "to_unit": "mi", "value": 340})
+  convert_temp           tool  ok  args  ok  ans MISS    3.8s  convert_units({"from_unit": "c", "to_unit": "f", "value": 29})
+  convert_mass_vs_calc   tool  ok  args  ok  ans  ok    3.0s  convert_units({"from_unit": "kg", "to_unit": "lb", "value": 2})
+  notes_search           tool  ok  args  ok  ans  -     3.1s  search_notes({"query": "Jetson"})
+  notes_read             tool  ok  args  ok  ans  ok    2.5s  search_notes({"query": "standup"})
+  notes_then_convert     tool MISS  args MISS  ans MISS    2.0s  convert_units({"from_unit": "km", "to_unit": "mi", "value": 0})
+  zero_arg_tool          tool  ok  args  ok  ans  -     1.3s  list_timers({})
+  time_timezone          tool MISS  args MISS  ans  -     2.4s  read_note({"name": "get_time"})
+  unknown_city           tool  ok  args  ok  ans  -     2.3s  get_weather({"city": "Atlantis"})
+  timer_then_list        tool  ok  args  ok  ans  -     2.5s  set_timer({"seconds": 300, "label": "tea"})
+  no_tool_greeting       tool  ok  args  ok  ans  -     3.2s  (no call)
+  no_tool_knowledge      tool  ok  args  ok  ans  -     0.9s  (no call)
+
+== solo ==
+  weather_direct         tool  ok  args  ok  ans  ok    3.6s  get_weather({"city": "Nairobi"})
+  weather_indirect       tool  ok  args  ok  ans  -     2.5s  get_weather({"city": "Eldoret"})
+  timer_minutes          tool  ok  args  ok  ans  -     2.2s  set_timer({"seconds": 600, "label": "standup"})
+  timer_compound         tool  ok  args MISS  ans  -     2.9s  set_timer({"seconds": 90, "label": "check the oven"})
+  math_words             tool  ok  args  ok  ans  ok    2.7s  calculate({"expression": "18000 / 5"})
+  math_direct            tool  ok  args  ok  ans  ok    2.5s  calculate({"expression": "1234 * 17"})
+  convert_distance       tool  ok  args  ok  ans  ok    3.0s  convert_units({"value": 340, "from_unit": "km", "to_unit": "mi"})
+  convert_temp           tool  ok  args  ok  ans  ok    3.0s  convert_units({"value": 29, "from_unit": "c", "to_unit": "f"})
+  convert_mass_vs_calc   tool  ok  args  ok  ans  ok    2.6s  convert_units({"value": 2, "from_unit": "kg", "to_unit": "lb"})
+  notes_search           tool  ok  args  ok  ans  -     3.1s  search_notes({"query": "Jetson"})
+  notes_read             tool  ok  args  ok  ans  ok    2.2s  search_notes({"query": "standup"})
+  notes_then_convert     tool  ok  args  ok  ans MISS    2.2s  search_notes({"query": "road distance to Kisumu"})
+  zero_arg_tool          tool  ok  args  ok  ans  -     1.6s  list_timers({})
+  time_timezone          tool  ok  args  ok  ans  -     2.4s  get_time({"timezone": "JST"})
+  unknown_city           tool  ok  args  ok  ans  -     2.2s  get_weather({"city": "Atlantis"})
+  timer_then_list        tool  ok  args  ok  ans  -     2.3s  set_timer({"seconds": 300, "label": "tea"})
+  no_tool_greeting       tool  ok  args  ok  ans  -     1.7s  (no call)
+  no_tool_knowledge      tool  ok  args  ok  ans  -     1.2s  (no call)
+
+========================================================================
+
+  dual      tool  16/18  ( 89%)   args  15/18  ( 83%)   answer   6/8   ( 75%)   malformed 0     2.5s/case
+            picker honoured the tool the planner named: 15/16 (94%)
+
+  solo      tool  18/18  (100%)   args  17/18  ( 94%)   answer   7/8   ( 88%)   malformed 0     2.4s/case
+========================================================================
+wrote results/run3_nothink.json

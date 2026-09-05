@@ -1,9 +1,7 @@
-//! On-device motion detection (#130) — pure-Rust frame differencing.
-//!
-//! Each frame is downsampled onto a small luma grid; motion is declared when
-//! the fraction of grid cells whose brightness changed by more than
-//! `pixel_delta` exceeds `changed_fraction`. No models, no native deps —
-//! deterministic and cheap enough for multi-FPS streams on the Jetson.
+//! On-device motion detection (#130) — pure-Rust frame differencing. Each frame
+//! is downsampled onto a small luma grid; motion is declared when the fraction of
+//! cells whose brightness changed by more than `pixel_delta` exceeds
+//! `changed_fraction`. No models, no native deps, cheap enough for the Jetson.
 
 use pond_core::user_data::domain::vision::Frame;
 

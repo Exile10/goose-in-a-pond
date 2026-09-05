@@ -16,11 +16,8 @@ pub enum PaymentRailError {
 
 /// Driven Port: PaymentRail
 ///
-/// Lightning settlement, off the inference hot path by construction: nothing
-/// in the request/response path calls this port directly — a background
-/// settlement job calls `batch_settle` once per threshold/interval, never
-/// per token. The invoice string is opaque here (BOLT11-shaped, but this
-/// layer doesn't parse it) — that's the concrete adapter's concern.
+/// Lightning settlement, off the inference hot path by construction: only a background
+/// settlement job calls `batch_settle`, once per threshold or interval, never per token.
 #[async_trait]
 pub trait PaymentRail: Send + Sync {
     async fn issue_invoice(&self, amount: Millisats) -> Result<String, PaymentRailError>;
@@ -31,13 +28,10 @@ pub trait PaymentRail: Send + Sync {
         preimage: &str,
     ) -> Result<bool, PaymentRailError>;
 
-    /// Pay `peer` `amount` against `invoice` — *their* invoice, obtained by
-    /// the caller beforehand (e.g. via
-    /// `pond_adapters_mesh_inference::MeshInferenceService::request_invoice`,
-    /// the mesh-side half of invoice exchange; this port has no transport of
-    /// its own to ask for one). `amount` is passed separately from the
-    /// amount encoded in `invoice` so an adapter can cross-check the two
-    /// don't disagree before paying.
+    /// Pay `peer` against *their* `invoice`, obtained by the caller beforehand (e.g. via
+    /// `MeshInferenceService::request_invoice`) since this port has no transport of its
+    /// own. `amount` is passed separately from the amount encoded in the opaque,
+    /// BOLT11-shaped `invoice` so an adapter can cross-check the two before paying.
     async fn batch_settle(
         &self,
         peer: PeerId,

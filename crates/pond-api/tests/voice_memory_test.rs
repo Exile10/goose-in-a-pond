@@ -1,13 +1,6 @@
-//! E2E tests: "remember X" in one voice turn → a later turn recalls X.
-//!
-//! Covers both voice paths:
-//! 1. **CLI path** — `ChatService::chat_stream_once()` (the `pond-server chat` CLI)
-//! 2. **Desktop path** — `POST /api/v1/chat/stream` SSE endpoint (pond-desktop)
-//!
-//! Both paths use `MemoryAwareAgent`: a deterministic mock that saves a fact when
-//! the message starts with "remember …" and returns stored facts otherwise.
-//! No real LLM required.
-//!
+//! E2E: "remember X" in one voice turn, a later turn recalls X, on both paths:
+//! `ChatService::chat_stream_once()` (CLI) and `POST /api/v1/chat/stream` (desktop).
+//! Both use `MemoryAwareAgent`, a deterministic mock, so no real LLM is required.
 //! Run: cargo test -p pond-api --test voice_memory_test
 
 use axum::body::Body;
@@ -105,6 +98,7 @@ async fn make_memory_app() -> (axum::Router, Arc<MockMemoryRepository>, tempfile
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -125,6 +119,7 @@ async fn make_memory_app() -> (axum::Router, Arc<MockMemoryRepository>, tempfile
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,
@@ -313,13 +308,9 @@ async fn desktop_voice_path_cross_turn_memory_recall() {
 }
 
 // ── Live tests (real LLM) ─────────────────────────────────────────────────────
-//
-// These tests exercise the full stack with a real language model so they can
-// verify that the LLM actually calls `save_memory` / `recall_memories` MCP
-// tools when instructed.  Run with:
-//
-//   GIAP_OLLAMA_URL=http://127.0.0.1:11434 GIAP_OLLAMA_MODEL=gemma3:4b \
-//     cargo test -p pond-api --test voice_memory_test -- --ignored
+// Full stack against a real model, to verify it calls the `save_memory` and
+// `recall_memories` MCP tools. Run with GIAP_OLLAMA_URL=http://127.0.0.1:11434
+// GIAP_OLLAMA_MODEL=gemma3:4b cargo test -p pond-api --test voice_memory_test -- --ignored
 
 #[tokio::test]
 #[ignore = "requires GIAP_OLLAMA_URL or GIAP_LLAMAFILE_URL"]
