@@ -1,19 +1,12 @@
-# Cross.toml — cross-compilation config for GIAP
-#
-# Usage (Jetson Orin Nano — ARM64 Linux, no CUDA):
-#   cargo install cross --locked
+# Cross.toml — cross-compilation config for GIAP (Jetson Orin Nano: ARM64 Linux, no CUDA).
+# Usage: cargo install cross --locked, then
 #   cross build -p pond-server --target aarch64-unknown-linux-gnu --release
-#
-# For local-inference (GGUF in-process) on Jetson, compile natively on the device:
-#   cargo build -p pond-server --features local-inference --release
-#   # Add --features pond-adapters-local-inference/cuda for GPU acceleration
+# local-inference (GGUF in-process; optional cuda feature) is compiled natively on the device.
 
 [build.env]
-# RUSTFLAGS is passed through so the host-side override (portable target-cpu for
-# the Jetson Orin Nano, e.g. cortex-a78) reaches the in-container rustc. This is
-# required to neutralise the workspace `.cargo/config.toml` `[build] rustflags =
-# ["-C","target-cpu=native"]`, which would otherwise bake the BUILD container's
-# CPU into the binary and produce a non-portable artifact.
+# RUSTFLAGS is passed through so the host-side override (a portable target-cpu such as
+# cortex-a78) reaches the in-container rustc and neutralises the workspace `.cargo/config.toml`
+# `target-cpu=native`, which would otherwise bake the BUILD container's CPU into the binary.
 passthrough = ["SQLX_OFFLINE", "RUST_LOG", "RUSTFLAGS"]
 
 [target.aarch64-unknown-linux-gnu]

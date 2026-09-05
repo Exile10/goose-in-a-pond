@@ -1,14 +1,7 @@
-//! Real connection to the Breez/Spark testnet — #[ignore]d, same convention
-//! as pond-adapters-goose's *_live_test.rs (GIAP_OLLAMA_URL/GIAP_LLAMAFILE_URL).
-//!
-//! Cannot run yet: needs a real BREEZ_API_KEY, which is still being
-//! requested (breez.technology/request-api-key) as of when this was
-//! written. Once it exists:
-//!
-//!   BREEZ_API_KEY=<key> cargo test -p pond-adapters-lightning --test live_test -- --ignored
-//!
-//! Defaults to Network::Regtest (no real funds) unless LIGHTNING_NETWORK=mainnet
-//! is set explicitly.
+//! Real connection to the Breez/Spark network; #[ignore]d like the other live tests. Needs a
+//! real BREEZ_API_KEY (breez.technology/request-api-key), then run
+//! `BREEZ_API_KEY=<key> cargo test -p pond-adapters-lightning --test live_test -- --ignored`.
+//! Defaults to Network::Regtest (no real funds) unless LIGHTNING_NETWORK=mainnet is set.
 
 use pond_adapters_lightning::{LightningConfig, LightningPaymentRail};
 use pond_core::mesh::domain::millisats::Millisats;

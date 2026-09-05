@@ -152,10 +152,7 @@ mod tests {
             tally.pending_borrowed(peer).await.unwrap(),
             TokenCount::new(0)
         );
-        assert_eq!(
-            tally.pending_lent(peer).await.unwrap(),
-            TokenCount::new(0)
-        );
+        assert_eq!(tally.pending_lent(peer).await.unwrap(), TokenCount::new(0));
     }
 
     #[tokio::test]
@@ -172,19 +169,13 @@ mod tests {
             tally.pending_borrowed(peer).await.unwrap(),
             TokenCount::new(30)
         );
-        assert_eq!(
-            tally.pending_lent(peer).await.unwrap(),
-            TokenCount::new(70)
-        );
+        assert_eq!(tally.pending_lent(peer).await.unwrap(), TokenCount::new(70));
 
         tally.mark_settled(peer, TokenCount::new(30)).await.unwrap();
         assert_eq!(
             tally.pending_borrowed(peer).await.unwrap(),
             TokenCount::new(0)
         );
-        assert_eq!(
-            tally.pending_lent(peer).await.unwrap(),
-            TokenCount::new(70)
-        );
+        assert_eq!(tally.pending_lent(peer).await.unwrap(), TokenCount::new(70));
     }
 }

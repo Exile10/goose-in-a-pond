@@ -299,7 +299,7 @@ print_summary() {
       echo -e "    cargo run -p pond-server -- serve --open"
       echo ""
       echo -e "  ${DIM}Web dashboard: http://localhost:4000${NC}"
-      echo -e "  ${DIM}Voice mode:    cargo run -p pond-server -- chat --input whisper${NC}"
+      echo -e "  ${DIM}Voice mode:    cargo run -p pond-server -- chat --voice${NC}"
     fi
 
     if [ "$S_DESKTOP" = "ok" ]; then

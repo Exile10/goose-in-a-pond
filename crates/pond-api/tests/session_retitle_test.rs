@@ -1,20 +1,7 @@
-//! `POST /api/v1/sessions/retitle` — the attended half of conversation naming.
-//!
-//! What these cover, in order of how much they matter:
-//!
-//! 1. **The button works at all.** The gate, the normalisation and the
-//!    persistence are unit-tested elsewhere; what no unit test can reach is
-//!    whether the route reaches the service. A control that silently does
-//!    nothing is the failure this repo has already paid for once.
-//! 2. **It still refuses to overwrite a name somebody typed.** The manual path
-//!    skips the *scheduling* gate only. If it skipped the per-conversation
-//!    rules too, pressing a button would quietly destroy titles, and there is
-//!    no undo for that.
-//! 3. **The reply is diagnosable.** A pass that renames nothing must say which
-//!    kind of nothing, so a person is not left pressing a button that appears
-//!    broken when it is in fact declining on purpose.
-//!
-//! Run: cargo test -p pond-api --test session_retitle_test
+//! `POST /api/v1/sessions/retitle`, the attended half of conversation naming.
+//! The gate, normalisation and persistence are unit-tested elsewhere; what only a
+//! route test reaches is that the button does something, that the manual path
+//! still refuses to overwrite a typed name, and that a refusal says which one.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -89,6 +76,7 @@ async fn make_app(
     let storage = Arc::new(SqliteSessionStorage::new(pool.clone()));
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db,
         onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
         handshake: Arc::new(mock_hs),
@@ -109,6 +97,7 @@ async fn make_app(
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,

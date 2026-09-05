@@ -1,9 +1,7 @@
 //! In-process, loopback-only integration tests for mesh inference (#132
-//! Milestone 3). Two real `Libp2pMeshTransport` nodes on `127.0.0.1`, mocked
-//! `PeerDirectory`/`CreditLedger`/`UsageTally` (trust-pin persistence and
-//! settlement are separate milestones — not what this crate is proving).
-//! Nothing here touches real hardware or the public network, so no test is
-//! `#[ignore]`d.
+//! Milestone 3): two real `Libp2pMeshTransport` nodes on `127.0.0.1` with mocked
+//! `PeerDirectory`/`CreditLedger`/`UsageTally`. No real hardware or public
+//! network is touched, so no test is `#[ignore]`d.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,8 +18,6 @@ use pond_core::mesh::mocks::mock_payment_rail::MockPaymentRail;
 use pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory;
 use pond_core::mesh::mocks::mock_usage_tally::MockUsageTally;
 use pond_core::mesh::ports::credit_ledger::CreditLedger;
-use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
-use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::mesh::ports::mesh_transport::MeshTransport;
 use pond_core::mesh::ports::payment_rail::PaymentRail;
 use pond_core::mesh::ports::peer_capability_query::PeerCapabilityQuery;
@@ -29,6 +25,8 @@ use pond_core::mesh::ports::peer_directory::PeerDirectory;
 use pond_core::mesh::ports::usage_tally::UsageTally;
 use pond_core::models::mocks::mock_provider::MockProvider;
 use pond_core::models::ports::provider::{LlmProvider, StreamToken};
+use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_mesh_protocol::identity::MeshKeypair;
 
 const PRODUCTION_LIKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -75,12 +73,10 @@ async fn wait_for_listen_address(node: &Libp2pMeshTransport) -> String {
     panic!("node never reported a listen address");
 }
 
-/// Grants `a` and `b` mutual trust in each other's *transport-level*
-/// directory, then connects `a` to `b` and waits until both sides'
-/// `connected_peers()` agrees — `b` (the listener) only learns about `a`
-/// once the handshake request arrives, asynchronously. Trust is not
-/// symmetric in the domain, so both directions are stated rather than
-/// assumed (mirrors `pond-adapters-mesh-libp2p`'s own test helper).
+/// Grants `a` and `b` mutual transport-level trust, connects `a` to `b`, and
+/// waits until both `connected_peers()` agree — the listener only learns about
+/// `a` once the handshake arrives. Trust is not symmetric, so both directions
+/// are stated (mirrors `pond-adapters-mesh-libp2p`'s own test helper).
 async fn connect(
     a: &Libp2pMeshTransport,
     a_dir: &MockPeerDirectory,
@@ -491,7 +487,8 @@ async fn lend_window_refuses_once_the_ceiling_is_crossed_then_resets() {
 
     // A rolling throttle, not a permanent ban — succeeds again once the window rolls over.
     tokio::time::sleep(Duration::from_millis(2_200)).await;
-    ask().await
+    ask()
+        .await
         .expect("request timed out")
         .expect("expected the request to succeed again once the window rolled over");
 }
@@ -830,12 +827,9 @@ async fn querying_capabilities_reflects_the_peers_real_payment_rail_state() {
     assert!(capabilities.lightning_available);
 }
 
-/// Yields pure `<think>...</think>` (no visible text at all) on its first
-/// `fail_first_n` calls, then a real answer — standing in for a bare local
-/// model that sometimes produces only reasoning with nothing after it.
-/// `calls` counts every `stream_complete` invocation, so a test can assert
-/// the lender actually retried locally rather than shipping the empty
-/// attempt to the wire.
+/// Yields pure `<think>...</think>` on its first `fail_first_n` calls, then a
+/// real answer. `calls` counts every `stream_complete` invocation, so a test can
+/// assert the lender retried locally rather than shipping the empty attempt.
 struct EmptyThenRealProvider {
     fail_first_n: usize,
     calls: std::sync::atomic::AtomicUsize,
@@ -869,9 +863,7 @@ impl LlmProvider for EmptyThenRealProvider {
         _system_prompt: &'a str,
         _messages: Vec<pond_core::models::domain::message::ChatMessage>,
     ) -> pond_core::models::ports::provider::TokenStream<'a> {
-        let call = self
-            .calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let chunks: Vec<anyhow::Result<StreamToken>> = if call < self.fail_first_n {
             vec![Ok(StreamToken::Text(
                 "<think>reasoning, no answer follows</think>".to_string(),
@@ -932,9 +924,10 @@ async fn a_lend_side_empty_completion_is_retried_and_the_real_answer_reaches_the
 
     let response = tokio::time::timeout(
         Duration::from_secs(5),
-        b_service
-            .provider()
-            .complete("sys", vec![pond_core::models::domain::message::ChatMessage::user("hi")]),
+        b_service.provider().complete(
+            "sys",
+            vec![pond_core::models::domain::message::ChatMessage::user("hi")],
+        ),
     )
     .await
     .expect("request timed out")
@@ -972,11 +965,9 @@ async fn a_lend_side_empty_completion_is_retried_and_the_real_answer_reaches_the
     );
 }
 
-/// A lender that never produces visible text — not even on the last
-/// attempt — must still terminate with a usage chunk rather than hang or
-/// error, bounded at `MAX_EMPTY_COMPLETION_ATTEMPTS` calls, so a permanently
-/// unproductive backing provider can't turn into runaway local compute
-/// spend or a stuck borrower.
+/// A lender that never produces visible text must still terminate with a usage
+/// chunk, bounded at `MAX_EMPTY_COMPLETION_ATTEMPTS` calls, so an unproductive
+/// backing provider cannot become runaway local spend or a stuck borrower.
 #[tokio::test]
 async fn a_lend_side_completion_that_never_produces_visible_text_still_terminates() {
     let (a_transport, a_dir) = spawn_transport().await; // the lender

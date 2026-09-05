@@ -1,12 +1,7 @@
-//! COCO class index → GIAP event label mapping.
-//!
-//! The recommended models (YOLOX-Nano, NanoDet-Plus) are trained on COCO's
-//! 80 classes. GIAP only cares about a handful of home-relevant labels, so
-//! everything else maps to `None` and the event stays plain `"motion"`.
-//!
-//! "package" is NOT a COCO class — until a fine-tuned model ships, luggage
-//! classes (backpack / handbag / suitcase) act as the proxy, which covers
-//! the common porch-delivery silhouettes.
+//! COCO class index → GIAP event label mapping. The recommended models are
+//! trained on COCO's 80 classes; every class GIAP does not care about maps to
+//! `None` and the event stays plain `"motion"`. "package" is NOT a COCO class,
+//! so luggage classes (backpack / handbag / suitcase) act as the proxy.
 
 /// GIAP label for a COCO class index, or `None` when the class is not
 /// home-relevant (event falls back to `"motion"`).

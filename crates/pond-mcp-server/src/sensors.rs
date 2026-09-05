@@ -5,14 +5,20 @@
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
+use pond_core::user_data::domain::schedule::{
+    CompareOp, SensorTriggerSpec, TaskKind, TriggerAction, TriggerCondition, TriggerSource,
+    TriggerSourceKind,
+};
 use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
+use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, SchedulerPort};
 use pond_core::user_data::ports::sensor_storage::SensorStorage;
+use pond_core::user_data::ports::settings::SettingsRepository;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, InitializeResult, ProtocolVersion,
-        ServerCapabilities, ServerInfo,
+        CallToolResult, Content, ErrorCode, ErrorData, Implementation, InitializeResult,
+        ProtocolVersion, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
@@ -52,6 +58,50 @@ pub struct GetSensorHistoryParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ListSensorsParams {
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct CreateSensorRuleParams {
+    pub name: Option<String>,
+    /// "sensor" (default) | "camera" | "device".
+    pub source: Option<String>,
+    /// Match this device/camera ID only; omit for any.
+    pub device_id: Option<String>,
+    /// Event type, e.g. "motion", "person", "temperature"; omit for any.
+    pub signal: Option<String>,
+    /// Compare event value: gt | gte | lt | lte | eq.
+    pub op: Option<String>,
+    /// Threshold for `op`.
+    pub value: Option<f64>,
+    /// Fire only after this local time, 24h "HH:MM".
+    pub after: Option<String>,
+    /// Fire only before this local time, 24h "HH:MM".
+    pub before: Option<String>,
+    /// Action: send this prompt to the agent.
+    pub prompt: Option<String>,
+    /// Action: switch this device (with power_on).
+    pub power_device_id: Option<String>,
+    /// true = on (default), false = off.
+    pub power_on: Option<bool>,
+    /// Action: notification title (requires notify_body).
+    pub notify_title: Option<String>,
+    pub notify_body: Option<String>,
+    /// Debounce seconds between fires. Default 60.
+    pub cooldown_secs: Option<u64>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct DeleteSensorRuleParams {
+    /// Rule ID (see list_sensor_rules).
+    pub rule_id: Option<String>,
+    /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
     #[schemars(skip)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
@@ -173,6 +223,18 @@ fn describe_age(elapsed: chrono::Duration) -> String {
 #[derive(Clone)]
 pub struct SensorsMcpServer {
     sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
+    /// Sensor RULES are scheduled tasks with a sensor trigger, so the tools
+    /// that manage them need the scheduler even though they live here. They
+    /// live here because a rule is ABOUT a sensor: filed under `giap-schedule`
+    /// they cost every pond that wanted a timer ~437 tokens of rule schema,
+    /// and a household with no sensors could never use them.
+    ///
+    /// `Option` because the scheduler is built later in startup than the rest
+    /// of these deps and may fail entirely; the tools say so rather than the
+    /// server refusing to start.
+    scheduler: Option<Arc<dyn SchedulerPort>>,
+    /// Read for one thing: the household timezone a new rule is stamped with.
+    settings_repo: Option<Arc<dyn SettingsRepository + Send + Sync>>,
     /// Read to answer for sensors that have never reported — readings alone cannot
     /// distinguish "no such device" from "that device is here and has said nothing
     /// yet", and the two need opposite replies — and to tell whether a device is
@@ -226,10 +288,22 @@ impl SensorsMcpServer {
         device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
         device_control: Arc<dyn DeviceControlPort>,
     ) -> Self {
+        Self::with_scheduler(sensor_storage, device_registry, device_control, None, None)
+    }
+
+    pub fn with_scheduler(
+        sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
+        device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+        device_control: Arc<dyn DeviceControlPort>,
+        scheduler: Option<Arc<dyn SchedulerPort>>,
+        settings_repo: Option<Arc<dyn SettingsRepository + Send + Sync>>,
+    ) -> Self {
         Self {
             sensor_storage,
             device_registry,
             device_control,
+            scheduler,
+            settings_repo,
             tool_router: Self::tool_router(),
         }
     }
@@ -272,6 +346,22 @@ impl SensorsMcpServer {
             .into_iter()
             .find(|v| v.name == sensor_type)
             .map(|v| v.value)
+    }
+
+    /// The scheduler, or an error a person can act on.
+    ///
+    /// A pond whose scheduler failed to start can still read sensors; only the
+    /// rule tools are unavailable, and saying which is better than a generic
+    /// internal error from three different tools.
+    fn scheduler(&self) -> Result<&Arc<dyn SchedulerPort>, ErrorData> {
+        self.scheduler.as_ref().ok_or_else(|| {
+            ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                "this pond's scheduler is not running, so sensor rules cannot be read or changed"
+                    .to_string(),
+                None,
+            )
+        })
     }
 
     /// Registered sensing devices that have no stored reading.
@@ -317,7 +407,12 @@ impl SensorsMcpServer {
 
         let (Some(device_id), Some(sensor_type)) = (device_id, sensor_type) else {
             return Ok(CallToolResult::success(vec![Content::text(
-                "Please provide both `device_id` and `sensor_type` (e.g. device_id='bedroom', sensor_type='temperature').",
+                // No sample values: `resolved_device` falls through to the
+                // literal string when the registry has no match, so a copied
+                // device_id='bedroom' queries a device that does not exist and
+                // reports on it as though it did.
+                "Please provide both `device_id` and `sensor_type`, taken from the \
+                 device and reading the user asked about.",
             )]));
         };
 
@@ -539,6 +634,199 @@ impl SensorsMcpServer {
             }
         }
     }
+
+    #[tool(
+        description = "Create a rule fired by sensor/camera/device events, not a timer. Needs at least one action: prompt, device power, or notify."
+    )]
+    async fn create_sensor_rule(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<CreateSensorRuleParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let p = params.0;
+
+        // ── Source ──
+        let source_kind = match p.source.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "sensor" => TriggerSourceKind::Sensor,
+            Some(s) if s == "camera" => TriggerSourceKind::Camera,
+            Some(s) if s == "device" => TriggerSourceKind::Device,
+            None => TriggerSourceKind::Sensor,
+            Some(other) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Invalid source '{other}'. Use sensor, camera, or device."
+                ))]));
+            }
+        };
+
+        // ── Condition ──
+        let op = match p.op.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+            None => None,
+            Some(s) => match s.as_str() {
+                "gt" | ">" => Some(CompareOp::Gt),
+                "gte" | ">=" => Some(CompareOp::Gte),
+                "lt" | "<" => Some(CompareOp::Lt),
+                "lte" | "<=" => Some(CompareOp::Lte),
+                "eq" | "==" | "=" => Some(CompareOp::Eq),
+                other => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Invalid op '{other}'. Use gt, gte, lt, lte, or eq."
+                    ))]));
+                }
+            },
+        };
+        for (field, v) in [("after", &p.after), ("before", &p.before)] {
+            if let Some(v) = v {
+                if chrono::NaiveTime::parse_from_str(v, "%H:%M").is_err() {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Invalid `{field}` '{v}' — use 24h HH:MM (e.g. \"18:30\")."
+                    ))]));
+                }
+            }
+        }
+
+        // ── Actions (at least one) ──
+        let mut actions = Vec::new();
+        if let Some(prompt) = p.prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+            actions.push(TriggerAction::AgentPrompt {
+                prompt: prompt.trim().to_string(),
+            });
+        }
+        if let Some(device_id) = p
+            .power_device_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            actions.push(TriggerAction::DevicePower {
+                device_id: device_id.trim().to_string(),
+                on: p.power_on.unwrap_or(true),
+            });
+        }
+        if let (Some(title), Some(body)) = (&p.notify_title, &p.notify_body) {
+            actions.push(TriggerAction::Notify {
+                title: title.clone(),
+                body: body.clone(),
+            });
+        }
+        if actions.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "A rule needs at least one action: `prompt`, `power_device_id` (+ `power_on`), \
+                 or `notify_title` + `notify_body`.",
+            )]));
+        }
+
+        let spec = SensorTriggerSpec {
+            source: TriggerSource {
+                kind: source_kind,
+                device_id: p.device_id.filter(|s| !s.trim().is_empty()),
+                signal: p.signal.filter(|s| !s.trim().is_empty()),
+            },
+            condition: TriggerCondition {
+                op,
+                value: p.value,
+                after: p.after,
+                before: p.before,
+            },
+            actions,
+            cooldown_secs: p
+                .cooldown_secs
+                .unwrap_or_else(SensorTriggerSpec::default_cooldown_secs),
+        };
+
+        let label = p
+            .name
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("Rule: {}", crate::schedule::sensor_rule_summary(&spec)));
+        // UTC when the repo is absent or unreadable, exactly as before: a rule
+        // with a timezone the pond guessed is better than no rule.
+        let timezone = match self.settings_repo.as_ref() {
+            Some(repo) => repo
+                .get()
+                .await
+                .map(|s| s.timezone)
+                .unwrap_or_else(|_| "UTC".to_string()),
+            None => "UTC".to_string(),
+        };
+        let id = format!("rule-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+        let req = pond_core::user_data::ports::scheduler::CreateScheduleRequest {
+            fire_at: None,
+            once: false,
+            id: id.clone(),
+            label: label.clone(),
+            // Sentinel for display — event rules are never cron-registered.
+            cron: "@event".to_string(),
+            timezone,
+            kind: TaskKind::SensorTrigger(spec.clone()),
+        };
+        match self.scheduler()?.create_task(req).await {
+            Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Sensor rule created: \"{label}\" [{id}] — {} (cooldown {}s). \
+                 It fires when a matching event arrives.",
+                crate::schedule::sensor_rule_summary(&spec),
+                spec.cooldown_secs,
+            ))])),
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Failed to create sensor rule: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        description = "List sensor/event-triggered rules. Time-based schedules: use list_schedules."
+    )]
+    async fn list_sensor_rules(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.scheduler()?.list_tasks().await {
+            Ok(tasks) => {
+                let rules: Vec<String> = tasks
+                    .iter()
+                    .filter_map(|t| match &t.kind {
+                        TaskKind::SensorTrigger(spec) => Some(format!(
+                            "- \"{}\" [{}]: {} (cooldown {}s{})",
+                            t.label,
+                            t.id,
+                            crate::schedule::sensor_rule_summary(spec),
+                            spec.cooldown_secs,
+                            if t.paused { ", paused" } else { "" },
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                let text = if rules.is_empty() {
+                    "No sensor rules defined. Create one with create_sensor_rule.".to_string()
+                } else {
+                    rules.join("\n")
+                };
+                Ok(CallToolResult::success(vec![Content::text(text)]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Failed to list sensor rules: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(description = "Delete a sensor rule by ID (see list_sensor_rules).")]
+    async fn delete_sensor_rule(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<DeleteSensorRuleParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(id) = params.0.rule_id.filter(|s| !s.trim().is_empty()) else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "I need a `rule_id`. Use list_sensor_rules to find it.",
+            )]));
+        };
+        match self.scheduler()?.delete_task(id.trim()).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Sensor rule {id} deleted."
+            ))])),
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Failed to delete sensor rule '{id}': {e}"
+            ))])),
+        }
+    }
 }
 
 #[tool_handler]
@@ -602,6 +890,25 @@ struct SensorDeps {
 
 static SENSOR_DEPS: OnceLock<SensorDeps> = OnceLock::new();
 
+/// The scheduler, installed separately because it is built LATER in startup
+/// than the sensor stores and can fail on its own. A second `OnceLock` rather
+/// than a field on `SensorDeps` so neither install has to wait for the other,
+/// and so a pond whose scheduler never starts still gets its sensor readings.
+static SENSOR_SCHEDULER: OnceLock<(
+    Arc<dyn SchedulerPort>,
+    Arc<dyn SettingsRepository + Send + Sync>,
+)> = OnceLock::new();
+
+/// Install the handles the sensor-RULE tools need. Safe to skip: without it
+/// those three tools answer that the scheduler is not running, and the reading
+/// tools are unaffected.
+pub fn init_sensor_rule_deps(
+    scheduler: Arc<dyn SchedulerPort>,
+    settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
+) {
+    let _ = SENSOR_SCHEDULER.set((scheduler, settings_repo));
+}
+
 /// Install the sensor server's storage handle. Call once at startup,
 /// before any chat session loads the extension.
 pub fn init_sensor_deps(
@@ -624,10 +931,13 @@ pub fn spawn_sensor_server(reader: DuplexStream, writer: DuplexStream) {
         );
         return;
     };
-    let server = SensorsMcpServer::new(
+    let rules = SENSOR_SCHEDULER.get();
+    let server = SensorsMcpServer::with_scheduler(
         deps.sensor_storage.clone(),
         deps.device_registry.clone(),
         deps.device_control.clone(),
+        rules.map(|(s, _)| s.clone()),
+        rules.map(|(_, r)| r.clone()),
     );
     crate::serve_builtin("giap-sensors", server, reader, writer);
 }

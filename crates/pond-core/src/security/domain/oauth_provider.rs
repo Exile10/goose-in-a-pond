@@ -1,11 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-/// Configuration for an OAuth 2.1 PKCE provider.
-///
-/// Each entry describes an external service (e.g. Spotify) that GIAP can
-/// authenticate against using the Authorization Code + PKCE flow.  The
-/// `bundled_client_id` ships with the binary; users may override it by
-/// storing their own Client ID in the secret store under
+/// Configuration for one external service (e.g. Spotify) GIAP authenticates
+/// against with OAuth 2.1 Authorization Code + PKCE. `bundled_client_id` ships
+/// with the binary; a user override is read from the secret store under
 /// `{PROVIDER_ID}_CLIENT_ID` (uppercase).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthProviderConfig {

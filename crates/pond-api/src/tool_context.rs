@@ -1,10 +1,7 @@
-//! Tool context formatting — shared between the parallel-prep path in
-//! routes.rs and the ToolAgent port implementation.
+//! Tool context formatting, shared by the parallel-prep path in routes.rs and the ToolAgent port.
 //!
-//! When the ToolAgent pre-fetches data (weather, Wikipedia, etc.), the
-//! formatted output includes a **dedup hint** telling the LLM not to call
-//! the same MCP tool again via Goose's agentic loop. This prevents
-//! duplicate tool invocations that waste latency and tokens.
+//! Pre-fetched output carries a dedup hint telling the LLM not to call the same MCP tool again
+//! through Goose's agentic loop, which would cost a duplicate round trip.
 
 use pond_core::mcp::domain::tool_result::ToolResult;
 
@@ -39,9 +36,8 @@ fn dedup_hint(tool: &str) -> String {
 
 /// Format tool results into attributed context for the main LLM.
 ///
-/// Each tool type gets a compact, purpose-built template. The output
-/// includes a dedup hint telling the LLM not to re-call the same MCP
-/// tool, since the data has already been pre-fetched by the ToolAgent.
+/// Each tool type gets its own compact template, plus a dedup hint so the LLM does not re-call an
+/// MCP tool the ToolAgent has already pre-fetched.
 pub fn format_tool_context(tool: &str, query: &str, message: &str, info: &str) -> String {
     let hint = dedup_hint(tool);
 
@@ -113,11 +109,8 @@ pub fn format_tool_context(tool: &str, query: &str, message: &str, info: &str) -
     }
 }
 
-/// Format a tool failure notice for the main LLM.
-///
-/// When a tool was classified as needed but returned no result, this gives
-/// the LLM context about what was attempted so it can answer from its own
-/// knowledge or suggest the user rephrase.
+/// Format a tool failure notice for the main LLM: names the tool and query that returned nothing,
+/// so the LLM answers from its own knowledge rather than assuming the data arrived.
 pub fn format_tool_failure(tool: &str, query: &str, message: &str) -> String {
     let label = if query.is_empty() {
         format!("[Tool: {} | Status: no result]", tool)
@@ -132,14 +125,10 @@ pub fn format_tool_failure(tool: &str, query: &str, message: &str) -> String {
     )
 }
 
-/// Format multiple tool results into a combined context string.
+/// Format multiple tool results into a combined context string, one labeled section per source.
 ///
-/// Each tool result is presented as a labeled section so the LLM can
-/// distinguish between different data sources. Used by the multi-tool
-/// parallel dispatch pipeline when `multi_tool_enabled` is true.
-///
-/// Includes dedup hints for each tool, telling the LLM not to re-call
-/// any of the pre-fetched MCP tools.
+/// Used by the parallel dispatch pipeline when `multi_tool_enabled` is true; carries a dedup hint
+/// per tool so the LLM does not re-call an MCP tool that was already pre-fetched.
 pub fn format_multi_tool_context(message: &str, results: &[ToolResult]) -> String {
     if results.is_empty() {
         return String::new();

@@ -1,9 +1,6 @@
-//! Integration tests for POST /api/v1/chat
-//!
-//! Tests the full stack: axum router → ChatService → SessionStorage.
-//! HTTP calls to the LLM backend are mocked via wiremock — no real
-//! llamafile process needed.
-//!
+//! Integration tests for POST /api/v1/chat over the full stack: axum router,
+//! ChatService, SessionStorage. LLM backend calls are mocked with wiremock, so no
+//! real llamafile process is needed.
 //! Run: cargo test -p pond-api --test chat_integration_test
 
 use std::sync::Arc;
@@ -95,6 +92,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -115,6 +113,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -374,11 +373,10 @@ async fn health_endpoint_accessible_without_auth() {
 
 // ── Persistence regression ─────────────────────────────────────────────────────
 
-/// Regression: chat/stream must persist user + assistant messages to
-/// pond_system.db so they are readable via GET /sessions/{id}/messages.
-///
-/// The stream body must be fully drained before querying — persistence
-/// happens inside the async_stream generator and only runs when polled.
+/// Regression: chat/stream must persist user and assistant messages to
+/// pond_system.db so GET /sessions/{id}/messages can read them. Drain the stream
+/// body fully before querying: persistence happens inside the async_stream
+/// generator and only runs when polled.
 #[tokio::test]
 async fn chat_stream_persists_messages_readable_via_sessions_endpoint() {
     let (app, _tmp) = make_app().await;
@@ -510,6 +508,7 @@ async fn make_app_with_agent(
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -530,6 +529,7 @@ async fn make_app_with_agent(
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -772,20 +772,10 @@ async fn chat_stream_emits_turn_stats_event() {
     assert_eq!(payload["inference_count"], 1);
 }
 
-/// Truncating a conversation tells the ENGINE, not only the database.
-///
-/// `pond_system.db` is authoritative for the UI, but it is not what the model
-/// reads: the live engine session holds its own copy of the turns. Deleting
-/// rows without telling the engine leaves the model being shown the exact
-/// messages the user just removed — an edit gets re-answered with the old
-/// answer still in context, a regenerate is asked to regenerate something it
-/// can still see, and the two stores stay divergent for the life of the
-/// process. Nothing surfaces that; the user just sees an assistant that appears
-/// not to have noticed.
-///
-/// Asserted through `MockAgent::forgotten_sessions` rather than by calling the
-/// method, because `Agent::forget_session` has an empty default body — a test
-/// that merely exercised the path would pass against the no-op just as happily.
+/// Truncating a conversation must tell the ENGINE, not only the database: the
+/// live engine session holds its own copy of the turns, so deleting rows alone
+/// leaves the model reading messages the user removed. Asserted through
+/// `MockAgent::forgotten_sessions`, since `Agent::forget_session` defaults to a no-op.
 #[tokio::test]
 async fn truncating_a_session_also_makes_the_engine_forget_it() {
     let agent = Arc::new(MockAgent::new());

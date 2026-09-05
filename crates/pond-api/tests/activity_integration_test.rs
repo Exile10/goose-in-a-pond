@@ -62,6 +62,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db,
         onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
         handshake: Arc::new(mock_hs),
@@ -82,6 +83,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -193,11 +195,10 @@ async fn activity_lists_events_and_hides_secret() {
     );
 }
 
-/// #157 review follow-up: Secret rows are excluded in the store query itself,
-/// so `limit` counts only surfaceable events. The seeded Secret event is the
-/// NEWEST row — with the old post-filter approach, `limit=2` fetched
-/// [Secret, device] and returned just 1 visible event; the SQL-level filter
-/// must return both visible ones.
+/// #157 review follow-up: Secret rows are excluded in the store query itself, so
+/// `limit` counts only surfaceable events. The seeded Secret event is the NEWEST
+/// row, so a post-filter would fetch [Secret, device] for `limit=2` and return
+/// one visible event; the SQL-level filter must return both.
 #[tokio::test]
 async fn activity_limit_counts_only_visible_events() {
     let (app, _tmp) = make_app().await;
