@@ -13,12 +13,9 @@ pub struct MemoryStatus {
     pub loaded_model: Option<String>,
 }
 
-/// Driven port: manages model loading, eviction, and pre-loading hints.
-///
-/// The real adapter (`ResourceAwareModelScheduler`) uses Goose's
-/// `InferenceRuntime` to query live memory and track which model is hot.
-/// A `NoopScheduler` is used for llamafile / Ollama backends that manage
-/// their own memory externally.
+/// Driven port: manages model loading, eviction, and pre-loading hints. `ResourceAwareModelScheduler`
+/// asks Goose's `InferenceRuntime` for live memory and which model is hot; `NoopScheduler` serves
+/// the llamafile and Ollama backends, which manage their own memory externally.
 #[async_trait]
 pub trait ModelScheduler: Send + Sync {
     /// Hint that the wake word was just detected — the scheduler may

@@ -1,13 +1,7 @@
-//! [`MatterCommissioner`] — the [`DeviceCommissioningPort`] over a live
-//! controller connection.
+//! [`MatterCommissioner`] — the [`DeviceCommissioningPort`] over a live controller connection.
 //!
-//! All three setup-code forms — a QR payload, a manual pairing code, a bare
-//! passcode — go to one `commission` op: the controller decodes the payload and
-//! decides how to find the device, which is knowledge that belongs next to
-//! matter.js rather than here.
-//!
-//! `decommission` removes the node from the fabric, which the delete path uses
-//! so a removed device does not re-announce itself on the next `subscribe`.
+//! All three setup-code forms (QR payload, manual pairing code, bare passcode) go to one
+//! `commission` op; `decommission` removes the node so it cannot re-announce on the next subscribe.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,11 +24,9 @@ use crate::protocol::{
 /// minute on a busy network. Well past the default op timeout.
 const COMMISSION_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Removal is slow too: the controller first tries to unpair from the device,
-/// which for an unreachable node waits out an mDNS/CHIP timeout (~15-30s) before
-/// removing the node from its own storage. The default 15s timeout is shorter
-/// than that, so GIAP would give up while the controller was still finishing —
-/// reporting a failure for a removal that actually happened.
+/// Removal is slow too: unpairing an unreachable node waits out an mDNS/CHIP timeout (~15-30s)
+/// before the controller removes it from storage. The default 15s op timeout would give up first
+/// and report a failure for a removal that actually happened.
 const DECOMMISSION_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The pre-flight probe is a local mDNS browse, so it answers in well under a
@@ -63,29 +55,13 @@ impl MatterCommissioner {
 
     /// Refuse early, and legibly, when nothing is in pairing mode.
     ///
-    /// Commissioning finds the device over mDNS, so "nothing is advertising"
-    /// settles the whole call. Left to the controller it does not look like
-    /// that: it waits out a discovery timeout and answers "commissioning
-    /// failed", with the actual reason buried in its own output. That is the
-    /// most common way commissioning fails, because a device stops advertising
-    /// ~15 minutes after it boots, and it is the one failure a user can fix in
-    /// ten seconds — if anything tells them what it is.
-    ///
-    /// A probe that itself fails proves nothing, so it never blocks the attempt:
-    /// an unexpected payload or a slow controller falls through to the real
-    /// commission rather than inventing a reason to refuse.
+    /// A device stops advertising ~15 minutes after boot, the most common failure, and left to the
+    /// controller it reads as a discovery timeout. A probe that itself fails never blocks it.
     async fn refuse_when_nothing_is_pairable(&self) -> Result<()> {
-        // With BLE on, the probe cannot settle the question. It is an mDNS
-        // browse, and a device out of its box holds no Wi-Fi credentials at all
-        // -- it advertises over Bluetooth and is invisible to mDNS, which is
-        // the whole reason BLE commissioning exists. Refusing on a zero there
-        // would turn the one transport that CAN pair a new device into
-        // "No device found in pairing mode", for a device sitting in pairing
-        // mode a metre away.
-        //
-        // So the shortcut applies only where it is sound. The cost of skipping
-        // it is the discovery wait this exists to save; the cost of not
-        // skipping it is a device that can never be paired.
+        // With BLE on the probe cannot settle the question: it is an mDNS browse, and a device out
+        // of its box holds no Wi-Fi credentials, so it advertises over Bluetooth and is invisible
+        // to mDNS. Refusing on a zero there would make the one transport that can pair a new
+        // device report "No device found in pairing mode". Skipping only costs the discovery wait.
         if self.client.has_ble() {
             tracing::debug!(
                 target: "giap::trace",
@@ -171,20 +147,10 @@ impl DeviceCommissioningPort for MatterCommissioner {
                     describe(&e)
                 };
                 self.notifier.pairing_failed(&told).await;
-                // Cross the port boundary as the sentence the user should read,
-                // and nothing else.
-                //
-                // Two frames used to ride along: a `.context("commissioning
-                // failed")` here, and — because `pond-api` renders `{e:#}` and
-                // cannot depend on this crate to ask for it — the wire code
-                // sitting at the bottom of the chain. So a rejected setup code
-                // arrived as "commissioning failed: Invalid pairing code:
-                // commission_failed". The code is consumed HERE, which is the
-                // only place that branches on it; past this point it is
-                // bookkeeping, and bookkeeping does not belong in a sentence.
-                //
-                // `told`, not `describe(&e)`: the better advice was already
-                // reaching the notification and not the dialog that asked.
+                // Cross the port boundary as the sentence the user should read, and nothing else:
+                // the wire code is consumed here, the only place that branches on it, so it does
+                // not reach `pond-api`'s `{e:#}` rendering as trailing bookkeeping. `told`, not
+                // `describe(&e)`, so the dialog gets the same advice as the notification.
                 return Err(anyhow::anyhow!("{told}"));
             }
         };

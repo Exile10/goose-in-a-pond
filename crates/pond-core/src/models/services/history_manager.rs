@@ -1,13 +1,7 @@
 //! Conversation history assembly for context injection.
 //!
-//! The [`HistoryManager`] groups stored session messages into atomic *turns*
-//! (a user message plus all subsequent assistant/tool messages until the next
-//! user message), then walks newest-first to keep turns that fit within a
-//! character budget. Turns are never split — a tool call and its result must
-//! travel together so the model never sees an orphan tool result.
-//!
-//! Output is always in chronological (oldest-first) order so it can be
-//! consumed directly by `InferenceProvider::stream_chat`.
+//! [`HistoryManager`] keeps whole turns newest-first within a character budget; splitting one
+//! orphans a tool result. Output is oldest-first for `InferenceProvider::stream_chat`.
 
 use crate::models::domain::message::{ChatMessage, Role};
 use crate::user_data::domain::session::SessionMessage;
@@ -58,10 +52,8 @@ impl HistoryManager {
 
 /// Group a flat message list into turns.
 ///
-/// Each turn starts with a user message and includes all subsequent
-/// non-user messages until the next user message. Stray leading
-/// non-user messages (e.g. an orphan tool result with no preceding user
-/// turn) are dropped — they'd confuse the model.
+/// A turn is a user message plus every following non-user message. Leading non-user messages,
+/// such as an orphan tool result with no preceding user turn, are dropped.
 fn group_into_turns(messages: &[ChatMessage]) -> Vec<&[ChatMessage]> {
     let mut turns: Vec<&[ChatMessage]> = Vec::new();
     let mut start = 0;

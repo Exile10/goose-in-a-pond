@@ -1,9 +1,6 @@
-//! The real capture device.
-//!
-//! Deliberately thin: everything decidable — the privacy gate, the state
-//! machine, buffering, format normalisation — lives in [`crate::owner`] and
-//! [`crate::ring`] where it is testable without a sound card. What is left here
-//! is opening a stream and pushing frames.
+//! The real capture device: opening a stream and pushing frames. Everything decidable — the
+//! privacy gate, the state machine, buffering, format normalisation — lives in [`crate::owner`]
+//! and [`crate::ring`], where it is testable without a sound card.
 
 use std::sync::Arc;
 
@@ -12,14 +9,10 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::owner::{CaptureDevice, MicShared};
 use crate::ring::{i16_to_f32, to_mono_f32, u16_to_f32};
 
-/// `cpal::Stream` is `!Send` — CoreAudio attaches property listeners to the
-/// creating thread. It is created on, used by, and dropped on the owner thread
-/// and never touched from anywhere else, so the transfer is sound. This is the
-/// same constraint `pond-adapters-piper`'s `AudioKeeper` works around for
-/// output.
-///
-/// The field is never read: holding the stream alive IS the point, and
-/// dropping it is what closes the device.
+/// `cpal::Stream` is `!Send` — CoreAudio attaches property listeners to the creating thread.
+/// It is created on, used by, and dropped on the owner thread and never touched elsewhere, so
+/// the transfer is sound. The field is never read: holding the stream alive is what keeps the
+/// device open, and dropping it is what closes it.
 struct SendableStream(#[allow(dead_code)] cpal::Stream);
 unsafe impl Send for SendableStream {}
 

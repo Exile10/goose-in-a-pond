@@ -534,7 +534,16 @@ pub fn init_draft_deps(draft_repo: Arc<dyn DraftRepository + Send + Sync>) {
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_draft_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = DRAFT_DEPS.get().expect("init_draft_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = DRAFT_DEPS.get() else {
+        tracing::error!(
+            "spawn_draft_server called before init_draft_deps — extension will not start"
+        );
+        return;
+    };
     let server = DraftMcpServer::new(deps.draft_repo.clone())
         .with_authority(DRAFT_AUTHORITY.get().cloned().flatten());
     crate::serve_builtin("giap-draft", server, reader, writer);

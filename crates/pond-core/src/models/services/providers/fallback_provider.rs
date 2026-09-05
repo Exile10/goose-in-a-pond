@@ -1,14 +1,7 @@
 //! FallbackProvider — transparent LLM provider fallback chain.
 //!
-//! Tries the primary provider first; on any error, transparently retries
-//! with the fallback provider. Chainable for multi-hop fallback:
-//!
-//! ```rust,ignore
-//! let provider = FallbackProvider::new(
-//!     llamafile,
-//!     FallbackProvider::new(ollama, mock),
-//! );
-//! ```
+//! Tries the primary provider first; on any error, transparently retries with the
+//! fallback provider. Chainable for multi-hop fallback.
 
 use crate::models::domain::message::ChatMessage;
 use crate::models::ports::provider::LlmProvider;

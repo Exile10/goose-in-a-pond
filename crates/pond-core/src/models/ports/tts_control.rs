@@ -1,28 +1,14 @@
-//! Driven Port: TtsControl
-//!
-//! Reconfiguring the *running* speech engine, so a voice change does not need
-//! the pond restarted.
-//!
-//! Separate from [`VoiceOutput`](super::voice_output::VoiceOutput) on purpose.
-//! `VoiceOutput` is what the chat loop holds: say this, stop, play a tone. It
-//! has no business knowing that voices have files behind them or that a
-//! quality tier is a different set of weights. This port is the other half —
-//! the one the settings screen drives — and nothing in the speaking path
-//! depends on it.
-//!
-//! Implementations own whatever fetching a change implies. Selecting a voice
-//! the household does not have yet is a download; the caller asks for the
-//! voice and waits, rather than being told to go and install something first.
+//! Driven Port: TtsControl — reconfiguring the running speech engine so a voice change needs no
+//! restart. Deliberately separate from [`VoiceOutput`](super::voice_output::VoiceOutput), which
+//! the chat loop holds: nothing in the speaking path depends on this port. Implementations own
+//! whatever fetching a change implies, so selecting an uninstalled voice downloads it here.
 
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// What actually happened when settings were applied.
-///
-/// Returned rather than assumed, because the three cases feel different to a
-/// person: a voice swap is instant, a first-time voice pauses to fetch half a
-/// megabyte, and a quality change fetches up to 326 MB and then reloads the
-/// engine. A UI that cannot tell them apart has to either lie or spin.
+/// What actually happened when settings were applied. Returned rather than assumed, because the
+/// three cases differ: a voice swap is instant, a first-time voice fetches half a megabyte, and a
+/// quality change fetches up to 326 MB and reloads the engine.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TtsApplied {
     /// The voice now in use.
@@ -42,17 +28,13 @@ pub struct TtsApplied {
 /// Driven Port: TtsControl
 #[async_trait]
 pub trait TtsControl: Send + Sync {
-    /// Bring the live engine in line with `voice`, `speed` and `quality`,
-    /// fetching whatever is missing first.
-    ///
-    /// Implementations must be safe to call while the engine is speaking: the
+    /// Bring the live engine in line with `voice`, `speed` and `quality`, fetching whatever is
+    /// missing first. Implementations must be safe to call while the engine is speaking: the
     /// settings screen calls this on every slider release.
     async fn apply(&self, voice: &str, speed: f32, quality: &str) -> Result<TtsApplied>;
 
-    /// Voices installed and ready to speak right now.
-    ///
-    /// The catalogue lists what *could* be used; this says what can be used
-    /// without waiting, which is what a picker needs in order to be honest
-    /// about which choices cost a download.
+    /// Voices installed and ready to speak right now. The catalogue lists what *could* be used;
+    /// this says what can be used without waiting, so a picker can name the choices that cost a
+    /// download.
     async fn installed_voices(&self) -> Vec<String>;
 }

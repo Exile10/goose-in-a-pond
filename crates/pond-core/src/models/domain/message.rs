@@ -25,11 +25,8 @@ pub struct ImageAttachment {
 
 /// A record of a tool invocation embedded in an assistant message.
 ///
-/// When the model emits a tool call during chat generation, the call metadata
-/// (id, name, arguments) is captured in this struct and attached to the
-/// assistant message. On subsequent turns, this lets us round-trip the
-/// assistant's tool calls back through the OpenAI-compatible
-/// `tool_calls` field so the model sees its own prior tool usage.
+/// Round-tripped on later turns through the OpenAI-compatible `tool_calls` field so
+/// the model sees its own prior tool usage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     pub id: String,
@@ -88,11 +85,10 @@ impl ChatMessage {
         }
     }
 
-    /// Create a tool result message. In the chat template, this renders with
-    /// `role: "tool"` so the model recognizes it as a tool response, not user input.
+    /// Create a tool result message, rendered by the chat template as `role: "tool"`.
     ///
-    /// `tool_call_id` must match the `id` field of the originating
-    /// `ToolCallRecord` on the preceding assistant message.
+    /// `tool_call_id` must match the `id` of the originating `ToolCallRecord` on the
+    /// preceding assistant message.
     pub fn tool_result(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
@@ -105,9 +101,7 @@ impl ChatMessage {
 
     /// Create an assistant message that includes tool-call metadata.
     ///
-    /// Use this when the assistant turn was a tool invocation step — `content`
-    /// may be empty if the model emitted only tool calls, or contain the
-    /// preamble text the model produced before the call.
+    /// `content` may be empty when the model emitted only tool calls.
     pub fn assistant_with_tool_calls(
         content: impl Into<String>,
         tool_calls: Vec<ToolCallRecord>,

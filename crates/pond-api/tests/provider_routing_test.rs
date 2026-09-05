@@ -1,11 +1,7 @@
-//! Universal loop routing integration tests for POST /api/v1/chat/stream.
-//!
-//! Verifies that classification metadata remains correct for chat/think/task
-//! messages while all requests execute through the Agent port.
-//!
-//! All tests use a wiremock server as the llamafile backend — no live services needed.
-//!
-//! Run: cargo test -p pond-api --test provider_routing_test
+//! Universal loop routing tests for POST /api/v1/chat/stream: classification
+//! metadata stays correct for chat, think and task messages while every request
+//! executes through the Agent port. A wiremock server stands in for the llamafile
+//! backend. Run: cargo test -p pond-api --test provider_routing_test
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -209,6 +205,7 @@ async fn make_app_with_provider(
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -229,6 +226,7 @@ async fn make_app_with_provider(
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,
@@ -554,6 +552,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -574,6 +573,7 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,
@@ -672,6 +672,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -692,6 +693,7 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,

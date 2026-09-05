@@ -119,6 +119,19 @@ pub struct JobState {
     /// different question from "may two jobs run together?", and only the second
     /// has one right answer for every job.
     pub idle_threshold: Duration,
+    /// Whether this job may run on a pond that has served no turn since boot.
+    ///
+    /// PER-JOB, and that is the whole point. `saw_activity_since_start` is one
+    /// value for the lane, so a caller that relaxed it to let ITSELF run
+    /// relaxed it for every other registered job at the same time -- and since
+    /// a never-run job sorts as maximally starved and the tie-break is
+    /// declaration order, the tick went to whichever job was declared first,
+    /// whose own task then refused it. The lane deadlocked while looking busy.
+    ///
+    /// The exemption exists because "nobody has chatted" is not the same as
+    /// "there is nothing to do": mail arrives from a connector, so the index
+    /// has real work on a pond that has served no turn at all.
+    pub exempt_from_activity_gate: bool,
 }
 
 /// Everything the lane needs for one tick.
@@ -182,7 +195,10 @@ pub fn select_next(inputs: LaneInputs<'_>) -> LaneDecision {
     for state in inputs.jobs {
         let decision = consolidation_schedule::should_run(GateInputs {
             enabled: state.enabled,
-            saw_activity_since_start: inputs.saw_activity_since_start,
+            // The lane-wide observation, OR this one job's exemption. Never the
+            // other way round: one job's exemption must not qualify the rest.
+            saw_activity_since_start: inputs.saw_activity_since_start
+                || state.exempt_from_activity_gate,
             idle_for: inputs.idle_for,
             idle_threshold: state.idle_threshold,
             since_last_run: state.since_last_run,
@@ -258,7 +274,54 @@ mod tests {
             since_last_run: since_last_run.map(Duration::from_secs),
             interval_floor: Duration::from_secs(floor_secs),
             idle_threshold: IDLE_THRESHOLD,
+            exempt_from_activity_gate: false,
         }
+    }
+
+    /// One job's exemption must not qualify the others.
+    ///
+    /// Before this was per-job, the index sweep relaxed the lane-wide activity
+    /// flag so IT could run on a pond nobody had chatted with. That relaxed the
+    /// flag for every registered job, and on a fresh boot every job is
+    /// never-run -- maximally starved -- so the tick went to whichever was
+    /// declared first. `IndexMaintenance` is declared last, so it lost every
+    /// tick to a job whose own task then refused the slot. Nothing ran, and
+    /// nothing said so.
+    #[test]
+    fn an_exemption_belongs_to_one_job_and_does_not_qualify_the_rest() {
+        let mut sweep = job(LaneJob::IndexMaintenance, None, 0);
+        sweep.exempt_from_activity_gate = true;
+        let jobs = [job(LaneJob::Consolidation, None, 0), sweep];
+
+        let decision = select_next(LaneInputs {
+            // Nobody has used this pond since boot.
+            saw_activity_since_start: false,
+            idle_for: LONG_IDLE,
+            jobs: &jobs,
+        });
+        assert_eq!(
+            decision,
+            LaneDecision::Run(LaneJob::IndexMaintenance),
+            "the exempt job must win, and must not have qualified consolidation"
+        );
+    }
+
+    /// Without an exemption the gate still holds for everyone.
+    #[test]
+    fn no_job_runs_before_the_pond_has_been_used() {
+        let jobs = [
+            job(LaneJob::Consolidation, None, 0),
+            job(LaneJob::IndexMaintenance, None, 0),
+        ];
+        let decision = select_next(LaneInputs {
+            saw_activity_since_start: false,
+            idle_for: LONG_IDLE,
+            jobs: &jobs,
+        });
+        assert!(
+            matches!(decision, LaneDecision::Idle(_)),
+            "the startup guard must still hold when nothing is exempt"
+        );
     }
 
     fn tick(jobs: &[JobState]) -> LaneDecision {

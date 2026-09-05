@@ -1,26 +1,7 @@
-//! #105 (Q2-28) — Command-chaining validation harness.
-//!
-//! Scripted multi-intent voice utterances ("turn off the lights AND set a
-//! 7am alarm") driven through the REAL GooseAdapter agent loop with the giap
-//! builtin extensions wired to recording fakes. Each scenario asserts the
-//! whole chain the issue calls for:
-//!
-//!   1. the loop executes a tool call per sub-intent (N tool calls),
-//!   2. the side effects really happened (device control invoked; schedule
-//!      created) — not just that some tool was named,
-//!   3. the final text — what the voice pipeline would SPEAK — summarises
-//!      every sub-action,
-//!   4. turn count and wall latency are printed, which is the data the
-//!      `voice_max_turns` default (Settings::default_voice_max_turns) was
-//!      tuned against.
-//!
-//! Live-hardware tests (need a local model), so `#[ignore]`d by default like
-//! `agentic_loop_live_test.rs`. Run with:
-//!
-//! ```bash
-//! GIAP_OLLAMA_URL=http://127.0.0.1:11434 GIAP_CHAINING_MODEL=llama3.2 \
-//!   cargo test -p pond-adapters-goose --test command_chaining_live_test -- --ignored --nocapture
-//! ```
+//! #105 (Q2-28) Command-chaining harness: multi-intent voice utterances through the REAL
+//! GooseAdapter loop with giap builtins wired to recording fakes. Asserts one tool call per
+//! sub-intent, real side effects and a spoken summary; prints the turn count and latency that
+//! `default_voice_max_turns` was tuned on. Ignored; set GIAP_OLLAMA_URL=http://127.0.0.1:11434.
 
 use anyhow::Result;
 use async_trait::async_trait;

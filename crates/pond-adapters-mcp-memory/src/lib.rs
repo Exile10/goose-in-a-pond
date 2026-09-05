@@ -1,25 +1,7 @@
-//! Flat-file persistent memory adapter for GIAP.
-//!
-//! Implements [`McpKnowledgePort`] using the same storage format as Goose's
-//! built-in `MemoryServer` so memories are portable between the two systems.
-//!
-//! **Storage layout** (`memory_dir/`):
-//! ```text
-//! memory_dir/
-//!   preferences.txt
-//!   devices.txt
-//!   routines.txt
-//!   ...
-//! ```
-//! Each category file contains entries separated by blank lines.  An entry
-//! begins with optional `#tag` lines, followed by the content lines.
-//!
-//! **Usage:**
-//! ```ignore
-//! let memory = GooseMcpMemoryAdapter::new(data_dir.join("memory"));
-//! // Wire into ChatService system prompt:
-//! let system = format!("{BASE}\n\n{}", memory.instructions());
-//! ```
+//! Flat-file persistent memory adapter for GIAP: [`McpKnowledgePort`] over the same storage format
+//! as Goose's built-in `MemoryServer`, so memories are portable between the two. One file per
+//! category under `memory_dir/` (`preferences.txt`, `devices.txt`, ...); entries are separated by
+//! blank lines, each starting with optional `#tag` lines followed by content lines.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;

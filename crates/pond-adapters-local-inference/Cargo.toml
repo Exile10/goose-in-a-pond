@@ -6,14 +6,9 @@ version.workspace = true
 authors.workspace = true
 license.workspace = true
 
-# ── Build note ────────────────────────────────────────────────────────────────
-# This crate compiles llama-cpp-2 + candle (heavy C++ / Rust ML libs).
-# First compile takes 5–15 min. Metal (macOS) activates automatically via
-# llama-cpp-2's target_os cfg. CUDA (Jetson) requires --features cuda.
-#
-# To build:
-#   cargo build -p pond-adapters-local-inference
-#   cargo build -p pond-adapters-local-inference --features cuda   # Jetson
+# Build note: this crate compiles llama-cpp-2 + candle, so a first compile takes 5-15 min.
+# Metal (macOS) activates automatically via llama-cpp-2's target_os cfg; CUDA (Jetson) needs
+# `cargo build -p pond-adapters-local-inference --features cuda`.
 
 [features]
 default = []

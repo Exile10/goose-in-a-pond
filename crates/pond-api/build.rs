@@ -1,11 +1,7 @@
 //! Ensures `pond-desktop/dist` exists at compile time so the `include_dir!`
-//! embedding of the web UI (see `routes.rs`) never fails on a fresh checkout.
-//!
-//! If the real UI hasn't been built yet (`cd pond-desktop && npm run build`),
-//! we drop a tiny placeholder `index.html`. The runtime handler detects the
-//! placeholder (via the `data-giap-placeholder` marker) and falls through to the
-//! on-disk `--static-dir`, so dev workflows are unaffected. For a true
-//! single-executable release, build the UI *before* `cargo build --release`.
+//! embedding of the web UI (see `routes.rs`) never fails on a fresh checkout. An
+//! unbuilt UI gets a placeholder `index.html`, which the handler detects by its
+//! `data-giap-placeholder` marker; build the UI before a release build.
 
 use std::path::Path;
 

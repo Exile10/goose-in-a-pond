@@ -22,20 +22,8 @@ pub fn mcp_tool_to_definition(
 }
 
 /// Extract human-readable text from an MCP `CallToolResult` content array.
-///
-/// MCP tool results contain an array of content items, each with a `type`
-/// field. This function extracts and concatenates all text content.
-///
-/// # Format
-///
-/// ```json
-/// [
-///   {"type": "text", "text": "The weather in Nairobi is 22C."},
-///   {"type": "image", "data": "..."}
-/// ]
-/// ```
-///
-/// Only `"text"` type items are extracted; other types are skipped.
+/// Each content item carries a `type`; only `"text"` items are concatenated
+/// and every other type is skipped.
 pub fn extract_tool_result_text(content: &[serde_json::Value]) -> String {
     let mut parts = Vec::new();
     for item in content {

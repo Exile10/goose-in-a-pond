@@ -1,76 +1,22 @@
-//! Compact-on-resume — PAI-4's time axis, as a pure gate.
-//!
-//! `docs/architecture/pai/04-smart-compaction.md` section 3.2 calls this "the
-//! highest-value time behaviour, and it is free". A session reopened after a
-//! gap is about to pay a full prefill whatever happens: the KV cache is long
-//! gone, the rolling summary has not been refreshed since before the gap, and
-//! the first turn back therefore reaches the model with a worse history than a
-//! continuously-active session would get. Reshaping that history *before* the
-//! first user message costs the user nothing, because there is no token stream
-//! to wait on yet.
-//!
-//! The rule the design states is one line:
-//!
-//! ```text
-//! session resumed && idle_gap > resume_compaction_idle_secs -> compact now
-//! ```
-//!
-//! and the design also says which shape to give it: "the pattern already proven
-//! in `user_data/services/consolidation_schedule.rs` — a pure `should_run` gate
-//! with a startup guard — rather than inventing new scheduling". So this module
-//! is that module's twin: plain `bool`s and `Duration`s in, a `Run`/`Skip` out,
-//! every rule unit-testable without a clock, a server, or a model.
-//!
-//! # The startup guard, translated
-//!
-//! Consolidation's guard is "never merely because the process has been up a
-//! while" — a box nobody has spoken to is not idle, it is unused. The same
-//! hazard exists here in a different costume: at boot, *every* session in the
-//! store has an enormous idle gap, so a gate that asked only about the gap would
-//! compact the entire history store on startup and call it a resume.
-//!
-//! [`ResumeGateInputs::reopened`] is what closes it. A resume is a thing a user
-//! did — they opened a session — not a state the clock drifted into. Nothing in
-//! this crate can set it from a timer, and the one production caller sets it
-//! from a request that a person made.
-//!
-//! # Which direction is the dangerous one
-//!
-//! An idle threshold that is too **small** is the scope-widening bug: a
-//! two-minute pause mid-conversation is not a resume, and a gate that read it as
-//! one would recompact between every pair of turns — spending a model call on
-//! each, on a device where that call competes with the next turn's prefill. A
-//! threshold that is too large only means the user pays what they pay today. So
-//! every fallback here resolves toward *not* running: an unparseable or zeroed
-//! setting is floored, not disabled, and a clock skewed into the future reads as
-//! a warm session rather than a stale one.
+//! Compact-on-resume, PAI-4's time axis as a pure `should_run` gate; see
+//! docs/architecture/pai/04-smart-compaction.md section 3.2. [`ResumeGateInputs::reopened`]
+//! is the startup guard: a resume is a user action, never an elapsed duration, or boot
+//! would compact every stored session. Fallbacks resolve toward not running, because too
+//! small a threshold recompacts mid-conversation.
 
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
-/// Default gap after which reopening a session counts as a resume.
-///
-/// 30 minutes, and the number is chosen against its neighbours rather than
-/// picked for roundness:
-///
-/// - It is 15x the default `summary_idle_secs` (120s), so the idle rolling
-///   summary has had many chances to run before this ever fires. Firing sooner
-///   would mostly duplicate work that loop already did.
-/// - It is 2x `INACTIVITY_THRESHOLD_SECS` (15 min), the point at which memory
-///   consolidation already considers the household asleep. A session untouched
-///   for twice that is not a pause in a conversation.
-///
-/// Shortening it is the change that costs something; see the module header.
+/// Default gap after which reopening a session counts as a resume: 30 minutes,
+/// chosen against its neighbours. It is 15x the default `summary_idle_secs`
+/// (120s), so the idle rolling summary has run many times first, and 2x
+/// `INACTIVITY_THRESHOLD_SECS` (15 min), where consolidation calls the house asleep.
 pub const RESUME_IDLE_THRESHOLD_SECS: u32 = 30 * 60;
 
-/// Floor applied to a stored `resume_compaction_idle_secs`.
-///
-/// Guards the same hole `interval_floor_from_hours` guards in
-/// `consolidation_schedule`: a stored `0` would otherwise mean "every reopen is
-/// a resume", which is the failure this gate exists to prevent. Five minutes is
-/// longer than any pause inside a live exchange and shorter than anything a user
-/// would call "coming back to it", so it is a floor rather than a second
-/// default.
+/// Floor applied to a stored `resume_compaction_idle_secs`, guarding the hole
+/// `interval_floor_from_hours` guards in `consolidation_schedule`: a stored `0`
+/// would mean "every reopen is a resume". Five minutes is longer than any pause
+/// inside a live exchange and shorter than "coming back to it".
 pub const MIN_RESUME_IDLE_SECS: u32 = 5 * 60;
 
 /// Everything the gate needs to decide whether a resume compaction may start.
@@ -141,16 +87,10 @@ impl GateDecision {
     }
 }
 
-/// Decide whether reopening a session should trigger a compaction pass now.
-///
-/// Semantics: *at most one pass per reopen, only for a session that has history
-/// and has been quiet longer than `idle_threshold`, and only when hybrid
-/// compaction owns pruning.*
-///
-/// The order of the checks is the order of the reported reasons, and it is
-/// chosen so the log line is the useful one: `NoSummariser` is checked last
-/// because "this would have run, but nothing can do the work" is a different
-/// operational problem from "this was never eligible".
+/// Decide whether reopening a session should trigger a compaction pass now: at
+/// most one per reopen, only for a session with history quiet longer than
+/// `idle_threshold`, and only when hybrid compaction owns pruning. `NoSummariser`
+/// is checked last so "eligible but no worker" reads differently from "ineligible".
 pub fn should_run(inputs: ResumeGateInputs) -> GateDecision {
     if !inputs.enabled {
         return GateDecision::Skip(SkipReason::Disabled);
@@ -171,21 +111,17 @@ pub fn should_run(inputs: ResumeGateInputs) -> GateDecision {
     GateDecision::Run
 }
 
-/// Convert a stored `resume_compaction_idle_secs` into a threshold duration.
-///
-/// Applies [`MIN_RESUME_IDLE_SECS`] as a floor. A `0` in the store — from a
-/// hand-edited row, a bad client, or a future migration that writes the column
-/// before the default lands — must not mean "compact on every reopen".
+/// Convert a stored `resume_compaction_idle_secs` into a threshold duration,
+/// applying [`MIN_RESUME_IDLE_SECS`] as a floor. A `0` in the store must not
+/// mean "compact on every reopen".
 pub fn idle_threshold_from_secs(secs: u32) -> Duration {
     Duration::from_secs(u64::from(secs.max(MIN_RESUME_IDLE_SECS)))
 }
 
 /// How long a session has been quiet, from its last activity timestamp.
 ///
-/// A timestamp in the future (clock skew, a restored backup, a device with a
-/// wrong RTC) yields `Duration::ZERO` — read as "active right now", which is the
-/// narrowing answer. Trusting it would classify a live session as a resume and
-/// recompact it mid-conversation.
+/// A timestamp in the future (clock skew, restored backup, wrong RTC) yields
+/// `Duration::ZERO`, read as active now, so a live session is never recompacted.
 pub fn idle_gap_since(last_activity: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
     (now - last_activity).to_std().unwrap_or(Duration::ZERO)
 }

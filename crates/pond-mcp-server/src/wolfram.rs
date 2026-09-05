@@ -230,9 +230,8 @@ fn recall(session: Option<&str>, id: &str) -> Option<ExploreOption> {
 #[tool_router(router = wolfram_tool_router, vis = "pub")]
 impl KnowledgeMcpServer {
     #[tool(description = "\
-Compute or look up a factual answer with Wolfram|Alpha: arithmetic, unit and \
-currency conversion, dates, statistics, science and geography data. Use for \
-anything that needs calculating rather than reading.")]
+Wolfram|Alpha, for anything computed rather than read: arithmetic, unit and \
+currency conversion, dates, statistics, science and geography data.")]
     async fn compute_answer(
         &self,
         ctx: RequestContext<RoleServer>,
@@ -271,9 +270,8 @@ anything that needs calculating rather than reading.")]
     }
 
     #[tool(description = "\
-Open one of the suggestions a previous compute_answer offered — a different \
-interpretation, or a section it did not show. Pass the id exactly as printed, \
-for example \"w3\".")]
+Open a suggestion from the previous compute_answer (another interpretation or \
+unshown section). Pass the id exactly as printed, e.g. \"w3\".")]
     async fn explore_computation(
         &self,
         ctx: RequestContext<RoleServer>,

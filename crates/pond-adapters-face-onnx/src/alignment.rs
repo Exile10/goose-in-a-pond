@@ -1,29 +1,7 @@
-//! Face alignment — similarity transform to the canonical 112×112 template.
-//!
-//! ArcFace (and all its descendants) are trained on faces warped to a fixed
-//! 5-point template.  Running the embedding network on a raw crop skips this
-//! step and causes embeddings from different people to collapse toward each
-//! other, producing the "everyone scores 0.5–0.7" failure mode.
-//!
-//! This module:
-//!   1. Solves Umeyama's closed-form 2-D similarity transform (rotation,
-//!      uniform scale, translation) that maps five detected landmarks onto
-//!      the canonical template.
-//!   2. Inverts the transform and evaluates it across the 112×112 destination
-//!      grid, fetching each source pixel via bilinear interpolation.
-//!
-//! The result is an [`image::DynamicImage`] of exactly 112×112 pixels,
-//! suitable for drop-in replacement of the crop+resize path.
-//!
-//! ## Canonical template
-//! These coordinates are the de-facto standard used by ArcFace / InsightFace
-//! / SCRFD and are expressed in the destination 112×112 pixel frame.
-//!
-//!   left eye     (38.2946, 51.6963)
-//!   right eye    (73.5318, 51.5014)
-//!   nose tip     (56.0252, 71.7366)
-//!   left mouth   (41.5493, 92.3655)
-//!   right mouth  (70.7299, 92.2041)
+//! Face alignment: Umeyama similarity transform of five landmarks onto the canonical 112×112
+//! ArcFace template ([`CANONICAL_112`]), then a backward warp with bilinear sampling.
+//! Skipping this step collapses embeddings of different people toward each other, the
+//! "everyone scores 0.5 to 0.7" failure mode. Output is exactly 112×112.
 
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
 use pond_core::user_data::domain::face_recognition::FaceLandmarks;
@@ -80,11 +58,10 @@ impl Similarity2D {
     }
 }
 
-/// Fit a similarity transform (rotation + uniform scale + translation) that
-/// maps `src` points to `dst` points in a least-squares sense.
+/// Fit the least-squares similarity transform (rotation, uniform scale, translation) mapping
+/// `src` points onto `dst` points.
 ///
-/// Implements Umeyama (1991) — closed form; no iterative solver required.
-/// This is what InsightFace / SCRFD use in Python via `skimage.transform`.
+/// Closed-form Umeyama (1991), the same solver InsightFace uses via `skimage.transform`.
 pub fn umeyama_similarity(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -> Similarity2D {
     let n = src.len() as f32;
 
@@ -133,11 +110,8 @@ pub fn umeyama_similarity(src: &[(f32, f32); 5], dst: &[(f32, f32); 5]) -> Simil
     let d = sig_yy;
     let det_sigma = a * d - b * c;
 
-    // Umeyama rotation: R = U · diag(1, ..., sign(det)) · Vᵀ.  For 2-D we
-    // can shortcut by picking S so the reflection is absorbed into the
-    // smaller singular value.  In practice, for our (well-posed) landmark
-    // data, det_sigma is positive and the correction is a no-op; the sign
-    // flip still matters if a detector ever returns mirrored landmarks.
+    // Umeyama rotation: R = U · diag(1, sign(det)) · Vᵀ. The sign flip is a no-op for
+    // well-posed landmarks but still matters if a detector returns mirrored ones.
     let s_diag_2 = if det_sigma < 0.0 { -1.0_f32 } else { 1.0 };
 
     // 2×2 SVD via eigendecomposition of AᵀA.
@@ -234,13 +208,10 @@ fn sample_bilinear(img: &DynamicImage, x: f32, y: f32) -> Rgb<u8> {
     Rgb(out)
 }
 
-/// Warp the source image to a square `side`×`side` canonical pose using a
-/// similarity transform fitted to the supplied five landmarks and the
-/// 112-pixel canonical template (rescaled to `side`).
+/// Warp the source image to a `side`×`side` canonical pose using a similarity transform
+/// fitted from the five landmarks to the 112-pixel template.
 ///
-/// Note: the canonical template is authored for 112×112; for other `side`
-/// values it scales linearly — safe because the embedding network is fixed
-/// at 112 in practice.
+/// The template scales linearly for other `side` values; the embedder is fixed at 112 anyway.
 pub fn align_to_canonical_112(
     img: &DynamicImage,
     landmarks: &FaceLandmarks,

@@ -1,13 +1,7 @@
-//! Thin WebSocket client for the Matter controller.
-//!
-//! One connection carries both request/response pairs (matched by `id`) and
-//! unsolicited events. A background read task routes responses to their waiting
-//! callers and fans events out on an mpsc channel the bridge consumes.
-//!
-//! It also relays the controller's own `log` events into `tracing`. The Rust
-//! side pipes the child's stderr as well, so a controller GIAP started is
-//! audible twice over; this path is what makes a controller the operator runs
-//! themselves — where there is no pipe to read — just as legible.
+//! Thin WebSocket client for the Matter controller. One connection carries request/response pairs
+//! (matched by `id`) and unsolicited events; a background read task routes responses to their
+//! callers and fans events out on an mpsc channel the bridge consumes. It relays the controller's
+//! own `log` events into `tracing`, the only visibility into a controller GIAP did not spawn.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,19 +39,16 @@ pub struct MatterClient {
     next_id: AtomicU64,
     /// Whether this controller has a BLE transport, as its greeting said.
     ///
-    /// Kept because the commissioning pre-flight has to reason about it: that
-    /// probe is an mDNS browse, and a device out of its box advertises over BLE
-    /// and not on mDNS at all. See `refuse_when_nothing_is_pairable`.
+    /// The commissioning pre-flight is an mDNS browse, and a device out of its box advertises over
+    /// BLE and not on mDNS at all. See `refuse_when_nothing_is_pairable`.
     ble: bool,
 }
 
 impl MatterClient {
-    /// Connect, check the greeting, and start the read/write tasks. Returns the
-    /// client plus the stream of unsolicited events.
-    ///
-    /// Relays the controller's `log` events into `tracing`. Use
-    /// [`connect_to_managed`] instead when GIAP spawned the controller itself
-    /// and is already relaying its stderr.
+    /// Connect, check the greeting, and start the read/write tasks. Returns the client plus the
+    /// stream of unsolicited events, and relays the controller's `log` events into `tracing`. Use
+    /// [`connect_to_managed`] instead when GIAP spawned the controller and already relays its
+    /// stderr.
     pub async fn connect(url: &str) -> Result<(Arc<Self>, mpsc::Receiver<MatterEvent>)> {
         Self::open(url, true).await
     }
@@ -173,9 +164,8 @@ impl MatterClient {
 
     /// Does this controller pair over Bluetooth as well as over IP?
     ///
-    /// What the controller actually loaded, not what was asked for: a request
-    /// that could not be honoured reads as `false` here, which is the truth
-    /// about what it can reach.
+    /// What the controller actually loaded, not what was asked for: a BLE request it could not
+    /// honour reads as `false` here.
     pub fn has_ble(&self) -> bool {
         self.ble
     }
@@ -230,17 +220,12 @@ impl MatterClient {
 
 /// Carry the controller's error code alongside its message.
 ///
-/// The code is what callers key their user-facing advice off — "nothing is in
-/// pairing mode" needs a different sentence from "that device is unreachable" —
-/// so it is preserved in the chain rather than flattened into prose. Redacted
-/// here as well as on the controller: this is the last point before the message
-/// reaches a log, an API response, or the model.
+/// Callers key user-facing advice off the code, so it stays in the chain rather than flattened
+/// into prose. Redacted here: the last point before a log, an API response or the model.
 fn controller_error(error: WireError) -> anyhow::Error {
-    // The code is the SOURCE and the message the context, not the other way
-    // round: `Display` is what the user and the model read, so it has to be the
-    // controller's prose. Attaching the message as context over a code-shaped
-    // error gives both — a readable error, with the code still reachable by
-    // `downcast_ref` for the callers that branch on it.
+    // The code is the source and the message the context, not the reverse: `Display` must be the
+    // controller's prose for the user and the model, while the code stays reachable via
+    // `downcast_ref` for callers that branch on it.
     anyhow::Error::new(ControllerCode(error.code)).context(redact_setup_code(&error.message))
 }
 
@@ -258,11 +243,8 @@ impl std::error::Error for ControllerCode {}
 
 /// The controller's error code for `error`, if it carries one.
 ///
-/// `downcast_ref` on the `anyhow::Error` itself, not a walk over `chain()`:
-/// anyhow stores a context frame as its own wrapper type, so the chain yields
-/// that wrapper rather than the `ControllerCode` inside it, and iterating finds
-/// nothing. The downcast is the supported way to reach a context value, and it
-/// keeps working after further `.context()` calls further up the stack.
+/// Must be `downcast_ref` on the error itself, not a walk over `chain()`: anyhow wraps a context
+/// frame in its own type, so the chain yields that wrapper and never the `ControllerCode` inside.
 pub fn code_of(error: &anyhow::Error) -> Option<&str> {
     error
         .downcast_ref::<ControllerCode>()

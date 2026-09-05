@@ -1,7 +1,9 @@
+pub mod activity_watcher;
 pub mod consolidation_schedule;
 pub mod identity_resolution;
 pub mod inference_lane;
 pub mod location;
+pub mod member_attribution;
 pub mod memory_cleanup;
 pub mod memory_consolidation;
 pub mod memory_extraction;
@@ -9,6 +11,6 @@ pub mod memory_graph;
 pub mod memory_relevance;
 pub mod oauth_providers;
 pub mod onboarding;
-pub mod pairing_attribution;
+pub mod place_detection;
 pub mod proactive_review;
 pub mod redacting_memory_repository;

@@ -72,11 +72,9 @@ pub struct OllamaFunctionDef {
 
 // ── Streaming response types ─────────────────────────────────────────────────
 
-/// A single NDJSON line from a streaming `/api/chat` response.
-///
-/// During streaming, each line contains a partial `message` with either
-/// `content` (text tokens) or `tool_calls` (structured tool invocations).
-/// The final line has `done: true` and includes token usage counts.
+/// A single NDJSON line from a streaming `/api/chat` response. Each carries a
+/// partial `message` with either `content` or `tool_calls`; the final line has
+/// `done: true` and the token usage counts.
 #[derive(Deserialize, Debug)]
 pub struct OllamaStreamChunk {
     /// Partial message — may contain text content or tool calls.
