@@ -1,8 +1,6 @@
-//! InferenceProvider port — tool-aware chat completion interface.
-//!
-//! Separate from [`LlmProvider`](super::provider::LlmProvider) which handles
-//! simple completions (memory extraction, answer review). This port adds
-//! native tool-calling support for the agent loop.
+//! InferenceProvider port — tool-aware chat completion. Separate from
+//! [`LlmProvider`](super::provider::LlmProvider), which handles the simple completions (memory
+//! extraction, answer review); this port adds native tool calling for the agent loop.
 
 use crate::models::domain::message::ChatMessage;
 use crate::models::domain::model_capabilities::ModelCapabilities;
@@ -58,24 +56,15 @@ pub struct InferenceOptions {
 /// A pinned, boxed stream of [`ChatEvent`] items.
 pub type ChatEventStream = Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Send>>;
 
-/// Driven Port: InferenceProvider
-///
-/// Abstraction for LLM inference with native tool-calling support.
-/// Both HTTP providers (Ollama, llamafile) and in-process providers
-/// (llama.cpp via GGUF) implement this trait.
-///
-/// The agent loop calls [`stream_chat`] in a loop: when the model emits
-/// [`ChatEvent::ToolCall`] events, the agent executes the tools, appends
-/// results to the message history, and calls `stream_chat` again. The
-/// loop terminates when no tool calls are emitted (model produced a
-/// final text answer) or a max-iteration guard fires.
+/// Driven Port: InferenceProvider — LLM inference with native tool calling, implemented by both
+/// HTTP providers (Ollama, llamafile) and in-process ones (llama.cpp via GGUF). The agent loop
+/// calls [`stream_chat`] repeatedly, executing each [`ChatEvent::ToolCall`] and appending its
+/// result, until a turn emits no tool calls or the max-iteration guard fires.
 #[async_trait]
 pub trait InferenceProvider: Send + Sync {
-    /// Stream a chat completion with optional tool definitions.
-    ///
-    /// If `tools` is non-empty and the model supports tool calling,
-    /// the stream may emit [`ChatEvent::ToolCall`] events. Otherwise
-    /// only [`ChatEvent::Text`] and [`ChatEvent::Usage`] are emitted.
+    /// Stream a chat completion with optional tool definitions. If `tools` is non-empty and the
+    /// model supports tool calling the stream may emit [`ChatEvent::ToolCall`]; otherwise only
+    /// [`ChatEvent::Text`] and [`ChatEvent::Usage`] are emitted.
     fn stream_chat(
         &self,
         system_prompt: &str,

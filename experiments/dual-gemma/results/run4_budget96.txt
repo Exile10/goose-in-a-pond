@@ -1,0 +1,49 @@
+
+== dual ==
+  weather_direct         tool  ok  args  ok  ans  ok    8.9s  get_weather({"city": "Nairobi"})
+  weather_indirect       tool  ok  args  ok  ans  -    11.9s  get_weather({"city": "Eldoret"})
+  timer_minutes          tool  ok  args  ok  ans  -     6.9s  set_timer({"seconds": 600, "label": "standup"})
+  timer_compound         tool  ok  args MISS  ans  -    19.2s  set_timer({"seconds": 90, "label": "check oven"})
+  math_words             tool  ok  args  ok  ans  ok   15.4s  calculate({"expression": "18000 / 5"})
+  math_direct            tool MISS  args MISS  ans  ok   14.2s  (no call)
+  convert_distance       tool  ok  args  ok  ans  ok   10.3s  convert_units({"from_unit": "km", "to_unit": "mi", "value": 340})
+  convert_temp           tool MISS  args MISS  ans  ok    6.6s  (no call)
+  convert_mass_vs_calc   tool  ok  args  ok  ans  ok    9.8s  convert_units({"from_unit": "kg", "to_unit": "lb", "value": 2})
+  notes_search           tool  ok  args  ok  ans  -     6.7s  search_notes({"query": "Jetson"})
+  notes_read             tool  ok  args  ok  ans  ok    6.2s  search_notes({"query": "standup"})
+  notes_then_convert     tool  ok  args  ok  ans MISS   16.0s  search_notes({"query": "road distance to Kisumu"})
+  zero_arg_tool          tool  ok  args  ok  ans  -     5.9s  list_timers({"required": "[]"})
+  time_timezone          tool MISS  args MISS  ans  -    16.8s  read_note({"name": "get_time"})
+  unknown_city           tool  ok  args  ok  ans  -     5.7s  get_weather({"city": "Atlantis"})
+  timer_then_list        tool  ok  args  ok  ans  -     9.1s  set_timer({"seconds": 300, "label": "tea"})
+  no_tool_greeting       tool  ok  args  ok  ans  -     9.2s  (no call)
+  no_tool_knowledge      tool  ok  args  ok  ans  -     7.1s  (no call)
+
+== solo ==
+  weather_direct         tool  ok  args  ok  ans  ok   16.4s  get_weather({"city": "Nairobi"})
+  weather_indirect       tool  ok  args  ok  ans  -    19.1s  get_weather({"city": "Eldoret"})
+  timer_minutes          tool  ok  args  ok  ans  -     9.5s  set_timer({"seconds": 600, "label": "standup"})
+  timer_compound         tool  ok  args  ok  ans  -    13.2s  set_timer({"seconds": 5400, "label": "check the oven"})
+  math_words             tool MISS  args MISS  ans  ok    7.5s  (no call)
+  math_direct            tool MISS  args MISS  ans MISS    5.8s  (no call)
+  convert_distance       tool  ok  args  ok  ans  ok   11.1s  convert_units({"value": 340, "from_unit": "km", "to_unit": "mi"})
+  convert_temp           tool  ok  args  ok  ans  ok   18.9s  convert_units({"value": 29, "from_unit": "c", "to_unit": "f"})
+  convert_mass_vs_calc   tool  ok  args  ok  ans  ok   11.9s  convert_units({"value": 2, "from_unit": "kg", "to_unit": "lb"})
+  notes_search           tool  ok  args  ok  ans  -    14.6s  search_notes({"query": "Jetson"})
+  notes_read             tool  ok  args  ok  ans  ok   11.7s  search_notes({"query": "standup"})
+  notes_then_convert     tool  ok  args  ok  ans MISS   18.4s  search_notes({"query": "road distance to Kisumu"})
+  zero_arg_tool          tool MISS  args MISS  ans  -     8.3s  (no call)
+  time_timezone          tool  ok  args  ok  ans  -     7.3s  get_time({"timezone": "JST"})
+  unknown_city           tool  ok  args  ok  ans  -    15.0s  get_weather({"city": "Atlantis"})
+  timer_then_list        tool  ok  args  ok  ans  -     7.7s  set_timer({"seconds": 300, "label": "tea"})
+  no_tool_greeting       tool  ok  args  ok  ans  -     6.9s  (no call)
+  no_tool_knowledge      tool  ok  args  ok  ans  -     5.8s  (no call)
+
+========================================================================
+
+  dual      tool  15/18  ( 83%)   args  14/18  ( 78%)   answer   7/8   ( 88%)   malformed 0     10.3s/case
+            picker honoured the tool the planner named: 15/16 (94%)
+
+  solo      tool  15/18  ( 83%)   args  15/18  ( 83%)   answer   6/8   ( 75%)   malformed 0     11.6s/case
+========================================================================
+wrote results/run4_budget96.json

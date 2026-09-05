@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dual-wield console</title>
+<style>
+:root{
+  --bg:#fbfbfa; --panel:#fff; --line:#e4e2dd; --ink:#26241f; --dim:#7d786d;
+  --plan:#3a6ea5; --pick:#8a5a2b; --tool:#4a7c59; --bad:#a8382f; --accent:#26241f;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#16150f; --panel:#1e1d17; --line:#33312a; --ink:#e8e5dc; --dim:#918b7c;
+  --plan:#7fb0e0; --pick:#d69f6a; --tool:#84c19a; --bad:#e08a80; --accent:#e8e5dc;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+  padding:18px 24px;border-bottom:1px solid var(--line)}
+h1{font-size:16px;font-weight:600;margin:0;letter-spacing:-.01em}
+.sub{color:var(--dim);font-size:13px}
+.status{margin-left:auto;display:flex;gap:14px;font:12px/1 var(--mono);color:var(--dim)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+  background:var(--dim);margin-right:6px;vertical-align:middle}
+.dot.up{background:var(--tool)} .dot.down{background:var(--bad)}
+main{display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:24px;
+  padding:22px 24px;max-width:1180px;margin:0 auto}
+@media (max-width:860px){main{grid-template-columns:1fr}aside{order:-1}}
+form{display:flex;gap:8px;margin-bottom:18px}
+input[type=text]{flex:1;min-width:0;padding:11px 13px;border:1px solid var(--line);
+  border-radius:7px;background:var(--panel);color:var(--ink);font-size:15px}
+input[type=text]:focus{outline:2px solid var(--plan);outline-offset:-1px}
+select,button{padding:11px 13px;border:1px solid var(--line);border-radius:7px;
+  background:var(--panel);color:var(--ink);font-size:14px;cursor:pointer}
+button{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:600}
+button:disabled{opacity:.45;cursor:default}
+.exchange{border:1px solid var(--line);border-radius:9px;background:var(--panel);
+  margin-bottom:16px;overflow:hidden}
+.q{padding:12px 15px;border-bottom:1px solid var(--line);font-weight:600}
+.q .arm{float:right;font:11px/1.6 var(--mono);color:var(--dim);text-transform:uppercase;
+  letter-spacing:.08em;font-weight:400}
+.row{display:grid;grid-template-columns:78px 1fr 52px;gap:12px;
+  padding:9px 15px;border-bottom:1px solid var(--line);align-items:baseline}
+.row:last-child{border-bottom:0}
+.who{font:11px/1.6 var(--mono);letter-spacing:.06em;font-weight:600}
+.who.planner{color:var(--plan)} .who.picker{color:var(--pick)}
+.who.tool{color:var(--tool)} .who.final{color:var(--ink)}
+.body{min-width:0;overflow-wrap:anywhere}
+.body code{font:13px/1.5 var(--mono);background:transparent}
+.at{font:11px/1.6 var(--mono);color:var(--dim);text-align:right}
+.tag{display:inline-block;font:10px/1.5 var(--mono);padding:1px 6px;border-radius:4px;
+  border:1px solid var(--line);color:var(--dim);margin-left:8px;letter-spacing:.04em}
+.tag.ok{color:var(--tool);border-color:var(--tool)}
+.tag.no{color:var(--bad);border-color:var(--bad)}
+.err{color:var(--bad)}
+.answer{padding:13px 15px;background:color-mix(in srgb,var(--plan) 7%,transparent)}
+aside h2{font:11px/1.6 var(--mono);letter-spacing:.09em;text-transform:uppercase;
+  color:var(--dim);margin:0 0 9px;font-weight:600}
+.card{border:1px solid var(--line);border-radius:9px;background:var(--panel);
+  padding:14px;margin-bottom:16px}
+.metric{font-size:26px;font-weight:600;letter-spacing:-.02em}
+.metric small{font-size:12px;font-weight:400;color:var(--dim);letter-spacing:0}
+.tools{list-style:none;margin:0;padding:0;font:12px/1.7 var(--mono)}
+.tools li{color:var(--dim)} .tools b{color:var(--ink);font-weight:600}
+.hint{color:var(--dim);font-size:12px;margin-top:10px}
+.live{padding:9px 15px;border-bottom:1px solid var(--line);
+  font:13px/1.5 var(--mono);color:var(--dim);overflow-wrap:anywhere;min-height:0}
+.live .think{opacity:.55;font-style:italic}
+.live:empty{display:none}
+.metrics{display:inline-block;font:10px/1.5 var(--mono);color:var(--dim);margin-left:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Dual-wield console</h1>
+  <span class="sub">E2B plans &middot; FunctionGemma calls</span>
+  <span class="sub" id="mode"></span>
+  <span class="sub" id="backend" style="font-weight:600"></span>
+  <div class="status">
+    <span><i class="dot" id="d-plan"></i>planner</span>
+    <span><i class="dot" id="d-pick"></i>picker</span>
+  </div>
+</header>
+
+<main>
+  <section>
+    <form id="f">
+      <input type="text" id="q" autocomplete="off" placeholder="Ask them something. Try: wake me in 10 minutes for the standup">
+      <select id="arm">
+        <option value="dual">dual</option>
+        <option value="solo">solo</option>
+        <option value="natural">natural</option>
+        <option value="all">all</option>
+      </select>
+      <button id="go">Send</button>
+    </form>
+    <div id="log"></div>
+  </section>
+
+  <aside>
+    <div class="card">
+      <h2>Cooperation</h2>
+      <div class="metric" id="coop">&mdash;<small id="coop-sub"></small></div>
+      <div class="hint">How often FunctionGemma called the tool E2B named.</div>
+    </div>
+    <div class="card">
+      <h2>Tools</h2>
+      <ul class="tools" id="tools"></ul>
+    </div>
+  </aside>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const log = $('#log');
+let honoured = 0, measurable = 0, busy = false;
+
+const LABEL = {planner:'E2B', picker:'FGEMMA', tool:'TOOL'};
+
+function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function health(){
+  fetch('/tools').then(r=>r.json()).then(ts=>{
+    $('#tools').innerHTML = ts.map(t =>
+      `<li><b>${esc(t.name)}</b>(${t.params.join(', ')})</li>`).join('');
+  });
+  fetch('/health').then(r=>r.json()).then(h=>{
+    $('#d-plan').className = 'dot ' + (h.planner?'up':'down');
+    $('#d-pick').className = 'dot ' + (h.picker?'up':'down');
+    $('#mode').textContent = h.think ? 'thinking on' : 'thinking off';
+    $('#backend').textContent = h.backend ? 'inference: ' + h.backend : '';
+  }).catch(()=>{});
+}
+
+function card(question, arm){
+  const el = document.createElement('div');
+  el.className = 'exchange';
+  el.innerHTML = `<div class="q"><span class="arm">${esc(arm)}</span>${esc(question)}</div>`;
+  log.prepend(el);
+  return el;
+}
+
+function liveEl(el){
+  let live = el.querySelector('.live');
+  if (!live){ live = document.createElement('div'); live.className = 'live'; el.appendChild(live); }
+  return live;
+}
+
+function addRow(el, who, text, tags, at, cls){
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML = `<div class="who ${who}">${LABEL[who]||who}</div>`
+    + `<div class="body ${cls||''}"><code>${esc(text)}</code>${tags||''}</div>`
+    + `<div class="at">${at!=null?at+'s':''}</div>`;
+  el.appendChild(row);
+  row.scrollIntoView({block:'nearest'});
+}
+
+function metricsTag(s){
+  const m = s.metrics;
+  if (!m || !m.prompt) return '';
+  return `<span class="metrics">${m.cached}/${m.prompt} cached &middot; ${m.gen} tok &middot; ${m.prefill_ms}ms prefill</span>`;
+}
+
+function renderStep(el, s){
+  const live = el.querySelector('.live');
+  if (live) live.remove();
+  if (s.kind === 'intent'){
+    const tag = (s.named ? `<span class="tag">names ${esc(s.named)}</span>`
+                         : `<span class="tag">no tool named</span>`) + metricsTag(s);
+    addRow(el, 'planner', s.text, tag, s.t);
+  } else if (s.kind === 'call'){
+    let tag = '';
+    if (s.agreed === true)  tag = '<span class="tag ok">honoured</span>';
+    if (s.agreed === false) tag = `<span class="tag no">overruled ${esc(s.named)}</span>`;
+    addRow(el, s.who, s.text, tag, s.t);
+  } else if (s.kind === 'observation'){
+    addRow(el, 'tool', s.text, '', s.t, s.error ? 'err' : '');
+  } else if (s.kind === 'error'){
+    addRow(el, s.who, s.text, '<span class="tag no">failed</span>', s.t, 'err');
+  } else if (s.kind === 'answer'){
+    const row = document.createElement('div');
+    row.className = 'answer';
+    row.innerHTML = `<div class="row" style="padding:0;border:0">`
+      + `<div class="who final">ANSWER</div><div class="body">${esc(s.text)}${metricsTag(s)}</div>`
+      + `<div class="at">${s.t}s</div></div>`;
+    el.appendChild(row);
+  }
+}
+
+function updateCoop(){
+  if (!measurable){ $('#coop').innerHTML = '&mdash;'; return; }
+  const pct = Math.round(100*honoured/measurable);
+  $('#coop').innerHTML = pct + '%<small> &nbsp;' + honoured + '/' + measurable + ' hand-offs</small>';
+}
+
+$('#f').addEventListener('submit', e => {
+  e.preventDefault();
+  if (busy) return;
+  const question = $('#q').value.trim();
+  if (!question) return;
+  const arm = $('#arm').value;
+  busy = true; $('#go').disabled = true;
+  $('#q').value = '';
+
+  let el = null;
+  const src = new EventSource('/stream?q=' + encodeURIComponent(question) + '&arm=' + arm);
+
+  src.addEventListener('start', ev => { el = card(question, JSON.parse(ev.data).arm); });
+  src.addEventListener('token', ev => {
+    if (!el) return;
+    const d = JSON.parse(ev.data);
+    const live = liveEl(el);
+    if (d.kind === 'reason'){
+      let t = live.querySelector('.think');
+      if (!t){ t = document.createElement('span'); t.className='think'; live.appendChild(t); }
+      t.textContent += d.text;
+    } else {
+      let c = live.querySelector('.said');
+      if (!c){ c = document.createElement('span'); c.className='said'; live.appendChild(c); }
+      c.textContent += d.text;
+    }
+    live.scrollIntoView({block:'nearest'});
+  });
+  src.addEventListener('step', ev => { if (el) renderStep(el, JSON.parse(ev.data)); });
+  src.addEventListener('done', ev => {
+    const d = JSON.parse(ev.data);
+    if (d.measurable){ honoured += d.honoured; measurable += d.measurable; updateCoop(); }
+    if (el){
+      const foot = document.createElement('div');
+      foot.className = 'row';
+      foot.innerHTML = `<div class="who">&nbsp;</div><div class="body" style="color:var(--dim);font-size:12px">`
+        + `${d.calls.length} call${d.calls.length===1?'':'s'}`
+        + (d.measurable ? ` &middot; ${d.honoured}/${d.measurable} honoured` : '')
+        + `</div><div class="at">${d.seconds}s</div>`;
+      el.appendChild(foot);
+    }
+  });
+  src.addEventListener('failed', ev => {
+    if (el) addRow(el, 'tool', JSON.parse(ev.data).error, '', null, 'err');
+  });
+  src.addEventListener('end', () => { src.close(); busy = false; $('#go').disabled = false; $('#q').focus(); });
+  src.onerror = () => { src.close(); busy = false; $('#go').disabled = false; };
+});
+
+// Implicit form submission is not reliable here, so bind Enter explicitly.
+$('#q').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || e.shiftKey) return;
+  e.preventDefault();
+  const f = $('#f');
+  if (f.requestSubmit) f.requestSubmit();
+  else f.dispatchEvent(new Event('submit', {cancelable:true}));
+});
+
+health(); setInterval(health, 15000); $('#q').focus();
+</script>
+</body>
+</html>

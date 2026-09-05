@@ -1,10 +1,7 @@
 //! Content hashes used to pin mesh peers to a known-good harness/model (#132).
 //!
-//! `HarnessHash` and `ModelHash` are distinct newtypes, not aliases of the
-//! same `[u8; 32]` type, so a harness hash can't be compared against a model
-//! hash by accident — the same reasoning `PeerId` uses for not being a bare
-//! byte array. The blake3 hashing itself lives in `pond-mesh-protocol`; this
-//! crate only owns the hash *value* type.
+//! `HarnessHash` and `ModelHash` are distinct newtypes over `[u8; 32]` so the two can't be
+//! compared by accident. The blake3 hashing lives in `pond-mesh-protocol`, not here.
 
 use serde::{Deserialize, Serialize};
 

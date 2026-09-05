@@ -1,16 +1,7 @@
-# Security scanning — keeps vulnerable dependencies and leaked secrets out of
-# the codebase. Three independent jobs:
-#
-#   rust-audit  — RustSec advisory scan of Cargo.lock (known CVEs/vulns in
-#                 crate dependencies). No build and no goose submodule needed:
-#                 cargo-audit reads the lockfile directly.
-#   npm-audit   — npm advisory scan of the pond-desktop dependency tree,
-#                 failing on high/critical findings.
-#   secrets     — gitleaks scan of the FULL git history for committed
-#                 credentials (API keys, tokens, private keys).
-#
-# Runs on every PR/push to main, weekly (to catch advisories published after
-# code was merged), and on demand.
+# Security scanning — three independent jobs: rust-audit (RustSec scan of Cargo.lock; no build,
+# no goose submodule), npm-audit (pond-desktop tree, fails on high/critical) and secrets
+# (gitleaks over the FULL git history). Runs on every PR/push to main, weekly (advisories
+# published after merge), and on demand.
 
 name: Security
 
@@ -52,12 +43,9 @@ jobs:
         with:
           tool: cargo-audit
 
-      # Fails the job on any vulnerability advisory affecting a lockfile.
-      # (Unmaintained/unsound advisories surface as warnings, not failures.)
-      #
-      # Both lockfiles must be named explicitly. Bare `cargo audit` reads the
-      # workspace lockfile only, and pond-desktop/src-tauri is a separate cargo
-      # project — four advisories accumulated there unnoticed because of that.
+      # Fails the job on any vulnerability advisory affecting a lockfile (unmaintained/unsound
+      # surface as warnings). Both lockfiles must be named: bare `cargo audit` reads only the
+      # workspace lockfile, and pond-desktop/src-tauri is a separate cargo project.
       - name: cargo audit (workspace)
         run: cargo audit
 
@@ -97,22 +85,10 @@ jobs:
   osv:
     name: All lockfiles — OSV (GitHub Advisory ranges)
     runs-on: ubuntu-latest
-    # Advisory, not blocking — for now, and deliberately.
-    #
-    # osv-scanner exits non-zero on ANY matched advisory at ANY severity, and
-    # this tree provably cannot reach zero: rsa 0.9.10 (RUSTSEC-2023-0071, the
-    # Marvin timing side-channel) has no fixed release at all, and neither does
-    # ttf-parser 0.25.1 (RUSTSEC-2026-0192). Others — quick-xml, scc — need
-    # semver-major bumps inside the goose submodule's own dependency tree,
-    # which is not ours to move.
-    #
-    # A gate that can never go green is not a gate; it trains everyone to
-    # ignore a red X, which is how the four unnoticed desktop-shell advisories
-    # happened in the first place. So this job reports and does not block until
-    # an `osv-scanner.toml` exists with a reviewed `[[IgnoredVulns]]` entry per
-    # unfixable advisory (id + reason + expiry, matching the triage rule already
-    # written down in .cargo/audit.toml). Drop this line in the same commit that
-    # adds that file.
+    # Advisory, not blocking, deliberately: osv-scanner exits non-zero on ANY advisory at ANY
+    # severity and this tree cannot reach zero (rsa RUSTSEC-2023-0071 and ttf-parser
+    # RUSTSEC-2026-0192 have no fix; quick-xml and scc need semver-major bumps inside goose). Drop
+    # `continue-on-error` once `osv-scanner.toml` has a reviewed `[[IgnoredVulns]]` entry for each.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
@@ -120,31 +96,10 @@ jobs:
           submodules: false
           fetch-depth: 1
 
-      # Why this exists alongside cargo audit.
-      #
-      # cargo-audit resolves against the RustSec advisory database. Dependabot
-      # resolves against the GitHub Advisory Database. The two disagree on
-      # affected ranges, and the GitHub ranges are sometimes wider — openssl,
-      # tar, serde_with and jsonwebtoken were all open Dependabot alerts
-      # against the workspace lockfile while `cargo audit` reported it clean.
-      # A green cargo-audit run is not evidence that a lockfile is clean.
-      #
-      # osv-scanner queries OSV.dev, which aggregates BOTH databases, so it sees
-      # what Dependabot sees across Cargo and npm alike. cargo-deny would NOT
-      # close this gap: its advisories check reads the same RustSec database
-      # cargo-audit already does.
-      #
-      # Lockfiles are listed explicitly rather than scanned recursively. A bare
-      # recursive scan also picks up vendor/temporal_rs and
-      # templates/extensions/rust — a vendored [patch] source and a standalone
-      # user-extension template — whose advisories are not ours to action, and
-      # that noise is what lets real findings sit unread. The cost is that a new
-      # lockfile must be added here; the npm-audit matrix above has the same
-      # requirement.
-      #
-      # The goose submodule is not checked out here, and does not need to be:
-      # its dependencies reach us through the workspace lockfile, which is
-      # scanned.
+      # Alongside cargo audit because cargo-audit reads only the RustSec database while Dependabot
+      # reads GitHub's, whose ranges are sometimes wider; osv-scanner queries OSV.dev, which
+      # aggregates both (cargo-deny would not: same RustSec data). Lockfiles are named explicitly
+      # so vendor/temporal_rs and templates/extensions/rust do not add noise; add new ones here.
       - name: osv-scanner
         uses: google/osv-scanner-action/osv-scanner-action@v2.5.1
         with:
@@ -166,20 +121,10 @@ jobs:
           fetch-depth: 0
           submodules: false
 
-      # Pinned gitleaks CLI via the official image (the gitleaks GitHub Action
-      # requires an org license; the CLI does not).
-      #
-      # Two modes, because the two events are asking different questions.
-      #
-      # A pull request asks "does this change introduce a secret". The history
-      # behind it is the same history that was already scanned when it landed on
-      # main, so re-reading every blob in every commit on every push to every PR
-      # buys nothing and is the most expensive job in this file — it grows with
-      # the age of the repository rather than with the size of the change.
-      #
-      # Pushes to main and the weekly run still read everything, which is where
-      # the "committed and later deleted" guarantee actually lives. A secret that
-      # slips through a PR scan is caught seconds later when the merge lands.
+      # Pinned gitleaks CLI via the official image (the GitHub Action needs an org license).
+      # A pull request asks "does this change introduce a secret", so it scans only the PR's
+      # commits: a full-history scan grows with the repository's age, not the change. Pushes to
+      # main and the weekly run still read everything, which is where the guarantee lives.
       - name: gitleaks — the commits this PR adds
         if: github.event_name == 'pull_request'
         env:
@@ -192,11 +137,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # gitleaks FAILS OPEN on a range it cannot resolve. Measured: given a
-          # malformed `--log-opts`, it prints "failed to scan Git repository",
-          # then "no leaks found", and exits 0. A secrets gate that reports
-          # success because it could not run is worse than not having one, so
-          # both halves are checked here rather than trusted.
+          # gitleaks FAILS OPEN on a range it cannot resolve: given a malformed `--log-opts` it
+          # prints "failed to scan Git repository", then "no leaks found", and exits 0. So both
+          # halves are checked here rather than trusted.
           test -n "$BASE_SHA" -a -n "$HEAD_SHA" || {
             echo "::error::empty base/head SHA — refusing to report a pass on a scan that cannot run"
             exit 1

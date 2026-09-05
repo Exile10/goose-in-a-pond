@@ -1,30 +1,7 @@
-//! SCRFD face detector — bbox + five landmarks, ONNX.
-//!
-//! SCRFD (Sample and Computation Redistribution for Face Detection, InsightFace
-//! 2021) is the de-facto standard detector for pairing with ArcFace.  Unlike
-//! UltraFace it produces the five canonical landmarks (eyes, nose, mouth
-//! corners) we need for similarity-transform alignment.
-//!
-//! # Graph shape
-//!
-//! SCRFD's ONNX export from InsightFace has three feature pyramid levels
-//! (strides 8, 16, 32) and three output tensors per level:
-//!   * `score_{stride}`    — (1, anchors·1, 1)        face-ness logit
-//!   * `bbox_{stride}`     — (1, anchors·4, 1)        (l,t,r,b) distances
-//!   * `kps_{stride}`      — (1, anchors·10, 1)       5×(dx, dy) offsets
-//!
-//! Each location at a given stride has `num_anchors = 2` anchor boxes.
-//! Bbox regression is expressed as distance from the anchor centre to each
-//! edge; keypoints are offsets from the anchor centre.  All values are
-//! already in input-image pixel units (the `mean=127.5, scale=1/128`
-//! preprocessing is applied on the raw pixels, not the output decoding).
-//!
-//! # Fallback policy
-//!
-//! If the model file at `$POND_FACE_DETECTOR_PATH` is absent, the server
-//! falls back to UltraFace (bbox only), and the embedding path degrades to
-//! crop-and-resize with the same behaviour as phase-2 baseline.  That is,
-//! alignment is a strict accuracy improvement, not a correctness requirement.
+//! SCRFD face detector (InsightFace 2021): bbox plus the five landmarks alignment needs.
+//! Three FPN levels (strides 8, 16, 32) each emit `score_/bbox_/kps_{stride}`, 2 anchors per
+//! location; bbox is (l,t,r,b) distance from the anchor centre, keypoints are offsets from it,
+//! all in input-pixel units. If `$POND_FACE_DETECTOR_PATH` is absent the server uses UltraFace.
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -126,12 +103,9 @@ impl FaceDetector for ScrfdDetector {
     async fn detect_face(&self, image_bytes: &[u8]) -> Result<Option<DetectedFace>> {
         let bytes = image_bytes.to_vec();
         let session = Arc::clone(&self.session);
-        // The configured score threshold (typically 0.5) is the right
-        // floor for normally-lit input. In low light SCRFD's confidence
-        // drops uniformly across all true faces — apply a relaxed
-        // threshold below LOW_LIGHT_TRIGGER so we still detect dim
-        // faces. The matcher's own threshold + the burst-liveness gates
-        // remain the real spoof / quality safeguards.
+        // In low light SCRFD's confidence drops uniformly across true faces, so below
+        // LOW_LIGHT_TRIGGER a relaxed threshold applies; the matcher threshold and the
+        // burst-liveness gates remain the real spoof and quality safeguards.
         let configured_score_thresh = self.score_thresh;
         let low_light_score_thresh: f32 = std::env::var("POND_FACE_SCRFD_LOW_LIGHT_THRESH")
             .ok()
@@ -154,20 +128,10 @@ impl FaceDetector for ScrfdDetector {
                     .resize_exact(input_side, input_side, FilterType::Triangle)
                     .to_rgb8();
 
-                // Pre-detection low-light auto-exposure.  When the input frame is
-                // dim (mean luminance < LOW_LIGHT_TRIGGER), apply the same
-                // per-channel 2-98 percentile stretch the embedder uses on its
-                // aligned crop — but here on the FULL detector tensor BEFORE
-                // SCRFD looks for faces.  This is the layer that matters for
-                // low light: without it, SCRFD's confidence on a dim face drops
-                // below its detection threshold and the embedder never even
-                // sees the frame.  Disable with POND_FACE_AUTO_EXPOSURE=off.
-                //
-                // Also pick a per-frame score threshold: if the input is dim
-                // (after the auto-exposure attempt) we relax to the low-light
-                // floor since SCRFD's own confidence drops uniformly on dim
-                // faces.  The matcher threshold + burst-liveness gates remain
-                // the real spoof / quality safeguards downstream.
+                // Low-light auto-exposure on the FULL detector input BEFORE SCRFD runs (the same
+                // 2-98 percentile stretch the embedder uses): without it a dim face never clears
+                // the detection threshold and the embedder never sees the frame. Disable with
+                // POND_FACE_AUTO_EXPOSURE=off. A still-dim frame relaxes the score threshold.
                 let pre_mean = crate::mean_luminance(&resized);
                 let was_dim = pre_mean < crate::LOW_LIGHT_TRIGGER;
                 if crate::auto_exposure_enabled() && was_dim {

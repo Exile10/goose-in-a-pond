@@ -4,9 +4,7 @@
  *
  * A small set of intent-shaped tools rather than one per endpoint (this was
  * once 14 tools, which was worse):
- *   play          — play a track or album, by name or URI
- *   play_playlist — play a playlist from the library, by name or link
- *   queue         — append to the queue without interrupting the current track
+ *   play          — play a track, album or playlist; now or next in the queue
  *   playlists     — list the user's playlists, split by who created them
  *   devices       — list playback devices, or move playback to one
  *   status        — what's currently playing + queue
@@ -22,71 +20,46 @@ const provider = new SpotifyProvider();
 const TOOLS = [
   {
     name: "play",
+    // One tool with two enums, not three tools that each spend most of their
+    // description warning about the other two. `control` already proved the
+    // shape here: 13 actions in 314 tokens, where play/queue/play_playlist
+    // cost 895 for three. An enum is also a stronger steer than prose asking
+    // the model not to pick a sibling.
+    // The enums carry their own semantics; repeating them here cost ~90 tokens
+    // to say everything twice. What stays is what no parameter can express:
+    // that playback continues past the song it was asked for, and that the
+    // result may not be what was asked for.
     description:
-      "Start playing music now, REPLACING whatever is currently playing. Give a song name, artist, or album and it will search Spotify and play the best match. Music KEEPS PLAYING after it: a song starts inside its album so the album follows on, and a single is topped up with more by the same artist. Do not tell the user playback will stop after the song, and do not queue extra songs yourself to keep it going. Examples: 'play Bohemian Rhapsody', 'play Drake', 'play chill vibes playlist'. To add something without interrupting the current track, use the 'queue' tool instead. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for.",
+      "Play music on Spotify. Music keeps playing afterwards: a song starts inside its album so the album follows on, and a single is topped up with more by the same artist — do not tell the user playback will stop after the song, and do not queue extra songs yourself to keep it going. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for.",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
           description:
-            "What to play — song name, artist, album, or mood (e.g. 'Marvin\\'s Room by Drake', 'jazz playlist', 'Kendrick Lamar').",
+            "What to play, as the user said it — 'Marvin's Room by Drake', 'Randoms', 'jazz'. Omit to resume what is paused.",
+        },
+        target: {
+          type: "string",
+          enum: ["track", "playlist"],
+          description:
+            "'playlist' matches the user's own playlists loosely by name, preferring ones they created. Default 'track' searches songs, artists and albums.",
+        },
+        when: {
+          type: "string",
+          enum: ["now", "next"],
+          description:
+            "'next' appends to the queue and lets the current track finish; Spotify cannot insert at a chosen position, and cannot queue a whole playlist, so this applies to tracks only. Default 'now' replaces what is playing.",
         },
         uri: {
           type: "string",
           description:
-            "Spotify URI to play directly (spotify:track:..., spotify:album:..., spotify:playlist:...). Use this only if you already have a URI. Otherwise use query.",
-        },
-        type: {
-          type: "string",
-          enum: ["track", "album", "playlist"],
-          description:
-            "What the query names, defaulting to 'track'. If the user says the word 'playlist' you MUST pass 'playlist', and if they say 'album' you MUST pass 'album' — leaving this unset searches the words as a SONG TITLE, so 'play the sautisol playlist' would start a single Sauti Sol track instead of their playlist. 'playlist' matches against the user's library by name; 'album' plays the whole record in order.",
+            "A pasted Spotify URI or link. Plays it directly, and is the only way to reach a playlist outside the user's library.",
         },
       },
     },
   },
-  {
-    name: "queue",
-    description:
-      "Add a song to the Spotify queue WITHOUT interrupting what is playing. The current track keeps playing and the song is appended after anything already queued. Use this whenever the user says queue, add, or 'after this' — never 'play', which would cut the current song off. Spotify has no way to insert at a specific position, so this always appends to the end.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description:
-            "What to queue — song name and optionally the artist (e.g. 'Bomba Train by E-Sir').",
-        },
-        uri: {
-          type: "string",
-          description:
-            "Spotify track URI to queue directly (spotify:track:...). Use this only if you already have a URI. Otherwise use query.",
-        },
-      },
-    },
-  },
-  {
-    name: "play_playlist",
-    description:
-      "Play one of the playlists in the user's Spotify library, by name. Use this for ANY request to play a playlist — 'play my Randoms playlist', 'play the EDM playlist', 'play randoms' when Randoms is one of their playlists. Do NOT use the 'play' tool for a playlist: it searches the words as a song title and starts an unrelated track instead. Matches loosely, so a rough or misspelled name is fine, and prefers a playlist the user created over one they follow.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        name: {
-          type: "string",
-          description:
-            "The playlist name as the user said it (e.g. 'Randoms', 'sauti sol kenyan gold', 'EDM'). Include 'by <person>' if they named an owner.",
-        },
-        uri: {
-          type: "string",
-          description:
-            "A Spotify playlist link or URI. Use this when the user pastes one — it plays even if the playlist is not in their library, which is the only way to reach someone else's playlist.",
-        },
-      },
-    },
-  },
-  {
+      {
     name: "playlists",
     description:
       "List every playlist in the user's Spotify library, separated into ones they created and ones they follow from other people. Use this to answer 'what playlists do I have' or 'which of these are mine', and to find the exact name before playing one with the 'play' tool.",
@@ -777,18 +750,32 @@ async function handleRequest(
       try {
         let text: string;
         switch (toolName) {
-          case "play":
-            debug("play →", args.query || args.uri || "(resume)");
-            text = await handlePlay(args);
+          // One tool, routed on its enums. The three handlers stay as they
+          // were -- the merge is at the tool surface, which is where the
+          // tokens were, not in the Spotify logic.
+          case "play": {
+            const target = (args.target as string | undefined) ?? "track";
+            const when = (args.when as string | undefined) ?? "now";
+            debug(`play → ${target}/${when}`, String(args.query ?? args.uri ?? "(resume)"));
+            if (target === "playlist") {
+              // `handlePlayPlaylist` reads `name`; the merged surface calls it
+              // `query`, so map rather than duplicating the handler.
+              //
+              // `when` is ignored here and the schema says so: Spotify has no
+              // call that queues a whole playlist. Splitting the enums made the
+              // request EXPRESSIBLE for the first time, so it has to be
+              // answered rather than silently doing something else.
+              text = await handlePlayPlaylist({ ...args, name: args.name ?? args.query });
+              if (when === "next") {
+                text += "\n\n(Played now — Spotify cannot add a whole playlist to the queue.)";
+              }
+            } else if (when === "next") {
+              text = await handleQueue(args);
+            } else {
+              text = await handlePlay(args);
+            }
             break;
-          case "queue":
-            debug("queue →", args.query || args.uri || "(nothing)");
-            text = await handleQueue(args);
-            break;
-          case "play_playlist":
-            debug("play_playlist →", args.name ?? args.query ?? "");
-            text = await handlePlayPlaylist(args);
-            break;
+          }
           case "library":
             debug("library →", args.action, args.query ?? "");
             text = await handleLibrary(args);

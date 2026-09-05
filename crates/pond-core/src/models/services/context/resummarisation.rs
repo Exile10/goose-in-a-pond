@@ -1,129 +1,38 @@
-//! Large-tier re-summarisation -- PAI-4's model axis, as a pure gate.
-//!
-//! `docs/architecture/pai/04-smart-compaction.md` section 3.1 gives the large
-//! tier one mechanism the other two do not get: "**LLM re-summarisation of the
-//! summary itself** when it grows stale. Here the summarisation call is cheap
-//! and off the critical path." This module is the arithmetic that decides when
-//! that is true, and how many tokens the rebuilt summary may spend.
-//!
-//! It is a *pure* gate in the shape [`super::resume_compaction`] proved: plain
-//! integers in, a `Run`/`Skip` out, every rule unit-testable without a clock, a
-//! database or a model. The mechanism that acts on it lives with the only other
-//! writer of `sessions.rolling_summary`,
-//! `shared::services::session_summary::SessionSummaryService::resummarise` --
-//! deliberately, because two files writing one column is how this programme has
-//! produced drift before.
-//!
-//! # What "grows stale" actually means
-//!
-//! `SessionSummaryService::refresh` is *incremental*. Each pass feeds the model
-//! the previous summary plus the messages it does not yet cover, and asks for
-//! "3-5 sentences maximum". So the summary is a fixed-size artefact standing in
-//! for an unbounded and growing span, rebuilt every time from its own previous
-//! output rather than from the conversation. Detail lost on pass *n* cannot come
-//! back on pass *n+1*: it is a lossy chain, and the loss compounds.
-//!
-//! On the small and medium tiers that is the right trade -- the alternative
-//! costs a model call on the box the next turn's prefill needs. On the large
-//! tier it is not: the call is somebody else's hardware, the window is generous,
-//! and the source messages are still sitting in `session_messages`. So the large
-//! tier's extra mechanism is to **rebuild the summary from the source span**
-//! rather than from the chain, with a budget the window can afford.
-//!
-//! # The two conditions, and why neither is a magic number
-//!
-//! - **The span the summary covers has outgrown the history budget**
-//!   ([`ResummariseGateInputs::covered_tokens`] >
-//!   [`ResummariseGateInputs::history_token_budget`]). Below that the trimmer
-//!   could still carry the covered messages verbatim, so the summary is a
-//!   convenience; above it, at least part of that span reaches the model *only*
-//!   through the summary, and its fidelity is load-bearing. The number is the
-//!   trimmer's own budget, not a new one. This is a **sufficient** condition
-//!   rather than a necessary one -- history is summary plus verbatim turns, so
-//!   the real crossover comes slightly earlier -- and stating it conservatively
-//!   is the narrowing direction: it declines to spend a model call in the
-//!   uncertain region.
-//! - **A rebuild has room to more than double what the summary spends**
-//!   (`summary_tokens * `[`MIN_REBUILD_GAIN`]` <= budget`). The first condition
-//!   alone is monotone -- PAI-4 P6's whole lesson is that a standing condition
-//!   acted on without a limiter fires forever -- and this is what stops a
-//!   summary that already spends its budget from being rewritten to the same
-//!   size, over and over, for nothing.
-//!
-//! # What this does NOT claim, having checked
-//!
-//! It does not make the gate self-clearing, and the first draft of this module
-//! said it did. `refresh` runs on every tier and asks for "3-5 sentences
-//! maximum", so on the large tier the two mechanisms genuinely oscillate: as
-//! soon as four new messages accumulate past the through-pointer, the next
-//! refresh folds the rebuilt summary back down toward its own much smaller
-//! budget, and the gate opens again. That is not a defect that hides -- each
-//! firing restores fidelity the collapse destroyed, which is real work -- but it
-//! does mean the rate is "at most one rebuild per compaction pass", not "once
-//! per session".
-//!
-//! **The rate limiter is upstream and already exists**, which is why this module
-//! does not grow one of its own. A compaction pass happens only when
-//! `ContextMonitor::claim_compaction` grants it (once per
-//! `COMPACTION_COOLDOWN_TURNS` recorded turns, PAI-4 P6) or when a session is
-//! reopened past `resume_compaction_idle_secs` (P4). A second limiter here would
-//! be a second copy of a rule those two phases already own.
-//!
-//! Reconciling the two budgets properly -- teaching `refresh` that a large
-//! window can afford more than three sentences -- would change the summary on a
-//! path P1 and P6 both argued about at length, and it needs the cache-age
-//! measurement P5 is for. It is named here rather than done here.
-//!
-//! # Which direction is the dangerous one
-//!
-//! Running when we should not: a model call that competes with a turn. Not
-//! running: the summary stays as good as it is today, which is the behaviour
-//! every tier has had since hybrid compaction shipped. So every fallback here
-//! resolves toward *not* running -- an unknown tier, an absent summary, a span
-//! that does not fit, a rebuild with no headroom to gain all mean skip.
+//! Large-tier re-summarisation -- PAI-4's model axis as a pure gate over plain integers; see
+//! `docs/architecture/pai/04-smart-compaction.md` section 3.1. The mechanism that acts on the
+//! decision lives in `shared::services::session_summary`, the only other writer of
+//! `sessions.rolling_summary`. Rate limiting is upstream; every fallback here means skip.
 
 use super::context_budget::CompactionProfile;
 use super::model_class::ModelClass;
 
 /// The rebuilt summary may occupy at most this fraction of the history budget.
 ///
-/// A sixteenth. The summary is a *header* on the history the trimmer splices,
-/// not a replacement for it, and the value of the large tier is that it can keep
-/// recent turns verbatim as well. At the large tier's floor (65,536 tokens,
-/// `history_token_budget` 20,000) that is 1,250 tokens; at the 128,000 anchor
-/// (80,000) it is 5,000, which [`RESUMMARY_MAX_BUDGET_TOKENS`] then caps.
+/// The summary is a *header* on the history the trimmer splices, not a replacement for it. At
+/// the large tier's floor (`history_token_budget` 20,000) a sixteenth is 1,250 tokens.
 pub const RESUMMARY_BUDGET_DIVISOR: usize = 16;
 
 /// Floor for the rebuilt summary's budget.
 ///
-/// Unreachable through the current anchors -- the large tier starts at a 1,250
-/// token budget -- and kept because the anchors are a table somebody will edit.
-/// A budget below this cannot hold more than the 3-5 sentences the incremental
-/// summary already produces, so firing at all would spend a model call to
-/// rewrite the same size artefact.
+/// Unreachable through the current anchors (the large tier starts at 1,250 tokens) and kept
+/// because those anchors are a table somebody will edit. Below this a rebuild gains nothing.
 pub const RESUMMARY_MIN_BUDGET_TOKENS: usize = 256;
 
 /// Ceiling for the rebuilt summary's budget.
 ///
-/// Past roughly this the artefact stops being a summary and becomes an abridged
-/// transcript that is re-prefilled on every single turn. 2,048 is four to eight
-/// pages of prose -- far more than the 3-5 sentences it replaces, and still
-/// under three percent of a 128K window.
+/// Past roughly this the artefact stops being a summary and becomes an abridged transcript
+/// re-prefilled every turn. 2,048 tokens is four to eight pages, under three percent of 128K.
 pub const RESUMMARY_MAX_BUDGET_TOKENS: usize = 2_048;
 
-/// Minimum multiple of the current summary's size that the budget must allow
-/// before a rebuild is worth a model call.
-///
-/// Two: do not spend a model call for less than a doubling. Read the module
-/// header before raising it -- this bounds the *pointless* rebuild, and it is
-/// deliberately not doing the job of a rate limiter, which lives upstream.
+/// Minimum multiple of the current summary's size the budget must allow before a rebuild is
+/// worth a model call: never spend a call for less than a doubling. This bounds the *pointless*
+/// rebuild only; the rate limiter is upstream in `ContextMonitor::claim_compaction`.
 pub const MIN_REBUILD_GAIN: usize = 2;
 
 /// Why a re-summarisation did not run.
 ///
-/// Ordered as the gate evaluates them, cheapest and most-invariant first, so a
-/// caller logging the reason gets the *first* thing that was wrong rather than
-/// an arbitrary one.
+/// Ordered as the gate evaluates them, cheapest and most-invariant first, so a caller logging
+/// the reason gets the *first* thing that was wrong rather than an arbitrary one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     /// This model class may not spend a model call on reshaping history --
@@ -198,11 +107,8 @@ pub fn resummary_budget_tokens(history_token_budget: usize) -> usize {
 
 /// Tokens of *source* the rebuild prompt may carry.
 ///
-/// The whole prompt budget of the window, minus the room the answer needs.
-/// `usable_prompt_tokens` already subtracts `output_reserve_tokens`, but that
-/// reserve is sized for a chat answer rather than for a summary of up to
-/// [`RESUMMARY_MAX_BUDGET_TOKENS`], so the summary budget is subtracted again
-/// rather than assumed to be covered. Subtracting twice is the narrow direction.
+/// `usable_prompt_tokens` already subtracts `output_reserve_tokens`, but that reserve is sized
+/// for a chat answer, so the summary budget comes off again. Subtracting twice is the narrow way.
 pub fn source_budget_tokens(profile: &CompactionProfile, summary_budget_tokens: usize) -> usize {
     profile
         .usable_prompt_tokens()
@@ -228,25 +134,10 @@ pub fn should_resummarise(inputs: ResummariseGateInputs) -> GateDecision {
     GateDecision::Run { budget_tokens }
 }
 
-/// Index of the oldest covered message the rebuild prompt can afford, taking
-/// the NEWEST affordable suffix of `per_message_tokens`.
-///
-/// Returns `0` when the whole span fits, and `per_message_tokens.len()` when not
-/// even the last message does -- which the caller treats as
-/// [`SkipReason::SourceTooLargeToRead`] rather than sending an empty span.
-///
-/// # Why the newest end
-///
-/// When the covered span does not fit, something has to be represented by the
-/// old summary instead of by its source, and the design's own time axis (3.2)
-/// says which end to give up: "a turn from three days ago is not worth the same
-/// tokens as one from five minutes ago". Keeping the newest suffix is also what
-/// P3's age-weighted retention will do, so the two cannot disagree later.
-///
-/// This is a bounded improvement rather than a full rebuild, and the doc comment
-/// says so rather than letting the name imply otherwise. The full-rebuild case
-/// is the common one: at the large tier's floor the source budget is over 63,000
-/// tokens.
+/// Index of the oldest covered message the rebuild prompt can afford, taking the NEWEST
+/// affordable suffix of `per_message_tokens`. Returns `0` when the whole span fits, and
+/// `per_message_tokens.len()` when not even the last message does, which the caller treats as
+/// [`SkipReason::SourceTooLargeToRead`]. Newest-first matches the 3.2 time axis and P3 retention.
 pub fn newest_affordable_start(per_message_tokens: &[usize], source_budget: usize) -> usize {
     let mut used = 0usize;
     let mut start = per_message_tokens.len();
@@ -262,9 +153,8 @@ pub fn newest_affordable_start(per_message_tokens: &[usize], source_budget: usiz
 
 /// The number of words to ask the model for, from a token budget.
 ///
-/// Models take a word count far more reliably than a token count, and roughly
-/// four tokens cover three English words. Rounded down, which keeps the ask
-/// inside the budget rather than at it.
+/// Models take a word count far more reliably than a token count, and roughly four tokens cover
+/// three English words. Rounded down, so the ask lands inside the budget rather than at it.
 pub fn budget_as_words(budget_tokens: usize) -> usize {
     budget_tokens * 3 / 4
 }
@@ -371,12 +261,9 @@ mod tests {
         ));
     }
 
-    /// A summary that already spends its budget is not rewritten to the same
-    /// size for nothing. The boundary is exactly a doubling, and it is pinned
-    /// from both sides because the whole point of `MIN_REBUILD_GAIN` is where it
-    /// sits: this test's first draft asserted that HALF the budget closes the
-    /// gate, which is off by one step and would have quietly described a
-    /// stricter rule than the code implements.
+    /// A summary that already spends its budget is not rewritten to the same size for nothing.
+    /// The boundary is exactly a doubling, pinned from both sides because where
+    /// `MIN_REBUILD_GAIN` sits is the whole point of the constant.
     #[test]
     fn a_summary_with_nothing_to_gain_is_not_rebuilt() {
         let budget = resummary_budget_tokens(20_000);
@@ -509,18 +396,10 @@ mod tests {
         }
     }
 
-    /// The way this phase could be dead without any other test noticing: if
-    /// `Large` were unreachable through the rungs an OFF-TURN pass can supply,
-    /// every test above would still pass and nothing would ever rebuild in
-    /// production. That is the `ProfileScope::Owner` failure — a fixture
-    /// production cannot produce — and it is the one worth pinning explicitly.
-    ///
-    /// `compaction_model_class` in `pond-api` has no engine report (that arrives
-    /// on `TurnStats`, i.e. only during a turn) and no registry pin (that is the
-    /// adapter's). So it composes exactly the rungs below, and both live routes
-    /// into the tier are asserted: a catalog row, which PAI-3 P3a taught the
-    /// catalog providers to write, and the capability window the adapter derives
-    /// from the model name.
+    /// Pins that `Large` is reachable through the rungs an OFF-TURN pass can supply. Without it
+    /// the phase could be dead in production while every test above still passed.
+    /// `compaction_model_class` in `pond-api` has neither an engine report nor a registry pin, so
+    /// both live routes are asserted: a catalog row, and the adapter's capability window.
     #[test]
     fn the_large_tier_is_reachable_through_the_rungs_an_off_turn_pass_can_supply() {
         use crate::models::services::context::context_governor::{ContextGovernor, ContextInputs};

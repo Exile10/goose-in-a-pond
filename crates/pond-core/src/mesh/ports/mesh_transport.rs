@@ -17,10 +17,8 @@ pub enum MeshTransportError {
 
 /// Driven Port: MeshTransport
 ///
-/// Low-level connectivity to other Ponds in the mesh. `address` is opaque to
-/// `pond-core` — a real transport (e.g. libp2p) parses it as its own address
-/// type; this port only knows it as a caller-supplied dial hint, so no
-/// transport-specific type leaks into the pure domain layer.
+/// Low-level connectivity to other Ponds. `address` stays an opaque, caller-supplied dial
+/// hint so no transport-specific type (e.g. libp2p's) leaks into the pure domain layer.
 #[async_trait]
 pub trait MeshTransport: Send + Sync {
     async fn connect(&self, peer: PeerId, address: String) -> Result<(), MeshTransportError>;

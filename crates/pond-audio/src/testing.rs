@@ -1,25 +1,15 @@
-//! A capture device that plays a supplied waveform.
-//!
-//! Deliberately **not** `#[cfg(test)]`. The point is not to test this crate —
-//! it is to make the *subscribers* in other crates testable. The two capture
-//! paths, the wake-word detector and the barge-in listener each opened
-//! `default_input_device()` themselves, and consequently had no tests at all:
-//! there was no way to drive them without a microphone and a person.
-//!
-//! With the owner between them and the hardware, any of those loops can be
-//! driven from a script and asserted on in CI.
+//! A capture device that plays a supplied waveform. Deliberately not `#[cfg(test)]`: it exists
+//! to make the subscribers in other crates testable, since a loop that opens
+//! `default_input_device()` itself cannot be driven without a microphone and a person.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::owner::{CaptureDevice, MicShared};
 
-/// Feeds 16 kHz mono f32 into the ring in real-time-sized slices, then silence.
-///
-/// Deterministic in content, approximate in timing — which is exactly what a
-/// poll loop with a 30 ms tick depends on. Tests assert on what was captured
-/// and on VAD transitions, never on exact sample counts at a wall-clock
-/// instant, because that would be flaky for reasons unrelated to the code.
+/// Feeds 16 kHz mono f32 into the ring in real-time-sized slices, then silence. Deterministic
+/// in content, approximate in timing, which is what a poll loop with a 30 ms tick depends on.
+/// Assert on captured audio and on VAD transitions, never on exact sample counts at an instant.
 pub struct ScriptedCapture {
     samples: Vec<f32>,
     chunk_ms: u64,

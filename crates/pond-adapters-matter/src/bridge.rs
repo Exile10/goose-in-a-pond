@@ -1,26 +1,7 @@
-//! The Matter bridge task: keeps GIAP's view of the fabric current.
-//!
-//! On start it sends `subscribe`, which returns every commissioned device and
-//! every reading they currently hold, and subscribes the connection to changes.
-//! Devices are synced into the [`DeviceRegistry`] under stable `matter-<node_id>`
-//! ids. From then on:
-//!
-//! - a `reading` event → [`BusEvent::Sensor`] on the EventBus, so #92 rules, the
-//!   activity feed and notifications react to Matter sensors exactly like any
-//!   other sensor source;
-//! - device lifecycle events refresh the registry.
-//!
-//! On connection loss `run_matter_bridge` returns. [`run_matter_supervisor`]
-//! wraps it in a reconnect loop: when the connection drops it re-establishes the
-//! WebSocket with backoff, swaps the new client into the shared handle the
-//! control port reads, and re-runs the bridge — which subscribes again and
-//! resyncs the fabric. A controller restart does not need a pond-server restart.
-//!
-//! Reconnecting only recovers a controller that is up. When the controller
-//! *process* has died there is nothing to reconnect to, so after
-//! [`RESPAWN_AFTER`] consecutive failures the supervisor re-runs the local
-//! controller setup before the next attempt, and keeps doing so on that cadence
-//! until it is back.
+//! The Matter bridge task: keeps GIAP's view of the fabric current. On start it sends `subscribe`,
+//! syncs every commissioned device into the [`DeviceRegistry`] under `matter-<node_id>` ids, and
+//! turns each `reading` event into a [`BusEvent::Sensor`]. [`run_matter_supervisor`] wraps it in a
+//! reconnect loop that re-runs local controller setup after [`RESPAWN_AFTER`] consecutive failures.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -60,16 +41,8 @@ const RESPAWN_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The last value published per `(device, sensor)`.
 ///
-/// The reason this exists rather than publishing whatever `subscribe` returns:
-/// the bridge re-subscribes on every reconnect, and the rules engine (#92) is
-/// LEVEL-based — republishing a steady "motion = true" is indistinguishable to
-/// it from motion starting again. A controller that reconnects a few times would
-/// re-fire every automation attached to every Matter sensor with nothing in the
-/// house having changed, and the reconnect-often case is exactly the one the
-/// supervisor exists to handle.
-///
-/// First sight still publishes everything, which is the behaviour that makes a
-/// steady sensor knowable at all; the cache is what distinguishes the two.
+/// The bridge re-subscribes on every reconnect and the rules engine (#92) is level-based, so
+/// republishing a steady "motion = true" would re-fire every automation attached to it.
 pub(crate) type ReadingCache = HashMap<(String, String), f64>;
 
 /// Where the supervisor reconnects to, and what it needs to bring the controller
@@ -85,17 +58,14 @@ pub struct SupervisorConfig {
     pub child: SharedServerChild,
     /// Whether the respawned controller should be asked for BLE again.
     ///
-    /// Carried rather than re-read: a respawn that quietly dropped a transport
-    /// the user asked for would leave a Pond that pairs new devices until the
-    /// first reconnect and then silently stops.
+    /// Carried rather than re-read: a respawn that dropped the transport would leave a Pond that
+    /// pairs new devices until the first reconnect and then silently stops.
     pub ble: bool,
 }
 
-/// Should the reconnect about to be made (1-based `attempt`) re-run controller
-/// setup first? True on the attempt following every [`RESPAWN_AFTER`] failures,
-/// so a controller that stays dead keeps being retried for as long as the outage
-/// lasts rather than once and never again. Pure, so the schedule is
-/// unit-testable without sleeping.
+/// Should the reconnect about to be made (1-based `attempt`) re-run controller setup first? True
+/// on the attempt following every [`RESPAWN_AFTER`] failures, so a controller that stays dead
+/// keeps being retried for the length of the outage. Pure, so the schedule tests without sleeping.
 fn should_respawn_controller(attempt: u32) -> bool {
     attempt > 1 && (attempt - 1).is_multiple_of(RESPAWN_AFTER)
 }
@@ -129,15 +99,8 @@ fn publish_reading(reading: &WireReading, cache: &mut ReadingCache, bus: &Arc<dy
 
 /// How often a device the controller can still see is touched in the registry.
 ///
-/// `is_online` is derived from `last_seen` being fresher than five minutes, so
-/// something has to say "still here" or every device eventually reads offline. The
-/// bridge only ever said it when an event arrived, and a Matter device that is
-/// simply idle sends none: a washer nobody touched went offline five minutes after
-/// the server started, and its "last seen" stayed frozen at the moment it was
-/// synced -- which is why the card read like a commissioning timestamp.
-///
-/// A fifth of the threshold, so four ticks can be missed before a device that is
-/// genuinely present is called absent.
+/// `is_online` means `last_seen` fresher than five minutes, so an idle Matter device that sends no
+/// events reads offline unless touched. A fifth of that threshold: four ticks may be missed.
 const LIVENESS_TICK: Duration = Duration::from_secs(60);
 
 /// Sync one device into the registry (register if new, heartbeat if known).
@@ -150,25 +113,18 @@ async fn sync_device(
 
     match registry.get_device(&device.id).await {
         Ok(Some(existing)) => {
-            // Only for a device the controller can actually see. This runs for every
-            // device in the snapshot, including the ones it reports as offline, so an
-            // unconditional heartbeat handed each of those a fresh five minutes of
-            // looking present at every connect and reconnect — a second mechanism
-            // vouching for a device the first one had already given up on.
+            // Only for a device the controller can actually see: this runs for every device in
+            // the snapshot, offline ones included, and an unconditional heartbeat would hand
+            // each of those a fresh five minutes of looking present at every reconnect.
             if device.is_online {
                 if let Err(e) = registry.heartbeat(&device.id).await {
                     tracing::warn!(device = %device.id, error = %e, "matter: heartbeat failed");
                 }
             }
-            // Re-derived typing has to reach a device that already exists, or it
-            // only ever applies to devices commissioned after the improvement
-            // shipped. Registration was the sole writer of these two fields, so
-            // every fan and sensor already on the fabric kept `device_type:
-            // "matter"` and no capabilities through every restart.
-            //
-            // Guarded on a real difference because this runs on the initial sync
-            // and on every reconnect — an unconditional UPDATE would be a write
-            // per device per reconnect for a value that almost never changes.
+            // Re-derived typing has to reach devices that already exist, or it only ever applies
+            // to ones commissioned later. Guarded on a real difference because this runs on the
+            // initial sync and on every reconnect: an unconditional UPDATE would be a write per
+            // device per reconnect for a value that almost never changes.
             if existing.device_type != device.device_type
                 || existing.capabilities != device.capabilities
             {
@@ -221,13 +177,10 @@ async fn sync_device(
     }
 }
 
-/// Run until the connection drops. `client` must be freshly connected; `events`
-/// is its event stream.
+/// Run until the connection drops. `client` must be freshly connected; `events` is its stream.
 ///
-/// Starts a fresh [`ReadingCache`], so every reading in the first `subscribe`
-/// snapshot is published. Right for a one-shot run; wrong for the supervisor's
-/// reconnect loop, which calls [`run_matter_bridge_with_cache`] instead so the
-/// cache outlives a single connection.
+/// Starts a fresh [`ReadingCache`], so the whole first `subscribe` snapshot is published. The
+/// supervisor calls [`run_matter_bridge_with_cache`] instead, to keep the cache across reconnects.
 pub async fn run_matter_bridge(
     client: Arc<MatterClient>,
     events: mpsc::Receiver<MatterEvent>,
@@ -254,14 +207,8 @@ pub async fn run_matter_bridge(
 
 /// As [`run_matter_bridge`], but the caller owns the dedupe cache.
 ///
-/// The cache has to outlive a single bridge run or it does nothing at all.
-/// [`ReadingCache`] exists because the bridge re-subscribes on every reconnect
-/// and the rules engine is level-based, so republishing a steady
-/// "motion = true" re-fires every automation attached to it. A cache rebuilt
-/// per run makes each reconnect's snapshot "first sight" again — which is
-/// exactly the case it was written for, so it was inert precisely when it
-/// mattered. Kept private: callers other than the supervisor have no reason to
-/// hold one, and `run_matter_bridge` is the shape they want.
+/// The cache must outlive a single bridge run: the bridge re-subscribes on every reconnect and the
+/// rules engine is level-based, so a per-run cache is inert precisely when it matters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_matter_bridge_with_cache(
     client: Arc<MatterClient>,
@@ -360,12 +307,9 @@ pub(crate) async fn run_matter_bridge_with_cache(
                         device = %device_id,
                         "matter: device removed from the fabric"
                     );
-                    // Only news if GIAP still thinks it has this device: a user
-                    // deleting one goes through the same removal, and telling
-                    // them about the thing they just did is noise.
-                    //
-                    // The lookup already had the name; the alert used to be given
-                    // the id and print it, so it named the device `"matter-18"`.
+                    // Only news if GIAP still thinks it has this device: a user deleting one
+                    // goes through the same removal, and telling them what they just did is
+                    // noise. The alert takes the name from the lookup, not the id.
                     present.remove(&device_id);
                     if let Ok(Some(device)) = registry.get_device(&device_id).await {
                         notifier.device_dropped(&device_id, &device.name).await;
@@ -376,16 +320,9 @@ pub(crate) async fn run_matter_bridge_with_cache(
                 if let Ok(AvailabilityEvent { device_id, online }) =
                     serde_json::from_value::<AvailabilityEvent>(payload)
                 {
-                    // A LEVEL report, repeated on the controller's tick, so most of
-                    // these say what the last one said. Log the CHANGES, at info.
-                    //
-                    // It was `debug!`, and the tracing filter admits debug from
-                    // `pond_server` only — so across every log file on the machine
-                    // where a working device kept going offline, the string
-                    // "availability changed" did not appear once. A state change the
-                    // user sees on a card, and gets an OS notification for, left no
-                    // trace anywhere. That is most of why this took three passes to
-                    // find.
+                    // A level report, repeated on the controller's tick, so most of these say
+                    // what the last one said. Log the changes, and at info: the tracing filter
+                    // admits debug only from `pond_server`, so a debug line here reaches no log.
                     if online != present.contains(&device_id) {
                         tracing::info!(
                             target: "giap::trace",
@@ -414,20 +351,10 @@ pub(crate) async fn run_matter_bridge_with_cache(
     Ok(()) // event channel closed = connection gone; caller reconnects
 }
 
-/// Run the bridge forever, reconnecting transparently when the controller
-/// connection drops.
+/// Run the bridge forever, reconnecting transparently when the controller connection drops.
 ///
-/// Owns the loop that [`run_matter_bridge`] documented as "caller reconnects":
-/// on drop it re-establishes the WebSocket with capped, jittered backoff, swaps
-/// the fresh client into `client_cell` (so the control port the MCP tool holds
-/// keeps working without being rebuilt), and re-runs the bridge.
-///
-/// When reconnecting keeps failing it also revives the controller itself — see
-/// [`should_respawn_controller`] — because a process that has exited will never
-/// answer a reconnect, however long the loop runs.
-///
-/// This never returns while the process lives; it is expected to be
-/// `tokio::spawn`ed.
+/// Re-establishes the WebSocket with jittered backoff and swaps the fresh client into `client_cell`
+/// so the control port keeps working; see [`should_respawn_controller`]. Never returns; spawn it.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_matter_supervisor(
     config: SupervisorConfig,

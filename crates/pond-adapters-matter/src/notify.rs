@@ -1,21 +1,7 @@
-//! Telling the user when something Matter-related actually happened.
-//!
-//! The adapter used to be silent in the direction that matters most. A device
-//! paired, a pairing failed, the controller died and was restarted, a node
-//! dropped off the fabric — all of it went, at best, into a log file nobody
-//! reads. "The lights stopped working and nothing said why" is not a diagnosis a
-//! household can act on.
-//!
-//! So the significant occurrences push a [`Notification`], which reaches phones
-//! over `GET /api/v1/notifications/stream` and the desktop through its poller.
-//! The bar for being here is deliberately high: a notification is an
-//! interruption, and a subsystem that interrupts on routine events gets muted,
-//! after which it cannot report the one thing that mattered.
-//!
-//! Everything alerting is debounced, following the pairing-alert window in
-//! `routes.rs`. The underlying `giap::trace` events are still emitted per
-//! occurrence — the debounce narrows what the user is *told*, never what is
-//! recorded.
+//! Telling the user when something Matter-related actually happened. Significant
+//! occurrences push a [`Notification`], reaching phones over
+//! `GET /api/v1/notifications/stream` and the desktop poller. Everything alerting is
+//! debounced on the `routes.rs` window; `giap::trace` still records every occurrence.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,17 +13,14 @@ use tokio::sync::{Mutex, RwLock};
 
 /// How long an alert of a given kind suppresses the next one of that kind.
 ///
-/// Ten minutes, matching the pairing-failure window in `routes.rs`. A flapping
-/// controller reconnects far faster than this, so the user hears "Matter is
-/// down" once rather than once per attempt.
+/// Ten minutes, matching the pairing-failure window in `routes.rs`. A flapping controller
+/// reconnects far faster, so the user hears "Matter is down" once, not once per attempt.
 const ALERT_WINDOW: Duration = Duration::from_secs(600);
 
 /// How long after asking for a removal the resulting event still counts as ours.
 ///
-/// Generous relative to the event, which follows within seconds, because the
-/// cost of being too tight is a false "your device left the network" alarm about
-/// something the user just did — and the cost of being too loose is only that a
-/// genuine departure of the SAME device inside the window goes unannounced.
+/// Generous relative to the event, which follows within seconds: too tight gives a false
+/// "your device left the network" alarm about something the user just did.
 const REMOVAL_GRACE: Duration = Duration::from_secs(120);
 
 /// Whether an unreachable alert is outstanding, so recovery is only announced to
@@ -58,24 +41,16 @@ struct State {
     expected_removals: HashMap<String, Instant>,
     /// Which device ids an expectation has already answered for.
     ///
-    /// Separate from `expected_removals` because one expectation answers for many
-    /// events — a hub and every device behind it — while still answering for each of
-    /// them only ONCE. Consuming the expectation on its first match silenced the hub
-    /// and then alerted for all of its children; not consuming anything would
-    /// silence a genuine later departure of a device that reused the id.
+    /// Separate from `expected_removals` because one expectation answers for many events
+    /// (a hub and every device behind it) while answering for each of them only ONCE.
     satisfied_removals: HashMap<String, Instant>,
 }
 
 impl State {
-    /// Was this removal one GIAP asked for?
-    ///
-    /// Matches the id exactly, or as a bridged child of an expected hub. Removing a
-    /// Matter hub takes its children off the fabric with it, so ONE expectation has
-    /// to answer for N events — which is why a prefix match is not consumed, unlike
-    /// an exact one. The entries still age out through the sweep in
-    /// `expect_removal`, so a hub removal cannot silence a real alert later.
-    ///
-    /// The trailing dash matters: `matter-9-` must not match `matter-90`.
+    /// Was this removal one GIAP asked for? Matches the id exactly, or as a bridged
+    /// child of an expected hub, so one expectation answers for N child events and a
+    /// prefix match is not consumed. Entries age out through the sweep in
+    /// `expect_removal`. The trailing dash matters: `matter-9-` must not match `matter-90`.
     fn take_expected_removal(&mut self, device_id: &str) -> bool {
         // Already answered for. A second departure of the same device is news, or the
         // first deliberate removal would silence every genuine one after it.
@@ -100,20 +75,14 @@ impl State {
 
 /// Builds and pushes the Matter notifications, holding the debounce state.
 ///
-/// Cloneable and cheap: the bridge, the supervisor and the commissioner each
-/// hold one, and they share the same window so two paths cannot both alert for
-/// the same outage.
+/// Cloneable and cheap: bridge, supervisor and commissioner each hold one and share the
+/// same window, so two paths cannot both alert for the same outage.
 #[derive(Clone)]
 pub struct MatterNotifier {
-    /// `None` until a sender is attached, and on a build without the
-    /// notification stack. Every method is then a no-op, which is why callers
-    /// never branch on it.
-    ///
-    /// Settable rather than fixed at construction because of startup order: the
-    /// Matter runtime is built before the notification stack exists (the agent
-    /// wiring in between needs the runtime's device-control facade), so the
-    /// sender arrives later. The alternative was reordering several hundred
-    /// lines of `serve()` around a subsystem that is off by default.
+    /// `None` until a sender is attached, and on a build without the notification
+    /// stack; every method is then a no-op, so callers never branch on it. Settable
+    /// rather than fixed at construction because of startup order: the Matter runtime
+    /// is built before the notification stack exists, so the sender arrives later.
     sender: Arc<RwLock<Option<Arc<dyn NotificationSender>>>>,
     state: Arc<Mutex<State>>,
 }
@@ -145,21 +114,10 @@ impl MatterNotifier {
         *self.sender.write().await = Some(sender);
     }
 
-    /// A device joined the fabric.
-    ///
-    /// Silent for a device behind a bridge. A hub arrives with everything it speaks
-    /// for -- a dozen bulbs is normal -- and each one registers separately, so this
-    /// fired a dozen times for one thing the user did.
-    ///
-    /// `pairing_success_is_not_debounced` is still right for its stated reason:
-    /// "adding several devices in one sitting is a normal thing to do, and each one
-    /// is a distinct fact". Twelve devices out of one setup code is ONE fact, and the
-    /// hub's own alert below is where it is reported.
-    ///
-    /// The hub's alert does not claim a count. It cannot know one: the children's
-    /// descriptors have not populated at the moment the hub registers, which is why
-    /// they arrive as separate events seconds later. Promising a number here would
-    /// mean promising the wrong one.
+    /// A device joined the fabric. Silent for a device behind a bridge: a hub's dozen
+    /// children each register separately, and the hub's own alert covers them. That
+    /// alert claims no count, because the children's descriptors have not populated at
+    /// the moment the hub registers.
     pub async fn device_paired(&self, device_id: &str, name: &str, device_type: &str) {
         if matter_bridged_endpoint(device_id).is_some() {
             return;
@@ -197,9 +155,8 @@ impl MatterNotifier {
 
     /// The controller has stopped answering and a restart is being attempted.
     ///
-    /// Raised on the first revival attempt rather than the first failed
-    /// reconnect: a controller restarting normally is back within a couple of
-    /// attempts, and alerting on those would tell the user about every blip.
+    /// Raised on the first revival attempt, not the first failed reconnect: a controller
+    /// restarting normally is back within a couple of attempts.
     pub async fn controller_unreachable(&self, url: &str) {
         {
             let mut state = self.state.lock().await;
@@ -243,22 +200,10 @@ impl MatterNotifier {
         .await;
     }
 
-    /// GIAP is about to remove `device_id` from the fabric itself.
-    ///
-    /// Needed because the delete path decommissions BEFORE it removes the
-    /// registry row (`unregister_device` in routes.rs — a Matter device has to
-    /// leave the fabric first, or the controller re-announces it and it comes
-    /// back). So the `device_removed` event arrives while the device is still
-    /// registered, and "is it still in the registry?" cannot by itself tell a
-    /// user's deletion from a device that left on its own. This can: the adapter
-    /// knows which removals it caused.
-    ///
-    /// One expectation covers a hub AND everything behind it, because removing a
-    /// Matter hub from the fabric removes its children too — the controller then
-    /// emits one `device_removed` per child, and the adapter cannot enumerate them
-    /// (it never held the hub's child list). Without prefix matching, a hub removal
-    /// the user performed produced one silent event and a dozen "it may have been
-    /// factory reset" alarms. See `take_expected_removal`.
+    /// GIAP is about to remove `device_id` from the fabric itself, so the resulting
+    /// `device_removed` is not alerted on. The delete path decommissions before it
+    /// unregisters, and one expectation covers a hub and every device behind it, since
+    /// removing a hub drops its children too. See `take_expected_removal`.
     pub async fn expect_removal(&self, device_id: &str) {
         let mut state = self.state.lock().await;
         // Opportunistic sweep: entries are only ever consumed by the matching
@@ -277,10 +222,8 @@ impl MatterNotifier {
 
     /// A device left the fabric. Silent when GIAP is the one that removed it.
     ///
-    /// `name` is what the user calls the device; the id is not for reading. This
-    /// alert used to interpolate the raw id, so it said `"matter-18" is no longer on
-    /// this Pond's Matter network` — and a bridged child would have made that
-    /// `"matter-90-7"`, which names nothing a person recognises.
+    /// `name` is what the user calls the device. The raw id must not appear in the alert:
+    /// a bridged child reads as `matter-90-7`, which names nothing a person recognises.
     pub async fn device_dropped(&self, device_id: &str, name: &str) {
         {
             let mut state = self.state.lock().await;
@@ -524,11 +467,9 @@ mod tests {
 
     #[tokio::test]
     async fn removing_a_hub_silences_its_children_too() {
-        // A Matter hub's children leave the fabric with it, and the controller emits
-        // one `device_removed` per child. The adapter never held the hub's child
-        // list, so it registers ONE expectation — which used to mean a hub the user
-        // deleted produced one silent event and a dozen "it may have been factory
-        // reset" alarms for a removal they had just performed.
+        // A hub's children leave the fabric with it, so the controller emits one
+        // `device_removed` per child. The adapter never held the child list and
+        // registers ONE expectation, which must silence all of them.
         let (notifier, recorder) = notifier().await;
 
         notifier.expect_removal("matter-90").await;

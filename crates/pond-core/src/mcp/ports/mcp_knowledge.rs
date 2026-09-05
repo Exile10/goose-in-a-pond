@@ -1,12 +1,7 @@
-//! McpKnowledgePort — structured persistent knowledge store for the assistant.
-//!
-//! Backed by Goose's `MemoryServer` (flat-file MCP storage).
-//! The `instructions()` output is prepended to the LLM system prompt so the
-//! assistant "remembers" facts across sessions without fine-tuning.
-//!
-//! The adapter lives in `pond-adapters-mcp-memory` (workspace-excluded, uses
-//! `goose-mcp`).  All `MemoryServer` operations are synchronous fs I/O — wrap
-//! every call in `tokio::task::spawn_blocking` in the adapter.
+//! McpKnowledgePort — structured persistent knowledge store for the assistant, backed by Goose's
+//! `MemoryServer` (flat-file MCP storage). The `instructions()` output is prepended to the LLM
+//! system prompt. The adapter is `pond-adapters-mcp-memory` (workspace-excluded); every
+//! `MemoryServer` call is synchronous fs I/O, so wrap each one in `tokio::task::spawn_blocking`.
 
 use anyhow::Result;
 use async_trait::async_trait;

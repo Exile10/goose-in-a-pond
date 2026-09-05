@@ -1,12 +1,7 @@
-//! Snapshot persistence for vision events (#175 follow-up).
-//!
-//! When the pipeline emits an event it can save the triggering frame as a
-//! JPEG so the dashboard and MCP tools can show *what* moved, not just that
-//! something did. `camera_events.snapshot_path` (migration 0003) has carried
-//! the path since the schema landed; this writes the file it points at.
-//!
-//! Disk use is bounded: after every write, only the newest
-//! [`SnapshotConfig::keep`] snapshots per camera are retained.
+//! Snapshot persistence for vision events (#175 follow-up). Saves the frame that
+//! triggered an event as a JPEG, writing the file that
+//! `camera_events.snapshot_path` (migration 0003) points at. Disk use is bounded:
+//! every write retains only the newest [`SnapshotConfig::keep`] per camera.
 
 use std::fs;
 use std::path::{Path, PathBuf};

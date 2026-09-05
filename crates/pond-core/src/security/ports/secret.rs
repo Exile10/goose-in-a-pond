@@ -3,9 +3,8 @@ use async_trait::async_trait;
 
 /// Secure storage for extension secrets (API keys, OAuth tokens, etc.).
 ///
-/// Secrets are stored in the system keyring (macOS Keychain, Linux secret-service)
-/// with a file fallback for headless environments.
-/// Values are NEVER returned through the REST API — only key names and existence checks.
+/// Stored in the system keyring (macOS Keychain, Linux secret-service) with a file
+/// fallback for headless environments. Values are NEVER returned through the REST API.
 #[async_trait]
 pub trait SecretRepository: Send + Sync {
     /// Get a secret value by key. Returns None if not set.

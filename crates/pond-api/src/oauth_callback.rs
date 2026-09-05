@@ -1,9 +1,7 @@
 //! OAuth 2.1 PKCE session management.
 //!
-//! Stores ephemeral PKCE sessions in memory (a single `HashMap` behind a
-//! `RwLock`).  Sessions are short-lived — created when the user clicks
-//! "Sign in with X" and consumed when the provider redirects back with
-//! an authorization code.  No persistence is needed.
+//! Sessions live in memory only: created when the user starts a sign-in and consumed when the
+//! provider redirects back with an authorization code, so nothing survives a restart by design.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::Rng;
@@ -54,16 +52,10 @@ pub struct FlowRecord {
     recorded_at: std::time::Instant,
 }
 
-/// Outcomes of finished OAuth flows, keyed by the same `state` nonce the
-/// in-flight session used.
+/// Outcomes of finished OAuth flows, keyed by the same `state` nonce the in-flight session used.
 ///
-/// The callback consumes the [`PkceSession`] when it runs, so presence in the
-/// session map cannot answer "did my sign-in work?" — an absent nonce is
-/// indistinguishable from one that never existed. Without this, the only
-/// signal available to the UI is whether the token key exists in the secret
-/// store, which is already true whenever the user is *re*-authorising: the
-/// poll then reports success ~2 seconds in, regardless of what the user did in
-/// the browser.
+/// The callback consumes the [`PkceSession`], so an absent nonce cannot tell a finished flow from
+/// one that never existed, and token presence in the secret store lies during re-authorisation.
 pub type OAuthOutcomes = Arc<RwLock<HashMap<String, FlowRecord>>>;
 
 /// Create a fresh (empty) OAuth outcome store.
@@ -129,11 +121,10 @@ pub fn internal_extension_token() -> &'static str {
     INTERNAL_EXTENSION_TOKEN.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
-/// Env var naming the local API base URL, read by extension subprocesses that
-/// call back into GIAP (e.g. the music extension refreshing its Spotify token).
+/// Env var naming the local API base URL, read by extension subprocesses that call back into GIAP.
 ///
-/// Extensions cannot assume a port: `serve` binds the first free one of
-/// 80 / 8080 / 4000 / 5000, so the value has to be handed down at spawn time.
+/// Extensions cannot assume a port: `serve` binds the first free of 80 / 8080 / 4000 / 5000, so the
+/// value has to be handed down at spawn time.
 pub const GIAP_SERVER_URL_ENV_KEY: &str = "GIAP_SERVER_URL";
 
 /// The loopback base URL for this server, for [`GIAP_SERVER_URL_ENV_KEY`].

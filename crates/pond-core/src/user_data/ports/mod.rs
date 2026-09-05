@@ -1,3 +1,4 @@
+pub mod account_credentials;
 pub mod camera_storage;
 pub mod device_attribution;
 pub mod device_commissioning;
@@ -13,6 +14,7 @@ pub mod memory_consolidator;
 pub mod memory_extractor;
 pub mod memory_repository;
 pub mod onboarding;
+pub mod place_lookup;
 pub mod profile;
 pub mod prompt_extra;
 pub mod prompt_template;

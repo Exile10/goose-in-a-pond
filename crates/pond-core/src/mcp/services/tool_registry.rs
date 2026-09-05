@@ -1,10 +1,7 @@
 //! In-memory tool registry implementation.
 //!
-//! Holds the tools of external MCP extensions, registered and deregistered at
-//! runtime as the user adds and removes them. It starts EMPTY: GIAP's own
-//! builtins are described to the model by native tool schemas generated from the
-//! real handlers, and the hand-written list this used to be seeded with had
-//! drifted until only four of its thirteen names existed.
+//! Holds external MCP extension tools, registered at runtime. It starts EMPTY: GIAP's
+//! builtins reach the model as native schemas, so a seed list here could only drift.
 
 use std::collections::HashMap;
 
@@ -19,32 +16,17 @@ const COMPACT_DESC_LIMIT: usize = 80;
 
 /// In-memory implementation of `ToolRegistryPort`.
 ///
-/// Uses a `RwLock<HashMap<extension_name, Vec<ExternalToolDescription>>>`
-/// keyed by extension name. The `"giap"` key is still read on the way out, so a
-/// caller that deliberately registers builtins keeps working, but nothing
-/// populates it by default.
+/// A `RwLock<HashMap<extension_name, Vec<ExternalToolDescription>>>`. The `"giap"` key is
+/// still read on the way out for callers that register builtins, but nothing populates it.
 pub struct InMemoryToolRegistry {
     tools: RwLock<HashMap<String, Vec<ExternalToolDescription>>>,
 }
 
 impl InMemoryToolRegistry {
-    /// Create an empty registry.
-    ///
-    /// It used to be seeded from a hardcoded `giap_tool_definitions()` list, and
-    /// that seed was how the fabricated inventory reached the model: the adapter
-    /// prefers this registry over its own static fallback, so the registry
-    /// branch — the one that looks dynamic — served 13 hand-written names of
-    /// which only four existed. `weather` was really `get_current_weather`,
-    /// `shell_command` really `run_shell_command`, and 48 real tools were
-    /// missing entirely. It cost ~732 tokens on every provider call and invited
-    /// calls to tools that would never resolve.
-    ///
-    /// Builtins are not re-listed here because they do not need to be: every
-    /// live provider receives them as native tool schemas, which are generated
-    /// from the real handlers and cannot drift. What belongs in this registry is
-    /// what those schemas do not cover — tools from external MCP extensions,
-    /// registered at the point they are added (see `routes.rs ::
-    /// register_extension_tools`).
+    /// Create an empty registry: builtins are not listed here, because every live provider
+    /// receives them as native tool schemas generated from the real handlers, which cannot
+    /// drift. This registry holds only external MCP extension tools, registered at the
+    /// point they are added (see `routes.rs :: register_extension_tools`).
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
@@ -150,11 +132,8 @@ mod tests {
 
     /// The registry carries no hardcoded inventory of its own.
     ///
-    /// Its predecessor asserted the opposite — that `new()` seeded one builtin
-    /// per entry in a hardcoded list — which is exactly what made the fabricated
-    /// names look verified. Builtins reach the model as native tool schemas
-    /// generated from the real handlers; a second, hand-maintained copy could
-    /// only ever disagree with them.
+    /// Builtins reach the model as native tool schemas generated from the real handlers;
+    /// a second, hand-maintained copy here could only ever disagree with them.
     #[tokio::test]
     async fn a_fresh_registry_advertises_no_builtins() {
         let registry = InMemoryToolRegistry::new();

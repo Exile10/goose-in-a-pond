@@ -1,12 +1,7 @@
-//! Context budget management for constrained LLM inference.
-//!
-//! On Jetson Orin Nano with a 7B Q4 model, the context window is ~8K tokens.
-//! After reserving space for the system prompt and the generated response,
-//! roughly 2,500 tokens (~9,952 chars at 4 chars/token) are usable for history.
-//!
-//! `trim_to_budget()` walks messages newest-first and keeps messages until
-//! the character budget is exhausted, then reverses to restore chronological order.
-//! This ensures the most recent context is always preserved.
+//! Context budget management for constrained LLM inference. On a Jetson Orin Nano with
+//! a 7B Q4 model the window is ~8K tokens, so after the system prompt and the response
+//! reserve roughly 2,500 tokens (4 chars/token) are usable for history.
+//! `trim_to_budget` keeps the newest messages that fit.
 
 use crate::models::domain::message::{ChatMessage, Role};
 use crate::models::domain::model_capabilities::ModelCapabilities;
@@ -16,16 +11,10 @@ const MIN_USABLE_HISTORY_CHARS: usize = 256;
 
 // ── Compaction profile ──────────────────────────────────────────────────────
 
-/// Per-model compaction parameters derived from the effective context window.
-///
-/// Goose's auto-compaction triggers at ~80% of its configured context_limit.
-/// On tiny KV caches (3K Jetson, 8K macOS Metal), that 80% threshold still
-/// leaves very little headroom. CompactionProfile tunes thresholds, memory
-/// injection budgets, and prompt budgets so the agent operates comfortably
-/// within the actual hardware limit.
-///
-/// Use [`CompactionProfile::from_context_window`] to derive the correct
-/// profile from the effective context size reported by the provider adapter.
+/// Per-model compaction parameters derived from the effective context window. Goose
+/// auto-compacts at ~80% of its configured context_limit, which leaves almost no
+/// headroom on a tiny KV cache (3K Jetson, 8K macOS Metal). Build one with
+/// [`CompactionProfile::from_context_window`], from the window the adapter reports.
 #[derive(Debug, Clone)]
 pub struct CompactionProfile {
     /// Fraction of context at which proactive compaction should trigger (0.0-1.0).
@@ -40,86 +29,44 @@ pub struct CompactionProfile {
     pub system_prompt_budget: usize,
     /// Max tokens to allocate for conversation history injection (per request).
     pub history_token_budget: usize,
-    /// Tokens held back for the model's OWN output — reasoning plus answer.
-    ///
-    /// Nothing else reserves this, and on a small window that omission is what
-    /// ends conversations. Measured on the Orin (n_ctx 4096): the preamble is
-    /// ~3,250 tokens, a couple of turns push the prompt to ~3,800, and then a
-    /// `thinking` block of up to 306 tokens overruns the window MID-generation.
-    /// llama.cpp returns ContextLengthExceeded ("Generation exhausted context
-    /// window"), and goose answers that by compacting the conversation
-    /// reactively — a path that does NOT consult GOOSE_AUTO_COMPACT_THRESHOLD,
-    /// so GIAP's "we own compaction" setting cannot prevent it. The user sees
-    /// their history replaced by a summary and an answer cut to one character.
-    ///
-    /// So the prompt must be budgeted against `context_window - this`, never
-    /// against the raw window.
+    /// Tokens held back for the model's OWN output — reasoning plus answer. Nothing else
+    /// reserves this, so the prompt must be budgeted against `context_window - this`: a
+    /// thinking block that overruns mid-generation returns ContextLengthExceeded, and
+    /// goose then compacts reactively through a path GOOSE_AUTO_COMPACT_THRESHOLD cannot stop.
     pub output_reserve_tokens: usize,
     /// The effective context window this profile was derived from.
     pub context_window_tokens: usize,
-    /// The window the PREAMBLE budgets were derived from.
-    ///
-    /// Equal to `context_window_tokens` except on providers whose preamble is
-    /// re-prefilled locally every turn, where it is the clamped prompt-side
-    /// window (`ContextGovernor::prompt_window`). Carrying both is what makes
-    /// the asymmetry a property of the profile rather than of whichever caller
-    /// remembered to clamp — see [`CompactionProfile::for_windows`].
+    /// The window the PREAMBLE budgets were derived from. Equal to
+    /// `context_window_tokens` except where the preamble is re-prefilled locally every
+    /// turn, when it is the clamped `ContextGovernor::prompt_window`. Carrying both keeps
+    /// the asymmetry a property of the profile — see [`CompactionProfile::for_windows`].
     pub prompt_window_tokens: usize,
 }
 
 impl CompactionProfile {
-    /// Tokens the whole PROMPT may occupy: the window minus the output reserve.
-    ///
-    /// This is the ceiling the engine's own reported `prompt_tokens` is compared
-    /// against, so it covers preamble plus history. For the history budget
-    /// alone, use [`CompactionProfile::usable_history_tokens`].
+    /// Tokens the whole PROMPT may occupy: the window minus the output reserve. The
+    /// ceiling the engine's reported `prompt_tokens` is compared against, so it covers
+    /// preamble plus history; for the history budget alone use
+    /// [`CompactionProfile::usable_history_tokens`].
     pub fn usable_prompt_tokens(&self) -> usize {
         self.context_window_tokens
             .saturating_sub(self.output_reserve_tokens)
     }
 
-    /// Tokens HISTORY may occupy: the usable prompt space, minus the preamble
-    /// this profile has already promised to the system prompt and the injected
-    /// memory block.
-    ///
-    /// `usable_prompt_tokens()` alone was never sufficient as a history clamp
-    /// and P4's own notes said so: at 8,192 the profile declares 1,024 + 3,000 +
-    /// 500 + 4,000 = 8,524 tokens against an 8,192-token window, and a clamp
-    /// that subtracts only the output reserve lets history claim 7,168 of it on
-    /// top of a preamble that is still going to be sent. The overrun that costs
-    /// is the mid-generation one described on `output_reserve_tokens`.
-    ///
-    /// Saturating rather than floored: a preamble allowance larger than the
-    /// window legitimately leaves no room for history at all, and
-    /// `turn_trimmer` owns the floor that keeps the current turn alive.
+    /// Tokens HISTORY may occupy: the usable prompt space minus the preamble this
+    /// profile already promised the system prompt and the memory block. Subtracting
+    /// only the output reserve would let history claim a preamble that is still sent.
+    /// Saturating, not floored: `turn_trimmer` owns the floor keeping the turn alive.
     pub fn usable_history_tokens(&self) -> usize {
         self.usable_prompt_tokens()
             .saturating_sub(self.system_prompt_budget + self.memory_token_budget)
     }
 }
 
-/// One point on the budget curve: the profile that this exact window produces.
-///
-/// # Why these six, and not the four tiers
-///
-/// Four of them ARE the old tier values, at the windows where the old step
-/// function returned them. The other two - 8,192 and 32,768 - are not tier
-/// boundaries, and pinning them is the whole reason this change is a refactor
-/// rather than a retune:
-///
-/// - **8,192 is the most-executed window in the system.** `prompt_window`
-///   clamps every local provider to exactly 8,192, and both prompt-side call
-///   sites (the compact-prompt decision and memory injection) pass the clamped
-///   value here. Interpolating 4,096 -> 12,288 across it would have cut
-///   `max_memory_fragments` from 5 to 4 and `memory_token_budget` from 500 to
-///   350 on every Jetson and every macOS Metal turn.
-/// - **32,768 is what the name heuristic hands to qwen and mistral**, and an
-///   existing regression test pins it.
-///
-/// Because 8,192/12,288 and 32,768/65,536 carry identical values, those two
-/// segments are FLAT: the whole of each old bucket's upper half answers exactly
-/// as it did before. What changes is the interior of the lower halves, which is
-/// the point - a 24K model and a 64K model no longer share a budget.
+/// One point on the budget curve: the profile that this exact window produces. 8,192
+/// and 32,768 are pinned deliberately, since `prompt_window` clamps every local provider
+/// to 8,192 and the name heuristic hands qwen and mistral 32,768, so the 8,192..12,288
+/// and 32,768..65,536 segments are flat.
 struct ProfileAnchor {
     window: usize,
     compaction_threshold: f32,
@@ -223,32 +170,10 @@ fn lerp_threshold(a: f32, b: f32, t: f64) -> f32 {
 }
 
 impl CompactionProfile {
-    /// Derive a compaction profile from the effective context window in tokens.
-    ///
-    /// Piecewise-linear over [`PROFILE_ANCHORS`], flat outside them. This
-    /// replaced four hardcoded tiers, and the anchors ARE the old tier values,
-    /// so every window the tiers were ever tested at answers identically - see
-    /// `TIER_FIXTURES` in the tests, which is the guard for that claim.
-    ///
-    /// # What actually changed, and why it is a fix
-    ///
-    /// The old step function was correct at its four boundaries and
-    /// over-committed everywhere in between: at 12,289 tokens it promised a
-    /// 20,000-token history budget, a 6,000-token system prompt, 1,500 tokens of
-    /// memory and a 2,048-token output reserve - 29,548 tokens of budget against
-    /// a 12,289-token window, 2.4x over. Only `turn_trimmer`'s
-    /// `min(usable_prompt_tokens())` clamp stood between that and a
-    /// mid-generation `ContextLengthExceeded`, and that clamp does not subtract
-    /// the system prompt or the memory block, so it was never sufficient.
-    ///
-    /// This matters most at 16,384, which is what the local model registry pins
-    /// on the Orin: budgets there now sum to 12,729 against the 16,384 window
-    /// instead of 29,548. Over 4,096..=200,000 the curve's budget sum is never
-    /// larger than the tiers' was, its over-commitment set is a strict subset of
-    /// theirs, and worst-case over-commitment falls from 2.404x to 1.041x.
-    ///
-    /// Every budget is monotonically non-decreasing in the window: raising
-    /// `context_window_override` can never buy less of anything.
+    /// Derive a compaction profile from the effective context window in tokens:
+    /// piecewise-linear over [`PROFILE_ANCHORS`], flat outside them, guarded by
+    /// `TIER_FIXTURES`. Every budget is monotonically non-decreasing in the window, and
+    /// the interior no longer over-commits: 16,384 sums to 12,729 rather than 29,548.
     pub fn from_context_window(context_tokens: usize) -> Self {
         let first = &PROFILE_ANCHORS[0];
         let last = &PROFILE_ANCHORS[PROFILE_ANCHORS.len() - 1];
@@ -290,45 +215,10 @@ impl CompactionProfile {
         }
     }
 
-    /// The asymmetric profile: history budgeted from the full window, preamble
-    /// budgeted from the clamped prompt-side window.
-    ///
-    /// # Why the two halves are not the same number
-    ///
-    /// A context window has two halves with opposite cost curves. The preamble
-    /// (system prompt, tool schemas, injected memories) is the KV prefix, so on
-    /// a provider that re-prefills locally every turn, every token of it is paid
-    /// again on every turn. The working set (conversation history) is paid too,
-    /// but it is what makes the assistant remember you, and it is what gets
-    /// thrown away first. So growing the window must buy working set, never
-    /// preamble (PAI-3 invariant 1).
-    ///
-    /// Until this existed the asymmetry was enforced by the CALLER: two sites in
-    /// `GooseAdapter` remembered to pass `ContextGovernor::prompt_window(..)`
-    /// into `from_context_window`, and every other consumer got a profile whose
-    /// preamble budgets scaled with the full window. That is the same shape as
-    /// the four-paths-disagree defect PAI-3 exists to remove, one layer down.
-    ///
-    /// # What it does with the tokens the preamble is not allowed to have
-    ///
-    /// It gives them to history. The preamble fields come from the anchor curve
-    /// at `prompt_window`; everything else comes from the curve at
-    /// `context_window`; and the difference between the two preamble
-    /// allowances is ADDED to `history_token_budget`. So the total budget is
-    /// identical to `from_context_window(context_window)` - which is what keeps
-    /// P4's "never promises more than the tiers did" property true - while the
-    /// split between prefix and working set moves.
-    ///
-    /// Concretely, on a local provider whose window resolves to 32,768 the
-    /// preamble stays at the 8,192 allowance (3,000 + 500) instead of growing to
-    /// 6,000 + 1,500, and the 4,000 tokens that frees go to history: 20,000 ->
-    /// 24,000. That is the measurable claim of this phase - flat TTFT, more
-    /// retained history.
-    ///
-    /// When `prompt_window >= context_window` there is nothing to clamp and
-    /// nothing to redistribute, so this is exactly `from_context_window`. HTTP
-    /// providers take that path: their preamble is not paid for in local
-    /// prefill.
+    /// The asymmetric profile: history budgeted from the full window, preamble from the
+    /// clamped prompt-side window, since the preamble is the KV prefix a local provider
+    /// re-prefills every turn (PAI-3 invariant 1). What the clamp frees goes to history,
+    /// so the total is unchanged; `prompt_window >= context_window` changes nothing.
     pub fn for_windows(context_window: usize, prompt_window: usize) -> Self {
         let full = Self::from_context_window(context_window);
         if prompt_window >= context_window {
@@ -347,54 +237,10 @@ impl CompactionProfile {
         }
     }
 
-    /// The same profile with part of the history budget held back for a second
-    /// agent that is claiming the same window — PAI-6 P4.
-    ///
-    /// # Why this touches ONE field
-    ///
-    /// A subagent is a second claim on one context window, and the obvious
-    /// implementation — scale the resolved window and re-derive the profile —
-    /// is wrong here. Every preamble field would shrink with it, the system
-    /// prompt would be rebuilt at a smaller allowance, and the KV prefix would
-    /// MOVE: a full re-prefill, measured at 3.7 s on the Orin, paid on the
-    /// parent's very next turn to save tokens on a working set that was going
-    /// to be trimmed anyway. PAI-3's asymmetry rule says growth buys working
-    /// set and never preamble; the same rule read backwards says a reservation
-    /// takes working set and never preamble.
-    ///
-    /// So `system_prompt_budget`, `memory_token_budget`, `max_memory_fragments`,
-    /// `output_reserve_tokens`, `compaction_threshold` and both window fields
-    /// come out untouched, and `use_compact_prompt()` therefore cannot flip
-    /// either. `memory_token_budget` is safe to leave alone for the reason
-    /// PAI-6 section 3.5 records: it feeds `memory_block_for_user_msg`, which
-    /// rides the USER message rather than the prefix.
-    ///
-    /// # Why the reservation is taken from the CLAMPED budget
-    ///
-    /// `history_token_budget` is a declared allowance, not a promise the window
-    /// can keep: at an 8,192 window it declares 4,000 tokens while only 3,668
-    /// survive `usable_history_tokens`. Subtracting the fraction from the
-    /// declared number would leave the parent holding more than the clamp
-    /// allows, the clamp would then discard the difference, and the two claims
-    /// would sum to more than the window — which is the whole failure this
-    /// method exists to prevent. Reserving out of `min(declared, usable)` is
-    /// what makes PAI-6 section 7's assertion true: the parent's effective
-    /// budget plus the reservation plus the preamble fits inside
-    /// `usable_prompt_tokens`, unless the remainder fell under
-    /// `turn_trimmer`'s floor, in which case the floor is the answer and the
-    /// sum legitimately overshoots by exactly that floor.
-    ///
-    /// # The fraction
-    ///
-    /// `0.0` returns an identical profile, which is the answer whenever nothing
-    /// is delegating — so this is a no-op on every turn of a pond that never
-    /// spawns a child. Anything that is not a finite number in `0.0..=1.0`
-    /// reserves the WHOLE claimable budget rather than being ignored:
-    /// `AgentRole::new` already refuses a `context_fraction` outside `(0, 1]`,
-    /// so a bad value here means a ledger defect, and this programme's standing
-    /// rule is that a failure narrows. Over-reserving costs the parent recall;
-    /// under-reserving costs a mid-generation `ContextLengthExceeded` and a
-    /// conversation goose compacts out from under the user.
+    /// The same profile with part of the history budget held back for a second agent
+    /// claiming the same window (PAI-6 P4). Only `history_token_budget` moves: shrinking
+    /// the preamble would move the KV prefix, a 3.7 s re-prefill on the Orin. Reserved out
+    /// of `min(declared, usable)` so both claims fit; a fraction outside `0.0..=1.0` takes all.
     pub fn with_history_reserved(&self, fraction: f32) -> Self {
         let fraction = if fraction.is_finite() && (0.0..=1.0).contains(&fraction) {
             fraction
@@ -413,19 +259,10 @@ impl CompactionProfile {
         }
     }
 
-    /// Whether the system prompt should use a compact format.
-    ///
-    /// Returns true when the window is small enough that verbose tool
-    /// descriptions and detailed instructions waste precious tokens.
-    ///
-    /// Reads the PROMPT window, not the context window: this is a preamble
-    /// decision, and on a local provider a 32K KV cache must not buy a more
-    /// verbose prefix. Under `from_context_window` the two are the same number,
-    /// so the 12288 boundary is unmoved for every existing caller.
-    ///
-    /// Deliberately NOT interpolated. Everything else on this profile is a
-    /// budget and answers "how much"; this one is a format switch and answers
-    /// "which". A continuous curve through a boolean has no meaning.
+    /// Whether the system prompt should use a compact format. Reads the PROMPT window,
+    /// not the context window: this is a preamble decision, and a 32K KV cache must not
+    /// buy a local provider a more verbose prefix. A hard step at 12288, deliberately
+    /// not interpolated: this is a format switch, not a budget.
     pub fn use_compact_prompt(&self) -> bool {
         self.prompt_window_tokens <= 12288
     }
@@ -433,17 +270,10 @@ impl CompactionProfile {
 
 // ── Reasoning effort (PAI-5 P4) ─────────────────────────────────────────────
 
-/// How much room the model is told it may spend thinking before it answers.
-///
-/// This is a preference with three settings, NOT a token count the user types.
-/// The right number is a function of the window and the device — see
-/// [`reasoning_budget_tokens`] — so the preference only chooses a share of a
-/// budget the profile already owns.
-///
-/// The string forms are pinned by
-/// `crate::user_data::domain::settings::REASONING_EFFORTS`, and
-/// `reasoning_effort_strings_agree_with_settings` fails if either side grows a
-/// value alone.
+/// How much room the model is told it may spend thinking before it answers: a
+/// preference with three settings, not a token count. It chooses a share of the budget
+/// [`reasoning_budget_tokens`] derives. `reasoning_effort_strings_agree_with_settings`
+/// pins the string forms against `user_data::domain::settings::REASONING_EFFORTS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
     /// Least thinking. The on-device default: reasoning tokens are decode
@@ -467,15 +297,10 @@ impl ReasoningEffort {
         ReasoningEffort::Thorough,
     ];
 
-    /// Parse the stored setting string.
-    ///
-    /// An unrecognised value falls back to [`ReasoningEffort::Brief`] — the
-    /// SMALLEST budget. This is the same bargain `NetworkMode::parse` strikes
-    /// and the direction matters: a typo that reached the store must not buy
-    /// the model a bigger think than anybody chose. The narrowing half is at
-    /// the edge, where `PUT /api/v1/settings` returns 422 for a value that is
-    /// not in `REASONING_EFFORTS` rather than absorbing it — because the
-    /// fallback here is a silent log line and nobody would ever see it.
+    /// Parse the stored setting string. An unrecognised value falls back to
+    /// [`ReasoningEffort::Brief`], the SMALLEST budget, so a typo that reached the
+    /// store cannot buy a bigger think than anybody chose. The rejection is at the
+    /// edge: `PUT /api/v1/settings` returns 422 outside `REASONING_EFFORTS`.
     pub fn parse(raw: &str) -> Self {
         match raw {
             "balanced" => ReasoningEffort::Balanced,
@@ -502,27 +327,16 @@ impl ReasoningEffort {
     }
 }
 
-/// The floor under any thinking budget.
-///
-/// Never zero. Zero is `thinking_mode = "off"`'s job, and it says so by
-/// removing the whole `<thinking>` section — a budget of zero words inside a
-/// section that still tells the model to reason is a contradiction, and a small
-/// model resolves contradictions by ignoring one half at random.
+/// The floor under any thinking budget. Never zero: that is `thinking_mode = "off"`'s
+/// job, which removes the whole `<thinking>` section. A zero budget inside a section
+/// that still asks the model to reason is a contradiction a small model resolves at
+/// random.
 const MIN_REASONING_BUDGET_TOKENS: usize = 32;
 
-/// Tokens a `<thinking>` block may run to, on this profile, at this effort.
-///
-/// Derived from [`CompactionProfile::output_reserve_tokens`] rather than from
-/// the window, because reasoning tokens ARE output tokens: they are decoded
-/// into the same reserve the answer is decoded into, and the overrun that
-/// section 3.3 of PAI-5 is about is precisely a thinking block eating the
-/// reserve mid-generation. Budgeting a share of the raw window instead would
-/// be budgeting against a pool this one does not draw from.
-///
-/// The shares are eighths of the reserve — 1/8, 1/4, 1/2 — which leaves the
-/// answer at least half the reserve at every effort. At the two windows that
-/// actually run (8,192 on every local provider, 32,768 for the name-heuristic
-/// HTTP models) that is 128/256/512 and 256/512/1,024 tokens.
+/// Tokens a `<thinking>` block may run to, on this profile, at this effort. Derived
+/// from [`CompactionProfile::output_reserve_tokens`], not the window: reasoning tokens
+/// are decoded into the same reserve as the answer. Shares are 1/8, 1/4 and 1/2, so
+/// the answer keeps at least half the reserve at every effort (PAI-5 section 3.3).
 pub fn reasoning_budget_tokens(profile: &CompactionProfile, effort: ReasoningEffort) -> usize {
     let reserve = profile.output_reserve_tokens;
     let share = match effort {
@@ -535,108 +349,34 @@ pub fn reasoning_budget_tokens(profile: &CompactionProfile, effort: ReasoningEff
 
 // ── PAI-5 P5: a reserve derived from what reasoning actually costs ──────────
 
-/// Fewest observations before this pond's own behaviour may move the reserve.
-///
-/// Below this the anchor stands. A handful of short thinking blocks is not
-/// evidence that reasoning is cheap here — it is evidence that nobody has asked
-/// a hard question yet — and the anchor was not a guess: it came from an
-/// observed mid-generation overrun on the Orin. Talking ourselves below a value
-/// that was set by a conversation dying is the one direction this must not move.
+/// Fewest observations before this pond's own behaviour may move the reserve. Below
+/// this the anchor stands: a few short thinking blocks are not evidence that reasoning
+/// is cheap here, and the anchor came from a measured mid-generation overrun on the
+/// Orin, so this must never be talked below it.
 pub const MIN_REASONING_SAMPLES: usize = 20;
 
-/// The step a derived reserve is rounded up to.
-///
-/// **This constant is what keeps this feature from fighting invariant 1**, and
-/// it is not a tidiness choice. `turn_profile` is the single producer of every
-/// budget in the live adapter and it runs PER TURN, so a reserve recomputed from
-/// a growing sample set would take a slightly different value on most turns.
-///
-/// Be exact about what that costs, because the first draft of this comment was
-/// not. The reserve feeds [`CompactionProfile::usable_prompt_tokens`] and
-/// [`usable_history_tokens`](CompactionProfile::usable_history_tokens), both of
-/// which are consumed by the turn trimmer. It does **not** move the preamble:
-/// the number actually rendered into the system prompt is
-/// [`reasoning_budget_words`], which takes `(effort, compact_prompt)` and never
-/// the profile. So a moving reserve does not re-render the prompt — it moves the
-/// point at which history is trimmed, and a trim drops the oldest messages, so
-/// everything after the preamble shifts and the reusable prefix truncates back
-/// to the preamble. The history re-prefills; the preamble does not.
-///
-/// That is a smaller cost than "the whole prompt" and still worth avoiding on
-/// every turn, on a device whose prefill runs at 674-976 tok/s. Quantising to
-/// 256 tokens means a new sample moves the reserve only when it crosses a step,
-/// which is rare and, when it happens, buys a correct budget for one trim.
-/// `a_growing_sample_set_does_not_move_the_reserve_every_turn` is the guard.
-///
-/// Quantising to 256 tokens means a new sample moves the reserve only when it
-/// crosses a step, which is rare and, when it happens, buys a correct budget for
-/// one re-prefill. `a_growing_sample_set_does_not_move_the_reserve_every_turn`
-/// is the guard, and it is the most important test in this section.
+/// The step a derived reserve is rounded up to. `turn_profile` runs per turn, so an
+/// unquantised reserve would move the trim point on most turns; it moves where history
+/// is cut, not the rendered preamble, which [`reasoning_budget_words`] owns. Guarded by
+/// `a_growing_sample_set_does_not_move_the_reserve_every_turn`.
 pub const RESERVE_QUANTUM_TOKENS: usize = 256;
 
 /// The most of the window the output reserve may take from observation alone.
 ///
-/// A verbose model on a small window would otherwise reserve so much that no
-/// history fits, and a conversation with no history is not a conversation. The
-/// anchor may exceed this — see [`observed_output_reserve`] — because an anchor
-/// is a measured failure and this is a policy.
+/// Without it a verbose model on a small window leaves no room for history. The
+/// anchor may exceed this ([`observed_output_reserve`]): a measurement beats a policy.
 pub const MAX_OBSERVED_RESERVE_SHARE: f32 = 0.25;
 
-/// The percentile of observed reasoning cost the reserve is sized to.
-///
-/// Not the mean: half of all turns would overrun, and an overrun is not a slow
-/// turn — it is llama.cpp returning `ContextLengthExceeded` mid-generation and
-/// goose reactively compacting through a path GIAP's own threshold cannot
-/// disable, so the user watches their history become a summary and their answer
-/// stop after one character.
-///
-/// Not the max either: one pathological turn would tax every later turn's
-/// history for the life of the pond.
+/// The percentile of observed reasoning cost the reserve is sized to. Not the mean:
+/// half the turns would overrun, and an overrun is `ContextLengthExceeded` mid-generation,
+/// which goose answers by compacting through a path GIAP's own threshold cannot disable.
+/// Not the max either: one pathological turn would tax every later turn's history.
 const REASONING_PERCENTILE: f64 = 0.95;
 
-/// Size the output reserve from what reasoning has actually cost on this pond.
-///
-/// This is PAI-5 P5. The anchor curve's `output_reserve_tokens` is a constant
-/// with a measured justification — one 306-token thinking block seen on an Orin
-/// — and a constant is what this phase exists to replace, because the cost of
-/// reasoning is a property of the MODEL and the EFFORT, both of which the
-/// household changes without telling anybody.
-///
-/// `samples` are observed `reasoning_tokens`, which PAI-5 P2 made real: they are
-/// counted through PAI-3's `TokenCounter`, reported alongside `completion_tokens`
-/// and never deducted from it, and persisted per assistant row by migration 0039
-/// as a nullable column with no `DEFAULT`, so an unmeasured turn is `None` and
-/// not a zero. **Pass only measured turns.** A `None` folded in as `0` is a
-/// vote for a smaller reserve cast by a turn that never reasoned, and it is the
-/// exact shape that would make this function argue for the bug it exists to fix.
-///
-/// The arithmetic ties itself to [`reasoning_budget_tokens`] rather than
-/// inventing a second relationship: that function gives `Thorough` half the
-/// reserve, so a reserve of `2 * p95` is the smallest one under which an
-/// observed-typical thinking block still fits at the most expensive effort the
-/// user can select. The answer keeps the other half.
-///
-/// **`reasoning_budget_tokens` has no production caller today** — checked, not
-/// assumed; the only mention outside this module is a doc comment in
-/// `settings.rs`. The relationship it states is still the right one to size
-/// against, because it is this codebase's own answer to "how much of the reserve
-/// may reasoning take", and a second answer invented here would be a second
-/// definition to keep in step. But a reader should know the 2x is anchored to a
-/// stated intent rather than to a live division, and that giving
-/// `reasoning_budget_tokens` a caller is what would make it load-bearing.
-///
-/// Order of operations, and each step narrows or is stated:
-///
-/// 1. Too few samples, or none — the anchor.
-/// 2. `2 * p95(samples)`, rounded UP to [`RESERVE_QUANTUM_TOKENS`].
-/// 3. Clamped to [`MAX_OBSERVED_RESERVE_SHARE`] of the window.
-/// 4. Floored at the anchor, **last**, so it wins even over step 3. That
-///    ordering is deliberate: the ceiling is a policy about leaving room for
-///    history, the anchor is the value at which a real conversation stopped
-///    dying, and when the two disagree the measurement wins. On the windows
-///    this runs at they do not disagree — 0.25 x 4 096 is 1 024 against a 768
-///    anchor — so this is a statement about which failure is worse, not a live
-///    branch.
+/// Size the output reserve from observed `reasoning_tokens` (PAI-5 P5). **Pass only
+/// measured turns**: a `None` folded in as `0` votes for a smaller reserve. Order is
+/// anchor if under [`MIN_REASONING_SAMPLES`], else `2 * p95` (Thorough may take half
+/// the reserve) quantised up, clamped to the share, then floored at the anchor last.
 pub fn observed_output_reserve(samples: &[u32], anchor: usize, window: usize) -> usize {
     if samples.len() < MIN_REASONING_SAMPLES {
         return anchor;
@@ -662,9 +402,8 @@ pub fn observed_output_reserve(samples: &[u32], anchor: usize, window: usize) ->
 
 /// The window the compact tier is sampled at when only `compact_prompt` is known.
 ///
-/// 8,192 is not an arbitrary pick: `ContextGovernor::prompt_window` clamps every
-/// local provider to exactly 8,192, so this is the most-executed window in the
-/// system and the profile curve is pinned at it by an existing regression test.
+/// `ContextGovernor::prompt_window` clamps every local provider to exactly 8,192,
+/// so this is the most-executed window and a regression test pins the curve at it.
 const COMPACT_TIER_SAMPLE_WINDOW: usize = 8_192;
 
 /// The window the roomy tier is sampled at when only `compact_prompt` is known.
@@ -674,30 +413,9 @@ const COMPACT_TIER_SAMPLE_WINDOW: usize = 8_192;
 const ROOMY_TIER_SAMPLE_WINDOW: usize = 32_768;
 
 /// Words a `<thinking>` block may run to — the prompt-side form of
-/// [`reasoning_budget_tokens`].
-///
-/// Words, not tokens, because the model cannot count its own tokens and a token
-/// figure in a prompt is read as decoration. `budget_as_words` is the existing
-/// precedent (`resummarisation.rs`) and rounds DOWN, keeping the ask inside the
-/// budget rather than at it.
-///
-/// # Why this takes a bool and not a `&CompactionProfile`
-///
-/// The prompt renderer never receives the profile. It receives `PromptState`,
-/// whose `compact_prompt` flag IS profile-derived
-/// ([`CompactionProfile::use_compact_prompt`]) and is the only profile signal
-/// that reaches it. So the curve is sampled at the two windows above rather
-/// than evaluated at the turn's own window.
-///
-/// That is a real loss of resolution and it is recorded rather than hidden: the
-/// file that could carry the whole profile into `PromptState` is
-/// `crates/pond-adapters-goose/src/goose_agent.rs`, which was held by another
-/// workstream when this landed. Widening `PromptState` with a
-/// `reasoning_budget_words` field and setting it from `turn_profile` beside
-/// `compact_prompt` (the same block, before `ensure_provider_current`, so the
-/// KV prefix still resolves once per session) is the follow-up. Until then the
-/// two-point sample is honest and, at the two windows that actually run,
-/// exactly equal to the full evaluation.
+/// [`reasoning_budget_tokens`]. Words, not tokens: `budget_as_words` rounds DOWN,
+/// keeping the ask inside the budget. Takes a bool because the prompt renderer sees
+/// only `PromptState::compact_prompt`, so the curve is sampled at the two windows above.
 pub fn reasoning_budget_words(effort: ReasoningEffort, compact_prompt: bool) -> usize {
     let window = if compact_prompt {
         COMPACT_TIER_SAMPLE_WINDOW
@@ -708,12 +426,10 @@ pub fn reasoning_budget_words(effort: ReasoningEffort, compact_prompt: bool) -> 
     super::resummarisation::budget_as_words(reasoning_budget_tokens(&profile, effort))
 }
 
-/// Calculate available history budget in characters after system prompt and tool schema overhead.
+/// Available history budget in characters, after system prompt and tool schema overhead.
 ///
-/// The returned value is the upper bound for the total length of message
-/// content that may be injected as conversation history. Always returns at
-/// least [`MIN_USABLE_HISTORY_CHARS`] so the agent can carry at least the
-/// most recent turn even when overhead is large.
+/// An upper bound on injected conversation history. Never returns less than
+/// [`MIN_USABLE_HISTORY_CHARS`], so the most recent turn survives a large overhead.
 pub fn available_history_chars(
     profile: &CompactionProfile,
     system_prompt_chars: usize,
@@ -726,33 +442,16 @@ pub fn available_history_chars(
         .max(MIN_USABLE_HISTORY_CHARS)
 }
 
-/// Maximum assistant tool-output size kept verbatim in history.
-///
-/// **Bytes**, and it was called `TOOL_RESULT_MAX_CHARS` until it was not. Every
-/// use compares against `String::len()` or feeds `truncate_at_byte_budget`, both
-/// of which are bytes, so the old name was wrong on its own terms.
-///
-/// It was also colliding: `shared::services::chat.rs` has its own
-/// `TOOL_RESULT_MAX_CHARS`, a different value (2000), a different unit
-/// (genuinely chars — it counts `char_indices`), and a different job (the NDJSON
-/// stream contract, not the model's context). Both were reachable from
-/// `pond-adapters-goose`. That one keeps its name because its name is true.
+/// Maximum assistant tool-output size kept verbatim in history. **Bytes**: every use
+/// compares against `String::len()` or feeds `truncate_at_byte_budget`. Distinct from
+/// `shared::services::chat.rs`'s `TOOL_RESULT_MAX_CHARS`, which is genuinely chars and
+/// governs the NDJSON stream contract rather than the model's context.
 pub const TOOL_RESULT_MAX_BYTES: usize = 1_500;
 
-/// Shrink an oversized tool result to `max_chars`-ish, keeping BOTH ends.
-///
-/// Returns `None` when `text` already fits, so callers can skip rewriting.
-///
-/// Head-only truncation loses exactly the part that usually carries the answer:
-/// a tool result's tail holds totals, the last log lines, the closing summary,
-/// the "N more results" count. Keeping ~60% head and ~40% tail preserves the
-/// shape of the payload (so the model can still tell what it is looking at) and
-/// the conclusion, and the marker states how much is missing so the model can
-/// call the tool again with a narrower query instead of assuming it saw
-/// everything.
-///
-/// Always splits on char boundaries; the result can exceed `max_chars` by the
-/// length of the marker, which is the honest trade for saying how much was cut.
+/// Shrink an oversized tool result to `max_chars`-ish, keeping BOTH ends: a tool
+/// result's tail carries the totals and closing summary, so ~60% head plus ~40% tail
+/// keeps the conclusion. Returns `None` when `text` already fits. Splits on char
+/// boundaries, and may exceed `max_chars` by the length of the truncation marker.
 pub fn truncate_head_tail(text: &str, max_chars: usize) -> Option<String> {
     if text.len() <= max_chars {
         return None;
@@ -855,9 +554,8 @@ fn trim_to_char_budget(
 
 /// Truncate oversized assistant tool outputs before history trimming.
 ///
-/// This targets assistant messages that look like structured tool output
-/// payloads (JSON/code blocks) and keeps the first [`TOOL_RESULT_MAX_BYTES`]
-/// characters plus a small marker.
+/// Targets assistant messages that look like structured tool payloads (JSON or
+/// code blocks), keeping the first [`TOOL_RESULT_MAX_BYTES`] plus a marker.
 pub fn truncate_tool_outputs(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     messages
         .into_iter()
@@ -901,15 +599,10 @@ pub fn trim_to_budget_with_limit(
     trim_to_char_budget(messages, usable_history_chars)
 }
 
-/// Trim a message list to fit within [`USABLE_HISTORY_CHARS`].
-///
-/// Walks messages newest-first, keeping each message until the budget is
-/// exhausted.  Returns the surviving messages in chronological (oldest-first)
-/// order so they can be passed directly to `LlmProvider::complete()`.
-///
-/// An individual message that exceeds the entire budget on its own is
-/// truncated to `USABLE_HISTORY_CHARS` characters so the caller always
-/// receives at least one message.
+/// Trim a message list to fit within [`USABLE_HISTORY_CHARS`]. Walks newest-first and
+/// returns the survivors oldest-first, ready to pass to `LlmProvider::complete()`. A
+/// single message larger than the whole budget is truncated rather than dropped, so
+/// the caller always gets at least one.
 pub fn trim_to_budget(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     trim_to_char_budget(messages, USABLE_HISTORY_CHARS)
 }
@@ -917,8 +610,7 @@ pub fn trim_to_budget(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
 /// Trim using the model's actual context window.
 ///
 /// Reserves 20% for the system prompt and generation headroom (minimum 2048 tokens).
-/// When `override_tokens` is non-zero, it caps the context window to that value
-/// (useful for memory-constrained deployments like Jetson 8GB).
+/// A non-zero `override_tokens` caps the window, for memory-constrained devices.
 pub fn trim_to_budget_for_model(
     messages: Vec<ChatMessage>,
     capabilities: &ModelCapabilities,
@@ -1269,15 +961,10 @@ mod tests {
             + p.history_token_budget
     }
 
-    /// Every window the discrete tiers were pinned at, with the values they
-    /// produced. This table IS the phase: the machinery changed, these answers
-    /// did not.
-    ///
-    /// It is deliberately wider than the four tier boundaries. 8,192 and 32,768
-    /// are not boundaries, but 8,192 is what `ContextGovernor::prompt_window`
-    /// hands every local provider and 32,768 is what the name heuristic hands
-    /// qwen and mistral - so a curve that only honoured the boundaries would
-    /// have shipped a real on-device change under a refactor's name.
+    /// Every window the discrete tiers were pinned at, with the values they produced:
+    /// the machinery changed, these answers must not. Wider than the four tier
+    /// boundaries because 8,192 is what `ContextGovernor::prompt_window` hands every
+    /// local provider and 32,768 is what the name heuristic hands qwen and mistral.
     const TIER_FIXTURES: &[(usize, f32, usize, usize, usize, usize, usize)] = &[
         // window,   threshold, memory, frags, system, history, reserve
         (0, 0.60, 200, 3, 1500, 1200, 768),
@@ -1373,11 +1060,9 @@ mod tests {
     }
 
     /// The Orin's real operating point, which no tier fixture covers: the local
-    /// model registry pins n_ctx at 16,384 there. The tiers put it in the 32K
-    /// bucket and declared 29,548 tokens of budget against a 16,384-token
-    /// window - 1.8x over, with only `turn_trimmer`'s history clamp (which does
-    /// not subtract the system prompt or the memory block) standing between that
-    /// and a mid-generation context overrun.
+    /// model registry pins n_ctx at 16,384 there. The tiers declared 29,548 tokens
+    /// of budget against that window, 1.8x over, with only `turn_trimmer`'s history
+    /// clamp between it and a mid-generation context overrun.
     #[test]
     fn the_orins_pinned_window_stops_promising_more_than_the_window_holds() {
         let p = CompactionProfile::from_context_window(16_384);
@@ -1474,12 +1159,10 @@ mod tests {
 
     // ── P5: asymmetric budgeting - preamble capped, working set scaled ───
 
-    /// The phase, as one assertion.
-    ///
-    /// A local provider's prompt window is clamped to 8,192 whatever the KV
-    /// cache holds, so quadrupling the window from 8,192 to 32,768 must buy
-    /// HISTORY and nothing else. If the preamble grows too, TTFT grows with it
-    /// permanently - it is the KV prefix, re-prefilled every turn (invariant 1).
+    /// A local provider's prompt window is clamped to 8,192 whatever the KV cache
+    /// holds, so quadrupling the window from 8,192 to 32,768 must buy HISTORY and
+    /// nothing else: the preamble is the KV prefix, re-prefilled every turn, so
+    /// growing it grows TTFT permanently (PAI-3 invariant 1).
     #[test]
     fn growing_the_window_buys_history_and_never_preamble() {
         let small = CompactionProfile::for_windows(8_192, 8_192);
@@ -1736,18 +1419,10 @@ mod tests {
 
     // ── PAI-6 P4: reserving history for a live subagent ─────────────────────
 
-    /// Everything a reservation must NOT move.
-    ///
-    /// The tempting implementation is `from_context_window(window * (1 -
-    /// fraction))`, which compiles, reads well, and shrinks the system-prompt
-    /// and memory allowances with it — so the preamble is rebuilt at a smaller
-    /// size and the KV prefix MOVES. That is a full re-prefill (3.7 s measured
-    /// on the Orin) charged to the parent's next turn, in exchange for tokens
-    /// on a working set the trimmer was about to cut anyway.
-    ///
-    /// Asserted field by field rather than with a window-derived expectation,
-    /// so a future field added to `CompactionProfile` and forgotten here is
-    /// caught by `the_reservation_covers_every_field_of_the_profile` below.
+    /// Everything a reservation must NOT move. Shrinking the preamble allowances
+    /// moves the KV prefix, costing a full re-prefill (3.7 s on the Orin) on the
+    /// parent's next turn. Asserted field by field so a new `CompactionProfile`
+    /// field is caught by `the_reservation_covers_every_field_of_the_profile`.
     #[test]
     fn a_reservation_takes_working_set_and_never_preamble() {
         let base = CompactionProfile::for_windows(32_768, 8_192);
@@ -1829,12 +1504,8 @@ mod tests {
 
     /// A fraction that is not a fraction reserves EVERYTHING.
     ///
-    /// `AgentRole::new` refuses a `context_fraction` outside `(0, 1]`, so any
-    /// of these means the ledger that summed them is broken. This programme's
-    /// rule is that a failure narrows: the parent losing recall is recoverable,
-    /// the parent over-committing the window is a mid-generation
-    /// `ContextLengthExceeded` and a conversation goose compacts out from under
-    /// the user.
+    /// `AgentRole::new` refuses a `context_fraction` outside `(0, 1]`, so a bad value is
+    /// a ledger defect; the failure narrows, since lost recall beats an overrun.
     #[test]
     fn a_fraction_that_is_not_a_fraction_reserves_the_whole_budget() {
         let base = CompactionProfile::from_context_window(8_192);
@@ -1878,12 +1549,8 @@ mod tests {
 
     /// A structural tripwire for the field-by-field assertion above: if
     /// `CompactionProfile` grows a field, this fails until somebody decides
-    /// whether a reservation may move it.
-    ///
-    /// Reads the struct definition rather than counting at runtime, because
-    /// there is no reflection here and a hand-maintained count is the vacuity
-    /// shape this programme has recorded (a control pinned to a number that
-    /// follows the constant wherever it moves).
+    /// whether a reservation may move it. It reads the struct declaration rather
+    /// than a hand-maintained count, which would follow the field list vacuously.
     #[test]
     fn the_reservation_covers_every_field_of_the_profile() {
         let source = include_str!("context_budget.rs");
@@ -1940,20 +1607,13 @@ mod tests {
 
     /// The guard that keeps this feature from being worse than the bug.
     ///
-    /// `turn_profile` builds a profile PER TURN and is the single producer of
-    /// every budget in the live adapter. If the reserve moved with each new
-    /// sample, the prompt would be budgeted against a slightly different number
-    /// on most turns, the rendered preamble would shift, and the KV prefix would
-    /// stop matching -- a full re-prefill every turn, measured at 4.19 s on the
-    /// Orin at 4 096 and 19.97 s at 16 384.
+    /// `turn_profile` builds a profile per turn, so a reserve that moved with each
+    /// sample would re-prefill every turn: 4.19 s on the Orin at 4 096, 19.97 s at 16 384.
     #[test]
     fn a_growing_sample_set_does_not_move_the_reserve_every_turn() {
-        // A conversation whose reasoning cost climbs, which is what a longer,
-        // harder conversation actually does. The first draft of this test used
-        // `300 + turn % 17`, which cycles through seventeen values, so the p95
-        // stops moving once they have all been seen -- and the test passed with
-        // the quantisation DELETED. It is written against the unquantised count
-        // now, so it cannot pass without the thing it names.
+        // A conversation whose reasoning cost climbs monotonically, so the p95
+        // keeps moving. A cycling sample set would let this pass with the
+        // quantisation deleted; it is asserted against the unquantised count.
         let mut observed: Vec<u32> = Vec::new();
         let mut reserves: Vec<usize> = Vec::new();
         let mut raw: Vec<usize> = Vec::new();
