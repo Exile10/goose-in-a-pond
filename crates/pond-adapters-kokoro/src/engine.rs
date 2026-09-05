@@ -1,21 +1,7 @@
-//! The ONNX session and the forward pass.
-//!
-//! Kokoro takes three tensors and returns a waveform:
-//!
-//! | input       | dtype | shape     |
-//! |-------------|-------|-----------|
-//! | `input_ids` | i64   | `[1, ≤512]` |
-//! | `style`     | f32   | `[1, 256]`  |
-//! | `speed`     | f32   | `[1]`       |
-//!
-//! Output is mono f32 at 24 kHz.
-//!
-//! ## Loading is lazy on purpose
-//!
-//! The weights are ~92 MB (q8) and the pond is idle most of its life on a
-//! shelf. Holding a session open from startup costs that memory continuously
-//! to save a one-off load before the first word. [`Engine`] therefore loads on
-//! first use and can be dropped again by [`Engine::unload`].
+//! The ONNX session and the forward pass. Kokoro takes `input_ids` (i64, `[1, ≤512]`),
+//! `style` (f32, `[1, 256]`) and `speed` (f32, `[1]`) and returns mono f32 at 24 kHz.
+//! The ~92 MB (q8) weights load on first use and can be dropped by [`Engine::unload`]: the
+//! pond is idle most of its life, so a session held from startup costs memory for nothing.
 
 use anyhow::{anyhow, Context, Result};
 use ort::session::Session;
@@ -35,12 +21,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Build a session over `model_path`.
-    ///
-    /// `intra_threads` bounds ONNX Runtime's per-op thread pool. On the Jetson
-    /// this matters twice over: the board has six cores that the LLM also
-    /// wants, and an unbounded pool spawns per-session threads that show up as
-    /// resident memory whether or not anything is speaking.
+    /// Build a session over `model_path`. `intra_threads` bounds ONNX Runtime's per-op thread
+    /// pool; on the Jetson the LLM wants the same six cores, and an unbounded pool's threads
+    /// sit in resident memory whether or not anything is speaking.
     pub fn load(model_path: &Path, intra_threads: Option<usize>) -> Result<Self> {
         if !model_path.exists() {
             return Err(anyhow!(
@@ -94,11 +77,8 @@ impl Engine {
             ));
         }
 
-        // Built as (shape, Vec) rather than through ndarray on purpose: `ort`
-        // resolves its own ndarray (0.17) while the workspace is on 0.16, so
-        // an `Array2` built here is a DIFFERENT type from the one ort's
-        // `from_array` accepts. The tuple form sidesteps the version skew and
-        // drops the dependency entirely.
+        // Built as (shape, Vec) on purpose: `ort` resolves ndarray 0.17 while the workspace is
+        // on 0.16, so an `Array2` built here is a different type from what `from_array` takes.
         let n = ids.len() as i64;
         let outputs = self
             .session

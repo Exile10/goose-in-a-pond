@@ -3,12 +3,8 @@
 //! Used by the multi-tool parallel dispatch pipeline to represent
 //! the output of each individual tool invocation.
 
-/// Result of a single tool execution.
-///
-/// Returned by `ToolAgent::process_multi()` to represent each tool's
-/// output in a multi-tool dispatch. The `tool_name` identifies which
-/// tool produced the result (e.g. "weather", "schedules") and `content`
-/// holds the tool's output text.
+/// Result of a single tool execution, returned by `ToolAgent::process_multi()` for each tool in a
+/// multi-tool dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResult {
     /// Name of the tool that produced this result (e.g. "weather", "schedules").

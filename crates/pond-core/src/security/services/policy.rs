@@ -1,10 +1,7 @@
-//! Default [`SecurityPolicy`] implementation: allow everything.
-//!
-//! This is the production default while the privacy boundary is a hook and not
-//! a gate. [`AllowAllPolicy::allow`] returns `Ok(true)` for every principal and
-//! scope; [`AllowAllPolicy::audit`] emits a `tracing` debug line and keeps no
-//! state. Deployments that want a real audit trail (e.g. one persisting to
-//! `pond_logs.db`) swap in a pond-infra adapter without changing any consumer.
+//! Default [`SecurityPolicy`]: allow everything, the production default while the
+//! privacy boundary is a hook and not a gate. [`AllowAllPolicy::allow`] returns
+//! `Ok(true)` for every principal and scope; [`AllowAllPolicy::audit`] logs and keeps
+//! no state. A pond-infra adapter can replace it without changing any consumer.
 
 use crate::security::ports::policy::{PolicyDecision, Principal, SecurityPolicy};
 use anyhow::Result;

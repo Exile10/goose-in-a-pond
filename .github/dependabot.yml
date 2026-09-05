@@ -1,19 +1,7 @@
-# Dependabot update PRs.
-#
-# Alerts were already on for this repository, but there was no config, so
-# nothing ever opened a PR — 35 alerts accumulated with no update path. This
-# file registers every manifest we actually build.
-#
-# Deliberately NOT registered:
-#   - goose/            — a submodule pinned to jarida-io/Goose. Its
-#                         dependencies reach us through the workspace lockfile,
-#                         which is registered below. Fixes belong upstream.
-#   - vendor/temporal_rs — a vendored [patch.crates-io] source.
-#   - templates/extensions/rust — a standalone template for user extensions,
-#                         not part of any build.
-#
-# When adding a new lockfile, add it here AND to the npm-audit matrix and the
-# osv job in .github/workflows/security.yml.
+# Dependabot update PRs: registers every manifest we actually build. A new lockfile goes here
+# AND in the npm-audit matrix and the osv job in .github/workflows/security.yml.
+# Deliberately NOT registered: goose/ (submodule pinned to jarida-io/Goose; its deps reach us via
+# the workspace lockfile, fixes belong upstream), vendor/temporal_rs, templates/extensions/rust.
 version: 2
 
 updates:

@@ -14,6 +14,11 @@ vi.mock("../api/PondApiClient", () => ({
     getSessionMessages: vi.fn(),
     setToken: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({ show_turn_stats: false, thinking_mode: "auto" }),
+    // Terminal state so the WarmupBanner renders nothing and never re-polls.
+    getWarmupStatus: vi.fn().mockResolvedValue({
+      state: "skipped", reason: "test", model: "", started_unix_ms: 0,
+      finished_unix_ms: null, elapsed_ms: 0,
+    }),
     updateSettings: vi.fn().mockResolvedValue({}),
     getModelCapabilities: vi.fn().mockResolvedValue({
       thinking: false,

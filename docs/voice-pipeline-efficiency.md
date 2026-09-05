@@ -105,7 +105,7 @@ fn rms_energy(samples: &[f32]) -> f32 {
 
 ```bash
 # Run calibration to see what RMS your mic reports at idle:
-pond-server chat --input whisper --wake-word goose
+pond-server chat --voice --wake-word goose
 # Watch the trace logs (RUST_LOG=trace) for "silent window skipped (rms=…)"
 
 # Typical values:
@@ -299,7 +299,7 @@ The energy gate threshold should be set just above the ambient noise floor of yo
 
 1. Start GIAP with `RUST_LOG=trace`:
    ```bash
-   RUST_LOG=trace cargo run -p pond-server -- chat --input whisper --wake-word goose
+   RUST_LOG=trace cargo run -p pond-server -- chat --voice --wake-word goose
    ```
 
 2. Stay quiet for 10 seconds. Watch for lines like:

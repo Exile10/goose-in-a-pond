@@ -1,14 +1,7 @@
-//! PAI-2 P8a acceptance: `GET /api/v1/security/policy-report` answers "what
-//! would flipping `security_policy_mode` to `enforce` break?" from evidence.
-//!
-//! The whole point of shipping the policy in `audit` mode is that a would-deny
-//! proceeds — so `ok` is `true` for exactly the requests `enforce` would block,
-//! and nothing that reads only the effect can answer the question. This drives a
-//! real router with a live `SqliteEventLog` and a live `SqliteSecurityPolicy`
-//! wired into `AppState`, makes an identity assertion the caller has not proved,
-//! and asserts the report can tell that apart from an allow.
-//!
-//! Run: cargo test -p pond-api --test policy_report_test
+//! PAI-2 P8a: `GET /api/v1/security/policy-report` answers what flipping
+//! `security_policy_mode` to `enforce` would break. In `audit` mode a would-deny
+//! still proceeds, so `ok` is `true` for exactly the requests `enforce` blocks and
+//! the effect alone cannot answer it. Run: cargo test -p pond-api --test policy_report_test
 
 use std::sync::Arc;
 
@@ -67,6 +60,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
     let session_storage = Arc::new(SqliteSessionStorage::new(pool.clone()));
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db,
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -90,6 +84,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -219,12 +214,10 @@ async fn report(app: &axum::Router) -> serde_json::Value {
     body_json(resp).await
 }
 
-/// `POLICY_COUNTERS` is a process-global and `cargo test` runs the functions in
-/// this file concurrently, so two tests taking a decision at the same time make
-/// each other's deltas wrong. Every test below that causes a policy decision
-/// holds this first. It is not paranoia: the first run of this file passed and
-/// the second failed with `process.would_deny` 2 vs 1, which is a test reporting
-/// the scheduler.
+/// `POLICY_COUNTERS` is a process-global and `cargo test` runs this file's
+/// functions concurrently, so two decisions taken at once corrupt each other's
+/// deltas. Every test below that causes a policy decision must hold this first,
+/// or it flakes with counts like `process.would_deny` 2 vs 1.
 static DECISION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn n(v: &serde_json::Value, block: &str, key: &str) -> u64 {

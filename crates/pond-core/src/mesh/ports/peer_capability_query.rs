@@ -15,12 +15,8 @@ pub enum PeerCapabilityQueryError {
 
 /// Driven Port: PeerCapabilityQuery
 ///
-/// A live, on-demand question — "what does this peer offer right now?" — not
-/// a separate port from `PeerDirectory` by accident: `PeerDirectory` is
-/// SQLite-persisted trust data (survives a restart by design); a peer's
-/// active capabilities can flip between two consecutive queries (Lightning
-/// wallet connects/disconnects, backing model swapped out), so caching them
-/// alongside trust scopes would make stale data look authoritative.
+/// A live, on-demand "what does this peer offer right now?". Kept out of the SQLite-backed
+/// `PeerDirectory`: capabilities flip between queries, so a cache would look authoritative.
 #[async_trait]
 pub trait PeerCapabilityQuery: Send + Sync {
     async fn capabilities_of(

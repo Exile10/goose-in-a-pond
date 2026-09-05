@@ -1,0 +1,19 @@
+[package]
+name = "pond-adapters-silero"
+description = "Silero VAD (ONNX) — a SpeechDetector that tells a fan from a voice"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pond-voice = { path = "../pond-voice" }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
+
+# Same ort setup as the other ONNX adapters: `load-dynamic` links the system
+# ONNX Runtime at run time rather than building one, which keeps GIAP's build
+# light and lets a Jetson operator swap in a CUDA or TensorRT build without
+# recompiling anything here.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-18"] }
+ndarray = "0.17"

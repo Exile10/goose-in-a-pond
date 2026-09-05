@@ -1,7 +1,9 @@
-//! Model downloader — Whisper ASR, Piper TTS, and llamafile LLM.
+//! Model downloader — Whisper ASR, Silero VAD, Kokoro TTS, and llamafile LLM.
 //!
 //! All models are downloaded into subdirectories of GIAP's data directory:
 //! - `models/ggml-*.bin`        — Whisper GGML models
+//! - `models/silero/`           — Silero VAD weights
+//! - `models/kokoro/`           — Kokoro engine, tokenizer and voices
 //! - `models/tts/`              — Piper voice models
 //! - `models/llm/`              — llamafile LLM models
 //!
@@ -12,17 +14,6 @@ use anyhow::{anyhow, Context, Result};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-// ── whisper-server binary download ────────────────────────────────────────────
-//
-// The subprocess path is gated behind `legacy-subprocess` at the call site
-// (main.rs, whisper_process.rs). These helpers stay compiled in both builds
-// because gating each item individually would noise up the module; the
-// dead-code warnings on the default build are accepted as a known trade-off.
-
-// ── Obtain whisper-server binary (download or build) ─────────────────────────
-
-// ── Build-tool helpers: cmake + git auto-download ─────────────────────────────
-
 // ── Piper TTS model download ───────────────────────────────────────────────────
 
 /// Directory for TTS voice models: `<data_dir>/models/tts/`.
@@ -30,40 +21,13 @@ pub fn tts_models_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("models").join("tts")
 }
 
-/// Download a specific piper voice model by its filename and URL into `<data_dir>/models/tts/`.
-///
-/// Both the `.onnx` weights and the `.onnx.json` config are downloaded.
-/// Returns the path to the `.onnx` file.
-pub async fn download_piper_model_entry(
-    data_dir: &Path,
-    model_filename: &str,
-    config_filename: &str,
-    model_url: &str,
-    config_url: &str,
-    size_mb: u64,
-) -> Result<PathBuf> {
-    let dir = tts_models_dir(data_dir);
-    tokio::fs::create_dir_all(&dir).await?;
-
-    let onnx_path = dir.join(model_filename);
-    let json_path = dir.join(config_filename);
-
-    // Status lines to stderr: reachable from the --json-events chat path (see
-    // download_file), where stdout is reserved exclusively for NDJSON.
-    if onnx_path.exists() {
-        eprintln!("  have: {}", onnx_path.display());
-    } else {
-        download_file(model_url, &onnx_path, size_mb).await?;
-    }
-
-    if json_path.exists() {
-        eprintln!("  have: {}", json_path.display());
-    } else {
-        download_file(config_url, &json_path, 1).await?;
-    }
-
-    Ok(onnx_path)
-}
+// `download_piper_model_entry` used to live here — it fetched a `.onnx` voice
+// and its `.onnx.json` config. It lost its last caller when Kokoro replaced
+// Piper as the engine, and the module comment that once licensed the resulting
+// dead-code warning ("gating each item individually would noise up the module")
+// described a `legacy-subprocess` feature that no longer exists. Deleted rather
+// than re-explained. `tts_models_dir` above stays: two callers still read that
+// directory to notice a pre-Kokoro install.
 
 // ── Piper binary download ──────────────────────────────────────────────────────
 
@@ -210,6 +174,65 @@ pub async fn ensure_kokoro_engine_reporting(
         .await
         {
             tracing::warn!("Kokoro voice {name} download failed: {e}");
+        }
+    }
+}
+
+// ── Silero VAD ────────────────────────────────────────────────────────────────
+
+/// The exact revision the detector was measured against.
+///
+/// Pinned rather than `main` because `pond_adapters_silero` hard-codes this
+/// model's shape — a 512-sample window and a `[2, 1, 128]` recurrent state —
+/// and a retag upstream would not fail the build. It would fail one inference
+/// per window at run time, and the detector deliberately treats an inference
+/// error as *speech* so a dead VAD cannot cut a sentence in half. The symptom
+/// of a silently changed model is therefore a microphone that never closes
+/// until the hard cap, with nothing in the log that points upstream. A pin
+/// costs nothing.
+const SILERO_REVISION: &str = "e71cae966052b992a7eca6b17738916ce0eca4ec";
+
+/// Where the detector looks: `<data_dir>/models/silero/silero_vad.onnx`.
+pub fn silero_model_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("models")
+        .join("silero")
+        .join("silero_vad.onnx")
+}
+
+/// Where the weights come from, in one place a test can read.
+fn silero_url() -> String {
+    format!(
+        "https://huggingface.co/onnx-community/silero-vad/resolve/{SILERO_REVISION}/onnx/model.onnx"
+    )
+}
+
+/// Fetch the Silero VAD weights unless they are already on disk.
+///
+/// 2 MB, once. Returns `None` when the file is neither present nor fetchable;
+/// the caller degrades to the energy gate rather than failing, because a pond
+/// with no network still has to be able to listen.
+pub async fn ensure_silero_model(data_dir: &Path) -> Option<PathBuf> {
+    let dest = silero_model_path(data_dir);
+    if dest.exists() {
+        return Some(dest);
+    }
+
+    let parent = dest.parent()?;
+    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+        tracing::warn!("could not create {}: {e}", parent.display());
+        return None;
+    }
+
+    // stderr, like every other status line in this module: the voice child runs
+    // under `--json-events`, where stdout carries NDJSON and nothing else.
+    eprintln!("  Listen   fetching the speech detector (2 MB, one time)...");
+    match download_file(&silero_url(), &dest, 2).await {
+        Ok(()) => Some(dest),
+        Err(e) => {
+            tracing::warn!("silero VAD download failed: {e}");
+            eprintln!("  Listen   speech detector download failed: {e}");
+            None
         }
     }
 }
@@ -1024,6 +1047,56 @@ mod tests {
     use tempfile::TempDir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── Silero VAD ────────────────────────────────────────────────────────────
+
+    /// A branch here would be a live dependency on whatever `main` points at
+    /// today, and the adapter hard-codes this model's window and state shape.
+    /// The failure mode is not a build break — it is one inference error per
+    /// window at run time, which the detector deliberately reports as *speech*,
+    /// which is a microphone that never closes.
+    #[test]
+    fn the_silero_weights_are_pinned_to_a_commit_not_a_branch() {
+        assert_eq!(
+            SILERO_REVISION.len(),
+            40,
+            "expected a full commit sha, got {SILERO_REVISION:?}"
+        );
+        assert!(SILERO_REVISION.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// The URL is only ever exercised on a fresh install, so a typo in it
+    /// survives every run on a machine that already has the file. This is the
+    /// one place it can be checked cheaply: `download_file` dispatches on
+    /// `parse_hf_url` returning `Some`, and a malformed URL silently falls
+    /// through to the plain-reqwest path instead.
+    #[test]
+    fn the_silero_url_routes_through_the_hf_cache() {
+        let (repo, revision, filename) =
+            pond_hf_cache::parse_hf_url(&silero_url()).expect("must parse as a Hugging Face URL");
+        assert_eq!(repo, "onnx-community/silero-vad");
+        assert_eq!(revision, SILERO_REVISION);
+        assert_eq!(filename, "onnx/model.onnx");
+    }
+
+    /// Called on every `chat --voice`, so the common case is the second one.
+    #[tokio::test]
+    async fn an_existing_silero_model_is_not_fetched_again() {
+        let tmp = TempDir::new().unwrap();
+        let dest = silero_model_path(tmp.path());
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"not really a model, but present").unwrap();
+
+        // No network is mocked: reaching for one would fail the test rather
+        // than pass it silently.
+        let got = ensure_silero_model(tmp.path()).await;
+
+        assert_eq!(got.as_deref(), Some(dest.as_path()));
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"not really a model, but present"
+        );
+    }
 
     // ── Whisper model download via mock HTTP server ───────────────────────────
 

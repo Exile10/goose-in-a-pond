@@ -1,18 +1,7 @@
-//! Model management service — the authoritative orchestrator for the model lifecycle.
-//!
-//! `ModelService` is the single entry-point for all model-related operations:
-//! fetching the catalog, downloading files, assigning models to roles, and resolving
-//! which model to use at runtime.  It has no knowledge of HTTP, SQLite, or file paths
-//! — those concerns live in the port implementations wired in `pond-server`.
-//!
-//! # Typical startup sequence
-//! ```text
-//! 1. model_service.seed_catalog()        // first run: fetch + upsert catalog
-//!    model_service.sync_disk_flags()     // subsequent runs: refresh downloaded flags
-//! 2. model_service.model_for_role("asr") // find the assigned ASR model
-//! 3. model_service.ensure_downloaded(id) // download if the file is missing
-//! 4. pass the returned PathBuf to the subprocess launcher
-//! ```
+//! Model management service — the single entry-point for the model lifecycle: catalog,
+//! downloads, role assignment, and runtime resolution. It knows nothing of HTTP, SQLite or
+//! file paths; those live in the port implementations wired in `pond-server`. Startup calls
+//! `seed_catalog` (or `sync_disk_flags` on later runs), `model_for_role`, `ensure_downloaded`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -147,9 +136,8 @@ impl ModelService {
 
     /// Ensure the model file for `model_id` is on disk.
     ///
-    /// - If the file already exists, returns its path immediately.
-    /// - If the record has a `url`, downloads to the storage path.
-    /// - If neither condition holds, returns an error.
+    /// Returns the existing path, otherwise downloads from the record's `url` to the storage
+    /// path; errors when the record has no `url`.
     pub async fn ensure_downloaded(&self, model_id: &str) -> Result<PathBuf> {
         let record = self
             .repo

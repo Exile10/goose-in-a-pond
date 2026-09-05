@@ -1,46 +1,16 @@
-//! Per-SESSION tool-relevance selection (Phase D2).
-//!
-//! Picks which `giap-*` extension groups have their tool SCHEMAS in the prompt
-//! for a conversation. Pure functions — the embedding call and the persistence
-//! live in the adapter.
-//!
-//! ## What this is not
-//!
-//! This is not a classifier and it does not decide whether the model uses tools.
-//! GIAP's working agreement is "trust the model for tool use — no keyword
-//! pre-classification", and this respects that: the model always receives a tool
-//! surface and always decides natively via MCP whether and which tool to call.
-//! What is decided here is only which schemas are physically present in the
-//! prompt, for prompt COST — the same class of decision as the memory token
-//! budget or the history trimmer, both of which already drop content to fit a
-//! budget. And unlike a classifier, the decision is reversible BY THE MODEL:
-//! `giap-toolkit`'s `enable_tool_group` pulls a dormant group in mid-session.
-//!
-//! ## Stickiness
-//!
-//! Selection runs once per session, not per turn. Per-turn churn would rewrite
-//! the tools JSON on every turn and destroy the local engine's KV prefix reuse —
-//! which is the entire reason to shrink the prompt in the first place.
-//!
-//! ## Bias
-//!
-//! Every failure path widens. No embedder, an embedding error, an empty
-//! registered set, or a score that lands just under the line all resolve toward
-//! MORE tools, never fewer. A missing tool costs the user a wrong answer; a
-//! surplus tool costs ~100 tokens.
+//! Per-SESSION tool-relevance selection (Phase D2): which `giap-*` groups have their tool
+//! SCHEMAS in the prompt, for prompt cost only; the model still decides tool use natively.
+//! Runs once per session, never per turn — per-turn churn rewrites the tools JSON and
+//! destroys the engine's KV prefix reuse. Every failure path widens, never narrows.
 
 use crate::mcp::domain::tool_group::{
     core_group_names, find_group, group_of_tool, is_catalog_extension, TOOL_GROUPS,
 };
 
-/// Cosine-similarity floor for including a non-core group, on
-/// all-MiniLM-L6-v2 (the fastembed model Phase A wired in).
-///
-/// Calibration on that model for short text: unrelated pairs land ~0.00-0.15,
-/// loosely related ~0.20-0.35, clearly on-topic above ~0.40. 0.28 sits
-/// deliberately BELOW the on-topic band — the asymmetry of costs (a surplus
-/// group is ~100-1200 prompt tokens, a missing group is a wasted round trip at
-/// ~10s on-device) means erring wide is correct.
+/// Cosine-similarity floor for including a non-core group, on all-MiniLM-L6-v2. Calibrated
+/// for short text: unrelated pairs land ~0.00-0.15, clearly on-topic above ~0.40. 0.28 sits
+/// below that band because a surplus group costs ~100-1200 prompt tokens and a missing one
+/// costs a wasted round trip, ~10s on-device.
 pub const DEFAULT_RELEVANCE_THRESHOLD: f32 = 0.28;
 
 /// Cosine similarity of the session's opening context against one group.
@@ -83,27 +53,10 @@ impl ToolSelection {
 /// Upper bound on any single embedded signal. Embedding models truncate anyway.
 const MAX_SIGNAL_CHARS: usize = 2000;
 
-/// The texts that represent a session's topic, each scored INDEPENDENTLY.
-///
-/// Returns the question first, then the standing context, then the active
-/// skills, and they must never be concatenated. A 17-character question
-/// ("Check the weather") embedded together with a kilobyte of memories
-/// yields a vector dominated by the memories: the question's own topic drops
-/// below the threshold, nothing clears the bar, and the top-scorer rescue
-/// then hands the session whichever group the *memory blob* happens to
-/// resemble. Observed live — "Check the weather" selected `giap-schedule`
-/// and left `giap-weather` dormant, so the model had no weather tool at all.
-///
-/// Scored separately and combined with `max`, a specific question wins on its own
-/// merits, while a vague opener ("what about tomorrow?") still falls back to the
-/// standing context — which is why the memories were included in the first place.
-///
-/// `skills` is each active user skill's "name: description", one per line.
-/// Without it, an active skill whose instructions call for a non-core group
-/// (e.g. a "task reminder" skill needing `giap-schedule`) would only get that
-/// group when the opening message happened to say so too — the skill telling
-/// the model to call a tool is worthless if the tool's schema was never
-/// selected into the prompt.
+/// The texts representing a session's topic — the question, the standing context, then
+/// each active skill's "name: description" — scored INDEPENDENTLY and combined with `max`,
+/// never concatenated. A short question embedded with a kilobyte of memories yields a
+/// vector the memories dominate: live, "Check the weather" selected `giap-schedule`.
 pub fn selection_signals(first_message: &str, memories: &str, skills: &str) -> Vec<String> {
     [first_message, memories, skills]
         .into_iter()
@@ -127,10 +80,8 @@ pub fn selection_signals(first_message: &str, memories: &str, skills: &str) -> V
 
 /// Combine per-signal scores into one score per group by taking the best.
 ///
-/// `max` and not a mean: the signals are alternative descriptions of what the
-/// session is about, not parts of one description, so a strong match on either
-/// is a strong match. Averaging would reintroduce the dilution this split exists
-/// to remove.
+/// `max` and not a mean: the signals are alternative descriptions of the session's topic,
+/// not parts of one, so averaging would reintroduce the dilution this split exists to fix.
 pub fn merge_scores(per_signal: &[Vec<GroupScore>]) -> Vec<GroupScore> {
     let mut merged: Vec<GroupScore> = Vec::new();
     for scores in per_signal {
@@ -157,19 +108,10 @@ pub fn scorable_groups(available: &[String]) -> Vec<(&'static str, &'static str)
         .collect()
 }
 
-/// Choose the groups for a session.
-///
-/// `available` — extensions actually registered this run (settings toggles
-/// already applied). `scores` — cosine of the selection signal against each
-/// scorable group, or `None` when no embedder was available or scoring failed.
-///
-/// Guarantees, in order of precedence:
-/// 1. `scores == None` → every available group (never narrow blindly).
-/// 2. Core groups are always present when registered.
-/// 3. Every group at or above `threshold` is present.
-/// 4. The single best-scoring non-core group is present even if it missed the
-///    threshold — the cheapest possible insurance against a session that needs
-///    one obvious capability the score merely under-rated.
+/// Choose the groups for a session. `available` is what is registered this run; `scores`
+/// is `None` when no embedder was available or scoring failed. Guarantees, in precedence
+/// order: no scores means every available group; core groups always when registered; every
+/// group at or above `threshold`; and the best-scoring non-core group even if it missed.
 pub fn select_groups(
     available: &[String],
     scores: Option<&[GroupScore]>,
@@ -223,9 +165,8 @@ pub fn select_groups(
 
 /// Retain only the tools belonging to `groups`.
 ///
-/// A tool with no `__` prefix, or one whose prefix is not a catalog extension,
-/// is KEPT: the first is goose plumbing the shim's allow-set already governs,
-/// the second is a user-added MCP server that selection does not own.
+/// A tool with no `__` prefix, or whose prefix is not a catalog extension, is KEPT: the
+/// first is goose plumbing the shim's allow-set governs, the second a user-added server.
 pub fn filter_tools_by_groups<'a, I>(tools: I, groups: &[String]) -> Vec<String>
 where
     I: IntoIterator<Item = &'a String>,
@@ -240,46 +181,10 @@ where
         .collect()
 }
 
-/// Remove every tool belonging to a group a `Guest` must never reach.
-///
-/// See [`crate::mcp::domain::tool_group::groups_denied_to_guests`] for the list
-/// and why it is a denylist rather than an allowlist.
-///
-/// **This is a PROMPT-SURFACE control, not an execution gate, and the
-/// difference matters.** It decides what the model can SEE, which is what stops
-/// it choosing a withheld tool. It does not stop one running: `goose_agent.rs`'s
-/// tool-call guard says so in terms — by the time it runs, "the tool either has
-/// run or is about to, and nothing here can stop it" — because goose keeps every
-/// extension loaded agent-wide and collects every `ToolRequest` regardless of
-/// which schemas were published. What that guard does is refuse to SURFACE the
-/// call and its result. A real execution gate needs an inspector registered with
-/// goose's `ToolInspectionManager`, whose `add_inspector` is private: a fork
-/// patch, not a local change.
-///
-/// So this is the layer that makes a withheld capability unreachable in
-/// practice, and it is defence in depth rather than a wall. It was previously
-/// described here as "the enforcement point for PAI-1 P5", which reads as the
-/// stronger claim and is worth not making, because the tool-narrowing design
-/// leans on this function.
-///
-/// **It operates on TOOLS rather than groups deliberately.** The group-level
-/// subtraction inside the
-/// adapter's selection path only runs when
-/// `settings.tool_selection_mode == "relevant"`, and the default is `"all"` --
-/// so on a default install the selection path is skipped entirely and the
-/// unfiltered tool set went straight to the model. A `Guest` turn kept
-/// `giap-memory` and could recall, keyword-search or `forget_memory` the whole
-/// household. P5 was recorded as landed while being inert on every default
-/// pond.
-///
-/// The set published to the provider shim is the only thing that actually
-/// constrains the model, so the check belongs here, where every mode converges.
-/// Filtering by group before selection cannot work: `giap-memory` and
-/// `giap-draft` are core groups and `select_groups` puts core groups back
-/// unconditionally.
-///
-/// Idempotent, so applying it after a path that already subtracted at the group
-/// level is harmless.
+/// Remove every tool a `Guest` must never reach; the list is in
+/// [`crate::mcp::domain::tool_group::groups_denied_to_guests`]. Filters TOOLS, because the
+/// group-level subtraction runs only under `tool_selection_mode = "relevant"` (default
+/// "all"). A prompt-surface control: a real gate needs goose's private `add_inspector`.
 pub fn subtract_guest_denied_tools<'a, I>(tools: I) -> Vec<String>
 where
     I: IntoIterator<Item = &'a String>,
@@ -298,59 +203,26 @@ where
             // Engine plumbing. Not personal data, and the shim's allow-set
             // governs it anyway — same reasoning as the unprefixed case.
             Some(ext) if ENGINE_TOOL_PREFIXES.contains(&ext) => true,
-            // Anything else with a prefix is a user-added MCP server, and the
-            // denylist can never name it — it holds `giap-*` literals and this
-            // prefix is not one. So the old `!denied.contains(&ext)` was
-            // structurally `true` here: a third-party server reading mail,
-            // calendars or files was invisible to PAI-1's guest boundary while
-            // every builtin was checked against it.
-            //
-            // Default-deny instead. An unidentified speaker is somebody the pond
-            // could not name, and for a server whose data GIAP knows nothing
-            // about the honest answer is no. The consented path is a per-server
-            // "guests may use this" flag, not a silent yes.
-            //
-            // The subagent side needs no equivalent: `TaskSpec::grants_tool`
-            // denies any group not explicitly in the child's set, so unknown
-            // already means no there.
+            // Anything else with a prefix is a user-added MCP server the `giap-*` denylist
+            // can never name, so default-deny: the honest answer about a server whose data
+            // GIAP knows nothing about is no. Consent is a per-server flag. The subagent
+            // side needs no equivalent — `TaskSpec::grants_tool` already denies unknowns.
             Some(_) => false,
         })
         .cloned()
         .collect()
 }
 
-/// Tool-name prefixes that belong to the AGENT ENGINE rather than to any
-/// extension.
-///
-/// goose injects a handful of its own tools (`platform__manage_schedule`,
-/// `recipe__final_output`). They are not personal data and the provider shim's
-/// allow-set already vetoes them, so they are kept for a guest on the same
-/// reasoning as an unprefixed name. Named explicitly because
-/// [`subtract_guest_denied_tools`] otherwise default-denies every non-catalog
-/// prefix, and silently dropping engine plumbing would look like a tool-calling
-/// bug rather than a boundary decision.
+/// Tool-name prefixes belonging to the AGENT ENGINE rather than any extension. goose
+/// injects a few of its own tools; they are not personal data and the provider shim's
+/// allow-set already vetoes them. Named explicitly because [`subtract_guest_denied_tools`]
+/// otherwise default-denies every non-catalog prefix, which would look like a bug.
 const ENGINE_TOOL_PREFIXES: &[&str] = &["platform", "recipe", "dynamic_task"];
 
-/// The groups a speaker with this scope may EVER hold.
-///
-/// This is the PAI-1 boundary as a value, and it exists because two callers used
-/// to derive it independently and one of them got it wrong. `dormant_groups_note`
-/// was built from the full registered list, so an unidentified speaker was shown
-/// `giap-memory`, `giap-vision`, `giap-audit` and `giap-context` under a sentence
-/// telling it that enabling one makes its tools available immediately — the
-/// groups had been withheld from the selection and then advertised anyway. And
-/// the escape hatch checked catalog membership and registration only, so the
-/// speaker could take what the menu offered.
-///
-/// Applied to the candidates going INTO [`select_groups`] rather than subtracted
-/// after. That works because `select_groups` filters the core set by `available`;
-/// an older comment in the adapter claimed a pre-filter "would not stick because
-/// select_groups puts core groups back unconditionally", which has not been true
-/// for as long as that filter has existed.
-///
-/// A denylist, for the same reason `groups_denied_to_guests` is one: a new
-/// extension is not personal data by default, and the failure mode of the
-/// alternative is a capability silently missing rather than one silently granted.
+/// The groups a speaker with this scope may EVER hold: the PAI-1 boundary as a value, so
+/// no caller derives it independently. Applied to the candidates going INTO
+/// [`select_groups`] rather than subtracted after, which works because `select_groups`
+/// filters the core set by `available`. A denylist, like `groups_denied_to_guests`.
 pub fn permitted_groups(
     available: &[String],
     scope: &crate::user_data::domain::profile::ProfileScope,
@@ -366,15 +238,10 @@ pub fn permitted_groups(
         .collect()
 }
 
-/// The `<tool-groups>` block for the user message's `<system-context>`.
-///
-/// Lists the groups that are NOT loaded, so the model can reach for
-/// `enable_tool_group` without first spending a round trip on
-/// `list_tool_groups`. Rides the user message, never the system prompt: it is
-/// session-specific and the system prefix must stay byte-identical across
-/// sessions for KV reuse.
-///
-/// Returns an empty string when nothing is dormant — no narrowing, no note.
+/// The `<tool-groups>` block for the user message's `<system-context>`, listing the groups
+/// that are NOT loaded so the model can call `enable_tool_group` without a round trip on
+/// `list_tool_groups`. It rides the user message because the system prefix must stay
+/// byte-identical across sessions for KV reuse. Empty string when nothing is dormant.
 pub fn dormant_groups_note(available: &[String], loaded: &[String]) -> String {
     let dormant: Vec<&'static crate::mcp::domain::tool_group::ToolGroup> = TOOL_GROUPS
         .iter()
@@ -532,15 +399,10 @@ mod tests {
 
     // ── The PAI-1 boundary ────────────────────────────────────────────────
 
-    /// A guest may not hold a personal-data group, and may not be shown one.
-    ///
-    /// Both halves in one test because they were one bug. The groups were
-    /// withheld from the selection and then advertised by
-    /// `dormant_groups_note`, which was built from the full registered list —
-    /// under a sentence that tells the model enabling a group makes its tools
-    /// available immediately. Withholding a capability and then publishing a
-    /// menu of it is worse than not withholding it, because it reads as an
-    /// invitation.
+    /// A guest may not hold a personal-data group, and may not be shown one: both halves
+    /// in one test because they were one bug. Groups withheld from the selection were then
+    /// advertised anyway by `dormant_groups_note`, under a sentence telling the model that
+    /// enabling one makes its tools available immediately.
     #[test]
     fn a_guest_is_neither_given_nor_offered_a_personal_group() {
         use crate::user_data::domain::profile::ProfileScope;
@@ -600,12 +462,9 @@ mod tests {
         }
     }
 
-    /// The ceiling bounds selection, including the core groups.
-    ///
-    /// This is what lets the boundary be applied once, going in, rather than
-    /// subtracted afterwards: `select_groups` filters `core_group_names()` by
-    /// `available`, so passing the guest ceiling as `available` keeps `giap-draft`
-    /// and `giap-memory` out even though both are core.
+    /// The ceiling bounds selection, including the core groups: `select_groups` filters
+    /// `core_group_names()` by `available`, so passing the guest ceiling as `available`
+    /// keeps `giap-draft` and `giap-memory` out even though both are core.
     #[test]
     fn selecting_from_the_guest_ceiling_drops_even_core_groups() {
         use crate::mcp::domain::tool_group::core_group_names;
@@ -690,11 +549,10 @@ mod tests {
         assert!(!kept.contains(&"giap-news__get_headlines".to_string()));
     }
 
-    /// The regression this split exists for: the question and the standing
-    /// context must reach the embedder as SEPARATE texts. Concatenated, a short
-    /// question is drowned by a long memory block and its own topic drops below
-    /// the threshold — live, "Check the weather" selected `giap-schedule` and
-    /// left `giap-weather` dormant.
+    /// The regression this split exists for: the question and the standing context must
+    /// reach the embedder as SEPARATE texts. Concatenated, a short question is drowned by
+    /// a long memory block — live, "Check the weather" selected `giap-schedule` and left
+    /// `giap-weather` dormant.
     #[test]
     fn question_and_memories_are_scored_separately() {
         let sigs = selection_signals("Check the weather", "- [identity] lives in Nairobi", "");
@@ -805,11 +663,10 @@ mod tests {
         );
     }
 
-    /// An active skill's own description is a selection signal in its own
-    /// right: an unrelated opening message plus a skill that needs
-    /// `giap-schedule` still selects `giap-schedule`, because a "task
-    /// reminder" skill telling the model to call a tool is worthless if that
-    /// tool's schema was never in the prompt to begin with.
+    /// An active skill's own description is a selection signal in its own right: an
+    /// unrelated opening message plus a skill that needs `giap-schedule` still selects
+    /// `giap-schedule`, because a skill telling the model to call a tool is worthless if
+    /// that tool's schema was never in the prompt to begin with.
     #[test]
     fn a_skill_signal_selects_its_group_despite_an_unrelated_question() {
         let avail = available();
@@ -953,17 +810,10 @@ mod tests {
         );
     }
 
-    /// A user-added MCP server is default-DENIED to a guest, and that is the
-    /// asymmetry with the line above.
-    ///
-    /// `groups_denied_to_guests()` is a list of `giap-*` literals, so a
-    /// non-catalog prefix could never appear in it: the old check was
-    /// structurally `true` for every third-party server. A server reading mail,
-    /// calendars or files was invisible to PAI-1's guest boundary while every
-    /// builtin was being checked against it.
-    ///
-    /// Withholding it from an unidentified speaker is the answer that can be
-    /// walked back with a per-server flag. The other direction cannot.
+    /// A user-added MCP server is default-DENIED to a guest, the asymmetry with the line
+    /// above: `groups_denied_to_guests()` holds `giap-*` literals only, so a non-catalog
+    /// prefix can never appear in it and a membership check would be structurally `true`.
+    /// Withholding can be walked back with a per-server flag; the other direction cannot.
     #[test]
     fn a_third_party_server_is_withheld_from_a_guest() {
         let all = tools(&[

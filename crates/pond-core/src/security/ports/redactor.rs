@@ -1,8 +1,7 @@
 //! Driven Port: removal of personal data before it is stored or sent.
 //!
-//! Deliberately synchronous and deliberately not a model. Invariant 3 of PAI-2
-//! also applies: this is never run over the model's own prompt. What it
-//! protects is the durable stores and anything that leaves the pond.
+//! Synchronous and not a model. Invariant 3 of PAI-2 applies: never run this over the
+//! model's own prompt; it protects the durable stores and anything leaving the pond.
 
 use crate::security::domain::redaction::{Redacted, RedactionLevel};
 

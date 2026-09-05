@@ -1,16 +1,7 @@
-//! Integration tests for OllamaProvider.
-//!
-//! These tests use a wiremock HTTP server in place of a real Ollama instance
-//! and inspect the outgoing request body to verify that:
-//!
-//!   1. The system prompt is always the first message sent to Ollama.
-//!   2. Multi-turn conversation history is forwarded in the correct order.
-//!   3. `with_max_tokens()` serialises `options.num_predict` in the request.
-//!   4. `with_temperature()` serialises `options.temperature` in the request.
-//!   5. The `options` key is absent when neither is configured.
-//!
-//! The live smoke test at the bottom requires a running `ollama serve` and
-//! a pulled model; it is ignored by default.
+//! Integration tests for `OllamaProvider`, driving a wiremock HTTP server in
+//! place of a real Ollama and inspecting the outgoing request body: system prompt
+//! first, history order, `options.num_predict` and `options.temperature`, and no
+//! `options` key when neither is set. The live smoke test below is `#[ignore]`d.
 
 use pond_adapters_ollama::OllamaProvider;
 use pond_core::models::domain::message::ChatMessage;
@@ -298,12 +289,8 @@ async fn stream_complete_yields_usage_from_response() {
 
 // ── Live smoke test ───────────────────────────────────────────────────────────
 
-/// Run with:
-///   `cargo test -p pond-adapters-ollama -- --ignored live_ollama`
-///
-/// Requires:
-///   - `ollama serve` running on localhost:11434
-///   - `ollama pull llama3.2` (or adjust the model below)
+/// Run with `cargo test -p pond-adapters-ollama -- --ignored live_ollama`.
+/// Requires `ollama serve` on localhost:11434 and `ollama pull llama3.2`.
 #[tokio::test]
 #[ignore = "requires local Ollama instance with llama3.2 pulled"]
 async fn live_ollama_completion() {

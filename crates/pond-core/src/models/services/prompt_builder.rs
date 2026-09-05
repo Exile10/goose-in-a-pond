@@ -1,34 +1,7 @@
-//! Prompt partitioning for KV-cache-friendly local inference.
-//!
-//! Splits the system prompt into a **static prefix** (identity, personality,
-//! capabilities, tool descriptions, behavioral rules) and a **dynamic suffix**
-//! (current date/time, memory fragments, profile context, prompt extras).
-//!
-//! Local inference providers (llama.cpp, Goose GGUF) can reuse the KV-cache
-//! for the static prefix across conversation turns, saving significant
-//! recomputation on every request.
-//!
-//! ## Usage
-//!
-//! ```ignore
-//! let partition = build_prompt_partition(&settings, profile, &state, &template);
-//!
-//! // Only rebuild the base prompt when the prefix hash changes
-//! if partition.prefix_hash != last_prefix_hash {
-//!     agent.override_system_prompt(partition.static_prefix);
-//!     last_prefix_hash = partition.prefix_hash;
-//! }
-//!
-//! // Always update the dynamic portions
-//! agent.extend_system_prompt("temporal", partition.dynamic_suffix);
-//! ```
-//!
-//! ## Prompt extras are outside `prefix_hash` — by design
-//!
-//! Prompt extras and skills (injected by the agent via `extend_system_prompt`
-//! as `<extension-notes>` blocks) are NOT part of the partition and are not
-//! covered by `prefix_hash`: they are appended after the partitioned prompt is
-//! applied, and changing them must not invalidate the static-prefix KV cache.
+//! Prompt partitioning for KV-cache-friendly local inference: a static prefix (identity,
+//! personality, capabilities, tool descriptions, rules) whose KV cache local providers reuse
+//! across turns, and a dynamic suffix (date/time, memory, profile, extras). Prompt extras and
+//! skills are appended later via `extend_system_prompt`, so `prefix_hash` must not cover them.
 
 use crate::prompts::{
     render_jinja_template, sanitize_field, ProfileContext, PromptState, PROMPT_BALANCED,
@@ -37,18 +10,9 @@ use crate::user_data::domain::settings::Settings;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// A system prompt split into cache-friendly parts.
-///
-/// The `static_prefix` contains everything that stays the same between
-/// conversation turns (identity, personality, tool descriptions, behavioral
-/// rules, how many devices are registered, thinking/voice mode sections).
-///
-/// The `dynamic_suffix` contains per-turn content: current date/time, which
-/// devices are online, profile context lines, and the prompt addendum.
-///
-/// `prefix_hash` is a 64-bit hash of the static prefix content, allowing
-/// callers to skip expensive `override_system_prompt()` calls when the
-/// prefix has not changed.
+/// A system prompt split into cache-friendly parts: a prefix that is stable across turns, a
+/// per-turn suffix, and a 64-bit hash of the prefix so callers can skip an expensive
+/// `override_system_prompt()` when it has not changed.
 #[derive(Debug, Clone)]
 pub struct PromptPartition {
     /// Stable portion of the system prompt — identity, capabilities, rules.
@@ -75,26 +39,8 @@ fn hash_string(s: &str) -> u64 {
 
 /// Build a partitioned system prompt from settings, profile, state, and template.
 ///
-/// ## Static prefix
-///
-/// The template is rendered with all stable context variables:
-/// - `assistant_name`, `user_name`, `personality`, `timezone`, `location`
-/// - `device_count`, `has_home_devices`
-/// - `has_tools`, `tools` (tool descriptions are static)
-/// - `thinking_enabled`, `voice_mode`
-///
-/// `current_date`, `current_time` and `online_device_names` are set to empty
-/// strings during static rendering. The first two are obviously temporal; the
-/// third is temporal in disguise, since `is_online` is recomputed on every read
-/// from a 300-second heartbeat window rather than stored.
-///
-/// ## Dynamic suffix
-///
-/// Contains lines that change per turn:
-/// - Current date and time
-/// - Which devices are reachable right now
-/// - Profile context (preferred name, language, birthday, atypical speech)
-/// - Prompt addendum from settings
+/// `current_date`, `current_time` and `online_device_names` are blanked in the static render as
+/// temporal (`is_online` is recomputed per read from a 300s window) and move to the suffix.
 pub fn build_prompt_partition(
     settings: &Settings,
     profile: Option<&ProfileContext>,
@@ -108,15 +54,10 @@ pub fn build_prompt_partition(
         // Carry all non-temporal fields from the caller's state
         device_count: state.device_count,
         has_home_devices: state.has_home_devices,
-        // Blanked for the same reason as the clock, and it is the same kind of
-        // field: `is_online` is not a stored column at all — `list_devices` does
-        // not even select it. It is derived at read time as
-        // `now - last_seen < ONLINE_THRESHOLD_SECS` (300s), so this string
-        // changes on a five-minute wall-clock timer with nobody touching
-        // anything. Left in the prefix it truncates KV reuse at the
-        // `<home-devices>` block every time a phone stops heartbeating.
-        // `device_count` and `has_home_devices` stay: they move only when a
-        // device is registered or removed.
+        // Blanked like the clock: `is_online` is not a stored column, it is derived at read
+        // time as `now - last_seen < ONLINE_THRESHOLD_SECS` (300s), so leaving it in the prefix
+        // truncates KV reuse at `<home-devices>` on a five-minute timer. `device_count` and
+        // `has_home_devices` stay: they move only when a device is registered or removed.
         online_device_names: String::new(),
         voice_mode: state.voice_mode,
         canvas_mode: state.canvas_mode,
@@ -157,11 +98,9 @@ pub fn build_prompt_partition(
         dynamic_parts.push(temporal);
     }
 
-    // Which devices are reachable right now. The template's `<home-devices>`
-    // block still states how many are registered — that is stable — but the
-    // live list is restated here, because it expires on a timer and the prefix
-    // has to survive that. Costs nothing when nothing is online, which on a
-    // real pond is most of the time.
+    // Which devices are reachable right now. The template's `<home-devices>` block keeps the
+    // stable registered count; the live list belongs here because it expires on a timer and
+    // the static prefix has to survive that.
     if !state.online_device_names.is_empty() {
         dynamic_parts.push(format!(
             "Online right now: {}.",
@@ -170,47 +109,10 @@ pub fn build_prompt_partition(
     }
 
     // Profile context lines (same logic as build_system_prompt_from_template_full)
-    if let Some(ctx) = profile {
-        let user = sanitize_field(&settings.user_name, 50);
-
-        if let Some(ref pname) = ctx.preferred_name {
-            let pname = sanitize_field(pname, 50);
-            if !pname.is_empty() && pname != user {
-                dynamic_parts.push(format!("The user prefers to be called {}.", pname));
-            }
-        }
-        if let Some(ref lang) = ctx.language {
-            let lang = sanitize_field(lang, 20);
-            if !lang.is_empty() && lang != "en" {
-                let lang_label = match lang.as_str() {
-                    "fr" => "French",
-                    "es" => "Spanish",
-                    "de" => "German",
-                    "sw" => "Swahili",
-                    "ar" => "Arabic",
-                    "pt" => "Portuguese",
-                    "zh" => "Chinese",
-                    "ja" => "Japanese",
-                    "ko" => "Korean",
-                    other => other,
-                };
-                dynamic_parts.push(format!("Always respond in {}.", lang_label));
-            }
-        }
-        if let Some(ref bday) = ctx.birthday {
-            let bday = sanitize_field(bday, 20);
-            if !bday.is_empty() {
-                dynamic_parts.push(format!("The user's birthday is {}.", bday));
-            }
-        }
-        if ctx.atypical_speech {
-            dynamic_parts.push(
-                "The user may have atypical speech — be patient, never correct speech \
-                 patterns, and interpret incomplete sentences charitably."
-                    .to_string(),
-            );
-        }
-    }
+    dynamic_parts.extend(crate::prompts::profile_context_lines(
+        profile,
+        &settings.user_name,
+    ));
 
     // Prompt addendum
     let addendum = sanitize_field(&settings.prompt_addendum, 500);
@@ -230,9 +132,8 @@ pub fn build_prompt_partition(
 
 /// Compute the prefix hash from settings and state WITHOUT building the full prompt.
 ///
-/// Useful for callers that need to check whether a rebuild is needed before
-/// doing the work. The hash is computed over the fields that determine the
-/// static prefix content.
+/// Hashes exactly the fields that determine the static prefix, so a caller can decide whether
+/// a rebuild is needed before doing the work.
 pub fn compute_prefix_hash_fast(
     settings: &Settings,
     state: &PromptState,
@@ -270,24 +171,17 @@ pub fn compute_prefix_hash_fast(
     state.compact_prompt.hash(&mut hasher);
     // Gates the "Available tools:" listing inside <tool-usage>
     state.native_tools_json.hash(&mut hasher);
-    // The tool LINES, not their count. Hashing only the length was wrong in the
-    // one direction that matters: under `tool_selection_mode = "relevant"` the
-    // selection is rescored every turn, so swapping one tool for another —
-    // same count, different prose in `<tool-usage>` — left this hash unchanged
-    // and told the provider to reuse a KV prefix for a prompt it never saw.
-    // Order is part of the identity here because it is part of the render.
+    // The tool LINES, not their count. Under `tool_selection_mode = "relevant"` the selection
+    // is rescored every turn, so a same-count swap changes the prose in `<tool-usage>`; hashing
+    // the length alone would tell the provider to reuse a KV prefix for a prompt it never saw.
+    // Order counts too: it is part of the render.
     state.available_tools.hash(&mut hasher);
     hasher.finish()
 }
 
-/// Resolve the template content string for a given settings configuration.
-///
-/// Priority:
-/// 1. `settings.custom_system_prompt` (if Some)
-/// 2. Built-in template selected by `settings.prompt_style`
-///
-/// This does NOT consult the DB template repository — callers should pass
-/// the DB template content as an override when available.
+/// Resolve the template content string for a settings configuration: `custom_system_prompt`
+/// when set, otherwise the built-in selected by `settings.prompt_style`. This does NOT consult
+/// the DB template repository — callers pass DB template content as an override when available.
 pub fn resolve_builtin_template(settings: &Settings) -> &'static str {
     // Derived from the one built-in table rather than matching on names here,
     // so a style added to `BUILTIN_PROMPT_TEMPLATES` is resolvable without a
@@ -443,17 +337,10 @@ mod tests {
         );
     }
 
-    /// Registering a device changes the prompt. A device merely *heartbeating*
-    /// must not.
+    /// Registering a device changes the prompt. A device merely *heartbeating* must not.
     ///
-    /// `is_online` is not stored — it is recomputed on every read as
-    /// `now - last_seen < 300s`. So the online set turns over on a five-minute
-    /// wall-clock timer with nobody doing anything, and if that string rides
-    /// the static prefix then the KV cache is truncated at `<home-devices>`
-    /// several times an hour for no reason a user could name. Both hashes are
-    /// asserted, because they are two independent renderings of the same
-    /// question and a fast path that disagrees with the real one is worse than
-    /// no fast path.
+    /// `is_online` is not stored; it is recomputed per read as `now - last_seen < 300s`, so
+    /// riding the static prefix would truncate the KV cache at `<home-devices>` hourly.
     #[test]
     fn a_device_going_quiet_does_not_move_the_static_prefix() {
         let settings = Settings::default();
@@ -509,11 +396,9 @@ mod tests {
         );
     }
 
-    /// The failure this catches is the silent one. Under
-    /// `tool_selection_mode = "relevant"` the selection is rescored every turn,
-    /// so a swap that keeps the count is the *common* shape of change — and a
-    /// hash over `.len()` alone called it unchanged, handing the provider a
-    /// reuse decision for a prompt it had never seen.
+    /// Under `tool_selection_mode = "relevant"` the selection is rescored every turn, so a swap
+    /// that keeps the count is the common shape of change; a hash over `.len()` alone calls it
+    /// unchanged and hands the provider a reuse decision for a prompt it never saw.
     #[test]
     fn swapping_one_tool_for_another_moves_the_fast_hash() {
         let settings = Settings::default();
@@ -772,19 +657,10 @@ mod tests {
         assert!(combined.contains("Thursday, 1 May 2026"));
     }
 
-    /// Style selection, asserted by IDENTITY rather than by prose.
-    ///
-    /// This used to match phrases out of each template ("intelligent AI
-    /// copilot", "privacy-first AI copilot") and broke the moment the identity
-    /// sections were rewritten — a test about which constant is returned failing
-    /// because of wording it never meant to pin. Comparing pointers to the
-    /// constants says exactly what "selects the correct style" means and cannot
-    /// rot when the prompts are edited.
-    ///
-    /// Compared by VALUE, not by pointer: these are `const` items, which Rust
-    /// inlines at each use site, so the test's `PROMPT_BALANCED` and the
-    /// function's are separate allocations and `std::ptr::eq` reports them
-    /// unequal even when the selection is correct.
+    /// Style selection, asserted by IDENTITY rather than by prose, so rewording a template
+    /// cannot break it. Compared by VALUE, not by pointer: these are `const` items that Rust
+    /// inlines at each use site, so `std::ptr::eq` reports unequal even when the selection is
+    /// correct.
     #[test]
     fn resolve_builtin_template_selects_correct_style() {
         let mut s = Settings::default();
@@ -827,6 +703,46 @@ mod tests {
         assert!(
             partition.static_prefix.contains("<voice-mode>"),
             "Voice mode section must be in static prefix"
+        );
+    }
+
+    /// The prose tool listing must be suppressed by `native_tools_json` whether or not the model
+    /// reasons: `native_tools_json` comes from the PROVIDER (`local`/`gguf`), so the two flags
+    /// must stay independent. Otherwise a non-reasoning model gets the whole tool surface twice,
+    /// as prose and as native declarations — measured 30,848 vs ~2,400 chars of system prompt.
+    #[test]
+    fn a_model_that_does_not_reason_is_not_handed_the_tools_twice() {
+        let settings = Settings::default();
+        let tools = vec![
+            "wikipedia — Look up factual info".to_string(),
+            "weather — Current conditions".to_string(),
+        ];
+
+        let mut sizes = Vec::new();
+        for thinking in [true, false] {
+            let state = PromptState {
+                available_tools: tools.clone(),
+                native_tools_json: true,
+                thinking_enabled: thinking,
+                ..default_state()
+            };
+            let partition = build_prompt_partition(&settings, None, &state, PROMPT_BALANCED);
+            assert!(
+                !partition.static_prefix.contains("wikipedia"),
+                "native_tools_json must suppress the prose listing (thinking={thinking})"
+            );
+            sizes.push(partition.static_prefix.len());
+        }
+
+        // The thinking section is a real and small difference; a tool listing
+        // appearing on one side is not.
+        let gap = sizes[0].abs_diff(sizes[1]);
+        assert!(
+            gap < 2_000,
+            "thinking should change the prefix by a section, not by a tool \
+             listing: {} vs {} ({gap} chars apart)",
+            sizes[0],
+            sizes[1]
         );
     }
 

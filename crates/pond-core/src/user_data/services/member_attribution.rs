@@ -1,4 +1,4 @@
-//! Who a new pairing code binds the device to.
+//! Attributing a thing to a household member when nobody said which one.
 //!
 //! `Handshake::issue_pairing_code_for` has taken an `Option<&str>` since PAI-1
 //! P9, and the pairing adapter has always honoured it: a member-bound code
@@ -16,6 +16,12 @@
 //!
 //! This is the writer. It answers one question and does not reach for a
 //! database to do it.
+//!
+//! Two callers now: a pairing code choosing which member a device becomes, and
+//! the context-source route choosing which member an account belongs to. They
+//! ask the same question, so they share [`sole_member`] rather than each
+//! growing their own "if there is only one profile" branch — which is how two
+//! surfaces end up disagreeing about who somebody is.
 //!
 //! # Why a sole member is a safe default and a second one is not
 //!
@@ -58,6 +64,15 @@ pub fn owner_for_new_code(
     if unattributed_requested {
         return None;
     }
+    sole_member(member_ids)
+}
+
+/// The one member, when there is exactly one.
+///
+/// The whole household-size rule, in one place. Zero members has no answer and
+/// two has no answer either — with two, picking one would attribute by creation
+/// order, which is evidence of nothing.
+pub fn sole_member(member_ids: &[String]) -> Option<String> {
     match member_ids {
         [only] => Some(only.clone()),
         _ => None,

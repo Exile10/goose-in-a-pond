@@ -11,6 +11,9 @@ import {
   type CompactionReport,
   type ContextIndexHealth,
   type ContextIndexRebuild,
+  type AccountSyncSummary,
+  type ContextItem,
+  type ContextSource,
   type Device,
   type DiskUsage,
   type DownloadEntry,
@@ -54,6 +57,8 @@ import {
   type TranscribeResponse,
   type UserSkill,
   type WeatherApiResponse,
+  type ZoneChoice,
+  type DetectedPlace,
 } from "./types";
 import { voiceTitle } from "../voice/voiceCatalogue";
 
@@ -253,7 +258,7 @@ export class PondApiClient {
   }
 
   private get<T>(path: string): Promise<T>                       { return this.request<T>("GET", path); }
-  private post<T>(path: string, body?: unknown): Promise<T>       { return this.request<T>("POST", path, body); }
+  private post<T>(path: string, body?: unknown, timeout?: number): Promise<T> { return this.request<T>("POST", path, body, timeout); }
   private put<T>(path: string, body?: unknown): Promise<T>        { return this.request<T>("PUT", path, body); }
   private patch<T = void>(path: string, body?: unknown): Promise<T> { return this.request<T>("PATCH", path, body); }
   private del<T = void>(path: string): Promise<T>                 { return this.request<T>("DELETE", path); }
@@ -718,6 +723,116 @@ export class PondApiClient {
     return this.post<ContextIndexRebuild>("/api/v1/context/index/rebuild", {});
   }
 
+  // ── Time and place ────────────────────────────────────────
+
+  /** Every IANA zone with today's offset. Public: the wizard needs it. */
+  listTimeZones(): Promise<{ zones: ZoneChoice[] }> {
+    return this.get<{ zones: ZoneChoice[] }>("/api/v1/time/zones");
+  }
+
+  /**
+   * Work out where this pond is, from several sources, cheapest first.
+   *
+   * Server-side so onboarding and Settings run the SAME cascade — they used to
+   * have one each, and neither produced usable coordinates.
+   */
+  detectLocation(hints: {
+    system_zone?: string;
+    typed_name?: string;
+    latitude?: number;
+    longitude?: number;
+  }): Promise<DetectedPlace> {
+    return this.post<DetectedPlace>("/api/v1/location/detect", hints);
+  }
+
+  // ── Connected accounts ────────────────────────────────────
+
+  /**
+   * The sources this session's speaker may see.
+   *
+   * Scoped on the server from the session, not filtered here: one member never
+   * sees another's accounts, and that is decided where the rows are.
+   */
+  listContextSources(sessionId: string): Promise<{ sources: ContextSource[] }> {
+    return this.get(
+      `/api/v1/context/sources?session_id=${encodeURIComponent(sessionId)}`,
+    );
+  }
+
+  /**
+   * Connect an account.
+   *
+   * The owner is NOT sent: the server resolves it from the session and the
+   * paired device this request arrived on. A caller-supplied owner would be a
+   * hole, and every item the source ever produces inherits it.
+   */
+  connectContextSource(input: {
+    kind: string;
+    provider: string;
+    sessionId: string;
+    credentials?: { username: string; password: string; baseUrl?: string };
+  }): Promise<{ id: string; kind: string; profile_id: string }> {
+    return this.post("/api/v1/context/sources", {
+      kind: input.kind,
+      provider: input.provider,
+      session_id: input.sessionId,
+      ...(input.credentials
+        ? {
+            credentials: {
+              username: input.credentials.username,
+              password: input.credentials.password,
+              ...(input.credentials.baseUrl
+                ? { base_url: input.credentials.baseUrl }
+                : {}),
+            },
+          }
+        : {}),
+    });
+  }
+
+  /** What the pond has read from connected sources, newest first.
+   *
+   * Keyword search, not semantic: somebody scanning this list is looking for a
+   * message they remember the words of, and a cosine ranking would bury an
+   * exact title match under things merely about the same subject. */
+  listContextItems(
+    sessionId: string,
+    query?: string,
+    limit = 200,
+  ): Promise<{ items: ContextItem[] }> {
+    const q = query?.trim() ? `&q=${encodeURIComponent(query.trim())}` : "";
+    return this.get(
+      `/api/v1/context/items?session_id=${encodeURIComponent(sessionId)}&limit=${limit}${q}`,
+    );
+  }
+
+  /** Correct a memory's wording, keeping its identity. */
+  updateMemory(id: string, content: string): Promise<void> {
+    return this.put(`/api/v1/memories/${encodeURIComponent(id)}`, { content });
+  }
+
+  /**
+   * Pull every connected account now, instead of waiting for the half-hourly
+   * sweep. Answers with what the pass did, so a person who just typed in a
+   * password learns whether it worked.
+   */
+  syncContextSources(): Promise<AccountSyncSummary> {
+    // Longer than the default: a sync is several HTTP round trips to somebody
+    // else's server, and timing out at 30s would report a failure for a pass
+    // that was still going.
+    return this.post("/api/v1/context/sync", {}, 120_000);
+  }
+
+  /** Disconnect a source. Its items go with it, and the reply says how many. */
+  disconnectContextSource(
+    id: string,
+    sessionId: string,
+  ): Promise<{ removed: number }> {
+    return this.del(
+      `/api/v1/context/sources/${encodeURIComponent(id)}?session_id=${encodeURIComponent(sessionId)}`,
+    );
+  }
+
   // ── Conversation titles ───────────────────────────────────
 
   /**
@@ -981,6 +1096,11 @@ export class PondApiClient {
 
   getMemoryStatus(): Promise<ModelMemoryStatus> {
     return this.get("/api/v1/models/memory-status");
+  }
+
+  /** Prefix warm-up status — is the pond ready for a first message yet. */
+  getWarmupStatus(): Promise<import("./types").WarmupStatus> {
+    return this.get("/api/v1/warmup");
   }
 
   getActiveRoles(): Promise<ModelActiveRoles> {

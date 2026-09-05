@@ -420,6 +420,28 @@ mod tests {
 
     // ── Network mode (PAI-2 P5) ─────────────────────────────────────────────
 
+    /// Loopback is CLASSIFIED as internal but is still RECORDED.
+    ///
+    /// Suppressing internal hosts inside `record_egress` was tried and undone.
+    /// It read well — an in-machine hop is not egress — but it made every
+    /// loopback call invisible, which is a loss for a feed whose job is showing
+    /// what the pond is doing, and it silently broke the guard asserting that
+    /// the push relay records its two calls at all (they run against a
+    /// loopback mock). Volume, if it becomes a problem, is the consumer's to
+    /// filter: the sensitivity is on every event for exactly that purpose.
+    #[test]
+    fn loopback_is_classified_internal_and_still_recorded() {
+        assert_eq!(classify_host("127.0.0.1"), PrivacySensitivity::Internal);
+        assert_eq!(classify_host("localhost"), PrivacySensitivity::Internal);
+        assert_ne!(
+            classify_host("gpu-box.tailnet.example"),
+            PrivacySensitivity::Internal
+        );
+        // The event carries the classification, so a reader can filter on it.
+        let event = egress_event("127.0.0.1", "", "", "LLM", Some(200), 5);
+        assert_eq!(event.privacy_sensitivity, PrivacySensitivity::Internal);
+    }
+
     #[test]
     fn network_mode_matrix_covers_every_mode_and_classification() {
         // (host, expected classification) -- real hosts, so a change to

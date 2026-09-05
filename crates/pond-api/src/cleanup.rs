@@ -1,27 +1,7 @@
-//! HF cache cleanup + disk-usage reporting.
-//!
-//! This module implements the conservative sweep that backs
-//! `POST /api/v1/models/cleanup` and the per-category usage report
-//! that backs `GET /api/v1/models/disk-usage`. Both operate only on the
-//! HF-style cache rooted at `{data_dir}/hf_cache` plus the flat-path
-//! mirror at `{data_dir}/models/**`.
-//!
-//! Safety contract:
-//!
-//! - Files outside `data_dir/hf_cache` are never deleted (legacy flat
-//!   files that have not been migrated stay where they are).
-//! - A blob is deletable only when there is no referencing symlink AND
-//!   its basename is not on the caller-supplied `protected_names` list.
-//! - `.incomplete` files are removed only when older than 24h.
-//! - Snapshot directories are removed only when every entry inside is a
-//!   broken symlink.
-//!
-//! All paths in the response are absolute and use forward slashes per
-//! `PathBuf::display()`.
-//!
-//! The free functions take a `data_dir: &Path` and a protected-name set
-//! so they can be exercised end-to-end with `tempfile::tempdir()` — no
-//! `AppState` required.
+//! HF cache cleanup + disk-usage reporting for `/api/v1/models/{cleanup,disk-usage}`.
+//! Deletion stays inside `{data_dir}/hf_cache` and the `{data_dir}/models/**` mirror: a blob goes
+//! only when no symlink references it and its name is not in `protected_names`; `.incomplete`
+//! files only past `STALE_INCOMPLETE_AGE`; a snapshot dir only when every entry is a dead symlink.
 
 use serde::Serialize;
 use std::collections::HashSet;

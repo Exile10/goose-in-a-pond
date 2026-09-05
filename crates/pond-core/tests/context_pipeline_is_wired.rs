@@ -84,4 +84,16 @@ fn the_ingest_pipeline_is_constructed_with_a_redactor() {
          every call -- while looking exactly like a working guard, which PAI-6 P5 records as the \
          most misleading failure shape available here."
     );
+    // Both binary paths, not just `serve`. One call satisfied the assertion
+    // above while the voice/CLI chat path had none -- and its first session to
+    // load giap-context panicked with "init_context_deps() not called"
+    // (2026-08-27). audit/vision/sensors each learned this same lesson
+    // separately (#115/#157, #130, and the sensors comment in main.rs); this
+    // pins context to the pattern so the fifth extension copies it too.
+    assert!(
+        MAIN.matches("init_context_deps").count() >= 2,
+        "`init_context_deps` is called on only one binary path. `serve` and the voice/CLI chat \
+         command wire their MCP deps independently; the path without the call panics the first \
+         time a session loads giap-context."
+    );
 }

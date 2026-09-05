@@ -9,12 +9,10 @@ license.workspace = true
 name = "pond_audio"
 path = "src/lib.rs"
 
-# The single microphone owner. Sits between `pond-voice` (pure DSP, no cpal) and
-# the adapters that used to each open their own input device.
-#
-# Deps are deliberately minimal: cpal for the device, pond-voice for the
-# primitives, tracing for diagnostics. No tokio — a cpal stream is `!Send` on
-# CoreAudio, so the owner is an OS thread with a channel, not an async task.
+# The single microphone owner, sitting between `pond-voice` (pure DSP, no cpal)
+# and the adapters. Deps stay minimal: cpal for the device, pond-voice for the
+# primitives, tracing for diagnostics. No tokio, because a cpal stream is `!Send`
+# on CoreAudio, so the owner is an OS thread with a channel, not an async task.
 [dependencies]
 cpal = "0.15"
 pond-voice = { path = "../pond-voice" }
