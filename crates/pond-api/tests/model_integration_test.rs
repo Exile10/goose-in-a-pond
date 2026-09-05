@@ -1,14 +1,6 @@
-//! Integration tests for model management routes.
-//!
-//! Covers:
-//! - DELETE /api/v1/models/{category}/{name}
-//!   - 404 when model not in catalog
-//!   - 409 when model has an active role assignment
-//!   - 204 success (file deleted + downloaded flag cleared)
-//! - POST /api/v1/models/{category}/{name}/activate
-//!   - 400 when role is incompatible with model category
-//!   - 200 success with correct role assignment persisted
-//!
+//! Model management routes. DELETE /api/v1/models/{category}/{name}: 404 when
+//! uncatalogued, 409 when a role still holds it, 204 deletes and clears the flag.
+//! POST the same path plus /activate: 400 on a category/role mismatch, 200 persists.
 //! Run: cargo test -p pond-api --test model_integration_test
 
 use std::sync::Arc;
@@ -120,6 +112,7 @@ async fn make_app_with_settings_repo() -> (
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -140,6 +133,7 @@ async fn make_app_with_settings_repo() -> (
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -445,14 +439,10 @@ fn kokoro_voice_record(name: &str) -> ModelRecord {
     }
 }
 
-/// The reported bug, exactly.
-///
-/// The models list buckets every TTS engine under one `tts` group, and callers
-/// reached for that group key instead of the record's own category. The lookup
-/// then built `tts_piper/af_heart` and answered
-/// "Model 'af_heart' not found in 'tts'" — every Kokoro voice was unusable from
-/// the Models page. Piper was unaffected only because its group key and its
-/// category happen to be the same word.
+/// The models list buckets every TTS engine under one `tts` group key, which is
+/// not the record's own category. A lookup that uses the group key builds
+/// `tts_piper/af_heart` and fails, so no Kokoro voice activates; Piper escapes
+/// only because its group key and its category happen to be the same word.
 #[tokio::test]
 async fn activate_kokoro_voice_via_the_tts_group_key() {
     let (app, repo, _tmp) = make_app().await;
@@ -505,12 +495,9 @@ async fn a_missing_non_tts_model_is_still_a_404() {
 }
 
 /// Activating a Kokoro voice must set the key the engine actually reads.
-///
 /// `active_tts_model` names the catalogue row; `voice_tts_voice` is what
 /// `KokoroOutput` resolves `<voice>.bin` from and what the Voice screen shows.
-/// Writing only the former left a household able to pick a voice in Models
-/// while `voice_tts_voice` still held the Piper filename from before the engine
-/// swap — the picker showed one voice and the pond spoke in another.
+/// Writing only the former leaves the picker and the spoken voice disagreeing.
 #[tokio::test]
 async fn activating_a_kokoro_voice_sets_voice_tts_voice() {
     let (app, repo, settings, _tmp) = make_app_with_settings_repo().await;

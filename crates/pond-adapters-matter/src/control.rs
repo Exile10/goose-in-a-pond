@@ -1,16 +1,7 @@
-//! [`MatterDeviceControl`] — the [`DeviceControlPort`] over a live controller
-//! connection.
-//!
-//! Every verb is one `control` op. Which cluster that becomes, which endpoint it
-//! lands on, and what unit the value is in are all the controller's business —
-//! it has matter.js's typed cluster models to decide with, where this crate had
-//! a hand-maintained table of decimal cluster ids.
-//!
-//! The outcome is built from what the controller says it applied, not from what
-//! the caller asked for. That distinction is the reason the wire carries an
-//! `applied` patch at all: reporting the request back as though it were the
-//! result is how a device that rejected a write still got described to the user
-//! as having taken it.
+//! [`MatterDeviceControl`] — the [`DeviceControlPort`] over a live controller connection. Every
+//! verb is one `control` op; cluster, endpoint and unit are the controller's business. The outcome
+//! is built from the controller's `applied` patch, never from the request: a device that rejected
+//! a write must not be reported to the user as having taken it.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -51,10 +42,8 @@ impl MatterDeviceControl {
 
     /// Drive one verb and report what the device became.
     ///
-    /// This is the only place a device command is logged, and it is logged
-    /// whichever way it goes: a control path that says nothing on success gives
-    /// no way to tell "the command was never sent" from "the device ignored it",
-    /// which was the whole diagnostic position before.
+    /// The only place a device command is logged, and it is logged whichever way it goes: silence
+    /// on success leaves no way to tell "never sent" from "the device ignored it".
     async fn control(
         &self,
         device_id: &str,

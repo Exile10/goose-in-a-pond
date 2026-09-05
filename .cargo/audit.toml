@@ -1,9 +1,7 @@
-# cargo-audit policy — every ignore below is a documented, justified exception,
-# not a silenced finding. Re-evaluate on each weekly Security run and remove
-# entries as soon as the owning dependency can be bumped.
-#
-# Triage rule: advisories fixable from THIS repo's lockfile are fixed, never
-# ignored (crossbeam-epoch and quinn-proto were bumped when this file landed).
+# cargo-audit policy — every ignore below is a documented, justified exception, not a silenced
+# finding. Re-evaluate on each weekly Security run; remove entries as soon as the owning
+# dependency can be bumped. Triage rule: advisories fixable from THIS repo's lockfile are fixed,
+# never ignored.
 
 [advisories]
 ignore = [
@@ -12,22 +10,16 @@ ignore = [
 
     # quick-xml 0.36/0.37: quadratic duplicate-attribute check (7.5) …
     "RUSTSEC-2026-0194",
-    # … and unbounded namespace-declaration allocation DoS (7.5).
-    # Owned by docx-rs under goose-mcp (goose submodule). BLOCKED UPSTREAM:
-    # docx-rs 0.4.20 is the latest release (checked 2026-07-16) and still
-    # requires quick-xml 0.36; the fix needs docx-rs to ship quick-xml >=0.41.
-    # GIAP does not parse untrusted XML/DOCX through these paths.
+    # … and unbounded namespace-declaration allocation DoS (7.5). Owned by docx-rs under
+    # goose-mcp (goose submodule). BLOCKED UPSTREAM: docx-rs 0.4.20 (latest, checked 2026-07-16)
+    # still requires quick-xml 0.36; the fix needs docx-rs to ship quick-xml >=0.41. GIAP does
+    # not parse untrusted XML/DOCX through these paths.
     "RUSTSEC-2026-0195",
 
-    # rsa: Marvin timing side-channel (5.9 medium). NO fixed release exists
-    # (long-standing ecosystem advisory). Reaches us two ways, neither of them
-    # production crypto: transitively, and as a pond-infra DEV-dependency that
-    # generates a throwaway RSA key so the FCM relay's signing path can be
-    # tested without committing a PEM. It is not linked into pond-server
-    # (`cargo tree -p pond-server -i rsa --edges normal` is empty), and GIAP's
-    # own crypto does not use it — pairing is HMAC-SHA256, tokens are sha256
-    # hashes. The side-channel needs an attacker timing decryptions we never
-    # perform. Remove the moment the rsa crate ships a fixed version.
+    # rsa: Marvin timing side-channel (5.9 medium). NO fixed release exists. Reaches us only
+    # transitively and as a pond-infra DEV-dependency (throwaway RSA key for the FCM relay test).
+    # Not linked into pond-server (`cargo tree -p pond-server -i rsa --edges normal` is empty);
+    # GIAP crypto is HMAC-SHA256 and sha256 hashes. Remove when rsa ships a fixed version.
     "RUSTSEC-2023-0071",
 
     # hickory-proto 0.25.2: NSEC3 closest-encloser proof enters an unbounded

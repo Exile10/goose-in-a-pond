@@ -12,13 +12,8 @@ pub enum UsageTallyError {
 
 /// Driven Port: UsageTally
 ///
-/// Two directions, never conflated: `record_borrowed`/`pending_borrowed`
-/// track what *we* owe a peer, and are all `SettlementService` ever pays
-/// against. `record_lent`/`pending_lent` track what a peer owes *us* —
-/// observability only; collecting it is that peer's job, not ours.
-///
-/// `record_*` are hot-path calls (once per served request); `mark_settled`
-/// runs from the settlement job only, and only ever reduces `tokens_borrowed`.
+/// The borrowed pair is what we owe a peer and all `SettlementService` pays against; the
+/// lent pair is observability only. `mark_settled` only ever reduces `tokens_borrowed`.
 #[async_trait]
 pub trait UsageTally: Send + Sync {
     async fn record_borrowed(

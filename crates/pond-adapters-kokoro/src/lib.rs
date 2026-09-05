@@ -1,30 +1,7 @@
-//! Kokoro-82M TTS adapter — GIAP's voice.
-//!
-//! Implements [`VoiceOutput`] with Kokoro-82M (StyleTTS2, Apache 2.0) run
-//! directly through `ort`. Replaces Piper as the default engine.
-//!
-//! ```text
-//! text ──espeak IPA──> phonemes ──vocab──> ids ──ort──> f32 @ 24 kHz ──> speaker
-//! ```
-//!
-//! ## What costs memory, and when
-//!
-//! | | resident | when |
-//! |---|---|---|
-//! | ONNX session (q8) | ~92 MB weights + arena | first `speak`, until [`KokoroOutput::unload`] |
-//! | style table | 522 KB | one voice at a time |
-//! | vocab | ~4 KB | always |
-//!
-//! Nothing is loaded at construction. A pond that never speaks never pays for
-//! the model, and `unload()` gives it back — which is why `new()` cannot fail
-//! on a bad model path and `speak()` can.
-//!
-//! ## Voice and pace are hot
-//!
-//! [`KokoroOutput::set_voice`] and [`set_speed`](KokoroOutput::set_speed) do
-//! not touch the session — voice swaps a 522 KB table, pace is a tensor value.
-//! That is what makes the settings UI able to re-synthesize a preview on every
-//! slider drag without a 92 MB reload.
+//! Kokoro-82M TTS adapter, GIAP's voice: [`VoiceOutput`] over `ort`, text to espeak IPA to
+//! vocab ids to f32 at 24 kHz. Nothing is loaded at construction: the ~92 MB session is paid
+//! for on first `speak` and returned by [`KokoroOutput::unload`], which is why `new()` cannot
+//! fail on a bad model path and `speak()` can. Voice (522 KB table) and pace never reload it.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -190,12 +167,9 @@ impl KokoroOutput {
         }
     }
 
-    /// Swap in a different quality tier (a different `.onnx` file).
-    ///
-    /// Drops the current session so the next utterance loads the new weights.
-    /// Taking the engine lock for the whole swap is what makes it atomic: a
-    /// synthesis already past this point finishes on the old weights, and the
-    /// next one cannot observe a path that disagrees with the loaded session.
+    /// Swap in a different quality tier (a different `.onnx` file). Drops the current session
+    /// so the next utterance loads the new weights. Holding the engine lock for the whole swap
+    /// is what makes it atomic: no synthesis can observe a path that disagrees with the session.
     pub async fn set_model(&self, path: PathBuf) -> Result<()> {
         if !path.exists() {
             return Err(anyhow::anyhow!(
@@ -241,11 +215,9 @@ impl KokoroOutput {
         if engine_guard.is_none() {
             let path = self.model_path.read().await.clone();
             let threads = self.config.intra_threads;
-            // Bounded because a broken ONNX Runtime does not fail — it HANGS.
-            // `load-dynamic` with no dylib to open blocks forever inside ort's
-            // init, and an unbounded await there is a permanently silent pond
-            // with nothing in the log. main.rs guards the Piper load the same
-            // way, for the same reason.
+            // Bounded because a broken ONNX Runtime does not fail, it hangs: `load-dynamic`
+            // with no dylib to open blocks forever inside ort's init, and an unbounded await
+            // there is a permanently silent pond with nothing in the log.
             let loaded = tokio::time::timeout(
                 LOAD_TIMEOUT,
                 tokio::task::spawn_blocking(move || Engine::load(&path, threads)),
@@ -353,43 +325,24 @@ impl VoiceOutput for KokoroOutput {
     }
 }
 
-/// The sentence the onboarding and settings previews speak.
-///
-/// It names the product, runs long enough to hear prosody rather than a single
-/// word, and contains the phonetic range that makes voices distinguishable —
+/// The sentence the onboarding and settings previews speak. It names the product, runs long
+/// enough to hear prosody, and carries the phonetic range that makes voices distinguishable:
 /// a fricative cluster, a diphthong, and a soft ending.
 pub const PREVIEW_SENTENCE: &str =
     "Hello, I'm Jarida. I live here on your shelf, I think on my own, \
      and nothing you say to me leaves this room.";
 
-/// Resolve the `.onnx` filename for a quality tier.
-///
-/// Tiers are the model repo's own filenames; picking a tier is picking a file,
-/// so there is nothing else to configure.
-/// Whether this build targets the boards where the int8 tiers misbehave.
-///
-/// Compile-time, and correct for both Jetson build paths: `deploy.sh` builds
-/// natively on the board and `build-docker.sh` cross-builds for aarch64.
+/// Whether this build targets the boards where the int8 tiers misbehave. Compile-time, and
+/// correct for both Jetson build paths: `deploy.sh` builds natively on the board and
+/// `build-docker.sh` cross-builds for aarch64.
 const fn aarch64_linux() -> bool {
     cfg!(all(target_arch = "aarch64", target_os = "linux"))
 }
 
-/// Bound on ONNX Runtime's per-op pool, derived from the machine.
-///
-/// Speech is the one thing here with a hard deadline: under RTF 1.0 synthesis
-/// stays ahead of playback, over it the pond falls further behind the longer it
-/// talks. Measured on a Jetson Orin Nano (6x Cortex-A78AE, JetPack 6) at q4f16
-/// against [`PREVIEW_SENTENCE`]:
-///
-/// | threads | 2    | 3    | 4    | 6    |
-/// |---------|------|------|------|------|
-/// | RTF     | 1.35 | 0.99 | 0.78 | 0.62 |
-///
-/// This was pinned at 2, which misses the deadline on that board at every tier.
-/// Leaving two cores for the rest of the pond puts a six-core Jetson on 4 —
-/// real time with margin — while still bounding the pool, which is what the pin
-/// was actually guarding: ONNX spawns these threads per session and they hold
-/// resident memory whether or not anything is speaking.
+/// Bound on ONNX Runtime's per-op pool, derived from the machine. Speech has a hard deadline:
+/// over RTF 1.0 the pond falls behind playback. Measured on a Jetson Orin Nano at q4f16 against
+/// [`PREVIEW_SENTENCE`], RTF is 1.35 / 0.99 / 0.78 / 0.62 at 2 / 3 / 4 / 6 threads, so leaving
+/// two cores free puts it on 4. The bound matters: ORT threads hold resident memory per session.
 pub fn default_intra_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -398,21 +351,10 @@ pub fn default_intra_threads() -> usize {
         .clamp(2, 6)
 }
 
-/// The quality tier to start a fresh install on.
-///
-/// A capability question, not a taste one. On aarch64 Linux the int8 tiers are
-/// each wrong in a different way — both measured on a Jetson Orin Nano, against
-/// a sentence an arm64 Mac speaks at RTF 0.42:
-///
-/// * `q8`, the cross-platform default, runs at RTF 1.23 given all six cores. It
-///   cannot keep ahead of its own playback at any thread count.
-/// * `q8f16` returns **digital silence** — a full-length buffer of zeros, after
-///   91 s of compute. The identical file is fine on macOS.
-///
-/// `q4f16` is the only tier there that both produces audio and clears real
-/// time. It costs 154 MB against q8's 92 MB, and that is the trade being made
-/// on the household's behalf: a larger one-time download for speech that does
-/// not stutter.
+/// The quality tier to start a fresh install on. A capability question, measured on a Jetson
+/// Orin Nano: `q8` runs at RTF 1.23 on all six cores and cannot keep ahead of playback, and
+/// `q8f16` returns a full-length buffer of digital silence (fine on macOS). `q4f16` is the
+/// only tier there that both produces audio and clears real time, at 154 MB against q8's 92.
 pub fn host_default_quality() -> &'static str {
     if aarch64_linux() {
         "q4f16"
@@ -421,47 +363,27 @@ pub fn host_default_quality() -> &'static str {
     }
 }
 
-/// The tier this host should adopt, or `None` to leave the stored one alone.
-///
-/// Separated from the caller because the rule is the whole subtlety and it was
-/// previously expressed inline, inside a function that returns early for an
-/// unrelated reason — so on every pond that had ever assigned a voice, the tier
-/// decision was simply never reached. Measured consequence on an Orin Nano:
-/// the board kept `q8` and synthesised at **RTF 1.335**, i.e. slower than
-/// playback, when `q4f16` runs it at 0.780.
-///
-/// Adopt only when the household has not chosen. `stored` being empty is a
-/// pond that has never had a tier; `stored == untouched` is a pond still
-/// carrying the struct default, which is a default rather than a decision.
-/// Anything else — including a tier this host must substitute — is somebody's
-/// choice and is left exactly as it is, because overwriting it would be the
-/// pond arguing with a person who has already decided.
+/// The tier this host should adopt, or `None` to leave the stored one alone. Adopt only when
+/// the household has not chosen: `stored` empty is a pond that never had a tier, and
+/// `stored == untouched` is a pond still carrying the struct default. Anything else is
+/// somebody's choice and is left exactly as it is, even a tier this host must substitute.
 pub fn tier_to_adopt(stored: &str, untouched: &str) -> Option<&'static str> {
     tier_to_adopt_for(host_default_quality(), stored, untouched)
 }
 
-/// The rule itself, with the host's tier passed in.
-///
-/// Split out because `host_default_quality()` reads the machine, so on an arm64
-/// Mac it returns the same `q8` that is the struct default — which makes the
-/// interesting clause (`stored == untouched`, host tier differs) unreachable,
-/// and a test written against [`tier_to_adopt`] there passes with that clause
-/// deleted. Verified: removing `|| stored == untouched` did not fail anything
-/// on macOS. The Jetson case has to be expressible without a Jetson, or the
-/// guard is decoration on every machine that runs CI.
+/// The rule itself, with the host's tier passed in. Split out because on an arm64 Mac
+/// `host_default_quality()` returns the struct default `q8`, which makes the
+/// `stored == untouched` clause unreachable through [`tier_to_adopt`]; the Jetson case has to
+/// be testable without a Jetson or the guard is decoration on every machine that runs CI.
 pub fn tier_to_adopt_for<'a>(host: &'a str, stored: &str, untouched: &str) -> Option<&'a str> {
     let stored = stored.trim();
     let unchosen = stored.is_empty() || stored == untouched;
     (unchosen && host != stored).then_some(host)
 }
 
-/// Swap out a tier that cannot work on this host, leaving every other choice
-/// alone.
-///
-/// Callers persist and display what this returns, so a household that lands on
-/// a dead tier sees the substitution instead of a pond that has quietly stopped
-/// speaking. That is the whole point: [`KokoroOutput::speak`] cannot tell a
-/// silent buffer from a quiet one, so nothing downstream would report it.
+/// Swap out a tier that cannot work on this host, leaving every other choice alone. Callers
+/// persist and display the result, so a household sees the substitution: [`KokoroOutput::speak`]
+/// cannot tell a silent buffer from a quiet one, so nothing downstream would report it.
 pub fn usable_quality(requested: &str) -> &str {
     if aarch64_linux() && requested == "q8f16" {
         return "q4f16";
@@ -610,14 +532,9 @@ mod tests {
         }
     }
 
-    /// A pond still carrying the struct default has not chosen anything, so the
-    /// host default is an upgrade rather than an override. This is the case
-    /// that was unreachable in practice: the real Orin Nano sat on `q8` at
-    /// RTF 1.335 because the only caller returned before asking.
-    /// THE case this exists for, written so it runs on any machine: a pond
-    /// still carrying the struct default, on a host whose tier differs. On the
-    /// real Orin Nano that is `q8` stored against a `q4f16` host, and it is why
-    /// the board synthesised at RTF 1.335 instead of 0.780.
+    /// The case this exists for, written so it runs on any machine: a pond still carrying the
+    /// struct default has not chosen, so a host whose tier differs is an upgrade rather than
+    /// an override. On the Orin Nano that is `q8` stored against a `q4f16` host.
     #[test]
     fn a_default_tier_is_replaced_by_a_host_that_needs_a_different_one() {
         assert_eq!(tier_to_adopt_for("q4f16", "q8", "q8"), Some("q4f16"));

@@ -1,50 +1,7 @@
-//! Bridges pond-core's `LlmProvider` port to Goose's native `Provider` trait
-//! (#132 Milestone 4), so `chat_provider = "mesh"` can drive real chat
-//! through `GooseAdapter` — not just the `GET /api/v1/test` diagnostic probe
-//! `pond-adapters-mesh-inference` was wired into first.
-//!
-//! Deliberately the *inverse* direction of `provider_adapter.rs`'s
-//! `GooseProviderAdapter` (which wraps a Goose `Provider` as an
-//! `LlmProvider`) — this wraps an `LlmProvider` as a Goose `Provider`.
-//!
-//! **No MCP tool-calling over mesh, by construction, not by oversight.**
-//! Goose bakes `tools: &[Tool]` into every `stream()` call and expects
-//! tool-call requests back in the response; `LlmProvider` has no tools
-//! parameter at all (confirmed by `GooseProviderAdapter::complete`, which
-//! already hardcodes `&[]` for the same reason). Extending `LlmProvider`
-//! itself would ripple into every other adapter (ollama, llamafile, local) —
-//! real scope, not this milestone. `tools` is silently dropped here at
-//! debug level, not warned — GIAP's `giap-draft` extension is always-on, so
-//! tools are present on nearly every real turn, and a per-request warning
-//! for expected, by-design behavior would just be noise.
-//!
-//! Dropping `tools` used to be the whole story, and it left the borrowed
-//! model holding a `system` prompt built as if those tools worked (Goose
-//! names them there regardless of the separate structured argument). The
-//! model would spend its answer reasoning about which tool to reach for, or
-//! announcing that none were needed, instead of just answering — a real
-//! chat turn returning "no tools or memory are needed for this question"
-//! instead of an answer is this exact failure.
-//!
-//! [`NO_TOOLS_OVER_MESH_NOTICE`] tells the model plainly that the tools it
-//! was just described no longer exist this turn — appended to the LAST
-//! message, not `system`. That is not incidental: `answer_contract()`
-//! (`pond-core`) is deliberately placed last inside `<system-context>`,
-//! immediately before `<user-message>`, on the documented finding that an
-//! instruction surviving to generation depends on how close it sits to
-//! it — `system` comes first in the prompt and is exactly the position that
-//! decays worst. A turn with no tools offered in the first place needs no
-//! override, so `messages` reaches the peer byte-for-byte in that case.
-//!
-//! Measured against a real mesh peer (a slower, Jetson-class lender): even
-//! trivial turns like "say hi" can still produce an empty first attempt, and
-//! `system` itself is lean (~2.3K chars for 62 tools — the tool JSON schemas
-//! live entirely in the dropped structured `tools` argument, never baked
-//! into prompt text). The failure is behavioral, not prompt size: a bare
-//! completion call has none of Goose's harness holding the model to a clean
-//! final answer, so nothing here should be mistaken for a fix to that —
-//! only for making the one instruction mesh depends on survive as well as
-//! this codebase already knows how.
+//! Wraps an `LlmProvider` as a Goose `Provider` (inverse of `provider_adapter.rs`) so that
+//! `chat_provider = "mesh"` drives real chat through `GooseAdapter` (#132 M4). No MCP tool-calling
+//! over mesh by construction: `LlmProvider` has no tools parameter, so `tools` is dropped and the
+//! model is told so on the LAST message, where an instruction survives best (`answer_contract()`).
 
 use std::sync::Arc;
 
@@ -58,17 +15,10 @@ use pond_core::models::domain::message::{ChatMessage, Role};
 use pond_core::models::ports::provider::{LlmProvider, StreamToken};
 use rmcp::model::Tool;
 
-/// Appended to the last message whenever `tools` is non-empty and about to
-/// be dropped, so the borrowed model is told plainly that the tools it was
-/// just described no longer work this turn — instead of silently
-/// discovering it mid-answer and narrating that discovery instead of
-/// replying.
-///
-/// Spelled out negatively as well as positively (not just "answer plainly"
-/// but "do not use tags / do not narrate") because both leaked failures
-/// observed were about FORM, not just content: one echoed `<answer-contract>`
-/// verbatim with the question stuffed inside, the other narrated a decision
-/// about tools instead of making one.
+/// Appended to the last message whenever a non-empty `tools` is about to be dropped, so the
+/// borrowed model hears that the tools it was just described do not work this turn. Spelled out
+/// negatively as well ("do not use tags / do not narrate") because both observed leaks were about
+/// FORM: one echoed `<answer-contract>` verbatim, the other narrated a tool decision.
 const NO_TOOLS_OVER_MESH_NOTICE: &str = "\n\n(Tool calls and memory search are not available for \
 this response — it is running on a borrowed peer over the mesh. Answer directly and briefly, in \
 plain prose. Do not call a tool, do not describe deciding whether one is needed, and do not use or \
@@ -122,19 +72,10 @@ impl Provider for MeshProvider {
                 tool_count = tools.len(),
                 "mesh provider: dropping tools — MCP tool-calling is not available over the mesh yet"
             );
-            // `system` was built assuming the tools listed there actually work —
-            // it names all `tools.len()` of them and invites the model to use
-            // them. Silently dropping only the structured `tools` argument left
-            // that invitation standing with nothing behind it: the borrowed
-            // model would reason out loud about which tool to reach for, or
-            // announce that none were needed, instead of just answering,
-            // because as far as its prompt is concerned they still exist.
-            //
-            // Appended to the LAST message, not `system` — see the module
-            // docs on why position matters this much for a small model.
-            // `messages` is never empty for a real turn (it always carries at
-            // least the current user turn), but an empty conversation falls
-            // back to `system` rather than silently dropping the notice.
+            // `system` names every tool and invites their use; dropping only the structured
+            // argument would leave the borrowed model narrating tool decisions, not answering.
+            // The notice goes on the LAST message, not `system` (module docs say why). A real turn
+            // always has a message; an empty one falls back to `system` rather than dropping it.
             match chat_messages.last_mut() {
                 Some(last) => last.content.push_str(NO_TOOLS_OVER_MESH_NOTICE),
                 None => {
@@ -197,11 +138,9 @@ mod tests {
         assert_eq!(translated.content, "hi there");
     }
 
-    /// `MockProvider`'s `stream_complete` uses the `LlmProvider` trait's
-    /// default (text-only, never yields `StreamToken::Usage`), so it can't
-    /// exercise the usage-translation path — this stub emits both, mirroring
-    /// what a real streaming provider (or `MeshInferenceProvider`'s own
-    /// responder) actually sends.
+    /// `MockProvider`'s `stream_complete` is the trait default (text-only, never
+    /// `StreamToken::Usage`), so it cannot exercise usage translation; this stub emits both,
+    /// as a real streaming provider or `MeshInferenceProvider`'s responder does.
     struct StreamingStubProvider;
 
     #[async_trait]
@@ -296,15 +235,10 @@ mod tests {
         }
     }
 
-    /// The exact failure this notice exists for: the prompt names tools that
-    /// `tools: &[Tool]` is about to make non-functional. Without the notice,
-    /// the borrowed model reasons about — or announces — tool use that can
-    /// never happen, instead of just answering.
-    ///
-    /// Appended to the LAST message, not `system` — see the module docs on
-    /// why: an instruction survives a small model's attention better the
-    /// closer it sits to generation, and `system` is the position furthest
-    /// from it.
+    /// The exact failure the notice exists for: `system` names tools the dropped `tools` argument
+    /// makes non-functional, and without it the borrowed model narrates tool use instead of
+    /// answering. It must land on the LAST message, not `system`, which sits furthest from
+    /// generation and decays worst for a small model (see the module docs).
     #[tokio::test]
     async fn a_nonempty_tools_list_gets_a_no_tools_notice_appended_to_the_last_message() {
         let provider = Arc::new(CapturingProvider::new());

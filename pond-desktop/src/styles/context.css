@@ -1,0 +1,515 @@
+/* ─── Context: what the pond knows ─────────────────────────────────────────
+ *
+ * Borrows Conversations' edge — the 2px ink border and hard offset shadow —
+ * because this is the other screen that shows the pond's own content rather
+ * than its chrome, and a second wall that behaved differently would be a
+ * second thing to learn.
+ *
+ * The one addition is the lineage flow, which is the only place on this screen
+ * allowed to raise its voice. Everything around it is deliberately quiet.
+ */
+
+.ctx {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-6) var(--space-6) 0;
+}
+
+/* ── Header ─────────────────────────────────────────────────────────────── */
+
+.ctx__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.ctx__title {
+  font-family: var(--font-heading);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  font-style: italic;
+  margin: 0;
+}
+
+.ctx__sub {
+  margin: var(--space-1) 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm, 14px);
+}
+
+.ctx__refresh {
+  font: inherit;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border, #dcd9e4);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+.ctx__refresh:hover { color: var(--color-text); border-color: var(--color-accent); }
+
+/* ── View switch ────────────────────────────────────────────────────────── */
+
+/* Not a pill row. Each view answers a different question, so each carries the
+   question it answers — the label alone would make them look interchangeable. */
+.ctx__views {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--space-3);
+}
+
+.ctx__view {
+  font: inherit;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 14px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border, #dcd9e4);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+}
+.ctx__view:hover { border-color: var(--color-accent); color: var(--color-text); }
+.ctx__view[aria-pressed="true"] {
+  border-color: var(--border-ink);
+  background: var(--color-accent-subtle);
+  color: var(--color-text);
+}
+.ctx__view:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+.ctx__viewLabel { font-weight: var(--weight-bold); font-size: 14px; }
+.ctx__viewBlurb { font-size: 12px; color: var(--color-text-secondary); }
+
+/* ── Tools ──────────────────────────────────────────────────────────────── */
+
+.ctx__tools { display: flex; gap: var(--space-3); flex-wrap: wrap; }
+
+.ctx__search {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border, #dcd9e4);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  flex: 1 1 260px;
+  max-width: 420px;
+}
+.ctx__searchInput {
+  font: inherit;
+  font-size: 14px;
+  border: 0;
+  outline: 0;
+  background: none;
+  color: var(--color-text);
+  width: 100%;
+}
+
+/* The focus ring belongs on the WRAPPER, which is what looks like the control.
+   Putting it on the inner input drew a second rounded rectangle inside the
+   border that was already there. */
+.ctx__search:focus-within {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-color: var(--color-accent);
+}
+
+.ctx__add { display: flex; gap: var(--space-3); flex-wrap: wrap; }
+.ctx__addInput {
+  font: inherit;
+  font-size: 14px;
+  flex: 1 1 260px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border, #dcd9e4);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+.ctx__addBtn {
+  font: inherit;
+  font-size: 14px;
+  font-weight: var(--weight-bold);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: var(--radius-md, 8px);
+  border: 2px solid var(--color-text);
+  background: var(--color-surface);
+  color: var(--color-text);
+  cursor: pointer;
+}
+.ctx__addBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+.ctx__addInput:focus-visible,
+.ctx__addBtn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+/* ── The wall ───────────────────────────────────────────────────────────── */
+
+/* Cards are as tall as their memory needs.
+ *
+ * This used to pin heights with `grid-row: span N` over 34px rows, choosing N
+ * from the content's CHARACTER COUNT — a guess that is wrong whenever wrapping
+ * disagrees with it, which is most of the time. Paired with `overflow: hidden`
+ * it amputated memories mid-sentence, and left holes under every card whose
+ * guess ran long.
+ *
+ * Conversations can pin heights because its cards hold a title and a clipped
+ * preview, where cutting off IS the design. Here the text is the whole content,
+ * and it has to be readable and editable, so the wall gives up an even bottom
+ * edge to keep every word. `start` alignment stops a short card stretching to
+ * match its tallest neighbour. */
+.ctx__wall {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  align-items: start;
+  gap: var(--space-4);
+}
+
+.ctx__card {
+  --ink-lift: 4px;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+
+  background: var(--color-surface);
+  border: 2px solid var(--color-text);
+  border-radius: var(--radius-lg, 12px);
+  box-shadow: var(--ink-lift) var(--ink-lift) 0 var(--border-ink);
+  transform: translate(calc(4px - var(--ink-lift)), calc(4px - var(--ink-lift)));
+  transition: box-shadow 120ms ease, transform 120ms ease, border-color 120ms ease;
+}
+
+
+.ctx__card:hover { --ink-lift: 7px; border-color: var(--color-accent); }
+
+/* The skeletons DO need fixed heights -- they have no content to be tall for,
+   and the point of them is holding the wall's shape before the real cards
+   arrive so the layout does not jump. */
+.ctx__card--ghost {
+  border-color: var(--color-border);
+  box-shadow: none;
+  transform: none;
+  opacity: 0.5;
+}
+.ctx__card--ghost[data-weight="tile"]   { min-height: 104px; }
+.ctx__card--ghost[data-weight="card"]   { min-height: 140px; }
+.ctx__card--ghost[data-weight="column"] { min-height: 176px; }
+
+.ctx__cardTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.ctx__tier {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: var(--weight-bold);
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+.ctx__tier[data-tier="permanent"] {
+  background: var(--color-text);
+  color: var(--color-surface);
+}
+
+.ctx__when { font-size: 12px; color: var(--color-text-secondary); }
+
+.ctx__cardBody {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  overflow: hidden;
+}
+
+.ctx__empty,
+.ctx__error {
+  margin: 0;
+  font-size: 14px;
+  color: var(--color-text-secondary);
+}
+.ctx__error { color: #8e4232; }
+
+/* ── Lineage ────────────────────────────────────────────────────────────── */
+
+.lin { display: flex; flex-direction: column; gap: var(--space-6); }
+
+.lin__intro { display: flex; flex-direction: column; gap: var(--space-2); max-width: 46ch; }
+.lin__intro p { margin: 0; font-size: 14px; line-height: 1.6; color: var(--color-text-secondary); }
+
+.lin__h {
+  font-family: var(--font-heading);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  font-style: italic;
+  margin: 0;
+}
+
+.lin__stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--space-4);
+  margin: 0;
+}
+.lin__stats > div { display: flex; flex-direction: column; gap: 2px; }
+.lin__stats dt {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+  font-weight: var(--weight-bold);
+}
+.lin__stats dd {
+  margin: 0;
+  font-size: 26px;
+  font-weight: var(--weight-bold);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.lin__unit { font-size: 13px; font-weight: 400; color: var(--color-text-secondary); }
+
+/* The signature. A chain is drawn as a wedge whose width is how many earlier
+   versions folded in — the flow narrows into the one row that survived, which
+   is what consolidation actually does. */
+.lin__chains { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-3); }
+
+.lin__chain {
+  display: grid;
+  grid-template-columns: minmax(64px, 22%) 1fr;
+  align-items: stretch;
+  gap: 0;
+  border: 2px solid var(--color-text);
+  border-radius: var(--radius-lg, 12px);
+  overflow: hidden;
+  background: var(--color-surface);
+  box-shadow: 4px 4px 0 var(--border-ink);
+}
+
+.lin__flow {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 62px;
+  background: var(--color-accent-subtle);
+  /* The wedge: full height at the left edge, narrowing to a point at the right
+     in proportion to how many versions folded in. */
+  clip-path: polygon(
+    0 calc(50% - var(--fan, 0.4) * 50%),
+    100% calc(50% - 8px),
+    100% calc(50% + 8px),
+    0 calc(50% + var(--fan, 0.4) * 50%)
+  );
+}
+
+.lin__fanCount {
+  font-size: 15px;
+  font-weight: var(--weight-bold);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-accent);
+}
+
+.lin__survivor {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--space-4);
+  border-left: 2px solid var(--color-text);
+  min-width: 0;
+}
+.lin__survivorText { margin: 0; font-size: 14px; line-height: 1.5; }
+.lin__survivorMeta { margin: 0; font-size: 12px; color: var(--color-text-secondary); }
+
+.lin__empty,
+.lin__note {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+  max-width: 56ch;
+}
+
+/* ── Vector coverage ────────────────────────────────────────────────────── */
+
+.lin__vectors { display: flex; flex-direction: column; gap: var(--space-3); }
+.lin__vectorsIntro { margin: 0; font-size: 13px; color: var(--color-text-secondary); }
+
+.lin__corpora { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-3); max-width: 40rem; }
+.lin__corpus { display: flex; flex-direction: column; gap: 5px; }
+.lin__corpusHead { display: flex; justify-content: space-between; gap: var(--space-3); font-size: 13px; }
+.lin__corpusName { font-weight: var(--weight-bold); text-transform: capitalize; }
+.lin__corpusCount { color: var(--color-text-secondary); font-variant-numeric: tabular-nums; }
+
+.lin__bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-accent-subtle);
+  border: 1px solid var(--color-border, #dcd9e4);
+  overflow: hidden;
+}
+.lin__barFill { display: block; height: 100%; background: var(--color-accent); }
+
+@media (prefers-reduced-motion: reduce) {
+  .ctx__card, .ctx__view { transition: none; }
+}
+
+.lin__corpusCount--held { color: #8e4232; font-weight: var(--weight-bold); }
+.lin__held {
+  margin: 2px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+
+/* ── Card actions ───────────────────────────────────────────────────────── */
+
+.ctx__cardActions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: auto;
+  flex-wrap: wrap;
+}
+
+.ctx__cardActions button {
+  font: inherit;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 9px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+.ctx__cardActions button:hover { color: var(--color-text); border-color: var(--color-accent); }
+.ctx__cardActions button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
+.ctx__danger:hover {
+  border-color: var(--color-destructive) !important;
+  color: var(--color-destructive-fg) !important;
+}
+.ctx__confirmAsk { font-size: 12px; font-weight: var(--weight-bold); }
+
+/* Revealed on hover or keyboard focus. Present in the DOM either way, so it is
+   reachable by tab — a control that only exists under a pointer is a control
+   keyboard users do not have. */
+.ctx__cardActions--hover { opacity: 0; transition: opacity 120ms ease; }
+.ctx__card:hover .ctx__cardActions--hover,
+.ctx__card:focus-within .ctx__cardActions--hover { opacity: 1; }
+@media (hover: none) {
+  .ctx__cardActions--hover { opacity: 1; }
+}
+
+.ctx__edit {
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  width: 100%;
+  min-height: 5rem;
+  resize: vertical;
+  padding: 8px 10px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+.ctx__edit:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
+/* ── Collected ──────────────────────────────────────────────────────────── */
+
+.coll { display: flex; flex-direction: column; gap: var(--space-4); }
+
+.coll__note {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--color-text-secondary);
+  max-width: 56ch;
+}
+
+.coll__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: 52rem;
+}
+
+.coll__item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-3);
+  align-items: start;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 8px);
+  background: var(--color-surface);
+}
+
+.coll__icon { color: var(--color-text-secondary); display: flex; padding-top: 2px; }
+.coll__body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.coll__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.coll__title { font-size: 14px; }
+.coll__when { font-size: 12px; color: var(--color-text-secondary); white-space: nowrap; }
+.coll__text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+  white-space: pre-line;
+}
+.coll__with { margin: 0; font-size: 12px; color: var(--color-text-secondary); }
+.coll__pending { margin: 0; font-size: 12px; color: var(--color-warning-fg); }
+
+.lin__vectorsHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.lin__rebuild {
+  font: inherit;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+  color: var(--color-text);
+  cursor: pointer;
+}
+.lin__rebuild:hover:not(:disabled) { border-color: var(--color-accent); }
+.lin__rebuild:disabled { opacity: 0.5; cursor: not-allowed; }
+.lin__rebuild:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }

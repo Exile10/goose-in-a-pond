@@ -289,7 +289,7 @@ You name conversations. Reply with the name and nothing else.
 
 - Ten words at most. Fewer is better.
 - Name the real subject, so it is recognisable in a list weeks from now.
-- Be concrete. \"Wake word fires twice on the Jetson\" beats \"Technical discussion\".
+- Be concrete: name the thing itself, not the category it belongs to.
 - Sentence case. No quotes, no full stop, no \"Chat about\".
 - If it covers several things, name the one it kept coming back to.";
 
@@ -542,6 +542,42 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prompt must not hand the model a ready-made title.
+    ///
+    /// It used to say: `Be concrete. "Wake word fires twice on the Jetson"
+    /// beats "Technical discussion".` That example satisfies every rule the
+    /// prompt states — under ten words, sentence case, no quotes, no full stop,
+    /// concrete — and names this user's actual hardware. A model at this size
+    /// copies worked examples, and `normalise_title` accepts it unchanged, so
+    /// the copy is PERSISTED as the conversation's real name.
+    ///
+    /// That makes it worse than a bad chat reply, which is transient. The user
+    /// ends up with several unrelated conversations all called the same thing,
+    /// written to the database, with nothing marking them as machine error.
+    ///
+    /// The rule survives; only the ready-made instance is gone.
+    #[test]
+    fn the_prompt_offers_no_title_a_model_could_copy() {
+        // A quoted, capitalised, multi-word phrase in a prompt that asks for
+        // exactly that shape is a title waiting to be echoed.
+        let quoted: Vec<&str> = TITLE_SYSTEM_PROMPT.split('"').collect();
+        for (i, chunk) in quoted.iter().enumerate() {
+            if i % 2 == 0 {
+                continue; // outside quotes
+            }
+            assert!(
+                chunk.split_whitespace().count() < 3,
+                "TITLE_SYSTEM_PROMPT quotes {chunk:?}, which is long enough to be \
+                 emitted as a title and would then be persisted as a real \
+                 conversation name"
+            );
+        }
+        assert!(
+            !TITLE_SYSTEM_PROMPT.contains("Jetson"),
+            "the prompt names this household's own hardware"
+        );
+    }
 
     fn base() -> TitleGateInputs<'static> {
         TitleGateInputs {

@@ -2,13 +2,8 @@ use serde::{Deserialize, Serialize};
 
 /// Runtime capabilities declared by an LLM provider.
 ///
-/// Each adapter populates this based on the active model's known features.
-/// Services and routes branch on these to enable model-specific behaviour
-/// (thinking mode, vision input, larger context windows) while keeping the
-/// core architecture model-agnostic.
-///
-/// All fields default to the most conservative assumption (false / 4096)
-/// so that unknown models work safely out of the box.
+/// Each adapter populates this from the active model's known features; services and routes
+/// branch on it. Fields default conservatively (false / 4096) so an unknown model works safely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     /// Model supports internal chain-of-thought reasoning.
@@ -70,69 +65,25 @@ const VISION_NAME_FRAGMENTS: &[&str] = &[
     "qwen2.5vl",
 ];
 
-/// Whole name segments (split on any non-alphanumeric character) that identify
-/// a multimodal model.
-///
-/// Segment matching rather than `contains`: `vl` as a bare substring appears
-/// inside plenty of unrelated words, and a false positive here is the expensive
-/// direction (see [`ModelCapabilities::name_implies_vision`]).
+/// Whole name segments (split on any non-alphanumeric character) that identify a multimodal
+/// model. Segment matching rather than `contains`: `vl` as a bare substring appears inside
+/// plenty of unrelated words, and a false positive here is the expensive direction (see
+/// [`ModelCapabilities::name_implies_vision`]).
 const VISION_NAME_SEGMENTS: &[&str] = &["vision", "vl", "vlm"];
 
-/// Spellings of the Gemma 4 family, including the `gemma3n` name Ollama and
-/// Hugging Face use for the same weights (`gemma3n:e4b`).
-///
-/// Consulted by the vision rule only. The other axes in
-/// [`ModelCapabilities::from_model_name`] still match `gemma-4*` literally:
-/// widening them would silently change thinking, tool-calling and context-window
-/// behaviour — and with it the prompt tier — for models beyond the vision bug
-/// this list was added for.
+/// Spellings of the Gemma 4 family, including the `gemma3n` name Ollama and Hugging Face use
+/// for the same weights (`gemma3n:e4b`). Consulted by the vision rule only: the other axes in
+/// [`ModelCapabilities::from_model_name`] still match `gemma-4*` literally, because widening
+/// them would also change thinking, tool-calling and context-window behaviour.
 const GEMMA4_NAME_FRAGMENTS: &[&str] = &[
     "gemma-4", "gemma4", "gemma_4", "gemma-3n", "gemma3n", "gemma_3n",
 ];
 
 impl ModelCapabilities {
-    /// Whether a model NAME is evidence that the model accepts image input.
-    ///
-    /// # Why this is deliberately asymmetric
-    ///
-    /// The two error directions do not cost the same. A false POSITIVE reaches
-    /// the system prompt (`<vision>`: "you can see images"), so a text-only
-    /// model is told it has an ability it does not have and answers an
-    /// image question by inventing an image. A false NEGATIVE only withholds
-    /// that section — the model stays as it was, which is the status quo the
-    /// section exists to improve. So the bias is heavily towards `false`:
-    /// anything unrecognised stays `false`, and there is one explicit exclusion
-    /// (below) for a family member that breaks its family's rule.
-    ///
-    /// # What the rules are NOT
-    ///
-    /// Two of the three rules name a known family outright
-    /// (`VISION_NAME_FRAGMENTS`, `GEMMA4_NAME_FRAGMENTS`). The third —
-    /// `VISION_NAME_SEGMENTS` — is a *marker* rule, not a family
-    /// identification: it credits any name carrying `vision` / `vl` / `vlm` as a
-    /// whole segment. That is what makes it cover the long tail of vendors and
-    /// quantisers who label a multimodal build that way without appearing in any
-    /// list here, and it is why `qwen2.5-vl`, `qwen3-vl` and `llama3.2-vision`
-    /// need no entry of their own. The cost is that a name which merely contains
-    /// the segment for an unrelated reason — `vision-labs/text-only-7b` — is
-    /// credited too. Segment matching (rather than `contains`) keeps that to
-    /// contrived names; it is accepted, not solved.
-    ///
-    /// # The exclusion
-    ///
-    /// Every featured Gemma 4 declares a vision encoder EXCEPT `E1B`
-    /// (`FEATURED_MODELS` in `goose-local-inference`, where `E1B` is the one
-    /// entry with `mmproj: None`). On the in-process engine that registry IS
-    /// the answer and this function is not consulted; on an HTTP provider
-    /// serving the same weights the name is all there is, so the exclusion has
-    /// to be repeated here or `gemma-4-E1B-it` on Ollama is told it can see.
-    ///
-    /// # Scope
-    ///
-    /// Ollama/llamafile-class open models only. Cloud models are not listed:
-    /// they are vision-capable, but they also do not exhibit the failure this
-    /// signal drives (a 4B model insisting it is "a text-based assistant"),
-    /// and every added entry is a claim this file has to keep true.
+    /// Whether a model NAME is evidence that the model accepts image input. Open-weight names
+    /// only, and biased to `false`: a false positive tells a text-only model it can see and it
+    /// invents images, while a false negative only withholds the `<vision>` prompt section.
+    /// `E1B` is excluded as the one featured Gemma 4 with `mmproj: None`.
     #[must_use]
     pub fn name_implies_vision(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
@@ -372,5 +323,24 @@ mod tests {
         assert_eq!(caps.thinking, caps2.thinking);
         assert_eq!(caps.vision, caps2.vision);
         assert_eq!(caps.context_window_tokens, caps2.context_window_tokens);
+    }
+}
+
+#[cfg(test)]
+mod probe_gap_tests {
+    use super::*;
+
+    /// The gap that made Nemotron hallucinate instead of calling a tool.
+    /// `thinking_mode = "auto"` resolves through this function, which reads the FILENAME;
+    /// Nemotron reasons and `ModelProbe` sees that, but its name does not say so, so the
+    /// prompt drops the thinking section while the engine has `enable_thinking = true`.
+    #[test]
+    fn the_name_heuristic_does_not_know_nemotron_reasons() {
+        let caps = ModelCapabilities::from_model_name("NVIDIA-Nemotron3-Nano-4B-Q4_K_M");
+        assert!(
+            !caps.thinking,
+            "if the name heuristic has learned Nemotron, this gap is closed and \
+             thinking_mode=auto no longer needs the probe"
+        );
     }
 }

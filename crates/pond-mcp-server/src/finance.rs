@@ -247,7 +247,11 @@ impl FinanceMcpServer {
             Some(t) => t,
             None => {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    "I need a target currency. Say something like 'convert 100 USD to EUR'.",
+                    // No worked conversion here. 'convert 100 USD to EUR' returns
+                    // a real, current, correct rate — for a pair the user never
+                    // named, in a household that transacts in KES. A right answer
+                    // to the wrong question is the hardest kind to notice.
+                    "I need a target currency — the one the user asked to convert into.",
                 )]));
             }
         };
@@ -1022,7 +1026,16 @@ pub fn init_finance_deps(http_client: reqwest::Client) {
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_finance_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = FINANCE_DEPS.get().expect("init_finance_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = FINANCE_DEPS.get() else {
+        tracing::error!(
+            "spawn_finance_server called before init_finance_deps — extension will not start"
+        );
+        return;
+    };
     let server = FinanceMcpServer::new(deps.http_client.clone());
     crate::serve_builtin("giap-finance", server, reader, writer);
 }

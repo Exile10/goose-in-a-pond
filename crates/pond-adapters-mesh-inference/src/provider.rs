@@ -140,11 +140,10 @@ impl LlmProvider for MeshInferenceProvider {
                 return;
             }
 
-            // First-token latency for the borrow path — issue #132's acceptance
-            // criteria name a sub-300ms budget on a LAN-local trusted chain.
-            // Not wired into Goose's own TurnStats (mesh is a coarse relay,
-            // no `time_to_first_token_ms` from the backing provider), so this
-            // is a standalone log line rather than reusing that plumbing.
+            // First-token latency for the borrow path — issue #132 budgets
+            // sub-300ms on a LAN-local trusted chain. Mesh is a coarse relay with
+            // no `time_to_first_token_ms` from the backing provider, so this logs
+            // standalone rather than feeding Goose's TurnStats.
             let mut first_token_logged = false;
 
             loop {
@@ -162,12 +161,10 @@ impl LlmProvider for MeshInferenceProvider {
                             yield Ok(StreamToken::Text(text));
                         }
                         Some(ChunkKind::Usage(usage)) => {
-                            // What we're actually billed for — includes the
-                            // lender's discarded empty-completion retries,
-                            // which `completion_tokens` alone doesn't. `0`
-                            // means an older peer that predates this field:
-                            // fall back rather than record an owed amount of
-                            // zero for a real completion.
+                            // `charged_tokens` covers the lender's discarded
+                            // empty-completion retries; `completion_tokens`
+                            // does not. `0` means a peer predating the field,
+                            // so fall back rather than bill a completion at 0.
                             let billed_tokens = if usage.charged_tokens > 0 {
                                 usage.charged_tokens
                             } else {

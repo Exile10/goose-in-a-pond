@@ -1,11 +1,7 @@
-//! YOLOX raw-output decoding + non-maximum suppression. Pure functions, so
-//! the whole decode path is unit-testable without an ONNX runtime.
-//!
-//! YOLOX's exported ONNX applies sigmoid inside the graph but leaves the
-//! grid/stride decode to the caller: the output is `[1, N, 5 + classes]`
-//! where each row is `[cx_raw, cy_raw, w_raw, h_raw, objectness, cls...]`
-//! and N is the sum of grid cells over strides 8/16/32 (3549 for 416×416).
-//! Real coordinates: `xy = (raw_xy + grid) * stride`, `wh = exp(raw_wh) * stride`.
+//! YOLOX raw-output decoding and non-maximum suppression, pure so the path is
+//! unit-testable without an ONNX runtime. The exported ONNX applies sigmoid
+//! in-graph but leaves grid/stride decode to the caller: output rows are
+//! `[cx, cy, w, h, obj, cls...]`, `xy = (raw_xy + grid) * stride`, `wh = exp(raw_wh) * stride`.
 
 /// One decoded box in letterboxed-input coordinates.
 #[derive(Debug, Clone, PartialEq)]

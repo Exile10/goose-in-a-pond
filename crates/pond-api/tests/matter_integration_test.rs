@@ -1,13 +1,7 @@
-//! Matter enablement over the real HTTP surface.
-//!
-//! The defect this covers: `matter_enabled` had no UI, and every reason
-//! commissioning could be unavailable — off, still starting, controller
-//! unreachable — collapsed into one 503 telling the user to "turn it on in
-//! Settings". So people were sent to look for a switch that did not exist, and
-//! when it did exist they were told it was off while it was on.
-//!
-//! These tests drive `POST /devices/commission`, `GET /matter/status`, and
-//! `PUT /settings` through the router with a runtime pinned to each state.
+//! Matter enablement over the real HTTP surface: `POST /devices/commission`,
+//! `GET /matter/status` and `PUT /settings` driven through the router with a runtime
+//! pinned to each state. Every reason commissioning can be unavailable — off, still
+//! starting, controller unreachable — must stay distinguishable, not collapse into one 503.
 
 use std::sync::Arc;
 
@@ -66,6 +60,7 @@ async fn make_app_with_settings(
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db,
         onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
         handshake: Arc::new(mock_hs),
@@ -97,6 +92,7 @@ async fn make_app_with_settings(
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -199,13 +195,10 @@ async fn commissioning_while_matter_is_unavailable_does_not_send_the_user_lookin
         .unwrap()
         .to_string();
 
-    // This assertion has now been wrong twice in the same way, which is the
-    // reason it no longer names a place. It first pinned "Settings", where no
-    // such control existed; it was corrected to "Devices tab", and then the
-    // matter.js controller work deleted the Matter toggle from that tab too --
-    // so the test went on enforcing a message that pointed at a switch nobody
-    // could find. `Disabled` is now only reachable on a build with no Matter
-    // support compiled in, where the honest answer names the build.
+    // The message must not name a place: no Matter toggle exists in Settings or on the
+    // Devices tab, so naming one sends the user hunting for a control that is not there.
+    // `Disabled` is only reachable on a build with no Matter support compiled in, where
+    // the honest answer names the build.
     for absent in ["Settings", "Devices tab", "turn it on"] {
         assert!(
             !error.contains(absent),
@@ -389,19 +382,10 @@ async fn deleting_a_matter_device_while_off_refuses_with_the_honest_reason() {
     assert!(!error.contains("Devices tab"), "{error}");
 }
 
-/// Deleting a device behind a Matter hub is refused, and the refusal is the whole
-/// feature.
-///
-/// A bridged device is one endpoint of a node that speaks for several. Matter
-/// commissions NODES, so there is no fabric operation that removes one endpoint —
-/// and both alternatives are worse than saying so. Decommissioning acts on the node,
-/// so it would silently take every sibling and the hub with it. Dropping the row
-/// alone leaves the controller to re-announce the device on its next subscribe,
-/// which is the zombie the endpoint already guards against for whole nodes.
-///
-/// Checked before the Matter-state gate on purpose: the answer does not depend on
-/// whether the controller is reachable, so a disabled runtime must not turn a
-/// permanent "this is not a thing you can do" into a temporary "try later".
+/// Deleting a device behind a Matter hub is refused, and the refusal is the whole feature:
+/// Matter commissions nodes, so decommissioning takes every sibling and dropping the row
+/// alone leaves a zombie the controller re-announces. Checked before the Matter-state gate,
+/// so an unreachable controller cannot turn a permanent refusal into a temporary "try later".
 #[tokio::test]
 async fn deleting_a_device_behind_a_hub_is_refused_and_names_the_hub() {
     let (app, _, _tmp) = make_app(Some(Arc::new(StubMatterRuntime::disabled()))).await;
@@ -427,16 +411,10 @@ async fn deleting_a_device_behind_a_hub_is_refused_and_names_the_hub() {
     assert_eq!(body["hub_id"], "matter-90");
 }
 
-/// This endpoint takes a patch over the whole of Settings, so the Matter check
-/// must not turn a bad stored controller address into a wall that blocks every
-/// unrelated save.
-///
-/// The fixture is the point. It used to store a perfectly valid
-/// `ws://127.0.0.1:5580/giap` while its comment claimed to be testing "no
-/// address", so the validation branch it exists for was never reached and the
-/// test passed with `touches_matter &&` deleted from the guard. Seeding the
-/// repository directly is the only way in: the API rejects a blank URL, which
-/// is exactly why a row in that shape can only be a legacy one.
+/// This endpoint takes a patch over the whole of Settings, so the Matter check must not
+/// turn a bad stored controller address into a wall that blocks every unrelated save.
+/// The fixture must really hold an invalid address, and seeding the repository directly is
+/// the only way in: the API rejects a blank URL, so a row in that shape can only be legacy.
 #[tokio::test]
 async fn a_save_that_does_not_touch_matter_is_not_blocked_by_it() {
     let runtime = Arc::new(StubMatterRuntime::disabled());
@@ -460,12 +438,10 @@ async fn a_save_that_does_not_touch_matter_is_not_blocked_by_it() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    // ...and it does NOT reconcile Matter. An unrelated save used to send
-    // `apply` unconditionally, and the reconciler treats "enabled but not yet
-    // Connected" as needing a restart -- so renaming the home during the
-    // multi-minute first controller install tore that install down and began
-    // it again. Retry from the Devices tab is unaffected: `saveMatter` sends
-    // both Matter keys, so it is a `touches_matter` save by construction.
+    // ...and it does NOT reconcile Matter. The reconciler treats "enabled but not yet
+    // Connected" as needing a restart, so an unconditional `apply` would tear down an
+    // in-flight controller install. `saveMatter` sends both Matter keys, so a genuine
+    // retry is still a `touches_matter` save.
     assert!(
         matter.unwrap().applied().is_empty(),
         "an unrelated settings save reconciled Matter, which restarts an \

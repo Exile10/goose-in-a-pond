@@ -1,14 +1,10 @@
 //! Deterministic digit-time → spoken-English conversion for voice mode.
 //!
-//! Small on-device models are unreliable at converting two-digit minutes
-//! into words in a single generation pass (e.g. "23" becoming "oh three"
-//! instead of "twenty-three"). Voice-mode prompts inject the result of
-//! [`spoken_time`] instead of raw `HH:MM` digits so the model only has to
-//! relay the phrase, never compute it.
+//! Small on-device models mis-say two-digit minutes ("23" as "oh three"), so voice
+//! prompts inject [`spoken_time`]'s phrase instead of raw `HH:MM` digits.
 
 /// Render a 24-hour `hour`/`minute` as a natural spoken-English phrase,
 /// e.g. `spoken_time(5, 23) == "five twenty-three in the morning"`.
-///
 /// `hour24` and `minute` are clamped into range (`0..24`, `0..60`) so a
 /// malformed caller never panics.
 pub fn spoken_time(hour24: u32, minute: u32) -> String {

@@ -1,9 +1,7 @@
-//! [`FrameSource`] over an ffmpeg subprocess (#130).
-//!
-//! Spawns `ffmpeg` reading an RTSP URL or a V4L2 device and emitting raw
-//! RGB24 frames on stdout, which `next_frame` consumes one fixed-size chunk at
-//! a time. Using the CLI (argv, no shell) keeps GIAP free of native
-//! libav/GStreamer linkage while supporting every input ffmpeg does.
+//! [`FrameSource`] over an ffmpeg subprocess (#130). Spawns `ffmpeg` on an RTSP
+//! URL or a V4L2 device emitting raw RGB24 frames on stdout, which `next_frame`
+//! consumes one fixed-size chunk at a time. The CLI (argv, no shell) keeps GIAP
+//! free of native libav/GStreamer linkage.
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;

@@ -1,52 +1,7 @@
-//! The on-pond producer (PAI-8 P3s) — the bridge from the event bus to the
-//! ingest pipeline.
-//!
-//! P1 built a pipeline that refuses everything it is not given and P2 built the
-//! retrieval side, and between them there was nothing that PRODUCES a
-//! [`RawItem`]. This module is that thing, and it is deliberately the smallest
-//! producer that can exist: a pure function from one [`BusEvent`] and one
-//! [`ContextSource`] to either an item or a named refusal.
-//!
-//! # The design, and why it is this one
-//!
-//! A household member creates a [`ContextSource`] whose [`kind`] is
-//! [`Sensor`](SourceKind::Sensor) or [`Camera`](SourceKind::Camera) and whose
-//! [`provider`] names the device it follows. When a matching
-//! [`BusEvent::Sensor`] or [`BusEvent::Camera`] arrives from that device it
-//! becomes an item ingested under that source, and therefore under that source's
-//! OWNER.
-//!
-//! [`ContextSource::profile_id`] is not an `Option`, so a source belongs to one
-//! member. That is the whole reason the producer keys on a source the member
-//! created rather than on the device registry: "the front-door camera is my
-//! context" is a thing a person can say, and it is the only honest answer to
-//! "whose data is this" for a device a household shares. A device registry entry
-//! belongs to the house; a context source belongs to a person.
-//!
-//! **Voice transcripts were considered and rejected.** [`SourceKind::Voice`] is
-//! `Landed`, so nothing in the type system stops it, and this module refuses it
-//! anyway: pouring every conversation turn into the corpus is section 3.2's own
-//! mistake in mirror image. `ChatService::persist_assistant_turn_with_extraction`
-//! already curates facts out of those turns into the memory corpus, and a second,
-//! uncurated copy of the same material would cost the retrieval budget twice and
-//! recall worse.
-//!
-//! # What this refuses, and the shape of the refusals
-//!
-//! Every refusal is a named variant of [`NotIngested`] rather than a `None`,
-//! because two of them have to carry a sentence: a source kind that has not
-//! landed is refused with [`SourceAvailability::refusal`] verbatim, which is the
-//! one place in the tree that says what has to land first. A `None` cannot carry
-//! that, which is why the return type is a `Result` and not the `Option` the
-//! brief sketched.
-//!
-//! The match on [`BusEvent`] has **no wildcard arm**. A seventh variant added to
-//! the bus does not compile until somebody decides what it means here, which is
-//! the only mechanism that survives the person who wrote this leaving.
-//!
-//! [`kind`]: ContextSource::kind
-//! [`provider`]: ContextSource::provider
-//! [`ContextSource::profile_id`]: ContextSource::profile_id
+//! The on-pond producer (PAI-8 P3s): a pure function from one [`BusEvent`] and one
+//! [`ContextSource`] to a [`RawItem`] or a named [`NotIngested`] refusal. A source has one
+//! `profile_id`, so keying on the member's source rather than the device registry is what makes
+//! ownership answerable. The match on [`BusEvent`] has NO wildcard arm, by design.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use thiserror::Error;
@@ -61,44 +16,10 @@ use crate::user_data::domain::settings::Settings;
 
 // ── The worth-keeping policy ────────────────────────────────────────────────
 
-/// Sensor signals whose readings are TRANSITIONS rather than samples.
-///
-/// This is the judgement in this module, and the number that forces it is
-/// blunt: a temperature sensor reporting every 30 seconds produces 2 880 rows a
-/// day per device, and this runs on a Jetson Orin Nano with an 8 GB budget where
-/// the corpus is also read back into a prompt. Ten such sensors would put a
-/// million rows a year into a store whose whole purpose is to answer "what
-/// happened", and the honest answer for any one of those rows is "nothing".
-///
-/// So the rule is: **keep transitions, drop samples.** A context item is a
-/// durable statement about the household. `occupancy = 1` is a statement.
-/// `temperature = 21.4` is one point on a series the pond ALREADY stores, in
-/// `sensor_readings` under `retention_sensor_days`, queryable by the
-/// `giap-sensor` tools with min/max/avg aggregation. Copying that series into
-/// the context corpus buys nothing and costs the budget twice.
-///
-/// **The rule is about the SIGNAL and never about the VALUE, and that is not
-/// laziness.** The obvious refinement — "keep the active edge, drop the resting
-/// state" — is wrong on this pond's own hardware. `pond-adapters-matter`'s
-/// `protocol.rs` maps Matter's `BooleanState` to `sensor_type = "contact"` with
-/// `true = closed`, per the Matter spec. A producer that kept non-zero readings
-/// would therefore file "the door is shut" as news and drop "the door opened".
-/// Polarity is device-specific, this function cannot know it, and guessing gets
-/// it exactly backwards on the one binary sensor family the tree actually
-/// implements.
-///
-/// An unrecognised signal is DROPPED. That is the narrowing direction: a new
-/// sensor type produces nothing until somebody adds it here, whereas the
-/// opposite default (a deny-list of known-continuous signals) answers an unknown
-/// signal with 2 880 rows a day.
-///
-/// What this rule does NOT bound: a discrete signal from a bridge that POLLS
-/// rather than reporting on change. Matter attribute subscriptions are
-/// edge-reported, so the three signals grounded in this tree today are safe, but
-/// a future adapter that polls a contact sensor every 30 seconds would produce
-/// the same 2 880 rows. Retention bounds it; this function does not. Said here
-/// rather than implied, because the alternative — quantising the timestamp in
-/// the idempotency key — is rejected below for a reason.
+/// Sensor signals whose readings are TRANSITIONS rather than samples: keep transitions, drop
+/// samples, because a 30-second sensor is 2 880 rows a day per device and the series already
+/// lives in `sensor_readings` under `retention_sensor_days`. The rule keys on the SIGNAL, never
+/// the value: Matter's `contact` is `true = closed`, so a non-zero rule would invert it.
 pub const DISCRETE_SENSOR_TYPES: &[&str] = &[
     // The three that exist in this tree today: `motion` (the sensor route and
     // the bus tests), `occupancy` and `contact` (the Matter bridge's
@@ -113,19 +34,14 @@ pub const DISCRETE_SENSOR_TYPES: &[&str] = &[
     "smoke",
     "leak",
     "button",
-    // Water freezing in a pipe, and rain falling. The same one bit as `leak`, off
-    // the same Matter cluster, and separated from it only by the endpoint's device
-    // type -- reported as `contact` until the bridge learned to tell them apart.
-    // Transitions by construction: a household cares that it started, and "the pipe
-    // sensor went to freezing at 04:20" is the sentence this corpus exists to say.
+    // Water freezing in a pipe, and rain falling: the same one bit as `leak`, off the same
+    // Matter cluster and separated from it only by the endpoint's device type. Transitions by
+    // construction.
     "freeze",
     "rain",
-    // The Matter `SmokeCoAlarm` cluster's own name for the same thing (#195).
-    // Its state is Normal/Warning/Critical rather than a boolean, but it is an
-    // ALARM: it changes rarely, every change is an event a household needs, and
-    // "the smoke alarm went to Critical at 03:12" is exactly the sentence this
-    // corpus exists to be able to say. Grouped with `smoke` above rather than
-    // replacing it, because the two names come from different bridges.
+    // The Matter `SmokeCoAlarm` cluster's own name for the same thing (#195). Normal/Warning/
+    // Critical rather than a boolean, but it changes rarely and every change matters. Kept
+    // alongside `smoke` above: the two names come from different bridges.
     "smoke_alarm",
     // Carbon monoxide, and the battery that lets either alarm sound at all. The same
     // shape as `smoke_alarm` and, for CO, the same urgency by a different route: smoke
@@ -133,56 +49,24 @@ pub const DISCRETE_SENSOR_TYPES: &[&str] = &[
     // sounding for carbon monoxide produced no reading anything here could keep.
     "co_alarm",
     "alarm_battery",
-    // An air purifier asking for its filter to be changed. Same argument as
-    // `smoke_alarm`: 0/1/2 rather than a boolean, but it is a device asking for
-    // something to be DONE, it changes a handful of times a year, and "the
-    // filter needs changing" is a household fact worth a durable row.
-    //
-    // These were minted by the Matter bridge long before they were listed here.
-    // The tripwire could not see them because they were written in a shape its
-    // extraction did not match, so every one of these readings was silently
-    // discarded — which is the exact failure that tripwire exists to catch,
-    // slipping past it on a technicality. Both names are now dispositioned.
+    // An air purifier asking for its filter to be changed. Same argument as `smoke_alarm`: 0/1/2
+    // rather than a boolean, but it changes a handful of times a year and asks for something to
+    // be DONE. The Matter bridge mints these in a shape the tripwire's extraction does not match,
+    // so listing them here is what stops the readings being silently discarded.
     "hepa_filter_change",
     "carbon_filter_change",
 ];
 
-/// Camera event types that mean "the pixels changed" rather than naming a thing.
+/// Camera event types meaning "the pixels changed" rather than naming a thing.
 ///
-/// `pond-adapters-vision`'s pipeline emits `"motion"` in three places — no
-/// classifier configured, the classifier erroring, and the classifier finding
-/// nothing above its own floor — so on a build without `vision-onnx` it is the
-/// only label a camera ever produces. Its `confidence` in that case is the
-/// fraction of the frame that changed, not a probability that anything is there.
-///
-/// A camera source on such a pond therefore ingests **nothing**, and that is the
-/// correct answer rather than a defect: 8 640 rows a day (the pipeline's
-/// 10-second `min_event_interval`) saying "something moved" is not context, it
-/// is a smoke detector for a corpus. When the classifier is present the label
-/// names a thing — `person`, `package`, `pet` — and that is a household fact
-/// worth a durable row.
-///
-/// A deny-list rather than an allow-list, which is the opposite choice from
-/// [`DISCRETE_SENSOR_TYPES`], and the asymmetry is deliberate: the value being
-/// excluded here is a KNOWN sentinel this repo emits, while everything else is
-/// by construction a positive classification out of a detector with 80 labels.
-/// An allow-list would silently drop 75 of them.
-/// `crates/pond-core/tests/context_producer_tracks_the_vision_pipeline.rs` ties
-/// this constant to the literal `pipeline.rs` actually emits, because the silent
-/// failure here is that the fallback label is renamed and this rule quietly
-/// starts keeping every frame.
+/// `pond-adapters-vision` emits `"motion"` when no classifier ran, so such a pond ingests nothing
+/// rather than 8 640 empty rows a day; `context_producer_tracks_the_vision_pipeline.rs` guards it.
 pub const UNCLASSIFIED_CAMERA_EVENT_TYPES: &[&str] = &["motion"];
 
 /// A classified camera event below this confidence is dropped.
 ///
-/// The same 0.5 `pond-adapters-vision`'s `MIN_CLASSIFIER_CONFIDENCE` uses, so
-/// the vision path never trips it — this gate is live for
-/// `POST /api/v1/camera/events`, where the confidence is whatever a paired
-/// client sent. A second floor that agrees with the first is not redundant when
-/// one of the two producers is outside this repo.
-///
-/// A camera event carrying NO confidence is kept: the manual route may legitimately
-/// omit it, and the event-type rule above has already done the narrowing.
+/// The same 0.5 as `pond-adapters-vision`'s `MIN_CLASSIFIER_CONFIDENCE`; the live gate is
+/// `POST /api/v1/camera/events`, whose confidence is client-sent. No confidence at all is kept.
 pub const MIN_CAMERA_CONFIDENCE: f64 = 0.5;
 
 // ── Refusals ────────────────────────────────────────────────────────────────
@@ -211,10 +95,8 @@ pub enum DropReason {
 
 /// Why a bus event did not become a context item.
 ///
-/// Every variant is a decision somebody made, and the ones that name a missing
-/// prerequisite quote [`SourceAvailability::refusal`] rather than restating it —
-/// there is exactly one sentence in this tree saying what a connector is waiting
-/// for and a second one would go stale.
+/// Variants naming a missing prerequisite quote [`SourceAvailability::refusal`] rather than
+/// restating it: one sentence in this tree says what a connector waits for, a second would rot.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum NotIngested {
     #[error(
@@ -285,10 +167,8 @@ pub enum NotIngested {
 
 /// Turns bus events into [`RawItem`]s for the sources that follow them.
 ///
-/// Constructed only from [`Settings`], so there is no way to hold one without
-/// having answered `context_ingest_enabled`. That is the same move PAI-6 P1 made
-/// with `DelegationDepth`: a toggle a caller can forget to read is a toggle that
-/// is on.
+/// Constructed only from [`Settings`], so there is no way to hold one without having answered
+/// `context_ingest_enabled`: a toggle a caller can forget to read is a toggle that is on.
 #[derive(Debug, Clone)]
 pub struct BusProducer {
     enabled: bool,
@@ -309,9 +189,8 @@ impl BusProducer {
 
     /// One event, one source: an item or a named refusal.
     ///
-    /// Pure. It reads no clock, no store and no global, so the same event and
-    /// the same source give the same answer forever — which is what makes the
-    /// idempotency claim below testable rather than asserted.
+    /// Pure — no clock, no store, no global — so the same event and source always give the same
+    /// answer, which is what makes the idempotency claim below testable.
     pub fn raw_item_for(
         &self,
         source: &ContextSource,
@@ -332,11 +211,10 @@ impl BusProducer {
             });
         }
 
-        // 2. Of the kinds that HAVE landed, which does the bus feed? Exhaustive
-        //    and wildcard-free: a ninth SourceKind does not compile until it is
-        //    answered. The connector arm is unreachable while step 1 stands, and
-        //    is written anyway so that promoting a kind to `Landed` does not
-        //    silently make it ingestable from the bus.
+        // 2. Of the kinds that HAVE landed, which does the bus feed? Exhaustive and
+        //    wildcard-free, so a ninth SourceKind does not compile until it is answered. The
+        //    connector arm is unreachable while step 1 stands, and is written anyway so
+        //    promoting a kind to `Landed` does not silently make it bus-ingestable.
         match source.kind() {
             SourceKind::Sensor | SourceKind::Camera => {}
             SourceKind::Voice => return Err(NotIngested::VoiceIsCuratedByMemoryExtraction),
@@ -351,17 +229,10 @@ impl BusProducer {
             }
         }
 
-        // 3. This source's own state. A kind can be landed and the member can
-        //    still have paused THIS source, and pausing is the only control they
-        //    have that stops the copying without deleting what is already
-        //    stored. Exhaustive and wildcard-free for the same reason as the
-        //    match above: a fifth status must be dispositioned, not defaulted.
-        //
-        //    Everything that is not `Connected` refuses, which is the narrowing
-        //    direction and matters more here than it looks: `SourceStatus::parse`
-        //    already reads an unrecognised stored string as `Error`, so a corrupt
-        //    row arrives here as `Error` and must not be the one that says
-        //    "carry on copying".
+        // 3. This source's own state; pausing is the member's only control that stops copying
+        //    without deleting what is stored. Exhaustive and wildcard-free: a fifth status must
+        //    be dispositioned. Everything not `Connected` refuses, which matters because
+        //    `SourceStatus::parse` reads an unrecognised stored string as `Error`.
         match source.status() {
             SourceStatus::Connected => {}
             status @ (SourceStatus::NeedsReauth | SourceStatus::Error | SourceStatus::Paused) => {
@@ -375,13 +246,9 @@ impl BusProducer {
         match event {
             BusEvent::Sensor(reading) => self.item_from_sensor(source, reading),
             BusEvent::Camera(camera) => self.item_from_camera(source, camera),
-            // A device state change is mostly the pond's own actuation coming
-            // back: the assistant turned the lamp on and the lamp reports
-            // `power = true`. More decisively, there is no landed `SourceKind`
-            // whose sensitivity floor and retention window were chosen for it —
-            // `retention_category() == Device` holds only for `Mobile`, which is
-            // `AwaitingIngestRoute`. Filing it under `Sensor` would classify a
-            // record of what the household switched on and off as a measurement.
+            // No landed `SourceKind` has a sensitivity floor or retention window chosen for a
+            // device state change: `retention_category() == Device` holds only for `Mobile`,
+            // which is `AwaitingIngestRoute`.
             BusEvent::Device(_) => Err(NotIngested::NoLandedSourceKindDescribesIt),
             // The pond noticing itself. `proactive_review::reviewable` refuses
             // exactly this pair for the same reason, and this is the second
@@ -395,19 +262,10 @@ impl BusProducer {
         }
     }
 
-    /// Every (source, item) pair one event produces across a household's
-    /// sources.
+    /// Every (source, item) pair one event produces across a household's sources.
     ///
-    /// Plural on purpose. Two members may each create a source following the
-    /// same front-door camera, and each then gets the item in their own corpus
-    /// under their own `profile_id`. The ids do not collide — the stored id is
-    /// `{source_id}:{external_id}` — so this is two rows by design rather than a
-    /// write race.
-    ///
-    /// Refusals are dropped here rather than returned: this is the call the
-    /// wiring makes for every event on the bus, and the overwhelmingly common
-    /// answer is "no source follows this device". Use
-    /// [`raw_item_for`](Self::raw_item_for) when the reason matters.
+    /// Two members may follow the same camera; the stored id `{source_id}:{external_id}` keeps
+    /// their rows distinct. Refusals are dropped; use [`raw_item_for`](Self::raw_item_for).
     pub fn items_for<'a>(
         &self,
         sources: &'a [ContextSource],
@@ -500,12 +358,9 @@ impl BusProducer {
             kind: ItemKind::Event,
             occurred_at: camera.created_at,
             title: format!("{} at {}", camera.event_type, camera.camera_id),
-            // `snapshot_path` and `metadata` are deliberately absent. The body
-            // is text a model reads back into its window: a filesystem path is
-            // not a household fact and is wrong the moment the file is pruned,
-            // and `metadata` is adapter-controlled JSON of unbounded size, which
-            // is token cost against PAI-3's asymmetry rule with no reading
-            // benefit. Neither is lost — both stay on the camera_events row.
+            // `snapshot_path` and `metadata` are deliberately absent: the body is text a model
+            // reads back into its window, and adapter-controlled JSON of unbounded size is token
+            // cost with no reading benefit. Both stay on the camera_events row.
             body,
             participants: Vec::new(),
         })
@@ -516,32 +371,8 @@ impl BusProducer {
 
 /// The external id of a sensor reading: `sensor:{device}:{signal}:{instant}`.
 ///
-/// **What it is derived from, and why those three.** The triple identifies the
-/// reading uniquely — one device cannot report two values for one signal at one
-/// instant — and every part of it travels in the event, so the id is a function
-/// of the event and of nothing else. No clock is read and no counter is kept.
-///
-/// **What re-ingesting the same event does.** `IngestPipeline` stores an item
-/// under `{source_id}:{external_id}` and `ContextRepository::save_item` is
-/// idempotent on `(source_id, external_id)`, so a second delivery of the same
-/// reading UPDATEs the row the first one wrote. Nothing accumulates. That is not
-/// a theoretical case: a cursor that slips backwards is normal, the bus is a
-/// broadcast channel a restarted consumer re-reads from, and a store that
-/// answered a re-delivery with a duplicate would fill the corpus with the same
-/// three readings.
-///
-/// **The value is NOT in the key**, deliberately: two readings at the same
-/// instant from the same device for the same signal are the same reading, and
-/// putting a `f64` in a primary key means the row identity depends on float
-/// formatting.
-///
-/// **Quantising the instant was considered and rejected.** Bucketing to the
-/// minute would collapse a polling bridge's repeats into one row and would look
-/// like a free rate limit. It is not free: two genuinely different readings in
-/// the same minute would then share a row, so the second silently destroys the
-/// first. That is a lossy policy wearing an idempotency key's clothes, and it
-/// would make "re-ingesting the same event is idempotent" and "ingesting a
-/// different event is not" stop being the same claim.
+/// Derived from the event alone, and `save_item` is idempotent on `(source_id, external_id)`, so
+/// a bus re-delivery UPDATEs the row. The value is out of the key; the instant is not quantised.
 fn sensor_external_id(reading: &SensorReading) -> String {
     format!(
         "sensor:{}:{}:{}",
@@ -553,13 +384,8 @@ fn sensor_external_id(reading: &SensorReading) -> String {
 
 /// The external id of a camera event: `camera:{camera}:{type}:{instant}`.
 ///
-/// [`CameraEvent::id`] is the upstream's own primary key and is deliberately NOT
-/// used. It is `None` until the row is persisted, and both publishers in this
-/// tree (`pond-adapters-vision`'s pipeline and the `POST /camera/events` route)
-/// persist first and stamp it before publishing — so it is populated today, and
-/// keying on it would mean any publisher that ever published before persisting
-/// mints a SECOND row for an event already stored. Deriving from the event's own
-/// content cannot develop that failure mode.
+/// [`CameraEvent::id`] is deliberately NOT used: it is `None` until the row is persisted, so a
+/// publisher that ever published before persisting would mint a SECOND row for a stored event.
 fn camera_external_id(camera: &CameraEvent) -> String {
     format!(
         "camera:{}:{}:{}",
@@ -599,13 +425,9 @@ fn camera_is_worth_keeping(camera: &CameraEvent) -> Result<(), DropReason> {
             event_type: camera.event_type.clone(),
         });
     }
-    // Written as "at or above the floor is kept" rather than "below the floor is
-    // dropped". Those are the same statement for every real number and NOT the
-    // same for `NaN`: `NaN < 0.5` is false, so the negative form keeps a
-    // confidence that is not a number. That value arrives from outside this
-    // repo — `POST /api/v1/camera/events` hands over whatever a paired client
-    // sent — and an unreadable confidence must narrow to a refusal rather than
-    // widen to an accepted row.
+    // Written as "at or above the floor is kept" rather than "below is dropped": `NaN < 0.5` is
+    // false, so the negative form would keep a confidence that is not a number. That value comes
+    // from outside this repo via `POST /api/v1/camera/events`, so it must narrow to a refusal.
     match camera.confidence {
         None => Ok(()),
         Some(c) if c >= MIN_CAMERA_CONFIDENCE => Ok(()),
@@ -684,14 +506,8 @@ mod tests {
 
     /// The name of a variant, by an exhaustive match with NO wildcard arm.
     ///
-    /// This exists so the fixture below is quantified over the enum rather than
-    /// over a list somebody kept up to date. A seventh `BusEvent` variant is a
-    /// compile error HERE as well as in `raw_item_for`, and the two are
-    /// different claims: the first says the producer decided, this says the
-    /// sweep still covers what it decided about. A plain `assert_eq!(len, 6)`
-    /// would have said neither — six entries still number six after a seventh
-    /// variant is added, so a count alone is satisfied by a fixture that has
-    /// gone stale, which is the failure it reads as guarding against.
+    /// Quantifies the fixture below over the enum rather than a hand-kept list: a seventh
+    /// `BusEvent` variant is a compile error here, where a count assertion would still pass.
     fn variant_name(event: &BusEvent) -> &'static str {
         match event {
             BusEvent::Sensor(_) => "sensor",
@@ -775,16 +591,10 @@ mod tests {
 
     // ── 1. Every variant is dispositioned ───────────────────────────────────
 
-    /// The event match has no wildcard arm.
-    ///
-    /// The module doc claims a seventh `BusEvent` variant cannot silently join,
-    /// and that claim rests entirely on rustc's exhaustiveness check — which a
-    /// single `_ =>` added by a later refactor switches off, with no compile
-    /// error, no failing test, and a new kind of household event answering
-    /// whatever the wildcard says. That is precisely the silent-and-expensive
-    /// shape this programme keeps rediscovering, so the absence is asserted
-    /// rather than commented. `ingest.rs` guards `RawItem`'s fields the same
-    /// way, and for the same reason: some properties are about the source text.
+    /// The event match has no wildcard arm, which is what makes the module doc's claim that a
+    /// seventh `BusEvent` variant cannot silently join hold: a single `_ =>` switches rustc's
+    /// exhaustiveness off with no compile error and no failing test. `ingest.rs` guards
+    /// `RawItem`'s fields the same way.
     #[test]
     fn the_event_match_has_no_wildcard_arm() {
         const SRC: &str = include_str!("producer.rs");
@@ -990,8 +800,10 @@ mod tests {
                 !availability.refusal().is_empty() && rendered.contains(availability.refusal()),
                 "the refusal does not carry the availability table's own sentence: {rendered}"
             );
+            // Names the MISSING THING, not a phase number: a guard that pins a phase id
+            // outlives the phase, one that pins the mechanism does not.
             assert!(
-                rendered.contains("PAI-8 P3") || rendered.contains("PAI-2 P6b"),
+                rendered.contains("ingest route") || rendered.contains("connector"),
                 "the refusal does not name what has to land first: {rendered}"
             );
         }
@@ -1001,9 +813,9 @@ mod tests {
         // this test pass having asserted nothing.
         assert_eq!(
             refused,
-            SourceKind::ALL.len() - 3,
-            "exactly the five connector kinds are unlanded; if that changed, this sweep is no \
-             longer testing what it claims"
+            SourceKind::ALL.len() - 5,
+            "sensor, camera, voice, mail and calendar have a path; files and chat do not. If \
+             that changed, this sweep is no longer testing what it claims"
         );
         assert!(
             p.raw_item_for(&source(SourceKind::Sensor, HALL_PIR), &event)
@@ -1130,18 +942,10 @@ mod tests {
         assert_ne!(base, other_device, "two devices share a row");
     }
 
-    /// The producer reads no clock.
-    ///
-    /// **Repetition alone does not prove this, and finding that out is why the
-    /// assertion below leads.** The obvious form — mint the id twenty-five times
-    /// and demand one distinct answer — was the only form this test had, and a
-    /// mutation replacing `reading.recorded_at` with `Utc::now()` PASSED it:
-    /// [`instant`] renders milliseconds, and twenty-five calls to `format!` fall
-    /// inside one of those. A guard whose subject is "does this read a clock"
-    /// cannot itself be decided by how fast the clock ticks. So the claim is
-    /// made positively instead — the key contains the EVENT's own instant — and
-    /// the repetition is kept underneath it as the cheaper check on everything
-    /// else in the item.
+    /// The producer reads no clock. Repetition alone cannot prove that: [`instant`] renders
+    /// milliseconds, so minting the id repeatedly still passes under `Utc::now()`. The lead
+    /// assertion is positive instead — the key contains the EVENT's own instant — with the
+    /// repetition kept underneath as the cheaper check on the rest of the item.
     #[test]
     fn the_external_id_is_a_function_of_the_event_and_nothing_else() {
         let p = producer();
@@ -1310,14 +1114,9 @@ mod tests {
             .is_ok());
     }
 
-    /// A confidence that is not a number is refused.
-    ///
-    /// The obvious spelling of this rule — `Some(c) if c < FLOOR => drop` —
-    /// KEEPS `NaN`, because every comparison with `NaN` is false. That is the
-    /// widening direction on a value this repo does not produce: the vision
-    /// pipeline's confidence is computed, but `POST /api/v1/camera/events`
-    /// carries whatever a paired client sent. An unreadable confidence has to
-    /// narrow to a refusal, which is invariant 2 applied to a float.
+    /// A confidence that is not a number is refused: `Some(c) if c < FLOOR => drop` would KEEP
+    /// `NaN`, since every `NaN` comparison is false. `POST /api/v1/camera/events` carries
+    /// whatever a paired client sent, so an unreadable confidence must narrow to a refusal.
     #[test]
     fn a_confidence_that_is_not_a_number_is_refused_rather_than_kept() {
         let p = producer();
@@ -1348,11 +1147,9 @@ mod tests {
             .is_err());
     }
 
-    /// Vacuity control for both rules above: neither constant is empty and
-    /// neither rule is a constant function. Without this, emptying
-    /// `DISCRETE_SENSOR_TYPES` would make the drop half of the sensor test pass
-    /// while the keep half is the only thing that fails, and the failure would
-    /// read as a fixture problem.
+    /// Vacuity control for both rules above: neither constant is empty and neither rule is a
+    /// constant function. Without it, emptying `DISCRETE_SENSOR_TYPES` leaves only the keep
+    /// half of the sensor test failing, which reads as a fixture problem.
     #[test]
     fn the_worth_keeping_rules_are_not_constant_functions() {
         assert!(!DISCRETE_SENSOR_TYPES.is_empty());

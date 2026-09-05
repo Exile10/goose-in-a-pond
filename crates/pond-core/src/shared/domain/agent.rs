@@ -3,6 +3,28 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Mutex;
 
+/// One step of the boot-time prefix warm-up (see `Agent::prewarm`).
+///
+/// Three states, not a percentage: the engine exposes no progress inside a
+/// model load or a prefill, and a bar that invents numbers is worse than one
+/// that says what it knows. `Warming` covers everything between "asked" and
+/// "the first token came back"; the UI renders it as an indeterminate bar
+/// with elapsed time, and voice mode speaks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WarmupPhase {
+    /// The warm-up generation is running: model load + prompt-prefix prefill.
+    Warming,
+    /// The prefix is resident in the engine's KV cache; turn 1 will reuse it.
+    Ready,
+    /// Nothing to warm on this backend (mock, HTTP providers) or explicitly
+    /// disabled. The UI shows nothing; voice skips the "warming up" line.
+    Skipped { reason: String },
+    /// The warm-up generation failed. Chat still works — the first real turn
+    /// simply pays the full prefill, exactly as before this feature existed.
+    Failed { reason: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
     pub message: String,
@@ -286,6 +308,12 @@ impl fmt::Display for WorkflowState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum WorkflowEvent {
+    /// Prefix warm-up progress at session start (see `Agent::prewarm`).
+    /// `state` is `warming` while the model loads and the prompt prefix
+    /// prefills, then exactly one of `ready` / `skipped` / `failed`. Emitted
+    /// BEFORE `Ready`, so a shell can show "warming up" during the one stretch
+    /// where the child is alive but cannot yet listen.
+    Warmup { state: String },
     /// Emitted once after models are loaded, before entering the wait loop.
     Ready { session_id: String },
     /// A workflow state transition. Serializes as

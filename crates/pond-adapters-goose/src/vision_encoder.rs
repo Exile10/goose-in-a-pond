@@ -1,27 +1,7 @@
-//! Vision-encoder (mmproj) resolution for GIAP-registered GGUF models.
-//!
-//! # Why this exists
-//!
-//! The engine's multimodal path is gated on exactly one thing:
-//! `has_vision = request.resolved_model.mmproj_path.is_some()`
-//! (`goose-local-inference/src/llamacpp/mod.rs`). Everything else — the
-//! `vision_capable` settings flag, the featured-model table — is advisory.
-//!
-//! `GooseAdapter::register_gguf_model` registers GIAP's own GGUFs under a BARE
-//! STEM (`gemma-4-E2B-it`) with `repo_id = "local/<stem>"`, because GIAP owns the
-//! files under its own data dir and must not let goose treat them as deletable
-//! goose-managed storage. That choice has a side effect: goose's own
-//! `LocalModelEntry::enrich_with_featured_mmproj` looks the model up with
-//! `featured_mmproj_spec(&self.id)`, which compares against the featured HF repo
-//! id (`unsloth/gemma-4-E2B-it-GGUF`). A bare stem never matches, so
-//! `mmproj_path` stayed `None` forever and no GIAP-registered model could ever
-//! see an image, however vision-capable the weights were.
-//!
-//! This module closes that gap on the GIAP side: map a stem back to its featured
-//! entry, fetch the encoder once into a GIAP-owned directory, and stamp the
-//! registry entry. `resolve_model_path` runs on EVERY `Provider::stream`, so a
-//! stamp taken after a background download turns vision on for the next turn —
-//! no provider rebuild, no restart.
+//! Vision-encoder (mmproj) resolution for GIAP-registered GGUF models. The engine enables image
+//! input only when a registry entry has `mmproj_path` set; goose's featured lookup never matches
+//! the bare stem `register_gguf_model` registers, so this module fetches the encoder into a
+//! GIAP-owned directory and stamps the entry. The stamp is re-read on every `Provider::stream`.
 
 use goose::providers::local_inference::local_model_registry::{
     get_registry, MmprojSpec, FEATURED_MODELS,
@@ -30,18 +10,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// Directory holding downloaded vision encoders.
-///
-/// Deliberately NOT `models/gguf/`: `resolve_gguf_filename` and
-/// `canonical_model_stem` scan that directory for `*.gguf` to map a display name
-/// onto a weights file, and an `mmproj-BF16.gguf` sitting in there is a
-/// candidate they would have to learn to ignore. Keeping encoders in their own
-/// subtree means those scans stay as simple as they are.
-/// The directory name is the NORMALISED model name, not the caller's spelling.
-/// Registration passes the collapsed registry stem (`gemma-4-E2B-it`) while the
-/// capability and readiness checks pass the settings spelling
-/// (`gemma-4-E2B-it-Q4_K_M`); both must land on one directory or the encoder is
-/// downloaded twice and found neither time.
+/// Directory holding downloaded vision encoders. Kept outside `models/gguf/` so the `*.gguf`
+/// scans in `resolve_gguf_filename` and `canonical_model_stem` never meet an encoder file. The
+/// leaf is the NORMALISED name: registration passes the collapsed stem while readiness checks
+/// pass the settings spelling, and both must land on one directory or the encoder downloads twice.
 #[must_use]
 pub fn mmproj_dir(data_dir: &Path, model_name: &str) -> PathBuf {
     data_dir
@@ -50,13 +22,9 @@ pub fn mmproj_dir(data_dir: &Path, model_name: &str) -> PathBuf {
         .join(normalize_model_name(model_name))
 }
 
-/// The featured vision-encoder spec for a GIAP registry stem, if the model
-/// declares one.
-///
-/// Matching is by normalised name rather than repo id: GIAP's stem is
-/// `gemma-4-E2B-it` and the featured repo is `unsloth/gemma-4-E2B-it-GGUF`, so
-/// the comparison strips the owner prefix, a trailing `-GGUF`, and any quant
-/// suffix the caller left on, then compares case-insensitively.
+/// The featured vision-encoder spec for a GIAP registry stem, if the model declares one.
+/// Matching is by normalised name, not repo id: the owner prefix, a trailing `-GGUF` and any
+/// quant suffix are stripped from both sides before a case-insensitive comparison.
 #[must_use]
 pub fn featured_mmproj_for_stem(stem: &str) -> Option<&'static MmprojSpec> {
     let wanted = normalize_model_name(stem);
@@ -68,18 +36,10 @@ pub fn featured_mmproj_for_stem(stem: &str) -> Option<&'static MmprojSpec> {
     })
 }
 
-/// Collapse a model spelling to a comparable key.
-///
-/// Drops the HF owner, a trailing `-GGUF`, a quant suffix in either spelling
-/// (`:Q4_K_M` as goose writes it, `-Q4_K_M` as GIAP's settings do), a `.gguf`
-/// extension, and case. Everything else is preserved, so `E2B` and `E4B` (and
-/// `E1B`, which has NO encoder) stay distinct.
-///
-/// The dash-quant strip is unconditional here, unlike `canonical_model_stem`
-/// which only collapses when both spellings resolve to the same file on disk.
-/// That check exists to protect a deliberate quant PIN from losing its identity;
-/// which vision encoder a model uses is a property of the family, not the quant,
-/// so no such care is needed.
+/// Collapse a model spelling to a comparable key: drops the HF owner, a trailing `-GGUF`, a quant
+/// suffix in either spelling (`:Q4_K_M` or `-Q4_K_M`), a `.gguf` extension, and case. `E2B`, `E4B`
+/// and `E1B` (which has NO encoder) stay distinct. Unlike `canonical_model_stem`, the dash-quant
+/// strip is unconditional because the encoder is a property of the family, not the quant.
 fn normalize_model_name(raw: &str) -> String {
     let no_owner = raw.rsplit('/').next().unwrap_or(raw);
     let no_colon_quant = no_owner.split(':').next().unwrap_or(no_owner);
@@ -97,13 +57,9 @@ fn normalize_model_name(raw: &str) -> String {
     }
 }
 
-/// `true` when the model declares a vision encoder, whether or not the encoder
-/// bytes are on disk yet.
-///
-/// This is what the UI should gate its attach affordance on: a user who has just
-/// selected a vision model should not be told the model cannot read images
-/// merely because a ~1 GB download has not finished. The turn itself checks for
-/// the bytes and says so precisely (see [`mmproj_ready`]).
+/// `true` when the model declares a vision encoder, whether or not the bytes are on disk yet.
+/// The UI should gate its attach affordance on this rather than on a ~1 GB download having
+/// finished; the turn itself checks for the bytes via [`mmproj_ready`] and says what is missing.
 #[must_use]
 pub fn declares_vision(model_name: &str) -> bool {
     featured_mmproj_for_stem(model_name).is_some()
@@ -116,11 +72,8 @@ pub fn mmproj_ready(data_dir: &Path, stem: &str) -> bool {
     resolved_mmproj_path(data_dir, stem).is_some()
 }
 
-/// The on-disk encoder for a stem, if it is already downloaded.
-///
-/// Checks GIAP's own directory first, then the path goose would have used, so an
-/// encoder fetched by goose's model manager is reused rather than downloaded
-/// twice.
+/// The on-disk encoder for a stem, if already downloaded. GIAP's own directory is checked first,
+/// then the path goose's model manager would have used, so an encoder is never fetched twice.
 #[must_use]
 pub fn resolved_mmproj_path(data_dir: &Path, stem: &str) -> Option<PathBuf> {
     let spec = featured_mmproj_for_stem(stem)?;
@@ -194,15 +147,10 @@ fn in_flight() -> &'static Mutex<HashSet<String>> {
     IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Ensure the vision encoder for `stem` is available, downloading it in the
-/// background if it is not.
-///
-/// Returns immediately. Deliberately NOT blocking: the encoder is ~1 GB and this
-/// runs inside a provider build on the path of a model switch, so blocking would
-/// stall the first chat after switching models for minutes with no feedback.
-/// Instead the turn that needs it reports precisely what is missing
-/// ([`mmproj_ready`]), and the stamp lands as soon as the bytes do — the engine
-/// re-reads the registry on every generation, so nothing has to be restarted.
+/// Ensure the vision encoder for `stem` is available, downloading it in the background if not.
+/// Returns immediately: this runs inside a provider build on the model-switch path, and blocking
+/// on a ~1 GB transfer would stall the first chat for minutes. The turn reports what is missing
+/// via [`mmproj_ready`]; the engine re-reads the registry per generation, so the stamp lands live.
 pub fn ensure_mmproj_available(data_dir: &Path, stem: &str) {
     let Some(spec) = featured_mmproj_for_stem(stem) else {
         return; // text-only model, nothing to fetch
@@ -265,10 +213,8 @@ async fn download_to(url: &str, dir: &Path, dest: &Path) -> anyhow::Result<u64> 
     tokio::fs::create_dir_all(dir).await?;
     let part = dest.with_extension("part");
 
-    // PAI-2 P6a: one gate for the whole encoder fetch. This is the single
-    // choke point -- every caller reaches the network through here -- and it
-    // runs inside a spawned task, so `record_egress`'s `tokio::spawn` has a
-    // runtime. The caller already logs a failed download as a warning and
+    // PAI-2 P6a: the single egress gate for every encoder fetch. It runs inside a spawned task,
+    // so `record_egress`'s `tokio::spawn` has a runtime. The caller logs a failed download and
     // leaves the model text-only, so a refusal degrades rather than breaks.
     let call = pond_core::shared::services::egress::begin(url, "GET")?;
     let sent = reqwest::Client::builder()
@@ -308,12 +254,9 @@ mod tests {
         assert_eq!(spec.filename, "mmproj-BF16.gguf");
     }
 
-    /// Both quant spellings must resolve. This is not cosmetic: `Settings`
-    /// stores `chat_model = "gemma-4-E2B-it-Q4_K_M"` while the registry key is
-    /// the collapsed stem `gemma-4-E2B-it`, and BOTH are passed to this module
-    /// (the capability check and the turn-time readiness check use the settings
-    /// spelling; registration uses the stem). An earlier version only stripped a
-    /// colon-quant and reported the real on-disk vision model as text-only.
+    /// Both quant spellings must resolve: `Settings` stores `chat_model = "gemma-4-E2B-it-Q4_K_M"`
+    /// while the registry key is the collapsed stem `gemma-4-E2B-it`, and both spellings reach
+    /// this module (readiness and capability checks use the settings one, registration the stem).
     #[test]
     fn both_quant_spellings_resolve() {
         assert!(featured_mmproj_for_stem("gemma-4-E2B-it-Q4_K_M").is_some());

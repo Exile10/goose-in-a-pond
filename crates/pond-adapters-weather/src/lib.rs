@@ -11,13 +11,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Send a prepared request and report the egress to the shared tracker (#113).
-///
-/// This adapter reaches the network with its own `reqwest::Client`, so it can't
-/// use `pond-mcp-server`'s `traced_get`; instead it reports directly into
-/// `pond-core`'s egress tracker. Records host / method / status / latency for
-/// every weather + geocoding call so it appears in the activity API alongside
-/// the other built-in tools. Returns the raw result so callers keep their own
-/// `.context(...)` / `.error_for_status()` handling.
+/// This adapter has its own `reqwest::Client`, so it cannot use `pond-mcp-server`'s
+/// `traced_get`; it records host, method, status and latency into `pond-core` itself
+/// and returns the raw result so callers keep their own error handling.
 pub(crate) async fn traced_send(
     builder: reqwest::RequestBuilder,
     url: &str,

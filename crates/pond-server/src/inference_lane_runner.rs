@@ -92,6 +92,9 @@ struct Registration {
     interval_floor: Duration,
     /// This job's own quiet requirement — see `JobState::idle_threshold`.
     idle_threshold: Duration,
+    /// May this job run before the pond has served a turn — see
+    /// `JobState::exempt_from_activity_gate`.
+    exempt_from_activity_gate: bool,
 }
 
 /// The shared inference slot and the registry of what wants it.
@@ -133,6 +136,12 @@ impl InferenceLane {
         saw_activity_since_start: bool,
         idle_for: Duration,
         idle_threshold: Duration,
+        // Whether THIS job may run on a pond that has served no turn since
+        // boot. Registered per job rather than folded into
+        // `saw_activity_since_start`, which is lane-wide: relaxing that to let
+        // one job through qualified every other registered job at the same
+        // time, and the tick went to whichever was declared first.
+        exempt_from_activity_gate: bool,
     ) -> Option<LaneSlot<'_>> {
         {
             let mut registry = self.registry.lock().await;
@@ -142,6 +151,7 @@ impl InferenceLane {
                     enabled,
                     interval_floor,
                     idle_threshold,
+                    exempt_from_activity_gate,
                 },
             );
         }
@@ -161,6 +171,7 @@ impl InferenceLane {
                     since_last_run: last_run.get(&j).map(|t| now.duration_since(*t)),
                     interval_floor: reg.interval_floor,
                     idle_threshold: reg.idle_threshold,
+                    exempt_from_activity_gate: reg.exempt_from_activity_gate,
                 })
                 .collect();
 
@@ -228,9 +239,19 @@ mod tests {
     const IDLE_THRESHOLD: Duration = Duration::from_secs(900);
     const LONG_IDLE: Duration = Duration::from_secs(3600);
 
+    /// `false` for the exemption: these tests are about the shared gate and the
+    /// tie-break between jobs, both of which an exempt job skips entirely.
     async fn ask(lane: &InferenceLane, job: LaneJob) -> Option<LaneSlot<'_>> {
-        lane.acquire(job, true, Duration::ZERO, true, LONG_IDLE, IDLE_THRESHOLD)
-            .await
+        lane.acquire(
+            job,
+            true,
+            Duration::ZERO,
+            true,
+            LONG_IDLE,
+            IDLE_THRESHOLD,
+            false,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -328,6 +349,7 @@ mod tests {
                 true,
                 Duration::from_secs(5), // user active 5s ago
                 IDLE_THRESHOLD,
+                false, // not exempt — the gate is the subject
             )
             .await;
         assert!(slot.is_none());

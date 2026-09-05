@@ -1,42 +1,7 @@
-//! Personal context streaming — the domain (PAI-8 P1).
-//!
-//! A [`ContextSource`] is an account, sensor or device that produces data about
-//! one household member. A [`ContextItem`] is one thing it produced. Section 5
-//! of `docs/architecture/pai/08-personal-context-streaming.md` lists seven
-//! invariants; three of them are shapes, and this module tries to make the
-//! compiler hold them rather than a runtime check that a later refactor deletes.
-//!
-//! # Invariant 1 — every item has an owner and a sensitivity
-//!
-//! `profile_id` is a `String` and not an `Option<String>`. PAI-1 section 1.2
-//! records what the alternative costs: `None` is always available, so it becomes
-//! the value every call site passes, and the whole household shared one pool.
-//! A `String` still has `""`, so [`ContextItem::from_parts`] refuses a blank
-//! one — and neither type derives `Deserialize`, so there is no serde door past
-//! the constructor.
-//!
-//! Sensitivity is **derived, never supplied**. A caller cannot classify its own
-//! item as `Public`: the classification is `max(the source kind's floor, what
-//! the redactor found)`, computed inside the constructor.
-//!
-//! # Invariant 3 — redaction precedes persistence
-//!
-//! This is the load-bearing one for P1, and it is not enforced by a decorator.
-//! PAI-2 P3's chokepoint 1 wraps `MemoryRepository` in
-//! [`RedactingMemoryRepository`], which is correct and which stops holding the
-//! day somebody constructs the inner repository directly. Here the redactor is a
-//! **parameter of the only constructor**: there is no way to obtain a
-//! `ContextItem` at all — on the ingest path or on the storage read path —
-//! without handing over a [`Redactor`]. `ContextRepository::save_item` takes a
-//! `&ContextItem`, so "redacted" is a property of the value rather than of the
-//! path it travelled.
-//!
-//! The storage adapter rebuilds a stored row through the same constructor, which
-//! means the read path re-redacts. That is free of behaviour for a row written
-//! properly — [`Redactor::redact`] is contractually idempotent — and it is a
-//! repair for a row that reached the table some other way.
-//!
-//! [`RedactingMemoryRepository`]: crate::user_data::services::redacting_memory_repository::RedactingMemoryRepository
+//! Personal context streaming — the domain (PAI-8 P1). Invariants are section 5 of
+//! `docs/architecture/pai/08-personal-context-streaming.md`, held by the types: `profile_id` is a
+//! non-blank `String`, sensitivity is derived rather than supplied, and [`ContextItem::from_parts`]
+//! is the only constructor and takes a [`Redactor`], so nothing reaches storage un-redacted.
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -45,20 +10,10 @@ use crate::security::domain::event::{EventCategory, PrivacySensitivity};
 use crate::security::domain::redaction::{RedactionKind, RedactionLevel};
 use crate::security::ports::redactor::Redactor;
 
-/// How much the ingest chokepoint removes.
-///
-/// `Secrets`, not `Full`, and the reasoning is
-/// [`RedactingMemoryRepository::LEVEL`]'s verbatim: a context item is read back
-/// into the model's context, and PAI-2 section 3.3's non-goal — the model is not
-/// blindfolded — dies if the assistant can never tell you who the e-mail was
-/// from. A credential is different: it rotates, it is never worth recalling, and
-/// its presence in a durable store is pure liability.
-///
-/// The two chokepoints agree deliberately. A pond that redacts a phone number
-/// out of an ingested message but keeps it in the memory extracted from that
-/// same message has spent the cost and bought nothing.
-///
-/// [`RedactingMemoryRepository::LEVEL`]: crate::user_data::services::redacting_memory_repository::RedactingMemoryRepository::LEVEL
+/// How much the ingest chokepoint removes. `Secrets`, not `Full`: a context item is read back
+/// into the model's context, and PAI-2 section 3.3's non-goal — the model is not blindfolded —
+/// dies if names go too. Must stay equal to `RedactingMemoryRepository::LEVEL`; redacting at one
+/// chokepoint and not the other spends the cost and buys nothing.
 pub const INGEST_REDACTION_LEVEL: RedactionLevel = RedactionLevel::Secrets;
 
 // ── Source kind ─────────────────────────────────────────────────────────────
@@ -84,16 +39,10 @@ pub enum SourceKind {
     Chat,
 }
 
-/// Whether P1's pipeline will accept items from a kind, and if not, what has to
-/// land first.
+/// Whether P1's pipeline will accept items from a kind, and if not, what has to land first.
 ///
-/// This is the deadlock recorded in PAI-8 section 3 and PAI-2 P6b, written as a
-/// type rather than as a paragraph. It is not decoration: [`IngestPipeline`]
-/// refuses every kind that is not [`Landed`](SourceAvailability::Landed), so
-/// "connectors are a later phase" is something the code enforces rather than
-/// something a reviewer has to remember.
-///
-/// [`IngestPipeline`]: crate::context::ingest::IngestPipeline
+/// [`IngestPipeline`](crate::context::ingest::IngestPipeline) refuses every kind that is not
+/// [`Landed`](SourceAvailability::Landed), which is how PAI-8 section 3's phasing is enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceAvailability {
     /// Ingest works today. Data this pond already holds; nothing leaves.
@@ -102,11 +51,11 @@ pub enum SourceAvailability {
     /// reaches out for these — a paired client pushes them — so no egress gate
     /// is involved, only an authenticated route that does not exist yet.
     AwaitingIngestRoute,
-    /// Waiting on PAI-2 P6b: the draft gate for outbound connector actions, and
-    /// redaction chokepoint 3 (before a body leaves the pond). Both are
-    /// unfinished, and chokepoint 3 has no call site until the first connector
-    /// exists — which is why neither side may be built assuming the other.
-    AwaitingEgressGate,
+    /// Waiting on a connector that signs in to the account and only READS. Not a security gate:
+    /// chokepoint 3 is discharged and PAI-8 §0 puts write-back out of scope. Kept because
+    /// accepting a kind nothing can produce would let `upsert_source` mint a source that stays
+    /// empty forever, and it lifts one kind at a time as each protocol's connector lands.
+    AwaitingReadConnector,
 }
 
 impl SourceAvailability {
@@ -118,10 +67,9 @@ impl SourceAvailability {
                 "this source kind is pushed to the pond by a paired client, and the ingest \
                  route it would arrive on (PAI-8 P3) does not exist yet"
             }
-            Self::AwaitingEgressGate => {
-                "this source kind needs a connector that reaches out to an account, and the \
-                 gate every outbound body must pass (PAI-2 P6b: the draft gate for connector \
-                 actions, and redaction chokepoint 3) is unfinished"
+            Self::AwaitingReadConnector => {
+                "this source kind needs a connector that signs in to the account and reads \
+                 it, and no connector for this protocol exists yet"
             }
         }
     }
@@ -168,18 +116,30 @@ impl SourceKind {
             // Data the pond already holds. Ingesting it adds no egress.
             Self::Sensor | Self::Camera | Self::Voice => SourceAvailability::Landed,
             Self::Mobile => SourceAvailability::AwaitingIngestRoute,
-            Self::Mail | Self::Calendar | Self::Files | Self::Chat => {
-                SourceAvailability::AwaitingEgressGate
-            }
+            // The CalDAV adapter reads it, the connect route stores its
+            // credentials and `calendar_sync` pulls it on a schedule. All three
+            // had to exist before this line could move: a `Landed` kind with no
+            // sync is a source that looks connected and stays empty.
+            Self::Calendar | Self::Mail => SourceAvailability::Landed,
+            Self::Files | Self::Chat => SourceAvailability::AwaitingReadConnector,
+        }
+    }
+
+    /// Whether connecting this kind means signing in to an account.
+    ///
+    /// Stated on the kind rather than checked at the route, because the connect surface and the
+    /// sync sweep both have to agree and a second copy is how they stop agreeing.
+    pub fn needs_credentials(&self) -> bool {
+        match self {
+            Self::Sensor | Self::Camera | Self::Voice | Self::Mobile => false,
+            Self::Mail | Self::Calendar | Self::Files | Self::Chat => true,
         }
     }
 
     /// The least sensitive an item from this kind may be classified.
     ///
-    /// A floor rather than a value, because the redactor's findings can only
-    /// push it up. Note that nothing here is `Public`: every one of these says
-    /// something about a person's day, and `Public` on the events log means
-    /// "safe to surface anywhere", which no personal context item is.
+    /// A floor, not a value: the redactor's findings can only push it up. Nothing here is
+    /// `Public`, which on the events log means safe to surface anywhere.
     pub fn min_sensitivity(&self) -> PrivacySensitivity {
         match self {
             // A reading is a measurement until it is about a person; "the hall
@@ -192,10 +152,8 @@ impl SourceKind {
 
     /// Which [`EventCategory`]'s retention setting governs items from this kind.
     ///
-    /// Reusing the events-log categories is deliberate. `retention_events_by_category`
-    /// is already the map the user edits, so answering "keep sensor data for
-    /// five days" governs the sensor context items too, rather than growing a
-    /// second retention vocabulary the user has to discover.
+    /// Reusing the events-log categories is deliberate: `retention_events_by_category` is the map
+    /// the user already edits, so no second retention vocabulary appears.
     pub fn retention_category(&self) -> EventCategory {
         match self {
             Self::Sensor => EventCategory::Sensor,
@@ -315,10 +273,8 @@ pub enum ContextError {
 
 /// An account, sensor or device that produces context for one household member.
 ///
-/// Private fields and no `Deserialize`, for the reason in the module docs. Note
-/// what is NOT here: a token. PAI-8 invariant 4 puts connector credentials in
-/// the encrypted secret store, so this type carries at most a `secret_ref` — the
-/// key to look one up — and the table has no column a token could be written to.
+/// No token: PAI-8 invariant 4 puts connector credentials in the encrypted secret store, so this
+/// type carries at most a `secret_ref` and the table has no column a token could be written to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextSource {
     id: String,
@@ -331,6 +287,14 @@ pub struct ContextSource {
     status: SourceStatus,
     secret_ref: Option<String>,
     created_at: DateTime<Utc>,
+}
+
+/// Where a source's sign-in details live in the secret store.
+///
+/// Derived from the source id, not stored beside it, so the two cannot drift. The connect route
+/// and the sync sweep must both call this; a second copy of the format string strands a secret.
+pub fn secret_key_for(source_id: &str) -> String {
+    format!("caldav:{source_id}")
 }
 
 /// The parts a [`ContextSource`] is built from, on both the connect path and the
@@ -421,11 +385,8 @@ impl ContextSource {
 
 /// The raw parts of an item, before redaction.
 ///
-/// `title` and `body` are the model's-eye content and are the two fields that go
-/// through the redactor. `participants` goes through it too: a participant list
-/// is where a bridge puts whatever the upstream account called the sender, and
-/// "whatever the upstream account called it" is exactly the field a credential
-/// ends up pasted into.
+/// `title`, `body` and `participants` all go through the redactor: a bridge puts whatever the
+/// upstream account called the sender into `participants`, which is where credentials land too.
 #[derive(Debug, Clone)]
 pub struct ItemParts {
     pub id: String,
@@ -466,24 +427,10 @@ pub struct ContextItem {
 }
 
 impl ContextItem {
-    /// The only constructor, and it takes the redactor.
-    ///
-    /// There is no second door — no `Deserialize`, no `new`, no
-    /// `trust_the_database` variant — so a `ContextItem` in hand is one whose
-    /// text has been through [`INGEST_REDACTION_LEVEL`]. That is what makes
-    /// invariant 3 a property of the type rather than of the call path.
-    ///
-    /// Two derivations happen here and neither is a parameter:
-    ///
-    /// * **Sensitivity.** `max(source kind floor, Sensitive if the redactor
-    ///   found anything)`. A caller cannot classify its own item as `Public`.
-    ///   When the row already carried a classification (`stored_sensitivity`),
-    ///   the answer is the stricter of the two: sensitivity is a restriction, so
-    ///   a value lowered out of band must not win.
-    /// * **`Secret` is unreachable, on purpose.** `Secret` means credentials,
-    ///   and credentials are what this level REPLACES. An item that contained an
-    ///   API key comes out `Sensitive` and without the key, which is the honest
-    ///   description of what is now stored.
+    /// The only constructor, and it takes the redactor: every `ContextItem` has been through
+    /// [`INGEST_REDACTION_LEVEL`]. Sensitivity is derived, never a parameter — the strictest of
+    /// the source kind's floor, `Sensitive` if the redactor found anything, and any
+    /// `stored_sensitivity`. `Secret` is unreachable: this level replaces credentials.
     pub fn from_parts(
         redactor: &dyn Redactor,
         parts: ItemParts,
@@ -595,11 +542,8 @@ impl ContextItem {
 
     /// The text an embedding is computed over.
     ///
-    /// Built from the REDACTED fields, which is the point: PAI-2 P3 had to drop
-    /// a memory's vector when a secret was found in it, because a vector
-    /// computed over a secret is a durable derivative of the secret. Here that
-    /// cannot arise — there is no moment at which this type holds the raw text
-    /// to embed.
+    /// Built from the REDACTED fields: a vector computed over a secret is a durable derivative of
+    /// it, and this type never holds the raw text (compare PAI-2 P3, which had to drop vectors).
     pub fn embedding_text(&self) -> String {
         if self.title.trim().is_empty() {
             self.body.clone()
@@ -821,16 +765,19 @@ mod tests {
     /// would let the pipeline accept a connector's data before the gate that is
     /// supposed to govern it exists.
     #[test]
-    fn only_the_on_pond_kinds_are_landed() {
+    fn only_kinds_with_a_working_path_are_landed() {
         let landed: Vec<&str> = SourceKind::ALL
             .into_iter()
             .filter(|k| k.availability() == SourceAvailability::Landed)
             .map(|k| k.as_str())
             .collect();
+        // A kind may only be `Landed` when something can actually produce items for it. Adding a
+        // name here before the adapter, the credential path and the sync all exist mints sources
+        // that look connected and stay empty.
         assert_eq!(
             landed,
-            vec!["sensor", "camera", "voice"],
-            "PAI-8 P1 is on-pond sources only; anything else needs a phase that has not landed"
+            vec!["sensor", "camera", "voice", "mail", "calendar"],
+            "a kind is Landed only once an adapter, a credential path and a sync exist for it"
         );
         for kind in SourceKind::ALL {
             if kind.availability() != SourceAvailability::Landed {

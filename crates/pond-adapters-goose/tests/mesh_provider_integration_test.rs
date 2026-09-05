@@ -1,11 +1,7 @@
-//! #132 Milestone 4: drives a real `GooseAdapter` turn through the new
-//! "mesh" arm in `ensure_provider_current`, using a real
-//! `MeshInferenceProvider` (mocked transport/ledger — no live network, so
-//! this runs in CI unlike the `*_live_test.rs` files in this directory).
-//!
-//! This is the integration point step 1 (`GET /api/v1/test`) couldn't cover:
-//! proving `chat_provider = "mesh"` actually reaches a real chat turn via
-//! `GooseAdapter`, not just `AppState.llm_provider`.
+//! #132 Milestone 4: drives a real `GooseAdapter` turn through the "mesh" arm of
+//! `ensure_provider_current` with a real `MeshInferenceProvider` over mocked transport and
+//! ledger, so it runs in CI unlike the `*_live_test.rs` files here. It proves that
+//! `chat_provider = "mesh"` reaches a real chat turn, not just `AppState.llm_provider`.
 
 use std::sync::Arc;
 
@@ -91,6 +87,7 @@ async fn a_chat_turn_over_an_unavailable_mesh_surfaces_a_clean_error() {
         canvas_mode: false,
         profile_scope: ProfileScope::Household,
         profile_context: None,
+        tool_group_allowlist: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();

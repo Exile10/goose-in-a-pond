@@ -25,6 +25,9 @@ export interface OnboardingDraft {
   language: string;
   timezone: string;
   locationName: string;
+  /** Filled by Auto-detect. 0/0 means unset, not the Gulf of Guinea. */
+  latitude: number;
+  longitude: number;
   enableWeather: boolean;
   // Personality & Identity
   promptStyle: string;
