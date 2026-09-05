@@ -192,6 +192,8 @@ async fn make_app(installed: Arc<Installed>) -> (axum::Router, tempfile::TempDir
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,
+        warmup: Default::default(),
+        account_sync: None,
         extension_manager: None, // the point of the test: no manager to start anything
         mcp_server_repo: Some(installed.clone()),
         tool_registry: None,
