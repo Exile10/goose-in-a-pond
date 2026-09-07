@@ -419,6 +419,91 @@ fn enforce_tools(tools: &[Tool], allowed: &Option<HashSet<String>>) -> Option<Ve
 /// re-prefilled by the local model each turn: the `"$schema"` URI, the struct-name `"title"`, and
 /// integer-width artifacts (`"format": "uintN"/"intN"` with the `minimum: 0` / power-of-two
 /// `maximum` pair serde derives). Walks nested objects but never touches `properties` KEYS.
+/// Write the final `(system, messages, tools)` as an OpenAI chat body when
+/// `GIAP_CAPTURE_PAYLOAD` names a directory.
+///
+/// Exists so a candidate engine in an inference bake-off is measured on the prompt GIAP
+/// actually sends. Reusing goose's `create_request` rather than hand-rolling the body keeps
+/// the capture honest: the same serializer the HTTP providers use, so a replay differs from
+/// a live call only by transport.
+///
+/// Failures are logged and swallowed -- a diagnostic must never fail a turn.
+fn capture_payload(model_config: &ModelConfig, system: &str, messages: &[Message], tools: &[Tool]) {
+    let Some(dir) = std::env::var_os("GIAP_CAPTURE_PAYLOAD") else {
+        return;
+    };
+    write_payload_capture(
+        std::path::Path::new(&dir),
+        model_config,
+        system,
+        messages,
+        tools,
+    );
+}
+
+/// The capture itself, with the directory passed in.
+///
+/// Split from [`capture_payload`] so a test can exercise it without `set_var`: the env is
+/// process-global and a test binary is threaded, so a test that set it would decide whether
+/// OTHER tests capture.
+fn write_payload_capture(
+    dir: &std::path::Path,
+    model_config: &ModelConfig,
+    system: &str,
+    messages: &[Message],
+    tools: &[Tool],
+) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    let body = match goose_providers::formats::openai::create_request(
+        model_config,
+        system,
+        messages,
+        tools,
+        &goose_providers::images::ImageFormat::OpenAi,
+        true,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("payload capture: could not build request body: {e}");
+            return None;
+        }
+    };
+    let Ok(text) = serde_json::to_string_pretty(&body) else {
+        tracing::warn!("payload capture: body is not serializable");
+        return None;
+    };
+
+    // The hash is over the body, so two turns that produce a byte-identical prompt land on
+    // the same name -- which is how the capture proves prefix stability rather than assuming it.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(
+        "payload-{seq:04}-{}t-{:016x}.json",
+        tools.len(),
+        h.finish()
+    ));
+
+    if let Err(e) = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &text)) {
+        tracing::warn!("payload capture: could not write {}: {e}", path.display());
+        return None;
+    }
+    tracing::info!(
+        target: "giap::trace",
+        kind = "payload_captured",
+        path = %path.display(),
+        tools = tools.len(),
+        system_chars = system.len(),
+        messages = messages.len(),
+        "captured the final provider payload"
+    );
+    Some(path)
+}
+
 fn minify_schema_object(obj: &mut serde_json::Map<String, serde_json::Value>) {
     obj.remove("$schema");
     obj.remove("title");
@@ -674,6 +759,18 @@ impl Provider for GiapProviderShim {
                 "provider system prompt provenance"
             );
         }
+
+        // Bake-off capture (`GIAP_CAPTURE_PAYLOAD=<dir>`). This is the only place the
+        // FINAL payload exists: goose's own `sessions.db` stores the raw messages, not the
+        // shim-enforced system prompt, the vetoed/minified tool array, or the core-first
+        // ordering -- so an engine replayed from that store is not answering GIAP's prompt.
+        // No-op, and no serialization cost, when the variable is unset.
+        capture_payload(
+            model_config,
+            enforced_system.as_deref().unwrap_or(system),
+            final_messages,
+            final_tools,
+        );
 
         let result = self
             .inner
@@ -971,6 +1068,69 @@ mod tests {
             "desc".to_string(),
             rmcp::object!({"type": "object"}),
         )
+    }
+
+    /// The bake-off replays these files against candidate engines, so the capture has to be
+    /// the payload GIAP sends -- and it has to be BYTE-STABLE across two identical turns, or
+    /// a "prefix moved" finding would just be capture noise. Same body, same name, one file.
+    #[test]
+    fn an_identical_turn_captures_to_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ModelConfig::new("gemma-4-E4B-it-qat-UD-Q4_K_XL");
+        let msgs = vec![Message::user().with_text("what is the weather?")];
+        let tools = vec![tool("giap-weather__get_current_weather")];
+
+        let first =
+            write_payload_capture(dir.path(), &cfg, "SYSTEM", &msgs, &tools).expect("captured");
+        let second =
+            write_payload_capture(dir.path(), &cfg, "SYSTEM", &msgs, &tools).expect("captured");
+
+        // The sequence number differs, the content hash does not.
+        assert_ne!(first, second, "each call gets its own sequence number");
+        let hash_of = |p: &std::path::Path| {
+            p.file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .rsplit_once('-')
+                .unwrap()
+                .1
+                .to_string()
+        };
+        assert_eq!(
+            hash_of(&first),
+            hash_of(&second),
+            "an identical payload must hash identically, or prefix-stability findings are noise"
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&first).unwrap()).unwrap();
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == "system"),
+            "the captured body must carry the shim-enforced system prompt: replaying without \
+             it measures a different prompt than GIAP sends"
+        );
+    }
+
+    /// A payload is captured only when asked for. The hook sits on the hot path of every
+    /// provider call, so an unset variable must not touch the filesystem.
+    #[test]
+    fn no_capture_directory_means_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = std::fs::read_dir(dir.path()).unwrap().count();
+        capture_payload(
+            &ModelConfig::new("m"),
+            "SYSTEM",
+            &[Message::user().with_text("hi")],
+            &[],
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
     }
 
     #[test]
