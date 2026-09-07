@@ -83,11 +83,20 @@ MEM_BEFORE="$(mem_snapshot)"
 tegra_start "$RUN/tegrastats.log"
 
 PORT="${BAKEOFF_C1_PORT:-4982}"
-# giap::trace is INFO-rooted; a warn-rooted RUST_LOG hides turn_end entirely.
-# goose carves llama-cpp-2 to ERROR in tracing_setup.rs, so the KV-cache size
-# lines need it raised explicitly or they never appear.
+# Every crate whose evidence this run depends on must be named here, because the
+# root is `warn` and an unnamed crate is silent at info.
+#
+# `pond_adapters_local_inference` was missing, and that cost two runs and a wrong
+# conclusion: `apply_jetson_settings` logs "Jetson context sized" unconditionally
+# -- there is no early return before it -- so an absent line cannot mean the
+# function bailed. It could only ever have meant the line was filtered, and it
+# was. The check below reads that line, so omitting the crate made the check
+# report the opposite of the truth.
+#
+# giap::trace is INFO-rooted; goose carves llama-cpp-2 to ERROR in
+# tracing_setup.rs, so the KV-cache size lines need it raised explicitly.
 POND_DATA_DIR="$SCRATCH" POND_DEV_ALLOW_LOOPBACK=1 \
-RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,goose_local_inference=debug,llama_cpp_2=info" \
+RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,pond_adapters_local_inference=info,goose_local_inference=debug,llama_cpp_2=info" \
   "$BIN" serve --port "$PORT" > "$RUN/server.log" 2>&1 < /dev/zero &
 SERVER_PID=$!
 bash "$HERE/memwatch.sh" --out "$RUN/mem.csv" --pid "$SERVER_PID" --interval 0.5 &
@@ -143,7 +152,7 @@ say "restarting the scratch pond so the settings are applied at boot"
 kill -9 "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
 rm -f "$SCRATCH/.runtime_api_port"
 POND_DATA_DIR="$SCRATCH" POND_DEV_ALLOW_LOOPBACK=1 \
-RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,goose_local_inference=debug,llama_cpp_2=info" \
+RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,pond_adapters_local_inference=info,goose_local_inference=debug,llama_cpp_2=info" \
   "$BIN" serve --port "$PORT" >> "$RUN/server.log" 2>&1 < /dev/zero &
 SERVER_PID=$!
 for _ in $(seq 1 150); do
