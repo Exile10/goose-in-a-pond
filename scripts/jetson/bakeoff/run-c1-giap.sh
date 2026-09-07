@@ -63,12 +63,18 @@ note "weights: $SRC ($(du -h "$SRC" | cut -f1))"
 # The embedding model, or tool_selection_mode=relevant silently cannot narrow.
 # Measured: every session logged `tool_selection_widened reason="no_embedder"`
 # and got all 61 tools, making the `relevant` and `all` arms the same prompt.
-for emb in "$REAL_DATA"/models/gguf/*embed*.gguf "$REAL_DATA"/models/gguf/*MiniLM*.gguf; do
+# It lives in models/embedding/, NOT models/gguf/ -- looking in the latter is
+# why the first attempt at this link found nothing and said nothing.
+mkdir -p "$SCRATCH/models/embedding"
+EMB_LINKED=0
+for emb in "$REAL_DATA"/models/embedding/*.gguf; do
   [ -e "$emb" ] || continue
-  ln "$(readlink -f "$emb")" "$SCRATCH/models/gguf/$(basename "$emb")" 2>/dev/null \
-    || cp "$(readlink -f "$emb")" "$SCRATCH/models/gguf/$(basename "$emb")"
+  ln "$(readlink -f "$emb")" "$SCRATCH/models/embedding/$(basename "$emb")" 2>/dev/null \
+    || cp "$(readlink -f "$emb")" "$SCRATCH/models/embedding/$(basename "$emb")"
   note "embedder: $(basename "$emb") linked (relevant-mode narrowing needs it)"
+  EMB_LINKED=1
 done
+[ "$EMB_LINKED" = 1 ] || add_warning "no embedding model found under $REAL_DATA/models/embedding — tool_selection_mode=relevant will widen to every tool"
 
 # Cold start is only cold if the page cache no longer holds the weights.
 [ "$COLD" = 1 ] && { say "dropping page cache for an honest cold start"; drop_caches; }
