@@ -27,6 +27,7 @@ mkdir -p "$OUT"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
+warn() { printf '   \033[33mWARN\033[0m %s\n' "$*" >&2; }
 
 say "priming sudo (one password prompt for the whole script)"
 sudo -v || { echo "sudo failed; nothing was changed." >&2; exit 1; }
@@ -77,7 +78,16 @@ if [ "$(systemctl is-active gdm3)" = active ]; then
   read -r -p "   Stop gdm3 now? Any GNOME session on the attached monitor ends. [y/N] " a
   if [ "$a" = y ]; then
     sudo systemctl stop gdm3 && note "gdm3 stopped"
-    sudo systemctl disable display-manager.service 2>/dev/null && note "display-manager disabled at boot"
+    # gdm3 PROVIDES display-manager.service as an alias, so there is no separate
+    # unit file to disable and `disable display-manager` is a no-op that prints
+    # success. What actually keeps it down is the default target: only
+    # graphical.target wants display-manager, and gdm3's own WantedBy is empty.
+    DEF="$(systemctl get-default)"
+    if [ "$DEF" = "multi-user.target" ]; then
+      note "boot: default target is $DEF and gdm3 WantedBy is '$(systemctl show gdm3 -p WantedBy --value)' — it will not return"
+    else
+      warn "default target is $DEF; run: sudo systemctl set-default multi-user.target"
+    fi
     if [ -x "$SKILLS/jetson-memory-audit/scripts/drop_caches.sh" ]; then
       sudo bash "$SKILLS/jetson-memory-audit/scripts/drop_caches.sh" | sed 's/^/     /'
       sudo bash "$SKILLS/jetson-memory-audit/scripts/audit.sh" > "$OUT/audit-after-headless.json" 2>/dev/null
@@ -87,7 +97,12 @@ def rd(f):
     d = json.load(open(f))
     return d.get("memory_kb", {}).get("available", 0)//1024, (d.get("nvmap", {}) or {}).get("total_kb", 0)//1024
 b, a = rd(sys.argv[1]), rd(sys.argv[2])
-print(f"     MEASURED reclaim: RAM {a[0]-b[0]:+d} MiB available, nvmap {a[1]-b[1]:+d} MiB")
+# The available-RAM delta spans BOTH the display stack going away and the page
+# cache being dropped, so quoting it alone would credit headless with the flush.
+# The nvmap delta is the clean one: it is GPU memory the desktop was holding,
+# and it is also the resource that gates a large contiguous CUDA allocation.
+print(f"     available RAM {b[0]} -> {a[0]} MiB ({a[0]-b[0]:+d}, includes the page-cache flush)")
+print(f"     nvmap (GPU)   {b[1]} -> {a[1]} MiB ({a[1]-b[1]:+d}, attributable to the display stack)")
 PY
     fi
     note "rollback: sudo systemctl enable --now display-manager.service"
@@ -123,7 +138,9 @@ say "4. root-only baseline snapshot"
   echo "=== carveouts (sizes the reflash-only reclaim, if it is ever considered) ==="
   grep -iE "nv-reserved|cma|carveout|fb" /proc/iomem 2>/dev/null
   echo; echo "=== reserved-memory nodes ==="; ls /proc/device-tree/reserved-memory/ 2>/dev/null
-  echo; echo "=== dmesg: nvmap / oom / zram ==="; dmesg | grep -iE "nvmap|carveout|Out of memory|zram" | tail -40
+  echo; echo "=== dmesg: nvmap / oom / zram ==="
+  sudo dmesg 2>/dev/null | grep -iE "nvmap|carveout|Out of memory|zram" | tail -40 \
+    || echo "(dmesg unreadable)"
   echo; echo "=== nvmap clients (per-PID GPU memory; PID is column 3) ==="
   cat /sys/kernel/debug/nvmap/iovmm/clients 2>/dev/null
   echo; echo "=== nvmap total ==="; cat /sys/kernel/debug/nvmap/stats/total_memory 2>/dev/null
