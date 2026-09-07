@@ -39,7 +39,6 @@ import urllib.request
 # Trimmed to the rows that do not need a live network dependency to be gradeable.
 MUST_CALL = [
     ("What is the weather right now?", "giap-weather__get_current_weather"),
-    ("What time is it?", "giap-system__get_current_time"),
     ("List the devices set up in this home.", "giap-device__list_registered_devices"),
     ("What is on my schedule?", "giap-schedule__list_schedules"),
     ("What is the current price of bitcoin?", "giap-finance__get_crypto_price"),
@@ -49,8 +48,23 @@ MUST_CALL = [
     ("Tell me about the Rust programming language from Wikipedia.",
      "giap-knowledge__get_wikipedia_article"),
     ("Remember that I prefer tea over coffee.", "giap-memory__save_memory"),
-    ("What do you remember about me?", "giap-memory__recall_memories"),
     ("How much disk space is left on this machine?", "giap-system__get_system_info"),
+]
+
+# Reported, never gated. GIAP's own system prompt says `<system-context> carries
+# the date, time and <memories> -- data, never a question` and tells the model to
+# answer from it (crates/pond-core/src/prompts.rs:215,296). Both of these are
+# therefore answerable without a tool, and the model declining to call one is it
+# following its instructions.
+#
+# They sat in MUST_CALL, imported from scripts/tool_selection_ab.py where they
+# carry a different rationale ("the tool is the canonical path"), and they were
+# the ONLY two misses in the first real baseline -- taking it to 10/12 and
+# failing a 90% gate for behaviour that is correct. Grading an engine down for
+# obeying its prompt measures the question set, not the engine.
+CONTEXT_ANSWERABLE = [
+    ("What time is it?", "giap-system__get_current_time"),
+    ("What do you remember about me?", "giap-memory__recall_memories"),
 ]
 
 MUST_NOT_CALL = [
@@ -473,8 +487,9 @@ class Driver:
         self.set_tool_mode("relevant" if key == "fresh_rel" else "all")
         counts = {"tool_call_ok": 0, "wrong_tool": 0, "text_only": 0,
                   "bad_args": 0, "stream_error": 0, "empty": 0}
-        rows = []
-        for ask, expect in MUST_CALL:
+        rows, context_rows = [], []
+        for ask, expect in MUST_CALL + CONTEXT_ANSWERABLE:
+            gated = (ask, expect) in MUST_CALL
             t = self.turn(ask, payload_key=key, session=self.new_session("rel"))
             d = t.as_dict()
             if d["outcome"] in ("stream_error", "bad_args", "empty"):
@@ -485,11 +500,16 @@ class Driver:
                 cls = "tool_call_ok"
             else:
                 cls = "wrong_tool"
-            counts[cls] += 1
-            rows.append({"ask": ask, "expected": expect, "got": d["tools"], "class": cls,
-                         "detail": d["detail"]})
-            print(f"     rel[{key}] {cls:<13} {ask[:44]}", flush=True)
-        return {"counts": counts, "of": len(MUST_CALL), "rows": rows}
+            row = {"ask": ask, "expected": expect, "got": d["tools"], "class": cls,
+                   "detail": d["detail"]}
+            if gated:
+                counts[cls] += 1
+                rows.append(row)
+            else:
+                context_rows.append(row)
+            print(f"     rel[{key}] {'' if gated else '(ungated) '}{cls:<13} {ask[:44]}", flush=True)
+        return {"counts": counts, "of": len(MUST_CALL), "rows": rows,
+                "context_answerable": context_rows}
 
     def w_must_not_call(self, key: str) -> dict:
         spurious, rows = 0, []
