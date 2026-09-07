@@ -274,6 +274,16 @@ PY
 
 # Capture the power/clock state into the environment the envelope reads.
 stamp_power_env() {
+  # Sampled at the START, when the board is idle. Comparing cur to max at the
+  # END sampled mid-load and reported "pinned" for a run whose governor was
+  # schedutil and whose GPU idled at 306 MHz.
+  local cur max gov
+  cur="$(gpu_cur_mhz)"; max="$(gpu_max_mhz)"; gov="$(cpu_governor)"
+  if [ "$gov" = performance ] && [ "$cur" = "$max" ]; then
+    export BAKEOFF_CLOCKS=pinned
+  else
+    export BAKEOFF_CLOCKS="dynamic(gov=$gov,gpu=${cur}/${max}MHz)"
+  fi
   export BAKEOFF_PM_NAME="$(nvpmodel_name)"
   export BAKEOFF_GOV="$(cpu_governor)"
   export BAKEOFF_GPU_MAX="$(gpu_max_mhz)"

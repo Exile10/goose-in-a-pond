@@ -173,7 +173,9 @@ sed -n '1,10p' "$RUN/engine-facts.txt" | sed 's/^/   /'
 
 MEM_SUM="$(bash "$HERE/memwatch.sh" --summary "$RUN/mem.csv")"
 export BAKEOFF_OC3_DELTA=$(( $(oc3_count) - OC0 )) BAKEOFF_OC3_SECS=$(( $(date +%s) - T0 ))
-export BAKEOFF_CLOCKS="$( [ "$(gpu_cur_mhz)" = "$(gpu_max_mhz)" ] && echo pinned || echo dynamic )"
+# BAKEOFF_CLOCKS was stamped by stamp_power_env at run START. Reading it here
+# sampled mid-load and called a schedutil run "pinned".
+: "${BAKEOFF_CLOCKS:=unknown}"
 envelope_write "$RUN/envelope.json" c2-llama-server "$BUILD_DESC" \
   "$REAL_DATA/models/gguf/$ENTRY" "$VARIANT" \
   "$(cat "$RUN/runs.json")" \

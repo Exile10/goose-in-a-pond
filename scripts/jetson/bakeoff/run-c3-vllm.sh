@@ -116,7 +116,9 @@ kill "$MEMWATCH_PID" 2>/dev/null; MEMWATCH_PID=""
 tegra_stop
 docker logs "$CONTAINER" > "$RUN/server.log" 2>&1 || true
 export BAKEOFF_OC3_DELTA=$(( $(oc3_count) - OC0 )) BAKEOFF_OC3_SECS=$(( $(date +%s) - T0 ))
-export BAKEOFF_CLOCKS="$( [ "$(gpu_cur_mhz)" = "$(gpu_max_mhz)" ] && echo pinned || echo dynamic )"
+# BAKEOFF_CLOCKS was stamped by stamp_power_env at run START. Reading it here
+# sampled mid-load and called a schedutil run "pinned".
+: "${BAKEOFF_CLOCKS:=unknown}"
 envelope_write "$RUN/envelope.json" c3-vllm "$IMAGE" "" "ctx${FIT_CTX}-util${FIT_UTIL}" \
   "$(cat "$RUN/runs.json")" \
   "$(python3 -c 'import json,sys; a=json.loads(sys.argv[1]); c=json.loads(sys.argv[2]); c["before"]=a; print(json.dumps(c))' "$MEM_BEFORE" "$(bash "$HERE/memwatch.sh" --summary "$RUN/mem.csv")")" \

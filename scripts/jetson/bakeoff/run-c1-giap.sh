@@ -60,6 +60,16 @@ SRC="$(readlink -f "$REAL_DATA/models/gguf/$ENTRY")"
 ln "$SRC" "$SCRATCH/models/gguf/$ENTRY" 2>/dev/null || cp "$SRC" "$SCRATCH/models/gguf/$ENTRY"
 note "weights: $SRC ($(du -h "$SRC" | cut -f1))"
 
+# The embedding model, or tool_selection_mode=relevant silently cannot narrow.
+# Measured: every session logged `tool_selection_widened reason="no_embedder"`
+# and got all 61 tools, making the `relevant` and `all` arms the same prompt.
+for emb in "$REAL_DATA"/models/gguf/*embed*.gguf "$REAL_DATA"/models/gguf/*MiniLM*.gguf; do
+  [ -e "$emb" ] || continue
+  ln "$(readlink -f "$emb")" "$SCRATCH/models/gguf/$(basename "$emb")" 2>/dev/null \
+    || cp "$(readlink -f "$emb")" "$SCRATCH/models/gguf/$(basename "$emb")"
+  note "embedder: $(basename "$emb") linked (relevant-mode narrowing needs it)"
+done
+
 # Cold start is only cold if the page cache no longer holds the weights.
 [ "$COLD" = 1 ] && { say "dropping page cache for an honest cold start"; drop_caches; }
 
@@ -94,6 +104,41 @@ sqlite3 "$SCRATCH/pond_system.db" \
 curl -sf -X PUT "$API/settings" -H 'Content-Type: application/json' \
   -d "{\"chat_provider\":\"local\",\"chat_model\":\"$MODEL\",\"tool_selection_mode\":\"relevant\"}" >/dev/null \
   || die "settings PUT failed"
+
+# RESTART, because the tuning is startup-wired.
+#
+# `apply_jetson_settings` runs when the per-role LLM provider is constructed,
+# and that happens ONCE at boot from whatever settings existed then. A PUT on a
+# running pond changes the row and leaves the model unstamped: the first run of
+# this script measured E4B at n_ctx 32768 instead of the derived 16384, with no
+# q8_0 KV and no n_ubatch cap, and drove MemAvailable to 364 MB with swap
+# engaged. Nothing in the output said so -- the turns all succeeded.
+# scripts/pai-bench.sh hit the same trap and documents it.
+say "restarting the scratch pond so the settings are applied at boot"
+kill -9 "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+rm -f "$SCRATCH/.runtime_api_port"
+POND_DATA_DIR="$SCRATCH" POND_DEV_ALLOW_LOOPBACK=1 \
+RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,goose_local_inference=debug,llama_cpp_2=info" \
+  "$BIN" serve --port "$PORT" >> "$RUN/server.log" 2>&1 < /dev/zero &
+SERVER_PID=$!
+for _ in $(seq 1 150); do
+  [ -s "$SCRATCH/.runtime_api_port" ] && break
+  kill -0 "$SERVER_PID" 2>/dev/null || { tail -40 "$RUN/server.log" >&2; die "server exited on restart"; }
+  sleep 2
+done
+PORT="$(tr -d ' \n' < "$SCRATCH/.runtime_api_port" 2>/dev/null || echo "$PORT")"
+API="http://127.0.0.1:$PORT/api/v1"
+until curl -sf -o /dev/null "$API/health"; do
+  kill -0 "$SERVER_PID" 2>/dev/null || { tail -40 "$RUN/server.log" >&2; die "server exited on restart"; }
+  sleep 2
+done
+
+# Refuse to measure an untuned engine and call it the incumbent.
+if ! grep -aq "Jetson context sized" "$RUN/server.log"; then
+  add_warning "no 'Jetson context sized' line after restart — this run is NOT the tuned incumbent"
+fi
+grep -a "Jetson context sized\|Applied Jetson" "$RUN/server.log" | tail -2 \
+  | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/   /'
 note "pond ready on $PORT"
 
 say "workloads: $WORKLOADS  (x$REPEATS)"
@@ -132,7 +177,9 @@ MEM_AFTER="$(mem_snapshot)"
 MEM_SUM="$(bash "$HERE/memwatch.sh" --summary "$RUN/mem.csv")"
 THERMAL="$(tegra_summary "$RUN/tegrastats.log")"
 export BAKEOFF_OC3_DELTA=$(( $(oc3_count) - OC0 )) BAKEOFF_OC3_SECS=$(( $(date +%s) - T0 ))
-export BAKEOFF_CLOCKS="$( [ "$(gpu_cur_mhz)" = "$(gpu_max_mhz)" ] && echo pinned || echo dynamic )"
+# BAKEOFF_CLOCKS was stamped by stamp_power_env at run START. Reading it here
+# sampled mid-load and called a schedutil run "pinned".
+: "${BAKEOFF_CLOCKS:=unknown}"
 
 envelope_write "$RUN/envelope.json" c1-giap "llama-cpp-2 0.1.146 in-process" \
   "$REAL_DATA/models/gguf/$ENTRY" baseline \
