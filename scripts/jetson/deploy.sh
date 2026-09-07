@@ -65,10 +65,19 @@ ssh "$HOST" "cd ~/${REMOTE_REPO} \
        --release"
 
 echo "==> [4/4] Restarting service + health check"
-ssh "$HOST" "systemctl --user restart goose-in-a-pond.service && sleep 4 \
-  && systemctl --user --no-pager status goose-in-a-pond.service | head -5 \
-  && curl -sf -o /dev/null -w 'API: HTTP %{http_code}\n' http://127.0.0.1:8080/api/v1/health \
-     || curl -sf -o /dev/null -w 'API(root): HTTP %{http_code}\n' http://127.0.0.1:8080/"
+# POLL, do not sleep-and-hope. The pond applies migrations, sizes the Jetson
+# context, loads the GGUF embedder and pre-warms the KV prefix before it binds,
+# which is tens of seconds on this board -- a fixed `sleep 4` reported HTTP 000
+# and a failed deploy for a service that was starting perfectly normally.
+ssh "$HOST" "systemctl --user restart goose-in-a-pond.service || exit 1
+  for i in \$(seq 1 60); do
+    code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8080/api/v1/health 2>/dev/null)
+    if [ \"\$code\" = 200 ]; then echo \"API: HTTP 200 after \${i}0s\"; exit 0; fi
+    sleep 10
+  done
+  echo 'API: never answered 200 within 10 minutes' >&2
+  systemctl --user --no-pager status goose-in-a-pond.service | head -12 >&2
+  exit 1"
 
 if [ "$DESKTOP" = true ]; then
   echo "==> [desktop] Ensuring WebKitGTK deps, then building the native Tauri app"
