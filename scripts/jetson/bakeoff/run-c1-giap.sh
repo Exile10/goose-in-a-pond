@@ -116,6 +116,15 @@ tegra_stop
   grep -E 'Applied Jetson|Jetson context sized|effective_ctx' "$RUN/server.log" | tail -10
   echo; echo "=== model slot identity (differing pointers = a slot bug) ==="
   grep -o 'generate: model slot identity.*' "$RUN/server.log" | tail -10
+  echo; echo "=== tool selection: did 'relevant' actually narrow? ==="
+  # A capture under tool_selection_mode=relevant came back with all 61 tools.
+  # `SelectionBasis::NoEmbedder` widens to every permitted group and says so
+  # here; without this line the only tell is that the counts are equal.
+  grep -o 'tool_selection_widened.*\|tool_selection .*mode=.*\|tools_offered=[0-9]* tools_count=[0-9]*' \
+    "$RUN/server.log" | tail -12
+  echo; echo "=== GPU offload actually achieved ==="
+  grep -oiE 'offloaded [0-9]+/[0-9]+ layers|n_gpu_layers *= *[0-9]+|NvMap.*error|cudaMalloc failed' \
+    "$RUN/server.log" | sort -u | tail -8
 } > "$RUN/engine-facts.txt"
 sed -n '1,12p' "$RUN/engine-facts.txt" | sed 's/^/   /'
 
