@@ -102,6 +102,7 @@ class Turn:
         self.usage: dict = {}
         self.timings: dict = {}                # llama.cpp server only
         self.engine_stats: dict = {}           # GIAP turn_stats only
+        self.inference_count = 1               # a GIAP turn can be several
 
     def mark_content(self, piece: str = "") -> None:
         now = time.monotonic()
@@ -127,13 +128,37 @@ class Turn:
         token_source = "usage"
         if comp is None:
             comp, token_source = self.chunks, "chunk_count"
-        rate = None
-        if decode_ms and decode_ms > 0 and comp:
-            rate = comp * 1000.0 / decode_ms
+
+        # Decode rate: the ENGINE's number wins whenever it reports one.
+        #
+        # A GIAP turn is not one inference. It reasons, may call a tool, waits on
+        # that tool, answers, then runs a goal check -- `inference_count` was 2-3
+        # on every measured turn. `completion_tokens` sums all of them while the
+        # client-visible window spans only the part that streamed text, so
+        # dividing one by the other produced 43-92 tok/s for a 4.2 GB model whose
+        # bandwidth ceiling is ~24. The engine reports per-inference and was
+        # steady at 15.6-16.4, which is the real figure.
+        engine_rate = (self.engine_stats or {}).get("decode_tok_per_sec")
+        rate, rate_source = None, "none"
+        if isinstance(engine_rate, (int, float)) and engine_rate > 0:
+            rate, rate_source = float(engine_rate), "engine"
+        elif decode_ms and decode_ms > 0 and comp and self.inference_count <= 1:
+            rate, rate_source = comp * 1000.0 / decode_ms, "client_window"
+        elif decode_ms and decode_ms > 0 and comp:
+            rate_source = "unmeasurable_multi_inference"
         return {
             "outcome": self.outcome,
             "detail": self.detail,
             "ttft_ms": ttft,
+            "decode_rate_source": rate_source,
+            "inference_count": self.inference_count,
+            # Engine-side, per-inference, and the only TTFT comparable with an
+            # HTTP engine's first-delta latency. `ttft_ms` above is turn-level:
+            # for GIAP it also contains reasoning tokens and any tool round-trip,
+            # which an HTTP replay of one payload does not have.
+            "engine_ttft_ms": (self.engine_stats or {}).get("ttft_ms"),
+            "engine_prefill_ms": (self.engine_stats or {}).get("prefill_ms"),
+            "reasoning_tokens": (self.engine_stats or {}).get("reasoning_tokens"),
             "ttfs_ms": ttfs,
             "wall_ms": wall,
             "decode_ms": decode_ms,
@@ -265,6 +290,8 @@ def stream_giap(base: str, message: str, session_id: str, timeout: float) -> Tur
         t.usage["completion_tokens"] = st["completion_tokens"]
     if st.get("prompt_tokens") is not None:
         t.usage["prompt_tokens"] = st["prompt_tokens"]
+    if isinstance(st.get("inference_count"), int) and st["inference_count"] > 0:
+        t.inference_count = st["inference_count"]
     if t.outcome == "ok" and not t.tools and not t.text:
         t.outcome, t.detail = "empty", "no content and no tool call"
     return t
@@ -370,8 +397,12 @@ class Driver:
             "ttft_ms": summarise([r["ttft_ms"] for r in rows]),
             "ttfs_ms": summarise([r["ttfs_ms"] for r in rows]),
             "decode_tok_per_sec": summarise([r["decode_tok_per_sec"] for r in rows]),
+            "engine_ttft_ms": summarise([r.get("engine_ttft_ms") for r in rows]),
+            "engine_prefill_ms": summarise([r.get("engine_prefill_ms") for r in rows]),
+            "reasoning_tokens": summarise([r.get("reasoning_tokens") for r in rows]),
             "prompt_tokens": summarise([r["prompt_tokens"] for r in rows]),
             "wall_ms": summarise([r["wall_ms"] for r in rows]),
+            "decode_rate_sources": sorted({r.get("decode_rate_source") for r in rows}),
         }
 
     # -- individual workloads -------------------------------------------------
