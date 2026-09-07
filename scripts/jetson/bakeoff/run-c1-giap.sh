@@ -111,6 +111,25 @@ curl -sf -X PUT "$API/settings" -H 'Content-Type: application/json' \
   -d "{\"chat_provider\":\"local\",\"chat_model\":\"$MODEL\",\"tool_selection_mode\":\"relevant\"}" >/dev/null \
   || die "settings PUT failed"
 
+# WARM-UP TURN FIRST, then restart. Two facts compose here:
+#
+#   `apply_jetson_settings` looks the model up in the PERSISTED registry to get
+#   its size, and silently does nothing when it is not there ("errors are
+#   ignored and defaults apply"). A fresh scratch data dir has an empty
+#   registry, so the first boot stamps nothing at all.
+#
+#   The registry entry is created by `register_gguf_model`, which runs on the
+#   GooseAdapter chat path -- i.e. only once a turn has actually been taken.
+#
+# So a fresh pond needs a turn to register the model, and a restart for the
+# stamping to find it. The household pond is tuned only because its registry
+# carries entries from previous runs; a genuinely fresh install gets no Jetson
+# tuning on its first boot either, which is worth knowing separately.
+say "warm-up turn to register the model (the registry is what stamping reads)"
+curl -sf -N -X POST "$API/chat/stream" -H 'Content-Type: application/json' \
+  -d '{"message":"hello","session_id":"bakeoff-warmup"}' --max-time 300 >/dev/null 2>&1 || true
+grep -a "Registered GGUF model" "$RUN/server.log" | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/   /'
+
 # RESTART, because the tuning is startup-wired.
 #
 # `apply_jetson_settings` runs when the per-role LLM provider is constructed,
@@ -141,7 +160,11 @@ done
 
 # Refuse to measure an untuned engine and call it the incumbent.
 if ! grep -aq "Jetson context sized" "$RUN/server.log"; then
-  add_warning "no 'Jetson context sized' line after restart — this run is NOT the tuned incumbent"
+  tail -20 "$RUN/server.log" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/   /' >&2
+  die "no 'Jetson context sized' line after the restart — the engine is UNTUNED and this
+   would be measured as the incumbent. Two earlier runs produced complete, plausible
+   numbers in exactly this state (n_ctx 32768 instead of 16384, no q8_0 KV, MemAvailable
+   down to 364 MB) and nothing in the output said so. Refusing to measure it."
 fi
 grep -a "Jetson context sized\|Applied Jetson" "$RUN/server.log" | tail -2 \
   | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/   /'
