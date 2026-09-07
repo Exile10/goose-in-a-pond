@@ -5966,6 +5966,11 @@ fn plan_live_image_cap(
 /// only needs to tell a quant suffix apart from a continuation of the model
 /// name (`it`, `instruct`), not to validate every possible tag.
 pub(crate) fn looks_like_quant_tag(tag: &str) -> bool {
+    // Unsloth's dynamic quants spell the tag `UD-Q4_K_XL`: `UD` is a marker ON a quant name,
+    // not a continuation of the model name. Without this the tag reads as two segments and
+    // half of it stays glued to the model, which is how `gemma-4-E4B-it-qat-UD-Q4_K_XL`
+    // acquired a second registry id.
+    let tag = tag.strip_prefix("UD-").unwrap_or(tag);
     let digit_after = |prefix: &str| {
         tag.strip_prefix(prefix)
             .and_then(|r| r.chars().next())
@@ -5991,17 +5996,24 @@ pub(crate) fn looks_like_quant_tag(tag: &str) -> bool {
 /// whose file is missing is left untouched (no evidence to collapse on).
 fn canonical_model_stem(model_name: &str, gguf_dir: &std::path::Path) -> String {
     let stem = model_name.trim_end_matches(".gguf");
-    let Some((base, tag)) = stem.rsplit_once(['-', '.']) else {
-        return stem.to_string();
-    };
-    if base.is_empty() || !looks_like_quant_tag(tag) {
-        return stem.to_string();
+    let resolved_stem = resolve_gguf_filename(stem, gguf_dir);
+    // Shortest base first, rather than splitting at the LAST separator: a quant tag can be
+    // compound (`UD-Q4_K_XL`), and a last-separator split leaves its first half attached to
+    // the model name. That produced two ids for one file on the Orin -- `...-qat-UD-Q4_K_XL`
+    // carrying the derived Jetson context, `...-qat-UD` carrying none -- so which context the
+    // model got depended on which spelling reached the registry.
+    for (i, _) in stem.match_indices(['-', '.']) {
+        let (base, tail) = stem.split_at(i);
+        // `tail` starts with the ASCII separator that matched.
+        let tag = &tail[1..];
+        if base.is_empty() || !looks_like_quant_tag(tag) {
+            continue;
+        }
+        if resolve_gguf_filename(base, gguf_dir) == resolved_stem {
+            return base.to_string();
+        }
     }
-    if resolve_gguf_filename(base, gguf_dir) == resolve_gguf_filename(stem, gguf_dir) {
-        base.to_string()
-    } else {
-        stem.to_string()
-    }
+    stem.to_string()
 }
 
 /// Phase D2 escape hatch. Driven by the `giap-toolkit` MCP extension, which is
@@ -8481,6 +8493,43 @@ mod tests {
         assert_eq!(
             canonical_model_stem("gemma-4-E4B-it-Q4_K_M", tmp.path()),
             "gemma-4-E4B-it"
+        );
+    }
+
+    /// The QAT weights the pond actually runs are spelled `...-qat-UD-Q4_K_XL`. Splitting at
+    /// the last separator called `Q4_K_XL` the tag and left `UD` on the name, so ONE file got
+    /// two registry ids -- and only one of them carried the derived Jetson `context_size`.
+    /// Observed live on the Orin: `gemma-4-E4B-it-qat-UD-Q4_K_XL` (ctx 16384, ngl 99) beside
+    /// `gemma-4-E4B-it-qat-UD` (nothing stamped).
+    #[test]
+    fn an_unsloth_dynamic_quant_tag_is_one_tag() {
+        assert!(looks_like_quant_tag("UD-Q4_K_XL"));
+        assert!(looks_like_quant_tag("UD-IQ4_XS"));
+        // `UD` alone is not a quant, and the prefix must not rescue a name continuation.
+        assert!(!looks_like_quant_tag("UD"));
+        assert!(!looks_like_quant_tag("UD-it"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf");
+        touch(tmp.path(), "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf");
+        for size in ["E2B", "E4B"] {
+            let full = format!("gemma-4-{size}-it-qat-UD-Q4_K_XL");
+            let stem = format!("gemma-4-{size}-it-qat");
+            assert_eq!(
+                canonical_model_stem(&full, tmp.path()),
+                stem,
+                "the whole compound tag must come off, leaving one id per file"
+            );
+            // And the collapsed stem still finds its file, or the collapse would strand it.
+            assert_eq!(
+                resolve_gguf_filename(&stem, tmp.path()),
+                format!("{full}.gguf")
+            );
+        }
+        // Siblings still do not cross-resolve after the change.
+        assert_eq!(
+            resolve_gguf_filename("gemma-4-E2B-it-qat", tmp.path()),
+            "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf"
         );
     }
 
