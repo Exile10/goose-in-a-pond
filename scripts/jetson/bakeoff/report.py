@@ -31,13 +31,23 @@ import sys
 REL_MIN_RELEVANT = 0.90
 REL_MIN_ALL = 0.83
 
-# Memory reserve, in MB, that must remain available at the run's minimum.
-# 1500 OS + GIAP server idle, + measured voice residency (ASR+TTS) or a 300 MB
-# fallback, + 512 MB of NvMap slack because a large CONTIGUOUS GPU allocation
-# can fail on this board with GBs still nominally free.
-RESERVE_OS_MB = 1500
+# Memory reserve, in MB, that must remain available at the run's MINIMUM.
+#
+# `MemAvailable` is what is left after everything already running, so the OS and
+# the server are on the spent side of the ledger, not the reserved side. Adding
+# an OS allowance here double-counted them and failed the incumbent at 1,308 MB
+# against a 2,312 MB bar that had ~1,500 MB of already-spent memory inside it.
+# What must genuinely remain is what is not yet loaded: the voice stack, and
+# enough contiguous room for a large CUDA allocation to succeed.
 RESERVE_VOICE_FALLBACK_MB = 300
 RESERVE_NVMAP_SLACK_MB = 512
+
+# Swap tolerance. The principle is that a model served from swap reads as a slow
+# model and never as an error, so swap use is disqualifying -- but SwapFree also
+# drifts by a few MB from unrelated background activity over an hour-long run.
+# A model actually spilling shows hundreds of MB, so the line goes where those
+# two cannot be confused rather than at a literal zero.
+SWAP_NOISE_MB = 128
 
 # Memory bandwidth ceiling: decode is bandwidth-bound, so tok/s can never
 # exceed roughly (GB/s) / (weights GB). A number above it is a measurement bug,
@@ -138,9 +148,11 @@ def apply_gates(env: dict, reserve_mb: int) -> dict:
         g["G2_memory"] = (None, "no memwatch summary (swap_delta_mb / mem_available_min_mb absent)")
     else:
         reasons, ok = [], True
-        if swap > 0:
+        if swap > SWAP_NOISE_MB:
             ok = False
-            reasons.append(f"{swap} MB of swap was consumed during the run")
+            reasons.append(f"{swap} MB of swap was consumed — part of the run was served from swap")
+        elif swap > 0:
+            reasons.append(f"{swap} MB swap drift (under the {SWAP_NOISE_MB} MB noise floor)")
         if avail_min < reserve_mb:
             ok = False
             reasons.append(f"MemAvailable fell to {avail_min} MB, below the {reserve_mb} MB reserve")
@@ -234,7 +246,7 @@ def main() -> int:
     args = ap.parse_args()
 
     voice_mb = args.voice_residency_mb or RESERVE_VOICE_FALLBACK_MB
-    reserve = RESERVE_OS_MB + voice_mb + RESERVE_NVMAP_SLACK_MB
+    reserve = voice_mb + RESERVE_NVMAP_SLACK_MB
 
     envs = load(args.indir)
     if not envs:
@@ -246,7 +258,7 @@ def main() -> int:
     w("# Jetson inference-engine bake-off\n")
     w(f"Envelopes: `{args.indir}`  ·  candidates: {len(envs)}\n")
     w(f"Memory reserve for G2: **{reserve} MB** "
-      f"({RESERVE_OS_MB} OS + {voice_mb} voice"
+      f"({voice_mb} voice"
       f"{' (fallback, not measured)' if not args.voice_residency_mb else ' (measured)'}"
       f" + {RESERVE_NVMAP_SLACK_MB} NvMap contiguous slack)\n")
 

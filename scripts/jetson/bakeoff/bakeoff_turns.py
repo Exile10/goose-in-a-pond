@@ -405,11 +405,38 @@ class Driver:
             "decode_rate_sources": sorted({r.get("decode_rate_source") for r in rows}),
         }
 
+    def set_tool_mode(self, mode: str) -> bool:
+        """GIAP mode only: switch the live tool-selection setting.
+
+        Without this the fresh_rel and fresh_all arms drive the same endpoint at
+        whatever mode happens to be configured, and both come back with the same
+        prompt -- measured 3,621 vs 3,620 tokens, which is the same prompt twice
+        wearing two names. In openai mode the arms differ by which captured
+        payload is replayed, so nothing to switch.
+        """
+        if self.a.mode != "giap":
+            return False
+        req = urllib.request.Request(
+            self.a.base.rstrip("/") + "/api/v1/settings",
+            data=json.dumps({"tool_selection_mode": mode}).encode(),
+            headers={"Content-Type": "application/json"}, method="PUT")
+        try:
+            urllib.request.urlopen(req, timeout=30).read()
+            time.sleep(1)
+            print(f"     tool_selection_mode -> {mode}", flush=True)
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"     !! could not set tool_selection_mode={mode}: {e}", flush=True)
+            return False
+
     # -- individual workloads -------------------------------------------------
     def w_fresh(self, key: str) -> dict:
-        return self.repeat(key, lambda i: self.turn("What is the weather right now?",
-                                                    payload_key=key,
-                                                    session=self.new_session(key)), self.a.repeats)
+        self.set_tool_mode("relevant" if key == "fresh_rel" else "all")
+        out = self.repeat(key, lambda i: self.turn("What is the weather right now?",
+                                                   payload_key=key,
+                                                   session=self.new_session(key)), self.a.repeats)
+        self.set_tool_mode("relevant")   # leave the pond in the production-candidate mode
+        return out
 
     def w_followup(self) -> dict:
         """Turn 2 of a live session: the KV-reuse case.
@@ -443,6 +470,7 @@ class Driver:
             session=self.new_session("decode"), max_tokens=256), self.a.repeats)
 
     def w_reliability(self, key: str) -> dict:
+        self.set_tool_mode("relevant" if key == "fresh_rel" else "all")
         counts = {"tool_call_ok": 0, "wrong_tool": 0, "text_only": 0,
                   "bad_args": 0, "stream_error": 0, "empty": 0}
         rows = []
