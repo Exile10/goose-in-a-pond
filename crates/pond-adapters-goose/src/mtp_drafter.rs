@@ -37,10 +37,17 @@ pub fn ensure_drafter_registered(data_dir: &Path, model_name: &str) -> Option<St
             return None;
         }
     };
+    // Registering and pointing are separate steps, and the early return has to
+    // skip only the first. This function is called twice with two different
+    // spellings of the same model -- once from startup with the settings
+    // string, once from the provider build with the canonical stem the engine
+    // resolves -- and returning here on "already registered" meant the second
+    // call, the only one holding the id that matters, never ran.
     if registry
         .get_model(spec.id)
         .is_some_and(|e| e.local_path == path)
     {
+        point_target_at_drafter(&mut registry, model_name, spec.id);
         return Some(spec.id.to_string());
     }
 
