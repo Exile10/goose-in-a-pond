@@ -350,6 +350,55 @@ and the port should reproduce it. If that curve is steep, there was never a spee
 available in-process whatever the acceptance rate says, and the sidecar recommendation
 would need revisiting.
 
+### Native run on the real serving path, 2026-09-08
+
+The measurements above call `generation_loop` directly. Driving `pond-server` in release
+instead — so a turn goes `GooseAdapter` → `GiapProviderShim` → `LocalInferenceProvider` →
+`inference_native_tools` → `generation_loop`, with 61 tools, a 7,916-token prompt and the
+KV session cache live — found one thing no test could.
+
+**In-process MTP deadlocked the server on first model resolution.** `resolve_model_path`
+holds the registry mutex and then called a helper that took `get_registry().lock()` again;
+std's `Mutex` is not reentrant. It fired only when a drafter was configured, because the
+`None` case never runs the closure — so the plain path, every unit test that builds a
+context directly, and the entire llama-server bake-off all missed it. The symptom was not
+an error: pond-server sat at 0.1% CPU with 277 MB resident, no model loaded, still
+answering `/health`, having logged `turn_start` and nothing after. Fixed by looking the
+drafter up through the guard already held.
+
+Two harness rules came out of the same session. A run must fail loudly if the drafter did
+not load, or the arm silently becomes a duplicate of the baseline — the first attempt
+reported "MTP" numbers for a process that had no drafter at all, because the drafter was
+never registered and `draft_model_path` was `None`. And two pond-servers on one
+`POND_DATA_DIR` deadlock on `registry.json.lock` while the survivor keeps answering curl,
+so the port and data dir both need an exclusivity gate.
+
+With the deadlock fixed and both arms run through the identical gated procedure
+(prewarm, warm-up turn, then three timed turns, same 7,916-token prompt):
+
+| arm | turn 1 | turn 2 | turn 3 | median |
+|---|---:|---:|---:|---:|
+| baseline | 22.11 | 22.20 | 23.16 | **22.20** tok/s |
+| + MTP, depth 4 | 21.02 | 20.55 | 19.49 | **20.55** tok/s |
+
+MTP is ~7% slower, and an earlier unmatched baseline run measured 25.9 tok/s median, so
+between-run variance on this machine (~17%) is larger than the gap. The honest reading is
+**not faster, possibly slower** — which is what the batch-cost curve predicts for depth 4
+on Metal, and consistent with the 0.81x measured in isolation.
+
+One thing production makes worse than the test: the registry ships
+`sampling: Temperature 0.8`, not greedy. The accept rule here is "sample from the target at
+each verified position, keep the draft if it matches" — correct at any temperature, since
+every emitted token is drawn from the target's own distribution, but acceptance falls as
+temperature rises. The 62% measured at temperature 0 is an upper bound on what production
+sampling will see.
+
+**Gap worth closing before the device run:** nothing surfaces draft acceptance in
+`TurnStats`. `MtpSession` counts `drafted`/`accepted` and the phase timings, and the tests
+read them, but a production turn reports none of it — so on the Orin there will be no way
+to tell "drafting well and the hardware cannot use it" from "drafting badly" without
+attaching a debugger.
+
 Two harness properties worth carrying to the device: both live tests take a process-wide
 mutex, because cargo ran them in parallel once and shared-GPU contention halved every
 number without failing anything (plain decode read 12.3 tok/s against 28.0 measured alone,
