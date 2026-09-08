@@ -124,6 +124,38 @@ set_mode() { curl -sf -X PUT "$API/settings" -H 'Content-Type: application/json'
 curl -sf -N -X POST "$API/chat/stream" -H 'Content-Type: application/json' \
   -d '{"message":"hello","session_id":"cap-warmup"}' --max-time 300 >/dev/null 2>&1 || true
 
+# RESTART. Two things need it and both fail silently without it.
+#
+# The Jetson tuning is applied when the per-role provider is built, at boot.
+# And the embedding provider gets 30 seconds to initialise: on a cold data dir
+# that races the ONNX Runtime download and TIMES OUT, leaving embedding_provider
+# as None -- at which point tool_selection_mode=relevant widens to every tool and
+# says so only in a log line. A capture taken in that state carried all 61 tools
+# under both modes, twice, while the C1 baseline it must be compared against ran
+# at 17. On the restart the runtime is already on disk and the init succeeds.
+say "restarting so the tuning and the embedder are both live at boot"
+kill -9 "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+rm -f "$SCRATCH/.runtime_api_port"
+POND_DATA_DIR="$SCRATCH" POND_DEV_ALLOW_LOOPBACK=1 GIAP_CAPTURE_PAYLOAD="$CAPDIR" \
+RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,pond_adapters_local_inference=info" \
+  "$BIN" serve --port "$PORT" >> "$SCRATCH/server.out" 2>&1 < /dev/zero &
+SERVER_PID=$!
+for _ in $(seq 1 150); do
+  [ -s "$SCRATCH/.runtime_api_port" ] && break
+  kill -0 "$SERVER_PID" 2>/dev/null || { tail -30 "$SCRATCH/server.out" >&2; die "server exited on restart"; }
+  sleep 2
+done
+PORT="$(tr -d ' \n' < "$SCRATCH/.runtime_api_port")"
+API="http://127.0.0.1:$PORT/api/v1"
+until curl -sf -o /dev/null "$API/health"; do
+  kill -0 "$SERVER_PID" 2>/dev/null || { tail -30 "$SCRATCH/server.out" >&2; die "server exited on restart"; }
+  sleep 2
+done
+grep -a "Jetson context sized" "$SCRATCH/server.out" | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/   /'
+if grep -aq "embedding provider failed to init" "$SCRATCH/server.out"; then
+  note "note: the embedder timed out on the FIRST boot; checking the restart took"
+fi
+
 # ── drive turns, taking the widest NEW capture after each ────────────────────
 # The shim captures every provider call, so one turn leaves several files: the
 # chat inference plus the goal check and the memory-extraction side call. The
@@ -174,4 +206,17 @@ print("\n   captured payloads:")
 for k, v in seen.items():
     print(f"     {k:<14} tools={v['tools']:<3} msgs={v['messages']:<3} ~{v['approx_prompt_tokens']} tok")
 PY
+# The two arms must actually differ, or every C2 comparison built on them is a
+# comparison of one prompt against itself. Two captures have already come back
+# with 61 tools under both modes.
+REL_T="$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1])).get("tools") or []))' "$OUT/payload-fresh_rel.json" 2>/dev/null || echo 0)"
+ALL_T="$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1])).get("tools") or []))' "$OUT/payload-fresh_all.json" 2>/dev/null || echo 0)"
+if [ "$REL_T" -ge "$ALL_T" ]; then
+  grep -a "tool_selection_widened\|kind=\"tool_selection\"" "$SCRATCH/server.out" | tail -2 \
+    | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/   /' >&2
+  die "relevant captured $REL_T tools and all captured $ALL_T — narrowing did not happen, so
+   the two payloads are the same prompt. Replaying C2 against them would compare it with a
+   C1 baseline that ran at a different prompt size and call the difference an engine result."
+fi
+note "arms differ: relevant=$REL_T tools, all=$ALL_T tools"
 note "payloads -> $OUT"
