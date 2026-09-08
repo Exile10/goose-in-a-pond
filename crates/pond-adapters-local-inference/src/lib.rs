@@ -220,6 +220,12 @@ impl LocalInferenceLlmAdapter {
             }
         }
 
+        // Register the drafter before `new` stamps settings: `apply_jetson_settings`
+        // decides whether to set `draft_model` by looking the id up in the
+        // registry, so a drafter registered after that point is ignored until
+        // the next provider build.
+        Self::register_drafter(model_id, data_dir);
+
         Self::new(model_id).await
     }
 
@@ -227,6 +233,80 @@ impl LocalInferenceLlmAdapter {
     ///
     /// A device profile lets a non-CUDA build take the Jetson branch on purpose: otherwise
     /// `jetson_context_size`, the arithmetic that can OOM the board, has no caller off-device.
+    /// Put the model's speculative-decoding drafter in the registry, if its
+    /// weights are on disk.
+    ///
+    /// Registration is what makes `draft_model` resolvable: the engine turns
+    /// that name into a path through the registry, so a drafter file with no
+    /// row is invisible. Idempotent, and called on every adapter build rather
+    /// than once, which is what makes the whole arrangement self-correcting --
+    /// a drafter downloaded after boot is picked up without a restart.
+    fn register_drafter(model_id: &str, data_dir: &std::path::Path) -> Option<String> {
+        use goose::providers::local_inference::local_model_registry::{
+            get_registry, LocalModelEntry, LocalModelStorage, ModelSettings,
+        };
+        use pond_core::models::domain::drafter::{drafter_for, drafter_path};
+
+        let spec = drafter_for(model_id)?;
+        let path = drafter_path(data_dir, &spec);
+        if !path.exists() {
+            return None;
+        }
+        let mut registry = get_registry().lock().ok()?;
+        if registry
+            .get_model(spec.id)
+            .is_some_and(|e| e.local_path == path)
+        {
+            return Some(spec.id.to_string());
+        }
+        let entry = LocalModelEntry {
+            id: spec.id.to_string(),
+            repo_id: spec.repo.to_string(),
+            filename: spec.filename.to_string(),
+            quantization: String::new(),
+            local_path: path,
+            source_url: format!(
+                "https://huggingface.co/{}/resolve/main/{}",
+                spec.repo, spec.filename
+            ),
+            backend_id: None,
+            storage: LocalModelStorage::ManualPath,
+            // Left at defaults on purpose: the drafter is never a chat model, so
+            // nothing reads its context size, tool mode or thinking flag. Its
+            // context is built from the TARGET's settings, beside the target's
+            // own, which is also why nothing here needs stamping.
+            settings: ModelSettings::default(),
+            size_bytes: 0,
+            mmproj_path: None,
+            mmproj_source_url: None,
+            mmproj_size_bytes: 0,
+            mmproj_checked: false,
+            shard_files: vec![],
+        };
+        match registry.add_model(entry) {
+            Ok(()) => Some(spec.id.to_string()),
+            Err(e) => {
+                tracing::warn!("could not register the MTP drafter: {e}");
+                None
+            }
+        }
+    }
+
+    /// The drafter id to hand the engine, or `None` to decode without speculation.
+    ///
+    /// Checks the file, not just the row: a registry entry whose weights have
+    /// been deleted would otherwise fail inside context creation on the next
+    /// turn, which reads as the engine breaking rather than as a missing file.
+    fn registered_drafter(model_id: &str) -> Option<String> {
+        use goose::providers::local_inference::local_model_registry::get_registry;
+        use pond_core::models::domain::drafter::drafter_for;
+
+        let spec = drafter_for(model_id)?;
+        let registry = get_registry().lock().ok()?;
+        let entry = registry.get_model(spec.id)?;
+        entry.local_path.exists().then(|| spec.id.to_string())
+    }
+
     fn apply_model_settings(model_id: &str) {
         #[cfg(feature = "cuda")]
         Self::apply_jetson_settings(model_id);
@@ -577,6 +657,16 @@ impl LocalInferenceLlmAdapter {
             // `tool_and_thinking_for`.
             tool_calling: tools,
             enable_thinking: thinking,
+            // Speculative decoding, when this model's drafter is registered AND
+            // its weights are still on disk. Re-decided on every provider build
+            // rather than configured once: `update_model_settings` below
+            // replaces the whole block, so a `draft_model` set by hand in
+            // registry.json is erased here anyway. Deciding it from the file
+            // system each time is what makes that safe -- a deleted drafter
+            // stops being referenced instead of failing the next context
+            // creation, and a newly downloaded one is picked up without a
+            // restart.
+            draft_model: Self::registered_drafter(model_id),
             // `enable_thinking` is set above from the template, not inherited.
             ..Default::default()
         };
