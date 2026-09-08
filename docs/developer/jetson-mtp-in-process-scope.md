@@ -274,4 +274,85 @@ Items 4 and 5 are the work. Everything else is wiring.
 
 Step 3 is the decision point and it is cheap. It is also the one this scope could be
 wrong about: everything above assumes the 2.8× survives moving from llama-server into
-GIAP's loop, and nothing measured so far demonstrates that.
+GIAP's loop. The section below is what the Mac harness could and could not settle about
+that.
+
+## Measured on the Mac, 2026-09-08
+
+Harness: `mtp.rs`'s two `#[ignore]`d tests, run against the real
+`gemma-4-E4B-it-qat-UD-Q4_K_XL` + `mtp-gemma-4-E4B-it` pair, M4, Metal.
+
+### Correctness: settled
+
+Greedy equivalence holds at draft depth 1, 4, 8 and 12 — identical **token IDs**, not
+merely identical text. Getting there cost three defects, none of which errored and all of
+which produced fluent output:
+
+| Defect | How it presented |
+|---|---|
+| draft context built without `ctx_other` | `failed to create draft context: null reference` |
+| `common_speculative_process` never called | `draft: llama_decode[0] returned -1`, inside the drafter |
+| KV rollback one position short, **and** the divergent token left undecoded | output diverged at token 3; plain 35 tokens, spec 3 |
+
+The third is the one worth remembering: two independent off-by-ones whose *combined*
+symptom was ordinary-looking text. Only comparing token IDs against an unspeculated run
+catches that, which is why the test asserts on IDs and sweeps depth — the accept
+arithmetic is indexed by draft length, so passing at depth 4 says nothing about depth 8.
+
+### Performance: the loop shape is not the problem
+
+| depth | speedup | drafts kept | tok/step | draft ms/step | verify ms/step |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1.14× | 84% | 1.84 | 3.6 | 44.0 |
+| 4 | **0.87×** | 62% | 3.50 | 8.8 | 118.9 |
+| 8 | **1.19×** | 50% | 5.00 | 16.0 | 112.0 |
+| 12 | 1.10× | 33% | 5.00 | 22.8 | 116.3 |
+
+Plain decode: 28.0 tok/s, 35.8 ms/token.
+
+`process` and `rollback` are 0.0 ms/step at every depth. That is the check that the drafter
+is sharing the target's KV cache — `common_speculative_mtp::process` skips its catch-up
+decode only when `llama_get_ctx_other(ctx_dft) == ctx_tgt`, so a non-zero reading there
+means `ctx_other` silently failed to take and every step is paying for a second forward
+pass. Worth keeping in any telemetry that ships.
+
+### Why depth 4 loses here, and why that does not transfer
+
+The decisive measurement is the cost of one target forward as a function of batch size,
+which is a property of the backend and nothing to do with the drafter:
+
+| batch | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | **9** | 13 | 17 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| ms | 30.1 | 43.7 | 62.1 | 83.4 | 121.5 | 121.4 | 155.5 | 170.2 | **116.5** | 121.8 | 125.4 |
+| ms/token | 30.1 | 21.9 | 20.7 | 20.8 | 24.3 | 20.2 | 22.2 | 21.3 | **12.9** | 9.4 | 7.4 |
+
+Batch 9 costs *less* than batch 5. That is ggml-metal's `ne11 > 8` switch from the mat-vec
+kernel to GEMM: at or below 8 positions Metal repeats a per-position kernel, so verifying
+four drafts costs very nearly what decoding them one at a time costs and there is almost
+nothing for speculation to save. Above 8 the cost goes flat, which is the regime
+speculative decoding is designed for.
+
+So the Mac's preference for depth 8 is a Metal artifact. **The default stays 4**, the value
+the Orin bake-off measured at 2.8× and 87% acceptance, and `inference_engine.rs` carries
+that reasoning at the call site so it does not get "fixed" from a Mac run.
+
+### What this does not establish
+
+No in-process number on the Orin. What the Mac shows is that GIAP's loop is not what would
+stop the 2.8× — at depth 8 the in-process loop beats plain decoding on a backend whose
+batch curve barely amortises at all, and the drafter itself costs 16 ms/step against a
+112 ms verify.
+
+Run `target_forward_cost_by_batch_size` on the device **first**, before any tuning. If the
+Orin's curve is flat from batch 2 — which is what a bandwidth-starved unified-memory part
+should give, and what would explain llama-server's 2.8× at depth 4 — then depth 4 is right
+and the port should reproduce it. If that curve is steep, there was never a speedup
+available in-process whatever the acceptance rate says, and the sidecar recommendation
+would need revisiting.
+
+Two harness properties worth carrying to the device: both live tests take a process-wide
+mutex, because cargo ran them in parallel once and shared-GPU contention halved every
+number without failing anything (plain decode read 12.3 tok/s against 28.0 measured alone,
+and depth 8 read 0.52× against 1.19×); and `speculate` calls `llama_synchronize` after the
+target decode, because Metal and CUDA both return from `llama_decode` before the graph has
+run and the unsynchronised timings blamed the wrong phase entirely.
