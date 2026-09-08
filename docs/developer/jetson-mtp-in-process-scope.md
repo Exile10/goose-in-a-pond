@@ -405,3 +405,62 @@ number without failing anything (plain decode read 12.3 tok/s against 28.0 measu
 and depth 8 read 0.52× against 1.19×); and `speculate` calls `llama_synchronize` after the
 target decode, because Metal and CUDA both return from `llama_decode` before the graph has
 run and the unsynchronised timings blamed the wrong phase entirely.
+
+## On the Orin, 2026-09-08 — in-process MTP works
+
+The fork is hosted (`jarida-io/llama-cpp-rs-giap`, private, pinned by SHA) and the device
+builds it: 29m 17s release build with CUDA sm_87, service healthy afterwards. Cargo needed
+`net.git-fetch-with-cli = true` in the nano's `~/.cargo/config.toml` — its libgit2 fetch
+ignores the `gh auth git-credential` helper the box authenticates with, and the fork is a
+private git dependency.
+
+Measured with the service stopped, `cargo test -p goose-local-inference --release
+--features cuda`, `n_ctx` 2048, greedy, unsloth MTP drafters:
+
+| target | plain | depth 1 | depth 4 | depth 8 | depth 12 |
+|---|---:|---:|---:|---:|---:|
+| E2B-qat | 24.4 tok/s | 1.42x | 1.76x | **1.90x** | 1.65x |
+| E4B-qat | 15.0 tok/s | 1.57x | 2.14x | **2.28x** | 2.08x |
+
+Greedy equivalence holds at every depth on both models — the same assertion the Mac runs
+make, now on the hardware that ships.
+
+### The batch-cost curve is flat here, exactly as predicted
+
+| batch | 1 | 2 | 4 | 8 | 9 | 17 |
+|---|---:|---:|---:|---:|---:|---:|
+| E2B ms | 31.4 | 30.9 | 38.7 | 62.8 | 39.7 | 50.9 |
+| E4B ms | 51.6 | 47.9 | 65.4 | 105.1 | 73.3 | 89.2 |
+
+A batch of 2 costs *less* than a batch of 1 on both. That is the bandwidth-bound regime
+speculative decoding is designed for, and it is why the Mac's verdict did not transfer:
+Metal repeats a mat-vec kernel below batch 9, the Orin streams the weights once. The
+prediction recorded before this run — flat curve here, so depth 4 should work — held.
+
+### Flash attention was worth more than the drafter
+
+The first device run measured **1.45x** on E4B, and I nearly wrote that up as "in-process
+gets half what the sidecar got". It was a configuration difference, not an engine one:
+`ModelSettings::default()` leaves `flash_attention`, `type_k/v`, `n_batch` and `n_ubatch`
+all `None`, so the test ran without flash attention and on an f16 KV cache, while the
+bake-off's 2.8x came from llama-server run with `-fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 128`.
+
+Setting the shipped configuration moved E4B from 1.45x to 2.14x at the same depth, and the
+drafter's cost fell from 54.3 to 19.5 ms/step. The shortfall was being charged to the
+drafter's account, which is where it would have stayed if the phase timings had not been
+there to contradict it.
+
+**2.28x in-process against the sidecar's 2.8x.** The remainder is unexplained; the runs
+differ in more than one way (`n_ctx` 2048 vs 16384, 35-token generations vs the bake-off's
+workload, no `--cache-reuse`), so it is not yet attributable.
+
+### What this does not settle
+
+- **Depth 8 beats depth 4 on both models** (1.90 vs 1.76, 2.28 vs 2.14), against a default
+  of 4. One run each, so not enough to move the default — but enough to measure properly.
+- **Production samples at temperature 0.8**, and every figure here is greedy. Acceptance
+  falls as temperature rises, so these are upper bounds on a real turn.
+- **Nothing is wired into the running pond.** The drafter files are on the device
+  (`mtp-gemma-4-E2B-it.gguf`, `mtp-gemma-4-E4B-it.gguf`, both `gemma4-assistant`) but
+  neither is in the registry, so the household pond is still decoding without speculation.
+- **No end-to-end device number**, so the turn-level effect of a 1.9x decode is unmeasured.
