@@ -464,3 +464,59 @@ workload, no `--cache-reuse`), so it is not yet attributable.
   (`mtp-gemma-4-E2B-it.gguf`, `mtp-gemma-4-E4B-it.gguf`, both `gemma4-assistant`) but
   neither is in the registry, so the household pond is still decoding without speculation.
 - **No end-to-end device number**, so the turn-level effect of a 1.9x decode is unmeasured.
+
+## A real turn on the device, 2026-09-08 — 1.57x, then it crashes
+
+Driven through `pond-server` on the Orin against an isolated data dir with hard-linked
+weights, E2B-qat, 61 tools, ~7,840-token prompt, the pond's own derived `n_ctx` of 16384:
+
+| arm | turn 1 | turn 2 | turn 3 | … | median |
+|---|---:|---:|---:|---|---:|
+| baseline | 27.5 | 31.1 | 31.0 | 8 turns, all clean | **31.0 tok/s** |
+| + MTP | **48.7** | **CRASH** | — | — | — |
+
+**1.57x on the turn that completed.** Then, creating the context for turn 2:
+
+```
+CUDA error: out of memory
+  cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0)
+ggml/src/ggml-cuda/ggml-cuda.cu:106: CUDA error
+```
+
+Aborted, core dumped. The board had ~5 GB free, so this is CUDA *pool address-space*
+reservation failing, not the weights failing to fit.
+
+### What it is not
+
+I guessed this was context churn — an MTP session builds two contexts (target and drafter)
+where a plain one builds one, and the crash came on the fourth context created. Running the
+baseline for **8 turns** disproves that: it creates a context per turn and never fails. The
+second context is what breaks it, not the rate of creation.
+
+It is also not a leaked context. `MtpSpeculative` owns both `LlamaContext`s as fields, so
+its `Drop` frees the speculative state and then both contexts. That was worth checking
+because `common_speculative_free` does not free the contexts itself -- llama-server frees
+them separately -- and a wrapper that forgot them would leak exactly like this.
+
+### What is still unknown
+
+Whether a smaller window fixes it. I tried `GOOSE_CONTEXT_LIMIT=8192` and the run still
+used 16384 and still crashed, because a pinned registry `context_size` outranks that env
+var -- and `apply_jetson_settings` re-stamps `context_size` at every provider init, so
+editing the registry by hand cannot test it either. **The code is the only knob**, which is
+also why the drafter cannot be enabled by configuration: `apply_jetson_settings` builds a
+fresh `ModelSettings { .., ..Default::default() }`, so a hand-set `draft_model` is erased
+on the next provider build. The measurement above used `GOOSE_LOCAL_DRAFT_MODEL`, which is
+read at resolve time and survives the stamping.
+
+### What this means
+
+The speedup is real and roughly what the isolated test predicted (1.57x end-to-end against
+1.76x at depth 4 in the harness, on a turn that is 2-3 inferences rather than one). But
+in-process MTP is **not shippable on this board at `n_ctx` 16384** until the second
+context's allocation is accounted for.
+
+The concrete gap: `jetson_context_size` derives the window from
+`LLM_BUDGET_MB - model_mb - COMPUTE_BUFFER_MB` and knows nothing about a drafter. With MTP
+on it must also subtract the drafter's weights and, on the evidence here, whatever the
+second CUDA context reserves -- which is the number nobody has measured yet.
