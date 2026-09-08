@@ -79,6 +79,25 @@ def med(env: dict, workload: str, metric: str):
     return m.get("median") if isinstance(m, dict) else None
 
 
+def ttft(env: dict, workload: str):
+    """Time to first token, comparable ACROSS transports.
+
+    For an HTTP replay one request is one inference, so client-side first-delta
+    IS the engine's TTFT. For GIAP a turn is 2-3 inferences plus reasoning plus a
+    tool round-trip, and its turn latency is 19-36 s against an engine TTFT near
+    1 s. Ranking the two side by side reported C2 as 98% faster, which is not an
+    engine result -- it is one number measuring a turn and another measuring an
+    inference. Prefer the engine's own figure wherever the candidate reports one.
+    """
+    return med(env, workload, "engine_ttft_ms") or med(env, workload, "ttft_ms")
+
+
+def turn_latency(env: dict, workload: str):
+    """What a user waits, end to end. Only defined for a candidate that runs the
+    whole agent loop, so it ranks nothing -- it is reported alongside."""
+    return med(env, workload, "ttft_ms")
+
+
 def spread(env: dict, workload: str, metric: str):
     w = (env.get("runs") or {}).get("workloads", {}).get(workload) or {}
     m = w.get(metric)
@@ -86,6 +105,15 @@ def spread(env: dict, workload: str, metric: str):
 
 
 def reliability(env: dict) -> dict:
+    """Scores per arm.
+
+    The `relevant` arm is NOT meaningful for a replayed payload. A narrowed
+    capture froze its tool set around the question it was captured for, so
+    substituting a different ask leaves the model graded on whether it called a
+    tool that is not in the array. Measured: every C2 variant scored 3/10 on
+    `relevant` and 9-10/10 on `all`, identically, which is the payload speaking
+    and not the engine. Only live-selection candidates can be gated on it.
+    """
     rel = (env.get("runs") or {}).get("workloads", {}).get("reliability") or {}
     out = {}
     for arm in ("relevant", "all"):
@@ -123,9 +151,14 @@ def apply_gates(env: dict, reserve_mb: int) -> dict:
     if not rel:
         g["G1_reliability"] = (None, "reliability workload not run")
     else:
+        replayed = env.get("candidate", "").startswith(("c2-", "c3-", "c4-"))
         reasons, ok = [], True
         for arm, floor in (("relevant", REL_MIN_RELEVANT), ("all", REL_MIN_ALL)):
             if arm not in rel:
+                continue
+            if arm == "relevant" and replayed:
+                reasons.append(f"relevant {rel[arm]['ok']}/{rel[arm]['of']} NOT GATED "
+                               f"(frozen payload: its tools were selected for a different ask)")
                 continue
             r = rel[arm]
             if r["rate"] < floor:
@@ -175,15 +208,38 @@ def apply_gates(env: dict, reserve_mb: int) -> dict:
     return g
 
 
+def draft_stats(env: dict) -> dict | None:
+    """llama.cpp's per-request `timings`, when the run used speculative decoding."""
+    for w in ("decode", "voice", "fresh_rel"):
+        for r in ((env.get("runs") or {}).get("workloads", {}).get(w) or {}).get("raw") or []:
+            t = r.get("timings") or {}
+            if t.get("draft_n"):
+                return t
+    return None
+
+
 def sanity(env: dict) -> list[str]:
     out = []
     wts = (env.get("model") or {}).get("bytes")
     dec = med(env, "decode", "decode_tok_per_sec")
+    spec = draft_stats(env)
     if wts and dec:
         ceiling = BANDWIDTH_GBPS / (wts / 1e9)
-        if dec > ceiling:
+        if dec > ceiling and spec:
+            # The ceiling bounds TARGET forward passes. Speculative decoding emits
+            # several accepted tokens per pass, so exceeding it is the mechanism
+            # working, not a broken measurement -- provided the acceptance rate is
+            # there to explain it.
+            acc = spec["draft_n_accepted"] / max(spec["draft_n"], 1)
+            out.append(f"decode {dec:.1f} tok/s is above the {ceiling:.1f} tok/s single-stream "
+                       f"ceiling, explained by speculative decoding: "
+                       f"{spec['draft_n_accepted']}/{spec['draft_n']} drafted tokens accepted "
+                       f"({acc:.0%}); the server's own timings report "
+                       f"{spec.get('predicted_per_second', 0):.1f} tok/s independently")
+        elif dec > ceiling:
             out.append(f"decode {dec:.1f} tok/s exceeds the {ceiling:.1f} tok/s bandwidth ceiling "
-                       f"for {wts/1e9:.2f} GB of weights — this is a measurement bug, not a fast engine")
+                       f"for {wts/1e9:.2f} GB of weights, with NO speculative decoding to explain "
+                       f"it — this is a measurement bug, not a fast engine")
     for w in ("voice", "followup", "decode", "fresh_rel"):
         s = spread(env, w, "decode_tok_per_sec") or spread(env, w, "ttft_ms")
         if s is not None and s > 15:
@@ -209,14 +265,17 @@ def usable(env: dict, gates: dict) -> tuple[bool, str]:
 
 def rank(cands: list[dict]) -> list[dict]:
     """Lexicographic with a significance band: a rung only decides when the gap is real."""
-    rungs = [("voice", "ttft_ms", False),
-             ("followup", "ttft_ms", False),
+    rungs = [("voice", "ttft", False),
+             ("followup", "ttft", False),
              ("decode", "decode_tok_per_sec", True),
-             ("fresh_rel", "ttft_ms", False)]
+             ("fresh_rel", "ttft", False)]
 
     def better(a, b) -> int:
         for w, m, higher in rungs:
-            va, vb = med(a, w, m), med(b, w, m)
+            if m == "ttft":
+                va, vb = ttft(a, w), ttft(b, w)
+            else:
+                va, vb = med(a, w, m), med(b, w, m)
             if va is None or vb is None or not va or not vb:
                 continue
             gap = abs(va - vb) / max(va, vb)
@@ -292,15 +351,15 @@ def main() -> int:
     w("\n## Measurements\n")
     w("Client-side timings throughout: from just before the request to the first chunk carrying "
       "content. Engine-reported numbers, where an engine reports any, are in the envelopes.\n")
-    w("\n| candidate | variant | voice TTFT | follow-up TTFT | decode | fresh TTFT | avail min | swap Δ | power |")
+    w("\n| candidate | variant | engine TTFT | turn latency | follow-up | decode | avail min | swap Δ | power |")
     w("|---|---|---:|---:|---:|---:|---:|---:|---|")
     for e, _ in scored:
         mem, p = e.get("memory") or {}, e.get("power") or {}
         w(f"| {e.get('candidate')} | {e.get('variant')} "
-          f"| {fmt(med(e,'voice','ttft_ms'),' ms',0)} "
-          f"| {fmt(med(e,'followup','ttft_ms'),' ms',0)} "
+          f"| {fmt(ttft(e,'voice'),' ms',0)} "
+          f"| {fmt(turn_latency(e,'voice'),' ms',0)} "
+          f"| {fmt(ttft(e,'followup'),' ms',0)} "
           f"| {fmt(med(e,'decode','decode_tok_per_sec'),' tok/s')} "
-          f"| {fmt(med(e,'fresh_rel','ttft_ms'),' ms',0)} "
           f"| {mem.get('mem_available_min_mb','—')} MB "
           f"| {mem.get('swap_delta_mb','—')} MB "
           f"| {p.get('nvpmodel_name','?')}/{p.get('jetson_clocks','?')} |")
@@ -317,9 +376,9 @@ def main() -> int:
         w("\n| metric | C1 | C2-baseline | delta | tolerance | verdict |")
         w("|---|---:|---:|---:|---|---|")
         for label, wl, m, tol in (("decode tok/s", "decode", "decode_tok_per_sec", 0.10),
-                                  ("voice TTFT", "voice", "ttft_ms", 0.15),
+                                  ("engine TTFT", "voice", "ttft", 0.15),
                                   ("prompt tokens", "fresh_rel", "prompt_tokens", 0.03)):
-            a, b = med(c1, wl, m), med(c2, wl, m)
+            a, b = (ttft(c1, wl), ttft(c2, wl)) if m == "ttft" else (med(c1, wl, m), med(c2, wl, m))
             if a and b:
                 d = (b - a) / a
                 v = "ok" if abs(d) <= tol else "**OUT OF TOLERANCE**"
@@ -341,7 +400,7 @@ def main() -> int:
               f"{os.path.basename((e.get('model') or {}).get('file') or '?')}")
         if order[0].get("candidate") != "c1-giap" and c1 is not None:
             top = order[0]
-            v_t, v_c = med(top, "voice", "ttft_ms"), med(c1, "voice", "ttft_ms")
+            v_t, v_c = ttft(top, "voice"), ttft(c1, "voice")
             d_t, d_c = med(top, "decode", "decode_tok_per_sec"), med(c1, "decode", "decode_tok_per_sec")
             gain = max((v_c - v_t) / v_c if v_c and v_t else 0,
                        (d_t - d_c) / d_c if d_c and d_t else 0)

@@ -565,7 +565,12 @@ class Driver:
     def w_canary(self, key: str) -> dict:
         hits, rows = 0, []
         for ask, want in CANARY:
-            t = self.turn(ask, payload_key=key, session=self.new_session("canary"), max_tokens=96)
+            # 96 tokens was too tight for a replayed payload. GIAP strips reasoning
+            # into its own frame; a raw llama-server without --reasoning-format puts
+            # it in `content`, so the budget was spent thinking and the answer never
+            # arrived. Every C2 variant scored 3-4/10 against C1's 10/10, identically
+            # across variants, which is the cap speaking and not the engine.
+            t = self.turn(ask, payload_key=key, session=self.new_session("canary"), max_tokens=512)
             ok = want.lower() in t.text.lower()
             hits += int(ok)
             rows.append({"ask": ask, "want": want, "ok": ok, "said": t.text[:120]})
