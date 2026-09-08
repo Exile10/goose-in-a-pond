@@ -71,6 +71,21 @@ ln "$SRC" "$SCRATCH/models/gguf/$ENTRY" 2>/dev/null \
 note "model:   $MODEL  (entry $ENTRY)"
 note "weights: hard-linked from $SRC"
 
+# The embedder, or tool_selection_mode=relevant cannot narrow and BOTH captured
+# payloads come back with all 61 tools. The first capture did exactly that, and
+# a C2 replayed against it would have answered an 8.5K-token prompt while C1's
+# baseline answered 3.6K -- a comparison of prompt sizes wearing an engine's
+# name. It lives in models/embedding/, not models/gguf/.
+mkdir -p "$SCRATCH/models/embedding"
+EMB=0
+for emb in "$REAL_MODELS"/embedding/*.gguf; do
+  [ -e "$emb" ] || continue
+  ln "$(readlink -f "$emb")" "$SCRATCH/models/embedding/$(basename "$emb")" 2>/dev/null \
+    || cp "$(readlink -f "$emb")" "$SCRATCH/models/embedding/$(basename "$emb")"
+  note "embedder: $(basename "$emb")"; EMB=1
+done
+[ "$EMB" = 1 ] || warn "no embedder under $REAL_MODELS/embedding — 'relevant' will capture all 61 tools"
+
 # ── start the scratch pond with the capture hook armed ───────────────────────
 PORT="${BAKEOFF_CAPTURE_PORT:-4981}"
 POND_DATA_DIR="$SCRATCH" POND_DEV_ALLOW_LOOPBACK=1 GIAP_CAPTURE_PAYLOAD="$CAPDIR" \
@@ -101,7 +116,13 @@ curl -sf -X PUT "$API/settings" -H 'Content-Type: application/json' \
   -d "{\"chat_provider\":\"local\",\"chat_model\":\"$MODEL\"}" >/dev/null || die "settings PUT failed"
 
 set_mode() { curl -sf -X PUT "$API/settings" -H 'Content-Type: application/json' \
-  -d "{\"tool_selection_mode\":\"$1\"}" >/dev/null; sleep 1; }
+  -d "{\"tool_selection_mode\":\"$1\"}" >/dev/null; sleep 2; }
+
+# One warm-up turn registers the model, which is what apply_jetson_settings reads
+# to size the context. Without it the capture runs against an untuned engine and
+# the prompt it records is not the prompt production sends.
+curl -sf -N -X POST "$API/chat/stream" -H 'Content-Type: application/json' \
+  -d '{"message":"hello","session_id":"cap-warmup"}' --max-time 300 >/dev/null 2>&1 || true
 
 # ── drive turns, taking the widest NEW capture after each ────────────────────
 # The shim captures every provider call, so one turn leaves several files: the
