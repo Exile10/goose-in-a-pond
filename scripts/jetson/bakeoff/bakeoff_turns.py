@@ -321,22 +321,51 @@ def load_payload(path: str) -> dict:
     return body
 
 
+GOAL_CHECK_MARKERS = ("Finish anything still outstanding", "still outstanding",
+                      "You did not produce")
+
+
 def with_user_message(body: dict, message: str) -> dict:
     """Swap the trailing user turn, holding the tool surface and system prompt fixed.
 
     Varying the ask while the tools stay byte-identical is what makes a
     reliability score attributable to the engine rather than to the prompt.
+
+    Everything AFTER the substituted user turn is dropped. A captured payload can
+    end with assistant and tool messages -- the first exchange of the turn it was
+    taken from -- and leaving them in place asks the new question as a
+    continuation of the old conversation rather than as itself. That is what took
+    the C2 canary to 1/10 against C1's 10/10 and read like an engine difference.
     """
     out = json.loads(json.dumps(body))
     msgs = out.get("messages") or []
-    for i in range(len(msgs) - 1, -1, -1):
-        if msgs[i].get("role") == "user":
-            msgs[i] = {"role": "user", "content": message}
-            break
-    else:
+    idx = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].get("role") == "user"), None)
+    if idx is None:
         msgs.append({"role": "user", "content": message})
+    else:
+        msgs = msgs[:idx] + [{"role": "user", "content": message}]
     out["messages"] = msgs
     return out
+
+
+def assert_replayable(name: str, body: dict) -> list[str]:
+    """Complain loudly about a payload that cannot be replayed as a fresh ask."""
+    problems = []
+    msgs = body.get("messages") or []
+    if not msgs:
+        return [f"{name}: no messages"]
+    last = msgs[-1]
+    if last.get("role") != "user":
+        problems.append(f"{name}: ends with role={last.get('role')}, not a user turn")
+    text = last.get("content") if isinstance(last.get("content"), str) else ""
+    for marker in GOAL_CHECK_MARKERS:
+        if marker in text:
+            problems.append(f"{name}: last user message is a goal-completeness check, "
+                            f"not a user turn -- the capture picked the wrong inference")
+            break
+    if not (body.get("tools") or []):
+        problems.append(f"{name}: carries no tools")
+    return problems
 
 
 # ── workloads ────────────────────────────────────────────────────────────────
@@ -359,11 +388,22 @@ class Driver:
     def __init__(self, args) -> None:
         self.a = args
         self.payloads: dict[str, dict] = {}
+        problems: list[str] = []
         if args.payloads:
             for name in ("fresh_all", "fresh_rel", "followup", "toolhistory"):
                 p = os.path.join(args.payloads, f"payload-{name}.json")
                 if os.path.exists(p):
-                    self.payloads[name] = load_payload(p)
+                    body = load_payload(p)
+                    problems += assert_replayable(name, body)
+                    self.payloads[name] = body
+        if problems and args.mode == "openai":
+            for p in problems:
+                print(f"  !! {p}", file=sys.stderr)
+            raise SystemExit(
+                "refusing to replay: these payloads are not fresh user asks, so every "
+                "substituted question would be answered as a continuation of the "
+                "conversation they were captured from. Re-run capture-payload.sh."
+            )
         self.session_seq = 0
         # payload_key -> what was used instead, surfaced in the output so a
         # substitution can never be mistaken for the real thing.
