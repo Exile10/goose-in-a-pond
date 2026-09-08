@@ -178,8 +178,28 @@ widest_new() { # widest_new <before-listing> <dest-name>
   note "payload-$dest.json   tools=${n% *}  bytes=${n#* }"
 }
 
+# Wait for narrowing to be LIVE before capturing anything.
+#
+# The embedder finishes initialising after the port opens, so the first turn
+# following a restart still widens to all 61 tools while the second narrows.
+# Measured: fresh_rel captured 61 while followup, one turn later, captured 23.
+# Capturing on turn one therefore recorded the widened prompt as if it were the
+# narrowed one. Burn turns until the selector actually reports narrowing.
+set_mode relevant
+say "waiting for tool-selection narrowing to come live (the embedder finishes after the port opens)"
+NARROWED=0
+for i in 1 2 3 4; do
+  turn "cap-warm-$i" "What is the weather right now?"
+  LAST="$(grep -a 'kind="tool_selection"' "$SCRATCH/server.out" | tail -1 | sed 's/\x1b\[[0-9;]*m//g')"
+  T="$(sed -n 's/.*[^_]tools=\([0-9]*\).*/\1/p' <<<"$LAST")"
+  TT="$(sed -n 's/.*tools_total=\([0-9]*\).*/\1/p' <<<"$LAST")"
+  note "probe $i: tools=${T:-?} of ${TT:-?}"
+  if [ -n "$T" ] && [ -n "$TT" ] && [ "$T" -lt "$TT" ]; then NARROWED=1; break; fi
+done
+[ "$NARROWED" = 1 ] || warn "selector never reported narrowing after 4 turns — the arms check below will catch it"
+
 say "capturing"
-B="$(snapshot)"; set_mode relevant; SID="cap-rel-$$"
+B="$(snapshot)"; SID="cap-rel-$$"
 turn "$SID" "What is the weather right now?";            widest_new "$B" fresh_rel
 B="$(snapshot)"; turn "$SID" "And tomorrow?";            widest_new "$B" followup
 B="$(snapshot)"; SID2="cap-hist-$$"
