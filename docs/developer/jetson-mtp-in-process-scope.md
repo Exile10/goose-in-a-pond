@@ -520,3 +520,76 @@ The concrete gap: `jetson_context_size` derives the window from
 `LLM_BUDGET_MB - model_mb - COMPUTE_BUFFER_MB` and knows nothing about a drafter. With MTP
 on it must also subtract the drafter's weights and, on the evidence here, whatever the
 second CUDA context reserves -- which is the number nobody has measured yet.
+
+## Shipped and measured on the Orin, 2026-09-08
+
+Eight consecutive real turns, E2B-qat, 61 tools, ~7,840-token prompt, drafter provisioned
+by the pond itself from an empty scratch data dir:
+
+| | turn 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 25.1 | 31.0 | 30.8 | 28.6 | 32.0 | 28.5 | 31.1 | 31.1 |
+| + MTP | 56.3 | 45.0 | 48.4 | 57.7 | 55.9 | 58.3 | 55.9 | 57.7 |
+
+**~1.8x end-to-end, and no crash.** The turn-2 abort is gone.
+
+### The crash was never the context window
+
+`cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, ...)` reserves **32 GB of GPU
+virtual address space per pool**, and a backend context holds up to eight of them
+(`pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS]`, created lazily per stream). One
+llama context survives that on an Orin; MTP needs two. The reservation is a fixed size
+whatever `n_ctx` is, so shrinking the window -- the obvious reading of "CUDA out of memory"
+-- could not have helped, and `jetson_context_size` was never the bug.
+
+Fixed by building against `GGML_CUDA_NO_VMM`, already exposed as `llama-cpp-sys-2`'s
+`cuda-no-vmm` feature. `ggml_cuda_init` now reports `VMM: no`, and the speedup survives it.
+
+### The budget still owed the drafter
+
+Separately from the crash, `jetson_context_size` sized the window from
+`LLM_BUDGET_MB - model_mb - COMPUTE_BUFFER_MB` while a second set of weights would be
+resident for the whole session. It now charges the drafter's real file size plus a 64 MB
+allowance, **once, not per token** -- the drafter shares the target's KV through
+`ctx_other`, which is visible as `process` costing 0.0 ms/step, so its cost is flat in
+`n_ctx` and belongs in the budget rather than the slope. The startup line now carries
+`drafter_mb`.
+
+The 64 MB is deliberately above what I measured. The honest measurement -- `MemAvailable`
+either side of building a drafter context -- read 38-47 MB at 8192 and 16384 against a
+57 MB file, and it is an under-estimate: mmap'd weights come out of reclaimable page cache,
+which `MemAvailable` counts as available. Two of its four rows read 0 MB for a context that
+cannot cost nothing, so it is not a number to build on.
+
+### Nobody has to know any of this
+
+The drafter is derived from the chat model's family, fetched once, validated, registered and
+attached. Failure at any step leaves the pond decoding exactly as before; the notification
+is the last resort.
+
+Three defects on the way there, all of the same shape -- code that looked right, compiled,
+and never ran:
+
+| Defect | How it presented |
+|---|---|
+| Registration lived in `pond-adapters-local-inference` | That crate feeds the QUARANTINED PondAgent loop. The live path is `GooseAdapter` building `LocalInferenceProvider` directly and never calls `new_with_data_dir`. Drafter on disk, validated, no registry row. |
+| `draft_model` written to the wrong registry row | `apply_jetson_settings` stamps the settings spelling (`gemma-4-E2B-it-qat-UD-Q4_K_XL`); the engine loads the canonical stem (`gemma-4-E2B-it-qat`). Two rows, one registry. |
+| The "already registered" early return | The function is called twice, with the two spellings. The first call registered the drafter, so the second -- the only one holding the id that matters -- returned before pointing the target at it. |
+
+### Still open
+
+**The same registry split affects the rest of the Jetson tuning.** `context_size`, flash
+attention, the q8_0 KV cache and the batch sizes are all stamped onto the row with
+`ctx=None` from the engine's point of view. Speculation is fixed because the fix runs on
+the live path with the canonical key in hand; the tuning block is not, and it wants its own
+measurement rather than an assumption. Observed directly:
+
+```
+gemma-4-E2B-it-qat-UD-Q4_K_XL   draft_model=... ctx=16384
+gemma-4-E2B-it-qat              draft_model=None ctx=None
+Loading gemma-4-E2B-it-qat from ...
+```
+
+Everything above is greedy or default sampling on one board; production samples at
+temperature 0.8, where acceptance is lower. And `TurnStats` still surfaces no acceptance
+rate, so a future regression would be invisible without a debugger.
