@@ -658,16 +658,53 @@ impl LocalInferenceLlmAdapter {
 
         match get_registry().lock() {
             Ok(mut registry) => {
-                if let Err(e) = registry.update_model_settings(model_id, jetson_settings) {
-                    tracing::debug!(
-                        "Jetson settings not applied to '{}' (model not yet registered): {}",
-                        model_id,
-                        e
-                    );
+                // Every row naming this same GGUF, not only the id we were
+                // handed. One file is registered under more than one id -- the
+                // spelling in settings (`gemma-4-E2B-it-qat-UD-Q4_K_XL`) and the
+                // canonical stem `register_gguf_model` returns
+                // (`gemma-4-E2B-it-qat`) -- and inference resolves the canonical
+                // one. Stamping only the id passed in put the whole tuning block
+                // on a row the engine never reads: measured on the Orin, the row
+                // it does read carried context_size, flash_attention, type_k,
+                // type_v, n_batch and n_ubatch all None, so the pond ran with an
+                // f16 KV cache and the default 2048/512 batch instead of q8_0 and
+                // 512/128 -- roughly 700 MB of footprint on a 7.6 GB board.
+                //
+                // Matching on the resolved path rather than on a name rule: the
+                // spellings are produced by two different canonicalisers in two
+                // crates, and a rule that tried to reproduce either would be one
+                // more thing to keep in step. Two rows for one file is the real
+                // defect; until that is gone, tuning all of them is what keeps
+                // the engine's row correct whichever one it picks.
+                let target = registry
+                    .get_model(model_id)
+                    .map(|e| Self::resolved(&e.local_path));
+                let ids: Vec<String> = match &target {
+                    Some(path) => registry
+                        .list_models()
+                        .iter()
+                        .filter(|e| Self::resolved(&e.local_path) == *path)
+                        .map(|e| e.id.clone())
+                        .collect(),
+                    None => vec![model_id.to_string()],
+                };
+                let mut applied = Vec::new();
+                for id in &ids {
+                    match registry.update_model_settings(id, jetson_settings.clone()) {
+                        Ok(()) => applied.push(id.as_str()),
+                        Err(e) => tracing::debug!(
+                            "Jetson settings not applied to '{}' (model not yet registered): {}",
+                            id,
+                            e
+                        ),
+                    }
+                }
+                if applied.is_empty() {
+                    tracing::debug!("Jetson settings applied to no row for '{}'", model_id);
                 } else {
                     tracing::info!(
-                        "Applied Jetson Orin Nano CUDA settings to model '{}'",
-                        model_id
+                        rows = ?applied,
+                        "Applied Jetson Orin Nano CUDA settings"
                     );
                 }
             }
@@ -678,6 +715,15 @@ impl LocalInferenceLlmAdapter {
                 );
             }
         }
+    }
+
+    /// Follow symlinks so two rows naming one GGUF compare equal.
+    ///
+    /// The registry's `local_path` is a `models/gguf/` name that the startup
+    /// hf_cache migration turns into a symlink into `hf_cache/.../blobs/<sha>`,
+    /// and different rows can hold either spelling.
+    fn resolved(p: &std::path::Path) -> std::path::PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
     }
 }
 
@@ -1220,6 +1266,40 @@ mod tests {
         let filename = format!("{}-{}.gguf", base_name, quantization);
 
         assert_eq!(filename, "SomeModel-Q8_0.gguf");
+    }
+
+    /// Two registry rows name one GGUF only if their paths resolve equal, and
+    /// the startup hf_cache migration turns one of them into a symlink. Compare
+    /// raw paths and the rows look like different files, so the tuning goes back
+    /// to landing on only one of them.
+    #[test]
+    fn rows_naming_one_file_through_a_symlink_compare_equal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = tmp.path().join("blobs").join("deadbeef");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"GGUF").unwrap();
+        let link = tmp.path().join("model.gguf");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&blob, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&blob, &link).unwrap();
+
+        assert_eq!(
+            LocalInferenceLlmAdapter::resolved(&link),
+            LocalInferenceLlmAdapter::resolved(&blob),
+            "a models/gguf symlink and its hf_cache blob are the same file"
+        );
+    }
+
+    /// A path that does not exist must still compare with itself, or a row whose
+    /// weights have been deleted would match nothing and drop out of stamping.
+    #[test]
+    fn a_missing_path_still_compares_with_itself() {
+        let p = std::path::Path::new("/nowhere/at/all/model.gguf");
+        assert_eq!(
+            LocalInferenceLlmAdapter::resolved(p),
+            LocalInferenceLlmAdapter::resolved(p)
+        );
     }
 
     /// A drafter is a second resident model, and the window has to pay for it.
