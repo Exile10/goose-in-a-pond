@@ -241,8 +241,15 @@ say "capturing"
 B="$(snapshot)"; SID="cap-rel-$$"
 turn "$SID" "What is the weather right now?";            first_chat_new "$B" fresh_rel
 B="$(snapshot)"; turn "$SID" "And tomorrow?";            first_chat_new "$B" followup
-B="$(snapshot)"; SID2="cap-hist-$$"
+# Snapshot AFTER the opening turn, not before it: first_chat_new takes the
+# earliest NEW capture, so a snapshot taken before turn one hands back turn
+# one's payload -- two messages, no tool history -- which is the opposite of
+# what this arm exists to test. The multiturn workload uses it to check that a
+# streaming tool-call parser survives history carrying prior tool_calls, the
+# case that broke a --jinja parser before.
+SID2="cap-hist-$$"
 turn "$SID2" "What is on my schedule?"
+B="$(snapshot)"
 turn "$SID2" "Thanks. Now what is the weather?";         first_chat_new "$B" toolhistory
 B="$(snapshot)"; set_mode all; SID3="cap-all-$$"
 turn "$SID3" "What is the weather right now?";           first_chat_new "$B" fresh_all
