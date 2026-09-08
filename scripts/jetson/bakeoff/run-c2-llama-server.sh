@@ -50,6 +50,14 @@ done
 [ -n "$ENTRY" ] || die "cannot resolve $MODEL under $REAL_DATA/models/gguf"
 SRC="$(readlink -f "$REAL_DATA/models/gguf/$ENTRY")"
 
+# A previous candidate's cleanup trap can still be tearing down when this starts,
+# and then the exclusivity gate correctly refuses. Give it a bounded chance to
+# finish rather than failing a chained run on a shutdown race.
+for _ in $(seq 1 30); do
+  pgrep -f "pond-server serve" >/dev/null 2>&1 || break
+  sleep 2
+done
+
 preflight
 stamp_power_env
 OC0="$(oc3_count)"; T0="$(date +%s)"
@@ -103,13 +111,23 @@ case "$VARIANT" in
   kvf16)
     ARGS=("${ARGS[@]/-ctk q8_0/}"); ARGS=("${ARGS[@]/-ctv q8_0/}") ;;
   mtp|draft)
-    [ -n "$DRAFT" ] || die "--variant $VARIANT needs --draft <assistant.gguf>"
+    [ -n "$DRAFT" ] || die "--variant $VARIANT needs --draft <drafter.gguf>"
     [ -f "$DRAFT" ] || die "draft model not found: $DRAFT"
+    # The drafter must carry arch `gemma4-assistant` (HYPHEN). The centroid-format
+    # drafters this project has from the ik_llama era are `gemma4_assistant` and
+    # `gemma4_mtp`, and they are not a rename away: upstream wants
+    # nextn.{eh_proj,enorm,hnorm,shared_head_*} where those carry
+    # mtp.{pre_projection,centroids,token_ordering}. Different layout entirely.
+    DRAFT_ARCH="$(strings -a "$DRAFT" 2>/dev/null | grep -m1 -x "gemma4-assistant\|gemma4_assistant\|gemma4_mtp" || echo unknown)"
+    note "drafter arch: $DRAFT_ARCH"
+    [ "$DRAFT_ARCH" = "gemma4-assistant" ] || add_warning \
+      "drafter arch is '$DRAFT_ARCH'; upstream llama.cpp registers 'gemma4-assistant' and will refuse this file"
     ARGS+=(-md /models/"$(basename "$DRAFT")")
     if has_flag -- "--spec-type"; then
-      SPEC="$(grep -o -- '--spec-type[^\n]*' <<<"$HELP" | head -1)"
-      note "build advertises: $SPEC"
-      ARGS+=(--spec-type "${BAKEOFF_SPEC_TYPE:-mtp}")
+      # unsloth documents `draft-mtp` for this drafter; this build advertises
+      # none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-*.
+      ARGS+=(--spec-type "${BAKEOFF_SPEC_TYPE:-draft-mtp}")
+      has_flag -- "--spec-draft-n-max" && ARGS+=(--spec-draft-n-max "${BAKEOFF_DRAFT_N_MAX:-4}")
     else MISSING+=("--spec-type"); add_warning "no --spec-type; speculative decoding cannot be tested on this build"; fi ;;
   *) die "unknown variant: $VARIANT" ;;
 esac
