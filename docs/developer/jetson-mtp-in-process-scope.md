@@ -576,19 +576,44 @@ and never ran:
 | `draft_model` written to the wrong registry row | `apply_jetson_settings` stamps the settings spelling (`gemma-4-E2B-it-qat-UD-Q4_K_XL`); the engine loads the canonical stem (`gemma-4-E2B-it-qat`). Two rows, one registry. |
 | The "already registered" early return | The function is called twice, with the two spellings. The first call registered the drafter, so the second -- the only one holding the id that matters -- returned before pointing the target at it. |
 
+### The tuning row, fixed
+
+**The same registry split was leaving the whole Jetson tuning block inert.** Read off the
+device before the fix, the row inference actually resolves:
+
+| setting | row the engine reads | row that was stamped |
+|---|---|---|
+| `context_size` | None | 16384 |
+| `n_gpu_layers` | None | 99 |
+| `flash_attention` | None | true |
+| `type_k` / `type_v` | None / None | q8_0 / q8_0 |
+| `n_batch` / `n_ubatch` | None / None | 512 / 128 |
+| `n_threads` | None | 4 |
+
+So the pond was running with an f16 KV cache instead of q8_0 and llama.cpp's default
+2048/512 batch instead of 512/128. This repository's own recorded measurements for those two
+settings -- KV 296 -> 157 MiB, peak footprint 437 -> 307 MB for the cache, and a compute
+buffer of 522 MiB at `n_ubatch` 512 against 129 MiB at 128 -- put the avoidable footprint
+at roughly 700 MB on a 7.6 GB board. Those are prior numbers from the source comments, not
+re-measured here.
+
+`n_gpu_layers` was the harmless one: `llama_model_default_params` sets it to `-1`, which
+offloads everything, so the board was never accidentally on the CPU.
+
+`apply_jetson_settings` now stamps **every row whose `local_path` resolves to the same
+GGUF**, matched on the resolved path rather than on a name rule -- the two spellings come
+from two different canonicalisers in two crates, and symlinks are followed because the
+startup hf_cache migration turns `models/gguf` entries into links into `hf_cache` blobs.
+
+After the fix, both rows carry `ctx=16384 fa=True k=q8_0 v=q8_0 batch=512/128 thr=4`, and
+eight consecutive turns run at 51.3-53.1 tok/s (median 52) with `MemAvailable` bottoming at
+2,317 MB. Note the decode spread narrows against the untuned run's 45-58 tok/s while the
+median moves little; the tuning buys footprint, not throughput.
+
+**Two rows for one file remains the real defect.** Nothing here removes it; stamping all of
+them is what keeps the engine's row correct whichever one it picks.
+
 ### Still open
-
-**The same registry split affects the rest of the Jetson tuning.** `context_size`, flash
-attention, the q8_0 KV cache and the batch sizes are all stamped onto the row with
-`ctx=None` from the engine's point of view. Speculation is fixed because the fix runs on
-the live path with the canonical key in hand; the tuning block is not, and it wants its own
-measurement rather than an assumption. Observed directly:
-
-```
-gemma-4-E2B-it-qat-UD-Q4_K_XL   draft_model=... ctx=16384
-gemma-4-E2B-it-qat              draft_model=None ctx=None
-Loading gemma-4-E2B-it-qat from ...
-```
 
 Everything above is greedy or default sampling on one board; production samples at
 temperature 0.8, where acceptance is lower. And `TurnStats` still surfaces no acceptance
