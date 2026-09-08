@@ -3603,6 +3603,38 @@ async fn run_server(
     > = Arc::new(
         pond_infra::sqlite_notification_queue::SqliteNotificationQueue::new(db.system.clone()),
     );
+
+    // The speculative-decoding drafter, provisioned the way the TTS engine is:
+    // a helper model nobody asked for and nobody should have to think about.
+    // Measured on the Orin, it takes a real turn from 31 to 49 tok/s.
+    //
+    // Silent by design when it cannot be had -- decode is simply not
+    // accelerated -- and `apply_jetson_settings` re-checks the file on every
+    // provider build, so a drafter that arrives later is picked up without a
+    // restart. Placed after the notification queue exists because the
+    // notification below is the LAST resort: it fires only when the pond will
+    // go on running slower than it could and nothing else would ever say so.
+    if model_download::drafter_for(&settings.chat_model).is_some()
+        && model_download::ensure_mtp_drafter(&data_dir, &settings.chat_model)
+            .await
+            .is_none()
+    {
+        let notice = pond_core::mcp::ports::notification::Notification {
+            id: uuid::Uuid::new_v4().to_string(),
+            target: "broadcast".to_string(),
+            category: "info".to_string(),
+            title: "Running without speculative decoding".to_string(),
+            body: format!(
+                "Could not fetch the helper model for {}. Chat works as usual, \
+                 replies are just slower. It retries on the next start.",
+                settings.chat_model
+            ),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            data: None,
+        };
+        let _ = notification_queue.enqueue(notice.clone()).await;
+        let _ = notification_tx.send(notice);
+    }
     // Real FCM relay when a service-account key is present (Path B: direct
     // FCM v1, data-only wake pings — no Expo hop, no content through Google);
     // otherwise the logging stub. Key location:
