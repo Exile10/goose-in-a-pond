@@ -2241,6 +2241,13 @@ impl GooseAdapter {
                 // purpose: the encoder is ~1 GB.
                 if let Some(ref dd) = self.data_dir {
                     crate::vision_encoder::ensure_mmproj_available(dd, &registry_key);
+                    // Speculative decoding's drafter, for the same reason and on
+                    // the same terms as the encoder above: the engine resolves it
+                    // by name through the registry, so a drafter file with no row
+                    // is invisible. Re-checked on every provider build, so one
+                    // that arrives later is used without a restart and one that
+                    // has been deleted simply stops being referenced.
+                    crate::mtp_drafter::ensure_drafter_registered(dd, &registry_key);
                 }
                 let cfg = goose_providers::model::ModelConfig::new(&registry_key);
                 tracing::debug!(

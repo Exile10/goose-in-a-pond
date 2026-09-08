@@ -1834,6 +1834,38 @@ async fn run_server(
     let effective_chat_provider = settings.chat_provider.clone();
     let effective_chat_model = settings.chat_model.clone();
 
+    // The speculative-decoding drafter, provisioned the way the TTS engine is:
+    // a helper model nobody asked for and nobody should have to think about.
+    // Measured on the Orin, it takes a real turn from 31 to 49 tok/s.
+    //
+    // Before ANY provider is built, because both consumers read the registry
+    // and neither re-reads it: `apply_jetson_settings` sizes the context window
+    // against the models that will be resident and sets `draft_model` from the
+    // registry, and it runs when the local adapter is constructed a few lines
+    // below. Registering after that point costs a restart to converge.
+    //
+    // Failure is silent by design -- decode is simply not accelerated. The
+    // notification further down is the last resort, and it is down there
+    // because the queue to put it on does not exist yet.
+    let drafter_wanted = model_download::drafter_for(&settings.chat_model).is_some();
+    let drafter_ready = if drafter_wanted {
+        let present = model_download::ensure_mtp_drafter(&data_dir, &settings.chat_model)
+            .await
+            .is_some();
+        // The registry row is what the engine resolves a drafter by name
+        // through, so a downloaded file with no row is invisible.
+        #[cfg(feature = "goose-agent")]
+        if present {
+            pond_adapters_goose::mtp_drafter::ensure_drafter_registered(
+                &data_dir,
+                &settings.chat_model,
+            );
+        }
+        present
+    } else {
+        false
+    };
+
     // ── Build per-role LLM providers ────────────────────────────────────────
     // Each role (Chat / Think / Task) may use a different provider + model.
     // Token budget and temperature are baked in at startup.
@@ -3604,21 +3636,9 @@ async fn run_server(
         pond_infra::sqlite_notification_queue::SqliteNotificationQueue::new(db.system.clone()),
     );
 
-    // The speculative-decoding drafter, provisioned the way the TTS engine is:
-    // a helper model nobody asked for and nobody should have to think about.
-    // Measured on the Orin, it takes a real turn from 31 to 49 tok/s.
-    //
-    // Silent by design when it cannot be had -- decode is simply not
-    // accelerated -- and `apply_jetson_settings` re-checks the file on every
-    // provider build, so a drafter that arrives later is picked up without a
-    // restart. Placed after the notification queue exists because the
-    // notification below is the LAST resort: it fires only when the pond will
-    // go on running slower than it could and nothing else would ever say so.
-    if model_download::drafter_for(&settings.chat_model).is_some()
-        && model_download::ensure_mtp_drafter(&data_dir, &settings.chat_model)
-            .await
-            .is_none()
-    {
+    // Last resort: the pond will go on running slower than it could and nothing
+    // else would ever say so.
+    if drafter_wanted && !drafter_ready {
         let notice = pond_core::mcp::ports::notification::Notification {
             id: uuid::Uuid::new_v4().to_string(),
             target: "broadcast".to_string(),
