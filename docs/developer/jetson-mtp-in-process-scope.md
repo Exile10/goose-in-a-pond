@@ -5,6 +5,75 @@ engine's 15.8** on `gemma-4-E4B-it-qat`, at 87 % draft acceptance, quality uncha
 See [`jetson-engine-bakeoff.md`](jetson-engine-bakeoff.md). This scopes bringing that
 in-process rather than adopting a sidecar.
 
+## BLOCKED — measured 2026-09-08, and this supersedes the scope below
+
+The bump was attempted. **It cannot be done.** `llama-cpp-2` removed the
+OpenAI-compat chat templating in `0.1.147` — the version immediately after ours — and
+added MTP in `0.1.151`. There is no version that has both:
+
+| version | `openai.rs` | `speculative.rs` (MTP) |
+|---|---|---|
+| **0.1.146** (pinned today) | **present** | — |
+| 0.1.147 – 0.1.150 | — | — |
+| 0.1.151 – 0.1.156 | — | **present** |
+
+Bumping to reach MTP therefore *removes* the API the live serving path renders every
+prompt with. `cargo check -p goose-local-inference` against `=0.1.156` fails with 13
+errors; 8 of them are this one cause. On the `-sys` side, `wrapper_oai.{h,cpp}` are
+deleted outright with no replacement anywhere in the crate.
+
+### What is lost, and why it is not a port
+
+`apply_chat_template_oaicompat` → `ChatTemplateResult` is not a formatting convenience.
+It carries three things the engine depends on:
+
+| Used for | Sites |
+|---|---|
+| Rendering the prompt with native tools JSON, `enable_thinking`, `parallel_tool_calls` | `inference_engine.rs:1641, 2361, 2629`; `mod.rs:81` |
+| **Deciding whether a model supports native tool calling at all** — `template_result_supports_native_tool_calling` does a dry run and reads the answer off the result | `mod.rs:59, 104` |
+| **Streaming tool-call parsing** — `streaming_state_oaicompat()` is what turns a token stream into `tool_calls` | `inference_native_tools.rs:37` |
+
+`ChatTemplateResult` is also a public field of the engine's own `PreparedGeneration`
+(`inference_engine.rs:305`), so the type is threaded through four modules.
+
+Replacing it means GIAP renders the Gemma chat template itself *and* writes its own
+streaming tool-call parser. The fork has `native_tool_parsing.rs` (323 lines) but it
+parses text into a message — it is not the incremental parser the streaming path needs,
+and `enable_thinking` plus the native-tool capability probe have no substitute at all.
+
+This is exactly the failure mode the recorded history warns about: a `--jinja` streaming
+tool-call parser breaking on GIAP's payload is what blocked the direct-llama.cpp route
+once already. Re-implementing that parser to gain decode speed trades the thing that
+works for the thing that is fast.
+
+### What this means for the recommendation
+
+The bake-off's finding stands — **upstream MTP is worth 2.8× decode on this board** — but
+it is not reachable by bumping the crate. The routes that remain:
+
+1. **Wait.** `openai.rs` may return, or the MTP API may be backported. Cheap to check
+   before each attempt: the table above is two `curl`s.
+2. **Fork `llama-cpp-2`.** Re-apply `openai.rs` and `wrapper_oai.{h,cpp}` from 0.1.146 on
+   top of 0.1.156. Mechanically plausible — they are self-contained — but it adds a
+   second vendored fork to maintain beneath the goose fork, and llama.cpp's own
+   `chat.cpp` will have moved underneath them.
+3. **Sidecar after all.** The bake-off measured `llama-server` doing this today with no
+   GIAP changes at all. The costs are real (a second supervised process, wall-clock
+   telemetry, re-solving `SacrificialContext` server-side) but they are *known*, whereas
+   the cost of writing a streaming tool-call parser is not.
+4. **Do nothing.** 15.8 tok/s is the current experience and nothing is broken.
+
+My earlier recommendation — "bump the engine, do not adopt a sidecar" — assumed the bump
+was available. It is not, and route 3 deserves a fresh look on that basis rather than
+being dismissed for costs that are smaller than the alternative's.
+
+### Cost of the check
+
+Two hours, and it landed before any of the hard work in the scope below was started. That
+was the point of ordering it first.
+
+---
+
 ## Headline: smaller than it looked
 
 I previously called this "new engine work, not a flag". That was wrong on the main
