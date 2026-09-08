@@ -140,7 +140,13 @@ gate_exclusive() {
   if command -v docker >/dev/null && [ -n "$(docker ps -q 2>/dev/null)" ]; then
     add_warning "docker containers are running: $(docker ps --format '{{.Image}}' | tr '\n' ' ')"; busy=1
   fi
-  local procs; procs="$(pgrep -a -f 'llama-server|vllm|ollama|pond-server' 2>/dev/null | head -3)"
+  # Match the BINARY, not any command line containing its name: `pgrep -f
+  # llama-server` matched run-c2-llama-server.sh itself and aborted the run it
+  # was gating. Exclude this script's own process tree for the same reason.
+  local procs
+  procs="$(pgrep -a -f 'llama-server|vllm serve|ollama serve|pond-server' 2>/dev/null \
+            | grep -v "bakeoff/run-c" | grep -v "bakeoff/capture" \
+            | awk -v me="$$" -v pp="$PPID" '$1 != me && $1 != pp' | head -3)"
   [ -n "$procs" ] && { add_warning "inference processes already running:"; echo "$procs" | sed 's/^/       /' >&2; busy=1; }
   [ "$busy" = 0 ] || die "another engine holds the board; stop it or two candidates share the memory pool"
 }
