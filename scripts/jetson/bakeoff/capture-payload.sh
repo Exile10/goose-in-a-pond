@@ -167,15 +167,54 @@ turn() { # turn <session> <message>
     --max-time 300 >/dev/null 2>&1 || true
 }
 snapshot() { ls -1 "$CAPDIR" 2>/dev/null | sort; }
-widest_new() { # widest_new <before-listing> <dest-name>
-  local before="$1" dest="$2" pick
-  pick="$(comm -13 <(echo "$before") <(snapshot) | while read -r f; do
-            [ -n "$f" ] && printf '%s %s\n' "$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1])).get("tools") or []))' "$CAPDIR/$f" 2>/dev/null || echo 0)" "$f"
-          done | sort -rn | head -1 | awk '{print $2}')"
-  if [ -z "$pick" ]; then warn "no new capture for $dest"; return 1; fi
+
+# Pick the turn's CHAT inference out of the several captures one turn leaves.
+#
+# "Widest" was the wrong rule. A turn leaves the chat inference, a memory
+# extraction, and the GOAL-COMPLETENESS CHECK -- and the goal check carries the
+# same tool array, so it can be just as wide. It is also the LAST of them, so
+# widest-with-ties picked it, and its final user message is
+# "Finish anything still outstanding for this: ..." with the whole first
+# exchange sitting above it as history.
+#
+# Replaying that meant every substituted question was asked as a continuation of
+# a conversation that had just failed to fetch weather. The C2 canary scored
+# 1/10 against C1's 10/10 and it read like an engine difference.
+#
+# The chat inference is the FIRST new capture that carries tools and whose last
+# message is a plain user turn. Filenames are sequence-numbered, so name order
+# is call order.
+first_chat_new() { # first_chat_new <before-listing> <dest-name>
+  local before="$1" dest="$2" pick=""
+  while read -r f; do
+    [ -n "$f" ] || continue
+    if python3 - "$CAPDIR/$f" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+msgs = d.get("messages") or []
+if not (d.get("tools") or []):
+    sys.exit(1)
+last = msgs[-1] if msgs else {}
+if last.get("role") != "user":
+    sys.exit(1)
+text = last.get("content") or ""
+if not isinstance(text, str):
+    sys.exit(1)
+# The goal check and the re-engagement steer both open with a fixed preamble.
+for marker in ("Finish anything still outstanding",
+               "still outstanding",
+               "You did not produce"):
+    if marker in text:
+        sys.exit(1)
+sys.exit(0)
+PYEOF
+    then pick="$f"; break; fi
+  done < <(comm -13 <(echo "$before") <(snapshot))
+
+  if [ -z "$pick" ]; then warn "no chat-inference capture for $dest"; return 1; fi
   cp "$CAPDIR/$pick" "$OUT/payload-$dest.json"
   local n; n="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(len(d.get("tools") or []), len(json.dumps(d)))' "$OUT/payload-$dest.json")"
-  note "payload-$dest.json   tools=${n% *}  bytes=${n#* }"
+  note "payload-$dest.json   tools=${n% *}  bytes=${n#* }  (chat inference)"
 }
 
 # Wait for narrowing to be LIVE before capturing anything.
@@ -200,13 +239,13 @@ done
 
 say "capturing"
 B="$(snapshot)"; SID="cap-rel-$$"
-turn "$SID" "What is the weather right now?";            widest_new "$B" fresh_rel
-B="$(snapshot)"; turn "$SID" "And tomorrow?";            widest_new "$B" followup
+turn "$SID" "What is the weather right now?";            first_chat_new "$B" fresh_rel
+B="$(snapshot)"; turn "$SID" "And tomorrow?";            first_chat_new "$B" followup
 B="$(snapshot)"; SID2="cap-hist-$$"
 turn "$SID2" "What is on my schedule?"
-turn "$SID2" "Thanks. Now what is the weather?";         widest_new "$B" toolhistory
+turn "$SID2" "Thanks. Now what is the weather?";         first_chat_new "$B" toolhistory
 B="$(snapshot)"; set_mode all; SID3="cap-all-$$"
-turn "$SID3" "What is the weather right now?";           widest_new "$B" fresh_all
+turn "$SID3" "What is the weather right now?";           first_chat_new "$B" fresh_all
 
 # What the engines must agree with, within 3%, or they are not answering the
 # same prompt and no comparison between them means anything.
