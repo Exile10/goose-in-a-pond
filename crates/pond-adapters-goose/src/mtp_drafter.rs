@@ -11,7 +11,7 @@
 //! and never runs.
 
 use goose::providers::local_inference::local_model_registry::{
-    get_registry, LocalModelEntry, LocalModelStorage, ModelSettings,
+    get_registry, LocalModelEntry, LocalModelRegistry, LocalModelStorage, ModelSettings,
 };
 use pond_core::models::domain::drafter::{drafter_for, drafter_path};
 use std::path::Path;
@@ -67,15 +67,46 @@ pub fn ensure_drafter_registered(data_dir: &Path, model_name: &str) -> Option<St
         mmproj_checked: false,
         shard_files: vec![],
     };
-    match registry.add_model(entry) {
-        Ok(()) => {
-            tracing::info!(drafter = spec.id, "MTP drafter registered");
-            Some(spec.id.to_string())
-        }
-        Err(e) => {
-            tracing::warn!("could not register the MTP drafter: {e}");
-            None
-        }
+    if let Err(e) = registry.add_model(entry) {
+        tracing::warn!("could not register the MTP drafter: {e}");
+        return None;
+    }
+    tracing::info!(drafter = spec.id, "MTP drafter registered");
+    point_target_at_drafter(&mut registry, model_name, spec.id);
+    Some(spec.id.to_string())
+}
+
+/// Set `draft_model` on the row the ENGINE resolves.
+///
+/// `apply_jetson_settings` stamps the model id as spelled in settings
+/// (`gemma-4-E2B-it-qat-UD-Q4_K_XL`), while the engine loads the canonical stem
+/// (`gemma-4-E2B-it-qat`) that `register_gguf_model` returns. Those are two rows
+/// in one registry, and a `draft_model` written to the first is never read. This
+/// is called with the canonical key, because that is what the caller in
+/// `goose_agent` has in hand.
+///
+/// Read-modify-write rather than a fresh block: `update_model_settings` replaces
+/// the whole `ModelSettings`, so constructing one here would drop whatever else
+/// the row is carrying.
+fn point_target_at_drafter(
+    registry: &mut impl std::ops::DerefMut<Target = LocalModelRegistry>,
+    model_id: &str,
+    drafter_id: &str,
+) {
+    let Some(mut settings) = registry.get_model(model_id).map(|e| e.settings.clone()) else {
+        return;
+    };
+    if settings.draft_model.as_deref() == Some(drafter_id) {
+        return;
+    }
+    settings.draft_model = Some(drafter_id.to_string());
+    match registry.update_model_settings(model_id, settings) {
+        Ok(()) => tracing::info!(
+            model = model_id,
+            drafter = drafter_id,
+            "speculation enabled"
+        ),
+        Err(e) => tracing::warn!("could not point '{model_id}' at its drafter: {e}"),
     }
 }
 
