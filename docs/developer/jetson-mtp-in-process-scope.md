@@ -5,7 +5,64 @@ engine's 15.8** on `gemma-4-E4B-it-qat`, at 87 % draft acceptance, quality uncha
 See [`jetson-engine-bakeoff.md`](jetson-engine-bakeoff.md). This scopes bringing that
 in-process rather than adopting a sidecar.
 
-## BLOCKED — measured 2026-09-08, and this supersedes the scope below
+## UNBLOCKED — the fork builds, 2026-09-08
+
+Route 2 was taken and it works. `~/Documents/Jarida/llama-cpp-rs-giap` is llama-cpp-rs
+**0.1.156 with the 0.1.146 OpenAI-compat surface re-applied**, and GIAP builds against it:
+
+```
+cargo check -p pond-server -p pond-adapters-goose   Finished
+cargo test  -p goose-local-inference --lib          146 passed; 3 failed
+```
+
+The three failures are the documented pre-existing host-memory context-cap tests,
+unchanged. `cargo fmt --check` clean.
+
+**Both APIs now coexist in one crate** — proven by a compile-only probe importing
+`model::ChatTemplateResult`, `openai::{ChatParseStateOaicompat, OpenAIChatTemplateParams}`
+and `speculative::{MtpSpeculative, MtpSpeculativeParams}` together. That combination does
+not exist in any published version.
+
+### What the port actually needed
+
+**16 of the 17 `common/chat.h` symbols `wrapper_oai.cpp` uses were unchanged**, and
+0.1.156's `chat.h` is otherwise a superset. Restored verbatim from 0.1.146:
+`wrapper_oai.{h,cpp}`, the `llama_rs_grammar_trigger` and
+`llama_rs_chat_template_result` structs plus the free function, `src/openai.rs`, and
+`model.rs`'s `GrammarTriggerType` / `GrammarTrigger` / `ChatTemplateResult` /
+`apply_chat_template_oaicompat` / `impl ChatTemplateResult`, with `ChatParseError` and
+one `ApplyChatTemplateError` variant in `lib.rs`.
+
+Three genuine adaptations:
+
+| Change | Fix |
+|---|---|
+| `common_chat_msg_diff_to_json_oaicompat` deleted upstream (header *and* definition) | Vendored into `wrapper_oai.cpp` as a static. Pure serialization over `common_chat_msg_diff`, whose layout is **byte-identical** between the trees — so it would fail to compile, not silently misbehave, if that changed. |
+| `params.thinking_end_tag` → `thinking_end_tags` (string → vector) | `.empty()` on the vector |
+| `dup_string_array` / `dup_trigger_array` dropped | Restored into `wrapper_oai.cpp`, not `wrapper_utils.h` — `wrapper_common.cpp` includes the latter and has neither `<vector>` nor `common/chat.h`, so putting them there broke the compile they were meant to fix |
+
+Two upstream signature changes on GIAP's side: `LlamaSampler::penalties` gained
+`n_vocab` (so `build_sampler` now takes the model), and `MtmdBitmap::from_buffer` gained
+a `placeholder` flag.
+
+### What is NOT done
+
+**MTP is not wired.** The fork makes it *reachable*; items 4–6 below (the `SessionKv`
+ownership problem and the speculative generation loop) are untouched. Nothing has been
+measured in-process — the 2.8× is still a llama-server number.
+
+**The fork has no home.** `[patch.crates-io]` uses a path relative to the workspace root,
+so the fork must sit beside the repo on every machine that builds it, including the
+Jetson (`~/llama-cpp-rs-giap` next to `~/goose-in-a-pond`). A git dependency removes that
+and is the right answer once there is somewhere to push it.
+
+**It is a second fork to maintain**, beneath the goose fork, and llama.cpp moves under
+both. The three adaptations above are the maintenance surface, and the byte-identical
+struct is the one that could bite silently if upstream ever reshapes it.
+
+---
+
+## Why it was blocked (superseded by the above, kept for the reasoning)
 
 The bump was attempted. **It cannot be done.** `llama-cpp-2` removed the
 OpenAI-compat chat templating in `0.1.147` — the version immediately after ours — and
