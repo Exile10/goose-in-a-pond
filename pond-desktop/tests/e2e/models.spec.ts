@@ -64,7 +64,7 @@ test.describe("Models section", () => {
     ).toBeVisible({ timeout: 10_000 });
   });
 
-  test("memory status shows total MB when non-zero", async ({ page }) => {
+  test("memory status reports the budget a model can actually have", async ({ page }) => {
     await page.route("**/api/v1/models/memory-status", (route) =>
       route.fulfill({
         json: {
@@ -77,8 +77,14 @@ test.describe("Models section", () => {
 
     await goToModels(page);
 
-    // Memory total should appear somewhere (8192 MB or 8 GB or similar)
-    await expect(page.getByText(/8192|8,192|8\.0|8 GB/i).first()).toBeVisible({ timeout: 10_000 });
+    // The header reports what a model can ACTUALLY have — 4096 MB of budget,
+    // rendered "4.0 GB" beside "for models" — not the 8192 MB device total.
+    // That is deliberate: the fit meters measure against the usable figure,
+    // and `fitReading` keeps the bar and the sentence agreeing about the same
+    // model. So the raw total is not on this screen to assert.
+    await expect(
+      page.locator(".mdl-stat", { hasText: "for models" }),
+    ).toContainText("4.0 GB", { timeout: 10_000 });
   });
 
   test("memory status shows loaded model name when a model is hot", async ({ page }) => {
@@ -251,11 +257,13 @@ test.describe("Models section", () => {
 
     await goToModels(page);
 
-    // A progress indicator should be visible (progress bar or percentage text)
+    // The bar carries a role and an accessible name now, so it can be named
+    // directly. The old `.or(getByText(/%|progress/))` fallback dated from
+    // markup that had neither, and matched both the bar and its own "26%"
+    // label — two elements, which is a strict-mode violation rather than a
+    // missing indicator.
     await expect(
-      page
-        .locator('[role="progressbar"]')
-        .or(page.getByText(/downloading|%|progress/i).first())
+      page.getByRole("progressbar", { name: /llama3\.2-3b\.gguf download progress/i }),
     ).toBeVisible({ timeout: 10_000 });
   });
 });
