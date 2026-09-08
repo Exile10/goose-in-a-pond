@@ -95,8 +95,8 @@ tree-sitter-rust = { version = "0.24", default-features = false }
 tree-sitter-swift = { version = "0.7", default-features = false }
 tree-sitter-typescript = { version = "0.23", default-features = false }
 # llama-cpp-2 has breaking changes in patch releases; goose pins it exactly.
-llama-cpp-2 = { version = "=0.1.146", default-features = false, features = ["sampler", "mtmd"] }
-llama-cpp-sys-2 = { version = "=0.1.146", default-features = false }
+llama-cpp-2 = { version = "=0.1.156", default-features = false, features = ["sampler", "mtmd", "common"] }
+llama-cpp-sys-2 = { version = "=0.1.156", default-features = false }
 # temporal_rs 0.1 (transitive via PCTX) enables unstable icu features without
 # pinning; goose pins icu to a compatible exact version. Mirrored here.
 icu_calendar = { version = "=2.1.1", default-features = false }
@@ -248,3 +248,17 @@ panic = "abort"
 
 # NOTE: goose's own [patch.crates-io] (vendored v8, cudaforge) is ignored when building from this
 # root; replicate entries here if its build graph ever needs them.
+
+# GIAP fork of llama-cpp-rs. Upstream removed the OpenAI-compat chat templating in
+# 0.1.147 and added MTP speculative decoding in 0.1.151, so NO published version has
+# both -- and the live serving path renders every prompt through the former while the
+# measured 2.8x decode win needs the latter. This is 0.1.156 with the OAI surface from
+# 0.1.146 re-applied. See docs/developer/jetson-mtp-in-process-scope.md.
+#
+# The path is RELATIVE to this workspace root, so the fork must sit beside the
+# repo on every machine that builds it -- including the Jetson, where that means
+# ~/llama-cpp-rs-giap next to ~/goose-in-a-pond. A git dependency would remove
+# that requirement and is the right answer once the fork has somewhere to live.
+[patch.crates-io]
+llama-cpp-2 = { path = "../llama-cpp-rs-giap/llama-cpp-2" }
+llama-cpp-sys-2 = { path = "../llama-cpp-rs-giap/llama-cpp-sys-2" }
