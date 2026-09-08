@@ -53,8 +53,12 @@ SRC="$(readlink -f "$REAL_DATA/models/gguf/$ENTRY")"
 # A previous candidate's cleanup trap can still be tearing down when this starts,
 # and then the exclusivity gate correctly refuses. Give it a bounded chance to
 # finish rather than failing a chained run on a shutdown race.
-for _ in $(seq 1 30); do
-  pgrep -f "pond-server serve" >/dev/null 2>&1 || break
+# Wait for whatever the PREVIOUS candidate left, which is a llama-server when
+# the previous candidate was another C2 variant -- the first version of this
+# waited only for pond-server, so chaining baseline -> iswa -> mtp failed both
+# later variants on the gate while the check itself was working correctly.
+for _ in $(seq 1 45); do
+  pgrep -x llama-server >/dev/null 2>&1 || pgrep -f "pond-server serve" >/dev/null 2>&1 || break
   sleep 2
 done
 
