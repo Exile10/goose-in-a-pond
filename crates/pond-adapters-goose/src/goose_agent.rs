@@ -2311,6 +2311,36 @@ impl GooseAdapter {
                     }
                 }
             }
+            // mistral.rs speaks OpenAI, not Ollama, so it takes goose's OpenAI
+            // provider pointed at a local host rather than the transport the
+            // llamafile arm above borrows. Mac-only today: see
+            // docs/developer/mistralrs-provider.md for why it is not a Jetson
+            // candidate.
+            "mistralrs" => {
+                let host = std::env::var("GIAP_MISTRALRS_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:9002".to_string());
+                std::env::set_var("OPENAI_HOST", &host);
+                std::env::set_var("OPENAI_BASE_PATH", "v1/chat/completions");
+                // mistral.rs does not authenticate; goose's provider requires the
+                // key to be present, so give it one rather than fail to build.
+                if std::env::var("OPENAI_API_KEY").is_err() {
+                    std::env::set_var("OPENAI_API_KEY", "not-required-by-mistralrs");
+                }
+                std::env::set_var("OPENAI_TIMEOUT", "600");
+                let model_name = if settings.chat_model.is_empty() {
+                    "default".to_string()
+                } else {
+                    settings.chat_model.clone()
+                };
+                let cfg = goose_providers::model::ModelConfig::new(&model_name);
+                match goose::providers::openai_def::from_env(None).await {
+                    Ok(p) => Some((Arc::new(p), cfg, Some(host))),
+                    Err(e) => {
+                        tracing::warn!("Failed to build mistral.rs provider: {e}");
+                        None
+                    }
+                }
+            }
             "ollama" => {
                 let ollama_host = std::env::var("GIAP_OLLAMA_URL")
                     .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
@@ -3587,7 +3617,10 @@ impl GooseAdapter {
                 // model's chat template (native tool calling) — the prompt
                 // template must not render its own "Available tools:" listing
                 // on top of that, or every schema is fed to the model twice.
-                native_tools_json: matches!(settings.chat_provider.as_str(), "local" | "gguf"),
+                native_tools_json: matches!(
+                    settings.chat_provider.as_str(),
+                    "local" | "gguf" | "mistralrs"
+                ),
                 prefix_hash: None, // filled by build_prompt_partition below
             }
         };
@@ -5338,7 +5371,10 @@ impl GooseAdapter {
             available_tools: Vec::new(),
             thinking_enabled: false,
             compact_prompt: true,
-            native_tools_json: matches!(settings.chat_provider.as_str(), "local" | "gguf"),
+            native_tools_json: matches!(
+                settings.chat_provider.as_str(),
+                "local" | "gguf" | "mistralrs"
+            ),
             prefix_hash: None,
         };
 

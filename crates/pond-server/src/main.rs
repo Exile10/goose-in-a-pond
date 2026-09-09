@@ -1939,6 +1939,18 @@ async fn run_server(
                 }
             }
 
+            // mistral.rs serves the same OpenAI-compatible surface LlamafileProvider
+            // already speaks, so it needs a URL rather than a new adapter.
+            "mistralrs" => {
+                let host = std::env::var("GIAP_MISTRALRS_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:9002".to_string());
+                Arc::new(
+                    LlamafileProvider::new(Some(&host))
+                        .with_max_tokens(max_tokens)
+                        .with_temperature(temperature),
+                ) as Arc<dyn LlmProvider>
+            }
+
             _ => Arc::new(
                 // Default: llamafile (covers "llamafile" and unknown provider values)
                 LlamafileProvider::new(Some(llamafile_url))
