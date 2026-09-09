@@ -109,7 +109,8 @@ jobs:
             -p pond-adapters-imap \
             -p pond-adapters-mcp-memory \
             -p pond-mesh-protocol \
-            -p pond-mcp-server
+            -p pond-mcp-server \
+            -p pond-adapters-mistralrs
 
       # --ignored is NOT passed so the 28 live-hardware tests are skipped.
       - name: cargo test (fast crates)
@@ -150,6 +151,14 @@ jobs:
       # `--all-targets` here too. It is off the fast pass because it builds llama-cpp-2.
       - name: cargo check (quarantined PondAgent + its test targets — pond-agent + pond-inference)
         run: cargo check -p pond-agent -p pond-inference --all-targets
+
+      # The direct mistral.rs backend is off by default, so nothing above
+      # compiles the ~60 lines in main.rs that wire it. An off-by-default
+      # feature nobody checks is how `pond-agent` rotted; this is the same
+      # guard, and it only re-checks pond-server itself — the dependency graph
+      # is unchanged, so the goose submodule is already built by the step above.
+      - name: cargo check (direct mistral.rs backend — off by default, so nothing else builds it)
+        run: cargo check -p pond-server --features mistralrs-agent
 
       # `cargo check --all-targets` above COMPILES pond-inference's tests but never RUNS them.
       # `no_giap_code_calls_llama_backend_init` and

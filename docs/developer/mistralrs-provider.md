@@ -14,6 +14,11 @@ scripts/try-mistralrs.sh                        # GIAP against it, scratch pond,
 
 `GIAP_MISTRALRS_URL` defaults to `http://127.0.0.1:9002`.
 
+There is now a second path that reaches the same server without goose at all —
+see [`mistralrs-direct-agent.md`](mistralrs-direct-agent.md). This document
+describes the goose-hosted provider; that one describes the direct backend, and
+`scripts/try-mistralrs.sh` switches between them with `MODE`.
+
 ## What was wired
 
 | file | change |
