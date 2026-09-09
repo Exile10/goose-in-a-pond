@@ -110,20 +110,104 @@ Schema micro-minification. Every safe transform, measured on the real payload:
 The shim already strips `$schema`, `title` and integer-width artifacts. There is
 nothing left in this direction.
 
+## Below GIAP: what goose and llama.cpp already offer
+
+Everything above treats the payload as fixed and asks how to shrink it. The
+engine layer asks a different question — how often you pay for it at all — and
+answers it better.
+
+### llama.cpp's prompt cache erases the tool block
+
+`--cache-prompt` is **on by default**. Measured against `llama-server`
+(`--cache-reuse 256 --cache-ram -1`) with the captured 61-tool payload:
+
+| request | TTFT |
+|---|---:|
+| 61-tool payload, cold | 12,377 ms |
+| exact repeat | **117 ms** |
+| same system + tools, different user message | **206 ms** |
+| tool round-trip: prefix + `tool_call` + result | **721 ms** |
+| repeat of the round-trip | 67 ms |
+| back to the first payload | 117 ms |
+
+Two things follow. The `inference_count × prefill` multiplier **disappears** —
+the second inference of a tool round-trip costs 721 ms instead of ~12,000. And
+the cache holds several branches at once (`--cache-ram -1`), so alternating
+between two suffixes stays warm.
+
+End to end through goose, same prompt, same model, same 61 tools:
+
+| | mistral.rs (cache off) | llama.cpp (cache on) |
+|---|---:|---:|
+| GIAP turn TTFT, ~7,300 tok | 8,600–8,900 ms | **587–847 ms** |
+| first turn on a cold server | — | 12,332 ms |
+
+**~11× on the identical payload, from engine configuration alone.** The cache is
+server-wide, not per session: a turn in a brand-new GIAP session is warm if any
+earlier turn warmed the same prefix, which is what makes GIAP's boot-time prefix
+prewarm pay for every session rather than only the first.
+
+mistral.rs cannot do this today — its prefix cache corrupts on the second
+request carrying a large tool payload, so it runs with `--prefix-cache-n 0`.
+That single difference is most of what "goose adds a lot of overhead" was
+measuring.
+
+### `--chat-template-kwargs` fixes the thinking gap without touching goose
+
+The body goose serializes carries no `chat_template_kwargs`, so Gemma 4 thinks
+on every turn. `llama-server --chat-template-kwargs '{"enable_thinking":false}'`
+sets it at the engine. Same question, same server otherwise:
+
+| | completion tokens |
+|---|---:|
+| thinking on (goose's default behaviour) | 231 |
+| `--chat-template-kwargs` | **54** |
+
+No GIAP change, no fork patch.
+
+### The other flags, and what they are for
+
+| flag | what it buys |
+|---|---|
+| `--cache-reuse N` | reuse past a divergence via KV shifting, not just an exact prefix |
+| `--cache-ram N` (default 8192 MiB, `-1` unlimited) | how many branches stay warm |
+| `--cache-idle-slots` (default on) | idle slots are folded into the prompt cache |
+| `--slot-save-path` + `/slots/{id}?action=save` | persist KV to disk — would make the 12.3 s cold cost payable once ever, not once per boot. **Untested here.** |
+| `--chat-template-file` | the lean-template hook |
+| `--json-schema` / `--grammar` | constrain output shape |
+
+### goose's own facilities
+
+| facility | verdict |
+|---|---|
+| `code-mode` tool disclosure (`ToolDisclosure::Catalog`) | replaces all 61 tools with three — `list_functions`, `get_function_details`, `execute_typescript` — and `Sidecar` with one. The biggest structural saving available, and almost certainly wrong here: it needs the `code-mode` feature GIAP disables for the rmcp conflict, a TypeScript runtime on the device, and it asks a 2B model to write TypeScript instead of emitting a tool call. |
+| `toolshim` | the opposite of a saving — routes output through a second interpreter model |
+
+### What this settles about the lean template
+
+With prefill cached, a 17% smaller tool block saves ~100 ms once, on the cold
+start, and nothing on any warm turn. Against a real risk to tool-call
+reliability on markup the model was trained on, that is not a trade worth
+making. **The lean template is dropped rather than A/B'd.**
+
 ## Ranked levers
 
 | # | lever | saving | status |
 |---|---|---|---|
-| 1 | `tool_selection_mode = "relevant"` | −68% prompt, −76% TTFT | **exists, not the default** |
-| 2 | Send `enable_thinking` on the HTTP path | ~400 completion tokens/turn | not wired |
-| 3 | Cut `inference_count`, or make re-prefill free | ×2–3 on the whole turn | engine property |
+| 1 | **Prompt caching on the engine** | ~11× TTFT (8,900 → 800 ms) | **on by default in llama.cpp; impossible in mistral.rs today** |
+| 2 | `--chat-template-kwargs '{"enable_thinking":false}'` | 231 → 54 completion tok | engine flag, no code |
+| 3 | `tool_selection_mode = "relevant"` | −68% prompt, −76% **cold** TTFT | exists, not the default; matters for the cold turn and for context headroom |
 | 4 | Split `set_device_state` / `create_sensor_rule` | ~1,400 chars (5%) | schema work |
 | 5 | Trim tool descriptions (6,368 chars) | up to ~1,500 chars | prose work |
 | 6 | Schema minification | 455 chars (1.7%) | **not worth it** |
+| 7 | Lean chat template | −14% prompt | **dropped** — see above |
 
-Levers 1 and 3 are the whole story; 4 and 5 are rounding on top of 1. Core-only
-(`giap-draft`, `giap-memory`, `giap-system`, `giap-toolkit` — 15 tools) is the
-floor at 5,747 chars, −79%.
+**Lever 1 is the whole story, and it is a choice of engine, not of prompt.**
+Everything that shrinks the payload only changes what the cold start costs;
+once the prefix is warm the payload is free. That reorders the rest: `relevant`
+mode is worth having for the cold turn and for context headroom, not for
+steady-state latency. Core-only (`giap-draft`, `giap-memory`, `giap-system`,
+`giap-toolkit` — 15 tools) is the payload floor at 5,747 chars, −79%.
 
 ## Reproducing this
 
