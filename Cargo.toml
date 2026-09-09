@@ -40,6 +40,8 @@ members = [
     "crates/pond-adapters-goose",
     "crates/pond-adapters-local-inference",
     "crates/pond-mcp-server",
+    # Checkpoint: a goose-free path to a mistral.rs server (pond-core only).
+    "crates/pond-adapters-mistralrs",
 ]
 
 [workspace.package]

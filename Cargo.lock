@@ -11289,6 +11289,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond-adapters-mistralrs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "pond-core",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "pond-adapters-ollama"
 version = "0.1.0"
 dependencies = [
@@ -11639,6 +11657,7 @@ dependencies = [
  "pond-adapters-mcp-memory",
  "pond-adapters-mesh-inference",
  "pond-adapters-mesh-libp2p",
+ "pond-adapters-mistralrs",
  "pond-adapters-ollama",
  "pond-adapters-silero",
  "pond-adapters-vision",

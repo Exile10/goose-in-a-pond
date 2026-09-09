@@ -125,7 +125,9 @@ enum Commands {
         #[arg(long)]
         debug: bool,
 
-        /// Agent backend: "goose" (default, full-featured) | "pond" (independent, KV-cache reuse) | "mock".
+        /// Agent backend: "goose" (default, full-featured) | "mistralrs" (direct
+        /// path to a mistral.rs server, needs --features mistralrs-agent) |
+        /// "pond" (quarantined) | "mock".
         /// Also configurable via PUT /api/v1/settings with agent_backend field.
         #[arg(long, default_value = "goose")]
         agent: String,
@@ -3094,6 +3096,15 @@ async fn run_server(
     #[cfg(not(feature = "pond-agent"))]
     let pond_agent_active = false;
 
+    // The mistral.rs backend is a checkpoint, not a quarantine: unlike "pond" it
+    // is reachable, because nothing rewrites the value and no guard rejects it.
+    // What keeps it out of production is the cargo feature, which is off by
+    // default and which no device build turns on.
+    #[cfg(feature = "mistralrs-agent")]
+    let mistralrs_active = agent_backend == pond_adapters_mistralrs::BACKEND_NAME;
+    #[cfg(not(feature = "mistralrs-agent"))]
+    let mistralrs_active = false;
+
     // Event bus (#91/#109), created here because the Matter runtime below
     // publishes sensor updates onto it. Its durable log bridge is wired further
     // down, once the logs DB handle is in scope.
@@ -3183,7 +3194,77 @@ async fn run_server(
         device_control.clone(),
     );
 
-    let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
+    let (agent, extension_manager, _tool_caller, tool_registry) = if mistralrs_active {
+        // A turn served without goose: pond-core's system prompt, the same MCP
+        // dispatcher PondAgent uses, and an HTTP client. No extension manager
+        // and no tool-calling specialist, because neither exists off the goose
+        // path — the registry below is the empty default for the same reason.
+        let default_registry: Arc<
+            dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort,
+        > = Arc::new(pond_core::mcp::services::tool_registry::InMemoryToolRegistry::new());
+
+        #[cfg(feature = "mistralrs-agent")]
+        let agent: Arc<dyn Agent> = {
+            let settings = settings_repo.get().await.unwrap_or_default();
+            let base_url = pond_adapters_mistralrs::base_url_from_env();
+            // The window mistral.rs was actually started with is not on its API,
+            // so GIAP's own resolution is the only source. Wrong here means a
+            // history budget the server will refuse, not a slow turn.
+            let context_tokens =
+                pond_core::models::services::context::context_governor::ContextGovernor::resolve(
+                    &pond_core::models::services::context::context_governor::ContextInputs {
+                        provider: &settings.chat_provider,
+                        model: &settings.chat_model,
+                        override_tokens: settings.context_window_override,
+                        registry_pinned: None,
+                        catalog_context_length: None,
+                        engine_reported: None,
+                        capability_window: None,
+                    },
+                )
+                .tokens;
+
+            let dispatcher: Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher> =
+                Arc::new(pond_mcp_server::McpToolDispatcher::new(
+                    memory_repo.clone(),
+                    weather.clone(),
+                    scheduler.clone(),
+                    settings_repo.clone(),
+                    device_registry.clone(),
+                    skill_repo.clone(),
+                    recipe_repo.clone(),
+                    draft_repo.clone(),
+                    embedding_provider.clone(),
+                    device_control.clone(),
+                ));
+
+            let provider = Arc::new(
+                pond_adapters_mistralrs::MistralRsProvider::new(&base_url, &settings.chat_model)
+                    .with_context_window(u32::try_from(context_tokens).unwrap_or(u32::MAX)),
+            );
+            println!("  Agent backend: mistralrs -> {base_url} (no goose)");
+            tracing::info!(
+                base_url = %base_url,
+                model = %settings.chat_model,
+                context_tokens,
+                "MistralRsAgent ready — direct path, goose not involved"
+            );
+            Arc::new(pond_adapters_mistralrs::MistralRsAgent::new(
+                provider,
+                settings_repo.clone(),
+                Some(prompt_template_repo.clone()),
+                Some(prompt_extra_repo.clone()),
+                Some(skill_repo.clone()),
+                device_registry.clone(),
+                session_storage.clone(),
+                Some(dispatcher),
+            )) as Arc<dyn Agent>
+        };
+        #[cfg(not(feature = "mistralrs-agent"))]
+        let agent: Arc<dyn Agent> = Arc::new(MockAgent::new());
+
+        (agent, None, None, default_registry)
+    } else if pond_agent_active {
         // Build PondAgent directly — no Goose, no llama backend conflict.
         let default_registry: Arc<
             dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort,
