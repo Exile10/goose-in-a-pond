@@ -227,6 +227,78 @@ impl MistralRsAgent {
     }
 }
 
+/// Environment variable that turns on payload capture.
+const DUMP_DIR_ENV: &str = "GIAP_MISTRALRS_DUMP_DIR";
+
+/// Write this turn's first request to `$GIAP_MISTRALRS_DUMP_DIR`, for replay in
+/// the bake-off lab.
+///
+/// Three files, because a harness wants different slices of the same request:
+/// `system.txt` (the assembled system prompt, as text), `tools.json` (the tool
+/// specs, as an array) and `body.json` (the whole thing, ready to POST).
+///
+/// This exists because a lab that invents its own prompt measures its own
+/// prompt. GIAP's real turn-1 payload is a few thousand tokens of preamble and
+/// tool schema, and prefill is most of TTFT on-device, so a toy prompt does not
+/// just understate the number -- it changes which engine wins.
+///
+/// Failures are logged and swallowed: a diagnostic that can break a turn is a
+/// worse trade than a diagnostic that sometimes does not appear.
+async fn dump_payload(
+    provider: &MistralRsProvider,
+    system_prompt: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+    options: &InferenceOptions,
+) {
+    let Ok(dir) = std::env::var(DUMP_DIR_ENV) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let body = match provider
+        .request_body_json(system_prompt, messages, tools, options, false)
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not build the payload dump");
+            return;
+        }
+    };
+    let tools_json = body
+        .get("tools")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+
+    let writes: [(&str, String); 3] = [
+        ("system.txt", system_prompt.to_string()),
+        (
+            "tools.json",
+            serde_json::to_string_pretty(&tools_json).unwrap_or_default(),
+        ),
+        (
+            "body.json",
+            serde_json::to_string_pretty(&body).unwrap_or_default(),
+        ),
+    ];
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(dir = %dir.display(), error = %e, "could not create the dump directory");
+        return;
+    }
+    for (name, content) in writes {
+        if let Err(e) = std::fs::write(dir.join(name), content) {
+            tracing::warn!(file = %name, error = %e, "could not write the payload dump");
+            return;
+        }
+    }
+    tracing::info!(
+        dir = %dir.display(),
+        system_chars = system_prompt.len(),
+        tools = tools.len(),
+        "wrote the turn payload"
+    );
+}
+
 /// Resolve `thinking_mode`, which is a three-state setting and not a boolean.
 fn thinking_enabled(settings: &Settings, caps: &ModelCapabilities) -> bool {
     match settings.thinking_mode.as_str() {
@@ -323,6 +395,19 @@ impl Agent for MistralRsAgent {
             tools_json_override: tools_json,
             compact_tools_json_override: None,
         };
+
+        // Turn 1's payload is the one a replay harness wants: later rounds
+        // carry tool results that only make sense with the tools that produced
+        // them. Written before the first request, so a turn that fails still
+        // leaves the payload that failed.
+        dump_payload(
+            &self.provider,
+            &system_prompt,
+            &messages,
+            &tool_defs,
+            &options,
+        )
+        .await;
 
         // Everything the loop needs, owned: the stream outlives `&self`.
         let provider = self.provider.clone();

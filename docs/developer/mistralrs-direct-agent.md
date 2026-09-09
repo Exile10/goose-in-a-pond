@@ -120,6 +120,50 @@ conversation was in the prompt. The goose path applies per-turn tool selection
 (`tool_selection_mode`); this agent asks the dispatcher for everything, every
 turn, which is the largest single gap between them.
 
+## Capturing the real payload for the lab
+
+```bash
+GIAP_MISTRALRS_DUMP_DIR=~/Documents/Jarida/mistralrs-bakeoff/giap-payload \
+  scripts/try-mistralrs.sh
+```
+
+Each turn overwrites three files with its FIRST inference's request:
+`system.txt` (the assembled system prompt), `tools.json` (the tool specs) and
+`body.json` (the whole thing, `stream:false`, ready to POST at
+`/v1/chat/completions`). All three come from the same builder the live request
+uses, and a unit test asserts the only difference is the `stream` flag — a dump
+reassembled by a second code path is worth nothing the moment the two drift.
+
+This exists because a lab that invents its own prompt measures its own prompt.
+GIAP's turn-1 payload is thousands of tokens of preamble and tool schema, and
+prefill is most of TTFT on-device, so a toy prompt does not merely understate
+TTFT — it can change which engine wins.
+
+## Where the goose overhead actually is
+
+Measured on 2026-09-10, one turn each, same scratch pond, same question:
+
+| | direct | goose | difference |
+|---|---:|---:|---|
+| system prompt | 1,994 chars | 1,820 chars | **none that matters** |
+| tools offered | 46 | 61 | 15 more groups |
+| tool schemas | 24,201 chars | 28,547 chars | +4,346 ≈ 1,100 tok |
+| prompt tokens | 5,706 | 7,633 | +1,927 tok |
+
+**It is not the system prompt.** The two are within 200 characters, and the
+direct one is the LARGER of the two — the goose path moves the dynamic suffix
+(date, time, memories) out of the system prompt and into a `<system-context>`
+block on the user message, to keep the static prefix token-stable for KV reuse.
+
+Of the ~1,900-token gap, about 1,100 is the extra tool schemas and the rest is
+goose's per-turn scaffolding: the `<system-context>` block, its message
+wrapping, and its history handling.
+
+**And the 15 missing tools are missing capability, not saved overhead.**
+`McpToolDispatcher` does not hold `giap-audit` or `giap-vision` (their backing
+stores are installed globally in `pond-server`, not through its constructor),
+among others. The direct path is cheaper partly because it can do less.
+
 ## The numbers it reports, and their provenance
 
 mistral.rs's OpenAI surface publishes no prefill timing, so:
@@ -158,8 +202,10 @@ harness. A number that cannot be true is worse than no number.
 
 ## Known limits of the checkpoint
 
-- **No per-turn tool selection.** Every turn carries every tool. See the
-  measurement above for what that costs.
+- **No per-turn tool selection.** Every turn carries every tool the dispatcher
+  holds. See the measurement above for what that costs.
+- **Fewer tools than the goose path** — 46 against 61. Not a saving: the
+  dispatcher does not hold every registered extension.
 - **No fallback for text-form tool calls**, and **no empty-turn re-engagement**.
   Both are measured above.
 - **`serve` only.** `pond-server chat` still goes through `build_goose_backend`.
