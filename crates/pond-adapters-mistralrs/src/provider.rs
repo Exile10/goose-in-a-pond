@@ -222,19 +222,25 @@ impl MistralRsProvider {
             .collect()
     }
 
-    /// Stream one completion, keeping thinking distinct from the answer.
-    pub async fn stream_raw(
-        &self,
+    /// The request body for one completion.
+    ///
+    /// Factored out so the capture hook writes the bytes that are actually
+    /// sent. A dump reassembled from the same inputs by a second code path is
+    /// worth nothing: the moment the two drift, the lab replays a prompt this
+    /// pond never sent, and every number taken from it is wrong in a way
+    /// nothing reports.
+    fn build_request<'a>(
+        model: &'a str,
         system_prompt: &str,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
         options: &InferenceOptions,
-    ) -> Result<MrEventStream> {
-        let model = self.resolve_model().await.to_string();
-        let body = ChatRequest {
-            model: &model,
+        stream: bool,
+    ) -> ChatRequest<'a> {
+        ChatRequest {
+            model,
             messages: Self::to_wire_messages(system_prompt, messages),
-            stream: true,
+            stream,
             max_tokens: options.max_tokens,
             temperature: options.temperature,
             tools: Self::tools_array(options, tools),
@@ -245,7 +251,43 @@ impl MistralRsProvider {
             chat_template_kwargs: serde_json::json!({
                 "enable_thinking": options.enable_thinking
             }),
-        };
+        }
+    }
+
+    /// The request body as JSON, ready to POST at `/v1/chat/completions`.
+    ///
+    /// `stream` is a parameter because a replay harness usually wants
+    /// `false` while the live path always wants `true`; everything else is
+    /// identical to what [`stream_raw`](Self::stream_raw) sends.
+    pub async fn request_body_json(
+        &self,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        options: &InferenceOptions,
+        stream: bool,
+    ) -> Result<serde_json::Value> {
+        let model = self.resolve_model().await.to_string();
+        Ok(serde_json::to_value(Self::build_request(
+            &model,
+            system_prompt,
+            messages,
+            tools,
+            options,
+            stream,
+        ))?)
+    }
+
+    /// Stream one completion, keeping thinking distinct from the answer.
+    pub async fn stream_raw(
+        &self,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        options: &InferenceOptions,
+    ) -> Result<MrEventStream> {
+        let model = self.resolve_model().await.to_string();
+        let body = Self::build_request(&model, system_prompt, messages, tools, options, true);
 
         let url = format!("{}/v1/chat/completions", self.base_url);
         let resp = self
@@ -522,6 +564,50 @@ mod tests {
         );
         assert_eq!(wire[2].role, "tool");
         assert_eq!(wire[2].tool_call_id.as_deref(), Some("call_7"));
+    }
+
+    /// The capture hook and the live request must be the same body. This is the
+    /// property that makes a dumped payload worth replaying, so it is asserted
+    /// on the shared builder rather than on either caller.
+    #[test]
+    fn the_captured_body_differs_from_the_sent_one_only_in_the_stream_flag() {
+        let options = InferenceOptions {
+            max_tokens: Some(256),
+            temperature: Some(0.7),
+            enable_thinking: false,
+            ..Default::default()
+        };
+        let messages = [ChatMessage::user("what time is it?")];
+        let sent = serde_json::to_value(MistralRsProvider::build_request(
+            "default",
+            "you are a duck",
+            &messages,
+            &[],
+            &options,
+            true,
+        ))
+        .unwrap();
+        let mut captured = serde_json::to_value(MistralRsProvider::build_request(
+            "default",
+            "you are a duck",
+            &messages,
+            &[],
+            &options,
+            false,
+        ))
+        .unwrap();
+
+        assert_eq!(captured["stream"], serde_json::json!(false));
+        assert_eq!(sent["stream"], serde_json::json!(true));
+        assert_eq!(captured["messages"][0]["role"], "system");
+        assert_eq!(captured["messages"][0]["content"], "you are a duck");
+        assert_eq!(captured["chat_template_kwargs"]["enable_thinking"], false);
+
+        // Everything else identical, checked by making the one known
+        // difference go away rather than by listing the fields — a field added
+        // to `ChatRequest` is then covered without a second edit here.
+        captured["stream"] = serde_json::json!(true);
+        assert_eq!(captured, sent);
     }
 
     #[test]
