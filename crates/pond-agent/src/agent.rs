@@ -22,7 +22,6 @@ use pond_core::prompts;
 use pond_core::shared::domain::agent::{AgentRequest, AgentResponse, AgentStreamEvent};
 use pond_core::user_data::domain::session::SessionMessage;
 use pond_core::user_data::domain::settings::Settings;
-use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
 use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
 use pond_core::user_data::ports::session_storage::SessionStorage;
@@ -54,8 +53,6 @@ pub struct PondAgent {
     extras_repo: Option<Arc<dyn PromptExtraRepository>>,
     /// User skills persistence (optional).
     skill_repo: Option<Arc<dyn UserSkillRepository>>,
-    /// Device registry for prompt context.
-    device_repo: Arc<dyn DeviceRegistry>,
     /// Session message persistence (for cross-session history if needed).
     session_storage: Arc<dyn SessionStorage>,
     /// MCP tool dispatcher — routes tool calls to the correct MCP server.
@@ -77,7 +74,6 @@ impl PondAgent {
         template_repo: Option<Arc<dyn PromptTemplateRepository>>,
         extras_repo: Option<Arc<dyn PromptExtraRepository>>,
         skill_repo: Option<Arc<dyn UserSkillRepository>>,
-        device_repo: Arc<dyn DeviceRegistry>,
         session_storage: Arc<dyn SessionStorage>,
         tool_dispatcher: Option<Arc<dyn ToolDispatcher>>,
     ) -> Self {
@@ -95,7 +91,6 @@ impl PondAgent {
             template_repo,
             extras_repo,
             skill_repo,
-            device_repo,
             session_storage,
             tool_dispatcher,
             last_provider_key: Mutex::new(initial_key),
@@ -181,17 +176,6 @@ impl PondAgent {
     /// Uses `PromptBuilder::build_prompt_partition()` when a template repo
     /// is available. Falls back to a simple default otherwise.
     async fn build_system_prompt(&self, settings: &Settings, request: &AgentRequest) -> String {
-        // Gather device state for prompt context.
-        let devices = self.device_repo.list_devices().await.unwrap_or_default();
-        let device_count = devices.len();
-        let has_home_devices = !devices.is_empty();
-        let online_device_names: String = devices
-            .iter()
-            .filter(|d| d.is_online)
-            .map(|d| d.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-
         // Determine thinking mode and tool calling capability.
         let provider = self.provider.read().await;
         let caps = provider.capabilities();
@@ -224,11 +208,7 @@ impl PondAgent {
         let state = prompts::PromptState {
             current_date,
             current_time,
-            device_count,
-            has_home_devices,
-            online_device_names,
             voice_mode: request.voice_mode,
-            canvas_mode: request.canvas_mode,
             available_tools,
             thinking_enabled,
             compact_prompt: false,
@@ -699,27 +679,6 @@ mod tests {
         }
     }
 
-    struct MockDeviceRegistry;
-
-    #[async_trait]
-    impl DeviceRegistry for MockDeviceRegistry {
-        async fn register(&self, _req: RegisterDeviceRequest) -> Result<Device> {
-            unimplemented!()
-        }
-        async fn list_devices(&self) -> Result<Vec<Device>> {
-            Ok(vec![])
-        }
-        async fn get_device(&self, _id: &str) -> Result<Option<Device>> {
-            Ok(None)
-        }
-        async fn unregister(&self, _id: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn heartbeat(&self, _id: &str) -> Result<()> {
-            Ok(())
-        }
-    }
-
     struct MockSessionStorage;
 
     #[async_trait]
@@ -813,7 +772,6 @@ mod tests {
             None,
             None,
             None,
-            Arc::new(MockDeviceRegistry),
             Arc::new(MockSessionStorage),
             None, // no tool dispatcher in tests
         )
@@ -925,7 +883,6 @@ mod tests {
             None,
             None,
             Some(Arc::new(skill_repo)),
-            Arc::new(MockDeviceRegistry),
             Arc::new(MockSessionStorage),
             None,
         );

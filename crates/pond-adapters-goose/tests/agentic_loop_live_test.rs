@@ -55,7 +55,6 @@ async fn live_action_loop_ollama_executes_tool_call() {
         Arc::new(pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_memory::MockMemoryRepository::default()),
-        Arc::new(pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry),
         url,
         None,
         None, // tool_registry
@@ -129,7 +128,6 @@ async fn live_action_loop_llamafile_executes_tool_call() {
         Arc::new(pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_memory::MockMemoryRepository::default()),
-        Arc::new(pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry),
         url,
         None,
         None, // tool_registry
@@ -199,7 +197,6 @@ async fn live_action_loop_local_executes_tool_call() {
         Arc::new(pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_memory::MockMemoryRepository::default()),
-        Arc::new(pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry),
         url,
         None,
         None, // tool_registry

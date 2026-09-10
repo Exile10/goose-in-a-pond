@@ -24,7 +24,6 @@ use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::models::services::prompt_builder::build_prompt_partition;
 use pond_core::prompts::PromptState;
 use pond_core::user_data::domain::memory::{cosine_similarity, MemoryFragment};
-use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
 use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
@@ -231,8 +230,6 @@ pub struct GooseAdapter {
     /// falls back to the keyword LIKE search. Optional because the fastembed
     /// adapter can fail to initialise (ONNX Runtime mismatch) or be disabled.
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
-    /// Device registry — queried per turn to populate PromptState for Jinja2 rendering.
-    device_repo: Arc<dyn DeviceRegistry>,
     /// Model catalog — the ONLY way this adapter can reach
     /// `ModelRecord.context_length`, which is rung 3 of the context governor.
     ///
@@ -495,7 +492,6 @@ impl GooseAdapter {
         extras_repo: Arc<dyn PromptExtraRepository>,
         skill_repo: Arc<dyn UserSkillRepository>,
         memory_repo: Arc<dyn MemoryRepository>,
-        device_repo: Arc<dyn DeviceRegistry>,
         llamafile_url: String,
         data_dir: Option<PathBuf>,
         tool_registry: Option<Arc<dyn ToolRegistryPort>>,
@@ -574,7 +570,6 @@ impl GooseAdapter {
             skill_repo,
             memory_repo,
             embedding_provider: None,
-            device_repo,
             model_repo: None,
             llamafile_url,
             data_dir,
@@ -622,7 +617,6 @@ impl GooseAdapter {
     /// Convenience factory for non-server use (tests, CLI one-shots).
     /// Uses mock repos and connects to llamafile at `host`.
     pub async fn with_llamafile(host: Option<&str>) -> Result<Self> {
-        use pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry;
         use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
         use pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository;
         use pond_core::user_data::mocks::mock_prompt_template::MockPromptTemplateRepository;
@@ -636,7 +630,6 @@ impl GooseAdapter {
             Arc::new(MockPromptExtraRepository::default()),
             Arc::new(MockSkillRepository::default()),
             Arc::new(MockMemoryRepository::default()),
-            Arc::new(MockDeviceRegistry),
             url,
             None,
             None, // tool_registry — no prose tool list; native schemas still apply
@@ -3470,16 +3463,12 @@ impl GooseAdapter {
         let candidate_limit =
             memory_limit.map(|limit| (limit * MEMORY_CANDIDATE_FANOUT).max(MEMORY_CANDIDATE_FLOOR));
 
-        let (
-            template_result,
-            devices_result,
-            extras_result,
-            skills_result,
-            recent_memories,
-            relevant_memories,
-        ) = tokio::join!(
+        // `self.device_repo.list_devices()` used to ride along here. It fed only
+        // the `<home-devices>` prompt section, deleted 2026-09-10 — a device list
+        // is what `giap-device__list_registered_devices` is for, and the online
+        // half of it moved on a five-minute timer. One fewer read per turn.
+        let (template_result, extras_result, skills_result, recent_memories, relevant_memories) = tokio::join!(
             self.template_repo.get(&settings.prompt_style),
-            self.device_repo.list_devices(),
             self.extras_repo.list_active(),
             self.skill_repo.list_active(),
             // Recent memories (recency-based)
@@ -3571,15 +3560,6 @@ impl GooseAdapter {
         let prompt_state = {
             use chrono::Local;
             let now = Local::now();
-            let devices = devices_result.unwrap_or_default();
-            let device_count = devices.len();
-            let has_home_devices = device_count > 0;
-            let online_device_names = devices
-                .iter()
-                .filter(|d| d.is_online)
-                .map(|d| d.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
             // The prompt tier follows the PROMPT-side window, which for local
             // inference is clamped so a huge KV cache never selects the verbose
             // tier (see `CompactionProfile::for_windows`). The profile itself
@@ -3606,11 +3586,7 @@ impl GooseAdapter {
             PromptState {
                 current_date: now.format("%A, %-d %B %Y").to_string(),
                 current_time: Self::format_current_time(now, is_voice),
-                device_count,
-                has_home_devices,
-                online_device_names,
                 voice_mode: is_voice,
-                canvas_mode: request.canvas_mode,
                 available_tools,
                 thinking_enabled,
                 compact_prompt,
@@ -5370,11 +5346,7 @@ impl GooseAdapter {
         let prompt_state = PromptState {
             current_date: String::new(),
             current_time: String::new(),
-            device_count: 0,
-            has_home_devices: false,
-            online_device_names: String::new(),
             voice_mode: false,
-            canvas_mode: false,
             available_tools: Vec::new(),
             thinking_enabled: false,
             compact_prompt: true,

@@ -51,16 +51,14 @@ pub fn build_prompt_partition(
     let static_state = PromptState {
         current_date: String::new(),
         current_time: String::new(),
-        // Carry all non-temporal fields from the caller's state
-        device_count: state.device_count,
-        has_home_devices: state.has_home_devices,
-        // Blanked like the clock: `is_online` is not a stored column, it is derived at read
-        // time as `now - last_seen < ONLINE_THRESHOLD_SECS` (300s), so leaving it in the prefix
-        // truncates KV reuse at `<home-devices>` on a five-minute timer. `device_count` and
-        // `has_home_devices` stay: they move only when a device is registered or removed.
-        online_device_names: String::new(),
+        // Carry all non-temporal fields from the caller's state.
+        //
+        // The three device fields that used to be blanked here are gone: the
+        // `<home-devices>` section they fed was deleted on 2026-09-10, because a
+        // device list is what `giap-device__list_registered_devices` is for and
+        // the online half of it moved on a five-minute timer, truncating KV
+        // reuse for a fact the model could have asked for.
         voice_mode: state.voice_mode,
-        canvas_mode: state.canvas_mode,
         available_tools: state.available_tools.clone(),
         thinking_enabled: state.thinking_enabled,
         compact_prompt: state.compact_prompt,
@@ -97,16 +95,6 @@ pub fn build_prompt_partition(
         }
         temporal.push_str(" Answer time/date questions directly from this — no tools needed.");
         dynamic_parts.push(temporal);
-    }
-
-    // Which devices are reachable right now. The template's `<home-devices>` block keeps the
-    // stable registered count; the live list belongs here because it expires on a timer and
-    // the static prefix has to survive that.
-    if !state.online_device_names.is_empty() {
-        dynamic_parts.push(format!(
-            "Online right now: {}.",
-            sanitize_field(&state.online_device_names, 300)
-        ));
     }
 
     // Profile context lines (same logic as build_system_prompt_from_template_full)
@@ -156,27 +144,25 @@ pub fn compute_prefix_hash_fast(
     // Template content
     template_content.hash(&mut hasher);
     // State fields that are baked into the static prefix
-    state.device_count.hash(&mut hasher);
-    state.has_home_devices.hash(&mut hasher);
     // `online_device_names` is deliberately NOT here: it no longer renders into
     // the static prefix (see `build_prompt_partition`). Hashing it would make
     // this path report "prefix changed" every five minutes for a prefix that
     // did not change, which costs a full re-prefill for nothing.
     state.voice_mode.hash(&mut hasher);
-    state.canvas_mode.hash(&mut hasher);
     state.thinking_enabled.hash(&mut hasher);
     // Selects the compact variant of four sections, AND the tier the thinking
     // word cap is drawn from. It was already baked into the static prefix and
     // already missing from this hash before PAI-5 P4; the second consumer is
     // what makes the omission worth closing rather than noting.
     state.compact_prompt.hash(&mut hasher);
-    // Gates the "Available tools:" listing inside <tool-usage>
+    // Reaches the prompt through `tools_offered`, which gates every tool section.
     state.native_tools_json.hash(&mut hasher);
-    // The tool LINES, not their count. Under `tool_selection_mode = "relevant"` the selection
-    // is rescored every turn, so a same-count swap changes the prose in `<tool-usage>`; hashing
-    // the length alone would tell the provider to reuse a KV prefix for a prompt it never saw.
-    // Order counts too: it is part of the render.
+    // No longer rendered as prose, but still an input: a non-empty list is one
+    // of the two things that make `tools_offered` true, and that gates whole
+    // sections. Hashed in full rather than by length for the same reason it
+    // always was — a same-count swap must not be mistaken for the same prompt.
     state.available_tools.hash(&mut hasher);
+    state.tools_offered.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -204,11 +190,7 @@ mod tests {
         PromptState {
             current_date: "Thursday, 1 May 2026".to_string(),
             current_time: "14:32".to_string(),
-            device_count: 0,
-            has_home_devices: false,
-            online_device_names: String::new(),
             voice_mode: false,
-            canvas_mode: false,
             available_tools: vec!["wikipedia — Look up factual info".to_string()],
             thinking_enabled: false,
             compact_prompt: false,
@@ -347,14 +329,8 @@ mod tests {
     fn a_device_going_quiet_does_not_move_the_static_prefix() {
         let settings = Settings::default();
 
-        let registered = PromptState {
-            has_home_devices: true,
-            device_count: 3,
-            online_device_names: "Speaker, Hub, Washer".to_string(),
-            ..default_state()
-        };
+        let registered = PromptState { ..default_state() };
         let all_quiet = PromptState {
-            online_device_names: String::new(),
             ..registered.clone()
         };
 
@@ -372,24 +348,19 @@ mod tests {
         );
     }
 
-    /// …and the model is still told, because moving it out of the prefix would
-    /// otherwise be a silent capability loss: "turn on the speaker" needs to
-    /// know the speaker is reachable.
+    /// The live device list no longer reaches the model through the prompt at
+    /// all. "Turn on the speaker" resolves the name through the device tools,
+    /// which is where a list that expires on a five-minute timer belongs.
     #[test]
-    fn the_online_list_still_reaches_the_model_through_the_dynamic_suffix() {
+    fn the_online_list_no_longer_rides_the_dynamic_suffix() {
         let settings = Settings::default();
-        let state = PromptState {
-            has_home_devices: true,
-            device_count: 3,
-            online_device_names: "Speaker, Hub, Washer".to_string(),
-            ..default_state()
-        };
+        let state = PromptState { ..default_state() };
 
         let p = build_prompt_partition(&settings, None, &state, PROMPT_BALANCED);
 
         assert!(
-            p.dynamic_suffix.contains("Speaker, Hub, Washer"),
-            "the live device list must survive somewhere: {}",
+            !p.dynamic_suffix.contains("Online right now"),
+            "the live device list must not be in the prompt: {}",
             p.dynamic_suffix
         );
         assert!(
@@ -435,29 +406,31 @@ mod tests {
         );
     }
 
+    /// Inverted on 2026-09-10, when `<home-devices>` was deleted. The household's
+    /// device list is no longer prompt input at all — it is what
+    /// `giap-device__list_registered_devices` answers — so registering a device
+    /// must NOT move the prefix and cost a re-prefill.
+    ///
+    /// Kept as an assertion rather than deleted: putting live household state
+    /// back into the preamble is the regression this guards, and it would
+    /// otherwise be invisible until someone measured TTFT after plugging in a
+    /// lamp.
     #[test]
-    fn prefix_hash_changes_when_devices_change() {
+    fn registering_a_device_no_longer_moves_the_prefix() {
         let settings = Settings::default();
+        let state = PromptState { ..default_state() };
 
-        let state1 = PromptState {
-            has_home_devices: false,
-            device_count: 0,
-            ..default_state()
-        };
+        let p1 = build_prompt_partition(&settings, None, &state, PROMPT_BALANCED);
+        let p2 = build_prompt_partition(&settings, None, &state, PROMPT_BALANCED);
 
-        let state2 = PromptState {
-            has_home_devices: true,
-            device_count: 2,
-            online_device_names: "Speaker, Hub".to_string(),
-            ..default_state()
-        };
-
-        let p1 = build_prompt_partition(&settings, None, &state1, PROMPT_BALANCED);
-        let p2 = build_prompt_partition(&settings, None, &state2, PROMPT_BALANCED);
-
-        assert_ne!(
+        assert_eq!(
             p1.prefix_hash, p2.prefix_hash,
-            "Prefix hash must change when device state changes"
+            "device state is not prompt input any more"
+        );
+        assert!(
+            !p1.static_prefix.contains("<home-devices>"),
+            "the home-devices section is gone: {}",
+            p1.static_prefix
         );
     }
 
@@ -749,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_section_in_static_prefix() {
+    fn tool_names_never_reach_the_prompt() {
         let settings = Settings::default();
         let state = PromptState {
             available_tools: vec!["wikipedia — Look up factual info".to_string()],
@@ -758,9 +731,17 @@ mod tests {
 
         let partition = build_prompt_partition(&settings, None, &state, PROMPT_BALANCED);
 
+        // The prose listing was deleted on 2026-09-10: every provider this pond
+        // ships feeds tools through the chat template, so naming them again in
+        // the preamble was pure duplication. The list still decides whether the
+        // tool SECTIONS render, which is what `tools_offered` carries.
         assert!(
-            partition.static_prefix.contains("wikipedia"),
-            "Tool descriptions must be in static prefix"
+            !partition.static_prefix.contains("wikipedia"),
+            "no individual tool may be named in the prompt"
+        );
+        assert!(
+            partition.static_prefix.contains("<tool-usage>"),
+            "a non-empty tool list must still light up the tool-usage guidance"
         );
     }
 }

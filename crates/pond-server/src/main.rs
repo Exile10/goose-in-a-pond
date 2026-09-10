@@ -3247,7 +3247,6 @@ async fn run_server(
                 Some(prompt_template_repo.clone()),
                 Some(prompt_extra_repo.clone()),
                 Some(skill_repo.clone()),
-                device_registry.clone(),
                 session_storage.clone(),
                 Some(dispatcher),
             )) as Arc<dyn Agent>
@@ -3304,7 +3303,6 @@ async fn run_server(
                     Some(prompt_template_repo.clone()),
                     Some(prompt_extra_repo.clone()),
                     Some(skill_repo.clone()),
-                    device_registry.clone(),
                     session_storage.clone(),
                     Some(disp),
                 );
@@ -8351,7 +8349,6 @@ async fn build_goose_backend(
             Some(template_repo),
             Some(extras_repo),
             Some(skill_repo),
-            device_registry,
             ss,
             Some(dispatcher),
         );
@@ -8423,7 +8420,6 @@ async fn build_goose_backend(
         extras_repo,
         skill_repo,
         memory_repo,
-        device_registry.clone(),
         llamafile_url.to_string(),
         Some(data_dir.to_path_buf()),
         Some(default_registry.clone()),
