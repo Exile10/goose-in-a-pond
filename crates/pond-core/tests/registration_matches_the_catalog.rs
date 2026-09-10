@@ -193,7 +193,7 @@ fn every_registered_extension_is_in_the_catalog_and_the_reverse() {
 /// any more.
 #[test]
 fn the_extension_count_is_pinned() {
-    const CLAIMED: usize = 17;
+    const CLAIMED: usize = 11;
 
     // The REGISTRATION count, not the catalog's length: it is what the counting
     // recipe in the guidance produces, and the two are pinned to each other by
@@ -249,7 +249,7 @@ fn dispatcher_routed_extensions() -> BTreeSet<String> {
         );
     }
     assert!(
-        by_const.len() >= 10,
+        by_const.len() >= 6,
         "found {} PREFIX_* consts in dispatcher.rs — the parser is broken, so an \
          empty result would prove nothing",
         by_const.len()
@@ -276,15 +276,6 @@ fn dispatcher_routed_extensions() -> BTreeSet<String> {
 /// the test below fail until somebody either routes it or writes down why not,
 /// which is the point: this drifted to 11-against-17 silently.
 const DISPATCHER_EXCLUSIONS: &[(&str, &str)] = &[
-    (
-        "giap-audit",
-        "needs the EventLog installed by pond-server's init_audit_deps; \
-         McpToolDispatcher::new receives no logs DB",
-    ),
-    (
-        "giap-vision",
-        "needs the CameraStorage installed by pond-server's init_vision_deps",
-    ),
     (
         "giap-sensors",
         "needs the SensorStorage installed by pond-server's init_sensor_deps",

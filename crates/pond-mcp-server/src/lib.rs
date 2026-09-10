@@ -1,15 +1,10 @@
 // ── Modular MCP servers (Phase 1 split) ─────────────────────────────────────
-pub mod audit;
 pub mod context;
 pub mod device;
 pub mod device_control;
-pub mod discovery;
 pub mod dispatcher;
-pub mod draft;
-pub mod finance;
 pub mod knowledge;
 pub mod memory;
-pub mod news;
 pub mod orchestrator;
 pub mod schedule;
 pub mod secrets;
@@ -17,7 +12,6 @@ pub mod sensors;
 pub mod session_meta;
 pub mod system;
 pub mod toolkit;
-pub mod vision;
 pub mod weather;
 pub mod wolfram;
 
@@ -141,33 +135,22 @@ pub async fn generate_params(
 }
 
 // Re-export key types for downstream crates
-pub use audit::AuditMcpServer;
 pub use device::DeviceMcpServer;
 pub use device_control::DeviceControlMcpServer;
-pub use discovery::DiscoveryMcpServer;
-pub use draft::DraftMcpServer;
-pub use finance::FinanceMcpServer;
 pub use knowledge::{clean_query_for_search, KnowledgeMcpServer};
 pub use memory::{auto_classify_segment, parse_memory_segment, parse_memory_tier, MemoryMcpServer};
-pub use news::NewsMcpServer;
 pub use orchestrator::OrchestratorMcpServer;
 pub use schedule::{try_upcoming_schedules_context, ScheduleMcpServer};
 pub use sensors::SensorsMcpServer;
 pub use system::SystemMcpServer;
 pub use toolkit::ToolkitMcpServer;
-pub use vision::VisionMcpServer;
 pub use weather::WeatherMcpServer;
 
 // Re-export init + spawn functions for Goose builtin extension registration
-pub use audit::{init_audit_deps, spawn_audit_server};
 pub use device::{init_device_deps, spawn_device_server};
 pub use device_control::{init_device_control_deps, spawn_device_control_server};
-pub use discovery::{init_discovery_deps, spawn_discovery_server};
-pub use draft::{init_draft_authority, init_draft_deps, spawn_draft_server};
-pub use finance::{init_finance_deps, spawn_finance_server};
 pub use knowledge::{init_knowledge_deps, spawn_knowledge_server};
 pub use memory::{init_memory_deps, spawn_memory_server};
-pub use news::{init_news_deps, spawn_news_server};
 // PAI-6 P5. `init_orchestrator_deps` is deliberately NOT called from
 // `register_giap_extensions`: the orchestrator is a Goose adapter and this crate
 // is built before it, so pond-server installs the handle once the adapter
@@ -182,7 +165,6 @@ pub use sensors::{init_sensor_deps, spawn_sensor_server};
 pub use session_meta::{session_from_meta, SESSION_ID_META_KEY};
 pub use system::spawn_system_server;
 pub use toolkit::{init_toolkit_deps, spawn_toolkit_server};
-pub use vision::{init_vision_deps, spawn_vision_server};
 pub use weather::{init_weather_deps, spawn_weather_server, WEATHER_APP_URI};
 
 // ── MCP App resources ─────────────────────────────────────────────────────

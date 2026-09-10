@@ -1748,8 +1748,6 @@ async fn run_server(
             redactor.clone(),
         ),
     );
-    let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
-        Arc::new(SqliteDraftRepository::new(db.system.clone()));
     let sensor_storage: Arc<
         dyn pond_core::user_data::ports::sensor_storage::SensorStorage + Send + Sync,
     > = Arc::new(SqliteSensorStorage::new(db.logs.clone()));
@@ -2041,17 +2039,6 @@ async fn run_server(
             pond_infra::pruning::run_pruning(logs, system, settings_repo).await;
         });
     }
-
-    // Install the audit MCP server's read handle on the unified event store
-    // (#115). Done here, where the logs DB is in scope, before any agent/builtin
-    // extension is built — `spawn_audit_server` only fires at chat time.
-    pond_mcp_server::init_audit_deps(
-        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
-    );
-
-    // Install the vision MCP server's camera-event store handle (#130), same
-    // deal — `spawn_vision_server` only fires at chat time.
-    pond_mcp_server::init_vision_deps(camera_storage.clone());
 
     // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
@@ -3225,7 +3212,6 @@ async fn run_server(
                     settings_repo.clone(),
                     device_registry.clone(),
                     skill_repo.clone(),
-                    draft_repo.clone(),
                     embedding_provider.clone(),
                     device_control.clone(),
                 ));
@@ -3278,7 +3264,6 @@ async fn run_server(
                     settings_repo.clone(),
                     device_registry.clone(),
                     skill_repo.clone(),
-                    draft_repo.clone(),
                     embedding_provider.clone(),
                     device_control.clone(),
                 );
@@ -3331,7 +3316,6 @@ async fn run_server(
             recipe_repo.clone(),
             prompt_template_repo.clone(),
             prompt_extra_repo.clone(),
-            draft_repo.clone(),
             device_control.clone(),
             Some(session_storage.clone()),
             Some(model_repo.clone()),
@@ -3628,16 +3612,6 @@ async fn run_server(
     // repositories that registration does not carry, and after `security_policy`
     // so draft decisions land in the same audit trail as identity assertions.
     // The server is not spawned until the first turn, so this is in time.
-    pond_mcp_server::init_draft_authority(Some(Arc::new(
-        pond_core::security::services::draft_authority::RepoDraftAuthority::new(
-            settings_repo.clone(),
-            session_storage.clone(),
-            profile_repo.clone(),
-            security_policy.clone(),
-        ),
-    )
-        as Arc<dyn pond_core::security::ports::draft_authority::DraftAuthority>));
-
     // Start routing WARN+ tracing events into the SQLite event log.
     // _file_guard must live until run_server returns so the background file
     // writer keeps flushing log output to disk.
@@ -3679,7 +3653,6 @@ async fn run_server(
         settings_repo.clone(),
         device_registry.clone(),
         skill_repo.clone(),
-        draft_repo.clone(),
         embedding_provider.clone(),
         device_control.clone(),
     )));
@@ -4832,16 +4805,6 @@ async fn run_chat(
     // its new site. PAI-2 P6a.
     let db = Database::init(&data_dir).await?;
 
-    // Install the audit MCP server's read handle so the giap-audit extension works
-    // in headless/CLI chat too (not just `run_server`); otherwise invoking the audit
-    // tool here would find no deps. (#115/#157)
-    pond_mcp_server::init_audit_deps(
-        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
-    );
-
-    // Same for the vision MCP server's camera-event store handle (#130).
-    pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
-
     // And the sensor store. `run_server` installs all three; this path
     // installed only two, so every voice session logged
     // "spawn_sensor_server called before init_sensor_deps" and then failed to
@@ -5107,8 +5070,6 @@ async fn run_chat(
     let device_registry_arc: Arc<
         dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
-    let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
-        Arc::new(SqliteDraftRepository::new(db.system.clone()));
 
     // Reseed built-in prompt templates at startup with the latest Jinja2 general-purpose content.
     // Uses upsert (not insert_if_absent) so existing installs get the updated templates.
@@ -5193,7 +5154,6 @@ async fn run_chat(
             recipe_repo,
             template_repo,
             extras_repo,
-            draft_repo,
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             Some(trim_storage), // powers the trimmer's summary splice
             Some(chat_model_repo.clone()),
@@ -8254,7 +8214,6 @@ async fn build_goose_backend(
     extras_repo: Arc<
         dyn pond_core::user_data::ports::prompt_extra::PromptExtraRepository + Send + Sync,
     >,
-    draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync>,
     device_control: Arc<
         dyn pond_core::user_data::ports::device_control::DeviceControlPort + Send + Sync,
     >,
@@ -8319,7 +8278,6 @@ async fn build_goose_backend(
             settings_repo.clone(),
             device_registry.clone(),
             skill_repo.clone(),
-            draft_repo,
             embedding_provider,
             device_control.clone(),
         );
@@ -8400,7 +8358,6 @@ async fn build_goose_backend(
         settings_repo.clone(),
         device_registry.clone(),
         skill_repo.clone(),
-        draft_repo,
         device_control,
         tool_caller.clone(),
     ) {
@@ -9093,16 +9050,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
 
-    // Install the audit MCP server's read handle so the giap-audit extension works
-    // from the `agent` subcommand too; otherwise invoking the audit tool here would
-    // find no deps. (#115/#157)
-    pond_mcp_server::init_audit_deps(
-        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
-    );
-
-    // Same for the vision MCP server's camera-event store handle (#130).
-    pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
-
     // Build all repos once — shared across Chat, Tools, and Extras arms.
     let settings_repo: Arc<
         dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
@@ -9143,8 +9090,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let device_registry: Arc<
         dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
-    let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
-        Arc::new(SqliteDraftRepository::new(db.system.clone()));
     // The catalog the context governor's rung 3 reads. The CLI paths get one
     // too: a `pond-server chat` turn budgets its history exactly the way a
     // dashboard turn does, and giving only the server the real window would put
@@ -9211,7 +9156,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
-                draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
                 Some(cli_model_repo.clone()),
@@ -9255,7 +9199,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
-                draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
                 Some(cli_model_repo.clone()),
@@ -9325,7 +9268,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
-                draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
                 Some(cli_model_repo.clone()),

@@ -1381,13 +1381,7 @@ impl TaskRun {
 /// mechanism strings are the reason each entry may not be deleted casually —
 /// they name the control that is absent for a subagent, not a preference.
 #[cfg(test)]
-const GROUPS_NO_SUBAGENT_MAY_HOLD: [(&str, &str); 6] = [
-    (
-        "giap-draft",
-        "approve_draft and reject_draft DECIDE, and the gate that would check who decided \
-         cannot resolve a subagent's engine session, so under the default PolicyMode::Audit \
-         it proceeds",
-    ),
+const GROUPS_NO_SUBAGENT_MAY_HOLD: [(&str, &str); 5] = [
     (
         TOOLKIT_EXTENSION,
         "enable_tool_group WIDENS an allow-set keyed by the process-global current_session_id(), \
@@ -1993,7 +1987,7 @@ mod tool_narrowing_tests {
                 &AgentRole::new(
                     "r",
                     "go",
-                    groups(&["giap-memory", "giap-weather", "giap-vision"]),
+                    groups(&["giap-memory", "giap-weather", "giap-sensors"]),
                     RolePersonalData::Deny,
                     3,
                     0.5,
@@ -2007,7 +2001,7 @@ mod tool_narrowing_tests {
         assert_eq!(spec.tool_groups(), &groups(&["giap-weather"]));
         assert!(!spec.grants_tool("giap-memory__recall_memories"));
         assert!(!spec.grants_tool("giap-memory__forget_memory"));
-        assert!(!spec.grants_tool("giap-vision__who_was_seen"));
+        assert!(!spec.grants_tool("giap-sensors__list_sensors"));
     }
 
     /// Vacuity control for the test above. The subtraction must be keyed on the
@@ -2094,25 +2088,25 @@ mod tool_narrowing_tests {
         );
     }
 
-    /// The draft half of PAI-6 P3. `is_draft_decision_permitted` resolves its
-    /// actor through `engine_session_map`, which holds no subagent, so it
-    /// answers `REASON_UNRESOLVED_ACTOR` and the default `PolicyMode::Audit`
-    /// PROCEEDS. Withholding the group is therefore the only enforcement.
+    /// The same property, on the group that still has no approval path for a
+    /// child: a subagent is forced to `GooseMode::Auto`, so actuating the house
+    /// has no confirmation step. `giap-draft` used to be the subject here until
+    /// the group was deleted on 2026-09-10.
     #[test]
-    fn a_subagent_can_never_reach_a_draft_decision_tool() {
+    fn a_subagent_can_never_reach_a_device_actuation_tool() {
         // `every_shape()`, not a literal of today's three -- the literal that
         // used to be here could not see a fourth scope shape.
         for parent_scope in ProfileScope::every_shape() {
             let authority = DelegationAuthority::root(
                 "s1",
                 parent_scope.clone(),
-                groups(&["giap-draft", "giap-weather"]),
+                groups(&["giap-device-control", "giap-weather"]),
             );
             for personal_data in RolePersonalData::ALL {
                 let role = AgentRole::new(
                     "r",
                     "go",
-                    groups(&["giap-draft", "giap-weather"]),
+                    groups(&["giap-device-control", "giap-weather"]),
                     personal_data,
                     3,
                     0.5,
@@ -2120,13 +2114,12 @@ mod tool_narrowing_tests {
                 .unwrap();
                 let spec = authority.delegate(&role, request()).unwrap();
                 assert!(
-                    !spec.grants_tool("giap-draft__approve_draft"),
+                    !spec.grants_tool("giap-device-control__set_device_state"),
                     "a {parent_scope:?} parent with {personal_data:?} handed a child the \
-                     ability to approve staged actions"
+                     ability to actuate the house"
                 );
-                assert!(!spec.grants_tool("giap-draft__reject_draft"));
-                // Vacuity control, inline: the refusal is about draft, not
-                // about the delegation having produced nothing at all.
+                // Vacuity control, inline: the refusal is about device-control,
+                // not about the delegation having produced nothing at all.
                 assert!(spec.grants_tool("giap-weather__get_forecast"));
             }
         }

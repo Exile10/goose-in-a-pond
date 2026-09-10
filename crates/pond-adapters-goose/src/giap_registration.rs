@@ -10,7 +10,6 @@ use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
-use pond_core::user_data::ports::draft::DraftRepository;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use pond_core::user_data::ports::scheduler::SchedulerPort;
 use pond_core::user_data::ports::settings::SettingsRepository;
@@ -42,7 +41,6 @@ pub fn register_giap_extensions(
     settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
     device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
     skill_repo: Arc<dyn UserSkillRepository + Send + Sync>,
-    draft_repo: Arc<dyn DraftRepository + Send + Sync>,
     device_control: Arc<dyn DeviceControlPort + Send + Sync>,
     tool_caller: Option<Arc<dyn ToolCaller>>,
 ) -> Result<Vec<String>> {
@@ -69,11 +67,6 @@ pub fn register_giap_extensions(
     pond_mcp_server::set_tool_caller(tool_caller);
 
     let mut registered = Vec::new();
-
-    // ── Always-on: draft server (safety feature) ────────────────────────────
-    pond_mcp_server::init_draft_deps(draft_repo);
-    register_builtin_extension("giap-draft", pond_mcp_server::spawn_draft_server);
-    registered.push("giap-draft".into());
 
     // ── Always-on: toolkit server (Phase D2 escape hatch) ───────────────────
     // Not toggleable: under `tool_selection_mode = "relevant"` its two tools let the model load a
@@ -136,45 +129,6 @@ pub fn register_giap_extensions(
             pond_mcp_server::spawn_device_control_server,
         );
         registered.push("giap-device-control".into());
-    }
-
-    // ── Knowledge expansion servers ────────────────────────────────────────
-    // All share a single HTTP client pool for efficiency.
-    let shared_http = pond_mcp_server::build_http_client();
-
-    if settings.ext_news_enabled {
-        // No settings repo: the Guardian and GNews keys live in the secret
-        // store, installed by `init_secret_deps` in pond-server (PAI-2 P2).
-        pond_mcp_server::init_news_deps(shared_http.clone());
-        register_builtin_extension("giap-news", pond_mcp_server::spawn_news_server);
-        registered.push("giap-news".into());
-    }
-
-    if settings.ext_finance_enabled {
-        pond_mcp_server::init_finance_deps(shared_http.clone());
-        register_builtin_extension("giap-finance", pond_mcp_server::spawn_finance_server);
-        registered.push("giap-finance".into());
-    }
-
-    if settings.ext_discovery_enabled {
-        pond_mcp_server::init_discovery_deps(shared_http, settings_repo);
-        register_builtin_extension("giap-discovery", pond_mcp_server::spawn_discovery_server);
-        registered.push("giap-discovery".into());
-    }
-
-    // Audit / privacy-audit server (#115). Its event-log handle is installed
-    // separately via `init_audit_deps` in pond-server (where the logs DB is in
-    // scope), so registration here only wires the spawn fn + toggle.
-    if settings.ext_audit_enabled {
-        register_builtin_extension("giap-audit", pond_mcp_server::spawn_audit_server);
-        registered.push("giap-audit".into());
-    }
-
-    // Vision server (#130). Like giap-audit, its camera-event store handle is
-    // installed separately via `init_vision_deps` in pond-server.
-    if settings.ext_vision_enabled {
-        register_builtin_extension("giap-vision", pond_mcp_server::spawn_vision_server);
-        registered.push("giap-vision".into());
     }
 
     // Sensor data aggregator. Storage handle installed separately via

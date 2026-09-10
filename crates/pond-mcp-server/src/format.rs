@@ -382,7 +382,7 @@ mod tests {
         // Vacuity control: if the helper were renamed, `served` would be 0 and
         // an empty offender list would read as success.
         assert!(
-            served >= 15,
+            served >= 9,
             "only {served} servers go through serve_builtin — the scan is looking \
              for the wrong name, so an empty offender list proves nothing"
         );
@@ -418,12 +418,8 @@ mod tests {
         &[
             ("knowledge.rs", include_str!("knowledge.rs")),
             ("wolfram.rs", include_str!("wolfram.rs")),
-            ("discovery.rs", include_str!("discovery.rs")),
-            ("news.rs", include_str!("news.rs")),
-            ("finance.rs", include_str!("finance.rs")),
             ("memory.rs", include_str!("memory.rs")),
             ("sensors.rs", include_str!("sensors.rs")),
-            ("vision.rs", include_str!("vision.rs")),
         ]
     }
 
@@ -469,23 +465,17 @@ mod tests {
     /// a second router composed onto the knowledge server, so the file name is
     /// not the extension name.
     const TOOL_SOURCES: &[(&str, &str)] = &[
-        ("giap-audit", include_str!("audit.rs")),
         ("giap-context", include_str!("context.rs")),
         ("giap-device", include_str!("device.rs")),
         ("giap-device-control", include_str!("device_control.rs")),
-        ("giap-discovery", include_str!("discovery.rs")),
-        ("giap-draft", include_str!("draft.rs")),
-        ("giap-finance", include_str!("finance.rs")),
         ("giap-knowledge", include_str!("knowledge.rs")),
         ("giap-knowledge", include_str!("wolfram.rs")),
         ("giap-memory", include_str!("memory.rs")),
-        ("giap-news", include_str!("news.rs")),
         ("giap-orchestrator", include_str!("orchestrator.rs")),
         ("giap-schedule", include_str!("schedule.rs")),
         ("giap-sensors", include_str!("sensors.rs")),
         ("giap-system", include_str!("system.rs")),
         ("giap-toolkit", include_str!("toolkit.rs")),
-        ("giap-vision", include_str!("vision.rs")),
         ("giap-weather", include_str!("weather.rs")),
     ];
 
@@ -551,12 +541,9 @@ mod tests {
             tools.contains("giap-knowledge__compute_answer"),
             "{tools:?}"
         );
-        // Disabled 2026-08-13 by removing its #[tool] attribute. Its doc comment
-        // still shows that attribute, so this is also the comment-stripping test.
-        assert!(!tools.contains("giap-discovery__search_web"), "{tools:?}");
         assert_eq!(
             tools.len(),
-            46,
+            32,
             "the tool inventory changed. Update this count in the same commit as \
              the tool — the number is the record, and a stale one is how a count \
              read 64 for months while the real number was 65. This assertion has \
