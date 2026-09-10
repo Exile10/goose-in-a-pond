@@ -259,3 +259,24 @@ Four things the removal changed beyond the schemas:
 
 `format.rs :: the_tool_inventory_parser_sees_the_tools_that_are_there` pins the
 count at 46 and is the guard that will catch the next drift.
+
+### What it bought, measured
+
+Same mistral.rs (`--prefix-cache-n 0`), both captured payloads replayed
+verbatim, interleaved, with a bare request as a drift bookend:
+
+| payload | body | TTFT (median of 3) |
+|---|---:|---:|
+| bare `"hi"` | — | 102 ms |
+| before, 61 tools | 30,463 chars | **11,890 ms** |
+| after, 41 tools | 21,951 chars | **6,562 ms** |
+
+**−28% payload, −45% TTFT.** Superlinear, exactly as the depth curve above
+predicted, which is why cutting tools is worth more than its share of the bytes.
+
+Two honesties about these numbers. The absolute figures are higher than the
+morning run on the same machine and payload (8,220 ms for 61 tools then, 11,890
+now) — machine state, not a code change; the interleaved ratio is the part to
+trust, and the bare bookend drifted 71 → 151 ms across the run. And this is the
+uncached case: with llama.cpp's prompt cache on, the whole payload is free after
+the first request either way, so this saving is a cold-start saving.
