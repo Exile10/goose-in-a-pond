@@ -2951,6 +2951,7 @@ impl GooseAdapter {
         memories: &str,
         skills: &str,
         scope: &ProfileScope,
+        minimal: bool,
     ) -> SessionGroups {
         use pond_core::mcp::services::tool_selection as sel;
 
@@ -3009,6 +3010,36 @@ impl GooseAdapter {
         }
 
         let available: Vec<String> = permitted.clone();
+
+        // "minimal": the hatch, and nothing else. Placed AFTER the cache and the
+        // persisted row on purpose — a group the model enabled earlier in this
+        // session must come back, or every turn pays the round trip again.
+        //
+        // It also skips scoring entirely, which is the point: no embedder call
+        // at session start, and no dependence on the embedding model having
+        // finished downloading. The widen-on-failure rule that protects
+        // "relevant" would defeat this mode outright, since widening means all.
+        if minimal {
+            let selection = sel::minimal_groups(&available);
+            self.persist_session_tool_groups(giap_session_id, &selection.groups)
+                .await;
+            self.remember_permitted(giap_session_id, &permitted).await;
+            tracing::info!(
+                target: "giap::trace",
+                kind = "tool_selection",
+                session_id = %giap_session_id,
+                mode = "minimal",
+                basis = "mode_minimal",
+                groups = selection.groups.len(),
+                groups_total = permitted.len(),
+                "tool selection: hatch only"
+            );
+            return SessionGroups {
+                loaded: selection.groups,
+                permitted,
+            };
+        }
+
         // Three signals, scored independently and merged with max. Concatenating
         // them let a kilobyte of memories drown a short question — see
         // `selection_signals`. The skills signal exists so an active skill can
@@ -3106,24 +3137,34 @@ impl GooseAdapter {
             }
         }
 
-        self.session_tool_groups
-            .write()
-            .await
-            .insert(giap_session_id.to_string(), selection.groups.clone());
+        self.persist_session_tool_groups(giap_session_id, &selection.groups)
+            .await;
         self.remember_permitted(giap_session_id, &permitted).await;
-        if let Some(storage) = &self.giap_session_storage {
-            if let Err(e) = storage
-                .set_session_tool_groups(giap_session_id, &selection.groups)
-                .await
-            {
-                // Non-fatal: the in-process cache still keeps the session stable
-                // for this run; only cross-restart stickiness is lost.
-                tracing::warn!("tool selection: persisting groups failed: {e}");
-            }
-        }
         SessionGroups {
             loaded: selection.groups,
             permitted,
+        }
+    }
+
+    /// Make this session's loaded groups stick: in-process for this run, and in
+    /// the session store across restarts.
+    ///
+    /// Persisting is non-fatal on failure — the in-process cache still keeps the
+    /// session stable, and only cross-restart stickiness is lost. Under
+    /// `"minimal"` that loss costs more than it used to: a restart mid-session
+    /// puts the model back at the hatch with one round trip to pay again.
+    async fn persist_session_tool_groups(&self, giap_session_id: &str, groups: &[String]) {
+        self.session_tool_groups
+            .write()
+            .await
+            .insert(giap_session_id.to_string(), groups.to_vec());
+        if let Some(storage) = &self.giap_session_storage {
+            if let Err(e) = storage
+                .set_session_tool_groups(giap_session_id, groups)
+                .await
+            {
+                tracing::warn!("tool selection: persisting groups failed: {e}");
+            }
         }
     }
 
@@ -4075,7 +4116,7 @@ impl GooseAdapter {
         //
         // `None` in "all" mode, where the two are the same set.
         let mut entitled_tools: Option<HashSet<String>> = None;
-        let allowed_tools = if settings.tool_selection_is_relevant() {
+        let allowed_tools = if settings.tool_selection_narrows() {
             let groups = self
                 .resolve_session_tool_groups(
                     &session_id,
@@ -4083,6 +4124,7 @@ impl GooseAdapter {
                     &memory_block_for_user_msg,
                     &skill_selection_signal,
                     &turn_scope,
+                    settings.tool_selection_is_minimal(),
                 )
                 .await;
             let selected: HashSet<String> =
@@ -4142,7 +4184,7 @@ impl GooseAdapter {
         // ── 6d. PAI-1 P5, enforced in BOTH selection modes ───────────────────
         //
         // The group-level subtraction lives inside `resolve_session_tool_groups`,
-        // which is only reached from the `tool_selection_is_relevant()` branch
+        // which is only reached from the `tool_selection_narrows()` branch
         // above. `default_tool_selection_mode()` is "all", so on a DEFAULT
         // install that branch never runs and this set went to the model
         // untouched -- a Guest kept `giap-memory` and could recall, search or
@@ -6103,7 +6145,7 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
         let settings = self.settings_repo.get().await.unwrap_or_default();
         // Not narrowing? Then every registered group is loaded, and saying so
         // truthfully is better than implying there is something to enable.
-        let loaded: Option<Vec<String>> = if settings.tool_selection_is_relevant() {
+        let loaded: Option<Vec<String>> = if settings.tool_selection_narrows() {
             self.session_tool_groups
                 .read()
                 .await

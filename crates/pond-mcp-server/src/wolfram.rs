@@ -1195,13 +1195,4 @@ mod tests {
             .map(|t| t.text.clone())
             .expect("tool results in this module are a single text block")
     }
-
-    /// Pull the first offered suggestion id out of a rendered result.
-    fn first_id(rendered: &str) -> String {
-        let at = rendered
-            .find("\n- [")
-            .unwrap_or_else(|| panic!("no suggestion offered in: {rendered}"));
-        let rest = &rendered[at + 4..];
-        rest[..rest.find(']').expect("unterminated id")].to_string()
-    }
 }

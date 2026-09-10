@@ -4,7 +4,8 @@
 //! destroys the engine's KV prefix reuse. Every failure path widens, never narrows.
 
 use crate::mcp::domain::tool_group::{
-    core_group_names, find_group, group_of_tool, is_catalog_extension, TOOL_GROUPS,
+    core_group_names, find_group, group_of_tool, is_catalog_extension, TOOLKIT_EXTENSION,
+    TOOL_GROUPS,
 };
 
 /// Cosine-similarity floor for including a non-core group, on all-MiniLM-L6-v2. Calibrated
@@ -30,6 +31,8 @@ pub enum SelectionBasis {
     NoEmbedder,
     /// Scored against group descriptions.
     Scored,
+    /// `tool_selection_mode = "minimal"`: the toolkit hatch only, no scoring.
+    ModeMinimal,
 }
 
 /// The outcome of selection for one session.
@@ -160,6 +163,30 @@ pub fn select_groups(
     ToolSelection {
         groups: chosen,
         basis: SelectionBasis::Scored,
+    }
+}
+
+/// The `"minimal"` answer: the toolkit escape hatch, and nothing else.
+///
+/// No scoring, no embedder, no core set. Two tools — `list_tool_groups` and
+/// `enable_tool_group` — are 209 tokens of the 8,192-token local prompt budget,
+/// which is the only shape that fits a 4% ceiling. Everything else is one
+/// `enable_tool_group` call away and, once enabled, is persisted for the
+/// session like any other loaded group.
+///
+/// `available` is the PERMITTED set, so a scope that denies the toolkit gets an
+/// empty selection rather than a hatch it is not entitled to. That is a pond
+/// with no tools at all, which is the honest outcome: the alternative is
+/// handing back a hatch whose every destination is denied.
+pub fn minimal_groups(available: &[String]) -> ToolSelection {
+    let groups = available
+        .iter()
+        .filter(|a| a.as_str() == TOOLKIT_EXTENSION)
+        .cloned()
+        .collect();
+    ToolSelection {
+        groups,
+        basis: SelectionBasis::ModeMinimal,
     }
 }
 
