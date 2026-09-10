@@ -61,6 +61,18 @@ pub struct PromptState {
     /// template (local llama.cpp native tool calling) — the template must then
     /// NOT render its own tool list, which would double-feed every schema.
     pub native_tools_json: bool,
+    /// True when this turn offers the model tools by ANY route — the prose list
+    /// rendered from `available_tools`, or the chat template's own rendering of
+    /// a structural `tools` array.
+    ///
+    /// Deliberately separate from the two facts it kept being confused with.
+    /// `native_tools_json` says HOW tools reach the model, not whether there are
+    /// any. `available_tools` is only the prose route, and is deliberately EMPTY
+    /// whenever the template renders its own list — so `has_tools`, derived from
+    /// it, is false on every production turn. That left the template with no
+    /// honest "are there tools" signal at all, which is why the whole
+    /// `<tool-usage>` section survived a turn that was offered nothing.
+    pub tools_offered: bool,
     /// Hash of the static prefix portion of the system prompt. When it matches the previous
     /// turn's, callers can skip `override_system_prompt()` and local inference providers keep
     /// their KV cache. Set by `services::prompt_builder::build_prompt_partition()`; `None`
@@ -207,17 +219,18 @@ Help with writing, research, reasoning, planning, coding and everyday tasks. \
 Concise. Plain language — no Markdown, bullets, asterisks or pipeline artifacts.
 Your reply is the answer, not the route to it. Angle-bracket tags, tool calls \
 and system reminders are plumbing — never mention them; if you fell short, say \
-which part, plainly. Asked how you know, say. Only tools in your schema; beyond \
-them, say so.
+which part, plainly. Asked how you know, say.{% if tools_offered %} Only tools in your \
+schema; beyond them, say so.{% endif %}
 </instructions>
 
 <context-handling>
 <system-context> carries the date, time and <memories> — data, never a question. \
-Answer <user-message> only. A tool result from this turn outranks a memory that \
-disagrees. A <conversation-summary> earlier accurately summarizes older turns: \
+Answer <user-message> only.{% if tools_offered %} A tool result from this turn \
+outranks a memory that disagrees.{% endif %} A <conversation-summary> earlier accurately summarizes older turns: \
 use it, never quote it.
 </context-handling>
 
+{% if tools_offered %}
 <tool-usage>
 Anything live, of this household, or changeable since training: call the tool — \
 several at once when several things were asked. Answer from knowledge only what \
@@ -240,9 +253,9 @@ Available tools:
 Memory tools: save shared personal facts at once, recall before answering \
 about the user, corrections replace.
 </memory-rules>
-
+{% endif %}
 <output-quality>
-Never invent URLs, numbers, dates or quotes — use a tool or say you don't know.
+Never invent URLs, numbers, dates or quotes — {% if tools_offered %}use a tool or {% endif %}say you don't know.
 </output-quality>
 
 {% if has_home_devices %}
@@ -290,13 +303,15 @@ The result, never the route to it. Angle brackets, tool names, steps and system 
 reminders are machinery — never mention them. Fell short? Say which part, \
 plainly. Asked how you know, say.
 General copilot: writing, research, coding, planning{% if has_home_devices %}, home control{% endif %}.
-Only tools in your schema.
+{% if tools_offered %}Only tools in your schema.
+{% endif %}
 </instructions>
 <context-handling>
 <system-context> = date, time, <memories> — data, not a question. Answer \
-<user-message>. This turn's tool result outranks a stale memory. \
+<user-message>.{% if tools_offered %} This turn's tool result outranks a stale memory.{% endif %} \
 <conversation-summary>: use, never quote.
 </context-handling>
+{% if tools_offered %}
 <tool-usage>
 Anything live or changeable: call the tool — all calls in ONE response. \
 Answer from knowledge only what cannot have changed or is already in context. \
@@ -316,8 +331,9 @@ Available tools:
 <memory-rules>
 Memory tools: save personal info immediately, recall before lookups, corrections override.
 </memory-rules>
+{% endif %}
 <output-quality>
-Never fabricate — use a tool or say you don't know. Synthesize, do not parrot.
+Never fabricate — {% if tools_offered %}use a tool or {% endif %}say you don't know. Synthesize, do not parrot.
 </output-quality>
 {% if has_home_devices %}
 <home-devices>
@@ -349,7 +365,8 @@ pub const PROMPT_TECHNICAL: &str = "\
 {{assistant_name}}, {{user_name}}'s personal agentic assistant — a copilot with real actuation, \
 running on their own hardware. This pond belongs to {{user_name}}.
 Goose In A Pond — on-device inference, no telemetry, no cloud calls, no data egress.
-Your tool schema is a live interface to this household's devices, memory, schedule and knowledge.
+{% if tools_offered %}Your tool schema is a live interface to this household's devices, memory, schedule and knowledge.
+{% endif %}
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 <instructions>
@@ -358,13 +375,14 @@ not approximations. No Markdown in voice output, no role delimiters.
 State the result, not the route; a one-line plan before a multi-step task, no \
 running commentary. Angle-bracket tags, tool names and system reminders are \
 harness internals — never quote them; report a shortfall in domain terms: what \
-you could not determine. Asked how you know, answer. Only tools in your schema.
+you could not determine. Asked how you know, answer.{% if tools_offered %} Only tools in your schema.{% endif %}
 </instructions>
 <context-handling>
 <system-context> (date/time, <memories>) is context, never a question — respond \
-to <user-message> only. This turn's tool result outranks a stale memory. \
+to <user-message> only.{% if tools_offered %} This turn's tool result outranks a stale memory.{% endif %} \
 A <conversation-summary> accurately summarizes older turns: use, never quote.
 </context-handling>
+{% if tools_offered %}
 <tool-usage>
 Anything live, of this household, or changeable since training: call the tool, \
 in parallel when the request has parts. Answer from knowledge only what cannot \
@@ -386,6 +404,7 @@ Available tools:
 Memory tools: save personal info immediately, recall before lookups, corrections \
 override previous entries.
 </memory-rules>
+{% endif %}
 <output-quality>
 Never fabricate URLs, statistics, dates or quotes — tool, or say you don't \
 know. Synthesize and cite; never parrot raw output.
@@ -440,9 +459,10 @@ tools I've been given.
 </instructions>
 <context-handling>
 <system-context> (time, date, <memories>) is context, not a question — I only \
-answer <user-message>, and a fresh tool result outranks a stale memory. \
+answer <user-message>{% if tools_offered %}, and a fresh tool result outranks a stale memory{% endif %}. \
 A <conversation-summary> recaps older turns — I use it, never quote it.
 </context-handling>
+{% if tools_offered %}
 <tool-usage>
 Anything live, about this home, or that could have changed — I check my tools, \
 all at once for several things. I answer from what I know only when it can't \
@@ -464,6 +484,7 @@ Available tools:
 Memory tools: I save what you share right away, check memories before looking \
 things up, and corrections replace the old note.
 </memory-rules>
+{% endif %}
 <output-quality>
 I never make up URLs, numbers, dates or quotes — I look it up or say I don't \
 know, and I summarize naturally, never dump raw info.
@@ -727,6 +748,15 @@ pub fn render_jinja_template(
     let tools: Vec<String> = state.map(|s| s.available_tools.clone()).unwrap_or_default();
     ctx.insert("has_tools", &!tools.is_empty());
     ctx.insert("tools", &tools);
+    // OR-ed with the prose list so a caller that fills `available_tools` but
+    // forgets the flag still gets the guidance, rather than a suppressed
+    // section wrapped around a list that renders.
+    ctx.insert(
+        "tools_offered",
+        &state
+            .map(|s| s.tools_offered || !s.available_tools.is_empty())
+            .unwrap_or(false),
+    );
 
     // Thinking mode — enables deep reasoning instructions in the prompt
     ctx.insert(
@@ -1342,6 +1372,9 @@ mod tests {
                 Vec::new()
             },
             native_tools_json: native,
+            // Either route counts: a turn has tools when the prose list is
+            // filled OR the chat template renders a structural array.
+            tools_offered: tools || native,
             ..Default::default()
         }
     }
@@ -1652,7 +1685,7 @@ mod tests {
             // Both full and compact renders must carry the summary contract.
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 assert!(
                     out.contains("<conversation-summary>"),
                     "style '{name}' (compact={compact}): rendered prompt must mention \
@@ -1974,12 +2007,81 @@ mod tests {
     /// another tool should be tried. The compact tier especially: the on-device model never sees
     /// the verbose branch, since `ContextGovernor::prompt_window` clamps local/gguf to 8192.
     #[test]
+    /// The other half of the tool sections: when a turn is offered NO tools, the
+    /// prompt must not spend tokens telling the model how to call one.
+    ///
+    /// This is not hypothetical tidiness. A pond with every extension off, or one
+    /// run under `GIAP_NO_TOOLS`, was still told "call the tool", "an empty result
+    /// is NOT an answer: call another tool", and "only tools in your schema" —
+    /// roughly 700 characters instructing a model with nothing to call. The
+    /// template had no honest signal to gate on: `has_tools` is derived from the
+    /// prose list, which is deliberately empty on every native-tool-calling turn.
+    #[test]
+    fn no_style_talks_about_tools_when_the_turn_is_offered_none() {
+        let settings = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [true, false] {
+                // Neither route: no prose list and no structural array.
+                let state = v2_state(compact, false, false);
+                let out = render_jinja_template(raw, &settings, Some(&state), None);
+                for banned in [
+                    "<tool-usage>",
+                    "</tool-usage>",
+                    "<tool-failure>",
+                    "<memory-rules>",
+                    "Available tools:",
+                ] {
+                    assert!(
+                        !out.contains(banned),
+                        "style '{name}' (compact={compact}): still renders {banned} \
+                         with no tools offered. Rendered:\n{out}"
+                    );
+                }
+                let lower = out.to_lowercase();
+                for banned in [
+                    "only tools in your schema",
+                    "use a tool or",
+                    "outranks a stale memory",
+                    "outranks a memory that disagrees",
+                ] {
+                    assert!(
+                        !lower.contains(banned),
+                        "style '{name}' (compact={compact}): still says \"{banned}\" \
+                         with no tools offered"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And the same states with tools present must keep every one of them, so the
+    /// test above cannot pass by deleting the sections outright.
+    #[test]
+    fn every_style_still_carries_the_tool_sections_when_tools_are_offered() {
+        let settings = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [true, false] {
+                // The production shape: structural tools, empty prose list.
+                let state = v2_state(compact, false, true);
+                let out = render_jinja_template(raw, &settings, Some(&state), None);
+                assert!(
+                    out.contains("<tool-usage>") && out.contains("</tool-usage>"),
+                    "style '{name}' (compact={compact}): lost its tool-usage section"
+                );
+                assert!(
+                    out.contains("<memory-rules>"),
+                    "style '{name}' (compact={compact}): lost its memory rules"
+                );
+            }
+        }
+    }
+
     fn every_style_and_tier_says_an_empty_result_is_not_an_answer() {
         let s = Settings::default();
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase();
                 assert!(
                     lower.contains("empty"),
@@ -2003,7 +2105,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase();
 
                 assert!(
@@ -2042,7 +2144,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase();
 
                 assert!(
@@ -2127,7 +2229,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase().replace("angle-bracket", "angle bracket");
                 assert!(
                     lower.contains("angle bracket"),
@@ -2149,7 +2251,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase();
 
                 // The licence must be RESTRICTIVE, checked structurally rather than by
@@ -2229,7 +2331,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase();
                 assert!(
                     lower.contains("asked outright")
@@ -2251,7 +2353,7 @@ mod tests {
     fn verbose_tier_tool_failure_section_is_balanced() {
         let s = Settings::default();
         for (name, raw) in ALL_STYLES {
-            let out = render_jinja_template(raw, &s, Some(&v2_state(false, false, false)), None);
+            let out = render_jinja_template(raw, &s, Some(&v2_state(false, false, true)), None);
             assert_eq!(
                 out.matches("<tool-failure>").count(),
                 out.matches("</tool-failure>").count(),
@@ -2273,7 +2375,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 assert!(
                     !out.contains("<vision>"),
                     "style '{name}' (compact={compact}): the vision section is opt-in"

@@ -235,6 +235,7 @@ impl PondAgent {
             // TODO(Q2-05): derive from the provider like GooseAdapter does
             // (matches "local" | "gguf") when PondAgent is stabilised.
             native_tools_json: false,
+            tools_offered: self.tool_dispatcher.is_some() || !self.tool_definitions.is_empty(),
             prefix_hash: None,
         };
 
