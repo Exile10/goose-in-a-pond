@@ -41,6 +41,38 @@ pub const ORCHESTRATOR_EXTENSION: &str = "giap-orchestrator";
 /// name (`giap-weather__get_forecast`). Goose's own convention.
 pub const TOOL_NAME_SEPARATOR: &str = "__";
 
+/// Environment variable that offers the model no tools at all.
+///
+/// Here rather than in an adapter because THREE places honour it -- the goose
+/// provider shim, GIAP's builtin registration, and the mistral.rs backend --
+/// and the point of the switch is that it means one thing everywhere. All
+/// three carried their own copy of the parsing rule, one of them cached and
+/// two not, and a divergence would have been silent: a pond that registered no
+/// extensions but still offered tools, or the reverse.
+pub const NO_TOOLS_ENV: &str = "GIAP_NO_TOOLS";
+
+/// Whether a value of [`NO_TOOLS_ENV`] means "no tools".
+///
+/// Takes the value rather than reading the environment so a test can exercise
+/// it: the environment is process-global and a test binary is threaded, so a
+/// test that set it would decide the answer for every other test in the
+/// process.
+///
+/// Anything present and not an explicit off-switch counts as on, because the
+/// failure that matters is a turn that quietly kept its tools after someone set
+/// the variable -- not one that lost them after `GIAP_NO_TOOLS=maybe`.
+pub fn no_tools_from(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None | Some("") | Some("0") | Some("false") | Some("no") => false,
+        Some(_) => true,
+    }
+}
+
+/// Read [`NO_TOOLS_ENV`] from the environment and apply [`no_tools_from`].
+pub fn no_tools_env_set() -> bool {
+    no_tools_from(std::env::var(NO_TOOLS_ENV).ok().as_deref())
+}
+
 /// Every group GIAP knows about. Registration is still gated by the
 /// `ext_*_enabled` settings toggles — this catalog describes what COULD be
 /// registered, and selection always intersects it with what actually was.
@@ -225,6 +257,26 @@ pub fn is_catalog_extension(extension: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_no_tools_switch_reads_presence_not_truthiness() {
+        assert!(no_tools_from(Some("1")));
+        assert!(no_tools_from(Some("yes")));
+        // Anything unrecognised still disables: a turn that quietly KEPT its
+        // tools after someone set the variable is the worse failure.
+        assert!(no_tools_from(Some("maybe")));
+    }
+
+    #[test]
+    fn the_no_tools_switch_is_off_when_unset_or_explicitly_off() {
+        assert!(!no_tools_from(None));
+        assert!(!no_tools_from(Some("")));
+        assert!(!no_tools_from(Some("0")));
+        assert!(!no_tools_from(Some("false")));
+        assert!(!no_tools_from(Some("no")));
+        // Whitespace is trimmed, so an env var set from a shell heredoc still reads.
+        assert!(!no_tools_from(Some("  0  ")));
+    }
+
     use super::*;
 
     #[test]
@@ -236,7 +288,7 @@ mod tests {
         assert_eq!(names.len(), total, "duplicate extension in TOOL_GROUPS");
     }
 
-    /// The four core groups are load-bearing for safety, continuity, and the
+    /// The three core groups are load-bearing for safety, continuity, and the
     /// escape hatch. A change here should be deliberate, so pin it.
     #[test]
     fn core_groups_are_exactly_the_documented_three() {
@@ -461,14 +513,21 @@ mod guest_denylist_tests {
     #[test]
     fn a_subagent_keeps_the_read_only_research_groups() {
         let denied = groups_denied_to_subagents();
+        // Every name here must be a group that EXISTS, or the assertion holds
+        // for the wrong reason: `giap-news` and `giap-finance` sat in this list
+        // after their groups were deleted, and "not denied" was true because
+        // there was nothing to deny.
         for kept in [
             "giap-weather",
             "giap-knowledge",
-            "giap-news",
-            "giap-finance",
+            "giap-sensors",
             "giap-device",
             "giap-memory",
         ] {
+            assert!(
+                is_catalog_extension(kept),
+                "{kept} is not a group any more, so asserting it is not denied proves nothing"
+            );
             assert!(
                 !denied.contains(&kept),
                 "{kept} reads rather than decides; denying it leaves subagents unable to do \

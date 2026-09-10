@@ -26,11 +26,22 @@
 //!
 //! ## Placement, honestly
 //!
-//! This sits last inside `<system-context>`, immediately before
-//! `<user-message>`. That is close to generation, not AT it: the user's own
-//! words follow, `EMPTY_TURN_STEER` is appended after `</user-message>` on a
-//! re-engagement, and the engine's completeness nudge lands after everything.
-//! Nearer is the claim; last is not.
+//! This sits last inside `<system-context>`, which since the envelope was
+//! reversed (the turn now reads `<user-message>` first, then
+//! `<system-context>`) means last in the whole turn message. The reversal was
+//! made for KV reuse, not for this -- `<system-context>` is stripped from prior
+//! user turns, and putting it first meant the strip diverged the cache at the
+//! first user message -- but the side effect is that the contract moved from
+//! "near generation" to genuinely at it.
+//!
+//! Two things still land after it, so "last" is a claim about this envelope
+//! rather than about the prompt: `EMPTY_TURN_STEER` is appended to the whole
+//! turn text on a re-engagement (`goose_agent.rs`, after `</system-context>`),
+//! and the engine's completeness nudge lands after everything.
+//!
+//! This paragraph said the opposite of all of that for as long as the reversal
+//! has been in -- it described the old order, in a section headed "honestly",
+//! while `goose_agent.rs` points the reader here for the placement rule.
 //!
 //! ## Cost
 //!

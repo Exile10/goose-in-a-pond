@@ -868,7 +868,43 @@ mod tests {
 
     const DAY: u64 = 24 * 60 * 60;
 
+    /// The envelope the adapter actually builds since the reorder: the user's
+    /// own words FIRST, then `<system-context>`.
+    ///
+    /// This is the property that whole change rests on. `<system-context>` used
+    /// to be the prefix, so `text[..start]` was always empty and nothing ever
+    /// exercised it; now it holds the user's real message, and a strip that
+    /// dropped or trimmed it would silently delete what the user said from
+    /// every history turn. `strip_system_context` is order-agnostic, so the two
+    /// fixtures below it kept passing while testing the old shape only.
     #[test]
+    fn stripping_preserves_everything_before_the_system_context_block() {
+        let turn = "<user-message>\nwhat did I ask you yesterday?\n</user-message>\n\
+                    <system-context>\nToday is X\n<memories>a memory</memories>\n\
+                    </system-context>\n";
+
+        let stripped = strip_system_context(turn);
+
+        assert_eq!(
+            stripped, "<user-message>\nwhat did I ask you yesterday?\n</user-message>\n",
+            "the user's words must survive the strip byte for byte"
+        );
+        assert!(!stripped.contains("<system-context>"));
+        assert!(!stripped.contains("a memory"));
+    }
+
+    /// A turn with nothing before the block still strips to nothing extra --
+    /// the old shape, kept so the reorder cannot be read as replacing it.
+    #[test]
+    fn stripping_a_leading_system_context_leaves_the_rest() {
+        let turn =
+            "<system-context>\nToday is X\n</system-context>\n<user-message>hi</user-message>";
+        assert_eq!(
+            strip_system_context(turn),
+            "<user-message>hi</user-message>"
+        );
+    }
+
     /// The production shape: the adapter trims before the turn is appended, so EVERY
     /// user message present is history and every block in it is stale. A fixture whose
     /// last message is the current turn's cannot occur in production — `trim_goose_history`

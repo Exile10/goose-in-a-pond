@@ -400,32 +400,14 @@ fn promote_tool_result_images(messages: &[Message], max_images: usize) -> Option
     Some(out)
 }
 
-/// Retain only allow-listed tools. Returns `None` when nothing was vetoed.
-/// Environment variable that offers the model no tools at all.
-const NO_TOOLS_ENV: &str = "GIAP_NO_TOOLS";
-
-/// Whether the value of [`NO_TOOLS_ENV`] means "no tools".
-///
-/// Split from the env read so a test can exercise it: the environment is
-/// process-global and a test binary is threaded, so a test that set it would
-/// decide the answer for every other test in the process.
-///
-/// Anything present and not an explicit off-switch counts as on, because the
-/// failure that matters is a turn that quietly kept its tools after someone
-/// set the variable — not one that lost them after `GIAP_NO_TOOLS=maybe`.
-fn no_tools_from(value: Option<&str>) -> bool {
-    match value.map(str::trim) {
-        None | Some("") | Some("0") | Some("false") | Some("no") => false,
-        Some(_) => true,
-    }
-}
+use pond_core::mcp::domain::tool_group::{no_tools_env_set, NO_TOOLS_ENV};
 
 /// Read once: this is on the per-turn path and the environment cannot change
 /// under a running process in any way this needs to notice.
 fn tools_disabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        let off = no_tools_from(std::env::var(NO_TOOLS_ENV).ok().as_deref());
+        let off = no_tools_env_set();
         if off {
             tracing::warn!(
                 "{NO_TOOLS_ENV} is set — every turn is offered ZERO tools, GIAP's and \
@@ -436,6 +418,7 @@ fn tools_disabled() -> bool {
     })
 }
 
+/// Retain only allow-listed tools. Returns `None` when nothing was vetoed.
 fn enforce_tools(tools: &[Tool], allowed: &Option<HashSet<String>>) -> Option<Vec<Tool>> {
     let allowed = allowed.as_ref()?;
     if tools.iter().all(|t| allowed.contains(t.name.as_ref())) {
@@ -1249,26 +1232,6 @@ mod tests {
     }
 
     #[test]
-    fn the_no_tools_switch_reads_presence_not_truthiness() {
-        assert!(no_tools_from(Some("1")));
-        assert!(no_tools_from(Some("yes")));
-        // Anything unrecognised still disables: a turn that quietly KEPT its
-        // tools after someone set the variable is the worse failure.
-        assert!(no_tools_from(Some("maybe")));
-    }
-
-    #[test]
-    fn the_no_tools_switch_is_off_when_unset_or_explicitly_off() {
-        assert!(!no_tools_from(None));
-        assert!(!no_tools_from(Some("")));
-        assert!(!no_tools_from(Some("0")));
-        assert!(!no_tools_from(Some("false")));
-        assert!(!no_tools_from(Some("no")));
-        // Whitespace is trimmed, so an env var set from a shell heredoc still reads.
-        assert!(!no_tools_from(Some("  0  ")));
-    }
-
-    #[test]
     fn minify_tools_returns_none_when_already_clean() {
         let clean = tool("giap-weather__get_current_weather");
         assert!(minify_tools(&[clean]).is_none());
@@ -1434,8 +1397,8 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         // A widen through one handle is visible through the other — this is what
         // lets the escape hatch affect the in-flight turn.
-        second.extend_allowed_tools(["giap-vision__list_camera_events".to_string()]);
-        assert!(first.is_tool_allowed("giap-vision__list_camera_events"));
+        second.extend_allowed_tools(["giap-sensors__get_sensor_reading".to_string()]);
+        assert!(first.is_tool_allowed("giap-sensors__get_sensor_reading"));
     }
 
     /// D2 escape hatch: enabling a group widens the live allow-set.

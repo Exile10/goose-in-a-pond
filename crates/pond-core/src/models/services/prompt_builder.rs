@@ -39,7 +39,7 @@ fn hash_string(s: &str) -> u64 {
 
 /// Build a partitioned system prompt from settings, profile, state, and template.
 ///
-/// `current_date`, `current_time` and `online_device_names` are blanked in the static render as
+/// `current_date` and `current_time` are blanked in the static render as
 /// temporal (`is_online` is recomputed per read from a 300s window) and move to the suffix.
 pub fn build_prompt_partition(
     settings: &Settings,
@@ -144,10 +144,12 @@ pub fn compute_prefix_hash_fast(
     // Template content
     template_content.hash(&mut hasher);
     // State fields that are baked into the static prefix
-    // `online_device_names` is deliberately NOT here: it no longer renders into
-    // the static prefix (see `build_prompt_partition`). Hashing it would make
-    // this path report "prefix changed" every five minutes for a prefix that
-    // did not change, which costs a full re-prefill for nothing.
+    // The device list used to be the trap here: hashing something that changes
+    // every five minutes reports "prefix changed" for a prefix that did not,
+    // and costs a full re-prefill for nothing. The field is gone entirely now
+    // (the prompt carries no home-device state), so the rule survives only as
+    // the reason to keep checking: hash what is baked into the static prefix,
+    // and nothing that moves under it.
     state.voice_mode.hash(&mut hasher);
     state.thinking_enabled.hash(&mut hasher);
     // Selects the compact variant of four sections, AND the tier the thinking
@@ -369,9 +371,14 @@ mod tests {
         );
     }
 
-    /// Under `tool_selection_mode = "relevant"` the selection is rescored every turn, so a swap
-    /// that keeps the count is the common shape of change; a hash over `.len()` alone calls it
-    /// unchanged and hands the provider a reuse decision for a prompt it never saw.
+    /// A swap that keeps the count is the common shape of change, and a hash over `.len()` alone
+    /// calls it unchanged — handing the provider a reuse decision for a prompt it never saw.
+    ///
+    /// This said the selection is "rescored every turn" under `"relevant"`. It is not:
+    /// `resolve_session_tool_groups` is sticky by design, precisely because re-scoring per turn
+    /// would rewrite the tools JSON every turn and destroy the KV prefix reuse the feature exists
+    /// to protect. The swap still happens — `enable_tool_group` mid-session, a scope change, a
+    /// mode change between sessions — so the property this pins is unaffected by the correction.
     #[test]
     fn swapping_one_tool_for_another_moves_the_fast_hash() {
         let settings = Settings::default();
@@ -542,7 +549,6 @@ mod tests {
         let state = default_state();
 
         let fast = compute_prefix_hash_fast(&settings, &state, PROMPT_BALANCED);
-        let partition = build_prompt_partition(&settings, None, &state, PROMPT_BALANCED);
 
         // They use different hashing strategies (field-level vs string-level),
         // so they won't match numerically. But they should both change when

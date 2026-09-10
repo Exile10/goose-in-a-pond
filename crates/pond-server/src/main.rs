@@ -3410,7 +3410,7 @@ async fn run_server(
     // is a requirement, not tidiness: `FileSecretRepository` caches
     // secrets.json in memory and rewrites it whole on `set`, so a second
     // instance would serve a stale cache and clobber this one's writes.
-    // `spawn_news_server` / `spawn_finance_server` only fire at chat time, so
+    // The servers that consume these handles only spawn at chat time, so
     // installing here (after the agent backend was built) is in time.
     if let Some(repo) = &secret_repo {
         pond_mcp_server::init_secret_deps(repo.clone());
@@ -8435,7 +8435,7 @@ async fn build_goose_backend(
             // refuses, so the failure would look like a working guard rather
             // than like broken wiring.
             //
-            // Installed unconditionally, like `init_audit_deps`: the toggle
+            // Installed unconditionally: the toggle
             // gates REGISTRATION (in `register_giap_extensions`), so with it off
             // no server is ever spawned and these handles are simply unused.
             {

@@ -477,8 +477,19 @@ function AddServerModal({ onClose, onAdded }: AddServerModalProps) {
 // conversation actually needs, chosen once when the conversation starts so the
 // prompt stays cacheable. Goose can still load any other group itself mid-chat,
 // so nothing becomes unreachable.
-const TOOL_MODE_LABELS: Record<string, string> = { all: "All tools", relevant: "Only relevant" };
-const TOOL_MODE_VALUES: Record<string, string> = { "All tools": "all", "Only relevant": "relevant" };
+// "Minimal" sends neither: the model gets only the two toolkit tools and asks
+// for a group when it wants one. 2.7% of an 8K prompt budget against 40.8% for
+// "All tools" -- the only setting that fits a 4% ceiling.
+const TOOL_MODE_LABELS: Record<string, string> = {
+  all: "All tools",
+  relevant: "Only relevant",
+  minimal: "Minimal",
+};
+const TOOL_MODE_VALUES: Record<string, string> = {
+  "All tools": "all",
+  "Only relevant": "relevant",
+  Minimal: "minimal",
+};
 
 function ToolLoadingCard({ onFlash }: { onFlash: (text: string, ok?: boolean) => void }) {
   const [mode, setMode] = useState<string | null>(null);
@@ -497,9 +508,12 @@ function ToolLoadingCard({ onFlash }: { onFlash: (text: string, ok?: boolean) =>
     setMode(next);
     try {
       await api.updateSettings({ tool_selection_mode: next } as Partial<Settings>);
-      onFlash(next === "relevant"
-        ? "New conversations will load only the tool groups they need."
-        : "All tools will be sent every turn.");
+      onFlash(
+        next === "relevant"
+          ? "New conversations will load only the tool groups they need."
+          : next === "minimal"
+            ? "New conversations start with no tools; Goose loads a group when it needs one."
+            : "All tools will be sent every turn.");
     } catch (e) {
       setMode(prev);
       onFlash(`Could not save tool loading mode: ${String(e)}`, false);
@@ -514,12 +528,13 @@ function ToolLoadingCard({ onFlash }: { onFlash: (text: string, ok?: boolean) =>
           <span className="mrow__meta">
             Sending every tool costs a large slice of the prompt on small local models.
             &ldquo;Only relevant&rdquo; picks the groups a conversation needs when it starts;
-            Goose can load any other group itself if it needs one.
+            &ldquo;Minimal&rdquo; sends none at all. Goose can load any group itself if it
+            needs one, so nothing becomes unreachable.
           </span>
         </div>
         {mode !== null && (
           <Segment
-            options={["All tools", "Only relevant"]}
+            options={["All tools", "Only relevant", "Minimal"]}
             value={TOOL_MODE_LABELS[mode] ?? "All tools"}
             onChange={pick}
           />

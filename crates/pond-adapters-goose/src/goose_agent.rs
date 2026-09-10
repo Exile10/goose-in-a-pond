@@ -3103,7 +3103,7 @@ impl GooseAdapter {
         // embeds against a file that is not there yet — and
         // `group_description_embeddings` used to latch that failure into a
         // `OnceCell` for the whole process. An operator who set "relevant" got
-        // all 66 tools for the lifetime of the server and no line said so.
+        // all 32 tools for the lifetime of the server and no line said so.
         if matches!(selection.basis, sel::SelectionBasis::NoEmbedder) {
             tracing::warn!(
                 target: "giap::trace",
@@ -3644,7 +3644,17 @@ impl GooseAdapter {
                 // allow-set is computed further down, so the signal here is the
                 // registered union plus whatever prose the registry adds — both
                 // empty exactly when the pond has nothing to offer.
-                tools_offered: !registered_extensions().is_empty() || has_prose_tools,
+                //
+                // `GIAP_NO_TOOLS` has to be checked here too, and not because
+                // registration already returns empty under it: a user-added MCP
+                // server does not pass through `register_giap_extensions` at
+                // all, so `has_prose_tools` could still be true. That pond
+                // rendered every tool section and was then handed zero tools by
+                // the shim, which vetoes last — the prompt teaching a model to
+                // call tools it does not have is the exact failure the switch
+                // exists to rule out.
+                tools_offered: !pond_core::mcp::domain::tool_group::no_tools_env_set()
+                    && (!registered_extensions().is_empty() || has_prose_tools),
                 prefix_hash: None, // filled by build_prompt_partition below
             }
         };
@@ -4101,8 +4111,8 @@ impl GooseAdapter {
         //
         // This does NOT decide whether the model uses tools (working agreement:
         // trust the model, no keyword pre-classification). It decides which
-        // extension SCHEMAS are physically in the prompt, for cost — 59 tools at
-        // ~100 tokens each through the Gemma template is ~5.9K of an 8K-class
+        // extension SCHEMAS are physically in the prompt, for cost — 27 tools is
+        // ~3,339 tokens, 40.8% of an 8K-class
         // on-device budget. The model still chooses natively, and can pull in any
         // dormant group itself via giap-toolkit.
         let mut dormant_groups_note = String::new();
@@ -4160,7 +4170,14 @@ impl GooseAdapter {
                 target: "giap::trace",
                 kind = "tool_selection",
                 session_id = %session_id,
-                mode = "relevant",
+                // The REAL mode. This said "relevant" unconditionally, which is
+                // the same defect this file already carries a paragraph about
+                // twenty lines up: a narrowed session whose trace names the
+                // wrong mode leaves nothing to diagnose from. Every turn after
+                // the first returns from the cache or the persisted row, so
+                // `resolve_session_tool_groups`' own "minimal" line is emitted
+                // once per session and this is the only per-turn record.
+                mode = %settings.tool_selection_mode,
                 groups = ?groups.loaded,
                 groups_total = groups.permitted.len(),
                 groups_registered = registered_extensions().len(),

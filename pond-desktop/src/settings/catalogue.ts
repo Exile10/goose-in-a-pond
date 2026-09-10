@@ -471,10 +471,11 @@ export const CATALOGUE: CatalogueCategory[] = [
           {
             key: "tool_selection_mode", label: "Tools sent each turn", description: "Whether it is offered everything it can do, or only what suits the question.", consumer: "live",
             control: { kind: "radio", options: [
-              { value: "all",      label: "All of them", hint: "Every enabled tool, every turn. Costs about 5.9K tokens" },
+              { value: "all",      label: "All of them", hint: "Every enabled tool, every turn. About 3.3K tokens, 41% of the prompt budget" },
               { value: "relevant", label: "The relevant ones", hint: "A small core plus what this conversation seems to need" },
+              { value: "minimal",  label: "None until asked for", hint: "Only the two tools that load a group. 222 tokens, 2.7%" },
             ] },
-            validate: oneOf(["all", "relevant"]),
+            validate: oneOf(["all", "relevant", "minimal"]),
           },
           { key: "tool_model", label: "Tool-call helper model", description: "A small helper model that tidies up requests the main one gets wrong.", control: { kind: "lookup", source: "llm-models", placeholder: "Not set" }, consumer: "live" },
           {

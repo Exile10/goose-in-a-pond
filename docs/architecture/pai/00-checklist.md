@@ -1922,11 +1922,11 @@ Brief was a redesign across seven axes — queuing, batching, precision, fault t
 cross-recommendation, MCP-UI, extensibility with the builtins standardised, and "extensions
 for everything". Plan at `.claude/plans/`, branch `feat/extensions-redesign`, seven commits.
 
-**The number that drove the design.** GIAP ships **46 tools across 17 extensions** to
-(66 until 2026-09-10, when 20 were removed — see
-[`prefill-cost-audit.md`](../../developer/prefill-cost-audit.md))
-gemma-4-E2B/E4B on an 8192-clamped prompt window, with `tool_selection_mode` defaulting to
-`"all"`. Published benchmarks put tool-selection accuracy for *Haiku* below 90% between **10
+**The number that drove the design.** GIAP ships **32 tools across 11 extensions**, 27 of them
+offered by default, to gemma-4-E2B/E4B on an 8192-clamped prompt window, with
+`tool_selection_mode` defaulting to `"all"`. It was 66 across 17 until 2026-09-10, when 20 tools
+and then six whole groups were removed — see
+[`prefill-cost-audit.md`](../../developer/prefill-cost-audit.md). Published benchmarks put tool-selection accuracy for *Haiku* below 90% between **10
 and 15** tools; at 107 both large and small models fail outright. GIAP's own D-phase numbers
 agree on cost (59 tools = 6,539 tok = 11.4 s TTFT; 17 = 2,386 = 4.0 s). "Extensions for
 everything" and "precision" therefore pull against each other, and the resolution is the
@@ -2014,3 +2014,32 @@ Guest scope: tightened twice. Approval: untouched. PAI-6: the delegation ceiling
 entitlement, which grants nothing the parent could not already reach. PAI-2: the degradation
 notes name a missing key but never its value, and `secret()` still returns `None`
 indistinguishably for unset / unreadable / no-store.
+
+**2026-09-10 — six tool groups deleted; PAI-1 P5 and PAI-6 P3 denylists shrank, PAI-2's outbound
+gate is gone.**
+
+- `giap-news`, `giap-audit`, `giap-finance`, `giap-discovery`, `giap-vision` and `giap-draft` were
+  deleted to cut the prompt's tool payload: 46 registered tools to 32, 41 offered to 27, 19,193
+  chars to 13,358 (~3,339 tok, 40.8% of the 8,192-token local prompt budget). Twenty individual
+  tools had gone the same way a day earlier. See
+  [`prefill-cost-audit.md`](../../developer/prefill-cost-audit.md).
+- **PAI-2 regressed, and this is the entry that says so.** `giap-draft` was the outbound-action
+  gate — the pond's only propose-then-confirm surface — and `giap-audit` was the only way to read
+  the egress record back. Section 3.6 of
+  [`02-privacy-and-security-guardrails.md`](02-privacy-and-security-guardrails.md) now carries the
+  correction. The lock/alarm rule survives as prose on `set_device_state`'s description, which is a
+  prompt-surface control rather than a mechanism. Treat P-outbound as **regressed, not satisfied**,
+  until a replacement gate exists.
+- **PAI-1 P5 / PAI-6 P3**: `groups_denied_to_guests()` lost `giap-draft`, `giap-audit` and
+  `giap-vision`; `groups_denied_to_subagents()` lost its entries for the deleted actuating groups.
+  Both properties still hold for the groups that remain, and both lists' vacuity controls were
+  repaired — they had been asserting over groups that no longer existed, which passes for the wrong
+  reason.
+- A third `tool_selection_mode`, `"minimal"`, offers the toolkit hatch alone: 222 tokens, 2.7% of
+  the prompt budget, against 40.8% for `"all"` and a 9.5% floor for `"relevant"`. Default is
+  unchanged at `"all"`. `pond-mcp-server/src/toolkit.rs` pins the 4% ceiling as a test over the real
+  serialized schemas.
+- **Verification debt**: none of this has run on the Orin. The device is still on `71b45984` — the
+  old prompt, the old prefill metric and all 41 tools. Every number above is a Mac measurement or a
+  character count; the PAI-3 / PAI-4 re-verification the engine work owes is unaffected but still
+  outstanding.
