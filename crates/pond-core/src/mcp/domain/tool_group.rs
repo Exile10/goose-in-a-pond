@@ -18,10 +18,15 @@ pub struct ToolGroup {
 }
 
 /// Why each core group is core, kept next to the data so the decision is reviewable.
-/// `giap-draft` is the confirmation/safety surface, the one extension registered unconditionally;
 /// `giap-memory` is cross-cutting and no opening message predicts it; `giap-system` holds
 /// `get_current_time`; `giap-toolkit` is the escape hatch that keeps narrowing reversible.
-pub const CORE_RATIONALE: &str = "draft=safety, memory=cross-cutting, system=time, toolkit=escape";
+///
+/// `giap-draft` was the fourth — the confirmation surface — until the 2026-09-10
+/// group deletions. Its staging tools went with `giap-news`, `giap-audit`,
+/// `giap-finance`, `giap-discovery` and `giap-vision`; the one rule it carried
+/// that nothing else asserted, the same-message go-ahead for a lock or an
+/// alarm, moved onto `set_device_state`'s own description.
+pub const CORE_RATIONALE: &str = "memory=cross-cutting, system=time, toolkit=escape";
 
 /// The extension providing the discovery / enable escape hatch.
 pub const TOOLKIT_EXTENSION: &str = "giap-toolkit";
@@ -41,13 +46,6 @@ pub const TOOL_NAME_SEPARATOR: &str = "__";
 /// registered, and selection always intersects it with what actually was.
 pub const TOOL_GROUPS: &[ToolGroup] = &[
     ToolGroup {
-        extension: "giap-draft",
-        description: "Pending actions awaiting the user's confirmation: save a draft of a risky \
-                      or irreversible action, list what is waiting, approve it once the user \
-                      agrees, or reject it if they decline.",
-        core: true,
-    },
-    ToolGroup {
         extension: "giap-memory",
         description: "The user's long-term memories: remember a fact or preference about them, \
                       recall what they have told you before, or forget something they no longer \
@@ -57,8 +55,7 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     ToolGroup {
         extension: "giap-system",
         description: "This machine and the current moment: the date, time and timezone, operating \
-                      system and hostname, memory and disk usage, desktop notifications, reading \
-                      and writing local files, and running shell commands.",
+                      system and hostname, memory and disk usage, and desktop notifications.",
         core: true,
     },
     ToolGroup {
@@ -106,40 +103,6 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
         description: "Actually operating the smart-home devices: turning a light or plug or \
                       appliance on and off, changing brightness or colour or temperature, opening \
                       or closing something, setting a device to a new state.",
-        core: false,
-    },
-    ToolGroup {
-        extension: "giap-news",
-        description:
-            "The news: today's headlines, top stories, and searching recent news coverage \
-                      about a topic, company, country or person.",
-        core: false,
-    },
-    ToolGroup {
-        extension: "giap-finance",
-        description: "Money and markets: stock and share prices, cryptocurrency prices, and \
-                      currency exchange rates between two currencies.",
-        core: false,
-    },
-    ToolGroup {
-        extension: "giap-discovery",
-        description: "Reference data about countries and shop products: a country's population, \
-                      capital, currency, languages and region; a packaged food looked up by \
-                      barcode or name, with its ingredients and nutrition; and crowdsourced \
-                      prices for one. This group does NOT search the web.",
-        core: false,
-    },
-    ToolGroup {
-        extension: "giap-audit",
-        description: "The privacy and activity audit trail: what this assistant has recorded and \
-                      done, which data left the device, and privacy questions about what is stored \
-                      and why.",
-        core: false,
-    },
-    ToolGroup {
-        extension: "giap-vision",
-        description: "What the cameras have seen: recent camera events, people or motion detected \
-                      at the door or in a room, and describing what is in a captured snapshot.",
         core: false,
     },
     ToolGroup {
@@ -196,13 +159,6 @@ pub fn groups_denied_to_guests() -> &'static [&'static str] {
     &[
         // Reads and deletes the household's long-term memory.
         "giap-memory",
-        // Approves and rejects staged actions -- and `approve_draft` performs
-        // no ownership check of its own.
-        "giap-draft",
-        // What data left the device, and when. A visitor's business it is not.
-        "giap-audit",
-        // Who has been seen on camera, and when.
-        "giap-vision",
         // Sensor history: when the house was empty, when somebody came home.
         "giap-sensors",
         // PAI-8. A member's own connected sources. Invariant 2 is that a Guest sees no context
@@ -223,9 +179,6 @@ pub fn groups_denied_to_guests() -> &'static [&'static str] {
 /// The tool set is the only boundary, so subtract this from the DERIVED set or core groups return.
 pub fn groups_denied_to_subagents() -> &'static [&'static str] {
     &[
-        // `approve_draft`/`reject_draft` DECIDE, and the gate that would check
-        // who decided cannot resolve a subagent (see above).
-        "giap-draft",
         // `enable_tool_group` WIDENS an allow-set, and a child has nothing to widen: its whole
         // grant is published up front by `narrow_child_groups` and bounded by the parent's
         // entitlement. Offering a 2-4B model a tool whose every call is refused is not harmless.
@@ -286,13 +239,10 @@ mod tests {
     /// The four core groups are load-bearing for safety, continuity, and the
     /// escape hatch. A change here should be deliberate, so pin it.
     #[test]
-    fn core_groups_are_exactly_the_documented_four() {
+    fn core_groups_are_exactly_the_documented_three() {
         let mut core = core_group_names();
         core.sort_unstable();
-        assert_eq!(
-            core,
-            vec!["giap-draft", "giap-memory", "giap-system", "giap-toolkit"]
-        );
+        assert_eq!(core, vec!["giap-memory", "giap-system", "giap-toolkit"]);
     }
 
     #[test]
@@ -318,7 +268,6 @@ mod tests {
 
     #[test]
     fn only_catalog_extensions_are_recognised() {
-        assert!(is_catalog_extension("giap-vision"));
         assert!(!is_catalog_extension("some-user-mcp-server"));
     }
 }
@@ -339,14 +288,16 @@ mod prefix_order_tests {
     fn core_tools_come_before_the_ones_a_turn_might_not_have() {
         let got = ordered(vec![
             "giap-weather__get_current_weather",
-            "giap-draft__list_drafts",
-            "giap-news__headlines",
+            "giap-memory__recall_memories",
             "giap-toolkit__enable_tool_group",
         ]);
         let first_two: Vec<&str> = got.iter().take(2).copied().collect();
         assert_eq!(
             first_two,
-            vec!["giap-draft__list_drafts", "giap-toolkit__enable_tool_group"],
+            vec![
+                "giap-memory__recall_memories",
+                "giap-toolkit__enable_tool_group"
+            ],
             "core groups must lead, or a turn that drops weather truncates the shared \
              prefix at the first tool"
         );
@@ -358,12 +309,12 @@ mod prefix_order_tests {
     fn two_different_selections_agree_for_their_whole_core_block() {
         let a = ordered(vec![
             "giap-weather__get_current_weather",
-            "giap-draft__list_drafts",
+            "giap-memory__recall_memories",
             "giap-toolkit__enable_tool_group",
         ]);
         let b = ordered(vec![
-            "giap-news__headlines",
-            "giap-draft__list_drafts",
+            "giap-knowledge__compute_answer",
+            "giap-memory__recall_memories",
             "giap-toolkit__enable_tool_group",
         ]);
         let shared = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
@@ -378,14 +329,12 @@ mod prefix_order_tests {
     #[test]
     fn the_order_is_stable_whatever_order_the_selection_arrives_in() {
         let forward = ordered(vec![
-            "giap-draft__list_drafts",
             "giap-weather__get_current_weather",
-            "giap-news__headlines",
+            "giap-knowledge__compute_answer",
         ]);
         let backward = ordered(vec![
-            "giap-news__headlines",
+            "giap-knowledge__compute_answer",
             "giap-weather__get_current_weather",
-            "giap-draft__list_drafts",
         ]);
         assert_eq!(forward, backward);
     }
@@ -397,9 +346,9 @@ mod prefix_order_tests {
     fn an_unknown_extension_does_not_lead() {
         let got = ordered(vec![
             "some-user-server__do_thing",
-            "giap-draft__list_drafts",
+            "giap-memory__recall_memories",
         ]);
-        assert_eq!(got.first(), Some(&"giap-draft__list_drafts"));
+        assert_eq!(got.first(), Some(&"giap-memory__recall_memories"));
     }
 }
 
@@ -470,14 +419,15 @@ mod guest_denylist_tests {
         }
     }
 
-    /// The three the list exists for, named individually so removing one fails a test rather than
-    /// passing quietly. `giap-draft` because the draft gate cannot resolve a subagent actor and
-    /// audit mode proceeds; `giap-toolkit` because `enable_tool_group` widens an allow-set;
+    /// The two the list exists for, named individually so removing one fails a test rather than
+    /// passing quietly. `giap-toolkit` because `enable_tool_group` widens an allow-set;
     /// `giap-device-control` because a subagent is forced to `GooseMode::Auto` with no approval.
+    /// `giap-draft` was the third until the group was deleted on 2026-09-10 — with no staging
+    /// tools there is nothing for an unresolvable actor to decide.
     #[test]
-    fn the_subagent_denylist_covers_deciding_widening_and_actuating() {
+    fn the_subagent_denylist_covers_widening_and_actuating() {
         let denied = groups_denied_to_subagents();
-        for required in ["giap-draft", TOOLKIT_EXTENSION, "giap-device-control"] {
+        for required in [TOOLKIT_EXTENSION, "giap-device-control"] {
             assert!(
                 denied.contains(&required),
                 "{required} must be withheld from subagents; see the doc comment for the \

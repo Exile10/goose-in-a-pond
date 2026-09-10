@@ -359,7 +359,6 @@ mod tests {
         for want in ["giap-device", "giap-device-control", "giap-schedule"] {
             assert!(sel.groups.contains(&want.to_string()), "{want} missing");
         }
-        assert!(!sel.groups.contains(&"giap-news".to_string()));
     }
 
     /// Rule 4: the best non-core scorer rides along even below the threshold,
@@ -368,16 +367,16 @@ mod tests {
     fn top_scorer_is_rescued_below_threshold() {
         let avail = available();
         let scores = vec![
-            score("giap-finance", 0.19),
-            score("giap-news", 0.11),
-            score("giap-vision", 0.03),
+            score("giap-weather", 0.19),
+            score("giap-knowledge", 0.11),
+            score("giap-sensors", 0.03),
         ];
         let sel = select_groups(&avail, Some(&scores), DEFAULT_RELEVANCE_THRESHOLD);
         assert!(
-            sel.groups.contains(&"giap-finance".to_string()),
+            sel.groups.contains(&"giap-weather".to_string()),
             "top scorer should be rescued"
         );
-        assert!(!sel.groups.contains(&"giap-news".to_string()));
+        assert!(!sel.groups.contains(&"giap-knowledge".to_string()));
     }
 
     /// Selection only ever picks from what is registered — a disabled extension
@@ -540,13 +539,13 @@ mod tests {
         let tools: Vec<String> = vec![
             "my-mcp__do_thing".into(),
             "unprefixed_tool".into(),
-            "giap-news__get_headlines".into(),
+            "giap-knowledge__compute_answer".into(),
         ];
         let groups: Vec<String> = vec!["giap-weather".into()];
         let kept = filter_tools_by_groups(&tools, &groups);
         assert!(kept.contains(&"my-mcp__do_thing".to_string()));
         assert!(kept.contains(&"unprefixed_tool".to_string()));
-        assert!(!kept.contains(&"giap-news__get_headlines".to_string()));
+        assert!(!kept.contains(&"giap-knowledge__compute_answer".to_string()));
     }
 
     /// The regression this split exists for: the question and the standing context must

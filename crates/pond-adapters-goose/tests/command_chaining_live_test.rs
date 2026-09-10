@@ -16,7 +16,6 @@ use pond_core::user_data::ports::device_control::{
     DeviceControlOutcome, DeviceControlPort, DeviceStatePatch,
 };
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
-use pond_core::user_data::ports::draft::DraftRepository;
 use pond_core::user_data::ports::scheduler::{
     CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest,
 };
@@ -211,32 +210,6 @@ impl SchedulerPort for RecordingScheduler {
     }
 }
 
-/// giap-draft is always registered; the scenarios never draft, so a no-op is enough.
-struct NoDrafts;
-
-#[async_trait]
-impl DraftRepository for NoDrafts {
-    async fn save(&self, _draft: pond_core::user_data::domain::draft::Draft) -> Result<()> {
-        Ok(())
-    }
-    async fn list_pending(
-        &self,
-        _session_id: &str,
-    ) -> Result<Vec<pond_core::user_data::domain::draft::Draft>> {
-        Ok(vec![])
-    }
-    async fn get(&self, _id: &str) -> Result<Option<pond_core::user_data::domain::draft::Draft>> {
-        Ok(None)
-    }
-    async fn update_status(
-        &self,
-        _id: &str,
-        _status: pond_core::user_data::domain::draft::DraftStatus,
-    ) -> Result<()> {
-        Ok(())
-    }
-}
-
 // ── Harness plumbing ─────────────────────────────────────────────────────────
 
 /// The recording fakes the MCP tools dispatch into. Registration into Goose's
@@ -262,7 +235,6 @@ fn recorders() -> &'static Recorders {
             Arc::new(ChainingSettingsRepo),
             Arc::new(OneLightRegistry),
             Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
-            Arc::new(NoDrafts),
             device_control.clone(),
             None,
         )

@@ -25,7 +25,7 @@
 //!
 //! # The reviewer cannot write its own proposal, and that shapes everything
 //!
-//! PAI-6's `groups_denied_to_subagents` withholds `giap-draft` from every
+//! PAI-6's `groups_denied_to_subagents` withholds the actuating groups from every
 //! child, because the draft decision gate cannot resolve a subagent as an
 //! actor. A proposal is a `drafts` row. So the reviewer **cannot stage one**,
 //! and no amount of role configuration would let it: the group is subtracted
@@ -105,7 +105,6 @@ giap_role:
     - giap-memory
     - giap-device
     - giap-sensors
-    - giap-vision
     - giap-weather
   personal_data: inherit
   max_turns: 4
@@ -169,7 +168,6 @@ pub const PROACTIVE_ROOT_GROUPS: &[&str] = &[
     "giap-memory",
     "giap-device",
     "giap-sensors",
-    "giap-vision",
     "giap-weather",
     "giap-knowledge",
 ];
@@ -1003,14 +1001,10 @@ impl FeedbackLedger {
 /// direction — a list of names with the reason each one would turn a proposer
 /// into an actor.
 #[cfg(test)]
-const GROUPS_A_PROPOSER_MAY_NOT_HOLD: [(&str, &str); 6] = [
+const GROUPS_A_PROPOSER_MAY_NOT_HOLD: [(&str, &str); 5] = [
     (
         "giap-device-control",
         "actuates the house, which is the one thing a proposal exists to ask permission for",
-    ),
-    (
-        "giap-draft",
-        "decides staged actions, and the gate that checks who decided cannot see a subagent",
     ),
     (
         "giap-schedule",

@@ -36,7 +36,8 @@ impl SqliteTelemetry {
              total_latency_ms, tool_name, tool_latency_ms, tool_cache_hit, \
              context_utilization_pct, model_name, timestamp, \
              prefill_ms, model_load_ms, decode_tok_per_sec, prefill_tok_per_sec, \
-             context_limit_tokens, inference_count, reasoning_tokens, reengagements \
+             context_limit_tokens, inference_count, reasoning_tokens, reengagements, \
+             prefilled_tokens, reused_prefix_tokens \
              FROM turn_metrics ORDER BY id ASC",
         )
         .fetch_all(pool)
@@ -208,6 +209,10 @@ mod tests {
             prefill_tok_per_sec: Some(600.0),
             context_limit_tokens: Some(3072),
             inference_count: Some(1),
+            // A turn that decoded its whole prompt and reused nothing — the
+            // shape a cold first turn has.
+            prefilled_tokens: Some(100 * turn_number),
+            reused_prefix_tokens: Some(0),
             // The unmeasured case on purpose: this is what a turn from a
             // provider with no `ProviderStats` looks like, and what every row
             // written before migration 0008 looks like. The tests that care

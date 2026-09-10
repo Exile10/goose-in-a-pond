@@ -108,18 +108,21 @@ fn every_event_log_write_sink_goes_through_the_redactor() {
     let lines: Vec<&str> = MAIN.lines().collect();
     let found = sites(&lines, "SqliteEventLog::new(");
     assert!(
-        found.len() >= 5,
-        "found {} SqliteEventLog::new( sites in main.rs; there were 5. This \
-         guard has stopped matching and is asserting nothing.",
+        found.len() >= 2,
+        "found {} SqliteEventLog::new( sites in main.rs; there were 2. This \
+         guard has stopped matching and is asserting nothing. It was 5 until the \
+         2026-09-10 group deletions took `giap-audit` and with it the three \
+         `.into_dyn()` read handles `init_audit_deps` consumed.",
         found.len()
     );
 
     let mut write_sinks = 0;
     for site in found {
-        // `.into_dyn()` is the read-handle form, and the only consumer is
-        // `init_audit_deps` -- the giap-audit extension's window onto the
-        // store. Redacting a read handle would scrub nothing on the way in and
-        // would double-scrub on the way out.
+        // `.into_dyn()` is the read-handle form. Its consumer was
+        // `init_audit_deps` -- the giap-audit extension's window onto the store
+        // -- which went with that group on 2026-09-10. Kept as a branch because
+        // redacting a read handle would scrub nothing on the way in and
+        // double-scrub on the way out, whoever reads next.
         if lines[site].contains(".into_dyn()") {
             continue;
         }

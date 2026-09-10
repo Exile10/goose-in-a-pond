@@ -2084,7 +2084,7 @@ mod tests {
             turn_budget_note(Some(50)),
             turn_budget_note(None),
             dormant_groups_note(
-                &["giap-weather".to_string(), "giap-news".to_string()],
+                &["giap-weather".to_string(), "giap-knowledge".to_string()],
                 &["giap-weather".to_string()],
             ),
         ];

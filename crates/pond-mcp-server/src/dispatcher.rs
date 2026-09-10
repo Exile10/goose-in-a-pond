@@ -20,7 +20,6 @@ use pond_core::mcp::ports::tools::tool_dispatcher::{ToolCallResult, ToolDispatch
 use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
-use pond_core::user_data::ports::draft::DraftRepository;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use pond_core::user_data::ports::scheduler::SchedulerPort;
 use pond_core::user_data::ports::settings::SettingsRepository;
@@ -31,9 +30,8 @@ use rmcp::{RoleServer, ServerHandler};
 use std::sync::Arc;
 
 use crate::{
-    DeviceControlMcpServer, DeviceMcpServer, DiscoveryMcpServer, DraftMcpServer, FinanceMcpServer,
-    KnowledgeMcpServer, MemoryMcpServer, NewsMcpServer, ScheduleMcpServer, SystemMcpServer,
-    WeatherMcpServer,
+    DeviceControlMcpServer, DeviceMcpServer, KnowledgeMcpServer, MemoryMcpServer,
+    ScheduleMcpServer, SystemMcpServer, WeatherMcpServer,
 };
 
 // ── Tool name constants ──────────────────────────────────────────────────────
@@ -45,30 +43,9 @@ const PREFIX_SCHEDULE: &str = "giap-schedule__";
 const PREFIX_SYSTEM: &str = "giap-system__";
 const PREFIX_DEVICE: &str = "giap-device__";
 const PREFIX_DEVICE_CONTROL: &str = "giap-device-control__";
-const PREFIX_NEWS: &str = "giap-news__";
-const PREFIX_FINANCE: &str = "giap-finance__";
-const PREFIX_DISCOVERY: &str = "giap-discovery__";
-const PREFIX_DRAFT: &str = "giap-draft__";
 /// Prefix for the audit / privacy tools (`get_recent_activity`, `summarize_activity`,
 /// privacy report). These ARE callable Goose builtin extension tools.
 ///
-/// `giap-audit` (and, symmetrically, `giap-vision`) are NOT in this dispatcher's
-/// `servers` vec, because both need backing stores installed by the global
-/// `init_audit_deps` / `init_vision_deps` (called in pond-server, where the logs
-/// DB is in scope) rather than through `McpToolDispatcher::new`, whose
-/// constructor receives no `EventLog` or `CameraStorage`. The live chat routes
-/// reach them through `GooseAdapter` and Goose's extension manager instead (see
-/// `giap_registration.rs`).
-///
-/// This comment used to call the dispatcher "the PondAgent direct-dispatch path,
-/// which is quarantined". It is not quarantined: `main.rs` binds it into
-/// `AppState` unconditionally and `POST /api/v1/tools/invoke` and
-/// `POST /api/v1/mcp/tools/call` serve it to any paired client. What keeps it
-/// safe is `routes.rs :: DIRECT_DISPATCH_ALLOWLIST`, not the quarantine — these
-/// routes carry no engine session, so no `_meta`, so no caller, and a policy
-/// check against an unknown caller is *permitted* under `PolicyMode::Audit`.
-#[allow(dead_code)] // documented, referenced in tests; not routed via this dispatcher (see above)
-const PREFIX_AUDIT: &str = "giap-audit__";
 
 // No hardcoded tool list — all tools discovered dynamically via ServerHandler::list_tools().
 
@@ -162,7 +139,6 @@ impl McpToolDispatcher {
         settings_repo: Arc<dyn SettingsRepository>,
         device_registry: Arc<dyn DeviceRegistry>,
         skill_repo: Arc<dyn UserSkillRepository>,
-        draft_repo: Arc<dyn DraftRepository>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
         device_control: Arc<dyn DeviceControlPort>,
     ) -> Self {
@@ -176,18 +152,6 @@ impl McpToolDispatcher {
         let device_server =
             DeviceMcpServer::new(device_registry.clone(), settings_repo.clone(), skill_repo);
         let device_control_server = DeviceControlMcpServer::new(device_control, device_registry);
-        // News and finance take no settings repo: their API keys live in the
-        // secret store (PAI-2 P2), read through `crate::secrets`.
-        let news_server = NewsMcpServer::new(http_client.clone());
-        let finance_server = FinanceMcpServer::new(http_client.clone());
-        let discovery_server = DiscoveryMcpServer::new(http_client, settings_repo);
-        // Defence in depth. `routes.rs :: DIRECT_DISPATCH_ALLOWLIST` is what keeps
-        // the draft tools off this path at all; the authority is what makes the
-        // ownership check real if they ever come back. Without it every decision
-        // is unresolvable, and unresolvable is *permitted* under `audit`.
-        let draft_server =
-            DraftMcpServer::new(draft_repo).with_authority(crate::draft::draft_authority());
-
         // Create a dummy peer via serve_directly on a DuplexStream.
         // The system server is lightweight (no deps) — we use it as the service
         // backing the peer. The DuplexStream client side is immediately dropped
@@ -222,22 +186,6 @@ impl McpToolDispatcher {
             RegisteredServer {
                 prefix: PREFIX_DEVICE_CONTROL,
                 server: Box::new(device_control_server),
-            },
-            RegisteredServer {
-                prefix: PREFIX_NEWS,
-                server: Box::new(news_server),
-            },
-            RegisteredServer {
-                prefix: PREFIX_FINANCE,
-                server: Box::new(finance_server),
-            },
-            RegisteredServer {
-                prefix: PREFIX_DISCOVERY,
-                server: Box::new(discovery_server),
-            },
-            RegisteredServer {
-                prefix: PREFIX_DRAFT,
-                server: Box::new(draft_server),
             },
         ];
         if let Some(sched) = schedule_server {
@@ -488,61 +436,9 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
             json!({ "type": "object", "properties": {} })
         }
         // News
-        "giap-news__search_news" => json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Topic to search for in news." }
-            },
-            "required": ["query"]
-        }),
-        "giap-news__get_headlines" => json!({
-            "type": "object",
-            "properties": {
-                "category": { "type": "string", "description": "News category (e.g. 'technology', 'sports', 'business')." }
-            }
-        }),
         // Finance
-        "giap-finance__convert_currency" => json!({
-            "type": "object",
-            "properties": {
-                "amount": { "type": "number", "description": "Amount to convert." },
-                "from": { "type": "string", "description": "Source currency code." },
-                "to": { "type": "string", "description": "Target currency code." }
-            },
-            "required": ["amount", "from", "to"]
-        }),
-        "giap-finance__get_crypto_price" => json!({
-            "type": "object",
-            "properties": {
-                "coin": { "type": "string", "description": "Cryptocurrency name or ID (e.g. 'bitcoin', 'ethereum')." }
-            },
-            "required": ["coin"]
-        }),
         // Discovery
-        "giap-discovery__lookup_product" => json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Product name or barcode." }
-            },
-            "required": ["query"]
-        }),
         // Draft
-        "giap-draft__save_draft" => json!({
-            "type": "object",
-            "properties": {
-                "content": { "type": "string", "description": "Draft content to save for approval." },
-                "title": { "type": "string", "description": "Draft title." }
-            },
-            "required": ["content"]
-        }),
-        "giap-draft__list_drafts" => json!({ "type": "object", "properties": {} }),
-        "giap-draft__approve_draft" | "giap-draft__reject_draft" => json!({
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "description": "Draft ID." }
-            },
-            "required": ["id"]
-        }),
         // Fallback
         _ => json!({ "type": "object", "properties": {} }),
     }
@@ -621,25 +517,11 @@ mod tests {
         assert_eq!(bare, "read_file");
     }
 
-    #[test]
-    fn parse_audit_tool_name() {
-        // `giap-audit` tools are callable via the Goose extension manager, not
-        // this quarantined PondAgent dispatcher. The prefix is still a valid,
-        // parseable route — asserting this keeps `PREFIX_AUDIT` referenced and
-        // documents that audit tool names are well-formed.
-        let (prefix, bare) = parse_tool_name("giap-audit__get_recent_activity").unwrap();
-        assert_eq!(prefix, PREFIX_AUDIT);
-        assert_eq!(bare, "get_recent_activity");
-    }
-
     /// Diagnostic: call list_tools on ALL MCP servers and show what the dispatcher collects.
     /// Run with `cargo test -p pond-mcp-server -- --nocapture inspect_mcp_tool_schemas`
     #[tokio::test]
     async fn inspect_mcp_tool_schemas() {
-        use crate::{
-            DiscoveryMcpServer, FinanceMcpServer, KnowledgeMcpServer, NewsMcpServer,
-            SystemMcpServer, WeatherMcpServer,
-        };
+        use crate::{KnowledgeMcpServer, SystemMcpServer, WeatherMcpServer};
 
         // Create peer for RequestContext
         let (_client, server_stream) = tokio::io::duplex(64);
@@ -684,21 +566,6 @@ mod tests {
                 "giap-knowledge__",
                 Box::new(KnowledgeMcpServer::new(http_client.clone())),
             ),
-            (
-                "giap-news__",
-                Box::new(NewsMcpServer::new(http_client.clone())),
-            ),
-            (
-                "giap-finance__",
-                Box::new(FinanceMcpServer::new(http_client.clone())),
-            ),
-            (
-                "giap-discovery__",
-                Box::new(DiscoveryMcpServer::new(
-                    http_client.clone(),
-                    settings.clone(),
-                )),
-            ),
         ];
 
         eprintln!("\n=== FULL MCP TOOL SCHEMA REPORT ===\n");
@@ -737,12 +604,12 @@ mod tests {
         }
 
         // Sanity floor: the 6 core servers here (system/weather/knowledge/news/
-        // finance/discovery) total ~13 tools after the 2026-09-10 inventory cut;
-        // assert a floor that catches a server returning nothing (list_tools
-        // error) without being brittle to ±1 tool.
+        // knowledge) total ~10 tools after the 2026-09-10 group deletions; assert
+        // a floor that catches a server returning nothing (list_tools error)
+        // without being brittle to +-1 tool.
         assert!(
-            total_tools >= 10,
-            "Expected 10+ tools from the 6 core servers, got {}",
+            total_tools >= 7,
+            "Expected 7+ tools from the core servers, got {}",
             total_tools
         );
     }

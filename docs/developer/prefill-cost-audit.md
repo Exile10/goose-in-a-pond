@@ -258,7 +258,36 @@ Four things the removal changed beyond the schemas:
   It still reaches the orchestrator, which is its real consumer.
 
 `format.rs :: the_tool_inventory_parser_sees_the_tools_that_are_there` pins the
-count at 46 and is the guard that will catch the next drift.
+count and is the guard that will catch the next drift.
+
+### Second cut, same day: six whole groups
+
+`giap-news`, `giap-audit`, `giap-finance`, `giap-discovery`, `giap-vision` and
+`giap-draft` deleted outright — 14 more tools, 46 registered down to 32 and 41
+offered down to 27. The tool payload goes 19,193 -> 13,358 chars (~3,339 tok).
+
+The MCP tool modules and their wiring went; the ports behind them did not,
+because each has consumers that are not tools: `CameraStorage` feeds the vision
+pipeline, `EventLog` feeds tracing, pruning, push relay and the security policy,
+and `DraftRepository` still backs the proposal REST route, which builds its own
+`SqliteDraftRepository` from the pool.
+
+Three consequences worth knowing:
+
+- **`giap-draft` was a core group and the pond's confirmation surface.** With it
+  gone there is no staging tool. The one rule it carried that nothing else
+  asserted — the same-message go-ahead for a lock or an alarm — had already
+  moved onto `set_device_state`'s description earlier the same day.
+- **`giap-audit` was the privacy/egress reporting surface.** The event log still
+  records; nothing offers the model a way to read it back.
+- The guest and subagent denylists lost their entries for the deleted groups,
+  and `GROUPS_NO_SUBAGENT_MAY_HOLD` its `giap-draft` row. The subagent guard now
+  names widening and actuating, not deciding.
+
+Still inert rather than removed, and worth a follow-up: the `ext_news_enabled`,
+`ext_audit_enabled`, `ext_finance_enabled`, `ext_discovery_enabled` and
+`ext_vision_enabled` settings rows, and the Canvas cards for news and crypto
+that can no longer be triggered by any tool result.
 
 ### What it bought, measured
 
