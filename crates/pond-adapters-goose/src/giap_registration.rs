@@ -46,6 +46,25 @@ pub fn register_giap_extensions(
     device_control: Arc<dyn DeviceControlPort + Send + Sync>,
     tool_caller: Option<Arc<dyn ToolCaller>>,
 ) -> Result<Vec<String>> {
+    // `GIAP_NO_TOOLS` — register nothing, so no MCP server is even spawned.
+    //
+    // The provider shim enforces the same thing again at the boundary where the
+    // final tool list is handed over, which is what actually guarantees "no
+    // tools": goose registers platform extensions of its own, and a user can
+    // add an MCP server, neither of which passes through here. This early
+    // return is the cheaper half — it stops fourteen servers starting for a
+    // pond that will offer none of them.
+    if std::env::var_os("GIAP_NO_TOOLS")
+        .is_some_and(|v| !matches!(v.to_string_lossy().trim(), "" | "0" | "false" | "no"))
+    {
+        tracing::warn!(
+            "GIAP_NO_TOOLS is set — registering no extensions at all. \
+             Unset it to restore normal behaviour."
+        );
+        println!("  Extensions: NONE (GIAP_NO_TOOLS is set)");
+        return Ok(Vec::new());
+    }
+
     // Set the ToolCaller specialist — all MCP tools use it for param generation
     pond_mcp_server::set_tool_caller(tool_caller);
 
