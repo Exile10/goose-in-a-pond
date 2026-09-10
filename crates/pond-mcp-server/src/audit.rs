@@ -124,35 +124,6 @@ event log. Answers \"what did you do?\". Never guess.")]
     }
 
     #[tool(description = "\
-Summarize recent activity as counts per category (overview, not a full list). Flags outbound \
-network call count.")]
-    async fn summarize_activity(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<WindowParams>,
-    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
-        let window = normalize_window(params.0.window.as_deref());
-        let since = chrono::Utc::now() - window_span(window);
-
-        let events = match self
-            .event_log
-            .query(EventQuery {
-                since: Some(since),
-                max_sensitivity: Some(MAX_SURFACEABLE),
-                limit: Some(SCAN_LIMIT),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(e) => e,
-            Err(e) => return Ok(read_error("activity summary", &e)),
-        };
-        Ok(CallToolResult::success(vec![Content::text(summary_text(
-            &events, window,
-        ))]))
-    }
-
-    #[tool(description = "\
 Privacy report: external hosts contacted (and via which tool) plus count of events touching \
 personal/sensitive data.")]
     async fn list_privacy_risks(
@@ -292,33 +263,6 @@ fn recent_lines(events: &[Event], window: &str, limit: usize) -> String {
         }
         out.push_str(&line);
         out.push('\n');
-    }
-    out.trim_end().to_string()
-}
-
-/// Counts per category over the window.
-fn summary_text(events: &[Event], window: &str) -> String {
-    let mut by_category: BTreeMap<String, usize> = BTreeMap::new();
-    let mut total = 0usize;
-    for e in events.iter().filter(|e| is_visible(e)) {
-        *by_category.entry(category_str(e.category)).or_default() += 1;
-        total += 1;
-    }
-    if total == 0 {
-        return format!("No activity recorded in the last {window}.");
-    }
-    let mut out = format!(
-        "In the last {window}: {total} event{}.\n",
-        if total == 1 { "" } else { "s" }
-    );
-    for (cat, n) in &by_category {
-        out.push_str(&format!("- {cat}: {n}\n"));
-    }
-    if let Some(net) = by_category.get("network") {
-        out.push_str(&format!(
-            "\n↳ {net} external network call{} — use list_privacy_risks for destinations.",
-            if *net == 1 { "" } else { "s" }
-        ));
     }
     out.trim_end().to_string()
 }
@@ -502,22 +446,6 @@ mod tests {
             recent_lines(&[], "hour", MAX_RECENT_LIMIT),
             "No activity recorded in the last hour."
         );
-    }
-
-    #[test]
-    fn summary_counts_by_category_excluding_secret() {
-        let events = vec![
-            ev(EventCategory::Sensor, "sensor.reading"),
-            ev(EventCategory::Sensor, "sensor.reading"),
-            ev(EventCategory::Network, "egress.http"),
-            ev(EventCategory::Auth, "auth.token").sensitivity(PrivacySensitivity::Secret),
-        ];
-        let out = summary_text(&events, "day");
-        assert!(out.contains("3 events"), "secret excluded: {out}");
-        assert!(out.contains("- sensor: 2"));
-        assert!(out.contains("- network: 1"));
-        assert!(!out.contains("auth"));
-        assert!(out.contains("1 external network call"));
     }
 
     #[test]

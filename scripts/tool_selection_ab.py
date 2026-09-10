@@ -68,11 +68,9 @@ MUST_CALL = [
       "this pond's own scheduled tasks"),
     Q("What is the current price of bitcoin?", "giap-finance__get_crypto_price",
       "changes by the minute"),
-    Q("What are today's top tech stories?", "giap-news__get_top_stories",
+    Q("What are today's top tech stories?", "giap-news__search_news",
       "today, by definition not in weights"),
-    Q("Look up Kenya's population and capital.", "giap-discovery__get_country_info",
-      "structured reference data with a dedicated tool"),
-    Q("What is the exchange rate from USD to KES?", "giap-finance__get_exchange_rate",
+    Q("Convert 100 US dollars to Kenyan shillings.", "giap-finance__convert_currency",
       "live forex"),
     Q("Tell me about the Rust programming language from Wikipedia.",
       "giap-knowledge__get_wikipedia_article", "named source, dedicated tool"),
@@ -86,6 +84,8 @@ MUST_CALL = [
 
 MUST_NOT_CALL = [
     Q("What is the capital of France?", None, "settled fact, cannot have changed"),
+    Q("Look up Kenya's population and capital.", None,
+      "settled reference data; get_country_info was removed 2026-09-10 for exactly this"),
     Q("How many centimetres are in a metre?", None, "definition"),
     Q("Write me a haiku about rain.", None, "generation, no lookup"),
     Q("What does the word 'ubiquitous' mean, roughly?", None,

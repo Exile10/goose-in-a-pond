@@ -233,8 +233,9 @@ pub fn groups_denied_to_subagents() -> &'static [&'static str] {
         // Actuates the house. There is no approval path for a subagent, and the
         // one it would otherwise take -- staging a draft -- is denied above.
         "giap-device-control",
-        // `write_file`, `run_shell_command` and `send_notification`. Writes and
-        // executes, with no approval path.
+        // `send_notification`, which reaches the member directly with no
+        // approval path. The file and shell tools this also covered were
+        // removed on 2026-09-10; the denial stands on the notifier alone.
         "giap-system",
         // Schedules future work that will run with the household's authority,
         // long after the delegation that created it has ended.

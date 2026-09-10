@@ -12,7 +12,6 @@ use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::draft::DraftRepository;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
-use pond_core::user_data::ports::recipe::AgentRecipeRepository;
 use pond_core::user_data::ports::scheduler::SchedulerPort;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::user_data::ports::skill::UserSkillRepository;
@@ -43,7 +42,6 @@ pub fn register_giap_extensions(
     settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
     device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
     skill_repo: Arc<dyn UserSkillRepository + Send + Sync>,
-    recipe_repo: Arc<dyn AgentRecipeRepository + Send + Sync>,
     draft_repo: Arc<dyn DraftRepository + Send + Sync>,
     device_control: Arc<dyn DeviceControlPort + Send + Sync>,
     tool_caller: Option<Arc<dyn ToolCaller>>,
@@ -106,7 +104,6 @@ pub fn register_giap_extensions(
             device_registry.clone(),
             settings_repo.clone(),
             skill_repo,
-            recipe_repo,
         );
         register_builtin_extension("giap-device", pond_mcp_server::spawn_device_server);
         registered.push("giap-device".into());

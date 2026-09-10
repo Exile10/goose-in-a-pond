@@ -70,17 +70,11 @@ pub struct WebSearchParams {
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-const REST_COUNTRIES_BASE: &str = "https://restcountries.com/v3.1";
 const OFF_BASE: &str = "https://world.openfoodfacts.org";
-const OFF_PRICES_BASE: &str = "https://prices.openfoodfacts.org/api/v1";
 
-const COUNTRY_INFO_BUDGET: usize = 800;
 const PRODUCT_SINGLE_BUDGET: usize = 1000;
 const PRODUCT_SEARCH_BUDGET: usize = 1500;
-const PRODUCT_PRICE_BUDGET: usize = 800;
 const WEB_SEARCH_BUDGET: usize = 1500;
-
-const COUNTRY_FIELDS: &str = "name,capital,population,currencies,languages,flags,region,subregion";
 
 // ── MCP server ─────────────────────────────────────────────────────────────
 
@@ -103,106 +97,6 @@ impl DiscoveryMcpServer {
             settings_repo,
             tool_router: Self::tool_router(),
         }
-    }
-
-    #[tool(description = "Look up country data: population, capital, currency, languages, region.")]
-    async fn get_country_info(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<CountryInfoParams>,
-    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
-        crate::set_current_tool("get_country_info");
-        let country = resolve_country(&params.0).await;
-        eprintln!("[discovery] get_country_info: country={:?}", country);
-
-        if country.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "I need a country name or code. Retry with a 'country' parameter \
-                 (e.g. 'Kenya', 'US', 'GBR').",
-            )]));
-        }
-
-        // Choose endpoint: alpha for 2-3 letter all-caps codes, name for everything else
-        let url = if looks_like_country_code(&country) {
-            format!(
-                "{}/alpha/{}?fields={}",
-                REST_COUNTRIES_BASE,
-                urlencoding::encode(&country),
-                COUNTRY_FIELDS,
-            )
-        } else {
-            format!(
-                "{}/name/{}?fields={}",
-                REST_COUNTRIES_BASE,
-                urlencoding::encode(&country),
-                COUNTRY_FIELDS,
-            )
-        };
-        eprintln!("[discovery] GET {}", url);
-
-        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
-            b.timeout(std::time::Duration::from_secs(10))
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[discovery] REST Countries request failed: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("REST Countries", &e.to_string()),
-                )]));
-            }
-        };
-
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            eprintln!("[discovery] country '{}' not found", country);
-            return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_no_results(
-                    &format!("country data for '{}'", country),
-                    &["giap-knowledge__get_wikipedia_article"],
-                ),
-            )]));
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            eprintln!("[discovery] REST Countries HTTP {status}");
-            return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_api_error("REST Countries", &format!("HTTP {status}")),
-            )]));
-        }
-
-        let body: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[discovery] failed to parse REST Countries response: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("REST Countries", &e.to_string()),
-                )]));
-            }
-        };
-
-        // REST Countries returns an array for /name, single object for /alpha
-        let entry = if body.is_array() {
-            body.as_array().and_then(|arr| arr.first())
-        } else {
-            Some(&body)
-        };
-
-        let text = match entry {
-            Some(c) => format_country(c),
-            None => crate::format::format_no_results(
-                &format!("country data for '{}'", country),
-                &["giap-knowledge__get_wikipedia_article"],
-            ),
-        };
-
-        let truncated = crate::format::truncate_to_budget(&text, COUNTRY_INFO_BUDGET);
-        eprintln!(
-            "[discovery] get_country_info done, {} chars",
-            truncated.len()
-        );
-        Ok(CallToolResult::success(vec![Content::text(truncated)]))
     }
 
     #[tool(description = "\
@@ -379,113 +273,6 @@ Look up a food product by barcode or name: nutrition, ingredients, allergens, Nu
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "\
-Recent crowdsourced prices for a product barcode (find it via lookup_product). Coverage strongest in Europe.")]
-    async fn get_product_price(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<ProductPriceParams>,
-    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
-        crate::set_current_tool("get_product_price");
-        let product = resolve_price_product(&params.0).await;
-        eprintln!("[discovery] get_product_price: product={:?}", product);
-
-        if product.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "I need a product barcode or name. Retry with a 'product' parameter.",
-            )]));
-        }
-
-        // Check if the input looks like a barcode
-        if !input_is_barcode(&product) {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "The Open Prices API works best with barcodes. '{}' looks like a product name. \
-                 Use lookup_product first to find the barcode, then call get_product_price with the barcode.",
-                product,
-            ))]));
-        }
-
-        let url = format!(
-            "{}/prices?product_code={}&order_by=-date&page_size=5",
-            OFF_PRICES_BASE,
-            urlencoding::encode(&product),
-        );
-        eprintln!("[discovery] GET {}", url);
-
-        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
-            b.timeout(std::time::Duration::from_secs(10))
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[discovery] Open Prices request failed: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("Open Prices", &e.to_string()),
-                )]));
-            }
-        };
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            eprintln!("[discovery] Open Prices HTTP {status}");
-            return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_api_error("Open Prices", &format!("HTTP {status}")),
-            )]));
-        }
-
-        let body: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[discovery] failed to parse Open Prices response: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("Open Prices", &e.to_string()),
-                )]));
-            }
-        };
-
-        let items_arr = body["items"].as_array();
-        let items: Vec<String> = items_arr
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| {
-                        let price = item["price"].as_f64()?;
-                        let currency = item["currency"].as_str().unwrap_or("???");
-                        let location = item["location"]["osm_name"]
-                            .as_str()
-                            .unwrap_or("Unknown location");
-                        let date = item["date"].as_str().unwrap_or("unknown date");
-                        Some(format!(
-                            "{:.2} {} at {} ({})",
-                            price, currency, location, date,
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_no_results("crowdsourced prices for this product", &[]),
-            )]));
-        }
-
-        let product_name = body["items"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|item| item["product"]["product_name"].as_str())
-            .unwrap_or("Product");
-
-        let header = format!("**{}** recent prices:", product_name);
-        let text = crate::format::format_list_result(&items, &header, PRODUCT_PRICE_BUDGET);
-        eprintln!(
-            "[discovery] get_product_price done, {} items, {} chars",
-            items.len(),
-            text.len()
-        );
-        Ok(CallToolResult::success(vec![Content::text(text)]))
-    }
-
     /// General web search. **DISABLED 2026-08-13 — not registered as a tool.**
     ///
     /// The `#[tool(...)]` attribute is deliberately absent, which is the whole
@@ -647,10 +434,7 @@ impl DiscoveryMcpServer {
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_no_results(
                     &format!("web results for '{}'", query),
-                    &[
-                        "giap-knowledge__get_wikipedia_article",
-                        "giap-knowledge__search_wikipedia",
-                    ],
+                    &["giap-knowledge__get_wikipedia_article"],
                 ),
             )]));
         }
@@ -747,79 +531,6 @@ pub fn format_population(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-/// Format a country entry from REST Countries API.
-fn format_country(c: &serde_json::Value) -> String {
-    let common_name = c["name"]["common"].as_str().unwrap_or("Unknown");
-    let official_name = c["name"]["official"].as_str().unwrap_or("");
-    let region = c["region"].as_str().unwrap_or("Unknown");
-    let subregion = c["subregion"].as_str().unwrap_or("");
-    let population = c["population"].as_u64().unwrap_or(0);
-    let flag = c["flags"]["emoji"]
-        .as_str()
-        .or_else(|| c["flag"].as_str())
-        .unwrap_or("");
-
-    let capitals: Vec<&str> = c["capital"]
-        .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-    let capital_str = if capitals.is_empty() {
-        "N/A".to_string()
-    } else {
-        capitals.join(", ")
-    };
-
-    let currencies: Vec<String> = c["currencies"]
-        .as_object()
-        .map(|obj| {
-            obj.iter()
-                .map(|(code, info)| {
-                    let name = info["name"].as_str().unwrap_or(code);
-                    format!("{} ({})", name, code)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let currency_str = if currencies.is_empty() {
-        "N/A".to_string()
-    } else {
-        currencies.join(", ")
-    };
-
-    let languages: Vec<&str> = c["languages"]
-        .as_object()
-        .map(|obj| obj.values().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-    let language_str = if languages.is_empty() {
-        "N/A".to_string()
-    } else {
-        languages.join(", ")
-    };
-
-    let region_str = if subregion.is_empty() {
-        region.to_string()
-    } else {
-        format!("{} ({})", region, subregion)
-    };
-
-    let name_line = if official_name.is_empty() || official_name == common_name {
-        format!("**{}**", common_name)
-    } else {
-        format!("**{}** ({})", common_name, official_name)
-    };
-
-    format!(
-        "{}\nRegion: {}\nCapital: {}\nPopulation: {}\nCurrencies: {}\nLanguages: {}\nFlag: {}",
-        name_line,
-        region_str,
-        capital_str,
-        format_population(population),
-        currency_str,
-        language_str,
-        flag,
-    )
-}
-
 /// Build structured UI data for a product card.
 fn build_product_ui_data(p: &serde_json::Value) -> serde_json::Value {
     let name = p["product_name"].as_str().unwrap_or("Unknown product");
@@ -901,70 +612,6 @@ fn extract_domain(url: &str) -> String {
         .unwrap_or("")
         .trim_start_matches("www.")
         .to_string()
-}
-
-// ── Parameter resolution ──────────────────────────────────────────────────
-
-const COUNTRY_SCHEMA: &str = r#"{"type":"object","properties":{"country":{"type":"string","description":"Country name or code to look up"}},"required":["country"]}"#;
-
-async fn resolve_country(params: &CountryInfoParams) -> String {
-    // 1. ToolCaller specialist
-    if let Some(args) = crate::generate_params("get_country_info", COUNTRY_SCHEMA).await {
-        if let Some(c) = args.get("country").and_then(|v| v.as_str()) {
-            let trimmed = c.trim();
-            if !trimmed.is_empty() {
-                eprintln!(
-                    "[discovery] resolve_country: ToolCaller produced: {:?}",
-                    trimmed
-                );
-                return trimmed.to_string();
-            }
-        }
-    }
-
-    // 2. Model params
-    if let Some(ref c) = params.country {
-        let trimmed = c.trim();
-        if !trimmed.is_empty() {
-            eprintln!(
-                "[discovery] resolve_country: model param 'country': {:?}",
-                trimmed
-            );
-            return trimmed.to_string();
-        }
-    }
-
-    // 3. Scan extras
-    for key in &["name", "country", "nation", "code", "region"] {
-        if let Some(val) = params.extra.get(*key) {
-            if let Some(s) = val.as_str() {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() {
-                    eprintln!(
-                        "[discovery] resolve_country: extras '{}': {:?}",
-                        key, trimmed
-                    );
-                    return trimmed.to_string();
-                }
-            }
-        }
-    }
-
-    // 4. Clean user message
-    let msg = crate::last_user_message();
-    if !msg.is_empty() {
-        let cleaned = crate::clean_query_for_search(&msg);
-        if !cleaned.is_empty() {
-            eprintln!(
-                "[discovery] resolve_country: user message: {:?} -> {:?}",
-                msg, cleaned
-            );
-            return cleaned;
-        }
-    }
-
-    eprintln!("[discovery] resolve_country: no country found");
-    String::new()
 }
 
 const PRODUCT_SCHEMA: &str = r#"{"type":"object","properties":{"barcode":{"type":"string","description":"Product barcode (EAN/UPC)"},"name":{"type":"string","description":"Product name to search"}}}"#;
@@ -1077,68 +724,6 @@ async fn resolve_product(params: &ProductLookupParams) -> (Option<String>, Optio
 
     eprintln!("[discovery] resolve_product: no product found");
     (None, None)
-}
-
-const PRICE_SCHEMA: &str = r#"{"type":"object","properties":{"product":{"type":"string","description":"Product barcode or name"}},"required":["product"]}"#;
-
-async fn resolve_price_product(params: &ProductPriceParams) -> String {
-    // 1. ToolCaller specialist
-    if let Some(args) = crate::generate_params("get_product_price", PRICE_SCHEMA).await {
-        if let Some(p) = args.get("product").and_then(|v| v.as_str()) {
-            let trimmed = p.trim();
-            if !trimmed.is_empty() {
-                eprintln!(
-                    "[discovery] resolve_price_product: ToolCaller produced: {:?}",
-                    trimmed
-                );
-                return trimmed.to_string();
-            }
-        }
-    }
-
-    // 2. Model params
-    if let Some(ref p) = params.product {
-        let trimmed = p.trim();
-        if !trimmed.is_empty() {
-            eprintln!(
-                "[discovery] resolve_price_product: model param 'product': {:?}",
-                trimmed
-            );
-            return trimmed.to_string();
-        }
-    }
-
-    // 3. Scan extras
-    for key in &["product", "item", "barcode", "price", "cost"] {
-        if let Some(val) = params.extra.get(*key) {
-            if let Some(s) = val.as_str() {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() {
-                    eprintln!(
-                        "[discovery] resolve_price_product: extras '{}': {:?}",
-                        key, trimmed
-                    );
-                    return trimmed.to_string();
-                }
-            }
-        }
-    }
-
-    // 4. Clean user message
-    let msg = crate::last_user_message();
-    if !msg.is_empty() {
-        let cleaned = crate::clean_query_for_search(&msg);
-        if !cleaned.is_empty() {
-            eprintln!(
-                "[discovery] resolve_price_product: user message: {:?} -> {:?}",
-                msg, cleaned
-            );
-            return cleaned;
-        }
-    }
-
-    eprintln!("[discovery] resolve_price_product: no product found");
-    String::new()
 }
 
 const WEB_SEARCH_SCHEMA: &str = r#"{"type":"object","properties":{"query":{"type":"string","description":"Web search query"}},"required":["query"]}"#;
@@ -1304,49 +889,6 @@ mod tests {
     }
 
     #[test]
-    fn format_country_handles_full_entry() {
-        let entry = serde_json::json!({
-            "name": {
-                "common": "Kenya",
-                "official": "Republic of Kenya"
-            },
-            "capital": ["Nairobi"],
-            "population": 53771296,
-            "currencies": {
-                "KES": { "name": "Kenyan shilling", "symbol": "KSh" }
-            },
-            "languages": {
-                "eng": "English",
-                "swa": "Swahili"
-            },
-            "region": "Africa",
-            "subregion": "Eastern Africa",
-            "flags": { "emoji": "\u{1f1f0}\u{1f1ea}" }
-        });
-        let result = format_country(&entry);
-        assert!(result.contains("**Kenya** (Republic of Kenya)"));
-        assert!(result.contains("Africa (Eastern Africa)"));
-        assert!(result.contains("Nairobi"));
-        assert!(result.contains("53,771,296"));
-        assert!(result.contains("Kenyan shilling (KES)"));
-        assert!(result.contains("English"));
-        assert!(result.contains("Swahili"));
-    }
-
-    #[test]
-    fn format_country_handles_minimal_entry() {
-        let entry = serde_json::json!({
-            "name": { "common": "Testland" },
-            "region": "Testregion",
-            "population": 0
-        });
-        let result = format_country(&entry);
-        assert!(result.contains("**Testland**"));
-        assert!(result.contains("Testregion"));
-        assert!(result.contains("N/A")); // missing capital, currencies, languages
-    }
-
-    #[test]
     fn format_product_handles_full_entry() {
         let product = serde_json::json!({
             "product_name": "Nutella",
@@ -1386,40 +928,6 @@ mod tests {
             "blog.rust-lang.org"
         );
         assert_eq!(extract_domain(""), "");
-    }
-
-    // ── resolve_* tests (no ToolCaller configured) ───────────────────────
-
-    #[tokio::test]
-    async fn resolve_country_from_param() {
-        let params = CountryInfoParams {
-            country: Some("Kenya".to_string()),
-            extra: Default::default(),
-        };
-        assert_eq!(resolve_country(&params).await, "Kenya");
-    }
-
-    #[tokio::test]
-    async fn resolve_country_from_extras() {
-        let mut extra = std::collections::HashMap::new();
-        extra.insert(
-            "name".to_string(),
-            serde_json::Value::String("Japan".to_string()),
-        );
-        let params = CountryInfoParams {
-            country: None,
-            extra,
-        };
-        assert_eq!(resolve_country(&params).await, "Japan");
-    }
-
-    #[tokio::test]
-    async fn resolve_country_empty_when_nothing_provided() {
-        let params = CountryInfoParams {
-            country: None,
-            extra: Default::default(),
-        };
-        assert_eq!(resolve_country(&params).await, "");
     }
 
     #[tokio::test]
@@ -1494,42 +1002,6 @@ mod tests {
             extra: Default::default(),
         };
         assert_eq!(resolve_web_query(&params).await, "");
-    }
-
-    #[tokio::test]
-    async fn resolve_price_product_from_param() {
-        let params = ProductPriceParams {
-            product: Some("3017620422003".to_string()),
-            location: None,
-            extra: Default::default(),
-        };
-        assert_eq!(resolve_price_product(&params).await, "3017620422003");
-    }
-
-    // ── Live integration tests ───────────────────────────────────────────
-
-    #[tokio::test]
-    #[ignore] // requires internet
-    async fn live_rest_countries_kenya() {
-        let client = reqwest::Client::new();
-        let url = format!(
-            "{}/name/Kenya?fields={}",
-            REST_COUNTRIES_BASE, COUNTRY_FIELDS,
-        );
-        let resp = client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .expect("REST Countries request failed");
-        assert!(resp.status().is_success());
-        let body: serde_json::Value = resp.json().await.expect("failed to parse response");
-        let arr = body.as_array().expect("should be an array");
-        assert!(!arr.is_empty());
-        let capitals = arr[0]["capital"].as_array().expect("should have capital");
-        let cap = capitals[0].as_str().expect("capital should be string");
-        assert_eq!(cap, "Nairobi");
-        eprintln!("Kenya capital: {}", cap);
     }
 
     #[tokio::test]
@@ -1683,15 +1155,6 @@ mod tests {
         assert!(!looks_like_country_code("gbr"));
     }
 
-    #[tokio::test]
-    async fn resolve_country_trims_whitespace() {
-        let params = CountryInfoParams {
-            country: Some("  Kenya  ".to_string()),
-            extra: Default::default(),
-        };
-        assert_eq!(resolve_country(&params).await, "Kenya");
-    }
-
     // ── lookup_product edge case tests ──────────────────────────────────
 
     #[test]
@@ -1711,60 +1174,6 @@ mod tests {
             .expect("should have ingredients line");
         // 200 chars of 'a' + "..." = 203, plus "Ingredients: " prefix
         assert!(ingredients_line.len() < 250);
-    }
-
-    // ── Live integration tests ──────────────────────────────────────────
-
-    #[tokio::test]
-    #[ignore] // requires internet
-    async fn live_open_prices_nutella() {
-        let client = reqwest::Client::builder()
-            .user_agent("goose-in-a-pond/0.1 (GIAP MCP)")
-            .build()
-            .unwrap();
-        let url = format!(
-            "{}/prices?product_code=3017620422003&order_by=-date&page_size=5",
-            OFF_PRICES_BASE,
-        );
-        let resp = client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .expect("Open Prices request failed");
-        assert!(resp.status().is_success());
-        let body: serde_json::Value = resp.json().await.expect("parse failed");
-        let total = body["total"].as_u64().unwrap_or(0);
-        eprintln!("Nutella prices: {} total entries", total);
-        assert!(total > 0, "should have prices for Nutella");
-        let items = body["items"].as_array().expect("items array missing");
-        assert!(!items.is_empty(), "should return at least one price");
-        let first = &items[0];
-        let price = first["price"].as_f64().expect("price field missing");
-        eprintln!(
-            "First price: {} {}",
-            price,
-            first["currency"].as_str().unwrap_or("?")
-        );
-        assert!(price > 0.0, "price should be positive");
-    }
-
-    #[tokio::test]
-    #[ignore] // requires internet
-    async fn live_rest_countries_nonexistent() {
-        let client = reqwest::Client::builder()
-            .user_agent("goose-in-a-pond/0.1 (GIAP MCP)")
-            .build()
-            .unwrap();
-        let url = format!("{}/name/Wakanda", REST_COUNTRIES_BASE);
-        let resp = client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .expect("request failed");
-        // REST Countries returns 404 for non-existent countries
-        assert_eq!(resp.status().as_u16(), 404);
     }
 
     #[tokio::test]

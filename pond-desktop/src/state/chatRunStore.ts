@@ -92,7 +92,6 @@ function friendlyToolStatus(rawName: string): string {
     recall_memories:          "Recalling what I know…",
     save_memory:              "Saving that for later…",
     list_schedules:           "Looking up your schedules…",
-    get_recipe:               "Finding that recipe…",
     get_user_profile:         "Looking up your profile…",
     list_skills:              "Checking my skills…",
   };

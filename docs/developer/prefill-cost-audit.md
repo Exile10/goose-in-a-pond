@@ -8,6 +8,11 @@ request as a drift bookend.
 
 ## The payload
 
+> **Superseded 2026-09-10.** Twenty of these tools were removed after this audit
+> — the inventory is now 46, and a fresh `"all"` turn is ~19,000 chars rather
+> than 27,443. Every number below is the measurement that motivated the cut, kept
+> as it was taken. See **The cut** at the end.
+
 One fresh turn, `tool_selection_mode = "all"`, 61 tools:
 
 | part | chars | ~tok | share |
@@ -218,3 +223,39 @@ GIAP_CAPTURE_PAYLOAD=/tmp/capture MODE=goose scripts/try-mistralrs.sh
 Writes `payload-<seq>-<n>t-<hash>.json` per inference. The hash is over the
 body, so two turns with a byte-identical prompt land on the same filename —
 which is how the capture proves prefix stability rather than assuming it.
+
+## The cut, 2026-09-10
+
+Twenty tools removed, 61 → 41 offered (66 → 46 registered), −8,424 chars of tool
+schema. Redundant first, then narrow-value, then two capability calls:
+
+| group | removed |
+|---|---|
+| giap-knowledge | `search_wikipedia` (get_wikipedia_article auto-searches), `explore_computation`, `define_word`, `search_books` |
+| giap-system | `run_shell_command`, `read_file`, `write_file` |
+| giap-sensors | `create_sensor_rule`, `list_sensor_rules`, `delete_sensor_rule` |
+| giap-discovery | `get_country_info`, `get_product_price` |
+| giap-finance | `get_exchange_rate` (convert_currency covers it), `get_stock_quote` |
+| giap-device | `get_model_assignments`, `get_recipe` |
+| giap-news | `get_top_stories` |
+| giap-audit | `summarize_activity` |
+| giap-vision | `look_at_camera_window` |
+| giap-schedule | `get_schedule_runs` |
+
+Four things the removal changed beyond the schemas:
+
+- **`giap-system` is no longer a write-or-execute surface.** The rationale for
+  denying it to subagents and proactive proposers is now `send_notification`
+  alone, and all three copies of that rationale say so.
+- **`compute_answer`'s "did you mean" no longer names a tool.** It suggested
+  `explore_computation` by id; it now asks the model to re-call `compute_answer`
+  with the suggestion's own wording, and the Wolfram UI chip sends that wording
+  instead of an id.
+- **The sensor-rule dependency path is gone** — `init_sensor_rule_deps`, the
+  scheduler handle on `SensorsMcpServer`, and its install in `main.rs`.
+- **`recipe_repo` stopped being a tool dependency**, so it was dropped from
+  `DeviceMcpServer`, `McpToolDispatcher::new` and `register_giap_extensions`.
+  It still reaches the orchestrator, which is its real consumer.
+
+`format.rs :: the_tool_inventory_parser_sees_the_tools_that_are_there` pins the
+count at 46 and is the guard that will catch the next drift.

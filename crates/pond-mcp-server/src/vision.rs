@@ -42,16 +42,6 @@ const DEFAULT_CAMERA_ID: &str = "camera-1";
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 50;
 
-/// Frames returned by `look_at_camera_window` when the model does not say.
-///
-/// Three is a compromise: enough to show a direction of travel ("someone walked
-/// up to the door and left"), few enough that the turn is not four full image
-/// prefills. The hard cap is
-/// `pond_core::models::domain::image_limits::MAX_IMAGES_PER_TURN`, shared with
-/// manual attachments so a sampled window and a hand-picked set cost the same
-/// worst case.
-const DEFAULT_WINDOW_FRAMES: usize = 3;
-
 /// How many recent events a window samples FROM. Bounds the DB read; the frame
 /// cap bounds what the model actually sees.
 const WINDOW_EVENT_SCAN: usize = 30;
@@ -102,34 +92,6 @@ pub struct LookAtWindowParams {
     #[serde(flatten)]
     #[schemars(skip)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
-// ── Frame helpers ────────────────────────────────────────────────────────────
-
-/// Pick `count` items spread evenly across `len`, always including the first and
-/// last when `count >= 2`.
-///
-/// This is what makes a sampled window a *window* rather than a burst: three
-/// frames taken from the start, middle, and end of a sequence show motion, three
-/// consecutive frames show one moment three times.
-///
-/// Returns indices in ascending order, never more than `len` of them.
-#[must_use]
-fn pick_evenly_spaced(len: usize, count: usize) -> Vec<usize> {
-    if len == 0 || count == 0 {
-        return Vec::new();
-    }
-    if count >= len {
-        return (0..len).collect();
-    }
-    if count == 1 {
-        // One frame from a window should be the newest, which is the last.
-        return vec![len - 1];
-    }
-    // Spread across the closed interval [0, len-1] so both ends are included.
-    (0..count)
-        .map(|i| (i * (len - 1)) / (count - 1))
-        .collect::<Vec<_>>()
 }
 
 /// Read a snapshot from disk and turn it into MCP image content.
@@ -356,88 +318,6 @@ attached an image, just look at it - do NOT call this.")]
     }
 
     #[tool(description = "\
-Fixed security cameras only. Up to 4 frames across recent events - shows what changed or \
-which way someone moved. If the user attached an image, just look at it - do NOT call \
-this.")]
-    async fn look_at_camera_window(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<LookAtWindowParams>,
-    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
-        use pond_core::models::domain::image_limits::MAX_IMAGES_PER_TURN;
-
-        let camera_id = params
-            .0
-            .camera_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_CAMERA_ID.to_string());
-        let frames = params
-            .0
-            .frames
-            .map(|f| f as usize)
-            .unwrap_or(DEFAULT_WINDOW_FRAMES)
-            .clamp(1, MAX_IMAGES_PER_TURN);
-
-        let events = match self
-            .camera_storage
-            .list_events(&camera_id, WINDOW_EVENT_SCAN)
-            .await
-        {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(error = %e, "vision: camera event listing failed");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    "Sorry, I couldn't reach the camera store right now.",
-                )]));
-            }
-        };
-
-        // Oldest-first so the model reads the window in the order it happened.
-        let mut with_frames: Vec<&CameraEvent> = events
-            .iter()
-            .filter(|e| e.snapshot_path.is_some())
-            .collect();
-        with_frames.reverse();
-        if with_frames.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_no_results(
-                    &format!("stored frames from camera '{camera_id}'"),
-                    &[
-                        "giap-vision__look_at_camera_snapshot",
-                        "giap-vision__get_recent_camera_events",
-                    ],
-                ),
-            )]));
-        }
-
-        let picked = pick_evenly_spaced(with_frames.len(), frames);
-        let mut parts: Vec<Content> = Vec::with_capacity(picked.len() * 2 + 1);
-        parts.push(Content::text(format!(
-            "{} frame(s) from camera '{camera_id}', oldest first, sampled across the last {} \
-             events.",
-            picked.len(),
-            with_frames.len(),
-        )));
-        for idx in picked {
-            let event = with_frames[idx];
-            let Some(path) = event.snapshot_path.as_deref() else {
-                continue;
-            };
-            if let Some(image) = snapshot_content(path).await {
-                parts.push(Content::text(frame_caption(event)));
-                parts.push(image);
-            }
-        }
-
-        if parts.len() == 1 {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "The saved frames for camera '{camera_id}' are no longer readable."
-            ))]));
-        }
-        Ok(CallToolResult::success(parts))
-    }
-
-    #[tool(description = "\
 Acknowledge a camera event by ID to stop re-alerts once the user has seen it.")]
     async fn acknowledge_camera_event(
         &self,
@@ -551,51 +431,6 @@ mod tests {
         let _server = VisionMcpServer::new(Arc::new(StubStorage(vec![])));
     }
 
-    // ── F5: even frame sampling ──────────────────────────────────────────
-
-    #[test]
-    fn sampling_nothing_yields_nothing() {
-        assert!(pick_evenly_spaced(0, 3).is_empty());
-        assert!(pick_evenly_spaced(5, 0).is_empty());
-    }
-
-    #[test]
-    fn a_short_window_is_returned_whole() {
-        assert_eq!(pick_evenly_spaced(2, 3), vec![0, 1]);
-        assert_eq!(pick_evenly_spaced(3, 3), vec![0, 1, 2]);
-    }
-
-    /// The point of sampling: both ends of the window are always present, so
-    /// three frames show a change rather than three views of one moment.
-    #[test]
-    fn sampling_spans_the_whole_window() {
-        assert_eq!(pick_evenly_spaced(10, 3), vec![0, 4, 9]);
-        assert_eq!(pick_evenly_spaced(30, 4), vec![0, 9, 19, 29]);
-        let picked = pick_evenly_spaced(100, 4);
-        assert_eq!(picked.first(), Some(&0));
-        assert_eq!(picked.last(), Some(&99));
-    }
-
-    #[test]
-    fn one_frame_from_a_window_is_the_newest() {
-        assert_eq!(pick_evenly_spaced(10, 1), vec![9]);
-    }
-
-    #[test]
-    fn sampling_is_ascending_and_never_repeats() {
-        for len in 1..40usize {
-            for count in 1..=4usize {
-                let picked = pick_evenly_spaced(len, count);
-                assert!(picked.len() <= count.min(len), "len={len} count={count}");
-                assert!(picked.iter().all(|i| *i < len), "len={len} count={count}");
-                assert!(
-                    picked.windows(2).all(|w| w[0] < w[1]),
-                    "not strictly ascending: len={len} count={count} -> {picked:?}"
-                );
-            }
-        }
-    }
-
     // ── F3: snapshot -> MCP image content ────────────────────────────────
 
     #[tokio::test]
@@ -698,11 +533,7 @@ mod tests {
 
         // acknowledge_camera_event takes an ID and returns no frames — it cannot
         // be confused for looking at an attachment.
-        let guarded = [
-            "get_recent_camera_events",
-            "look_at_camera_snapshot",
-            "look_at_camera_window",
-        ];
+        let guarded = ["get_recent_camera_events", "look_at_camera_snapshot"];
         for name in guarded {
             let tool = tools
                 .iter()

@@ -1922,7 +1922,9 @@ Brief was a redesign across seven axes — queuing, batching, precision, fault t
 cross-recommendation, MCP-UI, extensibility with the builtins standardised, and "extensions
 for everything". Plan at `.claude/plans/`, branch `feat/extensions-redesign`, seven commits.
 
-**The number that drove the design.** GIAP ships **66 tools across 17 extensions** to
+**The number that drove the design.** GIAP ships **46 tools across 17 extensions** to
+(66 until 2026-09-10, when 20 were removed — see
+[`prefill-cost-audit.md`](../../developer/prefill-cost-audit.md))
 gemma-4-E2B/E4B on an 8192-clamped prompt window, with `tool_selection_mode` defaulting to
 `"all"`. Published benchmarks put tool-selection accuracy for *Haiku* below 90% between **10
 and 15** tools; at 107 both large and small models fail outright. GIAP's own D-phase numbers

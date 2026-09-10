@@ -7,8 +7,8 @@
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, ErrorCode, ErrorData, Implementation, InitializeResult,
-        ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolResult, Content, ErrorData, Implementation, InitializeResult, ProtocolVersion,
+        ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
@@ -54,12 +54,6 @@ pub struct WriteFileParams {
     #[serde(default)]
     pub append: bool,
 }
-
-/// Allow-list of safe shell commands for `run_shell_command`.
-const ALLOWED_COMMANDS: &[&str] = &[
-    "ls", "cat", "echo", "date", "uptime", "df", "free", "whoami", "hostname", "pwd", "wc", "head",
-    "tail", "sort", "uniq", "grep", "find", "which", "env", "printenv",
-];
 
 // ── MCP server ─────────────────────────────────────────────────────────────
 
@@ -228,199 +222,6 @@ impl SystemMcpServer {
             },
         ))]))
     }
-
-    #[tool(
-        description = "Run an allow-listed command only (10s timeout): ls, cat, echo, date, \
-        uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, \
-        which, env, printenv."
-    )]
-    async fn run_shell_command(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<ShellCommandParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let cmd = params.0.command.trim().to_string();
-
-        if !ALLOWED_COMMANDS.contains(&cmd.as_str()) {
-            return Err(ErrorData::new(
-                ErrorCode::INVALID_PARAMS,
-                format!(
-                    "Command '{}' is not in the allow-list. Allowed: {}",
-                    cmd,
-                    ALLOWED_COMMANDS.join(", "),
-                ),
-                None,
-            ));
-        }
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::process::Command::new(&cmd)
-                .args(&params.0.args)
-                .output(),
-        )
-        .await;
-
-        match result {
-            Err(_elapsed) => Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Command '{}' timed out after 10 seconds.", cmd),
-                None,
-            )),
-            Ok(Err(e)) => Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to execute '{}': {}", cmd, e),
-                None,
-            )),
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let mut text = String::new();
-                if !stdout.is_empty() {
-                    text.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\n--- stderr ---\n");
-                    }
-                    text.push_str(&stderr);
-                }
-                if text.is_empty() {
-                    text.push_str("(no output)");
-                }
-                if !output.status.success() {
-                    text.push_str(&format!("\nExit code: {}", output.status));
-                }
-                Ok(CallToolResult::success(vec![Content::text(text)]))
-            }
-        }
-    }
-
-    #[tool(description = "Read a local file. Returns up to max_lines lines (default 100).")]
-    async fn read_file(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<ReadFileParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let path = params.0.path.trim();
-
-        if path.contains("..") {
-            return Err(ErrorData::new(
-                ErrorCode::INVALID_PARAMS,
-                "Path traversal ('..') is not allowed.",
-                None,
-            ));
-        }
-
-        if !std::path::Path::new(path).is_absolute() {
-            return Err(ErrorData::new(
-                ErrorCode::INVALID_PARAMS,
-                "Path must be absolute.",
-                None,
-            ));
-        }
-
-        let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-            ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to read '{}': {}", path, e),
-                None,
-            )
-        })?;
-
-        let max_lines = params.0.max_lines.unwrap_or(100);
-        let lines: Vec<&str> = content.lines().take(max_lines).collect();
-        let total_lines = content.lines().count();
-        let truncated = total_lines > max_lines;
-        let mut text = lines.join("\n");
-        if truncated {
-            text.push_str(&format!(
-                "\n\n[Showing {}/{} lines. Use max_lines to read more.]",
-                max_lines, total_lines,
-            ));
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(text)]))
-    }
-
-    #[tool(description = "Write or append content to a local file; creates parent dirs.")]
-    async fn write_file(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<WriteFileParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let path = params.0.path.trim();
-
-        if path.contains("..") {
-            return Err(ErrorData::new(
-                ErrorCode::INVALID_PARAMS,
-                "Path traversal ('..') is not allowed.",
-                None,
-            ));
-        }
-
-        if !std::path::Path::new(path).is_absolute() {
-            return Err(ErrorData::new(
-                ErrorCode::INVALID_PARAMS,
-                "Path must be absolute.",
-                None,
-            ));
-        }
-
-        // Create parent directories if they don't exist
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Failed to create directories for '{}': {}", path, e),
-                    None,
-                )
-            })?;
-        }
-
-        let bytes_written = params.0.content.len();
-
-        if params.0.append {
-            use tokio::io::AsyncWriteExt;
-            let mut file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .await
-                .map_err(|e| {
-                    ErrorData::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!("Failed to open '{}' for appending: {}", path, e),
-                        None,
-                    )
-                })?;
-            file.write_all(params.0.content.as_bytes())
-                .await
-                .map_err(|e| {
-                    ErrorData::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!("Failed to append to '{}': {}", path, e),
-                        None,
-                    )
-                })?;
-        } else {
-            tokio::fs::write(path, &params.0.content)
-                .await
-                .map_err(|e| {
-                    ErrorData::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!("Failed to write '{}': {}", path, e),
-                        None,
-                    )
-                })?;
-        }
-
-        let mode = if params.0.append { "Appended" } else { "Wrote" };
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "{} {} bytes to '{}'.",
-            mode, bytes_written, path,
-        ))]))
-    }
 }
 
 impl Default for SystemMcpServer {
@@ -475,14 +276,5 @@ mod tests {
     #[test]
     fn server_default() {
         let _server = SystemMcpServer::default();
-    }
-
-    #[test]
-    fn allowed_commands_contains_basics() {
-        assert!(ALLOWED_COMMANDS.contains(&"ls"));
-        assert!(ALLOWED_COMMANDS.contains(&"cat"));
-        assert!(ALLOWED_COMMANDS.contains(&"whoami"));
-        assert!(!ALLOWED_COMMANDS.contains(&"rm"));
-        assert!(!ALLOWED_COMMANDS.contains(&"sudo"));
     }
 }

@@ -96,10 +96,8 @@ const NAME_MAP: Record<string, string> = {
   get_current_weather: "Weather",
   // wikipedia
   get_wikipedia_article: "Wikipedia",
-  search_wikipedia: "Wikipedia Search",
   // computation
   compute_answer: "Computed",
-  explore_computation: "Computed",
   // schedule
   list_schedules: "Schedules",
   create_schedule: "Create Schedule",
@@ -107,7 +105,6 @@ const NAME_MAP: Record<string, string> = {
   pause_schedule: "Pause Schedule",
   resume_schedule: "Resume Schedule",
   run_schedule_now: "Run Schedule",
-  get_schedule_runs: "Schedule History",
   // memory
   save_memory: "Save Memory",
   recall_memories: "Recall Memory",
@@ -116,9 +113,6 @@ const NAME_MAP: Record<string, string> = {
   get_system_info: "System Info",
   get_current_time: "Current Time",
   send_notification: "Notification",
-  run_shell_command: "Shell Command",
-  read_file: "Read File",
-  write_file: "Write File",
   // devices
   list_registered_devices: "Devices",
   get_current_profile: "Profile",
