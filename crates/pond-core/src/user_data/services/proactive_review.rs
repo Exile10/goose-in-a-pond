@@ -1019,8 +1019,8 @@ const GROUPS_A_PROPOSER_MAY_NOT_HOLD: [(&str, &str); 6] = [
     ),
     (
         "giap-system",
-        "write_file, run_shell_command and send_notification: a proposer that can notify has \
-         skipped the member entirely",
+        "send_notification: a proposer that can notify has skipped the member entirely (the \
+         file and shell tools this also covered were removed on 2026-09-10)",
     ),
     (
         "giap-toolkit",

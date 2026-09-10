@@ -64,7 +64,6 @@ pub struct HeadlinesParams {
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-const HN_BASE_URL: &str = "https://hacker-news.firebaseio.com/v0";
 const GUARDIAN_BASE_URL: &str = "https://content.guardianapis.com";
 const GNEWS_BASE_URL: &str = "https://gnews.io/api/v4";
 
@@ -74,7 +73,6 @@ const GUARDIAN_SIGNUP: &str = "https://open-platform.theguardian.com/access/";
 const GNEWS_SIGNUP: &str = "https://gnews.io/register";
 const WIKIMEDIA_FEED_URL: &str = "https://api.wikimedia.org/feed/v1/wikipedia/en/featured";
 
-const TOP_STORIES_BUDGET: usize = 1500;
 const SEARCH_NEWS_BUDGET: usize = 2000;
 const HEADLINES_BUDGET: usize = 1500;
 
@@ -94,124 +92,6 @@ impl NewsMcpServer {
             http_client,
             tool_router: Self::tool_router(),
         }
-    }
-
-    #[tool(description = "\
-Trending Hacker News tech stories. Tech only; for world news use \
-search_news/get_headlines.")]
-    async fn get_top_stories(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<TopStoriesParams>,
-    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
-        crate::set_current_tool("get_top_stories");
-        let category = resolve_category(params.0.category.as_deref());
-        let limit = params.0.limit.unwrap_or(5).clamp(1, 15) as usize;
-        eprintln!(
-            "[news] get_top_stories: category={}, limit={}",
-            category, limit
-        );
-
-        // 1. Fetch story IDs
-        let ids_url = format!("{}/{}.json", HN_BASE_URL, category);
-        let ids_resp = match crate::http::traced_get(&self.http_client, &ids_url).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[news] HN story IDs fetch failed: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("Hacker News", &e.to_string()),
-                )]));
-            }
-        };
-
-        if !ids_resp.status().is_success() {
-            let status = ids_resp.status();
-            eprintln!("[news] HN story IDs returned HTTP {status}");
-            return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_api_error("Hacker News", &format!("HTTP {status}")),
-            )]));
-        }
-
-        let ids: Vec<u64> = match ids_resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[news] failed to parse HN story IDs: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("Hacker News", &e.to_string()),
-                )]));
-            }
-        };
-
-        let ids_to_fetch = &ids[..ids.len().min(limit)];
-        eprintln!("[news] fetching {} story details", ids_to_fetch.len());
-
-        // 2. Fetch story details sequentially (bounded by limit)
-        let mut items: Vec<String> = Vec::with_capacity(ids_to_fetch.len());
-        let mut ui_items: Vec<serde_json::Value> = Vec::with_capacity(ids_to_fetch.len());
-        for &id in ids_to_fetch {
-            let item_url = format!("{}/item/{}.json", HN_BASE_URL, id);
-            match crate::http::traced_get_with(&self.http_client, &item_url, |b| {
-                b.timeout(std::time::Duration::from_secs(8))
-            })
-            .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(item) = resp.json::<serde_json::Value>().await {
-                        let title = item["title"].as_str().unwrap_or("(untitled)");
-                        let score = item["score"].as_u64().unwrap_or(0);
-                        let by = item["by"].as_str().unwrap_or("unknown");
-                        let descendants = item["descendants"].as_u64().unwrap_or(0);
-                        let url = item["url"].as_str().unwrap_or("");
-
-                        let domain = extract_domain(url);
-                        let hn_link = format!("https://news.ycombinator.com/item?id={}", id);
-
-                        ui_items.push(serde_json::json!({
-                            "headline": title,
-                            "tag": "Tech",
-                            "timeAgo": format!("{} pts", score),
-                            "source": if domain.is_empty() { "Hacker News".to_string() } else { domain.clone() },
-                        }));
-
-                        let formatted = if domain.is_empty() {
-                            // Self-post (Ask HN, etc.)
-                            format!(
-                                "**{}** ({} pts) — by {} | {} comments | {}",
-                                title, score, by, descendants, hn_link,
-                            )
-                        } else {
-                            format!(
-                                "**{}** ({} pts) — {} | by {} | {} comments | {}",
-                                title, score, domain, by, descendants, hn_link,
-                            )
-                        };
-                        items.push(formatted);
-                    }
-                }
-                _ => {
-                    // Skip failed individual item fetches
-                    eprintln!("[news] failed to fetch HN item {id}, skipping");
-                }
-            }
-        }
-
-        let category_label = category.trim_end_matches("stories");
-        let header = format!("Hacker News — {} stories", category_label);
-        let text = crate::format::format_list_result(&items, &header, TOP_STORIES_BUDGET);
-        eprintln!(
-            "[news] get_top_stories done, {} items, {} chars",
-            items.len(),
-            text.len()
-        );
-
-        if !ui_items.is_empty() {
-            let ui_data = serde_json::json!({ "items": ui_items });
-            let hint = format!("[[[mcp-ui:news:{}]]]\n", ui_data);
-            let full_result = format!("{}{}", hint, text);
-            return Ok(CallToolResult::success(vec![Content::text(full_result)]));
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(description = "\
@@ -841,35 +721,6 @@ fn strip_html_tags(html: &str) -> String {
     result
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-/// Map a user-friendly category name to the Hacker News Firebase endpoint path.
-fn resolve_category(input: Option<&str>) -> &'static str {
-    match input.map(|s| s.trim().to_lowercase()).as_deref() {
-        Some("top") | None | Some("") => "topstories",
-        Some("best") => "beststories",
-        Some("new") | Some("newest") | Some("latest") => "newstories",
-        Some("ask") | Some("askhn") | Some("ask hn") => "askstories",
-        Some("show") | Some("showhn") | Some("show hn") => "showstories",
-        Some("job") | Some("jobs") | Some("hiring") => "jobstories",
-        // Unknown category — fall back to top
-        Some(_) => "topstories",
-    }
-}
-
-/// Extract domain from a URL for compact display.
-/// "https://www.example.com/path" -> "example.com"
-fn extract_domain(url: &str) -> String {
-    url.split("://")
-        .nth(1)
-        .unwrap_or("")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .trim_start_matches("www.")
-        .to_string()
-}
-
 /// Resolve the search query using the standard param fallback chain.
 const NEWS_QUERY_SCHEMA: &str = r#"{"type":"object","properties":{"query":{"type":"string","description":"Keywords to search for in news articles"}},"required":["query"]}"#;
 
@@ -967,64 +818,6 @@ pub fn spawn_news_server(reader: DuplexStream, writer: DuplexStream) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn category_maps_to_endpoint() {
-        assert_eq!(resolve_category(Some("top")), "topstories");
-        assert_eq!(resolve_category(Some("best")), "beststories");
-        assert_eq!(resolve_category(Some("new")), "newstories");
-        assert_eq!(resolve_category(Some("newest")), "newstories");
-        assert_eq!(resolve_category(Some("latest")), "newstories");
-        assert_eq!(resolve_category(Some("ask")), "askstories");
-        assert_eq!(resolve_category(Some("askhn")), "askstories");
-        assert_eq!(resolve_category(Some("show")), "showstories");
-        assert_eq!(resolve_category(Some("showhn")), "showstories");
-        assert_eq!(resolve_category(Some("job")), "jobstories");
-        assert_eq!(resolve_category(Some("jobs")), "jobstories");
-        assert_eq!(resolve_category(Some("hiring")), "jobstories");
-    }
-
-    #[test]
-    fn default_category_is_top() {
-        assert_eq!(resolve_category(None), "topstories");
-        assert_eq!(resolve_category(Some("")), "topstories");
-    }
-
-    #[test]
-    fn unknown_category_falls_back_to_top() {
-        assert_eq!(resolve_category(Some("random")), "topstories");
-        assert_eq!(resolve_category(Some("foobar")), "topstories");
-    }
-
-    #[test]
-    fn category_is_case_insensitive() {
-        assert_eq!(resolve_category(Some("TOP")), "topstories");
-        assert_eq!(resolve_category(Some("Best")), "beststories");
-        assert_eq!(resolve_category(Some("NEW")), "newstories");
-        assert_eq!(resolve_category(Some("ASK")), "askstories");
-    }
-
-    #[test]
-    fn extract_domain_works() {
-        assert_eq!(
-            extract_domain("https://www.example.com/path"),
-            "example.com"
-        );
-        assert_eq!(extract_domain("https://example.com/foo"), "example.com");
-        assert_eq!(
-            extract_domain("http://blog.rust-lang.org/2025/post"),
-            "blog.rust-lang.org"
-        );
-        assert_eq!(extract_domain(""), "");
-    }
-
-    #[test]
-    fn extract_domain_strips_www() {
-        assert_eq!(
-            extract_domain("https://www.nytimes.com/article"),
-            "nytimes.com"
-        );
-    }
-
     // resolve_query tests — no ToolCaller set, so falls through to model params
     #[tokio::test]
     async fn resolve_query_from_direct_field() {
@@ -1062,23 +855,6 @@ mod tests {
             extra: Default::default(),
         };
         assert_eq!(resolve_query(&params).await, "");
-    }
-
-    #[tokio::test]
-    #[ignore] // requires internet
-    async fn live_hacker_news_top_stories() {
-        let client = reqwest::Client::new();
-        let ids_url = format!("{}/topstories.json", HN_BASE_URL);
-        let resp = client
-            .get(&ids_url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .expect("HN request failed");
-        assert!(resp.status().is_success());
-        let ids: Vec<u64> = resp.json().await.expect("failed to parse HN IDs");
-        assert!(!ids.is_empty(), "HN should return at least one story ID");
-        eprintln!("HN returned {} story IDs, first: {}", ids.len(), ids[0]);
     }
 
     #[tokio::test]

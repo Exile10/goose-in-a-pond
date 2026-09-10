@@ -16,12 +16,12 @@ const STORE_PATH =
 // ─── Mock fallback (offline) ──────────────────────────────────
 const MOCK_EXTENSIONS: Extension[] = [
   { name: "giap-weather",      kind: "builtin",         description: "Local & forecast weather",         tools: ["get_current_weather", "get_forecast"],                                  enabled: true,  status: "connected" },
-  { name: "giap-knowledge",    kind: "builtin",         description: "Wikipedia, definitions, books, maths", tools: ["get_wikipedia_article", "search_wikipedia", "define_word", "compute_answer"], enabled: true, status: "connected" },
-  { name: "giap-news",         kind: "builtin",         description: "Daily headlines & stories",        tools: ["get_top_stories", "search_news", "get_headlines"],                      enabled: false, status: undefined },
-  { name: "giap-finance",      kind: "builtin",         description: "Crypto & market prices",           tools: ["get_exchange_rate", "get_stock_quote", "get_crypto_price"],              enabled: true,  status: "connected" },
+  { name: "giap-knowledge",    kind: "builtin",         description: "Wikipedia, definitions, books, maths", tools: ["get_wikipedia_article", "compute_answer"], enabled: true, status: "connected" },
+  { name: "giap-news",         kind: "builtin",         description: "Daily headlines & stories",        tools: ["search_news", "get_headlines"],                      enabled: false, status: undefined },
+  { name: "giap-finance",      kind: "builtin",         description: "Crypto & market prices",           tools: ["convert_currency", "get_crypto_price"],              enabled: true,  status: "connected" },
   { name: "giap-memory",       kind: "builtin",         description: "Save & recall memories",           tools: ["save_memory", "recall_memories", "forget_memory"],                      enabled: true,  status: "connected" },
   { name: "giap-schedule",     kind: "builtin",         description: "Tasks & recurring schedules",      tools: ["create_schedule", "list_schedules", "delete_schedule"],                  enabled: true,  status: "connected" },
-  { name: "giap-system",       kind: "builtin",         description: "Files, time & system info",        tools: ["get_current_time", "read_file", "write_file", "run_shell_command"],      enabled: true,  status: "connected" },
+  { name: "giap-system",       kind: "builtin",         description: "Time, system info & notifications", tools: ["get_current_time", "get_system_info", "send_notification"],      enabled: true,  status: "connected" },
 ];
 
 // ─── Determine status dot variant ────────────────────────────

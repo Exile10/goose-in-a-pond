@@ -1401,8 +1401,8 @@ const GROUPS_NO_SUBAGENT_MAY_HOLD: [(&str, &str); 6] = [
     ),
     (
         "giap-system",
-        "write_file, run_shell_command and send_notification: writes and executes, with no \
-         approval path",
+        "send_notification reaches the member directly, with no approval path (the file and \
+         shell tools this also covered were removed on 2026-09-10)",
     ),
     (
         "giap-schedule",

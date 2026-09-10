@@ -22,7 +22,6 @@ use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::draft::DraftRepository;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
-use pond_core::user_data::ports::recipe::AgentRecipeRepository;
 use pond_core::user_data::ports::scheduler::SchedulerPort;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::user_data::ports::skill::UserSkillRepository;
@@ -163,7 +162,6 @@ impl McpToolDispatcher {
         settings_repo: Arc<dyn SettingsRepository>,
         device_registry: Arc<dyn DeviceRegistry>,
         skill_repo: Arc<dyn UserSkillRepository>,
-        recipe_repo: Arc<dyn AgentRecipeRepository>,
         draft_repo: Arc<dyn DraftRepository>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
         device_control: Arc<dyn DeviceControlPort>,
@@ -175,12 +173,8 @@ impl McpToolDispatcher {
         let memory_server = MemoryMcpServer::new(memory_repo, embedding_provider);
         let schedule_server = scheduler.map(|s| ScheduleMcpServer::new(s, settings_repo.clone()));
         let system_server = SystemMcpServer::new();
-        let device_server = DeviceMcpServer::new(
-            device_registry.clone(),
-            settings_repo.clone(),
-            skill_repo,
-            recipe_repo,
-        );
+        let device_server =
+            DeviceMcpServer::new(device_registry.clone(), settings_repo.clone(), skill_repo);
         let device_control_server = DeviceControlMcpServer::new(device_control, device_registry);
         // News and finance take no settings repo: their API keys live in the
         // secret store (PAI-2 P2), read through `crate::secrets`.
@@ -391,41 +385,12 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
             },
             "required": ["topic"]
         }),
-        "giap-knowledge__search_wikipedia" => json!({
-            "type": "object",
-            "properties": {
-                "topic": { "type": "string", "description": "Search query for Wikipedia." }
-            },
-            "required": ["topic"]
-        }),
-        "giap-knowledge__define_word" => json!({
-            "type": "object",
-            "properties": {
-                "word": { "type": "string", "description": "The word to define." }
-            },
-            "required": ["word"]
-        }),
-        "giap-knowledge__search_books" => json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Book title, author, or topic to search for." }
-            },
-            "required": ["query"]
-        }),
         "giap-knowledge__compute_answer" => json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "The question to compute or look up." }
             },
             "required": ["query"]
-        }),
-        "giap-knowledge__explore_computation" => json!({
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "description": "Id of the suggestion to open, as printed (e.g. \"w3\")." },
-                "query": { "type": "string", "description": "The original question. Only needed when there is no id." },
-                "assumption": { "type": "string", "description": "A Wolfram assumption code, used with 'query'." }
-            }
         }),
         // Memory
         "giap-memory__save_memory" => json!({
@@ -483,14 +448,6 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
             },
             "required": ["id"]
         }),
-        "giap-schedule__get_schedule_runs" => json!({
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "description": "Schedule ID." },
-                "limit": { "type": "integer", "description": "Max runs to return (default 10)." }
-            },
-            "required": ["id"]
-        }),
         "giap-schedule__world_clock" => json!({
             "type": "object",
             "properties": {
@@ -507,13 +464,6 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
                 "body": { "type": "string", "description": "Notification body text." }
             },
             "required": ["title", "body"]
-        }),
-        "giap-system__run_shell_command" => json!({
-            "type": "object",
-            "properties": {
-                "command": { "type": "string", "description": "The shell command to execute (must be in the allow-list)." }
-            },
-            "required": ["command"]
         }),
         "giap-system__read_file" => json!({
             "type": "object",
@@ -534,24 +484,10 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
         // Device
         "giap-device__list_registered_devices"
         | "giap-device__get_user_profile"
-        | "giap-device__get_model_assignments"
         | "giap-device__list_skills" => {
             json!({ "type": "object", "properties": {} })
         }
-        "giap-device__get_recipe" => json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "Recipe name to look up." }
-            },
-            "required": ["name"]
-        }),
         // News
-        "giap-news__get_top_stories" => json!({
-            "type": "object",
-            "properties": {
-                "count": { "type": "integer", "description": "Number of stories (default 5)." }
-            }
-        }),
         "giap-news__search_news" => json!({
             "type": "object",
             "properties": {
@@ -566,14 +502,6 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
             }
         }),
         // Finance
-        "giap-finance__get_exchange_rate" => json!({
-            "type": "object",
-            "properties": {
-                "from": { "type": "string", "description": "Source currency code (e.g. 'USD')." },
-                "to": { "type": "string", "description": "Target currency code (e.g. 'KES')." }
-            },
-            "required": ["from", "to"]
-        }),
         "giap-finance__convert_currency" => json!({
             "type": "object",
             "properties": {
@@ -583,13 +511,6 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
             },
             "required": ["amount", "from", "to"]
         }),
-        "giap-finance__get_stock_quote" => json!({
-            "type": "object",
-            "properties": {
-                "symbol": { "type": "string", "description": "Stock ticker symbol (e.g. 'AAPL', 'MSFT')." }
-            },
-            "required": ["symbol"]
-        }),
         "giap-finance__get_crypto_price" => json!({
             "type": "object",
             "properties": {
@@ -598,26 +519,12 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
             "required": ["coin"]
         }),
         // Discovery
-        "giap-discovery__get_country_info" => json!({
-            "type": "object",
-            "properties": {
-                "country": { "type": "string", "description": "Country name (e.g. 'Kenya', 'Japan')." }
-            },
-            "required": ["country"]
-        }),
         "giap-discovery__lookup_product" => json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "Product name or barcode." }
             },
             "required": ["query"]
-        }),
-        "giap-discovery__get_product_price" => json!({
-            "type": "object",
-            "properties": {
-                "product": { "type": "string", "description": "Product name to get price for." }
-            },
-            "required": ["product"]
         }),
         // Draft
         "giap-draft__save_draft" => json!({
@@ -730,8 +637,8 @@ mod tests {
     #[tokio::test]
     async fn inspect_mcp_tool_schemas() {
         use crate::{
-            DiscoveryMcpServer, DraftMcpServer, FinanceMcpServer, KnowledgeMcpServer,
-            NewsMcpServer, SystemMcpServer, WeatherMcpServer,
+            DiscoveryMcpServer, FinanceMcpServer, KnowledgeMcpServer, NewsMcpServer,
+            SystemMcpServer, WeatherMcpServer,
         };
 
         // Create peer for RequestContext
@@ -830,11 +737,12 @@ mod tests {
         }
 
         // Sanity floor: the 6 core servers here (system/weather/knowledge/news/
-        // finance/discovery) total ~24 tools; assert a floor that catches a server
-        // returning nothing (list_tools error) without being brittle to ±1 tool.
+        // finance/discovery) total ~13 tools after the 2026-09-10 inventory cut;
+        // assert a floor that catches a server returning nothing (list_tools
+        // error) without being brittle to ±1 tool.
         assert!(
-            total_tools >= 20,
-            "Expected 20+ tools from the 6 core servers, got {}",
+            total_tools >= 10,
+            "Expected 10+ tools from the 6 core servers, got {}",
             total_tools
         );
     }

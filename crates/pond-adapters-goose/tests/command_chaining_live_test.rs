@@ -238,36 +238,6 @@ impl DraftRepository for NoDrafts {
     }
 }
 
-struct NoRecipes;
-
-#[async_trait]
-impl AgentRecipeRepository for NoRecipes {
-    async fn list(&self) -> Result<Vec<pond_core::user_data::domain::recipe::AgentRecipe>> {
-        Ok(vec![])
-    }
-    async fn get_by_name(
-        &self,
-        _name: &str,
-    ) -> Result<Option<pond_core::user_data::domain::recipe::AgentRecipe>> {
-        Ok(None)
-    }
-    async fn get_by_id(
-        &self,
-        _id: &str,
-    ) -> Result<Option<pond_core::user_data::domain::recipe::AgentRecipe>> {
-        Ok(None)
-    }
-    async fn upsert(
-        &self,
-        _recipe: &pond_core::user_data::domain::recipe::AgentRecipe,
-    ) -> Result<()> {
-        Ok(())
-    }
-    async fn delete(&self, _id: &str) -> Result<()> {
-        Ok(())
-    }
-}
-
 // ── Harness plumbing ─────────────────────────────────────────────────────────
 
 /// The recording fakes the MCP tools dispatch into. Registration into Goose's
@@ -293,7 +263,6 @@ fn recorders() -> &'static Recorders {
             Arc::new(ChainingSettingsRepo),
             Arc::new(OneLightRegistry),
             Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
-            Arc::new(NoRecipes),
             Arc::new(NoDrafts),
             device_control.clone(),
             None,

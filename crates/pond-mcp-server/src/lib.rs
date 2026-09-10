@@ -178,7 +178,7 @@ pub use orchestrator::{
 };
 pub use schedule::{init_schedule_deps, spawn_schedule_server};
 pub use secrets::{init_secret_deps, secret};
-pub use sensors::{init_sensor_deps, init_sensor_rule_deps, spawn_sensor_server};
+pub use sensors::{init_sensor_deps, spawn_sensor_server};
 pub use session_meta::{session_from_meta, SESSION_ID_META_KEY};
 pub use system::spawn_system_server;
 pub use toolkit::{init_toolkit_deps, spawn_toolkit_server};

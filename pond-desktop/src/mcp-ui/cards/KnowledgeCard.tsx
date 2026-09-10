@@ -90,7 +90,7 @@ registerMcpCard({
   key: "knowledge",
   label: "Knowledge",
   icon: "BookOpen",
-  toolPattern: /wikipedia|knowledge|define_word|search_books/,
+  toolPattern: /wikipedia|knowledge/,
   component: KnowledgeCard,
   mockTool: "giap-knowledge__get_wikipedia_article",
   mockData: {

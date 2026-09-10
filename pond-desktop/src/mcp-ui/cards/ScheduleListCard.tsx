@@ -175,7 +175,7 @@ registerMcpCard({
   key: "schedule",
   label: "Schedules",
   icon: "Clock",
-  toolPattern: /schedule|list_schedule|create_schedule|get_schedule_runs/,
+  toolPattern: /schedule|list_schedule|create_schedule/,
   component: ScheduleListCard,
   mockTool: "giap-schedule__list_schedules",
   mockData: {

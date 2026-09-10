@@ -17232,9 +17232,6 @@ mod tests {
     const MUST_NEVER_BE_DIRECTLY_DISPATCHABLE: &[&str] = &[
         "giap-draft__approve_draft",
         "giap-draft__reject_draft",
-        "giap-system__run_shell_command",
-        "giap-system__read_file",
-        "giap-system__write_file",
         "giap-memory__recall_memories",
         "giap-memory__save_memory",
         "giap-schedule__create_schedule",
