@@ -49,7 +49,6 @@ use pond_core::prompts;
 use pond_core::shared::domain::agent::{AgentRequest, AgentResponse, AgentStreamEvent};
 use pond_core::shared::domain::turn_stats::TurnStats;
 use pond_core::user_data::domain::settings::Settings;
-use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
 use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
 use pond_core::user_data::ports::session_storage::SessionStorage;
@@ -80,7 +79,6 @@ pub struct MistralRsAgent {
     template_repo: Option<Arc<dyn PromptTemplateRepository>>,
     extras_repo: Option<Arc<dyn PromptExtraRepository>>,
     skill_repo: Option<Arc<dyn UserSkillRepository>>,
-    device_repo: Arc<dyn DeviceRegistry>,
     session_storage: Arc<dyn SessionStorage>,
     tools: Option<Arc<dyn ToolDispatcher>>,
 }
@@ -93,7 +91,6 @@ impl MistralRsAgent {
         template_repo: Option<Arc<dyn PromptTemplateRepository>>,
         extras_repo: Option<Arc<dyn PromptExtraRepository>>,
         skill_repo: Option<Arc<dyn UserSkillRepository>>,
-        device_repo: Arc<dyn DeviceRegistry>,
         session_storage: Arc<dyn SessionStorage>,
         tools: Option<Arc<dyn ToolDispatcher>>,
     ) -> Self {
@@ -103,7 +100,6 @@ impl MistralRsAgent {
             template_repo,
             extras_repo,
             skill_repo,
-            device_repo,
             session_storage,
             tools,
         }
@@ -123,14 +119,6 @@ impl MistralRsAgent {
         request: &AgentRequest,
         tools_offered: bool,
     ) -> String {
-        let devices = self.device_repo.list_devices().await.unwrap_or_default();
-        let online_device_names: String = devices
-            .iter()
-            .filter(|d| d.is_online)
-            .map(|d| d.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-
         let caps = self.provider.capabilities();
         let thinking_enabled = thinking_enabled(settings, &caps);
 
@@ -138,11 +126,7 @@ impl MistralRsAgent {
         let state = prompts::PromptState {
             current_date: now.format("%A, %-d %B %Y").to_string(),
             current_time: now.format("%H:%M").to_string(),
-            device_count: devices.len(),
-            has_home_devices: !devices.is_empty(),
-            online_device_names,
             voice_mode: request.voice_mode,
-            canvas_mode: request.canvas_mode,
             // Empty because the tools go in the request body, not the prose.
             available_tools: Vec::new(),
             thinking_enabled,

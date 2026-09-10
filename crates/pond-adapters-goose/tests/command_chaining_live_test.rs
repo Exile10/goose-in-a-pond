@@ -17,7 +17,6 @@ use pond_core::user_data::ports::device_control::{
 };
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::user_data::ports::draft::DraftRepository;
-use pond_core::user_data::ports::recipe::AgentRecipeRepository;
 use pond_core::user_data::ports::scheduler::{
     CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest,
 };
@@ -295,7 +294,6 @@ async fn run_utterance(session_id: &str, utterance: &str) -> ChainRun {
         Arc::new(pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_memory::MockMemoryRepository::default()),
-        Arc::new(OneLightRegistry),
         url,
         None,
         None,
