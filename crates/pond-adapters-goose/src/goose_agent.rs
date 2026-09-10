@@ -4839,6 +4839,31 @@ impl GooseAdapter {
                                     turn_stats.completion_tokens += output.max(0) as u32;
                                 }
                                 if let Some(stats) = &pu.stats {
+                                    // What THIS inference actually decoded, and
+                                    // what it got from the retained KV cache.
+                                    // The engine has always reported the reuse;
+                                    // nothing read it, so the turn's prefill
+                                    // rate was one inference's prompt over every
+                                    // inference's time — 3,940 tok/s on a turn
+                                    // that decoded 55 tokens.
+                                    if let Some(reused) = stats.reused_prefix_tokens {
+                                        let reused = reused as u32;
+                                        turn_stats.reused_prefix_tokens =
+                                            Some(turn_stats.reused_prefix_tokens.unwrap_or(0) + reused);
+                                        turn_stats.prefilled_tokens += pu
+                                            .usage
+                                            .input_tokens
+                                            .map(|i| i.max(0) as u32)
+                                            .unwrap_or(0)
+                                            .saturating_sub(reused);
+                                    } else {
+                                        // No reuse reported: the whole prompt was decoded.
+                                        turn_stats.prefilled_tokens += pu
+                                            .usage
+                                            .input_tokens
+                                            .map(|i| i.max(0) as u32)
+                                            .unwrap_or(0);
+                                    }
                                     if turn_stats.ttft_ms.is_none() {
                                         turn_stats.ttft_ms = stats.time_to_first_token_ms;
                                     }

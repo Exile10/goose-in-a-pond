@@ -21,6 +21,30 @@ pub struct TurnStats {
     pub decode_ms: Option<u64>,
     /// Prompt size of the FINAL inference — the turn's real context load.
     pub prompt_tokens: u32,
+    /// Prompt tokens this turn actually DECODED, summed across its inferences.
+    ///
+    /// Distinct from `prompt_tokens` in both directions, and that is the point.
+    /// A turn reusing a KV prefix presents a 7,600-token prompt and decodes 55
+    /// of them; a cold turn with three tool round-trips decodes its prompt once
+    /// and reuses it twice. `prefill_tok_per_sec` was previously
+    /// `prompt_tokens / prefill_ms` — one inference's tokens over every
+    /// inference's time — which read 3,940 tok/s on a reuse turn that decoded
+    /// 55 tokens and 220 tok/s on a cold turn that decoded 6,807. Wrong by an
+    /// order of magnitude in both directions, and in opposite directions, so it
+    /// could not even be corrected by a constant.
+    ///
+    /// `0` with a non-zero `prefill_ms` is meaningful: everything was cached and
+    /// the time went on template application and tokenization.
+    #[serde(default)]
+    pub prefilled_tokens: u32,
+    /// Prompt tokens served from a retained KV cache instead of decoded, summed
+    /// across the turn's inferences.
+    ///
+    /// `None` means the backend reports nothing (every HTTP provider); `Some(0)`
+    /// means it supports prefix reuse and reused nothing, which on turn 2+ is a
+    /// prefix that stopped being token-stable and is worth chasing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_prefix_tokens: Option<u32>,
     /// Generated tokens, summed across the turn's inferences.
     pub completion_tokens: u32,
     /// Tokens spent on reasoning the user never sees, summed across the turn.
@@ -80,9 +104,12 @@ pub struct TurnStats {
 impl TurnStats {
     /// Derive the rate fields from the raw timing/token fields.
     pub fn finalize_rates(&mut self) {
-        if let (Some(prefill_ms), used) = (self.prefill_ms, self.prompt_tokens) {
-            if prefill_ms > 0 && used > 0 {
-                self.prefill_tok_per_sec = Some(used as f32 * 1000.0 / prefill_ms as f32);
+        // Tokens actually decoded over the time spent decoding them. Using
+        // `prompt_tokens` here — one inference's prompt over every inference's
+        // prefill — is the defect this field exists to fix.
+        if let (Some(prefill_ms), decoded) = (self.prefill_ms, self.prefilled_tokens) {
+            if prefill_ms > 0 && decoded > 0 {
+                self.prefill_tok_per_sec = Some(decoded as f32 * 1000.0 / prefill_ms as f32);
             }
         }
         if let Some(decode_ms) = self.decode_ms {
@@ -113,12 +140,60 @@ mod tests {
             prefill_ms: Some(2000),
             decode_ms: Some(4000),
             prompt_tokens: 1000,
+            prefilled_tokens: 1000,
             completion_tokens: 88,
             ..Default::default()
         };
         s.finalize_rates();
         assert_eq!(s.prefill_tok_per_sec, Some(500.0));
         assert_eq!(s.decode_tok_per_sec, Some(22.0));
+    }
+
+    /// The reuse turn that made the old formula unusable: a 7,600-token prompt
+    /// of which the engine decoded 55. The rate is about what was decoded.
+    #[test]
+    fn a_reused_prefix_does_not_inflate_the_prefill_rate() {
+        let mut s = TurnStats {
+            prefill_ms: Some(2000),
+            prompt_tokens: 7636,
+            prefilled_tokens: 55,
+            reused_prefix_tokens: Some(7581),
+            ..Default::default()
+        };
+        s.finalize_rates();
+        // The old formula gave 7636/2s = 3,818 tok/s for 55 decoded tokens.
+        assert_eq!(s.prefill_tok_per_sec, Some(27.5));
+    }
+
+    /// And the opposite end: a turn whose prefill time is spread over several
+    /// inferences must not be divided into one inference's prompt.
+    #[test]
+    fn several_inferences_sum_what_each_actually_decoded() {
+        let mut s = TurnStats {
+            prefill_ms: Some(4000),
+            // Final inference's prompt, which is NOT the work done.
+            prompt_tokens: 7000,
+            // 6,800 decoded cold, then 100 more on each of two tool rounds.
+            prefilled_tokens: 7000,
+            inference_count: 3,
+            ..Default::default()
+        };
+        s.finalize_rates();
+        assert_eq!(s.prefill_tok_per_sec, Some(1750.0));
+    }
+
+    /// Everything cached: no rate, rather than a division that invents one.
+    #[test]
+    fn a_fully_cached_prompt_reports_no_prefill_rate() {
+        let mut s = TurnStats {
+            prefill_ms: Some(300),
+            prompt_tokens: 7636,
+            prefilled_tokens: 0,
+            reused_prefix_tokens: Some(7636),
+            ..Default::default()
+        };
+        s.finalize_rates();
+        assert_eq!(s.prefill_tok_per_sec, None);
     }
 
     #[test]

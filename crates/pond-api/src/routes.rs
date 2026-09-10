@@ -1606,6 +1606,8 @@ fn turn_stats_frame(s: &pond_core::shared::domain::turn_stats::TurnStats) -> Str
         "prefill_ms": s.prefill_ms,
         "decode_tok_per_sec": s.decode_tok_per_sec,
         "prefill_tok_per_sec": s.prefill_tok_per_sec,
+        "prefilled_tokens": s.prefilled_tokens,
+        "reused_prefix_tokens": s.reused_prefix_tokens,
         "prompt_tokens": s.prompt_tokens,
         "completion_tokens": s.completion_tokens,
         "reasoning_tokens": s.reasoning_tokens,
@@ -2444,6 +2446,8 @@ async fn drive_turn(
                 model_load_ms: turn_stats.as_ref().and_then(|s| s.model_load_ms),
                 decode_tok_per_sec: turn_stats.as_ref().and_then(|s| s.decode_tok_per_sec),
                 prefill_tok_per_sec: turn_stats.as_ref().and_then(|s| s.prefill_tok_per_sec),
+                prefilled_tokens: turn_stats.as_ref().map(|s| s.prefilled_tokens),
+                reused_prefix_tokens: turn_stats.as_ref().and_then(|s| s.reused_prefix_tokens),
                 context_limit_tokens: turn_stats.as_ref().and_then(|s| s.context_limit_tokens),
                 inference_count: turn_stats.as_ref().map(|s| s.inference_count),
                 // What thinking cost, and what it cost when it went wrong.
