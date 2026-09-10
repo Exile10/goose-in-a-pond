@@ -76,6 +76,14 @@ fn row_to_turn_metrics(row: &sqlx::sqlite::SqliteRow) -> TurnMetrics {
         inference_count: row
             .get::<Option<i64>, _>("inference_count")
             .map(|v| v as u32),
+        // Same NULL-vs-zero rule as 0008: a turn that decoded nothing because
+        // the prompt was cached is a measurement; a row from before 0010 is not.
+        prefilled_tokens: row
+            .get::<Option<i64>, _>("prefilled_tokens")
+            .map(|v| v as u32),
+        reused_prefix_tokens: row
+            .get::<Option<i64>, _>("reused_prefix_tokens")
+            .map(|v| v as u32),
         // Nullable, and NULL must stay None rather than becoming Some(0).
         // Migration 0008 says why: a zero from an unmeasured turn is evidence
         // that does not exist, and it averages into every conclusion drawn from
@@ -96,8 +104,9 @@ impl TelemetryPort for SqliteTelemetry {
               total_latency_ms, tool_name, tool_latency_ms, tool_cache_hit, \
               context_utilization_pct, model_name, timestamp, \
               prefill_ms, model_load_ms, decode_tok_per_sec, prefill_tok_per_sec, \
-              context_limit_tokens, inference_count, reasoning_tokens, reengagements) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              context_limit_tokens, inference_count, reasoning_tokens, reengagements, \
+              prefilled_tokens, reused_prefix_tokens) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&metrics.session_id)
         .bind(metrics.turn_number as i64)
@@ -119,6 +128,8 @@ impl TelemetryPort for SqliteTelemetry {
         .bind(metrics.inference_count.map(|v| v as i64))
         .bind(metrics.reasoning_tokens.map(|v| v as i64))
         .bind(metrics.reengagements.map(|v| v as i64))
+        .bind(metrics.prefilled_tokens.map(|v| v as i64))
+        .bind(metrics.reused_prefix_tokens.map(|v| v as i64))
         .execute(&self.pool)
         .await
         .map_err(|e| e.to_string())?;

@@ -1672,6 +1672,8 @@ impl ChatService {
                 model_load_ms: stats.model_load_ms,
                 decode_tok_per_sec: stats.decode_tok_per_sec,
                 prefill_tok_per_sec: stats.prefill_tok_per_sec,
+                prefilled_tokens: Some(stats.prefilled_tokens),
+                reused_prefix_tokens: stats.reused_prefix_tokens,
                 context_limit_tokens: stats.context_limit_tokens,
                 reasoning_tokens: stats.reasoning_tokens,
                 reengagements: Some(stats.reengagements),
@@ -1697,14 +1699,25 @@ impl ChatService {
         if let Some(ttft) = stats.ttft_ms {
             parts.push(format!("ttft {ttft}ms"));
         }
+        // The prompt and the WORK are different numbers, and printing the prompt
+        // beside a prefill duration read as a throughput that was never measured.
         match (stats.prefill_ms, stats.prefill_tok_per_sec) {
             (Some(prefill), Some(rate)) => parts.push(format!(
-                "prefill {} tok in {:.1}s ({:.0} tok/s)",
+                "prefill {} of {} tok in {:.1}s ({:.0} tok/s)",
+                stats.prefilled_tokens,
                 stats.prompt_tokens,
                 prefill as f32 / 1000.0,
                 rate
             )),
+            (Some(prefill), None) => parts.push(format!(
+                "prefill 0 of {} tok in {:.1}s (all cached)",
+                stats.prompt_tokens,
+                prefill as f32 / 1000.0
+            )),
             _ => parts.push(format!("prompt {} tok", stats.prompt_tokens)),
+        }
+        if let Some(reused) = stats.reused_prefix_tokens {
+            parts.push(format!("reused {reused} tok"));
         }
         if let (Some(decode), Some(rate)) = (stats.decode_ms, stats.decode_tok_per_sec) {
             parts.push(format!(
