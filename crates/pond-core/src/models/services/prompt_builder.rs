@@ -65,6 +65,7 @@ pub fn build_prompt_partition(
         thinking_enabled: state.thinking_enabled,
         compact_prompt: state.compact_prompt,
         native_tools_json: state.native_tools_json,
+        tools_offered: state.tools_offered,
         prefix_hash: None,
     };
 
@@ -212,6 +213,7 @@ mod tests {
             thinking_enabled: false,
             compact_prompt: false,
             native_tools_json: false,
+            tools_offered: true,
             prefix_hash: None,
         }
     }

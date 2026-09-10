@@ -117,7 +117,12 @@ impl MistralRsAgent {
     /// `native_tools_json = true` — tools travel structurally in the request
     /// body, so the template must not also render a list of them. Feeding both
     /// is how a model ends up describing tools instead of calling them.
-    async fn build_system_prompt(&self, settings: &Settings, request: &AgentRequest) -> String {
+    async fn build_system_prompt(
+        &self,
+        settings: &Settings,
+        request: &AgentRequest,
+        tools_offered: bool,
+    ) -> String {
         let devices = self.device_repo.list_devices().await.unwrap_or_default();
         let online_device_names: String = devices
             .iter()
@@ -143,6 +148,7 @@ impl MistralRsAgent {
             thinking_enabled,
             compact_prompt: false,
             native_tools_json: true,
+            tools_offered,
             prefix_hash: None,
         };
 
@@ -209,6 +215,14 @@ impl MistralRsAgent {
     /// string rather than round-tripped via `ToolDefinition` — the same reason
     /// `PondAgent` does it: a conversion is a place for the schema to change.
     async fn turn_tools(&self) -> (Vec<ToolDefinition>, Option<String>) {
+        // The same switch the goose path honours, so it means one thing on both
+        // backends rather than "no tools, unless you picked the other one".
+        if std::env::var_os("GIAP_NO_TOOLS")
+            .is_some_and(|v| !matches!(v.to_string_lossy().trim(), "" | "0" | "false" | "no"))
+        {
+            tracing::warn!("GIAP_NO_TOOLS is set — this turn is offered no tools");
+            return (Vec::new(), None);
+        }
         let Some(ref disp) = self.tools else {
             return (Vec::new(), None);
         };
@@ -334,8 +348,13 @@ impl Agent for MistralRsAgent {
         request: AgentRequest,
     ) -> Result<BoxStream<'static, Result<AgentStreamEvent>>> {
         let settings = self.settings_repo.get().await?;
-        let system_prompt = self.build_system_prompt(&settings, &request).await;
+        // Tools first: the prompt's tool-usage guidance is conditional on there
+        // being any, and telling a model with none how to call one is how a
+        // turn ends up describing a tool instead of answering.
         let (tool_defs, tools_json) = self.turn_tools().await;
+        let system_prompt = self
+            .build_system_prompt(&settings, &request, !tool_defs.is_empty())
+            .await;
 
         let caps = self.provider.capabilities();
         let context_tokens = ContextGovernor::resolve(&ContextInputs {

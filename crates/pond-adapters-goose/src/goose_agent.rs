@@ -3601,6 +3601,7 @@ impl GooseAdapter {
                 Some(registry) => registry.prompt_description_lines(compact_prompt).await,
                 None => Vec::new(),
             };
+            let has_prose_tools = !available_tools.is_empty();
 
             PromptState {
                 current_date: now.format("%A, %-d %B %Y").to_string(),
@@ -3621,6 +3622,12 @@ impl GooseAdapter {
                     settings.chat_provider.as_str(),
                     "local" | "gguf" | "mistralrs"
                 ),
+                // Whether this turn is offered tools AT ALL, which is not the
+                // same question as how they reach the model. The per-turn
+                // allow-set is computed further down, so the signal here is the
+                // registered union plus whatever prose the registry adds — both
+                // empty exactly when the pond has nothing to offer.
+                tools_offered: !registered_extensions().is_empty() || has_prose_tools,
                 prefix_hash: None, // filled by build_prompt_partition below
             }
         };
@@ -5375,6 +5382,9 @@ impl GooseAdapter {
                 settings.chat_provider.as_str(),
                 "local" | "gguf" | "mistralrs"
             ),
+            // A child's envelope names its tools exactly, so it has some
+            // whenever the pond does.
+            tools_offered: !registered_extensions().is_empty(),
             prefix_hash: None,
         };
 
