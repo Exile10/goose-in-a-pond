@@ -4263,6 +4263,24 @@ impl GooseAdapter {
 
         let user_text = {
             let mut msg = String::with_capacity(512 + request.message.len());
+            // ORDER IS LOAD-BEARING, and not for the reason it looks like.
+            //
+            // `<user-message>` comes FIRST so that stripping the envelope from a
+            // prior turn is a suffix truncation rather than a prefix shift.
+            // `strip_system_context` preserves `text[..start]`, so with the
+            // envelope trailing, everything up to it — including the user's own
+            // words — stays byte-identical between the turn that sent it and
+            // every later turn that strips it.
+            //
+            // With the envelope leading, the strip changed the message from its
+            // first byte. Measured on an Orin, 2026-09-10: the engine's
+            // `ReusePrefix` stopped at 7,096 of 7,644 cached tokens — it reused
+            // the system prompt and the tool block and re-decoded the ENTIRE
+            // conversation, every turn, growing with the session. That was the
+            // whole of a warm turn's 1.65 s TTFT.
+            msg.push_str("<user-message>\n");
+            msg.push_str(&request.message);
+            msg.push_str("\n</user-message>\n");
             // Always present now (the budget note is unconditional), so the
             // <system-context> envelope is too.
             msg.push_str("<system-context>\n");
@@ -4286,16 +4304,14 @@ impl GooseAdapter {
             }
             msg.push_str(&turn_budget_block);
             msg.push('\n');
-            // Last inside the envelope, so the answer's shape is the closest
-            // instruction to where the answer gets written. The system prefix
-            // remains authoritative; this is a restatement of the part that
-            // decays with distance. See `answer_contract`'s module docs.
+            // Last inside the envelope, and the envelope now trails the user's
+            // words, so the answer's shape is the last thing before the model
+            // writes — closer than it was. The system prefix remains
+            // authoritative; this is a restatement of the part that decays with
+            // distance. See `answer_contract`'s module docs.
             msg.push_str(&pond_core::models::services::answer_contract::answer_contract());
             msg.push('\n');
-            msg.push_str("</system-context>\n");
-            msg.push_str("<user-message>\n");
-            msg.push_str(&request.message);
-            msg.push_str("\n</user-message>");
+            msg.push_str("</system-context>");
             msg
         };
         // Held as pieces rather than one built message: empty-turn recovery
