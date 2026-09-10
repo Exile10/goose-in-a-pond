@@ -1,11 +1,14 @@
 //! Driven Port: who is deciding a draft, and how hard the policy bites.
 //!
-//! The draft MCP server is a process-wide singleton. Goose's `SpawnServerFn` is
+//! A builtin MCP server is a process-wide singleton. Goose's `SpawnServerFn` is
 //! `fn(DuplexStream, DuplexStream)` -- no session parameter, no capture -- and
 //! `ExtensionManager::add_extension` early-returns for an unchanged config, so
-//! the first session to load `giap-draft` spawns the only instance and every
-//! later session reuses it. There is therefore no per-session state to hang a
-//! speaker on, and the process-global `set_current_session_id` cannot be used:
+//! the first session to load one spawns the only instance and every later
+//! session reuses it. (The server that made this concrete was `giap-draft`,
+//! deleted on 2026-09-10; the constraint is a property of every builtin, and
+//! this port still serves the proposal REST route.) There is therefore no
+//! per-session state to hang a speaker on, and the process-global
+//! `set_current_session_id` cannot be used:
 //! `sse_semaphore` is `Semaphore::new(4)`, so four turns race that one cell and
 //! using it would trade an authorisation hole for a misattribution bug.
 //!

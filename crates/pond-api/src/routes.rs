@@ -13789,8 +13789,12 @@ fn recipe_extension_to_tool_group(name: &str) -> Option<&'static str> {
         "schedule" | "scheduler" => Some("giap-schedule"),
         "memory" => Some("giap-memory"),
         "device" | "developer" => Some("giap-device"),
-        "matter" | "home" => Some("giap-matter"),
-        "vision" => Some("giap-vision"),
+        // Home actuation is `giap-device-control`. This said `giap-matter` for
+        // as long as the mapping has existed, and `giap-matter` is the name of
+        // the matter.js WEBSOCKET PROTOCOL (`pond-adapters-matter`), never a
+        // tool group -- so a `home` recipe narrowed to a group no tool belongs
+        // to and ran with no tools at all.
+        "matter" | "home" => Some("giap-device-control"),
         _ => None,
     }
 }
@@ -17232,10 +17236,10 @@ mod tests {
 
     /// The tools this path must never expose. Each one decides on the caller's behalf, executes,
     /// or reads household data, and the direct-dispatch routes carry no caller identity to check
-    /// it against. `approve_draft` is the sharpest: the confirmation step `save_draft` forces.
+    /// it against. `giap-orchestrator__delegate` is now the sharpest; the two `giap-draft` entries
+    /// that used to head this list went with their group, and an entry naming a tool that no
+    /// longer exists asserts nothing.
     const MUST_NEVER_BE_DIRECTLY_DISPATCHABLE: &[&str] = &[
-        "giap-draft__approve_draft",
-        "giap-draft__reject_draft",
         "giap-memory__recall_memories",
         "giap-memory__save_memory",
         "giap-schedule__create_schedule",
@@ -18353,5 +18357,57 @@ mod tests {
              equivalent and the writer contract is no longer pinned by anything"
         );
         assert!(!ctx.atypical_speech);
+    }
+
+    /// Every group `recipe_extension_to_tool_group` can name must be a group
+    /// that exists.
+    ///
+    /// A mapping to a non-existent group is worse than no mapping at all. The
+    /// name is RECOGNISED, so it is not dropped with the warning the function's
+    /// doc promises; it goes into `tool_group_allowlist`, and the filter in
+    /// `goose_agent`'s recipe branch then keeps the tools whose prefix matches
+    /// it -- of which there are none. The recipe runs with zero tools and the
+    /// only trace is a `recipe_tools_restricted` line saying `kept = 0`.
+    ///
+    /// Two mappings were in that state: `giap-vision`, whose group was deleted,
+    /// and `giap-matter`, which was never a tool group at all -- it is the
+    /// matter.js websocket protocol name.
+    #[test]
+    fn every_recipe_extension_maps_to_a_tool_group_that_exists() {
+        // The goose-side names this function is willing to translate. Kept
+        // literal rather than derived: the point is to exercise the match arms.
+        const RECIPE_EXTENSION_NAMES: &[&str] = &[
+            "weather",
+            "schedule",
+            "scheduler",
+            "memory",
+            "device",
+            "developer",
+            "matter",
+            "home",
+        ];
+
+        let mut mapped = 0usize;
+        for name in RECIPE_EXTENSION_NAMES {
+            let Some(group) = recipe_extension_to_tool_group(name) else {
+                panic!(
+                    "'{name}' is in this test's list but maps to nothing -- either the arm was                      removed on purpose, in which case drop it from the list, or by accident"
+                );
+            };
+            mapped += 1;
+            assert!(
+                pond_core::mcp::domain::tool_group::is_catalog_extension(group),
+                "recipe extension '{name}' maps to '{group}', which is not in TOOL_GROUPS. A                  recipe declaring `extensions: [{name}]` will narrow to that group, match no                  tool, and run with none."
+            );
+        }
+
+        // Vacuity control: if the arms were renamed, every lookup would return
+        // None and the loop above would panic -- but if the list were emptied,
+        // it would pass having asserted nothing.
+        assert_eq!(
+            mapped,
+            RECIPE_EXTENSION_NAMES.len(),
+            "the mapping list is not exercising the match arms"
+        );
     }
 }

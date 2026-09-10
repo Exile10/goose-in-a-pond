@@ -45,16 +45,18 @@ pub struct TurnMetrics {
     /// Prefill time (template + tokenize + prompt decode), summed across the
     /// turn's inferences. Engine-reported; None for providers without stats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_ms: Option<u64>,
     /// Prompt tokens this turn actually DECODED, summed across its inferences.
     /// `Some(0)` means everything came from the KV cache; `None` means the
     /// backend reports no `ProviderStats`. See migration 0010 for why
     /// `prefill_tok_per_sec` alone could not answer this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefilled_tokens: Option<u32>,
     /// Prompt tokens served from a retained KV cache instead of decoded, summed
     /// across the turn's inferences. `Some(0)` on turn 2+ means the prefix
     /// stopped being token-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reused_prefix_tokens: Option<u32>,
-    pub prefill_ms: Option<u64>,
     /// Cold model-load time when a load happened during this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_load_ms: Option<u64>,

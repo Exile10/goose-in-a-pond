@@ -55,7 +55,7 @@ pub const TOOL_SELECTION_MODE_RELEVANT: &str = "relevant";
 /// 327 tokens, and a tool costs ~74 characters of JSON envelope before it says
 /// anything at all: 27 tools breach the target with empty schemas. "relevant"
 /// cannot reach it either — its core floor (memory + system + toolkit) is 778
-/// tokens, 9.5%. Two tools, 209 tokens, 2.6%, is what is left.
+/// tokens, 9.5%. Two tools, 222 tokens, 2.7%, is what is left.
 ///
 /// The date and time ride in `<system-context>` every turn, so the most-asked
 /// capability does not need a tool to be present for it.
@@ -794,18 +794,24 @@ pub struct Settings {
     pub prefix_cache_prompt: bool,
 
     /// Which extension tool SCHEMAS reach the model: `"all"` (default) |
-    /// `"relevant"`.
+    /// `"relevant"` | `"minimal"`.
     ///
-    /// `"all"` sends every registered `giap-*` tool on every turn — 59 tools at
-    /// roughly 100 tokens each through the Gemma chat template, i.e. ~5.9K of an
-    /// 8K-class on-device prompt budget spent before the conversation starts.
+    /// `"all"` sends every registered `giap-*` tool on every turn — 27 tools,
+    /// ~3,339 tokens, 40.8% of the 8,192-token local prompt budget spent before
+    /// the conversation starts.
     ///
-    /// `"relevant"` keeps a small always-on core (draft, memory, system, and the
-    /// discovery escape hatch) plus the groups scored relevant to the session's
-    /// opening message, chosen ONCE per session so the KV prompt prefix stays
-    /// reusable across turns. The model can pull in any dormant group itself via
-    /// `enable_tool_group`, so nothing becomes unreachable — and this never
-    /// decides WHETHER tools are used, only which schemas are in the prompt.
+    /// `"relevant"` keeps a small always-on core (memory, system, and the
+    /// toolkit escape hatch — 778 tokens, 9.5%) plus the groups scored relevant
+    /// to the session's opening message, chosen ONCE per session so the KV
+    /// prompt prefix stays reusable across turns.
+    ///
+    /// `"minimal"` keeps only the hatch — 222 tokens, 2.7%, the one setting
+    /// that fits a 4% ceiling — and every group arrives when the model asks.
+    ///
+    /// The model can pull in any dormant group itself via `enable_tool_group`,
+    /// so nothing becomes unreachable under either narrowing mode — and this
+    /// never decides WHETHER tools are used, only which schemas are in the
+    /// prompt.
     ///
     /// Defaults to `"all"`: existing installs see no behaviour change until the
     /// operator opts in.
@@ -2333,6 +2339,59 @@ mod tests {
             assert!(
                 !s.tool_selection_is_relevant(),
                 "'{bogus}' must not enable narrowing"
+            );
+        }
+    }
+
+    /// The same exactness rule for "minimal", and the gate that decides whether
+    /// the per-session group machinery runs at all.
+    ///
+    /// `tool_selection_narrows()` returning false for "minimal" would put those
+    /// sessions back on the unnarrowed path with the full tool surface -- the
+    /// feature silently off, the setting still reading "minimal". Nothing
+    /// exercised either method when they were added beside
+    /// `tool_selection_is_relevant`, which is how a gate like that stays broken.
+    #[test]
+    fn minimal_narrows_and_only_the_exact_string_does() {
+        let mut s = Settings::default();
+        assert!(!s.tool_selection_is_minimal(), "the default is not minimal");
+        assert!(!s.tool_selection_narrows(), "the default must not narrow");
+
+        s.tool_selection_mode = TOOL_SELECTION_MODE_MINIMAL.to_string();
+        assert!(s.tool_selection_is_minimal());
+        assert!(s.tool_selection_narrows(), "minimal is a narrowing mode");
+        assert!(
+            !s.tool_selection_is_relevant(),
+            "minimal must not read as relevant -- they take different paths"
+        );
+
+        s.tool_selection_mode = TOOL_SELECTION_MODE_RELEVANT.to_string();
+        assert!(s.tool_selection_narrows(), "relevant is a narrowing mode");
+        assert!(!s.tool_selection_is_minimal());
+
+        for bogus in ["Minimal", "minimum", "none", "hatch", "", "true"] {
+            s.tool_selection_mode = bogus.to_string();
+            assert!(
+                !s.tool_selection_is_minimal() && !s.tool_selection_narrows(),
+                "'{bogus}' must not narrow anything"
+            );
+        }
+    }
+
+    /// Every accepted value must be reachable through the validator, or the
+    /// mode exists in the domain and is refused at the API.
+    #[test]
+    fn every_tool_selection_mode_is_a_mode_some_predicate_recognises() {
+        for mode in TOOL_SELECTION_MODES {
+            let mut s = Settings::default();
+            s.tool_selection_mode = (*mode).to_string();
+            let recognised = *mode == TOOL_SELECTION_MODE_ALL
+                || s.tool_selection_is_relevant()
+                || s.tool_selection_is_minimal();
+            assert!(
+                recognised,
+                "'{mode}' is in TOOL_SELECTION_MODES, so PUT /settings accepts it, but no \
+                 predicate recognises it -- it would store and then behave as \"all\""
             );
         }
     }

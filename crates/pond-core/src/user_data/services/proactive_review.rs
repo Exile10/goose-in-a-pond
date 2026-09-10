@@ -26,10 +26,15 @@
 //! # The reviewer cannot write its own proposal, and that shapes everything
 //!
 //! PAI-6's `groups_denied_to_subagents` withholds the actuating groups from every
-//! child, because the draft decision gate cannot resolve a subagent as an
-//! actor. A proposal is a `drafts` row. So the reviewer **cannot stage one**,
-//! and no amount of role configuration would let it: the group is subtracted
-//! after the role's request, not from it.
+//! child, because nothing in a subagent's turn can resolve it as an actor with
+//! the household's authority. So the reviewer **cannot act**, and no amount of
+//! role configuration would let it: the groups are subtracted after the role's
+//! request, not from it.
+//!
+//! This paragraph used to argue the point through `giap-draft`, the staging
+//! group — a proposal was a `drafts` row and the child could not write one.
+//! That group is gone; the property is unchanged and now rests directly on the
+//! actuating groups, which is what it always actually rested on.
 //!
 //! That is not a limitation to work around — it is the safety property. The
 //! subagent produces *words*; the loop that spawned it — which holds the
@@ -727,7 +732,7 @@ impl ReviewYield {
 /// Turn a finished run's answer into proposals.
 ///
 /// **This is the writer the subagent cannot be.** See the module docs: a child
-/// may not hold `giap-draft`, so the words come from the model and every fact
+/// holds no actuating group, so the words come from the model and every fact
 /// about the resulting row comes from here — the audience, the id, the expiry,
 /// the action kind and the cap.
 ///
@@ -1614,7 +1619,6 @@ mod tests {
         assert!(out.refusals.is_empty(), "silence is a valid review");
     }
 
-    #[test]
     /// A balanced pair inside a string proves nothing about the string
     /// tracking — the depth goes up and comes back down, so a scanner that
     /// cannot see strings gets the same answer. Verified by mutation: deleting

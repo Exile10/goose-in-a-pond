@@ -363,12 +363,21 @@ have reported it. When adding a sender, ask what the guard can SEE, not what it 
 
 ### 3.6 The outbound-action gate
 
-`giap-draft` is unconditionally registered as a safety extension (grep
-`register_builtin_extension("giap-draft"` in `giap_registration.rs`) and models save / list /
-approve / reject (grep `async fn approve_draft` in `pond-mcp-server/src/draft.rs`). Every
-side-effecting action from a connector — send, post, publish, delete — routes through it, scoped to
-the acting profile. This is reuse of a mechanism that exists and is already trusted, not a new
-approval system.
+> **This gate no longer exists, 2026-09-10.** `giap-draft` was deleted with five other tool groups
+> to cut the prompt's tool payload, and it was the pond's only staging-and-confirmation surface. The
+> paragraph below describes what was there; read it as history, not as a mechanism to grep for.
+>
+> What survives: the rule it carried is now prose on `set_device_state`'s own description — unlocking
+> a door or disarming an alarm needs the user's explicit go-ahead in the same message. That is a
+> prompt-surface control, weaker than a tool that could not execute without a second call. The event
+> log still records every action; nothing reads it back through a tool now that `giap-audit` is gone
+> either. **A replacement gate is unbuilt, and PAI-2 P-outbound should be treated as regressed rather
+> than satisfied until one exists.**
+
+`giap-draft` was unconditionally registered as a safety extension and models saved / listed /
+approved / rejected. Every side-effecting action from a connector — send, post, publish, delete —
+routed through it, scoped to the acting profile. This was reuse of a mechanism that existed and was
+already trusted, not a new approval system.
 
 > **Two corrections, 2026-08-05.** The `draft.rs:97,167,200,248` citation above had rotted — two of
 > the four line numbers were wrong when P1 went looking. Grep for the symbol, as this section now

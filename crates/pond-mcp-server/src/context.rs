@@ -380,7 +380,7 @@ impl ServerHandler for ContextMcpServer {
 
 // ── Static deps + spawn function for Goose's builtin registry ───────────────
 //
-// Same shape as `init_draft_deps` / `init_orchestrator_deps`, and for the same
+// Same shape as `init_orchestrator_deps`, and for the same
 // reason: `SpawnServerFn` is `fn(DuplexStream, DuplexStream)` — no parameters,
 // no capture — so the repositories have to arrive through a global installed at
 // startup.

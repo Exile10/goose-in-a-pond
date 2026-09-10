@@ -201,9 +201,7 @@ impl MistralRsAgent {
     async fn turn_tools(&self) -> (Vec<ToolDefinition>, Option<String>) {
         // The same switch the goose path honours, so it means one thing on both
         // backends rather than "no tools, unless you picked the other one".
-        if std::env::var_os("GIAP_NO_TOOLS")
-            .is_some_and(|v| !matches!(v.to_string_lossy().trim(), "" | "0" | "false" | "no"))
-        {
+        if pond_core::mcp::domain::tool_group::no_tools_env_set() {
             tracing::warn!("GIAP_NO_TOOLS is set — this turn is offered no tools");
             return (Vec::new(), None);
         }

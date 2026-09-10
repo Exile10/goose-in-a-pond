@@ -43,9 +43,6 @@ const PREFIX_SCHEDULE: &str = "giap-schedule__";
 const PREFIX_SYSTEM: &str = "giap-system__";
 const PREFIX_DEVICE: &str = "giap-device__";
 const PREFIX_DEVICE_CONTROL: &str = "giap-device-control__";
-/// Prefix for the audit / privacy tools (`get_recent_activity`, `summarize_activity`,
-/// privacy report). These ARE callable Goose builtin extension tools.
-///
 
 // No hardcoded tool list — all tools discovered dynamically via ServerHandler::list_tools().
 

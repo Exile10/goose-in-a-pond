@@ -912,6 +912,13 @@ export interface TurnStats {
   prefill_ms: number | null;
   decode_tok_per_sec: number | null;
   prefill_tok_per_sec: number | null;
+  // What the turn actually decoded, and what it got back from the KV cache.
+  // `prefill_tok_per_sec` is a rate over `prefilled_tokens`, not `prompt_tokens`:
+  // on a warm turn most of the prompt is reused and never prefilled at all.
+  // `reused_prefix_tokens === 0` on turn 2+ means the prefix stopped being
+  // token-stable, which is the single most useful number here.
+  prefilled_tokens: number | null;
+  reused_prefix_tokens: number | null;
   prompt_tokens: number;
   completion_tokens: number;
   context_used_tokens: number | null;

@@ -6,8 +6,8 @@
 //! `GET /api/v1/settings` serialises that struct wholesale, so every key was in
 //! the response body.
 //!
-//! Installed separately by `pond-server` — the same shape as `init_audit_deps`
-//! and `init_vision_deps` — rather than threaded through
+//! Installed separately by `pond-server` — the same shape as the other
+//! `init_*_deps` entry points — rather than threaded through
 //! `register_giap_extensions`. Two reasons. The secret repository is built after
 //! the agent backend in `serve()`, and the tools only read it at chat time. And
 //! there must be exactly ONE instance in the process: `FileSecretRepository`

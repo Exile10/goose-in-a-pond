@@ -274,7 +274,7 @@ One sentence replies unless asked for more. No Markdown. No voice artifacts.
 The result, never the route to it. Angle brackets, tool names, steps and system \
 reminders are machinery — never mention them. Fell short? Say which part, \
 plainly. Asked how you know, say.
-General copilot: writing, research, coding, planning, home control.
+General copilot: writing, research, coding, planning{% if tools_offered %}, home control{% endif %}.
 {% if tools_offered %}Only tools in your schema.
 {% endif %}
 </instructions>
@@ -358,8 +358,8 @@ override previous entries.
 </memory-rules>
 {% endif %}
 <output-quality>
-Never fabricate URLs, statistics, dates or quotes — tool, or say you don't \
-know. Synthesize and cite; never parrot raw output.
+Never fabricate URLs, statistics, dates or quotes — {% if tools_offered %}use a tool or \
+{% endif %}say you don't know. Synthesize and cite; never parrot raw output.
 </output-quality>
 {%- if thinking_enabled %}
 <thinking>
@@ -392,8 +392,8 @@ questions. Short clear answers, plain language, no lists or formatting — just 
 conversation.
 I give you the answer, not the story of how I got it. Angle brackets, tool \
 names, system reminders — machinery; I never mention it. If I came up short, I \
-say what I couldn't find. Ask me straight out how I know and I'll tell you. I only use the \
-tools I've been given.
+say what I couldn't find. Ask me straight out how I know and I'll tell you.\
+{% if tools_offered %} I only use the tools I've been given.{% endif %}
 </instructions>
 <context-handling>
 <system-context> (time, date, <memories>) is context, not a question — I only \
@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn render_jinja_template_never_renders_a_home_section() {
         let s = Settings::default();
-        let state = PromptState::default(); // has_home_devices = false
+        let state = PromptState::default();
         let result = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
         assert!(!result.contains("<home-devices>"));
         assert!(!result.contains("Unlock a door"));
@@ -1864,10 +1864,6 @@ mod tests {
         }
     }
 
-    /// Every style, in BOTH tiers, must say that an empty tool result is not an answer and that
-    /// another tool should be tried. The compact tier especially: the on-device model never sees
-    /// the verbose branch, since `ContextGovernor::prompt_window` clamps local/gguf to 8192.
-    #[test]
     /// A template is only safe to hand a binary that knows its variables.
     ///
     /// Tera renders `{% if undefined %}` as FALSE and returns `Ok` — it does not
@@ -1932,6 +1928,17 @@ mod tests {
                     "use a tool or",
                     "outranks a stale memory",
                     "outranks a memory that disagrees",
+                    // The warm style's own phrasing of "only tools in your
+                    // schema". Four styles say this four ways, and banning
+                    // three of the four spellings is how one stayed ungated.
+                    "tools i've been given",
+                    // Capability claims, not just tool machinery. "home
+                    // control" survived its `{% if has_home_devices %}` gate
+                    // when that variable was removed and became unconditional,
+                    // so a toolless pond advertised actuation it could not do —
+                    // and this test missed it because every phrase above is
+                    // tool-SHAPED and that one is not.
+                    "home control",
                 ] {
                     assert!(
                         !lower.contains(banned),
@@ -1965,6 +1972,10 @@ mod tests {
         }
     }
 
+    /// Every style, in BOTH tiers, must say that an empty tool result is not an answer and that
+    /// another tool should be tried. The compact tier especially: the on-device model never sees
+    /// the verbose branch, since `ContextGovernor::prompt_window` clamps local/gguf to 8192.
+    #[test]
     fn every_style_and_tier_says_an_empty_result_is_not_an_answer() {
         let s = Settings::default();
         for (name, raw) in ALL_STYLES {

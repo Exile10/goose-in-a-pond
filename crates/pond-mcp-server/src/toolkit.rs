@@ -5,7 +5,7 @@
 //! ## Why this exists
 //!
 //! Phase D narrows which extension tool schemas reach the model, per session, so
-//! a 59-tool surface (~5.9K prompt tokens through the Gemma chat template) fits
+//! a 27-tool surface (~3,339 prompt tokens, 40.8% of the budget) fits
 //! an 8K-class on-device budget. Narrowing is only safe if the model can reach a
 //! capability that was not preloaded — otherwise a mis-scored session is a dead
 //! end and the user just gets a worse assistant.
@@ -353,7 +353,8 @@ mod tests {
     /// every local provider gets, whatever its n_ctx), 4% of which is 327
     /// tokens. Tool JSON tokenizes at very close to 4 chars/token on the Gemma
     /// template — the 61-tool payload measured 30,463 chars against 7,633
-    /// counted prompt tokens, 0.2% off — so the ceiling in characters is 1,310.
+    /// counted prompt tokens, 0.2% off — so the ceiling in characters is 1,308
+    /// (the arithmetic below truncates twice, which is why it is not 1,310).
     ///
     /// Measured on the real serialized schemas rather than the source text,
     /// because what costs tokens is what `list_all()` hands the model: adding

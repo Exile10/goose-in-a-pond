@@ -31,7 +31,7 @@ pub fn registered_extensions() -> &'static [String] {
 
 /// Register GIAP MCP servers as Goose builtin extensions, respecting the `ext_*_enabled` toggles.
 /// Must be called once at process startup before any GooseAdapter session; returns the names
-/// actually registered. `giap-draft` is always on (safety feature, not toggleable).
+/// actually registered. `giap-toolkit` is always on (the escape hatch, not toggleable).
 pub fn register_giap_extensions(
     settings: &Settings,
     memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
@@ -50,14 +50,12 @@ pub fn register_giap_extensions(
     // final tool list is handed over, which is what actually guarantees "no
     // tools": goose registers platform extensions of its own, and a user can
     // add an MCP server, neither of which passes through here. This early
-    // return is the cheaper half — it stops fourteen servers starting for a
+    // return is the cheaper half — it stops eleven servers starting for a
     // pond that will offer none of them.
-    if std::env::var_os("GIAP_NO_TOOLS")
-        .is_some_and(|v| !matches!(v.to_string_lossy().trim(), "" | "0" | "false" | "no"))
-    {
+    if pond_core::mcp::domain::tool_group::no_tools_env_set() {
         tracing::warn!(
-            "GIAP_NO_TOOLS is set — registering no extensions at all. \
-             Unset it to restore normal behaviour."
+            "{} is set — registering no extensions at all. Unset it to restore normal behaviour.",
+            pond_core::mcp::domain::tool_group::NO_TOOLS_ENV
         );
         println!("  Extensions: NONE (GIAP_NO_TOOLS is set)");
         return Ok(Vec::new());
@@ -69,8 +67,10 @@ pub fn register_giap_extensions(
     let mut registered = Vec::new();
 
     // ── Always-on: toolkit server (Phase D2 escape hatch) ───────────────────
-    // Not toggleable: under `tool_selection_mode = "relevant"` its two tools let the model load a
-    // group nobody predicted. Its `ToolSelectionControl` handle is set by `init_toolkit_deps`
+    // Not toggleable: under `"relevant"` its two tools let the model load a group nobody
+    // predicted, and under `"minimal"` they are the ENTIRE tool surface — turning this off
+    // there would leave a pond that can never reach a tool again. Its
+    // `ToolSelectionControl` handle is set by `init_toolkit_deps`
     // in pond-server (the adapter is built after this call); without it both report all loaded.
     register_builtin_extension(
         pond_core::mcp::domain::tool_group::TOOLKIT_EXTENSION,

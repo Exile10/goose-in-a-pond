@@ -1709,10 +1709,22 @@ impl ChatService {
                 prefill as f32 / 1000.0,
                 rate
             )),
+            // No rate, for either of the two reasons `finalize_rates` withholds
+            // one: nothing was decoded, or it took no measurable time. Print
+            // what was actually decoded rather than assuming the first --
+            // hardcoding 0 here claimed "all cached" for a turn that had
+            // prefilled tokens and a sub-millisecond prefill, which is a lie in
+            // the one line this exists to make honest.
             (Some(prefill), None) => parts.push(format!(
-                "prefill 0 of {} tok in {:.1}s (all cached)",
+                "prefill {} of {} tok in {:.1}s{}",
+                stats.prefilled_tokens,
                 stats.prompt_tokens,
-                prefill as f32 / 1000.0
+                prefill as f32 / 1000.0,
+                if stats.prefilled_tokens == 0 {
+                    " (all cached)"
+                } else {
+                    ""
+                }
             )),
             _ => parts.push(format!("prompt {} tok", stats.prompt_tokens)),
         }
