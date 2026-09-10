@@ -2007,6 +2007,34 @@ mod tests {
     /// another tool should be tried. The compact tier especially: the on-device model never sees
     /// the verbose branch, since `ContextGovernor::prompt_window` clamps local/gguf to 8192.
     #[test]
+    /// A template is only safe to hand a binary that knows its variables.
+    ///
+    /// Tera renders `{% if undefined %}` as FALSE and returns `Ok` — it does not
+    /// error, so `render_jinja_template`'s fallback never fires and nothing is
+    /// logged. A pond whose `prompt_templates` rows are newer than its binary
+    /// therefore drops every tool section silently while still offering the
+    /// model a full tool array: the worst version of this bug, because the
+    /// prompt looks fine and the model simply stops being told what tools are
+    /// for.
+    ///
+    /// This is why the DB rows and the binary move together — the reseed at
+    /// boot is what keeps them in step, and hand-editing `prompt_templates` on
+    /// a device running an older build is not a shortcut for deploying.
+    #[test]
+    fn an_undefined_guard_renders_false_and_does_not_error() {
+        let out = tera::Tera::one_off(
+            "A{% if tools_offered %}B{% endif %}C",
+            &tera::Context::new(),
+            false,
+        );
+        assert_eq!(
+            out.expect("Tera treats an undefined guard as falsy, not as an error"),
+            "AC",
+            "if this ever starts erroring instead, the fallback path in \
+             render_jinja_template would leak raw Jinja markup into the system prompt"
+        );
+    }
+
     /// The other half of the tool sections: when a turn is offered NO tools, the
     /// prompt must not spend tokens telling the model how to call one.
     ///
