@@ -47,6 +47,19 @@ pub const TOOL_SELECTION_MODE_ALL: &str = "all";
 /// `tool_selection_mode`: core groups plus the groups scored relevant to the
 /// session, chosen once at session start (Phase D2).
 pub const TOOL_SELECTION_MODE_RELEVANT: &str = "relevant";
+/// `tool_selection_mode`: the toolkit escape hatch and nothing else — every
+/// other group arrives only when the model calls `enable_tool_group`.
+///
+/// This is the only mode that fits the 4%-of-prompt-budget target. The prompt
+/// budget for a local provider is `LOCAL_PROMPT_CLAMP` = 8,192 tokens, so 4% is
+/// 327 tokens, and a tool costs ~74 characters of JSON envelope before it says
+/// anything at all: 27 tools breach the target with empty schemas. "relevant"
+/// cannot reach it either — its core floor (memory + system + toolkit) is 778
+/// tokens, 9.5%. Two tools, 209 tokens, 2.6%, is what is left.
+///
+/// The date and time ride in `<system-context>` every turn, so the most-asked
+/// capability does not need a tool to be present for it.
+pub const TOOL_SELECTION_MODE_MINIMAL: &str = "minimal";
 
 /// `security_policy_mode`: no evaluation, no audit trail. Debugging only.
 pub const SECURITY_POLICY_MODE_OFF: &str = "off";
@@ -96,7 +109,11 @@ pub const REASONING_EFFORTS: &[&str] = &["brief", "balanced", "thorough"];
 // `settings_validation::FIELD_RULES`, which is what actually applies them.
 
 /// How many tools a turn is offered. See `tool_selection_mode`.
-pub const TOOL_SELECTION_MODES: &[&str] = &[TOOL_SELECTION_MODE_ALL, TOOL_SELECTION_MODE_RELEVANT];
+pub const TOOL_SELECTION_MODES: &[&str] = &[
+    TOOL_SELECTION_MODE_ALL,
+    TOOL_SELECTION_MODE_RELEVANT,
+    TOOL_SELECTION_MODE_MINIMAL,
+];
 
 /// The agent loop that serves turns.
 ///
@@ -1676,6 +1693,27 @@ impl Settings {
     /// unrecognised value must never silently narrow the model's tool surface.
     pub fn tool_selection_is_relevant(&self) -> bool {
         self.tool_selection_mode == TOOL_SELECTION_MODE_RELEVANT
+    }
+
+    /// Whether the session is offered the toolkit escape hatch and nothing else.
+    ///
+    /// Same exact-string discipline as `tool_selection_is_relevant`: an
+    /// unrecognised value must never silently narrow the tool surface, and this
+    /// mode narrows it further than any other.
+    pub fn tool_selection_is_minimal(&self) -> bool {
+        self.tool_selection_mode == TOOL_SELECTION_MODE_MINIMAL
+    }
+
+    /// Whether ANY narrowing is in force — the gate on the per-session group
+    /// machinery (resolution, persistence, the dormant-groups note, and the
+    /// `enable_tool_group` bound).
+    ///
+    /// Both narrowing modes need that machinery: "minimal" needs it more, since
+    /// every capability past the hatch is reached through it. Gating on
+    /// `tool_selection_is_relevant()` alone would leave "minimal" sessions
+    /// unable to persist a group the model had just enabled.
+    pub fn tool_selection_narrows(&self) -> bool {
+        self.tool_selection_is_relevant() || self.tool_selection_is_minimal()
     }
     fn default_agent_timeout_secs() -> u64 {
         300

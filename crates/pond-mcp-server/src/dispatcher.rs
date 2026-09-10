@@ -531,30 +531,6 @@ mod tests {
         let http_client = crate::build_http_client();
 
         // Mock settings repo
-        struct MockSettings;
-        #[async_trait]
-        impl pond_core::user_data::ports::settings::SettingsRepository for MockSettings {
-            async fn get(
-                &self,
-            ) -> anyhow::Result<pond_core::user_data::domain::settings::Settings> {
-                Ok(pond_core::user_data::domain::settings::Settings::default())
-            }
-            async fn update(
-                &self,
-                _: &pond_core::user_data::domain::settings::Settings,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-            async fn get_key(&self, _: &str) -> anyhow::Result<Option<String>> {
-                Ok(None)
-            }
-            async fn set_key(&self, _: &str, _: String) -> anyhow::Result<()> {
-                Ok(())
-            }
-        }
-        let settings: Arc<dyn pond_core::user_data::ports::settings::SettingsRepository> =
-            Arc::new(MockSettings);
-
         // All servers that don't require complex real deps
         let servers: Vec<(&str, Box<dyn McpServerBridge>)> = vec![
             (
