@@ -1547,39 +1547,6 @@ impl GooseAdapter {
         (settings.chat_provider, resolution)
     }
 
-    /// PAI-4 P3's verbatim horizon for this turn, or `None` when age weighting
-    /// is off.
-    ///
-    /// Prefers the value cached by `apply_goose_env_knobs`, exactly as
-    /// `window_and_provider` does, so the per-turn trim costs no settings read.
-    /// The cold path is a session trimmed before the settings path has ever
-    /// run; falling back to `Settings::default()` there rather than to "off"
-    /// keeps a missing cache from silently disabling the feature.
-    /// The guard is released in its own scope BEFORE the settings await. A
-    /// `MutexGuard` held across an await makes the whole future non-`Send`, and
-    /// `AgentPort`'s boxed futures require `Send` — so the first version of this
-    /// compiled nowhere and failed only under
-    /// `cargo check -p pond-adapters-goose`, which the fast-crate lint pass does
-    /// not run. `window_and_provider` avoids the same trap by cloning out of the
-    /// lock and returning early.
-    async fn verbatim_horizon(&self) -> Option<std::time::Duration> {
-        let cached = *self
-            .last_verbatim_days
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let days = match cached {
-            Some(days) => days,
-            None => {
-                self.settings_repo
-                    .get()
-                    .await
-                    .unwrap_or_default()
-                    .compaction_verbatim_days
-            }
-        };
-        pond_core::models::services::context::turn_trimmer::verbatim_horizon_from_days(days)
-    }
-
     /// The budget profile for this turn: history from the full resolved window,
     /// preamble from the prompt-side clamp.
     ///
@@ -2567,249 +2534,6 @@ impl GooseAdapter {
             .clone()
     }
 
-    /// Deterministically trim goose's stored conversation for this session:
-    /// strip stale <system-context> blocks from prior user turns, splice the
-    /// rolling <conversation-summary>, drop the oldest complete turns beyond the
-    /// profile's history budget, and cap how many historical images keep real
-    /// pixels. Never calls a model; errors are logged and skipped — a failed
-    /// trim must never block the turn.
-    ///
-    /// Runs only when `hybrid_compaction_enabled` (the default), which is also
-    /// what gates the image cap.
-    async fn trim_goose_history(&self, goose_sid: &str, giap_session_id: &str) {
-        use pond_core::models::services::context::turn_trimmer::{
-            trim_history, CurrentTurn, TrimMessage, TrimRole,
-        };
-
-        let conversation = match self.session_manager.get_session(goose_sid, true).await {
-            Ok(s) => match s.conversation {
-                Some(c) => c,
-                None => return,
-            },
-            Err(e) => {
-                tracing::debug!("trim: goose session unavailable: {e}");
-                return;
-            }
-        };
-        let source = conversation.messages().clone();
-        if source.is_empty() {
-            return;
-        }
-
-        // Rolling summary from GIAP storage (idle-refreshed).
-        let rolling_summary = match &self.giap_session_storage {
-            Some(storage) => storage
-                .get_rolling_summary(giap_session_id)
-                .await
-                .ok()
-                .and_then(|(s, _)| s),
-            None => None,
-        };
-
-        let profile = self.turn_profile(giap_session_id).await;
-        let last_real = self
-            .last_prompt_tokens_handle()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(giap_session_id)
-            .copied();
-
-        // Wall-clock now, in unix seconds, for PAI-4 P3's age weighting.
-        // `Message::created` is the same epoch. A clock that cannot be read at
-        // all yields `None` ages, which the trimmer treats as recent — the
-        // narrowing direction, and never a failed turn.
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs());
-
-        let trim_input: Vec<TrimMessage> = source
-            .iter()
-            .enumerate()
-            .map(|(index, m)| {
-                let has_tool_response = m.content.iter().any(|c| {
-                    matches!(
-                        c,
-                        goose::conversation::message::MessageContent::ToolResponse(_)
-                    )
-                });
-                let text = m.as_concat_text();
-                let role = if has_tool_response {
-                    TrimRole::ToolResult
-                } else {
-                    match m.role {
-                        rmcp::model::Role::User => TrimRole::User,
-                        rmcp::model::Role::Assistant => TrimRole::Assistant,
-                    }
-                };
-                let is_summary = text.trim_start().starts_with("<conversation-summary>");
-                // `saturating_sub` is the clock-skew rule, and it matches the
-                // one `resume_compaction::idle_gap_since` already uses: a
-                // message stamped in the future reads as age 0 (recent), never
-                // as an enormous positive age that would degrade it.
-                let age_secs = now_secs.map(|now| now.saturating_sub(m.created.max(0) as u64));
-                TrimMessage {
-                    index,
-                    role,
-                    text,
-                    is_summary,
-                    age_secs,
-                }
-            })
-            .collect();
-
-        // `CurrentTurn::NotYetAppended` is the same fact the image cap below
-        // already relies on: this runs before `Agent::reply`, so the newest user
-        // message in the conversation is the PREVIOUS turn's, not this one's.
-        // The trimmer used to assume the opposite and spare it, which left that
-        // turn's `<system-context>` — its date, its selected memories, its
-        // turn-budget note — to be re-prefilled as though it were current, and
-        // put two conflicting blocks in front of the model. It also meant
-        // `outcome.changed` was true on every turn from the third onwards, so
-        // the early return below never fired and every turn rewrote goose's
-        // whole message table.
-        let outcome = trim_history(
-            trim_input,
-            &profile,
-            rolling_summary.as_deref(),
-            last_real,
-            self.token_counter().await,
-            CurrentTurn::NotYetAppended,
-            self.verbatim_horizon().await,
-            // PAI-4 P5. Read through the port method rather than the field, so
-            // whatever a future caller (P7's compact endpoint) sees is exactly
-            // what the trimmer acted on — one reading, not two.
-            PrefixCacheState::posture_of(
-                pond_core::models::ports::agent::Agent::prefix_cache_state(self).as_ref(),
-            ),
-        );
-
-        // ── Live-history image cap (phase F2, live half) ──────────────────
-        //
-        // Same policy the hydration replay uses, applied to the conversation
-        // the engine already holds: only the most recent image-bearing turn
-        // keeps real pixels, everything older degrades to a text placeholder.
-        //
-        // Without it every image in the transcript is re-encoded on every
-        // later turn. Measured on a four-turn production conversation: 1, then
-        // 2, then 3 encodes per turn at 0.7-2.7s each, prefill 28s -> 37s. The
-        // cost is unbounded in the length of the conversation.
-        //
-        // The image on the turn about to be sent is NOT counted — it has not
-        // been appended to Goose's conversation yet, so it is not history, and
-        // this session still gets one fresh image plus one from before.
-        let (had_images, keep_images, images_dropped) =
-            plan_live_image_cap(&source, &outcome.messages);
-
-        // A conversation with no images (or one already inside the budget) must
-        // come out byte-identical: the trimmer's own `changed` flag is still the
-        // only thing that can trigger a rewrite.
-        if !outcome.changed && images_dropped == 0 {
-            return;
-        }
-
-        // Rebuild: original messages survive untouched unless (a) they are the
-        // spliced summary (fresh user message), (b) their text changed AND they
-        // are plain-text messages, (c) they carry an oversized structured tool
-        // response, whose TEXT bodies are truncated in place, or (d) they carry
-        // images over the history budget.
-        //
-        // (c) and (d) are the only cases that rewrite a structured message, and
-        // both do so by cloning the original and editing its content in place —
-        // ids, annotations, error flags and the tool-request/response pairing
-        // are preserved byte-for-byte. That pairing is load-bearing: an orphaned
-        // or re-keyed tool response is rejected by the provider, which is why
-        // (d) refuses to touch any message carrying tool parts at all.
-        let mut rebuilt: Vec<goose::conversation::message::Message> = Vec::new();
-        for (i, tm) in outcome.messages.iter().enumerate() {
-            if tm.is_summary || tm.index == usize::MAX {
-                rebuilt.push(goose::conversation::message::Message::user().with_text(&tm.text));
-                continue;
-            }
-            let original = &source[tm.index];
-            if let Some(truncated) = truncate_tool_response_text(
-                original,
-                pond_core::models::services::context_budget::TOOL_RESULT_MAX_BYTES,
-            ) {
-                rebuilt.push(truncated);
-                continue;
-            }
-            // (d) an image-bearing message over the history budget, or one whose
-            // text was rewritten — the text-only branch below cannot reach it,
-            // so before this its stale <system-context> also survived forever.
-            if had_images[i] > 0
-                && (keep_images[i] < had_images[i] || original.as_concat_text() != tm.text)
-            {
-                rebuilt.push(cap_message_images(original, keep_images[i], &tm.text));
-                continue;
-            }
-            let text_only = original
-                .content
-                .iter()
-                .all(|c| matches!(c, goose::conversation::message::MessageContent::Text(_)));
-            if text_only && original.as_concat_text() != tm.text {
-                let mut m = match original.role {
-                    rmcp::model::Role::User => {
-                        goose::conversation::message::Message::user().with_text(&tm.text)
-                    }
-                    rmcp::model::Role::Assistant => {
-                        goose::conversation::message::Message::assistant().with_text(&tm.text)
-                    }
-                };
-                m.id = original.id.clone();
-                m.created = original.created;
-                rebuilt.push(m);
-            } else {
-                rebuilt.push(original.clone());
-            }
-        }
-
-        // Second guard, behind `outcome.changed`.
-        //
-        // `replace_conversation` is not an update — it is `BEGIN IMMEDIATE;
-        // DELETE FROM messages WHERE session_id = ?` plus one INSERT per
-        // surviving message, each with a fresh `serde_json::to_string` of its
-        // content. Turn N therefore rewrites roughly 2(N-1) rows, and an
-        // image-bearing message carries its base64 inline, so a long
-        // conversation rewrites hundreds of KB per turn onto the Jetson's eMMC —
-        // into a database the REST API never reads.
-        //
-        // `outcome.changed` is the real fix and is now honest (see the
-        // `CurrentTurn` argument above). This hash catches the rest: any path
-        // that sets `changed` or drops an image but produces a conversation
-        // identical to the one already stored.
-        let rebuilt_fingerprint = conversation_fingerprint(&rebuilt);
-        let previous_fingerprint = conversation_fingerprint(&source);
-        if rebuilt_fingerprint == previous_fingerprint {
-            tracing::debug!(
-                target: "giap::trace",
-                kind = "history_trim_skipped",
-                session_id = %giap_session_id,
-                messages = rebuilt.len(),
-                "trim produced an identical conversation; not rewriting the engine store"
-            );
-            return;
-        }
-
-        let rebuilt_conversation = goose::conversation::Conversation::new_unvalidated(rebuilt);
-        match self
-            .session_manager
-            .replace_conversation(goose_sid, &rebuilt_conversation)
-            .await
-        {
-            Ok(()) => tracing::info!(
-                target: "giap::trace",
-                kind = "history_trim",
-                session_id = %giap_session_id,
-                dropped_turns = outcome.dropped_turns,
-                estimated_tokens = outcome.estimated_tokens,
-                summary_spliced = rolling_summary.is_some(),
-                images_dropped,
-            ),
-            Err(e) => tracing::warn!("trim: replace_conversation failed: {e}"),
-        }
-    }
-
     /// Memories topically relevant to `message`, each paired with its cosine
     /// similarity when one is known.
     ///
@@ -3196,6 +2920,74 @@ impl GooseAdapter {
             );
         }
         kept
+    }
+
+    /// Cap how many historical images keep real pixels, independent of any
+    /// compaction.
+    ///
+    /// Goose owns compaction since C1; this is the one piece of conversation
+    /// rewriting GIAP keeps, because the cost it defends against is invisible
+    /// to goose. `MAX_HISTORY_REPLAY_IMAGES` is 1: the newest image-bearing
+    /// history turn keeps its pixels, older ones become a text placeholder.
+    ///
+    /// The image on the turn about to be sent is NOT counted — it has not been
+    /// appended to goose's conversation yet, so this session still gets one
+    /// fresh image plus one from before.
+    ///
+    /// Rewrites nothing when the conversation already fits: `replace_conversation`
+    /// is DELETE + N INSERT with base64 images inline, hundreds of KB per turn
+    /// onto the Jetson's eMMC, into a table the REST API never reads.
+    async fn cap_history_images(&self, goose_sid: &str) {
+        use pond_core::models::services::context::image_history::history_image_placeholder;
+
+        let Ok(session) = self.session_manager.get_session(goose_sid, true).await else {
+            return;
+        };
+        let Some(conversation) = session.conversation else {
+            return;
+        };
+        let source: Vec<Message> = conversation.messages().clone();
+        if source.is_empty() {
+            return;
+        }
+
+        // Per-message image counts, in conversation order. A message carrying
+        // tool parts counts zero and is never rewritten: an orphaned or re-keyed
+        // tool response is rejected by the provider.
+        let (had, keep, dropped) = plan_image_cap(&source);
+        if dropped == 0 {
+            return;
+        }
+
+        let rebuilt: Vec<Message> = source
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                if had[i] > keep[i] {
+                    cap_message_images(m, keep[i], &history_image_placeholder(keep[i]))
+                } else {
+                    m.clone()
+                }
+            })
+            .collect();
+
+        let capped = goose::conversation::Conversation::new_unvalidated(rebuilt);
+        if let Err(e) = self
+            .session_manager
+            .replace_conversation(goose_sid, &capped)
+            .await
+        {
+            // Non-fatal: a failed cap costs encoder time, never the turn.
+            tracing::warn!("image cap: replacing the conversation failed: {e}");
+            return;
+        }
+        tracing::info!(
+            target: "giap::trace",
+            kind = "image_cap",
+            goose_sid = %goose_sid,
+            dropped,
+            "capped historical images"
+        );
     }
 
     /// Engine session id → GIAP session id.
@@ -4420,10 +4212,21 @@ impl GooseAdapter {
         // never fires on real traffic the trimmer was dead weight, and if it
         // fires often we have the number instead of an argument.
         //
-        // `trim_goose_history` is kept, unused on this path, because
-        // `hydrate_goose_session` still needs `plan_replay` when a fresh engine
-        // session meets a conversation that already has history — goose's store
-        // can be wiped independently of pond_system.db.
+        // What survives the trim's removal, and why it has to.
+        //
+        // `hydrate_goose_session` reaches `plan_replay` directly, not through
+        // the trimmer, so replay is unaffected.
+        //
+        // The IMAGE CAP does not survive on its own and must not be lost. It
+        // lived inside the trim as a final step, so deleting the trim deleted
+        // it — a silent regression, caught by `plan_live_image_cap` dropping to
+        // test-only callers. It is not a compaction concern: every replayed
+        // image re-runs the mmproj encoder (measured 0.7-2.7 s each, prefill
+        // 28 s -> 37 s across four turns), and goose cannot know that because
+        // nothing in its model of a conversation has a per-image decode cost.
+        // So it is re-applied here, on its own, against goose's conversation
+        // rather than against a trimmed copy of it.
+        self.cap_history_images(&goose_sid).await;
 
         let user_msg_len = request.message.len();
         let turn_start = std::time::Instant::now();
@@ -5877,101 +5680,6 @@ impl GooseAdapter {
     }
 }
 
-/// Shrink the text bodies of an oversized structured tool response, or `None`
-/// when the message carries no tool response over `max_chars`.
-///
-/// GIAP's `TOOL_RESULT_MAX_BYTES` used to reach only the trimmer's token
-/// ESTIMATE: the rebuild kept structured `ToolResponse` messages whole, so a
-/// 50K-char tool result was re-prefilled verbatim on every single turn until its
-/// entire turn aged out — the estimate said 1.5K, the engine paid for 50K.
-///
-/// The rewrite is deliberately surgical: the message is cloned and only
-/// `RawContent::Text` bodies inside the response are replaced. The response id,
-/// its annotations, `is_error`, and the tool-request/response pairing all survive
-/// untouched, because a re-keyed or orphaned tool response is rejected by the
-/// provider outright.
-///
-/// `structured_content` is left alone: it is arbitrary tool-defined JSON that
-/// cannot be truncated without risking invalid data, and the text bodies are
-/// what the chat template renders.
-/// A cheap stable digest of a conversation, used to decide whether rewriting the
-/// engine's message table would change anything.
-///
-/// Hashes the JSON form of each message's content rather than the content itself
-/// because `MessageContent` does not implement `Hash` — and the JSON is the
-/// faithful proxy here, since it is exactly the bytes `replace_conversation`
-/// would write. Serializing every message once per turn sounds expensive next to
-/// the alternative until you price the alternative: a transaction, a whole-table
-/// DELETE, and one INSERT per message, each doing this same serialization anyway.
-///
-/// `id` and `created` are included because the rebuild deliberately preserves
-/// them — a message that kept its identity but changed its text must still
-/// register as different.
-fn conversation_fingerprint(messages: &[goose::conversation::message::Message]) -> u64 {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    messages.len().hash(&mut hasher);
-    for m in messages {
-        m.id.hash(&mut hasher);
-        m.created.hash(&mut hasher);
-        match m.role {
-            rmcp::model::Role::User => 0u8,
-            rmcp::model::Role::Assistant => 1u8,
-        }
-        .hash(&mut hasher);
-        match serde_json::to_string(&m.content) {
-            Ok(json) => json.hash(&mut hasher),
-            // Unserializable content cannot be compared, so refuse to claim the
-            // conversation is unchanged: hash something unique to this message
-            // so the fingerprints differ and the write proceeds.
-            Err(_) => {
-                "unserializable".hash(&mut hasher);
-                std::ptr::from_ref(m).addr().hash(&mut hasher);
-            }
-        }
-    }
-    hasher.finish()
-}
-
-fn truncate_tool_response_text(
-    message: &goose::conversation::message::Message,
-    max_chars: usize,
-) -> Option<goose::conversation::message::Message> {
-    use goose::conversation::message::MessageContent;
-    use pond_core::models::services::context_budget::truncate_head_tail;
-
-    let oversized = message.content.iter().any(|c| match c {
-        MessageContent::ToolResponse(tr) => tr.tool_result.as_ref().is_ok_and(|r| {
-            r.content.iter().any(
-                |c| matches!(&c.raw, rmcp::model::RawContent::Text(t) if t.text.len() > max_chars),
-            )
-        }),
-        _ => false,
-    });
-    if !oversized {
-        return None;
-    }
-
-    let mut rewritten = message.clone();
-    for content in rewritten.content.iter_mut() {
-        let MessageContent::ToolResponse(tr) = content else {
-            continue;
-        };
-        let Ok(result) = tr.tool_result.as_mut() else {
-            continue;
-        };
-        for part in result.content.iter_mut() {
-            if let rmcp::model::RawContent::Text(text) = &mut part.raw {
-                if let Some(truncated) = truncate_head_tail(&text.text, max_chars) {
-                    text.text = truncated;
-                }
-            }
-        }
-    }
-    Some(rewritten)
-}
-
 /// The `.gguf` filename to register for a model name, tolerating a missing
 /// quantization suffix.
 ///
@@ -6161,27 +5869,30 @@ fn cap_message_images(original: &Message, keep: usize, text: &str) -> Message {
     capped
 }
 
-/// Per-message image counts and the cap plan for a trimmed conversation.
+/// Per-message image counts and the cap plan for a conversation.
 ///
-/// Returns `(had, keep, dropped_total)`, all aligned with `trimmed`. A message
-/// that carries tool parts, or that has no source row (the spliced summary,
-/// `index == usize::MAX`), counts as zero and is therefore never rewritten.
+/// Returns `(had, keep, dropped_total)`, aligned with `source`. A message
+/// carrying tool parts counts as zero and is never rewritten — an orphaned or
+/// re-keyed tool response is rejected by the provider.
 ///
-/// `dropped_total == 0` means the conversation already fits the policy and must
-/// be left byte-identical.
-fn plan_live_image_cap(
-    source: &[Message],
-    trimmed: &[pond_core::models::services::context::turn_trimmer::TrimMessage],
-) -> (Vec<usize>, Vec<usize>, usize) {
+/// `dropped_total == 0` means the conversation already fits and must be left
+/// byte-identical.
+///
+/// Took `TrimMessage`s until C1; it reads goose's conversation directly now,
+/// because the trim that produced those no longer runs.
+fn plan_image_cap(source: &[Message]) -> (Vec<usize>, Vec<usize>, usize) {
     use pond_core::models::services::context::image_history::{
         dropped_image_count, plan_history_images,
     };
 
-    let had: Vec<usize> = trimmed
+    let had: Vec<usize> = source
         .iter()
-        .map(|tm| match source.get(tm.index) {
-            Some(m) if !has_tool_parts(m) => image_part_count(m),
-            _ => 0,
+        .map(|m| {
+            if has_tool_parts(m) {
+                0
+            } else {
+                image_part_count(m)
+            }
         })
         .collect();
     let keep = plan_history_images(&had);
@@ -8128,8 +7839,9 @@ mod tests {
     }
 
     /// The KV invariant guard: a conversation that never had an image must come
-    /// out of the cap with nothing to do, so the trimmer's own `changed` flag
-    /// stays the only thing that can rewrite it.
+    /// out of the cap with nothing to do, so `dropped == 0` stays the only
+    /// thing that can trigger a rewrite. Since C1 there is no trimmer whose
+    /// `changed` flag could also do it — the cap is the sole rewriter.
     #[test]
     fn a_text_only_conversation_plans_no_image_change() {
         let source = vec![
@@ -8137,8 +7849,7 @@ mod tests {
             Message::assistant().with_text("hello"),
             Message::user().with_text("bye"),
         ];
-        let trimmed = vec![trim_msg(0, "hi"), trim_msg(1, "hello"), trim_msg(2, "bye")];
-        let (had, keep, dropped) = plan_live_image_cap(&source, &trimmed);
+        let (had, keep, dropped) = plan_image_cap(&source);
         assert_eq!(had, vec![0, 0, 0]);
         assert_eq!(keep, vec![0, 0, 0]);
         assert_eq!(dropped, 0);
@@ -8148,7 +7859,7 @@ mod tests {
     #[test]
     fn a_single_historical_image_is_left_alone() {
         let source = vec![user_with_images("look", &["AAAA"])];
-        let (_, _, dropped) = plan_live_image_cap(&source, &[trim_msg(0, "look")]);
+        let (_, _, dropped) = plan_image_cap(&source);
         assert_eq!(dropped, 0);
     }
 
@@ -8159,28 +7870,10 @@ mod tests {
             Message::assistant().with_text("ok"),
             user_with_images("second", &["BBBB", "CCCC"]),
         ];
-        let trimmed = vec![
-            trim_msg(0, "first"),
-            trim_msg(1, "ok"),
-            trim_msg(2, "second"),
-        ];
-        let (had, keep, dropped) = plan_live_image_cap(&source, &trimmed);
+        let (had, keep, dropped) = plan_image_cap(&source);
         assert_eq!(had, vec![1, 0, 2]);
         assert_eq!(keep, vec![0, 0, 1], "newest-first, leading image kept");
         assert_eq!(dropped, 2);
-    }
-
-    /// A spliced `<conversation-summary>` has no source row (`usize::MAX`) and
-    /// must not index out of bounds or steal budget.
-    #[test]
-    fn the_spliced_summary_row_counts_as_no_images() {
-        let source = vec![user_with_images("look", &["AAAA", "BBBB"])];
-        let mut summary = trim_msg(usize::MAX, "<conversation-summary>x</conversation-summary>");
-        summary.is_summary = true;
-        let (had, keep, dropped) = plan_live_image_cap(&source, &[summary, trim_msg(0, "look")]);
-        assert_eq!(had, vec![0, 2]);
-        assert_eq!(keep, vec![0, 1]);
-        assert_eq!(dropped, 1);
     }
 
     /// Tool request/response pairing is load-bearing — the cap must not so much
@@ -8205,13 +7898,7 @@ mod tests {
             response,
             user_with_images("second", &["BBBB"]),
         ];
-        let trimmed = vec![
-            trim_msg(0, "first"),
-            trim_msg(1, ""),
-            trim_msg(2, "front-door, person"),
-            trim_msg(3, "second"),
-        ];
-        let (had, keep, dropped) = plan_live_image_cap(&source, &trimmed);
+        let (had, keep, dropped) = plan_image_cap(&source);
         assert_eq!(
             &had[1..3],
             &[0, 0],
@@ -8297,9 +7984,7 @@ mod tests {
     fn capping_is_idempotent() {
         let original = user_with_images("look", &["AAAA", "BBBB"]);
         let once = cap_message_images(&original, 0, "look");
-        let text = once.as_concat_text();
-        let (had, keep, dropped) =
-            plan_live_image_cap(std::slice::from_ref(&once), &[trim_msg(0, &text)]);
+        let (had, keep, dropped) = plan_image_cap(std::slice::from_ref(&once));
         assert_eq!(had, vec![0]);
         assert_eq!(keep, vec![0]);
         assert_eq!(dropped, 0, "nothing left to drop on a second pass");
@@ -8325,10 +8010,7 @@ mod tests {
         // Stage 1: the 2-image turn is the newest, budget 1 -> keep the leading
         // image, one placeholder for the dropped one.
         let original = user_with_images("look at these", &["AAAA", "BBBB"]);
-        let (had, keep, dropped) = plan_live_image_cap(
-            std::slice::from_ref(&original),
-            &[trim_msg(0, &original.as_concat_text())],
-        );
+        let (had, keep, dropped) = plan_image_cap(std::slice::from_ref(&original));
         assert_eq!((had[0], keep[0], dropped), (2, 1, 1));
         let stage1 = cap_message_images(&original, keep[0], &original.as_concat_text());
         assert_eq!(image_parts(&stage1).len(), 1);
@@ -8350,7 +8032,7 @@ mod tests {
             trim_msg(0, &source[0].as_concat_text()),
             trim_msg(1, &source[1].as_concat_text()),
         ];
-        let (had, keep, dropped) = plan_live_image_cap(&source, &trimmed);
+        let (had, keep, dropped) = plan_image_cap(&source);
         assert_eq!((had[0], keep[0]), (1, 0), "the older turn loses its image");
         assert_eq!((had[1], keep[1]), (1, 1), "the newest turn keeps its own");
         assert_eq!(dropped, 1);
@@ -8636,8 +8318,6 @@ mod tests {
         // a coupling that no longer exists.
     }
 
-    // ── C3: structured tool-response truncation ──────────────────────────
-
     fn tool_response_message(id: &str, body: &str) -> goose::conversation::message::Message {
         goose::conversation::message::Message::user().with_tool_response(
             id,
@@ -8645,116 +8325,6 @@ mod tests {
                 rmcp::model::Content::text(body.to_string()),
             ])),
         )
-    }
-
-    fn tool_response_text(message: &goose::conversation::message::Message) -> String {
-        message
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                goose::conversation::message::MessageContent::ToolResponse(tr) => {
-                    tr.tool_result.as_ref().ok()
-                }
-                _ => None,
-            })
-            .flat_map(|r| r.content.iter())
-            .filter_map(|c| match &c.raw {
-                rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    #[test]
-    fn a_small_tool_response_is_not_rewritten() {
-        let msg = tool_response_message("call-1", "sunny, 21C");
-        assert!(truncate_tool_response_text(&msg, 1_500).is_none());
-    }
-
-    #[test]
-    fn plain_text_messages_are_never_rewritten() {
-        let msg = goose::conversation::message::Message::assistant()
-            .with_text("x".repeat(10_000).as_str());
-        assert!(truncate_tool_response_text(&msg, 1_500).is_none());
-    }
-
-    /// The bug this closes: an oversized structured tool result used to be
-    /// re-prefilled verbatim every turn because the rebuild kept it whole.
-    #[test]
-    fn an_oversized_tool_response_is_truncated_head_and_tail() {
-        let body = format!("FIRST-LINE{}LAST-LINE", "x".repeat(50_000));
-        let msg = tool_response_message("call-1", &body);
-        let out = truncate_tool_response_text(&msg, 1_500).expect("should truncate");
-        let text = tool_response_text(&out);
-        assert!(text.len() < 1_600, "len {}", text.len());
-        assert!(text.starts_with("FIRST-LINE"));
-        assert!(text.ends_with("LAST-LINE"));
-        assert!(text.contains("[... truncated "));
-    }
-
-    /// Pairing preservation — the property that matters most here: an orphaned
-    /// or re-keyed tool response is rejected outright by the provider, so the
-    /// rewrite must preserve the response id, the content-part count, the role,
-    /// and the error flag. Only the text shrinks.
-    #[test]
-    fn truncation_preserves_the_tool_call_pairing_structure() {
-        let body = "y".repeat(40_000);
-        let original = tool_response_message("call-abc", &body);
-        let rewritten = truncate_tool_response_text(&original, 1_500).expect("should truncate");
-
-        assert_eq!(rewritten.role, original.role);
-        assert_eq!(rewritten.content.len(), original.content.len());
-
-        let ids = |m: &goose::conversation::message::Message| {
-            m.content
-                .iter()
-                .filter_map(|c| match c {
-                    goose::conversation::message::MessageContent::ToolResponse(tr) => {
-                        Some((tr.id.clone(), tr.tool_result.is_ok()))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ids(&rewritten), ids(&original));
-        assert_eq!(ids(&rewritten), vec![("call-abc".to_string(), true)]);
-
-        let parts = |m: &goose::conversation::message::Message| {
-            m.content
-                .iter()
-                .filter_map(|c| match c {
-                    goose::conversation::message::MessageContent::ToolResponse(tr) => {
-                        tr.tool_result.as_ref().ok()
-                    }
-                    _ => None,
-                })
-                .map(|r| (r.content.len(), r.is_error))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(parts(&rewritten), parts(&original));
-        assert!(tool_response_text(&rewritten).len() < tool_response_text(&original).len());
-    }
-
-    /// An error tool result is truncated too, and stays an error.
-    #[test]
-    fn an_error_tool_response_keeps_its_error_flag() {
-        let msg = goose::conversation::message::Message::user().with_tool_response(
-            "call-err",
-            Ok(rmcp::model::CallToolResult::error(vec![
-                rmcp::model::Content::text("z".repeat(20_000)),
-            ])),
-        );
-        let out = truncate_tool_response_text(&msg, 1_500).expect("should truncate");
-        let is_error = out.content.iter().any(|c| match c {
-            goose::conversation::message::MessageContent::ToolResponse(tr) => tr
-                .tool_result
-                .as_ref()
-                .is_ok_and(|r| r.is_error == Some(true)),
-            _ => false,
-        });
-        assert!(is_error);
-        assert!(tool_response_text(&out).contains("[... truncated "));
     }
 
     #[test]
