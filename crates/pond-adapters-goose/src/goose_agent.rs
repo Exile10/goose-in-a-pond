@@ -153,7 +153,7 @@ fn goose_env_knobs(
     provider: &str,
     effective_ctx: usize,
     hybrid_compaction: bool,
-) -> [(&'static str, Option<String>); 4] {
+) -> [(&'static str, Option<String>); 5] {
     let local = matches!(provider, "local" | "gguf");
     [
         // Without this Goose's ModelConfig defaults context_limit to 128K and
@@ -188,6 +188,26 @@ fn goose_env_knobs(
         // (EMPTY_TURN_STEER), so Goose should detect the empty turn and hand
         // straight back.
         ("GOOSE_MAX_EMPTY_TURN_RETRIES", Some("0".to_string())),
+        // A tool result large enough to blow the window on its own.
+        //
+        // Goose spills an oversized text result to a tempfile and leaves a
+        // pointer (`large_response_handler.rs`), which is the right shape --
+        // but its default is 200,000 CHARACTERS, about 50K tokens. GIAP's
+        // prompt budget is 8,192. GIAP's own tools are already capped in bytes
+        // by `pond-mcp-server::format::truncate_to_budget`, so this is not
+        // about them: it is about a user-added MCP server, whose result passes
+        // through none of that and rides the 200K default straight into the
+        // window. The landing place is goose's REACTIVE compaction, which
+        // ignores `GOOSE_AUTO_COMPACT_THRESHOLD` and has no off switch at all.
+        //
+        // A quarter of the prompt budget, in bytes at ~4 chars/token: big
+        // enough that no ordinary result is touched, small enough that no
+        // single result can end the conversation. Local only -- an HTTP
+        // provider's window is not ours to ration.
+        (
+            "GOOSE_MAX_TOOL_RESPONSE_SIZE",
+            local.then(|| ((effective_ctx / 4) * 4).to_string()),
+        ),
     ]
 }
 
@@ -4535,6 +4555,23 @@ impl GooseAdapter {
             // Wall-clock start per tool call (keyed by Goose tool-call ID) for latency.
             let mut tool_call_starts: HashMap<String, std::time::Instant> = HashMap::new();
 
+            // ── Round-trip attribution (P0) ──────────────────────────────────
+            //
+            // A turn makes N provider calls and, until this existed, only the
+            // LAST one's numbers survived. The 2026-09-08 Orin bake-off recorded
+            // `engine_ttft_ms: 858` against a client-observed `ttft_ms: 43,570`
+            // with `inference_count: 3` -- a 42-second gap the engine does not
+            // account for and nothing else attributed. That gap is the single
+            // largest number in the system and it had no owner.
+            //
+            // These two carry the per-round-trip context that `AgentEvent::Usage`
+            // does not: when the previous inference ended (so the gap between
+            // them is measurable) and how many tools ran in between (so a
+            // tool-driven round-trip is distinguishable from a re-engagement or
+            // a compaction).
+            let mut last_inference_end: Option<std::time::Instant> = None;
+            let mut tools_since_inference: u32 = 0;
+
             tracing::info!(
                 target: "giap::trace",
                 kind = "turn_start",
@@ -4758,6 +4795,10 @@ impl GooseAdapter {
                                                 }
                                                 tool_id_to_name.insert(tr.id.clone(), tool_name.clone());
                                                 tool_call_starts.insert(tr.id.clone(), std::time::Instant::now());
+                                                // Attributes the NEXT round-trip: a provider call
+                                                // preceded by tool calls is a tool round-trip, one
+                                                // preceded by none is a re-engagement or a retry.
+                                                tools_since_inference += 1;
                                                 tracing::info!(
                                                     target: "giap::trace",
                                                     kind = "tool_call",
@@ -4907,6 +4948,52 @@ impl GooseAdapter {
                             goose::agents::AgentEvent::Usage(pu) => {
                                 saw_usage = true;
                                 turn_stats.inference_count += 1;
+
+                                // ── The round-trip line ──────────────────────
+                                //
+                                // `gap_ms` is the number this exists for: wall
+                                // time since the previous inference ENDED that
+                                // the engine does not report. Tool latency,
+                                // selection, trimming, memory work and goose's
+                                // own bookkeeping all live in there, and until
+                                // now they were one undifferentiated 42 seconds.
+                                //
+                                // `kind` classifies the round-trip by what
+                                // preceded it, which is the only signal
+                                // available here: tools ran, or they did not.
+                                let now = std::time::Instant::now();
+                                let gap_ms = last_inference_end
+                                    .map(|t| now.duration_since(t).as_millis() as u64);
+                                let engine_ttft = pu.stats.as_ref().and_then(|s| s.time_to_first_token_ms);
+                                let engine_prefill = pu.stats.as_ref().and_then(|s| s.prefill_ms);
+                                tracing::info!(
+                                    target: "giap::trace",
+                                    kind = "inference",
+                                    session_id = %session_id,
+                                    n = turn_stats.inference_count,
+                                    // 0 for the first call of a turn; thereafter
+                                    // the unattributed wall time before it.
+                                    gap_ms = gap_ms.unwrap_or(0),
+                                    since_turn_ms = now.duration_since(turn_start).as_millis() as u64,
+                                    engine_ttft_ms = engine_ttft.unwrap_or(0),
+                                    engine_prefill_ms = engine_prefill.unwrap_or(0),
+                                    prompt_tokens = pu.usage.input_tokens.unwrap_or(0).max(0) as u32,
+                                    output_tokens = pu.usage.output_tokens.unwrap_or(0).max(0) as u32,
+                                    tools_before = tools_since_inference,
+                                    reengagement = attempt as u32,
+                                    cause = if turn_stats.inference_count == 1 {
+                                        "first"
+                                    } else if tools_since_inference > 0 {
+                                        "after_tools"
+                                    } else if attempt > 0 {
+                                        "reengagement"
+                                    } else {
+                                        "continuation"
+                                    },
+                                );
+                                last_inference_end = Some(now);
+                                tools_since_inference = 0;
+
                                 if let Some(input) = pu.usage.input_tokens {
                                     turn_stats.prompt_tokens = input.max(0) as u32;
                                 }
@@ -8349,6 +8436,64 @@ mod tests {
         // Unset, not "0.8" — absence restores Goose's own default.
         assert!(knob(&knobs, "GOOSE_AUTO_COMPACT_THRESHOLD").is_none());
         assert!(knob(&knobs, "GOOSE_TOOL_PAIR_SUMMARIZATION").is_none());
+    }
+
+    /// A single tool result must not be able to end the conversation.
+    ///
+    /// Goose's default spill threshold is 200,000 CHARACTERS — roughly 50K
+    /// tokens against an 8,192-token prompt budget. GIAP's own tools are capped
+    /// in bytes elsewhere, so the exposure is a user-added MCP server, whose
+    /// result passes through none of that. What it lands in is goose's REACTIVE
+    /// compaction, which ignores `GOOSE_AUTO_COMPACT_THRESHOLD` and has no off
+    /// switch, so the cost of getting this wrong is not a truncated result — it
+    /// is a stalled turn and a summarisation pass nobody asked for.
+    #[test]
+    fn a_single_tool_result_cannot_blow_the_local_window() {
+        for ctx in [4096usize, 8192, 16384] {
+            let cap: usize = knob(
+                &goose_env_knobs("local", ctx, true),
+                "GOOSE_MAX_TOOL_RESPONSE_SIZE",
+            )
+            .expect("the local engine caps tool responses")
+            .parse()
+            .expect("a byte count");
+
+            // A quarter of the budget, expressed in bytes at ~4 chars/token.
+            assert_eq!(cap, ctx, "ctx {ctx}");
+            assert!(
+                cap / 4 < ctx,
+                "a result at the cap is {} tokens against a {ctx}-token budget — it would \
+                 still overflow the window it is meant to protect",
+                cap / 4
+            );
+        }
+
+        // Goose's own default is what this exists to displace.
+        assert!(
+            knob(
+                &goose_env_knobs("local", 8192, true),
+                "GOOSE_MAX_TOOL_RESPONSE_SIZE"
+            )
+            .map(|v| v.parse::<usize>().unwrap() < 200_000)
+            .unwrap_or(false),
+            "the cap must be below goose's 200,000-char default or it changes nothing"
+        );
+    }
+
+    /// An HTTP provider's window is not ours to ration — same rule as
+    /// tool-pair summarization below.
+    #[test]
+    fn http_providers_keep_gooses_own_tool_response_limit() {
+        for provider in ["ollama", "llamafile"] {
+            assert!(
+                knob(
+                    &goose_env_knobs(provider, 32768, true),
+                    "GOOSE_MAX_TOOL_RESPONSE_SIZE"
+                )
+                .is_none(),
+                "{provider}"
+            );
+        }
     }
 
     /// Tool-pair summarization is only disabled for the in-process engine: an

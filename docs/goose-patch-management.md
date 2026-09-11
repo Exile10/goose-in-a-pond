@@ -31,6 +31,29 @@ history, carrying:
 | llama.cpp KV cache type + physical batch | `ModelSettings` gains `type_k`/`type_v` (ggml type names, e.g. `"q8_0"`) and `n_ubatch`, wired into `build_context_params`. Upstream exposes `n_batch` but not the PHYSICAL batch, and no KV cache type at all, so neither of the two memory levers that measured as free on an 8 GB Orin was reachable from a host. Measured on gemma-4 E4B at ctx 16384 (M4/Metal, deterministic allocation, reproducible to +/-1 MiB across five runs): KV 296 -> 157 MiB and peak process footprint 437 -> 307 MB at `q8_0`; compute buffer 522 -> 129 MiB at `n_ubatch = 128` with decode unchanged (Orin sm_87: 14.4 vs 14.3 tok/s, prefill 38.3 vs 35.6). `q8_0` is quality-neutral by two independent tests -- greedy output BYTE-IDENTICAL to f16, and a paired per-chunk wikitext-2 run (n = 100, E2B Q4_K_M) giving dNLL -0.000987 +/- 0.000551, t = -1.79, i.e. indistinguishable from f16 at 95%. `q4_0` is accepted but deliberately not used: t = 0.35 on the mean, but 6.4x the per-chunk variance, so its average hides swings. `q5_1` measured WORSE than `q4_0` (t = 3.87) which is implausible on bit-count grounds and is most likely a flash-attention kernel path -- unverified, so treat that one as avoid-not-explained. A quantised V cache requires flash attention; that is checked and warned rather than left to fail opaquely at context creation. Additive and serde-default throughout, including the SDK DTO and BOTH `management.rs` mapping sites, so a settings round-trip cannot silently drop them. Upstreamable. | `crates/goose-local-inference/src/local_model_registry.rs`, `crates/goose-local-inference/src/llamacpp/inference_engine.rs`, `crates/goose-local-inference/src/management.rs`, `crates/goose-sdk-types/src/custom_requests.rs` |
 | builtin spawn panic is contained to its extension | `extension_fn(reader, writer)` runs synchronously inside the extension-loading future, so a panicking spawn fn unwound the loader while sibling builtins were mid-initialize -- their duplex peers dropped and every builtin reported broken-pipe/Closed. Observed 2026-08-27 in the voice child: one uninitialised `OnceLock` in giap-context's spawn fn (`init_context_deps() not called`) killed all fourteen builtin servers for the process, presenting as a total tool outage. `catch_unwind(AssertUnwindSafe(..))` around the call converts a startup panic into that extension's own `ConfigError`; the parent separately stopped its spawn fns panicking at all (the eleven remaining `.expect("init_*_deps")` sites now log-and-return, the pattern giap-sensors already used), so this is the belt for spawn fns that panic for any other reason. Upstreamable -- not GIAP-specific. Commit `9a91cbf42`. | `crates/goose/src/agents/extension_manager.rs` |
 
+### Divergences NOT in the table above — recorded 2026-09-11
+
+Found by reading the tree against `origin/main` rather than the table. An
+undocumented patch is one that gets dropped at the next sync, which is what this
+document exists to prevent — so these are listed even where the right answer is
+"delete it".
+
+| Divergence | Where | Disposition |
+|---|---|---|
+| **The whole MTP / speculative-decoding line** — a new `llamacpp/mtp.rs`, `SessionCtx`, drafter loading, `draft_n_max`/`draft_p_min`, `cuda-no-vmm`, and a dependency-graph change (`llama-cpp-2` `=0.1.146` → `=0.1.156` + `common`, patched to a private fork rev) | `crates/goose-local-inference/**`, both `Cargo.toml`s | **The largest divergence in the fork and it was unrecorded.** 8 commits on `feat/llama-cpp-2-0.1.156-oai-fork`. Recorded as shipped at ~1.8x on the Orin — but see the caveat below. Needs a row of its own once the fast-forward lands |
+| `crates/goose/src/prompts/giap_system.md` | goose crate | **Delete.** GIAP branding committed into a crate this table calls upstreamable, referenced by nothing, and dead by construction — it is absent from `TEMPLATE_REGISTRY`, so `render_template` returns `TemplateNotFound`. It was never needed: `render_template` already prefers `Paths::config_dir()/prompts/<name>`, so a host overrides any registered template with no patch at all |
+| Four `.snap.new` insta artifacts, three under a stray nested `goose/goose/` tree | `crates/goose/src/agents/snapshots/` | **Delete.** `.snap.new` is insta's *failure* output. They are also stale fossils — they say "created by Block, the parent company of Square" against current snapshots saying "created by AAIF" — so they carry no signal and will mask the next real snapshot change |
+| `mcp_client.rs:208` — upstream's cross-session `assert!` downgraded to `tracing::debug!` + overwrite | `crates/goose/src/agents/mcp_client.rs` | **Decide.** A relaxed concurrency invariant. It predates the side branch and sits on both fork branches, so it is not new — it is simply undocumented |
+
+**A measurement caveat worth carrying with the MTP row.** `mtp.rs` records
+"47.7 tok/s against 15.8, 87% draft acceptance". The only file in the repo
+carrying `draft_n_accepted` is `c2-mtp.json` from the 2026-09-08 bake-off, whose
+runtime is `llama-server` — **the sidecar, not the in-process path these commits
+built.** Both llama.cpp generate paths hardcode `draft: None` in `ProviderStats`
+(`inference_native_tools.rs`, `inference_emulated_tools.rs`) while `MtpSession`
+accumulates the counters, so the in-process acceptance rate has never been
+observed. Carry the feature; do not carry the number.
+
 ### Patches subsumed by upstream (dropped in the 2026-07 sync)
 
 - **MCP session panic→warning** (`5f7dceea`) — merged upstream long ago.
@@ -63,6 +86,25 @@ The parent repo (`goose-in-a-pond`) pins the submodule to the tip of
 `jarida-io/Goose:main`. `.gitmodules` names the branch, and
 `.github/workflows/ci.yml` clones that branch's HEAD directly (bypassing the
 stored submodule SHA).
+
+> **That is not true today, 2026-09-11.** The parent pins `d43cd702c`, which is on
+> `feat/llama-cpp-2-0.1.156-oai-fork` — **8 ahead of fork `main`, 0 behind**. The
+> breaking-sync procedure directly below was followed up to its last step and then
+> stopped: the side branch exists, the parent-side port landed (`Cargo.toml` pins
+> `llama-cpp-2 =0.1.156` and patches it to `jarida-io/llama-cpp-rs-giap` rev
+> `ad6e4b85`, which declares 0.1.156), but the fast-forward into fork `main` never
+> happened.
+>
+> Consequences, both live: fork `main` still asks for `=0.1.146`, which that patch
+> **cannot satisfy**, so a CI run resolves a graph no shipping build uses — and
+> `cargo check` never links, so it passes. And the side branch carries
+> `cuda = ["llama-cpp-2/cuda-no-vmm"]`, the flag that fixed a shipped Jetson OOM,
+> while fork `main` has plain `cuda`; `.gitmodules` `branch = main` means
+> `git submodule update --remote` walks back onto the broken one.
+>
+> The fix is the missing step: fast-forward fork `main` to `d43cd702c` (clean, 0
+> behind). Until then, treat every green CI run as evidence about a goose nobody
+> ships. `--locked` was added to every CI cargo step so the mismatch fails loudly.
 
 **Stage breaking syncs on a side branch.** CI clones the fork branch tip by
 name, so moving `main` underneath parent branches whose code still targets the
