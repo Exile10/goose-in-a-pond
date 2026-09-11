@@ -314,34 +314,6 @@ fn enforce_system(
     }
 }
 
-/// Strip Goose's injected `<turn-context>` blocks from message content.
-/// Returns `None` when nothing was stripped (no clone needed).
-fn strip_turn_context(messages: &[Message]) -> Option<Vec<Message>> {
-    let has_injection = messages.iter().any(|m| {
-        m.content.iter().any(|c| {
-            c.as_text()
-                .is_some_and(goose::conversation::is_turn_context_text)
-        })
-    });
-    if !has_injection {
-        return None;
-    }
-    Some(
-        messages
-            .iter()
-            .map(|m| {
-                let mut m = m.clone();
-                m.content.retain(|c| {
-                    !c.as_text()
-                        .is_some_and(goose::conversation::is_turn_context_text)
-                });
-                m
-            })
-            .filter(|m| !m.content.is_empty())
-            .collect(),
-    )
-}
-
 /// Provider names whose format layer already relocates tool-result images, so promotion must
 /// NOT run for them: `formats/openai.rs`, `formats/google.rs` and `formats/databricks.rs` each
 /// re-host a tool-response image as a following user message, so promoting would send it twice.
@@ -661,9 +633,30 @@ impl Provider for GiapProviderShim {
                  did not match GIAP's prefix, so the shim passed it through unchanged"
             );
         }
-        let stripped_messages = strip_turn_context(messages);
-        // Phase F3: run AFTER the turn-context strip so the promoted carrier is
-        // built from the messages the provider will actually receive.
+        // C3: goose's `<turn-context>` is KEPT.
+        //
+        // The shim used to strip every MOIM injection, on the reasoning that
+        // GIAP owns per-turn context through its own `<system-context>`. Parity
+        // means goose's block reaches the model: current time, working
+        // directory, remaining tokens, turn budget, and whatever the `todo` and
+        // `tom` extensions contribute — the last of which is the only mechanism
+        // either side has for an instruction that survives compaction.
+        //
+        // It needed BOTH halves. `MIN_CONTEXT_FOR_MOIM` was 32,000 upstream and
+        // GIAP clamps local prompts to 8,192, so the block was never composed in
+        // the first place; lowering it without this would have produced a block
+        // the shim then deleted, and stripping without lowering deleted a block
+        // that was never there. Neither half alone does anything.
+        //
+        // No stale-block problem, checked rather than assumed: `inject_moim`
+        // works on `conversation.clone()` (`agent.rs:2093`) and the result is
+        // used only for that provider call, so the stored conversation never
+        // accumulates injections.
+        //
+        // `strip_turn_context` is kept and still tested — it is the lever to
+        // pull if the block turns out to cost more in KV churn than it returns.
+        let stripped_messages: Option<Vec<Message>> = None;
+        // Phase F3: built from the messages the provider will actually receive.
         let promoted_messages = if provider_relocates_tool_images(self.inner.get_name()) {
             None
         } else {
@@ -952,25 +945,6 @@ mod tests {
     #[test]
     fn no_prefix_configured_means_pass_through() {
         assert_eq!(enforce_system("anything", &None, &[&None, &None]), None);
-    }
-
-    #[test]
-    fn turn_context_blocks_are_stripped_from_messages() {
-        let turn_ctx = "<turn-context>\n<current-time>2026-07-26 14:00</current-time>\n<working-directory>/home</working-directory>\n</turn-context>";
-        assert!(goose::conversation::is_turn_context_text(turn_ctx));
-        let msg = Message::user()
-            .with_text("real question")
-            .with_text(turn_ctx);
-        let stripped = strip_turn_context(&[msg]).expect("injection present");
-        assert_eq!(stripped.len(), 1);
-        assert_eq!(stripped[0].content.len(), 1);
-        assert_eq!(stripped[0].content[0].as_text(), Some("real question"));
-    }
-
-    #[test]
-    fn clean_messages_are_not_cloned() {
-        let msg = Message::user().with_text("hello");
-        assert!(strip_turn_context(&[msg]).is_none());
     }
 
     // ── F3: tool-result image promotion ──────────────────────────────────

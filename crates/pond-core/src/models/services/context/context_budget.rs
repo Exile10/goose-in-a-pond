@@ -2,8 +2,6 @@
 //! a 7B Q4 model the window is ~8K tokens, so after the system prompt and the response
 //! reserve roughly 2,500 tokens (4 chars/token) are usable for history.
 
-use crate::models::domain::message::ChatMessage;
-
 const CHARS_PER_TOKEN: usize = 4;
 const MIN_USABLE_HISTORY_CHARS: usize = 256;
 
@@ -496,69 +494,9 @@ pub fn truncate_head_tail(text: &str, max_chars: usize) -> Option<String> {
     ))
 }
 
-fn truncate_at_byte_budget(content: &str, max_bytes: usize) -> String {
-    if content.len() <= max_bytes {
-        return content.to_string();
-    }
-
-    let mut end = max_bytes.min(content.len());
-    while end > 0 && !content.is_char_boundary(end) {
-        end -= 1;
-    }
-    content[..end].to_string()
-}
-
-fn trim_to_char_budget(
-    messages: Vec<ChatMessage>,
-    usable_history_chars: usize,
-) -> Vec<ChatMessage> {
-    let mut kept: Vec<ChatMessage> = Vec::new();
-    let mut remaining = usable_history_chars;
-
-    for msg in messages.into_iter().rev() {
-        let len = msg.content.len();
-        if remaining == 0 {
-            break;
-        }
-        if len <= remaining {
-            remaining -= len;
-            kept.push(msg);
-        } else if kept.is_empty() {
-            // First (most recent) message exceeds budget — truncate rather than drop.
-            let truncated = truncate_at_byte_budget(&msg.content, remaining);
-            kept.push(ChatMessage {
-                content: truncated,
-                ..msg
-            });
-            break;
-        } else {
-            // Later messages don't fit — stop here.
-            break;
-        }
-    }
-
-    kept.reverse();
-    kept
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::domain::message::Role;
-
-    fn msg(content: &str) -> ChatMessage {
-        ChatMessage {
-            role: Role::User,
-            content: content.to_string(),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }
-    }
-
-    fn total_chars(msgs: &[ChatMessage]) -> usize {
-        msgs.iter().map(|m| m.content.len()).sum()
-    }
 
     // ── truncate_head_tail (C3) ──────────────────────────────────────────
 
