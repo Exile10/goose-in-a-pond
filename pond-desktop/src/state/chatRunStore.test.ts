@@ -28,6 +28,7 @@ import {
   hasLiveThread,
   acknowledgeCompletion,
   resetConversation,
+  openSession,
   truncateFrom,
   patchMessage,
 } from "./chatRunStore";
@@ -114,6 +115,9 @@ beforeEach(() => {
   setChatRunBridge(bridge());
   vi.mocked(api.getSessionMessages).mockResolvedValue([]);
   vi.mocked(api.getActiveRun).mockResolvedValue(null);
+  // The real one returns `Promise<void>`; a bare `vi.fn()` returns undefined,
+  // which only the callers that `await` it happen to survive.
+  vi.mocked(api.cancelRun).mockResolvedValue(undefined);
   localStorage.clear();
 });
 
@@ -588,6 +592,95 @@ describe("stopping on purpose", () => {
     expect(api.cancelRun).toHaveBeenCalledWith("run-11");
     expect(getChatRun().busy).toBe(false);
     expect(localStorage.getItem("giap-chat-run")).toBeNull();
+  });
+
+  /**
+   * Measured against a live pond before this was wired: a client that stopped
+   * reading at frame 2 had its run finish at frame 664, seventy-three seconds
+   * later, and post-turn memory extraction then opened a further provider call
+   * on the same single-slot engine. Bumping `runSeq` stops us writing the
+   * frames down; it was never what stopped the model.
+   */
+  it("stops the run when a new chat abandons it, as its doc has always said", async () => {
+    const held = deferredStream();
+    vi.mocked(api.chatStream).mockReturnValue(held.gen as never);
+    sendTurn({ text: "hi" });
+    await held.push({
+      type: "run_started",
+      run_id: "run-20",
+      session_id: "s",
+      epoch: "e",
+      seq: 1,
+    } as ChatEvent);
+
+    resetConversation();
+
+    expect(api.cancelRun).toHaveBeenCalledWith("run-20");
+  });
+
+  it("stops the run when another conversation is opened over it", async () => {
+    const held = deferredStream();
+    vi.mocked(api.chatStream).mockReturnValue(held.gen as never);
+    sendTurn({ text: "hi" });
+    await held.push({
+      type: "run_started",
+      run_id: "run-21",
+      session_id: "s",
+      epoch: "e",
+      seq: 1,
+    } as ChatEvent);
+
+    await openSession("some-other-session", { stopCurrentRun: true });
+
+    expect(api.cancelRun).toHaveBeenCalledWith("run-21");
+  });
+
+  /**
+   * The other three `openSession` callers are recovery, not abandonment:
+   * `resumeActiveRun` lays down history before reattaching, and the
+   * `replay_gap` / `run_evicted` arm reloads a conversation whose run is still
+   * generating. Cancelling by default would have aborted the run each of them
+   * exists to recover.
+   */
+  it("does not stop the run when a session is merely re-read", async () => {
+    const held = deferredStream();
+    vi.mocked(api.chatStream).mockReturnValue(held.gen as never);
+    sendTurn({ text: "hi" });
+    await held.push({
+      type: "run_started",
+      run_id: "run-23",
+      session_id: "s",
+      epoch: "e",
+      seq: 1,
+    } as ChatEvent);
+
+    await openSession("s");
+
+    expect(api.cancelRun).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The guard on the whole point of `resumable`. Leaving a turn deliberately
+   * cancels it; the window going away does not, and nothing here runs on
+   * unload — so a closed window still comes back to a finished answer.
+   */
+  it("does not stop a run just because the last subscriber unmounted", async () => {
+    const held = deferredStream();
+    vi.mocked(api.chatStream).mockReturnValue(held.gen as never);
+    const view = renderHook(() => useChatRun());
+    sendTurn({ text: "hi" });
+    await held.push({
+      type: "run_started",
+      run_id: "run-22",
+      session_id: "s",
+      epoch: "e",
+      seq: 1,
+    } as ChatEvent);
+
+    view.unmount();
+    await flush();
+
+    expect(api.cancelRun).not.toHaveBeenCalled();
   });
 
   it("still clears locally when the server cannot be told", async () => {

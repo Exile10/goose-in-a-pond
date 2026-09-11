@@ -1888,6 +1888,23 @@ async fn run_turn(
     // Released when the task ends, not when a reader goes away.
     let _run_permit = run_permit;
     drive_turn(&state, &run, req, device).await;
+    // Stamp the inactivity clock again now the work is actually over.
+    //
+    // `note_user_activity` is called when the REQUEST ARRIVES (`:1400`), and
+    // was called nowhere else on this path — so the clock measured time since
+    // the turn STARTED, and a turn that outran a threshold made the pond look
+    // idle while it was still generating. `summary_idle_secs` defaults to 120,
+    // and a fresh Orin turn in `jetson-bakeoff-2026-09-08` took 327 s: the
+    // rolling-summary refresh would start its own provider call, on the same
+    // single-slot engine, in the middle of the user's answer. Its
+    // activity-watcher cannot save it either, because nothing re-stamps the
+    // clock during a turn, so the watcher sees no resumption to cancel on.
+    //
+    // Every other reader of this clock inherits the fix: consolidation,
+    // titling, index maintenance and proactive review all ask the same
+    // question and all meant "since the pond last did something", not "since
+    // it last started doing something".
+    state.note_user_activity().await;
     // `finish` keeps the first terminal state, so a cancel that landed while
     // the tail was still running is not relabelled as an ordinary finish.
     run.finish(crate::runs::RunState::Finished);
