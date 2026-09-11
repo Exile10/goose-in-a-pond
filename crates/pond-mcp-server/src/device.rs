@@ -48,6 +48,16 @@ pub struct DeviceMcpServer {
 
 #[tool_router]
 impl DeviceMcpServer {
+    /// Every tool this server exposes, without constructing it or its deps.
+    ///
+    /// `tool_router()` is generated private to this module, so inventory code
+    /// outside it could not reach the real definitions and resorted to scanning
+    /// source text for `#[tool(` instead. This is the enumeration that scan was
+    /// standing in for.
+    pub(crate) fn tool_defs() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
+    }
+
     pub fn new(
         device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
         settings_repo: Arc<dyn SettingsRepository + Send + Sync>,

@@ -18,6 +18,8 @@ pub mod wolfram;
 // ── Shared utilities for Knowledge-family servers ───────────────────────────
 pub mod format;
 pub mod http;
+/// The tool block as the model sees it, pinned so a moved KV prefix is a diff.
+pub mod prefix_oracle;
 
 // ── Shared state for tool param generation ──────────────────────────────────
 

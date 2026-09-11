@@ -5677,10 +5677,18 @@ impl GooseAdapter {
         // create entries, so a session GIAP never chatted in resolves to `None`
         // and `enforce_tools(tools, &None)` is a silent no-op. A subagent is
         // exactly that kind of session. Without this the child's only tool
-        // boundary is `ExtensionConfig::available_tools`, which is real (it
-        // refuses inside `dispatch_tool_call`) but is one layer, and it only
-        // stops the CALL — the tool is still listed to the model, which then
-        // spends turns trying it.
+        // boundary is `ExtensionConfig::available_tools` — one layer rather
+        // than two.
+        //
+        // This used to say `available_tools` "only stops the CALL — the tool is
+        // still listed to the model". That is FALSE at the pinned goose:
+        // `fetch_all_tools` calls `config.is_tool_available(&tool.name)` while
+        // building the list (`extension_manager.rs:1440`), so a filtered tool
+        // never reaches the prompt at all; `dispatch_tool_call` (`:1817`) is the
+        // second enforcement, not the only one. The correction matters beyond
+        // this comment: it is the sentence that made the shim's per-turn veto
+        // look irreducible for GIAP's own builtins, when `available_tools` can
+        // do that job earlier and at the same boundary goose already uses.
         //
         // The system override is not a nicety either. A child's prompt is the
         // parent's static prefix plus GIAP's delegation envelope, so
