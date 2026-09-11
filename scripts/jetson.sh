@@ -23,7 +23,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # now costs nothing; catching it after the cross-compile costs the build.
 # shellcheck source=lib/macos-sdk.sh
 source "$HERE/lib/macos-sdk.sh"
-giap_pin_macos_sdk
+giap_select_coherent_toolchain
 
 CMD="${1:-help}"
 shift || true

@@ -1,99 +1,122 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# macos-sdk.sh — pin SDKROOT to the SDK that belongs to the active toolchain.
+# macos-sdk.sh — make sure clang and ld come from the same toolchain.
 #
 #   source "$(dirname "$0")/lib/macos-sdk.sh"
+#   giap_select_coherent_toolchain
 #
-# A no-op on anything but macOS, and a no-op when SDKROOT is already set.
+# A no-op on anything but macOS, and a no-op when the toolchain is already
+# coherent or the caller has pinned one.
 #
-# ── Why this exists ──────────────────────────────────────────────────────────
+# ── The failure ──────────────────────────────────────────────────────────────
 #
-# Installing the Command Line Tools separately from Xcode leaves two SDKs on the
-# machine, and clang and ld can end up on opposite sides of it:
-#
-#   xcode-select -p        → /Applications/Xcode.app/...        (so ld is Xcode's)
-#   xcrun --show-sdk-path  → .../Xcode.app/.../MacOSX26.5.sdk   (the matching SDK)
-#   clang's default        → /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
-#                            → MacOSX27.0.sdk                   (a DIFFERENT SDK)
-#
-# Xcode's linker then reads the newer SDK's stub library and does not recognise
-# a slice that postdates it:
+# Installing the Command Line Tools separately from Xcode can leave the linker
+# and the SDK on opposite sides of a version split:
 #
 #   ld: tapi error: malformed file
 #   .../MacOSX27.0.sdk/usr/lib/libSystem.B.tbd:4:20: error: unknown architecture
 #                      arm64e.x1-macos, arm64e.x1-maccatalyst ]
 #
-# Every crate that compiles C hits it. In this workspace that is `aws-lc-sys`,
-# which means pond-api, pond-infra, pond-mcp-server, pond-adapters-goose and
-# pond-server all fail to build, while `pond-core` — which pulls none of that
-# chain — builds fine.
+# Every crate that compiles C dies there. In this workspace that is `aws-lc-sys`,
+# so pond-api, pond-infra, pond-mcp-server, pond-adapters-goose and pond-server
+# all fail — while `pond-core`, which pulls none of that chain, builds green.
 #
-# That asymmetry is the dangerous part, and it is why this is a build hook
-# rather than a note in a README. A session that runs `cargo test -p pond-core`,
-# sees 1,500 green tests and calls the tree healthy is reporting on the one
-# crate the breakage cannot reach. That has already happened twice here: two
-# review agents hit this failure, silently skipped the runs they could not
-# perform, and reported pond-core's green as the result.
+# That asymmetry is the reason this is a build hook and not a README note. The
+# failure does not stop a session, it MISLEADS one: run pond-core, watch 1,500
+# tests pass, call the tree healthy. Two review agents did exactly that — hit the
+# link failure, skipped the runs they could not perform, and reported pond-core's
+# green as the result.
 #
 # ── The rule ─────────────────────────────────────────────────────────────────
 #
-# Use the SDK from the toolchain `xcode-select` selected, because that is the
-# toolchain whose `ld` is about to run. Not "the newest SDK", not a hardcoded
-# path — either of those rots at the next Xcode or CLT update. `xcrun` answers
-# this by definition, so it is the source of truth and the version numbers above
-# are illustration, not configuration.
+# A toolchain is COHERENT when clang's default SDK belongs to that same
+# toolchain, because then its clang, its ld and its SDK are one install.
+# Measured on the machine this was written for:
 #
-# A pre-set SDKROOT is left alone: someone who set it meant it.
+#   DEVELOPER_DIR=.../CommandLineTools   clang default -> CLT's SDK    COHERENT
+#   DEVELOPER_DIR=.../Xcode.app/...      clang default -> CLT's SDK    mismatched
+#
+# clang defaults to the CLT SDK whichever toolchain is selected, so selecting
+# Xcode is what produces the mismatch. Hence: SELECT a coherent toolchain rather
+# than forcing an SDK onto an incoherent one. Both cure the link error, but
+# pinning `SDKROOT=$(xcrun …)` pairs Xcode's older ld with Xcode's older SDK —
+# it fights the machine, and it disagrees with what `~/.cargo/config.toml` does
+# for bare `cargo` commands. One rule, applied in both places.
+#
+# Nothing here is hardcoded to a version: coherence is probed, not assumed, so
+# the day Xcode catches up this stops firing on its own.
 # ─────────────────────────────────────────────────────────────────────────────
 
-giap_pin_macos_sdk() {
-  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+# Candidates, most-preferred first. A coherent selection is kept as-is.
+_giap_toolchain_candidates() {
+  printf '%s\n' \
+    "/Library/Developer/CommandLineTools" \
+    "/Applications/Xcode.app/Contents/Developer"
+}
 
-  if [ -n "${SDKROOT:-}" ]; then
+# Is `dir` an internally consistent toolchain? True when clang, run under it,
+# reaches for an SDK that lives inside it.
+_giap_toolchain_is_coherent() {
+  local dir="$1" sdk
+  [ -x "$dir/usr/bin/clang" ] || [ -d "$dir" ] || return 1
+  sdk="$(DEVELOPER_DIR="$dir" clang -v -E -x c /dev/null 2>&1 \
+           | grep -m1 -o -- '-isysroot [^ ]*' | cut -d' ' -f2)" || return 1
+  [ -n "$sdk" ] || return 1
+  case "$sdk" in "$dir"*) return 0 ;; *) return 1 ;; esac
+}
+
+giap_select_coherent_toolchain() {
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+  command -v clang >/dev/null 2>&1 || return 0
+
+  # Someone who pinned a toolchain meant it.
+  [ -n "${DEVELOPER_DIR:-}" ] && return 0
+  # So did someone who pinned an SDK; that is the other valid cure.
+  [ -n "${SDKROOT:-}" ] && return 0
+
+  local current
+  current="$(xcode-select -p 2>/dev/null)" || return 0
+
+  # Already fine: say nothing.
+  if _giap_toolchain_is_coherent "$current"; then
     return 0
   fi
 
-  command -v xcrun >/dev/null 2>&1 || return 0
+  local cand
+  while IFS= read -r cand; do
+    [ -d "$cand" ] || continue
+    if _giap_toolchain_is_coherent "$cand"; then
+      export DEVELOPER_DIR="$cand"
+      printf '  [sdk] %s pairs its linker with another toolchain'"'"'s SDK\n' "$current" >&2
+      printf '  [sdk] selected DEVELOPER_DIR=%s (clang, ld and SDK from one install)\n' "$cand" >&2
+      return 0
+    fi
+  done < <(_giap_toolchain_candidates)
 
-  # The SDK belonging to the active toolchain. If xcrun cannot answer, the
-  # install is broken in a way this shim should not paper over — say nothing
-  # and let the real error surface.
+  # Nothing coherent. Forcing the SDK to match the active toolchain is the
+  # weaker cure but still beats a link error.
   local want
   want="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)" || return 0
   [ -n "$want" ] && [ -d "$want" ] || return 0
-
-  # What clang would pick on its own.
-  local have
-  have="$(clang -v -E -x c /dev/null 2>&1 \
-            | grep -m1 -o -- '-isysroot [^ ]*' \
-            | cut -d' ' -f2)" || true
-
-  # Agreeing is the normal case and needs no intervention.
-  [ -n "$have" ] && [ "$have" != "$want" ] || return 0
-
   export SDKROOT="$want"
-  printf '  [sdk] clang defaulted to %s\n' "$have" >&2
-  printf '  [sdk] pinned SDKROOT=%s (the active toolchain'"'"'s own SDK)\n' "$want" >&2
+  printf '  [sdk] no coherent toolchain found; pinned SDKROOT=%s\n' "$want" >&2
 }
 
-# Check without changing anything. Returns 1 when the two disagree, so a doctor
-# can report it and a build can act on it from the same rule.
-#
-# Echoes "<clang-default>|<xcrun-answer>" on divergence so a caller can name
+# Report without changing anything. Returns 1 when the ACTIVE toolchain is
+# incoherent, echoing "<active-dir>|<clang-default-sdk>" so a caller can name
 # both without re-deriving them.
-giap_macos_sdk_diverges() {
+giap_macos_toolchain_incoherent() {
   [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
-  command -v xcrun >/dev/null 2>&1 || return 0
+  command -v clang >/dev/null 2>&1 || return 0
 
-  local want have
-  want="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)" || return 0
-  have="$(clang -v -E -x c /dev/null 2>&1 \
-            | grep -m1 -o -- '-isysroot [^ ]*' \
-            | cut -d' ' -f2)" || return 0
+  local current sdk
+  current="$(xcode-select -p 2>/dev/null)" || return 0
+  [ -n "$current" ] || return 0
 
-  [ -n "$want" ] && [ -n "$have" ] || return 0
-  [ "$have" = "$want" ] && return 0
+  _giap_toolchain_is_coherent "$current" && return 0
 
-  printf '%s|%s' "$have" "$want"
+  sdk="$(clang -v -E -x c /dev/null 2>&1 \
+           | grep -m1 -o -- '-isysroot [^ ]*' | cut -d' ' -f2)"
+  printf '%s|%s' "$current" "$sdk"
   return 1
 }
