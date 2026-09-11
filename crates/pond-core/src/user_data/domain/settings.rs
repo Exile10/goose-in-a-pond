@@ -1099,28 +1099,6 @@ pub struct Settings {
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_device_enabled: bool,
 
-    /// Enable the news tools module (headlines, search, trending topics).
-    #[serde(default = "Settings::default_ext_enabled")]
-    pub ext_news_enabled: bool,
-
-    /// Enable the finance tools module (stocks, crypto, market data).
-    #[serde(default = "Settings::default_ext_enabled")]
-    pub ext_finance_enabled: bool,
-
-    /// Enable the discovery tools module (product search, recommendations).
-    #[serde(default = "Settings::default_ext_enabled")]
-    pub ext_discovery_enabled: bool,
-
-    /// Enable the audit/privacy tools module (recent activity, summary, privacy risks).
-    #[serde(default = "Settings::default_ext_enabled")]
-    pub ext_audit_enabled: bool,
-
-    /// Enable the vision tools module (recent camera events, acknowledge).
-    /// Read-only over the local event store — independent of `vision_enabled`,
-    /// which controls the capture pipeline itself.
-    #[serde(default = "Settings::default_ext_enabled")]
-    pub ext_vision_enabled: bool,
-
     /// Enable the sensor tools module (query stored IoT sensor readings).
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_sensor_enabled: bool,
@@ -1386,11 +1364,6 @@ impl Default for Settings {
             ext_knowledge_enabled: true,
             ext_system_enabled: true,
             ext_device_enabled: true,
-            ext_audit_enabled: true,
-            ext_vision_enabled: true,
-            ext_news_enabled: true,
-            ext_finance_enabled: true,
-            ext_discovery_enabled: true,
             ext_sensor_enabled: true,
             // The one `false` in this block, and it must stay a literal `false`
             // rather than `Self::default_ext_enabled()`. See the field.
@@ -2201,14 +2174,6 @@ mod tests {
     }
 
     #[test]
-    fn new_extension_toggles_default_to_true() {
-        let s: Settings = serde_json::from_str("{}").unwrap();
-        assert!(s.ext_news_enabled);
-        assert!(s.ext_finance_enabled);
-        assert!(s.ext_discovery_enabled);
-    }
-
-    #[test]
     fn privacy_and_home_fields_default_correctly() {
         let s = Settings::default();
         // Devices exist but the user controls privacy — mic/cameras default ON.
@@ -2249,12 +2214,12 @@ mod tests {
 
     #[test]
     fn partial_overrides_preserve_new_defaults() {
-        let json = r#"{"ext_news_enabled": false}"#;
+        let json = r#"{"ext_weather_enabled": false}"#;
         let s: Settings = serde_json::from_str(json).unwrap();
-        assert!(!s.ext_news_enabled);
-        // Other new toggles keep their defaults
-        assert!(s.ext_finance_enabled);
-        assert!(s.ext_discovery_enabled);
+        assert!(!s.ext_weather_enabled);
+        // Other toggles keep their defaults
+        assert!(s.ext_memory_enabled);
+        assert!(s.ext_schedule_enabled);
         // searxng_url still None
         assert!(s.searxng_url.is_none());
     }
@@ -2730,18 +2695,13 @@ mod tests {
             "context_window_override",
             "custom_system_prompt",
             "embedding_provider",
-            "ext_audit_enabled",
             "ext_device_enabled",
-            "ext_discovery_enabled",
-            "ext_finance_enabled",
             "ext_knowledge_enabled",
             "ext_memory_enabled",
-            "ext_news_enabled",
             "ext_orchestrator_enabled",
             "ext_schedule_enabled",
             "ext_sensor_enabled",
             "ext_system_enabled",
-            "ext_vision_enabled",
             "ext_weather_enabled",
             "home_name",
             "llm_max_tokens",

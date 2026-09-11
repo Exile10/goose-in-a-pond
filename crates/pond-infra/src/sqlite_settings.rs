@@ -558,46 +558,6 @@ impl SettingsRepository for SqliteSettingsRepository {
             }
         );
         upsert!(
-            "ext_news_enabled",
-            if settings.ext_news_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
-        upsert!(
-            "ext_finance_enabled",
-            if settings.ext_finance_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
-        upsert!(
-            "ext_discovery_enabled",
-            if settings.ext_discovery_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
-        upsert!(
-            "ext_audit_enabled",
-            if settings.ext_audit_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
-        upsert!(
-            "ext_vision_enabled",
-            if settings.ext_vision_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
-        upsert!(
             "ext_sensor_enabled",
             if settings.ext_sensor_enabled {
                 "true"
@@ -1111,11 +1071,6 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "ext_knowledge_enabled" => s.ext_knowledge_enabled = value == "true",
         "ext_system_enabled" => s.ext_system_enabled = value == "true",
         "ext_device_enabled" => s.ext_device_enabled = value == "true",
-        "ext_news_enabled" => s.ext_news_enabled = value == "true",
-        "ext_finance_enabled" => s.ext_finance_enabled = value == "true",
-        "ext_discovery_enabled" => s.ext_discovery_enabled = value == "true",
-        "ext_audit_enabled" => s.ext_audit_enabled = value == "true",
-        "ext_vision_enabled" => s.ext_vision_enabled = value == "true",
         "ext_sensor_enabled" => s.ext_sensor_enabled = value == "true",
         // PAI-6 P5. `value == "true"` is the right comparison here rather than a
         // parse-with-fallback: anything unreadable in that column is not "true",
