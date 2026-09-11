@@ -1021,10 +1021,14 @@ impl GooseAdapter {
     /// a multimodal turn, and multimodal turns forfeit the engine's KV prefix
     /// cache).
     ///
-    /// Budgeting reuses the same `trim_history` the in-turn trimmer uses, so a
-    /// long history is cut to the profile's budget exactly the way a live
-    /// conversation would have been. Any failure is logged and skipped — losing
-    /// the replay degrades the turn, it must never fail it.
+    /// Budgeting goes through `trim_history`, which is now reachable ONLY from
+    /// here: the in-turn trimmer was removed at C1 when the engine took over
+    /// context management. This path is reconstruction rather than compaction —
+    /// goose's store can be wiped independently of pond_system.db, so a fresh
+    /// engine session can meet a conversation it has never seen, and the
+    /// rolling summary is how the replay carries forward what the raw messages
+    /// alone no longer say. Any failure is logged and skipped — losing the
+    /// replay degrades the turn, it must never fail it.
     async fn hydrate_goose_session(&self, goose_sid: &str, giap_session_id: &str) {
         use pond_core::models::domain::message::Role as GiapRole;
         use pond_core::models::services::context::turn_trimmer::{plan_replay, TrimRole};
@@ -7906,8 +7910,8 @@ mod tests {
             role: pond_core::models::services::context::turn_trimmer::TrimRole::User,
             text: text.to_string(),
             is_summary: false,
-            // The image cap is age-blind: it runs AFTER `trim_history` over
-            // whatever survived, and its policy lives in `image_history`.
+            // The image cap is age-blind: it runs over whatever the
+            // conversation holds, and its policy lives in `image_history`.
             age_secs: None,
         }
     }
