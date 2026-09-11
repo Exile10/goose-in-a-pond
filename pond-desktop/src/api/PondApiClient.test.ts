@@ -304,6 +304,35 @@ describe("chatStream()", () => {
     await expect(gen.next()).rejects.toBeInstanceOf(ApiError);
   });
 
+  /**
+   * The server's SSE handler holds one of four `sse_semaphore` permits and an
+   * `AttachGuard` for as long as the response body is open. `releaseLock()`
+   * alone does not close it, so an abandoned turn kept both — measured against
+   * a live pond, four abandoned streams made every later send return
+   * `503 Too many concurrent streams` in under 2 ms, until the browser
+   * happened to garbage-collect the Response.
+   */
+  it("cancels the body when the consumer walks away mid-stream", async () => {
+    const encoder = new TextEncoder();
+    let cancelled: unknown = "not cancelled";
+    // Never closes on its own: only a cancel can end this one.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"text","content":"a"}\n'));
+      },
+      cancel(reason) {
+        cancelled = reason ?? null;
+      },
+    });
+    fetchMock.mockResolvedValueOnce(new Response(body, { status: 200 }));
+
+    for await (const ev of client().chatStream("hi")) {
+      if (ev.type === "text") break; // exactly what a session switch does
+    }
+
+    expect(cancelled).not.toBe("not cancelled");
+  });
+
   it("skips malformed SSE lines without throwing", async () => {
     const sseLines = [
       "data: not-valid-json",

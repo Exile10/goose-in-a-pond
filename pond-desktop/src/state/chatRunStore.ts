@@ -853,6 +853,32 @@ export async function resumeActiveRun(): Promise<boolean> {
 }
 
 /**
+ * Let go of the run this window is driving, and stop it server-side.
+ *
+ * Bumping `runSeq` alone only stops us *writing* the frames down -- the run is
+ * `Detached`, so the model keeps generating to completion for nobody. Measured
+ * against a live pond: a client that left at frame 2 had its run finish at
+ * frame 664, seventy-three seconds later, and post-turn memory extraction then
+ * opened a further provider call on the same single-slot engine.
+ *
+ * Deliberately leaving a turn is not the case `resumable` exists for. That case
+ * is the window going away with the turn still running, which is unchanged:
+ * nothing here runs on unload, so a closed window still comes back to a
+ * finished answer.
+ *
+ * Fire-and-forget: navigation must not wait on the network, and a stop the user
+ * asked for should not look like it failed because the request did.
+ */
+function stopServerRun(): void {
+  const runId = state.runId;
+  forgetRun();
+  if (!runId) return;
+  void api.cancelRun(runId).catch((e) => {
+    console.warn("Could not stop the run server-side (non-fatal):", e);
+  });
+}
+
+/**
  * Stop the turn on purpose.
  *
  * The only way now: a detached run does not end because its reader left, so
@@ -884,9 +910,24 @@ function replaceMessages(next: Message[]): void {
   commit();
 }
 
-/** Open one conversation, replaying its persisted history. */
-export async function openSession(sessionId: string): Promise<void> {
+/**
+ * Open one conversation, replaying its persisted history.
+ *
+ * `stopCurrentRun` is the difference between *leaving* a turn and merely
+ * *re-reading* one, and it defaults to off because three of this function's
+ * four callers are the latter: `resumeActiveRun` uses it to lay down the
+ * history before it reattaches, and the `replay_gap` / `run_evicted` arm uses
+ * it to reload a conversation whose run is still generating. Cancelling from
+ * in here would have aborted the very run those paths exist to recover.
+ *
+ * Only the wall's "open this conversation" passes `true`.
+ */
+export async function openSession(
+  sessionId: string,
+  opts?: { stopCurrentRun?: boolean },
+): Promise<void> {
   state.runSeq += 1; // anything still streaming stops writing here
+  if (opts?.stopCurrentRun) stopServerRun(); // ...and stops generating too
   state.busy = false;
   state.queued = [];
   state.sessionId = sessionId;
@@ -929,6 +970,7 @@ export async function followExternalSession(sessionId: string): Promise<void> {
 /** New chat: stop the run, drop the queue, clear the transcript. */
 export function resetConversation(): void {
   state.runSeq += 1;
+  stopServerRun(); // what this function's doc comment has always claimed to do
   state.busy = false;
   state.queued = [];
   state.sessionId = undefined;

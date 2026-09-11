@@ -407,7 +407,9 @@ export function Chat() {
     acknowledgeCompletion();
     dispatch({ type: "SET_SESSION_ID", payload: id });
     dispatch({ type: "CLEAR_CONTEXT_CARDS" });
-    void openSession(id);
+    // Leaving a turn on purpose: stop it, rather than leaving the model
+    // generating an answer this window will never show.
+    void openSession(id, { stopCurrentRun: true });
   }, [dispatch]);
 
   /** Start typing a name for this conversation. */
