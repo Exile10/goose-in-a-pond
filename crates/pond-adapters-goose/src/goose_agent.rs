@@ -4481,11 +4481,15 @@ impl GooseAdapter {
                     // Defaulted ON because the measurements say it is worth the
                     // cost; see `Settings::goal_check_enabled` for why this is a
                     // household setting rather than a `ModelClass` tier.
+                    //
+                    // Not armed for the prefix warm-up: see `AgentRequest::warmup`.
+                    // There is no person to be wrong at, and the second
+                    // round-trip was measured at ~718 ms of a ~11 s warm-up
+                    // whose only useful work is the ~7 s prefill.
                     agent_clone
                         .set_session_goal(
                             &turn_goose_sid,
-                            settings
-                                .goal_check_enabled
+                            (settings.goal_check_enabled && !request.warmup)
                                 .then(|| request.message.clone()),
                         )
                         .await;
@@ -5073,6 +5077,9 @@ impl AgentPort for GooseAdapter {
             // it here would warm a prefix no real turn goes on to use, which is
             // the one outcome that makes the warm-up worse than not running it.
             tool_group_allowlist: None,
+            // No completeness check on a ping nobody reads -- it is a whole
+            // extra round-trip, and it cannot help here.
+            warmup: true,
         };
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), async {
@@ -6667,6 +6674,49 @@ mod tests {
             .collect()
     }
 
+    /// The warm-up asks for no completeness check, and that is safe.
+    ///
+    /// Captured payloads (`GIAP_CAPTURE_PAYLOAD`) show what the check costs here:
+    /// the model replied `ok` to "Warm-up ping. Reply with only: ok", and goose's
+    /// `goal_nudge` then re-engaged it with a second 4,188-token round-trip
+    /// asking it to "finish anything still outstanding". Nobody reads either
+    /// reply.
+    ///
+    /// Safe because it cannot move the warmed prefix, which is the only way this
+    /// could do harm: the same capture shows the FIRST request's payload is
+    /// identical either way -- arming the goal appends a nudge as a later user
+    /// message, so it only ever adds a round-trip after the first has finished.
+    /// If that ever stops being true, this test still passes and the prewarm
+    /// quietly warms the wrong prefix; the byte-level guard for that is
+    /// `pond-mcp-server`'s prefix oracle, not this.
+    ///
+    /// A source scan for the same reason as its neighbours: the request is built
+    /// inline and handed straight to `chat_stream`, with no seam to call.
+    #[test]
+    fn the_prefix_warm_up_does_not_arm_the_completeness_check() {
+        let lines = stream_body_code();
+
+        let built = lines
+            .iter()
+            .position(|l| l.contains("prewarm-{stamp}"))
+            .expect(
+                "the warm-up no longer builds a `prewarm-` session id. If it was renamed, this \
+                 test needs the new anchor -- it is the only thing pinning that the warm-up \
+                 declares itself.",
+            );
+
+        // A window, not the next line: the request literal carries comments and
+        // several fields, and a fixed offset is what rotted the neighbouring
+        // assertion once already.
+        let window = lines[built..(built + 30).min(lines.len())].join("\n");
+
+        assert!(
+            window.contains("warmup: true"),
+            "the warm-up request does not set `warmup: true`, so it arms the completeness check \
+             and pays a second full round-trip for a reply nobody reads. Window:\n{window}"
+        );
+    }
+
     /// The answer contract is inside the envelope, not beside it.
     ///
     /// Placement is the whole claim. Inside `<system-context>` it is stripped
@@ -7194,6 +7244,13 @@ mod tests {
             window.contains("goal_check_enabled"),
             "the goal is armed unconditionally. It costs roughly twice the inferences per turn, \
              so it rides `Settings::goal_check_enabled`. Window:\n{window}"
+        );
+        assert!(
+            window.contains("warmup"),
+            "the goal is armed for the prefix warm-up as well as for real turns. The warm-up is a \
+             ping nobody reads, so the completeness check has nothing to check and costs it a \
+             whole second round-trip -- measured at ~718 ms of a ~11 s warm-up whose only useful \
+             work is the ~7 s prefill. Gate it on `!request.warmup`. Window:\n{window}"
         );
 
         // The process-wide setter must not appear in the stream at all.
@@ -8609,6 +8666,7 @@ mod tests {
             profile_scope: ProfileScope::Household,
             profile_context: None,
             tool_group_allowlist: None,
+            warmup: false,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

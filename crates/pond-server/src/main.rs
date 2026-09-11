@@ -9177,6 +9177,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 profile_scope: ProfileScope::Household,
                 profile_context: None,
                 tool_group_allowlist: None,
+                warmup: false,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -9246,6 +9247,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     profile_scope: ProfileScope::Household,
                     profile_context: None,
                     tool_group_allowlist: None,
+                    warmup: false,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");

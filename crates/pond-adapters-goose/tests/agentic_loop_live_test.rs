@@ -76,6 +76,7 @@ async fn live_action_loop_ollama_executes_tool_call() {
         profile_scope: ProfileScope::Household,
         profile_context: None,
         tool_group_allowlist: None,
+        warmup: false,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();
@@ -149,6 +150,7 @@ async fn live_action_loop_llamafile_executes_tool_call() {
         profile_scope: ProfileScope::Household,
         profile_context: None,
         tool_group_allowlist: None,
+        warmup: false,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();
@@ -218,6 +220,7 @@ async fn live_action_loop_local_executes_tool_call() {
         profile_scope: ProfileScope::Household,
         profile_context: None,
         tool_group_allowlist: None,
+        warmup: false,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();

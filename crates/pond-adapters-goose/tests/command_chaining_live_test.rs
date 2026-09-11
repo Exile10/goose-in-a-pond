@@ -284,6 +284,7 @@ async fn run_utterance(session_id: &str, utterance: &str) -> ChainRun {
         profile_scope: ProfileScope::Household,
         profile_context: None,
         tool_group_allowlist: None,
+        warmup: false,
     };
 
     let started = Instant::now();

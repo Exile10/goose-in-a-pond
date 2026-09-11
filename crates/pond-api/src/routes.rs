@@ -2057,6 +2057,7 @@ async fn drive_turn(
         profile_scope: turn_scope.clone(),
         profile_context: profile_context_for(state, &turn_scope).await,
         tool_group_allowlist: req.tool_group_allowlist.clone(),
+        warmup: false,
     };
 
     // The turn's own state: the visible answer, the tool results that go
@@ -10780,6 +10781,7 @@ async fn agent_chat_stream(
             profile_scope: turn_scope.clone(),
             profile_context: profile_context_for(&state, &turn_scope).await,
             tool_group_allowlist: None,
+            warmup: false,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {

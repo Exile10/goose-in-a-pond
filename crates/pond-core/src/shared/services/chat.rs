@@ -847,6 +847,7 @@ impl ChatService {
             // whose preferences these would be.
             profile_context: None,
             tool_group_allowlist: None,
+            warmup: false,
         };
         let response_text = self.agent.chat(request).await?.text;
 
@@ -1357,6 +1358,7 @@ impl ChatService {
             // whose preferences these would be.
             profile_context: None,
             tool_group_allowlist: None,
+            warmup: false,
         };
 
         // Clear any interrupt left over from the previous turn. Exactly once
