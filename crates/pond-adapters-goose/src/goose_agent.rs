@@ -2708,6 +2708,24 @@ impl GooseAdapter {
             .get(giap_session_id)
             .cloned()
         {
+            // Clamp to what is permitted NOW — the same rule the persisted path
+            // below states and applies, and for the same reason.
+            //
+            // This path did not, and the asymmetry was a latent PAI-1 hole: an
+            // Owner turn caches the wide group list, and a later Guest turn on
+            // the same session got it straight back. Scope is re-derived every
+            // turn (`request.profile_scope`), and it narrows on failure too —
+            // a transient `DeviceRung::Unavailable` falls through to Guest — so
+            // "the cache was filled by a wider speaker" is not a rare case.
+            //
+            // Not exploitable before this, but only by luck of a second layer:
+            // the tool-level `subtract_guest_denied_tools` at step 6d runs in
+            // both selection modes and removes exactly the guest-denied tools.
+            // That made the group-level leak invisible rather than harmless,
+            // and left one subtraction as the sole guard over a cache every
+            // other path is careful to clamp.
+            let cached =
+                pond_core::mcp::services::tool_selection::clamp_to_permitted(cached, &permitted);
             self.remember_permitted(giap_session_id, &permitted).await;
             return SessionGroups {
                 loaded: cached,
@@ -2722,10 +2740,9 @@ impl GooseAdapter {
                     // is stored per session and the speaker's scope is resolved
                     // per turn, so a session that was identified when it was
                     // saved and is not now must not get its groups back.
-                    let groups: Vec<String> = groups
-                        .into_iter()
-                        .filter(|g| permitted.iter().any(|p| p == g))
-                        .collect();
+                    let groups = pond_core::mcp::services::tool_selection::clamp_to_permitted(
+                        groups, &permitted,
+                    );
                     self.session_tool_groups
                         .write()
                         .await

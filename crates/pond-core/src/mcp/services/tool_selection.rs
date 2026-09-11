@@ -190,6 +190,25 @@ pub fn minimal_groups(available: &[String]) -> ToolSelection {
     }
 }
 
+/// Keep only the groups a scope is permitted to hold.
+///
+/// One function because there are three places that must apply this rule — the
+/// in-process cache, the persisted row, and anything that restores a group set
+/// from elsewhere — and writing it three times is how one of them came to be
+/// missing it. The cache path returned its entry unclamped, so an Owner turn
+/// could cache the wide list and a later Guest turn on the same session got it
+/// back.
+///
+/// Scope is re-derived every turn and narrows on failure (a transient device
+/// read falls through to Guest), so "the cache was filled by a wider speaker"
+/// is an ordinary case, not an exotic one.
+pub fn clamp_to_permitted(groups: Vec<String>, permitted: &[String]) -> Vec<String> {
+    groups
+        .into_iter()
+        .filter(|g| permitted.iter().any(|p| p == g))
+        .collect()
+}
+
 /// Retain only the tools belonging to `groups`.
 ///
 /// A tool with no `__` prefix, or whose prefix is not a catalog extension, is KEPT: the
@@ -342,6 +361,39 @@ mod tests {
     /// Core groups survive even when every score is zero.
     /// "minimal" offers the hatch and nothing else -- not the core set, which
     /// is 778 tokens and 9.5% of the local prompt budget on its own.
+    /// The asymmetry that made this a function: a wider speaker's cached set
+    /// must not survive into a narrower speaker's turn.
+    #[test]
+    fn a_wider_speakers_groups_do_not_survive_a_narrower_turn() {
+        let owner_cached = vec![
+            "giap-memory".to_string(),
+            "giap-sensors".to_string(),
+            "giap-weather".to_string(),
+        ];
+        // What a Guest is permitted: memory and sensors are personal-data groups.
+        let guest_permitted = vec!["giap-weather".to_string(), "giap-toolkit".to_string()];
+
+        let clamped = clamp_to_permitted(owner_cached, &guest_permitted);
+
+        assert_eq!(clamped, vec!["giap-weather".to_string()]);
+        assert!(
+            !clamped.iter().any(|g| g == "giap-memory"),
+            "a personal-data group reached a guest through the cache"
+        );
+    }
+
+    /// The other direction, so the clamp cannot pass by refusing everything.
+    #[test]
+    fn clamping_against_a_wider_ceiling_keeps_everything() {
+        let held = vec!["giap-weather".to_string(), "giap-memory".to_string()];
+        let permitted = vec![
+            "giap-weather".to_string(),
+            "giap-memory".to_string(),
+            "giap-sensors".to_string(),
+        ];
+        assert_eq!(clamp_to_permitted(held.clone(), &permitted), held);
+    }
+
     #[test]
     fn minimal_offers_the_hatch_and_nothing_else() {
         let available = vec![
