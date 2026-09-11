@@ -17,6 +17,14 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Every subcommand below either compiles here or ships what was compiled here,
+# and a cold CUDA build on the nano is 40-90 minutes. Catching an SDK mismatch
+# now costs nothing; catching it after the cross-compile costs the build.
+# shellcheck source=lib/macos-sdk.sh
+source "$HERE/lib/macos-sdk.sh"
+giap_pin_macos_sdk
+
 CMD="${1:-help}"
 shift || true
 

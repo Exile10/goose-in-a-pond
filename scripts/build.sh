@@ -19,6 +19,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
+# Before anything compiles: put clang and ld on the same SDK. Without this,
+# every crate that builds C fails to LINK on a Mac carrying both Xcode and a
+# newer Command Line Tools -- and pond-core, which pulls none of them, still
+# builds green. See scripts/lib/macos-sdk.sh for why that asymmetry is the
+# reason this runs here rather than living in a README.
+# shellcheck source=lib/macos-sdk.sh
+source "$SCRIPT_DIR/lib/macos-sdk.sh"
+giap_pin_macos_sdk
+
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'

@@ -33,6 +33,8 @@ if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 3 ]; then
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/macos-sdk.sh
+source "$HERE/lib/macos-sdk.sh"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
@@ -410,6 +412,23 @@ doctor() {
     missing)     bad "pond-desktop/dist missing — build the UI (menu 11) or rsync it from a dev machine"
                  DOC_FAIL=$((DOC_FAIL+1)) ;;
   esac
+
+  # 2b. macOS SDK consistency (build machines only; a no-op elsewhere).
+  #
+  # Reported rather than only fixed, because the failure mode is a LIE, not a
+  # stoppage: every crate pulling aws-lc-sys fails to link while pond-core
+  # builds green, so a run that only touches pond-core looks healthy. Two
+  # review agents have already reported that green as the tree's state.
+  if ! SDK_DIVERGE="$(giap_macos_sdk_diverges)"; then
+    warn "clang and the active toolchain disagree on the macOS SDK"
+    note "clang defaults to ${SDK_DIVERGE%%|*}"
+    note "xcode-select's toolchain owns ${SDK_DIVERGE##*|}"
+    note "every crate that compiles C fails to LINK; pond-core builds green regardless"
+    note "scripts/build.sh and scripts/jetson.sh pin SDKROOT themselves; a bare"
+    note "'cargo test' does not, so export it or fix the install:"
+    note "  export SDKROOT=\"\$(xcrun --sdk macosx --show-sdk-path)\""
+    DOC_WARN=$((DOC_WARN+1))
+  fi
 
   # 3. stray debug server binary.
   # On a dev machine a debug build is normal and expected; the only hazard is
