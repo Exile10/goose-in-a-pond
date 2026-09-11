@@ -5181,6 +5181,69 @@ impl AgentPort for GooseAdapter {
         })
     }
 
+    /// Compact this session now, through goose's own compaction.
+    ///
+    /// GIAP stopped trimming at C1, so the engine owns context management and
+    /// this is a request to it rather than work done here. `manual_compact:
+    /// true` is deliberate: on the automatic path goose preserves the most
+    /// recent text-only user message so the turn in flight still has its
+    /// question, and on an explicit press there is no turn in flight to
+    /// protect.
+    ///
+    /// Every failure returns an error rather than a silent `Ok(None)` — a
+    /// compaction the user pressed for and did not get must not read as one
+    /// that happened.
+    async fn compact_session(&self, session_id: &str) -> Result<Option<u32>> {
+        let goose_sid = self.resolve_goose_session(session_id).await;
+
+        let session = self
+            .session_manager
+            .get_session(&goose_sid, true)
+            .await
+            .map_err(|e| anyhow::anyhow!("no engine session for {session_id}: {e}"))?;
+        let Some(conversation) = session.conversation else {
+            return Ok(None);
+        };
+        if conversation.messages().is_empty() {
+            return Ok(None);
+        }
+
+        let provider = self.agent.provider().await?;
+        let model_config = self.agent.model_config_for_session(&goose_sid).await?;
+
+        let result = goose::context_mgmt::compact_messages(
+            provider.as_ref(),
+            &model_config,
+            &goose_sid,
+            &conversation,
+            true,
+        )
+        .await?;
+
+        self.session_manager
+            .replace_conversation(&goose_sid, &result.conversation)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("compaction produced a conversation we could not store: {e}")
+            })?;
+
+        // The prompt prefix is gone: the conversation the next turn sends is a
+        // summary plus a continuation nudge, sharing nothing with what the KV
+        // cache holds. Saying so is what keeps the next cold turn attributable.
+        self.note_prefix_invalidated(InvalidationReason::PromptChanged);
+
+        let retained = u32::try_from(result.retained_context_tokens).ok();
+        tracing::info!(
+            target: "giap::trace",
+            kind = "manual_compaction",
+            session_id = %session_id,
+            goose_sid = %goose_sid,
+            retained_tokens = retained.unwrap_or(0),
+            "compacted on request"
+        );
+        Ok(retained)
+    }
+
     async fn chat_stream(
         &self,
         request: AgentRequest,
