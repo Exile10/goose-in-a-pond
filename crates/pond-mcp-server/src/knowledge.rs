@@ -82,6 +82,23 @@ pub struct KnowledgeMcpServer {
 
 #[tool_router]
 impl KnowledgeMcpServer {
+    /// Every tool this server exposes, without constructing it or its deps.
+    ///
+    /// `tool_router()` is generated private to this module, so inventory code
+    /// outside it could not reach the real definitions and resorted to scanning
+    /// source text for `#[tool(` instead. This is the enumeration that scan was
+    /// standing in for.
+    /// BOTH routers. `KnowledgeMcpServer` is the one server built from two
+    /// `#[tool_router]` impl blocks (`Self::tool_router() + Self::wolfram_tool_router()`,
+    /// see `new`), so enumerating only the first silently drops `compute_answer`
+    /// — which is exactly what it did until the prefix oracle counted 26 tools
+    /// against a known 27.
+    pub(crate) fn tool_defs() -> Vec<rmcp::model::Tool> {
+        let mut tools = Self::tool_router().list_all();
+        tools.extend(Self::wolfram_tool_router().list_all());
+        tools
+    }
+
     pub fn new(http_client: reqwest::Client) -> Self {
         Self {
             http_client,
