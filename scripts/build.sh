@@ -26,7 +26,7 @@ cd "$ROOT_DIR"
 # reason this runs here rather than living in a README.
 # shellcheck source=lib/macos-sdk.sh
 source "$SCRIPT_DIR/lib/macos-sdk.sh"
-giap_pin_macos_sdk
+giap_select_coherent_toolchain
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'

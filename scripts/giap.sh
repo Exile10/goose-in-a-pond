@@ -419,14 +419,15 @@ doctor() {
   # stoppage: every crate pulling aws-lc-sys fails to link while pond-core
   # builds green, so a run that only touches pond-core looks healthy. Two
   # review agents have already reported that green as the tree's state.
-  if ! SDK_DIVERGE="$(giap_macos_sdk_diverges)"; then
-    warn "clang and the active toolchain disagree on the macOS SDK"
-    note "clang defaults to ${SDK_DIVERGE%%|*}"
-    note "xcode-select's toolchain owns ${SDK_DIVERGE##*|}"
-    note "every crate that compiles C fails to LINK; pond-core builds green regardless"
-    note "scripts/build.sh and scripts/jetson.sh pin SDKROOT themselves; a bare"
-    note "'cargo test' does not, so export it or fix the install:"
-    note "  export SDKROOT=\"\$(xcrun --sdk macosx --show-sdk-path)\""
+  if ! SDK_SPLIT="$(giap_macos_toolchain_incoherent)"; then
+    warn "the selected toolchain pairs its linker with another toolchain's SDK"
+    note "xcode-select -p  ${SDK_SPLIT%%|*}"
+    note "clang defaults to ${SDK_SPLIT##*|}"
+    note "every crate that compiles C fails to LINK; pond-core builds green regardless,"
+    note "which is what makes this mislead rather than stop you"
+    note "scripts/build.sh and scripts/jetson.sh select a coherent toolchain themselves,"
+    note "and ~/.cargo/config.toml covers bare cargo. To fix it for good:"
+    note "  sudo xcode-select --switch /Library/Developer/CommandLineTools"
     DOC_WARN=$((DOC_WARN+1))
   fi
 
