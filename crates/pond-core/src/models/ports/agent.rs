@@ -31,6 +31,24 @@ pub trait Agent: Send + Sync {
         ModelCapabilities::default()
     }
 
+    /// Compact this session's history now, on the user's instruction.
+    ///
+    /// The engine owns compaction since GIAP stopped trimming, so this is a
+    /// request to the engine rather than work GIAP does itself — the port
+    /// exists because `pond-api` must not depend on the goose crate, and the
+    /// hexagonal invariant is enforced by CI's fast-crate list, not by
+    /// convention.
+    ///
+    /// Returns the tokens retained afterwards when the engine reports them.
+    /// `Ok(None)` means the backend has no manual compaction and the caller
+    /// should say so rather than claim a no-op succeeded.
+    ///
+    /// Deliberately NOT "compact if needed": the automatic axis belongs to the
+    /// engine's own threshold. This is the explicit press.
+    async fn compact_session(&self, _session_id: &str) -> Result<Option<u32>> {
+        Ok(None)
+    }
+
     /// Call a tool directly by its fully-qualified name (e.g. "giap-weather__get_current_weather").
     ///
     /// Fallback for a model that emits tool calls as text markup (`<|tool_call>...<tool_call|>`)

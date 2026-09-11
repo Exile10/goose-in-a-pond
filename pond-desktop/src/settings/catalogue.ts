@@ -637,7 +637,6 @@ export const CATALOGUE: CatalogueCategory[] = [
           // The server floors this at MIN_RESUME_IDLE_SECS; too SMALL is the
           // damaging direction, so the client refuses the values that would be
           // silently corrected rather than letting them look accepted.
-          { key: "resume_compaction_idle_secs", label: "Count as resumed after", description: "How long a gap counts as coming back to a conversation rather than continuing it.", control: { kind: "number", min: 300, unit: "seconds" }, consumer: "live", proposed: true, validate: all(integer, atLeast(300, "seconds")) },
           { key: "compaction_verbatim_days", label: "Keep in full for", description: "How many days of conversation to keep word for word before shortening it.", control: { kind: "number", min: 0, unit: "days" }, consumer: "live", proposed: true, validate: all(integer, atLeast(0, "days")) },
         ],
       },

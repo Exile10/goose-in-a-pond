@@ -314,7 +314,6 @@ export interface Settings {
   // Compaction — GIAP-owned history pruning
   hybrid_compaction_enabled?: boolean;
   summary_idle_secs?: number;
-  resume_compaction_idle_secs?: number;
   compaction_verbatim_days?: number;
 
   // Retention — the unified events log (#117)

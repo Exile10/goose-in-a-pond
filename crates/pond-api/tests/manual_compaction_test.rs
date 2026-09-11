@@ -1,7 +1,15 @@
-//! PAI-4 P7 / P7b-fix — `POST /api/v1/sessions/:id/compact`, the manual axis. The press must
-//! work even though the pressure axis has already taken `claim_compaction`, while still not
-//! being a bypass: it rations the automatic axis, is refused mid-pass, and spends no second
-//! model call. Wiring only; the claim arithmetic is unit-tested in pond-core `context_monitor`.
+//! `POST /api/v1/sessions/:id/compact` — the manual press, after C4.
+//!
+//! What this file used to test is gone with its subject. The press had to
+//! coexist with an automatic pressure axis: claim without starving it, refuse
+//! mid-pass, spend no second model call. Since C4 the engine owns compaction,
+//! there is no GIAP-side pass to collide with, and the press simply asks goose
+//! to compact.
+//!
+//! What remains is wiring, which is all this file was ever for: the endpoint
+//! refuses an unsaturated session and reports its real utilisation, 404s an
+//! unknown session, names the switch when the monitor is off, and — the one
+//! inverted assertion — no longer refuses because a GIAP setting is off.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -293,169 +301,6 @@ fn saturate(state: &Arc<AppState>, session_id: &str) {
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
-/// THE GUARD of PAI-4 P7b-fix: it reproduces the production ordering. The chat-stream
-/// generator yields `context_warning` and calls `spawn_pressure_compaction` one statement
-/// later, taking `claim_compaction`, while the button appears only after `done`. So the quota
-/// is always already spent when a real press arrives, and the claim below is the fixture.
-#[tokio::test]
-async fn a_press_after_the_pressure_axis_already_claimed_still_compacts() {
-    let (app, state, _tmp) = make_app().await;
-    let session = state
-        .session_storage
-        .create_session("p7-after-pressure".to_string())
-        .await
-        .expect("create session");
-    seed_history(&state, &session.id, 12).await;
-    saturate(&state, &session.id);
-
-    assert!(
-        state.context_monitor.claim_compaction(&session.id),
-        "the pressure axis could not claim, so this test is not reproducing the \
-         production ordering and would pass against the dead button",
-    );
-
-    let body = compact(&app, &session.id).await;
-    assert_eq!(
-        body["status"], "compacted",
-        "the press was refused after the pressure axis took the shared quota \
-         one statement after the frame that renders this very button - which is \
-         what every real press looks like, so the advertised success path is \
-         unreachable rather than uncommon: {body}",
-    );
-    assert_eq!(
-        body["outcome"], "refreshed",
-        "the endpoint reported success without a pass having persisted a \
-         summary: {body}",
-    );
-}
-
-/// The non-widening control, and the reason the manual claim is not `true`: a press CONSUMES
-/// the automatic axis's quota without CHECKING it. Otherwise the two axes together summarise
-/// more often than either alone could, which is the widening P7's stamp argued against.
-#[tokio::test]
-async fn a_press_rations_the_automatic_axis_afterwards() {
-    let (app, state, _tmp) = make_app().await;
-    let session = state
-        .session_storage
-        .create_session("p7-rations".to_string())
-        .await
-        .expect("create session");
-    seed_history(&state, &session.id, 12).await;
-    saturate(&state, &session.id);
-
-    let body = compact(&app, &session.id).await;
-    assert_eq!(body["status"], "compacted", "{body}");
-
-    // One more pressured turn: nowhere near COMPACTION_COOLDOWN_TURNS, so the
-    // pressure axis must still be held off by the press that just happened.
-    saturate(&state, &session.id);
-    assert!(
-        !state.context_monitor.claim_compaction(&session.id),
-        "the pressure axis claimed one turn after a manual press - a press now \
-         costs the automatic axis nothing, so a user pressing the button and \
-         then taking a turn buys two summarisations where the rules allow one",
-    );
-}
-
-/// `compaction_in_flight` is what protects a serial on-device engine, and it is read BEFORE
-/// the claim so a refusal here does not spend one. Deterministic rather than timed: the
-/// second request is issued only once the first is provably inside `provider.complete`.
-#[tokio::test]
-async fn a_press_while_a_pass_is_in_flight_is_refused() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let (app, state, _tmp) = make_app_with_provider(Arc::new(CountingProvider {
-        calls: calls.clone(),
-        entered: entered.clone(),
-        release: Some(release.clone()),
-    }))
-    .await;
-
-    let session = state
-        .session_storage
-        .create_session("p7-in-flight".to_string())
-        .await
-        .expect("create session");
-    seed_history(&state, &session.id, 12).await;
-    saturate(&state, &session.id);
-
-    let first = tokio::spawn({
-        let app = app.clone();
-        let id = session.id.clone();
-        async move { compact(&app, &id).await }
-    });
-
-    entered.notified().await;
-
-    let second = compact(&app, &session.id).await;
-    assert_eq!(
-        second["status"], "skipped",
-        "a press landed while a pass was already running: {second}",
-    );
-    assert_eq!(
-        second["reason"], "already_running",
-        "a press during an in-flight pass was refused for the wrong reason - \
-         the in-flight peek is the guard that protects the serial on-device \
-         engine from two summarisations at once: {second}",
-    );
-    assert!(second["outcome"].is_null(), "{second}");
-
-    release.notify_waiters();
-    let first = first.await.expect("first press panicked");
-    assert_eq!(first["status"], "compacted", "{first}");
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "two presses reached the summariser",
-    );
-}
-
-/// What bounds a person hammering the button, now the turn cooldown does not:
-/// `SessionSummaryService::refresh` decides `NothingToDo` from the rolling summary's
-/// through-pointer before it reaches `provider.complete`. Counted, not read off the status
-/// string, because a pass that ran and one that did nothing are both reported `skipped`.
-#[tokio::test]
-async fn a_second_press_spends_no_second_model_call() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let (app, state, _tmp) = make_app_with_provider(Arc::new(CountingProvider {
-        calls: calls.clone(),
-        entered: Arc::new(tokio::sync::Notify::new()),
-        release: None,
-    }))
-    .await;
-
-    let session = state
-        .session_storage
-        .create_session("p7-second-press".to_string())
-        .await
-        .expect("create session");
-    seed_history(&state, &session.id, 12).await;
-    saturate(&state, &session.id);
-
-    let first = compact(&app, &session.id).await;
-    assert_eq!(first["status"], "compacted", "{first}");
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "the first press did not reach the summariser",
-    );
-
-    let second = compact(&app, &session.id).await;
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "the second press spent another summarisation model call with no new \
-         messages to fold - a client hammering this endpoint would stack them \
-         in front of the user's next turn on a serial on-device engine: {second}",
-    );
-    assert_eq!(
-        second["outcome"], "nothing_to_do",
-        "the second press did not report the through-pointer refusal it made: \
-         {second}",
-    );
-}
-
 /// A refusal has to say why. A control that silently does nothing is
 /// indistinguishable from a broken one, and this is the refusal a user will hit
 /// most: pressing the button on a conversation that is nowhere near full.
@@ -502,11 +347,19 @@ async fn compacting_an_unknown_session_is_a_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// Turning compaction off turns this off too. The manual axis reads the same
-/// switch the time and pressure axes read; acting here would resurrect half of a
-/// feature the user switched off.
+/// Turning the GIAP-side context features off does NOT disable the button.
+///
+/// It used to: the manual axis read the same switch as the time and pressure
+/// axes, and acting would have resurrected half a feature the user turned off.
+/// Those axes are gone — the press asks the ENGINE to compact, and the engine
+/// compacts on its own threshold whatever this setting says. Refusing here
+/// while automatic compaction carries on regardless would tell the user
+/// compaction is off while they watch it happen.
+///
+/// Inverted rather than deleted: a test that asserted the old gate and was
+/// simply removed leaves nothing saying the gate went on purpose.
 #[tokio::test]
-async fn the_hybrid_compaction_switch_disables_the_manual_axis() {
+async fn the_hybrid_compaction_switch_no_longer_disables_the_manual_axis() {
     let (app, state, _tmp) = make_app().await;
     let session = state
         .session_storage
@@ -525,13 +378,15 @@ async fn the_hybrid_compaction_switch_disables_the_manual_axis() {
         .expect("save settings");
 
     let body = compact(&app, &session.id).await;
-    assert_eq!(body["status"], "skipped", "{body}");
-    assert_eq!(body["reason"], "compaction_disabled", "{body}");
-    assert!(
-        state.context_monitor.claim_compaction(&session.id),
-        "a session refused because the feature is off had its cooldown spent \
-         anyway, so switching compaction back on would not restore the button",
+    assert_ne!(
+        body["reason"], "compaction_disabled",
+        "the setting still gates the press: {body}"
     );
+    // The MockAgent has no manual compaction, so the press reaches the engine
+    // and is honestly reported as having nothing to do — which is the point.
+    // What must NOT happen is a refusal that names the setting.
+    assert_eq!(body["status"], "skipped", "{body}");
+    assert_eq!(body["reason"], "nothing_to_summarise", "{body}");
 }
 
 /// With the monitor off, nothing ever calls `record_turn`, so every utilisation

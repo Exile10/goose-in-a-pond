@@ -723,18 +723,6 @@ pub struct Settings {
     #[serde(default = "Settings::default_summary_idle_secs")]
     pub summary_idle_secs: u32,
 
-    /// Gap after which reopening a session counts as a *resume*, and its
-    /// history is reshaped before the first turn back rather than during it.
-    ///
-    /// PAI-4 P4. The gate is
-    /// `models::services::context::resume_compaction::should_run`; this is only
-    /// the threshold it reads. Too small is the dangerous direction — a pause
-    /// inside a live conversation would be read as a resume and recompact
-    /// between every pair of turns — so `resume_compaction::MIN_RESUME_IDLE_SECS`
-    /// floors whatever is stored here.
-    #[serde(default = "Settings::default_resume_compaction_idle_secs")]
-    pub resume_compaction_idle_secs: u32,
-
     /// Days of history the in-turn trimmer keeps *verbatim* before age
     /// weighting is allowed to degrade it harder than the flat caps do.
     ///
@@ -1316,7 +1304,6 @@ impl Default for Settings {
             show_turn_stats: false,
             hybrid_compaction_enabled: Self::default_hybrid_compaction_enabled(),
             summary_idle_secs: Self::default_summary_idle_secs(),
-            resume_compaction_idle_secs: Self::default_resume_compaction_idle_secs(),
             compaction_verbatim_days: Self::default_compaction_verbatim_days(),
             agent_backend: Self::default_agent_backend(),
             agent_goose_mode: Self::default_agent_goose_mode(),
@@ -1572,15 +1559,8 @@ impl Settings {
         120
     }
 
-    /// 30 minutes — the single source is the constant the gate itself uses, so
-    /// the setting's default and the code's default cannot drift apart. See
-    /// `resume_compaction::RESUME_IDLE_THRESHOLD_SECS` for why that number.
-    fn default_resume_compaction_idle_secs() -> u32 {
-        crate::models::services::context::resume_compaction::RESUME_IDLE_THRESHOLD_SECS
-    }
-
     /// Three days — the single source is the constant the trimmer itself uses,
-    /// for the same reason `default_resume_compaction_idle_secs` reads its
+    /// for the same reason the other duration defaults read their
     /// gate's constant: the setting's default and the code's cannot drift.
     fn default_compaction_verbatim_days() -> u32 {
         crate::models::services::context::turn_trimmer::DEFAULT_VERBATIM_DAYS
@@ -2615,7 +2595,6 @@ mod tests {
             // what the household can see or decide. A control would also be a
             // trap — the damaging direction is *shorter*, and a slider inviting
             // "compact more often" would invite exactly that.
-            "resume_compaction_idle_secs",
             // PAI-4 P3's verbatim horizon. Headless with its neighbours, and
             // for a sharper version of the same reason: the damaging direction
             // is *shorter*, and the only honest UI label for it ("how many days

@@ -411,6 +411,19 @@ const ROOMY_TIER_SAMPLE_WINDOW: usize = 32_768;
 /// Words a `<thinking>` block may run to — the prompt-side form of
 /// [`reasoning_budget_tokens`]. Words, not tokens: `budget_as_words` rounds DOWN,
 /// keeping the ask inside the budget. Takes a bool because the prompt renderer sees
+/// The number of words to ask the model for, from a token budget.
+///
+/// Models take a word count far more reliably than a token count, and roughly
+/// four tokens cover three English words. Rounded down, so the ask lands inside
+/// the budget rather than at it.
+///
+/// Lived in `resummarisation` until that module went with the re-summarisation
+/// pass it gated. Its only remaining caller is the reasoning budget below,
+/// which is a prompt concern and was always the odd one out there.
+pub fn budget_as_words(budget_tokens: usize) -> usize {
+    budget_tokens * 3 / 4
+}
+
 /// only `PromptState::compact_prompt`, so the curve is sampled at the two windows above.
 pub fn reasoning_budget_words(effort: ReasoningEffort, compact_prompt: bool) -> usize {
     let window = if compact_prompt {
@@ -419,7 +432,7 @@ pub fn reasoning_budget_words(effort: ReasoningEffort, compact_prompt: bool) -> 
         ROOMY_TIER_SAMPLE_WINDOW
     };
     let profile = CompactionProfile::from_context_window(window);
-    super::resummarisation::budget_as_words(reasoning_budget_tokens(&profile, effort))
+    budget_as_words(reasoning_budget_tokens(&profile, effort))
 }
 
 /// Available history budget in characters, after system prompt and tool schema overhead.
@@ -1075,7 +1088,7 @@ mod tests {
             for e in ReasoningEffort::ALL {
                 assert_eq!(
                     reasoning_budget_words(*e, compact),
-                    super::super::resummarisation::budget_as_words(reasoning_budget_tokens(&p, *e)),
+                    budget_as_words(reasoning_budget_tokens(&p, *e)),
                     "window {window}, effort {}",
                     e.as_str()
                 );
