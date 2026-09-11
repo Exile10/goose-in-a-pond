@@ -1,10 +1,8 @@
 //! Context budget management for constrained LLM inference. On a Jetson Orin Nano with
 //! a 7B Q4 model the window is ~8K tokens, so after the system prompt and the response
 //! reserve roughly 2,500 tokens (4 chars/token) are usable for history.
-//! `trim_to_budget` keeps the newest messages that fit.
 
-use crate::models::domain::message::{ChatMessage, Role};
-use crate::models::domain::model_capabilities::ModelCapabilities;
+use crate::models::domain::message::ChatMessage;
 
 const CHARS_PER_TOKEN: usize = 4;
 const MIN_USABLE_HISTORY_CHARS: usize = 256;
@@ -498,15 +496,6 @@ pub fn truncate_head_tail(text: &str, max_chars: usize) -> Option<String> {
     ))
 }
 
-/// Approximate total context window in characters (8K tokens × 4 chars/token).
-pub const MAX_CONTEXT_CHARS: usize = 12_000;
-
-/// Characters reserved for the LLM's generated response.
-pub const RESERVE_FOR_RESPONSE_CHARS: usize = 2_048;
-
-/// Characters available for conversation history after reserving for response.
-pub const USABLE_HISTORY_CHARS: usize = MAX_CONTEXT_CHARS - RESERVE_FOR_RESPONSE_CHARS;
-
 fn truncate_at_byte_budget(content: &str, max_bytes: usize) -> String {
     if content.len() <= max_bytes {
         return content.to_string();
@@ -552,81 +541,6 @@ fn trim_to_char_budget(
     kept
 }
 
-/// Truncate oversized assistant tool outputs before history trimming.
-///
-/// Targets assistant messages that look like structured tool payloads (JSON or
-/// code blocks), keeping the first [`TOOL_RESULT_MAX_BYTES`] plus a marker.
-pub fn truncate_tool_outputs(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    messages
-        .into_iter()
-        .map(|msg| {
-            if msg.role != Role::Assistant || msg.content.len() <= TOOL_RESULT_MAX_BYTES {
-                return msg;
-            }
-
-            let looks_like_tool_output = msg.content.contains("```json")
-                || msg.content.contains("\"tool\"")
-                || msg.content.contains("\"result\"")
-                || (msg.content.contains('{') && msg.content.contains('}'));
-
-            if !looks_like_tool_output {
-                return msg;
-            }
-
-            let mut truncated = truncate_at_byte_budget(&msg.content, TOOL_RESULT_MAX_BYTES);
-            truncated.push_str("\n\n[tool output truncated]");
-            ChatMessage {
-                content: truncated,
-                ..msg
-            }
-        })
-        .collect()
-}
-
-/// Trim a message list to fit within a context-token budget.
-///
-/// The token limit is converted to an approximate char budget via 4 chars/token,
-/// with [`RESERVE_FOR_RESPONSE_CHARS`] held back for model generation.
-pub fn trim_to_budget_with_limit(
-    messages: Vec<ChatMessage>,
-    context_limit_tokens: usize,
-) -> Vec<ChatMessage> {
-    let usable_history_chars = context_limit_tokens
-        .saturating_mul(CHARS_PER_TOKEN)
-        .saturating_sub(RESERVE_FOR_RESPONSE_CHARS)
-        .max(MIN_USABLE_HISTORY_CHARS);
-
-    trim_to_char_budget(messages, usable_history_chars)
-}
-
-/// Trim a message list to fit within [`USABLE_HISTORY_CHARS`]. Walks newest-first and
-/// returns the survivors oldest-first, ready to pass to `LlmProvider::complete()`. A
-/// single message larger than the whole budget is truncated rather than dropped, so
-/// the caller always gets at least one.
-pub fn trim_to_budget(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    trim_to_char_budget(messages, USABLE_HISTORY_CHARS)
-}
-
-/// Trim using the model's actual context window.
-///
-/// Reserves 20% for the system prompt and generation headroom (minimum 2048 tokens).
-/// A non-zero `override_tokens` caps the window, for memory-constrained devices.
-pub fn trim_to_budget_for_model(
-    messages: Vec<ChatMessage>,
-    capabilities: &ModelCapabilities,
-    override_tokens: u32,
-) -> Vec<ChatMessage> {
-    let token_limit = if override_tokens > 0 {
-        override_tokens.min(capabilities.context_window_tokens) as usize
-    } else {
-        capabilities.context_window_tokens as usize
-    };
-    // Reserve 20% for system prompt + generation headroom, min 2048 tokens
-    let reserved = (token_limit / 5).max(2048);
-    let effective = token_limit.saturating_sub(reserved).max(256);
-    trim_to_budget_with_limit(messages, effective)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,11 +558,6 @@ mod tests {
 
     fn total_chars(msgs: &[ChatMessage]) -> usize {
         msgs.iter().map(|m| m.content.len()).sum()
-    }
-
-    #[test]
-    fn empty_input_returns_empty() {
-        assert!(trim_to_budget(vec![]).is_empty());
     }
 
     // ── truncate_head_tail (C3) ──────────────────────────────────────────
@@ -700,158 +609,6 @@ mod tests {
         let out = truncate_head_tail(&text, 10).unwrap();
         assert!(out.starts_with("yyyyyyyyyy"));
         assert!(out.contains("[... truncated 490 chars ...]"));
-    }
-
-    #[test]
-    fn small_history_passes_through_unchanged() {
-        let messages = vec![msg("Hello"), msg("How are you?"), msg("Good thanks")];
-        let result = trim_to_budget(messages.clone());
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].content, "Hello");
-        assert_eq!(result[2].content, "Good thanks");
-    }
-
-    #[test]
-    fn large_history_is_trimmed_to_budget() {
-        // 200 messages × 200 chars each = 40_000 chars >> USABLE_HISTORY_CHARS (9_952)
-        let messages: Vec<ChatMessage> = (0..200).map(|_| msg(&"x".repeat(200))).collect();
-        let result = trim_to_budget(messages);
-        assert!(total_chars(&result) <= USABLE_HISTORY_CHARS);
-        // Should keep at least 1 message
-        assert!(!result.is_empty());
-    }
-
-    #[test]
-    fn most_recent_messages_are_preserved() {
-        // Fill budget with old junk, then add a recent message that fits
-        let mut messages: Vec<ChatMessage> = (0..60).map(|_| msg(&"a".repeat(200))).collect();
-        messages.push(msg("final important message"));
-
-        let result = trim_to_budget(messages);
-        // The last message should always be in the result
-        assert_eq!(result.last().unwrap().content, "final important message");
-    }
-
-    #[test]
-    fn single_oversized_message_is_truncated_not_dropped() {
-        let big = msg(&"z".repeat(USABLE_HISTORY_CHARS + 1000));
-        let result = trim_to_budget(vec![big]);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].content.len(), USABLE_HISTORY_CHARS);
-    }
-
-    #[test]
-    fn chronological_order_preserved_after_trim() {
-        let messages: Vec<ChatMessage> =
-            (0..10u32).map(|i| msg(&format!("message-{}", i))).collect();
-        let result = trim_to_budget(messages);
-        // Result must be in original order (oldest first)
-        for w in result.windows(2) {
-            let a: u32 = w[0]
-                .content
-                .strip_prefix("message-")
-                .unwrap()
-                .parse()
-                .unwrap();
-            let b: u32 = w[1]
-                .content
-                .strip_prefix("message-")
-                .unwrap()
-                .parse()
-                .unwrap();
-            assert!(a < b, "messages out of order: {} >= {}", a, b);
-        }
-    }
-
-    #[test]
-    fn budget_exactly_full_keeps_all() {
-        // Each message is exactly USABLE_HISTORY_CHARS / 4 chars
-        let chunk = USABLE_HISTORY_CHARS / 4;
-        let messages: Vec<ChatMessage> = (0..4).map(|_| msg(&"m".repeat(chunk))).collect();
-        let result = trim_to_budget(messages);
-        assert_eq!(result.len(), 4);
-        assert_eq!(total_chars(&result), USABLE_HISTORY_CHARS);
-    }
-
-    #[test]
-    fn trim_to_budget_with_limit_respects_smaller_context() {
-        // context_limit_tokens=1024 -> usable chars = 4096-2048=2048
-        let messages: Vec<ChatMessage> = (0..20).map(|_| msg(&"x".repeat(200))).collect();
-        let result = trim_to_budget_with_limit(messages, 1024);
-        assert!(total_chars(&result) <= 2048);
-    }
-
-    #[test]
-    fn truncate_tool_outputs_truncates_large_assistant_payloads() {
-        let messages = vec![
-            ChatMessage {
-                role: Role::Assistant,
-                content: format!(
-                    "{{\"tool\":\"weather\",\"result\":\"{}\"}}",
-                    "x".repeat(TOOL_RESULT_MAX_BYTES + 300)
-                ),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            },
-            msg("normal user message"),
-        ];
-
-        let result = truncate_tool_outputs(messages);
-        assert_eq!(result.len(), 2);
-        assert!(result[0].content.len() <= TOOL_RESULT_MAX_BYTES + 40);
-        assert!(result[0].content.contains("[tool output truncated]"));
-        assert_eq!(result[1].content, "normal user message");
-    }
-
-    #[test]
-    fn truncate_tool_outputs_keeps_regular_assistant_text() {
-        let plain_assistant = ChatMessage {
-            role: Role::Assistant,
-            content: "This is a normal answer without tool payload markers.".to_string(),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        };
-        let result = truncate_tool_outputs(vec![plain_assistant.clone()]);
-        assert_eq!(result[0].content, plain_assistant.content);
-    }
-
-    #[test]
-    fn trim_for_model_uses_reported_context_window() {
-        // 128K context → 80% usable = ~102K tokens → ~409K chars
-        let caps = ModelCapabilities {
-            context_window_tokens: 128_000,
-            ..Default::default()
-        };
-        let messages: Vec<ChatMessage> = (0..200).map(|_| msg(&"x".repeat(200))).collect();
-        let result = trim_to_budget_for_model(messages.clone(), &caps, 0);
-        // With 128K context, all 200 messages (40K chars) should fit easily
-        assert_eq!(result.len(), 200);
-    }
-
-    #[test]
-    fn trim_for_model_with_small_context() {
-        // 4K context → 80% = ~3.2K tokens → ~12.8K chars - 2048 reserve
-        let caps = ModelCapabilities::default(); // 4096 tokens
-        let messages: Vec<ChatMessage> = (0..200).map(|_| msg(&"x".repeat(200))).collect();
-        let result = trim_to_budget_for_model(messages, &caps, 0);
-        // Should trim significantly — 40K chars won't fit in ~6K usable
-        assert!(result.len() < 200);
-        assert!(!result.is_empty());
-    }
-
-    #[test]
-    fn trim_for_model_override_caps_context() {
-        // Model reports 128K but override limits to 4K
-        let caps = ModelCapabilities {
-            context_window_tokens: 128_000,
-            ..Default::default()
-        };
-        let messages: Vec<ChatMessage> = (0..200).map(|_| msg(&"x".repeat(200))).collect();
-        let result = trim_to_budget_for_model(messages, &caps, 4096);
-        // Override to 4K should trim just like the small context case
-        assert!(result.len() < 200);
     }
 
     // ── CompactionProfile tests ─────────────────────────────────────────

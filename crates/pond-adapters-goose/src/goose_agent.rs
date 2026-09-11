@@ -149,11 +149,10 @@ This usually clears if you reword the question — or start a new chat if it kee
 /// unit-testing, and its result doubles as the change signature that stops
 /// `set_var` from firing on every turn (`set_var` is documented-unsound in a
 /// multi-threaded process, so it runs only when something actually changed).
-fn goose_env_knobs(
-    provider: &str,
-    effective_ctx: usize,
-    hybrid_compaction: bool,
-) -> [(&'static str, Option<String>); 5] {
+/// The goose env knobs GIAP sets. `hybrid_compaction` used to be a parameter;
+/// since C1/C2 it governs none of them, so taking it would be a lie the
+/// signature tells.
+fn goose_env_knobs(provider: &str, effective_ctx: usize) -> [(&'static str, Option<String>); 5] {
     let local = matches!(provider, "local" | "gguf");
     [
         // Without this Goose's ModelConfig defaults context_limit to 128K and
@@ -161,26 +160,22 @@ fn goose_env_knobs(
         // 4K (Jetson) — the model hits ContextLengthExceeded long before the
         // threshold and falls into the expensive emergency-compaction path.
         ("GOOSE_CONTEXT_LIMIT", Some(effective_ctx.to_string())),
-        // Hybrid compaction: GIAP owns trimming (deterministic, in-turn) and
-        // summarization (idle). A threshold >= 1.0 disables Goose's own
-        // auto-compaction, which would stall the turn with an LLM summarization
-        // pass mid-conversation on-device.
-        (
-            "GOOSE_AUTO_COMPACT_THRESHOLD",
-            hybrid_compaction.then(|| "1.0".to_string()),
-        ),
-        // Ownership rule: tool-result pruning has exactly one owner. In hybrid
-        // mode that owner is GIAP's deterministic trimmer, which truncates tool
-        // results head+tail with no model call at all. Goose's tool-pair
-        // summarization (default ON) spawns background LLM calls to summarize
-        // old tool pairs — on-device that spends the tok/s budget the user is
-        // waiting on, to redo work the trimmer already did. Only disabled for
-        // the local engine: an HTTP provider's spare capacity is not ours to
-        // save, and there the summaries are close to free.
-        (
-            "GOOSE_TOOL_PAIR_SUMMARIZATION",
-            (local && hybrid_compaction).then(|| "false".to_string()),
-        ),
+        // C2: goose's own auto-compaction runs, at its own default threshold.
+        //
+        // This was pinned to "1.0" — disabled — because an LLM summarisation
+        // pass mid-conversation stalls the turn on-device. Parity with the
+        // reference means letting it run. Note what this does NOT reach: the
+        // reactive path on `ContextLengthExceeded` was never governed by this
+        // knob and never had an off switch, so unsetting it changes the
+        // PROACTIVE path only.
+        ("GOOSE_AUTO_COMPACT_THRESHOLD", None),
+        // C2: tool-pair summarisation runs too, for the same reason.
+        //
+        // The trimmer that made this redundant is gone, so there is no longer a
+        // competing owner for tool-result pruning. It does spawn background LLM
+        // calls on a single-slot engine the user is waiting on — that cost is
+        // now part of what the measurement is measuring.
+        ("GOOSE_TOOL_PAIR_SUMMARIZATION", None),
         // Empty-turn recovery has exactly one owner, and it is GIAP. Goose's own
         // retry re-sends an unchanged conversation, which a deterministic local
         // model answers identically — three full prefills before the user sees
@@ -1281,11 +1276,7 @@ impl GooseAdapter {
             .last_verbatim_days
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(settings.compaction_verbatim_days);
-        let knobs = goose_env_knobs(
-            &settings.chat_provider,
-            effective_ctx,
-            settings.hybrid_compaction_enabled,
-        );
+        let knobs = goose_env_knobs(&settings.chat_provider, effective_ctx);
         let signature = knobs
             .iter()
             .map(|(k, v)| format!("{k}={}", v.as_deref().unwrap_or("")))
@@ -4412,10 +4403,27 @@ impl GooseAdapter {
         // Live handle for the tool-call guard inside the 'static stream closure.
         let guard_controls = session_controls.clone();
 
-        // ── Deterministic in-turn trim (hybrid compaction, GIAP-owned) ──
-        if settings.hybrid_compaction_enabled {
-            self.trim_goose_history(&goose_sid, &session_id).await;
-        }
+        // ── C1: the deterministic in-turn trim is GONE ───────────────────
+        //
+        // GIAP used to rewrite goose's conversation before every turn — strip
+        // stale `<system-context>`, truncate tool results, splice the rolling
+        // summary, drop the oldest complete turns. Goose now holds the whole
+        // conversation and compacts it the way it does for any other host.
+        //
+        // This is the parity decision, and it is not free. The trimmer is what
+        // kept the prompt under the window, so goose's REACTIVE compaction
+        // (`agent.rs:2640`) was unreachable; it ignores
+        // `GOOSE_AUTO_COMPACT_THRESHOLD`, has no off switch, and `do_compact`
+        // can run five whole-history prefills — ~19 s on the Orin at the
+        // measured 2,190 tok/s, before the summarisation decode. Expect it to
+        // fire. Its rate is the signal this change exists to produce: if it
+        // never fires on real traffic the trimmer was dead weight, and if it
+        // fires often we have the number instead of an argument.
+        //
+        // `trim_goose_history` is kept, unused on this path, because
+        // `hydrate_goose_session` still needs `plan_replay` when a fresh engine
+        // session meets a conversation that already has history — goose's store
+        // can be wiped independently of pond_system.db.
 
         let user_msg_len = request.message.len();
         let turn_start = std::time::Instant::now();
@@ -8422,28 +8430,53 @@ mod tests {
             .and_then(|(_, v)| v.clone())
     }
 
+    /// C1/C2: GIAP no longer suppresses goose's own context management.
+    ///
+    /// These two knobs were pinned — threshold "1.0" to disable auto-compaction,
+    /// tool-pair summarisation "false" — because GIAP's deterministic trimmer
+    /// owned both jobs. The trimmer is gone, so both are unset and goose uses its
+    /// own defaults. Inverted rather than deleted: a test that asserted the old
+    /// behaviour and was simply removed leaves nothing saying the suppression
+    /// went away on purpose.
+    ///
+    /// This is the parity assertion. If either comes back as `Some`, something
+    /// re-introduced GIAP-side ownership without saying so.
     #[test]
-    fn hybrid_compaction_disables_goose_compaction_and_tool_pair_summaries() {
-        let knobs = goose_env_knobs("local", 4096, true);
-        assert_eq!(knob(&knobs, "GOOSE_CONTEXT_LIMIT").as_deref(), Some("4096"));
-        assert_eq!(
-            knob(&knobs, "GOOSE_AUTO_COMPACT_THRESHOLD").as_deref(),
-            Some("1.0")
-        );
-        assert_eq!(
-            knob(&knobs, "GOOSE_TOOL_PAIR_SUMMARIZATION").as_deref(),
-            Some("false"),
-            "the deterministic trimmer owns tool-result pruning on-device"
-        );
-    }
+    fn goose_owns_its_own_compaction_now() {
+        // Every provider, not just the local engine. Tool-pair summarisation
+        // used to be disabled for `local` only — "an HTTP provider's spare
+        // capacity is not ours to conserve" — and that asymmetry is gone with
+        // the trimmer that motivated it.
+        for provider in ["local", "gguf", "ollama", "llamafile"] {
+            for ctx in [4096usize, 8192] {
+                let knobs = goose_env_knobs(provider, ctx);
+                assert!(
+                    knob(&knobs, "GOOSE_AUTO_COMPACT_THRESHOLD").is_none(),
+                    "{provider} ctx {ctx}"
+                );
+                assert!(
+                    knob(&knobs, "GOOSE_TOOL_PAIR_SUMMARIZATION").is_none(),
+                    "{provider} ctx {ctx}"
+                );
+            }
+        }
 
-    #[test]
-    fn without_hybrid_compaction_goose_keeps_its_own_defaults() {
-        let knobs = goose_env_knobs("local", 8192, false);
-        assert_eq!(knob(&knobs, "GOOSE_CONTEXT_LIMIT").as_deref(), Some("8192"));
-        // Unset, not "0.8" — absence restores Goose's own default.
-        assert!(knob(&knobs, "GOOSE_AUTO_COMPACT_THRESHOLD").is_none());
-        assert!(knob(&knobs, "GOOSE_TOOL_PAIR_SUMMARIZATION").is_none());
+        for ctx in [4096usize, 8192] {
+            let knobs = goose_env_knobs("local", ctx);
+            assert_eq!(
+                knob(&knobs, "GOOSE_CONTEXT_LIMIT").as_deref(),
+                Some(ctx.to_string().as_str()),
+                "the window is still ours to declare — goose defaults to 128K"
+            );
+            assert!(
+                knob(&knobs, "GOOSE_AUTO_COMPACT_THRESHOLD").is_none(),
+                "unset, so goose's own 0.8 applies (ctx {ctx})"
+            );
+            assert!(
+                knob(&knobs, "GOOSE_TOOL_PAIR_SUMMARIZATION").is_none(),
+                "unset, so goose's background tool-pair summaries run (ctx {ctx})"
+            );
+        }
     }
 
     /// A single tool result must not be able to end the conversation.
@@ -8459,7 +8492,7 @@ mod tests {
     fn a_single_tool_result_cannot_blow_the_local_window() {
         for ctx in [4096usize, 8192, 16384] {
             let cap: usize = knob(
-                &goose_env_knobs("local", ctx, true),
+                &goose_env_knobs("local", ctx),
                 "GOOSE_MAX_TOOL_RESPONSE_SIZE",
             )
             .expect("the local engine caps tool responses")
@@ -8479,7 +8512,7 @@ mod tests {
         // Goose's own default is what this exists to displace.
         assert!(
             knob(
-                &goose_env_knobs("local", 8192, true),
+                &goose_env_knobs("local", 8192),
                 "GOOSE_MAX_TOOL_RESPONSE_SIZE"
             )
             .map(|v| v.parse::<usize>().unwrap() < 200_000)
@@ -8495,28 +8528,10 @@ mod tests {
         for provider in ["ollama", "llamafile"] {
             assert!(
                 knob(
-                    &goose_env_knobs(provider, 32768, true),
+                    &goose_env_knobs(provider, 32768),
                     "GOOSE_MAX_TOOL_RESPONSE_SIZE"
                 )
                 .is_none(),
-                "{provider}"
-            );
-        }
-    }
-
-    /// Tool-pair summarization is only disabled for the in-process engine: an
-    /// HTTP provider's spare capacity is not ours to conserve.
-    #[test]
-    fn http_providers_keep_goose_tool_pair_summarization() {
-        for provider in ["ollama", "llamafile"] {
-            let knobs = goose_env_knobs(provider, 32768, true);
-            assert!(
-                knob(&knobs, "GOOSE_TOOL_PAIR_SUMMARIZATION").is_none(),
-                "{provider}"
-            );
-            assert_eq!(
-                knob(&knobs, "GOOSE_AUTO_COMPACT_THRESHOLD").as_deref(),
-                Some("1.0"),
                 "{provider}"
             );
         }
@@ -8532,7 +8547,7 @@ mod tests {
             for hybrid in [true, false] {
                 assert_eq!(
                     knob(
-                        &goose_env_knobs(provider, 4096, hybrid),
+                        &goose_env_knobs(provider, 4096),
                         "GOOSE_MAX_EMPTY_TURN_RETRIES"
                     )
                     .as_deref(),
@@ -8606,17 +8621,19 @@ mod tests {
     /// settings change MUST alter it and an unchanged setting must not.
     #[test]
     fn knob_signature_changes_only_when_a_setting_changes() {
-        let sig = |p, ctx, hybrid| {
-            goose_env_knobs(p, ctx, hybrid)
+        let sig = |p, ctx| {
+            goose_env_knobs(p, ctx)
                 .iter()
                 .map(|(k, v)| format!("{k}={}", v.as_deref().unwrap_or("")))
                 .collect::<Vec<_>>()
                 .join(";")
         };
-        assert_eq!(sig("local", 4096, true), sig("local", 4096, true));
-        assert_ne!(sig("local", 4096, true), sig("local", 4096, false));
-        assert_ne!(sig("local", 4096, true), sig("local", 8192, true));
-        assert_ne!(sig("local", 4096, true), sig("ollama", 4096, true));
+        assert_eq!(sig("local", 4096), sig("local", 4096));
+        assert_ne!(sig("local", 4096), sig("local", 8192));
+        assert_ne!(sig("local", 4096), sig("ollama", 4096));
+        // The hybrid-compaction axis is deliberately absent: since C1/C2 it
+        // governs no knob, so asserting it moves the signature would re-assert
+        // a coupling that no longer exists.
     }
 
     // ── C3: structured tool-response truncation ──────────────────────────
