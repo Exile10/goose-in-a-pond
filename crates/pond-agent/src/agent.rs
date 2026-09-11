@@ -797,6 +797,7 @@ mod tests {
                 profile_scope: ProfileScope::Household,
                 profile_context: None,
                 tool_group_allowlist: None,
+                warmup: false,
             })
             .await
             .unwrap();
@@ -818,6 +819,7 @@ mod tests {
                 profile_scope: ProfileScope::Household,
                 profile_context: None,
                 tool_group_allowlist: None,
+                warmup: false,
             })
             .await
             .unwrap();
@@ -897,6 +899,7 @@ mod tests {
             profile_scope: ProfileScope::Household,
             profile_context: None,
             tool_group_allowlist: None,
+            warmup: false,
         };
         let prompt = agent
             .build_system_prompt(&Settings::default(), &request)
