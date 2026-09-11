@@ -65,6 +65,18 @@ jobs:
       # is upstream main + the GIAP patch set (docs/goose-patch-management.md). A BREAKING future
       # sync must be staged on a side branch and fast-forwarded into fork main together with the
       # parent-side port, or older parent branches fail CI on fresh runs.
+      #
+      # THAT HAS HAPPENED AND IS UNRESOLVED (2026-09-11). The parent pins submodule SHA d43cd702c
+      # on `feat/llama-cpp-2-0.1.156-oai-fork`, 8 ahead of fork main and 0 behind. The parent asks
+      # for llama-cpp-2 =0.1.156 (Cargo.toml) and patches it to jarida-io/llama-cpp-rs-giap rev
+      # ad6e4b85, which declares 0.1.156. Fork main's goose still asks for =0.1.146, which that
+      # patch CANNOT satisfy -- so a run against fork main resolves a different graph than any
+      # build that ships, and `cargo check` never links, so it passes anyway. The side branch also
+      # carries `cuda-no-vmm`, the flag that fixed a shipped Jetson OOM; fork main has plain `cuda`.
+      #
+      # The fix is the missing fast-forward, not a change here. `--locked` on every cargo step
+      # below is the guard: a resolve that disagrees with Cargo.lock now fails loudly instead of
+      # quietly checking something nobody runs.
       - name: Checkout goose submodule
         run: |
           rm -rf goose
@@ -92,7 +104,7 @@ jobs:
 
       - name: cargo clippy (fast crates)
         run: |
-          cargo clippy \
+          cargo clippy --locked \
             -p pond-voice \
             -p pond-audio \
             -p pond-core \
@@ -115,7 +127,7 @@ jobs:
       # --ignored is NOT passed so the 28 live-hardware tests are skipped.
       - name: cargo test (fast crates)
         run: |
-          cargo test \
+          cargo test --locked \
             -p pond-voice \
             -p pond-audio \
             -p pond-core \
@@ -139,18 +151,18 @@ jobs:
       # these crates' tests/ and examples/ (excluded from the fast test job) would be compiled by
       # nothing. Not `--tests`: that builds bins in cfg(test) mode and misses `#[cfg(not(test))]`.
       - name: cargo check (production binary + its test targets — pond-server + goose adapter)
-        run: cargo check -p pond-server -p pond-adapters-goose --all-targets
+        run: cargo check --locked -p pond-server -p pond-adapters-goose --all-targets
 
       # The check above doesn't pass --features mesh, but the staged sidecar
       # build always does — this catches a mesh-only break the other misses.
       - name: cargo check (production binary with mesh feature — matches the staged sidecar build)
-        run: cargo check -p pond-server --features mesh --all-targets
+        run: cargo check --locked -p pond-server --features mesh --all-targets
 
       # The quarantined PondAgent stack (Q2-05). Off pond-server's default features, so the gate
       # above never reaches it, yet AGENTS.md promises it "compiles and can be enabled"; hence
       # `--all-targets` here too. It is off the fast pass because it builds llama-cpp-2.
       - name: cargo check (quarantined PondAgent + its test targets — pond-agent + pond-inference)
-        run: cargo check -p pond-agent -p pond-inference --all-targets
+        run: cargo check --locked -p pond-agent -p pond-inference --all-targets
 
       # The direct mistral.rs backend is off by default, so nothing above
       # compiles the ~60 lines in main.rs that wire it. An off-by-default
@@ -158,14 +170,14 @@ jobs:
       # guard, and it only re-checks pond-server itself — the dependency graph
       # is unchanged, so the goose submodule is already built by the step above.
       - name: cargo check (direct mistral.rs backend — off by default, so nothing else builds it)
-        run: cargo check -p pond-server --features mistralrs-agent
+        run: cargo check --locked -p pond-server --features mistralrs-agent
 
       # `cargo check --all-targets` above COMPILES pond-inference's tests but never RUNS them.
       # `no_giap_code_calls_llama_backend_init` and
       # `the_backend_handle_is_held_strongly_and_never_freed` guard against a process-wide panic
       # when GIAP and Goose both claim the llama backend; the live embed test is `#[ignore]`d.
       - name: cargo test (in-process GGUF engine + embedder — pond-inference)
-        run: cargo test -p pond-inference
+        run: cargo test --locked -p pond-inference
 
       # Compile-gate the ONNX vision classifier (ort is too heavy for the fast
       # lint/test pass, mirroring pond-adapters-face-onnx). Its pure decode/
