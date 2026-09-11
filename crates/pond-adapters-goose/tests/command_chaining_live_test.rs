@@ -41,11 +41,6 @@ fn chaining_settings() -> Settings {
     s.ext_weather_enabled = false;
     s.ext_knowledge_enabled = false;
     s.ext_system_enabled = false;
-    s.ext_news_enabled = false;
-    s.ext_finance_enabled = false;
-    s.ext_discovery_enabled = false;
-    s.ext_audit_enabled = false;
-    s.ext_vision_enabled = false;
     s
 }
 

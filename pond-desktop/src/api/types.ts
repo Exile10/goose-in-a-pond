@@ -207,11 +207,6 @@ export interface Settings {
   ext_knowledge_enabled?: boolean;
   ext_system_enabled?: boolean;
   ext_device_enabled?: boolean;
-  ext_news_enabled?: boolean;
-  ext_finance_enabled?: boolean;
-  ext_discovery_enabled?: boolean;
-  ext_audit_enabled?: boolean;
-  ext_vision_enabled?: boolean;
   ext_sensor_enabled?: boolean;
   /**
    * Delegation to saved agent roles. The one extension toggle that ships OFF —
