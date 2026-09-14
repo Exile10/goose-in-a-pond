@@ -163,12 +163,10 @@ export function Skills() {
         title="Skills"
         action={
           <Button
-            color="secondary"
-            radius="md"
+            variant="secondary"
             onPress={() => (showForm ? resetForm() : setShowForm(true))}
-            startContent={showForm ? undefined : <Plus size={14} />}
           >
-            {showForm ? "Cancel" : "Add Skill"}
+            {showForm ? null : <Plus size={14} />} {showForm ? "Cancel" : "Add Skill"}
           </Button>
         }
       />
@@ -182,8 +180,6 @@ export function Skills() {
               <Input
                 id="skill-name"
                 placeholder="e.g. Task Reminder"
-                variant="bordered"
-                radius="md"
                 value={name}
                 onChange={(e) => handleNameChange(e.target.value)}
               />
@@ -191,8 +187,6 @@ export function Skills() {
               <Input
                 id="skill-description"
                 placeholder='When should this activate? e.g. "Creates reminders when asked to be reminded of something"'
-                variant="bordered"
-                radius="md"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
               />
@@ -222,20 +216,17 @@ export function Skills() {
               />
               <div className="skills-form__actions">
                 <Button
-                  variant="light"
-                  radius="md"
+                  variant="ghost"
                   onPress={resetForm}
                 >
                   Cancel
                 </Button>
                 <Button
-                  color="secondary"
-                  radius="md"
+                  variant="secondary"
                   onPress={save}
                   isDisabled={!name.trim() || !description.trim() || !content.trim()}
-                  startContent={<Check size={14} />}
                 >
-                  {editingSkill ? "Update skill" : "Save skill"}
+                  <Check size={14} /> {editingSkill ? "Update skill" : "Save skill"}
                 </Button>
               </div>
             </div>
@@ -268,11 +259,12 @@ export function Skills() {
                 </span>
                 <Switch
                   size="sm"
-                  color="secondary"
                   isSelected={s.active}
-                  onValueChange={() => toggle(s.id, s.active)}
+                  onChange={() => toggle(s.id, s.active)}
                   aria-label={`Enable ${s.name}`}
-                />
+                >
+                  <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
+                </Switch>
               </div>
               <h3 className="skill-card__title">{s.name}</h3>
               <p className="skill-card__desc">

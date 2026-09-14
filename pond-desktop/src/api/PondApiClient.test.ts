@@ -458,10 +458,13 @@ describe("getDownloadProgress()", () => {
   });
 
   it("returns in-progress downloads", async () => {
-    const downloads = [{ filename: "model.gguf", category: "gguf", progress_pct: 42, status: "downloading" }];
+    const downloads = [
+      { filename: "model.gguf", category: "gguf", downloaded_bytes: 42, total_bytes: 100, status: "downloading" },
+    ];
     fetchMock.mockResolvedValueOnce(okJson({ downloads }));
     const res = await client().getDownloadProgress();
-    expect(res.downloads[0].progress_pct).toBe(42);
+    expect(res.downloads[0].downloaded_bytes).toBe(42);
+    expect(res.downloads[0].total_bytes).toBe(100);
   });
 });
 
