@@ -350,10 +350,20 @@ jobs:
       - name: Prepare Electron and its sandbox helper
         run: |
           set -euo pipefail
-          # --version starts no renderer and no zygote, so it is safe to run
-          # before the sandbox helper has been fixed, and it is enough to make
-          # the package extract itself.
-          npx electron --version
+          # Electron 44's npm package has NO postinstall script -- check its
+          # package.json, there is no `scripts` field at all. Extraction is
+          # explicit, through the `install-electron` bin it declares. So
+          # `npm ci` legitimately leaves node_modules/electron/dist empty, and
+          # `npm rebuild electron` does nothing because there is nothing to
+          # rebuild. Verified both locally.
+          #
+          # Extract it here, without running it. The ordering is circular if
+          # you get it wrong: the binary will not start until the sandbox
+          # helper is root-owned, and the helper does not exist until the
+          # binary is extracted. `npx electron --version` is not a way out --
+          # it goes far enough into Chromium startup to hit the very same
+          # FATAL:setuid_sandbox_host.cc abort.
+          npx install-electron
           SANDBOX=node_modules/electron/dist/chrome-sandbox
           if [ ! -f "$SANDBOX" ]; then
             echo "::error::expected $SANDBOX to exist after preparing Electron"
