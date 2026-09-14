@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    # Leaf crate: voice text/DSP primitives, no framework deps. Also path-dep'd
-    # by pond-desktop/src-tauri, which is a separate workspace.
+    # Leaf crate: voice text/DSP primitives, no framework deps. Kept a leaf by
+    # choice now rather than by necessity -- see its Cargo.toml.
     "crates/pond-voice",
     # Single microphone owner (cpal). Depends on pond-voice.
     "crates/pond-audio",

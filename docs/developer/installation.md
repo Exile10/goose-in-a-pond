@@ -51,7 +51,7 @@ Modes (auto-detected if omitted):
 
 Build:
   --full            Build the entire workspace including Goose (10+ min)
-  --desktop         Also build the Tauri desktop app
+  --desktop         Also build the Electron desktop app (macOS only)
   --no-verify       Skip the post-install health check
 
 Models:
@@ -155,7 +155,7 @@ cargo run -p pond-server --release -- serve --open
 cargo run -p pond-server --release -- chat --voice
 
 # Desktop app
-cd pond-desktop && npm run tauri dev
+cd pond-desktop && npm run dev:electron
 ```
 
 ## Production Deployment (Linux)

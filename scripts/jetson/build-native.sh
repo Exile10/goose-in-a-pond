@@ -7,8 +7,6 @@
 # Usage:
 #   bash scripts/jetson.sh build                  # CPU-only server
 #   bash scripts/jetson.sh build --cuda           # server with CUDA GPU accel
-#   bash scripts/jetson.sh build --desktop        # server + Tauri desktop app
-#   bash scripts/jetson.sh build --cuda --desktop
 #
 # Requirements:
 #   - JetPack 5.x (CUDA 11.4) or JetPack 6.x (CUDA 12.2) — pre-installed
@@ -18,19 +16,17 @@
 set -euo pipefail
 
 CUDA=false
-DESKTOP=false
 
 for arg in "$@"; do
   case "$arg" in
     --cuda)    CUDA=true ;;
-    --desktop) DESKTOP=true ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
   esac
 done
 
 echo "═══════════════════════════════════════════════════"
 echo "  GIAP — Jetson Orin Nano native build"
-echo "  CUDA: $CUDA  |  Desktop: $DESKTOP"
+echo "  CUDA: $CUDA"
 echo "═══════════════════════════════════════════════════"
 
 # ── 1. Rust toolchain ────────────────────────────────────────────────────────
@@ -53,15 +49,6 @@ sudo apt-get install -y \
   libasound2-dev \
   libdbus-1-dev \
   libsqlite3-dev
-
-if [ "$DESKTOP" = true ]; then
-  echo "Installing Tauri/WebKitGTK dependencies..."
-  # Single source of truth for the desktop build deps (checks + installs the
-  # full WebKitGTK set: webkit2gtk-4.1, gtk-3, libsoup-3.0, javascriptcoregtk,
-  # plus rsvg/patchelf/appindicator). Also enforced at compile time by
-  # pond-desktop/src-tauri/build.rs.
-  bash "$(dirname "${BASH_SOURCE[0]}")/../install-desktop-deps.sh"
-fi
 
 # ── 2b. Build the web UI (embedded into the single-executable server) ────────
 # pond-server embeds pond-desktop/dist at compile time (crates/pond-api/build.rs
@@ -93,32 +80,6 @@ SQLX_OFFLINE=true cargo build -p pond-server $SERVER_FEATURES --release
 
 echo ""
 echo "Server binary: $(pwd)/target/release/pond-server"
-
-# ── 4. Build Tauri desktop (optional) ────────────────────────────────────────
-if [ "$DESKTOP" = true ]; then
-  echo ""
-  echo "Building Tauri desktop app..."
-
-  if ! command -v node &>/dev/null; then
-    echo "Node.js not found. Install via nvm or apt:"
-    echo "  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -"
-    echo "  sudo apt-get install -y nodejs"
-    exit 1
-  fi
-
-  if ! command -v cargo-tauri &>/dev/null; then
-    echo "Installing tauri-cli..."
-    cargo install tauri-cli --locked
-  fi
-
-  cd pond-desktop
-  npm install
-  cargo tauri build
-  cd ..
-
-  echo ""
-  echo "Desktop bundle: $(pwd)/pond-desktop/src-tauri/target/release/bundle/"
-fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""

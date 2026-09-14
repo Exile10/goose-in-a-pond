@@ -1,0 +1,26 @@
+{
+  "//": [
+    "The main process and preload are Node, not DOM. They get their own",
+    "tsconfig so the renderer's `lib` (DOM, DOM.Iterable) and its lack of",
+    "@types/node cannot leak in either direction: a main-process file that",
+    "reaches for `document` should not compile, and neither should a renderer",
+    "file that reaches for `process`.",
+    "",
+    "`src/shell/contract.ts` is deliberately shared with the renderer, so it is",
+    "included here too. It imports nothing, which is what makes that safe."
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true
+  },
+  "include": ["./**/*.ts", "../src/shell/contract.ts"]
+}

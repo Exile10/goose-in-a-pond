@@ -29,7 +29,7 @@ this broken" question.
 
 | Document | Description |
 |---|---|
-| [Component Breakdown](./architecture/components.md) | Purpose and structure of every crate in `crates/` and `pond-desktop/` |
+| [Component Breakdown](./architecture/components.md) | Purpose and structure of every crate in `crates/`, plus `pond-desktop/` |
 | [Data Flow & Lifecycle](./architecture/data_flow.md) | How a chat request travels from HTTP → Core → Goose → response |
 | [Agent Pipeline](./architecture/agent_pipeline.md) | ToolAgent pre-processor, Main LLM, AnswerReviewer post-processor |
 | [Model Capabilities](./architecture/model_capabilities.md) | Runtime capability discovery: thinking, vision, context window |

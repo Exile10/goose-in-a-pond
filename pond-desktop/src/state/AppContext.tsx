@@ -6,8 +6,7 @@ import React, {
   useRef,
   type ReactNode,
 } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, listen, isDesktopShell } from "../shell";
 import { api } from "../api/PondApiClient";
 import { refreshHomeData } from "../hub/state/hubDataStore";
 import { setChatRunBridge, resumeActiveRun } from "./chatRunStore";
@@ -166,9 +165,8 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const unlisten: Array<() => void> = [];
 
-    // Guard: Tauri IPC may not be available in non-Tauri environments (browser dev, tests)
-    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-    if (!isTauri) {
+    // There is no bridge in the browser dev surface or under test.
+    if (!isDesktopShell()) {
       // Browser dev / Playwright mode: mark server online immediately so
       // all sections can load. Auth token not needed (loopback bypass).
       dispatch({ type: "SERVER_ONLINE" });
@@ -231,15 +229,15 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
     };
 
     // Server online/offline status — reactive path.
-    listen<boolean>("server-status", (e) => {
-      if (e.payload) {
+    unlisten.push(listen("server-status", (online) => {
+      if (online) {
         handleServerOnline();
       } else {
         // Server went offline — reset so a subsequent online event retriggers.
         onlineHandled = false;
         dispatch({ type: "SERVER_OFFLINE" });
       }
-    }).then((u) => unlisten.push(u));
+    }));
 
     // Active probe path. Tauri events are NOT buffered: if the Rust side
     // emits `server-status: true` before our `listen()` registration above
@@ -256,7 +254,7 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       for (let i = 0; i < 240; i++) {
         if (probeCancelled || onlineHandled) return;
         try {
-          const healthy = await invoke<boolean>("server_health");
+          const healthy = await invoke("server_health");
           if (healthy) {
             handleServerOnline();
             return;
@@ -269,116 +267,28 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
     })();
     unlisten.push(() => { probeCancelled = true; });
 
-    listen("server-starting", () => {
+    unlisten.push(listen("server-starting", () => {
       dispatch({ type: "SERVER_STARTING" });
-    }).then((u) => unlisten.push(u));
+    }));
 
     // Global voice activation hotkey
-    listen("desktop-summon", () => {
+    unlisten.push(listen("desktop-summon", () => {
       dispatch({ type: "VOICE_ACTIVATE" });
-    }).then((u) => unlisten.push(u));
+    }));
 
     // Recording lifecycle — voice state is now managed explicitly by
     // VoiceMode so calibration recordings don't corrupt it.
     // recording-started: no-op (callers set their own state)
     // recording-aborted: VoiceMode handles state transition itself
 
-    // ── Per-turn pipeline events (legacy HTTP path) ──────────────────────────
-    // EVENT OWNERSHIP NOTE: these listeners handle the OLD per-turn HTTP
-    // pipeline events emitted by audio_cmd.rs / canvas_feed.rs in the Tauri
-    // shell (transcript, response-token, tool-result, tts-start, tts-end).
-    //
-    // DOUBLE-DISPATCH FIX: AppContext is the SOLE owner of these legacy events.
-    // TauriVoiceBackend ALSO registered listeners for the same events, creating
-    // a verified double-dispatch bug (every event caused two reducer dispatches,
-    // corrupting the role guard at reducer.ts:201). TauriVoiceBackend's duplicate
-    // listeners have been removed from this registration path; it now only
-    // registers audio-level, wake-word-detected, wake-word-interrupt, and
-    // voice-dismissed (events it uniquely owns through its callback interface).
-    //
-    // The NEW voice-* events (voice-ready, voice-state, voice-transcript,
-    // voice-token, voice-tool-call, voice-tool-result, voice-done, voice-error,
-    // voice-session-ended) are the EXCLUSIVE domain of useVoiceSession and
-    // are NEVER registered here. They come from a completely separate Rust
-    // code path (chat_process.rs NDJSON reader) and never fire alongside the
-    // legacy per-turn events — so there is no cross-talk between the two paths.
-
-    // Transcript (user text after ASR)
-    // Rust emits TranscriptResult { text: String } -> payload is { text: "..." }
-    listen<{ text: string }>("transcript", (e) => {
-      const msg: TranscriptMessage = {
-        id: nextTranscriptId(),
-        role: "user",
-        text: e.payload.text,
-        timestamp: Date.now(),
-      };
-      dispatch({ type: "APPEND_TRANSCRIPT", payload: msg });
-      dispatch({ type: "SET_VOICE_STATE", payload: "thinking" });
-      // Seed an empty agent message for token streaming
-      const agentMsg: TranscriptMessage = {
-        id: nextTranscriptId(),
-        role: "agent",
-        text: "",
-        timestamp: Date.now(),
-      };
-      dispatch({ type: "APPEND_TRANSCRIPT", payload: agentMsg });
-    }).then((u) => unlisten.push(u));
-
-    // Streaming response tokens
-    listen<{ token: string; done: boolean }>("response-token", (e) => {
-      dispatch({ type: "APPEND_AGENT_TOKEN", payload: e.payload });
-    }).then((u) => unlisten.push(u));
-
-    // Tool call results — may include MCP-APP UI hints from backend
-    listen<{ tool: string; data: Record<string, unknown>; timestamp_ms: number; renderHint?: string }>(
-      "tool-result",
-      (e) => {
-        const card: ContextCard = {
-          id: nextCardId(),
-          tool: e.payload.tool,
-          data: e.payload.data,
-          timestamp_ms: e.payload.timestamp_ms,
-          ...(e.payload.renderHint ? { renderHint: e.payload.renderHint } : {}),
-        };
-        dispatch({ type: "PUSH_CONTEXT_CARD", payload: card });
-      },
-    ).then((u) => unlisten.push(u));
-
-    // TTS playback (legacy per-turn pipeline only — NOT emitted by the child
-    // process path; the child signals state via voice-state events instead)
-    listen("tts-start", () => {
-      dispatch({ type: "SET_VOICE_STATE", payload: "speaking" });
-    }).then((u) => unlisten.push(u));
-
-    listen("tts-end", () => {
-      dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
-    }).then((u) => unlisten.push(u));
-
     // macOS menu bar — View menu items
-    listen("canvas-toggle", () => {
+    unlisten.push(listen("canvas-toggle", () => {
       dispatch({ type: "SET_SECTION", payload: "canvas" });
-    }).then((u) => unlisten.push(u));
+    }));
 
-    listen("switch-to-voice", () => {
+    unlisten.push(listen("switch-to-voice", () => {
       dispatch({ type: "SET_MODE", payload: "voice" });
-    }).then((u) => unlisten.push(u));
-
-    // Pipeline errors
-    listen<string>("pipeline-error", (e) => {
-      dispatch({ type: "SET_VOICE_ERROR", payload: e.payload });
-      dispatch({ type: "SET_VOICE_STATE", payload: "error" });
-      // Auto-clear error after 4 seconds
-      setTimeout(() => {
-        dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
-        dispatch({ type: "SET_VOICE_ERROR", payload: null });
-      }, 4000);
-    }).then((u) => unlisten.push(u));
-
-    // Backend-assigned session ID — emitted at end of chat/stream SSE.
-    // Ensures the frontend sessionId tracks the canonical backend session.
-    listen<{ session_id: string; model_role: string }>("session-created", (e) => {
-      dispatch({ type: "SET_SESSION_ID", payload: e.payload.session_id });
-    }).then((u) => unlisten.push(u));
+    }));
 
     return () => {
       unlisten.forEach((u) => u());

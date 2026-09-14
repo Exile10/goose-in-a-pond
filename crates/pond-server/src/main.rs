@@ -136,9 +136,11 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
 
-        /// Also launch the native Tauri desktop app after the server starts.
-        /// Searches for the binary in pond-desktop/src-tauri/target/debug/ and
-        /// pond-desktop/src-tauri/target/release/bundle/macos/.
+        /// Also launch the native desktop app after the server starts.
+        /// macOS only. Looks for an installed app in /Applications, then a
+        /// locally packaged one under pond-desktop/release/, then the dev
+        /// Electron runtime. On Linux it says so and keeps serving: the UI
+        /// there is this server's own dashboard.
         #[arg(long)]
         native: bool,
     },
@@ -187,7 +189,7 @@ enum Commands {
 
         /// Emit the workflow as newline-delimited JSON (NDJSON) on stdout, one
         /// event per line. In this mode stdout carries NOTHING but JSON lines
-        /// (no banners, prompts, or emoji — those go to stderr); the Tauri shell
+        /// (no banners, prompts, or emoji — those go to stderr); the desktop shell
         /// parses these lines to drive the desktop voice UI.
         #[arg(long)]
         json_events: bool,
@@ -4516,9 +4518,9 @@ async fn run_server(
         }
     }
 
-    // --native: spawn the Tauri desktop app binary after the server is ready.
+    // --native: spawn the desktop app after the server is ready (macOS only).
     if native {
-        spawn_desktop_app(api_port);
+        spawn_desktop_app(api_port).await;
     }
 
     // Serve until a shutdown signal. We race the server against the signal
@@ -4597,46 +4599,117 @@ fn print_pairing_qr(url: &str) {
     }
 }
 
-/// Locate and spawn the pond-desktop Tauri binary.
+/// Locate and spawn the pond-desktop app.
 ///
-/// Search order (relative to the workspace root, i.e. where the server binary
-/// is invoked from):
-///   1. `pond-desktop/src-tauri/target/debug/pond-desktop`          — `cargo tauri dev`
-///   2. `pond-desktop/src-tauri/target/release/pond-desktop`        — release build
-///   3. `pond-desktop/src-tauri/target/release/bundle/macos/Goose In A Pond.app/Contents/MacOS/Goose In A Pond`
+/// macOS only: the desktop shell is an Electron app and is not packaged for
+/// Linux. On the Jetson the UI is the dashboard this very server already
+/// serves over HTTP, so there is nothing to spawn and nothing missing.
+///
+/// Search order:
+///   1. `$GIAP_DESKTOP_BIN`                                    — explicit override
+///   2. `/Applications/Goose In A Pond.app/...`                — installed
+///   3. `pond-desktop/release/mac-*/Goose In A Pond.app/...`   — local package
+///   4. `pond-desktop/node_modules/.bin/electron`              — dev, unpackaged
+///
+/// Note there is no debug/release pair to confuse any more. The Tauri version
+/// probed a debug build FIRST, so a stale `cargo build` artifact silently took
+/// precedence over the release one -- a trap documented in four places, and
+/// one that cannot occur here.
 ///
 /// The child process is detached (not joined) so the server keeps running.
-fn spawn_desktop_app(server_port: u16) {
-    let candidates: &[&str] = &[
-        "pond-desktop/src-tauri/target/debug/pond-desktop",
-        "pond-desktop/src-tauri/target/release/pond-desktop",
-        "pond-desktop/src-tauri/target/release/bundle/macos/Goose In A Pond.app/Contents/MacOS/Goose In A Pond",
-    ];
+#[cfg(target_os = "macos")]
+async fn spawn_desktop_app(server_port: u16) {
+    const APP_SUFFIX: &str = "Goose In A Pond.app/Contents/MacOS/Goose In A Pond";
 
-    let found = candidates.iter().find(|p| std::path::Path::new(p).exists());
-
-    match found {
-        Some(path) => {
-            tracing::info!("Launching native desktop app: {}", path);
-            match std::process::Command::new(path)
-                .env("GIAP_SERVER_PORT", server_port.to_string())
-                .spawn()
-            {
-                Ok(child) => {
-                    tracing::info!("Desktop app started (pid {})", child.id());
-                    // Drop child handle — process runs independently.
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to launch desktop app at {}: {}", path, e);
-                }
-            }
-        }
-        None => {
-            tracing::warn!(
-                "--native: desktop binary not found. Build it first:\n  cd pond-desktop && npm run tauri build\nor for dev:\n  cd pond-desktop && npm run tauri dev"
-            );
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(explicit) = std::env::var("GIAP_DESKTOP_BIN") {
+        if !explicit.is_empty() {
+            candidates.push(std::path::PathBuf::from(explicit));
         }
     }
+    candidates.push(std::path::PathBuf::from("/Applications").join(APP_SUFFIX));
+    // electron-builder writes into pond-desktop/release/mac-<arch>/.
+    for arch in ["mac-arm64", "mac", "mac-x64"] {
+        candidates.push(
+            std::path::PathBuf::from("pond-desktop/release")
+                .join(arch)
+                .join(APP_SUFFIX),
+        );
+    }
+
+    if let Some(path) = candidates.iter().find(|p| p.exists()) {
+        tracing::info!("Launching native desktop app: {}", path.display());
+        launch_desktop(path, &[], server_port).await;
+        return;
+    }
+
+    // Unpackaged dev: run Electron against the repo checkout. It needs the
+    // app directory as its argument, which a packaged bundle does not.
+    let dev_electron = std::path::PathBuf::from("pond-desktop/node_modules/.bin/electron");
+    if dev_electron.exists() {
+        tracing::info!("Launching the desktop app through the dev Electron runtime");
+        launch_desktop(&dev_electron, &["pond-desktop"], server_port).await;
+        return;
+    }
+
+    tracing::warn!(
+        "--native: no desktop app found. Build it first:\n  cd pond-desktop && npm run bundle:app\nor for dev:\n  cd pond-desktop && npm run dev:electron"
+    );
+}
+
+#[cfg(target_os = "macos")]
+async fn launch_desktop(path: &std::path::Path, args: &[&str], server_port: u16) {
+    let mut child = match std::process::Command::new(path)
+        .args(args)
+        // The shell reads this and MUST NOT spawn its own server; it attaches
+        // to ours instead. Without it there are two pond-servers fighting for
+        // one port, which presents as a blank window.
+        .env("GIAP_SERVER_PORT", server_port.to_string())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to launch the desktop app at {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let pid = child.id();
+
+    // Spawning is not the same as appearing, and this is the gap that made
+    // --native look broken: the app takes a single-instance lock, so if one is
+    // already running the process we just started quits within a few hundred
+    // milliseconds, in silence. Reporting "started" and returning left a server
+    // with no window on it and a log that claimed success.
+    //
+    // try_wait also reaps the child, which is what stopped it becoming a zombie
+    // under the server for as long as the server ran.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    match child.try_wait() {
+        Ok(Some(status)) => tracing::warn!(
+            "--native: the desktop app exited immediately (pid {pid}, {status}). \
+             The likely cause is that an instance is ALREADY RUNNING -- the app holds a \
+             single-instance lock, so a second launch quits at once and raises the existing \
+             window instead. That window is attached to whichever server started it, not to \
+             this one on port {server_port}. Quit the running app and retry, or just open \
+             http://127.0.0.1:{server_port} in a browser."
+        ),
+        Ok(None) => tracing::info!("Desktop app running (pid {pid})"),
+        Err(e) => tracing::debug!("could not check on the desktop app (pid {pid}): {e}"),
+    }
+}
+
+/// The desktop shell is macOS-only, so `--native` has nothing to launch here.
+/// This is not a degraded mode: on Linux -- which in practice means the Jetson
+/// -- the UI is the dashboard this server already serves.
+#[cfg(not(target_os = "macos"))]
+async fn spawn_desktop_app(server_port: u16) {
+    tracing::warn!(
+        "--native: the desktop shell is macOS-only. This server's dashboard is already \
+         available at http://127.0.0.1:{server_port} and on the LAN."
+    );
 }
 
 /// Write one `WorkflowEvent` to stdout as a single NDJSON line (JSON + `\n`,
@@ -5243,7 +5316,7 @@ async fn run_chat(
     // Writes one serialized WorkflowEvent per line to stdout with immediate
     // flush. In this mode the run_loop's human-facing prints are suppressed
     // (stdout_diagnostics=false) so stdout carries NOTHING but JSON lines. The
-    // Tauri shell parses these lines to drive the desktop voice UI.
+    // The desktop shell parses these lines to drive its voice UI.
     if json_events {
         let sink: pond_core::shared::services::chat::WorkflowEventSink =
             Arc::new(|event: &pond_core::shared::domain::agent::WorkflowEvent| {

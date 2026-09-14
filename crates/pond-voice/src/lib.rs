@@ -1,10 +1,10 @@
 //! Voice primitives shared by every GIAP surface.
 //!
 //! A LEAF crate: std only, no `pond-core`, no tokio, no cpal, no anyhow. That
-//! constraint is load-bearing — `pond-desktop/src-tauri` declares its own
-//! `[workspace]` and cannot depend on `pond-core`, so a leaf is the only shape
-//! that lets the desktop shell, the server, and both voice adapters share one
-//! implementation instead of four.
+//! shape was originally forced by a second cargo workspace under
+//! `pond-desktop/src-tauri`, which could not depend on `pond-core`. That
+//! workspace is gone, so the constraint is now deliberate rather than
+//! imposed — see `Cargo.toml` for why it is kept.
 //!
 //! See `docs/` and the module docs for what moved and from where.
 

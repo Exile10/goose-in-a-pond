@@ -83,8 +83,11 @@ declare global {
 export function defaultServerUrl(): string {
   if (typeof window !== "undefined") {
     if (window.__GIAP_SERVER_URL__) return window.__GIAP_SERVER_URL__;
-    const isTauri = "__TAURI_INTERNALS__" in window;
-    if (!isTauri && window.location?.origin?.startsWith("http")) {
+    // Only an http(s) page origin is a server worth talking to. The desktop
+    // shell serves the renderer from app://giap, which is deliberately not
+    // http -- and it always injects the URL above anyway, so this branch is
+    // the browser's.
+    if (window.location?.origin?.startsWith("http")) {
       return window.location.origin;
     }
   }

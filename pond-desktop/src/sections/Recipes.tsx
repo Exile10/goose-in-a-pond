@@ -270,12 +270,10 @@ export function Recipes() {
         title="Recipes"
         action={
           <Button
-            color="secondary"
-            radius="md"
+            variant="secondary"
             onPress={() => (showForm ? resetForm() : startCreate())}
-            startContent={showForm ? undefined : <Plus size={14} />}
           >
-            {showForm ? "Cancel" : "Add Recipe"}
+            {showForm ? null : <Plus size={14} />} {showForm ? "Cancel" : "Add Recipe"}
           </Button>
         }
       />
@@ -290,8 +288,6 @@ export function Recipes() {
               <Input
                 id="recipe-title"
                 placeholder="e.g. Morning Brief"
-                variant="bordered"
-                radius="md"
                 value={form.title}
                 onChange={(e) => updateForm("title", e.target.value)}
               />
@@ -302,8 +298,6 @@ export function Recipes() {
                   <Input
                     id="recipe-name"
                     placeholder={slugify(form.title) || "morning_brief"}
-                    variant="bordered"
-                    radius="md"
                     value={form.name}
                     onChange={(e) => updateForm("name", e.target.value)}
                   />
@@ -314,8 +308,6 @@ export function Recipes() {
               <Input
                 id="recipe-description"
                 placeholder="One sentence, shown in the recipe list"
-                variant="bordered"
-                radius="md"
                 value={form.description}
                 onChange={(e) => updateForm("description", e.target.value)}
               />
@@ -335,8 +327,6 @@ export function Recipes() {
                 {form.parameters.map((p, i) => (
                   <div key={i} className="recipe-param-row">
                     <Input
-                      variant="bordered"
-                      radius="md"
                       placeholder="key"
                       value={p.key}
                       onChange={(e) => updateParameter(i, { key: e.target.value })}
@@ -357,8 +347,6 @@ export function Recipes() {
                       {REQUIREMENTS.map((r) => <option key={r} value={r}>{r}</option>)}
                     </select>
                     <Input
-                      variant="bordered"
-                      radius="md"
                       placeholder="default (optional)"
                       value={p.default || ""}
                       onChange={(e) => updateParameter(i, { default: e.target.value })}
@@ -374,8 +362,8 @@ export function Recipes() {
                     </button>
                   </div>
                 ))}
-                <Button size="sm" variant="light" radius="md" onPress={addParameter} startContent={<Plus size={12} />}>
-                  Add parameter
+                <Button size="sm" variant="ghost" onPress={addParameter}>
+                  <Plus size={12} /> Add parameter
                 </Button>
               </div>
 
@@ -409,27 +397,23 @@ export function Recipes() {
                 <div className="recipe-activities-editor__add">
                   <Input
                     id="recipe-activity-draft"
-                    variant="bordered"
-                    radius="md"
                     placeholder="e.g. Give me my morning brief"
                     value={activityDraft}
                     onChange={(e) => setActivityDraft(e.target.value)}
                     onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addActivity(); } }}
                   />
-                  <Button size="sm" variant="light" radius="md" onPress={addActivity}>Add</Button>
+                  <Button size="sm" variant="ghost" onPress={addActivity}>Add</Button>
                 </div>
               </div>
 
               <div className="skills-form__actions">
-                <Button variant="light" radius="md" onPress={resetForm}>Cancel</Button>
+                <Button variant="ghost" onPress={resetForm}>Cancel</Button>
                 <Button
-                  color="secondary"
-                  radius="md"
+                  variant="secondary"
                   onPress={save}
                   isDisabled={!form.title.trim() || !form.prompt.trim()}
-                  startContent={<Check size={14} />}
                 >
-                  {editingRecipe ? "Update recipe" : "Save recipe"}
+                  <Check size={14} /> {editingRecipe ? "Update recipe" : "Save recipe"}
                 </Button>
               </div>
             </div>
@@ -460,11 +444,12 @@ export function Recipes() {
                 </span>
                 <Switch
                   size="sm"
-                  color="secondary"
                   isSelected={r.active !== false}
-                  onValueChange={() => toggleActive(r)}
+                  onChange={() => toggleActive(r)}
                   aria-label={`Enable ${r.title || r.name}`}
-                />
+                >
+                  <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
+                </Switch>
               </div>
               <h3 className="skill-card__title">{r.title || r.name}</h3>
               <p className="skill-card__desc">
@@ -527,8 +512,6 @@ export function Recipes() {
                 </label>
                 <Input
                   id={`run-param-${p.key}`}
-                  variant="bordered"
-                  radius="md"
                   placeholder={p.description || p.key}
                   value={runValues[p.key] || ""}
                   onChange={(e) => setRunValues((prev) => ({ ...prev, [p.key]: e.target.value }))}
@@ -537,15 +520,13 @@ export function Recipes() {
             ))}
             {runError && <p className="text-error text-error--sm">{runError}</p>}
             <div className="skills-form__actions">
-              <Button variant="light" radius="md" onPress={() => setRunTarget(null)}>Cancel</Button>
+              <Button variant="ghost" onPress={() => setRunTarget(null)}>Cancel</Button>
               <Button
-                color="secondary"
-                radius="md"
+                variant="secondary"
                 isDisabled={running === runTarget.name}
                 onPress={() => doRun(runTarget, runValues)}
-                startContent={<Play size={14} />}
               >
-                Run
+                <Play size={14} /> Run
               </Button>
             </div>
           </div>

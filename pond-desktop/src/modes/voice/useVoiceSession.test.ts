@@ -23,24 +23,18 @@ import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from "vite
 import { renderHook, act, cleanup } from "@testing-library/react";
 import React from "react";
 
-// ── Shared mutable stores for the Tauri mock ────────────────────────────────
+// ── Shared mutable stores for the shell-bridge mock ─────────────────────────
 
 // event name -> array of registered handler functions
-const _listeners: Record<string, Array<(e: { payload: unknown }) => void>> = {};
+const _listeners: Record<string, Array<(payload: unknown) => void>> = {};
 
 // Stored invoke mock
 let _invoke: Mock;
 
-// Whether listen() resolves immediately or is held back (for teardown-race tests).
-let _deferListenResolve = false;
-const _deferredResolvers: Array<() => void> = [];
-
-// Emit a fake Tauri event to all registered listeners for that event name.
-function emitTauriEvent(name: string, payload: unknown): void {
-  const handlers = _listeners[name] ?? [];
-  for (const h of handlers) {
-    h({ payload });
-  }
+// Emit a fake shell event to all registered listeners for that event name.
+// The bridge hands handlers the payload directly rather than an envelope.
+function emitShellEvent(name: string, payload: unknown): void {
+  for (const h of _listeners[name] ?? []) h(payload);
 }
 
 // ── Mock requestAnimationFrame / cancelAnimationFrame ──────────────────────
@@ -70,27 +64,22 @@ function flushRaf(): void {
   }
 }
 
-// ── Mock @tauri-apps/api/core ────────────────────────────────────────────────
+// ── Mock the shell bridge ────────────────────────────────────────────────────
+//
+// listen() is synchronous and returns its unsubscribe function directly, so
+// the mock has no promise machinery. The deferred-resolution switch that used
+// to live here existed solely to exercise a teardown race that Tauri's async
+// registration made possible; see the leak test below for what replaced it.
 
-vi.mock("@tauri-apps/api/core", () => ({
+vi.mock("../../shell", () => ({
   get invoke() { return _invoke; },
-}));
-
-// ── Mock @tauri-apps/api/event ───────────────────────────────────────────────
-
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn((name: string, handler: (e: { payload: unknown }) => void) => {
+  isDesktopShell: () => true,
+  listen: vi.fn((name: string, handler: (payload: unknown) => void) => {
     if (!_listeners[name]) _listeners[name] = [];
     _listeners[name].push(handler);
-    const unlisten = () => {
+    return () => {
       _listeners[name] = (_listeners[name] ?? []).filter((h) => h !== handler);
     };
-    if (_deferListenResolve) {
-      return new Promise<() => void>((resolve) => {
-        _deferredResolvers.push(() => resolve(unlisten));
-      });
-    }
-    return Promise.resolve(unlisten);
   }),
 }));
 
@@ -166,27 +155,27 @@ describe("useVoiceSession — state-string mapping", () => {
     clearDispatched();
 
     // Contract: wait -> wait (wake-word listening state, not idle)
-    act(() => { emitTauriEvent("voice-state", "wait"); });
+    act(() => { emitShellEvent("voice-state", "wait"); });
     expect(dispatchedOfType("SET_VOICE_STATE").at(-1)?.payload).toBe("wait");
 
     // Contract: listen -> recording
-    act(() => { emitTauriEvent("voice-state", "listen"); });
+    act(() => { emitShellEvent("voice-state", "listen"); });
     expect(dispatchedOfType("SET_VOICE_STATE").at(-1)?.payload).toBe("recording");
 
     // Contract: thinking -> thinking
-    act(() => { emitTauriEvent("voice-state", "thinking"); });
+    act(() => { emitShellEvent("voice-state", "thinking"); });
     expect(dispatchedOfType("SET_VOICE_STATE").at(-1)?.payload).toBe("thinking");
 
     // Contract: speak -> speaking
-    act(() => { emitTauriEvent("voice-state", "speak"); });
+    act(() => { emitShellEvent("voice-state", "speak"); });
     expect(dispatchedOfType("SET_VOICE_STATE").at(-1)?.payload).toBe("speaking");
 
     // Legacy compat: idle -> idle
-    act(() => { emitTauriEvent("voice-state", "idle"); });
+    act(() => { emitShellEvent("voice-state", "idle"); });
     expect(dispatchedOfType("SET_VOICE_STATE").at(-1)?.payload).toBe("idle");
 
     // Legacy compat: transcribing -> thinking
-    act(() => { emitTauriEvent("voice-state", "transcribing"); });
+    act(() => { emitShellEvent("voice-state", "transcribing"); });
     expect(dispatchedOfType("SET_VOICE_STATE").at(-1)?.payload).toBe("thinking");
 
     cleanup();
@@ -200,7 +189,7 @@ describe("useVoiceSession — state-string mapping", () => {
     await act(async () => { await Promise.resolve(); });
 
     clearDispatched();
-    act(() => { emitTauriEvent("voice-ready", { session_id: "s0" }); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "s0" }); });
 
     const stateActions = dispatchedOfType("SET_VOICE_STATE");
     expect(stateActions.length).toBeGreaterThan(0);
@@ -334,8 +323,6 @@ describe("useVoiceSession — StrictMode double-mount (finding 4+13)", () => {
 
   afterEach(() => {
     cleanup();
-    _deferListenResolve = false;
-    _deferredResolvers.length = 0;
   });
 
   it("startSession can be called after stopSession (start/stop/start sequence is not blocked)", async () => {
@@ -378,41 +365,33 @@ describe("useVoiceSession — listener teardown race (finding 5+18)", () => {
       delete _listeners[key];
     }
     _nextId = 0;
-    _deferListenResolve = false;
-    _deferredResolvers.length = 0;
   });
 
   afterEach(() => {
     cleanup();
-    _deferListenResolve = false;
-    _deferredResolvers.length = 0;
   });
 
-  it("listeners resolved after unmount are immediately unlistened (no leak)", async () => {
-    // Hold all listen() promises — simulates slow IPC resolution.
-    _deferListenResolve = true;
+  // What this used to test: an unlisten function resolving AFTER teardown,
+  // which Tauri's async listen() made possible and which the hook guarded with
+  // a cancelled flag. Synchronous registration makes that unrepresentable, so
+  // the bug class is gone rather than merely tested for. The invariant it was
+  // protecting -- unmounting leaves nothing registered -- is still worth
+  // pinning, and now it can be asserted directly.
+  it("leaves no listener registered after unmount", async () => {
     const useVoiceSession = await getHook();
     _invoke = vi.fn().mockResolvedValue("sess-race");
 
     const { unmount } = renderHook(() => useVoiceSession(), { wrapper });
-    // Effect starts but listen() promises have not resolved yet.
     await act(async () => { await Promise.resolve(); });
 
-    // Unmount before any listen() resolves — teardown runs with empty ref.
+    const whileMounted = Object.values(_listeners).reduce((n, a) => n + a.length, 0);
+    expect(whileMounted).toBeGreaterThan(0); // control: the test can fail
+
     unmount();
+    await act(async () => { await Promise.resolve(); });
 
-    // Now resolve all the deferred listen() promises.
-    await act(async () => {
-      for (const resolve of _deferredResolvers) {
-        resolve();
-      }
-      await Promise.resolve();
-      await Promise.resolve(); // let .then chains settle
-    });
-
-    // No listeners should remain registered (the cancelled flag caused immediate unlisten).
-    const listenerCount = Object.values(_listeners).reduce((sum, arr) => sum + arr.length, 0);
-    expect(listenerCount).toBe(0);
+    const afterUnmount = Object.values(_listeners).reduce((n, a) => n + a.length, 0);
+    expect(afterUnmount).toBe(0);
   });
 });
 
@@ -437,7 +416,7 @@ describe("useVoiceSession — double-dispatch regression", () => {
     await act(async () => { await Promise.resolve(); });
 
     clearDispatched();
-    act(() => { emitTauriEvent("voice-transcript", { text: "hello world" }); });
+    act(() => { emitShellEvent("voice-transcript", { text: "hello world" }); });
 
     const appendActions = dispatchedOfType("APPEND_TRANSCRIPT");
     // Exactly 2: one user message + one agent seed message
@@ -454,8 +433,8 @@ describe("useVoiceSession — double-dispatch regression", () => {
     await act(async () => { await Promise.resolve(); });
 
     clearDispatched();
-    act(() => { emitTauriEvent("voice-token", { content: "hello" }); });
-    act(() => { emitTauriEvent("voice-token", { content: " world" }); });
+    act(() => { emitShellEvent("voice-token", { content: "hello" }); });
+    act(() => { emitShellEvent("voice-token", { content: " world" }); });
 
     // Before flushing rAF, dispatch should not have fired yet
     expect(dispatchedOfType("APPEND_AGENT_TOKEN")).toHaveLength(0);
@@ -478,8 +457,8 @@ describe("useVoiceSession — double-dispatch regression", () => {
 
     clearDispatched();
     // Send a token then immediately send done without flushing rAF
-    act(() => { emitTauriEvent("voice-token", { content: "last" }); });
-    act(() => { emitTauriEvent("voice-done", { session_id: "sess-abc" }); });
+    act(() => { emitShellEvent("voice-token", { content: "last" }); });
+    act(() => { emitShellEvent("voice-done", { session_id: "sess-abc" }); });
 
     const tokenActions = dispatchedOfType("APPEND_AGENT_TOKEN");
     // Should have: one batch flush of "last" AND one done dispatch
@@ -497,7 +476,7 @@ describe("useVoiceSession — double-dispatch regression", () => {
     await act(async () => { await Promise.resolve(); });
 
     clearDispatched();
-    act(() => { emitTauriEvent("voice-tool-call", { tool: "giap__weather", id: "call-1" }); });
+    act(() => { emitShellEvent("voice-tool-call", { tool: "giap__weather", id: "call-1" }); });
 
     const cardActions = dispatchedOfType("PUSH_CONTEXT_CARD");
     expect(cardActions).toHaveLength(1);
@@ -516,7 +495,7 @@ describe("useVoiceSession — double-dispatch regression", () => {
 
     clearDispatched();
     act(() => {
-      emitTauriEvent("voice-tool-result", {
+      emitShellEvent("voice-tool-result", {
         tool: "giap__weather",
         id: "call-1",
         content: "Temperature: 22C",
@@ -542,7 +521,7 @@ describe("useVoiceSession — double-dispatch regression", () => {
     await act(async () => { await Promise.resolve(); });
 
     clearDispatched();
-    act(() => { emitTauriEvent("voice-done", { session_id: "sess-abc" }); });
+    act(() => { emitShellEvent("voice-done", { session_id: "sess-abc" }); });
 
     // Flush any rAF
     act(() => { flushRaf(); });
@@ -565,7 +544,7 @@ describe("useVoiceSession — double-dispatch regression", () => {
     await act(async () => { await Promise.resolve(); });
 
     clearDispatched();
-    act(() => { emitTauriEvent("voice-error", { message: "mic not found" }); });
+    act(() => { emitShellEvent("voice-error", { message: "mic not found" }); });
 
     expect(dispatchedOfType("SET_VOICE_ERROR")).toHaveLength(1);
     expect(dispatchedOfType("SET_VOICE_ERROR")[0].payload).toBe("mic not found");
@@ -597,12 +576,12 @@ describe("useVoiceSession — voice-session-ended handling", () => {
     await act(async () => { await Promise.resolve(); });
 
     // Simulate session active with a known session_id
-    act(() => { emitTauriEvent("voice-ready", { session_id: "s1" }); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "s1" }); });
     expect(result.current.sessionActive).toBe(true);
 
     clearDispatched();
     act(() => {
-      emitTauriEvent("voice-session-ended", { code: 0, reason: "stdin_eof", session_id: "s1" });
+      emitShellEvent("voice-session-ended", { code: 0, reason: "stdin_eof", session_id: "s1" });
     });
 
     expect(result.current.sessionActive).toBe(false);
@@ -620,11 +599,11 @@ describe("useVoiceSession — voice-session-ended handling", () => {
     const { result } = renderHook(() => useVoiceSession(), { wrapper });
     await act(async () => { await Promise.resolve(); });
 
-    act(() => { emitTauriEvent("voice-ready", { session_id: "s2" }); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "s2" }); });
 
     clearDispatched();
     act(() => {
-      emitTauriEvent("voice-session-ended", { code: 0, reason: "dismissed", session_id: "s2" });
+      emitShellEvent("voice-session-ended", { code: 0, reason: "dismissed", session_id: "s2" });
     });
 
     expect(result.current.sessionActive).toBe(false);
@@ -639,12 +618,12 @@ describe("useVoiceSession — voice-session-ended handling", () => {
     const { result } = renderHook(() => useVoiceSession(), { wrapper });
     await act(async () => { await Promise.resolve(); });
 
-    act(() => { emitTauriEvent("voice-ready", { session_id: "s1" }); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "s1" }); });
     expect(result.current.sessionActive).toBe(true);
 
     clearDispatched();
     act(() => {
-      emitTauriEvent("voice-session-ended", { code: 1, reason: "error", session_id: "s1" });
+      emitShellEvent("voice-session-ended", { code: 1, reason: "error", session_id: "s1" });
     });
 
     expect(result.current.sessionActive).toBe(false);
@@ -669,11 +648,11 @@ describe("useVoiceSession — voice-session-ended handling", () => {
     const { result } = renderHook(() => useVoiceSession(), { wrapper });
     await act(async () => { await Promise.resolve(); });
 
-    act(() => { emitTauriEvent("voice-ready", { session_id: "s3" }); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "s3" }); });
 
     clearDispatched();
     act(() => {
-      emitTauriEvent("voice-session-ended", { code: null, reason: "crashed", session_id: "s3" });
+      emitShellEvent("voice-session-ended", { code: null, reason: "crashed", session_id: "s3" });
     });
 
     expect(result.current.sessionActive).toBe(false);
@@ -697,7 +676,7 @@ describe("useVoiceSession — voice-session-ended handling", () => {
 
     // Start session A
     await act(async () => { await result.current.startSession(); });
-    act(() => { emitTauriEvent("voice-ready", { session_id: "session-A" }); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "session-A" }); });
     expect(result.current.sessionActive).toBe(true);
 
     // Stop session A and immediately start session B
@@ -706,14 +685,14 @@ describe("useVoiceSession — voice-session-ended handling", () => {
       .mockResolvedValueOnce("session-B")
       .mockResolvedValue(undefined);
     await act(async () => { await result.current.startSession(); });
-    act(() => { emitTauriEvent("voice-ready", { session_id: "session-B" }); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "session-B" }); });
     expect(result.current.sessionActive).toBe(true);
 
     clearDispatched();
 
     // Now deliver a stale ended event for session-A (old child finally reaped)
     act(() => {
-      emitTauriEvent("voice-session-ended", {
+      emitShellEvent("voice-session-ended", {
         code: 1,
         reason: "crashed",
         session_id: "session-A", // stale — does not match current "session-B"
@@ -734,7 +713,7 @@ describe("useVoiceSession — voice-session-ended handling", () => {
     await act(async () => { await Promise.resolve(); });
 
     clearDispatched();
-    act(() => { emitTauriEvent("voice-ready", { session_id: "ready-sess" }); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "ready-sess" }); });
 
     expect(result.current.sessionActive).toBe(true);
     expect(result.current.connecting).toBe(false);
@@ -766,7 +745,7 @@ describe("useVoiceSession — audio-level reactivity", () => {
 
     expect(result.current.audioLevel).toBe(0);
 
-    act(() => { emitTauriEvent("voice-audio-level", { rms: 0.37 }); });
+    act(() => { emitShellEvent("voice-audio-level", { rms: 0.37 }); });
     expect(result.current.audioLevel).toBe(0.37);
   });
 
@@ -777,12 +756,12 @@ describe("useVoiceSession — audio-level reactivity", () => {
     const { result } = renderHook(() => useVoiceSession(), { wrapper });
     await act(async () => { await Promise.resolve(); });
 
-    act(() => { emitTauriEvent("voice-ready", { session_id: "s1" }); });
-    act(() => { emitTauriEvent("voice-audio-level", { rms: 0.5 }); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "s1" }); });
+    act(() => { emitShellEvent("voice-audio-level", { rms: 0.5 }); });
     expect(result.current.audioLevel).toBe(0.5);
 
     act(() => {
-      emitTauriEvent("voice-session-ended", { code: null, reason: "stdin_eof", session_id: "s1" });
+      emitShellEvent("voice-session-ended", { code: null, reason: "stdin_eof", session_id: "s1" });
     });
     expect(result.current.audioLevel).toBe(0);
   });
@@ -811,8 +790,8 @@ describe("useVoiceSession — flashError persistence", () => {
     clearDispatched();
 
     // Fire two errors in quick succession
-    act(() => { emitTauriEvent("voice-error", { message: "error 1" }); });
-    act(() => { emitTauriEvent("voice-error", { message: "error 2" }); });
+    act(() => { emitShellEvent("voice-error", { message: "error 1" }); });
+    act(() => { emitShellEvent("voice-error", { message: "error 2" }); });
 
     const errorPayloads = dispatchedOfType("SET_VOICE_ERROR").map((a) => a.payload);
     expect(errorPayloads).toEqual(["error 1", "error 2"]);
@@ -849,19 +828,19 @@ describe("useVoiceSession — full contract event sequence", () => {
     // Contract sequence: ready -> state wait -> state listen -> transcript ->
     // state thinking -> tokens -> tool_call/tool_result -> state speak ->
     // turn_complete -> state wait
-    act(() => { emitTauriEvent("voice-ready", { session_id: "seq-session" }); });
-    act(() => { emitTauriEvent("voice-state", "wait"); });
-    act(() => { emitTauriEvent("voice-state", "listen"); });
-    act(() => { emitTauriEvent("voice-transcript", { text: "what is the weather" }); });
-    act(() => { emitTauriEvent("voice-state", "thinking"); });
-    act(() => { emitTauriEvent("voice-token", { content: "The" }); });
-    act(() => { emitTauriEvent("voice-token", { content: " weather" }); });
-    act(() => { emitTauriEvent("voice-tool-call", { tool: "giap__weather", id: "c1" }); });
-    act(() => { emitTauriEvent("voice-tool-result", { tool: "giap__weather", id: "c1", content: "22C" }); });
-    act(() => { emitTauriEvent("voice-state", "speak"); });
-    act(() => { emitTauriEvent("voice-done", { session_id: "seq-session" }); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "seq-session" }); });
+    act(() => { emitShellEvent("voice-state", "wait"); });
+    act(() => { emitShellEvent("voice-state", "listen"); });
+    act(() => { emitShellEvent("voice-transcript", { text: "what is the weather" }); });
+    act(() => { emitShellEvent("voice-state", "thinking"); });
+    act(() => { emitShellEvent("voice-token", { content: "The" }); });
+    act(() => { emitShellEvent("voice-token", { content: " weather" }); });
+    act(() => { emitShellEvent("voice-tool-call", { tool: "giap__weather", id: "c1" }); });
+    act(() => { emitShellEvent("voice-tool-result", { tool: "giap__weather", id: "c1", content: "22C" }); });
+    act(() => { emitShellEvent("voice-state", "speak"); });
+    act(() => { emitShellEvent("voice-done", { session_id: "seq-session" }); });
     // voice-done flushes tokens and dispatches wait state
-    act(() => { emitTauriEvent("voice-state", "wait"); });
+    act(() => { emitShellEvent("voice-state", "wait"); });
 
     // Verify state transitions
     const stateActions = dispatchedOfType("SET_VOICE_STATE").map((a) => a.payload);
@@ -914,7 +893,7 @@ describe("useVoiceSession — failed_to_start", () => {
     // No voice-ready: the child died during startup.
     clearDispatched();
     act(() => {
-      emitTauriEvent("voice-session-ended", {
+      emitShellEvent("voice-session-ended", {
         code: 1,
         reason: "failed_to_start",
         session_id: null,
@@ -943,7 +922,7 @@ describe("useVoiceSession — failed_to_start", () => {
 
     clearDispatched();
     act(() => {
-      emitTauriEvent("voice-session-ended", {
+      emitShellEvent("voice-session-ended", {
         code: 1,
         reason: "failed_to_start",
         session_id: null,
