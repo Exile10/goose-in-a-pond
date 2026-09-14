@@ -20,7 +20,18 @@
 //     child driver classifies with, and making it a union is what lets the
 //     renderer's reason handling be exhaustiveness-checked.
 
-/** How a voice session ended, as classified by the voice child driver. */
+/**
+ * How a voice session ended.
+ *
+ * These five are the documented contract -- three the child sends on its own
+ * `exit` line, two the shell synthesises -- but the set is OPEN, not closed:
+ * the child formats this field from a variable, so an unrecognised reason can
+ * reach the renderer. `reason` is therefore typed as this union widened with
+ * `string`, which keeps the literals as autocomplete while still admitting an
+ * unknown one. The renderer is already tolerant of that (`isCleanExit`
+ * defaults to abnormal, `endedErrorMessage` interpolates the raw string), and
+ * typing it closed would claim a guarantee the wire does not make.
+ */
 export type VoiceEndReason =
   /** Stdin closed, which is the clean shutdown handshake. */
   | "stdin_eof"
@@ -87,7 +98,8 @@ export interface ShellEvents {
   "voice-audio-level": { rms: number };
   "voice-session-ended": {
     code: number | null;
-    reason: VoiceEndReason;
+    // Widened deliberately -- see the note on VoiceEndReason.
+    reason: VoiceEndReason | (string & {});
     session_id?: string;
     detail?: string | null;
   };
