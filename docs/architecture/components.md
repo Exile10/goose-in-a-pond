@@ -202,6 +202,13 @@ launched by `pond-server serve --native` the parent pins the port through `GIAP_
 the shell must then attach rather than spawn — two servers fighting for one port present as a
 blank window, not as an error.
 
+**`--native` does nothing visible if the app is already running.** The shell holds a
+single-instance lock, so a second launch quits within a few hundred milliseconds and raises the
+EXISTING window — which is still attached to whichever server started it, not the new one. The
+server used to report "Desktop app started" and return, leaving a server with no window on it and
+a log claiming success; it now waits briefly, notices the child exited, and says so. Quit the
+running app before `--native`, or just open the new server's URL in a browser.
+
 ### Detached runs — a turn that outlives its connection
 
 `crates/pond-api/src/runs.rs`. A turn used to *be* the SSE response body, which
