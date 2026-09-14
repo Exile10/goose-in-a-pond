@@ -40,6 +40,7 @@
 #   bash scripts/jetson/kiosk.sh start        # run the kiosk in the foreground
 #   bash scripts/jetson/kiosk.sh measure      # memory cost, before vs after
 #   bash scripts/jetson/kiosk.sh install      # user systemd unit, starts at login
+#   bash scripts/jetson/kiosk.sh default-ui   # boot straight into the dashboard
 #   bash scripts/jetson/kiosk.sh stop
 # -----------------------------------------------------------------------------
 set -uo pipefail
@@ -288,6 +289,73 @@ UNIT
   info "and:         loginctl enable-linger $(id -un)   # so it survives logout"
 }
 
+# ── default-ui ───────────────────────────────────────────────────────────────
+
+cmd_default_ui() {
+  head1 "Making the GIAP dashboard the panel's default UI"
+  info "This still installs no desktop: the panel shows one fullscreen surface"
+  info "and the default systemd target stays multi-user.target."
+
+  if [ -z "$(connectors)" ]; then
+    bad "no KMS connectors — run 'sudo bash $0 enable-drm' first"
+    return 1
+  fi
+  if [ -z "$(connected)" ]; then
+    bad "connectors exist but none report 'connected' — no panel is attached"
+    return 1
+  fi
+
+  # 1. The driver has to come back after a reboot, or the panel is dark on the
+  #    one boot nobody is watching.
+  head1 "1/4  nvidia-drm at boot"
+  if [ -f /etc/modprobe.d/nvidia-drm.conf ]; then
+    ok "/etc/modprobe.d/nvidia-drm.conf already present"
+  else
+    if echo 'options nvidia-drm modeset=1' | sudo tee /etc/modprobe.d/nvidia-drm.conf >/dev/null; then
+      ok "wrote /etc/modprobe.d/nvidia-drm.conf"
+    else
+      bad "could not write it — is /etc/sudoers.d/giap installed?"
+      return 1
+    fi
+  fi
+
+  # 2. weston's DRM backend needs a logind SEAT, and a lingering user manager
+  #    does not have one — its session is class=background with no seat. The
+  #    reliable kiosk shape is therefore a real autologin session on tty1,
+  #    which is what gives the user manager a seat to inherit.
+  head1 "2/4  autologin on tty1 (this is what gives weston a seat)"
+  local ovr=/etc/systemd/system/getty@tty1.service.d/override.conf
+  if [ -f "$ovr" ]; then
+    ok "autologin override already present"
+  else
+    warn "needs a root-written file at $ovr"
+    info "run this once, then re-run 'default-ui':"
+    info "  sudo mkdir -p $(dirname "$ovr")"
+    info "  printf '[Service]\\\\nExecStart=\\\\nExecStart=-/sbin/agetty --autologin %s --noclear %%I \$TERM\\\\n' $(id -un) | sudo tee $ovr"
+    info "  sudo systemctl daemon-reload"
+    return 1
+  fi
+
+  # 3. The unit itself.
+  head1 "3/4  the kiosk unit"
+  cmd_install
+
+  # 4. Linger keeps the user manager alive across logout; the autologin session
+  #    supplies the seat. Both, not either.
+  head1 "4/4  enabling"
+  loginctl enable-linger "$(id -un)" 2>/dev/null && ok "linger enabled" || warn "could not enable linger"
+  systemctl --user enable giap-kiosk 2>/dev/null && ok "giap-kiosk enabled at login" || warn "could not enable the unit"
+
+  head1 "Done"
+  info "Reboot to confirm it comes up on its own. If the panel stays dark:"
+  info "  systemctl --user status giap-kiosk"
+  info "  journalctl --user -u giap-kiosk -n 50"
+  info ""
+  info "To undo: systemctl --user disable --now giap-kiosk"
+  info "         sudo rm /etc/systemd/system/getty@tty1.service.d/override.conf"
+  info "         sudo rm /etc/modprobe.d/nvidia-drm.conf"
+}
+
 case "${1:-probe}" in
   probe)      cmd_probe ;;
   enable-drm) cmd_enable_drm ;;
@@ -296,5 +364,6 @@ case "${1:-probe}" in
   stop)       cmd_stop ;;
   status)     cmd_status ;;
   install)    cmd_install ;;
-  *) echo "usage: $0 {probe|enable-drm|measure|start|stop|status|install}" >&2; exit 2 ;;
+  default-ui) cmd_default_ui ;;
+  *) echo "usage: $0 {probe|enable-drm|measure|start|stop|status|install|default-ui}" >&2; exit 2 ;;
 esac
