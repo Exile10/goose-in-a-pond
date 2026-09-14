@@ -4520,7 +4520,7 @@ async fn run_server(
 
     // --native: spawn the desktop app after the server is ready (macOS only).
     if native {
-        spawn_desktop_app(api_port);
+        spawn_desktop_app(api_port).await;
     }
 
     // Serve until a shutdown signal. We race the server against the signal
@@ -4618,7 +4618,7 @@ fn print_pairing_qr(url: &str) {
 ///
 /// The child process is detached (not joined) so the server keeps running.
 #[cfg(target_os = "macos")]
-fn spawn_desktop_app(server_port: u16) {
+async fn spawn_desktop_app(server_port: u16) {
     const APP_SUFFIX: &str = "Goose In A Pond.app/Contents/MacOS/Goose In A Pond";
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -4639,7 +4639,7 @@ fn spawn_desktop_app(server_port: u16) {
 
     if let Some(path) = candidates.iter().find(|p| p.exists()) {
         tracing::info!("Launching native desktop app: {}", path.display());
-        launch_desktop(path, &[], server_port);
+        launch_desktop(path, &[], server_port).await;
         return;
     }
 
@@ -4648,7 +4648,7 @@ fn spawn_desktop_app(server_port: u16) {
     let dev_electron = std::path::PathBuf::from("pond-desktop/node_modules/.bin/electron");
     if dev_electron.exists() {
         tracing::info!("Launching the desktop app through the dev Electron runtime");
-        launch_desktop(&dev_electron, &["pond-desktop"], server_port);
+        launch_desktop(&dev_electron, &["pond-desktop"], server_port).await;
         return;
     }
 
@@ -4658,8 +4658,8 @@ fn spawn_desktop_app(server_port: u16) {
 }
 
 #[cfg(target_os = "macos")]
-fn launch_desktop(path: &std::path::Path, args: &[&str], server_port: u16) {
-    match std::process::Command::new(path)
+async fn launch_desktop(path: &std::path::Path, args: &[&str], server_port: u16) {
+    let mut child = match std::process::Command::new(path)
         .args(args)
         // The shell reads this and MUST NOT spawn its own server; it attaches
         // to ours instead. Without it there are two pond-servers fighting for
@@ -4667,8 +4667,34 @@ fn launch_desktop(path: &std::path::Path, args: &[&str], server_port: u16) {
         .env("GIAP_SERVER_PORT", server_port.to_string())
         .spawn()
     {
-        Ok(child) => tracing::info!("Desktop app started (pid {})", child.id()),
-        Err(e) => tracing::warn!("Failed to launch the desktop app at {}: {e}", path.display()),
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!("Failed to launch the desktop app at {}: {e}", path.display());
+            return;
+        }
+    };
+    let pid = child.id();
+
+    // Spawning is not the same as appearing, and this is the gap that made
+    // --native look broken: the app takes a single-instance lock, so if one is
+    // already running the process we just started quits within a few hundred
+    // milliseconds, in silence. Reporting "started" and returning left a server
+    // with no window on it and a log that claimed success.
+    //
+    // try_wait also reaps the child, which is what stopped it becoming a zombie
+    // under the server for as long as the server ran.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    match child.try_wait() {
+        Ok(Some(status)) => tracing::warn!(
+            "--native: the desktop app exited immediately (pid {pid}, {status}). \
+             The likely cause is that an instance is ALREADY RUNNING -- the app holds a \
+             single-instance lock, so a second launch quits at once and raises the existing \
+             window instead. That window is attached to whichever server started it, not to \
+             this one on port {server_port}. Quit the running app and retry, or just open \
+             http://127.0.0.1:{server_port} in a browser."
+        ),
+        Ok(None) => tracing::info!("Desktop app running (pid {pid})"),
+        Err(e) => tracing::debug!("could not check on the desktop app (pid {pid}): {e}"),
     }
 }
 
@@ -4676,7 +4702,7 @@ fn launch_desktop(path: &std::path::Path, args: &[&str], server_port: u16) {
 /// This is not a degraded mode: on Linux -- which in practice means the Jetson
 /// -- the UI is the dashboard this server already serves.
 #[cfg(not(target_os = "macos"))]
-fn spawn_desktop_app(server_port: u16) {
+async fn spawn_desktop_app(server_port: u16) {
     tracing::warn!(
         "--native: the desktop shell is macOS-only. This server's dashboard is already \
          available at http://127.0.0.1:{server_port} and on the LAN."
