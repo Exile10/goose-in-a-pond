@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isDesktopShell } from "../shell";
 import { Button } from "@heroui/react";
 import { defaultServerUrl } from "../api/PondApiClient";
 import { Logo } from "./Logo";
@@ -28,9 +28,9 @@ export function StartupScreen({ onReady }: Props) {
     setPhase("starting");
     setError(null);
 
-    const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    const inShell = isDesktopShell();
 
-    if (isTauri) {
+    if (inShell) {
       try {
         await invoke("ensure_server_running");
       } catch (e) {
@@ -42,7 +42,7 @@ export function StartupScreen({ onReady }: Props) {
 
     setPhase("connecting");
 
-    if (!isTauri) {
+    if (!inShell) {
       // Browser dev mode: poll the health endpoint directly via fetch.
       // This lets Playwright and web browser testing work without Tauri.
       const serverUrl = defaultServerUrl();
@@ -70,7 +70,7 @@ export function StartupScreen({ onReady }: Props) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
 
       try {
-        const healthy = await invoke<boolean>("server_health");
+        const healthy = await invoke("server_health");
         if (healthy) {
           setPhase("ready");
           // Small delay so "Ready" is visible briefly

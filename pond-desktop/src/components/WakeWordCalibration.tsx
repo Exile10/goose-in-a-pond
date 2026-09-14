@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke, isDesktopShell } from "../shell";
+import { recordFixedDuration, micErrorMessage, type FixedRecorder } from "../modes/voice/micRecorder";
 import { Button } from "@heroui/react";
 import { Mic, RotateCcw, Check, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
@@ -59,27 +59,18 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
   const [audioLevel, setAudioLevel] = useState(0);
   const [countdownValue, setCountdownValue] = useState(3);
 
-  const [pendingWav, setPendingWav] = useState<number[] | null>(null);
+  const [pendingWav, setPendingWav] = useState<ArrayBuffer | null>(null);
 
   // Calibration prompts — short sentences the user reads aloud
   const [prompts] = useState(() => buildCalibrationPrompts(phrase));
 
   const prevSampleCount = useRef(0);
   const abortedRef = useRef(false);
-  const recordingRef = useRef(false);
-  // Evaluated at render time for the audio-level listener effect below; also
-  // re-checked at invoke time inside startSample so we see the live DOM state
-  // rather than a potentially-stale snapshot from an early render.
-  const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const recorderRef = useRef<FixedRecorder | null>(null);
 
-  // ── Audio level listener (Tauri only) ─────────────────────────
-  useEffect(() => {
-    if (!isTauri) return;
-    let unlisten: (() => void) | null = null;
-    listen<number>("audio-level", (e) => setAudioLevel(e.payload))
-      .then((u) => { unlisten = u; });
-    return () => { unlisten?.(); };
-  }, [isTauri]);
+  // The level used to arrive as an `audio-level` event from the Rust shell.
+  // Now the recorder reports it directly, so there is no listener to own and
+  // no event that can fire between mount and subscription.
 
   // ── Cleanup on unmount ────────────────────────────────────────
   // Reset on each mount: React 18 StrictMode reuses the same ref object across
@@ -89,11 +80,10 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
     abortedRef.current = false;
     return () => {
       abortedRef.current = true;
-      if (recordingRef.current && isTauri) {
-        invoke("abort_recording").catch(() => undefined);
-      }
+      recorderRef.current?.abort();
+      recorderRef.current = null;
     };
-  }, [isTauri]);
+  }, []);
 
   // ── Record a sample (stops at review phase) ───────────────────
   const startSample = useCallback(async () => {
@@ -111,50 +101,40 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
     }
     if (abortedRef.current) return;
 
-    // 2. Re-check Tauri IPC availability at call time (not just at render time)
-    //    so a stale snapshot from an early render can't cause a cryptic TypeError.
-    const tauriReady = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-    if (!tauriReady) {
-      setErrorMsg("Microphone capture requires the desktop app — Tauri IPC bridge unavailable. Try restarting the app.");
-      setPhase("error");
-      return;
+    // 2. A live voice session owns the microphone exclusively, and would also
+    //    hear the calibration utterance. Refuse rather than fight it. This
+    //    replaces the old stop_wake_listener call, which existed for the same
+    //    reason when the shell owned the mic.
+    if (isDesktopShell()) {
+      try {
+        await invoke("stop_voice_session");
+      } catch {
+        // Nothing was running, which is the common case.
+      }
     }
 
-    // 3. Stop any running wake listener so it doesn't detect the
-    //    calibration utterance and interfere with the recording.
-    await invoke("stop_wake_listener").catch(() => undefined);
-
-    // 4. Start Tauri mic capture
+    // 3. Record a fixed window, with the level coming back as it goes.
     setPhase("recording");
-    recordingRef.current = true;
+    const recorder = recordFixedDuration(RECORD_DURATION_MS, setAudioLevel);
+    recorderRef.current = recorder;
+
+    let wav: ArrayBuffer;
     try {
-      await invoke("start_recording");
+      ({ wav } = await recorder.done);
     } catch (e) {
-      recordingRef.current = false;
-      setErrorMsg(`Microphone error: ${e}`);
+      recorderRef.current = null;
+      setAudioLevel(0);
+      if (abortedRef.current) return;
+      setErrorMsg(micErrorMessage(e));
       setPhase("error");
       return;
     }
-
-    // 5. Record for 2.5s
-    await sleep(RECORD_DURATION_MS);
+    recorderRef.current = null;
+    setAudioLevel(0);
     if (abortedRef.current) return;
 
-    // 6. Stop recording, get WAV bytes
-    let wavBytes: number[];
-    try {
-      wavBytes = await invoke<number[]>("stop_recording");
-    } catch (e) {
-      recordingRef.current = false;
-      setErrorMsg(`Recording error: ${e}`);
-      setPhase("error");
-      return;
-    }
-    recordingRef.current = false;
-    if (abortedRef.current) return;
-
-    // 7. Hold at review — let the user decide to submit or discard
-    setPendingWav(wavBytes);
+    // 4. Hold at review — let the user decide to submit or discard
+    setPendingWav(wav);
     setPhase("review");
   }, []);
 
@@ -165,8 +145,7 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
     setPhase("submitting");
 
     try {
-      const buffer = new Uint8Array(pendingWav).buffer;
-      const result = await api.calibrateWakeWord(buffer);
+      const result = await api.calibrateWakeWord(pendingWav);
 
       if (abortedRef.current) return;
 

@@ -13,6 +13,7 @@ import type {
   VoiceBackend, VoiceState, PipelineOpts, ResponseMeta, ToolCallData,
 } from "./VoiceBackend";
 import {
+  MIC_CONSTRAINTS,
   encodeWav, calculateRms, downsampleTo16k, getAudioContext, closeAudioContext,
   playPingTone, playThinkingTone, splitSentences, stripMarkdown, normalizeForSpeech,
   isWhisperArtifact, checkDismissal, getToolAnnouncement, getQuip,
@@ -34,13 +35,6 @@ interface RecordingContext {
 }
 
 // ── Constants ────────────────────────────────────────────────────
-
-const MIC_CONSTRAINTS: MediaStreamConstraints = {
-  audio: {
-    sampleRate: { ideal: 16000 }, channelCount: { exact: 1 },
-    echoCancellation: true, noiseSuppression: true,
-  } as MediaTrackConstraints,
-};
 
 const WAKE_SPEECH_RMS = 0.008;
 const WAKE_SILENCE_RMS = 0.004;

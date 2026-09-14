@@ -27,18 +27,25 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
+import { invoke, isDesktopShell } from "../shell";
 import { useAppState } from "../state/AppContext";
 import { useConfirm, ErrorBanner } from "../components/shared";
 import type { Extension, AddExtensionRequest, MarketplaceExtension, SecretRequirement, AgentTool } from "../api/types";
 
-/** Open a URL in the system browser. Uses Tauri shell plugin when available, falls back to window.open. */
+/**
+ * Open a URL in the user's real browser.
+ *
+ * In the desktop shell this must go through the main process: window.open on
+ * an app:// page creates another in-app window rather than leaving the app,
+ * so the old catch-all fallback was wrong rather than merely degraded. (The
+ * shell also denies window.open outright, which is what makes that safe.)
+ */
 async function openExternal(url: string) {
-  try {
-    const { open } = await import("@tauri-apps/plugin-shell");
-    await open(url);
-  } catch {
-    window.open(url, "_blank", "noopener,noreferrer");
+  if (isDesktopShell()) {
+    await invoke("open_external", { url });
+    return;
   }
+  window.open(url, "_blank", "noopener,noreferrer");
 }
 
 // ── Secret Config Modal ───────────────────────────────────────

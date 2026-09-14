@@ -25,7 +25,7 @@ import { VoiceSwitcher } from "../../components/VoiceSwitcher";
 import { useAppState, useAppDispatch } from "../../state/AppContext";
 import { useVoicePipeline } from "./useVoicePipeline";
 import { useVoiceSession } from "./useVoiceSession";
-import { isTauriEnv } from "./VoiceBackend";
+import { isDesktopShell } from "../../shell";
 
 // ── CountdownRing (inline SVG) ─────────────────────────────
 
@@ -103,11 +103,15 @@ function VoiceModeChildProcess() {
   // one tick so a fast remount (React StrictMode's dev double-invoke, or the
   // user quickly leaving and re-entering the screen) can cancel it instead
   // of tearing the session down and spawning another. Without this, every
-  // such remount killed a live child and started a new one within ~100ms:
-  // fast enough to crash @tauri-apps/api's event bridge when an in-flight
-  // Rust event raced the listener teardown (`listeners[eventId]` goes
-  // undefined), and too fast for any session to survive long enough to do
-  // anything.
+  // such remount killed a live child and started a new one within ~100ms —
+  // too fast for any session to survive long enough to do anything, and each
+  // respawn reloads the models.
+  //
+  // It also used to crash Tauri's event bridge outright, when an in-flight
+  // event raced the listener teardown and `listeners[eventId]` went
+  // undefined. That half no longer applies: subscription is synchronous and
+  // there is no eventId table to go stale. The defer stays for the reason
+  // above, which is the one that was always about the child.
   const pendingStopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Conversation name ──────────────────────────────────────
@@ -439,10 +443,13 @@ function VoiceModePipeline() {
 // ── Public export: selects the correct path at runtime ──────
 
 export function VoiceMode() {
-  // Select the Tauri child-process path when running inside Tauri, and the
-  // plain browser HTTP pipeline otherwise.  isTauriEnv() checks for
-  // window.__TAURI_INTERNALS__ — the same guard used by createVoiceBackend().
-  if (isTauriEnv()) {
+  // The desktop shell gets the child-process path, where one pond-server
+  // process owns the mic, the model and the speaker with no transport
+  // boundaries between them. A browser has no such child and gets the HTTP
+  // pipeline. The check is for the bridge itself, not for a framework global:
+  // sniffing for the latter is how this silently picks the wrong path when
+  // the shell underneath changes.
+  if (isDesktopShell()) {
     return <VoiceModeChildProcess />;
   }
   return <VoiceModePipeline />;
