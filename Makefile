@@ -37,9 +37,9 @@ ui:
 server:
 	bash scripts/giap.sh build
 
-## desktop       Build the Tauri desktop app (with the custom-protocol feature)
+## desktop       Build the Electron desktop app (macOS only)
 desktop:
-	bash scripts/giap.sh build-desktop
+	cd pond-desktop && npm ci && npm run bundle:app
 
 ## doctor        Health check — submodule drift, CUDA build, service scope, disk
 doctor:

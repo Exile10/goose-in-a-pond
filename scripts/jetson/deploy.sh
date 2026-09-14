@@ -26,11 +26,9 @@ set -euo pipefail
 
 HOST="${JETSON_HOST:-nano}"
 BRANCH="main"
-DESKTOP=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --branch) BRANCH="$2"; shift 2 ;;
-    --desktop) DESKTOP=true; shift ;;   # also build the native Tauri app (needs a display)
     *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
@@ -79,26 +77,4 @@ ssh "$HOST" "systemctl --user restart goose-in-a-pond.service || exit 1
   systemctl --user --no-pager status goose-in-a-pond.service | head -12 >&2
   exit 1"
 
-if [ "$DESKTOP" = true ]; then
-  echo "==> [desktop] Ensuring WebKitGTK deps, then building the native Tauri app"
-  # install-desktop-deps.sh checks + installs the WebKitGTK stack (also enforced
-  # at compile time by pond-desktop/src-tauri/build.rs). A cargo build of the
-  # src-tauri crate embeds the dist synced above — no Node/cargo-tauri needed on
-  # the device (the Jetson's Node is too old for Vite).
-  #
-  # --features custom-protocol is LOAD-BEARING and is what `cargo tauri build`
-  # passes for you. Without it Tauri stays in dev mode and the WebView loads
-  # tauri.conf.json's devUrl (http://localhost:1420) instead of the embedded
-  # dist, so the app opens to "Could not connect to localhost: Connection
-  # refused" — with no build error to explain it.
-  ssh "$HOST" "cd ~/${REMOTE_REPO} \
-    && bash scripts/install-desktop-deps.sh \
-    && PATH=\$HOME/.cargo/bin:\$PATH SQLX_OFFLINE=true \
-       cargo build --release --features custom-protocol \
-         --manifest-path pond-desktop/src-tauri/Cargo.toml \
-    && echo 'Desktop app: ~/'${REMOTE_REPO}'/pond-desktop/src-tauri/target/release/pond-desktop'"
-  echo "    Launch on the attached display:  ssh $HOST 'DISPLAY=:0 ~/${REMOTE_REPO}/pond-desktop/src-tauri/target/release/pond-desktop'"
-fi
-
-echo ""
 echo "Deployed. Dashboard: http://nano.local:8080"
