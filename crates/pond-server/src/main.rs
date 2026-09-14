@@ -189,7 +189,7 @@ enum Commands {
 
         /// Emit the workflow as newline-delimited JSON (NDJSON) on stdout, one
         /// event per line. In this mode stdout carries NOTHING but JSON lines
-        /// (no banners, prompts, or emoji — those go to stderr); the Tauri shell
+        /// (no banners, prompts, or emoji — those go to stderr); the desktop shell
         /// parses these lines to drive the desktop voice UI.
         #[arg(long)]
         json_events: bool,
@@ -4518,7 +4518,7 @@ async fn run_server(
         }
     }
 
-    // --native: spawn the Tauri desktop app binary after the server is ready.
+    // --native: spawn the desktop app after the server is ready (macOS only).
     if native {
         spawn_desktop_app(api_port);
     }
@@ -5287,7 +5287,7 @@ async fn run_chat(
     // Writes one serialized WorkflowEvent per line to stdout with immediate
     // flush. In this mode the run_loop's human-facing prints are suppressed
     // (stdout_diagnostics=false) so stdout carries NOTHING but JSON lines. The
-    // Tauri shell parses these lines to drive the desktop voice UI.
+    // The desktop shell parses these lines to drive its voice UI.
     if json_events {
         let sink: pond_core::shared::services::chat::WorkflowEventSink =
             Arc::new(|event: &pond_core::shared::domain::agent::WorkflowEvent| {

@@ -5,7 +5,8 @@
 //! like it had done something, and produced NO COORDINATES — then set
 //! `enable_weather`, so a household finished setup with weather switched on and
 //! nothing to forecast. The one in Settings asked the browser for coordinates,
-//! which a Tauri webview does not reliably answer. The server had a fifth path
+//! which a WebView did not reliably answer (the desktop shell is Chromium now,
+//! so that is worth re-testing rather than assuming). The server had a fifth path
 //! that geocoded on save, so the same question got a different answer depending
 //! on which screen you were standing in front of.
 //!

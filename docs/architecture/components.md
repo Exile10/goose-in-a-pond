@@ -9,7 +9,7 @@ Each crate in `crates/` and the `pond-desktop/` app has a distinct responsibilit
 ```
 ┌──────────────────────────────────────────────────────┐
 │  Drivers (things that call the Core)                 │
-│  pond-server (CLI + HTTP)  ·  pond-desktop (Tauri)   │
+│  pond-server (CLI + HTTP) · pond-desktop (Electron)  │
 ├──────────────────────────────────────────────────────┤
 │  Application / API Layer                             │
 │  pond-api  (Axum router + REST DTOs)                 │
@@ -163,14 +163,19 @@ Exposes GIAP's smart home capabilities to the Goose agent as 9 MCP tools under t
 
 ## pond-desktop — Native Desktop App
 
-A [Tauri 2.0](https://tauri.app) application providing a native UI for macOS and Linux (Windows: future).
+An [Electron](https://electronjs.org) application providing a native UI for macOS. It is not
+packaged for Linux: on the Jetson the UI is the dashboard `pond-server` already serves over HTTP,
+and that board runs headless by design (GNOME held 2.6 GB of nvmap, see
+`docs/developer/jetson-device-tuning.md`).
 
 | Directory | Purpose |
 |---|---|
-| `src-tauri/` | Rust backend — window management, hotkeys, system tray, audio recording, TTS playback, server lifecycle |
-| `src/` | React 19 + TypeScript frontend |
+| `electron/main/` | Main process — window, `app://` protocol, menu, tray, hotkeys, IPC, the pond-server sidecar's lifecycle, and the voice child driver |
+| `electron/preload/` | The contextBridge. Validates every channel against the contract's allowlists before forwarding |
+| `src/shell/` | The IPC contract (closed unions for commands and events) and the renderer's side of the bridge |
+| `src/` | React 19 + TypeScript renderer |
 | `src/styles/` | Jarida design tokens and base CSS (offline fonts via fontsource) |
-| `src/state/` | `AppState` reducer + `AppContext` (all Tauri event listeners), and `chatRunStore` — the live chat turn (see below) |
+| `src/state/` | `AppState` reducer + `AppContext` (the shell's non-voice event listeners), and `chatRunStore` — the live chat turn (see below) |
 | `src/api/` | `PondApiClient` — single class for all REST calls |
 | `src/modes/` | `GuiMode` (sidebar app), `VoiceMode` (full-window orb) |
 | `src/sections/` | 10 GUI sections: Dashboard, Chat, Devices, Schedules, Memory, Skills, Models, Prompts, Settings, Agent |
@@ -182,7 +187,11 @@ A [Tauri 2.0](https://tauri.app) application providing a native UI for macOS and
 - **Voice mode** — full-window voice orb with transcript feed
 - **Canvas mode** — always-on-top translucent overlay for ambient display
 
-The desktop app starts `pond-server` automatically via the `ensure_server_running` Tauri command, polls `server_health`, and displays a branded startup screen while the server comes online.
+The desktop app starts `pond-server` automatically via the `ensure_server_running` IPC command,
+polls `server_health`, and displays a branded startup screen while the server comes online. When
+launched by `pond-server serve --native` the parent pins the port through `GIAP_SERVER_PORT`, and
+the shell must then attach rather than spawn — two servers fighting for one port present as a
+blank window, not as an error.
 
 ### Detached runs — a turn that outlives its connection
 
