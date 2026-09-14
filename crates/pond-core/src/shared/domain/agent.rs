@@ -300,7 +300,7 @@ impl fmt::Display for WorkflowState {
 /// # NDJSON contract (terminal-voice-in-desktop, Architecture A)
 ///
 /// The variants that carry an external contract payload serialize — via
-/// `serde_json::to_string` — to EXACTLY the shapes the Tauri shell parses off
+/// `serde_json::to_string` — to EXACTLY the shapes the desktop shell parses off
 /// the child's stdout (one JSON object per line, `snake_case`), tagged with an
 /// `"event"` field:
 ///
@@ -434,7 +434,7 @@ impl ThrottledAudioLevelSink {
 // ── Golden NDJSON serializer tests ──────────────────────────────────────────
 //
 // These assert the EXACT JSON strings the terminal-voice-in-desktop contract
-// (Architecture A) specifies. The Tauri shell parses these off child stdout;
+// (Architecture A) specifies. The desktop shell parses these off child stdout;
 // any drift here breaks the parser, so the strings are pinned byte-for-byte.
 #[cfg(test)]
 mod ndjson_golden_tests {

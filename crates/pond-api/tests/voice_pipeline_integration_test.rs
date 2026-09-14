@@ -209,7 +209,7 @@ async fn collect_sse_events(body: axum::body::Body) -> Vec<serde_json::Value> {
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 /// Canonical event shape: each token event must have BOTH type/content AND token fields.
-/// This ensures the Tauri voice pipeline (audio_cmd.rs) and canvas_feed.rs both work.
+/// This ensures the desktop voice pipeline and the browser one both work.
 #[tokio::test]
 async fn stream_events_have_type_text_and_token_fields() {
     let (app, _tmp) = make_app().await;

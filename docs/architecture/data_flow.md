@@ -102,26 +102,33 @@ Falls back to hard truncation (`trim_to_budget()`) if the LLM call fails.
 
 ## Desktop App Event Flow
 
-The Tauri desktop app communicates with the Rust backend via IPC commands and events:
+The renderer talks to the Electron main process over a typed bridge. Both sides import
+`pond-desktop/src/shell/contract.ts`, so a command or event name that is not declared there does
+not compile — and the preload refuses any channel not on its runtime allowlist.
 
 ```
-Frontend (React)                          Backend (Rust)
+Renderer (React)                          Main process (TypeScript)
      │                                         │
-     │  invoke("ensure_server_running")  ──►   │  Spawns pond-server process
-     │  poll invoke("server_health")    ──►   │  Returns true when HTTP ready
+     │  invoke("ensure_server_running")  ──►   │  Spawns or attaches to pond-server
+     │  invoke("server_health")          ──►   │  True when HTTP is answering
+     │  invoke("start_voice_session")    ──►   │  Spawns the voice child
+     │  invoke("stop_voice_session")     ──►   │  Ends it, escalating to a kill
+     │  invoke("open_external", {url})   ──►   │  Opens the system browser
      │                                         │
-     │  ◄──  emit("server-status", true)      │  Health monitor loop
-     │  ◄──  emit("desktop-summon")           │  Global hotkey ⌘⇧V
-     │  ◄──  emit("recording-started")        │  Mic open
-     │  ◄──  emit("transcript", text)         │  ASR complete
-     │  ◄──  emit("response-token", {token})  │  Streaming LLM token
-     │  ◄──  emit("tool-result", {tool,data}) │  MCP tool called
-     │  ◄──  emit("tts-start")                │  Piper speaking
-     │  ◄──  emit("tts-end")                  │  Speaking done
-     │  ◄──  emit("pipeline-error", msg)      │  Error in voice loop
+     │  ◄──  "server-status" (bool)           │  Health loop
+     │  ◄──  "server-starting"                │  Recovery began
+     │  ◄──  "desktop-summon"                 │  Global hotkey Cmd+Shift+V
+     │  ◄──  "canvas-toggle"                  │  Global hotkey Cmd+Shift+G
+     │  ◄──  "switch-to-voice"                │  View menu
+     │  ◄──  "voice-*" (11 events)            │  One per NDJSON line from the voice child
 ```
 
-All Tauri event listeners live exclusively in `AppContext.tsx`. Components dispatch Redux-style actions; they never call Tauri IPC directly.
+The `voice-*` family is mapped 1:1 from the voice child's stdout, except `voice-session-ended`,
+which the main process synthesises when the child's stdout AND process have both closed.
+
+Ownership is split and the split is enforced by convention: `useVoiceSession` owns every `voice-*`
+listener and nothing else registers one; `AppContext.tsx` owns the other five. Components dispatch
+Redux-style actions; they never call the bridge directly.
 
 ---
 
