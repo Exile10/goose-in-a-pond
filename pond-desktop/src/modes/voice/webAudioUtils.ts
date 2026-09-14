@@ -20,6 +20,22 @@
  * @param sampleRate  Sample rate in Hz (typically 16000)
  * @returns ArrayBuffer containing a valid WAV file
  */
+/**
+ * Microphone constraints, shared by every capture path.
+ *
+ * 16 kHz mono is what the transcription endpoint wants, so asking the browser
+ * for it avoids a resample; echo cancellation is what stops the assistant
+ * hearing its own speech as a new utterance.
+ */
+export const MIC_CONSTRAINTS: MediaStreamConstraints = {
+  audio: {
+    sampleRate: { ideal: 16000 },
+    channelCount: { exact: 1 },
+    echoCancellation: true,
+    noiseSuppression: true,
+  } as MediaTrackConstraints,
+};
+
 export function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
   const numChannels = 1;
   const bitsPerSample = 16;
