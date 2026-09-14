@@ -4669,7 +4669,10 @@ async fn launch_desktop(path: &std::path::Path, args: &[&str], server_port: u16)
     {
         Ok(child) => child,
         Err(e) => {
-            tracing::warn!("Failed to launch the desktop app at {}: {e}", path.display());
+            tracing::warn!(
+                "Failed to launch the desktop app at {}: {e}",
+                path.display()
+            );
             return;
         }
     };
