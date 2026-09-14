@@ -1,0 +1,64 @@
+# GIAP deploy and maintenance — passwordless sudo for the operations a deploy
+# actually performs on this board.
+#
+# Install (validates before replacing, so a syntax error cannot lock you out):
+#   sudo install -m 0440 -o root -g root \
+#     ~/goose-in-a-pond/scripts/jetson/sudoers-giap /etc/sudoers.d/giap
+#   sudo visudo -c
+#
+# Remove:  sudo rm /etc/sudoers.d/giap
+#
+# ── WHY THIS IS A LIST AND NOT `ALL` ────────────────────────────────────────
+#
+# `nano` is already in the `sudo` group, so it can already become root — this
+# only removes the password prompt. What that changes is who can do it without
+# knowing the password, and on this board that question has a specific answer:
+# pond-server runs AS `nano`, and it runs an LLM that calls tools.
+#
+# Today that path is closed. GIAP's own MCP tools have no shell execution at
+# all (`giap-system` is time, system info and notifications; there is no
+# Command::new anywhere in pond-mcp-server), and goose's `developer` and
+# `computercontroller` builtins are stripped. But unstripping one of those, or
+# adding a third-party MCP server that can exec, would turn a user-level
+# capability into a root one — silently, and without touching this file.
+#
+# So: enumerate. It is defence in depth rather than a hard boundary (several
+# entries below are root-equivalent if you work at it), but it keeps the blast
+# radius legible and it makes `sudo -l` an honest description of what deploys
+# need.
+#
+# If you decide you want the blanket version anyway, it is one line:
+#   nano ALL=(ALL) NOPASSWD: ALL
+# and deleting everything else. Your device, your call — but make it knowingly.
+#
+# ── WHAT DEPLOYS ACTUALLY NEED ──────────────────────────────────────────────
+# Derived from the sudo calls in scripts/jetson/*, scripts/lib/install-systemd.sh
+# and scripts/giap.sh.
+
+# Service lifecycle: install-systemd.sh, deploy.sh restart, giap.sh.
+nano ALL=(root) NOPASSWD: /usr/bin/systemctl
+
+# Package installs during setup and desktop-dependency preflight.
+nano ALL=(root) NOPASSWD: /usr/bin/apt-get, /usr/bin/apt
+
+# Display path: loading nvidia-drm is what exposes KMS connectors so the panel
+# can be driven without a desktop. Reversible with rmmod.
+nano ALL=(root) NOPASSWD: /usr/sbin/modprobe, /usr/sbin/rmmod
+
+# Diagnostics that are root-only on this kernel. dmesg is how NvMap errors are
+# found, and NvMap error 12 is the failure that looks like a slow model.
+nano ALL=(root) NOPASSWD: /usr/bin/dmesg
+
+# Jetson power and clock state — nvpmodel picks the power mode, and the
+# over-current behaviour of MAXN_SUPER versus 25W is a real tuning axis here.
+nano ALL=(root) NOPASSWD: /usr/sbin/nvpmodel, /usr/bin/jetson_clocks
+
+# Swap, and dropping caches before a GPU load. drop_caches before -ngl is the
+# documented workaround for NvMap allocation failures on this board.
+nano ALL=(root) NOPASSWD: /usr/sbin/swapon, /usr/sbin/sysctl vm.drop_caches=*
+nano ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches
+
+# Exactly one config file, at exactly one path, so nvidia-drm survives a
+# reboot. `tee` with an unrestricted path would be a root write primitive and
+# would make every line above pointless, which is why this names the file.
+nano ALL=(root) NOPASSWD: /usr/bin/tee /etc/modprobe.d/nvidia-drm.conf
