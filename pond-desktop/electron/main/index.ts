@@ -146,6 +146,7 @@ if (!app.requestSingleInstanceLock()) {
     win = createMainWindow({
       preloadPath: join(__dirname, "../preload/index.cjs"),
       serverUrl: server.url,
+      userDataDir: app.getPath("userData"),
       devServerUrl: process.env["GIAP_DEV_SERVER"],
       onCloseRequested: (w) => {
         if (quitting) {
