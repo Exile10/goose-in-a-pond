@@ -18,7 +18,7 @@ import { createMainWindow, distRoot } from "./window";
 import { ServerProcess, recoveryBackoffSeconds, resolveServerBinary } from "./serverProcess";
 import { VoiceChildProcess } from "./voice/VoiceChildProcess";
 import { registerIpc } from "./ipc";
-import { installMenu } from "./menu";
+import { installMenu, setAboutPanel } from "./menu";
 import { createTray, setTrayStatus, destroyTray } from "./tray";
 import { registerHotkeys, unregisterHotkeys } from "./hotkeys";
 import type { ShellEvent, ShellEvents } from "../../src/shell/contract";
@@ -140,6 +140,7 @@ if (!app.requestSingleInstanceLock()) {
     // still be holding the microphone.
     voice.cleanupOrphans();
 
+    setAboutPanel();
     installMenu({ emit });
     registerIpc({ server, voice });
 
@@ -160,7 +161,7 @@ if (!app.requestSingleInstanceLock()) {
     createTray({
       emit,
       showWindow,
-      iconPath: join(app.getAppPath(), "build", "trayTemplate.png"),
+      iconPath: join(app.getAppPath(), "electron", "assets", "trayTemplate.png"),
     });
 
     registerHotkeys({ emit, focusWindow: showWindow, log: log.info });
