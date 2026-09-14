@@ -99,54 +99,30 @@ knob), `docs/wake-word-calibration.md:319`, `docs/developer/model_architecture.m
 
 ---
 
-## Tier 2 — desktop dead audio (Rust, ~2,900 lines)
+## Tier 2 — desktop dead audio (Rust) — RESOLVED
 
-Root cause: `TauriVoiceBackend.ts` is unreachable. `VoiceMode.tsx:374`
-short-circuits to `VoiceModeChildProcess` under the same `__TAURI_INTERNALS__`
-predicate `createVoiceBackend` uses, and the child component has no fallback.
-Everything it invoked dies with it.
+Resolved by the Electron migration: `pond-desktop/src-tauri/` was deleted
+wholesale, and every item this section listed went with it — `audio_cmd.rs`,
+`audio.rs`, `canvas_feed.rs`, `thought_filter.rs`, `tts_text.rs`, the rodio
+playback path, the wake listener with no entry point, and the `SpeculativeLlmSlot`
+scaffolding. About 4,000 lines of Rust in total, of which this section had
+already identified roughly 2,900 as dead.
 
-**Tier 2A** (statically dead once `TauriVoiceBackend.ts` goes):
-`audio_cmd.rs` `run_voice_pipeline` (408-881), `record_with_vad` (216-313),
-`play_ping` (315-359), `start_wake_listener` cmd (361-399), TTS helpers
-(883-975), quips (115-142), `SharedAudioOutput` (53-108), `SpeculativeLlmSlot`
-(10-28); `audio.rs` `record_with_vad` (388-621), speculative spawn (353-386),
-`VadSilenceTracker` (290-351), tests (1142-1269), `stop_capture` (124-155);
-`canvas_feed.rs` and `thought_filter.rs` whole; `tts_text.rs:956-981`;
-`AppContext.tsx:253-322, 333-348`.
+Two things from it survive and are worth carrying forward:
 
-**Tier 2B** (runtime-dead via a closed loop, *not* statically dead —
-`voice_cmd.rs:182` still references `audio::start_wake_listener`):
-`audio.rs:623-1118`, `voice_cmd.rs` restore paths, `tts_text.rs` whole (981).
-
-**Landmines — three of these do not compile if applied literally:**
-
-- `voice_cmd.rs` **110-119** removes `return Ok(());` *and* the closing brace of
-  `if !voice.is_active() {`. 
-- `voice_cmd.rs` **84-88** removes the `Err(e)` tail expression, so the match
-  arms disagree in type.
-- `audio.rs` **59-62** swallows the `}` closing `struct WakeListenerState`
-  (correct range 56-61); **73-78** swallows the `}` closing its `impl`.
-- `wake_was_running` / `set_wake_was_running` are **not** then-unused —
-  `chat_process.rs:940` and `943-950` test them.
-- Four orphaned imports the audit missed: `audio_cmd.rs:3`
-  (`crate::process::ServerProcess`), `:4` (`reqwest::multipart`), and two more.
-- `SharedAudioOutput::new()` is not passive — it opens the default output
-  device at startup and spawns `desktop-audio-keeper`. Deleting it changes
-  startup behaviour.
-- Emit census missed `ttft` (`audio_cmd.rs:757`) and `voice-dismissed` (`:568`).
-
-**MUST SURVIVE:** `start_recording` / `stop_recording` / `abort_recording` /
-`stop_wake_listener` — `WakeWordCalibration.tsx:93, 125, 131` still invokes them.
-
----
+- The microphone is the renderer's now (`src/modes/voice/micRecorder.ts` and
+  `WebVoiceBackend`), so the "landmine" list about which capture path owns the
+  device no longer has two candidates to arbitrate between.
+- `TauriVoiceBackend.ts`, the root cause named here, is also gone; `VoiceMode`
+  forks on `isDesktopShell()` and the browser path is the only backend
+  `createVoiceBackend` returns.
 
 ## Tier 3 — TypeScript (~845 lines)
 
 | Item | Range | Status |
 |---|---|---|
 | `src/modes/webAudioUtils.ts` | whole, 548 | **DELETED 2026-08-01** — zero importers, verified twice |
-| `src/modes/voice/TauriVoiceBackend.ts` | whole, 194 | unreachable; ships today as a dead lazy chunk |
+| `src/modes/voice/TauriVoiceBackend.ts` | whole, 194 | DELETED — was unreachable, shipped as a dead lazy chunk |
 | `src/modes/voice/VoiceBackend.ts` | **89-92**, not 89-91 | 92 is the closing brace |
 | `Voice.tsx` hands-free Row | **245-254**, not 249-252 | 249-252 alone leaves `control={\n}` — a parse error |
 | `Voice.tsx` push-to-talk Row | 312-316 | genuinely fake, but more evidence of being actively built |

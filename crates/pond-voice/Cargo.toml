@@ -11,19 +11,25 @@ path = "src/lib.rs"
 
 # LEAF CRATE — deliberately almost dependency-free.
 #
-# Everything depends inward on this: pond-core, both voice adapters, pond-api,
-# and — the reason it exists — `pond-desktop/src-tauri`, which declares its own
-# `[workspace]` and therefore cannot use pond-core. That path dependency is what
-# finally deletes `src-tauri/src/tts_text.rs`, a 981-line verbatim Rust port of
-# the normalisation in this crate, and lets both `webAudioUtils.ts` copies
-# shrink to a thin wrapper over the server.
+# Everything depends inward on this: pond-core, both voice adapters, pond-api.
+#
+# READ THIS BEFORE RELAXING THE RULE. The crate was carved out because
+# `pond-desktop/src-tauri` declared its own `[workspace]` and therefore could
+# not depend on pond-core, so a leaf was the only shape all four consumers
+# could share. That second workspace is gone -- the desktop shell is Electron
+# now -- so the rule is a CHOICE, not a physical constraint. It is still the
+# right choice: this is where the TTS normalisation and whisper-artifact
+# stripping live, and a dependency-free surface is what lets any surface call
+# them without inheriting a runtime.
+#
+# The next person to grep for `src-tauri`, find nothing, and conclude the rule
+# is stale should read the paragraph above and then not add tokio.
 #
 # Dependencies are declared EXPLICITLY rather than with `workspace = true`.
 # `workspace = true` resolves against the outermost workspace, which is the
 # landmine already documented for the goose submodule
-# (docs/goose-patch-management.md); a crate reaching into a second build tree
-# should not carry that coupling. Adding tokio, cpal, anyhow or pond-core here
-# would defeat the whole point — keep this list at std plus, at most, thiserror.
+# (docs/goose-patch-management.md). Adding tokio, cpal, anyhow or pond-core
+# here would defeat the point — keep this list at std plus, at most, thiserror.
 [dependencies]
 
 [dev-dependencies]

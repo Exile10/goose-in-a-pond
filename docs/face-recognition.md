@@ -406,7 +406,7 @@ Disable the whole layer with `POND_FACE_AUTO_EXPOSURE=off`.
      or "We couldn't confirm a real, live face" (liveness failure) or
      "No matching profile found".
    - **Delete biometrics** — opens an inline confirmation panel (the
-     Tauri WebView ignores the browser `confirm()` dialog), then POSTs
+     the WebView ignores the browser `confirm()` dialog), then POSTs
      `DELETE /users/{id}/biometrics`.
 
 ### Web — `/faces` page
@@ -501,7 +501,7 @@ dev install with `cargo run -p pond-server --features face-onnx -- serve --nativ
 ## Build & Run
 
 ```bash
-# One-line dev launch (starts pond-server + spawns the Tauri desktop window)
+# One-line dev launch (starts pond-server + spawns the desktop window; macOS)
 cargo run -p pond-server --features face-onnx -- serve --native
 ```
 

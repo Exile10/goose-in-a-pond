@@ -84,10 +84,6 @@ export interface VoiceBackend {
 
 // ── Factory ──────────────────────────────────────────────────
 
-export function isTauriEnv(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
 /**
  * Create the VoiceBackend for the current runtime.
  *

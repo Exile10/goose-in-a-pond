@@ -4,7 +4,7 @@
 below was checked by grep against the symbol, not by reading a previous version of this document.
 Line numbers rot; symbols do not. Re-verify before trusting.
 
-This document is the shared definition of GIAP's settings surface for **every** client — the Tauri
+This document is the shared definition of GIAP's settings surface for **every** client — the
 desktop app, Goose On The Go (GOTG), the embedded web UI, and anything else that speaks
 `/api/v1/settings`. It exists because the settings surface currently has no shared vocabulary: the
 desktop app groups fields one way, the domain struct groups them another, and the API exposes a flat

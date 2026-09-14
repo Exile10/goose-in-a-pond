@@ -21,8 +21,7 @@
 // ────────────────────────────────────────────────────────────
 
 import { useEffect, useRef, useCallback, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke, listen } from "../../shell";
 import { useAppDispatch, useAppState } from "../../state/AppContext";
 import { nextTranscriptId, nextCardId } from "../../state/reducer";
 
@@ -153,8 +152,7 @@ export function useVoiceSession(): VoiceSessionAPI {
   // Updated on startSession invoke return and on voice-ready; cleared on ended.
   const activeSessionIdRef = useRef<string | null>(null);
 
-  // All unlisten functions from Tauri listen() registrations.
-  // Populated as each promise resolves; see cancelled-flag pattern below.
+  // Unsubscribe functions for every voice-* listener this hook owns.
   const unlistenersRef = useRef<Array<() => void>>([]);
 
   // Token accumulation buffer for rAF batching (finding 41).
@@ -183,49 +181,33 @@ export function useVoiceSession(): VoiceSessionAPI {
     dispatch({ type: "APPEND_AGENT_TOKEN", payload: { token: batch, done: false } });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Tauri event listeners ────────────────────────────────────────────────
+  // ── Shell event listeners ────────────────────────────────────────────────
   // All voice-* event subscriptions live HERE and nowhere else.
   // See EVENT OWNERSHIP RULE at the top of this file.
 
   useEffect(() => {
-    // Finding 5+18: cancelled flag ensures that if the effect cleanup runs before
-    // all listen() promises resolve, any unlisten functions that arrive after
-    // teardown are called immediately instead of stored (preventing listener leaks
-    // on StrictMode double-mount and fast mount/unmount sequences).
-    let cancelled = false;
-    const pending: Array<Promise<() => void>> = [];
-
-    function register(p: Promise<() => void>): void {
-      pending.push(
-        p.then((unlisten) => {
-          if (cancelled) {
-            // Teardown already ran — call immediately to avoid a leaked listener.
-            unlisten();
-          } else {
-            unlistenersRef.current.push(unlisten);
-          }
-          return unlisten;
-        }),
-      );
-    }
+    // Registration is synchronous, so there is nothing to race: an unlisten
+    // cannot arrive after teardown, and no event can be missed between mount
+    // and subscription. The cancelled-flag register that used to live here
+    // existed only because Tauri's listen() round-tripped into Rust.
 
     // voice-warmup: warming | ready | skipped | failed. Precedes voice-ready.
-    register(
-      listen<string>("voice-warmup", (e) => {
-        setWarmingUp(e.payload === "warming");
+    unlistenersRef.current.push(
+      listen("voice-warmup", (payload) => {
+        setWarmingUp(payload === "warming");
       }),
     );
 
     // voice-ready: child is fully initialised and entering the wait loop.
     // Emitted once per session after models are loaded.
-    register(
-      listen<{ session_id: string }>("voice-ready", (e) => {
+    unlistenersRef.current.push(
+      listen("voice-ready", (payload) => {
         setConnecting(false);
         setWarmingUp(false);
         setSessionActive(true);
-        if (e.payload?.session_id) {
-          activeSessionIdRef.current = e.payload.session_id;
-          dispatch({ type: "SET_SESSION_ID", payload: e.payload.session_id });
+        if (payload?.session_id) {
+          activeSessionIdRef.current = payload.session_id;
+          dispatch({ type: "SET_SESSION_ID", payload: payload.session_id });
         }
         // Child enters the wake-word wait loop; show the wait orb.
         dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
@@ -233,20 +215,20 @@ export function useVoiceSession(): VoiceSessionAPI {
     );
 
     // voice-state: wait | listen | thinking | speak (contract section 1)
-    register(
-      listen<string>("voice-state", (e) => {
-        const mapped = CHILD_STATE_MAP[e.payload] ?? "idle";
+    unlistenersRef.current.push(
+      listen("voice-state", (payload) => {
+        const mapped = CHILD_STATE_MAP[payload] ?? "idle";
         dispatch({ type: "SET_VOICE_STATE", payload: mapped });
       }),
     );
 
     // voice-transcript: confirmed user utterance post-ASR
-    register(
-      listen<{ text: string }>("voice-transcript", (e) => {
+    unlistenersRef.current.push(
+      listen("voice-transcript", (payload) => {
         const userMsg = {
           id: nextTranscriptId(),
           role: "user" as const,
-          text: e.payload.text,
+          text: payload.text,
           timestamp: Date.now(),
         };
         dispatch({ type: "APPEND_TRANSCRIPT", payload: userMsg });
@@ -264,9 +246,9 @@ export function useVoiceSession(): VoiceSessionAPI {
     );
 
     // voice-token: assistant token delta — batched via rAF (finding 41)
-    register(
-      listen<{ content: string }>("voice-token", (e) => {
-        pendingTokensRef.current += e.payload.content;
+    unlistenersRef.current.push(
+      listen("voice-token", (payload) => {
+        pendingTokensRef.current += payload.content;
         if (rafHandleRef.current === null) {
           rafHandleRef.current = requestAnimationFrame(flushPendingTokens);
         }
@@ -274,15 +256,15 @@ export function useVoiceSession(): VoiceSessionAPI {
     );
 
     // voice-tool-call: push a context card for the in-flight tool
-    register(
-      listen<{ tool: string; id: string }>("voice-tool-call", (e) => {
+    unlistenersRef.current.push(
+      listen("voice-tool-call", (payload) => {
         dispatch({
           type: "PUSH_CONTEXT_CARD",
           payload: {
             id: nextCardId(),
-            tool: e.payload.tool,
-            callId: e.payload.id,
-            data: { id: e.payload.id },
+            tool: payload.tool,
+            callId: payload.id,
+            data: { id: payload.id },
             timestamp_ms: Date.now(),
           },
         });
@@ -294,30 +276,30 @@ export function useVoiceSession(): VoiceSessionAPI {
     // avoiding duplicate cards. Passing `tool` lets the reducer still surface an
     // orphan result (no matching call card) as its own card rather than dropping
     // it — the normal path has the call card, so this is a safety net only.
-    register(
-      listen<{ tool: string; id: string; content: string }>("voice-tool-result", (e) => {
+    unlistenersRef.current.push(
+      listen("voice-tool-result", (payload) => {
         dispatch({
           type: "UPDATE_CONTEXT_CARD",
           payload: {
-            callId: e.payload.id,
-            tool: e.payload.tool,
-            data: { result: e.payload.content },
+            callId: payload.id,
+            tool: payload.tool,
+            data: { result: payload.content },
           },
         });
       }),
     );
 
     // voice-done: turn complete; flush any buffered tokens first, then mark done.
-    register(
-      listen<{ session_id?: string }>("voice-done", (e) => {
+    unlistenersRef.current.push(
+      listen("voice-done", (payload) => {
         // Flush any rAF-buffered tokens before marking done (finding 41).
         if (rafHandleRef.current !== null) {
           cancelAnimationFrame(rafHandleRef.current);
           flushPendingTokens();
         }
         dispatch({ type: "APPEND_AGENT_TOKEN", payload: { token: "", done: true } });
-        if (e.payload?.session_id) {
-          dispatch({ type: "SET_SESSION_ID", payload: e.payload.session_id });
+        if (payload?.session_id) {
+          dispatch({ type: "SET_SESSION_ID", payload: payload.session_id });
         }
         // Child returns to the wait loop after each completed turn.
         dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
@@ -326,21 +308,21 @@ export function useVoiceSession(): VoiceSessionAPI {
 
     // voice-error: non-fatal child error; surface via flashError (persists
     // until the user dismisses or retries).
-    register(
-      listen<{ message?: string } | string>("voice-error", (e) => {
+    unlistenersRef.current.push(
+      listen("voice-error", (payload) => {
         const msg =
-          typeof e.payload === "string"
-            ? e.payload
-            : e.payload?.message ?? "Voice session error";
+          typeof payload === "string"
+            ? payload
+            : payload?.message ?? "Voice session error";
         flashError(msg);
       }),
     );
 
     // voice-audio-level: live mic RMS during wait/recording, throttled
     // Rust-side. Drives the orb's audio-reactive pulse.
-    register(
-      listen<{ rms: number }>("voice-audio-level", (e) => {
-        setAudioLevel(e.payload.rms);
+    unlistenersRef.current.push(
+      listen("voice-audio-level", (payload) => {
+        setAudioLevel(payload.rms);
       }),
     );
 
@@ -353,9 +335,9 @@ export function useVoiceSession(): VoiceSessionAPI {
     // not be treated as a clean exit.
     // Finding 14-consumer also: call stop_voice_session best-effort so the
     // shell restores the wake listener when the child exits on its own.
-    register(
-      listen<{ code: number | null; reason: string; session_id?: string; detail?: string | null }>("voice-session-ended", (e) => {
-        const incomingId = e.payload?.session_id ?? null;
+    unlistenersRef.current.push(
+      listen("voice-session-ended", (payload) => {
+        const incomingId = payload?.session_id ?? null;
         // If the event carries a session_id that does not match the active one,
         // drop it — it belongs to a previous child.
         if (incomingId !== null && activeSessionIdRef.current !== null && incomingId !== activeSessionIdRef.current) {
@@ -371,11 +353,11 @@ export function useVoiceSession(): VoiceSessionAPI {
         // restore the listener; this closes the loop from the frontend side).
         invoke("stop_voice_session").catch(() => {});
 
-        const code = e.payload?.code ?? null;
-        const reason = e.payload?.reason ?? "unknown";
+        const code = payload?.code ?? null;
+        const reason = payload?.reason ?? "unknown";
         if (!isCleanExit(code, reason)) {
           // Abnormal exit — surface error; stays until dismissed/retried.
-          flashError(endedErrorMessage(code, reason, e.payload?.detail));
+          flashError(endedErrorMessage(code, reason, payload?.detail));
         } else {
           // Clean exit (stdin_eof / dismissed) — return to idle.
           dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
@@ -384,10 +366,6 @@ export function useVoiceSession(): VoiceSessionAPI {
     );
 
     return () => {
-      // Mark cancelled so any still-resolving listen() promises call their
-      // unlisten immediately instead of storing it (finding 5+18).
-      cancelled = true;
-      // Teardown all already-registered listeners.
       unlistenersRef.current.forEach((u) => u());
       unlistenersRef.current = [];
       // Cancel any in-flight rAF and flush buffered tokens (finding 41).
@@ -417,7 +395,7 @@ export function useVoiceSession(): VoiceSessionAPI {
       // that conversation rather than a new one — same history, same Goose
       // engine session, same agent mid-thought. `null` (no chat has happened
       // yet) still starts fresh, and the child returns whichever id it used.
-      const sessionId = await invoke<string>("start_voice_session", {
+      const sessionId = await invoke("start_voice_session", {
         sessionId: appSessionIdRef.current,
       });
       // Track for stale-ended filtering (finding 14-consumer).
