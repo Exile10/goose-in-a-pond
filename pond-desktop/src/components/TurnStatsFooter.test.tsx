@@ -12,6 +12,8 @@ function stats(overrides: Partial<TurnStats> = {}): TurnStats {
     prefill_ms: 3100,
     decode_tok_per_sec: 22.34,
     prefill_tok_per_sec: 594.0,
+    prefilled_tokens: 1843,
+    reused_prefix_tokens: 0,
     prompt_tokens: 1843,
     completion_tokens: 87,
     context_used_tokens: 1843,

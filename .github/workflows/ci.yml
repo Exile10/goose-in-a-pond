@@ -66,17 +66,21 @@ jobs:
       # sync must be staged on a side branch and fast-forwarded into fork main together with the
       # parent-side port, or older parent branches fail CI on fresh runs.
       #
-      # THAT HAS HAPPENED AND IS UNRESOLVED (2026-09-11). The parent pins submodule SHA d43cd702c
-      # on `feat/llama-cpp-2-0.1.156-oai-fork`, 8 ahead of fork main and 0 behind. The parent asks
-      # for llama-cpp-2 =0.1.156 (Cargo.toml) and patches it to jarida-io/llama-cpp-rs-giap rev
-      # ad6e4b85, which declares 0.1.156. Fork main's goose still asks for =0.1.146, which that
-      # patch CANNOT satisfy -- so a run against fork main resolves a different graph than any
-      # build that ships, and `cargo check` never links, so it passes anyway. The side branch also
-      # carries `cuda-no-vmm`, the flag that fixed a shipped Jetson OOM; fork main has plain `cuda`.
+      # THAT HAPPENED, AND WAS RESOLVED 2026-09-12 by the missing fast-forward. It is recorded
+      # here because the failure mode is silent and will recur the same way. What it looked like:
+      # the parent pinned a side-branch SHA asking for llama-cpp-2 =0.1.156 and patching it to
+      # jarida-io/llama-cpp-rs-giap rev ad6e4b85 (which declares 0.1.156), while fork main's goose
+      # still asked for =0.1.146 -- a version that patch CANNOT satisfy. So a run against fork main
+      # resolved a different graph than anything that ships, and `cargo check` never links, so it
+      # passed anyway. Fork main also had plain `cuda` where the side branch had `cuda-no-vmm`, the
+      # flag that fixed a shipped Jetson OOM.
       #
-      # The fix is the missing fast-forward, not a change here. `--locked` on every cargo step
-      # below is the guard: a resolve that disagrees with Cargo.lock now fails loudly instead of
-      # quietly checking something nobody runs.
+      # Now: fork `main` and `feat/llama-cpp-2-0.1.156-oai-fork` are the same commit, main asks for
+      # =0.1.156, and `cuda-no-vmm` is on main. `--locked` on every cargo step below is the standing
+      # guard -- a resolve that disagrees with Cargo.lock fails loudly instead of quietly checking
+      # something nobody runs. To check by hand, compare the two refs and the version they ask for:
+      #
+      #   git ls-remote https://github.com/jarida-io/Goose main refs/heads/feat/llama-cpp-2-0.1.156-oai-fork
       - name: Checkout goose submodule
         run: |
           rm -rf goose
@@ -264,6 +268,16 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+        env:
+          # Nothing in this job launches Electron, and setup-node's npm cache
+          # does not cover ~/.cache/electron — so skip the ~100 MB download.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+      # Vite builds with esbuild, which strips types without checking them, so
+      # until this step existed nothing type-checked pond-desktop/dist — the
+      # very artifact pond-api embeds with include_dir!.
+      - name: Typecheck
+        run: npm run typecheck
 
       - name: Vitest (unit tests)
         run: npm test
