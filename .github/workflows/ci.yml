@@ -330,20 +330,39 @@ jobs:
       - name: Build the renderer and the main process
         run: npm run build && npm run build:main
 
-      # Electron's SUID sandbox helper has to be root-owned and mode 4755, and
-      # npm cannot install it that way. Chromium refuses to start rather than
-      # silently drop the sandbox: "The SUID sandbox helper binary was found,
-      # but is not configured correctly. Rather than run without sandboxing I'm
-      # aborting now."
+      # Two separate things have to be true before Electron will start here.
       #
-      # Fixing the permissions rather than passing --no-sandbox, deliberately:
-      # --no-sandbox would make the job pass while testing a configuration
-      # nobody ships, and would stop the smoke test noticing if the sandbox
-      # ever broke for real.
-      - name: Give the Electron sandbox helper the ownership it requires
+      # 1. The binary must actually be extracted. `npm ci` does not reliably
+      #    leave node_modules/electron/dist populated on this runner -- the
+      #    first run fetched it lazily, during the smoke step. So force it now,
+      #    while there is still something that can report a clear failure.
+      #
+      # 2. The SUID sandbox helper must be root-owned and mode 4755, which npm
+      #    cannot do. Chromium refuses to start rather than quietly drop the
+      #    sandbox: "The SUID sandbox helper binary was found, but is not
+      #    configured correctly. Rather than run without sandboxing I'm
+      #    aborting now."
+      #
+      # Fixing the ownership rather than passing --no-sandbox, deliberately:
+      # --no-sandbox would make this job green while exercising a
+      # configuration nobody ships, and would stop the smoke test ever
+      # noticing if the sandbox broke for real.
+      - name: Prepare Electron and its sandbox helper
         run: |
-          sudo chown root:root node_modules/electron/dist/chrome-sandbox
-          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+          set -euo pipefail
+          # --version starts no renderer and no zygote, so it is safe to run
+          # before the sandbox helper has been fixed, and it is enough to make
+          # the package extract itself.
+          npx electron --version
+          SANDBOX=node_modules/electron/dist/chrome-sandbox
+          if [ ! -f "$SANDBOX" ]; then
+            echo "::error::expected $SANDBOX to exist after preparing Electron"
+            ls -la node_modules/electron/dist 2>/dev/null | head -20 || echo "(no dist directory at all)"
+            exit 1
+          fi
+          sudo chown root:root "$SANDBOX"
+          sudo chmod 4755 "$SANDBOX"
+          ls -l "$SANDBOX"
 
       - name: Launch headless and assert the bridge
         run: xvfb-run -a node scripts/smoke.mjs
