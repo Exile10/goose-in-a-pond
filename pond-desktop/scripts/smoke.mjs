@@ -50,6 +50,15 @@ async function waitForPage(timeoutMs = 45_000) {
 
 /** Minimal CDP client: enough to evaluate expressions in the page. */
 async function connect(page) {
+  if (typeof WebSocket === "undefined") {
+    // Node gained a global WebSocket in 22. Electron 44 requires >= 22.12.0
+    // anyway, so this only fires on a runtime too old to run the app at all —
+    // but a named error beats a bare ReferenceError from inside the harness.
+    throw new Error(
+      `this script needs a global WebSocket, which Node gained in 22 (running ${process.version}). ` +
+        "electron@44 declares engines >= 22.12.0, so upgrade rather than polyfill.",
+    );
+  }
   const ws = new WebSocket(page.webSocketDebuggerUrl);
   const pending = new Map();
   let id = 0;
