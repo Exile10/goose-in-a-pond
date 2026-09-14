@@ -16,9 +16,18 @@ export interface TrayTargets {
 let tray: Tray | null = null;
 
 export function createTray(t: TrayTargets): Tray {
+  // createFromPath picks up the @2x file sitting beside this one on its own,
+  // so only the @1x path is named.
   const image = nativeImage.createFromPath(t.iconPath);
-  // A template image follows the menu bar's light/dark appearance on macOS;
-  // without this the icon is a fixed colour and disappears against one of them.
+  if (image.isEmpty()) {
+    // Worth saying out loud rather than showing a blank slot: this is what a
+    // packaging mistake looks like, and the tray is otherwise silent about it.
+    console.warn(`[giap] tray icon missing or unreadable at ${t.iconPath}`);
+  }
+  // A template image carries shape only -- macOS discards the colour and
+  // re-tints the alpha to suit the menu bar, so it stays legible in light
+  // mode, dark mode and when highlighted. An opaque coloured image here draws
+  // as a solid block.
   image.setTemplateImage(true);
 
   tray = new Tray(image);

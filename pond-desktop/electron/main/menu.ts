@@ -12,10 +12,28 @@
 // translated) rather than being re-implemented badly.
 
 import { Menu, app, type MenuItemConstructorOptions } from "electron";
+import { join } from "node:path";
 import type { ShellEvent } from "../../src/shell/contract";
 
 export interface MenuTargets {
   emit(event: ShellEvent): void;
+}
+
+/**
+ * Brand the standard About panel.
+ *
+ * Without this it shows Electron's default: the app name, the Electron and
+ * Chromium versions, and nothing about the product. Credit is
+ * "Jarida Open Source Community" per DESIGN.md section 8.
+ */
+export function setAboutPanel(): void {
+  app.setAboutPanelOptions({
+    applicationName: "Goose In A Pond",
+    applicationVersion: app.getVersion(),
+    copyright: "Copyright (c) 2026 Jarida Open Source Community\nApache-2.0",
+    credits: "Privacy-first, fully local AI smart home assistant.\nAll inference, voice and memory run on your own hardware.",
+    iconPath: join(app.getAppPath(), "electron", "assets", "about.png"),
+  });
 }
 
 export function buildMenuTemplate(t: MenuTargets): MenuItemConstructorOptions[] {
