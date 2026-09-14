@@ -16,6 +16,12 @@ files:
   - "dist/**"
   - "dist-electron/**"
   - "package.json"
+  # Ship no node_modules at all. Everything the renderer uses is already
+  # bundled into dist/ by Vite, and tsup bundles the main process and preload
+  # with `electron` as the only external -- which the runtime provides. Without
+  # this, electron-builder includes every production dependency anyway and the
+  # asar goes from ~5 MB to ~105 MB of code that is already in dist/.
+  - "!node_modules/**"
 
 extraResources:
   # Staged by scripts/stage-server-sidecar.sh and checked by
