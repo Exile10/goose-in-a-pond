@@ -568,7 +568,7 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
             let handshake_limiter = handshake_limiter.clone();
             rate_limit_with_limiter(req, next, limiter, handshake_limiter)
         }))
-        // CORS scoped to the first-party Tauri desktop origins (#94); other browser origins are
+        // CORS scoped to the first-party desktop origins (#94); other browser origins are
         // rejected. Native GOTG mobile clients send no `Origin` header, so they are unaffected.
         // Operators can allow-list more origins via `POND_CORS_ALLOWED_ORIGINS` (comma-separated).
         .layer(build_cors_layer())
@@ -580,7 +580,13 @@ fn build_cors_layer() -> CorsLayer {
     use axum::http::{header, HeaderValue, Method};
 
     let mut origins: Vec<HeaderValue> = [
-        "tauri://localhost",
+        // The packaged desktop renderer. It is served from a privileged custom
+        // scheme rather than file://, precisely so it HAS an origin worth
+        // naming here -- file:// sends `Origin: null`, which cannot be
+        // allow-listed meaningfully and would force this list open.
+        "app://giap",
+        // The Vite dev server, which the shell loads instead of the bundle
+        // during development.
         "http://localhost:1420",
         "http://127.0.0.1:1420",
     ]
