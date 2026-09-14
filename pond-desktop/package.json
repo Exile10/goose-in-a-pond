@@ -2,6 +2,7 @@
   "name": "pond-desktop",
   "private": true,
   "version": "0.1.0",
+  "main": "dist-electron/main/index.cjs",
   "type": "module",
   "scripts": {
     "dev": "concurrently --kill-others-on-fail -n vite,server -c cyan,green \"vite\" \"npm run dev:server\"",
@@ -9,11 +10,12 @@
     "dev:server:mesh": "cd .. && cargo run -p pond-server --features mesh -- serve",
     "dev:mesh": "concurrently --kill-others-on-fail -n vite,server -c cyan,green \"vite\" \"npm run dev:server:mesh\"",
     "dev:vite": "vite",
+    "dev:electron": "concurrently --kill-others-on-fail -n vite,main,shell -c cyan,yellow,magenta \"vite\" \"tsup --watch\" \"wait-on tcp:1420 dist-electron/main/index.cjs && GIAP_DEV_SERVER=http://localhost:1420 electron .\"",
     "build": "vite build",
+    "build:main": "tsup",
     "preview": "vite preview",
     "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json",
-    "tauri": "tauri",
     "stage:server": "bash ../scripts/stage-server-sidecar.sh",
     "stage:server:stub": "bash ../scripts/stage-server-sidecar-stub.sh",
     "bundle:app": "npm run stage:server && npm run tauri build"
@@ -50,10 +52,14 @@
     "@types/react-dom": "^19.2.5",
     "@vitejs/plugin-react": "^6.1.1",
     "concurrently": "^10.0.5",
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3",
     "happy-dom": "^20.11.12",
     "tailwindcss": "^4.2.2",
+    "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "vite": "^8.2.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "wait-on": "^9.1.0"
   }
 }
