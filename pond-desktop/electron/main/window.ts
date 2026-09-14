@@ -7,6 +7,7 @@
 import { BrowserWindow, screen, shell } from "electron";
 import { join } from "node:path";
 import { rendererEntryUrl } from "./protocol";
+import { usableBounds, readState, writeState, stateFilePath } from "./windowState";
 
 /** Below this the panel is a kiosk display, not a desktop. */
 const SMALL_W = 1100;
@@ -41,29 +42,11 @@ export function windowGeometry(workArea: { width: number; height: number }): Geo
   };
 }
 
-/**
- * Clamp a remembered position onto a display that still exists.
- *
- * Moving the window to a second monitor, quitting, and unplugging that monitor
- * would otherwise restore it off-screen, where it cannot be reached.
- */
-export function clampToDisplay(
-  bounds: { x: number; y: number; width: number; height: number },
-  displays: Array<{ x: number; y: number; width: number; height: number }>,
-): { x: number; y: number } | null {
-  const visible = displays.some(
-    (d) =>
-      bounds.x + bounds.width > d.x &&
-      bounds.x < d.x + d.width &&
-      bounds.y + bounds.height > d.y &&
-      bounds.y < d.y + d.height,
-  );
-  return visible ? { x: bounds.x, y: bounds.y } : null;
-}
-
 export interface CreateWindowOptions {
   preloadPath: string;
   serverUrl: string;
+  /** Where to remember the window's position between runs. */
+  userDataDir: string;
   /**
    * In dev, the Vite server to load instead of the built bundle, so HMR works.
    * Its origin (http://localhost:1420) is already in pond-server's CORS
@@ -78,13 +61,25 @@ export function createMainWindow(opts: CreateWindowOptions): BrowserWindow {
   const workArea = screen.getPrimaryDisplay().workAreaSize;
   const geom = windowGeometry(workArea);
 
+  // A remembered position, but only if some display still covers it. On a
+  // kiosk panel we ignore it entirely -- the window is fullscreen there and a
+  // saved desktop position would be meaningless.
+  const statePath = stateFilePath(opts.userDataDir);
+  const remembered = geom.kiosk
+    ? null
+    : usableBounds(
+        readState(statePath),
+        screen.getAllDisplays().map((d) => d.bounds),
+      );
+
   const win = new BrowserWindow({
     title: "Goose In A Pond",
-    width: geom.width,
-    height: geom.height,
+    ...(remembered ? { x: remembered.x, y: remembered.y } : {}),
+    width: remembered?.width ?? geom.width,
+    height: remembered?.height ?? geom.height,
     minWidth: 360,
     minHeight: 480,
-    center: true,
+    center: remembered === null,
     show: false,
     frame: !geom.kiosk,
     fullscreen: geom.kiosk,
@@ -114,7 +109,18 @@ export function createMainWindow(opts: CreateWindowOptions): BrowserWindow {
 
   void win.loadURL(opts.devServerUrl ?? rendererEntryUrl());
 
+  // Save on the events that actually settle a new position, not on every
+  // frame of a drag.
+  const remember = () => {
+    if (win.isDestroyed() || win.isMinimized() || win.isFullScreen()) return;
+    writeState(statePath, win.getNormalBounds());
+  };
+  win.on("moved", remember);
+  win.on("resized", remember);
+
   win.on("close", (e) => {
+    // Record where it was before anything hides or destroys it.
+    remember();
     e.preventDefault();
     opts.onCloseRequested(win);
   });
