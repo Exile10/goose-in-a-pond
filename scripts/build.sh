@@ -9,7 +9,7 @@
 #   bash scripts/build.sh --jetson            # Cross-compile for Jetson (Docker)
 #   bash scripts/build.sh --jetson --cuda     # Native CUDA build (ON Jetson)
 #   bash scripts/build.sh --jetson --deploy   # Cross-compile + scp to Jetson
-#   bash scripts/build.sh --desktop           # Also build Tauri desktop app
+#   bash scripts/build.sh --desktop           # Also build the Electron desktop app (macOS)
 #   bash scripts/build.sh --test              # Build + run all tests
 #   bash scripts/build.sh --help              # Show this help
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,7 +65,7 @@ Build modes:
   --jetson --cuda    Build natively ON the Jetson with CUDA GPU acceleration
 
 Options:
-  --desktop          Also build the Tauri desktop app
+  --desktop          Also build the Electron desktop app (macOS only)
   --deploy           Cross-compile + scp to Jetson (set JETSON_HOST=user@ip)
   --test             Build + run cargo test + npm test + playwright
   --help             Show this help
@@ -203,7 +203,15 @@ build_jetson_native() {
 }
 
 build_desktop() {
-  log "Building Tauri desktop app..."
+  log "Building the Electron desktop app..."
+
+  # macOS only. The old jetson branch here cross-built a .deb and was
+  # unreachable anyway -- scripts/jetson.sh never routed to this script -- and
+  # the device is headless: its UI is the dashboard pond-server serves.
+  if [ "$(uname -s)" != "Darwin" ]; then
+    error "The desktop shell is macOS-only. This machine serves its UI over HTTP already."
+    exit 1
+  fi
 
   if ! command -v node &>/dev/null; then
     error "Node.js not found. Install: https://nodejs.org/"
@@ -211,29 +219,13 @@ build_desktop() {
   fi
 
   cd pond-desktop
+  [ -d node_modules ] || { log "Installing npm dependencies..."; npm ci; }
 
-  # Install deps if needed
-  if [ ! -d "node_modules" ]; then
-    log "Installing npm dependencies..."
-    npm install
-  fi
-
-  # Install Tauri CLI if needed
-  if ! npx tauri --version &>/dev/null 2>&1; then
-    log "Installing Tauri CLI..."
-    npm install @tauri-apps/cli
-  fi
-
-  if [ "$MODE" = "jetson" ]; then
-    log "Building desktop for $JETSON_TARGET..."
-    npm run build
-    cargo tauri build --target "$JETSON_TARGET" --bundles deb
-    success "Desktop bundle: src-tauri/target/${JETSON_TARGET}/release/bundle/"
-  else
-    npm run build
-    cargo tauri build
-    success "Desktop build complete"
-  fi
+  # bundle:app stages a release pond-server as the sidecar, builds the main
+  # process, verifies the staged sidecar, and packages. See
+  # scripts/stage-server-sidecar.sh for why the ordering matters.
+  npm run bundle:app
+  success "Desktop bundle: pond-desktop/release/"
 
   cd "$ROOT_DIR"
 }

@@ -222,10 +222,13 @@ detect_binaries() {
   [ -f target/release/pond-server ] && { D_BIN_REL="present"; D_BIN_REL_WHEN="$(file_when target/release/pond-server)"; } || D_BIN_REL="missing"
   [ -f target/debug/pond-server ] && D_BIN_DBG="present" || D_BIN_DBG="absent"
   [ -f target/release/.giap-build-stamp ] && D_STAMP="$(head -1 target/release/.giap-build-stamp 2>/dev/null)" || D_STAMP=""
-  if [ -f pond-desktop/src-tauri/target/release/pond-desktop ]; then
-    D_DESKTOP="release ($(file_when pond-desktop/src-tauri/target/release/pond-desktop))"
-  elif [ -f pond-desktop/src-tauri/target/debug/pond-desktop ]; then
-    D_DESKTOP="DEBUG ONLY — shadows release for --native"
+  local app_bin="Goose In A Pond.app/Contents/MacOS/Goose In A Pond"
+  if [ "$D_OS" != "macos" ]; then
+    D_DESKTOP="n/a (the desktop shell is macOS-only)"
+  elif [ -f "/Applications/$app_bin" ]; then
+    D_DESKTOP="installed ($(file_when "/Applications/$app_bin"))"
+  elif [ -f "pond-desktop/release/mac-arm64/$app_bin" ]; then
+    D_DESKTOP="packaged ($(file_when "pond-desktop/release/mac-arm64/$app_bin"))"
   else
     D_DESKTOP="missing"
   fi
@@ -558,9 +561,8 @@ doctor() {
 
   # 9. desktop app
   case "$D_DESKTOP" in
-    release*)   ok "desktop app built ($D_DESKTOP)" ;;
-    "DEBUG ONLY"*) bad "only a DEBUG desktop binary exists — it shadows release for --native"
-                   DOC_FAIL=$((DOC_FAIL+1)) ;;
+    installed*|packaged*) ok "desktop app present ($D_DESKTOP)" ;;
+    "n/a"*)     info "desktop shell is macOS-only; this machine uses the dashboard at http://<host>:${D_PORT:-8080}" ;;
     missing)    info "desktop app not built (only needed for the GUI)" ;;
   esac
 
@@ -720,12 +722,10 @@ action_install() {
     say ""
     say "  1) Full install         — deps, build, models, service (default)"
     say "  2) Minimal              — server + DB only, no model downloads"
-    say "  3) Full + desktop app   — also builds the Tauri app"
     printf '  choose [1]: '
     local c=""; read -r c
     case "$c" in
       2) args="$args --minimal" ;;
-      3) args="$args --desktop" ;;
       *) ;;
     esac
   fi
@@ -809,15 +809,14 @@ action_build_server() {
 
 action_build_desktop() {
   head1 "Build the desktop app"
-  info "--features custom-protocol is load-bearing: without it Tauri stays in dev"
-  note "mode and the WebView loads devUrl http://localhost:1420 — the app opens to"
-  note "'Could not connect to localhost: Connection refused', with no build error."
-  if [ "$D_OS" = "linux" ] && [ ! -f /usr/include/webkitgtk-4.1/webkit/webkit.h ] 2>/dev/null; then
-    info "If this fails on WebKitGTK headers: bash scripts/install-desktop-deps.sh"
+  if [ "$D_OS" != "macos" ]; then
+    bad "the desktop shell is macOS-only; there is nothing to build here"
+    note "this machine serves its UI over HTTP already — http://<host>:${D_PORT:-8080}"
+    return 1
   fi
-  local cb; cb="$(cargo_bin)"
-  run_sh "SQLX_OFFLINE=true $cb build --release --features custom-protocol \
-    --manifest-path pond-desktop/src-tauri/Cargo.toml"
+  note "this stages a release pond-server as the app's sidecar first, which is"
+  note "a full release build and takes a while"
+  run_sh "cd pond-desktop && npm ci && npm run bundle:app"
   local rc=$?
   detect_binaries
   [ $rc -eq 0 ] && ok "desktop app built: $D_DESKTOP" || bad "desktop build failed"
@@ -909,18 +908,26 @@ action_serve_foreground() {
 
 action_launch_gui() {
   head1 "Launch the desktop GUI"
-  local bin="pond-desktop/src-tauri/target/release/pond-desktop"
-  [ -f "$bin" ] || { bad "desktop app not built (menu 31)"; return 1; }
-  if [ -z "$D_DISPLAY" ]; then bad "no display detected — nothing to draw on"; return 1; fi
+  if [ "$D_OS" != "macos" ]; then
+    bad "the desktop shell is macOS-only"
+    note "open the dashboard in a browser instead — http://<host>:${D_PORT:-8080}"
+    return 1
+  fi
+  local app_bin="Goose In A Pond.app/Contents/MacOS/Goose In A Pond"
+  local bin=""
+  for candidate in "/Applications/$app_bin" "$REPO_ROOT/pond-desktop/release/mac-arm64/$app_bin"; do
+    [ -f "$candidate" ] && { bin="$candidate"; break; }
+  done
+  [ -n "$bin" ] || { bad "desktop app not built (menu 31)"; return 1; }
   detect_runtime
   if [ -z "$D_PORT" ] || [ "$D_HEALTH" != "200" ]; then
     warn "no healthy server detected; the app will show a connection error."
     confirm "Launch anyway?" || return 1
   fi
-  info "display $D_DISPLAY · server port ${D_PORT:-unknown}"
+  info "server port ${D_PORT:-unknown}"
   note "GIAP_SERVER_PORT puts the app in parent-managed mode so it attaches to the"
   note "running server instead of spawning its own on 4000"
-  run_sh "DISPLAY=$D_DISPLAY GIAP_SERVER_PORT=${D_PORT:-8080} nohup $REPO_ROOT/$bin >/tmp/giap-desktop.log 2>&1 &"
+  run_sh "GIAP_SERVER_PORT=${D_PORT:-8080} nohup \"$bin\" >/tmp/giap-desktop.log 2>&1 &"
   ok "launched (log: /tmp/giap-desktop.log)"
 }
 
@@ -949,9 +956,9 @@ action_reclaim_disk() {
 action_kill_strays() {
   head1 "Stop stray processes"
   local pids; pids="$(pgrep -f '[p]ond-server' 2>/dev/null | tr '\n' ' ')"
-  local dpids; dpids="$(pgrep -f '[p]ond-desktop' 2>/dev/null | tr '\n' ' ')"
+  local dpids; dpids="$(pgrep -f '[G]oose In A Pond.app/Contents/MacOS' 2>/dev/null | tr '\n' ' ')"
   info "pond-server: ${pids:-none}"
-  info "pond-desktop: ${dpids:-none}"
+  info "desktop app: ${dpids:-none}"
   [ -z "$pids$dpids" ] && { ok "nothing to stop"; return 0; }
   note "killing by PID — 'pkill -f pond-server' over SSH matches and kills your own shell"
   confirm "Terminate these?" || return 1
@@ -1025,7 +1032,7 @@ show_menu() {
   say "   1) Doctor — full health check (read-only)"
   say "   3) Repair the goose submodule"
   say "   4) Reclaim disk (target/debug only)"
-  say "   5) Stop stray pond-server / pond-desktop processes"
+  say "   5) Stop stray pond-server / desktop app processes"
   say ""
   say "  ${C_B}Install & build${C_RST}"
   say "  10) Install GIAP on this host (first-time setup)"
@@ -1041,7 +1048,7 @@ show_menu() {
   say "  25) Run the server in the foreground"
   say ""
   say "  ${C_B}Desktop${C_RST}"
-  say "  31) Build the desktop app (with custom-protocol)"
+  say "  31) Build the desktop app (macOS only)"
   say "  32) Launch the GUI on this machine's display"
   say ""
   say "  ${C_B}Observe${C_RST}"

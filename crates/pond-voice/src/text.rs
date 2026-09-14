@@ -1,15 +1,15 @@
 //! Turning model output into speakable text.
 //!
 //! Everything here is pure: `&str` in, `String` out, no I/O, no async, no
-//! framework types. That is what lets it live in a leaf crate that
-//! `pond-desktop/src-tauri` — a separate cargo workspace that cannot see
-//! `pond-core` — can depend on directly.
+//! framework types. That is what lets it live in a leaf crate anything can
+//! depend on without inheriting a runtime.
 //!
 //! Before this crate the same logic existed in FOUR places: here (as private
-//! helpers inside `ChatService`), a 981-line verbatim Rust port at
-//! `pond-desktop/src-tauri/src/tts_text.rs`, and two TypeScript copies under
-//! `pond-desktop/src/`. Any fix had to be applied four times or the surfaces
-//! drifted.
+//! helpers inside `ChatService`), a 981-line verbatim Rust port in the Tauri
+//! desktop shell, and two TypeScript copies under `pond-desktop/src/`. Any fix
+//! had to be applied four times or the surfaces drifted. The Rust port went
+//! with the shell in the Electron migration; the TypeScript copies remain, and
+//! carry parity comments back to here.
 //!
 //! Moved verbatim from `pond-core/src/shared/services/chat.rs:144-1067` with
 //! its tests. Items are `pub` only because they now cross a crate boundary;

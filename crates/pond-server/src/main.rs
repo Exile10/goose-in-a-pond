@@ -136,9 +136,11 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
 
-        /// Also launch the native Tauri desktop app after the server starts.
-        /// Searches for the binary in pond-desktop/src-tauri/target/debug/ and
-        /// pond-desktop/src-tauri/target/release/bundle/macos/.
+        /// Also launch the native desktop app after the server starts.
+        /// macOS only. Looks for an installed app in /Applications, then a
+        /// locally packaged one under pond-desktop/release/, then the dev
+        /// Electron runtime. On Linux it says so and keeps serving: the UI
+        /// there is this server's own dashboard.
         #[arg(long)]
         native: bool,
     },
@@ -4597,46 +4599,88 @@ fn print_pairing_qr(url: &str) {
     }
 }
 
-/// Locate and spawn the pond-desktop Tauri binary.
+/// Locate and spawn the pond-desktop app.
 ///
-/// Search order (relative to the workspace root, i.e. where the server binary
-/// is invoked from):
-///   1. `pond-desktop/src-tauri/target/debug/pond-desktop`          — `cargo tauri dev`
-///   2. `pond-desktop/src-tauri/target/release/pond-desktop`        — release build
-///   3. `pond-desktop/src-tauri/target/release/bundle/macos/Goose In A Pond.app/Contents/MacOS/Goose In A Pond`
+/// macOS only: the desktop shell is an Electron app and is not packaged for
+/// Linux. On the Jetson the UI is the dashboard this very server already
+/// serves over HTTP, so there is nothing to spawn and nothing missing.
+///
+/// Search order:
+///   1. `$GIAP_DESKTOP_BIN`                                    — explicit override
+///   2. `/Applications/Goose In A Pond.app/...`                — installed
+///   3. `pond-desktop/release/mac-*/Goose In A Pond.app/...`   — local package
+///   4. `pond-desktop/node_modules/.bin/electron`              — dev, unpackaged
+///
+/// Note there is no debug/release pair to confuse any more. The Tauri version
+/// probed a debug build FIRST, so a stale `cargo build` artifact silently took
+/// precedence over the release one -- a trap documented in four places, and
+/// one that cannot occur here.
 ///
 /// The child process is detached (not joined) so the server keeps running.
+#[cfg(target_os = "macos")]
 fn spawn_desktop_app(server_port: u16) {
-    let candidates: &[&str] = &[
-        "pond-desktop/src-tauri/target/debug/pond-desktop",
-        "pond-desktop/src-tauri/target/release/pond-desktop",
-        "pond-desktop/src-tauri/target/release/bundle/macos/Goose In A Pond.app/Contents/MacOS/Goose In A Pond",
-    ];
+    const APP_SUFFIX: &str = "Goose In A Pond.app/Contents/MacOS/Goose In A Pond";
 
-    let found = candidates.iter().find(|p| std::path::Path::new(p).exists());
-
-    match found {
-        Some(path) => {
-            tracing::info!("Launching native desktop app: {}", path);
-            match std::process::Command::new(path)
-                .env("GIAP_SERVER_PORT", server_port.to_string())
-                .spawn()
-            {
-                Ok(child) => {
-                    tracing::info!("Desktop app started (pid {})", child.id());
-                    // Drop child handle — process runs independently.
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to launch desktop app at {}: {}", path, e);
-                }
-            }
-        }
-        None => {
-            tracing::warn!(
-                "--native: desktop binary not found. Build it first:\n  cd pond-desktop && npm run tauri build\nor for dev:\n  cd pond-desktop && npm run tauri dev"
-            );
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(explicit) = std::env::var("GIAP_DESKTOP_BIN") {
+        if !explicit.is_empty() {
+            candidates.push(std::path::PathBuf::from(explicit));
         }
     }
+    candidates.push(std::path::PathBuf::from("/Applications").join(APP_SUFFIX));
+    // electron-builder writes into pond-desktop/release/mac-<arch>/.
+    for arch in ["mac-arm64", "mac", "mac-x64"] {
+        candidates.push(
+            std::path::PathBuf::from("pond-desktop/release")
+                .join(arch)
+                .join(APP_SUFFIX),
+        );
+    }
+
+    if let Some(path) = candidates.iter().find(|p| p.exists()) {
+        tracing::info!("Launching native desktop app: {}", path.display());
+        launch_desktop(path, &[], server_port);
+        return;
+    }
+
+    // Unpackaged dev: run Electron against the repo checkout. It needs the
+    // app directory as its argument, which a packaged bundle does not.
+    let dev_electron = std::path::PathBuf::from("pond-desktop/node_modules/.bin/electron");
+    if dev_electron.exists() {
+        tracing::info!("Launching the desktop app through the dev Electron runtime");
+        launch_desktop(&dev_electron, &["pond-desktop"], server_port);
+        return;
+    }
+
+    tracing::warn!(
+        "--native: no desktop app found. Build it first:\n  cd pond-desktop && npm run bundle:app\nor for dev:\n  cd pond-desktop && npm run dev:electron"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn launch_desktop(path: &std::path::Path, args: &[&str], server_port: u16) {
+    match std::process::Command::new(path)
+        .args(args)
+        // The shell reads this and MUST NOT spawn its own server; it attaches
+        // to ours instead. Without it there are two pond-servers fighting for
+        // one port, which presents as a blank window.
+        .env("GIAP_SERVER_PORT", server_port.to_string())
+        .spawn()
+    {
+        Ok(child) => tracing::info!("Desktop app started (pid {})", child.id()),
+        Err(e) => tracing::warn!("Failed to launch the desktop app at {}: {e}", path.display()),
+    }
+}
+
+/// The desktop shell is macOS-only, so `--native` has nothing to launch here.
+/// This is not a degraded mode: on Linux -- which in practice means the Jetson
+/// -- the UI is the dashboard this server already serves.
+#[cfg(not(target_os = "macos"))]
+fn spawn_desktop_app(server_port: u16) {
+    tracing::warn!(
+        "--native: the desktop shell is macOS-only. This server's dashboard is already \
+         available at http://127.0.0.1:{server_port} and on the LAN."
+    );
 }
 
 /// Write one `WorkflowEvent` to stdout as a single NDJSON line (JSON + `\n`,

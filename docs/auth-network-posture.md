@@ -59,13 +59,21 @@ This is **off by default** and intended only for dev machines.
 
 ## CORS
 
-Scoped to first-party origins (`tauri://localhost`, `http://localhost:1420`,
+Scoped to first-party origins (`app://giap`, `http://localhost:1420`,
 `http://127.0.0.1:1420`); **not** `Any`. Add extra browser origins (e.g. a LAN
 dashboard) with a comma-separated:
 
 ```
 POND_CORS_ALLOWED_ORIGINS=https://dashboard.lan,https://…
 ```
+
+`app://giap` is the packaged desktop app. Its renderer is deliberately served
+from a privileged custom scheme rather than from `file://`, and the reason is
+this list: a `file://` page sends `Origin: null`, which cannot be
+allow-listed in any meaningful way and would have forced the allowlist open to
+`Any` — undoing the scoping this section exists to describe. The two `:1420`
+entries are the Vite dev server, which the desktop shell loads instead of the
+packaged bundle during development.
 
 Native mobile clients (GOTG) don't send a browser `Origin` header, so CORS does
 not apply to them.
