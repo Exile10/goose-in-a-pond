@@ -8,6 +8,7 @@ import {
   PARENT_MANAGED_POLL_ATTEMPTS,
   type ServerDeps,
 } from "./serverProcess";
+import { type OrphanDeps } from "./orphan";
 
 // Ports the 6 tests from src-tauri/src/process.rs and the 2 from main.rs, none
 // of which ever ran in CI, and adds the branches they left uncovered -- in
@@ -153,7 +154,25 @@ function deps(over: Partial<ServerDeps> = {}): ServerDeps {
       .fn()
       .mockReturnValue({ exitCode: null, kill: vi.fn() }) as never,
     sleep: () => Promise.resolve(),
+    // NOT optional. Without these the suite reads the real pidfile under
+    // tmpdir and can SIGKILL a pond-server the developer is running in another
+    // terminal -- a test run that kills your dev server is not a test run.
+    orphanDeps: stubOrphanDeps(),
+    writePid: vi.fn(),
+    removePid: vi.fn(),
     ...over,
+  };
+}
+
+/** An OrphanDeps that touches nothing real and finds no orphan. */
+function stubOrphanDeps(): OrphanDeps {
+  return {
+    isAlive: vi.fn().mockReturnValue(false),
+    commandLine: vi.fn().mockReturnValue(null),
+    kill: vi.fn(),
+    readFile: vi.fn().mockReturnValue(null),
+    removeFile: vi.fn(),
+    warn: vi.fn(),
   };
 }
 
@@ -369,6 +388,73 @@ describe("ServerProcess", () => {
     await expect(s.ensureRunning()).rejects.toThrow();
     expect(exited.signals).toHaveLength(0);
     expect(d.spawnFn).toHaveBeenCalledTimes(2);
+  });
+
+  // The zombie half of the bug. An orphan from a previous run IS healthy on
+  // 4000, so a health check that runs first adopts it and the reaper never
+  // gets a look -- which is how one sidecar survived several launches.
+  it("reaps a sidecar orphaned by a previous run before asking whether one is listening", async () => {
+    const order: string[] = [];
+    const orphanDeps = stubOrphanDeps();
+    orphanDeps.readFile = vi.fn(() => {
+      order.push("reap");
+      return null;
+    });
+    const d = deps({
+      orphanDeps,
+      fetchFn: vi.fn(async () => {
+        order.push("health");
+        return { ok: true } as Response;
+      }) as unknown as typeof fetch,
+    });
+    await new ServerProcess(d).ensureRunning();
+    expect(order).toEqual(["reap", "health"]);
+  });
+
+  // `pond-server serve --native` launches this shell, so our own PARENT's
+  // command line matches the sidecar predicate exactly. A stale pidfile plus a
+  // reused pid would have us kill the process that started us.
+  it("never reaps in parent-managed mode, because the parent is itself a pond-server serve", async () => {
+    const orphanDeps = stubOrphanDeps();
+    const d = deps({
+      orphanDeps,
+      env: { GIAP_SERVER_PORT: "8080" },
+      fetchFn: vi.fn().mockResolvedValue({ ok: true }) as never,
+    });
+    await new ServerProcess(d).ensureRunning();
+    expect(orphanDeps.readFile).not.toHaveBeenCalled();
+  });
+
+  // A recovery ten minutes in must not kill the server we adopted at startup.
+  it("reaps only once, however many recoveries run", async () => {
+    const orphanDeps = stubOrphanDeps();
+    const d = deps({ orphanDeps, fetchFn: fetchHealthyAfter(1) });
+    const s = new ServerProcess(d);
+    await s.ensureRunning();
+    await s.ensureRunning();
+    await s.ensureRunning();
+    expect(orphanDeps.readFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("records the spawned pid so a later launch can reap it", async () => {
+    const child = new FakeChild();
+    const d = deps({
+      fetchFn: fetchHealthyAfter(1),
+      spawnFn: spawnsInOrder(child),
+    });
+    await new ServerProcess(d).ensureRunning();
+    expect(d.writePid).toHaveBeenCalledWith(child.pid);
+  });
+
+  it("clears the pid record when it shuts the server down", async () => {
+    const d = deps({
+      fetchFn: fetchHealthyAfter(1),
+      spawnFn: spawnsInOrder(new FakeChild()),
+    });
+    const s = new ServerProcess(d);
+    await s.ensureRunning();
+    s.shutdown();
+    expect(d.removePid).toHaveBeenCalled();
   });
 
   // A tick or a renderer request landing mid-teardown must not leave behind a
