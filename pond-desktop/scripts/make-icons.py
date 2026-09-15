@@ -17,16 +17,26 @@ asar, so it lives under electron/ and is listed in electron-builder.yml's
 `files`. Putting it in build/ works in dev — app.getAppPath() is the project
 directory there — and silently produces a tray with no icon once packaged.
 
-Everything derives from src/assets/goose-logo.png, the brand mark itself. Per
-DESIGN.md section 8 the logo is never stretched, skewed, rotated, recoloured
-outside the palette, or given effects — so it is only ever scaled
-proportionally and placed on a ground.
+Everything derives from the brand mark itself, which ships in two variants:
+goose-logo.png is dark ink for light grounds, goose-logo-dark.png is white ink
+for dark ones. Per DESIGN.md section 8 the logo is never stretched, skewed,
+rotated, recoloured outside the palette, or given effects — so it is only ever
+scaled proportionally and placed on a ground.
 
-Two things this fixes, both of which shipped:
+The app icon is the white mark on a near-black plate. Which variant goes on
+which ground is the whole question here, and it has been got wrong twice:
 
-  * The app icon was goose-logo-DARK — the white-on-transparent variant meant
-    for dark grounds. Its ink measured #E0E0E0, so on a light Dock or in
-    Finder it was very nearly invisible.
+  * Originally the app icon was goose-logo-DARK with NO plate at all. White
+    ink measured #FEFEFE on transparency, so against a light Dock, Finder
+    window or Launchpad page nothing showed but the purple beak.
+
+  * The fix for that put the dark mark on an off-white plate, which is legible
+    everywhere but renders as a bright card on a dark desktop, matching
+    neither the product's own dark UI nor the apps beside it.
+
+Pairing the white mark with a dark plate satisfies both: the plate supplies
+the contrast the mark needs, so legibility no longer depends on whatever is
+behind the icon.
 
   * The tray icon was a solid opaque purple square with no mark in it at all.
     Since the main process calls setTemplateImage(true), macOS discarded the
@@ -49,15 +59,20 @@ except ImportError:
 
 HERE = Path(__file__).resolve().parent
 DESKTOP = HERE.parent
-SOURCE = DESKTOP / "src/assets/goose-logo.png"
+# The mark in both variants. The app icon takes the light-ink one because its
+# plate is dark; the tray takes either, since a template image keeps only the
+# alpha and the two variants share a silhouette.
+MARK_ON_DARK = DESKTOP / "src/assets/goose-logo-dark.png"
+MARK_ON_LIGHT = DESKTOP / "src/assets/goose-logo.png"
 BUILD = DESKTOP / "build"
 # Runtime assets, shipped inside the asar — see the note above.
 ASSETS = DESKTOP / "electron/assets"
 
-# --color-content from src/styles/design-tokens.css: the warm near-white the
-# product actually renders on. A neutral ground, which is what DESIGN.md
-# permits for the black mark.
-GROUND = (250, 250, 248, 255)
+# --color-surface from the dark theme in src/styles/design-tokens.css: the card
+# face the product itself renders, a near-black carrying the brand's purple
+# tint rather than a flat grey. The icon's plate is a card face, so it takes the
+# same value instead of a hex invented here.
+GROUND = (0x1E, 0x1B, 0x26, 255)
 
 # Apple's icon grid: the artwork sits in a rounded rectangle whose corner
 # radius is ~22.37% of the canvas, inset from the edges.
@@ -74,17 +89,17 @@ ICNS_SIZES = [16, 32, 64, 128, 256, 512, 1024]
 TRAY_HEIGHT = 16
 
 
-def trimmed_mark() -> Image.Image:
+def trimmed_mark(source: Path) -> Image.Image:
     """The brand mark cropped to its own ink, so placement is predictable.
 
     The source is a 500x500 canvas with the mark occupying roughly the middle
     third vertically. Cropping to the alpha bounding box removes that padding
     without touching the artwork.
     """
-    im = Image.open(SOURCE).convert("RGBA")
+    im = Image.open(source).convert("RGBA")
     box = im.getchannel("A").getbbox()
     if box is None:
-        sys.exit(f"{SOURCE} has no visible pixels")
+        sys.exit(f"{source} has no visible pixels")
     return im.crop(box)
 
 
@@ -97,7 +112,7 @@ def rounded_rect_mask(size: int, radius: int) -> Image.Image:
 
 
 def build_app_icon() -> Path:
-    mark = trimmed_mark()
+    mark = trimmed_mark(MARK_ON_DARK)
     canvas = Image.new("RGBA", (MASTER, MASTER), (0, 0, 0, 0))
 
     inset = round(MASTER * INSET_RATIO)
@@ -155,7 +170,7 @@ def build_about(master: Path) -> Path:
 
 def build_tray() -> list[Path]:
     """Black-plus-alpha silhouettes for the macOS menu bar."""
-    mark = trimmed_mark()
+    mark = trimmed_mark(MARK_ON_LIGHT)
     written = []
     for scale, name in ((1, "trayTemplate.png"), (2, "trayTemplate@2x.png")):
         h = TRAY_HEIGHT * scale
