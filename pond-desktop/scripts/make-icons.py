@@ -93,14 +93,33 @@ ASSETS = DESKTOP / "electron/assets"
 # chrome; this one is tuned against the operating system's.
 GROUND = (0x1C, 0x1C, 0x1E, 255)
 
-# Apple's icon grid: the artwork sits in a rounded rectangle whose corner
-# radius is ~22.37% of the canvas, inset from the edges.
-CORNER_RATIO = 0.2237
-INSET_RATIO = 0.0977
-# How much of the rounded rect's width the mark occupies. The mark is wide
-# (about 1.7:1), so fitting it by width and letting it sit short is correct;
-# forcing it taller would crop or distort it.
-MARK_WIDTH_RATIO = 0.74
+# Full bleed, and the reason is macOS 26 rather than taste.
+#
+# The old values were Apple's Big Sur icon grid: a rounded rect of corner radius
+# 22.37%, inset 9.77% from a transparent canvas. macOS 26 composites its own
+# container behind a legacy .icns, so an icon that draws its own inset plate
+# renders as a plate INSIDE that container -- two stacked rounded squares, which
+# is what "double colours between the outer and inner logo" was describing. The
+# inset is not margin any more; it is a window onto the system's tile.
+#
+# Measured off an app that renders correctly on this OS (Goose): its artwork
+# starts at y=0 with no inset at all, and its top edge turns opaque at x=317 of
+# 1024 -- a corner radius of 31%, not 22.37%. macOS 26's corner is rounder than
+# the old grid, so artwork cut to the old radius leaves the container's corners
+# showing around it.
+#
+# Filling the canvas means our plate covers the container completely and the
+# icon is one shape again. A dark icon has no other option: Apple's own Home.app
+# is still inset 7% and looks right, but only because orange cannot be mistaken
+# for the container behind it.
+CORNER_RATIO = 0.31
+INSET_RATIO = 0.0
+# How much of the plate's width the mark occupies. Lowered from 0.74 with the
+# inset removal: the plate grew from 824 to 1024, so the old ratio would have
+# grown the mark with it and pushed it into the container's edge. 0.60 of 1024
+# is 614px, within a few pixels of the 610px the mark occupied before, so the
+# artwork is unchanged in absolute size -- only its surround grew.
+MARK_WIDTH_RATIO = 0.60
 
 MASTER = 1024
 ICNS_SIZES = [16, 32, 64, 128, 256, 512, 1024]
