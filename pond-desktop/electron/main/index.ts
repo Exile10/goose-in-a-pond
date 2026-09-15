@@ -13,6 +13,8 @@
 
 import { app, BrowserWindow } from "electron";
 import { join, resolve } from "node:path";
+import { readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { registerAppScheme, serveRendererFrom } from "./protocol";
 import { createMainWindow, distRoot } from "./window";
 import {
@@ -26,6 +28,7 @@ import { installMenu, setAboutPanel } from "./menu";
 import { createTray, setTrayStatus, destroyTray } from "./tray";
 import { registerHotkeys, unregisterHotkeys } from "./hotkeys";
 import { createHealthLoop, createTeardown } from "./lifecycle";
+import { resolveDataDir, readRuntimePort, RUNTIME_PORT_FILE } from "./dataDir";
 import type { ShellEvent, ShellEvents } from "../../src/shell/contract";
 
 const log = {
@@ -48,6 +51,31 @@ function emit<E extends ShellEvent>(name: E, payload?: ShellEvents[E]): void {
   win.webContents.send(`giap:${name}`, payload);
 }
 
+/**
+ * The port pond-server says it bound, and when it said so.
+ *
+ * Deliberately computed from the server's own data directory rather than
+ * Electron's userData path, which points somewhere else entirely on Linux.
+ */
+function readPortFile(): { port: number; mtimeMs: number } | null {
+  const file = join(
+    resolveDataDir({
+      env: process.env,
+      home: homedir(),
+      platform: process.platform,
+    }),
+    RUNTIME_PORT_FILE,
+  );
+  try {
+    const port = readRuntimePort(readFileSync(file, "utf8"));
+    if (port === null) return null;
+    return { port, mtimeMs: statSync(file).mtimeMs };
+  } catch {
+    // Not written yet, or unreadable. The caller keeps its assumed port.
+    return null;
+  }
+}
+
 const server = new ServerProcess({
   lookup: {
     isPackaged: app.isPackaged,
@@ -55,6 +83,8 @@ const server = new ServerProcess({
     repoRoot,
     platform: process.platform,
   },
+  readPortFile,
+  onUrlChanged: (url) => emit("server-url", url),
   log,
 });
 

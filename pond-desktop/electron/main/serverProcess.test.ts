@@ -457,6 +457,51 @@ describe("ServerProcess", () => {
     expect(d.removePid).toHaveBeenCalled();
   });
 
+  // --port is a START port for the server's bind_with_fallback, so a server
+  // that finds 4000 taken binds 4001 and says nothing. The UI then talks to a
+  // port nothing is listening on -- silently, which is how this whole class of
+  // bug stays hidden.
+  it("adopts the port pond-server actually bound when it fell back past 4000", async () => {
+    const onUrlChanged = vi.fn();
+    const d = deps({
+      fetchFn: vi.fn(async (input: string) => {
+        // Only 4001 answers, the way a fallback bind behaves.
+        if (String(input).includes("4001")) return { ok: true } as Response;
+        throw new Error("refused");
+      }) as unknown as typeof fetch,
+      spawnFn: spawnsInOrder(new FakeChild()),
+      readPortFile: () => ({ port: 4001, mtimeMs: Date.now() + 1_000 }),
+      onUrlChanged,
+    });
+    const s = new ServerProcess(d);
+    expect(await s.ensureRunning()).toBe("http://127.0.0.1:4001");
+    expect(s.url).toBe("http://127.0.0.1:4001");
+    expect(onUrlChanged).toHaveBeenCalledWith("http://127.0.0.1:4001");
+  });
+
+  // A port file from yesterday's run must never outrank today's spawn.
+  it("ignores a port file written before the server it just started", async () => {
+    const d = deps({
+      fetchFn: fetchHealthyAfter(1),
+      spawnFn: spawnsInOrder(new FakeChild()),
+      readPortFile: () => ({ port: 4001, mtimeMs: 0 }),
+    });
+    const s = new ServerProcess(d);
+    expect(await s.ensureRunning()).toBe("http://127.0.0.1:4000");
+  });
+
+  it("stays put when the port file names the port it already assumed", async () => {
+    const onUrlChanged = vi.fn();
+    const d = deps({
+      fetchFn: fetchHealthyAfter(1),
+      spawnFn: spawnsInOrder(new FakeChild()),
+      readPortFile: () => ({ port: 4000, mtimeMs: Date.now() + 1_000 }),
+      onUrlChanged,
+    });
+    await new ServerProcess(d).ensureRunning();
+    expect(onUrlChanged).not.toHaveBeenCalled();
+  });
+
   // A tick or a renderer request landing mid-teardown must not leave behind a
   // sidecar that nothing will ever shut down.
   it("refuses to spawn once the shell has begun quitting", async () => {

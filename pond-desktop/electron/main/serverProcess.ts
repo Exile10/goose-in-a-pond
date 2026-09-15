@@ -149,6 +149,14 @@ export interface ServerDeps {
   spawnFn?: typeof spawn;
   sleep?: (ms: number) => Promise<void>;
   log?: { info(m: string): void; warn(m: string): void };
+  /**
+   * The runtime port file, with the time it was written.
+   *
+   * Seam rather than a path so tests never touch the real data directory.
+   */
+  readPortFile?: () => { port: number; mtimeMs: number } | null;
+  /** Called when the bound port turns out not to be the one we assumed. */
+  onUrlChanged?: (url: string) => void;
   /** Orphan-reaping seams. Tests MUST stub these; see the note in the tests. */
   orphanDeps?: OrphanDeps;
   writePid?: (pid: number) => void;
@@ -164,14 +172,25 @@ export class ServerProcess {
   private stopped = false;
   /** Orphan reaping is once per run; see cleanupOrphans. */
   private reapedOrphans = false;
-  readonly url: string;
+  private currentUrl: string;
   readonly parentManaged: boolean;
 
   constructor(private readonly deps: ServerDeps) {
     const env = deps.env ?? process.env;
     const resolved = resolveServerUrl(env["GIAP_SERVER_PORT"]);
-    this.url = resolved.url;
+    this.currentUrl = resolved.url;
     this.parentManaged = resolved.parentManaged;
+  }
+
+  /**
+   * Where the server is, as far as we know.
+   *
+   * Not readonly: `--port` is a START port for the Rust's bind_with_fallback,
+   * so a server that finds 4000 taken binds 4001 and says nothing. Assuming
+   * 4000 in that case points the UI at a server that is not there.
+   */
+  get url(): string {
+    return this.currentUrl;
   }
 
   private get log() {
@@ -271,6 +290,7 @@ export class ServerProcess {
     // GooseAdapter inside it resolve extension paths like
     // extensions/music/src/server.ts regardless of where the shell was
     // started. A no-op in a packaged app, where those paths are absolute.
+    const spawnedAt = Date.now();
     const child = spawnFn(binary, ["serve", "--port", String(DEFAULT_PORT)], {
       stdio: "inherit",
       ...(this.deps.lookup.isPackaged
@@ -285,6 +305,10 @@ export class ServerProcess {
     for (let i = 0; i < SPAWNED_POLL_ATTEMPTS; i++) {
       await this.sleep(POLL_MS);
       if (await this.healthCheck()) {
+        this.log.info(`spawned pond-server is ready at ${this.url}`);
+        return this.url;
+      }
+      if (this.adoptBoundPort(spawnedAt)) {
         this.log.info(`spawned pond-server is ready at ${this.url}`);
         return this.url;
       }
@@ -320,6 +344,31 @@ export class ServerProcess {
     if (this.reapedOrphans || this.parentManaged) return;
     this.reapedOrphans = true;
     reapPidfileOrphan(SERVER_CHILD, this.deps.orphanDeps ?? realOrphanDeps);
+  }
+
+  /**
+   * Adopt the port the server actually bound, if it is not the one we assumed.
+   *
+   * Only ever consulted while OUR child is starting, and only for a file
+   * written after we spawned it -- a port file left by yesterday's run must
+   * never outrank today's spawn. The port still has to answer before we move.
+   */
+  private adoptBoundPort(spawnedAt: number): boolean {
+    const read = this.deps.readPortFile;
+    if (!read) return false;
+
+    const file = read();
+    if (file === null || file.mtimeMs < spawnedAt) return false;
+
+    const candidate = `http://127.0.0.1:${file.port}`;
+    if (candidate === this.currentUrl) return false;
+
+    this.log.warn(
+      `pond-server bound port ${file.port} rather than ${DEFAULT_PORT}; adopting it`,
+    );
+    this.currentUrl = candidate;
+    this.deps.onUrlChanged?.(candidate);
+    return true;
   }
 
   private writePid(pid: number): void {
