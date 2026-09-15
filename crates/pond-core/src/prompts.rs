@@ -233,7 +233,8 @@ with the same parameters again.{% else %}
 An error, an empty result or a \"not found\" is NOT an answer: call another tool \
 that covers the question, never the same tool with the same parameters again.
 </tool-failure>
-{% endif %} A successful result IS the answer — give it at once, own words, never raw.
+{% endif %} A successful result IS the answer — give it at once, own words, never raw, \
+and never repeat a call you already made this turn with the same arguments.
 </tool-usage>
 
 <memory-rules>
@@ -295,7 +296,7 @@ another tool that applies, never an identical re-call.{% else %}
 Error, empty, \"not found\" — NOT an answer; try another tool that applies, \
 never an identical re-call.
 </tool-failure>
-{% endif %} Good result = the answer — give it straight.
+{% endif %} Good result = the answer — give it straight; never re-call identically.
 </tool-usage>
 <memory-rules>
 Memory tools: save personal info immediately, recall before lookups, corrections override.
@@ -351,7 +352,8 @@ another tool that applies, never an identical re-call.{% else %}
 An error or empty result is NOT an answer — call another tool that applies, \
 never an identical re-call.
 </tool-failure>
-{% endif %} Synthesize immediately after a successful result; no follow-ups.
+{% endif %} Synthesize immediately after a successful result; no follow-ups, no \
+identical re-call.
 </tool-usage>
 <memory-rules>
 Memory tools: save personal info immediately, recall before lookups, corrections \
@@ -414,7 +416,8 @@ call.{% else %}
 A tool that errors or comes back empty is not the answer — I try another tool \
 that could help, and I never repeat the exact same call.
 </tool-failure>
-{% endif %} A good result is the answer, so I just give it.
+{% endif %} A good result is the answer, so I just give it, and I never make the same \
+call twice in one turn.
 </tool-usage>
 <memory-rules>
 Memory tools: I save what you share right away, check memories before looking \
@@ -1287,6 +1290,33 @@ mod tests {
                     !lower.contains("authoritative"),
                     "style '{name}' (compact={compact}) still calls something \
                      authoritative without saying what it outranks"
+                );
+            }
+        }
+    }
+
+    /// The one rule that would have stopped a 25-call loop was scoped to the
+    /// failure branch: "an error, an empty result or a 'not found' ... never the
+    /// same tool with the same parameters again". Both turns that looped were
+    /// SUCCESSES, so it was never in scope. Every style now bans the repeat
+    /// outright, not only after a failure.
+    #[test]
+    fn every_style_forbids_repeating_a_call_it_already_made() {
+        let settings = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [true, false] {
+                let state = v2_state(compact, true, true);
+                let out = render_jinja_template(raw, &settings, Some(&state), None);
+                let lower = out.to_lowercase();
+
+                let bans_repeat = lower.contains("never repeat a call")
+                    || lower.contains("never re-call identically")
+                    || lower.contains("no identical re-call")
+                    || lower.contains("never make the same call twice");
+                assert!(
+                    bans_repeat,
+                    "style '{name}' (compact={compact}) forbids an identical re-call only \
+                     after a failure, which is exactly the gap a successful result fell through"
                 );
             }
         }
