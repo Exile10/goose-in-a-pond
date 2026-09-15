@@ -88,7 +88,12 @@ which city. Never guess weather or shell out for it.")]
         );
 
         match &self.weather {
-            None => Ok(CallToolResult::success(vec![Content::text(
+            // An error, not a success. The household prompt's one anti-repeat
+            // rule is conditioned on a failure ("an error, an empty result or a
+            // 'not found' is NOT an answer ... never the same tool with the same
+            // parameters again"), so returning a failure as a success put the
+            // rule out of scope for exactly the results that needed it.
+            None => Ok(CallToolResult::error(vec![Content::text(
                 "Weather is not configured on this pond: no location is set in settings. \
                  No other tool, shell command or external request can supply it.",
             )])),
@@ -120,7 +125,7 @@ which city. Never guess weather or shell out for it.")]
                     }
                     Err(e) => {
                         tracing::warn!("weather: fetch failed: {e}");
-                        Ok(CallToolResult::success(vec![Content::text(format!(
+                        Ok(CallToolResult::error(vec![Content::text(format!(
                             "Weather fetch failed: {e}"
                         ))]))
                     }
@@ -153,7 +158,9 @@ location for the configured home. Never guess data.")]
         );
 
         match &self.weather {
-            None => Ok(CallToolResult::success(vec![Content::text(
+            // A failure, reported as one -- see the note on the current-weather
+            // tool above.
+            None => Ok(CallToolResult::error(vec![Content::text(
                 "Weather is not configured on this pond: no location is set in settings. \
                  No other tool, shell command or external request can supply a forecast.",
             )])),
@@ -196,7 +203,7 @@ location for the configured home. Never guess data.")]
                     }
                     Err(e) => {
                         tracing::warn!("weather: forecast fetch failed: {e}");
-                        Ok(CallToolResult::success(vec![Content::text(format!(
+                        Ok(CallToolResult::error(vec![Content::text(format!(
                             "Forecast fetch failed: {e}"
                         ))]))
                     }
@@ -414,6 +421,31 @@ mod result_wording_tests {
             assert!(
                 !src.contains(phrase),
                 "a weather result still instructs the model ({phrase:?}); state the fact and                  let the prompt decide what to do with it"
+            );
+        }
+    }
+
+    /// A failed fetch must be a failed tool result, not a successful one whose
+    /// text happens to describe a failure. goose branches on `is_error`, and
+    /// the prompt's anti-repeat rule is conditioned on the failure branch.
+    #[test]
+    fn every_weather_failure_path_returns_an_error_result() {
+        let bodies = tool_bodies();
+        for needle in [
+            "Weather fetch failed",
+            "Forecast fetch failed",
+            "Weather is not configured on this pond",
+        ] {
+            let at = bodies.find(needle).expect("failure path missing");
+            // Walk back to the CallToolResult constructor for this path.
+            let before = &bodies[..at];
+            let ctor = before
+                .rfind("CallToolResult::")
+                .expect("no constructor before the text");
+            assert!(
+                before[ctor..].starts_with("CallToolResult::error"),
+                "the failure path for {needle:?} still returns CallToolResult::success, so the \
+                 prompt's anti-repeat rule never applies to it"
             );
         }
     }
