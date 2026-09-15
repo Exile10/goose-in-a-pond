@@ -8497,6 +8497,61 @@ mod tests {
         );
     }
 
+    /// Two different tools must not pool their budgets, or a turn that calls
+    /// three tools once each looks like a repeat and gets cut short.
+    #[test]
+    fn the_repetition_budget_is_per_tool_and_not_shared() {
+        let mut counts: std::collections::HashMap<(String, u64), usize> =
+            std::collections::HashMap::new();
+        let fp = canonical_args_fingerprint(None);
+        for tool in [
+            "giap-weather__get_current_weather",
+            "music__status",
+            "giap-device__get_user_profile",
+        ] {
+            *counts.entry((tool.to_string(), fp)).or_insert(0) += 1;
+        }
+        assert_eq!(
+            counts.len(),
+            3,
+            "three different tools collapsed into one budget"
+        );
+        assert!(
+            counts
+                .values()
+                .all(|n| *n <= MAX_IDENTICAL_TOOL_CALLS_PER_TURN),
+            "one call each must never trip the guard"
+        );
+    }
+
+    /// The guard is keyed on whatever tool the model called, so it covers tools
+    /// that do not exist yet. It must not special-case the two that happened to
+    /// expose the bug -- a hardcoded name here would be a guard for weather and
+    /// music and nothing else.
+    #[test]
+    fn the_repetition_guard_names_no_particular_tool() {
+        let body = stream_body_code();
+        let guard_region: String = body
+            .iter()
+            .skip_while(|l| !l.contains("canonical_args_fingerprint("))
+            .take(40)
+            .cloned()
+            .collect::<Vec<String>>()
+            .join("\n");
+        assert!(
+            !guard_region.is_empty(),
+            "the repetition backstop is gone from the stream body (stream_body_code \
+             strips comments, so this anchors on the fingerprint call itself)"
+        );
+        for named in ["weather", "music__", "get_current_weather", "status"] {
+            assert!(
+                !guard_region.contains(named),
+                "the repetition guard special-cases {named:?}; it must key on whatever \
+                 tool the model called so it covers every tool, including future ones"
+            );
+        }
+    }
+
     /// The budgets are rails, not preferences. If someone widens them past the
     /// point where a loop is still bounded well inside `agent_max_turns`, the
     /// guard stops being a guard.
