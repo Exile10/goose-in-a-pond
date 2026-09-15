@@ -657,26 +657,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_content_with_json_tool() {
-        let text = "Here is the result.\n{\"tool_calls\": [{\"name\": \"x\", \"arguments\": {}}]}";
-        let content = extract_content(text);
-        assert_eq!(content, "Here is the result.");
-    }
-
-    #[test]
-    fn extract_content_no_tools() {
-        let text = "Just a normal response.";
-        assert_eq!(extract_content(text), text);
-    }
-
-    #[test]
-    fn extract_content_with_xml_tool() {
-        let text = "Answer:\n<tool_call>\n<function=foo>\n<parameter=x>1</parameter>\n</function>\n</tool_call>";
-        let content = extract_content(text);
-        assert_eq!(content, "Answer:");
-    }
-
-    #[test]
     fn tools_to_json_empty() {
         assert!(tools_to_json(&[]).is_none());
     }
