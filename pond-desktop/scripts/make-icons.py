@@ -23,8 +23,8 @@ for dark ones. Per DESIGN.md section 8 the logo is never stretched, skewed,
 rotated, recoloured outside the palette, or given effects — so it is only ever
 scaled proportionally and placed on a ground.
 
-The app icon is the white mark on a near-black plate. Which variant goes on
-which ground is the whole question here, and it has been got wrong twice:
+The app icon is the white mark on a near-black plate. Which mark goes on which
+ground is the whole question here, and it took three attempts:
 
   * Originally the app icon was goose-logo-DARK with NO plate at all. White
     ink measured #FEFEFE on transparency, so against a light Dock, Finder
@@ -34,9 +34,14 @@ which ground is the whole question here, and it has been got wrong twice:
     everywhere but renders as a bright card on a dark desktop, matching
     neither the product's own dark UI nor the apps beside it.
 
-Pairing the white mark with a dark plate satisfies both: the plate supplies
-the contrast the mark needs, so legibility no longer depends on whatever is
-behind the icon.
+  * Inverting it -- white mark, dark plate -- fixed the brightness but picked
+    the plate from a product token, landing a shade LIGHTER than the Dock and
+    purple where the Dock is grey. Read as a nested square: an icon inside an
+    icon. See the note on GROUND, which is the part people get wrong.
+
+The plate supplies the contrast the mark needs, so legibility never depends on
+what is behind the icon; its COLOUR is chosen against the operating system's
+chrome rather than the app's.
 
   * The tray icon was a solid opaque purple square with no mark in it at all.
     Since the main process calls setTemplateImage(true), macOS discarded the
@@ -68,11 +73,25 @@ BUILD = DESKTOP / "build"
 # Runtime assets, shipped inside the asar — see the note above.
 ASSETS = DESKTOP / "electron/assets"
 
-# --color-surface from the dark theme in src/styles/design-tokens.css: the card
-# face the product itself renders, a near-black carrying the brand's purple
-# tint rather than a flat grey. The icon's plate is a card face, so it takes the
-# same value instead of a hex invented here.
-GROUND = (0x1E, 0x1B, 0x26, 255)
+# macOS's own dark chrome value, and NEUTRAL -- deliberately not one of the
+# product's dark surface tokens.
+#
+# The plate has to sit against the Dock, Launchpad and the app switcher, not
+# against the app's own UI. Using --color-surface (#1E1B26) put a plate on
+# screen that was both slightly LIGHTER than the Dock and purple where the Dock
+# is grey, and the eye reads a near-match in value plus a mismatch in hue as two
+# stacked rectangles -- a nested square, reported as "double colours between the
+# outer and inner logo".
+#
+# Matching the Dock's own value instead makes the plate disappear on a dark Dock
+# (the mark reads as floating, which is the uniform look) while still rendering
+# as an ordinary dark rounded square against a light wallpaper, Finder or
+# Launchpad. Legibility never depends on the background, because the plate is
+# opaque and the mark is white.
+#
+# Do not reach for a product token here. They are tuned against the app's own
+# chrome; this one is tuned against the operating system's.
+GROUND = (0x1C, 0x1C, 0x1E, 255)
 
 # Apple's icon grid: the artwork sits in a rounded rectangle whose corner
 # radius is ~22.37% of the canvas, inset from the edges.
