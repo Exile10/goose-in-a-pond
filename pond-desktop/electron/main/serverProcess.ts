@@ -34,6 +34,14 @@
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
+import {
+  reapPidfileOrphan,
+  writePidfile,
+  removePidfile,
+  realOrphanDeps,
+  SERVER_CHILD,
+  type OrphanDeps,
+} from "./orphan";
 
 export const DEFAULT_PORT = 4000;
 const HEALTH_TIMEOUT_MS = 2_000;
@@ -141,6 +149,10 @@ export interface ServerDeps {
   spawnFn?: typeof spawn;
   sleep?: (ms: number) => Promise<void>;
   log?: { info(m: string): void; warn(m: string): void };
+  /** Orphan-reaping seams. Tests MUST stub these; see the note in the tests. */
+  orphanDeps?: OrphanDeps;
+  writePid?: (pid: number) => void;
+  removePid?: () => void;
 }
 
 const noopLog = { info() {}, warn() {} };
@@ -150,6 +162,8 @@ export class ServerProcess {
   private recovery: Promise<unknown> = Promise.resolve();
   /** Set by shutdown(). Once true this instance never spawns again. */
   private stopped = false;
+  /** Orphan reaping is once per run; see cleanupOrphans. */
+  private reapedOrphans = false;
   readonly url: string;
   readonly parentManaged: boolean;
 
@@ -206,6 +220,11 @@ export class ServerProcess {
       throw new Error("the shell is quitting; not starting pond-server");
     }
 
+    // BEFORE the health check, and this ordering is the second half of the
+    // bug: an orphan from a previous run is healthy on 4000, so checking first
+    // means adopting it and never reaping it at all.
+    this.cleanupOrphans();
+
     if (await this.healthCheck()) {
       this.log.info(`connected to an existing pond-server at ${this.url}`);
       return this.url;
@@ -252,14 +271,16 @@ export class ServerProcess {
     // GooseAdapter inside it resolve extension paths like
     // extensions/music/src/server.ts regardless of where the shell was
     // started. A no-op in a packaged app, where those paths are absolute.
-    this.adoptChild(
-      spawnFn(binary, ["serve", "--port", String(DEFAULT_PORT)], {
-        stdio: "inherit",
-        ...(this.deps.lookup.isPackaged
-          ? {}
-          : { cwd: this.deps.lookup.repoRoot }),
-      }),
-    );
+    const child = spawnFn(binary, ["serve", "--port", String(DEFAULT_PORT)], {
+      stdio: "inherit",
+      ...(this.deps.lookup.isPackaged
+        ? {}
+        : { cwd: this.deps.lookup.repoRoot }),
+    });
+    this.adoptChild(child);
+    // Recorded so the NEXT launch can reap this process if we are killed
+    // hard enough that no quit path runs.
+    if (typeof child.pid === "number") this.writePid(child.pid);
 
     for (let i = 0; i < SPAWNED_POLL_ATTEMPTS; i++) {
       await this.sleep(POLL_MS);
@@ -284,6 +305,29 @@ export class ServerProcess {
     throw new Error(
       `Spawned pond-server did not become healthy within ${this.budgetSeconds()} s`,
     );
+  }
+
+  /**
+   * Reap a sidecar orphaned by a hard kill of a previous run.
+   *
+   * Once per run, deliberately: a later recovery must not kill a server we
+   * legitimately adopted minutes ago. Never in parent-managed mode -- the
+   * parent there is `pond-server serve --native`, whose command line matches
+   * the sidecar predicate exactly, so a stale pidfile plus a reused pid could
+   * have us kill our own parent.
+   */
+  private cleanupOrphans(): void {
+    if (this.reapedOrphans || this.parentManaged) return;
+    this.reapedOrphans = true;
+    reapPidfileOrphan(SERVER_CHILD, this.deps.orphanDeps ?? realOrphanDeps);
+  }
+
+  private writePid(pid: number): void {
+    (this.deps.writePid ?? ((p: number) => writePidfile(SERVER_CHILD, p)))(pid);
+  }
+
+  private removePid(): void {
+    (this.deps.removePid ?? (() => removePidfile(SERVER_CHILD)))();
   }
 
   /** Seconds a self-spawned server is given, derived so the message cannot drift. */
@@ -397,6 +441,7 @@ export class ServerProcess {
       // Already gone.
     }
     this.child = null;
+    this.removePid();
     this.log.info("pond-server shut down");
   }
 }
