@@ -105,10 +105,24 @@ is selected into its own bucket and never touches the general allowance
 Pairing was split out in `a2c86a93` because a chatty client spending the shared
 allowance would lock a device out of `/handshake` — the recovery path. The verify
 limiter sits inside the handler rather than the middleware, so it applies to
-loopback too: the endpoint is security-sensitive regardless of origin. All three
-emit `Retry-After` on a 429, and clients are expected to honour it.
+loopback too: the endpoint is security-sensitive regardless of origin.
+
+The 429 does not have one shape. General and pairing go through
+`AuthError::RateLimitExceeded` and set a `Retry-After` **header**
+(`middleware/mod.rs:49-53`); verify is built in the handler and puts the same
+figure in a `retry_after_secs` **JSON body field** with no header
+(`routes.rs:681-688`). A pairing client has to read both, and since verify is
+the tighter bucket it is the 429 such a client will actually see. Making the
+two uniform is a behaviour change and belongs in its own PR.
 
 Brute force is bounded by that verify limiter plus one-challenge-per-attempt, not
-by a lockout. At 10 attempts / 60 s against a code that lives 10 minutes, a single
-code is exposed to roughly 100 guesses out of 1,000,000 — about 0.01% of the key
-space — and each guess burns its own challenge, so attempts cannot be pipelined.
+by a lockout. The bound is **per source IP**, like the table above: the limiter
+keys on the TCP peer address (`routes.rs:676-678`), so every distinct address
+gets its own bucket. At 10 attempts / 60 s against a code that lives 10 minutes,
+one address is worth roughly 100 guesses out of 1,000,000 — about 0.01% of the
+key space — and each guess burns its own challenge, so attempts cannot be
+pipelined. An attacker holding N addresses gets 100N. That matters for the threat
+model named above: a wifi guest cannot spoof a source address through a TCP
+handshake, but can hold several without effort — a second DHCP lease, a static
+address in the subnet, or IPv6 privacy addresses, which rotate on their own. On a
+typical /24 the worst case is nearer 2.5% of the key space than 0.01%.
