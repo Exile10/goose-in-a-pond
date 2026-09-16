@@ -23,6 +23,10 @@ test("Hub visual screenshot", async ({ page }) => {
   // Let animations settle
   await page.waitForTimeout(800);
 
+  // The AskGoose bar, room pills and category dock are not checked here any
+  // more: the Home redesign removed them, and their components have been
+  // deleted. The `.askgoose` check was an unguarded `locator.evaluate`, so it
+  // hung for the full 30s timeout rather than failing fast.
   await page.screenshot({ path: "/tmp/hub-phase1-home.png", fullPage: false });
   console.log("Hub screenshot saved: /tmp/hub-phase1-home.png");
 
@@ -30,13 +34,6 @@ test("Hub visual screenshot", async ({ page }) => {
   const railWidth = await page.locator(".irail").evaluate((el) => el.getBoundingClientRect().width);
   console.log(`IconRail width: ${railWidth}px (expected 86)`);
 
-  // Check AskGoose bar present
-  const hasAskGoose = await page.locator(".askgoose").isVisible();
-  console.log(`AskGoose bar visible: ${hasAskGoose}`);
-
-  // Check room pills
-  const hasPills = await page.locator(".rpills").isVisible();
-  console.log(`Room pills visible: ${hasPills}`);
 
   // Check favourites grid (device tiles)
   const tileCount = await page.locator(".dtile").count();
@@ -50,9 +47,6 @@ test("Hub visual screenshot", async ({ page }) => {
   const hasWeather = await page.locator(".wx").isVisible();
   console.log(`Weather widget visible: ${hasWeather}`);
 
-  // Check category dock at bottom (.cdock is the CategoryDock root class)
-  const hasDock = await page.locator(".cdock").isVisible();
-  console.log(`Category dock visible: ${hasDock}`);
 
   // A11y: IconRail buttons must be <button> with aria-label
   const railButtons = page.locator(".irail__item");
@@ -64,12 +58,6 @@ test("Hub visual screenshot", async ({ page }) => {
     console.log(`  [${i}] tag=${tag} aria-label="${label}"`);
   }
 
-  // A11y: AskGoose element
-  const askGooseBar = page.locator(".askgoose");
-  const askGooseTag = await askGooseBar.evaluate((el) => el.tagName.toLowerCase());
-  const askGooseBtn = page.locator(".askgoose button, .askgoose__bar");
-  const askBtnCount = await askGooseBtn.count();
-  console.log(`\nAskGoose outer tag: ${askGooseTag}, inner buttons: ${askBtnCount}`);
 
   // A11y: dot buttons on tiles
   const dotBtns = page.locator(".dtile__dots");
@@ -82,8 +70,6 @@ test("Hub visual screenshot", async ({ page }) => {
 
   expect(railWidth).toBeGreaterThanOrEqual(84);
   expect(railWidth).toBeLessThanOrEqual(90);
-  expect(hasAskGoose).toBe(true);
-  expect(hasPills).toBe(true);
   expect(tileCount).toBeGreaterThan(0);
 });
 
