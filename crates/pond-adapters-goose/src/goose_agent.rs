@@ -116,6 +116,17 @@ const GOOSE_GOAL_NOTIFICATION_PREFIX: &str = "Goal: ";
 /// case at pass three instead of pass twenty-five.
 const MAX_GOAL_RECHECKS_PER_TURN: u32 = 2;
 
+/// How long a tripped guard waits for the engine to wind itself up before it
+/// gives up and drops the stream.
+///
+/// Generous on purpose: overshooting costs a few seconds on a turn that has
+/// already been cut short and whose text the user is reading, while undershooting
+/// loses the message from the engine's history, which is the defect this exists
+/// to prevent. Goose breaks out of its provider loop and its tool loop on the
+/// cancelled token, so the only way to reach this is an engine that has stopped
+/// responding at all.
+const GUARD_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How many times one tool may be called with byte-identical arguments in a turn.
 ///
 /// The backstop for a loop the completeness check did not cause. Three allows a
@@ -4474,6 +4485,19 @@ impl GooseAdapter {
             let mut goal_rechecks: u32 = 0;
             let mut tool_call_counts: HashMap<(String, u64), usize> = HashMap::new();
             let mut guard_tripped = false;
+            // Set when a repetition guard trips. Cancelling is not enough on its
+            // own: goose's reply stream is a pull-based `async_stream` with no
+            // driver of its own, so dropping it here suspends the generator at
+            // its last yield forever. It never reaches its top-of-loop cancel
+            // check and never runs the end-of-iteration flush that writes
+            // `messages_to_add` -- which on the goal-recheck arm is exactly the
+            // assistant answer the user has just been shown. So keep polling,
+            // discarding what comes back, until goose winds itself up.
+            //
+            // Bounded, because a stalled provider must not hold the turn open:
+            // goose breaks out of both its provider loop and its tool loop on
+            // the cancelled token, so a healthy engine ends well inside this.
+            let mut drain_deadline: Option<tokio::time::Instant> = None;
 
             tracing::info!(
                 target: "giap::trace",
@@ -4605,22 +4629,45 @@ impl GooseAdapter {
                     // otherwise yield nothing at all for the whole of the
                     // child's run. `next_parent_step` owns the select, the
                     // bias, and the cancel-safety argument for both branches.
-                    let event_result = match crate::orchestrator::next_parent_step(
-                        &mut goose_stream,
-                        &mut progress,
-                    ).await {
+                    let step = if let Some(deadline) = drain_deadline {
+                        match tokio::time::timeout_at(
+                            deadline,
+                            crate::orchestrator::next_parent_step(&mut goose_stream, &mut progress),
+                        ).await {
+                            Ok(step) => step,
+                            Err(_) => {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    "the engine did not wind up within the guard drain timeout; \
+                                     dropping the stream, so this turn's last message may be \
+                                     missing from the engine's own history",
+                                );
+                                break 'engine;
+                            }
+                        }
+                    } else {
+                        crate::orchestrator::next_parent_step(&mut goose_stream, &mut progress).await
+                    };
+                    let event_result = match step {
                         crate::orchestrator::ParentStep::Progress(frame) => {
                             // Straight out, unabsorbed. It is not an engine
                             // event: it never becomes text, a tool result, or
                             // anything else this turn persists. PAI-6
                             // invariant 4 — only the delegation's RESULT does,
                             // and that arrives as the tool response below.
-                            yield Ok(frame.into());
+                            if drain_deadline.is_none() {
+                                yield Ok(frame.into());
+                            }
                             continue 'engine;
                         }
                         crate::orchestrator::ParentStep::EngineEnded => break 'engine,
                         crate::orchestrator::ParentStep::Engine(event_result) => event_result,
                     };
+                    if drain_deadline.is_some() {
+                        // Draining: the client has already been told the turn is
+                        // over. Keep polling so goose flushes, surface nothing.
+                        continue 'engine;
+                    }
                     match event_result {
                         Ok(event) => match event {
                             goose::agents::AgentEvent::Message(msg) => {
@@ -4737,12 +4784,16 @@ impl GooseAdapter {
                                                     yield Ok(AgentStreamEvent::TurnLimitReached {
                                                         max_turns: MAX_IDENTICAL_TOOL_CALLS_PER_TURN as u32,
                                                     });
-                                                    // Cancel rather than just dropping the stream:
-                                                    // goose checks the token at the top of its
-                                                    // loop, so it unwinds cleanly and its
-                                                    // in-flight history writes settle.
+                                                    // Cancel, then DRAIN. The cancel alone only
+                                                    // arms goose's own checks; it has to be polled
+                                                    // again to reach them. Its tool loop tests the
+                                                    // token before dispatching, so the repeated
+                                                    // call does not run.
                                                     cancel_token.cancel();
-                                                    break 'engine;
+                                                    drain_deadline = Some(
+                                                        tokio::time::Instant::now() + GUARD_DRAIN_TIMEOUT,
+                                                    );
+                                                    continue 'engine;
                                                 }
                                                 tool_id_to_name.insert(tr.id.clone(), tool_name.clone());
                                                 tool_call_starts.insert(tr.id.clone(), std::time::Instant::now());
@@ -4791,8 +4842,16 @@ impl GooseAdapter {
                                                 yield Ok(AgentStreamEvent::TurnLimitReached {
                                                     max_turns: MAX_GOAL_RECHECKS_PER_TURN,
                                                 });
+                                                // See `drain_deadline`. This arm fires on a
+                                                // no-tool round, so the answer the user just saw
+                                                // is sitting unflushed in goose's `messages_to_add`
+                                                // and breaking here would drop it from the history
+                                                // the next turn is built from.
                                                 cancel_token.cancel();
-                                                break 'engine;
+                                                drain_deadline = Some(
+                                                    tokio::time::Instant::now() + GUARD_DRAIN_TIMEOUT,
+                                                );
+                                                continue 'engine;
                                             }
                                         }
                                         goose::conversation::message::MessageContent::ToolResponse(tr) => {
