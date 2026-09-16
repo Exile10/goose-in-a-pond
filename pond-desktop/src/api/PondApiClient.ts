@@ -272,7 +272,15 @@ export class PondApiClient {
     return this.get("/api/v1/health");
   }
 
-  getSystemInfo(): Promise<{ hostname: string; port: number; version: string; platform: string; arch: string }> {
+  getSystemInfo(): Promise<{
+    hostname: string;
+    /** LAN IPv4 a phone should use when it cannot resolve `<hostname>.local`. Null when the host has no LAN route. */
+    lan_address: string | null;
+    port: number;
+    version: string;
+    platform: string;
+    arch: string;
+  }> {
     return this.get("/api/v1/system/info");
   }
 
