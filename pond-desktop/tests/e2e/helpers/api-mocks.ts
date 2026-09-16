@@ -403,7 +403,10 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
   // Extensions secrets endpoint
   await page.route("**/api/v1/extensions/*/secrets", (route) => {
     if (route.request().method() === "POST") {
-      return route.fulfill({ status: 204, body: "" });
+      // Matches the documented contract: the route reports whether the running
+      // extension picked the new credentials up. A 204 here would exercise the
+      // undefined-body path rather than the one users hit.
+      return route.fulfill({ json: { stored: 1, restarted: false, restart_error: null } });
     }
     return route.fulfill({ json: { requirements: [], fulfilled: {} } });
   });
