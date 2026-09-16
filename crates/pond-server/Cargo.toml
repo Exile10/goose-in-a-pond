@@ -30,6 +30,16 @@ goose-agent = ["dep:pond-adapters-goose"]
 # Turning it back on is a decision about the quarantine, not about the build:
 #   cargo build -p pond-server --features pond-agent
 pond-agent = ["dep:pond-agent", "dep:pond-inference"]
+# Enable the direct mistral.rs backend (`agent_backend = "mistralrs"`).
+#
+# OFF BY DEFAULT and Mac-only by intent. It compiles a goose-free turn loop that
+# talks to a mistral.rs server over its OpenAI-compatible API -- the other end of
+# the experiment the goose-hosted "mistralrs" *provider* started. mistral.rs is
+# not a Jetson candidate on today's numbers (docs/developer/mistralrs-provider.md),
+# so nothing that builds for the device should compile this.
+#
+#   cargo run -p pond-server --features mistralrs-agent -- serve --agent mistralrs
+mistralrs-agent = ["dep:pond-adapters-mistralrs"]
 # Enable flat-file MCP memory (memories injected into system prompt every chat turn).
 # cargo run -p pond-server --features mcp-memory -- serve
 mcp-memory = ["dep:pond-adapters-mcp-memory"]
@@ -116,6 +126,8 @@ fs2 = { workspace = true }
 pond-adapters-goose           = { path = "../pond-adapters-goose", optional = true }
 # Optional: only compiled when --features pond-agent is passed.
 pond-agent                    = { path = "../pond-agent", optional = true }
+# Optional: only compiled when --features mistralrs-agent is passed.
+pond-adapters-mistralrs       = { path = "../pond-adapters-mistralrs", optional = true }
 pond-inference                = { path = "../pond-inference", optional = true }
 # Optional: only compiled when --features mcp-memory is passed.
 pond-adapters-mcp-memory      = { workspace = true, optional = true }

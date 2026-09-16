@@ -50,17 +50,18 @@ describe("WolframCard", () => {
     expect(screen.getByRole("button", { name: /Surface temperature/i })).toBeTruthy();
   });
 
-  it("sends a message carrying the id, not a tool call", () => {
+  it("sends the suggestion's wording, not an id nothing resolves", () => {
     const onAction = vi.fn();
     render(<WolframCard data={MERCURY} toolName="t" onAction={onAction} />);
     fireEvent.click(screen.getByRole("button", { name: /a chemical element/i }));
 
     const sent = onAction.mock.calls[0][0] as string;
-    // `explore_computation` resolves the id; the query and label are what make
-    // the sent message legible in the transcript.
-    expect(sent).toContain("w1");
+    // The label and the original question are the whole message: the id is a
+    // list key now, and sending one would ask the model to quote a handle that
+    // names nothing.
     expect(sent).toContain("a chemical element");
     expect(sent).toContain("mercury");
+    expect(sent).not.toContain("w1");
   });
 
   it("renders suggestions as plain labels where there is nothing to send to", () => {

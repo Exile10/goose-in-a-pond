@@ -103,11 +103,15 @@ function WolframCard({ data, onAction, variant }: McpCardProps) {
  * One explorable suggestion.
  *
  * Clicking it does NOT call the tool directly. It asks the assistant, which
- * then calls `explore_computation` on the normal engine path — so the follow-up
- * is audited, policy-checked and part of the conversation, the same as if the
- * user had typed it. Reaching the tool from here would need the knowledge tools
- * on `DIRECT_DISPATCH_ALLOWLIST`, which would hand them to every paired client
- * and every sandboxed MCP App iframe as well.
+ * re-asks `compute_answer` with the suggestion's own wording on the normal
+ * engine path — so the follow-up is audited, policy-checked and part of the
+ * conversation, the same as if the user had typed it. Reaching the tool from
+ * here would need the knowledge tools on `DIRECT_DISPATCH_ALLOWLIST`, which
+ * would hand them to every paired client and every sandboxed MCP App iframe.
+ *
+ * It used to send the suggestion's id for `explore_computation` to resolve.
+ * That tool was removed on 2026-09-10, so the wording is now the whole message:
+ * an id would name nothing.
  *
  * With no `onAction` wired (the Canvas surface, today) it renders as a plain
  * label rather than a button that does nothing when pressed.
@@ -135,12 +139,11 @@ function SuggestionChip({
     );
   }
 
-  // The id is what the tool resolves; the label and the original question are
-  // there so the sent message still reads as something a person would say, and
-  // so a model that ignores the id has enough left to act on.
+  // The wording is the whole message: nothing resolves an id any more, so the
+  // sent text has to stand on its own as something a person would say.
   const prompt = query
-    ? `For "${query}", ${verb} ${label} — open suggestion ${suggestion.id}.`
-    : `Open suggestion ${suggestion.id} (${label}).`;
+    ? `For "${query}", ${verb} ${label}.`
+    : `${verb.charAt(0).toUpperCase()}${verb.slice(1)} ${label}.`;
 
   return (
     <button
@@ -161,7 +164,7 @@ registerMcpCard({
   key: "wolfram",
   label: "Computed",
   icon: "Sigma",
-  toolPattern: /compute_answer|explore_computation|wolfram/,
+  toolPattern: /compute_answer|wolfram/,
   component: WolframCard,
   mockTool: "giap-knowledge__compute_answer",
   mockData: {

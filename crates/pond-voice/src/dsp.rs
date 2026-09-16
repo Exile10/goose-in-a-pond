@@ -2,13 +2,15 @@
 //!
 //! Before this module the same handful of operations existed in up to four
 //! copies each — WAV encoding in `pond-adapters-whisper`, `pond-adapters-piper`,
-//! `pond-server/piper_http.rs` and `pond-desktop/src-tauri/audio.rs`; RMS in
+//! `pond-server/piper_http.rs` and the desktop shell's own native audio; RMS in
 //! three; resampling and the VAD state machine in two apiece. Fixing one copy
 //! never fixed the others.
 //!
-//! Everything here is pure and `std`-only so it can be shared by the server,
-//! both adapters, and eventually the Tauri shell (which is a separate cargo
-//! workspace and cannot see `pond-core`).
+//! Everything here is pure and `std`-only so it can be shared by the server and
+//! both adapters without any of them inheriting a runtime. The desktop shell no
+//! longer needs it at all: its capture moved to the renderer's Web Audio, and
+//! the TypeScript counterparts of these functions live in
+//! `pond-desktop/src/modes/voice/webAudioUtils.ts`.
 //!
 //! ## Sample scaling
 //!

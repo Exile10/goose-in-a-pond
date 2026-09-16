@@ -4,7 +4,7 @@
 below was checked by grep against the symbol, not by reading a previous version of this document.
 Line numbers rot; symbols do not. Re-verify before trusting.
 
-This document is the shared definition of GIAP's settings surface for **every** client — the Tauri
+This document is the shared definition of GIAP's settings surface for **every** client — the
 desktop app, Goose On The Go (GOTG), the embedded web UI, and anything else that speaks
 `/api/v1/settings`. It exists because the settings surface currently has no shared vocabulary: the
 desktop app groups fields one way, the domain struct groups them another, and the API exposes a flat
@@ -398,7 +398,7 @@ Validated: `network_mode`, `reasoning_effort`, `agent_backend`, `matter_ws_url`.
 Unvalidated, each with a documented accepted-value set and a silent fallback:
 `thinking_mode` (`auto`/`on`/`off`), `prompt_style` (`balanced`/`concise`/`technical`/`warm`),
 `review_mode` (`off`/`on`/`auto`), `memory_consolidation_mode` (`single`/`adversarial`),
-`tool_selection_mode` (`all`/`relevant`), `security_policy_mode` (`off`/`audit`/`enforce`),
+`tool_selection_mode` (`all`/`relevant`/`minimal`), `security_policy_mode` (`off`/`audit`/`enforce`),
 `embedding_provider` (`fastembed`/`gguf`/`none`).
 
 `security_policy_mode` is the sharp one: it is API-only, so the *only* way to set it is the path with

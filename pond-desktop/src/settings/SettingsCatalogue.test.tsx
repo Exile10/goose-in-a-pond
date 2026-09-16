@@ -36,6 +36,18 @@ function serverSettings(overrides: Record<string, unknown> = {}) {
   return { ...structuredClone(SERVER_SETTINGS), ...overrides };
 }
 
+// The zone the device reports, held in a variable so a test can choose it.
+// Reading the real one couples the suite to the machine: a CI runner is UTC,
+// so a test that saves "UTC" and expects to be offered something else is
+// asking whether the two differ on THIS host, not whether the component does
+// the right thing when they do.
+let deviceZoneValue = "Africa/Nairobi";
+
+vi.mock("../lib/place", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/place")>()),
+  deviceZone: () => deviceZoneValue,
+}));
+
 vi.mock("../api/PondApiClient", () => ({
   api: {
     getSettings: vi.fn(),
@@ -100,7 +112,10 @@ function rowFor(label: string): HTMLElement {
   return row as HTMLElement;
 }
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  deviceZoneValue = "Africa/Nairobi";
+});
 afterEach(cleanup);
 
 describe("SettingsCatalogue", () => {
@@ -407,13 +422,22 @@ describe("SettingsCatalogue", () => {
     expect([...model.options].map((o) => o.text)).toContain("some-model-i-removed — not installed");
   });
 
-  it("offers the device's own time zone only when it differs", async () => {
-    const systemZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  it("offers the device's own time zone when it differs from the saved one", async () => {
+    deviceZoneValue = "Africa/Kampala";
     await renderPage({ timezone: "UTC" });
-    const detect = screen.getByRole("button", { name: new RegExp(`Use ${systemZone}`) });
+    const detect = screen.getByRole("button", { name: /Use Africa\/Kampala/ });
     fireEvent.click(detect);
     await waitFor(() =>
-      expect((screen.getByLabelText("Time zone") as HTMLSelectElement).value).toBe(systemZone));
+      expect((screen.getByLabelText("Time zone") as HTMLSelectElement).value)
+        .toBe("Africa/Kampala"));
+  });
+
+  // The other half of "only when it differs", which nothing asserted before:
+  // the offer has to be absent, not merely correct when present.
+  it("offers nothing when the device already agrees with the saved zone", async () => {
+    deviceZoneValue = "UTC";
+    await renderPage({ timezone: "UTC" });
+    expect(screen.queryByRole("button", { name: /^Use / })).toBeNull();
   });
 
   it("searches across every category, not just the open one", async () => {

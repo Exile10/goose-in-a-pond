@@ -162,7 +162,7 @@ Reports that simply restate this tooling's output are usually not actionable on
 their own. The `Security` workflow runs on every PR and push to `main`, weekly,
 and on demand:
 
-- **`cargo audit`** against the workspace and `pond-desktop/src-tauri` lockfiles.
+- **`cargo audit`** against the workspace lockfile.
 - **`npm audit --audit-level=high`** against every npm lockfile we build.
 - **`osv-scanner`** across all lockfiles. This exists because `cargo audit`
   reads RustSec while Dependabot reads the GitHub Advisory Database, and the two

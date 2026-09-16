@@ -1,0 +1,20 @@
+=== carveouts (sizes the reflash-only reclaim, if it is ever considered) ===
+
+=== reserved-memory nodes ===
+#address-cells
+camdbg_carveout
+framebuffer@0,0
+linux,cma
+name
+pva-carveout
+ramoops_carveout
+ranges
+rce-reservation
+#size-cells
+vpr-carveout
+
+=== dmesg: nvmap / oom / zram ===
+
+=== nvmap clients (per-PID GPU memory; PID is column 3) ===
+
+=== nvmap total ===

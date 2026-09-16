@@ -101,6 +101,8 @@ mod tests {
             model_load_ms: None,
             decode_tok_per_sec: None,
             prefill_tok_per_sec: None,
+            prefilled_tokens: None,
+            reused_prefix_tokens: None,
             context_limit_tokens: None,
             inference_count: None,
             reasoning_tokens: None,

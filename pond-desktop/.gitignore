@@ -6,6 +6,11 @@ src-tauri/target/
 # A large release binary — never committed; produced fresh per target/host.
 src-tauri/binaries/
 
+# Electron build output
+dist-electron/
+release/
+resources/
+
 # Generated test artifacts (never commit — #163 accidentally committed 214 of these)
 playwright-report/
 test-results/

@@ -372,6 +372,16 @@ fn render_value(value: &ValueSpec) -> String {
 
 #[tool_router]
 impl DeviceControlMcpServer {
+    /// Every tool this server exposes, without constructing it or its deps.
+    ///
+    /// `tool_router()` is generated private to this module, so inventory code
+    /// outside it could not reach the real definitions and resorted to scanning
+    /// source text for `#[tool(` instead. This is the enumeration that scan was
+    /// standing in for.
+    pub(crate) fn tool_defs() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
+    }
+
     pub fn new(
         control: Arc<dyn DeviceControlPort + Send + Sync>,
         registry: Arc<dyn DeviceRegistry + Send + Sync>,
@@ -442,7 +452,7 @@ impl DeviceControlMcpServer {
     }
 
     #[tool(
-        description = "Set smart-device state: power, brightness, target_temp, lock, colour, fan, position, tilt, valve. device_id: id, name, or natural ref like \"the light\"."
+        description = "Set smart-device state: power, brightness, target_temp, lock, colour, fan, position, tilt, valve. device_id: id, name, or natural ref like \"the light\". Unlocking a door or disarming an alarm needs the user's explicit go-ahead in the same message. A device you cannot find is not set up yet — say so rather than guessing."
     )]
     async fn set_device_state(
         &self,

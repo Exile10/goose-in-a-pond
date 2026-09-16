@@ -50,4 +50,10 @@ pub struct PromptTemplate {
 /// 1 is the tag-skeleton rewrite of 2026-08-14: judgment licences for tools and
 /// thinking, the covertness rule generalised to any angle-bracket block, and
 /// compact tiers for every section that lacked one.
-pub const FACTORY_VERSION: i64 = 1;
+///
+/// 2 is 2026-09-10: every tool section — `<tool-usage>`, `<tool-failure>`,
+/// `<memory-rules>`, the schema sentence and the tool-vs-memory precedence
+/// rule — became conditional on the turn actually being offered tools. A fork
+/// of generation 1 still instructs a model with nothing to call, which is
+/// ~800 characters of dead prose on every turn.
+pub const FACTORY_VERSION: i64 = 2;

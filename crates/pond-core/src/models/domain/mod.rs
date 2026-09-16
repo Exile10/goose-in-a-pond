@@ -1,5 +1,6 @@
 pub mod acceleration;
 pub mod device_profile;
+pub mod drafter;
 pub mod gguf;
 pub mod image_limits;
 pub mod message;

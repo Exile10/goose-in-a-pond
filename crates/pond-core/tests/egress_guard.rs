@@ -122,6 +122,11 @@ const LOOPBACK_ONLY: &[Exempt] = &[
         non_target_urls: &[],
     },
     Exempt {
+        file: "crates/pond-adapters-mistralrs/src/provider.rs",
+        reason: "talks to a local mistral.rs server on 127.0.0.1:9002 (Mac-only checkpoint)",
+        non_target_urls: &[],
+    },
+    Exempt {
         file: "crates/pond-infra/src/ollama_provider.rs",
         reason: "talks to the Ollama daemon on localhost:11434",
         non_target_urls: &[],

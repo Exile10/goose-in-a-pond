@@ -314,34 +314,6 @@ fn enforce_system(
     }
 }
 
-/// Strip Goose's injected `<turn-context>` blocks from message content.
-/// Returns `None` when nothing was stripped (no clone needed).
-fn strip_turn_context(messages: &[Message]) -> Option<Vec<Message>> {
-    let has_injection = messages.iter().any(|m| {
-        m.content.iter().any(|c| {
-            c.as_text()
-                .is_some_and(goose::conversation::is_turn_context_text)
-        })
-    });
-    if !has_injection {
-        return None;
-    }
-    Some(
-        messages
-            .iter()
-            .map(|m| {
-                let mut m = m.clone();
-                m.content.retain(|c| {
-                    !c.as_text()
-                        .is_some_and(goose::conversation::is_turn_context_text)
-                });
-                m
-            })
-            .filter(|m| !m.content.is_empty())
-            .collect(),
-    )
-}
-
 /// Provider names whose format layer already relocates tool-result images, so promotion must
 /// NOT run for them: `formats/openai.rs`, `formats/google.rs` and `formats/databricks.rs` each
 /// re-host a tool-response image as a following user message, so promoting would send it twice.
@@ -400,6 +372,24 @@ fn promote_tool_result_images(messages: &[Message], max_images: usize) -> Option
     Some(out)
 }
 
+use pond_core::mcp::domain::tool_group::{no_tools_env_set, NO_TOOLS_ENV};
+
+/// Read once: this is on the per-turn path and the environment cannot change
+/// under a running process in any way this needs to notice.
+fn tools_disabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let off = no_tools_env_set();
+        if off {
+            tracing::warn!(
+                "{NO_TOOLS_ENV} is set — every turn is offered ZERO tools, GIAP's and \
+                 goose's alike. Unset it to restore normal behaviour."
+            );
+        }
+        off
+    })
+}
+
 /// Retain only allow-listed tools. Returns `None` when nothing was vetoed.
 fn enforce_tools(tools: &[Tool], allowed: &Option<HashSet<String>>) -> Option<Vec<Tool>> {
     let allowed = allowed.as_ref()?;
@@ -419,6 +409,91 @@ fn enforce_tools(tools: &[Tool], allowed: &Option<HashSet<String>>) -> Option<Ve
 /// re-prefilled by the local model each turn: the `"$schema"` URI, the struct-name `"title"`, and
 /// integer-width artifacts (`"format": "uintN"/"intN"` with the `minimum: 0` / power-of-two
 /// `maximum` pair serde derives). Walks nested objects but never touches `properties` KEYS.
+/// Write the final `(system, messages, tools)` as an OpenAI chat body when
+/// `GIAP_CAPTURE_PAYLOAD` names a directory.
+///
+/// Exists so a candidate engine in an inference bake-off is measured on the prompt GIAP
+/// actually sends. Reusing goose's `create_request` rather than hand-rolling the body keeps
+/// the capture honest: the same serializer the HTTP providers use, so a replay differs from
+/// a live call only by transport.
+///
+/// Failures are logged and swallowed -- a diagnostic must never fail a turn.
+fn capture_payload(model_config: &ModelConfig, system: &str, messages: &[Message], tools: &[Tool]) {
+    let Some(dir) = std::env::var_os("GIAP_CAPTURE_PAYLOAD") else {
+        return;
+    };
+    write_payload_capture(
+        std::path::Path::new(&dir),
+        model_config,
+        system,
+        messages,
+        tools,
+    );
+}
+
+/// The capture itself, with the directory passed in.
+///
+/// Split from [`capture_payload`] so a test can exercise it without `set_var`: the env is
+/// process-global and a test binary is threaded, so a test that set it would decide whether
+/// OTHER tests capture.
+fn write_payload_capture(
+    dir: &std::path::Path,
+    model_config: &ModelConfig,
+    system: &str,
+    messages: &[Message],
+    tools: &[Tool],
+) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    let body = match goose_providers::formats::openai::create_request(
+        model_config,
+        system,
+        messages,
+        tools,
+        &goose_providers::images::ImageFormat::OpenAi,
+        true,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("payload capture: could not build request body: {e}");
+            return None;
+        }
+    };
+    let Ok(text) = serde_json::to_string_pretty(&body) else {
+        tracing::warn!("payload capture: body is not serializable");
+        return None;
+    };
+
+    // The hash is over the body, so two turns that produce a byte-identical prompt land on
+    // the same name -- which is how the capture proves prefix stability rather than assuming it.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(
+        "payload-{seq:04}-{}t-{:016x}.json",
+        tools.len(),
+        h.finish()
+    ));
+
+    if let Err(e) = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, &text)) {
+        tracing::warn!("payload capture: could not write {}: {e}", path.display());
+        return None;
+    }
+    tracing::info!(
+        target: "giap::trace",
+        kind = "payload_captured",
+        path = %path.display(),
+        tools = tools.len(),
+        system_chars = system.len(),
+        messages = messages.len(),
+        "captured the final provider payload"
+    );
+    Some(path)
+}
+
 fn minify_schema_object(obj: &mut serde_json::Map<String, serde_json::Value>) {
     obj.remove("$schema");
     obj.remove("title");
@@ -558,9 +633,30 @@ impl Provider for GiapProviderShim {
                  did not match GIAP's prefix, so the shim passed it through unchanged"
             );
         }
-        let stripped_messages = strip_turn_context(messages);
-        // Phase F3: run AFTER the turn-context strip so the promoted carrier is
-        // built from the messages the provider will actually receive.
+        // C3: goose's `<turn-context>` is KEPT.
+        //
+        // The shim used to strip every MOIM injection, on the reasoning that
+        // GIAP owns per-turn context through its own `<system-context>`. Parity
+        // means goose's block reaches the model: current time, working
+        // directory, remaining tokens, turn budget, and whatever the `todo` and
+        // `tom` extensions contribute — the last of which is the only mechanism
+        // either side has for an instruction that survives compaction.
+        //
+        // It needed BOTH halves. `MIN_CONTEXT_FOR_MOIM` was 32,000 upstream and
+        // GIAP clamps local prompts to 8,192, so the block was never composed in
+        // the first place; lowering it without this would have produced a block
+        // the shim then deleted, and stripping without lowering deleted a block
+        // that was never there. Neither half alone does anything.
+        //
+        // No stale-block problem, checked rather than assumed: `inject_moim`
+        // works on `conversation.clone()` (`agent.rs:2093`) and the result is
+        // used only for that provider call, so the stored conversation never
+        // accumulates injections.
+        //
+        // `strip_turn_context` is kept and still tested — it is the lever to
+        // pull if the block turns out to cost more in KV churn than it returns.
+        let stripped_messages: Option<Vec<Message>> = None;
+        // Phase F3: built from the messages the provider will actually receive.
         let promoted_messages = if provider_relocates_tool_images(self.inner.get_name()) {
             None
         } else {
@@ -594,6 +690,11 @@ impl Provider for GiapProviderShim {
             (v != selected).then_some(v)
         };
         let final_tools: &[Tool] = ordered_tools.as_deref().unwrap_or(selected);
+        // Applied LAST, after selection, ordering and minification, because this
+        // is the only boundary that sees every tool the provider will be given —
+        // GIAP's builtins, a user's own MCP server, and goose's platform
+        // extensions alike. Filtering earlier would let any of those through.
+        let final_tools: &[Tool] = if tools_disabled() { &[] } else { final_tools };
 
         if enforced_system.is_some()
             || stripped_messages.is_some()
@@ -674,6 +775,18 @@ impl Provider for GiapProviderShim {
                 "provider system prompt provenance"
             );
         }
+
+        // Bake-off capture (`GIAP_CAPTURE_PAYLOAD=<dir>`). This is the only place the
+        // FINAL payload exists: goose's own `sessions.db` stores the raw messages, not the
+        // shim-enforced system prompt, the vetoed/minified tool array, or the core-first
+        // ordering -- so an engine replayed from that store is not answering GIAP's prompt.
+        // No-op, and no serialization cost, when the variable is unset.
+        capture_payload(
+            model_config,
+            enforced_system.as_deref().unwrap_or(system),
+            final_messages,
+            final_tools,
+        );
 
         let result = self
             .inner
@@ -834,25 +947,6 @@ mod tests {
         assert_eq!(enforce_system("anything", &None, &[&None, &None]), None);
     }
 
-    #[test]
-    fn turn_context_blocks_are_stripped_from_messages() {
-        let turn_ctx = "<turn-context>\n<current-time>2026-07-26 14:00</current-time>\n<working-directory>/home</working-directory>\n</turn-context>";
-        assert!(goose::conversation::is_turn_context_text(turn_ctx));
-        let msg = Message::user()
-            .with_text("real question")
-            .with_text(turn_ctx);
-        let stripped = strip_turn_context(&[msg]).expect("injection present");
-        assert_eq!(stripped.len(), 1);
-        assert_eq!(stripped[0].content.len(), 1);
-        assert_eq!(stripped[0].content[0].as_text(), Some("real question"));
-    }
-
-    #[test]
-    fn clean_messages_are_not_cloned() {
-        let msg = Message::user().with_text("hello");
-        assert!(strip_turn_context(&[msg]).is_none());
-    }
-
     // ── F3: tool-result image promotion ──────────────────────────────────
 
     fn image_tool_response(id: &str, note: &str, images: &[(&str, &str)]) -> Message {
@@ -971,6 +1065,69 @@ mod tests {
             "desc".to_string(),
             rmcp::object!({"type": "object"}),
         )
+    }
+
+    /// The bake-off replays these files against candidate engines, so the capture has to be
+    /// the payload GIAP sends -- and it has to be BYTE-STABLE across two identical turns, or
+    /// a "prefix moved" finding would just be capture noise. Same body, same name, one file.
+    #[test]
+    fn an_identical_turn_captures_to_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ModelConfig::new("gemma-4-E4B-it-qat-UD-Q4_K_XL");
+        let msgs = vec![Message::user().with_text("what is the weather?")];
+        let tools = vec![tool("giap-weather__get_current_weather")];
+
+        let first =
+            write_payload_capture(dir.path(), &cfg, "SYSTEM", &msgs, &tools).expect("captured");
+        let second =
+            write_payload_capture(dir.path(), &cfg, "SYSTEM", &msgs, &tools).expect("captured");
+
+        // The sequence number differs, the content hash does not.
+        assert_ne!(first, second, "each call gets its own sequence number");
+        let hash_of = |p: &std::path::Path| {
+            p.file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .rsplit_once('-')
+                .unwrap()
+                .1
+                .to_string()
+        };
+        assert_eq!(
+            hash_of(&first),
+            hash_of(&second),
+            "an identical payload must hash identically, or prefix-stability findings are noise"
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&first).unwrap()).unwrap();
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == "system"),
+            "the captured body must carry the shim-enforced system prompt: replaying without \
+             it measures a different prompt than GIAP sends"
+        );
+    }
+
+    /// A payload is captured only when asked for. The hook sits on the hot path of every
+    /// provider call, so an unset variable must not touch the filesystem.
+    #[test]
+    fn no_capture_directory_means_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = std::fs::read_dir(dir.path()).unwrap().count();
+        capture_payload(
+            &ModelConfig::new("m"),
+            "SYSTEM",
+            &[Message::user().with_text("hi")],
+            &[],
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
     }
 
     #[test]
@@ -1214,8 +1371,8 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         // A widen through one handle is visible through the other — this is what
         // lets the escape hatch affect the in-flight turn.
-        second.extend_allowed_tools(["giap-vision__list_camera_events".to_string()]);
-        assert!(first.is_tool_allowed("giap-vision__list_camera_events"));
+        second.extend_allowed_tools(["giap-sensors__get_sensor_reading".to_string()]);
+        assert!(first.is_tool_allowed("giap-sensors__get_sensor_reading"));
     }
 
     /// D2 escape hatch: enabling a group widens the live allow-set.

@@ -303,7 +303,7 @@ print_summary() {
     fi
 
     if [ "$S_DESKTOP" = "ok" ]; then
-      echo -e "  ${DIM}Desktop app:   cd pond-desktop && npm run tauri dev${NC}"
+      echo -e "  ${DIM}Desktop app:   cd pond-desktop && npm run dev:electron (macOS)${NC}"
     elif [ "$S_DESKTOP" = "skipped" ]; then
       echo -e "  ${DIM}Desktop app:   bash scripts/install.sh --desktop${NC}"
     fi

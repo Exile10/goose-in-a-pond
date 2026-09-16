@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# run-c1-giap.sh — the incumbent: llama.cpp in-process via llama-cpp-2, driven
+# through GIAP's own serving path. This is the BASELINE every other candidate is
+# scored against, so it runs first and it runs last (the bookend check).
+#
+#   bash scripts/jetson/bakeoff/run-c1-giap.sh --model gemma-4-E4B-it-qat [--workloads all] [-r 5]
+#
+# Uses a scratch POND_DATA_DIR with the GGUF hard-linked in, so a probe can
+# never touch the household pond's database or its weights.
+# ─────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
+# shellcheck disable=SC1091
+. "$HERE/lib.sh"
+
+MODEL=""; WORKLOADS="voice,followup,decode,fresh_rel"; REPEATS=5; BIN=""; COLD=1; KEEP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model)     MODEL="$2"; shift 2 ;;
+    --workloads) WORKLOADS="$2"; shift 2 ;;
+    -r|--repeats) REPEATS="$2"; shift 2 ;;
+    --bin)       BIN="$2"; shift 2 ;;
+    --no-cold)   COLD=0; shift ;;
+    --keep)      KEEP=1; shift ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+[ -n "$MODEL" ] || die "--model is required"
+
+REAL_DATA="${POND_REAL_DATA_DIR:-$DATA_DIR_DEFAULT}"
+[ -n "$BIN" ] || BIN="$REPO/target/release/pond-server"
+[ -x "$BIN" ] || die "no release pond-server at $BIN — a debug build is CPU-only and would measure nothing"
+
+preflight
+stamp_power_env
+OC0="$(oc3_count)"; T0="$(date +%s)"
+
+RUN="$RESULTS_ROOT/c1-giap/$MODEL"
+mkdir -p "$RUN"
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/bakeoff-c1.XXXXXX")"
+mkdir -p "$SCRATCH/models/gguf"
+SERVER_PID=""; MEMWATCH_PID=""
+cleanup() {
+  [ -n "$MEMWATCH_PID" ] && kill "$MEMWATCH_PID" 2>/dev/null
+  [ -n "$SERVER_PID" ] && kill -9 "$SERVER_PID" 2>/dev/null
+  tegra_stop
+  [ "$KEEP" = 1 ] && note "kept scratch: $SCRATCH" || rm -rf "$SCRATCH"
+}
+trap cleanup EXIT
+
+ENTRY=""
+for path in "$REAL_DATA/models/gguf/$MODEL.gguf" "$REAL_DATA/models/gguf/$MODEL"-*.gguf; do
+  [ -e "$path" ] && { ENTRY="$(basename "$path")"; break; }
+done
+[ -n "$ENTRY" ] || { ls -1 "$REAL_DATA/models/gguf" | sed 's/^/  /' >&2; die "cannot resolve $MODEL"; }
+SRC="$(readlink -f "$REAL_DATA/models/gguf/$ENTRY")"
+[ -f "$SRC" ] || die "$ENTRY -> $SRC is not a file"
+ln "$SRC" "$SCRATCH/models/gguf/$ENTRY" 2>/dev/null || cp "$SRC" "$SCRATCH/models/gguf/$ENTRY"
+note "weights: $SRC ($(du -h "$SRC" | cut -f1))"
+
+# The embedding model, or tool_selection_mode=relevant silently cannot narrow.
+# Measured: every session logged `tool_selection_widened reason="no_embedder"`
+# and got all 61 tools, making the `relevant` and `all` arms the same prompt.
+# It lives in models/embedding/, NOT models/gguf/ -- looking in the latter is
+# why the first attempt at this link found nothing and said nothing.
+mkdir -p "$SCRATCH/models/embedding"
+EMB_LINKED=0
+for emb in "$REAL_DATA"/models/embedding/*.gguf; do
+  [ -e "$emb" ] || continue
+  ln "$(readlink -f "$emb")" "$SCRATCH/models/embedding/$(basename "$emb")" 2>/dev/null \
+    || cp "$(readlink -f "$emb")" "$SCRATCH/models/embedding/$(basename "$emb")"
+  note "embedder: $(basename "$emb") linked (relevant-mode narrowing needs it)"
+  EMB_LINKED=1
+done
+[ "$EMB_LINKED" = 1 ] || add_warning "no embedding model found under $REAL_DATA/models/embedding — tool_selection_mode=relevant will widen to every tool"
+
+# Cold start is only cold if the page cache no longer holds the weights.
+[ "$COLD" = 1 ] && { say "dropping page cache for an honest cold start"; drop_caches; }
+
+MEM_BEFORE="$(mem_snapshot)"
+tegra_start "$RUN/tegrastats.log"
+
+PORT="${BAKEOFF_C1_PORT:-4982}"
+# Every crate whose evidence this run depends on must be named here, because the
+# root is `warn` and an unnamed crate is silent at info.
+#
+# `pond_adapters_local_inference` was missing, and that cost two runs and a wrong
+# conclusion: `apply_jetson_settings` logs "Jetson context sized" unconditionally
+# -- there is no early return before it -- so an absent line cannot mean the
+# function bailed. It could only ever have meant the line was filtered, and it
+# was. The check below reads that line, so omitting the crate made the check
+# report the opposite of the truth.
+#
+# giap::trace is INFO-rooted; goose carves llama-cpp-2 to ERROR in
+# tracing_setup.rs, so the KV-cache size lines need it raised explicitly.
+POND_DATA_DIR="$SCRATCH" POND_DEV_ALLOW_LOOPBACK=1 \
+RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,pond_adapters_local_inference=info,goose_local_inference=debug,llama_cpp_2=info" \
+  "$BIN" serve --port "$PORT" > "$RUN/server.log" 2>&1 < /dev/zero &
+SERVER_PID=$!
+bash "$HERE/memwatch.sh" --out "$RUN/mem.csv" --pid "$SERVER_PID" --interval 0.5 &
+MEMWATCH_PID=$!
+
+note "waiting for the scratch pond"
+for _ in $(seq 1 150); do
+  [ -s "$SCRATCH/.runtime_api_port" ] && break
+  kill -0 "$SERVER_PID" 2>/dev/null || { tail -40 "$RUN/server.log" >&2; die "server exited"; }
+  sleep 2
+done
+PORT="$(tr -d ' \n' < "$SCRATCH/.runtime_api_port" 2>/dev/null || echo "$PORT")"
+until curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/v1/health"; do
+  kill -0 "$SERVER_PID" 2>/dev/null || { tail -40 "$RUN/server.log" >&2; die "server exited"; }
+  sleep 2
+done
+API="http://127.0.0.1:$PORT/api/v1"
+sqlite3 "$SCRATCH/pond_system.db" \
+  "INSERT OR REPLACE INTO onboarding_state (id, current_step) VALUES (1, 'Completed');"
+curl -sf -X PUT "$API/settings" -H 'Content-Type: application/json' \
+  -d "{\"chat_provider\":\"local\",\"chat_model\":\"$MODEL\",\"tool_selection_mode\":\"relevant\"}" >/dev/null \
+  || die "settings PUT failed"
+
+# WARM-UP TURN FIRST, then restart. Two facts compose here:
+#
+#   `apply_jetson_settings` looks the model up in the PERSISTED registry to get
+#   its size, and silently does nothing when it is not there ("errors are
+#   ignored and defaults apply"). A fresh scratch data dir has an empty
+#   registry, so the first boot stamps nothing at all.
+#
+#   The registry entry is created by `register_gguf_model`, which runs on the
+#   GooseAdapter chat path -- i.e. only once a turn has actually been taken.
+#
+# So a fresh pond needs a turn to register the model, and a restart for the
+# stamping to find it. The household pond is tuned only because its registry
+# carries entries from previous runs; a genuinely fresh install gets no Jetson
+# tuning on its first boot either, which is worth knowing separately.
+say "warm-up turn to register the model (the registry is what stamping reads)"
+curl -sf -N -X POST "$API/chat/stream" -H 'Content-Type: application/json' \
+  -d '{"message":"hello","session_id":"bakeoff-warmup"}' --max-time 300 >/dev/null 2>&1 || true
+grep -a "Registered GGUF model" "$RUN/server.log" | tail -1 | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/   /'
+
+# RESTART, because the tuning is startup-wired.
+#
+# `apply_jetson_settings` runs when the per-role LLM provider is constructed,
+# and that happens ONCE at boot from whatever settings existed then. A PUT on a
+# running pond changes the row and leaves the model unstamped: the first run of
+# this script measured E4B at n_ctx 32768 instead of the derived 16384, with no
+# q8_0 KV and no n_ubatch cap, and drove MemAvailable to 364 MB with swap
+# engaged. Nothing in the output said so -- the turns all succeeded.
+# scripts/pai-bench.sh hit the same trap and documents it.
+say "restarting the scratch pond so the settings are applied at boot"
+kill -9 "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+rm -f "$SCRATCH/.runtime_api_port"
+POND_DATA_DIR="$SCRATCH" POND_DEV_ALLOW_LOOPBACK=1 \
+RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,pond_adapters_local_inference=info,goose_local_inference=debug,llama_cpp_2=info" \
+  "$BIN" serve --port "$PORT" >> "$RUN/server.log" 2>&1 < /dev/zero &
+SERVER_PID=$!
+for _ in $(seq 1 150); do
+  [ -s "$SCRATCH/.runtime_api_port" ] && break
+  kill -0 "$SERVER_PID" 2>/dev/null || { tail -40 "$RUN/server.log" >&2; die "server exited on restart"; }
+  sleep 2
+done
+PORT="$(tr -d ' \n' < "$SCRATCH/.runtime_api_port" 2>/dev/null || echo "$PORT")"
+API="http://127.0.0.1:$PORT/api/v1"
+until curl -sf -o /dev/null "$API/health"; do
+  kill -0 "$SERVER_PID" 2>/dev/null || { tail -40 "$RUN/server.log" >&2; die "server exited on restart"; }
+  sleep 2
+done
+
+# Refuse to measure an untuned engine and call it the incumbent.
+if ! grep -aq "Jetson context sized" "$RUN/server.log"; then
+  tail -20 "$RUN/server.log" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/   /' >&2
+  die "no 'Jetson context sized' line after the restart — the engine is UNTUNED and this
+   would be measured as the incumbent. Two earlier runs produced complete, plausible
+   numbers in exactly this state (n_ctx 32768 instead of 16384, no q8_0 KV, MemAvailable
+   down to 364 MB) and nothing in the output said so. Refusing to measure it."
+fi
+grep -a "Jetson context sized\|Applied Jetson" "$RUN/server.log" | tail -2 \
+  | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^/   /'
+note "pond ready on $PORT"
+
+say "workloads: $WORKLOADS  (x$REPEATS)"
+python3 "$HERE/bakeoff_turns.py" --mode giap --base "http://127.0.0.1:$PORT" \
+  --workloads "$WORKLOADS" -r "$REPEATS" --out "$RUN/runs.json" | tee "$RUN/driver.log"
+
+kill "$MEMWATCH_PID" 2>/dev/null; MEMWATCH_PID=""
+tegra_stop
+
+# ── harvest what only the log knows ──────────────────────────────────────────
+# The prefill plan and the KV-cache allocation are the two facts that decide
+# whether a follow-up turn really reused its prefix and what the cache costs
+# per token. Neither reaches turn_stats.
+{
+  echo "=== prefill plans (expect CreateContext, then ReusePrefix on turn 2+) ==="
+  grep -o 'prompt prefill plan.*' "$RUN/server.log" | tail -40
+  echo; echo "=== KV cache allocations (size = N MiB (C cells, L layers)) ==="
+  grep -o 'llama_kv_cache.*size *= *[0-9.]* MiB.*' "$RUN/server.log" | sort -u
+  echo; echo "=== Jetson settings actually applied ==="
+  grep -E 'Applied Jetson|Jetson context sized|effective_ctx' "$RUN/server.log" | tail -10
+  echo; echo "=== model slot identity (differing pointers = a slot bug) ==="
+  grep -o 'generate: model slot identity.*' "$RUN/server.log" | tail -10
+  echo; echo "=== tool selection: did 'relevant' actually narrow? ==="
+  # A capture under tool_selection_mode=relevant came back with all 61 tools.
+  # `SelectionBasis::NoEmbedder` widens to every permitted group and says so
+  # here; without this line the only tell is that the counts are equal.
+  grep -o 'tool_selection_widened.*\|tool_selection .*mode=.*\|tools_offered=[0-9]* tools_count=[0-9]*' \
+    "$RUN/server.log" | tail -12
+  echo; echo "=== GPU offload actually achieved ==="
+  grep -oiE 'offloaded [0-9]+/[0-9]+ layers|n_gpu_layers *= *[0-9]+|NvMap.*error|cudaMalloc failed' \
+    "$RUN/server.log" | sort -u | tail -8
+} > "$RUN/engine-facts.txt"
+sed -n '1,12p' "$RUN/engine-facts.txt" | sed 's/^/   /'
+
+MEM_AFTER="$(mem_snapshot)"
+MEM_SUM="$(bash "$HERE/memwatch.sh" --summary "$RUN/mem.csv")"
+THERMAL="$(tegra_summary "$RUN/tegrastats.log")"
+export BAKEOFF_OC3_DELTA=$(( $(oc3_count) - OC0 )) BAKEOFF_OC3_SECS=$(( $(date +%s) - T0 ))
+# BAKEOFF_CLOCKS was stamped by stamp_power_env at run START. Reading it here
+# sampled mid-load and called a schedutil run "pinned".
+: "${BAKEOFF_CLOCKS:=unknown}"
+
+envelope_write "$RUN/envelope.json" c1-giap "llama-cpp-2 0.1.146 in-process" \
+  "$REAL_DATA/models/gguf/$ENTRY" baseline \
+  "$(cat "$RUN/runs.json")" \
+  "$(python3 -c 'import json,sys; a=json.loads(sys.argv[1]); b=json.loads(sys.argv[2]); c=json.loads(sys.argv[3]); c.update({"before":a,"after":b}); print(json.dumps(c))' "$MEM_BEFORE" "$MEM_AFTER" "$MEM_SUM")" \
+  "$THERMAL" \
+  "$(python3 -c 'import json,sys; print(json.dumps({"engine_facts_file": sys.argv[1], "server_log": sys.argv[2]}))' "$RUN/engine-facts.txt" "$RUN/server.log")"
+
+say "done"
+note "results: $RUN"

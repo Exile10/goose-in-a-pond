@@ -5,7 +5,7 @@
 //! ## Why this exists
 //!
 //! Phase D narrows which extension tool schemas reach the model, per session, so
-//! a 59-tool surface (~5.9K prompt tokens through the Gemma chat template) fits
+//! a 27-tool surface (~3,339 prompt tokens, 40.8% of the budget) fits
 //! an 8K-class on-device budget. Narrowing is only safe if the model can reach a
 //! capability that was not preloaded — otherwise a mis-scored session is a dead
 //! end and the user just gets a worse assistant.
@@ -88,6 +88,16 @@ pub struct ToolkitMcpServer {
 
 #[tool_router]
 impl ToolkitMcpServer {
+    /// Every tool this server exposes, without constructing it or its deps.
+    ///
+    /// `tool_router()` is generated private to this module, so inventory code
+    /// outside it could not reach the real definitions and resorted to scanning
+    /// source text for `#[tool(` instead. This is the enumeration that scan was
+    /// standing in for.
+    pub(crate) fn tool_defs() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
+    }
+
     pub fn new(control: Option<Arc<dyn ToolSelectionControl>>) -> Self {
         Self {
             control,
@@ -343,5 +353,44 @@ mod tests {
             extra: Default::default(),
         };
         assert_eq!(resolve_group(&params), None);
+    }
+
+    /// Under `tool_selection_mode = "minimal"` these two tools are the ENTIRE
+    /// tool surface, and the reason that mode exists is a 4%-of-prompt-budget
+    /// ceiling. So the ceiling has to be a test, not a claim in a doc comment.
+    ///
+    /// The budget is `LOCAL_PROMPT_CLAMP` = 8,192 tokens (the prompt-side clamp
+    /// every local provider gets, whatever its n_ctx), 4% of which is 327
+    /// tokens. Tool JSON tokenizes at very close to 4 chars/token on the Gemma
+    /// template — the 61-tool payload measured 30,463 chars against 7,633
+    /// counted prompt tokens, 0.2% off — so the ceiling in characters is 1,308
+    /// (the arithmetic below truncates twice, which is why it is not 1,310).
+    ///
+    /// Measured on the real serialized schemas rather than the source text,
+    /// because what costs tokens is what `list_all()` hands the model: adding
+    /// one optional field to `EnableToolGroupParams` is a one-line change that
+    /// would quietly move this number.
+    #[test]
+    fn the_hatch_fits_four_percent_of_the_prompt_budget() {
+        const PROMPT_BUDGET_TOKENS: usize = 8_192;
+        const CHARS_PER_TOKEN: usize = 4;
+        let ceiling = PROMPT_BUDGET_TOKENS * 4 / 100 * CHARS_PER_TOKEN;
+
+        let tools = ToolkitMcpServer::tool_router().list_all();
+        let chars: usize = tools
+            .iter()
+            .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0))
+            .sum();
+
+        assert_eq!(tools.len(), 2, "the hatch is two tools: {tools:?}");
+        assert!(
+            chars <= ceiling,
+            "the minimal tool surface is {chars} chars (~{} tok, {:.1}% of the \
+             {PROMPT_BUDGET_TOKENS}-token prompt budget) and the ceiling is \
+             {ceiling} chars (327 tok, 4.0%). \"minimal\" no longer delivers \
+             what it is named for.",
+            chars / CHARS_PER_TOKEN,
+            100.0 * (chars as f32 / CHARS_PER_TOKEN as f32) / PROMPT_BUDGET_TOKENS as f32,
+        );
     }
 }

@@ -71,6 +71,13 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-kokoro/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-kokoro/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-audio-out/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-lightning/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-lightning/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-matter/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-mesh-inference/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-mesh-inference/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-silero/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-silero/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/goose/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/crates/pond-mcp-server/target" />

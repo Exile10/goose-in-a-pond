@@ -69,6 +69,16 @@ pub struct MemoryMcpServer {
 
 #[tool_router]
 impl MemoryMcpServer {
+    /// Every tool this server exposes, without constructing it or its deps.
+    ///
+    /// `tool_router()` is generated private to this module, so inventory code
+    /// outside it could not reach the real definitions and resorted to scanning
+    /// source text for `#[tool(` instead. This is the enumeration that scan was
+    /// standing in for.
+    pub(crate) fn tool_defs() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
+    }
+
     pub fn new(
         memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
