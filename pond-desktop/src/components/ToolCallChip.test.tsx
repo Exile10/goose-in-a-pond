@@ -92,10 +92,11 @@ describe("ToolCallChip — MCP-UI cards in the conversation", () => {
     expand();
     fireEvent.click(screen.getByRole("button", { name: /a chemical element/i }));
 
-    // The id is what explore_computation resolves, so it has to survive into
-    // the message; the rest is there so the message reads like a person.
+    // Nothing resolves an id any more (explore_computation was removed on
+    // 2026-09-10), so the wording has to carry the whole request — and must
+    // NOT smuggle an id the model would try to quote back.
     const sent = onAction.mock.calls[0][0] as string;
-    expect(sent).toContain("w2");
     expect(sent).toContain("a chemical element");
+    expect(sent).not.toContain("w2");
   });
 });

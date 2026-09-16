@@ -22,13 +22,10 @@ use pond_core::mesh::domain::peer_id::PeerId as MeshPeerId;
 use pond_core::mesh::domain::trust_scope::TrustScope;
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::models::ports::provider::LlmProvider;
-use pond_core::models::services::context::context_budget::CompactionProfile;
 use pond_core::models::services::context::context_governor::{
     ContextGovernor, ContextInputs, EngineWindow,
 };
 use pond_core::models::services::context::context_monitor::ContextHealth;
-use pond_core::models::services::context::model_class::ModelClass;
-use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::prompts::{builtin_template_content, ProfileContext};
 use pond_core::security::domain::event::{EventCategory, EventQuery, PrivacySensitivity};
 use pond_core::security::domain::proven_device::{DeviceRung, ProvenDevice};
@@ -1606,6 +1603,8 @@ fn turn_stats_frame(s: &pond_core::shared::domain::turn_stats::TurnStats) -> Str
         "prefill_ms": s.prefill_ms,
         "decode_tok_per_sec": s.decode_tok_per_sec,
         "prefill_tok_per_sec": s.prefill_tok_per_sec,
+        "prefilled_tokens": s.prefilled_tokens,
+        "reused_prefix_tokens": s.reused_prefix_tokens,
         "prompt_tokens": s.prompt_tokens,
         "completion_tokens": s.completion_tokens,
         "reasoning_tokens": s.reasoning_tokens,
@@ -1889,6 +1888,23 @@ async fn run_turn(
     // Released when the task ends, not when a reader goes away.
     let _run_permit = run_permit;
     drive_turn(&state, &run, req, device).await;
+    // Stamp the inactivity clock again now the work is actually over.
+    //
+    // `note_user_activity` is called when the REQUEST ARRIVES (`:1400`), and
+    // was called nowhere else on this path — so the clock measured time since
+    // the turn STARTED, and a turn that outran a threshold made the pond look
+    // idle while it was still generating. `summary_idle_secs` defaults to 120,
+    // and a fresh Orin turn in `jetson-bakeoff-2026-09-08` took 327 s: the
+    // rolling-summary refresh would start its own provider call, on the same
+    // single-slot engine, in the middle of the user's answer. Its
+    // activity-watcher cannot save it either, because nothing re-stamps the
+    // clock during a turn, so the watcher sees no resumption to cancel on.
+    //
+    // Every other reader of this clock inherits the fix: consolidation,
+    // titling, index maintenance and proactive review all ask the same
+    // question and all meant "since the pond last did something", not "since
+    // it last started doing something".
+    state.note_user_activity().await;
     // `finish` keeps the first terminal state, so a cancel that landed while
     // the tail was still running is not relabelled as an ordinary finish.
     run.finish(crate::runs::RunState::Finished);
@@ -2041,6 +2057,7 @@ async fn drive_turn(
         profile_scope: turn_scope.clone(),
         profile_context: profile_context_for(state, &turn_scope).await,
         tool_group_allowlist: req.tool_group_allowlist.clone(),
+        warmup: false,
     };
 
     // The turn's own state: the visible answer, the tool results that go
@@ -2444,6 +2461,8 @@ async fn drive_turn(
                 model_load_ms: turn_stats.as_ref().and_then(|s| s.model_load_ms),
                 decode_tok_per_sec: turn_stats.as_ref().and_then(|s| s.decode_tok_per_sec),
                 prefill_tok_per_sec: turn_stats.as_ref().and_then(|s| s.prefill_tok_per_sec),
+                prefilled_tokens: turn_stats.as_ref().map(|s| s.prefilled_tokens),
+                reused_prefix_tokens: turn_stats.as_ref().and_then(|s| s.reused_prefix_tokens),
                 context_limit_tokens: turn_stats.as_ref().and_then(|s| s.context_limit_tokens),
                 inference_count: turn_stats.as_ref().map(|s| s.inference_count),
                 // What thinking cost, and what it cost when it went wrong.
@@ -2509,7 +2528,6 @@ async fn drive_turn(
                 // summarisation model call between the user's last token and
                 // the end of their stream, on the tier that can least afford
                 // it. Everything real happens in the detached task.
-                spawn_pressure_compaction(state, &session_id);
             }
         }
     }
@@ -3468,358 +3486,8 @@ async fn get_session_messages(
         .collect();
 
     // PAI-4 P4: opening a session is the resume signal. Never awaited — see
-    // `spawn_resume_compaction`.
-    spawn_resume_compaction(&state, &session_id, offset, messages.len());
 
     Ok(Json(json!({ "messages": list })))
-}
-
-/// Sessions with a between-turns compaction pass currently in flight.
-///
-/// Process-local, because the hazard is process-local: two rapid reopens of the
-/// same session would each spawn a refresh, and on the serial on-device engine
-/// the second queues behind the first while the user's first turn queues behind
-/// both. A row in the database would be worse, not better — it would outlive a
-/// `kill -9` and strand the session as permanently "compacting".
-///
-/// PAI-4 P6 widened this from resume-only to *all* compaction passes. There are
-/// now two independent triggers — the time axis (P4, a reopen after a gap) and
-/// the pressure axis (P6, a session past 75% of its window) — and a session that
-/// has just been reopened after a long gap is exactly the session most likely to
-/// saturate on its first turn back. Keeping one set means the two axes exclude
-/// each other rather than stacking two model calls in front of the same turn.
-static COMPACTIONS_IN_FLIGHT: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<String>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-
-/// Run one rolling-summary refresh for a session, off the request path.
-///
-/// The shared body of both compaction triggers. Everything that makes a pass
-/// safe lives here so the two axes cannot drift:
-///
-/// - **It claims the session first**, and returns `None` when a pass is already
-///   running — see [`COMPACTIONS_IN_FLIGHT`].
-/// - **A user turn reclaims the engine immediately.** The refresh races a
-///   watcher on `last_user_activity`, the same contract the idle summary loop in
-///   `pond-server` uses; a cancelled refresh persists nothing.
-///
-/// - **The large tier rebuilds as well as refreshes** (PAI-4 P2). After the
-///   incremental refresh, `SessionSummaryService::resummarise` re-reads the
-///   covered messages and rebuilds the summary from source with a budget the
-///   window can afford. That second model call is gated on
-///   [`ModelClass::permits_compaction_model_call`], and **only** that call is:
-///   extending the gate to the refresh above would switch the rolling summary
-///   off on the small tier, which PAI-4 P1 argued against at length and P6
-///   deliberately did not do.
-///
-/// Returns the outcome of the refresh when a pass actually ran. Callers are
-/// already inside a spawned task: this awaits a model call — two, on the large
-/// tier — and must never be called from a handler body or an SSE generator.
-async fn run_compaction_pass(
-    state: &Arc<AppState>,
-    session_id: &str,
-    settings: &Settings,
-    provider: Arc<dyn pond_core::models::ports::provider::LlmProvider>,
-    trigger: &'static str,
-) -> Option<pond_core::shared::services::session_summary::RefreshOutcome> {
-    {
-        let mut in_flight = match COMPACTIONS_IN_FLIGHT.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if !in_flight.insert(session_id.to_string()) {
-            return None;
-        }
-    }
-
-    // Abort the moment the user starts typing — the on-device engine is
-    // serial, and this pass must never be what a turn waits behind.
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let baseline = state.last_user_activity.read().await.elapsed();
-    let watcher_activity = state.last_user_activity.clone();
-    let watcher_cancel = cancel.clone();
-    let watcher = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if watcher_activity.read().await.elapsed() < baseline {
-                watcher_cancel.cancel();
-                break;
-            }
-        }
-    });
-
-    let svc = pond_core::shared::services::session_summary::SessionSummaryService::new(
-        provider,
-        state.session_storage.clone(),
-    );
-    let result = svc.refresh(session_id, &cancel).await;
-
-    // PAI-4 P2 — the large tier's extra mechanism, and the first thing in this
-    // programme that `ModelClass` gates rather than merely describes.
-    //
-    // It runs AFTER the refresh, not instead of it and not before it. The
-    // refresh advances the through-pointer; rebuilding first would rebuild a
-    // summary the refresh then folds over. Both share this pass's single
-    // in-flight claim and its single cancellation token, so the large tier's two
-    // model calls are still one cancellable pass rather than two things a turn
-    // could queue behind.
-    let resummarised = {
-        let (class, profile) = compaction_model_class(state, settings).await;
-        // `resummarise` checks the tier before it makes even a database read, so
-        // on the small and medium tiers this whole block is the governor
-        // resolution above and nothing else.
-        match svc
-            .resummarise(session_id, class, &profile, &HeuristicTokenCounter, &cancel)
-            .await
-        {
-            Ok(outcome) => Some(outcome),
-            Err(e) => {
-                // Every failure here means "leave the stored summary exactly as
-                // it was", which is the behaviour every tier had before P2.
-                tracing::debug!("{trigger} re-summarisation failed for {session_id}: {e}");
-                None
-            }
-        }
-    };
-
-    watcher.abort();
-
-    match COMPACTIONS_IN_FLIGHT.lock() {
-        Ok(mut g) => {
-            g.remove(session_id);
-        }
-        Err(poisoned) => {
-            poisoned.into_inner().remove(session_id);
-        }
-    }
-
-    match result {
-        Ok(outcome) => {
-            tracing::info!(
-                target: "giap::trace",
-                kind = "compaction_pass",
-                trigger = trigger,
-                session_id = %session_id,
-                outcome = ?outcome,
-                resummarisation = ?resummarised,
-            );
-            Some(outcome)
-        }
-        Err(e) => {
-            tracing::debug!("{trigger} compaction failed for {session_id}: {e}");
-            None
-        }
-    }
-}
-
-/// The active model's compaction tier and budget curve, for an off-turn pass.
-///
-/// PAI-4 P2. The rungs are the ones `chat_stream` feeds the governor, minus the
-/// two that only a turn can supply: `engine_reported` arrives on `TurnStats` and
-/// `registry_pinned` belongs to the adapter. Both absent means this resolves no
-/// *higher* than the live path would, and lower is the safe direction here —
-/// [`ModelClass::Large`] is the only tier that unlocks a model call, and a
-/// smaller window can only move a model out of it.
-///
-/// The class is derived from `settings.chat_provider`, and that is the provider
-/// that will make the call: `rebuild_llm_provider` builds `state.llm_provider`
-/// from `chat_provider`/`chat_model`, so the box the gate is reasoning about is
-/// the box the summariser runs on. If those two ever diverge, this gate starts
-/// answering a question about a different machine.
-///
-/// `from_context_window` rather than `for_windows`: the prompt-side clamp only
-/// bites on providers whose preamble is re-prefilled here every turn, and the
-/// only class that reaches the re-summarisation is definitionally not one of
-/// them.
-async fn compaction_model_class(
-    state: &Arc<AppState>,
-    settings: &Settings,
-) -> (ModelClass, CompactionProfile) {
-    let catalog_context_length = match &state.model_repo {
-        Some(repo) => {
-            let id = ModelRecord::id_for(
-                &ModelCategory::for_chat_provider(&settings.chat_provider),
-                &settings.chat_model,
-            );
-            repo.get_by_id(&id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|m| m.context_length)
-        }
-        None => None,
-    };
-
-    let resolution = ContextGovernor::resolve(&ContextInputs {
-        provider: &settings.chat_provider,
-        model: &settings.chat_model,
-        override_tokens: settings.context_window_override,
-        registry_pinned: None,
-        catalog_context_length,
-        engine_reported: None,
-        capability_window: Some(state.agent.capabilities().context_window_tokens),
-    });
-
-    (
-        ModelClass::from_resolution(&settings.chat_provider, &resolution),
-        CompactionProfile::from_context_window(resolution.tokens),
-    )
-}
-
-/// PAI-4 P6 — act on `should_compact`, between turns rather than during one.
-///
-/// `should_compact` has been computed since long before PAI-4 and, until this
-/// phase, its only consumer in production was the `context_warning` SSE frame:
-/// the server told the client the window was filling and then did nothing about
-/// it. This is the server-side half. The frame is unchanged — the client still
-/// gets it, and it still fires on the same predicate.
-///
-/// **Where this runs is the whole design.** Invariant 1 says compaction never
-/// blocks a turn, ever, and the obvious implementation — doing the work at the
-/// point `should_compact` is read — breaks it, because that point is inside the
-/// SSE generator with the user watching a token stream and the `done` frame
-/// still unsent. So this function does nothing but `tokio::spawn`; every read,
-/// every gate and the model call itself happen in the detached task, after the
-/// stream that spawned it has been dropped.
-///
-/// **The claim is the rate limiter, and it is not optional.** `should_compact`
-/// is monotone in utilisation: past 75% it is true on every subsequent turn.
-/// `ContextMonitor::claim_compaction` is what turns that standing condition into
-/// at most one pass per [`COMPACTION_COOLDOWN_TURNS`](pond_core::models::services::context::context_monitor)
-/// turns, and it recomputes health under its own lock so two turns finishing at
-/// once cannot both be authorised by one snapshot.
-fn spawn_pressure_compaction(state: &Arc<AppState>, session_id: &str) {
-    let state = state.clone();
-    let session_id = session_id.to_string();
-    tokio::spawn(async move {
-        // Same switch the time axis reads. Hybrid compaction off means the
-        // trimmer and the summary are both off; acting here would resurrect
-        // half of a feature the user turned off.
-        let Ok(settings) = state.settings_repo.get().await else {
-            return;
-        };
-        if !settings.hybrid_compaction_enabled {
-            return;
-        }
-
-        // Claimed before the provider is read, because the claim is the cheap
-        // check and it is the one that fails most often.
-        if !state.context_monitor.claim_compaction(&session_id) {
-            return;
-        }
-
-        let Some(provider) = state.llm_provider.read().await.clone() else {
-            return;
-        };
-
-        if let Some(outcome) =
-            run_compaction_pass(&state, &session_id, &settings, provider, "pressure").await
-        {
-            // Only a refresh that actually persisted a new summary changed the
-            // shape of the history. `NothingToDo` and `Cancelled` left it
-            // exactly as it was, and telling the monitor otherwise would throw
-            // away a growth window for nothing.
-            if matches!(
-                outcome,
-                pond_core::shared::services::session_summary::RefreshOutcome::Refreshed { .. }
-            ) {
-                state.context_monitor.note_compacted(&session_id);
-            }
-        }
-    });
-}
-
-/// PAI-4 P4 — compact a session on resume, before its first turn back.
-///
-/// `docs/architecture/pai/04-smart-compaction.md` 3.2: a session reopened after
-/// a gap is about to pay a full prefill whatever happens, so reshaping its
-/// history now costs the user nothing. What it buys today is the rolling
-/// summary: the idle refresh loop in `pond-server` skips every session whose
-/// `updated_at` predates process start (its "never at startup" guard), so a
-/// conversation from before the last restart carries a summary that stops where
-/// it stopped — and the trimmer splices that stale summary into every turn until
-/// four new messages accumulate. Refreshing while the user is still reading the
-/// history closes that, and does it off the token stream.
-///
-/// Three properties this must have, and how each is obtained:
-///
-/// - **It never blocks the reopen** (invariant 1). Everything below, including
-///   the two database reads the gate needs, happens inside the spawned task, so
-///   `GET /sessions/:id/messages` returns at exactly the speed it did before.
-/// - **It is never triggered by a clock.** The gate's `reopened` input is the
-///   startup guard: at boot every stored session has a gap of days, and a rule
-///   that asked only about the gap would compact the whole store on startup.
-///   Only a request a person made sets it.
-/// - **A user turn reclaims the engine immediately.** The refresh races a
-///   watcher on `last_user_activity`, the same contract the idle summary loop
-///   uses; a cancelled refresh persists nothing.
-fn spawn_resume_compaction(
-    state: &Arc<AppState>,
-    session_id: &str,
-    offset: usize,
-    page_len: usize,
-) {
-    let state = state.clone();
-    let session_id = session_id.to_string();
-    tokio::spawn(async move {
-        use pond_core::models::services::context::resume_compaction as resume;
-
-        let Ok(settings) = state.settings_repo.get().await else {
-            return;
-        };
-        let Ok(session) = state.session_storage.get_session(&session_id).await else {
-            return;
-        };
-        let provider = state.llm_provider.read().await.clone();
-
-        let decision = resume::should_run(resume::ResumeGateInputs {
-            enabled: settings.hybrid_compaction_enabled,
-            // A page request with an offset is scroll-back through history the
-            // user is already reading, not a reopen.
-            reopened: offset == 0,
-            has_prior_history: page_len > 0,
-            idle_gap: resume::idle_gap_since(session.updated_at, chrono::Utc::now()),
-            idle_threshold: resume::idle_threshold_from_secs(settings.resume_compaction_idle_secs),
-            summariser_available: provider.is_some(),
-        });
-
-        if let resume::GateDecision::Skip(reason) = decision {
-            tracing::trace!(
-                target: "giap::trace",
-                kind = "resume_compaction_skipped",
-                session_id = %session_id,
-                reason = reason.as_str(),
-            );
-            return;
-        }
-        let Some(provider) = provider else { return };
-
-        // PAI-4 P6 moved the in-flight claim, the cancellation watcher and the
-        // refresh itself into `run_compaction_pass`, shared with the pressure
-        // axis. The gate above is what stays specific to a resume.
-        run_compaction_pass(&state, &session_id, &settings, provider, "resume").await;
-    });
-}
-
-/// Is a compaction pass already running for this session?
-///
-/// A read-only peek at [`COMPACTIONS_IN_FLIGHT`], for the one caller that has to
-/// *tell a person* why nothing happened. `run_compaction_pass` collapses "a pass
-/// was already running" and "the pass failed" into the same `None`, which is
-/// fine for the two spawned triggers — nobody is reading their return value —
-/// and useless on an endpoint whose entire job is to report. Peeking first makes
-/// the common case ("you pressed this a second after the turn that already
-/// triggered one") say so.
-///
-/// The peek is advisory and the claim inside `run_compaction_pass` is still the
-/// authority: a pass that starts between this read and that claim reports
-/// `failed` instead of `already_running`. That mislabels a benign race and
-/// changes nothing about what happened — no pass ran on this request either way.
-fn compaction_in_flight(session_id: &str) -> bool {
-    match COMPACTIONS_IN_FLIGHT.lock() {
-        Ok(g) => g.contains(session_id),
-        Err(poisoned) => poisoned.into_inner().contains(session_id),
-    }
 }
 
 /// The body every outcome of `POST /sessions/:id/compact` reports.
@@ -3923,8 +3591,6 @@ async fn compact_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    use pond_core::shared::services::session_summary::RefreshOutcome;
-
     state
         .session_storage
         .get_session(&session_id)
@@ -3960,17 +3626,15 @@ async fn compact_session(
             &health,
         ));
     }
-    if !settings.hybrid_compaction_enabled {
-        // The same switch the other two axes read first. Acting here would
-        // resurrect half of a feature the user turned off.
-        return Ok(compaction_report(
-            &session_id,
-            "skipped",
-            Some("compaction_disabled"),
-            None,
-            &health,
-        ));
-    }
+    // `hybrid_compaction_enabled` no longer gates this.
+    //
+    // It read "the same switch the other two axes read first", and those axes
+    // are gone — the press now asks the ENGINE to compact, and the engine
+    // compacts on its own threshold whatever this setting says. Refusing the
+    // button while automatic compaction carries on regardless would be
+    // arbitrary: the user would be told compaction is off while watching it
+    // happen. The setting's remaining job is the idle rolling summary, which is
+    // a retrieval artefact rather than a compaction axis.
     if !health.should_compact {
         return Ok(compaction_report(
             &session_id,
@@ -3981,66 +3645,33 @@ async fn compact_session(
         ));
     }
 
-    // The provider is read before the claim, which is the opposite order to
-    // `spawn_pressure_compaction`, and the difference matters here. There, the
-    // claim is read first because it is the cheap check and the one that fails
-    // most often. Here, a claim spent on a pass that then cannot run burns a
-    // cooldown counted in recorded turns — and a user pressing a button is very
-    // often not taking any turns, so the button would stay dead until they did.
-    let Some(provider) = state.llm_provider.read().await.clone() else {
-        return Ok(compaction_report(
-            &session_id,
-            "skipped",
-            Some("no_summariser"),
-            None,
-            &health,
-        ));
-    };
-    if compaction_in_flight(&session_id) {
-        return Ok(compaction_report(
-            &session_id,
-            "skipped",
-            Some("already_running"),
-            None,
-            &health,
-        ));
-    }
-    if !state.context_monitor.claim_manual_compaction(&session_id) {
-        // The manual claim skips the cooldown, so the ONLY way it refuses after
-        // the `should_compact` read above is that a turn completed in between
-        // and took the session back under the threshold, or that the session
-        // left the monitor's map entirely. `cooling_down` was the label here
-        // before P7b-fix and would now be a lie; `not_under_pressure` is what
-        // the claim actually decided, and it is the same sentence the branch
-        // above reports for the same condition.
-        return Ok(compaction_report(
-            &session_id,
-            "skipped",
-            Some("not_under_pressure"),
-            None,
-            &health,
-        ));
-    }
-
-    let outcome = run_compaction_pass(&state, &session_id, &settings, provider, "manual").await;
-
-    let (status, reason, outcome_label) = match outcome {
-        // Same rule as the pressure axis: only a refresh that actually persisted
-        // a new summary changed the shape of the history, so only that one is
-        // allowed to throw away the growth window.
-        Some(RefreshOutcome::Refreshed { .. }) => {
+    // C4: the press goes to the ENGINE now.
+    //
+    // GIAP used to own this: claim a slot, spawn an activity watcher, run its
+    // own summariser, release. Since C1 the engine owns context management, so
+    // the button asks it to compact rather than doing a second, different kind
+    // of compaction beside it. `Agent::compact_session` calls goose's own
+    // `compact_messages` with `manual_compact: true`.
+    //
+    // The in-flight claim, the cooldown and the activity watcher went with the
+    // GIAP-side pass. goose serialises its own compaction per session, and the
+    // press is explicit — a user who presses twice means it.
+    let (status, reason, outcome_label) = match state.agent.compact_session(&session_id).await {
+        Ok(Some(_retained)) => {
             state.context_monitor.note_compacted(&session_id);
             ("compacted", None, Some("refreshed"))
         }
-        Some(RefreshOutcome::NothingToDo) => (
+        // The backend has no manual compaction, or the session had nothing to
+        // compact. Reported as skipped rather than as success.
+        Ok(None) => (
             "skipped",
             Some("nothing_to_summarise"),
             Some("nothing_to_do"),
         ),
-        Some(RefreshOutcome::Cancelled) => {
-            ("skipped", Some("preempted_by_turn"), Some("cancelled"))
+        Err(e) => {
+            tracing::warn!("manual compaction failed for {session_id}: {e}");
+            ("skipped", Some("failed"), None)
         }
-        None => ("skipped", Some("failed"), None),
     };
 
     // Re-read: `note_compacted` drops the growth samples, so a compacted session
@@ -11150,6 +10781,7 @@ async fn agent_chat_stream(
             profile_scope: turn_scope.clone(),
             profile_context: profile_context_for(&state, &turn_scope).await,
             tool_group_allowlist: None,
+            warmup: false,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {
@@ -13785,8 +13417,12 @@ fn recipe_extension_to_tool_group(name: &str) -> Option<&'static str> {
         "schedule" | "scheduler" => Some("giap-schedule"),
         "memory" => Some("giap-memory"),
         "device" | "developer" => Some("giap-device"),
-        "matter" | "home" => Some("giap-matter"),
-        "vision" => Some("giap-vision"),
+        // Home actuation is `giap-device-control`. This said `giap-matter` for
+        // as long as the mapping has existed, and `giap-matter` is the name of
+        // the matter.js WEBSOCKET PROTOCOL (`pond-adapters-matter`), never a
+        // tool group -- so a `home` recipe narrowed to a group no tool belongs
+        // to and ran with no tools at all.
+        "matter" | "home" => Some("giap-device-control"),
         _ => None,
     }
 }
@@ -17228,13 +16864,10 @@ mod tests {
 
     /// The tools this path must never expose. Each one decides on the caller's behalf, executes,
     /// or reads household data, and the direct-dispatch routes carry no caller identity to check
-    /// it against. `approve_draft` is the sharpest: the confirmation step `save_draft` forces.
+    /// it against. `giap-orchestrator__delegate` is now the sharpest; the two `giap-draft` entries
+    /// that used to head this list went with their group, and an entry naming a tool that no
+    /// longer exists asserts nothing.
     const MUST_NEVER_BE_DIRECTLY_DISPATCHABLE: &[&str] = &[
-        "giap-draft__approve_draft",
-        "giap-draft__reject_draft",
-        "giap-system__run_shell_command",
-        "giap-system__read_file",
-        "giap-system__write_file",
         "giap-memory__recall_memories",
         "giap-memory__save_memory",
         "giap-schedule__create_schedule",
@@ -18352,5 +17985,57 @@ mod tests {
              equivalent and the writer contract is no longer pinned by anything"
         );
         assert!(!ctx.atypical_speech);
+    }
+
+    /// Every group `recipe_extension_to_tool_group` can name must be a group
+    /// that exists.
+    ///
+    /// A mapping to a non-existent group is worse than no mapping at all. The
+    /// name is RECOGNISED, so it is not dropped with the warning the function's
+    /// doc promises; it goes into `tool_group_allowlist`, and the filter in
+    /// `goose_agent`'s recipe branch then keeps the tools whose prefix matches
+    /// it -- of which there are none. The recipe runs with zero tools and the
+    /// only trace is a `recipe_tools_restricted` line saying `kept = 0`.
+    ///
+    /// Two mappings were in that state: `giap-vision`, whose group was deleted,
+    /// and `giap-matter`, which was never a tool group at all -- it is the
+    /// matter.js websocket protocol name.
+    #[test]
+    fn every_recipe_extension_maps_to_a_tool_group_that_exists() {
+        // The goose-side names this function is willing to translate. Kept
+        // literal rather than derived: the point is to exercise the match arms.
+        const RECIPE_EXTENSION_NAMES: &[&str] = &[
+            "weather",
+            "schedule",
+            "scheduler",
+            "memory",
+            "device",
+            "developer",
+            "matter",
+            "home",
+        ];
+
+        let mut mapped = 0usize;
+        for name in RECIPE_EXTENSION_NAMES {
+            let Some(group) = recipe_extension_to_tool_group(name) else {
+                panic!(
+                    "'{name}' is in this test's list but maps to nothing -- either the arm was                      removed on purpose, in which case drop it from the list, or by accident"
+                );
+            };
+            mapped += 1;
+            assert!(
+                pond_core::mcp::domain::tool_group::is_catalog_extension(group),
+                "recipe extension '{name}' maps to '{group}', which is not in TOOL_GROUPS. A                  recipe declaring `extensions: [{name}]` will narrow to that group, match no                  tool, and run with none."
+            );
+        }
+
+        // Vacuity control: if the arms were renamed, every lookup would return
+        // None and the loop above would panic -- but if the list were emptied,
+        // it would pass having asserted nothing.
+        assert_eq!(
+            mapped,
+            RECIPE_EXTENSION_NAMES.len(),
+            "the mapping list is not exercising the match arms"
+        );
     }
 }

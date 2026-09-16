@@ -25,11 +25,16 @@
 //!
 //! # The reviewer cannot write its own proposal, and that shapes everything
 //!
-//! PAI-6's `groups_denied_to_subagents` withholds `giap-draft` from every
-//! child, because the draft decision gate cannot resolve a subagent as an
-//! actor. A proposal is a `drafts` row. So the reviewer **cannot stage one**,
-//! and no amount of role configuration would let it: the group is subtracted
-//! after the role's request, not from it.
+//! PAI-6's `groups_denied_to_subagents` withholds the actuating groups from every
+//! child, because nothing in a subagent's turn can resolve it as an actor with
+//! the household's authority. So the reviewer **cannot act**, and no amount of
+//! role configuration would let it: the groups are subtracted after the role's
+//! request, not from it.
+//!
+//! This paragraph used to argue the point through `giap-draft`, the staging
+//! group — a proposal was a `drafts` row and the child could not write one.
+//! That group is gone; the property is unchanged and now rests directly on the
+//! actuating groups, which is what it always actually rested on.
 //!
 //! That is not a limitation to work around — it is the safety property. The
 //! subagent produces *words*; the loop that spawned it — which holds the
@@ -105,7 +110,6 @@ giap_role:
     - giap-memory
     - giap-device
     - giap-sensors
-    - giap-vision
     - giap-weather
   personal_data: inherit
   max_turns: 4
@@ -169,7 +173,6 @@ pub const PROACTIVE_ROOT_GROUPS: &[&str] = &[
     "giap-memory",
     "giap-device",
     "giap-sensors",
-    "giap-vision",
     "giap-weather",
     "giap-knowledge",
 ];
@@ -729,7 +732,7 @@ impl ReviewYield {
 /// Turn a finished run's answer into proposals.
 ///
 /// **This is the writer the subagent cannot be.** See the module docs: a child
-/// may not hold `giap-draft`, so the words come from the model and every fact
+/// holds no actuating group, so the words come from the model and every fact
 /// about the resulting row comes from here — the audience, the id, the expiry,
 /// the action kind and the cap.
 ///
@@ -1003,14 +1006,10 @@ impl FeedbackLedger {
 /// direction — a list of names with the reason each one would turn a proposer
 /// into an actor.
 #[cfg(test)]
-const GROUPS_A_PROPOSER_MAY_NOT_HOLD: [(&str, &str); 6] = [
+const GROUPS_A_PROPOSER_MAY_NOT_HOLD: [(&str, &str); 5] = [
     (
         "giap-device-control",
         "actuates the house, which is the one thing a proposal exists to ask permission for",
-    ),
-    (
-        "giap-draft",
-        "decides staged actions, and the gate that checks who decided cannot see a subagent",
     ),
     (
         "giap-schedule",
@@ -1019,8 +1018,8 @@ const GROUPS_A_PROPOSER_MAY_NOT_HOLD: [(&str, &str); 6] = [
     ),
     (
         "giap-system",
-        "write_file, run_shell_command and send_notification: a proposer that can notify has \
-         skipped the member entirely",
+        "send_notification: a proposer that can notify has skipped the member entirely (the \
+         file and shell tools this also covered were removed on 2026-09-10)",
     ),
     (
         "giap-toolkit",
@@ -1620,7 +1619,6 @@ mod tests {
         assert!(out.refusals.is_empty(), "silence is a valid review");
     }
 
-    #[test]
     /// A balanced pair inside a string proves nothing about the string
     /// tracking — the depth goes up and comes back down, so a scanner that
     /// cannot see strings gets the same answer. Verified by mutation: deleting

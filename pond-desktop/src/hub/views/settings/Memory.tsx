@@ -261,10 +261,8 @@ export function MemoryDetail({ go }: MemoryDetailProps) {
       setMems(active);
       if (settings != null) {
         setCompactionEnabled(
-          (settings as Record<string, unknown>).memory_consolidation_enabled === true,
+          settings.memory_consolidation_enabled === true,
         );
-        // `embedding_provider` is on the Settings type, so no cast is needed here
-        // (and adding one introduces a TS2352 the untyped sibling above already has).
         if (settings.embedding_provider) {
           setEmbeddingProvider(settings.embedding_provider);
         }

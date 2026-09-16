@@ -94,6 +94,7 @@ mod tests {
             profile_scope: crate::user_data::domain::profile::ProfileScope::Household,
             profile_context: None,
             tool_group_allowlist: None,
+            warmup: false,
         };
         let response = agent.chat(request).await.unwrap();
         assert_eq!(response.text, "Echo: Hello, Pond!");
@@ -113,6 +114,7 @@ mod tests {
             profile_scope: crate::user_data::domain::profile::ProfileScope::Household,
             profile_context: None,
             tool_group_allowlist: None,
+            warmup: false,
         };
         let mut stream = agent.chat_stream(request).await.unwrap();
 

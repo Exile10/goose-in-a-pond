@@ -465,10 +465,11 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   denylist is a real catalog extension, because a typo there is invisible in exactly the same way —
   the filter would simply never match, and the denial would look present while protecting nothing.
 
-  `groups_denied_to_guests()` in `mcp/domain/tool_group.rs` names them: `giap-memory`, `giap-draft`,
-  `giap-audit`, `giap-vision`, `giap-sensors`. The adapter subtracts them **after** `select_groups`,
-  because `giap-memory` and `giap-draft` are `core` and selection puts core groups back
-  unconditionally -- filtering the candidates going in would not stick.
+  `groups_denied_to_guests()` in `mcp/domain/tool_group.rs` names them; read the list there rather
+  than from here. `giap-draft`, `giap-audit` and `giap-vision` were on it until those groups were
+  deleted on 2026-09-10. The adapter subtracts them **after** `select_groups`, because `giap-memory`
+  is `core` and selection puts core groups back unconditionally -- filtering the candidates going in
+  would not stick.
 
   This is the layer that actually closes the MCP hole. Suppressing memory injection stops a guest
   being *told* anything; removing the tools stops the model being *able* to look. `recall_memories`

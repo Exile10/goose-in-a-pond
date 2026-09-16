@@ -18,7 +18,8 @@ license.workspace = true
 [features]
 default = []
 # Enable CUDA kernel compilation for Jetson Orin Nano / NVIDIA GPUs.
-cuda = ["llama-cpp-2/cuda"]
+# Same VMM reservation problem as goose-local-inference; keep the two in step.
+cuda = ["llama-cpp-2/cuda-no-vmm"]
 
 [dependencies]
 pond-core     = { workspace = true }

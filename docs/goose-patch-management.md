@@ -30,6 +30,30 @@ history, carrying:
 | model-config failures name the session and the keys | "Could not resolve model config: missing provider" named neither which session had no stored config nor which global key was consulted, so an embedder whose own provider wiring had silently not run got an engine-internal string and no way to tell which knob was at fault. Both resolution sites (Agent reply and the platform-extensions tool-call side) now name the session id, the resolved-or-missing provider and the exact keys (GOOSE_PROVIDER / GOOSE_MODEL / goose config), in deliberately identical wording so one failure cannot read as two. Parent-side companion: pond PR #303 (session rows always written or the turn refused; GOOSE_PROVIDER exported as backstop; errored turns not re-engaged). Upstreamable. Commit `6a12584af` (cherry-picked from `b1eb61792`). | `crates/goose/src/agents/agent.rs`, `crates/goose/src/agents/platform_extensions/mod.rs` |
 | llama.cpp KV cache type + physical batch | `ModelSettings` gains `type_k`/`type_v` (ggml type names, e.g. `"q8_0"`) and `n_ubatch`, wired into `build_context_params`. Upstream exposes `n_batch` but not the PHYSICAL batch, and no KV cache type at all, so neither of the two memory levers that measured as free on an 8 GB Orin was reachable from a host. Measured on gemma-4 E4B at ctx 16384 (M4/Metal, deterministic allocation, reproducible to +/-1 MiB across five runs): KV 296 -> 157 MiB and peak process footprint 437 -> 307 MB at `q8_0`; compute buffer 522 -> 129 MiB at `n_ubatch = 128` with decode unchanged (Orin sm_87: 14.4 vs 14.3 tok/s, prefill 38.3 vs 35.6). `q8_0` is quality-neutral by two independent tests -- greedy output BYTE-IDENTICAL to f16, and a paired per-chunk wikitext-2 run (n = 100, E2B Q4_K_M) giving dNLL -0.000987 +/- 0.000551, t = -1.79, i.e. indistinguishable from f16 at 95%. `q4_0` is accepted but deliberately not used: t = 0.35 on the mean, but 6.4x the per-chunk variance, so its average hides swings. `q5_1` measured WORSE than `q4_0` (t = 3.87) which is implausible on bit-count grounds and is most likely a flash-attention kernel path -- unverified, so treat that one as avoid-not-explained. A quantised V cache requires flash attention; that is checked and warned rather than left to fail opaquely at context creation. Additive and serde-default throughout, including the SDK DTO and BOTH `management.rs` mapping sites, so a settings round-trip cannot silently drop them. Upstreamable. | `crates/goose-local-inference/src/local_model_registry.rs`, `crates/goose-local-inference/src/llamacpp/inference_engine.rs`, `crates/goose-local-inference/src/management.rs`, `crates/goose-sdk-types/src/custom_requests.rs` |
 | builtin spawn panic is contained to its extension | `extension_fn(reader, writer)` runs synchronously inside the extension-loading future, so a panicking spawn fn unwound the loader while sibling builtins were mid-initialize -- their duplex peers dropped and every builtin reported broken-pipe/Closed. Observed 2026-08-27 in the voice child: one uninitialised `OnceLock` in giap-context's spawn fn (`init_context_deps() not called`) killed all fourteen builtin servers for the process, presenting as a total tool outage. `catch_unwind(AssertUnwindSafe(..))` around the call converts a startup panic into that extension's own `ConfigError`; the parent separately stopped its spawn fns panicking at all (the eleven remaining `.expect("init_*_deps")` sites now log-and-return, the pattern giap-sensors already used), so this is the belt for spawn fns that panic for any other reason. Upstreamable -- not GIAP-specific. Commit `9a91cbf42`. | `crates/goose/src/agents/extension_manager.rs` |
+| MOIM reaches the hardware GIAP ships to | `MIN_CONTEXT_FOR_MOIM` 32,000 -> 4,096. Goose injects `<turn-context>` into the last user message every turn -- current time, working directory, tokens remaining, turn budget, plus whatever the `todo` and `tom` extensions contribute -- and it is the only mechanism either side has for an instruction that survives compaction. The gate reads the MODEL's context limit (`get_context_limit`, falling back to `ModelConfig::context_limit`), NOT the host's prompt budget, and that is the detail that decides whether it fires: an Orin Nano running gemma-4 E2B/E4B has a 16,384 window, so upstream's 32,000 skipped the whole mechanism on the hardware GIAP ships to, while a Mac dev box at 32,768 had it on the whole time -- which is exactly why nobody noticed. Do not try to reproduce the difference locally without pinning the context limit. 4,096 is the smallest window GIAP's budget curve has an anchor for (`context_budget::PROFILE_ANCHORS`), keeping a floor below which the block's own ~60 tokens would be a meaningful fraction of the prompt. **Needs its parent-side half or it does nothing**, and the converse: GIAP's provider shim used to delete every `<turn-context>` before the provider saw it (`strip_turn_context`), so lowering this alone would have composed a block the shim then deleted, and un-stripping alone would have deleted a block that was never composed. The shim half landed in parent `47b6346f`; `strip_turn_context` is deliberately kept and still tested there as the lever to pull if the block costs more in KV churn than it returns. No stale-block problem, checked rather than assumed: `inject_moim` works on `conversation.clone()` (`agent.rs:2093`) and the result is used for that provider call only, so the stored conversation never accumulates injections. The cost is real and worth carrying: the block holds a minute-resolution timestamp and sits in the LAST user message, so the prompt TAIL changes every turn. It does not move the static prefix -- system prompt and tools sort before it, confirmed from a captured payload pair (`GIAP_CAPTURE_PAYLOAD`) -- but `goose-providers::is_turn_context_text` exists upstream so Anthropic's cache can exclude the block, and the local llama.cpp path has no equivalent exclusion. **Not upstreamable as written**: lowering a constant changes behaviour for every upstream host. The upstreamable shape is an env override (`GOOSE_MIN_CONTEXT_FOR_MOIM`) defaulting to 32,000, which is how `GOOSE_MAX_EMPTY_TURN_RETRIES` was handled in the thinking-only-turns row above. | `crates/goose/src/agents/moim.rs` |
+
+### Divergences NOT in the table above — recorded 2026-09-11
+
+Found by reading the tree against `origin/main` rather than the table. An
+undocumented patch is one that gets dropped at the next sync, which is what this
+document exists to prevent — so these are listed even where the right answer is
+"delete it".
+
+| Divergence | Where | Disposition |
+|---|---|---|
+| **The whole MTP / speculative-decoding line** — a new `llamacpp/mtp.rs`, `SessionCtx`, drafter loading, `draft_n_max`/`draft_p_min`, `cuda-no-vmm`, and a dependency-graph change (`llama-cpp-2` `=0.1.146` → `=0.1.156` + `common`, patched to a private fork rev) | `crates/goose-local-inference/**`, both `Cargo.toml`s | **The largest divergence in the fork and it was unrecorded.** 8 commits on `feat/llama-cpp-2-0.1.156-oai-fork`. Recorded as shipped at ~1.8x on the Orin — but see the caveat below. Needs a row of its own once the fast-forward lands |
+| `crates/goose/src/prompts/giap_system.md` | goose crate | **Delete.** GIAP branding committed into a crate this table calls upstreamable, referenced by nothing, and dead by construction — it is absent from `TEMPLATE_REGISTRY`, so `render_template` returns `TemplateNotFound`. It was never needed: `render_template` already prefers `Paths::config_dir()/prompts/<name>`, so a host overrides any registered template with no patch at all |
+| Four `.snap.new` insta artifacts, three under a stray nested `goose/goose/` tree | `crates/goose/src/agents/snapshots/` | **Delete.** `.snap.new` is insta's *failure* output. They are also stale fossils — they say "created by Block, the parent company of Square" against current snapshots saying "created by AAIF" — so they carry no signal and will mask the next real snapshot change |
+| `mcp_client.rs:208` — upstream's cross-session `assert!` downgraded to `tracing::debug!` + overwrite | `crates/goose/src/agents/mcp_client.rs` | **Decide.** A relaxed concurrency invariant. It predates the side branch and sits on both fork branches, so it is not new — it is simply undocumented |
+
+**A measurement caveat worth carrying with the MTP row.** `mtp.rs` records
+"47.7 tok/s against 15.8, 87% draft acceptance". The only file in the repo
+carrying `draft_n_accepted` is `c2-mtp.json` from the 2026-09-08 bake-off, whose
+runtime is `llama-server` — **the sidecar, not the in-process path these commits
+built.** Both llama.cpp generate paths hardcode `draft: None` in `ProviderStats`
+(`inference_native_tools.rs`, `inference_emulated_tools.rs`) while `MtpSession`
+accumulates the counters, so the in-process acceptance rate has never been
+observed. Carry the feature; do not carry the number.
 
 ### Patches subsumed by upstream (dropped in the 2026-07 sync)
 
@@ -63,6 +87,25 @@ The parent repo (`goose-in-a-pond`) pins the submodule to the tip of
 `jarida-io/Goose:main`. `.gitmodules` names the branch, and
 `.github/workflows/ci.yml` clones that branch's HEAD directly (bypassing the
 stored submodule SHA).
+
+> **That is not true today, 2026-09-11.** The parent pins `d43cd702c`, which is on
+> `feat/llama-cpp-2-0.1.156-oai-fork` — **8 ahead of fork `main`, 0 behind**. The
+> breaking-sync procedure directly below was followed up to its last step and then
+> stopped: the side branch exists, the parent-side port landed (`Cargo.toml` pins
+> `llama-cpp-2 =0.1.156` and patches it to `jarida-io/llama-cpp-rs-giap` rev
+> `ad6e4b85`, which declares 0.1.156), but the fast-forward into fork `main` never
+> happened.
+>
+> Consequences, both live: fork `main` still asks for `=0.1.146`, which that patch
+> **cannot satisfy**, so a CI run resolves a graph no shipping build uses — and
+> `cargo check` never links, so it passes. And the side branch carries
+> `cuda = ["llama-cpp-2/cuda-no-vmm"]`, the flag that fixed a shipped Jetson OOM,
+> while fork `main` has plain `cuda`; `.gitmodules` `branch = main` means
+> `git submodule update --remote` walks back onto the broken one.
+>
+> The fix is the missing step: fast-forward fork `main` to `d43cd702c` (clean, 0
+> behind). Until then, treat every green CI run as evidence about a goose nobody
+> ships. `--locked` was added to every CI cargo step so the mismatch fails loudly.
 
 **Stage breaking syncs on a side branch.** CI clones the fork branch tip by
 name, so moving `main` underneath parent branches whose code still targets the

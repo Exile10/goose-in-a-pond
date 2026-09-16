@@ -22,7 +22,7 @@ bash scripts/jetson.sh <command>
 | Command | Where it runs | What it does |
 |---|---|---|
 | `deploy` | dev machine | One-command deploy: reset the nano's checkout to `origin/<branch>`, build the web UI locally (nano's Node is too old for Vite), rsync `dist/`, release-build with CUDA on the device, restart the user service, health-check. |
-| `build [--cuda] [--desktop]` | ON the Jetson | Native build. `--cuda` enables GPU inference (sm_87) — GPU builds MUST be on-device (nvcc + JetPack must match). `--desktop` adds the Tauri app. |
+| `build [--cuda]` | ON the Jetson | Native build. `--cuda` enables GPU inference (sm_87) — GPU builds MUST be on-device (nvcc + JetPack must match). |
 | `docker-build [--full]` | dev machine (arm64) | CPU-only aarch64 binary via a native `linux/arm64` container (no cross/qemu on Apple Silicon). No CUDA possible here. |
 | `optimize` | ON the Jetson | The llama.cpp optimization suite (`llama-optimization/`): deps, perf mode (max clocks), CUDA sm_87 llama.cpp build, model download, benchmark, services. |
 | `probe-mlc [--keep]` | ON the Jetson | Experiment: MLC-LLM serve + tool-call quality probe. |

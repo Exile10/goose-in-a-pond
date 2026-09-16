@@ -48,9 +48,8 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use crate::knowledge::{clean_query_for_search, KnowledgeMcpServer};
 
@@ -78,7 +77,6 @@ const MAX_EXPLORE: usize = 6;
 /// for a session: an id from twenty tool calls ago is not one the model is
 /// still reasoning about, and the explicit `query` + `assumption` form is the
 /// recovery path when an id has aged out.
-const EXPLORE_RING: usize = 32;
 
 /// One call to the Full Results API.
 ///
@@ -173,7 +171,6 @@ pub struct ExploreOption {
 }
 
 /// Suggestions, tagged with the engine session that was offered them.
-static EXPLORE_RING_STORE: Mutex<VecDeque<(String, ExploreOption)>> = Mutex::new(VecDeque::new());
 static NEXT_EXPLORE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Assign ids to a batch of suggestions and make them resolvable by id, for one
@@ -191,38 +188,22 @@ static NEXT_EXPLORE_ID: AtomicU64 = AtomicU64::new(1);
 /// alternative is one shared bucket for every unattributed caller.
 ///
 /// Ids are process-monotonic rather than per-result (`w1` every time) on
-/// purpose: reusing `w1` for a different suggestion means a model that echoes a
-/// stale id from earlier in the conversation silently opens the wrong thing.
-fn remember(session: Option<&str>, mut options: Vec<ExploreOption>) -> Vec<ExploreOption> {
-    let Some(session) = session else {
+/// purpose: reusing `w1` for a different suggestion means a stale id from
+/// earlier in the conversation points at something else.
+///
+/// They are now only a stable list key for the UI card. Nothing resolves one
+/// back to a suggestion: `explore_computation` was the reader and is gone, so
+/// a follow-up re-asks `compute_answer` with the suggestion's own wording
+/// instead of naming an id.
+fn with_ids(session: Option<&str>, mut options: Vec<ExploreOption>) -> Vec<ExploreOption> {
+    if session.is_none() {
         return Vec::new();
-    };
-    let Ok(mut ring) = EXPLORE_RING_STORE.lock() else {
-        // A poisoned lock costs the openers, not the answer.
-        tracing::warn!("wolfram explore ring poisoned; suggestions will not be addressable by id");
-        return Vec::new();
-    };
+    }
     for opt in &mut options {
         let n = NEXT_EXPLORE_ID.fetch_add(1, Ordering::Relaxed);
         opt.id = format!("w{n}");
-        ring.push_back((session.to_string(), opt.clone()));
-        while ring.len() > EXPLORE_RING {
-            ring.pop_front();
-        }
     }
     options
-}
-
-/// Resolve a suggestion id within one session. `None` when it never existed,
-/// has aged out, or belongs to a different session.
-fn recall(session: Option<&str>, id: &str) -> Option<ExploreOption> {
-    let session = session?;
-    let wanted = id.trim().trim_start_matches('[').trim_end_matches(']');
-    let ring = EXPLORE_RING_STORE.lock().ok()?;
-    ring.iter()
-        .rev()
-        .find(|(owner, o)| owner == session && o.id.eq_ignore_ascii_case(wanted))
-        .map(|(_, o)| o.clone())
 }
 
 // ── Tools ──────────────────────────────────────────────────────────────────
@@ -267,73 +248,6 @@ currency conversion, dates, statistics, science and geography data.")]
             session.as_deref(),
         )
         .await
-    }
-
-    #[tool(description = "\
-Open a suggestion from the previous compute_answer (another interpretation or \
-unshown section). Pass the id exactly as printed, e.g. \"w3\".")]
-    async fn explore_computation(
-        &self,
-        ctx: RequestContext<RoleServer>,
-        params: Parameters<ExploreParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        crate::set_current_tool("explore_computation");
-        eprintln!(
-            "[wolfram] explore_computation called: id={:?} query={:?}",
-            params.0.id, params.0.query
-        );
-
-        let Some(app_id) = app_id().await else {
-            return Ok(text_result(&crate::format::format_not_configured(
-                "Wolfram|Alpha",
-                WOLFRAM_SIGNUP_URL,
-            )));
-        };
-
-        let session = crate::session_from_meta(&ctx.meta);
-        match resolve_explore_target(&params.0, session.as_deref()) {
-            ExploreTarget::Known(opt) => {
-                eprintln!("[wolfram] exploring {} ({})", opt.id, opt.label);
-                self.run_wolfram(
-                    WolframQuery {
-                        base: WOLFRAM_QUERY_BASE,
-                        app_id: &app_id,
-                        input: &opt.query,
-                        assumption: opt.assumption.as_deref(),
-                        pod_id: opt.pod_id.as_deref(),
-                    },
-                    session.as_deref(),
-                )
-                .await
-            }
-            ExploreTarget::Explicit { query, assumption } => {
-                self.run_wolfram(
-                    WolframQuery {
-                        base: WOLFRAM_QUERY_BASE,
-                        app_id: &app_id,
-                        input: &query,
-                        assumption: assumption.as_deref(),
-                        pod_id: None,
-                    },
-                    session.as_deref(),
-                )
-                .await
-            }
-            ExploreTarget::UnknownId(id) => {
-                // Not an error: the model can recover, and saying how is the
-                // difference between a retry and an apology.
-                eprintln!("[wolfram] unknown explore id {id:?}");
-                Ok(text_result(&format!(
-                    "No suggestion with id '{id}' is available any more. This is NOT the \
-                     answer — call giap-knowledge__compute_answer with the original \
-                     question to get a fresh set of suggestions, then use one of those ids."
-                )))
-            }
-            ExploreTarget::Nothing => Ok(text_result(
-                "I need the id of a suggestion to open, such as 'w3'. Retry with an \
-                 'id' parameter, or pass 'query' and 'assumption' together.",
-            )),
-        }
     }
 }
 
@@ -470,14 +384,14 @@ pub fn render_query_result(body: &Value, query: &str, session: Option<&str>) -> 
         // Wolfram understood nothing. Its own "did you mean" is the best next
         // step it can offer; after that the question is not a computation and
         // belongs to Wikipedia.
-        let suggestions = remember(session, parse_didyoumeans(qr, query));
+        let suggestions = with_ids(session, parse_didyoumeans(qr, query));
         if !suggestions.is_empty() {
             let body_text = format!(
                 "Wolfram|Alpha could not interpret '{}'. This is NOT the answer. It \
                  suggests these readings instead — call \
-                 giap-knowledge__explore_computation with one of these ids, or \
-                 giap-knowledge__get_wikipedia_article if none of them is what the \
-                 user meant.\n\n{}",
+                 giap-knowledge__compute_answer again with one of them, worded \
+                 exactly as written, or giap-knowledge__get_wikipedia_article if \
+                 none of them is what the user meant.\n\n{}",
                 query,
                 render_explore_lines(&suggestions),
             );
@@ -506,13 +420,14 @@ pub fn render_query_result(body: &Value, query: &str, session: Option<&str>) -> 
         pod_id: Some(pod.id.clone()),
     }));
     options.truncate(MAX_EXPLORE);
-    let options = remember(session, options);
+    let options = with_ids(session, options);
 
     let mut body_text = crate::format::truncate_to_budget(&lines.join("\n"), WOLFRAM_BUDGET);
     if !options.is_empty() {
         body_text.push_str(&format!(
             "\n\nMore is available. To open one, call \
-             giap-knowledge__explore_computation with its id:\n{}",
+             giap-knowledge__compute_answer again with it, worded exactly as \
+             written:\n{}",
             render_explore_lines(&options),
         ));
     }
@@ -524,7 +439,7 @@ pub fn render_query_result(body: &Value, query: &str, session: Option<&str>) -> 
 fn render_explore_lines(options: &[ExploreOption]) -> String {
     options
         .iter()
-        .map(|o| format!("- [{}] {} {}", o.id, o.kind.verb(), o.label))
+        .map(|o| format!("- {} {}: \"{}\"", o.kind.verb(), o.label, o.query))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -734,53 +649,6 @@ pub enum ExploreTarget {
     Nothing,
 }
 
-fn resolve_explore_target(params: &ExploreParams, session: Option<&str>) -> ExploreTarget {
-    let id = params
-        .id
-        .as_deref()
-        .or_else(|| params.extra.get("suggestion").and_then(|v| v.as_str()))
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    if let Some(id) = id {
-        return match recall(session, id) {
-            Some(opt) => ExploreTarget::Known(Box::new(opt)),
-            // An id we do not know, but an explicit query alongside it is still
-            // actionable — prefer answering over correcting.
-            None => match params
-                .query
-                .as_deref()
-                .map(str::trim)
-                .filter(|q| !q.is_empty())
-            {
-                Some(q) => ExploreTarget::Explicit {
-                    query: q.to_string(),
-                    assumption: params.assumption.clone(),
-                },
-                None => ExploreTarget::UnknownId(id.to_string()),
-            },
-        };
-    }
-
-    match params
-        .query
-        .as_deref()
-        .map(str::trim)
-        .filter(|q| !q.is_empty())
-    {
-        Some(q) => ExploreTarget::Explicit {
-            query: q.to_string(),
-            assumption: params
-                .assumption
-                .as_deref()
-                .map(str::trim)
-                .filter(|a| !a.is_empty())
-                .map(str::to_string),
-        },
-        None => ExploreTarget::Nothing,
-    }
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -878,47 +746,6 @@ mod tests {
         assert_eq!(parse_assumptions(&object_form, "q").len(), 1);
     }
 
-    // ── Offering and opening suggestions ──────────────────────────────────
-
-    #[test]
-    fn an_assumption_becomes_an_addressable_suggestion() {
-        let session = Some("s-assume");
-        let out = render_query_result(&mercury_payload(), "mercury", session);
-
-        // The reading Wolfram already used is values[0]; offering it back would
-        // be offering to re-run the same query.
-        assert!(!out.contains("a planet\n"), "got: {out}");
-        assert!(out.contains("a chemical element"), "got: {out}");
-        assert!(out.contains("interpret as"), "got: {out}");
-
-        // And the offered id must resolve to the assumption code, which is the
-        // whole reason the model is given "w1" instead of "*C.mercury-_*Element-".
-        let opt = recall(session, &first_id(&out)).expect("offered id must resolve");
-        assert_eq!(opt.assumption.as_deref(), Some("*C.mercury-_*Element-"));
-        assert_eq!(opt.query, "mercury");
-    }
-
-    #[test]
-    fn pods_beyond_the_budget_become_suggestions_instead_of_being_dropped() {
-        let session = Some("s-pods");
-        let pods: Vec<Value> = (0..8)
-            .map(|i| {
-                json!({"id": format!("P{i}"), "title": format!("Section {i}"),
-                            "subpods": [{"plaintext": format!("body {i}")}]})
-            })
-            .collect();
-        let out = render_query_result(&json!({"queryresult": {"pods": pods}}), "q", session);
-
-        assert!(out.contains("Section 4"), "5 pods shown: {out}");
-        // Pod 5 is past MAX_PODS, so it must appear as an opener rather than
-        // vanishing — silently truncating is the failure this guards.
-        assert!(out.contains("show section Section 5"), "got: {out}");
-        assert_eq!(
-            recall(session, &first_id(&out)).unwrap().pod_id.as_deref(),
-            Some("P5")
-        );
-    }
-
     #[test]
     fn an_uninterpretable_query_offers_wolframs_own_rewording() {
         let session = Some("s-dym");
@@ -928,10 +755,14 @@ mod tests {
         }});
         let out = render_query_result(&body, "integrat x2", session);
         assert!(out.contains("ask instead"), "got: {out}");
-        let opt = recall(session, &first_id(&out)).unwrap();
-        // A "did you mean" replaces the question rather than refining it.
-        assert_eq!(opt.query, "integrate x^2");
-        assert_eq!(opt.assumption, None);
+        // A "did you mean" replaces the question rather than refining it, and
+        // the replacement has to be IN the text: with no id to resolve, the
+        // wording is the only thing the model can act on.
+        assert!(out.contains("integrate x^2"), "got: {out}");
+        assert!(
+            out.contains("giap-knowledge__compute_answer"),
+            "the reader must be told which tool to re-ask with; got: {out}"
+        );
     }
 
     #[test]
@@ -946,54 +777,6 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_never_reused_across_results() {
-        let session = Some("s-reuse");
-        let first = render_query_result(&mercury_payload(), "mercury", session);
-        let second = render_query_result(&mercury_payload(), "mercury", session);
-        let (a, b) = (first_id(&first), first_id(&second));
-        // Reusing "w1" means a model echoing a stale id from earlier in the
-        // conversation silently opens something else.
-        assert_ne!(a, b, "two results must not both offer {a}");
-        assert!(
-            recall(session, &a).is_some(),
-            "the older id must still resolve"
-        );
-    }
-
-    #[test]
-    fn a_bracketed_id_resolves_because_that_is_how_it_was_printed() {
-        let session = Some("s-brackets");
-        let out = render_query_result(&mercury_payload(), "mercury", session);
-        let bare = first_id(&out);
-        // The result prints "- [w1] ...", so a model echoing what it saw sends
-        // the brackets with it often enough that rejecting them is a bug.
-        assert!(recall(session, &format!("[{bare}]")).is_some());
-        assert_eq!(
-            recall(session, &format!("[{bare}]")),
-            recall(session, &bare)
-        );
-    }
-
-    // ── Session scoping ───────────────────────────────────────────────────
-
-    #[test]
-    fn one_sessions_suggestion_is_not_readable_from_another() {
-        let mine = Some("s-mine");
-        let theirs = Some("s-theirs");
-        let out = render_query_result(&mercury_payload(), "my private question", mine);
-        let id = first_id(&out);
-
-        assert!(
-            recall(mine, &id).is_some(),
-            "the owner must still resolve it"
-        );
-        // The ring holds the user's own question text and the ids are short
-        // enough to guess, so a neighbouring session reading one back would be
-        // handing over what someone else asked.
-        assert_eq!(recall(theirs, &id), None, "another session resolved {id}");
-    }
-
-    #[test]
     fn an_unattributed_call_is_offered_no_ids_at_all() {
         // No agent-session-id in _meta. Minting into a shared bucket is the
         // giap-draft "default" bug; withholding the openers is not.
@@ -1004,47 +787,6 @@ mod tests {
         );
         assert!(!out.contains("\n- ["), "no ids may be offered: {out}");
         assert!(!out.contains("explore_computation"), "got: {out}");
-    }
-
-    // ── Recovering from a lost id ─────────────────────────────────────────
-
-    #[test]
-    fn an_aged_out_id_is_recoverable_rather_than_fatal() {
-        let params = ExploreParams {
-            id: Some("w999999".into()),
-            query: Some("3 miles in km".into()),
-            assumption: Some("*C.foo-".into()),
-            extra: Default::default(),
-        };
-        // An id we cannot resolve, but an explicit query alongside it, is still
-        // answerable — the point of accepting both forms.
-        assert_eq!(
-            resolve_explore_target(&params, Some("s-aged")),
-            ExploreTarget::Explicit {
-                query: "3 miles in km".into(),
-                assumption: Some("*C.foo-".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn an_unknown_id_with_nothing_else_says_how_to_recover() {
-        let params = ExploreParams {
-            id: Some("w404".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve_explore_target(&params, Some("s-404")),
-            ExploreTarget::UnknownId("w404".into())
-        );
-    }
-
-    #[test]
-    fn explore_with_no_arguments_at_all_asks_for_one() {
-        assert_eq!(
-            resolve_explore_target(&ExploreParams::default(), S),
-            ExploreTarget::Nothing
-        );
     }
 
     // ── Secret hygiene ────────────────────────────────────────────────────
@@ -1376,10 +1118,9 @@ mod tests {
         // would still build, every unit test above would still pass, and the
         // model would simply never be offered them.
         assert!(names.contains(&"compute_answer"), "got: {names:?}");
-        assert!(names.contains(&"explore_computation"), "got: {names:?}");
-        // And the four this file's sibling owns are still there.
+        // And the ones this file's sibling owns are still there.
         assert!(names.contains(&"get_wikipedia_article"), "got: {names:?}");
-        assert_eq!(names.len(), 6, "giap-knowledge serves six tools: {names:?}");
+        assert_eq!(names.len(), 2, "giap-knowledge serves two tools: {names:?}");
     }
 
     #[tokio::test]
@@ -1453,14 +1194,5 @@ mod tests {
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .expect("tool results in this module are a single text block")
-    }
-
-    /// Pull the first offered suggestion id out of a rendered result.
-    fn first_id(rendered: &str) -> String {
-        let at = rendered
-            .find("\n- [")
-            .unwrap_or_else(|| panic!("no suggestion offered in: {rendered}"));
-        let rest = &rendered[at + 4..];
-        rest[..rest.find(']').expect("unterminated id")].to_string()
     }
 }

@@ -1,0 +1,155 @@
+{
+  "sku": "orin-nano",
+  "generation": "orin",
+  "product_line": "orin-nano",
+  "variant": "orin-nano-8gb",
+  "mem_total_gb": 7,
+  "l4t_version": "36.4.7",
+  "product_model": "nvidia jetson orin nano engineering reference developer kit super",
+  "memory_kb": {
+    "total": 7802680,
+    "available": 6995600,
+    "free": 7019428,
+    "cached": 122564,
+    "swap_total": 5998468,
+    "swap_free": 5875064
+  },
+  "default_systemd_target": "multi-user.target",
+  "candidate_services": {
+    "gdm3": {
+      "active": "inactive",
+      "enabled": "alias"
+    },
+    "gdm": {
+      "active": "inactive",
+      "enabled": "static"
+    },
+    "lightdm": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "sddm": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "display-manager": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "pulseaudio": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "bluetooth": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "ModemManager": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "cups": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "cups-browsed": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "snapd": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "whoopsie": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "kerneloops": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "avahi-daemon": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "unattended-upgrades": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "packagekit": {
+      "active": "active",
+      "enabled": "static"
+    },
+    "nvargus-daemon": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "containerd": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "docker": {
+      "active": "active",
+      "enabled": "enabled"
+    }
+  },
+  "tegrastats_sample": "09-07-2026 21:54:12 RAM 640/7620MB (lfb 100x4MB) SWAP 121/5858MB (cached 0MB) CPU [0%@729,0%@729,0%@729,0%@729,3%@729,0%@729] EMC_FREQ 1%@2133 GR3D_FREQ 0%@[305] NVDEC off NVJPG off NVJPG1 off VIC off OFA off APE 200 cpu@50.625C soc2@49.406C soc0@50.406C gpu@50.812C tj@50.812C soc1@50.156C VDD_IN 4983mW/5024mW VDD_CPU_GPU_CV 522mW/542mW VDD_SOC 1487mW/1487mW",
+  "nvmap": {
+    "readable": true,
+    "total_kb": 0,
+    "stats_total_bytes": 0,
+    "top_clients": []
+  },
+  "procrank_top": [
+    {
+      "pid": 131309,
+      "pss_kb": 40856,
+      "cmd": "snapd"
+    },
+    {
+      "pid": 1114,
+      "pss_kb": 38991,
+      "cmd": "dockerd"
+    },
+    {
+      "pid": 4273,
+      "pss_kb": 31293,
+      "cmd": "packagekitd"
+    },
+    {
+      "pid": 909,
+      "pss_kb": 28774,
+      "cmd": "containerd"
+    },
+    {
+      "pid": 4209,
+      "pss_kb": 12487,
+      "cmd": "geoclue"
+    },
+    {
+      "pid": 1290,
+      "pss_kb": 11689,
+      "cmd": "pulseaudio"
+    },
+    {
+      "pid": 4516,
+      "pss_kb": 11221,
+      "cmd": "fwupd"
+    },
+    {
+      "pid": 253,
+      "pss_kb": 7196,
+      "cmd": "systemd-journal"
+    },
+    {
+      "pid": 558,
+      "pss_kb": 6708,
+      "cmd": "NetworkManager"
+    },
+    {
+      "pid": 1,
+      "pss_kb": 5863,
+      "cmd": "systemd"
+    }
+  ]
+}

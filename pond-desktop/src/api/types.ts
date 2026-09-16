@@ -207,11 +207,6 @@ export interface Settings {
   ext_knowledge_enabled?: boolean;
   ext_system_enabled?: boolean;
   ext_device_enabled?: boolean;
-  ext_news_enabled?: boolean;
-  ext_finance_enabled?: boolean;
-  ext_discovery_enabled?: boolean;
-  ext_audit_enabled?: boolean;
-  ext_vision_enabled?: boolean;
   ext_sensor_enabled?: boolean;
   /**
    * Delegation to saved agent roles. The one extension toggle that ships OFF —
@@ -319,7 +314,6 @@ export interface Settings {
   // Compaction — GIAP-owned history pruning
   hybrid_compaction_enabled?: boolean;
   summary_idle_secs?: number;
-  resume_compaction_idle_secs?: number;
   compaction_verbatim_days?: number;
 
   // Retention — the unified events log (#117)
@@ -912,6 +906,13 @@ export interface TurnStats {
   prefill_ms: number | null;
   decode_tok_per_sec: number | null;
   prefill_tok_per_sec: number | null;
+  // What the turn actually decoded, and what it got back from the KV cache.
+  // `prefill_tok_per_sec` is a rate over `prefilled_tokens`, not `prompt_tokens`:
+  // on a warm turn most of the prompt is reused and never prefilled at all.
+  // `reused_prefix_tokens === 0` on turn 2+ means the prefix stopped being
+  // token-stable, which is the single most useful number here.
+  prefilled_tokens: number | null;
+  reused_prefix_tokens: number | null;
   prompt_tokens: number;
   completion_tokens: number;
   context_used_tokens: number | null;

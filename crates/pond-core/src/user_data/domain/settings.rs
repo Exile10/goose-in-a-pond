@@ -47,6 +47,19 @@ pub const TOOL_SELECTION_MODE_ALL: &str = "all";
 /// `tool_selection_mode`: core groups plus the groups scored relevant to the
 /// session, chosen once at session start (Phase D2).
 pub const TOOL_SELECTION_MODE_RELEVANT: &str = "relevant";
+/// `tool_selection_mode`: the toolkit escape hatch and nothing else — every
+/// other group arrives only when the model calls `enable_tool_group`.
+///
+/// This is the only mode that fits the 4%-of-prompt-budget target. The prompt
+/// budget for a local provider is `LOCAL_PROMPT_CLAMP` = 8,192 tokens, so 4% is
+/// 327 tokens, and a tool costs ~74 characters of JSON envelope before it says
+/// anything at all: 27 tools breach the target with empty schemas. "relevant"
+/// cannot reach it either — its core floor (memory + system + toolkit) is 778
+/// tokens, 9.5%. Two tools, 222 tokens, 2.7%, is what is left.
+///
+/// The date and time ride in `<system-context>` every turn, so the most-asked
+/// capability does not need a tool to be present for it.
+pub const TOOL_SELECTION_MODE_MINIMAL: &str = "minimal";
 
 /// `security_policy_mode`: no evaluation, no audit trail. Debugging only.
 pub const SECURITY_POLICY_MODE_OFF: &str = "off";
@@ -96,7 +109,11 @@ pub const REASONING_EFFORTS: &[&str] = &["brief", "balanced", "thorough"];
 // `settings_validation::FIELD_RULES`, which is what actually applies them.
 
 /// How many tools a turn is offered. See `tool_selection_mode`.
-pub const TOOL_SELECTION_MODES: &[&str] = &[TOOL_SELECTION_MODE_ALL, TOOL_SELECTION_MODE_RELEVANT];
+pub const TOOL_SELECTION_MODES: &[&str] = &[
+    TOOL_SELECTION_MODE_ALL,
+    TOOL_SELECTION_MODE_RELEVANT,
+    TOOL_SELECTION_MODE_MINIMAL,
+];
 
 /// The agent loop that serves turns.
 ///
@@ -706,18 +723,6 @@ pub struct Settings {
     #[serde(default = "Settings::default_summary_idle_secs")]
     pub summary_idle_secs: u32,
 
-    /// Gap after which reopening a session counts as a *resume*, and its
-    /// history is reshaped before the first turn back rather than during it.
-    ///
-    /// PAI-4 P4. The gate is
-    /// `models::services::context::resume_compaction::should_run`; this is only
-    /// the threshold it reads. Too small is the dangerous direction — a pause
-    /// inside a live conversation would be read as a resume and recompact
-    /// between every pair of turns — so `resume_compaction::MIN_RESUME_IDLE_SECS`
-    /// floors whatever is stored here.
-    #[serde(default = "Settings::default_resume_compaction_idle_secs")]
-    pub resume_compaction_idle_secs: u32,
-
     /// Days of history the in-turn trimmer keeps *verbatim* before age
     /// weighting is allowed to degrade it harder than the flat caps do.
     ///
@@ -777,18 +782,24 @@ pub struct Settings {
     pub prefix_cache_prompt: bool,
 
     /// Which extension tool SCHEMAS reach the model: `"all"` (default) |
-    /// `"relevant"`.
+    /// `"relevant"` | `"minimal"`.
     ///
-    /// `"all"` sends every registered `giap-*` tool on every turn — 59 tools at
-    /// roughly 100 tokens each through the Gemma chat template, i.e. ~5.9K of an
-    /// 8K-class on-device prompt budget spent before the conversation starts.
+    /// `"all"` sends every registered `giap-*` tool on every turn — 27 tools,
+    /// ~3,339 tokens, 40.8% of the 8,192-token local prompt budget spent before
+    /// the conversation starts.
     ///
-    /// `"relevant"` keeps a small always-on core (draft, memory, system, and the
-    /// discovery escape hatch) plus the groups scored relevant to the session's
-    /// opening message, chosen ONCE per session so the KV prompt prefix stays
-    /// reusable across turns. The model can pull in any dormant group itself via
-    /// `enable_tool_group`, so nothing becomes unreachable — and this never
-    /// decides WHETHER tools are used, only which schemas are in the prompt.
+    /// `"relevant"` keeps a small always-on core (memory, system, and the
+    /// toolkit escape hatch — 778 tokens, 9.5%) plus the groups scored relevant
+    /// to the session's opening message, chosen ONCE per session so the KV
+    /// prompt prefix stays reusable across turns.
+    ///
+    /// `"minimal"` keeps only the hatch — 222 tokens, 2.7%, the one setting
+    /// that fits a 4% ceiling — and every group arrives when the model asks.
+    ///
+    /// The model can pull in any dormant group itself via `enable_tool_group`,
+    /// so nothing becomes unreachable under either narrowing mode — and this
+    /// never decides WHETHER tools are used, only which schemas are in the
+    /// prompt.
     ///
     /// Defaults to `"all"`: existing installs see no behaviour change until the
     /// operator opts in.
@@ -1076,28 +1087,6 @@ pub struct Settings {
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_device_enabled: bool,
 
-    /// Enable the news tools module (headlines, search, trending topics).
-    #[serde(default = "Settings::default_ext_enabled")]
-    pub ext_news_enabled: bool,
-
-    /// Enable the finance tools module (stocks, crypto, market data).
-    #[serde(default = "Settings::default_ext_enabled")]
-    pub ext_finance_enabled: bool,
-
-    /// Enable the discovery tools module (product search, recommendations).
-    #[serde(default = "Settings::default_ext_enabled")]
-    pub ext_discovery_enabled: bool,
-
-    /// Enable the audit/privacy tools module (recent activity, summary, privacy risks).
-    #[serde(default = "Settings::default_ext_enabled")]
-    pub ext_audit_enabled: bool,
-
-    /// Enable the vision tools module (recent camera events, acknowledge).
-    /// Read-only over the local event store — independent of `vision_enabled`,
-    /// which controls the capture pipeline itself.
-    #[serde(default = "Settings::default_ext_enabled")]
-    pub ext_vision_enabled: bool,
-
     /// Enable the sensor tools module (query stored IoT sensor readings).
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_sensor_enabled: bool,
@@ -1315,7 +1304,6 @@ impl Default for Settings {
             show_turn_stats: false,
             hybrid_compaction_enabled: Self::default_hybrid_compaction_enabled(),
             summary_idle_secs: Self::default_summary_idle_secs(),
-            resume_compaction_idle_secs: Self::default_resume_compaction_idle_secs(),
             compaction_verbatim_days: Self::default_compaction_verbatim_days(),
             agent_backend: Self::default_agent_backend(),
             agent_goose_mode: Self::default_agent_goose_mode(),
@@ -1363,11 +1351,6 @@ impl Default for Settings {
             ext_knowledge_enabled: true,
             ext_system_enabled: true,
             ext_device_enabled: true,
-            ext_audit_enabled: true,
-            ext_vision_enabled: true,
-            ext_news_enabled: true,
-            ext_finance_enabled: true,
-            ext_discovery_enabled: true,
             ext_sensor_enabled: true,
             // The one `false` in this block, and it must stay a literal `false`
             // rather than `Self::default_ext_enabled()`. See the field.
@@ -1576,15 +1559,8 @@ impl Settings {
         120
     }
 
-    /// 30 minutes — the single source is the constant the gate itself uses, so
-    /// the setting's default and the code's default cannot drift apart. See
-    /// `resume_compaction::RESUME_IDLE_THRESHOLD_SECS` for why that number.
-    fn default_resume_compaction_idle_secs() -> u32 {
-        crate::models::services::context::resume_compaction::RESUME_IDLE_THRESHOLD_SECS
-    }
-
     /// Three days — the single source is the constant the trimmer itself uses,
-    /// for the same reason `default_resume_compaction_idle_secs` reads its
+    /// for the same reason the other duration defaults read their
     /// gate's constant: the setting's default and the code's cannot drift.
     fn default_compaction_verbatim_days() -> u32 {
         crate::models::services::context::turn_trimmer::DEFAULT_VERBATIM_DAYS
@@ -1676,6 +1652,27 @@ impl Settings {
     /// unrecognised value must never silently narrow the model's tool surface.
     pub fn tool_selection_is_relevant(&self) -> bool {
         self.tool_selection_mode == TOOL_SELECTION_MODE_RELEVANT
+    }
+
+    /// Whether the session is offered the toolkit escape hatch and nothing else.
+    ///
+    /// Same exact-string discipline as `tool_selection_is_relevant`: an
+    /// unrecognised value must never silently narrow the tool surface, and this
+    /// mode narrows it further than any other.
+    pub fn tool_selection_is_minimal(&self) -> bool {
+        self.tool_selection_mode == TOOL_SELECTION_MODE_MINIMAL
+    }
+
+    /// Whether ANY narrowing is in force — the gate on the per-session group
+    /// machinery (resolution, persistence, the dormant-groups note, and the
+    /// `enable_tool_group` bound).
+    ///
+    /// Both narrowing modes need that machinery: "minimal" needs it more, since
+    /// every capability past the hatch is reached through it. Gating on
+    /// `tool_selection_is_relevant()` alone would leave "minimal" sessions
+    /// unable to persist a group the model had just enabled.
+    pub fn tool_selection_narrows(&self) -> bool {
+        self.tool_selection_is_relevant() || self.tool_selection_is_minimal()
     }
     fn default_agent_timeout_secs() -> u64 {
         300
@@ -2157,14 +2154,6 @@ mod tests {
     }
 
     #[test]
-    fn new_extension_toggles_default_to_true() {
-        let s: Settings = serde_json::from_str("{}").unwrap();
-        assert!(s.ext_news_enabled);
-        assert!(s.ext_finance_enabled);
-        assert!(s.ext_discovery_enabled);
-    }
-
-    #[test]
     fn privacy_and_home_fields_default_correctly() {
         let s = Settings::default();
         // Devices exist but the user controls privacy — mic/cameras default ON.
@@ -2205,12 +2194,12 @@ mod tests {
 
     #[test]
     fn partial_overrides_preserve_new_defaults() {
-        let json = r#"{"ext_news_enabled": false}"#;
+        let json = r#"{"ext_weather_enabled": false}"#;
         let s: Settings = serde_json::from_str(json).unwrap();
-        assert!(!s.ext_news_enabled);
-        // Other new toggles keep their defaults
-        assert!(s.ext_finance_enabled);
-        assert!(s.ext_discovery_enabled);
+        assert!(!s.ext_weather_enabled);
+        // Other toggles keep their defaults
+        assert!(s.ext_memory_enabled);
+        assert!(s.ext_schedule_enabled);
         // searxng_url still None
         assert!(s.searxng_url.is_none());
     }
@@ -2295,6 +2284,59 @@ mod tests {
             assert!(
                 !s.tool_selection_is_relevant(),
                 "'{bogus}' must not enable narrowing"
+            );
+        }
+    }
+
+    /// The same exactness rule for "minimal", and the gate that decides whether
+    /// the per-session group machinery runs at all.
+    ///
+    /// `tool_selection_narrows()` returning false for "minimal" would put those
+    /// sessions back on the unnarrowed path with the full tool surface -- the
+    /// feature silently off, the setting still reading "minimal". Nothing
+    /// exercised either method when they were added beside
+    /// `tool_selection_is_relevant`, which is how a gate like that stays broken.
+    #[test]
+    fn minimal_narrows_and_only_the_exact_string_does() {
+        let mut s = Settings::default();
+        assert!(!s.tool_selection_is_minimal(), "the default is not minimal");
+        assert!(!s.tool_selection_narrows(), "the default must not narrow");
+
+        s.tool_selection_mode = TOOL_SELECTION_MODE_MINIMAL.to_string();
+        assert!(s.tool_selection_is_minimal());
+        assert!(s.tool_selection_narrows(), "minimal is a narrowing mode");
+        assert!(
+            !s.tool_selection_is_relevant(),
+            "minimal must not read as relevant -- they take different paths"
+        );
+
+        s.tool_selection_mode = TOOL_SELECTION_MODE_RELEVANT.to_string();
+        assert!(s.tool_selection_narrows(), "relevant is a narrowing mode");
+        assert!(!s.tool_selection_is_minimal());
+
+        for bogus in ["Minimal", "minimum", "none", "hatch", "", "true"] {
+            s.tool_selection_mode = bogus.to_string();
+            assert!(
+                !s.tool_selection_is_minimal() && !s.tool_selection_narrows(),
+                "'{bogus}' must not narrow anything"
+            );
+        }
+    }
+
+    /// Every accepted value must be reachable through the validator, or the
+    /// mode exists in the domain and is refused at the API.
+    #[test]
+    fn every_tool_selection_mode_is_a_mode_some_predicate_recognises() {
+        for mode in TOOL_SELECTION_MODES {
+            let mut s = Settings::default();
+            s.tool_selection_mode = (*mode).to_string();
+            let recognised = *mode == TOOL_SELECTION_MODE_ALL
+                || s.tool_selection_is_relevant()
+                || s.tool_selection_is_minimal();
+            assert!(
+                recognised,
+                "'{mode}' is in TOOL_SELECTION_MODES, so PUT /settings accepts it, but no \
+                 predicate recognises it -- it would store and then behave as \"all\""
             );
         }
     }
@@ -2553,7 +2595,6 @@ mod tests {
             // what the household can see or decide. A control would also be a
             // trap — the damaging direction is *shorter*, and a slider inviting
             // "compact more often" would invite exactly that.
-            "resume_compaction_idle_secs",
             // PAI-4 P3's verbatim horizon. Headless with its neighbours, and
             // for a sharper version of the same reason: the damaging direction
             // is *shorter*, and the only honest UI label for it ("how many days
@@ -2633,18 +2674,13 @@ mod tests {
             "context_window_override",
             "custom_system_prompt",
             "embedding_provider",
-            "ext_audit_enabled",
             "ext_device_enabled",
-            "ext_discovery_enabled",
-            "ext_finance_enabled",
             "ext_knowledge_enabled",
             "ext_memory_enabled",
-            "ext_news_enabled",
             "ext_orchestrator_enabled",
             "ext_schedule_enabled",
             "ext_sensor_enabled",
             "ext_system_enabled",
-            "ext_vision_enabled",
             "ext_weather_enabled",
             "home_name",
             "llm_max_tokens",

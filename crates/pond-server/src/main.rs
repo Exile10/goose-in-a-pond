@@ -125,7 +125,9 @@ enum Commands {
         #[arg(long)]
         debug: bool,
 
-        /// Agent backend: "goose" (default, full-featured) | "pond" (independent, KV-cache reuse) | "mock".
+        /// Agent backend: "goose" (default, full-featured) | "mistralrs" (direct
+        /// path to a mistral.rs server, needs --features mistralrs-agent) |
+        /// "pond" (quarantined) | "mock".
         /// Also configurable via PUT /api/v1/settings with agent_backend field.
         #[arg(long, default_value = "goose")]
         agent: String,
@@ -134,9 +136,11 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
 
-        /// Also launch the native Tauri desktop app after the server starts.
-        /// Searches for the binary in pond-desktop/src-tauri/target/debug/ and
-        /// pond-desktop/src-tauri/target/release/bundle/macos/.
+        /// Also launch the native desktop app after the server starts.
+        /// macOS only. Looks for an installed app in /Applications, then a
+        /// locally packaged one under pond-desktop/release/, then the dev
+        /// Electron runtime. On Linux it says so and keeps serving: the UI
+        /// there is this server's own dashboard.
         #[arg(long)]
         native: bool,
     },
@@ -185,7 +189,7 @@ enum Commands {
 
         /// Emit the workflow as newline-delimited JSON (NDJSON) on stdout, one
         /// event per line. In this mode stdout carries NOTHING but JSON lines
-        /// (no banners, prompts, or emoji — those go to stderr); the Tauri shell
+        /// (no banners, prompts, or emoji — those go to stderr); the desktop shell
         /// parses these lines to drive the desktop voice UI.
         #[arg(long)]
         json_events: bool,
@@ -1746,8 +1750,6 @@ async fn run_server(
             redactor.clone(),
         ),
     );
-    let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
-        Arc::new(SqliteDraftRepository::new(db.system.clone()));
     let sensor_storage: Arc<
         dyn pond_core::user_data::ports::sensor_storage::SensorStorage + Send + Sync,
     > = Arc::new(SqliteSensorStorage::new(db.logs.clone()));
@@ -1834,6 +1836,38 @@ async fn run_server(
     let effective_chat_provider = settings.chat_provider.clone();
     let effective_chat_model = settings.chat_model.clone();
 
+    // The speculative-decoding drafter, provisioned the way the TTS engine is:
+    // a helper model nobody asked for and nobody should have to think about.
+    // Measured on the Orin, it takes a real turn from 31 to 49 tok/s.
+    //
+    // Before ANY provider is built, because both consumers read the registry
+    // and neither re-reads it: `apply_jetson_settings` sizes the context window
+    // against the models that will be resident and sets `draft_model` from the
+    // registry, and it runs when the local adapter is constructed a few lines
+    // below. Registering after that point costs a restart to converge.
+    //
+    // Failure is silent by design -- decode is simply not accelerated. The
+    // notification further down is the last resort, and it is down there
+    // because the queue to put it on does not exist yet.
+    let drafter_wanted = model_download::drafter_for(&settings.chat_model).is_some();
+    let drafter_ready = if drafter_wanted {
+        let present = model_download::ensure_mtp_drafter(&data_dir, &settings.chat_model)
+            .await
+            .is_some();
+        // The registry row is what the engine resolves a drafter by name
+        // through, so a downloaded file with no row is invisible.
+        #[cfg(feature = "goose-agent")]
+        if present {
+            pond_adapters_goose::mtp_drafter::ensure_drafter_registered(
+                &data_dir,
+                &settings.chat_model,
+            );
+        }
+        present
+    } else {
+        false
+    };
+
     // ── Build per-role LLM providers ────────────────────────────────────────
     // Each role (Chat / Think / Task) may use a different provider + model.
     // Token budget and temperature are baked in at startup.
@@ -1905,6 +1939,18 @@ async fn run_server(
                         ) as Arc<dyn LlmProvider>
                     }
                 }
+            }
+
+            // mistral.rs serves the same OpenAI-compatible surface LlamafileProvider
+            // already speaks, so it needs a URL rather than a new adapter.
+            "mistralrs" => {
+                let host = std::env::var("GIAP_MISTRALRS_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:9002".to_string());
+                Arc::new(
+                    LlamafileProvider::new(Some(&host))
+                        .with_max_tokens(max_tokens)
+                        .with_temperature(temperature),
+                ) as Arc<dyn LlmProvider>
             }
 
             _ => Arc::new(
@@ -1995,17 +2041,6 @@ async fn run_server(
             pond_infra::pruning::run_pruning(logs, system, settings_repo).await;
         });
     }
-
-    // Install the audit MCP server's read handle on the unified event store
-    // (#115). Done here, where the logs DB is in scope, before any agent/builtin
-    // extension is built — `spawn_audit_server` only fires at chat time.
-    pond_mcp_server::init_audit_deps(
-        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
-    );
-
-    // Install the vision MCP server's camera-event store handle (#130), same
-    // deal — `spawn_vision_server` only fires at chat time.
-    pond_mcp_server::init_vision_deps(camera_storage.clone());
 
     // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
@@ -2785,13 +2820,6 @@ async fn run_server(
         }
     };
 
-    // The sensor-RULE tools live in `giap-sensors` but need the scheduler, and
-    // the scheduler is built here rather than beside the other sensor deps —
-    // hence a second install rather than reordering startup around it.
-    if let Some(sched) = scheduler.clone() {
-        pond_mcp_server::init_sensor_rule_deps(sched, settings_repo.clone());
-    }
-
     // MCP Memory — enabled when --features mcp-memory is passed at build time.
     #[cfg(feature = "mcp-memory")]
     let mcp_memory: Option<
@@ -3050,6 +3078,15 @@ async fn run_server(
     #[cfg(not(feature = "pond-agent"))]
     let pond_agent_active = false;
 
+    // The mistral.rs backend is a checkpoint, not a quarantine: unlike "pond" it
+    // is reachable, because nothing rewrites the value and no guard rejects it.
+    // What keeps it out of production is the cargo feature, which is off by
+    // default and which no device build turns on.
+    #[cfg(feature = "mistralrs-agent")]
+    let mistralrs_active = agent_backend == pond_adapters_mistralrs::BACKEND_NAME;
+    #[cfg(not(feature = "mistralrs-agent"))]
+    let mistralrs_active = false;
+
     // Event bus (#91/#109), created here because the Matter runtime below
     // publishes sensor updates onto it. Its durable log bridge is wired further
     // down, once the logs DB handle is in scope.
@@ -3139,7 +3176,74 @@ async fn run_server(
         device_control.clone(),
     );
 
-    let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
+    let (agent, extension_manager, _tool_caller, tool_registry) = if mistralrs_active {
+        // A turn served without goose: pond-core's system prompt, the same MCP
+        // dispatcher PondAgent uses, and an HTTP client. No extension manager
+        // and no tool-calling specialist, because neither exists off the goose
+        // path — the registry below is the empty default for the same reason.
+        let default_registry: Arc<
+            dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort,
+        > = Arc::new(pond_core::mcp::services::tool_registry::InMemoryToolRegistry::new());
+
+        #[cfg(feature = "mistralrs-agent")]
+        let agent: Arc<dyn Agent> = {
+            let settings = settings_repo.get().await.unwrap_or_default();
+            let base_url = pond_adapters_mistralrs::base_url_from_env();
+            // The window mistral.rs was actually started with is not on its API,
+            // so GIAP's own resolution is the only source. Wrong here means a
+            // history budget the server will refuse, not a slow turn.
+            let context_tokens =
+                pond_core::models::services::context::context_governor::ContextGovernor::resolve(
+                    &pond_core::models::services::context::context_governor::ContextInputs {
+                        provider: &settings.chat_provider,
+                        model: &settings.chat_model,
+                        override_tokens: settings.context_window_override,
+                        registry_pinned: None,
+                        catalog_context_length: None,
+                        engine_reported: None,
+                        capability_window: None,
+                    },
+                )
+                .tokens;
+
+            let dispatcher: Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher> =
+                Arc::new(pond_mcp_server::McpToolDispatcher::new(
+                    memory_repo.clone(),
+                    weather.clone(),
+                    scheduler.clone(),
+                    settings_repo.clone(),
+                    device_registry.clone(),
+                    skill_repo.clone(),
+                    embedding_provider.clone(),
+                    device_control.clone(),
+                ));
+
+            let provider = Arc::new(
+                pond_adapters_mistralrs::MistralRsProvider::new(&base_url, &settings.chat_model)
+                    .with_context_window(u32::try_from(context_tokens).unwrap_or(u32::MAX)),
+            );
+            println!("  Agent backend: mistralrs -> {base_url} (no goose)");
+            tracing::info!(
+                base_url = %base_url,
+                model = %settings.chat_model,
+                context_tokens,
+                "MistralRsAgent ready — direct path, goose not involved"
+            );
+            Arc::new(pond_adapters_mistralrs::MistralRsAgent::new(
+                provider,
+                settings_repo.clone(),
+                Some(prompt_template_repo.clone()),
+                Some(prompt_extra_repo.clone()),
+                Some(skill_repo.clone()),
+                session_storage.clone(),
+                Some(dispatcher),
+            )) as Arc<dyn Agent>
+        };
+        #[cfg(not(feature = "mistralrs-agent"))]
+        let agent: Arc<dyn Agent> = Arc::new(MockAgent::new());
+
+        (agent, None, None, default_registry)
+    } else if pond_agent_active {
         // Build PondAgent directly — no Goose, no llama backend conflict.
         let default_registry: Arc<
             dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort,
@@ -3162,8 +3266,6 @@ async fn run_server(
                     settings_repo.clone(),
                     device_registry.clone(),
                     skill_repo.clone(),
-                    recipe_repo.clone(),
-                    draft_repo.clone(),
                     embedding_provider.clone(),
                     device_control.clone(),
                 );
@@ -3188,7 +3290,6 @@ async fn run_server(
                     Some(prompt_template_repo.clone()),
                     Some(prompt_extra_repo.clone()),
                     Some(skill_repo.clone()),
-                    device_registry.clone(),
                     session_storage.clone(),
                     Some(disp),
                 );
@@ -3217,7 +3318,6 @@ async fn run_server(
             recipe_repo.clone(),
             prompt_template_repo.clone(),
             prompt_extra_repo.clone(),
-            draft_repo.clone(),
             device_control.clone(),
             Some(session_storage.clone()),
             Some(model_repo.clone()),
@@ -3312,7 +3412,7 @@ async fn run_server(
     // is a requirement, not tidiness: `FileSecretRepository` caches
     // secrets.json in memory and rewrites it whole on `set`, so a second
     // instance would serve a stale cache and clobber this one's writes.
-    // `spawn_news_server` / `spawn_finance_server` only fire at chat time, so
+    // The servers that consume these handles only spawn at chat time, so
     // installing here (after the agent backend was built) is in time.
     if let Some(repo) = &secret_repo {
         pond_mcp_server::init_secret_deps(repo.clone());
@@ -3514,16 +3614,6 @@ async fn run_server(
     // repositories that registration does not carry, and after `security_policy`
     // so draft decisions land in the same audit trail as identity assertions.
     // The server is not spawned until the first turn, so this is in time.
-    pond_mcp_server::init_draft_authority(Some(Arc::new(
-        pond_core::security::services::draft_authority::RepoDraftAuthority::new(
-            settings_repo.clone(),
-            session_storage.clone(),
-            profile_repo.clone(),
-            security_policy.clone(),
-        ),
-    )
-        as Arc<dyn pond_core::security::ports::draft_authority::DraftAuthority>));
-
     // Start routing WARN+ tracing events into the SQLite event log.
     // _file_guard must live until run_server returns so the background file
     // writer keeps flushing log output to disk.
@@ -3565,8 +3655,6 @@ async fn run_server(
         settings_repo.clone(),
         device_registry.clone(),
         skill_repo.clone(),
-        recipe_repo.clone(),
-        draft_repo.clone(),
         embedding_provider.clone(),
         device_control.clone(),
     )));
@@ -3603,6 +3691,26 @@ async fn run_server(
     > = Arc::new(
         pond_infra::sqlite_notification_queue::SqliteNotificationQueue::new(db.system.clone()),
     );
+
+    // Last resort: the pond will go on running slower than it could and nothing
+    // else would ever say so.
+    if drafter_wanted && !drafter_ready {
+        let notice = pond_core::mcp::ports::notification::Notification {
+            id: uuid::Uuid::new_v4().to_string(),
+            target: "broadcast".to_string(),
+            category: "info".to_string(),
+            title: "Running without speculative decoding".to_string(),
+            body: format!(
+                "Could not fetch the helper model for {}. Chat works as usual, \
+                 replies are just slower. It retries on the next start.",
+                settings.chat_model
+            ),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            data: None,
+        };
+        let _ = notification_queue.enqueue(notice.clone()).await;
+        let _ = notification_tx.send(notice);
+    }
     // Real FCM relay when a service-account key is present (Path B: direct
     // FCM v1, data-only wake pings — no Expo hop, no content through Google);
     // otherwise the logging stub. Key location:
@@ -4410,9 +4518,9 @@ async fn run_server(
         }
     }
 
-    // --native: spawn the Tauri desktop app binary after the server is ready.
+    // --native: spawn the desktop app after the server is ready (macOS only).
     if native {
-        spawn_desktop_app(api_port);
+        spawn_desktop_app(api_port).await;
     }
 
     // Serve until a shutdown signal. We race the server against the signal
@@ -4491,46 +4599,117 @@ fn print_pairing_qr(url: &str) {
     }
 }
 
-/// Locate and spawn the pond-desktop Tauri binary.
+/// Locate and spawn the pond-desktop app.
 ///
-/// Search order (relative to the workspace root, i.e. where the server binary
-/// is invoked from):
-///   1. `pond-desktop/src-tauri/target/debug/pond-desktop`          — `cargo tauri dev`
-///   2. `pond-desktop/src-tauri/target/release/pond-desktop`        — release build
-///   3. `pond-desktop/src-tauri/target/release/bundle/macos/Goose In A Pond.app/Contents/MacOS/Goose In A Pond`
+/// macOS only: the desktop shell is an Electron app and is not packaged for
+/// Linux. On the Jetson the UI is the dashboard this very server already
+/// serves over HTTP, so there is nothing to spawn and nothing missing.
+///
+/// Search order:
+///   1. `$GIAP_DESKTOP_BIN`                                    — explicit override
+///   2. `/Applications/Goose In A Pond.app/...`                — installed
+///   3. `pond-desktop/release/mac-*/Goose In A Pond.app/...`   — local package
+///   4. `pond-desktop/node_modules/.bin/electron`              — dev, unpackaged
+///
+/// Note there is no debug/release pair to confuse any more. The Tauri version
+/// probed a debug build FIRST, so a stale `cargo build` artifact silently took
+/// precedence over the release one -- a trap documented in four places, and
+/// one that cannot occur here.
 ///
 /// The child process is detached (not joined) so the server keeps running.
-fn spawn_desktop_app(server_port: u16) {
-    let candidates: &[&str] = &[
-        "pond-desktop/src-tauri/target/debug/pond-desktop",
-        "pond-desktop/src-tauri/target/release/pond-desktop",
-        "pond-desktop/src-tauri/target/release/bundle/macos/Goose In A Pond.app/Contents/MacOS/Goose In A Pond",
-    ];
+#[cfg(target_os = "macos")]
+async fn spawn_desktop_app(server_port: u16) {
+    const APP_SUFFIX: &str = "Goose In A Pond.app/Contents/MacOS/Goose In A Pond";
 
-    let found = candidates.iter().find(|p| std::path::Path::new(p).exists());
-
-    match found {
-        Some(path) => {
-            tracing::info!("Launching native desktop app: {}", path);
-            match std::process::Command::new(path)
-                .env("GIAP_SERVER_PORT", server_port.to_string())
-                .spawn()
-            {
-                Ok(child) => {
-                    tracing::info!("Desktop app started (pid {})", child.id());
-                    // Drop child handle — process runs independently.
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to launch desktop app at {}: {}", path, e);
-                }
-            }
-        }
-        None => {
-            tracing::warn!(
-                "--native: desktop binary not found. Build it first:\n  cd pond-desktop && npm run tauri build\nor for dev:\n  cd pond-desktop && npm run tauri dev"
-            );
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(explicit) = std::env::var("GIAP_DESKTOP_BIN") {
+        if !explicit.is_empty() {
+            candidates.push(std::path::PathBuf::from(explicit));
         }
     }
+    candidates.push(std::path::PathBuf::from("/Applications").join(APP_SUFFIX));
+    // electron-builder writes into pond-desktop/release/mac-<arch>/.
+    for arch in ["mac-arm64", "mac", "mac-x64"] {
+        candidates.push(
+            std::path::PathBuf::from("pond-desktop/release")
+                .join(arch)
+                .join(APP_SUFFIX),
+        );
+    }
+
+    if let Some(path) = candidates.iter().find(|p| p.exists()) {
+        tracing::info!("Launching native desktop app: {}", path.display());
+        launch_desktop(path, &[], server_port).await;
+        return;
+    }
+
+    // Unpackaged dev: run Electron against the repo checkout. It needs the
+    // app directory as its argument, which a packaged bundle does not.
+    let dev_electron = std::path::PathBuf::from("pond-desktop/node_modules/.bin/electron");
+    if dev_electron.exists() {
+        tracing::info!("Launching the desktop app through the dev Electron runtime");
+        launch_desktop(&dev_electron, &["pond-desktop"], server_port).await;
+        return;
+    }
+
+    tracing::warn!(
+        "--native: no desktop app found. Build it first:\n  cd pond-desktop && npm run bundle:app\nor for dev:\n  cd pond-desktop && npm run dev:electron"
+    );
+}
+
+#[cfg(target_os = "macos")]
+async fn launch_desktop(path: &std::path::Path, args: &[&str], server_port: u16) {
+    let mut child = match std::process::Command::new(path)
+        .args(args)
+        // The shell reads this and MUST NOT spawn its own server; it attaches
+        // to ours instead. Without it there are two pond-servers fighting for
+        // one port, which presents as a blank window.
+        .env("GIAP_SERVER_PORT", server_port.to_string())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to launch the desktop app at {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let pid = child.id();
+
+    // Spawning is not the same as appearing, and this is the gap that made
+    // --native look broken: the app takes a single-instance lock, so if one is
+    // already running the process we just started quits within a few hundred
+    // milliseconds, in silence. Reporting "started" and returning left a server
+    // with no window on it and a log that claimed success.
+    //
+    // try_wait also reaps the child, which is what stopped it becoming a zombie
+    // under the server for as long as the server ran.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    match child.try_wait() {
+        Ok(Some(status)) => tracing::warn!(
+            "--native: the desktop app exited immediately (pid {pid}, {status}). \
+             The likely cause is that an instance is ALREADY RUNNING -- the app holds a \
+             single-instance lock, so a second launch quits at once and raises the existing \
+             window instead. That window is attached to whichever server started it, not to \
+             this one on port {server_port}. Quit the running app and retry, or just open \
+             http://127.0.0.1:{server_port} in a browser."
+        ),
+        Ok(None) => tracing::info!("Desktop app running (pid {pid})"),
+        Err(e) => tracing::debug!("could not check on the desktop app (pid {pid}): {e}"),
+    }
+}
+
+/// The desktop shell is macOS-only, so `--native` has nothing to launch here.
+/// This is not a degraded mode: on Linux -- which in practice means the Jetson
+/// -- the UI is the dashboard this server already serves.
+#[cfg(not(target_os = "macos"))]
+async fn spawn_desktop_app(server_port: u16) {
+    tracing::warn!(
+        "--native: the desktop shell is macOS-only. This server's dashboard is already \
+         available at http://127.0.0.1:{server_port} and on the LAN."
+    );
 }
 
 /// Write one `WorkflowEvent` to stdout as a single NDJSON line (JSON + `\n`,
@@ -4698,16 +4877,6 @@ async fn run_chat(
     // even existed. It moved below the settings load for the reason given at
     // its new site. PAI-2 P6a.
     let db = Database::init(&data_dir).await?;
-
-    // Install the audit MCP server's read handle so the giap-audit extension works
-    // in headless/CLI chat too (not just `run_server`); otherwise invoking the audit
-    // tool here would find no deps. (#115/#157)
-    pond_mcp_server::init_audit_deps(
-        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
-    );
-
-    // Same for the vision MCP server's camera-event store handle (#130).
-    pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
 
     // And the sensor store. `run_server` installs all three; this path
     // installed only two, so every voice session logged
@@ -4974,8 +5143,6 @@ async fn run_chat(
     let device_registry_arc: Arc<
         dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
-    let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
-        Arc::new(SqliteDraftRepository::new(db.system.clone()));
 
     // Reseed built-in prompt templates at startup with the latest Jinja2 general-purpose content.
     // Uses upsert (not insert_if_absent) so existing installs get the updated templates.
@@ -5060,7 +5227,6 @@ async fn run_chat(
             recipe_repo,
             template_repo,
             extras_repo,
-            draft_repo,
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             Some(trim_storage), // powers the trimmer's summary splice
             Some(chat_model_repo.clone()),
@@ -5150,7 +5316,7 @@ async fn run_chat(
     // Writes one serialized WorkflowEvent per line to stdout with immediate
     // flush. In this mode the run_loop's human-facing prints are suppressed
     // (stdout_diagnostics=false) so stdout carries NOTHING but JSON lines. The
-    // Tauri shell parses these lines to drive the desktop voice UI.
+    // The desktop shell parses these lines to drive its voice UI.
     if json_events {
         let sink: pond_core::shared::services::chat::WorkflowEventSink =
             Arc::new(|event: &pond_core::shared::domain::agent::WorkflowEvent| {
@@ -8121,7 +8287,6 @@ async fn build_goose_backend(
     extras_repo: Arc<
         dyn pond_core::user_data::ports::prompt_extra::PromptExtraRepository + Send + Sync,
     >,
-    draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync>,
     device_control: Arc<
         dyn pond_core::user_data::ports::device_control::DeviceControlPort + Send + Sync,
     >,
@@ -8186,8 +8351,6 @@ async fn build_goose_backend(
             settings_repo.clone(),
             device_registry.clone(),
             skill_repo.clone(),
-            recipe_repo.clone(),
-            draft_repo,
             embedding_provider,
             device_control.clone(),
         );
@@ -8217,7 +8380,6 @@ async fn build_goose_backend(
             Some(template_repo),
             Some(extras_repo),
             Some(skill_repo),
-            device_registry,
             ss,
             Some(dispatcher),
         );
@@ -8269,8 +8431,6 @@ async fn build_goose_backend(
         settings_repo.clone(),
         device_registry.clone(),
         skill_repo.clone(),
-        recipe_repo.clone(),
-        draft_repo,
         device_control,
         tool_caller.clone(),
     ) {
@@ -8290,7 +8450,6 @@ async fn build_goose_backend(
         extras_repo,
         skill_repo,
         memory_repo,
-        device_registry.clone(),
         llamafile_url.to_string(),
         Some(data_dir.to_path_buf()),
         Some(default_registry.clone()),
@@ -8349,7 +8508,7 @@ async fn build_goose_backend(
             // refuses, so the failure would look like a working guard rather
             // than like broken wiring.
             //
-            // Installed unconditionally, like `init_audit_deps`: the toggle
+            // Installed unconditionally: the toggle
             // gates REGISTRATION (in `register_giap_extensions`), so with it off
             // no server is ever spawned and these handles are simply unused.
             {
@@ -8964,16 +9123,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
 
-    // Install the audit MCP server's read handle so the giap-audit extension works
-    // from the `agent` subcommand too; otherwise invoking the audit tool here would
-    // find no deps. (#115/#157)
-    pond_mcp_server::init_audit_deps(
-        pond_infra::sqlite_event_log::SqliteEventLog::new(db.logs.clone()).into_dyn(),
-    );
-
-    // Same for the vision MCP server's camera-event store handle (#130).
-    pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
-
     // Build all repos once — shared across Chat, Tools, and Extras arms.
     let settings_repo: Arc<
         dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
@@ -9014,8 +9163,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let device_registry: Arc<
         dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
-    let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
-        Arc::new(SqliteDraftRepository::new(db.system.clone()));
     // The catalog the context governor's rung 3 reads. The CLI paths get one
     // too: a `pond-server chat` turn budgets its history exactly the way a
     // dashboard turn does, and giving only the server the real window would put
@@ -9082,7 +9229,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
-                draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
                 Some(cli_model_repo.clone()),
@@ -9104,6 +9250,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 profile_scope: ProfileScope::Household,
                 profile_context: None,
                 tool_group_allowlist: None,
+                warmup: false,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -9126,7 +9273,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
-                draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
                 Some(cli_model_repo.clone()),
@@ -9174,6 +9320,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     profile_scope: ProfileScope::Household,
                     profile_context: None,
                     tool_group_allowlist: None,
+                    warmup: false,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");
@@ -9196,7 +9343,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 recipe_repo,
                 template_repo,
                 extras_repo,
-                draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
                 Some(cli_model_repo.clone()),

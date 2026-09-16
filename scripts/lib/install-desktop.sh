@@ -26,10 +26,8 @@ build_desktop() {
     return
   fi
 
-  # Install Tauri CLI if not present and user wants to build
-  if ! command -v cargo-tauri &>/dev/null 2>&1; then
-    log "Tauri CLI not found -- it will be installed on first 'npm run tauri dev'"
-  fi
+  # Nothing else to install: Electron and electron-builder are npm
+  # devDependencies, so `npm install` above is the whole toolchain.
 
   S_DESKTOP="ok"
   cd "$REPO_DIR"

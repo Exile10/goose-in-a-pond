@@ -16,8 +16,6 @@ use pond_core::user_data::ports::device_control::{
     DeviceControlOutcome, DeviceControlPort, DeviceStatePatch,
 };
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
-use pond_core::user_data::ports::draft::DraftRepository;
-use pond_core::user_data::ports::recipe::AgentRecipeRepository;
 use pond_core::user_data::ports::scheduler::{
     CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest,
 };
@@ -43,11 +41,6 @@ fn chaining_settings() -> Settings {
     s.ext_weather_enabled = false;
     s.ext_knowledge_enabled = false;
     s.ext_system_enabled = false;
-    s.ext_news_enabled = false;
-    s.ext_finance_enabled = false;
-    s.ext_discovery_enabled = false;
-    s.ext_audit_enabled = false;
-    s.ext_vision_enabled = false;
     s
 }
 
@@ -212,62 +205,6 @@ impl SchedulerPort for RecordingScheduler {
     }
 }
 
-/// giap-draft is always registered; the scenarios never draft, so a no-op is enough.
-struct NoDrafts;
-
-#[async_trait]
-impl DraftRepository for NoDrafts {
-    async fn save(&self, _draft: pond_core::user_data::domain::draft::Draft) -> Result<()> {
-        Ok(())
-    }
-    async fn list_pending(
-        &self,
-        _session_id: &str,
-    ) -> Result<Vec<pond_core::user_data::domain::draft::Draft>> {
-        Ok(vec![])
-    }
-    async fn get(&self, _id: &str) -> Result<Option<pond_core::user_data::domain::draft::Draft>> {
-        Ok(None)
-    }
-    async fn update_status(
-        &self,
-        _id: &str,
-        _status: pond_core::user_data::domain::draft::DraftStatus,
-    ) -> Result<()> {
-        Ok(())
-    }
-}
-
-struct NoRecipes;
-
-#[async_trait]
-impl AgentRecipeRepository for NoRecipes {
-    async fn list(&self) -> Result<Vec<pond_core::user_data::domain::recipe::AgentRecipe>> {
-        Ok(vec![])
-    }
-    async fn get_by_name(
-        &self,
-        _name: &str,
-    ) -> Result<Option<pond_core::user_data::domain::recipe::AgentRecipe>> {
-        Ok(None)
-    }
-    async fn get_by_id(
-        &self,
-        _id: &str,
-    ) -> Result<Option<pond_core::user_data::domain::recipe::AgentRecipe>> {
-        Ok(None)
-    }
-    async fn upsert(
-        &self,
-        _recipe: &pond_core::user_data::domain::recipe::AgentRecipe,
-    ) -> Result<()> {
-        Ok(())
-    }
-    async fn delete(&self, _id: &str) -> Result<()> {
-        Ok(())
-    }
-}
-
 // ── Harness plumbing ─────────────────────────────────────────────────────────
 
 /// The recording fakes the MCP tools dispatch into. Registration into Goose's
@@ -293,8 +230,6 @@ fn recorders() -> &'static Recorders {
             Arc::new(ChainingSettingsRepo),
             Arc::new(OneLightRegistry),
             Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
-            Arc::new(NoRecipes),
-            Arc::new(NoDrafts),
             device_control.clone(),
             None,
         )
@@ -326,7 +261,6 @@ async fn run_utterance(session_id: &str, utterance: &str) -> ChainRun {
         Arc::new(pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_memory::MockMemoryRepository::default()),
-        Arc::new(OneLightRegistry),
         url,
         None,
         None,
@@ -350,6 +284,7 @@ async fn run_utterance(session_id: &str, utterance: &str) -> ChainRun {
         profile_scope: ProfileScope::Household,
         profile_context: None,
         tool_group_allowlist: None,
+        warmup: false,
     };
 
     let started = Instant::now();

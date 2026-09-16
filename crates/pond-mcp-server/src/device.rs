@@ -3,10 +3,9 @@
 //! Provides 6 tools: `list_registered_devices`, `get_user_profile`,
 //! `get_model_assignments`, `list_skills`, `load_skill`, `get_recipe`.
 //! Depends on [`DeviceRegistry`], [`SettingsRepository`],
-//! [`UserSkillRepository`], and [`AgentRecipeRepository`].
+//! and [`UserSkillRepository`].
 
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
-use pond_core::user_data::ports::recipe::AgentRecipeRepository;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::user_data::ports::skill::UserSkillRepository;
 use rmcp::{
@@ -43,24 +42,31 @@ pub struct DeviceMcpServer {
     device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
     settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
     skill_repo: Arc<dyn UserSkillRepository + Send + Sync>,
-    recipe_repo: Arc<dyn AgentRecipeRepository + Send + Sync>,
     #[allow(dead_code)] // accessed by rmcp's generated tool_handler code
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl DeviceMcpServer {
+    /// Every tool this server exposes, without constructing it or its deps.
+    ///
+    /// `tool_router()` is generated private to this module, so inventory code
+    /// outside it could not reach the real definitions and resorted to scanning
+    /// source text for `#[tool(` instead. This is the enumeration that scan was
+    /// standing in for.
+    pub(crate) fn tool_defs() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
+    }
+
     pub fn new(
         device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
         settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
         skill_repo: Arc<dyn UserSkillRepository + Send + Sync>,
-        recipe_repo: Arc<dyn AgentRecipeRepository + Send + Sync>,
     ) -> Self {
         Self {
             device_registry,
             settings_repo,
             skill_repo,
-            recipe_repo,
             tool_router: Self::tool_router(),
         }
     }
@@ -156,26 +162,6 @@ impl DeviceMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "Get active model config: main LLM and tool-calling model.")]
-    async fn get_model_assignments(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let s = self.settings_repo.get().await.map_err(|e| {
-            ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Settings error: {}", e),
-                None,
-            )
-        })?;
-        let tool = s.tool_model.as_deref().unwrap_or("(none)");
-        let text = format!(
-            "Main LLM:    {}/{}\nTool caller: {}",
-            s.chat_provider, s.chat_model, tool,
-        );
-        Ok(CallToolResult::success(vec![Content::text(text)]))
-    }
-
     #[tool(
         description = "List active user skills by name and description. Call load_skill to get \
                         a skill's full instructions."
@@ -251,38 +237,6 @@ impl DeviceMcpServer {
             ))])),
         }
     }
-
-    #[tool(description = "Get a named agent recipe's YAML.")]
-    async fn get_recipe(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<GetRecipeParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let recipe = self
-            .recipe_repo
-            .get_by_name(&params.0.name)
-            .await
-            .map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Recipe error: {}", e),
-                    None,
-                )
-            })?;
-        match recipe {
-            None => Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_dead_end(
-                    &format!("a recipe named '{}'", params.0.name),
-                    "No tool lists recipes, so there is nothing further to try — ask \
-                     the user for the exact recipe name.",
-                ),
-            )])),
-            Some(r) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Recipe: {}\n{}\n\n{}",
-                r.name, r.description, r.yaml
-            ))])),
-        }
-    }
 }
 
 #[tool_handler]
@@ -315,7 +269,6 @@ struct DeviceDeps {
     device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
     settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
     skill_repo: Arc<dyn UserSkillRepository + Send + Sync>,
-    recipe_repo: Arc<dyn AgentRecipeRepository + Send + Sync>,
 }
 
 static DEVICE_DEPS: OnceLock<DeviceDeps> = OnceLock::new();
@@ -325,13 +278,11 @@ pub fn init_device_deps(
     device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
     settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
     skill_repo: Arc<dyn UserSkillRepository + Send + Sync>,
-    recipe_repo: Arc<dyn AgentRecipeRepository + Send + Sync>,
 ) {
     let _ = DEVICE_DEPS.set(DeviceDeps {
         device_registry,
         settings_repo,
         skill_repo,
-        recipe_repo,
     });
 }
 
@@ -351,7 +302,6 @@ pub fn spawn_device_server(reader: DuplexStream, writer: DuplexStream) {
         deps.device_registry.clone(),
         deps.settings_repo.clone(),
         deps.skill_repo.clone(),
-        deps.recipe_repo.clone(),
     );
     crate::serve_builtin("giap-device", server, reader, writer);
 }
@@ -362,7 +312,6 @@ pub fn spawn_device_server(reader: DuplexStream, writer: DuplexStream) {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use pond_core::user_data::domain::recipe::AgentRecipe;
     use pond_core::user_data::domain::settings::Settings;
     use pond_core::user_data::domain::skill::UserSkill;
     use pond_core::user_data::ports::device_registry::{Device, RegisterDeviceRequest};
@@ -430,32 +379,11 @@ mod tests {
         }
     }
 
-    struct StubRecipes;
-    #[async_trait]
-    impl AgentRecipeRepository for StubRecipes {
-        async fn list(&self) -> anyhow::Result<Vec<AgentRecipe>> {
-            Ok(vec![])
-        }
-        async fn get_by_name(&self, _: &str) -> anyhow::Result<Option<AgentRecipe>> {
-            Ok(None)
-        }
-        async fn get_by_id(&self, _: &str) -> anyhow::Result<Option<AgentRecipe>> {
-            Ok(None)
-        }
-        async fn upsert(&self, _: &AgentRecipe) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn delete(&self, _: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
     fn test_server() -> DeviceMcpServer {
         DeviceMcpServer::new(
             Arc::new(StubDeviceRegistry),
             Arc::new(StubSettings),
             Arc::new(StubSkills),
-            Arc::new(StubRecipes),
         )
     }
 
@@ -507,7 +435,6 @@ mod tests {
             Arc::new(StubDeviceRegistry),
             Arc::new(StubSettings),
             Arc::new(StubSkillsWithData),
-            Arc::new(StubRecipes),
         )
     }
 

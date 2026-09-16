@@ -1,0 +1,196 @@
+{
+  "sku": "orin-nano",
+  "generation": "orin",
+  "product_line": "orin-nano",
+  "variant": "orin-nano-8gb",
+  "mem_total_gb": 7,
+  "l4t_version": "36.4.7",
+  "product_model": "nvidia jetson orin nano engineering reference developer kit super",
+  "memory_kb": {
+    "total": 7802680,
+    "available": 2273152,
+    "free": 111356,
+    "cached": 2068344,
+    "swap_total": 5998468,
+    "swap_free": 5541240
+  },
+  "default_systemd_target": "multi-user.target",
+  "candidate_services": {
+    "gdm3": {
+      "active": "active",
+      "enabled": "alias"
+    },
+    "gdm": {
+      "active": "active",
+      "enabled": "static"
+    },
+    "lightdm": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "sddm": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "display-manager": {
+      "active": "active",
+      "enabled": "alias"
+    },
+    "pulseaudio": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "bluetooth": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "ModemManager": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "cups": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "cups-browsed": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "snapd": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "whoopsie": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "kerneloops": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "avahi-daemon": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "unattended-upgrades": {
+      "active": "inactive",
+      "enabled": "disabled"
+    },
+    "packagekit": {
+      "active": "active",
+      "enabled": "static"
+    },
+    "nvargus-daemon": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "containerd": {
+      "active": "active",
+      "enabled": "enabled"
+    },
+    "docker": {
+      "active": "active",
+      "enabled": "enabled"
+    }
+  },
+  "tegrastats_sample": "09-07-2026 21:53:51 RAM 5265/7620MB (lfb 1x1MB) SWAP 447/5858MB (cached 0MB) CPU [7%@729,4%@729,2%@729,3%@729,4%@729,2%@729] EMC_FREQ 1%@2133 GR3D_FREQ 0%@[305] NVDEC off NVJPG off NVJPG1 off VIC off OFA off APE 200 cpu@50.718C soc2@49.468C soc0@50.25C gpu@50.906C tj@50.906C soc1@50.125C VDD_IN 5265mW/5285mW VDD_CPU_GPU_CV 683mW/703mW VDD_SOC 1487mW/1507mW",
+  "nvmap": {
+    "readable": true,
+    "total_kb": 2656976,
+    "stats_total_bytes": 2720743424,
+    "top_clients": [
+      {
+        "pid": 16459,
+        "cmd": "pond-server",
+        "kb": 2475008
+      },
+      {
+        "pid": 4166,
+        "cmd": "gnome-shell",
+        "kb": 92524
+      },
+      {
+        "pid": 3769,
+        "cmd": "Xorg",
+        "kb": 72936
+      },
+      {
+        "pid": 6554,
+        "cmd": "gnome-control-c",
+        "kb": 5720
+      },
+      {
+        "pid": 7381,
+        "cmd": "pond-desktop",
+        "kb": 2876
+      },
+      {
+        "pid": 5023,
+        "cmd": "pond-desktop",
+        "kb": 2876
+      },
+      {
+        "pid": 16291,
+        "cmd": "pond-desktop",
+        "kb": 2876
+      },
+      {
+        "pid": 4319,
+        "cmd": "xdg-desktop-por",
+        "kb": 2160
+      }
+    ]
+  },
+  "procrank_top": [
+    {
+      "pid": 16459,
+      "pss_kb": 1109082,
+      "cmd": "pond-server"
+    },
+    {
+      "pid": 16315,
+      "pss_kb": 253108,
+      "cmd": "WebKitWebProces"
+    },
+    {
+      "pid": 5811,
+      "pss_kb": 159532,
+      "cmd": "update-manager"
+    },
+    {
+      "pid": 4166,
+      "pss_kb": 158657,
+      "cmd": "gnome-shell"
+    },
+    {
+      "pid": 16291,
+      "pss_kb": 53212,
+      "cmd": "pond-desktop"
+    },
+    {
+      "pid": 3769,
+      "pss_kb": 52628,
+      "cmd": "Xorg"
+    },
+    {
+      "pid": 7509,
+      "pss_kb": 45227,
+      "cmd": "python3"
+    },
+    {
+      "pid": 1114,
+      "pss_kb": 38986,
+      "cmd": "dockerd"
+    },
+    {
+      "pid": 131309,
+      "pss_kb": 38892,
+      "cmd": "snapd"
+    },
+    {
+      "pid": 16304,
+      "pss_kb": 30991,
+      "cmd": "WebKitNetworkPr"
+    }
+  ]
+}
