@@ -24,7 +24,23 @@ use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 ///
 /// Deliberately does NOT list `awdl`/`llw`: AWDL is a genuine mDNS transport
 /// for Apple peer-to-peer, and it has not been observed failing here.
-const TUNNEL_PREFIXES: &[&str] = &["utun", "ipsec", "ppp"];
+///
+/// The symptom above was observed on macOS, whose tunnels are `utun`/`ipsec`/
+/// `ppp`. The Linux names are listed too, because the Jetson is the primary
+/// deployment target and a hub there is at least as likely to sit behind
+/// WireGuard as a developer's laptop. Whether Linux reproduces this exact error
+/// is untested -- but a rule naming an absent interface is inert, so listing
+/// them costs nothing and not listing them would leave the real target
+/// uncovered.
+///
+/// No real LAN interface is shadowed by these: Linux names its wired and
+/// wireless interfaces `eth*`, `en*` and `wl*`, and Docker and libvirt use
+/// `veth*`, `docker*` and `virbr*`.
+const TUNNEL_PREFIXES: &[&str] = &[
+    // macOS / BSD
+    "utun", "ipsec", "ppp", // Linux: OpenVPN and IPIP, WireGuard, bridged tap
+    "tun", "wg", "tap",
+];
 
 /// How many indices of each prefix to exclude, e.g. `utun0` through `utun15`.
 ///
@@ -143,7 +159,12 @@ mod tests {
     fn excludes_no_real_lan_interface_and_no_awdl() {
         let names = tunnel_interface_names();
         for real in [
-            "en0", "en1", "eth0", "wlan0", "bridge0", "awdl0", "llw0", "lo0",
+            // macOS
+            "en0", "en1", "bridge0", "awdl0", "llw0", "lo0",
+            // Linux, including the predictable-naming and container forms the
+            // Jetson will actually have. `tap`/`tun` are prefixes of nothing
+            // here, which is what makes them safe to list.
+            "eth0", "wlan0", "enp3s0", "wlp2s0", "docker0", "virbr0", "veth1a2b", "lo",
         ] {
             assert!(
                 !names.iter().any(|n| n == real),
