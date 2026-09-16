@@ -147,6 +147,20 @@ test('the same recording is not queued twice', () => {
   assert.deepEqual(pickFollowUps(seed, candidates, 10).map(t => t.uri), ['spotify:track:x1']);
 });
 
+test('the requested track is not queued behind itself', () => {
+  // The case that actually reaches queueFollowUps: the seed is a single, so the
+  // artist search also returns the album cut of the same song under a different
+  // id. Deduplicating candidates against each other is not enough - the seed
+  // has to be in the set too, or the song just asked for plays twice in a row.
+  const seed = track({ album_type: 'single', album_total_tracks: 1 });
+  const candidates = [
+    track({ id: 'alb', uri: 'spotify:track:alb', name: 'Nairobi', album_type: 'album' }),
+    track({ id: 'oth', uri: 'spotify:track:oth', name: 'Extravaganza' }),
+  ];
+
+  assert.deepEqual(pickFollowUps(seed, candidates, 10).map(t => t.name), ['Extravaganza']);
+});
+
 test('without artist ids the artist name is the fallback', () => {
   // The player endpoints omit artist ids, so a seed taken from there has none.
   // Matching on the name is weaker but better than queueing nothing.

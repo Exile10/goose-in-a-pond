@@ -146,6 +146,11 @@ export function pickFollowUps(
   limit: number,
 ): TrackInfo[] {
   const seedIds = new Set(seed.artist_ids ?? []);
+  // Seeded with the requested track: a single and its album cut are the same
+  // recording under two ids, and the single is precisely the case that reaches
+  // this function, so without the seed in here the song the user asked for gets
+  // queued behind itself and plays twice.
+  const seen = new Set([seed.name]);
   const out: TrackInfo[] = [];
 
   for (const c of candidates) {
@@ -155,8 +160,8 @@ export function pickFollowUps(
       ? (c.artist_ids ?? []).some(id => seedIds.has(id))
       : c.artist === seed.artist;
     if (!sharesArtist) continue;
-    // Two search hits can be the same recording on a single and on an album.
-    if (out.some(o => o.name === c.name)) continue;
+    if (seen.has(c.name)) continue;
+    seen.add(c.name);
     out.push(c);
   }
 
