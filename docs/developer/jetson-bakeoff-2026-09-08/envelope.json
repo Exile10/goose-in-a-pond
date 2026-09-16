@@ -1,0 +1,1699 @@
+{
+  "schema": 1,
+  "captured_at": "2026-09-08T02:20:38+03:00",
+  "candidate": "c1-giap",
+  "runtime": "llama-cpp-2 0.1.146 in-process",
+  "variant": "baseline",
+  "device": {
+    "sku": "orin-nano",
+    "variant": "orin-nano-8gb",
+    "l4t": "36.4.7",
+    "kernel": "5.15.148-tegra",
+    "mem_total_mb": 0,
+    "nvmap_module": "/lib/modules/5.15.148-tegra/updates/drivers/video/tegra/nvmap/nvmap.ko"
+  },
+  "power": {
+    "nvpmodel_name": "MAXN_SUPER",
+    "cpu_governor": "schedutil",
+    "gpu_max_mhz": 1020,
+    "jetson_clocks": "dynamic(gov=schedutil,gpu=306/1020MHz)",
+    "oc3_delta": 76,
+    "oc3_seconds": 5179
+  },
+  "model": {
+    "file": "/home/nano/.local/share/goose-in-a-pond/models/gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+    "realpath": "/home/nano/.local/share/goose-in-a-pond/hf_cache/hub/models--unsloth--gemma-4-E4B-it-qat-GGUF/blobs/3018d4d4c45e3e08a9064e62cfcd6a52add26a3be9e873b78b1d373881a90768",
+    "bytes": 4215695776,
+    "sha256": "df0fd4ee07072c607c29a0a1cb4f98918426cca12f45a2776bdd6ee6d09a4de3"
+  },
+  "runs": {
+    "mode": "giap",
+    "base": "http://127.0.0.1:4982",
+    "model": "",
+    "repeats": 5,
+    "workloads": {
+      "fresh_all": {
+        "raw": [
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 43569.912011997076,
+            "decode_rate_source": "engine",
+            "inference_count": 3,
+            "engine_ttft_ms": 3294,
+            "engine_prefill_ms": 4112,
+            "reasoning_tokens": 103,
+            "ttfs_ms": 47457.19795199693,
+            "wall_ms": 48021.962868995615,
+            "decode_ms": 4452.0508569985395,
+            "decode_tok_per_sec": 15.970189094543457,
+            "completion_tokens": 600,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3614,
+            "cached_prompt_tokens": null,
+            "text_chars": 114,
+            "tools": [
+              "giap-weather__get_current_weather"
+            ],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 3294,
+              "prefill_ms": 4112,
+              "decode_tok_per_sec": 15.970189094543457,
+              "prefill_tok_per_sec": 878.8910522460938,
+              "prompt_tokens": 3614,
+              "completion_tokens": 600,
+              "reasoning_tokens": 103,
+              "context_used_tokens": 3614,
+              "context_limit_tokens": 16384,
+              "context_pct": 22.05810546875,
+              "model_load_ms": null,
+              "inference_count": 3,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 24026.424338000652,
+            "decode_rate_source": "engine",
+            "inference_count": 3,
+            "engine_ttft_ms": 860,
+            "engine_prefill_ms": 1620,
+            "reasoning_tokens": 194,
+            "ttfs_ms": 30885.752811998827,
+            "wall_ms": 31950.14409400028,
+            "decode_ms": 7923.7197559996275,
+            "decode_tok_per_sec": 16.044937133789062,
+            "completion_tokens": 557,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3620,
+            "cached_prompt_tokens": null,
+            "text_chars": 146,
+            "tools": [
+              "giap-weather__get_current_weather"
+            ],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 860,
+              "prefill_ms": 1620,
+              "decode_tok_per_sec": 16.044937133789062,
+              "prefill_tok_per_sec": 2234.56787109375,
+              "prompt_tokens": 3620,
+              "completion_tokens": 557,
+              "reasoning_tokens": 194,
+              "context_used_tokens": 3620,
+              "context_limit_tokens": 16384,
+              "context_pct": 22.0947265625,
+              "model_load_ms": null,
+              "inference_count": 3,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 23841.558595006063,
+            "decode_rate_source": "engine",
+            "inference_count": 3,
+            "engine_ttft_ms": 858,
+            "engine_prefill_ms": 1653,
+            "reasoning_tokens": 152,
+            "ttfs_ms": 31234.292937006103,
+            "wall_ms": 31855.105126000126,
+            "decode_ms": 8013.546530994063,
+            "decode_tok_per_sec": 15.901573181152344,
+            "completion_tokens": 548,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3623,
+            "cached_prompt_tokens": null,
+            "text_chars": 151,
+            "tools": [
+              "giap-weather__get_current_weather"
+            ],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 858,
+              "prefill_ms": 1653,
+              "decode_tok_per_sec": 15.901573181152344,
+              "prefill_tok_per_sec": 2191.7724609375,
+              "prompt_tokens": 3623,
+              "completion_tokens": 548,
+              "reasoning_tokens": 152,
+              "context_used_tokens": 3623,
+              "context_limit_tokens": 16384,
+              "context_pct": 22.113037109375,
+              "model_load_ms": null,
+              "inference_count": 3,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 22953.654976998223,
+            "decode_rate_source": "engine",
+            "inference_count": 3,
+            "engine_ttft_ms": 188,
+            "engine_prefill_ms": 1021,
+            "reasoning_tokens": 155,
+            "ttfs_ms": 30212.721855998097,
+            "wall_ms": 30767.034741002135,
+            "decode_ms": 7813.379764003912,
+            "decode_tok_per_sec": 16.12350845336914,
+            "completion_tokens": 612,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3614,
+            "cached_prompt_tokens": null,
+            "text_chars": 114,
+            "tools": [
+              "giap-weather__get_current_weather"
+            ],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 188,
+              "prefill_ms": 1021,
+              "decode_tok_per_sec": 16.12350845336914,
+              "prefill_tok_per_sec": 3539.6669921875,
+              "prompt_tokens": 3614,
+              "completion_tokens": 612,
+              "reasoning_tokens": 155,
+              "context_used_tokens": 3614,
+              "context_limit_tokens": 16384,
+              "context_pct": 22.05810546875,
+              "model_load_ms": null,
+              "inference_count": 3,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 21828.574545004813,
+            "decode_rate_source": "engine",
+            "inference_count": 3,
+            "engine_ttft_ms": 858,
+            "engine_prefill_ms": 1668,
+            "reasoning_tokens": 223,
+            "ttfs_ms": 32921.495927999786,
+            "wall_ms": 33798.65231700387,
+            "decode_ms": 11970.077771999058,
+            "decode_tok_per_sec": 15.883556365966797,
+            "completion_tokens": 598,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3622,
+            "cached_prompt_tokens": null,
+            "text_chars": 150,
+            "tools": [
+              "giap-weather__get_current_weather"
+            ],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 858,
+              "prefill_ms": 1668,
+              "decode_tok_per_sec": 15.883556365966797,
+              "prefill_tok_per_sec": 2171.462890625,
+              "prompt_tokens": 3622,
+              "completion_tokens": 598,
+              "reasoning_tokens": 223,
+              "context_used_tokens": 3622,
+              "context_limit_tokens": 16384,
+              "context_pct": 22.10693359375,
+              "model_load_ms": null,
+              "inference_count": 3,
+              "reengagements": 0
+            }
+          }
+        ],
+        "ttft_ms": {
+          "n": 5,
+          "median": 23841.56,
+          "min": 21828.57,
+          "max": 43569.91,
+          "spread_pct": 91.2
+        },
+        "ttfs_ms": {
+          "n": 5,
+          "median": 31234.29,
+          "min": 30212.72,
+          "max": 47457.2,
+          "spread_pct": 55.2
+        },
+        "decode_tok_per_sec": {
+          "n": 5,
+          "median": 15.97,
+          "min": 15.88,
+          "max": 16.12,
+          "spread_pct": 1.5
+        },
+        "engine_ttft_ms": {
+          "n": 5,
+          "median": 858,
+          "min": 188,
+          "max": 3294,
+          "spread_pct": 362.0
+        },
+        "engine_prefill_ms": {
+          "n": 5,
+          "median": 1653,
+          "min": 1021,
+          "max": 4112,
+          "spread_pct": 187.0
+        },
+        "reasoning_tokens": {
+          "n": 5,
+          "median": 155,
+          "min": 103,
+          "max": 223,
+          "spread_pct": 77.4
+        },
+        "prompt_tokens": {
+          "n": 5,
+          "median": 3620,
+          "min": 3614,
+          "max": 3623,
+          "spread_pct": 0.2
+        },
+        "wall_ms": {
+          "n": 5,
+          "median": 31950.14,
+          "min": 30767.03,
+          "max": 48021.96,
+          "spread_pct": 54.0
+        },
+        "decode_rate_sources": [
+          "engine"
+        ],
+        "seconds": 295.6
+      },
+      "fresh_rel": {
+        "raw": [
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 40304.37958599941,
+            "decode_rate_source": "engine",
+            "inference_count": 3,
+            "engine_ttft_ms": 853,
+            "engine_prefill_ms": 1593,
+            "reasoning_tokens": 183,
+            "ttfs_ms": 48387.719851998554,
+            "wall_ms": 49368.56641700433,
+            "decode_ms": 9064.186831004918,
+            "decode_tok_per_sec": 16.005983352661133,
+            "completion_tokens": 749,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3621,
+            "cached_prompt_tokens": null,
+            "text_chars": 146,
+            "tools": [
+              "giap-weather__get_current_weather"
+            ],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 853,
+              "prefill_ms": 1593,
+              "decode_tok_per_sec": 16.005983352661133,
+              "prefill_tok_per_sec": 2273.069580078125,
+              "prompt_tokens": 3621,
+              "completion_tokens": 749,
+              "reasoning_tokens": 183,
+              "context_used_tokens": 3621,
+              "context_limit_tokens": 16384,
+              "context_pct": 22.100830078125,
+              "model_load_ms": null,
+              "inference_count": 3,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 35713.83892699669,
+            "decode_rate_source": "engine",
+            "inference_count": 3,
+            "engine_ttft_ms": 1006,
+            "engine_prefill_ms": 2171,
+            "reasoning_tokens": 471,
+            "ttfs_ms": 50276.61461399839,
+            "wall_ms": 51430.68005699752,
+            "decode_ms": 15716.84113000083,
+            "decode_tok_per_sec": 16.024364471435547,
+            "completion_tokens": 805,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3676,
+            "cached_prompt_tokens": null,
+            "text_chars": 199,
+            "tools": [
+              "giap-weather__get_current_weather"
+            ],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1006,
+              "prefill_ms": 2171,
+              "decode_tok_per_sec": 16.024364471435547,
+              "prefill_tok_per_sec": 1693.2288818359375,
+              "prompt_tokens": 3676,
+              "completion_tokens": 805,
+              "reasoning_tokens": 471,
+              "context_used_tokens": 3676,
+              "context_limit_tokens": 16384,
+              "context_pct": 22.4365234375,
+              "model_load_ms": null,
+              "inference_count": 3,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 36732.43409499992,
+            "decode_rate_source": "engine",
+            "inference_count": 3,
+            "engine_ttft_ms": 1004,
+            "engine_prefill_ms": 2354,
+            "reasoning_tokens": 438,
+            "ttfs_ms": 46538.407724001445,
+            "wall_ms": 47494.82319200615,
+            "decode_ms": 10762.389097006235,
+            "decode_tok_per_sec": 16.085790634155273,
+            "completion_tokens": 864,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3666,
+            "cached_prompt_tokens": null,
+            "text_chars": 145,
+            "tools": [
+              "giap-weather__get_current_weather"
+            ],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1004,
+              "prefill_ms": 2354,
+              "decode_tok_per_sec": 16.085790634155273,
+              "prefill_tok_per_sec": 1557.3492431640625,
+              "prompt_tokens": 3666,
+              "completion_tokens": 864,
+              "reasoning_tokens": 438,
+              "context_used_tokens": 3666,
+              "context_limit_tokens": 16384,
+              "context_pct": 22.37548828125,
+              "model_load_ms": null,
+              "inference_count": 3,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 23404.76189099718,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1015,
+            "engine_prefill_ms": 1162,
+            "reasoning_tokens": 112,
+            "ttfs_ms": 24640.180775997578,
+            "wall_ms": 24640.180775997578,
+            "decode_ms": 1235.4188850003993,
+            "decode_tok_per_sec": 16.113080978393555,
+            "completion_tokens": 391,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3580,
+            "cached_prompt_tokens": null,
+            "text_chars": 117,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1015,
+              "prefill_ms": 1162,
+              "decode_tok_per_sec": 16.113080978393555,
+              "prefill_tok_per_sec": 3080.89501953125,
+              "prompt_tokens": 3580,
+              "completion_tokens": 391,
+              "reasoning_tokens": 112,
+              "context_used_tokens": 3580,
+              "context_limit_tokens": 16384,
+              "context_pct": 21.8505859375,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 34909.20109199942,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1011,
+            "engine_prefill_ms": 1163,
+            "reasoning_tokens": 292,
+            "ttfs_ms": 35956.18852900225,
+            "wall_ms": 35956.18852900225,
+            "decode_ms": 1046.9874370028265,
+            "decode_tok_per_sec": 16.083417892456055,
+            "completion_tokens": 745,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3577,
+            "cached_prompt_tokens": null,
+            "text_chars": 105,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1011,
+              "prefill_ms": 1163,
+              "decode_tok_per_sec": 16.083417892456055,
+              "prefill_tok_per_sec": 3075.666259765625,
+              "prompt_tokens": 3577,
+              "completion_tokens": 745,
+              "reasoning_tokens": 292,
+              "context_used_tokens": 3577,
+              "context_limit_tokens": 16384,
+              "context_pct": 21.832275390625,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          }
+        ],
+        "ttft_ms": {
+          "n": 5,
+          "median": 35713.84,
+          "min": 23404.76,
+          "max": 40304.38,
+          "spread_pct": 47.3
+        },
+        "ttfs_ms": {
+          "n": 5,
+          "median": 46538.41,
+          "min": 24640.18,
+          "max": 50276.61,
+          "spread_pct": 55.1
+        },
+        "decode_tok_per_sec": {
+          "n": 5,
+          "median": 16.08,
+          "min": 16.01,
+          "max": 16.11,
+          "spread_pct": 0.7
+        },
+        "engine_ttft_ms": {
+          "n": 5,
+          "median": 1006,
+          "min": 853,
+          "max": 1015,
+          "spread_pct": 16.1
+        },
+        "engine_prefill_ms": {
+          "n": 5,
+          "median": 1593,
+          "min": 1162,
+          "max": 2354,
+          "spread_pct": 74.8
+        },
+        "reasoning_tokens": {
+          "n": 5,
+          "median": 292,
+          "min": 112,
+          "max": 471,
+          "spread_pct": 122.9
+        },
+        "prompt_tokens": {
+          "n": 5,
+          "median": 3621,
+          "min": 3577,
+          "max": 3676,
+          "spread_pct": 2.7
+        },
+        "wall_ms": {
+          "n": 5,
+          "median": 47494.82,
+          "min": 24640.18,
+          "max": 51430.68,
+          "spread_pct": 56.4
+        },
+        "decode_rate_sources": [
+          "engine"
+        ],
+        "seconds": 327.7
+      },
+      "followup": {
+        "raw": [
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 31664.742587003275,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1355,
+            "engine_prefill_ms": 1500,
+            "reasoning_tokens": 200,
+            "ttfs_ms": 32858.05302300287,
+            "wall_ms": 33617.22644200199,
+            "decode_ms": 1952.483854998718,
+            "decode_tok_per_sec": 15.867231369018555,
+            "completion_tokens": 566,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3732,
+            "cached_prompt_tokens": null,
+            "text_chars": 185,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1355,
+              "prefill_ms": 1500,
+              "decode_tok_per_sec": 15.867231369018555,
+              "prefill_tok_per_sec": 2488.0,
+              "prompt_tokens": 3732,
+              "completion_tokens": 566,
+              "reasoning_tokens": 200,
+              "context_used_tokens": 3732,
+              "context_limit_tokens": 16384,
+              "context_pct": 22.7783203125,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 26006.306351002422,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1508,
+            "engine_prefill_ms": 1675,
+            "reasoning_tokens": 171,
+            "ttfs_ms": 27250.11198499851,
+            "wall_ms": 28119.352752997656,
+            "decode_ms": 2113.046401995234,
+            "decode_tok_per_sec": 16.054298400878906,
+            "completion_tokens": 492,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3802,
+            "cached_prompt_tokens": null,
+            "text_chars": 195,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1508,
+              "prefill_ms": 1675,
+              "decode_tok_per_sec": 16.054298400878906,
+              "prefill_tok_per_sec": 2269.850830078125,
+              "prompt_tokens": 3802,
+              "completion_tokens": 492,
+              "reasoning_tokens": 171,
+              "context_used_tokens": 3802,
+              "context_limit_tokens": 16384,
+              "context_pct": 23.20556640625,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 27157.617990997096,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1324,
+            "engine_prefill_ms": 1476,
+            "reasoning_tokens": 173,
+            "ttfs_ms": 28339.4893079967,
+            "wall_ms": 28339.4893079967,
+            "decode_ms": 1181.8713169996045,
+            "decode_tok_per_sec": 15.916619300842285,
+            "completion_tokens": 394,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3697,
+            "cached_prompt_tokens": null,
+            "text_chars": 111,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1324,
+              "prefill_ms": 1476,
+              "decode_tok_per_sec": 15.916619300842285,
+              "prefill_tok_per_sec": 2504.742431640625,
+              "prompt_tokens": 3697,
+              "completion_tokens": 394,
+              "reasoning_tokens": 173,
+              "context_used_tokens": 3697,
+              "context_limit_tokens": 16384,
+              "context_pct": 22.564697265625,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 35517.38120099617,
+            "decode_rate_source": "engine",
+            "inference_count": 3,
+            "engine_ttft_ms": 1319,
+            "engine_prefill_ms": 2460,
+            "reasoning_tokens": 399,
+            "ttfs_ms": 46770.88172299409,
+            "wall_ms": 47151.875576993916,
+            "decode_ms": 11634.494375997747,
+            "decode_tok_per_sec": 15.996589660644531,
+            "completion_tokens": 713,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3799,
+            "cached_prompt_tokens": null,
+            "text_chars": 143,
+            "tools": [
+              "giap-weather__get_weather_forecast"
+            ],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1319,
+              "prefill_ms": 2460,
+              "decode_tok_per_sec": 15.996589660644531,
+              "prefill_tok_per_sec": 1544.3089599609375,
+              "prompt_tokens": 3799,
+              "completion_tokens": 713,
+              "reasoning_tokens": 399,
+              "context_used_tokens": 3799,
+              "context_limit_tokens": 16384,
+              "context_pct": 23.187255859375,
+              "model_load_ms": null,
+              "inference_count": 3,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 25241.75091500365,
+            "decode_rate_source": "engine",
+            "inference_count": 3,
+            "engine_ttft_ms": 1308,
+            "engine_prefill_ms": 2209,
+            "reasoning_tokens": 233,
+            "ttfs_ms": 31418.39668900502,
+            "wall_ms": 32108.486046003236,
+            "decode_ms": 6866.7351309995865,
+            "decode_tok_per_sec": 16.017412185668945,
+            "completion_tokens": 574,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3793,
+            "cached_prompt_tokens": null,
+            "text_chars": 163,
+            "tools": [
+              "giap-weather__get_weather_forecast"
+            ],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1308,
+              "prefill_ms": 2209,
+              "decode_tok_per_sec": 16.017412185668945,
+              "prefill_tok_per_sec": 1717.0665283203125,
+              "prompt_tokens": 3793,
+              "completion_tokens": 574,
+              "reasoning_tokens": 233,
+              "context_used_tokens": 3793,
+              "context_limit_tokens": 16384,
+              "context_pct": 23.150634765625,
+              "model_load_ms": null,
+              "inference_count": 3,
+              "reengagements": 0
+            }
+          }
+        ],
+        "ttft_ms": {
+          "n": 5,
+          "median": 27157.62,
+          "min": 25241.75,
+          "max": 35517.38,
+          "spread_pct": 37.8
+        },
+        "decode_tok_per_sec": {
+          "n": 5,
+          "median": 16.0,
+          "min": 15.87,
+          "max": 16.05,
+          "spread_pct": 1.2
+        },
+        "cached_prompt_tokens": null,
+        "seconds": 557.8
+      },
+      "voice": {
+        "raw": [
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 22844.602415003465,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1059,
+            "engine_prefill_ms": 1210,
+            "reasoning_tokens": 62,
+            "ttfs_ms": 24074.794200001634,
+            "wall_ms": 24074.794200001634,
+            "decode_ms": 1230.1917849981692,
+            "decode_tok_per_sec": 16.082406997680664,
+            "completion_tokens": 395,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3574,
+            "cached_prompt_tokens": null,
+            "text_chars": 47,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1059,
+              "prefill_ms": 1210,
+              "decode_tok_per_sec": 16.082406997680664,
+              "prefill_tok_per_sec": 2953.718994140625,
+              "prompt_tokens": 3574,
+              "completion_tokens": 395,
+              "reasoning_tokens": 62,
+              "context_used_tokens": 3574,
+              "context_limit_tokens": 16384,
+              "context_pct": 21.81396484375,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 19058.322157005023,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1002,
+            "engine_prefill_ms": 1149,
+            "reasoning_tokens": 32,
+            "ttfs_ms": 20343.37558200059,
+            "wall_ms": 20343.37558200059,
+            "decode_ms": 1285.0534249955672,
+            "decode_tok_per_sec": 16.09617042541504,
+            "completion_tokens": 237,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3575,
+            "cached_prompt_tokens": null,
+            "text_chars": 55,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1002,
+              "prefill_ms": 1149,
+              "decode_tok_per_sec": 16.09617042541504,
+              "prefill_tok_per_sec": 3111.401123046875,
+              "prompt_tokens": 3575,
+              "completion_tokens": 237,
+              "reasoning_tokens": 32,
+              "context_used_tokens": 3575,
+              "context_limit_tokens": 16384,
+              "context_pct": 21.820068359375,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 18340.164232999086,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 175,
+            "engine_prefill_ms": 332,
+            "reasoning_tokens": 62,
+            "ttfs_ms": 19564.897124997515,
+            "wall_ms": 19564.897124997515,
+            "decode_ms": 1224.7328919984284,
+            "decode_tok_per_sec": 16.104393005371094,
+            "completion_tokens": 253,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3574,
+            "cached_prompt_tokens": null,
+            "text_chars": 42,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 175,
+              "prefill_ms": 332,
+              "decode_tok_per_sec": 16.104393005371094,
+              "prefill_tok_per_sec": 10765.060546875,
+              "prompt_tokens": 3574,
+              "completion_tokens": 253,
+              "reasoning_tokens": 62,
+              "context_used_tokens": 3574,
+              "context_limit_tokens": 16384,
+              "context_pct": 21.81396484375,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 23191.316550997726,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1019,
+            "engine_prefill_ms": 1187,
+            "reasoning_tokens": 62,
+            "ttfs_ms": 24422.150669000985,
+            "wall_ms": 24422.150669000985,
+            "decode_ms": 1230.8341180032585,
+            "decode_tok_per_sec": 16.072837829589844,
+            "completion_tokens": 346,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3574,
+            "cached_prompt_tokens": null,
+            "text_chars": 42,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1019,
+              "prefill_ms": 1187,
+              "decode_tok_per_sec": 16.072837829589844,
+              "prefill_tok_per_sec": 3010.951904296875,
+              "prompt_tokens": 3574,
+              "completion_tokens": 346,
+              "reasoning_tokens": 62,
+              "context_used_tokens": 3574,
+              "context_limit_tokens": 16384,
+              "context_pct": 21.81396484375,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 16623.42277100106,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1026,
+            "engine_prefill_ms": 1197,
+            "reasoning_tokens": 32,
+            "ttfs_ms": 17914.346315999865,
+            "wall_ms": 17914.346315999865,
+            "decode_ms": 1290.9235449988046,
+            "decode_tok_per_sec": 15.901548385620117,
+            "completion_tokens": 230,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3575,
+            "cached_prompt_tokens": null,
+            "text_chars": 55,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1026,
+              "prefill_ms": 1197,
+              "decode_tok_per_sec": 15.901548385620117,
+              "prefill_tok_per_sec": 2986.63330078125,
+              "prompt_tokens": 3575,
+              "completion_tokens": 230,
+              "reasoning_tokens": 32,
+              "context_used_tokens": 3575,
+              "context_limit_tokens": 16384,
+              "context_pct": 21.820068359375,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          }
+        ],
+        "ttft_ms": {
+          "n": 5,
+          "median": 19058.32,
+          "min": 16623.42,
+          "max": 23191.32,
+          "spread_pct": 34.5
+        },
+        "ttfs_ms": {
+          "n": 5,
+          "median": 20343.38,
+          "min": 17914.35,
+          "max": 24422.15,
+          "spread_pct": 32.0
+        },
+        "decode_tok_per_sec": {
+          "n": 5,
+          "median": 16.08,
+          "min": 15.9,
+          "max": 16.1,
+          "spread_pct": 1.3
+        },
+        "engine_ttft_ms": {
+          "n": 5,
+          "median": 1019,
+          "min": 175,
+          "max": 1059,
+          "spread_pct": 86.8
+        },
+        "engine_prefill_ms": {
+          "n": 5,
+          "median": 1187,
+          "min": 332,
+          "max": 1210,
+          "spread_pct": 74.0
+        },
+        "reasoning_tokens": {
+          "n": 5,
+          "median": 62,
+          "min": 32,
+          "max": 62,
+          "spread_pct": 48.4
+        },
+        "prompt_tokens": {
+          "n": 5,
+          "median": 3574,
+          "min": 3574,
+          "max": 3575,
+          "spread_pct": 0.0
+        },
+        "wall_ms": {
+          "n": 5,
+          "median": 20343.38,
+          "min": 17914.35,
+          "max": 24422.15,
+          "spread_pct": 32.0
+        },
+        "decode_rate_sources": [
+          "engine"
+        ],
+        "seconds": 175.4
+      },
+      "decode": {
+        "raw": [
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 15247.692744997039,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 255,
+            "engine_prefill_ms": 1225,
+            "reasoning_tokens": 39,
+            "ttfs_ms": null,
+            "wall_ms": 39491.4865460014,
+            "decode_ms": 24243.793801004358,
+            "decode_tok_per_sec": 15.728315353393555,
+            "completion_tokens": 1451,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3961,
+            "cached_prompt_tokens": null,
+            "text_chars": 390,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 255,
+              "prefill_ms": 1225,
+              "decode_tok_per_sec": 15.728315353393555,
+              "prefill_tok_per_sec": 3233.469482421875,
+              "prompt_tokens": 3961,
+              "completion_tokens": 1451,
+              "reasoning_tokens": 39,
+              "context_used_tokens": 3961,
+              "context_limit_tokens": 16384,
+              "context_pct": 24.176025390625,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 10716.579680003633,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1003,
+            "engine_prefill_ms": 1957,
+            "reasoning_tokens": 53,
+            "ttfs_ms": null,
+            "wall_ms": 34909.23626100266,
+            "decode_ms": 24192.656580999028,
+            "decode_tok_per_sec": 15.945680618286133,
+            "completion_tokens": 1038,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3961,
+            "cached_prompt_tokens": null,
+            "text_chars": 390,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1003,
+              "prefill_ms": 1957,
+              "decode_tok_per_sec": 15.945680618286133,
+              "prefill_tok_per_sec": 2024.016357421875,
+              "prompt_tokens": 3961,
+              "completion_tokens": 1038,
+              "reasoning_tokens": 53,
+              "context_used_tokens": 3961,
+              "context_limit_tokens": 16384,
+              "context_pct": 24.176025390625,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 11379.81356799719,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1009,
+            "engine_prefill_ms": 1937,
+            "reasoning_tokens": 64,
+            "ttfs_ms": null,
+            "wall_ms": 35363.282895996235,
+            "decode_ms": 23983.469327999046,
+            "decode_tok_per_sec": 15.887676239013672,
+            "completion_tokens": 1445,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3961,
+            "cached_prompt_tokens": null,
+            "text_chars": 390,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1009,
+              "prefill_ms": 1937,
+              "decode_tok_per_sec": 15.887676239013672,
+              "prefill_tok_per_sec": 2044.914794921875,
+              "prompt_tokens": 3961,
+              "completion_tokens": 1445,
+              "reasoning_tokens": 64,
+              "context_used_tokens": 3961,
+              "context_limit_tokens": 16384,
+              "context_pct": 24.176025390625,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 10303.066706001118,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1017,
+            "engine_prefill_ms": 1958,
+            "reasoning_tokens": 49,
+            "ttfs_ms": null,
+            "wall_ms": 34544.223370998225,
+            "decode_ms": 24241.156664997106,
+            "decode_tok_per_sec": 15.805581092834473,
+            "completion_tokens": 1131,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3961,
+            "cached_prompt_tokens": null,
+            "text_chars": 390,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1017,
+              "prefill_ms": 1958,
+              "decode_tok_per_sec": 15.805581092834473,
+              "prefill_tok_per_sec": 2022.982666015625,
+              "prompt_tokens": 3961,
+              "completion_tokens": 1131,
+              "reasoning_tokens": 49,
+              "context_used_tokens": 3961,
+              "context_limit_tokens": 16384,
+              "context_pct": 24.176025390625,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          },
+          {
+            "outcome": "ok",
+            "detail": "",
+            "ttft_ms": 10919.229364000785,
+            "decode_rate_source": "engine",
+            "inference_count": 2,
+            "engine_ttft_ms": 1001,
+            "engine_prefill_ms": 1957,
+            "reasoning_tokens": 59,
+            "ttfs_ms": null,
+            "wall_ms": 35181.5588410027,
+            "decode_ms": 24262.329477001913,
+            "decode_tok_per_sec": 15.830224990844727,
+            "completion_tokens": 1286,
+            "completion_token_source": "usage",
+            "prompt_tokens": 3961,
+            "cached_prompt_tokens": null,
+            "text_chars": 390,
+            "tools": [],
+            "timings": null,
+            "engine_stats": {
+              "type": "turn_stats",
+              "ttft_ms": 1001,
+              "prefill_ms": 1957,
+              "decode_tok_per_sec": 15.830224990844727,
+              "prefill_tok_per_sec": 2024.016357421875,
+              "prompt_tokens": 3961,
+              "completion_tokens": 1286,
+              "reasoning_tokens": 59,
+              "context_used_tokens": 3961,
+              "context_limit_tokens": 16384,
+              "context_pct": 24.176025390625,
+              "model_load_ms": null,
+              "inference_count": 2,
+              "reengagements": 0
+            }
+          }
+        ],
+        "ttft_ms": {
+          "n": 5,
+          "median": 10919.23,
+          "min": 10303.07,
+          "max": 15247.69,
+          "spread_pct": 45.3
+        },
+        "ttfs_ms": null,
+        "decode_tok_per_sec": {
+          "n": 5,
+          "median": 15.83,
+          "min": 15.73,
+          "max": 15.95,
+          "spread_pct": 1.4
+        },
+        "engine_ttft_ms": {
+          "n": 5,
+          "median": 1003,
+          "min": 255,
+          "max": 1017,
+          "spread_pct": 76.0
+        },
+        "engine_prefill_ms": {
+          "n": 5,
+          "median": 1957,
+          "min": 1225,
+          "max": 1958,
+          "spread_pct": 37.5
+        },
+        "reasoning_tokens": {
+          "n": 5,
+          "median": 53,
+          "min": 39,
+          "max": 64,
+          "spread_pct": 47.2
+        },
+        "prompt_tokens": {
+          "n": 5,
+          "median": 3961,
+          "min": 3961,
+          "max": 3961,
+          "spread_pct": 0.0
+        },
+        "wall_ms": {
+          "n": 5,
+          "median": 35181.56,
+          "min": 34544.22,
+          "max": 39491.49,
+          "spread_pct": 14.1
+        },
+        "decode_rate_sources": [
+          "engine"
+        ],
+        "seconds": 447.4
+      },
+      "reliability": {
+        "relevant": {
+          "counts": {
+            "tool_call_ok": 10,
+            "wrong_tool": 0,
+            "text_only": 2,
+            "bad_args": 0,
+            "stream_error": 0,
+            "empty": 0
+          },
+          "of": 12,
+          "rows": [
+            {
+              "ask": "What is the weather right now?",
+              "expected": "giap-weather__get_current_weather",
+              "got": [
+                "giap-weather__get_current_weather"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What time is it?",
+              "expected": "giap-system__get_current_time",
+              "got": [],
+              "class": "text_only",
+              "detail": ""
+            },
+            {
+              "ask": "List the devices set up in this home.",
+              "expected": "giap-device__list_registered_devices",
+              "got": [
+                "giap-device__list_registered_devices"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What is on my schedule?",
+              "expected": "giap-schedule__list_schedules",
+              "got": [
+                "giap-schedule__list_schedules"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What is the current price of bitcoin?",
+              "expected": "giap-finance__get_crypto_price",
+              "got": [
+                "giap-finance__get_crypto_price"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What are today's top tech stories?",
+              "expected": "giap-news__get_top_stories",
+              "got": [
+                "giap-news__get_top_stories"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "Look up Kenya's population and capital.",
+              "expected": "giap-discovery__get_country_info",
+              "got": [
+                "giap-discovery__get_country_info"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What is the exchange rate from USD to KES?",
+              "expected": "giap-finance__get_exchange_rate",
+              "got": [
+                "giap-finance__get_exchange_rate",
+                "giap-finance__convert_currency"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "Tell me about the Rust programming language from Wikipedia.",
+              "expected": "giap-knowledge__get_wikipedia_article",
+              "got": [
+                "giap-toolkit__enable_tool_group",
+                "giap-knowledge__get_wikipedia_article"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "Remember that I prefer tea over coffee.",
+              "expected": "giap-memory__save_memory",
+              "got": [
+                "giap-memory__save_memory"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What do you remember about me?",
+              "expected": "giap-memory__recall_memories",
+              "got": [],
+              "class": "text_only",
+              "detail": ""
+            },
+            {
+              "ask": "How much disk space is left on this machine?",
+              "expected": "giap-system__get_system_info",
+              "got": [
+                "giap-system__get_system_info"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            }
+          ]
+        },
+        "all": {
+          "counts": {
+            "tool_call_ok": 10,
+            "wrong_tool": 0,
+            "text_only": 2,
+            "bad_args": 0,
+            "stream_error": 0,
+            "empty": 0
+          },
+          "of": 12,
+          "rows": [
+            {
+              "ask": "What is the weather right now?",
+              "expected": "giap-weather__get_current_weather",
+              "got": [
+                "giap-weather__get_current_weather"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What time is it?",
+              "expected": "giap-system__get_current_time",
+              "got": [],
+              "class": "text_only",
+              "detail": ""
+            },
+            {
+              "ask": "List the devices set up in this home.",
+              "expected": "giap-device__list_registered_devices",
+              "got": [
+                "giap-device__list_registered_devices"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What is on my schedule?",
+              "expected": "giap-schedule__list_schedules",
+              "got": [
+                "giap-schedule__list_schedules"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What is the current price of bitcoin?",
+              "expected": "giap-finance__get_crypto_price",
+              "got": [
+                "giap-finance__get_crypto_price"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What are today's top tech stories?",
+              "expected": "giap-news__get_top_stories",
+              "got": [
+                "giap-news__get_top_stories"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "Look up Kenya's population and capital.",
+              "expected": "giap-discovery__get_country_info",
+              "got": [
+                "giap-discovery__get_country_info"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What is the exchange rate from USD to KES?",
+              "expected": "giap-finance__get_exchange_rate",
+              "got": [
+                "giap-finance__get_exchange_rate",
+                "giap-finance__convert_currency"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "Tell me about the Rust programming language from Wikipedia.",
+              "expected": "giap-knowledge__get_wikipedia_article",
+              "got": [
+                "giap-toolkit__enable_tool_group",
+                "giap-knowledge__get_wikipedia_article"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "Remember that I prefer tea over coffee.",
+              "expected": "giap-memory__save_memory",
+              "got": [
+                "giap-memory__save_memory"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            },
+            {
+              "ask": "What do you remember about me?",
+              "expected": "giap-memory__recall_memories",
+              "got": [],
+              "class": "text_only",
+              "detail": ""
+            },
+            {
+              "ask": "How much disk space is left on this machine?",
+              "expected": "giap-system__get_system_info",
+              "got": [
+                "giap-system__get_system_info"
+              ],
+              "class": "tool_call_ok",
+              "detail": ""
+            }
+          ]
+        },
+        "seconds": 1491.0
+      },
+      "must_not_call": {
+        "spurious": 3,
+        "of": 10,
+        "rows": [
+          {
+            "ask": "What is the capital of France?",
+            "got": [
+              "giap-toolkit__enable_tool_group",
+              "giap-knowledge__get_wikipedia_article"
+            ],
+            "spurious": true
+          },
+          {
+            "ask": "How many centimetres are in a metre?",
+            "got": [],
+            "spurious": false
+          },
+          {
+            "ask": "Write me a haiku about rain.",
+            "got": [],
+            "spurious": false
+          },
+          {
+            "ask": "Say hello.",
+            "got": [],
+            "spurious": false
+          },
+          {
+            "ask": "What is 17 times 23?",
+            "got": [],
+            "spurious": false
+          },
+          {
+            "ask": "Summarise what you can help me with.",
+            "got": [],
+            "spurious": false
+          },
+          {
+            "ask": "Translate 'good morning' into French.",
+            "got": [],
+            "spurious": false
+          },
+          {
+            "ask": "Who wrote Pride and Prejudice?",
+            "got": [
+              "giap-toolkit__enable_tool_group",
+              "giap-knowledge__search_books"
+            ],
+            "spurious": true
+          },
+          {
+            "ask": "What is the boiling point of water at sea level?",
+            "got": [
+              "giap-toolkit__enable_tool_group",
+              "giap-knowledge__compute_answer",
+              "giap-knowledge__get_wikipedia_article"
+            ],
+            "spurious": true
+          },
+          {
+            "ask": "Explain what an API is, briefly.",
+            "got": [],
+            "spurious": false
+          }
+        ],
+        "seconds": 559.6
+      },
+      "canary": {
+        "score": 10,
+        "of": 10,
+        "rows": [
+          {
+            "ask": "What is the capital of France?",
+            "want": "paris",
+            "ok": true,
+            "said": "The capital of France is Paris."
+          },
+          {
+            "ask": "What is 17 times 23?",
+            "want": "391",
+            "ok": true,
+            "said": "17 times 23 is 391."
+          },
+          {
+            "ask": "How many centimetres are in a metre?",
+            "want": "100",
+            "ok": true,
+            "said": "There are 100 centimetres in a metre."
+          },
+          {
+            "ask": "Who wrote Pride and Prejudice?",
+            "want": "austen",
+            "ok": true,
+            "said": "Jane Austen wrote Pride and Prejudice."
+          },
+          {
+            "ask": "What is the boiling point of water at sea level in Celsius?",
+            "want": "100",
+            "ok": true,
+            "said": "The boiling point of water at sea level is 100 degrees Celsius."
+          },
+          {
+            "ask": "What is the chemical symbol for gold?",
+            "want": "au",
+            "ok": true,
+            "said": "The chemical symbol for gold is Au."
+          },
+          {
+            "ask": "How many continents are there?",
+            "want": "seven",
+            "ok": true,
+            "said": "There are seven continents."
+          },
+          {
+            "ask": "What planet is known as the red planet?",
+            "want": "mars",
+            "ok": true,
+            "said": "The planet known as the red planet is Mars."
+          },
+          {
+            "ask": "Translate 'good morning' into French.",
+            "want": "bonjour",
+            "ok": true,
+            "said": "Bonjour"
+          },
+          {
+            "ask": "What is the largest ocean on Earth?",
+            "want": "pacific",
+            "ok": true,
+            "said": "The largest ocean on Earth is the Pacific Ocean. It is the largest and deepest of Earth's five oceanic divisions."
+          }
+        ],
+        "seconds": 540.3
+      },
+      "multiturn": {
+        "stream_errors": 0,
+        "of": 5,
+        "rows": [
+          {
+            "opened_with": "What is the weather right now?",
+            "outcome": "ok",
+            "detail": ""
+          },
+          {
+            "opened_with": "What time is it?",
+            "outcome": "ok",
+            "detail": ""
+          },
+          {
+            "opened_with": "List the devices set up in this home.",
+            "outcome": "ok",
+            "detail": ""
+          },
+          {
+            "opened_with": "What is on my schedule?",
+            "outcome": "ok",
+            "detail": ""
+          },
+          {
+            "opened_with": "What is the current price of bitcoin?",
+            "outcome": "ok",
+            "detail": ""
+          }
+        ],
+        "seconds": 509.0
+      }
+    }
+  },
+  "memory": {
+    "samples": 5055,
+    "mem_available_start_mb": 5857,
+    "mem_available_min_mb": 1308,
+    "mem_available_end_mb": 2424,
+    "peak_footprint_mb": 4549,
+    "swap_delta_mb": 16,
+    "lfb_min_mb": 1,
+    "nvmap_pid_peak_mb": null,
+    "before": {
+      "mem_available_mb": 5864,
+      "mem_free_mb": 3333,
+      "swap_free_mb": 5596,
+      "cached_mb": 2731,
+      "nvmap_total_mb": null,
+      "nvmap_pid_mb": null,
+      "lfb_mb": 116
+    },
+    "after": {
+      "mem_available_mb": 2431,
+      "mem_free_mb": 377,
+      "swap_free_mb": 5583,
+      "cached_mb": 2258,
+      "nvmap_total_mb": null,
+      "nvmap_pid_mb": null,
+      "lfb_mb": 3
+    }
+  },
+  "thermal": {
+    "tj_peak_c": 71.937,
+    "vdd_in_mw_avg": 16981,
+    "vdd_in_mw_peak": 18949,
+    "gr3d_pct_avg": 84,
+    "samples": 12891
+  },
+  "warnings": [
+    "drop_caches needs root; this run is NOT a cold start"
+  ],
+  "engine_facts_file": "/home/nano/bakeoff-results/2026-09-08/c1-giap/gemma-4-E4B-it-qat/engine-facts.txt",
+  "server_log": "/home/nano/bakeoff-results/2026-09-08/c1-giap/gemma-4-E4B-it-qat/server.log"
+}

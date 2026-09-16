@@ -31,7 +31,7 @@ GIAP is built on [Block's Goose](https://github.com/aaif-goose/goose) open-sourc
 | **Smart devices** | Register, query, and control devices via MCP tools |
 | **Persistent memory** | SQLite-backed memory fragments injected into every prompt |
 | **Schedules** | Cron-style task automation with webhook dispatch |
-| **Desktop app** | Native Tauri 2 app (macOS + Linux) with GUI, Voice, and Canvas modes |
+| **Desktop app** | Native Electron app (macOS) with GUI, Voice, and Canvas modes |
 | **Mobile companion** | Goose On The Go — remote control via authenticated REST API |
 | **Privacy** | All inference, voice, and memory runs 100% on-device |
 
@@ -62,7 +62,7 @@ pond-adapters-llamafile     (llamafile / OpenAI-compat provider)
 pond-adapters-local-inference (in-process GGUF via llama-cpp-2)
 pond-adapters-mcp-memory    (flat-file MCP memory)
 pond-mcp-server             (GIAP as a Goose builtin MCP extension)
-pond-desktop                (Tauri 2 desktop app — React + Rust)
+pond-desktop                (Electron desktop app — React + TypeScript)
 ```
 
 **Detailed docs:**
@@ -195,10 +195,10 @@ cargo run -p pond-server -- chat --voice
 ```bash
 cd pond-desktop
 npm install
-npm run tauri dev
+npm run dev:electron
 ```
 
-The Tauri app starts `pond-server` automatically and provides three modes: GUI sidebar, Voice orb, and Canvas floating overlay.
+The desktop app starts `pond-server` automatically and provides three modes: GUI sidebar, Voice orb, and Canvas floating overlay.
 
 ---
 
@@ -293,7 +293,7 @@ See the [TDD Guide](./docs/testing/tdd_guide.md) for the full testing philosophy
 | Agent framework | [Goose](https://github.com/aaif-goose/goose) by Block |
 | HTTP API | Axum 0.8 |
 | Database | SQLite via SQLx (two DBs: `pond_system.db`, `pond_logs.db`) |
-| Desktop shell | Tauri 2.0 |
+| Desktop shell | Electron |
 | Desktop UI | React 19 + TypeScript + Vite |
 | Speech-to-text | whisper.cpp (HTTP server mode) |
 | Text-to-speech | Piper TTS (subprocess) |

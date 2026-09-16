@@ -4,7 +4,8 @@
 //! destroys the engine's KV prefix reuse. Every failure path widens, never narrows.
 
 use crate::mcp::domain::tool_group::{
-    core_group_names, find_group, group_of_tool, is_catalog_extension, TOOL_GROUPS,
+    core_group_names, find_group, group_of_tool, is_catalog_extension, TOOLKIT_EXTENSION,
+    TOOL_GROUPS,
 };
 
 /// Cosine-similarity floor for including a non-core group, on all-MiniLM-L6-v2. Calibrated
@@ -30,6 +31,8 @@ pub enum SelectionBasis {
     NoEmbedder,
     /// Scored against group descriptions.
     Scored,
+    /// `tool_selection_mode = "minimal"`: the toolkit hatch only, no scoring.
+    ModeMinimal,
 }
 
 /// The outcome of selection for one session.
@@ -163,6 +166,49 @@ pub fn select_groups(
     }
 }
 
+/// The `"minimal"` answer: the toolkit escape hatch, and nothing else.
+///
+/// No scoring, no embedder, no core set. Two tools — `list_tool_groups` and
+/// `enable_tool_group` — are 222 tokens of the 8,192-token local prompt budget,
+/// which is the only shape that fits a 4% ceiling. Everything else is one
+/// `enable_tool_group` call away and, once enabled, is persisted for the
+/// session like any other loaded group.
+///
+/// `available` is the PERMITTED set, so a scope that denies the toolkit gets an
+/// empty selection rather than a hatch it is not entitled to. That is a pond
+/// with no tools at all, which is the honest outcome: the alternative is
+/// handing back a hatch whose every destination is denied.
+pub fn minimal_groups(available: &[String]) -> ToolSelection {
+    let groups = available
+        .iter()
+        .filter(|a| a.as_str() == TOOLKIT_EXTENSION)
+        .cloned()
+        .collect();
+    ToolSelection {
+        groups,
+        basis: SelectionBasis::ModeMinimal,
+    }
+}
+
+/// Keep only the groups a scope is permitted to hold.
+///
+/// One function because there are three places that must apply this rule — the
+/// in-process cache, the persisted row, and anything that restores a group set
+/// from elsewhere — and writing it three times is how one of them came to be
+/// missing it. The cache path returned its entry unclamped, so an Owner turn
+/// could cache the wide list and a later Guest turn on the same session got it
+/// back.
+///
+/// Scope is re-derived every turn and narrows on failure (a transient device
+/// read falls through to Guest), so "the cache was filled by a wider speaker"
+/// is an ordinary case, not an exotic one.
+pub fn clamp_to_permitted(groups: Vec<String>, permitted: &[String]) -> Vec<String> {
+    groups
+        .into_iter()
+        .filter(|g| permitted.iter().any(|p| p == g))
+        .collect()
+}
+
 /// Retain only the tools belonging to `groups`.
 ///
 /// A tool with no `__` prefix, or whose prefix is not a catalog extension, is KEPT: the
@@ -183,7 +229,8 @@ where
 
 /// Remove every tool a `Guest` must never reach; the list is in
 /// [`crate::mcp::domain::tool_group::groups_denied_to_guests`]. Filters TOOLS, because the
-/// group-level subtraction runs only under `tool_selection_mode = "relevant"` (default
+/// group-level subtraction runs only under `tool_selection_narrows()` — "relevant" or
+/// "minimal" (default
 /// "all"). A prompt-surface control: a real gate needs goose's private `add_inspector`.
 pub fn subtract_guest_denied_tools<'a, I>(tools: I) -> Vec<String>
 where
@@ -312,6 +359,94 @@ mod tests {
     }
 
     /// Core groups survive even when every score is zero.
+    /// "minimal" offers the hatch and nothing else -- not the core set, which
+    /// is 778 tokens and 9.5% of the local prompt budget on its own.
+    /// The asymmetry that made this a function: a wider speaker's cached set
+    /// must not survive into a narrower speaker's turn.
+    #[test]
+    fn a_wider_speakers_groups_do_not_survive_a_narrower_turn() {
+        let owner_cached = vec![
+            "giap-memory".to_string(),
+            "giap-sensors".to_string(),
+            "giap-weather".to_string(),
+        ];
+        // What a Guest is permitted: memory and sensors are personal-data groups.
+        let guest_permitted = vec!["giap-weather".to_string(), "giap-toolkit".to_string()];
+
+        let clamped = clamp_to_permitted(owner_cached, &guest_permitted);
+
+        assert_eq!(clamped, vec!["giap-weather".to_string()]);
+        assert!(
+            !clamped.iter().any(|g| g == "giap-memory"),
+            "a personal-data group reached a guest through the cache"
+        );
+    }
+
+    /// The other direction, so the clamp cannot pass by refusing everything.
+    #[test]
+    fn clamping_against_a_wider_ceiling_keeps_everything() {
+        let held = vec!["giap-weather".to_string(), "giap-memory".to_string()];
+        let permitted = vec![
+            "giap-weather".to_string(),
+            "giap-memory".to_string(),
+            "giap-sensors".to_string(),
+        ];
+        assert_eq!(clamp_to_permitted(held.clone(), &permitted), held);
+    }
+
+    #[test]
+    fn minimal_offers_the_hatch_and_nothing_else() {
+        let available = vec![
+            "giap-memory".to_string(),
+            "giap-system".to_string(),
+            TOOLKIT_EXTENSION.to_string(),
+            "giap-weather".to_string(),
+        ];
+
+        let sel = minimal_groups(&available);
+
+        assert_eq!(sel.groups, vec![TOOLKIT_EXTENSION.to_string()]);
+        assert_eq!(sel.basis, SelectionBasis::ModeMinimal);
+        // The core groups specifically: they are the ones every other narrowing
+        // path puts back unconditionally, so they are what would leak in here.
+        for core in core_group_names() {
+            if core != TOOLKIT_EXTENSION {
+                assert!(
+                    !sel.groups.iter().any(|g| g == core),
+                    "{core} is core, but minimal offers the hatch alone"
+                );
+            }
+        }
+    }
+
+    /// A scope that is not entitled to the toolkit gets NO hatch, not a hatch
+    /// whose every destination is denied.
+    ///
+    /// `available` is the permitted set, so this is the guest/denied case. The
+    /// result is a pond with no tools at all, which is the honest outcome --
+    /// and it is a one-line `filter`, which is exactly the kind of line that
+    /// gets rewritten into `unwrap_or(TOOLKIT_EXTENSION)` by someone who reads
+    /// the empty vector as a bug.
+    #[test]
+    fn minimal_offers_nothing_when_the_hatch_is_not_permitted() {
+        let available = vec!["giap-weather".to_string(), "giap-memory".to_string()];
+
+        let sel = minimal_groups(&available);
+
+        assert!(
+            sel.groups.is_empty(),
+            "the toolkit is not permitted here, so there is no hatch to offer: {:?}",
+            sel.groups
+        );
+        assert_eq!(sel.basis, SelectionBasis::ModeMinimal);
+    }
+
+    /// Nothing registered is not a crash, and not a widening either.
+    #[test]
+    fn minimal_on_an_empty_availability_is_empty() {
+        assert!(minimal_groups(&[]).groups.is_empty());
+    }
+
     #[test]
     fn core_groups_are_always_present() {
         let avail = available();
@@ -325,7 +460,7 @@ mod tests {
         }
     }
 
-    /// The point of the feature: a weather question does not load 59 tools.
+    /// The point of the feature: a weather question does not load all 27 tools.
     #[test]
     fn a_single_relevant_group_narrows_hard() {
         let avail = available();
@@ -340,7 +475,9 @@ mod tests {
         }
         let sel = select_groups(&avail, Some(&scores), DEFAULT_RELEVANCE_THRESHOLD);
         assert_eq!(sel.basis, SelectionBasis::Scored);
-        // 4 core + weather, and nothing else.
+        // core + weather, and nothing else (the count comes from
+        // `core_group_names()` below rather than a literal, which is why this
+        // survived the core set going from four groups to three).
         assert_eq!(sel.groups.len(), core_group_names().len() + 1);
         assert!(sel.groups.contains(&"giap-weather".to_string()));
         assert!(!sel.groups.contains(&"giap-schedule".to_string()));
@@ -353,13 +490,12 @@ mod tests {
             score("giap-device", 0.44),
             score("giap-device-control", 0.41),
             score("giap-schedule", 0.30),
-            score("giap-news", 0.02),
+            score("giap-knowledge", 0.02),
         ];
         let sel = select_groups(&avail, Some(&scores), DEFAULT_RELEVANCE_THRESHOLD);
         for want in ["giap-device", "giap-device-control", "giap-schedule"] {
             assert!(sel.groups.contains(&want.to_string()), "{want} missing");
         }
-        assert!(!sel.groups.contains(&"giap-news".to_string()));
     }
 
     /// Rule 4: the best non-core scorer rides along even below the threshold,
@@ -368,24 +504,28 @@ mod tests {
     fn top_scorer_is_rescued_below_threshold() {
         let avail = available();
         let scores = vec![
-            score("giap-finance", 0.19),
-            score("giap-news", 0.11),
-            score("giap-vision", 0.03),
+            score("giap-weather", 0.19),
+            score("giap-knowledge", 0.11),
+            score("giap-sensors", 0.03),
         ];
         let sel = select_groups(&avail, Some(&scores), DEFAULT_RELEVANCE_THRESHOLD);
         assert!(
-            sel.groups.contains(&"giap-finance".to_string()),
+            sel.groups.contains(&"giap-weather".to_string()),
             "top scorer should be rescued"
         );
-        assert!(!sel.groups.contains(&"giap-news".to_string()));
+        assert!(!sel.groups.contains(&"giap-knowledge".to_string()));
     }
 
     /// Selection only ever picks from what is registered — a disabled extension
     /// cannot be resurrected by a high score.
     #[test]
     fn unavailable_groups_are_never_selected() {
+        // A registered, non-core group that no score names. It must be
+        // `giap-memory`-free: the last assertion below is precisely that a core
+        // group which is NOT registered stays out, so putting one in `avail`
+        // would delete the property being tested.
         let avail: Vec<String> = vec![
-            "giap-draft".into(),
+            "giap-knowledge".into(),
             "giap-toolkit".into(),
             "giap-weather".into(),
         ];
@@ -464,7 +604,7 @@ mod tests {
 
     /// The ceiling bounds selection, including the core groups: `select_groups` filters
     /// `core_group_names()` by `available`, so passing the guest ceiling as `available`
-    /// keeps `giap-draft` and `giap-memory` out even though both are core.
+    /// keeps `giap-memory` out even though it is core.
     #[test]
     fn selecting_from_the_guest_ceiling_drops_even_core_groups() {
         use crate::mcp::domain::tool_group::core_group_names;
@@ -511,8 +651,12 @@ mod tests {
 
     #[test]
     fn scorable_groups_excludes_core_and_unregistered() {
+        // A user-added MCP server stands in for "registered but not in the
+        // catalog". This said `giap-draft`, which was a catalog group until it
+        // was deleted -- after which the fixture was exercising the external
+        // path while still reading as a test about a GIAP group.
         let avail: Vec<String> = vec![
-            "giap-draft".into(),
+            "some-user-mcp-server".into(),
             "giap-memory".into(),
             "giap-weather".into(),
         ];
@@ -540,13 +684,13 @@ mod tests {
         let tools: Vec<String> = vec![
             "my-mcp__do_thing".into(),
             "unprefixed_tool".into(),
-            "giap-news__get_headlines".into(),
+            "giap-knowledge__compute_answer".into(),
         ];
         let groups: Vec<String> = vec!["giap-weather".into()];
         let kept = filter_tools_by_groups(&tools, &groups);
         assert!(kept.contains(&"my-mcp__do_thing".to_string()));
         assert!(kept.contains(&"unprefixed_tool".to_string()));
-        assert!(!kept.contains(&"giap-news__get_headlines".to_string()));
+        assert!(!kept.contains(&"giap-knowledge__compute_answer".to_string()));
     }
 
     /// The regression this split exists for: the question and the standing context must
@@ -734,17 +878,28 @@ mod tests {
     /// kept every memory tool. Nothing below depends on selection running.
     #[test]
     fn guest_denied_tools_are_removed_from_an_unfiltered_set() {
+        // Only tools whose GROUP still exists. `giap-draft__approve_draft`,
+        // `giap-audit__list_egress` and `giap-vision__describe_scene` were in
+        // this fixture after their groups were deleted, and they were still
+        // withheld -- but by the default-deny-unknown-prefix arm below, not by
+        // the denylist this test names. The assertion passed while guarding
+        // nothing.
         let all = tools(&[
             "giap-memory__recall_memories",
             "giap-memory__forget_memory",
             "giap-memory__keyword_search",
-            "giap-draft__approve_draft",
-            "giap-audit__list_egress",
-            "giap-vision__describe_scene",
             "giap-sensors__read_sensor",
             "giap-weather__get_forecast",
             "giap-toolkit__enable_tool_group",
         ]);
+        for tool in &all {
+            let group = group_of_tool(tool).expect("fixture tools are prefixed");
+            assert!(
+                is_catalog_extension(group),
+                "{tool}'s group is gone, so this fixture would exercise the \
+                 unknown-prefix arm rather than the denylist"
+            );
+        }
 
         let kept = subtract_guest_denied_tools(all.iter());
 
@@ -752,9 +907,6 @@ mod tests {
             "giap-memory__recall_memories",
             "giap-memory__forget_memory",
             "giap-memory__keyword_search",
-            "giap-draft__approve_draft",
-            "giap-audit__list_egress",
-            "giap-vision__describe_scene",
             "giap-sensors__read_sensor",
         ] {
             assert!(

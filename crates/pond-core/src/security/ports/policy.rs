@@ -439,8 +439,9 @@ pub const REASON_UNPROVEN_IDENTITY: &str =
 ///    be resolved. Refuse. Access narrows on failure (PAI-1 invariant 2), and
 ///    an unresolvable caller is the definition of failure here.
 /// 2. **`Guest`** -- never. Belt and braces behind the tool-group denylist: if
-///    a future selection mode leaks `giap-draft` to a visitor again (it did,
-///    for a day, in PAI-1 P5), the tool itself still refuses.
+///    a future selection mode leaks a deciding surface to a visitor again (it
+///    did, for a day, in PAI-1 P5, when the group was `giap-draft`), the
+///    decision itself still refuses.
 /// 3. **An owned draft** -- `Owner(id)` may decide only its own. `Household`
 ///    may decide any, because
 ///    [`identity_resolution::resolve`](crate::user_data::services::identity_resolution::resolve)

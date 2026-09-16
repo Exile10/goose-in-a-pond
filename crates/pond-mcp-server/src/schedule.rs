@@ -11,10 +11,7 @@
 //! them too — a rule is still a scheduled task underneath.
 //! Depends on [`SchedulerPort`] and [`SettingsRepository`].
 
-use pond_core::user_data::domain::schedule::{
-    CompareOp, SensorTriggerSpec, TaskKind, TriggerAction, TriggerCondition, TriggerSource,
-    TriggerSourceKind,
-};
+use pond_core::user_data::domain::schedule::{SensorTriggerSpec, TaskKind, TriggerSourceKind};
 use pond_core::user_data::ports::scheduler::{
     CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest,
 };
@@ -214,6 +211,16 @@ pub struct ScheduleMcpServer {
 
 #[tool_router]
 impl ScheduleMcpServer {
+    /// Every tool this server exposes, without constructing it or its deps.
+    ///
+    /// `tool_router()` is generated private to this module, so inventory code
+    /// outside it could not reach the real definitions and resorted to scanning
+    /// source text for `#[tool(` instead. This is the enumeration that scan was
+    /// standing in for.
+    pub(crate) fn tool_defs() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
+    }
+
     pub fn new(
         scheduler: Arc<dyn SchedulerPort>,
         settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
@@ -695,82 +702,6 @@ One-shot timer or reminder: fires ONCE after a delay, then deletes itself \
             Err(e) => Err(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Failed to {action} schedule: {e}"),
-                None,
-            )),
-        }
-    }
-
-    #[tool(description = "Get recent run history for a schedule: status, result, duration.")]
-    async fn get_schedule_runs(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<GetScheduleRunsParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let limit = params.0.limit.unwrap_or(10);
-        match self.scheduler.get_runs(&params.0.id, limit).await {
-            Ok(runs) => {
-                let text = if runs.is_empty() {
-                    format!("No execution history for schedule '{}'.", params.0.id)
-                } else {
-                    runs.iter()
-                        .map(|r| {
-                            let duration = r
-                                .duration_ms
-                                .map(|d| format!(" ({d}ms)"))
-                                .unwrap_or_default();
-                            let detail = match &r.status {
-                                pond_core::user_data::domain::schedule::RunStatus::Completed => {
-                                    let preview = r
-                                        .result
-                                        .as_deref()
-                                        .unwrap_or("")
-                                        .chars()
-                                        .take(200)
-                                        .collect::<String>();
-                                    format!("completed{duration}: {preview}")
-                                }
-                                pond_core::user_data::domain::schedule::RunStatus::Failed => {
-                                    let err = r.error.as_deref().unwrap_or("unknown error");
-                                    format!("failed{duration}: {err}")
-                                }
-                                pond_core::user_data::domain::schedule::RunStatus::Running => {
-                                    "running...".to_string()
-                                }
-                            };
-                            format!("- [{}] {}", r.started_at.format("%Y-%m-%d %H:%M"), detail)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                // Build UI hint with structured run data
-                let ui_runs: Vec<serde_json::Value> = runs
-                    .iter()
-                    .map(|r| {
-                        let status_str = match &r.status {
-                            pond_core::user_data::domain::schedule::RunStatus::Completed => "completed",
-                            pond_core::user_data::domain::schedule::RunStatus::Failed => "failed",
-                            pond_core::user_data::domain::schedule::RunStatus::Running => "running",
-                        };
-                        serde_json::json!({
-                            "started_at": r.started_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            "status": status_str,
-                            "duration_ms": r.duration_ms,
-                            "result": r.result.as_deref().unwrap_or("").chars().take(200).collect::<String>(),
-                            "error": r.error.as_deref().unwrap_or(""),
-                        })
-                    })
-                    .collect();
-                let ui_data = serde_json::json!({
-                    "schedule_id": params.0.id,
-                    "runs": ui_runs,
-                });
-                let hint = format!("[[[mcp-ui:schedule_runs:{}]]]\n", ui_data);
-                let full_result = format!("{}{}", hint, text);
-                Ok(CallToolResult::success(vec![Content::text(full_result)]))
-            }
-            Err(e) => Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to get runs: {}", e),
                 None,
             )),
         }

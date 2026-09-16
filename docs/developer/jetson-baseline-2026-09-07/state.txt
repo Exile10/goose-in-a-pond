@@ -1,0 +1,109 @@
+2026-09-07T14:51:37+03:00
+Linux nano 5.15.148-tegra #1 SMP PREEMPT Thu Sep 18 15:08:33 PDT 2025 aarch64 aarch64 aarch64 GNU/Linux
+# R36 (release), REVISION: 4.7, GCID: 42132812, BOARD: generic, EABI: aarch64, DATE: Thu Sep 18 22:54:44 UTC 2025
+# KERNEL_VARIANT: oot
+TARGET_USERSPACE_LIB_DIR=nvidia
+TARGET_USERSPACE_LIB_DIR_PATH=usr/lib/aarch64-linux-gnu/nvidia
+--- targets/services ---
+multi-user.target
+gdm3                   active
+display-manager        active
+systemd-oomd           inactive
+nvargus-daemon         active
+nvgetty                inactive
+nvzramconfig           failed
+nvpower                inactive
+nvpmodel               inactive
+unattended-upgrades    inactive
+avahi-daemon           active
+bluetooth              active
+pulseaudio             inactive
+Linger=yes
+Restart=on-failure
+ActiveState=inactive
+--- memory/swap ---
+               total        used        free      shared  buff/cache   available
+Mem:            7619        5386          94          53        2139        1947
+Swap:          12001         457       11544
+NAME       TYPE      SIZE  USED PRIO
+/swapfile  file        8G    0B   -2
+/dev/zram0 partition 635M 75.8M    5
+/dev/zram1 partition 635M 76.6M    5
+/dev/zram2 partition 635M 76.2M    5
+/dev/zram3 partition 635M 74.6M    5
+/dev/zram4 partition 635M 76.5M    5
+/dev/zram5 partition 635M 77.2M    5
+NAME       ALGORITHM DISKSIZE  DATA COMPR TOTAL STREAMS MOUNTPOINT
+/dev/zram5 lzo-rle       635M 77.1M 17.7M   20M       6 [SWAP]
+/dev/zram4 lzo-rle       635M 76.4M 17.8M   20M       6 [SWAP]
+/dev/zram3 lzo-rle       635M 74.4M 17.7M 20.1M       6 [SWAP]
+/dev/zram2 lzo-rle       635M 76.1M 17.5M 19.9M       6 [SWAP]
+/dev/zram1 lzo-rle       635M 76.6M 18.4M 20.7M       6 [SWAP]
+/dev/zram0 lzo-rle       635M 75.8M 17.7M 20.4M       6 [SWAP]
+vm.swappiness = 10
+/etc/sysctl.d/99-pond-spark-swap.conf:1:vm.swappiness=10
+# /etc/fstab: static file system information.
+#
+# These are the filesystems that are always mounted on boot, you can
+# override any of these by copying the appropriate line from this file into
+# /etc/fstab and tweaking it as you see fit.  See fstab(5).
+#
+# <file system> <mount point>             <type>          <options>                               <dump> <pass>
+/dev/root            /                     ext4           defaults                                     0 1
+UUID=4AA3-B0A6 /boot/efi vfat defaults 0 1
+/swapfile none swap sw 0 0
+--- disk ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p1  116G  109G  1.4G  99% /
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          1         0         24.36GB   24.36GB (100%)
+Containers      0         0         0B        0B
+Local Volumes   0         0         0B        0B
+Build Cache     0         0         0B        0B
+--- power ---
+NV Power Mode: MAXN_SUPER
+2
+pmode:0002/etc/nvpmodel/nvpmodel_p3767_0003_super.conf
+< POWER_MODEL ID=0 NAME=15W >
+< POWER_MODEL ID=1 NAME=25W >
+< POWER_MODEL ID=2 NAME=MAXN_SUPER >
+< POWER_MODEL ID=3 NAME=7W >
+< PM_CONFIG DEFAULT=1 >
+15340000.vic
+15380000.nvjpg
+15480000.nvdec
+15540000.nvjpg
+15a50000.ofa
+17000000.gpu
+/sys/class/devfreq/17000000.gpu gov=nvhost_podgov cur=306000000 min=306000000 max=1020000000
+schedutil
+ondemand userspace performance schedutil 
+/sys/devices/platform/soctherm-oc-event/hwmon/hwmon3/oc1_event_cnt:0
+/sys/devices/platform/soctherm-oc-event/hwmon/hwmon3/oc2_event_cnt:0
+/sys/devices/platform/soctherm-oc-event/hwmon/hwmon3/oc3_event_cnt:2354
+--- kernel/nvmap ---
+nvidia-l4t-core 36.4.7-20250918154033
+nvidia-l4t-kernel 5.15.148-tegra-36.4.7-20250918154033
+nvidia-l4t-kernel-dtbs 5.15.148-tegra-36.4.7-20250918154033
+nvidia-l4t-kernel-headers 5.15.148-tegra-36.4.7-20250918154033
+nvidia-l4t-kernel-oot-headers 5.15.148-tegra-36.4.7-20250918154033
+nvidia-l4t-kernel-oot-modules 5.15.148-tegra-36.4.7-20250918154033
+holds:
+dpkg-query: no path found matching pattern /lib/modules/5.15.148-tegra/updates/drivers/video/tegra/nvmap/nvmap.ko
+5.15.148-tegra SMP preempt mod_unload modversions aarch64
+cat: /sys/module/nvmap/srcversion: No such file or directory
+6e406a50de2d43e9e6f5e26acab90df12ba4c31d858831b979ca41d33ce1084d  /lib/modules/5.15.148-tegra/updates/drivers/video/tegra/nvmap/nvmap.ko
+# SPDX-FileCopyrightText: Copyright (c) 2019-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+deb https://repo.download.nvidia.com/jetson/common r36.4 main
+deb https://repo.download.nvidia.com/jetson/t234 r36.4 main
+deb https://repo.download.nvidia.com/jetson/ffmpeg r36.4 main
+--- disk-full symptoms in pond logs ---

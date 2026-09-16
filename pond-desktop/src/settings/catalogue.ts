@@ -455,11 +455,6 @@ export const CATALOGUE: CatalogueCategory[] = [
           { key: "ext_knowledge_enabled", label: "Knowledge", description: "Let it look things up in an encyclopedia.", control: { kind: "toggle" }, consumer: "live" },
           { key: "ext_system_enabled", label: "System", description: "Let it read files and check on the device it runs on.", control: { kind: "toggle" }, consumer: "live" },
           { key: "ext_device_enabled", label: "Devices", description: "Let it see and change the devices in this home.", control: { kind: "toggle" }, consumer: "live" },
-          { key: "ext_news_enabled", label: "News", description: "Let it fetch headlines and news.", control: { kind: "toggle" }, consumer: "live" },
-          { key: "ext_finance_enabled", label: "Finance", description: "Let it look up share and currency prices.", control: { kind: "toggle" }, consumer: "live" },
-          { key: "ext_discovery_enabled", label: "Discovery", description: "Let it search for products and make recommendations.", control: { kind: "toggle" }, consumer: "live" },
-          { key: "ext_audit_enabled", label: "Activity log", description: "Let it report on its own recent activity and privacy risks.", control: { kind: "toggle" }, consumer: "live" },
-          { key: "ext_vision_enabled", label: "Camera events", description: "Let it look back over recent camera events. It cannot switch the camera on.", control: { kind: "toggle" }, consumer: "live" },
           { key: "ext_sensor_enabled", label: "Sensors", description: "Let it read what the sensors in this home have recorded.", control: { kind: "toggle" }, consumer: "live" },
           { key: "ext_orchestrator_enabled", label: "Delegation", description: "Let it hand part of a job to a helper working on its own.", control: { kind: "toggle" }, consumer: "live" },
           { key: "ext_context_enabled", label: "Personal context", description: "Let it read the notes and documents this home has given it.", control: { kind: "toggle" }, consumer: "live", proposed: true },
@@ -471,10 +466,11 @@ export const CATALOGUE: CatalogueCategory[] = [
           {
             key: "tool_selection_mode", label: "Tools sent each turn", description: "Whether it is offered everything it can do, or only what suits the question.", consumer: "live",
             control: { kind: "radio", options: [
-              { value: "all",      label: "All of them", hint: "Every enabled tool, every turn. Costs about 5.9K tokens" },
+              { value: "all",      label: "All of them", hint: "Every enabled tool, every turn. About 3.3K tokens, 41% of the prompt budget" },
               { value: "relevant", label: "The relevant ones", hint: "A small core plus what this conversation seems to need" },
+              { value: "minimal",  label: "None until asked for", hint: "Only the two tools that load a group. 222 tokens, 2.7%" },
             ] },
-            validate: oneOf(["all", "relevant"]),
+            validate: oneOf(["all", "relevant", "minimal"]),
           },
           { key: "tool_model", label: "Tool-call helper model", description: "A small helper model that tidies up requests the main one gets wrong.", control: { kind: "lookup", source: "llm-models", placeholder: "Not set" }, consumer: "live" },
           {
@@ -641,7 +637,6 @@ export const CATALOGUE: CatalogueCategory[] = [
           // The server floors this at MIN_RESUME_IDLE_SECS; too SMALL is the
           // damaging direction, so the client refuses the values that would be
           // silently corrected rather than letting them look accepted.
-          { key: "resume_compaction_idle_secs", label: "Count as resumed after", description: "How long a gap counts as coming back to a conversation rather than continuing it.", control: { kind: "number", min: 300, unit: "seconds" }, consumer: "live", proposed: true, validate: all(integer, atLeast(300, "seconds")) },
           { key: "compaction_verbatim_days", label: "Keep in full for", description: "How many days of conversation to keep word for word before shortening it.", control: { kind: "number", min: 0, unit: "days" }, consumer: "live", proposed: true, validate: all(integer, atLeast(0, "days")) },
         ],
       },

@@ -3,14 +3,12 @@
  *
  * E2E tests for the child-process voice session (Architecture A).
  *
- * We cannot drive a real Tauri binary from Playwright; instead we:
- *   1. Inject a fake __TAURI_INTERNALS__ + __TAURI_EVENT_PLUGIN_INTERNALS__
- *      via addInitScript so:
- *        - isTauriEnv() returns true (checks __TAURI_INTERNALS__ in window)
- *        - listen() / invoke() use our fake implementations
- *        - VoiceMode renders VoiceModeChildProcess
- *        - AppContext's server_health probe returns true immediately
- *   2. Expose window.__testEmitTauriEvent__ so the test can fire voice-*
+ * These run against the Vite dev server in Chromium, so there is no real
+ * shell. We install a fake window.giap via addInitScript, which is all the
+ * renderer needs: isDesktopShell() becomes true, VoiceMode renders
+ * VoiceModeChildProcess, and invoke()/listen() go to our fakes.
+ *   1. Inject the fake bridge before any page script runs.
+ *   2. Expose window.__testEmitShellEvent__ so the test can fire voice-*
  *      events to all registered listeners.
  *   3. Stub invoke() for all commands the app needs on startup.
  *   4. Register mockAllApiRoutes catch-alls FIRST (last-registered-wins in
@@ -29,86 +27,37 @@
 import { test, expect, type Page } from "@playwright/test";
 import { mockAllApiRoutes } from "./helpers/api-mocks";
 
-// ── Tauri stub init script ────────────────────────────────────────────────────
-// Injected before any page script runs. Implements:
-//  - window.__TAURI_INTERNALS__.invoke  (intercepts all invoke() calls)
-//  - window.__TAURI_INTERNALS__.transformCallback  (stores callbacks by id)
-//  - window.__TAURI_EVENT_PLUGIN_INTERNALS__.unregisterListener
-//  - window.__testEmitTauriEvent__  (test helper to fire events)
+// ── Shell bridge stub ─────────────────────────────────────────────────────────
+//
+// The whole fake, which is most of what this migration bought here: the Tauri
+// version needed a callback-id registry, a transformCallback shim, an eventId
+// table and four plugin:event|* pseudo-commands, because every subscription
+// was an async round-trip through a generic invoke channel. The bridge
+// registers synchronously, so a Map of handlers is the entire thing.
 
-const TAURI_STUB_SCRIPT = `
+const SHELL_STUB_SCRIPT = `
 (function () {
-  // Map from callbackId -> handler function (stored by transformCallback)
-  const _callbacks = {};
-  // Map from eventId -> { event, cbId } (stored by plugin:event|listen)
-  const _listeners = {};
-  let _nextEventId = 1;
-  let _nextCbId = 1;
+  const listeners = {};
 
-  // transformCallback: store handler under a numeric id, return the id
-  function transformCallback(handler, once) {
-    const id = _nextCbId++;
-    _callbacks[id] = function(payload) {
-      if (once) delete _callbacks[id];
-      handler(payload);
-    };
-    return id;
-  }
-
-  // The core invoke shim — handles all @tauri-apps/api/core.invoke() calls
-  async function invoke(cmd, args) {
-    if (cmd === 'server_health') return true;
-    if (cmd === 'start_voice_session') return 'e2e-child-session';
-    if (cmd === 'stop_voice_session') return undefined;
-    if (cmd === 'voice_session_active') return false;
-
-    if (cmd === 'plugin:event|listen') {
-      // args = { event, target, handler: cbId }
-      const eventId = _nextEventId++;
-      _listeners[eventId] = { event: args.event, cbId: args.handler };
-      return eventId;
-    }
-
-    if (cmd === 'plugin:event|unlisten') {
-      const { eventId } = args;
-      delete _listeners[eventId];
+  window.giap = {
+    serverUrl: "http://127.0.0.1:4000",
+    invoke: async function (command) {
+      if (command === "server_health") return true;
+      if (command === "ensure_server_running") return "http://127.0.0.1:4000";
+      if (command === "start_voice_session") return "e2e-child-session";
       return undefined;
-    }
-
-    if (cmd === 'plugin:event|emit') return undefined;
-    if (cmd === 'plugin:event|emit_to') return undefined;
-
-    // Other plugin calls (autostart, window-state, global-shortcut, etc.)
-    if (cmd && cmd.startsWith('plugin:')) return undefined;
-
-    // Fallback for any other command
-    return undefined;
-  }
-
-  // Required by @tauri-apps/api/event._unlisten
-  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
-    unregisterListener: function(event, eventId) {
-      delete _listeners[eventId];
-    }
+    },
+    listen: function (event, handler) {
+      (listeners[event] = listeners[event] || []).push(handler);
+      return function () {
+        listeners[event] = (listeners[event] || []).filter(function (h) { return h !== handler; });
+      };
+    },
   };
 
-  // Main TAURI_INTERNALS object
-  window.__TAURI_INTERNALS__ = {
-    transformCallback: transformCallback,
-    invoke: invoke,
-  };
-
-  // Test helper: emit a fake Tauri event to all registered listeners
-  window.__testEmitTauriEvent__ = function(eventName, payload) {
-    for (const eventId of Object.keys(_listeners)) {
-      const entry = _listeners[eventId];
-      if (entry && entry.event === eventName) {
-        const cb = _callbacks[entry.cbId];
-        if (cb) {
-          cb({ event: eventName, id: eventId, payload });
-        }
-      }
-    }
+  // Test helper: fire an event at every registered listener.
+  window.__testEmitShellEvent__ = function (event, payload) {
+    (listeners[event] || []).forEach(function (h) { h(payload); });
   };
 })();
 `;
@@ -116,8 +65,8 @@ const TAURI_STUB_SCRIPT = `
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async function setupPage(page: Page): Promise<void> {
-  // 1. Inject Tauri stub BEFORE any page scripts run (addInitScript runs first)
-  await page.addInitScript(TAURI_STUB_SCRIPT);
+  // 1. Inject the bridge stub BEFORE any page script runs.
+  await page.addInitScript(SHELL_STUB_SCRIPT);
 
   // 2. Pin the API base for PondApiClient
   await page.addInitScript(() => {
@@ -133,7 +82,7 @@ async function emitEvent(page: Page, name: string, payload: unknown): Promise<vo
   await page.evaluate(
     ([n, p]) => {
       (window as unknown as Record<string, (n: string, p: unknown) => void>)
-        .__testEmitTauriEvent__(n, p);
+        .__testEmitShellEvent__(n, p);
     },
     [name, payload] as [string, unknown],
   );

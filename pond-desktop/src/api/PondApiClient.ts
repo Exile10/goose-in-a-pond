@@ -83,8 +83,11 @@ declare global {
 export function defaultServerUrl(): string {
   if (typeof window !== "undefined") {
     if (window.__GIAP_SERVER_URL__) return window.__GIAP_SERVER_URL__;
-    const isTauri = "__TAURI_INTERNALS__" in window;
-    if (!isTauri && window.location?.origin?.startsWith("http")) {
+    // Only an http(s) page origin is a server worth talking to. The desktop
+    // shell serves the renderer from app://giap, which is deliberately not
+    // http -- and it always injects the URL above anyway, so this branch is
+    // the browser's.
+    if (window.location?.origin?.startsWith("http")) {
       return window.location.origin;
     }
   }
@@ -1520,6 +1523,22 @@ export class PondApiClient {
         }
       }
     } finally {
+      // Abandoning this generator must CLOSE the body, not merely let go of it.
+      // `releaseLock()` alone leaves the response un-cancelled, so the socket
+      // stays open; the server's SSE generator is never dropped, so its
+      // `sse_semaphore` permit and its `AttachGuard` are both still held. There
+      // are four permits. Measured: four turns abandoned mid-stream (four
+      // conversation switches) and every later send gets
+      // `503 Too many concurrent streams` in under 2 ms, until the browser
+      // happens to garbage-collect the Response.
+      //
+      // `cancel()` on a body already read to EOF is a no-op, so the normal
+      // completion path is unchanged.
+      try {
+        await reader.cancel();
+      } catch {
+        // Already closed, or errored on the way down: nothing left to release.
+      }
       reader.releaseLock();
     }
   }

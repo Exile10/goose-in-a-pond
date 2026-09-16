@@ -256,10 +256,11 @@ then consolidation hardening, then multimodality.
   JSON — and the KV prefix — does not churn between turns. Every failure path
   widens to ALL groups (no embedder, embed error, empty registry, unrecognised
   mode string). Narrowing is enforced at the SHIM, not by loading/unloading
-  extensions: goose keeps offering all 59 tools and the veto drops the dormant
+  extensions: goose keeps offering all 27 tools and the veto drops the dormant
   ones, so a widen lands on the next provider call of the same reply loop.
-  Core set: `giap-draft` (safety, unconditionally registered), `giap-memory`
-  (cross-cutting), `giap-system` (holds `get_current_time`), `giap-toolkit`.
+  Core set: `giap-memory` (cross-cutting), `giap-system` (holds
+  `get_current_time`), `giap-toolkit` (the hatch). `giap-draft` was the fourth
+  until its group was deleted on 2026-09-10.
   Escape hatch: `giap-toolkit`'s `list_tool_groups` + `enable_tool_group`, plus a
   `<tool-groups>` listing of dormant groups in `<system-context>` so the model
   usually skips the discovery round trip. This is NOT a keyword classifier and

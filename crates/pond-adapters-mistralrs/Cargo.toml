@@ -1,0 +1,31 @@
+[package]
+name = "pond-adapters-mistralrs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# A direct path from GIAP to a mistral.rs server: no goose, no provider shim, no
+# extension manager. `pond-core` is the ONLY GIAP dependency — tools arrive
+# through the `ToolDispatcher` port and history through `SessionStorage`, so
+# nothing here can reach the submodule even by accident. That is the property
+# the checkpoint exists to test; adding a goose dependency to this Cargo.toml
+# would end the experiment without failing a single test.
+
+[dependencies]
+pond-core   = { path = "../pond-core" }
+anyhow      = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+chrono      = { workspace = true }
+futures     = { workspace = true }
+reqwest     = { workspace = true, features = ["json"] }
+serde       = { workspace = true, features = ["derive"] }
+serde_json  = { workspace = true }
+tokio       = { workspace = true, features = ["sync", "rt"] }
+tracing     = { workspace = true }
+uuid        = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+pond-core = { path = "../pond-core", features = ["test-mocks"] }
+tokio     = { workspace = true, features = ["rt-multi-thread", "macros"] }

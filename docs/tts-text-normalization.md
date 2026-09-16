@@ -8,12 +8,14 @@ before sending text to the Piper TTS engine. This ensures the TTS pronounces "5k
 
 ## Implementation
 
-The normalization runs in `normalize_for_speech()` which exists in two identical copies:
+The normalization runs in `normalize_for_speech()`, which lives in exactly one place now:
 
-- **CLI:** `crates/pond-core/src/shared/services/chat.rs`
-- **Desktop:** `pond-desktop/src-tauri/src/tts_text.rs`
+- **Rust:** `crates/pond-voice/src/text.rs`, used by the server and both voice adapters.
 
-Both must be kept in sync. The desktop can't import pond-core (separate Cargo workspace).
+There used to be a second, verbatim 981-line copy in the Tauri desktop shell, because that shell
+was a separate cargo workspace and could not import `pond-core`. The Electron migration deleted
+it. The remaining duplication is the TypeScript side — `pond-desktop/src/modes/voice/webAudioUtils.ts`
+— which the browser voice path needs and which carries parity comments pointing back here.
 
 ---
 
@@ -157,13 +159,12 @@ Matched case-insensitively at word boundaries only.
 
 ## Adding New Entries
 
-1. Add to the appropriate `const` table in BOTH files:
-   - `crates/pond-core/src/shared/services/chat.rs`
-   - `pond-desktop/src-tauri/src/tts_text.rs`
+1. Add to the appropriate `const` table in `crates/pond-voice/src/text.rs`
 2. For `UNIT_SUFFIXES`: sort by length descending (longest first)
-3. Add a test in `chat.rs` (the `#[cfg(test)]` module)
-4. Run `cargo test -p pond-core -- normalize_` to verify
-5. Build desktop: `cd pond-desktop/src-tauri && cargo build`
+3. Add a test in the same file's `#[cfg(test)]` module
+4. Run `cargo test -p pond-voice -- normalize_` to verify
+5. If the browser voice path needs the same behaviour, mirror it in
+   `pond-desktop/src/modes/voice/webAudioUtils.ts` and note the parity there
 
 ---
 

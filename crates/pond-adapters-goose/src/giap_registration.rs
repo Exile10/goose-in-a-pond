@@ -10,9 +10,7 @@ use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
-use pond_core::user_data::ports::draft::DraftRepository;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
-use pond_core::user_data::ports::recipe::AgentRecipeRepository;
 use pond_core::user_data::ports::scheduler::SchedulerPort;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::user_data::ports::skill::UserSkillRepository;
@@ -33,7 +31,7 @@ pub fn registered_extensions() -> &'static [String] {
 
 /// Register GIAP MCP servers as Goose builtin extensions, respecting the `ext_*_enabled` toggles.
 /// Must be called once at process startup before any GooseAdapter session; returns the names
-/// actually registered. `giap-draft` is always on (safety feature, not toggleable).
+/// actually registered. `giap-toolkit` is always on (the escape hatch, not toggleable).
 pub fn register_giap_extensions(
     settings: &Settings,
     memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
@@ -43,24 +41,36 @@ pub fn register_giap_extensions(
     settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
     device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
     skill_repo: Arc<dyn UserSkillRepository + Send + Sync>,
-    recipe_repo: Arc<dyn AgentRecipeRepository + Send + Sync>,
-    draft_repo: Arc<dyn DraftRepository + Send + Sync>,
     device_control: Arc<dyn DeviceControlPort + Send + Sync>,
     tool_caller: Option<Arc<dyn ToolCaller>>,
 ) -> Result<Vec<String>> {
+    // `GIAP_NO_TOOLS` — register nothing, so no MCP server is even spawned.
+    //
+    // The provider shim enforces the same thing again at the boundary where the
+    // final tool list is handed over, which is what actually guarantees "no
+    // tools": goose registers platform extensions of its own, and a user can
+    // add an MCP server, neither of which passes through here. This early
+    // return is the cheaper half — it stops eleven servers starting for a
+    // pond that will offer none of them.
+    if pond_core::mcp::domain::tool_group::no_tools_env_set() {
+        tracing::warn!(
+            "{} is set — registering no extensions at all. Unset it to restore normal behaviour.",
+            pond_core::mcp::domain::tool_group::NO_TOOLS_ENV
+        );
+        println!("  Extensions: NONE (GIAP_NO_TOOLS is set)");
+        return Ok(Vec::new());
+    }
+
     // Set the ToolCaller specialist — all MCP tools use it for param generation
     pond_mcp_server::set_tool_caller(tool_caller);
 
     let mut registered = Vec::new();
 
-    // ── Always-on: draft server (safety feature) ────────────────────────────
-    pond_mcp_server::init_draft_deps(draft_repo);
-    register_builtin_extension("giap-draft", pond_mcp_server::spawn_draft_server);
-    registered.push("giap-draft".into());
-
     // ── Always-on: toolkit server (Phase D2 escape hatch) ───────────────────
-    // Not toggleable: under `tool_selection_mode = "relevant"` its two tools let the model load a
-    // group nobody predicted. Its `ToolSelectionControl` handle is set by `init_toolkit_deps`
+    // Not toggleable: under `"relevant"` its two tools let the model load a group nobody
+    // predicted, and under `"minimal"` they are the ENTIRE tool surface — turning this off
+    // there would leave a pond that can never reach a tool again. Its
+    // `ToolSelectionControl` handle is set by `init_toolkit_deps`
     // in pond-server (the adapter is built after this call); without it both report all loaded.
     register_builtin_extension(
         pond_core::mcp::domain::tool_group::TOOLKIT_EXTENSION,
@@ -106,7 +116,6 @@ pub fn register_giap_extensions(
             device_registry.clone(),
             settings_repo.clone(),
             skill_repo,
-            recipe_repo,
         );
         register_builtin_extension("giap-device", pond_mcp_server::spawn_device_server);
         registered.push("giap-device".into());
@@ -120,45 +129,6 @@ pub fn register_giap_extensions(
             pond_mcp_server::spawn_device_control_server,
         );
         registered.push("giap-device-control".into());
-    }
-
-    // ── Knowledge expansion servers ────────────────────────────────────────
-    // All share a single HTTP client pool for efficiency.
-    let shared_http = pond_mcp_server::build_http_client();
-
-    if settings.ext_news_enabled {
-        // No settings repo: the Guardian and GNews keys live in the secret
-        // store, installed by `init_secret_deps` in pond-server (PAI-2 P2).
-        pond_mcp_server::init_news_deps(shared_http.clone());
-        register_builtin_extension("giap-news", pond_mcp_server::spawn_news_server);
-        registered.push("giap-news".into());
-    }
-
-    if settings.ext_finance_enabled {
-        pond_mcp_server::init_finance_deps(shared_http.clone());
-        register_builtin_extension("giap-finance", pond_mcp_server::spawn_finance_server);
-        registered.push("giap-finance".into());
-    }
-
-    if settings.ext_discovery_enabled {
-        pond_mcp_server::init_discovery_deps(shared_http, settings_repo);
-        register_builtin_extension("giap-discovery", pond_mcp_server::spawn_discovery_server);
-        registered.push("giap-discovery".into());
-    }
-
-    // Audit / privacy-audit server (#115). Its event-log handle is installed
-    // separately via `init_audit_deps` in pond-server (where the logs DB is in
-    // scope), so registration here only wires the spawn fn + toggle.
-    if settings.ext_audit_enabled {
-        register_builtin_extension("giap-audit", pond_mcp_server::spawn_audit_server);
-        registered.push("giap-audit".into());
-    }
-
-    // Vision server (#130). Like giap-audit, its camera-event store handle is
-    // installed separately via `init_vision_deps` in pond-server.
-    if settings.ext_vision_enabled {
-        register_builtin_extension("giap-vision", pond_mcp_server::spawn_vision_server);
-        registered.push("giap-vision".into());
     }
 
     // Sensor data aggregator. Storage handle installed separately via

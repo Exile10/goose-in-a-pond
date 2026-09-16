@@ -292,7 +292,9 @@ Verified — the crash report says so in as many words:
 > NSBluetoothAlwaysUsageDescription key with a string value explaining to the
 > user how the app uses this data.
 
-`pond-desktop/src-tauri/Info.plist` carries it.
+`pond-desktop/electron-builder.yml`'s `mac.extendInfo` block carries it. Note the responsible-
+process chain is one hop longer under Electron (app -> pond-server -> node), so re-verify this on
+a real BLE pairing after any packaging change rather than assuming it carried over.
 
 The controller is a bare `node`, so what matters is not its own bundle but the
 **responsible process** macOS attributes it to — the app at the root of the

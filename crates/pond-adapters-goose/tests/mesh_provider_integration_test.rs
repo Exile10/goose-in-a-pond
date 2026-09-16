@@ -69,7 +69,6 @@ async fn a_chat_turn_over_an_unavailable_mesh_surfaces_a_clean_error() {
         Arc::new(pond_core::user_data::mocks::mock_prompt_extra::MockPromptExtraRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_skill::MockSkillRepository::default()),
         Arc::new(pond_core::user_data::mocks::mock_memory::MockMemoryRepository::default()),
-        Arc::new(pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry),
         "http://127.0.0.1:8080".to_string(),
         None,
         None, // tool_registry
@@ -88,6 +87,7 @@ async fn a_chat_turn_over_an_unavailable_mesh_surfaces_a_clean_error() {
         profile_scope: ProfileScope::Household,
         profile_context: None,
         tool_group_allowlist: None,
+        warmup: false,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();

@@ -81,16 +81,17 @@ impl BusEvent {
             // on the seven-day retention sweep rather than the thirty-day one.
             //
             // What `Sensitive` does NOT do is hide it from the audit MCP
-            // tools. `pond-mcp-server/src/audit.rs :: MAX_SURFACEABLE` IS
-            // `Sensitive`, so those reads surface everything below `Secret` --
-            // a `presence.profile` row is readable through `recent_activity`
-            // today, and classifying it lower would not change that. What
-            // keeps it from a visitor is that `giap-audit` is in
-            // `groups_denied_to_guests`; member-to-member it is exposed, and
-            // the renderer prints the timestamp and the action without the
-            // `profile_id`, so what leaks is the timing of an arrival rather
-            // than whose. Narrowing that is a change to `audit.rs`, not to
-            // this classification.
+            // tools. That used to mean `recent_activity` surfaced a
+            // `presence.profile` row to any member, kept from a visitor only
+            // by `giap-audit` being in `groups_denied_to_guests`.
+            //
+            // `giap-audit` was deleted on 2026-09-10, so nothing reads the
+            // event log back through a tool at all now and the exposure is
+            // closed -- by the reader going away, not by this classification
+            // changing. If a reporting surface is ever rebuilt, the leak comes
+            // back with it: the row is `Sensitive`, the renderer prints the
+            // timestamp and the action without the `profile_id`, and what
+            // leaks is the timing of an arrival rather than whose.
             //
             // `Agent` rather than `Sensor` because this is the pond's own
             // conclusion about a person, not a reading off a device -- filing

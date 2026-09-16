@@ -182,14 +182,12 @@ export function useVoicePipeline(): VoicePipelineAPI {
 
   useEffect(() => {
     api.getSettings().then((s) => {
-      const dur = (s as Record<string, unknown>).voice_recording_duration_secs;
+      const dur = s.voice_recording_duration_secs;
       if (typeof dur === "number" && dur > 0) { setMaxSecs(dur); setSecsLeft(dur); }
 
-      const ww = (s as Record<string, unknown>).voice_wake_word;
+      const ww = s.voice_wake_word;
       if (typeof ww === "string" && ww.trim()) setWakeWord(ww.trim());
 
-      // Typed on Settings, so read directly rather than through the untyped
-      // cast the older reads above still use.
       if (typeof s.voice_thinking_tone_enabled === "boolean") {
         thinkingToneRef.current = s.voice_thinking_tone_enabled;
       }
@@ -204,7 +202,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
 
     // Load calibrated variants
     api.getSettings().then((s) => {
-      const variants: string[] = (s as Record<string, unknown>).voice_wake_word_transcriptions as string[] ?? [];
+      const variants: string[] = s.voice_wake_word_transcriptions ?? [];
       wakeVariantsRef.current = variants;
       backend.startWakeListener(wakeWord, variants);
       dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
