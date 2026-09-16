@@ -21,7 +21,7 @@ pub const LARGE_WINDOW_FLOOR: usize = 65_536;
 ///
 /// `ollama` and `llamafile` count: on a pond they speak HTTP to `127.0.0.1`, so a call
 /// takes the GPU the next turn needs. A deny-list for the large tier, so too wide is safe.
-pub const ON_DEVICE_PROVIDERS: [&str; 4] = ["local", "gguf", "ollama", "llamafile"];
+pub const ON_DEVICE_PROVIDERS: [&str; 5] = ["local", "gguf", "ollama", "llamafile", "mistralrs"];
 
 /// Providers this pond knows are served from somebody else's machine.
 ///

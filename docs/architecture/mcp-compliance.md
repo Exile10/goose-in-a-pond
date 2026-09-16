@@ -48,12 +48,12 @@ Defined in `crates/pond-mcp-server/src/giap_server.rs`:
 
 | Category | Count | Tools |
 |----------|-------|-------|
-| Schedule | 7 | `list_schedules`, `create_schedule`, `delete_schedule`, `pause_schedule`, `resume_schedule`, `run_schedule_now`, `get_schedule_runs` |
+| Schedule | 6 | `list_schedules`, `create_schedule`, `schedule_action`, `set_timer`, `world_clock`, plus the actions folded into `schedule_action` |
 | Memory | 3 | `save_memory`, `recall_memories`, `forget_memory` |
-| Knowledge | 2 | `search_wikipedia`, `get_wikipedia_article` |
-| System | 6 | `get_current_time`, `get_system_info`, `send_notification`, `run_shell_command`, `read_file`, `write_file` |
-| Profile | 2 | `get_user_profile`, `get_model_assignments` |
-| Other | 4 | `get_current_weather`, `list_registered_devices`, `list_skills`, `get_recipe` |
+| Knowledge | 2 | `get_wikipedia_article`, `compute_answer` |
+| System | 3 | `get_current_time`, `get_system_info`, `send_notification` |
+| Profile | 1 | `get_user_profile` |
+| Other | 3 | `get_current_weather`, `list_registered_devices`, `list_skills` |
 
 ---
 

@@ -1,6 +1,26 @@
 # Desktop Voice Mode — Functional Parity with CLI
 
-This document covers the changes that brought the desktop Tauri app's voice pipeline to
+> **HISTORICAL.** This records a completed effort, and every
+> `pond-desktop/src-tauri/...` path below refers to a shell that no longer
+> exists — the desktop app moved to Electron and that directory was deleted.
+>
+> The parity it describes was not lost; it was superseded twice over, and
+> reading this for *where* rather than *what* will send you to the wrong file:
+>
+> - The desktop voice path is now a child process running the CLI loop itself,
+>   so "parity with the CLI" is achieved by being the CLI rather than by
+>   matching it feature for feature. See
+>   [voice-desktop-child-process.md](./developer/voice-desktop-child-process.md).
+> - The TTS normalisation that lived in `tts_text.rs` is now only in
+>   `crates/pond-voice/src/text.rs`. See
+>   [tts-text-normalization.md](./tts-text-normalization.md).
+> - The browser voice path's equivalents are in
+>   `pond-desktop/src/modes/voice/webAudioUtils.ts` and `WebVoiceBackend.ts`.
+>
+> Kept because the *reasoning* is still worth reading: each section below says
+> why a behaviour exists, and those reasons outlived the files.
+
+This document covers the changes that brought the desktop app's voice pipeline to
 functional parity with the CLI's `pond-server chat --voice` experience.
 
 ---
@@ -208,5 +228,4 @@ The redundant `"token"` field was removed from both `chat_stream` and `agent_cha
 
 - `cargo test -p pond-core` — 221 tests pass (includes 48 normalization tests)
 - `cargo build -p pond-server` — compiles clean
-- `cd pond-desktop/src-tauri && cargo build` — compiles clean
 - `cd pond-desktop && npx vitest run` — 128/130 pass (2 pre-existing Schedules failures)

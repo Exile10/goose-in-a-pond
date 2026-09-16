@@ -77,6 +77,22 @@ pub struct AgentRequest {
     /// ordinary case for chat turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_group_allowlist: Option<Vec<String>>,
+    /// This turn is the boot-time prefix warm-up, not a person asking anything.
+    ///
+    /// There is nobody to be wrong at, so the completeness check
+    /// (`Settings::goal_check_enabled`, armed in the Goose adapter) is not armed
+    /// for it. That check is deliberately ON for real turns and deliberately
+    /// costs roughly twice the inferences per turn -- measured, on a warm-up
+    /// ping, as a second 4,188-token round-trip asking the model to "finish
+    /// anything still outstanding" after it had already replied `ok`.
+    ///
+    /// Skipping it cannot move the warmed prefix, which is the only thing that
+    /// would make this unsafe: arming the goal does not alter the FIRST
+    /// request's payload -- it appends a nudge as a later user message, so it
+    /// only ever adds a round-trip after the first one has finished. Verified
+    /// from a captured payload pair (`GIAP_CAPTURE_PAYLOAD`).
+    #[serde(default)]
+    pub warmup: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,7 +300,7 @@ impl fmt::Display for WorkflowState {
 /// # NDJSON contract (terminal-voice-in-desktop, Architecture A)
 ///
 /// The variants that carry an external contract payload serialize — via
-/// `serde_json::to_string` — to EXACTLY the shapes the Tauri shell parses off
+/// `serde_json::to_string` — to EXACTLY the shapes the desktop shell parses off
 /// the child's stdout (one JSON object per line, `snake_case`), tagged with an
 /// `"event"` field:
 ///
@@ -418,7 +434,7 @@ impl ThrottledAudioLevelSink {
 // ── Golden NDJSON serializer tests ──────────────────────────────────────────
 //
 // These assert the EXACT JSON strings the terminal-voice-in-desktop contract
-// (Architecture A) specifies. The Tauri shell parses these off child stdout;
+// (Architecture A) specifies. The desktop shell parses these off child stdout;
 // any drift here breaks the parser, so the strings are pinned byte-for-byte.
 #[cfg(test)]
 mod ndjson_golden_tests {
@@ -584,6 +600,7 @@ mod agent_request_scope_tests {
             profile_scope: scope,
             profile_context: None,
             tool_group_allowlist: None,
+            warmup: false,
         }
     }
 

@@ -256,8 +256,8 @@ export function AccountDetail({ go }: AccountDetailProps) {
   // Count unique rooms from device list (devices have a `room` field)
   const roomSet = new Set(
     devices
-      .filter((d) => typeof (d as Record<string, unknown>).room === "string")
-      .map((d) => (d as Record<string, unknown>).room as string),
+      .filter((d) => typeof d.room === "string")
+      .map((d) => d.room as string),
   );
   const roomCount = roomSet.size || devices.length;
 

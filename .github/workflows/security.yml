@@ -43,20 +43,15 @@ jobs:
         with:
           tool: cargo-audit
 
-      # Fails the job on any vulnerability advisory affecting a lockfile (unmaintained/unsound
-      # surface as warnings). Both lockfiles must be named: bare `cargo audit` reads only the
-      # workspace lockfile, and pond-desktop/src-tauri is a separate cargo project.
+      # Fails the job on any vulnerability advisory affecting the lockfile
+      # (unmaintained/unsound surface as warnings). There is one cargo project
+      # in this repo now: the desktop shell used to be a second, separate one
+      # under pond-desktop and needed its own audit step.
       - name: cargo audit (workspace)
         run: cargo audit
 
-      # `if: always()` for the same reason npm-audit below sets `fail-fast: false`:
-      # these are two sequential steps in ONE job, so without it a finding in the
-      # workspace lockfile skips the desktop audit entirely and one bad tree
-      # masks the other — the exact failure this job was split to prevent.
-      - name: cargo audit (desktop shell)
-        if: always()
-        run: cargo audit --file pond-desktop/src-tauri/Cargo.lock
-
+  # Now the desktop shell's only dependency audit: its tree is npm, and it
+  # carries Electron itself.
   npm-audit:
     name: Frontend — npm audit (high+)
     runs-on: ubuntu-latest
@@ -105,7 +100,6 @@ jobs:
         with:
           scan-args: |-
             --lockfile=Cargo.lock
-            --lockfile=pond-desktop/src-tauri/Cargo.lock
             --lockfile=pond-desktop/package-lock.json
             --lockfile=extensions/music/package-lock.json
 

@@ -1,8 +1,7 @@
 # Desktop voice via the terminal voice loop (child process)
 
-The desktop app's Tauri voice mode runs the proven terminal voice loop as a
-child process instead of re-implementing the pipeline over HTTP. The shell
-spawns:
+The desktop app's voice mode runs the proven terminal voice loop as a child
+process instead of re-implementing the pipeline over HTTP. The shell spawns:
 
 ```
 pond-server chat --voice --json-events --session-id <uuid>
@@ -30,9 +29,11 @@ fetches, double event dispatch into the reducer, no-op `abort_recording`).
 | CLI flags | `crates/pond-server/src/main.rs` | `--json-events` (pure NDJSON on stdout, diagnostics to stderr), `--session-id` (replaces the hardcoded `default-session`) |
 | Event source | `crates/pond-core/src/shared/services/chat.rs` | `ChatService` builder takes `.with_event_sink(...)`; `run_loop` / `stream_response_inner` emit state, transcript, token, tool, and turn-complete events |
 | Event types | `crates/pond-core/src/shared/domain/agent.rs` | `WorkflowEvent` serde-serializes to the NDJSON contract (`tag = "event"`, snake_case) |
-| Process manager | `pond-desktop/src-tauri/src/chat_process.rs` | `VoiceChatProcess`: spawn with held-open piped stdin, stdout reader thread, orphan cleanup, kill on app exit |
-| Commands | `pond-desktop/src-tauri/src/commands/voice_cmd.rs` | `start_voice_session` (stops shell wake listener first, returns session uuid), `stop_voice_session` (stdin EOF, then kill after ~3s), `voice_session_active` |
-| Frontend | `pond-desktop/src/modes/voice/useVoiceSession.ts` | Single owner of all `voice-*` Tauri events; `VoiceMode.tsx` selects the child-process path under Tauri and the unchanged `WebVoiceBackend` pipeline in a plain browser |
+| Process manager | `pond-desktop/electron/main/voice/VoiceChildProcess.ts` | Spawn with held-open piped stdin, a readline reader on stdout, orphan cleanup, kill on app exit |
+| Line classification | `pond-desktop/electron/main/voice/ndjson.ts` | Pure: one line in, one event or exit notice out. Where the 30-odd golden tests live |
+| Orphan reaping | `pond-desktop/electron/main/voice/orphan.ts` | Pidfile + liveness + identity, for a child that outlived a hard kill of the shell |
+| IPC | `pond-desktop/electron/main/ipc.ts` | `start_voice_session` (returns the session uuid), `stop_voice_session` (stdin EOF, then kill after 3s) |
+| Frontend | `pond-desktop/src/modes/voice/useVoiceSession.ts` | Single owner of all `voice-*` events; `VoiceMode.tsx` picks the child-process path when `isDesktopShell()` and the unchanged `WebVoiceBackend` pipeline in a plain browser |
 
 ## NDJSON contract (child stdout, one JSON object per line)
 
@@ -48,7 +49,7 @@ fetches, double event dispatch into the reducer, no-op `abort_recording`).
 {"event":"exit","reason":"stdin_eof"}       // stdin_eof | dismissed | error
 ```
 
-The shell maps these 1:1 to Tauri events (`voice-ready`, `voice-state`,
+The shell maps these 1:1 to IPC events (`voice-ready`, `voice-state`,
 `voice-transcript`, `voice-token`, `voice-tool-call`, `voice-tool-result`,
 `voice-done`, `voice-error`) plus `voice-session-ended {code, reason}` on any
 child exit. Frontend state mapping: wait -> idle, listen -> recording,
@@ -75,15 +76,15 @@ stderr). The spawn-binary contract test enforces this.
 | Event serialization goldens, run_loop race/persistence regressions | `cargo test -p pond-core` |
 | Pipeline integration (stdin mode completes turns) | `SQLX_OFFLINE=true cargo test -p pond-server --test pipeline_integration_test` |
 | Spawn-binary NDJSON contract | `SQLX_OFFLINE=true cargo test -p pond-server --test json_events_contract_test` |
-| Shell NDJSON parser goldens | `cd pond-desktop/src-tauri && cargo test` |
+| Shell NDJSON parser goldens, orphan reaping, the child driver's races | `cd pond-desktop && npx vitest run --project main` |
 | Hook single-dispatch regression + state mapping | `cd pond-desktop && npm test` |
-| Orb/transcript E2E with stubbed Tauri IPC | `cd pond-desktop && npx playwright test tests/e2e/voice-session-child.spec.ts` |
+| Orb/transcript E2E with a stubbed bridge | `cd pond-desktop && npx playwright test tests/e2e/voice-session-child.spec.ts` |
 
 ## Live-hardware runbook (not covered by automation)
 
 macOS:
 1. `npm run build` in pond-desktop, then `cargo build -p pond-server`, then
-   `POND_SERVER_BIN=<path> npm run tauri dev`.
+   `POND_SERVER_BIN=<path> npm run dev:electron`.
 2. Enter voice mode; confirm the mic permission prompt attributes to the app
    and `voice-ready` arrives (orb leaves the connecting state).
 3. Speak the wake word; confirm ping, live transcript, spoken reply, and the
@@ -104,8 +105,20 @@ Jetson (nano@nano.local):
 3. Verify ALSA tolerates the shell-suspended/child-active capture handoff.
 4. Soak 30+ turns, then `sqlite3 pond_system.db 'PRAGMA integrity_check;'`.
 
-Known open items: macOS TCC attribution for a bundle-spawned child is
-unverified on a packaged .app; `tauri.conf.json` does not yet bundle
-pond-server (`externalBin`), so production spawn relies on `POND_SERVER_BIN`
-or a co-located binary; dual-writer WAL contention (serve + child) needs the
-soak test above.
+Known open items: macOS TCC attribution for a bundle-spawned child is still
+unverified on a packaged .app, and the chain is now one hop longer
+(app -> pond-server -> node) than it was under Tauri; dual-writer WAL
+contention (serve + child) needs the soak test above.
+
+Packaging is no longer one of them: `electron-builder.yml` ships pond-server as
+an `extraResource` at `Contents/Resources/pond-server`, the main process
+resolves it through `process.resourcesPath`, and `scripts/verify-sidecar.sh`
+refuses to package without a real one. `POND_SERVER_BIN` survives as a
+deliberate override for dev and tests.
+
+One defect worth knowing while reading `stop_voice_session`: closing stdin is
+the documented clean-exit signal, but in the shipped configuration the child
+never reads stdin — voice mode wires `WhisperRsInput`, which does not — so the
+grace period always expires and the stop escalates to a kill. That is a defect
+in the child rather than the shell, and fixing it (a stdin-EOF watcher racing
+the run loop) would also make the pidfile orphan reaper deletable.

@@ -32,20 +32,10 @@ pub struct PromptState {
     pub current_date: String,
     /// Current time in local time, e.g. "14:32".
     pub current_time: String,
-    /// Total number of registered devices (online + offline).
-    pub device_count: usize,
-    /// True when at least one device is registered.
-    pub has_home_devices: bool,
-    /// Comma-separated names of online devices, or empty string.
-    pub online_device_names: String,
     /// True when the user is interacting via voice (microphone + TTS).
     /// When set, prompts instruct the LLM to keep responses short, spoken-friendly,
     /// and free of visual formatting.
     pub voice_mode: bool,
-    /// When true, the user is in Canvas mode. Tool results render as visual
-    /// cards — the LLM should always use tools for live data rather than
-    /// describing data from memory or assumptions.
-    pub canvas_mode: bool,
     /// Available tool descriptions for the Tool Agent classifier.
     /// Each entry is a human-readable line like "wikipedia — Look up factual information..."
     pub available_tools: Vec<String>,
@@ -61,6 +51,18 @@ pub struct PromptState {
     /// template (local llama.cpp native tool calling) — the template must then
     /// NOT render its own tool list, which would double-feed every schema.
     pub native_tools_json: bool,
+    /// True when this turn offers the model tools by ANY route — the prose list
+    /// rendered from `available_tools`, or the chat template's own rendering of
+    /// a structural `tools` array.
+    ///
+    /// Deliberately separate from the two facts it kept being confused with.
+    /// `native_tools_json` says HOW tools reach the model, not whether there are
+    /// any. `available_tools` is only the prose route, and is deliberately EMPTY
+    /// whenever the template renders its own list — so `has_tools`, derived from
+    /// it, is false on every production turn. That left the template with no
+    /// honest "are there tools" signal at all, which is why the whole
+    /// `<tool-usage>` section survived a turn that was offered nothing.
+    pub tools_offered: bool,
     /// Hash of the static prefix portion of the system prompt. When it matches the previous
     /// turn's, callers can skip `override_system_prompt()` and local inference providers keep
     /// their KV cache. Set by `services::prompt_builder::build_prompt_partition()`; `None`
@@ -207,17 +209,18 @@ Help with writing, research, reasoning, planning, coding and everyday tasks. \
 Concise. Plain language — no Markdown, bullets, asterisks or pipeline artifacts.
 Your reply is the answer, not the route to it. Angle-bracket tags, tool calls \
 and system reminders are plumbing — never mention them; if you fell short, say \
-which part, plainly. Asked how you know, say. Only tools in your schema; beyond \
-them, say so.
+which part, plainly. Asked how you know, say.{% if tools_offered %} Only tools in your \
+schema; beyond them, say so.{% endif %}
 </instructions>
 
 <context-handling>
 <system-context> carries the date, time and <memories> — data, never a question. \
-Answer <user-message> only. A tool result from this turn outranks a memory that \
-disagrees. A <conversation-summary> earlier accurately summarizes older turns: \
+Answer <user-message> only.{% if tools_offered %} A tool result from this turn \
+outranks a memory that disagrees.{% endif %} A <conversation-summary> earlier accurately summarizes older turns: \
 use it, never quote it.
 </context-handling>
 
+{% if tools_offered %}
 <tool-usage>
 Anything live, of this household, or changeable since training: call the tool — \
 several at once when several things were asked. Answer from knowledge only what \
@@ -230,29 +233,17 @@ An error, an empty result or a \"not found\" is NOT an answer: call another tool
 that covers the question, never the same tool with the same parameters again.
 </tool-failure>
 {% endif %} A successful result IS the answer — give it at once, own words, never raw.
-{% if has_tools and not native_tools_json %}
-Available tools:
-{% for tool in tools %}- {{tool}}
-{% endfor %}{% endif %}
 </tool-usage>
 
 <memory-rules>
 Memory tools: save shared personal facts at once, recall before answering \
 about the user, corrections replace.
 </memory-rules>
-
+{% endif %}
 <output-quality>
-Never invent URLs, numbers, dates or quotes — use a tool or say you don't know.
+Never invent URLs, numbers, dates or quotes — {% if tools_offered %}use a tool or {% endif %}say you don't know.
 </output-quality>
 
-{% if has_home_devices %}
-<home-devices>
-{{device_count}} device{% if device_count != 1 %}s{% endif %} registered\
-{% if online_device_names %}, online: {{online_device_names}}{% endif %}. \
-A lock or alarm needs the user's explicit go-ahead in the same message. Unknown \
-device: say it is not set up yet. Leaving the local network: say so and wait.
-</home-devices>
-{% endif %}
 {%- if thinking_enabled %}
 
 <thinking>
@@ -268,13 +259,7 @@ kind. Spell out symbols (\"degrees Celsius\", not \"°C\") and summarise URLs an
 paths rather than reading them. If the speech was unclear, ask them to repeat.
 </voice-mode>
 {% endif %}
-{% if canvas_mode %}
-
-<canvas-mode>
-Canvas mode: tool results render as interactive cards on screen. Always call the \
-tool for live data instead of describing it.
-</canvas-mode>
-{% endif %}";
+";
 
 /// Concise — minimal, action-first. For power users who want brevity.
 pub const PROMPT_CONCISE: &str = "\
@@ -289,14 +274,16 @@ One sentence replies unless asked for more. No Markdown. No voice artifacts.
 The result, never the route to it. Angle brackets, tool names, steps and system \
 reminders are machinery — never mention them. Fell short? Say which part, \
 plainly. Asked how you know, say.
-General copilot: writing, research, coding, planning{% if has_home_devices %}, home control{% endif %}.
-Only tools in your schema.
+General copilot: writing, research, coding, planning{% if tools_offered %}, home control{% endif %}.
+{% if tools_offered %}Only tools in your schema.
+{% endif %}
 </instructions>
 <context-handling>
 <system-context> = date, time, <memories> — data, not a question. Answer \
-<user-message>. This turn's tool result outranks a stale memory. \
+<user-message>.{% if tools_offered %} This turn's tool result outranks a stale memory.{% endif %} \
 <conversation-summary>: use, never quote.
 </context-handling>
+{% if tools_offered %}
 <tool-usage>
 Anything live or changeable: call the tool — all calls in ONE response. \
 Answer from knowledge only what cannot have changed or is already in context. \
@@ -308,23 +295,14 @@ Error, empty, \"not found\" — NOT an answer; try another tool that applies, \
 never an identical re-call.
 </tool-failure>
 {% endif %} Good result = the answer — give it straight.
-{% if has_tools and not native_tools_json %}
-Available tools:
-{% for tool in tools %}- {{tool}}
-{% endfor %}{% endif %}
 </tool-usage>
 <memory-rules>
 Memory tools: save personal info immediately, recall before lookups, corrections override.
 </memory-rules>
-<output-quality>
-Never fabricate — use a tool or say you don't know. Synthesize, do not parrot.
-</output-quality>
-{% if has_home_devices %}
-<home-devices>
-{{device_count}} registered{% if online_device_names %} (online: {{online_device_names}}){% endif %}.
-Door/alarm: require explicit confirmation. Unknown device: say not set up yet.
-</home-devices>
 {% endif %}
+<output-quality>
+Never fabricate — {% if tools_offered %}use a tool or {% endif %}say you don't know. Synthesize, do not parrot.
+</output-quality>
 {%- if thinking_enabled %}
 <thinking>
 Hard problems: reason first, under {{reasoning_budget_words}} words. Simple ones: just answer.
@@ -335,13 +313,7 @@ Hard problems: reason first, under {{reasoning_budget_words}} words. Simple ones
 Responses read aloud via TTS. Short, conversational, no formatting. Spell out symbols.
 </voice-mode>
 {% endif %}
-{% if canvas_mode %}
-
-<canvas-mode>
-Canvas mode: tool results render as interactive cards on screen. Always call the \
-tool for live data instead of describing it.
-</canvas-mode>
-{% endif %}";
+";
 
 /// Technical — verbose, tool-aware, narrates reasoning. For developers / power users.
 pub const PROMPT_TECHNICAL: &str = "\
@@ -349,7 +321,8 @@ pub const PROMPT_TECHNICAL: &str = "\
 {{assistant_name}}, {{user_name}}'s personal agentic assistant — a copilot with real actuation, \
 running on their own hardware. This pond belongs to {{user_name}}.
 Goose In A Pond — on-device inference, no telemetry, no cloud calls, no data egress.
-Your tool schema is a live interface to this household's devices, memory, schedule and knowledge.
+{% if tools_offered %}Your tool schema is a live interface to this household's devices, memory, schedule and knowledge.
+{% endif %}
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 <instructions>
@@ -358,13 +331,14 @@ not approximations. No Markdown in voice output, no role delimiters.
 State the result, not the route; a one-line plan before a multi-step task, no \
 running commentary. Angle-bracket tags, tool names and system reminders are \
 harness internals — never quote them; report a shortfall in domain terms: what \
-you could not determine. Asked how you know, answer. Only tools in your schema.
+you could not determine. Asked how you know, answer.{% if tools_offered %} Only tools in your schema.{% endif %}
 </instructions>
 <context-handling>
 <system-context> (date/time, <memories>) is context, never a question — respond \
-to <user-message> only. This turn's tool result outranks a stale memory. \
+to <user-message> only.{% if tools_offered %} This turn's tool result outranks a stale memory.{% endif %} \
 A <conversation-summary> accurately summarizes older turns: use, never quote.
 </context-handling>
+{% if tools_offered %}
 <tool-usage>
 Anything live, of this household, or changeable since training: call the tool, \
 in parallel when the request has parts. Answer from knowledge only what cannot \
@@ -377,27 +351,16 @@ An error or empty result is NOT an answer — call another tool that applies, \
 never an identical re-call.
 </tool-failure>
 {% endif %} Synthesize immediately after a successful result; no follow-ups.
-{% if has_tools and not native_tools_json %}
-Available tools:
-{% for tool in tools %}- {{tool}}
-{% endfor %}{% endif %}
 </tool-usage>
 <memory-rules>
 Memory tools: save personal info immediately, recall before lookups, corrections \
 override previous entries.
 </memory-rules>
-<output-quality>
-Never fabricate URLs, statistics, dates or quotes — tool, or say you don't \
-know. Synthesize and cite; never parrot raw output.
-</output-quality>
-{% if has_home_devices %}
-<home-devices>
-Registered: {{device_count}} device{% if device_count != 1 %}s{% endif %}. \
-{% if online_device_names %}Online: {{online_device_names}}.{% else %}None currently online.{% endif %}
-Door unlock / alarm disarm: requires explicit same-message confirmation.
-Unrecognised device: offer to add it. External egress: disclose destination and await OK.
-</home-devices>
 {% endif %}
+<output-quality>
+Never fabricate URLs, statistics, dates or quotes — {% if tools_offered %}use a tool or \
+{% endif %}say you don't know. Synthesize and cite; never parrot raw output.
+</output-quality>
 {%- if thinking_enabled %}
 <thinking>
 Multi-step, comparison or plan: reason it through, weigh trade-offs, surface \
@@ -410,13 +373,7 @@ User is speaking via microphone, responses read aloud. Concise, spoken-friendly.
 No visual formatting. Spell out symbols. Summarise URLs and paths.
 </voice-mode>
 {% endif %}
-{% if canvas_mode %}
-
-<canvas-mode>
-Canvas mode: tool results render as interactive cards on screen. Always call the \
-tool for live data instead of describing it.
-</canvas-mode>
-{% endif %}";
+";
 
 /// Warm — conversational, family-friendly, personality-forward. No jargon.
 pub const PROMPT_WARM: &str = "\
@@ -435,14 +392,15 @@ questions. Short clear answers, plain language, no lists or formatting — just 
 conversation.
 I give you the answer, not the story of how I got it. Angle brackets, tool \
 names, system reminders — machinery; I never mention it. If I came up short, I \
-say what I couldn't find. Ask me straight out how I know and I'll tell you. I only use the \
-tools I've been given.
+say what I couldn't find. Ask me straight out how I know and I'll tell you.\
+{% if tools_offered %} I only use the tools I've been given.{% endif %}
 </instructions>
 <context-handling>
 <system-context> (time, date, <memories>) is context, not a question — I only \
-answer <user-message>, and a fresh tool result outranks a stale memory. \
+answer <user-message>{% if tools_offered %}, and a fresh tool result outranks a stale memory{% endif %}. \
 A <conversation-summary> recaps older turns — I use it, never quote it.
 </context-handling>
+{% if tools_offered %}
 <tool-usage>
 Anything live, about this home, or that could have changed — I check my tools, \
 all at once for several things. I answer from what I know only when it can't \
@@ -455,28 +413,16 @@ A tool that errors or comes back empty is not the answer — I try another tool 
 that could help, and I never repeat the exact same call.
 </tool-failure>
 {% endif %} A good result is the answer, so I just give it.
-{% if has_tools and not native_tools_json %}
-Available tools:
-{% for tool in tools %}- {{tool}}
-{% endfor %}{% endif %}
 </tool-usage>
 <memory-rules>
 Memory tools: I save what you share right away, check memories before looking \
 things up, and corrections replace the old note.
 </memory-rules>
+{% endif %}
 <output-quality>
 I never make up URLs, numbers, dates or quotes — I look it up or say I don't \
 know, and I summarize naturally, never dump raw info.
 </output-quality>
-{% if has_home_devices %}
-<home-devices>
-I know about {{device_count}} device{% if device_count != 1 %}s{% endif %} in your home\
-{% if online_device_names %} ({{online_device_names}} {% if device_count == 1 %}is{% else %}are{% endif %} online right now){% endif %}.
-I'll always check before unlocking a door or turning off an alarm. If I don't \
-recognise a device I'll say so and offer to add it, and I'll always ask before \
-doing anything outside your home network.
-</home-devices>
-{% endif %}
 {%- if thinking_enabled %}
 <thinking>
 Tricky, comparative or multi-step: I think it through first, under \
@@ -490,13 +436,7 @@ loud. Short and chatty, no formatting, symbols spelled out. If I didn't catch \
 something, I'll ask you to say it again.
 </voice-mode>
 {% endif %}
-{% if canvas_mode %}
-
-<canvas-mode>
-Canvas mode: tool results render as interactive cards on screen. Always call the \
-tool for live data instead of describing it.
-</canvas-mode>
-{% endif %}";
+";
 
 // ── Vision capability section ────────────────────────────────────────────
 
@@ -683,14 +623,13 @@ pub fn render_jinja_template(
     // "which city?", so say what to DO with it. Static per install, so the prefix stays
     // KV-stable. `location::resolve` is the one place that decides where this pond is,
     // including the fall back to the time zone.
-    let location = match crate::user_data::services::location::resolve(settings).describe() {
-        None => String::new(),
-        Some(place) => format!(
-            "\nLocation: {}. This is the user's home — when a tool needs a place \
-             and none was given, use it rather than asking which city.",
-            sanitize_field(place, 100)
-        ),
-    };
+    // Deliberately empty since 2026-09-10. It used to name the pond's place and
+    // tell the model to use it "when a tool needs a place and none was given" —
+    // which is exactly what `get_current_weather` and `get_weather_forecast`
+    // already promise in their own descriptions ("omit location for the
+    // configured home"). The variable stays so a custom template referencing
+    // {{location}} still renders rather than erroring.
+    let location = String::new();
 
     let mut ctx = tera::Context::new();
     ctx.insert("assistant_name", &name);
@@ -699,34 +638,28 @@ pub fn render_jinja_template(
     ctx.insert("timezone", &tz);
     ctx.insert("location", &location);
 
-    // Runtime state — defaults to empty/zero when not provided
-    let (current_date, current_time, device_count, has_home, online_names) = state
-        .map(|s| {
-            (
-                s.current_date.as_str(),
-                s.current_time.as_str(),
-                s.device_count,
-                s.has_home_devices,
-                s.online_device_names.as_str(),
-            )
-        })
-        .unwrap_or(("", "", 0, false, ""));
+    // Runtime state — defaults to empty when not provided
+    let (current_date, current_time) = state
+        .map(|s| (s.current_date.as_str(), s.current_time.as_str()))
+        .unwrap_or(("", ""));
 
     ctx.insert("current_date", current_date);
     ctx.insert("current_time", current_time);
-    ctx.insert("device_count", &device_count);
-    ctx.insert("has_home_devices", &has_home);
-    ctx.insert("online_device_names", online_names);
     ctx.insert("voice_mode", &state.map(|s| s.voice_mode).unwrap_or(false));
-    ctx.insert(
-        "canvas_mode",
-        &state.map(|s| s.canvas_mode).unwrap_or(false),
-    );
 
     // Available tools — rendered into the prompt so the model knows its capabilities
     let tools: Vec<String> = state.map(|s| s.available_tools.clone()).unwrap_or_default();
     ctx.insert("has_tools", &!tools.is_empty());
     ctx.insert("tools", &tools);
+    // OR-ed with the prose list so a caller that fills `available_tools` but
+    // forgets the flag still gets the guidance, rather than a suppressed
+    // section wrapped around a list that renders.
+    ctx.insert(
+        "tools_offered",
+        &state
+            .map(|s| s.tools_offered || !s.available_tools.is_empty())
+            .unwrap_or(false),
+    );
 
     // Thinking mode — enables deep reasoning instructions in the prompt
     ctx.insert(
@@ -958,28 +891,12 @@ mod tests {
     }
 
     #[test]
-    fn render_jinja_template_home_section_hidden_without_devices() {
+    fn render_jinja_template_never_renders_a_home_section() {
         let s = Settings::default();
-        let state = PromptState::default(); // has_home_devices = false
+        let state = PromptState::default();
         let result = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
         assert!(!result.contains("<home-devices>"));
         assert!(!result.contains("Unlock a door"));
-    }
-
-    #[test]
-    fn render_jinja_template_home_section_visible_with_devices() {
-        let s = Settings::default();
-        let state = PromptState {
-            has_home_devices: true,
-            device_count: 2,
-            online_device_names: "Speaker, Hub".to_string(),
-            ..Default::default()
-        };
-        let result = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
-        assert!(result.contains("<home-devices>"));
-        assert!(result.contains("2"));
-        assert!(result.contains("Speaker, Hub"));
-        assert!(result.contains("Unlock a door") || result.contains("alarm"));
     }
 
     #[test]
@@ -1142,11 +1059,18 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_includes_location_when_set() {
+    /// Inverted on 2026-09-10. The location line told the model to use the
+    /// pond's place "when a tool needs one and none was given" — which is what
+    /// `get_current_weather` and `get_weather_forecast` already promise in their
+    /// own descriptions. The place is a tool's default, not preamble.
+    fn build_system_prompt_omits_the_location() {
         let mut s = Settings::default();
         s.weather_location_name = "Nairobi".to_string();
         let p = build_system_prompt(&s);
-        assert!(p.contains("Nairobi"));
+        assert!(
+            !p.contains("Nairobi"),
+            "the place belongs to the tools: {p}"
+        );
     }
 
     #[test]
@@ -1159,25 +1083,17 @@ mod tests {
     // ── build_system_prompt_from_template_full ────────────────────────────────
 
     #[test]
-    fn build_system_prompt_from_template_full_home_section_conditional() {
+    /// There is no home section any more, in any state: a device list is what
+    /// `giap-device__list_registered_devices` is for.
+    fn build_system_prompt_from_template_full_has_no_home_section() {
         let s = Settings::default();
-        // No devices — home section must be absent
-        let state_none = PromptState::default();
-        let out =
-            build_system_prompt_from_template_full(&s, None, Some(&state_none), PROMPT_BALANCED);
-        assert!(!out.contains("<home-devices>"));
-
-        // With devices — home section must appear
-        let state_with = PromptState {
-            has_home_devices: true,
-            device_count: 1,
-            online_device_names: "Hub".to_string(),
-            ..Default::default()
-        };
-        let out2 =
-            build_system_prompt_from_template_full(&s, None, Some(&state_with), PROMPT_BALANCED);
-        assert!(out2.contains("<home-devices>"));
-        assert!(out2.contains("Hub"));
+        let out = build_system_prompt_from_template_full(
+            &s,
+            None,
+            Some(&PromptState::default()),
+            PROMPT_BALANCED,
+        );
+        assert!(!out.contains("<home-devices>"), "{out}");
     }
 
     #[test]
@@ -1282,8 +1198,8 @@ mod tests {
     ];
 
     /// The unified ordered tag skeleton every style must contain.
-    /// Conditional tags (<home-devices>, <thinking>, <voice-mode>,
-    /// <canvas-mode>) are still present in the RAW template inside their
+    /// Conditional tags (<thinking>, <voice-mode>)
+    /// are still present in the RAW template inside their
     /// {% if %} gates, so they are checked here too.
     const SKELETON_TAGS: &[&str] = &[
         "identity",
@@ -1292,10 +1208,8 @@ mod tests {
         "tool-usage",
         "memory-rules",
         "output-quality",
-        "home-devices",
         "thinking",
         "voice-mode",
-        "canvas-mode",
     ];
 
     /// Extract structural tags from a RAW template constant: a line whose trimmed content is
@@ -1342,6 +1256,9 @@ mod tests {
                 Vec::new()
             },
             native_tools_json: native,
+            // Either route counts: a turn has tools when the prose list is
+            // filled OR the chat template renders a structural array.
+            tools_offered: tools || native,
             ..Default::default()
         }
     }
@@ -1449,32 +1366,31 @@ mod tests {
     }
 
     #[test]
-    fn v2_native_tools_json_suppresses_tool_listing() {
+    fn no_style_names_individual_tools_in_prose() {
         let s = Settings::default();
         for (name, raw) in ALL_STYLES {
-            // native_tools_json=false + tools present → listing rendered
-            let listed = render_jinja_template(raw, &s, Some(&v2_state(false, true, false)), None);
-            assert!(
-                listed.contains("Available tools:"),
-                "style '{name}': tool listing must render when native_tools_json=false"
-            );
-            assert!(
-                listed.contains("get_current_weather"),
-                "style '{name}': tool description lines must render"
-            );
-
-            // native_tools_json=true → NO listing (provider feeds tools JSON
-            // via the chat template), but the behavioral <tool-usage> text stays
-            let native = render_jinja_template(raw, &s, Some(&v2_state(false, true, true)), None);
-            assert!(
-                !native.contains("Available tools:"),
-                "style '{name}': tool listing must NOT render when native_tools_json=true \
-                 (would double-feed every schema)"
-            );
-            assert!(
-                native.contains("<tool-usage>"),
-                "style '{name}': behavioral tool-usage section must survive native_tools_json"
-            );
+            // Both routes, both answers: the prompt never lists tool names.
+            // The prose listing was deleted on 2026-09-10 — every provider this
+            // pond ships feeds tools through the chat template, so the listing
+            // rendered for no shipped configuration and cost four lines per
+            // style to keep.
+            for native in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(false, true, native)), None);
+                assert!(
+                    !out.contains("Available tools:"),
+                    "style '{name}' (native={native}): prose tool listing is gone"
+                );
+                assert!(
+                    !out.contains("get_current_weather"),
+                    "style '{name}' (native={native}): no individual tool may be named"
+                );
+                // The BEHAVIOURAL section is independent of how tools arrive.
+                assert!(
+                    out.contains("<tool-usage>"),
+                    "style '{name}' (native={native}): tool-usage guidance must survive"
+                );
+            }
         }
     }
 
@@ -1492,10 +1408,8 @@ mod tests {
     struct Shape {
         what: &'static str,
         thinking: bool,
-        devices: bool,
         vision: bool,
         voice: bool,
-        canvas: bool,
     }
 
     /// Every reachable compact configuration, enumerated rather than swept as a product:
@@ -1506,26 +1420,20 @@ mod tests {
         Shape {
             what: "text, no devices, thinking off",
             thinking: false,
-            devices: false,
             vision: false,
             voice: false,
-            canvas: false,
         },
         Shape {
             what: "text, no devices, thinking on",
             thinking: true,
-            devices: false,
             vision: false,
             voice: false,
-            canvas: false,
         },
         Shape {
             what: "text, devices, thinking on",
             thinking: true,
-            devices: true,
             vision: false,
             voice: false,
-            canvas: false,
         },
         // The Orin household default: thinking_mode "auto" resolves true for
         // Gemma-4, a home has devices, and E4B declares an mmproj so the
@@ -1533,26 +1441,20 @@ mod tests {
         Shape {
             what: "text, devices, thinking on, vision (the Orin household default)",
             thinking: true,
-            devices: true,
             vision: true,
             voice: false,
-            canvas: false,
         },
         Shape {
             what: "canvas, devices, thinking on, vision",
             thinking: true,
-            devices: true,
             vision: true,
             voice: false,
-            canvas: true,
         },
         Shape {
             what: "voice, devices (thinking and vision forced off)",
             thinking: false,
-            devices: true,
             vision: false,
             voice: true,
-            canvas: false,
         },
     ];
 
@@ -1576,15 +1478,7 @@ mod tests {
                     native_tools_json: true,
                     available_tools: sample_tool_lines(),
                     thinking_enabled: shape.thinking,
-                    has_home_devices: shape.devices,
-                    device_count: if shape.devices { 4 } else { 0 },
-                    online_device_names: if shape.devices {
-                        "Kitchen light, Hallway lock".to_string()
-                    } else {
-                        String::new()
-                    },
                     voice_mode: shape.voice,
-                    canvas_mode: shape.canvas,
                     ..Default::default()
                 };
 
@@ -1634,7 +1528,7 @@ mod tests {
     fn the_first_reachable_shape_is_the_bare_one() {
         let bare = &REACHABLE_SHAPES[0];
         assert!(
-            !bare.thinking && !bare.devices && !bare.vision && !bare.voice && !bare.canvas,
+            !bare.thinking && !bare.vision && !bare.voice,
             "REACHABLE_SHAPES[0] must be the configuration-free shape — the budget \
              split reads it as the style's own cost. Got: {}",
             bare.what
@@ -1652,7 +1546,7 @@ mod tests {
             // Both full and compact renders must carry the summary contract.
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 assert!(
                     out.contains("<conversation-summary>"),
                     "style '{name}' (compact={compact}): rendered prompt must mention \
@@ -1970,6 +1864,114 @@ mod tests {
         }
     }
 
+    /// A template is only safe to hand a binary that knows its variables.
+    ///
+    /// Tera renders `{% if undefined %}` as FALSE and returns `Ok` — it does not
+    /// error, so `render_jinja_template`'s fallback never fires and nothing is
+    /// logged. A pond whose `prompt_templates` rows are newer than its binary
+    /// therefore drops every tool section silently while still offering the
+    /// model a full tool array: the worst version of this bug, because the
+    /// prompt looks fine and the model simply stops being told what tools are
+    /// for.
+    ///
+    /// This is why the DB rows and the binary move together — the reseed at
+    /// boot is what keeps them in step, and hand-editing `prompt_templates` on
+    /// a device running an older build is not a shortcut for deploying.
+    #[test]
+    fn an_undefined_guard_renders_false_and_does_not_error() {
+        let out = tera::Tera::one_off(
+            "A{% if tools_offered %}B{% endif %}C",
+            &tera::Context::new(),
+            false,
+        );
+        assert_eq!(
+            out.expect("Tera treats an undefined guard as falsy, not as an error"),
+            "AC",
+            "if this ever starts erroring instead, the fallback path in \
+             render_jinja_template would leak raw Jinja markup into the system prompt"
+        );
+    }
+
+    /// The other half of the tool sections: when a turn is offered NO tools, the
+    /// prompt must not spend tokens telling the model how to call one.
+    ///
+    /// This is not hypothetical tidiness. A pond with every extension off, or one
+    /// run under `GIAP_NO_TOOLS`, was still told "call the tool", "an empty result
+    /// is NOT an answer: call another tool", and "only tools in your schema" —
+    /// roughly 700 characters instructing a model with nothing to call. The
+    /// template had no honest signal to gate on: `has_tools` is derived from the
+    /// prose list, which is deliberately empty on every native-tool-calling turn.
+    #[test]
+    fn no_style_talks_about_tools_when_the_turn_is_offered_none() {
+        let settings = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [true, false] {
+                // Neither route: no prose list and no structural array.
+                let state = v2_state(compact, false, false);
+                let out = render_jinja_template(raw, &settings, Some(&state), None);
+                for banned in [
+                    "<tool-usage>",
+                    "</tool-usage>",
+                    "<tool-failure>",
+                    "<memory-rules>",
+                    "Available tools:",
+                ] {
+                    assert!(
+                        !out.contains(banned),
+                        "style '{name}' (compact={compact}): still renders {banned} \
+                         with no tools offered. Rendered:\n{out}"
+                    );
+                }
+                let lower = out.to_lowercase();
+                for banned in [
+                    "only tools in your schema",
+                    "use a tool or",
+                    "outranks a stale memory",
+                    "outranks a memory that disagrees",
+                    // The warm style's own phrasing of "only tools in your
+                    // schema". Four styles say this four ways, and banning
+                    // three of the four spellings is how one stayed ungated.
+                    "tools i've been given",
+                    // Capability claims, not just tool machinery. "home
+                    // control" survived its `{% if has_home_devices %}` gate
+                    // when that variable was removed and became unconditional,
+                    // so a toolless pond advertised actuation it could not do —
+                    // and this test missed it because every phrase above is
+                    // tool-SHAPED and that one is not.
+                    "home control",
+                ] {
+                    assert!(
+                        !lower.contains(banned),
+                        "style '{name}' (compact={compact}): still says \"{banned}\" \
+                         with no tools offered"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And the same states with tools present must keep every one of them, so the
+    /// test above cannot pass by deleting the sections outright.
+    #[test]
+    fn every_style_still_carries_the_tool_sections_when_tools_are_offered() {
+        let settings = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [true, false] {
+                // The production shape: structural tools, empty prose list.
+                let state = v2_state(compact, false, true);
+                let out = render_jinja_template(raw, &settings, Some(&state), None);
+                assert!(
+                    out.contains("<tool-usage>") && out.contains("</tool-usage>"),
+                    "style '{name}' (compact={compact}): lost its tool-usage section"
+                );
+                assert!(
+                    out.contains("<memory-rules>"),
+                    "style '{name}' (compact={compact}): lost its memory rules"
+                );
+            }
+        }
+    }
+
     /// Every style, in BOTH tiers, must say that an empty tool result is not an answer and that
     /// another tool should be tried. The compact tier especially: the on-device model never sees
     /// the verbose branch, since `ContextGovernor::prompt_window` clamps local/gguf to 8192.
@@ -1979,7 +1981,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase();
                 assert!(
                     lower.contains("empty"),
@@ -2003,7 +2005,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase();
 
                 assert!(
@@ -2042,7 +2044,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase();
 
                 assert!(
@@ -2093,7 +2095,7 @@ mod tests {
             turn_budget_note(Some(50)),
             turn_budget_note(None),
             dormant_groups_note(
-                &["giap-weather".to_string(), "giap-news".to_string()],
+                &["giap-weather".to_string(), "giap-knowledge".to_string()],
                 &["giap-weather".to_string()],
             ),
         ];
@@ -2127,7 +2129,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase().replace("angle-bracket", "angle bracket");
                 assert!(
                     lower.contains("angle bracket"),
@@ -2149,7 +2151,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase();
 
                 // The licence must be RESTRICTIVE, checked structurally rather than by
@@ -2229,7 +2231,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 let lower = out.to_lowercase();
                 assert!(
                     lower.contains("asked outright")
@@ -2251,7 +2253,7 @@ mod tests {
     fn verbose_tier_tool_failure_section_is_balanced() {
         let s = Settings::default();
         for (name, raw) in ALL_STYLES {
-            let out = render_jinja_template(raw, &s, Some(&v2_state(false, false, false)), None);
+            let out = render_jinja_template(raw, &s, Some(&v2_state(false, false, true)), None);
             assert_eq!(
                 out.matches("<tool-failure>").count(),
                 out.matches("</tool-failure>").count(),
@@ -2273,7 +2275,7 @@ mod tests {
         for (name, raw) in ALL_STYLES {
             for compact in [false, true] {
                 let out =
-                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, true)), None);
                 assert!(
                     !out.contains("<vision>"),
                     "style '{name}' (compact={compact}): the vision section is opt-in"

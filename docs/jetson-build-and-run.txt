@@ -113,22 +113,14 @@ Notes:
     ships a stale UI until you rsync dist/ from the Mac:
         rsync -az --delete pond-desktop/dist/ nano:goose-in-a-pond/pond-desktop/dist/
 
-Build the desktop app (separate cargo target, needed for --native):
-
-    cd ~/goose-in-a-pond
-    PATH=$HOME/.cargo/bin:$PATH SQLX_OFFLINE=true \
-    cargo build --release --features custom-protocol \
-      --manifest-path pond-desktop/src-tauri/Cargo.toml
-
-  --features custom-protocol IS LOAD-BEARING. It is what `cargo tauri build`
-  passes for you. Without it Tauri stays in dev mode and the WebView loads
-  tauri.conf.json's devUrl (http://localhost:1420) instead of the embedded
-  dist, so the app opens to "Could not connect to localhost: Connection
-  refused" - and there is no build error to explain it.
+There is no desktop app to build on this board. The shell is Electron and is
+packaged for macOS only; this device's UI is the dashboard pond-server itself
+serves, which is the same React bundle embedded at compile time. The board also
+runs headless on purpose - gdm3 is disabled because GNOME held 2.6 GB of nvmap,
+see docs/developer/jetson-device-tuning.md.
 
 Timings from a full clean rebuild on 2026-07-28:
     pond-server release + CUDA ... 35m01s
-    pond-desktop Tauri release ...  7m05s
 An incremental build after a goose submodule bump was about 10m30s.
 
 If you need disk before a big build: `target/debug` on the device is ~10 GB of
@@ -137,36 +129,18 @@ about 21 GB.
 
 
 -------------------------------------------------------------------------------
-RUN - OPTION A: ONE PROCESS (--native)
+RUN: THE SERVICE
 -------------------------------------------------------------------------------
-
-    systemctl --user stop goose-in-a-pond
-    cd ~/goose-in-a-pond
-    DISPLAY=:0 ./target/release/pond-server serve --port 8080 --native
-
-  - Stop the service first, or you get two servers.
-  - Run from the repo ROOT. spawn_desktop_app looks for the desktop binary at
-    paths relative to the current working directory.
-  - Pass --port 8080 explicitly. Without it the fallback scan can land on 4000.
-  - DISPLAY=:0 is needed when launching over SSH. There is a local session on
-    :0; the spawned app inherits your environment and will not find a display
-    otherwise.
-
-
--------------------------------------------------------------------------------
-RUN - OPTION B: SERVICE + DESKTOP SEPARATELY (PREFERRED)
--------------------------------------------------------------------------------
-
-The service keeps auto-starting at boot and there is no way to accidentally
-end up with two servers.
 
     systemctl --user start goose-in-a-pond          # server on 8080
 
-    DISPLAY=:0 GIAP_SERVER_PORT=8080 \
-      ~/goose-in-a-pond/pond-desktop/src-tauri/target/release/pond-desktop
+Then open http://nano.local:8080 from any machine on the LAN, or a browser on
+the board's own panel if one is attached.
 
-GIAP_SERVER_PORT puts the desktop app in parent-managed mode, so it attaches to
-the running server on 8080 instead of spawning its own on 4000.
+`serve --native` does nothing useful here: it prints that the desktop shell is
+macOS-only and keeps serving. That used to be two documented run modes and a
+trap about a stray debug binary shadowing the release one; both are gone with
+the Tauri shell.
 
 Service management:
 
@@ -230,10 +204,6 @@ OTHER GOTCHAS
 
   - `pkill -f pond-server` over SSH kills your own shell, because the remote
     command line contains the pattern. Use the explicit PID, or `[p]ond-server`.
-
-  - spawn_desktop_app checks src-tauri/target/DEBUG/pond-desktop BEFORE
-    release. A stray debug desktop build silently wins. Same class of trap as
-    the server.
 
   - Do not run a chat or load a model while a release build is linking. The
     linker gets OOM-killed.
