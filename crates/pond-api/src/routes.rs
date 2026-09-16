@@ -3943,6 +3943,53 @@ async fn get_session_attachment(
     }
 }
 
+/// The LAN address a phone on the same network should use to reach this hub.
+///
+/// A mDNS hostname is the nicer thing to hand out — it survives a DHCP lease
+/// change, where a baked-in address does not — but Android's resolver does not
+/// do mDNS, so `<host>.local` simply fails to resolve there. The pairing QR
+/// carries both and lets the client fall back.
+///
+/// Found by asking the routing table which source address it would use to reach
+/// the mDNS group, which is the same question the phone is really asking. No
+/// packet is sent: `connect` on a UDP socket only fixes the route. That is also
+/// why the destination is the multicast group rather than a public address —
+/// routing to the internet may well go out of a VPN, which is the one interface
+/// that cannot carry LAN discovery.
+///
+/// Returns `None` rather than a guess when there is no LAN route to speak of.
+fn lan_address() -> Option<String> {
+    use std::net::UdpSocket;
+
+    // The mDNS group first, then RFC1918 gateways for hosts whose multicast
+    // route is unusual. Each is only a routing probe.
+    for probe in [
+        "224.0.0.251:5353",
+        "192.168.0.1:80",
+        "10.0.0.1:80",
+        "172.16.0.1:80",
+    ] {
+        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+            continue;
+        };
+        if socket.connect(probe).is_err() {
+            continue;
+        }
+        let Ok(addr) = socket.local_addr() else {
+            continue;
+        };
+        let std::net::IpAddr::V4(v4) = addr.ip() else {
+            continue;
+        };
+        // Loopback and link-local (169.254/16, a failed DHCP) reach nobody.
+        if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+            continue;
+        }
+        return Some(v4.to_string());
+    }
+    None
+}
+
 async fn system_info(State(state): State<Arc<AppState>>) -> Json<Value> {
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
@@ -3954,6 +4001,9 @@ async fn system_info(State(state): State<Arc<AppState>>) -> Json<Value> {
 
     Json(json!({
         "hostname": hostname,
+        // Null when the host has no LAN route. Clients that cannot resolve
+        // `<hostname>.local` — Android, notably — use this instead.
+        "lan_address": lan_address(),
         "port": state.api_port,
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
