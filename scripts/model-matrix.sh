@@ -194,6 +194,13 @@ run_model() {
     done
   fi
 
+  # Refuse to start on an occupied port. Paired with the ownership check below:
+  # this catches the leak before it can be measured, that one catches ours dying.
+  if curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/api/v1/health"; then
+    echo "  FAIL $model — port $PORT is already serving; a leaked pond-server would be measured instead"
+    rm -rf "$data_dir"; return
+  fi
+
   # ORT_DYLIB_PATH is exported at the top when a runtime was found on this
   # machine, and inherited from here. Without it every model re-downloads ~30 MB
   # into its own scratch dir, because the dir is wiped between models -- minutes
@@ -202,13 +209,6 @@ run_model() {
   # space ("Application Support") and `${VAR:+VAR="$VAR"}` does not survive word
   # splitting, which turned the assignment into a command and failed every model
   # instantly with "No such file or directory".
-  # Refuse to start on an occupied port. Paired with the ownership check below:
-  # this catches the leak before it can be measured, that one catches ours dying.
-  if curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/api/v1/health"; then
-    echo "  FAIL $model — port $PORT is already serving; a leaked pond-server would be measured instead"
-    rm -rf "$data_dir"; return
-  fi
-
   POND_DATA_DIR="$data_dir" POND_DEV_ALLOW_LOOPBACK=1 \
     RUST_LOG="${MATRIX_RUST_LOG:-warn,giap::trace=info,pond_adapters_goose=debug,pond_adapters_local_inference=debug,goose_local_inference=debug}" \
     "$BIN" serve --port "$PORT" > "$log" 2>&1 &
