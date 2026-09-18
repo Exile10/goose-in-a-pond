@@ -3975,6 +3975,38 @@ async fn get_session_attachment(
 /// that cannot carry LAN discovery.
 ///
 /// Returns `None` rather than a guess when there is no LAN route to speak of.
+fn lan_address() -> Option<String> {
+    use std::net::UdpSocket;
+
+    // The mDNS group first, then RFC1918 gateways for hosts whose multicast
+    // route is unusual. Each is only a routing probe.
+    for probe in [
+        "224.0.0.251:5353",
+        "192.168.0.1:80",
+        "10.0.0.1:80",
+        "172.16.0.1:80",
+    ] {
+        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+            continue;
+        };
+        if socket.connect(probe).is_err() {
+            continue;
+        }
+        let Ok(addr) = socket.local_addr() else {
+            continue;
+        };
+        let std::net::IpAddr::V4(v4) = addr.ip() else {
+            continue;
+        };
+        // Loopback and link-local (169.254/16, a failed DHCP) reach nobody.
+        if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+            continue;
+        }
+        return Some(v4.to_string());
+    }
+    None
+}
+
 /// True for the CGNAT range Tailscale assigns node addresses from, 100.64.0.0/10.
 ///
 /// Checked explicitly because the probe below can succeed without a tailnet: a
@@ -4012,38 +4044,6 @@ fn tailnet_address() -> Option<String> {
     };
 
     is_tailnet_v4(v4).then(|| v4.to_string())
-}
-
-fn lan_address() -> Option<String> {
-    use std::net::UdpSocket;
-
-    // The mDNS group first, then RFC1918 gateways for hosts whose multicast
-    // route is unusual. Each is only a routing probe.
-    for probe in [
-        "224.0.0.251:5353",
-        "192.168.0.1:80",
-        "10.0.0.1:80",
-        "172.16.0.1:80",
-    ] {
-        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
-            continue;
-        };
-        if socket.connect(probe).is_err() {
-            continue;
-        }
-        let Ok(addr) = socket.local_addr() else {
-            continue;
-        };
-        let std::net::IpAddr::V4(v4) = addr.ip() else {
-            continue;
-        };
-        // Loopback and link-local (169.254/16, a failed DHCP) reach nobody.
-        if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
-            continue;
-        }
-        return Some(v4.to_string());
-    }
-    None
 }
 
 async fn system_info(State(state): State<Arc<AppState>>) -> Json<Value> {
