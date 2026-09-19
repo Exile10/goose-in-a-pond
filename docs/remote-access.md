@@ -115,5 +115,7 @@ and home LAN again. Exercise app/server restarts, LAN address changes, unavailab
 VPN, certificate renewal, and incorrect-pin rejection by both REST and SSE.
 A build or unit-test pass does not establish physical roaming acceptance.
 
-HTTPS does not complete authorization hardening. See
-[the security posture](auth-network-posture.md) for the remaining W3 work.
+This branch includes W3 authorization checks for notification ownership, bearer
+revocation and protected diagnostics. HTTPS is independent of those checks. See
+[the security posture](auth-network-posture.md) for the implemented contract and
+remaining bearer-token risks.

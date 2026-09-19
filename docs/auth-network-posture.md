@@ -23,24 +23,70 @@ HTTPS. Headscale node certificate issuance is not required. See
 
 Do not publish the listener on the public internet. An untrusted tailnet node
 can reach public API routes; encrypting transport does not authenticate its user.
-The broader W3 authorization work remains separate: bearer-token/device binding,
-the revoke endpoint contract, and narrowing the public allowlist are not changed
-by this milestone. Non-API pages are absent from the companion router.
+This branch also includes W3 authorization checks for session revocation,
+device-scoped notifications and public-route exposure, described below. Those
+checks do not prove possession of a device private key. Non-API pages are absent
+from the companion router.
 
 ## Authentication
 
 - All `/api/v1/*` routes require `Authorization: Bearer <session_token>` and are
   rejected with **401** otherwise, **except** the public allowlist: `/health`,
-  `/handshake`, `/handshake/{init,verify,refresh,revoke,pairing-code}`,
+  `/handshake`, `/handshake/{init,verify,refresh,pairing-code}`,
   onboarding routes, and a few local dev/test pages
   (`crates/pond-api/src/middleware/mod.rs::route_exposure`). The allowlist is
   state-scoped rather than flat: each entry in `PUBLIC_ROUTES` carries an
-  `Exposure` of `Always`, `UntilOnboarded`, or `UntilOnboardedThenHostOnly`, so a
-  route open during onboarding can close afterwards.
+  `Exposure` of `Always`, `HostOnly`, `Authenticated`, `UntilOnboarded`, or
+  `UntilOnboardedThenHostOnly`. `Authenticated` keeps revocation available before
+  onboarding finishes without making it public. `HostOnly` requires a token from
+  network peers; only the actual loopback connection gets the compatibility
+  exemption. Missing connection metadata is treated as remote, and forwarding
+  headers do not change this classification.
 - Tokens are validated against the DB-backed `SqliteHandshakeAdapter`
   (`validate_token`): only unrevoked, unexpired session tokens pass.
 - Session tokens expire after 24h; refresh tokens after 30d. Clients rotate via
   `POST /api/v1/handshake/refresh` (rotation revokes the old session).
+
+### Revocation and device-scoped delivery
+
+`POST /api/v1/handshake/revoke` requires the current session bearer token. It
+revokes that session row, including the associated refresh credential. The
+request body does not choose a token: older GOTG clients may continue sending
+`{token: ...}`, but only the bearer is used. Missing, expired and revoked bearer
+credentials return 401. The endpoint works before and after onboarding.
+
+`GET /api/v1/notifications/stream?device_id=...` and
+`POST/DELETE /api/v1/devices/{id}/push-token` require the target device to match
+`Principal.device_id`, obtained by the middleware from `caller_for_token`.
+A mismatch (including absent token attribution) returns 403 `device_mismatch`
+before queue access, device lookup or push-token mutation. A caller cannot use
+these routes to discover whether someone else's device exists. Claims are not
+copied into the principal, and smart-home device targets are not confused with
+the identity of a companion phone. No IP address binding is added; an issued
+session can roam and refresh remotely.
+
+This is bearer authorization, not device-key proof of possession. A stolen
+session can still act as its recorded device until expiry or revocation. Refresh
+is possession-based; an already open SSE connection is not reauthenticated per
+event. Closing active streams on credential revocation and addressing concurrent
+refresh/revoke races require a separate session-lifecycle change. A client with
+an expired session must refresh before server-side logout; local credential
+removal alone is not a server revocation guarantee.
+
+### Diagnostics and bootstrap
+
+Transcription (`POST /transcribe`) and agent status (`GET /dev/goose`) require
+authentication and completed onboarding. `/tts`, `/test`, `/test/speak`, and
+non-API dashboard/development pages allow anonymous **loopback** callers only;
+remote callers need a valid token. This preserves local desktop/CLI speech.
+Health, onboarding status and `/system/info` remain public for connection and
+pairing bootstrap; discovery information must never establish trust in a new TLS
+key. Existing onboarding and OAuth-specific guards remain in place.
+
+Denials emit a structured `device_mismatch` warning with the operation name;
+accepted device checks emit debug events, and successful revocation emits an
+info event. Tokens, notification contents and claimed identifiers are excluded
+from those events. The API error code is stable for client localization.
 
 ## Pairing (how a client gets a token)
 
