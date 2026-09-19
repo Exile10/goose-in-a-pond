@@ -594,11 +594,29 @@ fn verify_limiter() -> &'static crate::middleware::RateLimiter {
         .get_or_init(|| crate::middleware::RateLimiter::new(10, std::time::Duration::from_secs(60)))
 }
 
-/// Record a pairing outcome in the unified event log (category `Auth`,
-/// `Sensitive` — surfaceable by the audit tools, never the payload itself)
-/// and push a security notification to connected devices (#164 follow-up).
-/// Both are best-effort: they must never change the handshake response.
-async fn emit_pairing_outcome(state: &AppState, paired: bool, device_name: Option<&str>) {
+/// Record the result of a pairing attempt, in the log and in the event log.
+///
+/// The event goes to the unified event log (category `Auth`, `Sensitive` —
+/// surfaceable by the audit tools, never the payload itself) and a security
+/// notification goes to connected devices (#164 follow-up). Both are
+/// best-effort: they must never change the handshake response.
+///
+/// `reason` is the handshake's own `rejection_reason` on a failure: a closed set
+/// of short codes (`invalid_mac`, `challenge_expired`, `unknown_challenge`, and
+/// so on). It is safe to log -- none of them carries the pairing code or the MAC,
+/// and neither is logged anywhere else either.
+///
+/// Recording it matters because a failed attempt used to leave nothing behind at
+/// all. `Handshake::reject` builds a response and returns; success wrote one INFO
+/// line and failure wrote nothing, so an operator working through several tries
+/// could not tell which had failed, let alone why. The phone alert fires, but it
+/// is debounced to one per ten minutes and says only that something failed.
+async fn emit_pairing_outcome(
+    state: &AppState,
+    paired: bool,
+    device_name: Option<&str>,
+    reason: Option<&str>,
+) {
     use pond_core::security::domain::event::{Event, EventCategory, PrivacySensitivity};
 
     let action = if paired {
@@ -606,11 +624,31 @@ async fn emit_pairing_outcome(state: &AppState, paired: bool, device_name: Optio
     } else {
         "auth.pairing_verify_failed"
     };
+
+    // Both edges, so tailing the log shows every attempt and its outcome.
+    if paired {
+        tracing::info!(
+            device = device_name.unwrap_or("unnamed"),
+            "pairing accepted"
+        );
+    } else {
+        tracing::warn!(
+            device = device_name.unwrap_or("unnamed"),
+            reason = reason.unwrap_or("unspecified"),
+            "pairing rejected"
+        );
+    }
+
     if let Some(event_log) = state.event_log.as_ref() {
         let mut event =
             Event::new(EventCategory::Auth, action).sensitivity(PrivacySensitivity::Sensitive);
         if let Some(name) = device_name {
             event = event.attr("device_name", name);
+        }
+        // Without this the event log records that a pairing failed but not what
+        // went wrong, which is the one thing worth going back for.
+        if let Some(reason) = reason.filter(|_| !paired) {
+            event = event.attr("rejection_reason", reason);
         }
         if let Err(e) = event_log.append(event).await {
             tracing::warn!(error = %e, action, "failed to record pairing event");
@@ -692,11 +730,23 @@ async fn handshake_verify(
     let resp = match state.handshake.verify_handshake(request).await {
         Ok(resp) => resp,
         Err(e) => {
-            emit_pairing_outcome(&state, false, device_name.as_deref()).await;
+            emit_pairing_outcome(
+                &state,
+                false,
+                device_name.as_deref(),
+                Some("internal_error"),
+            )
+            .await;
             return Err(handshake_error("verify", e));
         }
     };
-    emit_pairing_outcome(&state, resp.accepted, device_name.as_deref()).await;
+    emit_pairing_outcome(
+        &state,
+        resp.accepted,
+        device_name.as_deref(),
+        resp.rejection_reason.as_deref(),
+    )
+    .await;
     Ok(Json(resp))
 }
 
