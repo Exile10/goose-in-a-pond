@@ -594,11 +594,12 @@ fn verify_limiter() -> &'static crate::middleware::RateLimiter {
         .get_or_init(|| crate::middleware::RateLimiter::new(10, std::time::Duration::from_secs(60)))
 }
 
-/// Record a pairing outcome in the unified event log (category `Auth`,
-/// `Sensitive` — surfaceable by the audit tools, never the payload itself)
-/// and push a security notification to connected devices (#164 follow-up).
-/// Both are best-effort: they must never change the handshake response.
 /// Record the result of a pairing attempt, in the log and in the event log.
+///
+/// The event goes to the unified event log (category `Auth`, `Sensitive` —
+/// surfaceable by the audit tools, never the payload itself) and a security
+/// notification goes to connected devices (#164 follow-up). Both are
+/// best-effort: they must never change the handshake response.
 ///
 /// `reason` is the handshake's own `rejection_reason` on a failure: a closed set
 /// of short codes (`invalid_mac`, `challenge_expired`, `unknown_challenge`, and
