@@ -653,7 +653,13 @@ doctor() {
   if command -v tailscale >/dev/null 2>&1; then
     ts_ip="$(tailscale ip -4 2>/dev/null | head -1)"
     case "$ts_ip" in
-      100.*) ok "tailnet address $ts_ip — a paired phone can reach this Pond from outside the house" ;;
+      # 100.64.0.0/10, spelled out because a case glob cannot express a numeric
+      # range. It has to agree with `is_tailnet_v4` in crates/pond-api/src/routes.rs:
+      # a bare `100.*` calls 100.128.0.1 healthy while /api/v1/system/info publishes
+      # `tailnet_address: null` for it, so doctor would contradict the server on
+      # exactly the near-misses the arm below exists to report.
+      100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*)
+             ok "tailnet address $ts_ip — a paired phone can reach this Pond from outside the house" ;;
       "")    warn "tailscale is installed but this host has no tailnet address"
              note "remote pairing will fall back to the LAN address, which fails once the phone leaves"
              note "fix: tailscale up   (add --login-server=<url> for a self-hosted Headscale)"
