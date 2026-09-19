@@ -96,10 +96,21 @@ duplicate GGML symbols from Whisper and llama.cpp. Their dependency declarations
 are unchanged by this feature; no duplicate-symbol suppression was added. The
 original checkout and its uncommitted changes were preserved, and the production
 service was restored with one server process. This failure prevents Jetson live
-acceptance. A Galaxy A57 is now available via ADB, but the physical roaming matrix has
-not been performed. The last Jetson check found no `tailscale` executable on PATH.
-The full LAN → cellular/VPN → other Wi-Fi → LAN matrix, real Expo fetch/XHR
-pin rejection, and unavailable-VPN behavior therefore remain hardware acceptance
-items. Native iOS transport and app-level simulator verification pass as recorded above.
+acceptance. On 2026-09-20, the physical Galaxy A57 (SM-A576B, Android 16) passed
+all 17 companion native integration checks in an isolated Release test app.
+Pairing, authenticated REST, refresh, and SSE used direct home Wi-Fi to a freshly
+compiled W2 Pond on the Mac with scratch data. USB-forwarded certificate fixtures
+verified real Expo fetch and React Native XHR/SSE, wrong-pin rejection before HTTP,
+expiry, hostname mismatch, redirects, plaintext refusal, cleared trust,
+deduplication, foreground resume, and secure persistence after process restart.
+The existing companion installation was preserved, temporary listeners and USB
+forwarding were removed, and the Jetson production service remained active.
+The shared runner is documented in GOTG's `docs/PINNED_HTTPS.md`.
+
+The physical roaming matrix has not been performed. The last Jetson check found
+no `tailscale` executable on PATH; the operator confirmed the phone is signed in.
+The full LAN → cellular/VPN → other Wi-Fi → LAN matrix and unavailable-VPN
+behavior remain hardware acceptance items. Native iOS transport and app-level
+simulator verification pass as recorded above.
 Physical iPhone roaming acceptance is explicitly deferred by the operator because no iPhone is available. The feature must not be described as fully deployed or completely verified
 until those checks are recorded.
