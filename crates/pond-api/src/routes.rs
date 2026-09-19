@@ -4057,6 +4057,45 @@ fn lan_address() -> Option<String> {
     None
 }
 
+/// True for the CGNAT range Tailscale assigns node addresses from, 100.64.0.0/10.
+///
+/// Checked explicitly because the probe below can succeed without a tailnet: a
+/// host with an ordinary default route will happily tell you which address it
+/// would use to reach 100.100.100.100, and that answer is its LAN address. Only
+/// an address inside this range is evidence the packet would go over WireGuard.
+fn is_tailnet_v4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 100 && (64..=127).contains(&b)
+}
+
+/// This Pond's Tailscale address, when it is on a tailnet.
+///
+/// The address a phone uses to reach this Pond from outside the house. It is
+/// worth having alongside `lan_address` rather than instead of it: at home the
+/// LAN address is a direct hop and needs no VPN running, so the client prefers
+/// it and falls back to this one.
+///
+/// Found the same way as `lan_address` — ask the routing table which source
+/// address it would use, sending nothing — but aimed at 100.100.100.100, the
+/// address Tailscale's own MagicDNS resolver answers on. Note the symmetry with
+/// the comment above: `lan_address` avoids routing to the internet precisely
+/// because it may leave via a VPN, and here that VPN is the whole point.
+///
+/// Deliberately not the MagicDNS *name*: reading that means shelling out to the
+/// `tailscale` CLI, and a node's address is stable for its lifetime, so the name
+/// buys nothing here. The certificate work will need it and can pay for it then.
+fn tailnet_address() -> Option<String> {
+    use std::net::UdpSocket;
+
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("100.100.100.100:53").ok()?;
+    let std::net::IpAddr::V4(v4) = socket.local_addr().ok()?.ip() else {
+        return None;
+    };
+
+    is_tailnet_v4(v4).then(|| v4.to_string())
+}
+
 async fn system_info(State(state): State<Arc<AppState>>) -> Json<Value> {
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
@@ -4071,6 +4110,10 @@ async fn system_info(State(state): State<Arc<AppState>>) -> Json<Value> {
         // Null when the host has no LAN route. Clients that cannot resolve
         // `<hostname>.local` — Android, notably — use this instead.
         "lan_address": lan_address(),
+        // Null unless this Pond is on a tailnet. Reachable from outside the
+        // house, so it is what a paired phone falls back to when the LAN
+        // address does not answer.
+        "tailnet_address": tailnet_address(),
         "port": state.api_port,
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
@@ -16918,6 +16961,53 @@ async fn clear_session_user_handler(
 
 #[cfg(test)]
 mod tests {
+
+    /// The address a phone uses to reach this Pond from outside the house.
+    ///
+    /// The range check carries the whole weight: the routing probe answers even
+    /// on a host with no tailnet, so without it the Pond would publish its LAN
+    /// address as a remote one and every off-network client would fail.
+    mod tailnet_range {
+        use super::super::is_tailnet_v4;
+        use std::net::Ipv4Addr;
+
+        #[test]
+        fn accepts_the_whole_cgnat_range_tailscale_assigns_from() {
+            for ip in [
+                Ipv4Addr::new(100, 64, 0, 0),
+                Ipv4Addr::new(100, 100, 100, 100),
+                Ipv4Addr::new(100, 127, 255, 255),
+            ] {
+                assert!(is_tailnet_v4(ip), "{ip} is inside 100.64.0.0/10");
+            }
+        }
+
+        #[test]
+        fn rejects_the_neighbours_of_that_range() {
+            // 100.63.x and 100.128.x are ordinary public space. Off-by-one here
+            // publishes somebody else's address as this Pond's.
+            for ip in [
+                Ipv4Addr::new(100, 63, 255, 255),
+                Ipv4Addr::new(100, 128, 0, 0),
+            ] {
+                assert!(!is_tailnet_v4(ip), "{ip} is outside 100.64.0.0/10");
+            }
+        }
+
+        #[test]
+        fn rejects_the_lan_addresses_the_probe_returns_without_a_tailnet() {
+            // Exactly what the probe answers on a host that merely has a default
+            // route, which is the case the check exists to catch.
+            for ip in [
+                Ipv4Addr::new(192, 168, 1, 11),
+                Ipv4Addr::new(10, 0, 0, 5),
+                Ipv4Addr::new(172, 16, 4, 2),
+                Ipv4Addr::LOCALHOST,
+            ] {
+                assert!(!is_tailnet_v4(ip), "{ip} is not a tailnet address");
+            }
+        }
+    }
 
     /// Whisper `.bin` files have no self-describing header, so the filename is
     /// the only source — but it is whisper.cpp's own published convention
