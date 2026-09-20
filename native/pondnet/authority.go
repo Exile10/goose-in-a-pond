@@ -128,6 +128,62 @@ func LoadAuthority(directory string) (Authority, error) {
 	return out, nil
 }
 
+// Register introduces this household to the enrollment service, so that a
+// household can be set up without an operator creating it by hand.
+//
+// It proves possession of the household key and nothing else. That is enough,
+// because the coordinator's policy grants each phone its own Pond and nothing
+// else, so a household that is not yours gives you no reach into one that is.
+// The service names the household from the key rather than trusting what is
+// sent, so this cannot claim another household.
+//
+// It is safe to repeat: the service answers with the same household rather than
+// conflicting, which is how a lost response is recovered.
+func (a Authority) Register(ctx context.Context, origin string, port uint16) (string, error) {
+	u, e := url.Parse(origin)
+	if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return "", errors.New("enrollment requires an HTTPS origin")
+	}
+	if port == 0 {
+		return "", errors.New("a companion port is required")
+	}
+	envelope, e := enrollment.SignHousehold(enrollment.HouseholdRegistration{
+		PublicKey: a.PublicKey,
+		Port:      port,
+		Expires:   time.Now().Add(2 * time.Minute).Unix(),
+	}, a.key)
+	if e != nil {
+		return "", e
+	}
+	body, _ := json.Marshal(envelope)
+	request, e := http.NewRequestWithContext(ctx, "POST", strings.TrimSuffix(origin, "/")+"/v1/household", bytes.NewReader(body))
+	if e != nil {
+		return "", e
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client := http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, e := client.Do(request)
+	if e != nil {
+		return "", errors.New("enrollment service unavailable")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", errors.New("household registration was not completed")
+	}
+	var result struct {
+		Household string `json:"household"`
+	}
+	if e = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&result); e != nil {
+		return "", e
+	}
+	// The service must have named the household this key owns; anything else
+	// means we are not talking to the coordinator we think we are.
+	if result.Household != a.Household {
+		return "", errors.New("coordinator named a different household")
+	}
+	return result.Household, nil
+}
+
 // Submit sends a narrowly scoped approval to the configured enrollment origin.
 // Callers must authorize the device locally before invoking this operation.
 func (a Authority) Submit(ctx context.Context, origin string, approval enrollment.Approval) (enrollment.Device, error) {

@@ -23,6 +23,9 @@ var nodeKeyPattern = regexp.MustCompile(`^nodekey:[0-9a-f]{64}$`)
 var machineKeyPattern = regexp.MustCompile(`^mkey:[0-9a-f]{64}$`)
 var numeric = regexp.MustCompile(`^[1-9][0-9]{0,19}$`)
 
+// userNamePattern bounds the coordinator user name derived from a household id.
+var userNamePattern = regexp.MustCompile(`^household-[0-9a-f]{32}$`)
+
 // ErrRegistrationRejected means no registration mutation was accepted. Unlike a
 // lost response, this outcome must never be turned into an inventory-based grant.
 var ErrRegistrationRejected = errors.New("registration was rejected")
@@ -62,6 +65,7 @@ type Registered struct {
 // Backend is the private Headscale administrative boundary.
 type Backend interface {
 	Inventory(context.Context) ([]Registered, error)
+	EnsureUser(context.Context, string) (string, error)
 	Register(context.Context, string, string) (Registered, error)
 	Delete(context.Context, string) error
 	Policy(context.Context, []Rule) error
@@ -81,11 +85,12 @@ type Service struct {
 	Now     func() time.Time
 	slots   chan struct{}
 	limiter *rate.Limiter
+	sources *sources
 }
 
 // New reconciles the durable allowlist before accepting enrollment requests.
 func New(ctx context.Context, s *Store, b Backend) (*Service, error) {
-	service := &Service{Store: s, Backend: b, Now: time.Now, slots: make(chan struct{}, 8), limiter: rate.NewLimiter(10, 20)}
+	service := &Service{Store: s, Backend: b, Now: time.Now, slots: make(chan struct{}, 8), limiter: rate.NewLimiter(10, 20), sources: newSources()}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := service.policy(ctx); err != nil {
@@ -168,6 +173,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		io.WriteString(w, `{"ok":true}`)
+		return
+	}
+	if r.Method == "POST" && r.URL.Path == "/v1/household" {
+		s.registerHousehold(w, r)
 		return
 	}
 	if r.Method != "POST" || r.URL.Path != "/v1/approval" {

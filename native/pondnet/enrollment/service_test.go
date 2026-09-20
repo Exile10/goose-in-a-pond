@@ -19,6 +19,8 @@ import (
 )
 
 type fakeBackend struct {
+	users        map[string]string
+	created      int
 	nodes        []Registered
 	calls        int
 	deleted      int
@@ -44,6 +46,21 @@ func (f *fakeBackend) Register(_ context.Context, user, auth string) (Registered
 	return n, nil
 }
 func (f *fakeBackend) Inventory(context.Context) ([]Registered, error) { return f.nodes, nil }
+func (f *fakeBackend) EnsureUser(_ context.Context, name string) (string, error) {
+	if f.fail {
+		return "", errors.New("offline")
+	}
+	if id, ok := f.users[name]; ok {
+		return id, nil
+	}
+	if f.users == nil {
+		f.users = map[string]string{}
+	}
+	f.created++
+	id := strconv.Itoa(len(f.users) + 1)
+	f.users[name] = id
+	return id, nil
+}
 func (f *fakeBackend) Delete(_ context.Context, id string) error {
 	f.deleted++
 	kept := f.nodes[:0]
