@@ -3661,6 +3661,9 @@ async fn run_server(
     };
     let (cert, key) = tls_identity.pem();
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert, key).await?;
+    #[cfg(unix)]
+    let (embedded, embedded_listener) =
+        pond_server::embedded_network::Runtime::new(&data_dir, https_port)?;
     std::fs::write(data_dir.join(".runtime_https_port"), https_port.to_string())?;
 
     // Persist the ACTUAL bound port so the standalone `pond pairing` CLI can
@@ -4520,7 +4523,39 @@ async fn run_server(
 
     let companion =
         pond_api::build_companion_router(state.clone()).layer(axum::Extension(transport.clone()));
-    let app = pond_api::build_router(state, static_dir).layer(axum::Extension(transport.clone()));
+    let app =
+        pond_api::build_router(state.clone(), static_dir).layer(axum::Extension(transport.clone()));
+    #[cfg(unix)]
+    let companion = companion
+        .layer(axum::Extension(embedded.clone()
+            as Arc<
+                dyn pond_core::security::ports::remote_access::RemoteRevocation,
+            >))
+        .layer(axum::Extension(embedded.address.clone()))
+        .merge(pond_server::embedded_network::companion_management(
+            embedded.clone(),
+            state.clone(),
+        ));
+    #[cfg(unix)]
+    let app = app
+        .layer(axum::Extension(embedded.clone()
+            as Arc<
+                dyn pond_core::security::ports::remote_access::RemoteRevocation,
+            >))
+        .layer(axum::Extension(embedded.address.clone()))
+        .merge(pond_server::embedded_network::management(embedded.clone()));
+    #[cfg(unix)]
+    let embedded_router = pond_server::embedded_network::private_companion(companion.clone());
+    #[cfg(unix)]
+    match embedded.config() {
+        Ok(config) if config.enabled => {
+            if let Err(error) = embedded.start(config).await {
+                tracing::error!(%error, "embedded remote access did not start; local HTTPS remains available");
+            }
+        }
+        Ok(_) => (),
+        Err(error) => tracing::error!(%error, "embedded remote access configuration is invalid"),
+    }
 
     // Resolve hostname — strip trailing ".local" if the OS already appended it
     let hostname = hostname::get()
@@ -4569,10 +4604,26 @@ async fn run_server(
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(30));
         ticks.tick().await;
         loop {
+            #[cfg(unix)]
+            tokio::select! { _ = ticks.tick() => (), _ = embedded.changed.notified() => () }
+            #[cfg(not(unix))]
             ticks.tick().await;
-            match tls_identity::certificate_names(&tls_hostname)
-                .and_then(|names| tls_identity.renew_if_needed(&names))
-            {
+            let names = tls_identity::certificate_names(&tls_hostname).map(|names| {
+                #[cfg(unix)]
+                {
+                    let mut names = names;
+                    names.extend(embedded.addresses());
+                    names.sort();
+                    names.dedup();
+                    names
+                }
+                #[cfg(not(unix))]
+                {
+                    names
+                }
+            });
+            let names = names?;
+            match tls_identity.renew_if_needed(&names) {
                 Ok(true) => {
                     let (cert, key) = tls_identity.pem();
                     tls_config.reload_from_pem(cert, key).await?;
@@ -4580,9 +4631,35 @@ async fn run_server(
                 Ok(false) => {}
                 Err(error) => return Err::<(), anyhow::Error>(error),
             }
+            #[cfg(unix)]
+            embedded.publish_ready(&names);
+        }
+    };
+    let embedded_server = async {
+        #[cfg(unix)]
+        {
+            axum::serve(embedded_listener, embedded_router.into_make_service())
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<Result<()>>().await
+        }
+    };
+    let revocations = async {
+        #[cfg(unix)]
+        {
+            embedded.reconcile_revocations().await
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<Result<()>>().await
         }
     };
     let serve_result = tokio::select! {
+        result = revocations => result,
+        result = embedded_server => result,
         result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result.map_err(anyhow::Error::from),
         result = https_server => result.map_err(anyhow::Error::from),
         result = renewal => result,
@@ -4592,6 +4669,10 @@ async fn run_server(
         }
     };
     tls_handle.shutdown();
+    #[cfg(unix)]
+    if let Err(error) = embedded.shutdown().await {
+        tracing::warn!(%error, "embedded networking shutdown failed");
+    }
 
     // Stop the matter-server GIAP started, if any. kill_on_drop does not fire on
     // the signal path (the process exits without unwinding), so the runtime is

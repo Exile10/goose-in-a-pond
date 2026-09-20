@@ -381,3 +381,60 @@ async fn expensive_diagnostics_require_auth_but_local_voice_still_works() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test]
+async fn revocation_waits_for_durable_queue_and_uses_authenticated_device() {
+    use pond_core::security::ports::remote_access::RemoteRevocation;
+    struct Queue {
+        failed: std::sync::atomic::AtomicBool,
+        device: std::sync::Mutex<Option<String>>,
+    }
+    #[async_trait::async_trait]
+    impl RemoteRevocation for Queue {
+        async fn queue(&self, id: &str) -> anyhow::Result<()> {
+            if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("storage unavailable");
+            }
+            *self.device.lock().unwrap() = Some(id.to_owned());
+            Ok(())
+        }
+    }
+    let h = make_app().await;
+    let a = pair(&h, "phone000000000001").await;
+    let token = a.session_token.as_deref().unwrap();
+    let queue = Arc::new(Queue {
+        failed: true.into(),
+        device: Default::default(),
+    });
+    let router = h
+        .remote
+        .clone()
+        .layer(axum::Extension(queue.clone() as Arc<dyn RemoteRevocation>));
+    let response = send(
+        &router,
+        Method::POST,
+        "/api/v1/handshake/revoke",
+        Some(token),
+        json!({"device_id":"another-device"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(h.handshake.validate_token(token).await.unwrap());
+    queue
+        .failed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let response = send(
+        &router,
+        Method::POST,
+        "/api/v1/handshake/revoke",
+        Some(token),
+        json!({"device_id":"another-device"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!h.handshake.validate_token(token).await.unwrap());
+    assert_eq!(
+        queue.device.lock().unwrap().as_deref(),
+        Some("phone000000000001")
+    );
+}

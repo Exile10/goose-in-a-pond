@@ -1,4 +1,5 @@
 import i18n from '../i18n';
+import { RemoteAccess } from './RemoteAccess';
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Button, Chip } from "@heroui/react";
 import { RefreshCw, Smartphone, Wifi } from "lucide-react";
@@ -213,6 +214,7 @@ function Step({
         {icon}
         <span>{children}</span>
       </span>
+      <RemoteAccess />
     </div>
   );
 }
