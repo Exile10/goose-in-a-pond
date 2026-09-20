@@ -323,6 +323,14 @@ export class PondApiClient {
     return this.request<T>("DELETE", path);
   }
 
+  remoteStatus(): Promise<{ state: string; authUrl?: string }> { return this.get('/api/v1/remote-access'); }
+  prepareRemoteIdentity(): Promise<{ household: string; publicKey: string }> { return this.post('/api/v1/remote-access/identity', {}); }
+  enableRemoteAccess(config: { enabled: boolean; controlUrl: string; enrollmentUrl: string }): Promise<unknown> { return this.post('/api/v1/remote-access', config); }
+  remoteRecoveryRequests(): Promise<{ id: string; device: string; approved: boolean }[]> { return this.get('/api/v1/remote-access/recovery-requests'); }
+  approveRemoteRecovery(id: string): Promise<unknown> { return this.post(`/api/v1/remote-access/recovery-requests/${encodeURIComponent(id)}`, {}); }
+  registerRemotePond(): Promise<unknown> { return this.post('/api/v1/remote-access/register', {}); }
+  disableRemoteAccess(): Promise<unknown> { return this.del('/api/v1/remote-access'); }
+
   // ── Health ────────────────────────────────────────────────
 
   health(): Promise<HealthResponse> {

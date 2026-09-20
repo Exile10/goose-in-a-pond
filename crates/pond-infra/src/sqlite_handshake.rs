@@ -142,6 +142,21 @@ impl SqliteHandshakeAdapter {
         client_type: &str,
         device_id: &str,
     ) -> Result<(String, String, DateTime<Utc>)> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = self
+            .issue_session_pair_in(&mut tx, client_id, client_type, device_id)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    async fn issue_session_pair_in(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        client_id: &str,
+        client_type: &str,
+        device_id: &str,
+    ) -> Result<(String, String, DateTime<Utc>)> {
         let session_token = Self::random_token();
         let refresh_token = Self::random_token();
         let now = Self::now();
@@ -154,7 +169,7 @@ impl SqliteHandshakeAdapter {
         )
         .bind(now.to_rfc3339())
         .bind(device_id)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
 
         sqlx::query(
@@ -171,7 +186,7 @@ impl SqliteHandshakeAdapter {
         .bind(expires.to_rfc3339())
         .bind(refresh_expires.to_rfc3339())
         .bind(now.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
 
         Ok((session_token, refresh_token, expires))
@@ -301,7 +316,10 @@ impl Handshake for SqliteHandshakeAdapter {
     }
 
     async fn revoke_token(&self, token: &str) -> Result<()> {
-        sqlx::query("UPDATE session_tokens SET revoked_at = ? WHERE token_hash = ?")
+        // The route has already authenticated this token. A refresh may have rotated
+        // its row while durable network revocation was being queued. Revoke the
+        // device selected by that authenticated row, including any completed rotation.
+        sqlx::query("UPDATE session_tokens SET revoked_at = ? WHERE device_id = (SELECT device_id FROM session_tokens WHERE token_hash = ?) AND revoked_at IS NULL")
             .bind(Self::now().to_rfc3339())
             .bind(Self::sha256_hex(token.as_bytes()))
             .execute(&self.pool)
@@ -503,6 +521,7 @@ impl Handshake for SqliteHandshakeAdapter {
     }
 
     async fn refresh(&self, request: RefreshRequest) -> Result<HandshakeResponse> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let refresh_hash = Self::sha256_hex(request.refresh_token.as_bytes());
         let now = Utc::now().to_rfc3339();
         let row: Option<(String, String, String)> = sqlx::query_as(
@@ -511,7 +530,7 @@ impl Handshake for SqliteHandshakeAdapter {
         )
         .bind(&refresh_hash)
         .bind(&now)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         let Some((client_id, client_type, device_id)) = row else {
@@ -522,11 +541,12 @@ impl Handshake for SqliteHandshakeAdapter {
         sqlx::query("UPDATE session_tokens SET revoked_at = ? WHERE refresh_hash = ?")
             .bind(&now)
             .bind(&refresh_hash)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         let (session, refresh, expires) = self
-            .issue_session_pair(&client_id, &client_type, &device_id)
+            .issue_session_pair_in(&mut tx, &client_id, &client_type, &device_id)
             .await?;
+        tx.commit().await?;
         Ok(self.response(
             true,
             Some(session),
@@ -856,6 +876,39 @@ mod tests {
             hs.validate_token(&token2).await.unwrap(),
             "new session live"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_cannot_escape_authenticated_device_revocation() {
+        let hs = fresh().await;
+        for _ in 0..20 {
+            let (session, refresh, _) = hs
+                .issue_session_pair("race-device", "gotg", "race-device")
+                .await
+                .unwrap();
+            let (rotated, revoked) = tokio::join!(
+                hs.refresh(RefreshRequest {
+                    refresh_token: refresh
+                }),
+                hs.revoke_token(&session),
+            );
+            revoked.unwrap();
+            let rotated = rotated.unwrap();
+            if let Some(token) = rotated.session_token {
+                assert!(
+                    !hs.validate_token(&token).await.unwrap(),
+                    "rotation escaped revocation"
+                );
+            }
+            let (active,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM session_tokens WHERE device_id = ? AND revoked_at IS NULL",
+            )
+            .bind("race-device")
+            .fetch_one(&hs.pool)
+            .await
+            .unwrap();
+            assert_eq!(active, 0);
+        }
     }
 
     #[tokio::test]

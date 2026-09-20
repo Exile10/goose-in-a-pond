@@ -28,6 +28,37 @@ device-scoped notifications and public-route exposure, described below. Those
 checks do not prove possession of a device private key. Non-API pages are absent
 from the companion router.
 
+## Embedded networking and household authority
+
+Remote access is explicit opt-in. Local-only companions do not contact Headscale.
+The Pond's separate persistent Ed25519 authority key signs expiring, single-use
+registration approvals. The enrollment service maps those approvals to
+operator-provisioned pilot households, supplies default-deny ACLs, and keeps
+administrative credentials private. Approved phones can reach only their own
+Pond's companion HTTPS port; phone-to-phone, cross-household, subnet and exit-node
+access have no allow rule. Coordinator inventory drift removes permissions rather
+than silently accepting a changed device identity.
+
+The bundled helper terminates application TLS on the Pond and forwards into a
+private Unix socket. Only that private router accepts its peer-identity header;
+public listeners ignore caller-supplied forwarding identity. The shared auth and
+rate-limit middleware sees the actual embedded peer. LAN-only pairing and
+loopback-only management therefore remain enforced. Remote addresses are published
+only after the listener and certificate are ready.
+
+GOTG connects remote endpoints through a credentialed, allowlisted loopback CONNECT
+proxy; proxy credentials remain native-only. The Go dialer uses the embedded
+WireGuard stack directly and cannot fall back to the host's separate VPN route.
+Native networking still verifies HTTPS, SPKI, hostname and certificate dates before
+sending Pond HTTP. iOS ATS exceptions are limited to the embedded IPv4/IPv6 ranges,
+and the native URL protocol intercepts all requests to those ranges, rejecting
+unconfigured endpoints and plaintext. Unrelated traffic uses platform trust.
+
+See [pilot deployment](../deploy/remote-access/README.md) for provisioning, durable
+revocation, approved identity replacement and consistent backup restoration. Losing
+the household authority requires its backup or a new household; there is no cloud
+recovery override. This transport does not complete broader authorization work.
+
 ## Authentication
 
 - All `/api/v1/*` routes require `Authorization: Bearer <session_token>` and are
@@ -50,7 +81,10 @@ from the companion router.
 ### Revocation and device-scoped delivery
 
 `POST /api/v1/handshake/revoke` requires the current session bearer token. It
-revokes that session row, including the associated refresh credential. The
+revokes every session and refresh credential for the authenticated device. Session
+issuance and refresh rotation use SQLite transactions so concurrent rotation cannot
+escape device revocation. The Pond persists its network-revocation queue before
+acknowledging success; coordinator outages do not silently discard that work. The
 request body does not choose a token: older GOTG clients may continue sending
 `{token: ...}`, but only the bearer is used. Missing, expired and revoked bearer
 credentials return 401. The endpoint works before and after onboarding.
@@ -68,8 +102,8 @@ session can roam and refresh remotely.
 This is bearer authorization, not device-key proof of possession. A stolen
 session can still act as its recorded device until expiry or revocation. Refresh
 is possession-based; an already open SSE connection is not reauthenticated per
-event. Closing active streams on credential revocation and addressing concurrent
-refresh/revoke races require a separate session-lifecycle change. A client with
+event. Closing already active streams on credential revocation remains a separate
+session-lifecycle change; new requests reject revoked credentials immediately. A client with
 an expired session must refresh before server-side logout; local credential
 removal alone is not a server revocation guarantee.
 

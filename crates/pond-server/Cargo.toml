@@ -207,6 +207,7 @@ mdns-sd = "0.11"
 qrcode  = "0.14"
 
 [dev-dependencies]
+tower = { workspace = true, features = ["util"] }
 wiremock   = { workspace = true }
 tempfile   = { workspace = true }
 tokio      = { workspace = true, features = ["rt-multi-thread", "macros"] }

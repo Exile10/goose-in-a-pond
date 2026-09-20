@@ -783,6 +783,9 @@ async fn handshake_refresh(
 async fn handshake_revoke(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
+    remote: Option<
+        axum::Extension<Arc<dyn pond_core::security::ports::remote_access::RemoteRevocation>>,
+    >,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let token = crate::middleware::extract_bearer_token(&headers).map_err(|_| {
         (
@@ -801,6 +804,24 @@ async fn handshake_revoke(
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid_token"})),
         ));
+    }
+    if let Some(axum::Extension(remote)) = remote {
+        let caller = state
+            .handshake
+            .caller_for_token(&token)
+            .await
+            .map_err(|e| handshake_error("revoke", e))?
+            .ok_or((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":"invalid_token"})),
+            ))?;
+        remote.queue(&caller.device_id).await.map_err(|_| {
+            tracing::error!("could not persist remote device revocation");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"revocation_unavailable"})),
+            )
+        })?;
     }
     state
         .handshake
@@ -4130,6 +4151,7 @@ fn tailnet_address() -> Option<String> {
 async fn system_info(
     State(state): State<Arc<AppState>>,
     transport: Option<axum::Extension<crate::network::CompanionTransport>>,
+    embedded: Option<axum::Extension<crate::network::EmbeddedAddress>>,
 ) -> Json<Value> {
     let (https_port, tls_spki_sha256) = crate::network::transport_fields(transport);
     let hostname = hostname::get()
@@ -4148,7 +4170,7 @@ async fn system_info(
         // Null unless this Pond is on a tailnet. Reachable from outside the
         // house, so it is what a paired phone falls back to when the LAN
         // address does not answer.
-        "tailnet_address": tailnet_address(),
+        "tailnet_address": match embedded { Some(e) => e.0.0.read().ok().and_then(|v| v.clone()), None => tailnet_address() },
         "https_port": https_port,
         "tls_spki_sha256": tls_spki_sha256,
         "port": state.api_port,

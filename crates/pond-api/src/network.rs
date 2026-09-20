@@ -15,6 +15,10 @@ pub struct CompanionTransport {
     pub tls_spki_sha256: String,
 }
 
+/// Public address of the embedded node, separate from its private enrollment state.
+#[derive(Clone, Default)]
+pub struct EmbeddedAddress(pub std::sync::Arc<std::sync::RwLock<Option<String>>>);
+
 /// Whether an address belongs to Tailscale's IPv4 or IPv6 allocations.
 pub fn is_tailnet(ip: IpAddr) -> bool {
     match ip {
