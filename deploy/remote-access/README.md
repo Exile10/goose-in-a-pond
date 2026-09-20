@@ -55,7 +55,25 @@ preparation milestone. Configure host firewall and DNS before doing so. The
 control Docker network is not an authorization boundary against host operators;
 only trusted operators may manage this host.
 
-## Provisioning a pilot household
+## How a household joins
+
+A household registers itself. The Pond sends its public key and companion port,
+signed with that key, to `/v1/household`; the service names the household by
+digesting the key rather than trusting what was sent, creates its coordinator
+user, and stores it. Repeating the call answers with the same household, so a
+lost response costs nothing and an operator-created household answers
+identically.
+
+Admission proves possession of a key and nothing else, because admission is not
+what separates households: the policy is, and it grants each phone its own Pond's
+HTTPS port and nothing more. Registration is rate limited per source address, the
+source table is capped, and the number of households is capped, because
+`--provision` used to be the only thing bounding what admission could consume.
+
+The manual path below remains for an operator-created household and for anyone
+running their own coordination service.
+
+## Provisioning a household by hand
 
 On the Pond's local Pairing page, choose **Prepare household identity**. Transfer
 only its household identifier and public key to the pilot operator. The private
