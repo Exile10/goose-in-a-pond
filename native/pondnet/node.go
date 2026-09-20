@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"net/url"
@@ -28,6 +29,40 @@ import (
 var hostnamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$`)
 var tailnet4 = netip.MustParsePrefix("100.64.0.0/10")
 var tailnet6 = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+
+// authURLPattern matches the enrollment capability wherever the backend prints
+// it. The backend announces the registration URL in plain text, and Status
+// documents that this value must never enter logs, so every line is filtered
+// before it reaches a sink rather than trusting callers to be careful.
+var authURLPattern = regexp.MustCompile(`https?://[^\s"'` + "`" + `]*/register/[^\s"'` + "`" + `]*`)
+
+var diagnosticsMu sync.RWMutex
+var diagnosticsSink func(string)
+
+// SetDiagnostics installs a sink for backend log lines, or removes it with nil.
+//
+// Backend logging is discarded by default and that default is deliberate: it is
+// verbose and names addresses and keys, and this process ships no remote
+// logging. Turning it on is a local debugging decision for a debug build, never
+// something a release does. Lines are redacted before the sink sees them.
+//
+// Without a sink, a node that cannot reach its control server fails completely
+// silently, which is how a field failure becomes undiagnosable.
+func SetDiagnostics(sink func(string)) {
+	diagnosticsMu.Lock()
+	diagnosticsSink = sink
+	diagnosticsMu.Unlock()
+}
+
+func backendLogf(format string, args ...any) {
+	diagnosticsMu.RLock()
+	sink := diagnosticsSink
+	diagnosticsMu.RUnlock()
+	if sink == nil {
+		return
+	}
+	sink(authURLPattern.ReplaceAllString(fmt.Sprintf(format, args...), "<redacted enrollment URL>"))
+}
 
 // Status is safe to display locally. AuthURL is an enrollment capability: it
 // must never enter logs, analytics, notifications, or unauthenticated APIs.
@@ -104,7 +139,7 @@ func Open(dir, hostname, control string) (*Node, error) {
 	// disable Tailscale's separate remote diagnostic uploader.
 	envknob.SetNoLogsNoSupport()
 	s := &tsnet.Server{Dir: dir, Store: identity, Hostname: hostname, ControlURL: control,
-		Logf: func(string, ...any) {}, UserLogf: func(string, ...any) {}}
+		Logf: backendLogf, UserLogf: backendLogf}
 	if err := s.Start(); err != nil {
 		s.Close()
 		lock.Close()
