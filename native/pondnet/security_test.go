@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -282,5 +283,48 @@ func TestProfileChangeClosesActiveProxyStream(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("stream cancellation was not prompt")
+	}
+}
+
+// Backend diagnostics are opt-in, and the enrollment capability must not survive
+// into whatever sink an operator installs. tsnet prints the registration URL in
+// plain prose, so redaction happens on the way out rather than at each caller.
+func TestBackendDiagnosticsAreOptInAndRedactEnrollmentURLs(t *testing.T) {
+	t.Cleanup(func() { SetDiagnostics(nil) })
+
+	// Absent a sink, a backend line must go nowhere at all.
+	backendLogf("control: %s", "https://control.example/register/abcdef0123456789")
+
+	var lines []string
+	SetDiagnostics(func(line string) { lines = append(lines, line) })
+
+	for _, sample := range []string{
+		"To authenticate, visit: https://control.example/register/abcdef0123456789",
+		`{"url":"https://control.example/register/abcdef0123456789"}`,
+		"http://control.example:8080/register/abcdef0123456789 and trailing prose",
+	} {
+		backendLogf("%s", sample)
+	}
+	backendLogf("plain line with no capability")
+
+	if len(lines) != 4 {
+		t.Fatalf("expected 4 delivered lines once a sink exists, got %d", len(lines))
+	}
+	for _, line := range lines[:3] {
+		if strings.Contains(line, "/register/") || strings.Contains(line, "abcdef0123456789") {
+			t.Fatalf("enrollment capability survived redaction: %q", line)
+		}
+		if !strings.Contains(line, "<redacted enrollment URL>") {
+			t.Fatalf("expected a redaction marker in %q", line)
+		}
+	}
+	if lines[3] != "plain line with no capability" {
+		t.Fatalf("an unrelated line was altered: %q", lines[3])
+	}
+
+	SetDiagnostics(nil)
+	backendLogf("after removal: https://control.example/register/abcdef0123456789")
+	if len(lines) != 4 {
+		t.Fatalf("removing the sink must stop delivery, got %d lines", len(lines))
 	}
 }

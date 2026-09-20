@@ -177,6 +177,7 @@ export function Pairing() {
               <code style={{ fontSize: 11 }}>_pond._tcp.local.</code> via mDNS.
             </Step>
           </div>
+          <RemoteAccess />
         </div>
       </div>
     </div>
@@ -214,7 +215,6 @@ function Step({
         {icon}
         <span>{children}</span>
       </span>
-      <RemoteAccess />
     </div>
   );
 }
