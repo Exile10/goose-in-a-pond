@@ -149,3 +149,35 @@ This branch includes W3 authorization checks for notification ownership, bearer
 revocation and protected diagnostics. HTTPS is independent of those checks. See
 [the security posture](auth-network-posture.md) for the implemented contract and
 remaining bearer-token risks.
+
+## Backing up the Pond's irreplaceable state
+
+The household authority is an Ed25519 private key at
+`<data_dir>/embedded-network/authority/identity.json`. Losing it means a new household:
+there is no cloud account recovery, and every paired device must pair again. The HTTPS
+identity (`tls/identity.json`) and the WireGuard node state
+(`embedded-network/node/tailscaled.state`) must be restored *with* it, because trust is
+the combination and not any one of the three.
+
+`scripts/pond-snapshot.py` streams a tar of exactly that state to standard output:
+the three items above, `secrets/`, `secrets.json`, the schedules, and consistent copies
+of `pond_system.db` and `pond_vectors.db` taken through SQLite's online backup API so
+the Pond keeps serving. It deliberately omits `models/`, `hf_cache/`, `bin/`, `lib/` and
+the logs, which are gigabytes and all refetchable; the remainder is under a megabyte.
+
+Run it from an operator machine so the Pond needs no additional software, no elevated
+privileges and no writable scratch space, and so the archive lands somewhere the Pond's
+own disk failure cannot reach:
+
+```
+ssh <pond> 'python3 -' < scripts/pond-snapshot.py | age -R <recipients> -o pond-state.tar.age
+```
+
+Encrypting on the operator machine to an age recipient keeps the private key off the
+Pond, matching the coordinator's arrangement in `deploy/remote-access/`.
+
+One trap when verifying such an archive: the databases are produced by SQLite's backup
+API, so they carry a WAL journal-mode header but no `-wal` sidecar. They open normally,
+but an explicit read-only open (`file:...?mode=ro`) fails with `unable to open database
+file`, because SQLite cannot create the write-ahead index. That is a property of the
+verification command, not a corrupt backup; check integrity with an ordinary connection.

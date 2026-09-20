@@ -31,14 +31,23 @@ These names are public configuration, not credentials.
 2. Create a short-lived administration key using
    `docker compose exec -T headscale headscale apikeys create --expiration 24h`.
    Redirect its output directly to `runtime/secrets/headscale_admin` under umask
-   077. Do not copy the value into commands, tickets, logs, or shell history.
+   077, then give that file to UID/GID 65532 with mode 0400. Do not copy the value
+   into commands, tickets, logs, or shell history. A Compose file secret is a bind
+   mount rather than a copy, so the container reads the host file's own ownership:
+   left root-only it is unreadable to the non-root enrollment user, and enrollment
+   never becomes healthy. Note also that `docker compose exec -T` consumes standard
+   input, which silently truncates the remainder of a script piped to
+   `ssh <host> bash -s`; redirect it from `/dev/null` inside such scripts.
 3. Build and start enrollment with `docker compose up -d --build enrollment`.
    It installs the complete default-deny policy before becoming healthy.
 4. Start the gateway with `docker compose up -d gateway`. It requires healthy
    enrollment at startup. Check HTTPS health and confirm that `/api/v1/user` on
    the public Headscale hostname returns 404.
-5. Rotate the administration key before expiry. Update the secret file and
-   recreate enrollment. The key is read once at startup.
+5. Rotate the administration key before expiry with `./rotate-admin-key.sh [90d]`.
+   The key is read once at startup, so the order is load-bearing: mint, install,
+   recreate enrollment, confirm it reports healthy, and only then expire the
+   previous key. Reversing the last two locks the service out of the coordinator.
+   The script restores the previous key if enrollment does not come back.
 
 The Compose port bindings default to loopback. Setting `HTTPS_BIND=0.0.0.0` and
 `STUN_BIND=0.0.0.0` is an explicit public-deployment step and is outside this
@@ -92,17 +101,28 @@ together preserves trust. Loss of the authority requires its backup or a new
 household; there is no cloud account recovery.
 
 For infrastructure backup, stop gateway and enrollment first, then Headscale. Take
-a coordinated, encrypted backup of both databases and their accompanying files,
-Headscale Noise/DERP identities, configuration, and Caddy state. Copy the complete
-Headscale directory, including any SQLite WAL/SHM files. An independent copy of
-only enrollment or only Headscale can restore inconsistent authorization mappings.
-Keep the backup key outside this host; never store plaintext archives in Git.
+a coordinated, encrypted backup of both stores and their accompanying files,
+Headscale Noise/DERP identities, configuration, and Caddy state. The two stores are
+not alike: Headscale keeps SQLite, while enrollment keeps `state.json`, written by
+atomic rename under a `store.lock` flock. Copy the complete Headscale directory,
+including any SQLite WAL/SHM files. An independent copy of only enrollment or only
+Headscale can restore inconsistent authorization mappings. Keep the backup key
+outside this host; never store plaintext archives in Git.
+
+`./backup.sh` performs exactly this sequence and is driven by the reference units in
+`systemd/`, whose paths assume a deployment at `/opt/goose-remote-access`: it stops gateway, enrollment and Headscale in order, checks
+both stores while nothing is writing, encrypts a single archive to an age recipient
+whose private key is deliberately absent from this host, restarts in reverse order
+through an EXIT trap, and prunes to `KEEP` archives. It refuses to run at all rather
+than write an unencrypted archive. Expect roughly fifteen seconds of downtime per
+run; a connected Pond reconnects afterwards with its machine identity retained.
 
 Restore into fresh isolated directories with the original permissions, using the
 pinned versions, and recreate the containers with those directories mounted. Do
 not replace files beneath a reused Docker Desktop bind mount: the local mobile
 restore fixture reproduced stale-file failures there despite valid SQLite data.
-Verify SQLite integrity before startup. Start Headscale and enrollment with the gateway still off. Verify policy
+Verify Headscale's SQLite integrity, and that the enrollment `state.json` parses,
+before startup. Start Headscale and enrollment with the gateway still off. Verify policy
 installation, two-household isolation, replay rejection, and a revoked device.
 Only then permit ingress. Provisioning credentials should be replaced after a
 restore. Unit tests cover authority persistence and corrupt files; the complete
@@ -119,6 +139,16 @@ to eight, and public requests to 10/s with a burst of 20. Logs name transitions 
 failures, never signatures, auth IDs, QR payloads, or credentials. Container logs
 rotate at 10 MiB with three files. Alerts, off-host metrics, disk thresholds, and
 credential-expiry notifications must be configured for public operation.
+
+When checking the embedded DERP relay, verify STUN with a well-formed request. The
+relay is Tailscale's STUN server, which deliberately drops binding requests carrying
+neither a SOFTWARE attribute nor a FINGERPRINT so it cannot be used as a general
+reflector. A minimal twenty-byte binding request therefore times out against a
+perfectly healthy relay, including from the host itself and against the container
+address, which reads exactly like a firewall or publishing fault. Confirm the
+listener with `ss -lunp` inside the container's network namespace before suspecting
+the network, and confirm `derp.server` in the Headscale log at `debug` level: the
+packaged `warn` level suppresses the line announcing the STUN listener.
 
 See `../../docs/embedded-remote-access-verification.md` for measured local results
 and remaining gaps. Do not infer physical-phone roaming or complete deployment
