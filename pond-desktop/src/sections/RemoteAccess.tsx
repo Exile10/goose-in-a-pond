@@ -56,7 +56,9 @@ export function RemoteAccess() {
         if (current !== generation.current) return;
         setState('local');
       } else {
-        for (const value of [control, enrollment]) {
+        // Empty means the hosted coordinator, which the server fills in when it
+        // enables. Only validate what the household actually chose.
+        for (const value of [control, enrollment].filter((entry) => entry !== '')) {
           const url = new URL(value);
           if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error('invalid origin');
         }
@@ -85,15 +87,19 @@ export function RemoteAccess() {
   return <section aria-labelledby="remote-access-title" style={{ marginTop: 32, display: 'grid', gap: 12 }}>
     <h2 id="remote-access-title">{t('remote.title')}</h2>
     <p>{t('remote.description')}</p>
-    <button disabled={busy} onClick={() => void run('identity')}>{t('remote.identity')}</button>
-    {identity && <div style={{ overflowWrap: 'anywhere' }}>
-      <p>{t('remote.provision')}</p>
-      <dl><dt>{t('remote.household')}</dt><dd>{identity.household}</dd><dt>{t('remote.publicKey')}</dt><dd>{identity.publicKey}</dd></dl>
-    </div>}
-    <label>{t('remote.coordinator')}<input type="url" value={control} onChange={(e) => setControl(e.target.value)} disabled={busy} /></label>
-    <label>{t('remote.enrollment')}<input type="url" value={enrollment} onChange={(e) => setEnrollment(e.target.value)} disabled={busy} /></label>
-    <button disabled={busy || !control || !enrollment} onClick={() => void run('enable')}>{t('remote.enable')}</button>
+    <button disabled={busy} onClick={() => void run('enable')}>{t('remote.enable')}</button>
     <button disabled={busy} onClick={() => void run('disable')}>{t('remote.disable')}</button>
+    <details>
+      <summary>{t('remote.advanced')}</summary>
+      <p>{t('remote.advancedDescription')}</p>
+      <label>{t('remote.coordinator')}<input type="url" value={control} onChange={(e) => setControl(e.target.value)} disabled={busy} /></label>
+      <label>{t('remote.enrollment')}<input type="url" value={enrollment} onChange={(e) => setEnrollment(e.target.value)} disabled={busy} /></label>
+      <button disabled={busy} onClick={() => void run('identity')}>{t('remote.identity')}</button>
+      {identity && <div style={{ overflowWrap: 'anywhere' }}>
+        <p>{t('remote.provision')}</p>
+        <dl><dt>{t('remote.household')}</dt><dd>{identity.household}</dd><dt>{t('remote.publicKey')}</dt><dd>{identity.publicKey}</dd></dl>
+      </div>}
+    </details>
     <h3>{t('remote.recoveryTitle')}</h3>
     <p>{t('remote.recoveryDescription')}</p>
     {reviewFailed && <p role="alert">{t('remote.reviewFailed')}</p>}

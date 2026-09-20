@@ -34,6 +34,36 @@ mod recovery;
 
 const PEER_HEADER: &str = "x-pond-embedded-peer";
 
+/// The coordination and enrollment services a household uses when it has not
+/// chosen its own.
+///
+/// A household should not have to know what a Headscale origin is to reach its
+/// own Pond from outside the house, so enabling remote access without naming a
+/// coordinator uses these. They are substituted when the user enables remote
+/// access, never when configuration is read: an empty control URL is what
+/// distinguishes a local-only household, and defaulting on read would make every
+/// such household start contacting coordination and start advertising a
+/// coordinator to its paired phones.
+///
+/// Self-hosting stays supported: an explicitly configured origin is used as given
+/// and never replaced.
+pub const DEFAULT_CONTROL_URL: &str = "https://control.jarida.io";
+pub const DEFAULT_ENROLLMENT_URL: &str = "https://enroll.jarida.io";
+
+/// Fill in the hosted coordinator for a household that named none.
+///
+/// Both origins move together. A household that set one and not the other has
+/// configured something deliberate and half-finished, and quietly completing it
+/// from the other side would point it at a coordinator it never chose; the
+/// existing validation rejects that instead.
+fn with_default_coordinator(mut config: Config) -> Config {
+    if config.control_url.is_empty() && config.enrollment_url.is_empty() {
+        config.control_url = DEFAULT_CONTROL_URL.to_string();
+        config.enrollment_url = DEFAULT_ENROLLMENT_URL.to_string();
+    }
+    config
+}
+
 /// Non-secret enrollment settings. No auth key can be stored in this file.
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -373,6 +403,7 @@ impl Runtime {
     /// Start once, keeping stdin open so a normal shutdown stops the helper.
     pub async fn start(self: &Arc<Self>, config: Config) -> Result<()> {
         ensure!(config.enabled, "remote access must be explicitly enabled");
+        let config = with_default_coordinator(config);
         ensure!(
             !config.enrollment_url.is_empty(),
             "enrollment service is required"
@@ -809,6 +840,55 @@ pub fn companion_management(runtime: Arc<Runtime>, state: Arc<pond_api::AppState
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabling_without_a_coordinator_uses_the_hosted_one() {
+        let filled = with_default_coordinator(Config {
+            enabled: true,
+            ..Default::default()
+        });
+        assert_eq!(filled.control_url, DEFAULT_CONTROL_URL);
+        assert_eq!(filled.enrollment_url, DEFAULT_ENROLLMENT_URL);
+    }
+
+    #[test]
+    fn a_configured_coordinator_is_never_replaced() {
+        let chosen = Config {
+            enabled: true,
+            control_url: "https://control.example".into(),
+            enrollment_url: "https://enroll.example".into(),
+        };
+        let filled = with_default_coordinator(chosen.clone());
+        assert_eq!(filled.control_url, chosen.control_url);
+        assert_eq!(filled.enrollment_url, chosen.enrollment_url);
+    }
+
+    #[test]
+    fn a_half_configured_coordinator_is_not_quietly_completed() {
+        // Completing this from the other side would point the household at a
+        // coordinator it never chose. start() rejects it instead.
+        let half = Config {
+            enabled: true,
+            control_url: "https://control.example".into(),
+            enrollment_url: String::new(),
+        };
+        let filled = with_default_coordinator(half);
+        assert_eq!(filled.control_url, "https://control.example");
+        assert!(filled.enrollment_url.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_household_that_never_enabled_remote_access_keeps_no_coordinator() {
+        // The default must not reach configuration on disk: an empty control URL
+        // is what marks a household local-only, and queue() relies on it to stay
+        // silent.
+        let data = tempfile::tempdir().unwrap();
+        let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
+        let stored = runtime.config().unwrap();
+        assert!(!stored.enabled);
+        assert!(stored.control_url.is_empty());
+        assert!(stored.enrollment_url.is_empty());
+    }
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
