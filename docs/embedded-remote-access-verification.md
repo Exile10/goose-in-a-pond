@@ -390,3 +390,30 @@ Both final mobile reruns pass 39 assertions with zero failures:
 after each isolated fixture run. Physical Android installation and cellular tests
 wait for the phone and publicly reachable Goose infrastructure; physical iPhone
 and minimum-iOS runtime checks remain pending.
+
+## PR and CI handoff (2026-09-20)
+
+Review branches are published as Pond PR 377 and GOTG PR 39, both draft while
+physical/public-network acceptance remains pending. The normal Android release
+APK installs and launches on `emulator-5554`; its main activity remains foreground.
+The unavailable physical phone is untouched.
+
+The initial Pond PR CI run reproduces the existing private `llama-cpp-2` fetch,
+HeroUI dependency resolution, and Matter esbuild lockfile failures. Its OSV and
+RustSec logs contain exactly the same 33 distinct advisory identifiers as the
+saved main baseline; no new identifier appears in those existing lockfile gates.
+The PR secret scan passes. Runs: 35503308906 (CI), 35503308899 (security).
+
+The new Go module now has independent CI formatting, race, vet, production-command
+and Linux ARM64 helper build checks, plus pinned `govulncheck` and a blocking OSV
+module scan. Local formatting/build and YAML parse checks pass. Existing Go race,
+vet and ARM64 compilation results are recorded above.
+
+The module scan reports [GO-2026-5932](https://pkg.go.dev/vuln/GO-2026-5932) for
+unmaintained OpenPGP packages within `golang.org/x/crypto`. Those packages are not
+in the current import graph. `govulncheck` v1.8.0 reports zero vulnerable imported
+packages and zero reachable vulnerabilities, with one module-only finding. The
+advisory has no fixed version; no ignore or security-gate bypass was added. The
+module-level gate remains a visible review blocker despite the absence of a
+reachable vulnerable package. Logs: `/tmp/pond-embedded-go-osv.log` and
+`/tmp/pond-go-vulnerability-reachability.log`.
