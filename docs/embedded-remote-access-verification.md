@@ -417,3 +417,42 @@ advisory has no fixed version; no ignore or security-gate bypass was added. The
 module-level gate remains a visible review blocker despite the absence of a
 reachable vulnerable package. Logs: `/tmp/pond-embedded-go-osv.log` and
 `/tmp/pond-go-vulnerability-reachability.log`.
+
+## Physical Android acceptance and app update (2026-09-20)
+
+The Galaxy A57 passes all 39 isolated app assertions on the final feature build
+with direct LAN pairing to a fresh scratch Pond. This includes native Expo fetch
+and RN XHR/SSE, wrong-pin and plaintext rejection, certificate renewal/expiry/
+hostname checks, forced DERP, remote pairing refusal, authorized refresh, outage
+recovery, infrastructure restoration, local replacement approval, and retained
+identity/authenticated REST/SSE after process restart. The runner exits zero and
+restores the normal native libraries. Log:
+`/tmp/gotg-final-physical-android-rerun.log`.
+
+The first attempt was interrupted after Android killed the background test process
+with `ApplicationExitInfo` reason `LOW_MEMORY`. It is not counted as a pass. The
+complete rerun kept the test app foreground except for its deliberate lifecycle
+check. Headscale and test-control endpoints use USB forwarding; direct LAN Pond
+traffic and forced encrypted relay traffic do not establish public cellular
+roaming.
+
+The normal release APK was installed in place after its signing certificate matched
+the installed app. The original APK is saved privately for rollback. App ID, data
+directory inodes, first-install timestamp, and granted camera/notification
+permissions were retained; the production package was never cleared or
+uninstalled. This personal release uses the existing Android debug certificate,
+not a Play distribution signing key.
+
+The old HTTP profile correctly required fresh local pairing. Manual pairing used
+the production Jetson's HTTPS address, public-key pin read through authenticated
+SSH, and a one-time code from its loopback-only endpoint. The normal app reports
+`Connected locally`, retains pairing across a full process restart, and loads its
+Devices screen without the earlier transport error. The remote enable flow shows
+local-approval feedback while production remote configuration is absent. The app
+was left local-only; Jetson remains active with embedded networking stopped.
+
+Both origin/main and upstream/main were refreshed in both repositories and remain
+ancestors of the feature branches. The new Go race/vet/ARM64 CI job passes in run
+35503688527. Previously documented dependency and advisory gates remain blocked.
+Public cellular roaming, physical iPhone testing, and iOS 16.4 runtime validation
+remain pending.
