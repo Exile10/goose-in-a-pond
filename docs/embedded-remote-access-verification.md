@@ -456,3 +456,21 @@ ancestors of the feature branches. The new Go race/vet/ARM64 CI job passes in ru
 35503688527. Previously documented dependency and advisory gates remain blocked.
 Public cellular roaming, physical iPhone testing, and iOS 16.4 runtime validation
 remain pending.
+
+## Matter repair and physical pairing paths (2026-09-20)
+
+Production Matter startup exposed the existing npm 10 lockfile failure. The repair
+is isolated in PR 378 and included in this feature branch: only missing dependency
+entries are added. Jetson clean installation and managed startup pass, its
+loopback-only controller connects on 5580, and the phone warning clears. Google's
+MVD commissions as a light. A phone command turns it on in MVD; changing it off in
+MVD is correctly read after Devices refresh. The mobile grid does not currently
+subscribe to external state changes, so automatic live card updates remain open.
+
+Physical Galaxy A57 pairing verification now covers manual HTTPS address/pin/code,
+LAN discovery selection (address prefill with separate pin still required), and
+real camera QR scanning with user-assisted camera positioning. QR pairing completes
+and survives application restart. Existing device and companion pairings were not
+reset. The phone accurately reports unconfigured remote infrastructure once,
+without approval/recovery instructions that cannot resolve it. Public cellular
+roaming still requires deployment of the coordination and relay services.
