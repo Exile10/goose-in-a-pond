@@ -247,6 +247,8 @@ impl Runtime {
             .arg(self.directory.join("authority"))
             .arg("--enrollment")
             .arg(config.enrollment_url)
+            .arg("--port")
+            .arg(self.port.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -741,6 +743,13 @@ async fn register_pond(
         node_key: current.node_key,
         machine_key: current.machine_key,
     };
+    // Introduce the household first. A household that an operator created
+    // already exists and this answers with it, so the two paths converge here
+    // and a household nobody provisioned can still set itself up.
+    if let Err(error) = runtime.authority("register", serde_json::Value::Null).await {
+        tracing::warn!(%error, "household registration failed");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     runtime
         .enroll("pond000000000001", "pond", &registration)
         .await

@@ -155,14 +155,21 @@ func (s *Store) save() (err error) {
 	return dir.Sync()
 }
 
-// Provision binds one immutable household key to an operator-created Headscale user.
+// Provision binds one immutable household key to a Headscale user, whether an
+// operator created it or the household registered itself.
 func (s *Store) Provision(id string, h Household) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.provisionLocked(id, h)
+}
+
+// provisionLocked is the same operation for a caller that already holds the lock,
+// such as a registration that must create the user and the household as one step.
+func (s *Store) provisionLocked(id string, h Household) error {
 	key, err := base64.StdEncoding.DecodeString(h.PublicKey)
 	if !identifier.MatchString(id) || err != nil || len(key) != ed25519.PublicKeySize || !numeric.MatchString(h.UserID) || h.Port == 0 {
 		return errors.New("invalid household")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if old, ok := s.value.Households[id]; ok {
 		if old == h {
 			return nil

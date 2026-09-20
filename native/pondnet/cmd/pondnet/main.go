@@ -27,7 +27,7 @@ func main() {
 	socket := flag.String("socket", "", "private companion Unix socket")
 	identity := flag.String("identity", "", "existing Pond TLS identity file")
 	port := flag.Int("port", 4443, "tailnet HTTPS port")
-	authorityAction := flag.String("authority-action", "", "local authority operation: identity, inspect, enroll, replace or revoke")
+	authorityAction := flag.String("authority-action", "", "local authority operation: identity, register, inspect, enroll, replace or revoke")
 	enrollmentOrigin := flag.String("enrollment", "", "enrollment HTTPS origin")
 	flag.Parse()
 	if *notices {
@@ -48,6 +48,15 @@ func main() {
 		}
 		if *authorityAction == "identity" {
 			json.NewEncoder(os.Stdout).Encode(authority)
+			return
+		}
+		if *authorityAction == "register" {
+			household, err := authority.Register(context.Background(), *enrollmentOrigin, uint16(*port))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "household registration incomplete")
+				os.Exit(1)
+			}
+			json.NewEncoder(os.Stdout).Encode(map[string]string{"household": household})
 			return
 		}
 		if *authorityAction != "enroll" && *authorityAction != "revoke" && *authorityAction != "inspect" && *authorityAction != "replace" {

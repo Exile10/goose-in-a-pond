@@ -60,6 +60,56 @@ func (h *Headscale) call(ctx context.Context, method, path string, body, result 
 	return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(result)
 }
 
+// EnsureUser returns the numeric ID of the household's user, creating it if this
+// is the household's first registration.
+//
+// Look-up comes first and creation is tolerant of an existing name, so a lost
+// response cannot strand a household: the next attempt finds the user the
+// previous one created rather than failing on a duplicate.
+func (h *Headscale) EnsureUser(ctx context.Context, name string) (string, error) {
+	if !userNamePattern.MatchString(name) {
+		return "", errors.New("invalid household user")
+	}
+	existing, err := h.findUser(ctx, name)
+	if err != nil || existing != "" {
+		return existing, err
+	}
+	var created struct {
+		User struct {
+			ID string `json:"id"`
+		} `json:"user"`
+	}
+	if err := h.call(ctx, "POST", "/api/v1/user", map[string]string{"name": name}, &created); err != nil {
+		// The name may have been taken by a concurrent or previously lost attempt.
+		if again, lookupErr := h.findUser(ctx, name); lookupErr == nil && again != "" {
+			return again, nil
+		}
+		return "", err
+	}
+	if !numeric.MatchString(created.User.ID) {
+		return "", errors.New("coordinator returned an invalid household user")
+	}
+	return created.User.ID, nil
+}
+
+func (h *Headscale) findUser(ctx context.Context, name string) (string, error) {
+	var accounts struct {
+		Users []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"users"`
+	}
+	if err := h.call(ctx, "GET", "/api/v1/user", nil, &accounts); err != nil {
+		return "", err
+	}
+	for _, account := range accounts.Users {
+		if account.Name == name {
+			return account.ID, nil
+		}
+	}
+	return "", nil
+}
+
 // Register approves the pending auth ID under the operator-provisioned user.
 func (h *Headscale) Register(ctx context.Context, user, auth string) (Registered, error) {
 	// AuthRegister accepts a user name, not the numeric database ID.
