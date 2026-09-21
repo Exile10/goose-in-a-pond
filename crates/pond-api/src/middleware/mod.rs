@@ -452,10 +452,18 @@ pub async fn auth_middleware(
     // A client-supplied device would outrank every proof the pond can make, since
     // `PairedDevice` beats face and explicit id; `device_rung_wiring.rs` guards it.
     let (mut principal, principal_device) = match state.handshake.caller_for_token(&token).await {
-        Ok(Some(caller)) => (
-            Principal::token(caller.client_id).with_device(caller.device_id.clone()),
-            caller.device_id,
-        ),
+        Ok(Some(caller)) => {
+            // Copied out before the principal takes it, so `with_device` is
+            // still handed `caller.device_id` and nothing else.
+            // `device_rung_wiring` reads this line to prove that, and a clone
+            // inside the call is enough to fail it -- correctly, because the
+            // next thing to appear there would be a header.
+            let on_lan = caller.device_id.clone();
+            (
+                Principal::token(caller.client_id).with_device(caller.device_id),
+                on_lan,
+            )
+        }
         _ => (Principal::token("unknown".to_string()), String::new()),
     };
     if let Some(ci) = req
