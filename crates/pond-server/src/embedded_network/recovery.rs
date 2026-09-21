@@ -303,7 +303,7 @@ mod tests {
         use pond_infra::{db::Database, sqlite_handshake::SqliteHandshakeAdapter};
         let data = tempfile::tempdir().unwrap();
         let db = Database::init(data.path()).await.unwrap();
-        let handshake = Arc::new(SqliteHandshakeAdapter::new(db.system.clone()));
+        let handshake = Arc::new(SqliteHandshakeAdapter::new(db.system.clone(), None));
         let code = handshake.issue_pairing_code().await.unwrap();
         let paired = handshake
             .handshake(HandshakeRequest {

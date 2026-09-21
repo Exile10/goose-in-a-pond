@@ -4235,8 +4235,9 @@ async fn run_server(
     // DB-backed handshake/pairing (#93). Construct before `db` is moved into
     // AppState, then issue a fresh pairing code the operator reads off the CLI
     // to pair a GOTG device.
-    let handshake: Arc<dyn pond_core::security::ports::handshake::Handshake> =
-        Arc::new(SqliteHandshakeAdapter::new(db.system.clone()));
+    let handshake: Arc<dyn pond_core::security::ports::handshake::Handshake> = Arc::new(
+        SqliteHandshakeAdapter::new(db.system.clone(), Some(pairing_pin.clone())),
+    );
     let pairing_hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "pond".to_string());

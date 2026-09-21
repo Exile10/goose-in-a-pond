@@ -36,7 +36,7 @@ async fn make_app() -> Harness {
 
     let profiles = Arc::new(SqliteProfileRepository::new(pool.clone()));
 
-    let handshake = Arc::new(SqliteHandshakeAdapter::new(pool.clone()));
+    let handshake = Arc::new(SqliteHandshakeAdapter::new(pool.clone(), None));
     let state = Arc::new(AppState {
         warmup: Default::default(),
         db,
@@ -186,6 +186,7 @@ async fn pair(h: &Harness, id: &str) -> HandshakeResponse {
     let result = h
         .handshake
         .verify_handshake(VerifyRequest {
+            channel_binding: None,
             challenge_id: init.challenge_id,
             mac,
             device_name: Some(id.into()),
