@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api/PondApiClient';
 
@@ -84,29 +84,58 @@ export function RemoteAccess() {
       console.warn('[remote] local activation operation failed');
     } finally { if (current === generation.current) setBusy(false); }
   };
-  return <section aria-labelledby="remote-access-title" style={{ marginTop: 32, display: 'grid', gap: 12 }}>
-    <h2 id="remote-access-title">{t('remote.title')}</h2>
-    <p>{t('remote.description')}</p>
-    <button disabled={busy} onClick={() => void run('enable')}>{t('remote.enable')}</button>
-    <button disabled={busy} onClick={() => void run('disable')}>{t('remote.disable')}</button>
+  // One primary action that matches the current state. Showing both an enable and
+  // a disable control at once is what made the panel read as "not enabled" while
+  // it was running.
+  const on = state === 'enabled';
+  const settling = state === 'connecting' || state === 'provision';
+  const field: React.CSSProperties = { display: 'grid', gap: 4 };
+  const input: React.CSSProperties = { width: '100%', boxSizing: 'border-box' };
+  return <section aria-labelledby="remote-access-title" style={{ marginTop: 32, display: 'grid', gap: 16 }}>
+    <div style={{ display: 'grid', gap: 6 }}>
+      <h2 id="remote-access-title" style={{ margin: 0 }}>{t('remote.title')}</h2>
+      <p style={{ margin: 0 }}>{t('remote.description')}</p>
+    </div>
+    <p role="status" style={{ margin: 0, fontWeight: 600 }}>{t(`remote.${state}`)}</p>
+    <div>
+      <button disabled={busy || settling} onClick={() => void run(on ? 'disable' : 'enable')}>
+        {t(on ? 'remote.disable' : 'remote.enable')}
+      </button>
+    </div>
     <details>
       <summary>{t('remote.advanced')}</summary>
-      <p>{t('remote.advancedDescription')}</p>
-      <label>{t('remote.coordinator')}<input type="url" value={control} onChange={(e) => setControl(e.target.value)} disabled={busy} /></label>
-      <label>{t('remote.enrollment')}<input type="url" value={enrollment} onChange={(e) => setEnrollment(e.target.value)} disabled={busy} /></label>
-      <button disabled={busy} onClick={() => void run('identity')}>{t('remote.identity')}</button>
-      {identity && <div style={{ overflowWrap: 'anywhere' }}>
-        <p>{t('remote.provision')}</p>
-        <dl><dt>{t('remote.household')}</dt><dd>{identity.household}</dd><dt>{t('remote.publicKey')}</dt><dd>{identity.publicKey}</dd></dl>
-      </div>}
+      <div style={{ display: 'grid', gap: 12, marginTop: 12 }}>
+        <p style={{ margin: 0 }}>{t('remote.advancedDescription')}</p>
+        <label style={field}>
+          <span>{t('remote.coordinator')}</span>
+          <input style={input} type="url" inputMode="url" placeholder="https://control.example" value={control} onChange={(e) => setControl(e.target.value)} disabled={busy || on} />
+        </label>
+        <label style={field}>
+          <span>{t('remote.enrollment')}</span>
+          <input style={input} type="url" inputMode="url" placeholder="https://enroll.example" value={enrollment} onChange={(e) => setEnrollment(e.target.value)} disabled={busy || on} />
+        </label>
+        <div>
+          <button disabled={busy} onClick={() => void run('identity')}>{t('remote.identity')}</button>
+        </div>
+        {identity && <div style={{ overflowWrap: 'anywhere', display: 'grid', gap: 4 }}>
+          <p style={{ margin: 0 }}>{t('remote.provision')}</p>
+          <dl style={{ display: 'grid', gap: 4, margin: 0 }}>
+            <dt style={{ fontWeight: 600 }}>{t('remote.household')}</dt><dd style={{ margin: 0 }}>{identity.household}</dd>
+            <dt style={{ fontWeight: 600 }}>{t('remote.publicKey')}</dt><dd style={{ margin: 0 }}>{identity.publicKey}</dd>
+          </dl>
+        </div>}
+      </div>
     </details>
-    <h3>{t('remote.recoveryTitle')}</h3>
-    <p>{t('remote.recoveryDescription')}</p>
-    {reviewFailed && <p role="alert">{t('remote.reviewFailed')}</p>}
-    {requests.map((request) => <div key={request.id} style={{ overflowWrap: 'anywhere' }}>
-      <p>{t('remote.reviewCode', { id: request.id })}</p>
-      <button disabled={busy || request.approved} onClick={() => void approve(request.id)}>{t(request.approved ? 'remote.reviewApproved' : 'remote.reviewApprove')}</button>
-    </div>)}
-    <p role="status">{t(`remote.${state}`)}</p>
+    <div style={{ display: 'grid', gap: 6 }}>
+      <h3 style={{ margin: 0 }}>{t('remote.recoveryTitle')}</h3>
+      <p style={{ margin: 0 }}>{t('remote.recoveryDescription')}</p>
+      {reviewFailed && <p role="alert" style={{ margin: 0 }}>{t('remote.reviewFailed')}</p>}
+      {requests.map((request) => <div key={request.id} style={{ overflowWrap: 'anywhere', display: 'grid', gap: 4 }}>
+        <p style={{ margin: 0 }}>{t('remote.reviewCode', { id: request.id })}</p>
+        <div>
+          <button disabled={busy || request.approved} onClick={() => void approve(request.id)}>{t(request.approved ? 'remote.reviewApproved' : 'remote.reviewApprove')}</button>
+        </div>
+      </div>)}
+    </div>
   </section>;
 }
