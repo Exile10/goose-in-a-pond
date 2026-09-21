@@ -328,6 +328,20 @@ impl Handshake for SqliteHandshakeAdapter {
         }
     }
 
+    async fn revoke_device(&self, device_id: &str) -> Result<u64> {
+        // Marked rather than deleted, like every other revocation here: the row
+        // is what `validate_token` reads, and a deleted row and an unknown
+        // token are indistinguishable to an auditor later.
+        let revoked = sqlx::query(
+            "UPDATE session_tokens SET revoked_at = ? WHERE device_id = ? AND revoked_at IS NULL",
+        )
+        .bind(Self::now().to_rfc3339())
+        .bind(device_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(revoked.rows_affected())
+    }
+
     async fn revoke_token(&self, token: &str) -> Result<()> {
         // The route has already authenticated this token. A refresh may have rotated
         // its row while durable network revocation was being queued. Revoke the
@@ -1602,6 +1616,55 @@ mod tests {
             resp.rejection_reason.as_deref(),
             Some("channel_binding_mismatch")
         );
+    }
+
+    /// Removing a device has to remove its access.
+    ///
+    /// `session_tokens.device_id` carries no foreign key and nothing cascades
+    /// onto that table, so for as long as this did not exist, deleting a
+    /// `devices` row left every token it had been issued validating happily.
+    /// An operator removing a lost phone was told it was gone.
+    #[tokio::test]
+    async fn revoking_a_device_ends_every_session_it_holds() {
+        let hs = fresh().await;
+        let first = pair(&hs, &hs.issue_pairing_code().await.unwrap().code, "phone").await;
+        let other = pair(&hs, &hs.issue_pairing_code().await.unwrap().code, "tablet").await;
+        let phone = first.session_token.unwrap();
+        let tablet = other.session_token.unwrap();
+        assert!(hs.validate_token(&phone).await.unwrap());
+        assert!(hs.validate_token(&tablet).await.unwrap());
+
+        // The device id is the client id this adapter derives it from.
+        assert_eq!(hs.revoke_device("phone").await.unwrap(), 1);
+        assert!(!hs.validate_token(&phone).await.unwrap());
+        assert!(
+            hs.validate_token(&tablet).await.unwrap(),
+            "revoking one device must not disconnect the household"
+        );
+        // And the refresh token dies with it, or the phone simply mints a new
+        // session and the revocation lasts until the next expiry.
+        let refreshed = hs
+            .refresh(RefreshRequest {
+                refresh_token: first.refresh_token.unwrap(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !refreshed.accepted,
+            "a revoked device refreshed back into a session"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_a_device_with_no_sessions_is_not_an_error() {
+        let hs = fresh().await;
+        // Idempotent, because the delete path calls it before dropping the row
+        // and a retried delete must not fail on the second attempt.
+        assert_eq!(hs.revoke_device("never-paired").await.unwrap(), 0);
+        let code = hs.issue_pairing_code().await.unwrap().code;
+        assert!(pair(&hs, &code, "phone").await.accepted);
+        assert_eq!(hs.revoke_device("phone").await.unwrap(), 1);
+        assert_eq!(hs.revoke_device("phone").await.unwrap(), 0);
     }
 
     /// The transcript, against vectors computed outside both implementations.

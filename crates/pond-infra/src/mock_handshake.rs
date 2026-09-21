@@ -83,6 +83,12 @@ impl Handshake for MockHandshake {
         Ok(tokens.get(token).copied().unwrap_or(false))
     }
 
+    async fn revoke_device(&self, _device_id: &str) -> Result<u64> {
+        // The mock issues tokens without recording a device, so it has none to
+        // revoke and says so rather than reporting a number it cannot back up.
+        Ok(0)
+    }
+
     async fn revoke_token(&self, token: &str) -> Result<()> {
         self.valid_tokens.write().await.remove(token);
         Ok(())

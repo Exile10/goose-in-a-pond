@@ -4531,6 +4531,35 @@ async fn unregister_device(
         );
     }
 
+    // Take the device's access with it. `session_tokens` carries no foreign key
+    // onto `devices` and nothing cascades, so without this the row vanishes from
+    // the list while every token it was issued keeps validating -- an operator
+    // removing a lost phone would be told it was gone while it carried on
+    // working. Revoked BEFORE the row is dropped: if this fails, the device is
+    // still listed and still deletable, which is the recoverable order.
+    match state.handshake.revoke_device(&id).await {
+        Ok(revoked) => {
+            if revoked > 0 {
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "device_sessions_revoked",
+                    device = %id,
+                    sessions = revoked,
+                    "devices: revoked the sessions of a device being removed"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(device = %id, error = %e, "devices: could not revoke sessions; refusing to remove the device while its access would survive");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "could not revoke this device's access, so it has not been removed"
+                })),
+            ));
+        }
+    }
+
     state.device_registry.unregister(&id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
