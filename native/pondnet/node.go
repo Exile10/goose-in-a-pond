@@ -54,6 +54,15 @@ func SetDiagnostics(sink func(string)) {
 	diagnosticsMu.Unlock()
 }
 
+// Redact strips a node-authorisation URL from a line about to be logged.
+//
+// That URL is a bearer capability for joining this household, and the backend
+// announces it in plain text. Exported so every path that writes a line to a
+// log goes through the same rule rather than each deciding for itself.
+func Redact(line string) string {
+	return authURLPattern.ReplaceAllString(line, "<redacted enrollment URL>")
+}
+
 func backendLogf(format string, args ...any) {
 	diagnosticsMu.RLock()
 	sink := diagnosticsSink
@@ -61,7 +70,7 @@ func backendLogf(format string, args ...any) {
 	if sink == nil {
 		return
 	}
-	sink(authURLPattern.ReplaceAllString(fmt.Sprintf(format, args...), "<redacted enrollment URL>"))
+	sink(Redact(fmt.Sprintf(format, args...)))
 }
 
 // Status is safe to display locally. AuthURL is an enrollment capability: it

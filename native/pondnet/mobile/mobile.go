@@ -40,13 +40,37 @@ func SetDiagnostics(sink Diagnostics) {
 
 // diagnose reports a binding-layer event when an operator has enabled
 // diagnostics. It is a no-op otherwise, like the backend sink.
+// diagnose records something this package decided was worth saying: a handful
+// of deliberate lines about why the node cannot do its job.
+//
+// Always recorded when an event sink is installed, and the native layer
+// installs one unconditionally. These are not tailscale's backend log -- that
+// is verbose, names addresses and keys, and stays behind `SetDiagnostics`.
+// These are ours, there are a couple of them, and they are the difference
+// between "the node did not connect" and "the first resolver refused TCP".
+//
+// Requiring somebody to find a switch and reproduce the failure before the
+// reason is written down is how a field failure becomes undiagnosable, which is
+// the thing the switch was meant to prevent.
 func diagnose(line string) {
-	diagnosticsMu.RLock()
-	sink := diagnostics
-	diagnosticsMu.RUnlock()
+	eventMu.RLock()
+	sink := events
+	eventMu.RUnlock()
 	if sink != nil {
-		sink.Log(line)
+		sink.Log(pondnet.Redact(line))
 	}
+}
+
+var eventMu sync.RWMutex
+var events Diagnostics
+
+// SetEventLog installs the sink for this package's own diagnostic lines, or
+// removes it with nil. Installed unconditionally by the native layer; see
+// `diagnose`.
+func SetEventLog(sink Diagnostics) {
+	eventMu.Lock()
+	events = sink
+	eventMu.Unlock()
 }
 
 // Start owns one node in the application's private directory. It does not touch
