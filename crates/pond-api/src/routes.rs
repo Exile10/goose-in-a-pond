@@ -805,16 +805,18 @@ async fn handshake_revoke(
             Json(json!({"error": "invalid_token"})),
         ));
     }
+    // Named once, and used for both the network revocation and the registry
+    // removal below.
+    let caller = state
+        .handshake
+        .caller_for_token(&token)
+        .await
+        .map_err(|e| handshake_error("revoke", e))?
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"invalid_token"})),
+        ))?;
     if let Some(axum::Extension(remote)) = remote {
-        let caller = state
-            .handshake
-            .caller_for_token(&token)
-            .await
-            .map_err(|e| handshake_error("revoke", e))?
-            .ok_or((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error":"invalid_token"})),
-            ))?;
         remote.queue(&caller.device_id).await.map_err(|_| {
             tracing::error!("could not persist remote device revocation");
             (
@@ -828,6 +830,31 @@ async fn handshake_revoke(
         .revoke_token(&token)
         .await
         .map_err(|e| handshake_error("revoke", e))?;
+
+    // A device that signed out has left the household, so it leaves the
+    // registry with its credentials. It used to keep its tile on the devices
+    // screen -- offline, last seen minutes ago -- which reads as a device that
+    // is merely away rather than one that is gone, and leaves the operator
+    // removing by hand something that already removed itself.
+    //
+    // After the credentials, deliberately. If this fails the device has still
+    // lost its access and the row can be deleted by hand, which is the
+    // recoverable order; the reverse would leave a device listed as gone while
+    // its token still worked.
+    match state.device_registry.unregister(&caller.device_id).await {
+        Ok(()) => tracing::info!(
+            target: "giap::trace",
+            kind = "device_signed_out",
+            device = %caller.device_id,
+            "devices: a device signed out and was removed from the registry"
+        ),
+        Err(error) => tracing::warn!(
+            error = %error,
+            device = %caller.device_id,
+            "devices: a device signed out but its registry row could not be removed; its access is revoked"
+        ),
+    }
+
     tracing::info!(
         operation = "session_revoke",
         "session and refresh credential revoked"
