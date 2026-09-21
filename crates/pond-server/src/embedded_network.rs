@@ -723,8 +723,8 @@ async fn authority_identity(
         .authority("identity", serde_json::Value::Null)
         .await
         .map(Json)
-        .map_err(|_| {
-            tracing::warn!("embedded enrollment operation failed");
+        .map_err(|error| {
+            tracing::warn!(%error, operation = "identity", "embedded enrollment failed");
             StatusCode::SERVICE_UNAVAILABLE
         })
 }
@@ -754,8 +754,8 @@ async fn register_pond(
         .enroll("pond000000000001", "pond", &registration)
         .await
         .map(Json)
-        .map_err(|_| {
-            tracing::warn!("embedded enrollment operation failed");
+        .map_err(|error| {
+            tracing::warn!(%error, operation = "enroll", "embedded enrollment failed");
             StatusCode::SERVICE_UNAVAILABLE
         })
 }
