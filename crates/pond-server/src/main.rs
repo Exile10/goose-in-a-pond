@@ -3655,9 +3655,10 @@ async fn run_server(
         &data_dir,
         &tls_identity::certificate_names(&tls_hostname)?,
     )?;
+    let pairing_pin = tls_identity.pin()?;
     let transport = pond_api::network::CompanionTransport {
         https_port,
-        tls_spki_sha256: tls_identity.pin()?,
+        tls_spki_sha256: pairing_pin.clone(),
     };
     let (cert, key) = tls_identity.pem();
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert, key).await?;
@@ -4490,6 +4491,7 @@ async fn run_server(
         &pairing_hostname,
         https_port,
         env!("CARGO_PKG_VERSION"),
+        &pairing_pin,
     ) {
         Ok(h) => {
             println!("  mDNS: advertising _pond._tcp.local. over HTTPS on port {https_port}");
