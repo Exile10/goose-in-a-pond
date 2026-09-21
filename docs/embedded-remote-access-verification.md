@@ -180,6 +180,55 @@ HTTPS (PR 38). Both origin and upstream main refs were refreshed before this wor
   The phone-facing local review/approval/cancellation path still needs wiring and
   validation; this is not an end-to-end device recovery completion claim.
 
+## Cellular roaming and hardware acceptance (2026-09-21)
+
+Home Wi-Fi to cellular to another Wi-Fi and home again, on the Galaxy A57 with
+the separate Tailscale app disconnected. All four hops pass. The phone holds its
+tailnet address across the transitions and the coordinator reports it online
+throughout. This closes the roaming prerequisite recorded as outstanding below.
+
+Also exercised end to end on that hardware against the deployed coordinator:
+pairing with no fingerprint step (the pin is taken from the `_pond._tcp` TXT
+record and bound into the handshake proof), Matter QR commissioning (scan to a
+light on the fabric in three seconds), device revocation in both directions,
+enrollment replacement after the phone regenerated its tailnet identity, and
+remote access enabling idempotently on an already-enrolled device.
+
+### The resolver defect that was blocking roaming
+
+The node resolved nothing on cellular while working on Wi-Fi. The carrier lists
+two resolvers and the first refuses DNS over TCP:
+
+```text
+TCP 53 -> 41.90.218.49   refused    (first in the OS's list)
+TCP 53 -> 41.90.218.51   open
+```
+
+`dialResolver` walked that list with a three-second budget each, so every lookup
+spent itself before reaching the server that answers. Resolvers are dialled
+concurrently now and the first to answer wins.
+
+Recorded because the wrong answer is instructive: the A57's cellular interface
+does sit at `100.123.71.232`, inside the tailnet's own `100.64.0.0/10`, exactly
+as the plan predicted, and that collision was read as the cause before the
+coordinator's own logs were checked. Those logs showed the node completing the
+control handshake and holding a map poll for minutes at a time on Wi-Fi. The
+addressing collision is real and was not the fault.
+
+### Diagnosis was blocked by discarded causes
+
+Four layers each discarded what the layer below reported: the Pond spawned the
+network helper with stderr going to `Stdio::null`, the helper printed a fixed
+sentence without `Submit`'s error, `Submit` turned every non-200 into one message
+without the coordinator's status, and the status alone could not distinguish six
+different `409`s. Every layer carries its cause now.
+
+The node's own diagnostic lines were behind the same switch as tailscale's
+backend log, and that switch was off in release -- so `diagnose("resolver:
+dialing ... over tcp failed")` was written on every attempt and read by nobody.
+Those lines are recorded unconditionally now, through the same redaction;
+tailscale's verbose backend log stays behind a debuggable build.
+
 ## Remaining acceptance work
 
 - The Android API 37 emulator passes the expanded 39-assertion suite, including
@@ -201,10 +250,10 @@ HTTPS (PR 38). Both origin and upstream main refs were refreshed before this wor
 - iOS 16.4 runtime acceptance and physical iPhone tests remain pending. No new iOS
   simulator has been created. The unavailable Android phone is replaced only for
   local test coverage by an API 37 ARM64 emulator with 16 KB pages.
-- Public hosting/domain deployment remains a separate prerequisite. Real cellular
-  roaming with the separate Tailscale app disconnected is not established by
-  loopback/USB or simulator relay tests. Production phone installation waits for
-  the Galaxy A57 to return.
+- Public hosting/domain deployment and real cellular roaming are both done; see
+  the 2026-09-21 section above. What remains unmeasured on real hardware is the
+  presence gate actually firing: it is deployed and recording sightings, but
+  nothing lapses for thirty days, so only its unit tests have exercised the sweep.
 - Strict server Clippy remains blocked by ten pond-voice warnings in files
   identical to origin/main; no lint rules were relaxed. Existing CI dependency
   access, Matter lockfile, security advisory and frontend resolution blockers
