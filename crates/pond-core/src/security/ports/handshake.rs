@@ -276,6 +276,24 @@ pub trait Handshake: Send + Sync {
             .map(|caller| caller.client_id))
     }
 
+    /// Revoke every session a device holds, and report how many were live.
+    ///
+    /// Removing a device from the household registry has to take its access
+    /// with it. `session_tokens.device_id` carries no foreign key, and nothing
+    /// cascades onto that table, so deleting the `devices` row on its own left
+    /// the tokens valid -- an operator who removed a lost phone from the device
+    /// list would have been told it was gone while it carried on working.
+    ///
+    /// # Why this has no default
+    ///
+    /// Every other new method on this trait is defaulted, and each of those
+    /// defaults **narrows**: a forgotten override loses a capability. A default
+    /// here would do the opposite. `Ok(0)` would mean "revoked nothing", the
+    /// caller would delete the device row anyway, and the omission would widen
+    /// access while reading like success. So it is required, and an adapter
+    /// that cannot revoke has to say so out loud.
+    async fn revoke_device(&self, device_id: &str) -> Result<u64>;
+
     /// Revoke a session token (disconnect a client).
     async fn revoke_token(&self, token: &str) -> Result<()>;
 

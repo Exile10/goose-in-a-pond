@@ -10,6 +10,10 @@ pub struct DeviceHandshake(pub String);
 
 #[async_trait]
 impl Handshake for DeviceHandshake {
+    async fn revoke_device(&self, _device_id: &str) -> Result<u64> {
+        Ok(0)
+    }
+
     async fn handshake(&self, _: HandshakeRequest) -> Result<HandshakeResponse> {
         anyhow::bail!("pairing is not used by this delivery fixture")
     }
