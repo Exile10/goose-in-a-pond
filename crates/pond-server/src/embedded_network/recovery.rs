@@ -146,22 +146,17 @@ async fn request(
         )
         .await
         .map_err(failed)?;
-    // Both refusals below used to return a bare 409 and write nothing, so a
-    // household that could not recover had no way to find out why: the journal
-    // showed no recovery attempt at all, because a refused one left no trace.
+    // An active enrollment is no longer refused here. The coordinator will not
+    // replace one, so it has to be stood down first -- but that is a step the
+    // pond can take on the household's behalf, and `execute` takes it once a
+    // person has approved. Asking the user to know that, and to perform it
+    // through a sign-out, made the one case replacement exists for the one case
+    // it could not serve.
+    //
+    // It is NOT done here. This route needs only a LAN peer and a bearer token,
+    // so revoking at request time would let anyone who has both knock the
+    // household's phone off the tailnet without approving anything.
     let status = old["status"].as_str().unwrap_or("unknown");
-    if !matches!(status, "revoked" | "failed" | "pending") {
-        // Replacement supersedes an enrollment that has stopped working. While
-        // the coordinator still calls this device active, superseding it would
-        // be a way to take over a live enrollment, so it is refused here rather
-        // than at the coordinator. Revoking the old enrollment first is what
-        // makes the device replaceable -- signing out on the phone queues it.
-        tracing::warn!(
-            %device, %status,
-            "remote recovery refused: the coordinator still calls this device active, so its enrollment must be revoked before it can be replaced"
-        );
-        return Err(StatusCode::CONFLICT);
-    }
     if old["machineKey"].as_str() == Some(&registration.machine_key) {
         tracing::warn!(
             %device,
@@ -170,9 +165,13 @@ async fn request(
         return Err(StatusCode::CONFLICT);
     }
     let Some(revision) = old["revision"].as_str().filter(|v| valid_device(v)) else {
-        tracing::warn!(%device, "remote recovery refused: the enrollment carries no usable revision to supersede");
+        tracing::warn!(%device, %status, "remote recovery refused: the enrollment carries no usable revision to supersede");
         return Err(StatusCode::CONFLICT);
     };
+    // Captured before any revocation, and still correct after one: revoking
+    // preserves the revision, so the record this replacement supersedes is
+    // pinned from the moment the user was asked about it.
+    tracing::info!(%device, %status, "remote recovery awaiting local review");
     payload["expectedRevision"] = serde_json::Value::String(revision.to_owned());
     let id = runtime.recovery.insert(device, hash, payload, generation)?;
     tracing::info!("remote recovery awaits local review");
@@ -259,6 +258,47 @@ async fn operation(
         if !runtime.config().map_err(failed)?.enabled {
             return Err(StatusCode::CONFLICT);
         }
+        // The coordinator replaces an enrollment that has been stood down, not a
+        // live one, so a device whose record is still active needs revoking
+        // first. Two steps either way; the difference is that the pond takes
+        // them rather than telling the user to sign out and work it out.
+        //
+        // Here rather than at request time, because this runs only after a
+        // person approved it at the pond. Revoking on request alone would hand
+        // anyone with a LAN address and a token a way to drop the household's
+        // remote access without approving anything.
+        //
+        // Revoking preserves the record's revision, so the `expectedRevision`
+        // captured when the user was asked still pins the same record.
+        let live = runtime
+            .authority(
+                "inspect",
+                serde_json::json!({"device": device, "role": "phone"}),
+            )
+            .await
+            .map_err(failed)?;
+        if live["status"].as_str() == Some("active") {
+            tracing::info!(
+                %device,
+                "remote recovery: standing down the active enrollment so it can be replaced"
+            );
+            runtime
+                .authority(
+                    "revoke",
+                    serde_json::json!({
+                        "household":"", "device": device, "role":"phone", "action":"revoke",
+                        "authId":"", "nodeKey":"", "nonce":"", "expires":0
+                    }),
+                )
+                .await
+                .map_err(|error| {
+                    // Nothing has changed yet, so the approval can simply be
+                    // used again once coordination is reachable.
+                    tracing::warn!(%error, %device, "remote recovery: could not stand down the existing enrollment");
+                    StatusCode::SERVICE_UNAVAILABLE
+                })?;
+        }
+
         // The approved payload is consumed before a possibly ambiguous external write.
         // A failed response is never replayed. Credentials are checked after taking
         // the same lock used to queue revocation, and the coordinator checks revision.
