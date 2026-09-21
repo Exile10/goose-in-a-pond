@@ -93,7 +93,14 @@ separate from any production signing key and requires no database migration.
 A shared manager selects endpoints for REST and foreground SSE. On Wi-Fi it
 prefers pinned local addresses, uses mDNS to find a changed address, then tries
 the authenticated embedded address when remote access is enabled. Cellular uses
-the embedded node; local-only profiles remain disconnected away from home. Network changes and foreground
+the embedded node; local-only profiles remain disconnected away from home.
+
+The node's resolvers are dialled **concurrently**, first to answer wins. They used
+to be tried in order with a three-second budget each, and a carrier showed why
+that is not enough: Safaricom reports two resolvers for its LTE network and the
+first refuses DNS over TCP, so every lookup spent its budget on a server that
+would never answer and the node resolved nothing on cellular while working on
+Wi-Fi. Network changes and foreground
 resume re-evaluate the choice; background probing pauses. Recovery is coalesced,
 uses a capped backoff, and stops after six failed attempts until another trigger
 or a manual retry. NetInfo does not perform external reachability probes or
@@ -126,8 +133,42 @@ They do not replace native HTTPS, pin, hostname or date validation. Browser pinn
 is outside this implementation. iOS 16.4 remains the build minimum, with its older
 proxy path still awaiting runtime acceptance.
 
+### Enabling, replacing and lapsing (2026-09-21)
+
+Enabling remote access inspects the coordinator first and returns the existing
+enrollment when the device is already **active and still holds the identity it
+enrolled with**. Pressing the button on a pond where remote access already works
+is a no-op rather than a conflict. A mismatched identity -- a phone that re-paired
+and regenerated its tailnet keys -- is a real conflict: the enrollment is refused
+with `409` and the app points at recovery.
+
+Recovery replaces an enrollment. The coordinator replaces one that has been stood
+down rather than a live one, so the Pond revokes the existing enrollment itself
+and then replaces it, and **only after a person has approved the replacement at
+the Pond**. It is not done at request time: that route needs only a LAN peer and
+a bearer token, so revoking there would let anyone with both drop the household's
+remote access without approving anything. The revision is re-read from the
+stand-down's own answer, because standing an enrollment down gives it a new one --
+assuming otherwise cost a household its enrollment without a replacement.
+
+Remote access lapses after thirty days without the device authenticating from the
+household LAN; see `docs/auth-network-posture.md`. The deadline is reported in the
+remote configuration and the app warns from a week out.
+
+A failure reports which kind it is. The helper exits 3 when the coordinator
+refused the request and 1 when it could not be reached, so `register_phone`
+answers `409` for a decision and `503` for an outage, and the app can tell a
+household whose phone is already enrolled from one whose coordinator is
+unreachable. Every layer carries the cause it was given: the Pond captures the
+helper's stderr, the helper prints `Submit`'s error, and `Submit` carries the
+coordinator's status and its error identifier.
+
+### Disabling and signing out
+
 Disabling remote access stops local networking and preserves the pairing. Logout
-waits for acknowledged Pond revocation before clearing credentials. The Pond queues
+waits for acknowledged Pond revocation before clearing credentials, and also
+removes the device from the registry so it does not linger as one that is merely
+offline. The Pond queues
 network revocation durably and retries while coordination is unavailable; application
 session and refresh credentials are revoked together. Corrupt identity files cause
 visible failure. Restore the private identity backup rather than deleting it to

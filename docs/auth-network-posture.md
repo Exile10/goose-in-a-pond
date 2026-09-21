@@ -89,6 +89,48 @@ request body does not choose a token: older GOTG clients may continue sending
 `{token: ...}`, but only the bearer is used. Missing, expired and revoked bearer
 credentials return 401. The endpoint works before and after onboarding.
 
+Revocation and registry membership move together in both directions (2026-09-21).
+`DELETE /api/v1/devices/{id}` revokes every live session for that device through
+`Handshake::revoke_device` **before** dropping the row, and refuses the delete if
+that fails -- `session_tokens.device_id` carries no foreign key and nothing
+cascades onto that table, so the row and the credentials were previously
+independent and removing a phone from the list left its token validating.
+`POST /handshake/revoke` does the inverse: a device that signs out leaves the
+registry as well as losing its credentials, so it stops appearing as a device
+that is merely offline. Each orders itself so a failure is recoverable: the
+delete refuses rather than completing with access live, and the sign-out removes
+credentials first so a failed row removal still leaves the device without access.
+
+`revoke_device` carries no default on the port. Every other new method there is
+defaulted and each of those defaults narrows -- a forgotten override loses a
+capability. A default here would do the opposite: `Ok(0)` reads as "revoked
+nothing", the caller deletes the row anyway, and the omission widens access while
+looking like success.
+
+### Remote access lapses without household presence (2026-09-21)
+
+Remote access is granted because a device was once on the household LAN, and
+nothing re-checked that afterwards: a phone that was lost, stolen, or belonged to
+somebody who has left kept a working route in indefinitely. A device now renews
+its remote access by authenticating from a directly attached LAN peer, recorded
+in the auth middleware -- the one place that knows both which device a token
+belongs to and that the peer is not on the tailnet. Thirty days
+(`LAN_PRESENCE_WINDOW_DAYS`) without that and its remote access is revoked
+through the same durable queue every other revocation uses. Local pairing is
+untouched; bringing the device home restores it, and the deadline is reported in
+the remote configuration so the app warns from a week out.
+
+This is a second gate beside local approval, not a replacement. Approval decides
+**who may change** a household's remote identity, which is what stops somebody
+briefly on the wifi installing their own. Presence decides **how long an identity
+stays valid unattended**. Neither covers the other's case.
+
+Two deliberate omissions, both narrowing. A device with no sighting at all is
+never swept: absence of evidence is not evidence of absence. A household that
+never enabled remote access is never swept either, and does not contact
+coordination to discover it has nothing to revoke. Sightings live in
+`presence.json` beside `revocations.json` rather than a `devices` column.
+
 `GET /api/v1/notifications/stream?device_id=...` and
 `POST/DELETE /api/v1/devices/{id}/push-token` require the target device to match
 `Principal.device_id`, obtained by the middleware from `caller_for_token`.
