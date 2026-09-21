@@ -118,19 +118,62 @@ func dialResolver(ctx context.Context, network, _ string) (net.Conn, error) {
 	// Returning a stream connection is also what tells Go to frame the query for
 	// TCP: it picks framing by whether this conn implements net.PacketConn.
 	_ = network
-	// Bound each attempt so one dead server cannot consume the caller's deadline.
+
+	// Every server at once, first one to answer wins.
+	//
+	// These used to be tried in order with three seconds each, and a carrier
+	// showed why that is not good enough: Safaricom reports two resolvers and
+	// the FIRST one refuses DNS over TCP. Every lookup spent its budget dialling
+	// a server that would never answer before reaching the one that would, so
+	// the node could not resolve its coordinator at all on cellular while
+	// working perfectly on wifi.
+	//
+	// The file already warned about this shape for UDP -- "a UDP attempt here
+	// just burns the lookup's whole budget" -- and then reintroduced it by
+	// walking a list. Racing them costs one extra connection to a server that is
+	// answering anyway, and removes a whole class of ordering luck.
+	attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	type dialed struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan dialed, len(servers))
 	for _, server := range servers {
-		attempt, cancel := context.WithTimeout(ctx, 3*time.Second)
-		dialer := net.Dialer{}
-		conn, err := dialer.DialContext(attempt, "tcp", server.String())
-		cancel()
-		if err == nil {
-			return conn, nil
+		go func(server netip.AddrPort) {
+			dialer := net.Dialer{}
+			conn, err := dialer.DialContext(attempt, "tcp", server.String())
+			if err != nil {
+				diagnose("resolver: dialing " + server.String() + " over tcp failed: " + err.Error())
+			}
+			results <- dialed{conn: conn, err: err}
+		}(server)
+	}
+
+	var last error
+	for range servers {
+		select {
+		case result := <-results:
+			if result.err == nil {
+				// Cancelling closes the losers' dials; any that already
+				// succeeded are closed by the drain below.
+				go func() {
+					for range make([]struct{}, len(servers)-1) {
+						if late := <-results; late.conn != nil {
+							late.conn.Close()
+						}
+					}
+				}()
+				return result.conn, nil
+			}
+			last = result.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		diagnose("resolver: dialing " + server.String() + " over tcp failed: " + err.Error())
-		if ctx.Err() != nil {
-			return nil, err
-		}
+	}
+	if last != nil {
+		return nil, last
 	}
 	return nil, errors.New("no configured resolver could be dialled")
 }
