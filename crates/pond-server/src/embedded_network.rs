@@ -766,8 +766,8 @@ async fn remote_configuration(
     let device =
         pond_core::security::domain::proven_device::ProvenDevice::from_principal(&principal);
     device.id().ok_or(StatusCode::FORBIDDEN)?;
-    let config = runtime.config().map_err(|_| {
-        tracing::warn!("embedded enrollment operation failed");
+    let config = runtime.config().map_err(|error| {
+        tracing::warn!(%error, operation = "config", "embedded enrollment failed");
         StatusCode::SERVICE_UNAVAILABLE
     })?;
     Ok(Json(
@@ -788,20 +788,26 @@ async fn register_phone(
     let (device, _) = recovery::caller(&headers, handshake.as_ref()).await?;
     if runtime
         .pending_revocations()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .map_err(|error| {
+            tracing::warn!(%error, operation = "pending_revocations", "embedded enrollment failed");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?
         .contains(&device)
     {
         return Err(StatusCode::CONFLICT);
     }
     let payload = runtime
         .registration_payload(&device, "phone", &registration)
-        .map_err(|_| StatusCode::CONFLICT)?;
+        .map_err(|error| {
+            tracing::warn!(%error, %device, operation = "registration_payload", "embedded enrollment failed");
+            StatusCode::CONFLICT
+        })?;
     runtime
         .authority("enroll", payload)
         .await
         .map(Json)
-        .map_err(|_| {
-            tracing::warn!("embedded enrollment operation failed");
+        .map_err(|error| {
+            tracing::warn!(%error, %device, operation = "enroll_phone", "embedded enrollment failed");
             StatusCode::SERVICE_UNAVAILABLE
         })
 }
