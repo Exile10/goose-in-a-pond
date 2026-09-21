@@ -892,22 +892,40 @@ async fn register_phone(
     // falls through to the enrollment below rather than guessing: this is a
     // way to avoid a pointless conflict, not a second place that decides
     // whether a device is enrolled.
-    if let Ok(existing) = runtime.authority("inspect", payload.clone()).await {
-        let field = |name: &str| {
-            existing
-                .get(name)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        if field("status") == "active" && field("machineKey") == registration.machine_key {
+    match runtime.authority("inspect", payload.clone()).await {
+        Ok(existing) => {
+            let field = |name: &str| {
+                existing
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let status = field("status");
+            // Machine keys are public identifiers, not secrets -- the same
+            // value the coordinator hands back on an inspect. Logged as a
+            // match or a mismatch rather than in full, because which of the
+            // two it is is the entire question and the keys themselves are
+            // sixty characters of noise.
+            let same_identity = field("machineKey") == registration.machine_key;
+            if status == "active" && same_identity {
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "remote_access_already_enrolled",
+                    %device,
+                    "remote access: already enrolled with this identity and active; nothing to do"
+                );
+                return Ok(Json(existing));
+            }
             tracing::info!(
-                target: "giap::trace",
-                kind = "remote_access_already_enrolled",
-                %device,
-                "remote access: already enrolled with this identity and active; nothing to do"
+                %device, status = %status, same_identity,
+                "remote access: an existing enrollment does not match, so enrolling again"
             );
-            return Ok(Json(existing));
+        }
+        Err(error) => {
+            // Not a failure: the enrollment below is the authority, and this
+            // was only a chance to avoid a conflict it would raise.
+            tracing::info!(%error, %device, "remote access: could not inspect the existing enrollment; enrolling");
         }
     }
 
