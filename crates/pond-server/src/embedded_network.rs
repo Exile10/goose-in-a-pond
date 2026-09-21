@@ -251,7 +251,12 @@ impl Runtime {
             .arg(self.port.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Captured, not discarded. This was `Stdio::null()`, so when the
+            // helper failed it explained itself into /dev/null and the pond
+            // reported one generic sentence with no exit code -- which is
+            // exactly as much as an operator could learn about why remote
+            // access would not turn on.
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
         if let Some(mut input) = child.stdin.take() {
@@ -260,9 +265,23 @@ impl Runtime {
         let output =
             tokio::time::timeout(std::time::Duration::from_secs(25), child.wait_with_output())
                 .await??;
+        // Two different failures, reported as two different things. Conflating
+        // them said "operation failed" for both an unreachable coordinator and
+        // a helper that answered with too much.
         ensure!(
-            output.status.success() && output.stdout.len() < 8192,
-            "household enrollment operation failed"
+            output.status.success(),
+            "the network helper exited {} during {action}: {}",
+            output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "on a signal".to_string()),
+            helper_complaint(&output.stderr),
+        );
+        ensure!(
+            output.stdout.len() < 8192,
+            "the network helper answered {action} with {} bytes, more than the 8192 allowed",
+            output.stdout.len(),
         );
         Ok(serde_json::from_slice(&output.stdout)?)
     }
@@ -714,6 +733,41 @@ struct Registration {
     machine_key: String,
 }
 
+/// The last thing the network helper said before it gave up, fit to log.
+///
+/// Bounded, flattened to one line, and stripped of anything carrying a
+/// `/register/` path. That path is the tailnet node-authorisation URL: it is a
+/// bearer capability for joining this household, and the helper already redacts
+/// it from its own diagnostics sink for that reason (`native/pondnet/node.go`).
+/// Capturing stderr must not be the hole that puts it back in a log file.
+///
+/// An empty answer is reported as such rather than as nothing, so "the helper
+/// said why" and "the helper said nothing" stay distinguishable.
+fn helper_complaint(stderr: &[u8]) -> String {
+    const KEEP: usize = 400;
+    let text = String::from_utf8_lossy(stderr);
+    let redacted: Vec<&str> = text
+        .split_whitespace()
+        .map(|word| {
+            if word.contains("/register/") {
+                "<redacted enrolment URL>"
+            } else {
+                word
+            }
+        })
+        .collect();
+    let line = redacted.join(" ");
+    if line.is_empty() {
+        return "and said nothing".to_string();
+    }
+    match line.char_indices().nth_back(KEEP) {
+        // Keep the END: a helper that fails prints its context first and its
+        // reason last, so the tail is the part worth having.
+        Some((at, _)) => format!("...{}", &line[at..]),
+        None => line,
+    }
+}
+
 async fn authority_identity(
     State(runtime): State<Arc<Runtime>>,
     peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
@@ -854,6 +908,49 @@ pub fn companion_management(runtime: Arc<Runtime>, state: Arc<pond_api::AppState
 
 #[cfg(test)]
 mod tests {
+
+    use super::helper_complaint;
+
+    /// The helper's stderr now reaches a log file, so what it may carry there
+    /// is a decision rather than an accident.
+    ///
+    /// A `/register/` URL is the tailnet node-authorisation link: a bearer
+    /// capability for joining this household. The helper already keeps it out
+    /// of its own diagnostics for that reason, and capturing stderr must not be
+    /// the hole that puts it back.
+    #[test]
+    fn the_helper_complaint_never_carries_a_node_authorisation_url() {
+        let noisy = "dial failed for https://controlpond.jarida.io/register/nodekey%3Aabc123 \
+                     after 3 tries";
+        let said = helper_complaint(noisy.as_bytes());
+        assert!(!said.contains("/register/"), "{said}");
+        assert!(!said.contains("nodekey"), "{said}");
+        assert!(said.contains("<redacted enrolment URL>"), "{said}");
+        // The rest survives, or redaction has cost us the diagnosis it exists
+        // to make safe.
+        assert!(said.contains("dial failed"), "{said}");
+        assert!(said.contains("after 3 tries"), "{said}");
+    }
+
+    #[test]
+    fn the_helper_complaint_is_one_bounded_line() {
+        let long = format!("start {} end", "chatter ".repeat(400));
+        let said = helper_complaint(long.as_bytes());
+        assert!(said.len() <= 512, "unbounded: {} bytes", said.len());
+        assert!(!said.contains('\n'), "a log line must be one line");
+        // The tail is kept: a helper prints its context first and its reason
+        // last, so truncating from the front keeps the part worth having.
+        assert!(said.ends_with("end"), "{said}");
+        assert!(said.starts_with("..."), "{said}");
+    }
+
+    #[test]
+    fn saying_nothing_is_reported_as_saying_nothing() {
+        // Distinguishable from a helper that explained itself, rather than
+        // rendering as an empty gap in the sentence.
+        assert_eq!(helper_complaint(b""), "and said nothing");
+        assert_eq!(helper_complaint(b"   \n  "), "and said nothing");
+    }
     use super::*;
 
     #[test]
