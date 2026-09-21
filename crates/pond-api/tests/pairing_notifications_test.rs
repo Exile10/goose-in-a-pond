@@ -68,6 +68,7 @@ impl Handshake for RejectingHandshake {
             server_version: "test".into(),
             capabilities: vec![],
             rejection_reason: Some("invalid_mac".into()),
+            server_proof: None,
         })
     }
 }
@@ -98,6 +99,7 @@ impl Handshake for AcceptingHandshake {
             server_version: "test".into(),
             capabilities: vec![],
             rejection_reason: None,
+            server_proof: None,
         })
     }
 }

@@ -129,9 +129,49 @@ The Android and iOS clients use two-phase HMAC pairing; they do not transmit the
 1. Operator reads the pairing code printed on server startup (or `GET
    /api/v1/handshake/pairing-code`, loopback-only).
 2. Client `POST /handshake/init {client_id,…}` → `{challenge_id, challenge}`.
-3. Client computes `mac = HMAC-SHA256(pairing_code, challenge ‖ client_id)` and
-   `POST /handshake/verify {challenge_id, mac}` → `{session_token, refresh_token,
-   expires_at}`.
+3. Client computes `mac = HMAC-SHA256(pairing_code, transcript)` and
+   `POST /handshake/verify {challenge_id, mac, channel_binding?}` →
+   `{session_token, refresh_token, expires_at, server_proof?}`.
+
+### Channel binding (2026-09-21)
+
+A client that reached the Pond over pinned TLS names the key it pinned to in
+`channel_binding` and folds it into the transcript. The Pond recomputes with its
+**own** pin, so the two agree only when the client is talking to this Pond
+directly:
+
+```text
+bound     HMAC(code, "goose-pair-client-v1"\0 ‖ challenge ‖ \0 ‖ client_id ‖ \0 ‖ spki)
+unbound   HMAC(code, challenge ‖ client_id)
+```
+
+and the Pond answers with `server_proof` over the same transcript under
+`goose-pair-server-v1`, which only something holding the pairing code can
+produce. A client that sent a binding and got no proof back must treat the pair
+as failed.
+
+What this buys: the pin no longer has to reach the phone by a trustworthy route,
+which is what lets `_pond._tcp.local.` publish it in a `pin` TXT record for the
+app to fill in (`mdns_advertiser.rs`) instead of somebody transcribing 51
+characters of base64. Someone who intercepts the connection and serves their own
+certificate gets a client that MACs over *their* key: relaying that fails the
+recomputation (`channel_binding_mismatch`); stripping the binding and relaying
+leaves a MAC over a transcript the Pond no longer computes (`invalid_mac`); and
+answering the client directly fails the server proof. A wrong pin therefore ends
+pairing in a visible failure rather than a successful pair with the wrong Pond.
+
+The binding is optional because the desktop dashboard pairs over loopback HTTP,
+where there is no certificate and nothing in the middle. Optional is not
+downgradable: a client that binds always binds, and computing *either*
+transcript needs the pairing code. A binding is rejected outright, before the
+challenge is consumed, when it is not this Pond's pin — including when the Pond
+has no TLS identity to compare against, so the field can never be advisory. The
+five `sqlite_handshake.rs` tests under `// ---- Channel binding` hold each of
+those down.
+
+Not covered: the legacy single-shot `POST /handshake`, which carries the code in
+the request body and so has no MAC to bind. It is LAN-gated like the rest and no
+shipped client uses it.
 
 Legacy handshake, initialization, and verification require loopback or a peer
 within an active directly attached LAN interface's netmask. Tunnel interfaces,

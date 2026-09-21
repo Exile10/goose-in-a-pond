@@ -37,7 +37,7 @@ async fn make_app() -> Harness {
 
     let profiles = Arc::new(SqliteProfileRepository::new(pool.clone()));
 
-    let handshake = Arc::new(SqliteHandshakeAdapter::new(pool.clone()));
+    let handshake = Arc::new(SqliteHandshakeAdapter::new(pool.clone(), None));
     let state = Arc::new(AppState {
         warmup: Default::default(),
         db,

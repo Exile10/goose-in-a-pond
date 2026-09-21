@@ -72,6 +72,9 @@ impl Handshake for MockHandshake {
                 "settings".to_string(),
             ],
             rejection_reason: None,
+            // The mock has no TLS identity and accepts no binding, so it has
+            // nothing to prove.
+            server_proof: None,
         })
     }
 
