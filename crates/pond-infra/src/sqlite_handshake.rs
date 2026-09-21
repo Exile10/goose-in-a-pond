@@ -1604,6 +1604,40 @@ mod tests {
         );
     }
 
+    /// The transcript, against vectors computed outside both implementations.
+    ///
+    /// These exact strings are asserted again in the app, in
+    /// `goose-on-the-go/services/__tests__/hmac.test.ts :: the pairing
+    /// transcript`. That is the point of them: the two sides compute the same
+    /// bytes in different languages, and a change to either that nobody carried
+    /// across shows up here as a failing vector rather than in the field as a
+    /// pairing that will not complete and says only `invalid_mac`.
+    #[test]
+    fn the_transcript_matches_the_app() {
+        let challenge: Vec<u8> = (0u8..32).collect();
+        let code = b"482915";
+        let client = b"install-abcdef";
+        let spki = "sha256/TnkUsN+AaLec3BDTh/KUwSokXTmCq2+4rlfBnmJxPkE=";
+
+        let mac = |label: &[u8], spki: Option<&str>| {
+            hex_lower(&pair_mac(code, label, &challenge, client, spki).unwrap())
+        };
+        assert_eq!(
+            mac(CLIENT_LABEL, Some(spki)),
+            "2cc63017ff6979d0f1c4009a4f37c3c95bc2d535897fc2fb19a0a496f6a649aa",
+        );
+        assert_eq!(
+            mac(SERVER_LABEL, Some(spki)),
+            "73171bac55bb3346045142bb0647057067d94712f5fab82d2260bf91c106ebe0",
+        );
+        // The original shape, for a client older than the binding. It has to
+        // stay byte-for-byte what it was or every such client stops pairing.
+        assert_eq!(
+            mac(CLIENT_LABEL, None),
+            "b922abd25f5f1519c9d0f8ccabab4ed17b3e888a3b868be9cfdc320de017ec30",
+        );
+    }
+
     /// The dashboard pairs over loopback HTTP, where there is no certificate to
     /// bind to and nothing in the middle to bind against. It keeps the original
     /// transcript, and gets no proof back because there is none to make.
