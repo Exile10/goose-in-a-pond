@@ -249,21 +249,78 @@ async fn an_existing_session_can_refresh_from_the_tailnet() {
         }),
     )
     .await;
+
     assert_eq!(status, StatusCode::OK);
     assert_eq!(refreshed["accepted"], true);
+}
+
+/// The dashboard paths the companion listener must never serve.
+const DASHBOARD_PATHS: [&str; 4] = ["/", "/dev/test", "/dev/face", "/assets/index.js"];
+
+async fn get(router: &axum::Router, path: &str, bearer: Option<&str>) -> StatusCode {
+    let mut request = Request::builder().uri(path);
+    if let Some(token) = bearer {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    router
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Pair a device the honest way and return its session token.
+async fn session_token(h: &Harness) -> String {
+    let code = h.handshake.issue_pairing_code().await.unwrap();
+    let paired = h
+        .handshake
+        .handshake(HandshakeRequest {
+            client_id: "phone".into(),
+            client_type: "gotg".into(),
+            client_version: "test".into(),
+            pairing_code: Some(code.code),
+        })
+        .await
+        .unwrap();
+    assert!(paired.accepted);
+    paired.session_token.unwrap()
 }
 
 #[tokio::test]
 async fn companion_never_serves_dashboard_and_missing_peer_fails_closed() {
     let h = make_app().await;
-    for path in ["/", "/dev/test", "/dev/face", "/assets/index.js"] {
-        let response = h
-            .companion
-            .clone()
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+
+    // The assertion that actually says the dashboard is ABSENT from this
+    // router, rather than merely shadowed by the middleware: a caller holding a
+    // real session token still gets nothing, because `build_companion_router`
+    // registers no static fallback and no `/dev` pages at all.
+    let token = session_token(&h).await;
+    for path in DASHBOARD_PATHS {
+        assert_eq!(
+            get(&h.companion, path, Some(&token)).await,
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+
+    // Unauthenticated, the refusal comes earlier and reads 401. This asserted
+    // 404 until `431f3de9` narrowed non-API paths from `Exposure::Always` to
+    // `Exposure::HostOnly` -- anonymous static assets and dev pages became
+    // loopback-only, which is strictly better and is why they no longer reach
+    // the router to be missing from it. The companion has no peer address at
+    // all here, so it is not loopback and the token check answers first.
+    //
+    // 401 is not a weaker answer than 404 and it discloses nothing: EVERY
+    // non-API path on this listener answers the same way whether or not it
+    // exists, so the code cannot be used to probe for one. The pass above is
+    // what pins the absence; this one pins that nothing is served anonymously.
+    for path in DASHBOARD_PATHS {
+        assert_eq!(
+            get(&h.companion, path, None).await,
+            StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
     }
     let (status, body) = post(
         &h.companion,
