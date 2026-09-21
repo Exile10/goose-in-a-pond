@@ -13,6 +13,7 @@ void i18n.use(initReactI18next).init({
     identity: 'Prepare household identity', household: 'Household identifier', publicKey: 'Enrollment public key',
     provision: 'Give this public identity to your operator. Keep the private identity and its backup on your Pond.',
     coordinator: 'Headscale HTTPS origin', enrollment: 'Enrollment HTTPS origin',
+    toggleLabel: 'Reach this Pond from outside your home',
     advanced: 'Use my own coordination service',
     advancedDescription: 'Leave these empty to use the hosted service. Set both to run your own; setting only one is rejected.',
     enable: 'Enable remote access', disable: 'Keep local only',
