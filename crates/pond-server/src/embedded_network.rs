@@ -47,8 +47,8 @@ const PEER_HEADER: &str = "x-pond-embedded-peer";
 ///
 /// Self-hosting stays supported: an explicitly configured origin is used as given
 /// and never replaced.
-pub const DEFAULT_CONTROL_URL: &str = "https://control.jarida.io";
-pub const DEFAULT_ENROLLMENT_URL: &str = "https://enroll.jarida.io";
+pub const DEFAULT_CONTROL_URL: &str = "https://controlpond.jarida.io";
+pub const DEFAULT_ENROLLMENT_URL: &str = "https://enrollpond.jarida.io";
 
 /// Fill in the hosted coordinator for a household that named none.
 ///
