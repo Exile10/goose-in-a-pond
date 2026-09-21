@@ -43,7 +43,7 @@ func main() {
 		}
 		authority, err := pondnet.LoadAuthority(*state)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "household authority unavailable")
+			fmt.Fprintln(os.Stderr, "household authority unavailable:", err)
 			os.Exit(1)
 		}
 		if *authorityAction == "identity" {
@@ -53,7 +53,7 @@ func main() {
 		if *authorityAction == "register" {
 			household, err := authority.Register(context.Background(), *enrollmentOrigin, uint16(*port))
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "household registration incomplete")
+				fmt.Fprintln(os.Stderr, "household registration incomplete:", err)
 				os.Exit(1)
 			}
 			json.NewEncoder(os.Stdout).Encode(map[string]string{"household": household})
@@ -71,7 +71,7 @@ func main() {
 		approval.Action = *authorityAction
 		result, err := authority.Submit(context.Background(), *enrollmentOrigin, approval)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "household enrollment incomplete")
+			fmt.Fprintln(os.Stderr, "household enrollment incomplete:", err)
 			os.Exit(1)
 		}
 		json.NewEncoder(os.Stdout).Encode(result)
