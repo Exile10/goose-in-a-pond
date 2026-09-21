@@ -1,7 +1,7 @@
 //! Bundled userspace networking lifecycle and its private companion boundary.
 //! The public listeners never accept the embedded peer header.
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::StatusCode,
@@ -268,6 +268,15 @@ impl Runtime {
         // Two different failures, reported as two different things. Conflating
         // them said "operation failed" for both an unreachable coordinator and
         // a helper that answered with too much.
+        // Exit 3 is the helper's word for a coordinator that understood the
+        // request and refused it. That is a different answer to the user than a
+        // coordinator it could not reach, and flattening both into one status
+        // told a household with remote access already enrolled that remote
+        // access was not set up -- and hid the recovery control that would have
+        // fixed it.
+        if output.status.code() == Some(3) {
+            bail!(RefusedByCoordinator(helper_complaint(&output.stderr)));
+        }
         ensure!(
             output.status.success(),
             "the network helper exited {} during {action}: {}",
@@ -733,6 +742,22 @@ struct Registration {
     machine_key: String,
 }
 
+/// A coordinator answer that was a decision rather than a fault.
+///
+/// Carried as its own type so the handler can choose a status from it: a
+/// household whose phone is already enrolled needs the replacement flow, and
+/// telling it the service is unavailable sends it to the wrong control.
+#[derive(Debug)]
+pub struct RefusedByCoordinator(pub String);
+
+impl std::fmt::Display for RefusedByCoordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RefusedByCoordinator {}
+
 /// The last thing the network helper said before it gave up, fit to log.
 ///
 /// Bounded, flattened to one line, and stripped of anything carrying a
@@ -861,8 +886,13 @@ async fn register_phone(
         .await
         .map(Json)
         .map_err(|error| {
-            tracing::warn!(%error, %device, operation = "enroll_phone", "embedded enrollment failed");
-            StatusCode::SERVICE_UNAVAILABLE
+            let refused = error.downcast_ref::<RefusedByCoordinator>().is_some();
+            tracing::warn!(%error, %device, refused, operation = "enroll_phone", "embedded enrollment failed");
+            if refused {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         })
 }
 /// Companion enrollment uses the same bearer middleware and actual-peer LAN checks.

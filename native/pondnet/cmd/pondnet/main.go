@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/Exile10/goose-in-a-pond/native/pondnet/enrollment"
@@ -72,6 +73,14 @@ func main() {
 		result, err := authority.Submit(context.Background(), *enrollmentOrigin, approval)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "household enrollment incomplete:", err)
+			// Exit 3 for a decision, 1 for a fault. A coordinator that refused
+			// this request understood it perfectly; the pond must not report
+			// that to a user as "remote access is not set up", which is what
+			// one exit code for both outcomes forced it to do.
+			var refused *pondnet.Refused
+			if errors.As(err, &refused) {
+				os.Exit(3)
+			}
 			os.Exit(1)
 		}
 		json.NewEncoder(os.Stdout).Encode(result)
