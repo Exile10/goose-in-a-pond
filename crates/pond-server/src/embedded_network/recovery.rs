@@ -158,14 +158,14 @@ async fn request(
         // makes the device replaceable -- signing out on the phone queues it.
         tracing::warn!(
             %device, %status,
-            "remote recovery refused: the coordinator still calls this device active, so its              enrollment must be revoked before it can be replaced"
+            "remote recovery refused: the coordinator still calls this device active, so its enrollment must be revoked before it can be replaced"
         );
         return Err(StatusCode::CONFLICT);
     }
     if old["machineKey"].as_str() == Some(&registration.machine_key) {
         tracing::warn!(
             %device,
-            "remote recovery refused: this device already holds the enrolled identity, so there              is nothing to replace"
+            "remote recovery refused: this device already holds the enrolled identity, so there is nothing to replace"
         );
         return Err(StatusCode::CONFLICT);
     }
