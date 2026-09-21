@@ -1,8 +1,12 @@
 package mobile
 
 import (
+	"context"
+	"net"
+	"net/netip"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNativeResolverMetadata(t *testing.T) {
@@ -73,5 +77,86 @@ func TestResolversAreAbsentUntilInstalledAndSurviveAnEmptyUpdate(t *testing.T) {
 	}
 	if len(configuredServers()) != 1 {
 		t.Fatal("malformed metadata discarded the working resolvers")
+	}
+}
+
+// The carrier case, which walking the list in order could not survive.
+//
+// Safaricom reports two resolvers for its LTE network and the FIRST one refuses
+// DNS over TCP. Dialling them in sequence spent each lookup's budget on a server
+// that would never answer, so the node resolved nothing on cellular while
+// working perfectly on wifi.
+func TestADeadFirstResolverDoesNotCostTheLookup(t *testing.T) {
+	t.Cleanup(func() {
+		resolverMu.Lock()
+		resolvers = nil
+		resolverMu.Unlock()
+	})
+
+	// A listener that accepts is the one that answers; a closed port stands in
+	// for the resolver that refuses TCP.
+	answering, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer answering.Close()
+	go func() {
+		for {
+			conn, err := answering.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := dead.Addr().(*net.TCPAddr)
+	dead.Close() // nothing is listening there now
+
+	live := answering.Addr().(*net.TCPAddr)
+	resolverMu.Lock()
+	resolvers = []netip.AddrPort{
+		netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(deadAddr.Port)),
+		netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(live.Port)),
+	}
+	resolverMu.Unlock()
+
+	started := time.Now()
+	conn, err := dialResolver(context.Background(), "udp", "")
+	if err != nil {
+		t.Fatal("the answering resolver was never reached:", err)
+	}
+	conn.Close()
+	// Sequential dialling would have waited on the dead server first. The point
+	// is not the exact number; it is that a dead server costs no wall clock.
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("a dead first resolver cost %s of the lookup", elapsed)
+	}
+}
+
+func TestEveryResolverDeadIsStillAnError(t *testing.T) {
+	t.Cleanup(func() {
+		resolverMu.Lock()
+		resolvers = nil
+		resolverMu.Unlock()
+	})
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := closed.Addr().(*net.TCPAddr)
+	closed.Close()
+
+	resolverMu.Lock()
+	resolvers = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(addr.Port))}
+	resolverMu.Unlock()
+
+	if conn, err := dialResolver(context.Background(), "udp", ""); err == nil {
+		conn.Close()
+		t.Fatal("dialling a resolver that is not there reported success")
 	}
 }
