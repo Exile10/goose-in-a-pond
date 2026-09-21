@@ -146,17 +146,33 @@ async fn request(
         )
         .await
         .map_err(failed)?;
-    if !matches!(
-        old["status"].as_str(),
-        Some("revoked" | "failed" | "pending")
-    ) || old["machineKey"].as_str() == Some(&registration.machine_key)
-    {
+    // Both refusals below used to return a bare 409 and write nothing, so a
+    // household that could not recover had no way to find out why: the journal
+    // showed no recovery attempt at all, because a refused one left no trace.
+    let status = old["status"].as_str().unwrap_or("unknown");
+    if !matches!(status, "revoked" | "failed" | "pending") {
+        // Replacement supersedes an enrollment that has stopped working. While
+        // the coordinator still calls this device active, superseding it would
+        // be a way to take over a live enrollment, so it is refused here rather
+        // than at the coordinator. Revoking the old enrollment first is what
+        // makes the device replaceable -- signing out on the phone queues it.
+        tracing::warn!(
+            %device, %status,
+            "remote recovery refused: the coordinator still calls this device active, so its              enrollment must be revoked before it can be replaced"
+        );
         return Err(StatusCode::CONFLICT);
     }
-    let revision = old["revision"]
-        .as_str()
-        .filter(|v| valid_device(v))
-        .ok_or(StatusCode::CONFLICT)?;
+    if old["machineKey"].as_str() == Some(&registration.machine_key) {
+        tracing::warn!(
+            %device,
+            "remote recovery refused: this device already holds the enrolled identity, so there              is nothing to replace"
+        );
+        return Err(StatusCode::CONFLICT);
+    }
+    let Some(revision) = old["revision"].as_str().filter(|v| valid_device(v)) else {
+        tracing::warn!(%device, "remote recovery refused: the enrollment carries no usable revision to supersede");
+        return Err(StatusCode::CONFLICT);
+    };
     payload["expectedRevision"] = serde_json::Value::String(revision.to_owned());
     let id = runtime.recovery.insert(device, hash, payload, generation)?;
     tracing::info!("remote recovery awaits local review");
