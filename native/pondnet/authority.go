@@ -169,7 +169,7 @@ func (a Authority) Register(ctx context.Context, origin string, port uint16) (st
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("the coordinator answered %s to registration", response.Status)
+		return "", fmt.Errorf("the coordinator answered %s to registration: %s", response.Status, refusal(response.Body))
 	}
 	var result struct {
 		Household string `json:"household"`
@@ -222,8 +222,31 @@ func (a Authority) Submit(ctx context.Context, origin string, approval enrollmen
 		// deployed, 429 that it is shedding load, 5xx that it is unwell. Losing
 		// it left "enrollment was not completed", which names the outcome
 		// everybody already knew and none of the causes.
-		return result, fmt.Errorf("the coordinator answered %s to %s", response.Status, approval.Action)
+		return result, fmt.Errorf("the coordinator answered %s to %s: %s", response.Status, approval.Action, refusal(response.Body))
 	}
 	e = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&result)
 	return result, e
+}
+
+// refusal reads the coordinator's own account of why it said no.
+//
+// Its errors are a closed set of identifiers - approval_used,
+// identity_already_enrolled, pond_registration_required and the rest - and each
+// one calls for something different. The status alone cannot tell them apart:
+// this service has six distinct 409s. Bounded, because it is a remote party's
+// bytes going into a local log.
+func refusal(body io.Reader) string {
+	var answer struct {
+		Error string `json:"error"`
+	}
+	raw, e := io.ReadAll(io.LimitReader(body, 512))
+	if e != nil || len(raw) == 0 {
+		return "with no explanation"
+	}
+	if json.Unmarshal(raw, &answer) == nil && answer.Error != "" {
+		return answer.Error
+	}
+	// Not the shape we expect, so report that rather than nothing - a proxy
+	// answering in place of the coordinator looks exactly like this.
+	return "an unrecognised answer"
 }
