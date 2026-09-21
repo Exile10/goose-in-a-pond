@@ -451,15 +451,43 @@ pub async fn auth_middleware(
     // door the device id may come through -- the token this pond issued at pairing.
     // A client-supplied device would outrank every proof the pond can make, since
     // `PairedDevice` beats face and explicit id; `device_rung_wiring.rs` guards it.
-    let mut principal = match state.handshake.caller_for_token(&token).await {
-        Ok(Some(caller)) => Principal::token(caller.client_id).with_device(caller.device_id),
-        _ => Principal::token("unknown".to_string()),
+    let (mut principal, principal_device) = match state.handshake.caller_for_token(&token).await {
+        Ok(Some(caller)) => (
+            Principal::token(caller.client_id).with_device(caller.device_id.clone()),
+            caller.device_id,
+        ),
+        _ => (Principal::token("unknown".to_string()), String::new()),
     };
     if let Some(ci) = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
     {
         principal = principal.with_remote_addr(ci.0.to_string());
+    }
+
+    // A device that authenticates from the household's own network has just
+    // proved it is still part of the household, which is what its remote access
+    // is renewed by. Recorded here because this is the one place that knows both
+    // facts at once: which device the token belongs to, and that the peer is on
+    // a directly attached LAN rather than the tailnet.
+    //
+    // Through an extension the server installs, so this crate keeps no knowledge
+    // of how presence is stored, and a build without the embedded network simply
+    // has nobody to tell.
+    if let Some(presence) = req
+        .extensions()
+        .get::<Arc<dyn pond_core::security::ports::remote_access::DevicePresence>>()
+        .cloned()
+    {
+        let on_household_lan = crate::network::require_lan(
+            req.extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .copied(),
+        )
+        .is_ok();
+        if on_household_lan {
+            presence.seen_on_lan(&principal_device).await;
+        }
     }
 
     let mut req = req;
