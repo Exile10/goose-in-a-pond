@@ -114,8 +114,11 @@ pub(super) async fn caller(
     let device = network_device(&caller.device_id).map_err(|_| StatusCode::FORBIDDEN)?;
     Ok((device, Sha256::digest(token.as_bytes()).into()))
 }
-fn failed(_: anyhow::Error) -> StatusCode {
-    tracing::warn!("remote recovery operation failed");
+fn failed(error: anyhow::Error) -> StatusCode {
+    // Reports the cause. It used to discard it, which is how a replacement that
+    // failed on a stale revision read as "remote recovery operation failed" and
+    // reached the user as "remote access is not set up on this Pond".
+    tracing::warn!(%error, "remote recovery operation failed");
     StatusCode::SERVICE_UNAVAILABLE
 }
 async fn request(
@@ -277,12 +280,13 @@ async fn operation(
             )
             .await
             .map_err(failed)?;
+        let mut payload = payload;
         if live["status"].as_str() == Some("active") {
             tracing::info!(
                 %device,
                 "remote recovery: standing down the active enrollment so it can be replaced"
             );
-            runtime
+            let stood_down = runtime
                 .authority(
                     "revoke",
                     serde_json::json!({
@@ -297,6 +301,17 @@ async fn operation(
                     tracing::warn!(%error, %device, "remote recovery: could not stand down the existing enrollment");
                     StatusCode::SERVICE_UNAVAILABLE
                 })?;
+
+            // Re-read the revision rather than assuming the old one survived.
+            // It does not: standing an enrollment down gives it a new revision,
+            // so the `expectedRevision` captured when the user was asked is
+            // stale by the time the replacement is sent, and the coordinator
+            // refuses it -- after the old enrollment is already gone.
+            let Some(revision) = stood_down["revision"].as_str().filter(|v| valid_device(v)) else {
+                tracing::warn!(%device, "remote recovery: the stood-down enrollment reported no usable revision");
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            payload["expectedRevision"] = serde_json::Value::String(revision.to_owned());
         }
 
         // The approved payload is consumed before a possibly ambiguous external write.
