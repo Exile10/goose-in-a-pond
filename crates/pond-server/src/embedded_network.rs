@@ -881,6 +881,36 @@ async fn register_phone(
             tracing::warn!(%error, %device, operation = "registration_payload", "embedded enrollment failed");
             StatusCode::CONFLICT
         })?;
+
+    // Ask before telling. A phone that is already enrolled, still active, and
+    // still holding the identity it enrolled with does not need enrolling
+    // again -- and asking anyway produces a conflict the user reads as a
+    // failure, on a pond where remote access is working.
+    //
+    // Only an answer that is affirmative on every count short-circuits. Any
+    // other outcome, including one where the coordinator cannot be asked,
+    // falls through to the enrollment below rather than guessing: this is a
+    // way to avoid a pointless conflict, not a second place that decides
+    // whether a device is enrolled.
+    if let Ok(existing) = runtime.authority("inspect", payload.clone()).await {
+        let field = |name: &str| {
+            existing
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        if field("status") == "active" && field("machineKey") == registration.machine_key {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "remote_access_already_enrolled",
+                %device,
+                "remote access: already enrolled with this identity and active; nothing to do"
+            );
+            return Ok(Json(existing));
+        }
+    }
+
     runtime
         .authority("enroll", payload)
         .await
