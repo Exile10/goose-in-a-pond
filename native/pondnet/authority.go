@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/Exile10/goose-in-a-pond/native/pondnet/enrollment"
 	"golang.org/x/sys/unix"
 	"io"
@@ -164,11 +165,11 @@ func (a Authority) Register(ctx context.Context, origin string, port uint16) (st
 	client := http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, e := client.Do(request)
 	if e != nil {
-		return "", errors.New("enrollment service unavailable")
+		return "", fmt.Errorf("enrollment service unavailable: %w", e)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", errors.New("household registration was not completed")
+		return "", fmt.Errorf("the coordinator answered %s to registration", response.Status)
 	}
 	var result struct {
 		Household string `json:"household"`
@@ -212,11 +213,16 @@ func (a Authority) Submit(ctx context.Context, origin string, approval enrollmen
 	client := http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, e := client.Do(request)
 	if e != nil {
-		return result, errors.New("enrollment service unavailable")
+		return result, fmt.Errorf("enrollment service unavailable: %w", e)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return result, errors.New("enrollment was not completed")
+		// The status is the whole diagnosis: 401 and 403 mean the coordinator
+		// rejected this household's signature, 404 that the route is not
+		// deployed, 429 that it is shedding load, 5xx that it is unwell. Losing
+		// it left "enrollment was not completed", which names the outcome
+		// everybody already knew and none of the causes.
+		return result, fmt.Errorf("the coordinator answered %s to %s", response.Status, approval.Action)
 	}
 	e = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&result)
 	return result, e
