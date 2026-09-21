@@ -4543,6 +4543,10 @@ async fn run_server(
     let app = app
         .layer(axum::Extension(embedded.clone()
             as Arc<
+                dyn pond_core::security::ports::remote_access::DevicePresence,
+            >))
+        .layer(axum::Extension(embedded.clone()
+            as Arc<
                 dyn pond_core::security::ports::remote_access::RemoteRevocation,
             >))
         .layer(axum::Extension(embedded.address.clone()))

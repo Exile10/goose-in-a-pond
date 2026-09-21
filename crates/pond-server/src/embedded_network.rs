@@ -10,10 +10,11 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use pond_api::network::{is_tailnet, EmbeddedAddress};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::Write,
     net::SocketAddr,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
@@ -385,6 +386,13 @@ impl Runtime {
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;
+            // Devices that have stopped coming home lose their remote access.
+            // Queued here rather than acted on directly, so it travels the same
+            // durable path as every other revocation and survives a coordinator
+            // that is offline.
+            if let Err(error) = self.sweep_absent_devices().await {
+                tracing::warn!(%error, "could not check which devices have been away too long");
+            }
             let pending = {
                 let _guard = self.revocations.lock().await;
                 self.pending_revocations()?
@@ -627,6 +635,115 @@ fn valid_device(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Where the household records when it last saw each of its devices at home.
+///
+/// A JSON map beside `revocations.json` rather than a column on `devices`:
+/// this is remote-access state, it belongs with the rest of the subsystem's
+/// files, and it avoids claiming a migration version number while several
+/// branches are open against this repository.
+const PRESENCE_FILE: &str = "presence.json";
+
+impl Runtime {
+    fn presence(&self) -> Result<BTreeMap<String, String>> {
+        let path = self.directory.join(PRESENCE_FILE);
+        match std::fs::read(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(error) => Err(error.into()),
+            Ok(bytes) => {
+                ensure!(bytes.len() <= 1 << 20, "implausible presence record");
+                Ok(serde_json::from_slice(&bytes)?)
+            }
+        }
+    }
+
+    fn save_presence(&self, seen: &BTreeMap<String, String>) -> Result<()> {
+        let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
+        serde_json::to_writer(&mut file, seen)?;
+        file.as_file().sync_all()?;
+        file.persist(self.directory.join(PRESENCE_FILE))?;
+        std::fs::File::open(&self.directory)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Revoke the remote access of every device that has not been home inside
+    /// the window. Runs beside the revocation retry, which is what carries the
+    /// result to the coordinator.
+    async fn sweep_absent_devices(&self) -> Result<()> {
+        use pond_core::security::ports::remote_access::{
+            DevicePresence, RemoteRevocation, LAN_PRESENCE_WINDOW_DAYS,
+        };
+        // A household that never enabled remote access has nothing to revoke,
+        // and must not contact coordination to discover that.
+        if self.config()?.enrollment_url.is_empty() {
+            return Ok(());
+        }
+        let cutoff = Utc::now() - chrono::Duration::days(LAN_PRESENCE_WINDOW_DAYS);
+        for device in self.absent_since(cutoff).await? {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "remote_access_lapsed",
+                %device,
+                window_days = LAN_PRESENCE_WINDOW_DAYS,
+                "remote access lapsed: this device has not been on the household network inside \
+                 the window, so its remote access is being revoked. Local pairing is untouched, \
+                 and bringing it home restores it."
+            );
+            self.queue(&device).await?;
+            // Forget the sighting, or every sweep re-queues a revocation that
+            // has already been made.
+            let mut seen = self.presence()?;
+            seen.remove(&device);
+            self.save_presence(&seen)?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl pond_core::security::ports::remote_access::DevicePresence for Runtime {
+    async fn seen_on_lan(&self, device_id: &str) {
+        // The pond's own device id, not the coordinator's hash of it. `queue`
+        // hashes when it sends a revocation onward, and hashing here as well
+        // would revoke a device that does not exist.
+        if device_id.is_empty() || device_id.len() > 256 {
+            return;
+        }
+        let write = || -> Result<()> {
+            let mut seen = self.presence()?;
+            seen.insert(device_id.to_string(), Utc::now().to_rfc3339());
+            self.save_presence(&seen)
+        };
+        if let Err(error) = write() {
+            // Never fails the request that carried it. A lost renewal costs a
+            // device an earlier reminder to come home, not its access.
+            tracing::warn!(%error, device = %device_id, "could not record a LAN sighting");
+        }
+    }
+
+    async fn absent_since(&self, cutoff: DateTime<Utc>) -> Result<Vec<String>> {
+        Ok(self
+            .presence()?
+            .into_iter()
+            .filter(|(_, seen)| {
+                DateTime::parse_from_rfc3339(seen)
+                    .map(|at| at.with_timezone(&Utc) < cutoff)
+                    // An unreadable timestamp is not evidence of absence.
+                    .unwrap_or(false)
+            })
+            .map(|(device, _)| device)
+            .collect())
+    }
+
+    async fn lapses_at(&self, device_id: &str) -> Result<Option<DateTime<Utc>>> {
+        use pond_core::security::ports::remote_access::LAN_PRESENCE_WINDOW_DAYS;
+        Ok(self.presence()?.get(device_id).and_then(|seen| {
+            DateTime::parse_from_rfc3339(seen)
+                .ok()
+                .map(|at| at.with_timezone(&Utc) + chrono::Duration::days(LAN_PRESENCE_WINDOW_DAYS))
+        }))
+    }
+}
+
 #[async_trait::async_trait]
 impl pond_core::security::ports::remote_access::RemoteRevocation for Runtime {
     async fn queue(&self, device_id: &str) -> Result<()> {
@@ -849,9 +966,25 @@ async fn remote_configuration(
         tracing::warn!(%error, operation = "config", "embedded enrollment failed");
         StatusCode::SERVICE_UNAVAILABLE
     })?;
-    Ok(Json(
-        serde_json::json!({"enabled":config.enabled,"controlUrl":config.control_url,"state":runtime.status.read().unwrap_or_else(|p|p.into_inner()).state}),
-    ))
+    // When this device's remote access lapses if it does not come home, so the
+    // app can say so beforehand rather than after it has gone.
+    let lapses_at = match device.id() {
+        Some(id) => {
+            use pond_core::security::ports::remote_access::DevicePresence;
+            runtime
+                .lapses_at(id)
+                .await
+                .unwrap_or_default()
+                .map(|at| at.to_rfc3339())
+        }
+        None => None,
+    };
+    Ok(Json(serde_json::json!({
+        "enabled": config.enabled,
+        "controlUrl": config.control_url,
+        "state": runtime.status.read().unwrap_or_else(|p| p.into_inner()).state,
+        "lapsesAt": lapses_at,
+    })))
 }
 async fn register_phone(
     State(runtime): State<Arc<Runtime>>,
@@ -1081,6 +1214,117 @@ mod tests {
     }
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
+
+    /// Remote access is granted because a device was once standing in the
+    /// house, and until this nothing re-checked that. A phone that is lost, or
+    /// belonged to somebody who has left, kept a working route in forever.
+    #[tokio::test]
+    async fn a_device_that_stops_coming_home_loses_its_remote_access() {
+        use pond_core::security::ports::remote_access::{DevicePresence, LAN_PRESENCE_WINDOW_DAYS};
+        let data = tempfile::tempdir().unwrap();
+        let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
+        runtime
+            .persist(&Config {
+                enabled: true,
+                control_url: "https://coord.example".into(),
+                enrollment_url: "https://enroll.example".into(),
+            })
+            .unwrap();
+
+        runtime.seen_on_lan("phone000000000001").await;
+        runtime.seen_on_lan("phone000000000002").await;
+        // Nobody is absent yet, and a sweep must not revoke the household.
+        runtime.sweep_absent_devices().await.unwrap();
+        assert!(runtime.pending_revocations().unwrap().is_empty());
+
+        // Age one device past the window by hand: the clock is the input, so
+        // the test sets it rather than waiting a month.
+        let mut seen = runtime.presence().unwrap();
+        let stale = Utc::now() - chrono::Duration::days(LAN_PRESENCE_WINDOW_DAYS + 1);
+        let key = seen.keys().next().unwrap().clone();
+        seen.insert(key.clone(), stale.to_rfc3339());
+        runtime.save_presence(&seen).unwrap();
+
+        runtime.sweep_absent_devices().await.unwrap();
+        let queued = runtime.pending_revocations().unwrap();
+        assert_eq!(
+            queued.len(),
+            1,
+            "exactly the absent device, not the household"
+        );
+        // The queue holds the coordinator's name for the device, which is what
+        // `queue` derives; presence holds the pond's own. Comparing them
+        // directly is what caught the id being hashed twice.
+        assert!(queued.contains(&network_device(&key).unwrap()));
+
+        // The sighting is forgotten with it, or every later sweep re-queues a
+        // revocation that has already been made.
+        assert!(!runtime.presence().unwrap().contains_key(&key));
+        runtime.sweep_absent_devices().await.unwrap();
+        assert_eq!(runtime.pending_revocations().unwrap().len(), 1);
+    }
+
+    /// Absence of evidence is not evidence of absence. A device this pond has
+    /// never happened to observe must not lose anything for it.
+    #[tokio::test]
+    async fn a_device_with_no_sighting_is_never_swept() {
+        use pond_core::security::ports::remote_access::DevicePresence;
+        let data = tempfile::tempdir().unwrap();
+        let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
+        runtime
+            .persist(&Config {
+                enabled: true,
+                control_url: "https://coord.example".into(),
+                enrollment_url: "https://enroll.example".into(),
+            })
+            .unwrap();
+        assert!(runtime.absent_since(Utc::now()).await.unwrap().is_empty());
+        runtime.sweep_absent_devices().await.unwrap();
+        assert!(runtime.pending_revocations().unwrap().is_empty());
+    }
+
+    /// A household that never enabled remote access has nothing to revoke and
+    /// must not contact coordination to find that out. Same rule the revocation
+    /// queue already follows.
+    #[tokio::test]
+    async fn a_local_only_household_is_never_swept() {
+        use pond_core::security::ports::remote_access::{DevicePresence, LAN_PRESENCE_WINDOW_DAYS};
+        let data = tempfile::tempdir().unwrap();
+        let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
+        runtime.seen_on_lan("phone000000000001").await;
+        let mut seen = runtime.presence().unwrap();
+        let key = seen.keys().next().unwrap().clone();
+        let stale = Utc::now() - chrono::Duration::days(LAN_PRESENCE_WINDOW_DAYS + 1);
+        seen.insert(key, stale.to_rfc3339());
+        runtime.save_presence(&seen).unwrap();
+
+        runtime.sweep_absent_devices().await.unwrap();
+        assert!(runtime.pending_revocations().unwrap().is_empty());
+        assert!(!runtime.directory.join("revocations.json").exists());
+    }
+
+    /// The app is told when access lapses so it can say so beforehand, rather
+    /// than the user finding out by losing it.
+    #[tokio::test]
+    async fn the_lapse_deadline_is_a_window_after_the_last_sighting() {
+        use pond_core::security::ports::remote_access::{DevicePresence, LAN_PRESENCE_WINDOW_DAYS};
+        let data = tempfile::tempdir().unwrap();
+        let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
+        assert_eq!(runtime.lapses_at("phone000000000001").await.unwrap(), None);
+
+        let before = Utc::now();
+        runtime.seen_on_lan("phone000000000001").await;
+        let lapses = runtime
+            .lapses_at("phone000000000001")
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = before + chrono::Duration::days(LAN_PRESENCE_WINDOW_DAYS);
+        assert!(
+            (lapses - expected).num_seconds().abs() < 60,
+            "lapses at {lapses}, expected about {expected}"
+        );
+    }
 
     #[tokio::test]
     async fn revocation_is_durable_idempotent_and_local_only_does_not_enroll() {
