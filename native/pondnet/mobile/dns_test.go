@@ -160,3 +160,121 @@ func TestEveryResolverDeadIsStillAnError(t *testing.T) {
 		t.Fatal("dialling a resolver that is not there reported success")
 	}
 }
+
+// udpResponder answers any datagram with a minimal reply carrying the query's id,
+// which is all udpAnswers checks for. It stands in for a router that serves DNS
+// over UDP.
+func udpResponder(t *testing.T) (netip.AddrPort, func()) {
+	t.Helper()
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("could not listen on udp", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buffer := make([]byte, 512)
+		for {
+			read, from, err := packet.ReadFrom(buffer)
+			if err != nil {
+				return
+			}
+			if read < 2 {
+				continue
+			}
+			reply := make([]byte, 12)
+			reply[0], reply[1] = buffer[0], buffer[1]
+			reply[2] = 0x81 // response, recursion desired
+			if _, err := packet.WriteTo(reply, from); err != nil {
+				return
+			}
+		}
+	}()
+	address := netip.MustParseAddrPort(packet.LocalAddr().String())
+	return address, func() { packet.Close(); <-done }
+}
+
+func useResolvers(t *testing.T, servers ...netip.AddrPort) {
+	t.Helper()
+	resolverMu.Lock()
+	previous := resolvers
+	resolvers = servers
+	resolverMu.Unlock()
+	t.Cleanup(func() {
+		resolverMu.Lock()
+		resolvers = previous
+		resolverMu.Unlock()
+	})
+}
+
+// The failure this guards against: a router that answers DNS over UDP and ignores
+// TCP. Dialling TCP only, the node could not resolve its coordinator at all on
+// such a network, while every other application on it resolved normally.
+func TestResolverFallsBackToUdpWhenTcpIsRefused(t *testing.T) {
+	server, stop := udpResponder(t)
+	defer stop()
+	// Nothing is listening on TCP at that port, so the TCP half of the race fails.
+	useResolvers(t, server)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := dialResolver(ctx, "udp", "")
+	if err != nil {
+		t.Fatal("a server answering over udp was treated as unreachable", err)
+	}
+	defer conn.Close()
+	// Go frames the query by the connection's type, so a UDP win has to hand back
+	// something that is a PacketConn or the query goes out with TCP length prefixes.
+	if _, ok := conn.(net.PacketConn); !ok {
+		t.Fatal("udp winner returned a stream connection; Go would frame the query for tcp")
+	}
+}
+
+// The behaviour that was already there and must survive: a server that answers
+// only over TCP still resolves. This is the case the TCP-only dial was written for.
+func TestResolverStillUsesTcpWhenUdpIsSilent(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("could not listen on tcp", err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+	useResolvers(t, netip.MustParseAddrPort(listener.Addr().String()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := dialResolver(ctx, "udp", "")
+	if err != nil {
+		t.Fatal("a server answering over tcp was treated as unreachable", err)
+	}
+	defer conn.Close()
+	if _, ok := conn.(net.PacketConn); ok {
+		t.Fatal("tcp-only server produced a packet connection")
+	}
+}
+
+func TestUdpProbeIsNotSatisfiedBySilence(t *testing.T) {
+	// A UDP dial cannot fail, so an unanswered server must be rejected by the
+	// exchange rather than by the dial. Without this, the race would always be
+	// won instantly by a dead socket.
+	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := netip.MustParseAddrPort(packet.LocalAddr().String())
+	packet.Close() // nothing answers here now
+
+	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+	if udpAnswers(ctx, address) {
+		t.Fatal("a server that never replied was reported as answering over udp")
+	}
+}

@@ -2,6 +2,7 @@ package mobile
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"net"
@@ -97,6 +98,56 @@ func configuredServers() []netip.AddrPort {
 	return resolvers
 }
 
+// udpProbe builds a DNS query for the root zone with a random id. The answer is
+// not used: this asks whether the server responds at all, not what it says.
+func udpProbe() []byte {
+	id := make([]byte, 2)
+	if _, err := rand.Read(id); err != nil {
+		// A predictable id is still fine for a reachability probe on the local
+		// link; failing the lookup over it would not be.
+		id[0], id[1] = 0x50, 0x4e
+	}
+	return []byte{
+		id[0], id[1],
+		0x01, 0x00, // standard query, recursion desired
+		0x00, 0x01, // one question
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00,       // root name
+		0x00, 0x02, // NS
+		0x00, 0x01, // IN
+	}
+}
+
+// udpAnswers reports whether a server actually replies over UDP.
+//
+// This cannot be done by dialling. UDP is connectionless, so net.Dial succeeds
+// against a server that will never answer -- which is why racing a UDP dial
+// against a TCP one would hand back a dead socket every time, instantly. The
+// only way to learn that UDP works is to use it.
+func udpAnswers(ctx context.Context, server netip.AddrPort) bool {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "udp", server.String())
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(2 * time.Second)
+	}
+	if conn.SetDeadline(deadline) != nil {
+		return false
+	}
+	query := udpProbe()
+	if _, err := conn.Write(query); err != nil {
+		return false
+	}
+	reply := make([]byte, 512)
+	read, err := conn.Read(reply)
+	// A header and a matching id is proof enough. Anything more would be reading
+	// an answer this function has no use for.
+	return err == nil && read >= 12 && reply[0] == query[0] && reply[1] == query[1]
+}
+
 // dialResolver ignores the address Go derived from configuration that does not
 // exist on this platform and dials a resolver the operating system actually
 // reported. Successive calls rotate, so Go's own retry reaches a different
@@ -111,12 +162,22 @@ func dialResolver(ctx context.Context, network, _ string) (net.Conn, error) {
 	// obtaining the live one would mean taking the lifecycle lock that a starting
 	// node already holds. On this platform netns only applies the protect and
 	// bind-to-network hooks, and neither is registered here.
-	// Always TCP, whatever Go asked for. A home router commonly answers DNS over
-	// TCP while ignoring UDP from a client it did not hand the lease to, and Go
-	// only retries over TCP when a UDP answer comes back truncated, never when it
-	// times out - so a UDP attempt here just burns the lookup's whole budget.
-	// Returning a stream connection is also what tells Go to frame the query for
-	// TCP: it picks framing by whether this conn implements net.PacketConn.
+	// Go's choice of transport is ignored, deliberately: it only retries over TCP
+	// when a UDP answer comes back truncated, never when it times out, so letting
+	// it pick means one dead transport burns the whole lookup budget.
+	//
+	// This used to mean always TCP, on the reasoning that a home router commonly
+	// answers DNS over TCP while ignoring UDP from a client it did not hand the
+	// lease to. That is true of some routers and false of others, and when it is
+	// false the node cannot resolve its coordinator at all. Observed on a home
+	// network in September 2026: the gateway answered UDP and timed out on TCP,
+	// for both the IPv4 and IPv6 resolvers it advertised, so every lookup failed
+	// while every other application on the network resolved normally.
+	//
+	// So neither transport is assumed now. Both are tried at once and whichever
+	// proves itself first is used. Which one Go then frames the query for follows
+	// from the connection it is handed: it picks by whether the conn implements
+	// net.PacketConn.
 	_ = network
 
 	// Every server at once, first one to answer wins.
@@ -139,7 +200,10 @@ func dialResolver(ctx context.Context, network, _ string) (net.Conn, error) {
 		conn net.Conn
 		err  error
 	}
-	results := make(chan dialed, len(servers))
+	// Two attempts per server: a TCP dial, which proves itself by connecting, and a
+	// UDP exchange, which has to prove itself by being answered.
+	attempts := len(servers) * 2
+	results := make(chan dialed, attempts)
 	for _, server := range servers {
 		go func(server netip.AddrPort) {
 			dialer := net.Dialer{}
@@ -149,17 +213,30 @@ func dialResolver(ctx context.Context, network, _ string) (net.Conn, error) {
 			}
 			results <- dialed{conn: conn, err: err}
 		}(server)
+		go func(server netip.AddrPort) {
+			if !udpAnswers(attempt, server) {
+				diagnose("resolver: " + server.String() + " did not answer over udp")
+				results <- dialed{err: errors.New("no udp answer from " + server.String())}
+				return
+			}
+			// A fresh socket, so the probe's reply cannot be sitting in the buffer
+			// waiting to be mistaken for the answer to Go's own query.
+			dialer := net.Dialer{}
+			conn, err := dialer.DialContext(attempt, "udp", server.String())
+			results <- dialed{conn: conn, err: err}
+		}(server)
 	}
 
 	var last error
-	for range servers {
+	for range make([]struct{}, attempts) {
 		select {
 		case result := <-results:
-			if result.err == nil {
+			if result.err == nil && result.conn != nil {
 				// Cancelling closes the losers' dials; any that already
 				// succeeded are closed by the drain below.
+				remaining := attempts - 1
 				go func() {
-					for range make([]struct{}, len(servers)-1) {
+					for range make([]struct{}, remaining) {
 						if late := <-results; late.conn != nil {
 							late.conn.Close()
 						}
