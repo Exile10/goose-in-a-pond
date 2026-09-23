@@ -100,7 +100,12 @@ to be tried in order with a three-second budget each, and a carrier showed why
 that is not enough: Safaricom reports two resolvers for its LTE network and the
 first refuses DNS over TCP, so every lookup spent its budget on a server that
 would never answer and the node resolved nothing on cellular while working on
-Wi-Fi. Network changes and foreground
+Wi-Fi. Nor is the transport assumed: each server is tried over TCP and UDP at
+once, and whichever proves itself first is used. A home gateway was found that
+refuses DNS over TCP on every resolver it advertises while answering UDP, and
+there racing servers cannot help (#394). UDP is connectionless, so a dial proves
+nothing; reachability over UDP is shown by a real root-zone query whose random
+id comes back. Network changes and foreground
 resume re-evaluate the choice; background probing pauses. Recovery is coalesced,
 uses a capped backoff, and stops after six failed attempts until another trigger
 or a manual retry. NetInfo does not perform external reachability probes or
