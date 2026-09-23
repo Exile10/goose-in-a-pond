@@ -215,6 +215,14 @@ coordinator's own logs were checked. Those logs showed the node completing the
 control handshake and holding a map poll for minutes at a time on Wi-Fi. The
 addressing collision is real and was not the fault.
 
+### A second resolver defect: a gateway that refuses TCP entirely
+
+Racing the servers fixed the carrier above. It could not fix a home network where the gateway refused DNS over **TCP** on both resolvers it advertised, IPv4 and IPv6, while answering **UDP** normally. The node resolved nothing there, and the phone logged **88 dial timeouts in a minute**, while every other app on the network resolved fine over UDP (#394).
+
+`dialResolver` discarded the transport Go asked for and always used TCP, on a documented assumption about routers that ignore UDP from clients they did not lease. That holds for some routers and not others, so neither transport is assumed now: both are tried per server, and whichever proves itself first is used. UDP is the asymmetric case. `net.Dial` over UDP cannot fail, so a raced UDP dial would win at once with a dead socket. The probe therefore sends a real query for the root zone with a random id and waits for the id to come back, and the winning connection is a fresh socket so the probe's reply cannot be mistaken for the answer to Go's own query.
+
+On the network where it failed, the dial timeouts went from 88 a minute to none and the node reached its coordinator. `TestResolverFallsBackToUdpWhenTcpIsRefused` fails against the old behaviour. `TestResolverStillUsesTcpWhenUdpIsSilent` passes both ways, so the case the TCP-only dial was written for is unchanged. `TestUdpProbeIsNotSatisfiedBySilence` pins the connectionless trap.
+
 ### Diagnosis was blocked by discarded causes
 
 Four layers each discarded what the layer below reported: the Pond spawned the
