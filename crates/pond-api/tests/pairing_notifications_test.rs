@@ -49,6 +49,9 @@ impl Handshake for RejectingHandshake {
     async fn validate_token(&self, _token: &str) -> Result<bool> {
         Ok(false)
     }
+    async fn revoke_device(&self, _device_id: &str) -> Result<u64> {
+        Ok(0)
+    }
     async fn revoke_token(&self, _token: &str) -> Result<()> {
         Ok(())
     }
@@ -62,6 +65,7 @@ impl Handshake for RejectingHandshake {
             server_version: "test".into(),
             capabilities: vec![],
             rejection_reason: Some("invalid_mac".into()),
+            server_proof: None,
         })
     }
 }
@@ -77,6 +81,9 @@ impl Handshake for AcceptingHandshake {
     async fn validate_token(&self, _token: &str) -> Result<bool> {
         Ok(false)
     }
+    async fn revoke_device(&self, _device_id: &str) -> Result<u64> {
+        Ok(0)
+    }
     async fn revoke_token(&self, _token: &str) -> Result<()> {
         Ok(())
     }
@@ -90,6 +97,7 @@ impl Handshake for AcceptingHandshake {
             server_version: "test".into(),
             capabilities: vec![],
             rejection_reason: None,
+            server_proof: None,
         })
     }
 }
