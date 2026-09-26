@@ -1,4 +1,5 @@
 import i18n from '../i18n';
+import { RemoteAccess } from './RemoteAccess';
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Button, Chip } from "@heroui/react";
 import { RefreshCw, Smartphone, Wifi } from "lucide-react";
@@ -40,8 +41,12 @@ export function Pairing() {
             ),
       ]);
       if (!pc.code) throw new Error("Server returned no pairing code");
-      // Every address, tried in this order: mDNS (survives DHCP; Android's resolver has no mDNS),
-      // the raw LAN address, then the tailnet address for when the phone is away from home.
+      // Every address this Pond has, because none of them works everywhere.
+      // The mDNS name survives a DHCP lease change and is what an iPhone
+      // resolves happily; Android's resolver does no mDNS at all, so
+      // `<host>.local` fails there and the phone needs the raw address; and
+      // neither reaches the Pond once the phone leaves the house, which is what
+      // the tailnet address is for. The client tries them in that order.
       if (!sysInfo.https_port || !sysInfo.tls_spki_sha256) throw new Error(i18n.t('pairing.unavailable'));
       const params = new URLSearchParams({
         v: "2",
@@ -62,6 +67,7 @@ export function Pairing() {
     }
   }, []);
 
+  // Render QR code onto canvas whenever pairUrl changes.
   useEffect(() => {
     if (!info?.pairUrl || !canvasRef.current) return;
     QRCode.toCanvas(canvasRef.current, info.pairUrl, {
@@ -71,6 +77,7 @@ export function Pairing() {
     }).catch((e) => console.error("QR render failed", e));
   }, [info?.pairUrl]);
 
+  // Countdown timer.
   useEffect(() => {
     if (!info?.expiresAt) return;
     const id = setInterval(() => setTimeLeft(timeUntil(info.expiresAt)), 500);
@@ -78,6 +85,7 @@ export function Pairing() {
     return () => clearInterval(id);
   }, [info?.expiresAt]);
 
+  // Auto-refresh when expired.
   useEffect(() => {
     if (timeLeft === "expired") loadPairingInfo(true);
   }, [timeLeft, loadPairingInfo]);
@@ -169,6 +177,7 @@ export function Pairing() {
               <code style={{ fontSize: 11 }}>_pond._tcp.local.</code> via mDNS.
             </Step>
           </div>
+          <RemoteAccess />
         </div>
       </div>
     </div>

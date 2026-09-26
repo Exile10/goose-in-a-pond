@@ -11693,6 +11693,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "tower 0.5.3",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -17201,8 +17202,6 @@ dependencies = [
 [[package]]
 name = "whisper-rs-sys"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6986c0fe081241d391f09b9a071fbcbb59720c3563628c3c829057cf69f2a56f"
 dependencies = [
  "bindgen 0.72.1",
  "cfg-if 1.0.4",

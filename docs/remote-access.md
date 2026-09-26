@@ -1,4 +1,4 @@
-# Remote access with pinned HTTPS
+# Embedded remote access with pinned HTTPS
 
 ## Connection model
 
@@ -7,12 +7,29 @@ it uses HTTPS on the LAN at home and HTTPS inside Tailscale/WireGuard away from
 home. HTTPS is HTTP over TLS; WireGuard is an additional encrypted transport.
 TLS terminates on the Pond. No cloud service holds its private key.
 
-Run Tailscale clients directly on both the Pond and phone. For Headscale, join
-with `tailscale up --login-server=https://headscale.example.com`. No embedded
-VPN client is included. Source-masking proxies and subnet routers are unsupported
-for pairing: the server classifies the actual TCP peer, never forwarding headers.
-Do not expose the companion listener to the public internet. Limit tailnet access
-with the coordinator's ACLs. Android permits one active VPN at a time.
+GOTG embeds a userspace Tailscale/WireGuard node on Android and iOS. The Pond
+bundles the same pinned Go networking module as a supervised helper. No separate
+Tailscale app, system VPN profile, or user Tailscale account is required. After
+local pairing, choose **Enable remote access** or **Keep local only**. Local-only
+profiles do not start a node or contact a coordination service. Remote operation
+uses only the explicitly configured Goose-operated Headscale and DERP endpoints;
+there is no fallback to hosted Tailscale or a separate VPN app.
+
+This branch prepares a locally tested pilot deployment. Public domains and hosting
+are still prerequisites for cellular use. Follow
+[the deployment guide](../deploy/remote-access/README.md) to provision a pilot
+household and obtain local Pond approval. The enrollment service alone holds
+Headscale administration credentials. The Pond signs short-lived, single-use
+approvals binding its household, paired phone and pending network registration.
+Replacement phones require local pairing and explicit approval; there is no cloud
+account-recovery bypass.
+
+Source-masking proxies and subnet routers are unsupported for pairing. Public
+listeners classify the actual TCP peer, never forwarding headers. Embedded traffic
+enters through a private Unix socket whose trusted helper supplies the real remote
+peer identity. It remains remote for handshake and local-management guards. Do not
+publish the companion listener directly on the public internet. Default-deny
+coordinator policy permits an approved phone to reach only its own Pond HTTPS port.
 
 ## Listeners and local tools
 
@@ -75,7 +92,20 @@ separate from any production signing key and requires no database migration.
 
 A shared manager selects endpoints for REST and foreground SSE. On Wi-Fi it
 prefers pinned local addresses, uses mDNS to find a changed address, then tries
-the saved tailnet address. Cellular uses tailnet. Network changes and foreground
+the authenticated embedded address when remote access is enabled. Cellular uses
+the embedded node; local-only profiles remain disconnected away from home.
+
+The node's resolvers are dialled **concurrently**, first to answer wins. They used
+to be tried in order with a three-second budget each, and a carrier showed why
+that is not enough: Safaricom reports two resolvers for its LTE network and the
+first refuses DNS over TCP, so every lookup spent its budget on a server that
+would never answer and the node resolved nothing on cellular while working on
+Wi-Fi. Nor is the transport assumed: each server is tried over TCP and UDP at
+once, and whichever proves itself first is used. A home gateway was found that
+refuses DNS over TCP on every resolver it advertises while answering UDP, and
+there racing servers cannot help (#394). UDP is connectionless, so a dial proves
+nothing; reachability over UDP is shown by a real root-zone query whose random
+id comes back. Network changes and foreground
 resume re-evaluate the choice; background probing pauses. Recovery is coalesced,
 uses a capped backoff, and stops after six failed attempts until another trigger
 or a manual retry. NetInfo does not perform external reachability probes or
@@ -97,30 +127,103 @@ builds permit loopback HTTP for Metro through `adb reverse` only. Run Expo
 prebuild to regenerate native integration from `plugins/with-pond-tls.js`.
 
 On iOS, both Expo fetch and React Native XHR install the shared Pond URL protocol
-before initialization. Only Pond requests use this protocol; each uses an
+before initialization. Configured Pond requests and every request to the embedded address ranges use this
+protocol; unconfigured remote endpoints fail closed. Each accepted request uses an
 ephemeral session with SPKI, validity, and hostname validation. Changing trust
 cancels active requests, including SSE. Unrelated traffic uses normal platform
 trust. Expo prebuild recreates the source files, bridge, and Xcode integration.
-The Apple transport core and 17 app-level iOS simulator checks pass, including
-real scratch-Pond pairing, refresh, REST/SSE, invalid-pin rejection, persistence
-and foreground resume. Physical roaming remains separate, as recorded in
-[verification](pinned-https-verification.md).
+On iOS 17+, scoped ATS exceptions for `100.64.0.0/10` and
+`fd7a:115c:a1e0::/48` allow native verification of the Pond's self-signed identity.
+They do not replace native HTTPS, pin, hostname or date validation. Browser pinning
+is outside this implementation. iOS 16.4 remains the build minimum, with its older
+proxy path still awaiting runtime acceptance.
+
+### Enabling, replacing and lapsing (2026-09-21)
+
+Enabling remote access inspects the coordinator first and returns the existing
+enrollment when the device is already **active and still holds the identity it
+enrolled with**. Pressing the button on a pond where remote access already works
+is a no-op rather than a conflict. A mismatched identity -- a phone that re-paired
+and regenerated its tailnet keys -- is a real conflict: the enrollment is refused
+with `409` and the app points at recovery.
+
+Recovery replaces an enrollment. The coordinator replaces one that has been stood
+down rather than a live one, so the Pond revokes the existing enrollment itself
+and then replaces it, and **only after a person has approved the replacement at
+the Pond**. It is not done at request time: that route needs only a LAN peer and
+a bearer token, so revoking there would let anyone with both drop the household's
+remote access without approving anything. The revision is re-read from the
+stand-down's own answer, because standing an enrollment down gives it a new one --
+assuming otherwise cost a household its enrollment without a replacement.
+
+Remote access lapses after thirty days without the device authenticating from the
+household LAN; see `docs/auth-network-posture.md`. The deadline is reported in the
+remote configuration and the app warns from a week out.
+
+A failure reports which kind it is. The helper exits 3 when the coordinator
+refused the request and 1 when it could not be reached, so `register_phone`
+answers `409` for a decision and `503` for an outage, and the app can tell a
+household whose phone is already enrolled from one whose coordinator is
+unreachable. Every layer carries the cause it was given: the Pond captures the
+helper's stderr, the helper prints `Submit`'s error, and `Submit` carries the
+coordinator's status and its error identifier.
+
+### Disabling and signing out
+
+Disabling remote access stops local networking and preserves the pairing. Logout
+waits for acknowledged Pond revocation before clearing credentials, and also
+removes the device from the registry so it does not linger as one that is merely
+offline. The Pond queues
+network revocation durably and retries while coordination is unavailable; application
+session and refresh credentials are revoked together. Corrupt identity files cause
+visible failure. Restore the private identity backup rather than deleting it to
+create an unrelated household.
 
 ## Verification
 
 Use the security tests and `scripts/live-test.sh` against scratch data, including
 a restart with populated databases. Device acceptance additionally requires
-physical Android/iOS phones and a Jetson: home LAN, cellular with VPN, another Wi-Fi,
+physical Android/iOS phones and a Jetson: home LAN, cellular with embedded networking, another Wi-Fi,
 and home LAN again. Exercise app/server restarts, LAN address changes, unavailable
-VPN, certificate renewal, and incorrect-pin rejection by both REST and SSE.
-A build or unit-test pass does not establish physical roaming acceptance.
+coordination/relay service, certificate renewal, and incorrect-pin rejection by both REST and SSE.
+Disconnect the separate Tailscale app for these tests. A build or unit-test pass
+does not establish physical roaming acceptance. See the current
+[embedded verification ledger](embedded-remote-access-verification.md) for measured
+simulator, scratch-Pond, backup/restore and remaining hardware results.
 
-## Authorization
+This branch includes W3 authorization checks for notification ownership, bearer
+revocation and protected diagnostics. HTTPS is independent of those checks. See
+[the security posture](auth-network-posture.md) for the implemented contract and
+remaining bearer-token risks.
 
-Pinned HTTPS protects the transport; it does not decide who may call what. W3
-restricts notification streams and push-token changes to the device recorded on
-the session token, authenticates session revocation, and closes anonymous network
-access to transcription and diagnostics. It does not bind a session to an IP
-address, so roaming remains possible. See
-[the security posture](auth-network-posture.md#revocation-and-device-scoped-delivery)
-for the contract and the remaining bearer-token risks.
+## Backing up the Pond's irreplaceable state
+
+The household authority is an Ed25519 private key at
+`<data_dir>/embedded-network/authority/identity.json`. Losing it means a new household:
+there is no cloud account recovery, and every paired device must pair again. The HTTPS
+identity (`tls/identity.json`) and the WireGuard node state
+(`embedded-network/node/tailscaled.state`) must be restored *with* it, because trust is
+the combination and not any one of the three.
+
+`scripts/pond-snapshot.py` streams a tar of exactly that state to standard output:
+the three items above, `secrets/`, `secrets.json`, the schedules, and consistent copies
+of `pond_system.db` and `pond_vectors.db` taken through SQLite's online backup API so
+the Pond keeps serving. It deliberately omits `models/`, `hf_cache/`, `bin/`, `lib/` and
+the logs, which are gigabytes and all refetchable; the remainder is under a megabyte.
+
+Run it from an operator machine so the Pond needs no additional software, no elevated
+privileges and no writable scratch space, and so the archive lands somewhere the Pond's
+own disk failure cannot reach:
+
+```
+ssh <pond> 'python3 -' < scripts/pond-snapshot.py | age -R <recipients> -o pond-state.tar.age
+```
+
+Encrypting on the operator machine to an age recipient keeps the private key off the
+Pond, matching the coordinator's arrangement in `deploy/remote-access/`.
+
+One trap when verifying such an archive: the databases are produced by SQLite's backup
+API, so they carry a WAL journal-mode header but no `-wal` sidecar. They open normally,
+but an explicit read-only open (`file:...?mode=ro`) fails with `unable to open database
+file`, because SQLite cannot create the write-ahead index. That is a property of the
+verification command, not a corrupt backup; check integrity with an ordinary connection.

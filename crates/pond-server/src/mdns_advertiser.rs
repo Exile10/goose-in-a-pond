@@ -1,4 +1,8 @@
-//! Advertises `_pond._tcp.local.` so phones on the LAN find this hub without an IP.
+//! mDNS service advertisement for LAN discovery.
+//!
+//! Registers a `_pond._tcp.local.` service so phones on the same network can
+//! find this hub without manual IP entry.  The [`MdnsHandle`] keeps the
+//! background `ServiceDaemon` alive; dropping it deregisters the service.
 
 use anyhow::Result;
 use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
@@ -43,11 +47,29 @@ const TUNNEL_PREFIXES: &[&str] = &[
     "tailscale",
 ];
 
-/// Indices excluded per prefix (`utun0`..`utun15`); a busy Mac runs four or five tunnels.
+/// How many indices of each prefix to exclude, e.g. `utun0` through `utun15`.
+///
+/// macOS numbers tunnels from zero and a laptop with a VPN, Handoff and an
+/// iCloud Private Relay session runs four or five; sixteen is slack for a host
+/// that runs several at once.
 const TUNNEL_INDEX_LIMIT: usize = 16;
 
-/// Exclusion names, built rather than read from the OS: absent names are inert, a later VPN
-/// is covered, and a second `if-addrs` copy (no `link-local`) once returned none.
+/// The interface names to exclude, built rather than enumerated.
+///
+/// **This does not ask the OS what exists, and that is the point.** The first
+/// version of this enumerated live interfaces with `if-addrs` and shipped doing
+/// nothing at all, because mdns-sd depends on `if-addrs` 0.13 with the
+/// `link-local` feature while a fresh `if-addrs = "0.15"` here resolved to a
+/// second copy without it. Two versions, no feature unification, and the
+/// addresses on a tunnel are exactly the `fe80::` link-locals that the feature
+/// governs -- so the list came back empty, every unit test passed against
+/// hand-typed names, and the error kept printing.
+///
+/// `IfKind::Name` rules are matched against whatever interfaces exist each time
+/// the daemon re-applies its selections, so a rule naming an interface that is
+/// absent is simply inert. Building the name space instead of sampling it also
+/// covers the common case the enumerating version could never have handled: a
+/// VPN dialled AFTER the server started.
 fn tunnel_interface_names() -> Vec<String> {
     TUNNEL_PREFIXES
         .iter()
@@ -70,7 +92,10 @@ impl Drop for MdnsHandle {
 }
 
 /// Advertise `_pond._tcp.local.` on `port` using `hostname` as the instance label.
-pub fn advertise(hostname: &str, port: u16, version: &str) -> Result<MdnsHandle> {
+///
+/// Returns [`None`] (with a warning log) rather than propagating the error, so
+/// a missing mDNS stack never prevents the server from starting.
+pub fn advertise(hostname: &str, port: u16, version: &str, pin: &str) -> Result<MdnsHandle> {
     let daemon = ServiceDaemon::new()?;
 
     let tunnels = tunnel_interface_names();
@@ -93,6 +118,13 @@ pub fn advertise(hostname: &str, port: u16, version: &str) -> Result<MdnsHandle>
     let mut properties = std::collections::HashMap::new();
     properties.insert("v".to_string(), version.to_string());
     properties.insert("scheme".to_string(), "https".to_string());
+    // The public-key pin, so a phone on this LAN can offer it rather than asking
+    // someone to copy fifty-one characters of base64 off a screen. This is a
+    // convenience, not an authentication: mDNS is unauthenticated and anything on
+    // the network can claim it, so a client must still confirm the value against
+    // the Pond before trusting it. It is public information either way, published
+    // in the pairing QR and recoverable from any TLS handshake with this Pond.
+    properties.insert("pin".to_string(), pin.to_string());
 
     let service = ServiceInfo::new(
         service_type,
@@ -102,7 +134,10 @@ pub fn advertise(hostname: &str, port: u16, version: &str) -> Result<MdnsHandle>
         port,
         Some(properties),
     )?
-    // mdns-sd won't fill addresses for an empty host; without this phones get no resolvable IP.
+    // mdns-sd does NOT auto-populate interface addresses from an empty host —
+    // without this the service advertises with no resolvable IP and phones
+    // silently fail to connect. enable_addr_auto() makes the daemon announce
+    // (and keep updated) every reachable interface address.
     .enable_addr_auto();
 
     let full_name = service.get_fullname().to_string();
@@ -130,13 +165,18 @@ mod tests {
         assert!(names.iter().any(|n| n == "ppp0"));
     }
 
+    /// AWDL is how Apple peer-to-peer does mDNS, and llw is its low-latency
+    /// sibling. Neither has been observed failing here, and excluding them
+    /// would remove a working transport to cure noise it is not making.
     #[test]
     fn excludes_no_real_lan_interface_and_no_awdl() {
         let names = tunnel_interface_names();
         for real in [
             // macOS
             "en0", "en1", "bridge0", "awdl0", "llw0", "lo0",
-            // Linux, incl. predictable and container names; `tap`/`tun` prefix none of them.
+            // Linux, including the predictable-naming and container forms the
+            // Jetson will actually have. `tap`/`tun` are prefixes of nothing
+            // here, which is what makes them safe to list.
             "eth0", "wlan0", "enp3s0", "wlp2s0", "docker0", "virbr0", "veth1a2b", "lo",
         ] {
             assert!(
@@ -154,7 +194,19 @@ mod tests {
         );
     }
 
-    /// Run with a VPN up: `cargo test -p pond-server --bin pond-server -- --ignored`.
+    /// The test the first version of this fix did not have, and the reason it
+    /// shipped doing nothing.
+    ///
+    /// That version enumerated live interfaces through a second, feature-poorer
+    /// copy of `if-addrs` than the one mdns-sd uses, so the list came back
+    /// EMPTY on a host with four tunnels up. Every unit test passed, because
+    /// every unit test fed the predicate names typed by hand. Nothing compared
+    /// the exclusion list against the machine.
+    ///
+    /// Ignored by default because it asserts about the host: it needs a tunnel
+    /// interface up to mean anything, and it is BSD/macOS-shaped. Run with
+    /// `cargo test -p pond-server --bin pond-server -- --ignored` on a machine
+    /// with a VPN connected.
     #[test]
     #[ignore = "asserts about the host's live interfaces; needs a tunnel up"]
     fn the_exclusion_list_covers_the_tunnels_this_host_actually_has() {
