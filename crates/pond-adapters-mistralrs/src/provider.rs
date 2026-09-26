@@ -462,6 +462,9 @@ impl InferenceProvider for MistralRsProvider {
         // A server property: mistral.rs takes `tools` and returns `tool_calls` for any model.
         caps.tool_calling = true;
         caps.context_window_tokens = self.context_window();
+        // Whatever the name says: nothing on this path reads `request.images`, so a picture
+        // would be dropped while the capability told the UI and the prompt it could be seen.
+        caps.vision = false;
         caps
     }
 }
@@ -639,6 +642,16 @@ mod tests {
     fn tool_calling_is_reported_regardless_of_the_model_name() {
         let p = MistralRsProvider::new("http://127.0.0.1:9002", "some-unknown-gguf");
         assert!(p.capabilities().tool_calling);
+    }
+
+    /// Nothing on this path reads `request.images`, so no model name, however much it looks
+    /// like a vision model, may claim vision here.
+    #[test]
+    fn no_model_claims_vision_on_this_path() {
+        for model in ["gemma-4-E2B-it", "llama3.2-vision:11b", "qwen2.5-vl:7b"] {
+            let p = MistralRsProvider::new("http://127.0.0.1:9002", model);
+            assert!(!p.capabilities().vision, "{model}");
+        }
     }
 
     #[test]

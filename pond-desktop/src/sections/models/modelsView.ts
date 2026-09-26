@@ -60,7 +60,7 @@ export interface FitReading {
 /** Will this model fit this device's model budget? `unknown`, never a guess, when the budget
  *  is absent (desktop dev machines, builds without the scheduler). */
 export function fitReading(
-  m: Pick<ModelEntry, "size_mb" | "ram_estimate_mb">,
+  m: Pick<ModelEntry, "size_mb" | "ram_estimate_mb" | "reads_images" | "image_support_bytes">,
   memory: ModelMemoryStatus | null | undefined,
 ): FitReading {
   const verdict = modelFitFor(m, memory);
@@ -130,13 +130,20 @@ function thousands(n: number): string {
 
 /** Facts beside a model's name, from the structured (GGUF-header) fields; absent ones are omitted. */
 export function modelFacts(
-  m: Pick<ModelEntry, "quantization" | "context_length" | "asr_size" | "asr_language">,
+  m: Pick<
+    ModelEntry,
+    "quantization" | "context_length" | "asr_size" | "asr_language" | "reads_images"
+  >,
 ): string[] {
   const out: string[] = [];
   if (m.quantization) out.push(m.quantization);
   if (m.context_length && m.context_length > 0) out.push(`${thousands(m.context_length)} ctx`);
   if (m.asr_size) out.push(m.asr_size);
   if (m.asr_language) out.push(m.asr_language === "en" ? "English" : "Multilingual");
+  // `=== true`, never truthy: `reads_images` is device-aware and absent for
+  // anything the server has not classified, and absent must read as "no fact
+  // to show" rather than "yes".
+  if (m.reads_images === true) out.push("Reads pictures");
   return out;
 }
 

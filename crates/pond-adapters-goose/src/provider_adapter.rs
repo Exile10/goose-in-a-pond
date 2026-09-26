@@ -39,9 +39,22 @@ impl GooseProviderAdapter {
             rmcp::model::Role::Assistant => Role::Assistant,
         };
 
+        let text = msg.as_concat_text();
+        let content = if text.trim().is_empty() {
+            msg.content
+                .iter()
+                .filter_map(|c| c.as_thinking())
+                .map(|t| t.thinking.trim())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            text
+        };
+
         ChatMessage {
             role,
-            content: msg.as_concat_text(),
+            content,
             images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,

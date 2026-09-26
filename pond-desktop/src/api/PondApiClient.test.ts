@@ -11,8 +11,8 @@ function okJson(body: unknown, status = 200): Response {
   });
 }
 
-function errJson(status: number, message: string): Response {
-  return new Response(JSON.stringify({ error: message }), {
+function errJson(status: number, message: string, code?: string): Response {
+  return new Response(JSON.stringify({ error: message, ...(code ? { code } : {}) }), {
     status,
     headers: { "Content-Type": "application/json" },
   });
@@ -86,6 +86,68 @@ describe("updateSettings()", () => {
     expect(JSON.parse(init.body as string)).toMatchObject({
       assistant_name: "Puck",
     });
+  });
+});
+
+// ── models ────────────────────────────────────────────────────────────────────
+
+describe("listModels()", () => {
+  it("flattens the grouped reply, carrying reads_images and image_support_bytes through", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({
+        gguf: [
+          {
+            name: "gemma-4-E2B-it-Q4_K_M",
+            description: "Gemma 4 E2B",
+            active: true,
+            downloaded: true,
+            size_mb: 2600,
+            category: "llm",
+            reads_images: true,
+            image_support_bytes: 986_833_728,
+          },
+          {
+            name: "llama-3.2-3b",
+            description: "Llama 3.2 3B",
+            active: false,
+            downloaded: true,
+            size_mb: 1900,
+            category: "llm",
+          },
+        ],
+        llamafile: [],
+        whisper: [],
+        tts: [],
+        ollama: [],
+        embedding: [],
+      }),
+    );
+    const models = await client().listModels();
+    const vision = models.find((m) => m.name === "gemma-4-E2B-it-Q4_K_M");
+    expect(vision?.reads_images).toBe(true);
+    expect(vision?.image_support_bytes).toBe(986_833_728);
+    const textOnly = models.find((m) => m.name === "llama-3.2-3b");
+    expect(textOnly?.reads_images).toBeUndefined();
+    expect(textOnly?.image_support_bytes).toBeUndefined();
+  });
+});
+
+describe("getVisionStatus()", () => {
+  it("GETs /api/v1/models/vision-status", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({
+        model: "gemma-4-E2B-it-Q4_K_M",
+        state: { kind: "downloading", done: 412 * 1_048_576, total: 941 * 1_048_576 },
+        size_bytes: 986_833_728,
+        message: "Getting picture support ready: 412 MB of 941 MB. Text chat works meanwhile.",
+      }),
+    );
+    const status = await client().getVisionStatus();
+    expect(status.state.kind).toBe("downloading");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/vision-status",
+      expect.anything(),
+    );
   });
 });
 
@@ -196,6 +258,134 @@ describe("deleteSession()", () => {
     await client().deleteSession("s1");
     expect(fetchMock.mock.calls[0][0]).toContain("/api/v1/sessions/s1");
     expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe("DELETE");
+  });
+});
+
+// PAI-5 P6. What a live pond-server returned for one turn recorded with
+// `persist_thinking` on -- captured over real HTTP on 2026-09-24, ids shortened.
+// It goes through the REAL mapping from a raw fetch body. The replay tests in
+// `Chat.test.tsx` mock `getSessionMessages` itself, which skips the one piece
+// of code that dropped `thinking`; that is how every reloaded conversation lost
+// its reasoning while those tests stayed green.
+describe("getSessionMessages()", () => {
+  const userRow = {
+    id: "m-user",
+    session_id: "sess-1",
+    role: "user",
+    content: "what is in this picture?",
+    created_at: "2026-09-24T07:14:51+00:00",
+    liked: null,
+    images: [
+      {
+        id: "att-1",
+        mime_type: "image/png",
+        byte_size: 70,
+        url: "/api/v1/sessions/sess-1/attachments/att-1",
+      },
+    ],
+  };
+  const replyRow = {
+    id: "m-reply",
+    session_id: "sess-1",
+    role: "assistant",
+    content: "A single white pixel.",
+    created_at: "2026-09-24T07:15:42+00:00",
+    liked: null,
+    thinking: ["It is a 1x1 PNG.", "So: one pixel, white."],
+  };
+
+  it("keeps the persisted reasoning on the assistant row", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ messages: [userRow, replyRow] }));
+    const msgs = await client().getSessionMessages("sess-1");
+    // Both passages, in order: a mapping that kept only the first would pass
+    // a check on presence.
+    expect(msgs[1].thinking).toEqual([
+      "It is a 1x1 PNG.",
+      "So: one pixel, white.",
+    ]);
+  });
+
+  it("drops nothing else the server sent", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ messages: [userRow, replyRow] }));
+    const msgs = await client().getSessionMessages("sess-1");
+    // Against the wire rows themselves, so any field the mapping forgets
+    // fails here rather than in some screen that quietly shows less.
+    expect(msgs).toEqual([userRow, replyRow]);
+  });
+
+  it("keeps 'nothing was recorded' apart from 'recorded, and empty'", async () => {
+    const unrecorded = { ...replyRow, id: "m-unrecorded", thinking: undefined };
+    const empty = { ...replyRow, id: "m-empty", thinking: [] };
+    fetchMock.mockResolvedValueOnce(okJson({ messages: [unrecorded, empty] }));
+    const msgs = await client().getSessionMessages("sess-1");
+    expect(msgs[0].thinking).toBeUndefined();
+    expect(msgs[1].thinking).toEqual([]);
+  });
+});
+
+describe("getSessionAttachment()", () => {
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+  const png = () =>
+    new Response(PNG, {
+      status: 200,
+      headers: { "Content-Type": "image/png" },
+    });
+
+  afterEach(() => localStorage.clear());
+
+  it("GETs the bytes with the bearer token an <img src> cannot send", async () => {
+    fetchMock.mockResolvedValueOnce(png());
+    const blob = await new PondApiClient(
+      "http://localhost:4000",
+      "tok",
+    ).getSessionAttachment("sess 1", "att/1");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(
+      "http://localhost:4000/api/v1/sessions/sess%201/attachments/att%2F1",
+    );
+    expect(init.method).toBe("GET");
+    expect((init.headers as Record<string, string>)["Authorization"]).toBe(
+      "Bearer tok",
+    );
+    expect(new Uint8Array(await blob.arrayBuffer())).toEqual(PNG);
+  });
+
+  it("re-pairs once on a 401 and retries, like every other call", async () => {
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    localStorage.setItem("giap-session-token", "stale");
+    localStorage.setItem("giap-refresh-token", "r1");
+    localStorage.setItem("giap-token-expires-at", future);
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.includes("/handshake/refresh")) {
+        return okJson({
+          accepted: true,
+          session_token: "fresh",
+          refresh_token: "r2",
+          expires_at: future,
+        });
+      }
+      const auth = (init?.headers as Record<string, string> | undefined)?.[
+        "Authorization"
+      ];
+      return auth === "Bearer fresh"
+        ? png()
+        : errJson(401, "Invalid or expired token");
+    });
+
+    const blob = await client().getSessionAttachment("s", "a");
+    expect(new Uint8Array(await blob.arrayBuffer())).toEqual(PNG);
+  });
+
+  it("throws ApiError when the bytes are gone", async () => {
+    fetchMock.mockResolvedValueOnce(
+      errJson(404, "Attachment bytes are no longer available"),
+    );
+    const err = await client()
+      .getSessionAttachment("s", "a")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(404);
   });
 });
 
@@ -310,6 +500,28 @@ describe("ApiError", () => {
     );
     await expect(client().health()).rejects.toMatchObject({ status: 502 });
   });
+
+  it("captures a structured {error, code} body's code, for a caller to branch on", async () => {
+    fetchMock.mockResolvedValueOnce(errJson(409, "Picture support is not ready yet.", "vision_not_ready"));
+    try {
+      await client().getPrompt("missing");
+      expect.fail("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ApiError);
+      expect((e as ApiError).code).toBe("vision_not_ready");
+      expect((e as ApiError).body).toMatchObject({ code: "vision_not_ready" });
+    }
+  });
+
+  it("leaves code undefined for a plain {error} body", async () => {
+    fetchMock.mockResolvedValueOnce(errJson(500, "internal error"));
+    try {
+      await client().getPrompt("missing");
+      expect.fail("should have thrown");
+    } catch (e) {
+      expect((e as ApiError).code).toBeUndefined();
+    }
+  });
 });
 
 // ── chatStream ────────────────────────────────────────────────────────────────
@@ -353,7 +565,29 @@ describe("chatStream()", () => {
     await expect(gen.next()).rejects.toBeInstanceOf(ApiError);
   });
 
-  /** An open body holds one of four server SSE permits; `releaseLock()` alone does not close it. */
+  it("carries a refused turn's structured code — e.g. a 409 before any frame", async () => {
+    fetchMock.mockResolvedValueOnce(errJson(409, "Picture support is not ready yet.", "vision_not_ready"));
+    const gen = client().chatStream("look at this", undefined, undefined, undefined, [
+      { data: "AAA", mime_type: "image/png" },
+    ]);
+    try {
+      await gen.next();
+      expect.fail("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ApiError);
+      expect((e as ApiError).status).toBe(409);
+      expect((e as ApiError).code).toBe("vision_not_ready");
+    }
+  });
+
+  /**
+   * The server's SSE handler holds one of four `sse_semaphore` permits and an
+   * `AttachGuard` for as long as the response body is open. `releaseLock()`
+   * alone does not close it, so an abandoned turn kept both — measured against
+   * a live pond, four abandoned streams made every later send return
+   * `503 Too many concurrent streams` in under 2 ms, until the browser
+   * happened to garbage-collect the Response.
+   */
   it("cancels the body when the consumer walks away mid-stream", async () => {
     const encoder = new TextEncoder();
     let cancelled: unknown = "not cancelled";

@@ -237,7 +237,7 @@ impl ThreeStageConsolidator {
             "Memories:\n{formatted_memories}"
         ))];
         let response = provider.complete(PROPOSER_PROMPT, messages).await?;
-        let cleaned = crate::llm_memory_extractor::strip_thinking(&response.content);
+        let cleaned = crate::conversation_extractor::strip_thinking(&response.content);
         Ok(parse_proposals(&cleaned))
     }
 
@@ -257,7 +257,7 @@ impl ThreeStageConsolidator {
             "Memories:\n{formatted_memories}\n\nProposals:\n{proposals_json}"
         ))];
         let response = provider.complete(ADVERSARY_PROMPT, messages).await?;
-        let cleaned = crate::llm_memory_extractor::strip_thinking(&response.content);
+        let cleaned = crate::conversation_extractor::strip_thinking(&response.content);
         Ok(parse_challenges(&cleaned))
     }
 
@@ -278,7 +278,7 @@ impl ThreeStageConsolidator {
             "Proposals:\n{proposals_json}\n\nChallenges:\n{challenges_json}"
         ))];
         let response = provider.complete(JUDGE_PROMPT, messages).await?;
-        let cleaned = crate::llm_memory_extractor::strip_thinking(&response.content);
+        let cleaned = crate::conversation_extractor::strip_thinking(&response.content);
         Ok(parse_decisions(&cleaned))
     }
 }
@@ -371,7 +371,7 @@ fn parse_proposals(raw: &str) -> Vec<ConsolidationProposal> {
                 let segment = v
                     .get("segment")
                     .and_then(|s| s.as_str())
-                    .and_then(|s| crate::llm_memory_extractor::parse_segment_str(s))
+                    .and_then(|s| crate::llm_memory_consolidator::parse_segment_str(s))
                     .unwrap_or(pond_core::user_data::domain::memory::MemorySegment::Knowledge);
                 let importance = v
                     .get("importance")
@@ -413,7 +413,7 @@ fn parse_proposals(raw: &str) -> Vec<ConsolidationProposal> {
                 let new_segment = v
                     .get("segment")
                     .and_then(|s| s.as_str())
-                    .and_then(|s| crate::llm_memory_extractor::parse_segment_str(s))
+                    .and_then(|s| crate::llm_memory_consolidator::parse_segment_str(s))
                     .unwrap_or(pond_core::user_data::domain::memory::MemorySegment::Knowledge);
                 let new_importance = v
                     .get("importance")
@@ -448,7 +448,7 @@ fn parse_proposals(raw: &str) -> Vec<ConsolidationProposal> {
                                 let segment = entry
                                     .get("segment")
                                     .and_then(|s| s.as_str())
-                                    .and_then(|s| crate::llm_memory_extractor::parse_segment_str(s))
+                                    .and_then(|s| crate::llm_memory_consolidator::parse_segment_str(s))
                                     .unwrap_or(pond_core::user_data::domain::memory::MemorySegment::Knowledge);
                                 let importance = entry
                                     .get("importance")
@@ -691,7 +691,7 @@ mod tests {
     #[test]
     fn parse_proposals_with_thinking_tags() {
         let raw = "<think>let me think about this</think>[{\"action\":\"prune\",\"id\":\"x\",\"reason\":\"old\"}]";
-        let cleaned = crate::llm_memory_extractor::strip_thinking(raw);
+        let cleaned = crate::conversation_extractor::strip_thinking(raw);
         let proposals = parse_proposals(&cleaned);
         assert_eq!(proposals.len(), 1);
     }

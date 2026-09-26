@@ -11,6 +11,8 @@ import {
   type CompactionReport,
   type ContextIndexHealth,
   type ContextIndexRebuild,
+  type LaneRunResult,
+  type LaneStatus,
   type AccountSyncSummary,
   type ContextItem,
   type ContextSource,
@@ -49,6 +51,7 @@ import {
   type SessionMessageToolCall,
   type ProposalDecision,
   type ProposalList,
+  type SuggestionList,
   type SessionSummary,
   type MusicControlAction,
   type NowPlayingApiResponse,
@@ -226,13 +229,21 @@ export class PondApiClient {
     return h;
   }
 
-  private async request<T>(
+  /**
+   * Send one authenticated request and hand back the response unread.
+   *
+   * The half every JSON call and every bytes call share: the proactive token
+   * refresh, the timeout, one coalesced re-pair on a 401, and a non-2xx mapped
+   * to `ApiError`. Split out of `request()` so a caller that wants bytes
+   * rather than JSON inherits all four instead of copying three of them.
+   */
+  private async send(
     method: string,
     path: string,
     body?: unknown,
     timeout?: number,
     _retry = false,
-  ): Promise<T> {
+  ): Promise<Response> {
     await this.ensureTokenFresh();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout ?? 30_000);
@@ -247,21 +258,23 @@ export class PondApiClient {
       if (res.status === 401 && !_retry) {
         // Token rejected (e.g. rotated): re-pair once, coalesced, then retry.
         await this.reauthenticate();
-        return this.request<T>(method, path, body, timeout, true);
+        return this.send(method, path, body, timeout, true);
       }
       if (!res.ok) {
         let msg = res.statusText;
+        let code: string | undefined;
+        let body: unknown;
         try {
-          msg = (await res.json()).error ?? msg;
+          body = await res.json();
+          const b = body as { error?: string; code?: string };
+          msg = b.error ?? msg;
+          code = b.code;
         } catch {
           /* ignore */
         }
-        throw new ApiError(res.status, msg);
+        throw new ApiError(res.status, msg, code, body);
       }
-      const ct = res.headers.get("content-type") ?? "";
-      if (res.status === 204 || !ct.includes("json"))
-        return undefined as unknown as T;
-      return res.json() as Promise<T>;
+      return res;
     } catch (e) {
       clearTimeout(timeoutId);
       if (e instanceof DOMException && e.name === "AbortError") {
@@ -269,6 +282,20 @@ export class PondApiClient {
       }
       throw e;
     }
+  }
+
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    timeout?: number,
+  ): Promise<T> {
+    const res = await this.send(method, path, body, timeout);
+    // 204 No Content and any other empty body — return undefined cast to T
+    const ct = res.headers.get("content-type") ?? "";
+    if (res.status === 204 || !ct.includes("json"))
+      return undefined as unknown as T;
+    return res.json() as Promise<T>;
   }
 
   private get<T>(path: string): Promise<T> {
@@ -776,6 +803,39 @@ export class PondApiClient {
     return this.post<ContextIndexRebuild>("/api/v1/context/index/rebuild", {});
   }
 
+  /**
+   * Record that a composed suggestion was tapped.
+   *
+   * Only composed ones: a template suggestion is recomputed on every read and
+   * has no row to settle. Without this the queue never drains and a household
+   * reads the same composed questions forever, which is the complaint the whole
+   * surface was built from, one tier up.
+   */
+  markSuggestionTaken(id: string): Promise<{ id: string; settled: boolean }> {
+    return this.post(`/api/v1/suggestions/${encodeURIComponent(id)}/taken`, {});
+  }
+
+  // ── The inference lane ────────────────────────────────────
+
+  /** What every background job is doing and waiting for. */
+  laneStatus(): Promise<LaneStatus> {
+    return this.get<LaneStatus>("/api/v1/lane");
+  }
+
+  /**
+   * Ask one background job to take its next tick now.
+   *
+   * Wakes rather than runs: the work happens in the job's own loop under the
+   * same single slot every scheduled pass takes, so this returns as soon as the
+   * doorbell has been rung. What happened is read back from `laneStatus`.
+   */
+  runLaneJob(job: string): Promise<LaneRunResult> {
+    return this.post<LaneRunResult>(
+      `/api/v1/lane/jobs/${encodeURIComponent(job)}/run`,
+      {},
+    );
+  }
+
   // ── Time and place ────────────────────────────────────────
 
   /** Every IANA zone with today's offset. Public: the wizard needs it. */
@@ -1105,6 +1165,8 @@ export class PondApiClient {
             asr_size: item.asr_size as string | undefined,
             tts_engine: item.tts_engine as string | undefined,
             config_filename: item.config_filename as string | undefined,
+            reads_images: item.reads_images as boolean | undefined,
+            image_support_bytes: item.image_support_bytes as number | undefined,
           });
         }
       }
@@ -1137,9 +1199,19 @@ export class PondApiClient {
     return this.get("/api/v1/models/memory-status");
   }
 
+  /** What the batch memory-extraction engine is doing, and why it is not. */
+  getExtractionStatus(): Promise<import("./types").ExtractionStatus> {
+    return this.get("/api/v1/memories/extraction-status");
+  }
+
   /** Prefix warm-up status — is the pond ready for a first message yet. */
   getWarmupStatus(): Promise<import("./types").WarmupStatus> {
     return this.get("/api/v1/warmup");
+  }
+
+  /** Picture support for the active chat model — see `useVisionStatus`. */
+  getVisionStatus(): Promise<import("./types").VisionStatus> {
+    return this.get("/api/v1/models/vision-status");
   }
 
   getActiveRoles(): Promise<ModelActiveRoles> {
@@ -1189,6 +1261,19 @@ export class PondApiClient {
     );
   }
 
+  /**
+   * What the household might want to ask.
+   *
+   * `sessionId` is OPTIONAL, unlike every proposal call, and that is the point:
+   * `state.sessionId` is null on a cold launch and never persisted, so a Home
+   * screen that waited for one would show nothing on exactly the launch this
+   * fills. Passing one when it exists only sharpens the audience.
+   */
+  listSuggestions(sessionId?: string | null): Promise<SuggestionList> {
+    const q = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+    return this.get<SuggestionList>(`/api/v1/suggestions${q}`);
+  }
+
   decideProposal(
     id: string,
     sessionId: string,
@@ -1228,17 +1313,23 @@ export class PondApiClient {
           ? r
           : ((r as { messages: Array<Record<string, unknown>> }).messages ??
             []);
-        return raw.map((m): SessionMessage => ({
-          id: m.id as string,
-          session_id: m.session_id as string,
-          role: m.role as SessionMessage["role"],
-          content: (m.content as string) ?? "",
-          created_at: m.created_at as string,
-          tool_calls: m.tool_calls as SessionMessageToolCall[] | undefined,
-          tool_call_id: m.tool_call_id as string | undefined,
-          images: m.images as SessionMessage["images"],
-          liked: m.liked as boolean | null | undefined,
-        }));
+        return raw.map(
+          (m): SessionMessage =>
+            ({
+              id: m.id as string,
+              session_id: m.session_id as string,
+              role: m.role as SessionMessage["role"],
+              content: (m.content as string) ?? "",
+              created_at: m.created_at as string,
+              tool_calls: m.tool_calls as SessionMessageToolCall[] | undefined,
+              tool_call_id: m.tool_call_id as string | undefined,
+              images: m.images as SessionMessage["images"],
+              // Passed through as sent: absent stays absent and `[]` stays
+              // `[]`, the distinction the type documents.
+              thinking: m.thinking as SessionMessage["thinking"],
+              liked: m.liked as boolean | null | undefined,
+            }) satisfies Record<keyof SessionMessage, unknown>,
+        );
       },
     );
   }
@@ -1410,9 +1501,24 @@ export class PondApiClient {
     );
   }
 
-  /** Absolute URL for a persisted chat-image attachment (see SessionMessageImage.url). */
-  sessionAttachmentUrl(sessionId: string, attachmentId: string): string {
-    return `${this.base}/api/v1/sessions/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(attachmentId)}`;
+  /**
+   * The bytes of one persisted chat-image attachment (see SessionMessageImage).
+   *
+   * Fetched, never handed to `<img src>`. The route sits on the protected
+   * router and the server accepts only an `Authorization: Bearer` header, which
+   * an image element cannot send, so a bare URL answers 401 on every pond
+   * started without the loopback dev bypass. Callers show the result through
+   * an object URL they own and revoke.
+   */
+  async getSessionAttachment(
+    sessionId: string,
+    attachmentId: string,
+  ): Promise<Blob> {
+    const res = await this.send(
+      "GET",
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(attachmentId)}`,
+    );
+    return res.blob();
   }
 
   /** Runs a recipe server-side, streaming the same SSE events as `chatStream`. */
@@ -1500,12 +1606,17 @@ export class PondApiClient {
 
     if (!res.ok) {
       let msg = res.statusText;
+      let code: string | undefined;
+      let body: unknown;
       try {
-        msg = (await res.json()).error ?? msg;
+        body = await res.json();
+        const b = body as { error?: string; code?: string };
+        msg = b.error ?? msg;
+        code = b.code;
       } catch {
         /* ignore */
       }
-      throw new ApiError(res.status, msg);
+      throw new ApiError(res.status, msg, code, body);
     }
 
     const reader = res.body!.getReader();

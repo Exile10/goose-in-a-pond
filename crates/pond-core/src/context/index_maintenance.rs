@@ -8,7 +8,11 @@ use tokio_util::sync::CancellationToken;
 use crate::context::summary_indexing::{run_summary_indexing, SUMMARY_BATCH_PAUSE_MS};
 use crate::context::vector_index::{Corpus, VectorIndex};
 use crate::models::ports::embedding::EmbeddingProvider;
+use crate::user_data::ports::memory_repository::MemoryRepository;
 use crate::user_data::ports::session_storage::SessionStorage;
+use crate::user_data::services::memory_relevance::{
+    run_memory_embedding_sweep, BACKFILL_BATCH_PAUSE_MS, BACKFILL_BATCH_SIZE,
+};
 
 /// What one maintenance pass did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -19,6 +23,8 @@ pub struct MaintenanceReport {
     pub summaries_indexed: usize,
     /// Context items embedded that arrived without a vector.
     pub context_indexed: usize,
+    /// Memory fragments embedded that arrived without a vector.
+    pub memories_indexed: usize,
     /// Index rows whose source row is gone.
     pub orphans_pruned: u64,
     /// Rows still lacking a usable vector when the pass finished.
@@ -70,6 +76,7 @@ const MAX_BATCHES: usize = 500;
 pub async fn run_index_maintenance(
     index: &Arc<dyn VectorIndex>,
     storage: &dyn SessionStorage,
+    memories: &dyn MemoryRepository,
     embedder: &dyn EmbeddingProvider,
     cancel: &CancellationToken,
     budget: IndexBudget,
@@ -173,7 +180,32 @@ pub async fn run_index_maintenance(
         }
     }
 
-    // 3. Orphans, after the writes: pruning first deletes rows step 1 would re-create.
+    // 2c. Memory fragments that have no vector. The store's OWN column, not the
+    //     index's: `search_similar` reads `memories.embedding` directly, so a row
+    //     with a NULL there is unreachable semantically no matter how healthy the
+    //     index is, and step 1's adoption cannot help because there is nothing to
+    //     copy. The only other filler is `run_backfill`, spawned once at boot --
+    //     so before this step, every row consolidation minted, every row
+    //     `update_content` rewrote, and every row whose embed failed stayed
+    //     invisible until the next restart.
+    if !cancel.is_cancelled() {
+        report.memories_indexed = run_memory_embedding_sweep(
+            memories,
+            embedder,
+            BACKFILL_BATCH_SIZE,
+            BACKFILL_BATCH_PAUSE_MS,
+            cancel,
+            match budget {
+                IndexBudget::OneBatch => 1,
+                IndexBudget::UntilDone => MAX_BATCHES,
+            },
+        )
+        .await;
+    }
+
+    // 3. Orphans. Deliberately AFTER the writes: pruning first would delete rows
+    //    that step 1 is about to legitimately re-create, doing the same work
+    //    twice on every pass.
     if !cancel.is_cancelled() {
         match index.prune_orphans().await {
             Ok(n) => report.orphans_pruned = n,
@@ -204,12 +236,14 @@ pub async fn run_index_maintenance(
     if report.adopted > 0
         || report.summaries_indexed > 0
         || report.context_indexed > 0
+        || report.memories_indexed > 0
         || report.orphans_pruned > 0
     {
         tracing::info!(
             adopted = report.adopted,
             summaries = report.summaries_indexed,
             context = report.context_indexed,
+            memories = report.memories_indexed,
             orphans_pruned = report.orphans_pruned,
             "personal-context index maintenance pass complete"
         );
@@ -343,6 +377,7 @@ mod tests {
         }
     }
 
+    use crate::user_data::mocks::mock_memory::MockMemoryRepository;
     use crate::user_data::mocks::mock_session::InMemorySessionStorage;
 
     #[tokio::test]
@@ -352,6 +387,7 @@ mod tests {
         let report = run_index_maintenance(
             &index,
             &InMemorySessionStorage::new(),
+            &MockMemoryRepository::new(),
             &StubEmbedder,
             &CancellationToken::new(),
             IndexBudget::OneBatch,
@@ -383,6 +419,7 @@ mod tests {
         let report = run_index_maintenance(
             &index,
             &InMemorySessionStorage::new(),
+            &MockMemoryRepository::new(),
             &StubEmbedder,
             &CancellationToken::new(),
             IndexBudget::UntilDone,
@@ -406,6 +443,7 @@ mod tests {
         let report = run_index_maintenance(
             &index,
             &InMemorySessionStorage::new(),
+            &MockMemoryRepository::new(),
             &StubEmbedder,
             &CancellationToken::new(),
             IndexBudget::OneBatch,
@@ -459,6 +497,90 @@ mod tests {
         }
     }
 
+    /// A memory row with no vector, which NOTHING else repairs after boot.
+    ///
+    /// The startup backfill is a one-shot spawn; adoption only copies vectors
+    /// that already exist. So a fragment consolidation minted at 02:00 was
+    /// unreachable by semantic search until somebody restarted the pond.
+    #[tokio::test]
+    async fn a_pass_embeds_a_memory_row_the_startup_backfill_has_already_missed() {
+        use crate::user_data::domain::memory::{MemoryFragment, MemorySegment};
+
+        let memories = MockMemoryRepository::new();
+        memories
+            .add(MemoryFragment::from_extraction(
+                "minted-after-boot".into(),
+                None,
+                "Jerry keeps the sourdough starter in the pantry.".into(),
+                MemorySegment::Preference,
+                0.7,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(memories.search_unembedded(8).await.unwrap().len(), 1);
+
+        let spy = Arc::new(SpyIndex::default());
+        let index: Arc<dyn VectorIndex> = spy.clone();
+        let report = run_index_maintenance(
+            &index,
+            &InMemorySessionStorage::new(),
+            &memories,
+            &StubEmbedder,
+            &CancellationToken::new(),
+            IndexBudget::OneBatch,
+        )
+        .await;
+
+        assert_eq!(report.memories_indexed, 1);
+        assert!(
+            memories.search_unembedded(8).await.unwrap().is_empty(),
+            "the row is still unembedded, so semantic search still cannot see it"
+        );
+    }
+
+    /// The memory sweep obeys the same one-bite rule as the context step, or a
+    /// household with a large store hands the lane slot to the embedder.
+    #[tokio::test]
+    async fn a_scheduled_pass_takes_one_bite_of_the_memory_backlog() {
+        use crate::user_data::domain::memory::{MemoryFragment, MemorySegment};
+
+        let memories = MockMemoryRepository::new();
+        let backlog = BACKFILL_BATCH_SIZE + 5;
+        for i in 0..backlog {
+            memories
+                .add(MemoryFragment::from_extraction(
+                    format!("row-{i}"),
+                    None,
+                    format!("Jerry waters the greenhouse bed number {i}."),
+                    MemorySegment::Knowledge,
+                    0.5,
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let spy = Arc::new(SpyIndex::default());
+        let index: Arc<dyn VectorIndex> = spy.clone();
+        let report = run_index_maintenance(
+            &index,
+            &InMemorySessionStorage::new(),
+            &memories,
+            &StubEmbedder,
+            &CancellationToken::new(),
+            IndexBudget::OneBatch,
+        )
+        .await;
+
+        assert_eq!(report.memories_indexed, BACKFILL_BATCH_SIZE);
+        assert_eq!(
+            memories.search_unembedded(backlog).await.unwrap().len(),
+            backlog - BACKFILL_BATCH_SIZE,
+            "the rest must be left for the next tick, not swept in one go"
+        );
+    }
+
     /// A member's turn must be able to take the CPU back mid-pass.
     #[tokio::test]
     async fn a_cancelled_pass_does_no_work() {
@@ -469,6 +591,7 @@ mod tests {
         let report = run_index_maintenance(
             &index,
             &InMemorySessionStorage::new(),
+            &MockMemoryRepository::new(),
             &StubEmbedder,
             &cancel,
             IndexBudget::OneBatch,

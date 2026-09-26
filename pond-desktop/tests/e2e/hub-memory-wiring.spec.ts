@@ -1,6 +1,7 @@
 /** Memory sub-screen wired to listMemories/deleteMemory, with an offline fallback. */
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import { navigateTo } from "./helpers/nav";
 
 // ─── Mock data ────────────────────────────────────────────────
 
@@ -145,9 +146,11 @@ async function goToMemoryScreen(page: Page) {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/");
   await page.waitForSelector(".ghub", { timeout: 10_000 });
-  await page.getByRole("button", { name: "Settings", exact: true }).first().click();
-  await page.waitForSelector(".set", { timeout: 5_000 });
-  await page.getByRole("button", { name: /^Memory$/ }).first().click();
+  // The rail is a drawer now. The drawer calls this destination "Context" (the
+  // GuiSection name both shells share); the hub maps that section to its
+  // "memory" route, which is the same MemoryDetail screen the Settings list
+  // used to reach under the label "Memory".
+  await navigateTo(page, "Context");
   await page.waitForTimeout(600);
 }
 
