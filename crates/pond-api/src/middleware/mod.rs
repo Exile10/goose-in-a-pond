@@ -150,8 +150,12 @@ fn loopback_flag_enabled(value: Option<&str>) -> bool {
 /// Wizard writes must close with the wizard, or any LAN caller could rewrite settings later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exposure {
-    /// Public in every state: pairing, health, onboarding status and diagnostics.
+    /// Public in every state: pairing, health, onboarding status and discovery information.
     Always,
+    /// Only local compatibility callers may omit credentials.
+    HostOnly,
+    /// Authentication is required even before onboarding completes.
+    Authenticated,
     /// Public only while onboarding is incomplete. The wizard's own surface.
     UntilOnboarded,
     /// As [`Exposure::UntilOnboarded`], but still open to loopback once set up.
@@ -159,8 +163,9 @@ enum Exposure {
     UntilOnboardedThenHostOnly,
 }
 
-/// Every `(method, path, exposure)` reachable with no bearer token; `{brace}` is one segment.
-/// Must match the public router in `routes::api_routes` (`public_router_and_allowlist_agree`).
+/// Every pre-onboarding `(method, path, exposure)`; `{brace}` is one segment, and each entry says
+/// when it stops being public. Must match the public router in `routes::api_routes`
+/// (`public_router_and_allowlist_agree`).
 const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::GET, "/health", Exposure::Always),
     // Pairing precedes any token; the pairing-code routes are loopback-gated in their handlers.
@@ -168,7 +173,7 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::POST, "/handshake/init", Exposure::Always),
     (Method::POST, "/handshake/verify", Exposure::Always),
     (Method::POST, "/handshake/refresh", Exposure::Always),
-    (Method::POST, "/handshake/revoke", Exposure::Always),
+    (Method::POST, "/handshake/revoke", Exposure::Authenticated),
     (Method::GET, "/handshake/pairing-code", Exposure::Always),
     (Method::POST, "/handshake/pairing-code", Exposure::Always),
     // Onboarding: runs before any device pairs, and must not afterwards.
@@ -195,19 +200,19 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::PUT, "/settings", Exposure::UntilOnboarded),
     // Warm-up banner during the wizard; afterwards `PondApiClient.get` sends the bearer token.
     (Method::GET, "/warmup", Exposure::UntilOnboarded),
-    // Local Piper, no user data. `Always` because `playTtsSentence` (WebVoiceBackend.ts) and
-    // `fetch_tts_bytes` (audio_cmd.rs) call it tokenless after setup; closing it mutes the pond.
-    (Method::POST, "/tts", Exposure::Always),
+    // Local Piper, no user data. `playTtsSentence` (WebVoiceBackend.ts) and `fetch_tts_bytes`
+    // (audio_cmd.rs) call it tokenless after setup; HostOnly keeps those loopback callers and
+    // makes remote peers authenticate.
+    (Method::POST, "/tts", Exposure::HostOnly),
     // Wizard voice setup; afterwards PondApiClient.ts sends the token (verified, unlike /tts).
     (Method::POST, "/voice/tts/apply", Exposure::UntilOnboarded),
     (Method::POST, "/voice/calibrate", Exposure::UntilOnboarded),
     (Method::DELETE, "/voice/calibrate", Exposure::UntilOnboarded),
-    // Diagnostics, not wizard needs. Whether they should be unauthenticated at all is still open.
-    (Method::POST, "/transcribe", Exposure::Always),
+    // Discovery needs system info before pairing. The test routes are local-only; transcription
+    // and agent diagnostics are in the protected router.
     (Method::GET, "/system/info", Exposure::Always),
-    (Method::GET, "/test", Exposure::Always),
-    (Method::POST, "/test/speak", Exposure::Always),
-    (Method::GET, "/dev/goose", Exposure::Always),
+    (Method::GET, "/test", Exposure::HostOnly),
+    (Method::POST, "/test/speak", Exposure::HostOnly),
     // Onboarding creates/patches; GET /profiles and DELETE /profiles/{id} are deliberately absent.
     (Method::POST, "/profiles", Exposure::UntilOnboarded),
     (Method::PATCH, "/profiles/{id}", Exposure::UntilOnboarded),
@@ -241,10 +246,10 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 
 /// This request's exposure class, or `None` when the route is not on the allowlist.
 fn route_exposure(method: &Method, path: &str) -> Option<Exposure> {
-    // Non-API paths are dashboard static assets (`serve_web` only reads files).
-    // Returns before any DB access: every asset request passes through here.
+    // Non-API paths are dashboard assets and dev pages, local compatibility surfaces.
+    // A forwarding header cannot grant the actual peer this exemption.
     if !path.starts_with("/api/") {
-        return Some(Exposure::Always);
+        return Some(Exposure::HostOnly);
     }
 
     let path = path.strip_prefix("/api/v1").unwrap_or(path);
@@ -260,6 +265,8 @@ fn route_exposure(method: &Method, path: &str) -> Option<Exposure> {
 fn public_without_token(exposure: Exposure, onboarded: bool, peer_is_loopback: bool) -> bool {
     match exposure {
         Exposure::Always => true,
+        Exposure::HostOnly => peer_is_loopback,
+        Exposure::Authenticated => false,
         Exposure::UntilOnboarded => !onboarded,
         Exposure::UntilOnboardedThenHostOnly => !onboarded || peer_is_loopback,
     }
@@ -269,7 +276,7 @@ fn public_without_token(exposure: Exposure, onboarded: bool, peer_is_loopback: b
 /// Test-only: answering live requests from the worst case would reopen every hole.
 #[cfg(test)]
 fn reachable_without_token_in_some_state(method: &Method, path: &str) -> bool {
-    route_exposure(method, path).is_some()
+    route_exposure(method, path).is_some_and(|e| e != Exposure::Authenticated)
 }
 
 /// Whether the pond is set up, read live: a cache would make reset a one-way door.
@@ -318,7 +325,8 @@ pub async fn log_requests(req: Request, next: Next) -> Response {
     response
 }
 
-/// Global bearer-token authentication; `PUBLIC_ROUTES` entries bypass it per their exposure.
+/// Global bearer-token authentication. `PUBLIC_ROUTES` entries bypass it only when their exposure
+/// admits the actual peer and the current onboarding state.
 pub async fn auth_middleware(
     State(state): State<Arc<crate::AppState>>,
     headers: axum::http::HeaderMap,
@@ -335,8 +343,11 @@ pub async fn auth_middleware(
         .unwrap_or(false);
 
     if let Some(exposure) = route_exposure(req.method(), path.path()) {
-        // `Always` (every static asset, /health) must never cost a database read.
-        let onboarded = exposure != Exposure::Always && pond_is_onboarded(state.as_ref()).await;
+        // Only onboarding-dependent classes cost a database read.
+        let onboarded = matches!(
+            exposure,
+            Exposure::UntilOnboarded | Exposure::UntilOnboardedThenHostOnly
+        ) && pond_is_onboarded(state.as_ref()).await;
         if public_without_token(exposure, onboarded, peer_is_loopback) {
             let mut req = req;
             // `onboarded` here only for host recovery: the one privileged anonymous caller.
@@ -519,17 +530,10 @@ mod tests {
             (Method::POST, "/api/v1/handshake/init"),
             (Method::POST, "/api/v1/handshake/verify"),
             (Method::POST, "/api/v1/handshake/refresh"),
-            (Method::POST, "/api/v1/handshake/revoke"),
             (Method::GET, "/api/v1/handshake/pairing-code"),
             (Method::GET, "/api/v1/onboard/status"),
-            (Method::POST, "/api/v1/transcribe"),
-            // Voice callers hit /tts tokenless after setup; closing it mutes a set-up pond.
-            (Method::POST, "/api/v1/tts"),
             (Method::GET, "/api/v1/oauth/callback"),
             (Method::POST, "/api/v1/oauth/refresh"),
-            (Method::GET, "/"),
-            (Method::GET, "/index.html"),
-            (Method::GET, "/assets/main.js"),
         ] {
             assert!(
                 answers_without_token(&method, path, ONBOARDED, FROM_THE_LAN),
@@ -540,6 +544,9 @@ mod tests {
 
         // Refused in the WIDEST state (mid-onboarding, on the host) means refused everywhere.
         for (method, path) in [
+            (Method::POST, "/api/v1/handshake/revoke"),
+            (Method::POST, "/api/v1/transcribe"),
+            (Method::GET, "/api/v1/dev/goose"),
             (Method::POST, "/api/v1/oauth/authorize"),
             (Method::POST, "/api/v1/chat"),
             (Method::GET, "/api/v1/devices"),
@@ -699,9 +706,11 @@ mod tests {
 
         let expected = vec![
             "DELETE /voice/calibrate = UntilOnboarded".to_string(),
+            "GET /test = HostOnly".to_string(),
             // Nothing secret (phase, model name, timestamps); the boot warm-up precedes any token.
             "GET /warmup = UntilOnboarded".to_string(),
             "PATCH /profiles/{id} = UntilOnboarded".to_string(),
+            "POST /handshake/revoke = Authenticated".to_string(),
             // One outbound geocoding call for a place NAME; no household data leaves. Wizard-only.
             "POST /location/detect = UntilOnboarded".to_string(),
             "POST /onboard = UntilOnboarded".to_string(),
@@ -709,6 +718,8 @@ mod tests {
             "POST /onboard/reset = UntilOnboardedThenHostOnly".to_string(),
             "POST /onboard/step/{name} = UntilOnboarded".to_string(),
             "POST /profiles = UntilOnboarded".to_string(),
+            "POST /test/speak = HostOnly".to_string(),
+            "POST /tts = HostOnly".to_string(),
             "POST /voice/calibrate = UntilOnboarded".to_string(),
             // The wizard's voice step runs before any token exists; it closes after onboarding.
             "POST /voice/tts/apply = UntilOnboarded".to_string(),
