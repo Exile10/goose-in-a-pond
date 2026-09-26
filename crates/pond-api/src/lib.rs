@@ -2,6 +2,7 @@
 
 pub mod cleanup;
 pub mod middleware;
+pub mod network;
 pub mod oauth_callback;
 pub mod routes;
 pub mod runs;
@@ -410,6 +411,15 @@ pub fn web_ui_embedded() -> bool {
 
 /// Build the full API router: web dashboard at `/{route}`, REST API under `/api/v1/`.
 pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
+    build_transport_router(state, Some(static_dir))
+}
+
+/// Companion listener: the same API guards, without desktop assets or root dev pages.
+pub fn build_companion_router(state: Arc<AppState>) -> Router {
+    build_transport_router(state, None)
+}
+
+fn build_transport_router(state: Arc<AppState>, static_dir: Option<std::path::PathBuf>) -> Router {
     // Remote clients only: loopback (the local dashboard) is exempt in the middleware.
     let rate_limiter = Arc::new(middleware::RateLimiter::new(
         600,
@@ -422,13 +432,15 @@ pub fn build_router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Rou
         std::time::Duration::from_secs(60),
     ));
 
-    Router::new()
-        // Dev test page — no auth required, returns HTML
-        .route("/dev/test", axum::routing::get(routes::dev_test_page))
-        .route("/dev/face", axum::routing::get(routes::dev_face_page))
-        .nest("/api/v1", routes::api_routes(state.clone()))
-        // Web UI: embedded when built in, else from `static_dir` (dev).
-        .fallback(move |uri: axum::http::Uri| routes::serve_web(uri, static_dir.clone()))
+    let mut router = Router::new().nest("/api/v1", routes::api_routes(state.clone()));
+    // Dev pages and the web UI (embedded when built in, else `static_dir`) are local-listener only.
+    if let Some(static_dir) = static_dir {
+        router = router
+            .route("/dev/test", axum::routing::get(routes::dev_test_page))
+            .route("/dev/face", axum::routing::get(routes::dev_face_page))
+            .fallback(move |uri: axum::http::Uri| routes::serve_web(uri, static_dir.clone()));
+    }
+    router
         .layer(axum::middleware::from_fn(middleware::log_requests))
         // Must come after log_requests: axum applies layers in reverse order.
         .layer(axum::middleware::from_fn_with_state(

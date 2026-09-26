@@ -34,8 +34,13 @@ use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 /// `veth*`, `docker*` and `virbr*`.
 const TUNNEL_PREFIXES: &[&str] = &[
     // macOS / BSD
-    "utun", "ipsec", "ppp", // Linux: OpenVPN and IPIP, WireGuard, bridged tap
-    "tun", "wg", "tap",
+    "utun",
+    "ipsec",
+    "ppp", // Linux: OpenVPN and IPIP, WireGuard, bridged tap
+    "tun",
+    "wg",
+    "tap",
+    "tailscale",
 ];
 
 /// Indices excluded per prefix (`utun0`..`utun15`); a busy Mac runs four or five tunnels.
@@ -87,6 +92,7 @@ pub fn advertise(hostname: &str, port: u16, version: &str) -> Result<MdnsHandle>
 
     let mut properties = std::collections::HashMap::new();
     properties.insert("v".to_string(), version.to_string());
+    properties.insert("scheme".to_string(), "https".to_string());
 
     let service = ServiceInfo::new(
         service_type,

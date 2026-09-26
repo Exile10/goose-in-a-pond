@@ -1,18 +1,32 @@
-# Authentication and network exposure
+# Authentication and network security posture
 
 How `pond-server` authenticates clients and what it exposes on the network.
 Covers issues #4, #8, #93, #94.
 
-## Bind & exposure
+## Trust boundary and transport
 
-`pond-server` binds `0.0.0.0:<API_SERVER>` (default 4000), so it is reachable
-from the **local network**, not just loopback. Everything below assumes that
-LAN reachability. W3 restricts unauthenticated diagnostics and device-scoped
-notification delivery; it does not encrypt this listener. Do not expose a
-plaintext listener through a tailnet or the internet. The separate pinned-HTTPS
-work in [PR #375](https://github.com/jarida-io/goose-in-a-pond/pull/375) supplies
-loopback-only HTTP and an API-only HTTPS listener. These authorization checks
-apply independently of transport.
+There are three zones: loopback, directly attached LAN, and tailnet. The local
+HTTP listener binds `127.0.0.1` (normally 4000); its dashboard, root development
+pages, desktop integration, and OAuth callbacks are local. The companion API
+listener uses HTTPS (normally 4443) on IPv4 network interfaces. Both share the
+same authentication and rate-limit middleware. Each port has ten consecutive
+fallback choices; `.runtime_api_port` and `.runtime_https_port` record the actual
+ports. Implementation: `pond-server/src/main.rs::run_server`, `ports.rs`, and
+`pond-api/src/lib.rs::build_transport_router`.
+
+TLS terminates on the Pond with a persisted ECDSA P-256 key. The native companion pins the
+public key delivered through the local v2 pairing QR and still checks certificate
+validity and hostname SANs. Annual certificate renewal retains the key; replacing
+the key requires local re-pairing. WireGuard protects remote transport underneath
+HTTPS. Headscale node certificate issuance is not required. See
+[remote access](remote-access.md) for deployment and certificate recovery.
+
+Do not publish the listener on the public internet. An untrusted tailnet node
+can reach public API routes; encrypting transport does not authenticate its user.
+What those routes are, and who may call them, is the W3 authorization work under
+[Authentication](#authentication): device-scoped notification delivery,
+authenticated revocation, and diagnostics closed to network peers. Non-API pages
+are absent from the companion router.
 
 ## Authentication
 
@@ -76,7 +90,7 @@ from those events. The API error code is stable for client localization.
 
 ## Pairing (how a client gets a token)
 
-Two-phase, HMAC-based — the 6-digit pairing code is **never sent over the wire**:
+The Android and iOS clients use two-phase HMAC pairing; they do not transmit the six-digit code directly:
 
 1. Operator reads the pairing code printed on server startup (or `GET
    /api/v1/handshake/pairing-code`, loopback-only).
@@ -85,8 +99,15 @@ Two-phase, HMAC-based — the 6-digit pairing code is **never sent over the wire
    `POST /handshake/verify {challenge_id, mac}` → `{session_token, refresh_token,
    expires_at}`.
 
-Codes are single-use and expire in 10 min; a challenge expires in 60 s. Only
-sha256 hashes of codes/tokens are persisted.
+Legacy handshake, initialization, and verification require loopback or a peer
+within an active directly attached LAN interface's netmask. Tunnel interfaces,
+point-to-point links, and tailnet allocations are excluded. Missing connection
+metadata or failed interface classification is denied. Forwarding headers are
+ignored. The rejection is HTTP 403 with `pairing_requires_lan`, including remote
+completion of a challenge initialized locally. Refresh is still remotely usable.
+See `pond-api/src/network.rs` and the handshake handlers in `routes.rs`.
+
+Codes are single-use and expire in 10 min; a challenge expires in 60 s. The adapter hashes codes and tokens for validation; consult `sqlite_handshake.rs` for the storage contract.
 
 **There is no failed-attempt lockout, and its absence is deliberate.** A bad MAC
 burns the *challenge*, not the code: `verify_handshake` consumes the challenge
@@ -94,7 +115,7 @@ before it checks the MAC (`sqlite_handshake.rs:355-371`) and returns
 `invalid_mac` with the pairing code untouched (`:414-419`), which is consumed
 only on success (`:435-439`). The `pairing_codes` table has no attempt counter,
 and `bad_mac_attempts_do_not_lock_out_pairing_code` (`:955`) asserts a
-legitimate pairing still succeeds after ten bad guesses. A lockout would hand
+legitimate pairing still succeeds after ten bad guesses. Pairing is now limited to direct LAN peers. A lockout would still hand
 any guest on the wifi a denial of service against the operator's own pairing.
 
 ### Token contract
@@ -175,3 +196,21 @@ model named above: a wifi guest cannot spoof a source address through a TCP
 handshake, but can hold several without effort — a second DHCP lease, a static
 address in the subnet, or IPv6 privacy addresses, which rotate on their own. On a
 typical /24 the worst case is nearer 2.5% of the key space than 0.01%.
+
+## Residual risks and deferred authorization work
+
+A stolen bearer token is usable until expiry or revocation; session validation
+is not proof of possession of a device key. Refresh remains possession-based
+with a 30-day window. A compromised tailnet member can reach the API's existing
+public allowlist: pairing, health, discovery information, and the onboarding
+routes until onboarding completes. W3 answers the development and test routes on
+loopback only, and moved transcription and agent diagnostics behind
+authentication. Rate limiting and transport encryption do not remove the
+remaining bearer-token risks above.
+
+Native Android and iOS implement public-key pinning in this milestone. Browser
+pinning is not implemented. iOS simulator transport verification passes; physical
+iPhone roaming remains deferred until a device is available. Source-masking proxies/subnet routers cannot be
+used to establish that a pairing peer is local. A compromised Pond OS or phone
+can expose private keys or credentials; pinning cannot protect either endpoint
+from its own compromise.

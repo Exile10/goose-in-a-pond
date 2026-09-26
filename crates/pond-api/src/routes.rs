@@ -469,8 +469,13 @@ async fn health() -> Json<Value> {
 /// TODO: full GIAP ↔ GOTG handshake (verify client, exchange token, return connection details).
 async fn handshake_handler(
     State(state): State<Arc<AppState>>,
+    peer: Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        axum::extract::rejection::ExtensionRejection,
+    >,
     body: Result<Json<HandshakeRequest>, JsonRejection>,
 ) -> Result<Json<HandshakeResponse>, (axum::http::StatusCode, Json<Value>)> {
+    crate::network::require_lan(peer.ok())?;
     let Json(request) = body.map_err(|e| {
         (
             axum::http::StatusCode::BAD_REQUEST,
@@ -514,8 +519,13 @@ fn bad_body() -> (StatusCode, Json<Value>) {
 /// Phase 1 of pairing: client requests a challenge (public).
 async fn handshake_init(
     State(state): State<Arc<AppState>>,
+    peer: Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        axum::extract::rejection::ExtensionRejection,
+    >,
     body: Result<Json<InitRequest>, JsonRejection>,
 ) -> Result<Json<ChallengeResponse>, (StatusCode, Json<Value>)> {
+    crate::network::require_lan(peer.ok())?;
     let Json(request) = body.map_err(|_| bad_body())?;
     let resp = state
         .handshake
@@ -626,9 +636,15 @@ async fn emit_pairing_outcome(
 /// Phase 2 of pairing: client proves the pairing code via MAC (public).
 async fn handshake_verify(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    peer: Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        axum::extract::rejection::ExtensionRejection,
+    >,
     body: Result<Json<VerifyRequest>, JsonRejection>,
 ) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
+    let peer = peer.ok();
+    crate::network::require_lan(peer)?;
+    let peer = peer.expect("LAN guard requires a connection address").0;
     // Per source IP, loopback included.
     if let Err(remaining) = verify_limiter()
         .check_rate_limit_detailed(&peer.ip().to_string())
@@ -3316,7 +3332,11 @@ fn tailnet_address() -> Option<String> {
     is_tailnet_v4(v4).then(|| v4.to_string())
 }
 
-async fn system_info(State(state): State<Arc<AppState>>) -> Json<Value> {
+async fn system_info(
+    State(state): State<Arc<AppState>>,
+    transport: Option<axum::Extension<crate::network::CompanionTransport>>,
+) -> Json<Value> {
+    let (https_port, tls_spki_sha256) = crate::network::transport_fields(transport);
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
@@ -3331,6 +3351,8 @@ async fn system_info(State(state): State<Arc<AppState>>) -> Json<Value> {
         "lan_address": lan_address(),
         // Null off a tailnet; the phone's fallback when the LAN address doesn't answer.
         "tailnet_address": tailnet_address(),
+        "https_port": https_port,
+        "tls_spki_sha256": tls_spki_sha256,
         "port": state.api_port,
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
