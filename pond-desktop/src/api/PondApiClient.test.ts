@@ -866,6 +866,46 @@ describe("per-instance client id", () => {
   });
 });
 
+// Pairing registers the desktop as a device row; `is_online` ages out after five minutes of no beat.
+describe("heartbeatSelf()", () => {
+  const future = new Date(Date.now() + 3_600_000).toISOString();
+
+  afterEach(() => localStorage.clear());
+
+  it("beats the same device row that pairing registered", async () => {
+    localStorage.clear();
+    let sentClientId: string | undefined;
+    const posted: string[] = [];
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.includes("/handshake/pairing-code"))
+        return okJson({ code: "123456", expires_at: future });
+      if (url.includes("/handshake/init")) {
+        sentClientId = JSON.parse(String(init?.body)).client_id;
+        return okJson({ challenge: "ch", challenge_id: "cid" });
+      }
+      if (url.includes("/handshake/verify"))
+        return okJson({
+          accepted: true,
+          session_token: "t",
+          refresh_token: "r",
+          expires_at: future,
+        });
+      if (url.includes("/heartbeat")) posted.push(url);
+      return okJson({});
+    });
+
+    const api = client();
+    await api.pair();
+    await api.heartbeatSelf();
+
+    // A beat against any other row refreshes nothing.
+    expect(sentClientId).toBeTruthy();
+    expect(posted).toEqual([
+      `http://localhost:4000/api/v1/devices/${sentClientId}/heartbeat`,
+    ]);
+  });
+});
+
 // One call redirects the singleton, so the shell can fix a fallback port without a reload.
 describe("setBase", () => {
   it("follows the shell's server URL for requests it has not sent yet", async () => {
