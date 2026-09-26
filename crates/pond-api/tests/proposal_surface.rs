@@ -93,6 +93,9 @@ async fn make_app() -> Harness {
 
     let state = Arc::new(AppState {
         warmup: Default::default(),
+        suggestion_queue: std::sync::Arc::new(
+            pond_infra::sqlite_suggestion_queue::SqliteSuggestionQueue::new(db.system.clone()),
+        ),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(hs),
@@ -113,6 +116,7 @@ async fn make_app() -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        lane: None,
         account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
@@ -143,8 +147,7 @@ async fn make_app() -> Harness {
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
-        memory_extractor: None,
-        memory_extraction_service: None,
+        extraction_status: None,
         last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
         consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
         consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
@@ -408,7 +411,41 @@ async fn a_guest_receives_nothing_and_is_told_why() {
 
 /// `Household` is the broadcast, so it cannot hold a proposal even on a one-member pond.
 #[tokio::test]
-async fn an_unidentified_session_on_a_one_member_pond_is_still_refused() {
+async fn an_unidentified_session_on_a_multi_member_pond_is_still_refused() {
+    let h = make_app().await;
+    let liz = member(&h, "Liz").await;
+    let _jerry = member(&h, "Jerry").await;
+    save_proposal(&h, "p-liz-1", &liz, Duration::hours(2)).await;
+
+    let session = unidentified_session(&h, "s-anon").await;
+    let (status, body) = get_json(&h.app, &format!("/api/v1/proposals?session_id={session}")).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "with two members, answering would address Liz's proposal to whoever is holding \
+         the screen. Body: {body}"
+    );
+
+    // Vacuity control: the same proposal is visible once the session names its member.
+    let bound = session_of(&h, "s-liz", &liz).await;
+    let (status, body) = get_json(&h.app, &format!("/api/v1/proposals?session_id={bound}")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(ids(&body), vec!["p-liz-1".to_string()], "body: {body}");
+}
+
+/// A household of one has exactly one possible answer, so stop asking.
+///
+/// The measured consequence of the old behaviour: on a pond with
+/// `proactive_review_enabled` switched on, `drafts where origin='proactive'`
+/// was 0 and the Home column had never rendered a row -- because the surface
+/// that would have shown them answered 403 to the only caller there was.
+///
+/// Note the scope this asserts on is `Owner`, not `Household`: the fallthrough
+/// RESOLVES the member rather than widening the audience, so nothing downstream
+/// ever sees a broadcast and invariant 4 is untouched.
+#[tokio::test]
+async fn an_unidentified_session_on_a_one_member_pond_gets_that_members_proposals() {
     let h = make_app().await;
     let liz = member(&h, "Liz").await;
     save_proposal(&h, "p-liz-1", &liz, Duration::hours(2)).await;
@@ -418,22 +455,15 @@ async fn an_unidentified_session_on_a_one_member_pond_is_still_refused() {
 
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "a Household scope IS the broadcast, and invariant 4 forbids one. Body: {body}"
+        StatusCode::OK,
+        "a one-member pond has nobody else the proposal could belong to. Body: {body}"
     );
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("whole household"),
-        "the refusal must name the broadcast it refused; body: {body}"
-    );
-
-    // Vacuity control: the same proposal is visible once the session names its member.
-    let bound = session_of(&h, "s-liz", &liz).await;
-    let (status, body) = get_json(&h.app, &format!("/api/v1/proposals?session_id={bound}")).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(ids(&body), vec!["p-liz-1".to_string()], "body: {body}");
+    assert_eq!(
+        body["profile_id"].as_str(),
+        Some(liz.as_str()),
+        "the response must name the member it resolved, not the household; body: {body}"
+    );
 }
 
 #[tokio::test]

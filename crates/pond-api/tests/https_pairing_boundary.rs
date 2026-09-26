@@ -101,8 +101,11 @@ async fn make_app() -> Harness {
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
-        memory_extractor: None,
-        memory_extraction_service: None,
+        lane: None,
+        extraction_status: None,
+        suggestion_queue: Arc::new(
+            pond_infra::sqlite_suggestion_queue::SqliteSuggestionQueue::new(pool.clone()),
+        ),
         last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
         consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
         consolidation_event_tx: tokio::sync::broadcast::channel(16).0,

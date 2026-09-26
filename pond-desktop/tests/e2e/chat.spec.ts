@@ -1,6 +1,7 @@
 /** Chat section E2E against mocked API routes; the stream mock is overridden per test. */
 import { test, expect } from "@playwright/test";
 import { mockAllApiRoutes, mockSseStream } from "./helpers/api-mocks";
+import { navigateTo } from "./helpers/nav";
 
 // ── Helper: build a mock SSE body ─────────────────────────────────────────────
 
@@ -38,11 +39,8 @@ function sseStream(
 
 async function goToChat(page: Parameters<typeof mockAllApiRoutes>[0]) {
   await page.goto("/");
-  const chatBtn = page
-    .getByRole("button", { name: /chat/i })
-    .or(page.locator('[title="Chat"]'))
-    .first();
-  await chatBtn.click({ timeout: 10_000 });
+  // Chat lives behind the drawer's "Pond" group now, not on the page.
+  await navigateTo(page, "Chat");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -237,10 +235,6 @@ test.describe("Chat section — a turn survives leaving the section", () => {
     await mockAllApiRoutes(page);
   });
 
-  async function goToSection(page: Parameters<typeof mockAllApiRoutes>[0], name: RegExp) {
-    await page.getByRole("button", { name }).or(page.locator(`[title="${name.source}"]`)).first().click();
-  }
-
   test("the answer that lands while you are on another section is there when you return", async ({ page }) => {
     // Held open until released, so "still answering" is a real state, not a race.
     let release: () => void = () => {};
@@ -260,14 +254,14 @@ test.describe("Chat section — a turn survives leaving the section", () => {
     await textarea.press("Meta+Enter");
 
     // Leave while it is still working.
-    await goToSection(page, /devices/i);
+    await navigateTo(page, "Devices");
     await expect(page.locator("textarea")).toHaveCount(0);
 
     // It finishes with nothing mounted to receive it.
     release();
     await page.waitForTimeout(500);
 
-    await goToSection(page, /chat/i);
+    await navigateTo(page, "Chat");
     // The thread, not the wall, and the answer is in it.
     await expect(page.getByText("Geese fly in a V to save energy.")).toBeVisible({
       timeout: 10_000,
@@ -292,8 +286,8 @@ test.describe("Chat section — a turn survives leaving the section", () => {
     await textarea.press("Meta+Enter");
     await expect(page.getByText("take your time")).toBeVisible();
 
-    await goToSection(page, /devices/i);
-    await goToSection(page, /chat/i);
+    await navigateTo(page, "Devices");
+    await navigateTo(page, "Chat");
 
     // Back in the thread, question showing, composer still in queue mode.
     await expect(page.getByText("take your time")).toBeVisible({ timeout: 10_000 });

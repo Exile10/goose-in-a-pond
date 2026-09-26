@@ -128,19 +128,26 @@ fn position(body: &str, needle: &str, handler: &str) -> usize {
 
 /// The plain `persist_assistant_turn` silently skips memory extraction.
 #[test]
-fn both_stream_handlers_extract_memory_from_the_turn() {
+fn neither_stream_handler_extracts_inline() {
     for handler in [CHAT, AGENT] {
         let body = handler_body(handler);
         assert!(
-            body.contains("persist_assistant_turn_with_extraction"),
-            "{handler} persists its turn without extracting from it, so a conversation held \
-             there contributes nothing to memory"
+            body.contains("persist_assistant_turn("),
+            "{handler} no longer persists its turn at all, so the batch walk has nothing \
+             to read and the conversation is lost to memory entirely"
         );
-        assert!(
-            body.contains("with_memory_extraction"),
-            "{handler} never wires the extractor onto its ChatService, so \
-             persist_assistant_turn_with_extraction has nothing to spawn"
-        );
+        for gone in [
+            "persist_assistant_turn_with_extraction",
+            "with_memory_extraction",
+            "memory_extraction_service",
+        ] {
+            assert!(
+                !body.contains(gone),
+                "{handler} still reaches for `{gone}`: the per-turn extraction path was \
+                 removed, and a handler that extracts inline writes memories the batch \
+                 engine will then offer again"
+            );
+        }
     }
 }
 
@@ -310,7 +317,7 @@ fn neither_handler_scopes_its_service_from_a_literal() {
 #[test]
 fn chat_stream_persists_the_turn_before_it_closes_the_stream() {
     let body = handler_body(CHAT);
-    let persisted = position(body, "persist_assistant_turn_with_extraction", CHAT);
+    let persisted = position(body, ".persist_assistant_turn(", CHAT);
     let done = position(body, "\"done\": true", CHAT);
 
     assert!(
@@ -389,6 +396,9 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
 
     let state = Arc::new(AppState {
         warmup: Default::default(),
+        suggestion_queue: std::sync::Arc::new(
+            pond_infra::sqlite_suggestion_queue::SqliteSuggestionQueue::new(db.system.clone()),
+        ),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -409,6 +419,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        lane: None,
         account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
@@ -445,8 +456,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
-        memory_extractor: None,
-        memory_extraction_service: None,
+        extraction_status: None,
         last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
         consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
         consolidation_event_tx: tokio::sync::broadcast::channel(16).0,

@@ -17,7 +17,9 @@ use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
 use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+use pond_core::user_data::ports::lane_control::{LaneControl, WakeOutcome};
 use pond_core::user_data::ports::session_storage::SessionStorage;
+use pond_core::user_data::services::inference_lane::LaneJob;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::onboarding::SqlxOnboardingRepository;
@@ -58,8 +60,58 @@ impl LlmProvider for StubProvider {
     }
 }
 
+/// A lane that records what it was asked to wake, and answers how it was told.
+///
+/// `snapshot` is unreachable from this route and panics rather than returning a
+/// plausible empty one: a snapshot nobody asked for would be a silent way for a
+/// future handler to read state this stub never had.
+struct StubLane {
+    woken: Arc<std::sync::Mutex<Vec<LaneJob>>>,
+    outcome: WakeOutcome,
+}
+
+#[async_trait::async_trait]
+impl LaneControl for StubLane {
+    async fn snapshot(&self) -> pond_core::user_data::ports::lane_control::LaneSnapshot {
+        unreachable!("the retitle route does not read the lane's state")
+    }
+    async fn wake(&self, job: LaneJob) -> WakeOutcome {
+        self.woken.lock().unwrap().push(job);
+        self.outcome
+    }
+}
+
 async fn make_app(
     provider: Option<Arc<dyn LlmProvider>>,
+) -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempDir) {
+    let (app, storage, tmp, _) = make_app_with_lane(provider, None).await;
+    (app, storage, tmp)
+}
+
+/// The same app, with a lane whose wakes the caller can read back.
+async fn make_app_with_lane(
+    provider: Option<Arc<dyn LlmProvider>>,
+    outcome: Option<WakeOutcome>,
+) -> (
+    axum::Router,
+    Arc<SqliteSessionStorage>,
+    tempfile::TempDir,
+    Arc<std::sync::Mutex<Vec<LaneJob>>>,
+) {
+    let woken = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let lane: Option<Arc<dyn LaneControl>> = outcome.map(|outcome| {
+        Arc::new(StubLane {
+            woken: woken.clone(),
+            outcome,
+        }) as Arc<dyn LaneControl>
+    });
+    let (app, storage, tmp) = build_app(provider, lane).await;
+    (app, storage, tmp, woken)
+}
+
+async fn build_app(
+    provider: Option<Arc<dyn LlmProvider>>,
+    lane: Option<Arc<dyn LaneControl>>,
 ) -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
@@ -73,6 +125,9 @@ async fn make_app(
 
     let state = Arc::new(AppState {
         warmup: Default::default(),
+        suggestion_queue: std::sync::Arc::new(
+            pond_infra::sqlite_suggestion_queue::SqliteSuggestionQueue::new(db.system.clone()),
+        ),
         db,
         onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
         handshake: Arc::new(mock_hs),
@@ -93,6 +148,7 @@ async fn make_app(
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        lane,
         account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
@@ -129,8 +185,7 @@ async fn make_app(
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
-        memory_extractor: None,
-        memory_extraction_service: None,
+        extraction_status: None,
         last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
         consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
         consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
@@ -205,125 +260,94 @@ async fn retitle(app: &axum::Router) -> (StatusCode, Value) {
     (status, json)
 }
 
+/// The press asks the titling job to run, and says so.
 #[tokio::test]
-async fn a_press_renames_a_conversation_still_on_its_fallback_name() {
-    let provider = StubProvider::new("Wake word fires twice on the Jetson");
-    let (app, storage, _tmp) = make_app(Some(provider.clone())).await;
-
+async fn a_press_asks_the_titling_job_for_its_next_pass() {
+    let provider = StubProvider::new("Wake word fires twice");
+    let (app, storage, _tmp, woken) =
+        make_app_with_lane(Some(provider.clone()), Some(WakeOutcome::Woken)).await;
     seed(&storage, "sess-1", 8).await;
-    storage
-        .set_derived_title("sess-1", "so i was wondering whether 0")
-        .await
-        .unwrap();
 
     let (status, body) = retitle(&app).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["renamed_count"], 1);
-    assert_eq!(body["renamed"][0]["session_id"], "sess-1");
-    assert_eq!(
-        body["renamed"][0]["title"],
-        "Wake word fires twice on the Jetson"
-    );
 
-    assert_eq!(
-        storage
-            .get_session("sess-1")
-            .await
-            .unwrap()
-            .title
-            .as_deref(),
-        Some("Wake word fires twice on the Jetson"),
-        "the new name must actually be persisted, not just reported"
-    );
-    // Provenance recorded, so the automatic pass knows this one is now current.
-    assert_eq!(
-        storage.get_title_provenance("sess-1").await.unwrap().0,
-        Some("model".to_string())
-    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["started"], true);
+    assert_eq!(*woken.lock().unwrap(), vec![LaneJob::Titling]);
 }
 
 #[tokio::test]
-async fn a_press_never_overwrites_a_name_somebody_typed() {
-    let provider = StubProvider::new("Something else entirely");
-    let (app, storage, _tmp) = make_app(Some(provider.clone())).await;
+async fn the_press_decodes_nothing_in_the_request() {
+    let provider = StubProvider::new("A name nobody asked for");
+    let (app, storage, _tmp, _) =
+        make_app_with_lane(Some(provider.clone()), Some(WakeOutcome::Woken)).await;
+    // Three conversations all sitting on their fallback names: the sweep would
+    // have renamed every one of them, inline, before answering.
+    for id in ["sess-1", "sess-2", "sess-3"] {
+        seed(&storage, id, 8).await;
+    }
 
-    seed(&storage, "sess-1", 12).await;
-    storage
-        .update_title("sess-1", "Jetson deploy notes".to_string())
-        .await
-        .unwrap();
+    let (status, _) = retitle(&app).await;
 
-    let (status, body) = retitle(&app).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["renamed_count"], 0);
-    assert_eq!(body["skipped"]["user_named"], 1);
     assert_eq!(
         provider.calls(),
         0,
-        "a protected conversation must cost no inference"
-    );
-    assert_eq!(
-        storage
-            .get_session("sess-1")
-            .await
-            .unwrap()
-            .title
-            .as_deref(),
-        Some("Jetson deploy notes")
+        "the request must not decode; the lane runs the pass"
     );
 }
 
+/// A pond whose titling loop never spawned has nothing to wake, and the button
+/// must be able to say that rather than claim a pass it did not start.
 #[tokio::test]
-async fn a_pass_that_renames_nothing_says_which_kind_of_nothing() {
-    let provider = StubProvider::new("A perfectly good name");
-    let (app, storage, _tmp) = make_app(Some(provider.clone())).await;
-
-    // Too short to describe — the six-word fallback already covers this.
-    seed(&storage, "sess-short", 1).await;
+async fn a_job_with_no_loop_says_so_rather_than_claiming_it_started() {
+    let provider = StubProvider::new("unused");
+    let (app, _storage, _tmp, _) =
+        make_app_with_lane(Some(provider), Some(WakeOutcome::NotPresent)).await;
 
     let (status, body) = retitle(&app).await;
+
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["renamed_count"], 0);
-    assert_eq!(body["considered"], 1);
-    assert_eq!(body["skipped"]["too_short"], 1);
-    assert_eq!(provider.calls(), 0);
+    assert_eq!(body["started"], false);
+    assert!(
+        body["reason"].as_str().is_some_and(|r| r.contains("loop")),
+        "{body}"
+    );
 }
 
+/// And a process with no lane at all is a third answer, not the second one.
 #[tokio::test]
-async fn the_pond_does_not_name_its_own_background_conversations() {
-    let provider = StubProvider::new("A name nobody asked for");
-    let (app, storage, _tmp) = make_app(Some(provider.clone())).await;
-
-    // The prefix `sched-` marks a conversation the pond opened for itself.
-    seed(&storage, "sched-nightly-1700000000", 10).await;
-    storage
-        .set_derived_title("sched-nightly-1700000000", "so i was wondering whether 0")
-        .await
-        .unwrap();
+async fn a_process_with_no_lane_is_a_different_answer_from_a_missing_loop() {
+    let provider = StubProvider::new("unused");
+    let (app, _storage, _tmp) = make_app(Some(provider)).await;
 
     let (status, body) = retitle(&app).await;
+
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        body["considered"], 0,
-        "it should not even have been looked at"
+    assert_eq!(body["started"], false);
+    assert!(
+        body["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("no inference lane")),
+        "{body}"
     );
-    assert_eq!(provider.calls(), 0);
 }
 
+/// Checked in the handler rather than left to the job, because the job's answer
+/// to "no model configured" is to skip its tick in silence — right for a
+/// background loop and useless to somebody who just pressed a button.
 #[tokio::test]
 async fn without_a_model_the_button_says_so_rather_than_failing_quietly() {
-    let (app, storage, _tmp) = make_app(None).await;
-    seed(&storage, "sess-1", 8).await;
+    let (app, _storage, _tmp, woken) = make_app_with_lane(None, Some(WakeOutcome::Woken)).await;
 
     let (status, body) = retitle(&app).await;
+
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body["error"].as_str().is_some_and(|e| e.contains("model")));
     assert!(
-        body["error"].as_str().unwrap_or_default().contains("model"),
-        "the reason must name the missing piece, got {body}"
+        woken.lock().unwrap().is_empty(),
+        "nothing should be woken to do work it has no model for"
     );
 }
-
-// ── The per-conversation button: obeys rather than protects ─────────────────
 
 async fn retitle_one(app: &axum::Router, session_id: &str) -> (StatusCode, Value) {
     let request = Request::builder()
@@ -355,8 +379,9 @@ async fn asking_for_one_conversation_replaces_even_a_name_typed_by_hand() {
         .unwrap();
 
     // The sweep leaves it alone...
-    let (_, sweep) = retitle(&app).await;
-    assert_eq!(sweep["skipped"]["user_named"], 1);
+    // The sweep's own refusal is no longer reachable through a route -- it
+    // belongs to the titling job now -- and is asserted where it lives, in
+    // `session_title.rs`'s `a_user_named_session_costs_no_inference_at_all`.
     assert_eq!(provider.calls(), 0);
 
     // ...and asking for this one specifically does not.
@@ -387,8 +412,10 @@ async fn asking_for_one_conversation_rebuilds_a_name_that_still_fits() {
         .unwrap();
 
     // Nothing has changed since that name was written, so the sweep declines.
-    let (_, sweep) = retitle(&app).await;
-    assert_eq!(sweep["skipped"]["still_current"], 1);
+    // As above: the sweep declining a name that still fits is
+    // `session_title.rs`'s business, and its suite asserts it. What this test
+    // is for is the other half of the asymmetry -- that asking for ONE
+    // conversation rebuilds it anyway.
 
     let (status, body) = retitle_one(&app, "sess-1").await;
     assert_eq!(status, StatusCode::OK);
@@ -422,14 +449,16 @@ async fn asking_for_a_conversation_that_does_not_exist_is_a_404() {
 
 /// The desktop client types every field of this reply.
 #[tokio::test]
-async fn the_reply_carries_every_field_the_client_reads() {
+async fn the_reply_carries_every_field_the_client_reads_and_no_stale_ones() {
     let provider = StubProvider::new("A name");
-    let (app, storage, _tmp) = make_app(Some(provider)).await;
+    let (app, storage, _tmp, _) =
+        make_app_with_lane(Some(provider), Some(WakeOutcome::Woken)).await;
     seed(&storage, "sess-1", 8).await;
 
     let (_, body) = retitle(&app).await;
 
-    for key in [
+    assert!(body["started"].is_boolean(), "{body}");
+    for stale in [
         "renamed",
         "renamed_count",
         "considered",
@@ -438,18 +467,9 @@ async fn the_reply_carries_every_field_the_client_reads() {
         "failed",
         "skipped",
     ] {
-        assert!(body.get(key).is_some(), "missing {key} in {body}");
-    }
-    for key in [
-        "user_named",
-        "still_current",
-        "too_short",
-        "unknown_provenance",
-    ] {
         assert!(
-            body["skipped"].get(key).is_some(),
-            "missing skipped.{key} in {body}"
+            body.get(stale).is_none(),
+            "{stale} is a count this reply cannot honestly carry: {body}"
         );
     }
-    assert!(body["renamed"].is_array());
 }
