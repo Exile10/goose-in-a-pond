@@ -13,9 +13,14 @@ failed reports the opposite of the truth.
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
+
+# What the egress gate says when it refuses a weather call: an open-meteo host, named as the
+# destination of the refused request.
+OPEN_METEO_REFUSAL = re.compile(r"outbound request to (?:[a-z-]+\.)?open-meteo\.com(?![\w.-])")
 
 DATA_DIR = os.environ.get("POND_DATA_DIR", "/tmp/pond-live")
 DB = os.path.join(DATA_DIR, "pond_system.db")
@@ -687,7 +692,8 @@ def section_network_mode_after_restart():
         body,
         ("names the setting", "network_mode" in detail),
         ("names the mode", "offline" in detail),
-        ("names the host", "open-meteo.com" in detail),
+        # The refused host itself, not "open-meteo.com" anywhere in the body.
+        ("names the host", OPEN_METEO_REFUSAL.search(detail) is not None),
     )
 
     # Put it back, and prove the gate is a gate and not a one-way door. The
