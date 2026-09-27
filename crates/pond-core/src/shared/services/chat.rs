@@ -13,10 +13,7 @@ use crate::shared::domain::agent::{AgentRequest, AgentStreamEvent, WorkflowEvent
 use crate::shared::services::print_output::PrintOutput;
 use crate::shared::services::stdin_input::StdinInput;
 use crate::user_data::domain::session::SessionMessage;
-use crate::user_data::ports::memory_extractor::MemoryExtractor;
-use crate::user_data::ports::memory_repository::MemoryRepository;
 use crate::user_data::ports::session_storage::SessionStorage;
-use crate::user_data::services::memory_extraction::MemoryExtractionService;
 use anyhow::Result;
 use futures::StreamExt as _;
 use std::io::{self, Write};
@@ -309,11 +306,10 @@ pub struct ChatService {
     system_prompt: String,
     /// Optional Answer Reviewer — adversarial post-inference quality gate.
     answer_reviewer: Option<Arc<dyn crate::models::ports::answer_reviewer::AnswerReviewer>>,
-    /// With all three memory fields set, `persist_assistant_turn_with_extraction` runs extraction.
-    memory_extractor: Option<Arc<dyn MemoryExtractor>>,
-    memory_extraction_service: Option<Arc<MemoryExtractionService>>,
-    memory_repo: Option<Arc<dyn MemoryRepository>>,
-    /// When set, `persist_assistant_turn` records Agent, Inference and per-tool events.
+    /// Optional unified activity log. When set, `persist_assistant_turn` records
+    /// one Agent event, one Inference event (when token usage is known), and one
+    /// Tool event per tool call — so the activity feed reflects chat activity,
+    /// not just Auth/Network. `None` in tests and the CLI path.
     event_log: Option<Arc<dyn EventLog>>,
     /// `emit_event` also forwards here, e.g. to the `--json-events` NDJSON writer.
     event_sink: Option<WorkflowEventSink>,
@@ -372,9 +368,6 @@ impl ChatService {
             session_storage,
             system_prompt: SYSTEM_PROMPT.to_string(),
             answer_reviewer: None,
-            memory_extractor: None,
-            memory_extraction_service: None,
-            memory_repo: None,
             event_log: None,
             event_sink: None,
             stdout_diagnostics: true,
@@ -464,19 +457,6 @@ impl ChatService {
             }
         }
         decision
-    }
-
-    /// Attach memory extraction, which `persist_assistant_turn_with_extraction` then spawns.
-    pub fn with_memory_extraction(
-        mut self,
-        extractor: Arc<dyn MemoryExtractor>,
-        service: Arc<MemoryExtractionService>,
-        repo: Arc<dyn MemoryRepository>,
-    ) -> Self {
-        self.memory_extractor = Some(extractor);
-        self.memory_extraction_service = Some(service);
-        self.memory_repo = Some(repo);
-        self
     }
 
     /// Attach an Answer Reviewer for post-inference adversarial quality review.
@@ -924,45 +904,22 @@ impl ChatService {
         }
     }
 
-    /// `persist_assistant_turn` plus background memory extraction, so handlers can't omit it.
-    pub async fn persist_assistant_turn_with_extraction(
-        &self,
-        tool_results: Vec<String>,
-        assistant_text: &str,
-        usage: Option<(u32, u32)>,
-        model_name: Option<&str>,
-        user_message: &str,
-    ) -> Result<()> {
-        self.persist_assistant_turn(tool_results, assistant_text, usage, model_name)
-            .await?;
-
-        if let (Some(ext), Some(svc), Some(repo)) = (
-            self.memory_extractor.clone(),
-            self.memory_extraction_service.clone(),
-            self.memory_repo.clone(),
-        ) {
-            let user_msg = user_message.to_string();
-            let asst_resp = assistant_text.to_string();
-            let sid = self.session_id.clone();
-            let scope = self.profile_scope.clone();
-            tokio::spawn(async move {
-                svc.run(
-                    ext.as_ref(),
-                    repo.as_ref(),
-                    &user_msg,
-                    &asst_resp,
-                    Some(&sid),
-                    &scope,
-                )
-                .await;
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Stream, speak by sentence, and persist a confirmed turn; don't `speak()` the result again.
-    /// Speculative transcripts must use the non-persisting `stream_response_inner` instead.
+    /// Streaming chat — routes through the Agent, chunks TTS by sentence,
+    /// AND persists the turn (user + assistant) to session storage.
+    ///
+    /// Differences from `chat_once`:
+    /// - Calls `agent.chat_stream()` so text arrives token-by-token.
+    /// - Speaks each completed sentence immediately (low-latency TTS).
+    /// - Announces MCP tool calls with a short spoken phrase before execution.
+    /// - Speaking happens *inside* this method; callers must NOT call
+    ///   `voice_output.speak()` on the returned text.
+    ///
+    /// This is the persisting entry point used for a *confirmed* transcript.
+    /// The Q2-26 speculative path must NOT call this — it calls
+    /// `stream_response_inner` (no persistence) so a provisional transcript
+    /// that later turns out wrong never lands a phantom turn in
+    /// `pond_system.db`. `run_loop` persists the confirmed turn exactly once
+    /// via `persist_confirmed_turn`.
     pub async fn chat_stream_once(&self, message: String) -> Result<String> {
         let fired_at = std::time::Instant::now();
         let user_msg = ChatMessage::user(message.clone());

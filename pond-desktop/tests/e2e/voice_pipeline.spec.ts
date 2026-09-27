@@ -1,9 +1,7 @@
 /** VoiceMode in the Vite SPA (no native shell): renders, starts waiting, exits, sane session id. */
 import { test, expect } from "@playwright/test";
 import { mockAllApiRoutes } from "./helpers/api-mocks";
-
-// Exact aria-label: other buttons contain "voice mode" in their text.
-const VOICE_BTN = '[aria-label="Voice mode"]';
+import { navigateTo, openDrawer } from "./helpers/nav";
 
 test.beforeEach(async ({ page }) => {
   await mockAllApiRoutes(page);
@@ -11,8 +9,9 @@ test.beforeEach(async ({ page }) => {
 });
 
 test.describe("Voice mode", () => {
-  test("clicking Voice mode button switches the view", async ({ page }) => {
-    const voiceBtn = page.locator(VOICE_BTN);
+  test("clicking Voice in the drawer switches the view", async ({ page }) => {
+    const goTo = await openDrawer(page);
+    const voiceBtn = goTo.getByRole("button", { name: "Voice", exact: true });
     await expect(voiceBtn).toBeVisible();
     await voiceBtn.click();
 
@@ -23,14 +22,14 @@ test.describe("Voice mode", () => {
   });
 
   test("VoiceMode shows a mic-related control", async ({ page }) => {
-    await page.locator(VOICE_BTN).click();
+    await navigateTo(page, "Voice");
 
     const voiceButtons = page.getByRole("button");
     await expect(voiceButtons.first()).toBeVisible({ timeout: 10_000 });
   });
 
   test("back button returns to GUI mode", async ({ page }) => {
-    await page.locator(VOICE_BTN).click();
+    await navigateTo(page, "Voice");
 
     await page.waitForTimeout(500);
 
@@ -43,7 +42,7 @@ test.describe("Voice mode", () => {
     if (await backBtn.isVisible()) {
       await backBtn.click();
       await expect(
-        page.locator('aside[aria-label="Navigation"]')
+        page.locator('[aria-label="Open menu"]')
       ).toBeVisible({ timeout: 5_000 });
     }
   });
@@ -59,7 +58,7 @@ test.describe("Voice mode", () => {
   });
 
   test("TranscriptFeed container is rendered in voice mode", async ({ page }) => {
-    await page.locator(VOICE_BTN).click();
+    await navigateTo(page, "Voice");
 
     await expect(page.locator("body")).toBeVisible({ timeout: 5_000 });
     await expect(page.getByText(/something went wrong/i)).not.toBeVisible();

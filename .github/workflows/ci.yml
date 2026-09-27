@@ -29,6 +29,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# Every job only reads the repository; caches and artifacts use the runtime token, not this one.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # .cargo/config.toml sets `-C target-cpu=native` for Jetson perf. On CI that is a SIGILL
@@ -38,6 +42,35 @@ env:
   RUSTFLAGS: ""
 
 jobs:
+  embedded-network:
+    name: Embedded Go — race / vet / ARM64 build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: native/pondnet
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: native/pondnet/go.mod
+          cache-dependency-path: native/pondnet/go.sum
+      - name: Formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Race tests
+        run: go test -mod=readonly -race ./...
+      - name: Vet
+        run: go vet -mod=readonly ./...
+      - name: Vulnerability reachability
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - name: Production commands
+        run: go build -mod=readonly ./cmd/...
+      - name: Jetson helper cross-compilation
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: arm64
+        run: go build -mod=readonly -trimpath -o "$RUNNER_TEMP/pondnet-linux-arm64" ./cmd/pondnet
+
   # 1: Rust ─────────────────────────────────────────────────────────────
   # Formatting, lints and the fast test suite. Excludes crates that pull the Goose submodule or
   # native system libs (pond-adapters-goose, pond-adapters-local-inference,
@@ -132,7 +165,8 @@ jobs:
             -p pond-adapters-mcp-memory \
             -p pond-mesh-protocol \
             -p pond-mcp-server \
-            -p pond-adapters-mistralrs
+            -p pond-adapters-mistralrs \
+            -p pond-hf-cache
 
       # --ignored is NOT passed so the 28 live-hardware tests are skipped.
       - name: cargo test (fast crates)
@@ -154,7 +188,8 @@ jobs:
             -p pond-adapters-imap \
             -p pond-adapters-mcp-memory \
             -p pond-mesh-protocol \
-            -p pond-mcp-server
+            -p pond-mcp-server \
+            -p pond-hf-cache
 
       # Gate the PRODUCTION binary's compilation (pulls the Goose submodule); slow on a cold cache.
       # `--all-targets` is load-bearing: without a target selector cargo builds lib + bins ONLY, so
@@ -328,7 +363,7 @@ jobs:
       # lands in ~/.cache/electron. Without this the ~100 MB download happens
       # on every run; keyed on the lockfile so it only misses on a real bump.
       - name: Cache the Electron binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/electron
@@ -412,7 +447,7 @@ jobs:
           cache-dependency-path: pond-desktop/package-lock.json
 
       - name: Cache the Electron binary
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/electron

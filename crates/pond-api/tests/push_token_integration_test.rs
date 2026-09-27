@@ -13,7 +13,9 @@ use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
 use pond_core::user_data::ports::device_registry::{DeviceRegistry, RegisterDeviceRequest};
 use pond_core::user_data::ports::push_token::PushTokenRepository;
 use pond_infra::db::Database;
-use pond_infra::mock_handshake::MockHandshake;
+#[path = "support/device_handshake.rs"]
+mod device_handshake;
+use device_handshake::DeviceHandshake;
 use pond_infra::onboarding::SqlxOnboardingRepository;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_prompt_extra::SqlitePromptExtraRepository;
@@ -55,11 +57,13 @@ async fn make_app() -> (
         Arc::new(SqlitePushTokenRepository::new(pool.clone()));
 
     let db = Arc::new(db);
-    let mock_hs = MockHandshake::new();
-    mock_hs.add_valid_token("test-token".to_string()).await;
+    let mock_hs = DeviceHandshake(device_id.clone());
 
     let state = Arc::new(AppState {
         warmup: Default::default(),
+        suggestion_queue: std::sync::Arc::new(
+            pond_infra::sqlite_suggestion_queue::SqliteSuggestionQueue::new(db.system.clone()),
+        ),
         db,
         onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
         handshake: Arc::new(mock_hs),
@@ -80,6 +84,7 @@ async fn make_app() -> (
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        lane: None,
         account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
@@ -116,8 +121,7 @@ async fn make_app() -> (
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
-        memory_extractor: None,
-        memory_extraction_service: None,
+        extraction_status: None,
         last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
         consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
         consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
@@ -212,7 +216,7 @@ async fn register_then_delete_push_token_persists() {
 }
 
 #[tokio::test]
-async fn register_push_token_unknown_device_404() {
+async fn register_push_token_other_device_is_forbidden_without_disclosing_existence() {
     let (app, _repo, _device_id, _tmp) = make_app().await;
     let (status, _) = send(
         &app,
@@ -222,7 +226,7 @@ async fn register_push_token_unknown_device_404() {
         Some(serde_json::json!({ "token": "t", "platform": "fcm" })),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
