@@ -139,6 +139,12 @@ resolve_server() {
 # a test binary and reads exactly like a miscompile. It is not one.
 export RUSTFLAGS=""
 
+# A scratch pond must not start the ~1 GB picture-support fetch the serve
+# process now begins at boot for a vision-capable chat model: the transfer
+# outlives the run, is killed with it, and leaves an .incomplete behind in a
+# directory that is about to be deleted. The same trap as ORT above.
+export POND_DISABLE_MODEL_PROVISIONING=1
+
 if [ "$DO_BUILD" -eq 1 ]; then
   say "building pond-server (RUSTFLAGS empty, per ci.yml)"
   if ! cargo build -p pond-server; then
@@ -150,7 +156,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
   fi
 fi
 
-BIN="target/debug/pond-server"
+BIN="${CARGO_TARGET_DIR:-target}/debug/pond-server"
 [ -x "$BIN" ] || { echo "no binary at $BIN (drop --no-build?)" >&2; exit 1; }
 
 if [ "$DO_UI" -eq 1 ]; then
@@ -217,6 +223,24 @@ kill -9 "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
 # Drop the old server's port file, or resolve_server returns instantly with a
 # stale port and the restart is verified against whatever now holds it.
 rm -f "$DATA_DIR/.runtime_api_port"
+# Stamp a lane run while nothing is holding the database, so the restart has a
+# fact to remember. The lane's clock is durable as of 0059, and the only thing
+# that can prove that wiring -- load at boot, into the runner, out through the
+# route -- is a second process reading what a first one left behind. Writing it
+# here rather than waiting for a real background pass is what makes the check
+# deterministic: whether any job wins the slot during a live test depends on a
+# model this pond does not have.
+python3 - "$DATA_DIR" <<'LANESTAMP'
+import sqlite3, sys, datetime
+con = sqlite3.connect(sys.argv[1] + "/pond_system.db")
+at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=600)
+con.execute(
+    "INSERT INTO lane_job_runs (job, last_run_at) VALUES (?, ?) "
+    "ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at",
+    ("titling", at.replace(microsecond=0).isoformat().replace("+00:00", "Z")),
+)
+con.commit()
+LANESTAMP
 POND_DATA_DIR="$DATA_DIR" POND_DEV_ALLOW_LOOPBACK=1 RUST_LOG=info \
   "$BIN" serve --port "$PORT" --static-dir pond-desktop/dist \
   > "$DATA_DIR/server2.out" 2>&1 < /dev/zero &
@@ -316,6 +340,10 @@ if [ "$AUTH_OK" -eq 1 ]; then
            RC=1 ;;
     esac
   done
+
+  if ! POND_DATA_DIR="$AUTH_DIR" python3 scripts/remote_auth_checks.py; then
+    RC=1
+  fi
 
   # ── PAI-2 P7: the onboarding holes close, and a reset reopens them ─────────
   #

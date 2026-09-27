@@ -3,7 +3,6 @@ import { Bell, Calendar, Shield, Camera, Sparkles, BatteryLow } from "lucide-rea
 import { useAppState } from "../../state/AppContext";
 import type { ScheduleRunNotification } from "../../api/types";
 import {
-  MOCK_NOTIFICATIONS,
   CATEGORY_COLOR,
   groupNotifications,
   relativeTime,
@@ -124,10 +123,9 @@ export function NotificationsView({ go }: NotificationsViewProps) {
 
   // scheduleRuns is kept fresh by AppContext, so nothing is fetched here.
   const allItems = useMemo<Notification[]>(() => {
-    const runNotifs = scheduleRuns.map(buildNotificationFromRun);
-    return [...runNotifs, ...MOCK_NOTIFICATIONS].sort(
-      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
-    );
+    return scheduleRuns
+      .map(buildNotificationFromRun)
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   }, [scheduleRuns]);
 
   // Overlay local read state

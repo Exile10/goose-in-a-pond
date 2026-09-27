@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 /// Below this the walk has broken, not the tree shrunk. 363 files today.
 const MIN_FILES_SCANNED: usize = 300;
-/// Below this the send detector has broken, not the code moved. 18 today.
+/// Below this the send detector has broken, not the code moved. 18 today (counted 2026-09-24,
+/// after the vision encoder's raw fetch in `pond-adapters-goose/src/vision_encoder.rs` moved onto
+/// `pond-hf-cache` and that file stopped sending).
 const MIN_SENDERS: usize = 15;
 /// Only ever goes down; at 0, every sender reaches the tracker or is checked loopback-only.
 const MAX_UNGATED: usize = 0;
@@ -27,7 +29,9 @@ const TRACKER_SYMBOLS: &[&str] = &[
 const EGRESS_TRACKED: &[&str] = &[
     "crates/pond-adapters-goose/src/extension_manager.rs",
     "crates/pond-api/src/routes.rs",
-    "crates/pond-adapters-goose/src/vision_encoder.rs",
+    // PAI-8's first connector. check_egress before the send and record_egress
+    // after, per the weather template -- so an offline pond refuses to ask a
+    // third party about the household's day, and every request is in the feed.
     "crates/pond-adapters-caldav/src/lib.rs",
     "crates/pond-adapters-weather/src/lib.rs",
     "crates/pond-hf-cache/src/lib.rs",
@@ -478,6 +482,8 @@ fn every_entry_point_installs_the_gate_before_it_downloads() {
         "    ensure_onnx_runtime();",
         "model_download::download_file(",
         "download_and_extract_ort(",
+        // The vision encoder, fetched at serve start.
+        "agent.prepare_model(",
     ];
 
     /// Helpers, not entry points (callers own the install); named so each exemption is audited.

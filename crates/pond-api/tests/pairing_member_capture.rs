@@ -1,4 +1,7 @@
-//! Pairing codes are bound to a household member at issuance (HTTP half).
+//! PAI-1 P9's HTTP half: a pairing code is bound to a household member at ISSUANCE. The code
+//! must reach `pairing_codes.profile_id`; a non-loopback peer is refused even with a member
+//! named; an unknown member mints nothing (migration 0043's foreign key); an unparsable body
+//! is refused, not defaulted. The code to `devices.profile_id` step lives in sqlite_handshake.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,6 +31,8 @@ struct Harness {
     /// The same state, reached from a LAN address.
     remote: axum::Router,
     profiles: Arc<SqliteProfileRepository>,
+    /// The pond's own pool, for the one test that has to break the attribution read on purpose.
+    pool: sqlx::Pool<sqlx::Sqlite>,
     _tmp: tempfile::TempDir,
 }
 
@@ -41,12 +46,17 @@ async fn make_app() -> Harness {
 
     let state = Arc::new(AppState {
         warmup: Default::default(),
+        suggestion_queue: std::sync::Arc::new(
+            pond_infra::sqlite_suggestion_queue::SqliteSuggestionQueue::new(db.system.clone()),
+        ),
         db,
         onboarding_repo: Arc::new(pond_infra::onboarding::SqlxOnboardingRepository::new(
             pool.clone(),
         )),
-        // Real adapter: the route must reach `issue_pairing_code_for`.
-        handshake: Arc::new(SqliteHandshakeAdapter::new(pool.clone())),
+        // The real adapter: the whole point is that the route reaches
+        // `issue_pairing_code_for`, and a mock would answer whatever it was
+        // told to.
+        handshake: Arc::new(SqliteHandshakeAdapter::new(pool.clone(), None)),
         whisper_url: "http://127.0.0.1:9000".into(),
         transcribe_audio: None,
         session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
@@ -64,6 +74,7 @@ async fn make_app() -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        lane: None,
         account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
@@ -100,8 +111,7 @@ async fn make_app() -> Harness {
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
-        memory_extractor: None,
-        memory_extraction_service: None,
+        extraction_status: None,
         last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
         consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
         consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
@@ -144,11 +154,14 @@ async fn make_app() -> Harness {
         loopback,
         remote,
         profiles,
+        pool,
         _tmp: tmp,
     }
 }
 
-/// `POST /handshake/pairing-code`; `body: None` sends no body or content type, as the CLI does.
+/// `POST /handshake/pairing-code` with a raw body. `body: None` sends no body
+/// and no content type at all, which is what the CLI and the desktop dashboard
+/// have done since #93 and must keep working.
 async fn issue(router: &axum::Router, body: Option<&str>) -> (StatusCode, Value) {
     let req = Request::builder()
         .method(Method::POST)
@@ -169,7 +182,10 @@ async fn issue(router: &axum::Router, body: Option<&str>) -> (StatusCode, Value)
     (status, json)
 }
 
-/// The live code from `GET /handshake/pairing-code`, re-read from the row; `code: null` = none.
+/// The live pairing code as `GET /handshake/pairing-code` reports it. A genuine read-back,
+/// not an echo: `current_pairing_code` runs a fresh `SELECT`, so `profile_id` is the value
+/// the row holds and the one `verify_handshake` later copies onto the device. `code: null`
+/// means nothing was minted.
 async fn live_code(router: &axum::Router) -> Value {
     let resp = router
         .clone()
@@ -231,7 +247,8 @@ async fn a_code_issued_for_a_member_carries_that_member_into_the_row() {
     );
 }
 
-/// Also the vacuity control for every "no code was issued" assertion below.
+/// The backwards-compatible path, and the vacuity control for every "no code
+/// was issued" assertion below: issuance really does work in this harness.
 #[tokio::test]
 async fn a_code_issued_with_no_body_at_all_is_unattributed_as_it_always_was() {
     let h = make_app().await;
@@ -255,7 +272,10 @@ async fn a_code_issued_with_no_body_at_all_is_unattributed_as_it_always_was() {
 
 // ── The sole-member default ──────────────────────────────────────────────────
 
-/// An unattributed device never writes `sessions.profile_id`, leaving its summaries unreachable.
+/// `issue_pairing_code_for` takes a member, and a caller that passes none leaves every device
+/// on the pond paired unattributed. Such a device falls through the paired-device rung on
+/// every turn, so `sessions.profile_id` is never written and the summary corpus is
+/// unretrievable.
 #[tokio::test]
 async fn a_sole_member_household_binds_the_code_without_being_asked() {
     let h = make_app().await;
@@ -275,7 +295,9 @@ async fn a_sole_member_household_binds_the_code_without_being_asked() {
     assert_eq!(stored["profile_id"].as_str(), Some(jerry.as_str()));
 }
 
-/// The escape hatch that makes the sole-member default safe.
+/// The escape hatch, and the reason the default above is safe to have. Without it a
+/// one-member pond could not pair a guest's phone without that phone becoming the member's,
+/// and every turn it sent would inherit an identity nobody claimed.
 #[tokio::test]
 async fn a_sole_member_household_can_still_pair_a_guests_phone() {
     let h = make_app().await;
@@ -293,6 +315,8 @@ async fn a_sole_member_household_can_still_pair_a_guests_phone() {
     assert!(stored["profile_id"].is_null());
 }
 
+/// Two members is no answer, not a coin flip. Binding to whoever was created
+/// first would attribute a phone by row order, which is evidence of nothing.
 #[tokio::test]
 async fn two_members_still_require_the_operator_to_name_one() {
     let h = make_app().await;
@@ -309,7 +333,8 @@ async fn two_members_still_require_the_operator_to_name_one() {
 
 // ── The security argument the capture point rests on ─────────────────────────
 
-/// A 200 here would turn capture-at-issuance into capture-from-a-client.
+/// If this ever passes as a 200, capture-at-issuance has become capture-from-a-
+/// client, which is the hole PAI-1 P4 closed one rung lower down.
 #[tokio::test]
 async fn a_remote_peer_naming_a_member_is_refused_and_mints_nothing() {
     let h = make_app().await;
@@ -332,7 +357,8 @@ async fn a_remote_peer_naming_a_member_is_refused_and_mints_nothing() {
 #[tokio::test]
 async fn a_member_who_does_not_exist_is_refused_and_mints_nothing() {
     let h = make_app().await;
-    // A real member exists, so the refusal is about this id, not an empty table.
+    // A real member exists, so the refusal below is about THIS id and not about
+    // an empty `profiles` table.
     let _liz = a_member(&h, "Liz").await;
 
     let (status, body) = issue(&h.loopback, Some(r#"{"profile_id":"ghost"}"#)).await;
@@ -367,7 +393,9 @@ async fn a_blank_member_is_refused_rather_than_stored() {
     assert!(live_code(&h.loopback).await["code"].is_null());
 }
 
-/// `deny_unknown_fields` makes a misspelt `profileId` a 400 instead of a silent unattributed code.
+/// The typo case, the one that would otherwise be silent. `deny_unknown_fields` turns a
+/// misspelt `profileId` into a 400; without it the operator is told the code was issued,
+/// the code is unattributed, and nothing surfaces until a paired phone gets no proposals.
 #[tokio::test]
 async fn a_body_this_route_does_not_understand_is_refused_not_defaulted() {
     let h = make_app().await;
@@ -394,7 +422,8 @@ async fn a_body_this_route_does_not_understand_is_refused_not_defaulted() {
 
 // ── The read-back ────────────────────────────────────────────────────────────
 
-/// An operator who cannot see the binding cannot notice a wrong one.
+/// `GET /handshake/pairing-code` re-displays the live code, and now says whose
+/// it is. An operator who cannot see the binding cannot notice a wrong one.
 #[tokio::test]
 async fn re_displaying_the_code_names_the_member_it_is_bound_to() {
     let h = make_app().await;
@@ -409,4 +438,209 @@ async fn re_displaying_the_code_names_the_member_it_is_bound_to() {
         body["profile_id"], liz,
         "the re-display must name the member too; body: {body}"
     );
+}
+
+// ── Who a paired device belongs to: `GET /devices/self` ──────────────────────
+//
+// Everything above stops at the code: it proves `pairing_codes.profile_id` is written and
+// leaves the code-to-device step to `sqlite_handshake`. These go the rest of the way. The pair
+// is completed over HTTP with a MAC computed the way a phone computes it, and `/devices/self`
+// is called with the token the pond issued -- so the device the route reads came out of
+// `auth_middleware` via `caller_for_token`, exactly as it does for a real phone, and no test
+// here writes a `Principal` by hand.
+
+type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+/// What a phone computes: `HMAC-SHA256(pairing_code, challenge || client_id)`, lowercase hex.
+fn client_mac(code: &str, challenge_b64: &str, client_id: &str) -> String {
+    use base64::Engine as _;
+    use hmac::Mac as _;
+    let challenge = base64::engine::general_purpose::STANDARD
+        .decode(challenge_b64.as_bytes())
+        .unwrap();
+    let mut mac = HmacSha256::new_from_slice(code.as_bytes()).unwrap();
+    mac.update(&challenge);
+    mac.update(client_id.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+async fn post_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Pair `client_id` with `code` and return the session token the pond issued.
+///
+/// Over loopback: `require_lan` classifies a peer against this host's real interfaces, so a
+/// fixed LAN address pairs only on a machine that happens to sit on that subnet.
+async fn pair(h: &Harness, code: &str, client_id: &str) -> String {
+    let (status, init) = post_json(
+        &h.loopback,
+        "/api/v1/handshake/init",
+        serde_json::json!({
+            "client_id": client_id,
+            "client_type": "gotg",
+            "client_version": "1.0.0",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "handshake/init: {init}");
+    let (status, verified) = post_json(
+        &h.loopback,
+        "/api/v1/handshake/verify",
+        serde_json::json!({
+            "challenge_id": init["challenge_id"],
+            "mac": client_mac(code, init["challenge"].as_str().unwrap(), client_id),
+            "device_name": format!("{client_id} phone"),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "handshake/verify: {verified}");
+    assert_eq!(
+        verified["accepted"], true,
+        "the pair was refused: {verified}"
+    );
+    verified["session_token"]
+        .as_str()
+        .expect("an accepted pair mints a session token")
+        .to_string()
+}
+
+/// `GET /devices/self` from a LAN address, with `token` if one is given.
+async fn device_self(h: &Harness, token: Option<&str>) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/devices/self");
+    if let Some(token) = token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = h
+        .remote
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn code_of(body: &Value) -> String {
+    body["code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no code was issued: {body}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_phone_paired_with_a_members_code_reads_that_member_back() {
+    let h = make_app().await;
+    let liz = a_member(&h, "Liz").await;
+    let (_, issued) = issue(&h.loopback, Some(&format!(r#"{{"profile_id":"{liz}"}}"#))).await;
+    let token = pair(&h, &code_of(&issued), "liz-phone").await;
+
+    let (status, body) = device_self(&h, Some(&token)).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["device_id"], "liz-phone",
+        "the device the token was issued to; body: {body}"
+    );
+    assert_eq!(body["profile"]["id"], liz, "body: {body}");
+    assert_eq!(body["profile"]["display_name"], "Liz", "body: {body}");
+    // Display only, and only what a greeting needs. A member's preferences are theirs, and
+    // the avatar is not something this route has any business handing out.
+    let profile = body["profile"].as_object().expect("profile is an object");
+    assert_eq!(
+        profile.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["display_name", "id"],
+        "`/devices/self` returns the member's id and name and nothing else; body: {body}"
+    );
+}
+
+/// NULL is *nobody has claimed this device*, not an error and not everybody. Migration 0043's
+/// normal case, since pairing happens before anyone says who they are.
+#[tokio::test]
+async fn a_phone_paired_with_an_unattributed_code_reads_no_member() {
+    let h = make_app().await;
+    // Two members, so the code is not bound to the sole member automatically.
+    a_member(&h, "Liz").await;
+    a_member(&h, "Jerry").await;
+    let (_, issued) = issue(&h.loopback, None).await;
+    let token = pair(&h, &code_of(&issued), "kitchen-tablet").await;
+
+    let (status, body) = device_self(&h, Some(&token)).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["device_id"], "kitchen-tablet", "body: {body}");
+    assert!(
+        body["profile"].is_null(),
+        "an unclaimed device names nobody; body: {body}"
+    );
+}
+
+/// The one this route could get wrong quietly. A failed attribution read is `Unavailable`, and
+/// reporting it as "no member" would look exactly like an unclaimed phone -- a greeting with no
+/// name, and nothing anywhere saying the pond could not tell. `DeviceRung::rung` consumes the
+/// `Result` so that cannot be spelled away; this holds the route to the same rule.
+#[tokio::test]
+async fn a_failed_attribution_read_is_reported_rather_than_read_as_unclaimed() {
+    let h = make_app().await;
+    let liz = a_member(&h, "Liz").await;
+    let (_, issued) = issue(&h.loopback, Some(&format!(r#"{{"profile_id":"{liz}"}}"#))).await;
+    let token = pair(&h, &code_of(&issued), "liz-phone").await;
+
+    // Break only the attribution read. Authentication reads `session_tokens` and never this
+    // column, so the request still arrives with its device and fails exactly where it should.
+    sqlx::query("ALTER TABLE devices RENAME COLUMN profile_id TO profile_id_unreadable")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = device_self(&h, Some(&token)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a read that failed must not answer 200 with no member; body: {body}"
+    );
+    assert!(
+        body.get("profile").is_none(),
+        "no member may be claimed, and none denied, from a read that did not happen; body: {body}"
+    );
+}
+
+/// Not on `PUBLIC_ROUTES`: who a device belongs to is not an anonymous question.
+#[tokio::test]
+async fn devices_self_requires_a_token() {
+    let h = make_app().await;
+    let (status, body) = device_self(&h, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
 }

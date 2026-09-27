@@ -23,6 +23,15 @@ import {
 } from "./reducer";
 import type { ScheduleRunNotification } from "../api/types";
 
+/**
+ * How often this client refreshes its own device row.
+ *
+ * Derived from the registry's five-minute online threshold, not picked: short
+ * enough that a single dropped beat cannot age the row out, long enough to stay
+ * well clear of the per-IP request budget.
+ */
+const SELF_HEARTBEAT_MS = 120_000;
+
 const StateCtx = createContext<AppState | null>(null);
 const DispatchCtx = createContext<React.Dispatch<AppAction> | null>(null);
 
@@ -145,6 +154,20 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       }),
     [state.sessionToken, state.serverOnline],
   );
+
+  // Keep this machine's device row fresh: `is_online` ages out after five minutes (#387).
+  // Two minutes leaves margin for one dropped beat; a miss is not retried, the next is
+  // scheduled. Not gated on visibility: a minimised desktop is still on the network.
+  useEffect(() => {
+    if (!state.serverOnline || !state.sessionToken) return;
+    const beat = () => {
+      // Non-fatal: a failed beat only costs this row the freshness it would have gained.
+      void api.heartbeatSelf().catch(() => {});
+    };
+    beat();
+    const timer = setInterval(beat, SELF_HEARTBEAT_MS);
+    return () => clearInterval(timer);
+  }, [state.serverOnline, state.sessionToken]);
 
   // Resume a turn started by a previous window. Asked once, after the bridge above has a token;
   // an ordinary cold start costs one 404.

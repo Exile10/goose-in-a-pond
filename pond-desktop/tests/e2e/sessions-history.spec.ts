@@ -1,6 +1,7 @@
 /** Chat-history sidebar: title fallback, message counts, rename (PATCH) and delete (DELETE). */
 import { test, expect } from "@playwright/test";
 import { mockAllApiRoutes } from "./helpers/api-mocks";
+import { navigateTo } from "./helpers/nav";
 
 const SESSIONS = [
   {
@@ -28,11 +29,8 @@ const SESSIONS = [
 
 async function goToChat(page: Parameters<typeof mockAllApiRoutes>[0]) {
   await page.goto("/");
-  const chatBtn = page
-    .getByRole("button", { name: /chat/i })
-    .or(page.locator('[title="Chat"]'))
-    .first();
-  await chatBtn.click({ timeout: 10_000 });
+  // Chat lives behind the drawer's "Pond" group now, not on the page.
+  await navigateTo(page, "Chat");
 }
 
 async function openHistory(page: Parameters<typeof mockAllApiRoutes>[0]) {
@@ -42,7 +40,22 @@ async function openHistory(page: Parameters<typeof mockAllApiRoutes>[0]) {
   ).toBeVisible({ timeout: 10_000 });
 }
 
-test.describe("Chat history sidebar", () => {
+// Parked, and not by the drawer.
+//
+// Every test below drives `SessionDropdown` — the "session history" trigger,
+// `.session-dropdown__item`, the inline rename textbox, the delete-confirm. No
+// screen renders that component any more: 595abd4e (2026-08-15) replaced the
+// dropdown with the `ChatHistory` wall, which Chat shows by default and whose
+// only way back is the header's "All conversations". `grep -rn SessionDropdown
+// src` finds the file and one comment, no call site.
+//
+// So this is not a navigation failure and there is no honest migration: the
+// wall has no rename control and labels a titleless session "Untitled" rather
+// than "Session <id8>", so re-pointing these would mean rewriting what they
+// assert. Parked whole rather than deleted — the behaviour it covers (title
+// fallback, message_count badge, PATCH rename, DELETE with confirm) still needs
+// an E2E, written against the wall.
+test.describe.fixme("Chat history sidebar", () => {
   test.beforeEach(async ({ page }) => {
     await mockAllApiRoutes(page);
     // After mockAllApiRoutes, so it takes precedence.

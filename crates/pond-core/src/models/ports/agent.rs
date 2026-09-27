@@ -1,4 +1,5 @@
 use crate::models::domain::model_capabilities::ModelCapabilities;
+use crate::models::domain::vision_encoder::EncoderState;
 use crate::models::services::context::prefix_cache::PrefixCacheState;
 pub use crate::shared::domain::agent::{
     AgentRequest, AgentResponse, AgentStreamEvent, WarmupPhase,
@@ -27,8 +28,33 @@ pub trait Agent: Send + Sync {
         ModelCapabilities::default()
     }
 
-    /// Compact this session now, on the user's instruction; returns tokens retained if reported.
-    /// `Ok(None)`: the backend has no manual compaction; the caller must say so, not claim success.
+    /// Where picture support stands for `model` under `provider`, as a pure read: header, size
+    /// and sidecar at most, never a hash, a rename or a fetch, so a model list may call it per
+    /// row. `None` means this agent does not know, and callers fail open to the adapter's own
+    /// backstop rather than refuse on no information.
+    fn vision_state(&self, _provider: &str, _model: &str) -> Option<EncoderState> {
+        None
+    }
+
+    /// A model just arrived (download finished) or became the active chat model: start
+    /// whatever it needs to be fully usable, such as its vision encoder, in the background.
+    /// Must return at once and never fail the caller; the default has nothing to prepare.
+    fn prepare_model(&self, _model: &str) {}
+
+    /// Compact this session's history now, on the user's instruction.
+    ///
+    /// The engine owns compaction since GIAP stopped trimming, so this is a
+    /// request to the engine rather than work GIAP does itself — the port
+    /// exists because `pond-api` must not depend on the goose crate, and the
+    /// hexagonal invariant is enforced by CI's fast-crate list, not by
+    /// convention.
+    ///
+    /// Returns the tokens retained afterwards when the engine reports them.
+    /// `Ok(None)` means the backend has no manual compaction and the caller
+    /// should say so rather than claim a no-op succeeded.
+    ///
+    /// Deliberately NOT "compact if needed": the automatic axis belongs to the
+    /// engine's own threshold. This is the explicit press.
     async fn compact_session(&self, _session_id: &str) -> Result<Option<u32>> {
         Ok(None)
     }
@@ -105,5 +131,15 @@ mod tests {
             PrefixCacheState::posture_of(state.as_ref()),
             CachePosture::Warm
         );
+    }
+
+    /// An agent that does not implement picture support reports "unknown", which the API passes
+    /// through, and has nothing to prepare. Reporting NotDeclared by default would refuse every
+    /// image on every backend that simply has not been taught the port.
+    #[test]
+    fn an_agent_that_does_not_report_vision_is_unknown_and_prepares_nothing() {
+        let agent: Box<dyn Agent> = Box::new(NoSessionStoreAgent);
+        assert_eq!(agent.vision_state("local", "gemma-4-E2B-it"), None);
+        agent.prepare_model("gemma-4-E2B-it");
     }
 }

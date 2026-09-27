@@ -1,6 +1,7 @@
 /** Voice sub-screen wired to settings: pickers, speaking-rate slider, voice_tts_voice updates. */
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import { navigateTo } from "./helpers/nav";
 
 const MOCK_SETTINGS = {
   assistant_name: "Pond",
@@ -101,7 +102,8 @@ async function goToVoiceScreen(page: Page) {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/");
   await page.waitForSelector(".ghub", { timeout: 10_000 });
-  await page.getByRole("button", { name: "Settings", exact: true }).first().click();
+  // The hub's icon rail is gone; Settings now lives in the drawer.
+  await navigateTo(page, "Settings");
   await page.waitForSelector(".set", { timeout: 5_000 });
   await page.getByRole("button", { name: /^Voice$/ }).first().click();
   await page.waitForTimeout(600);
