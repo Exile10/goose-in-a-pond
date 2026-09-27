@@ -491,10 +491,13 @@ async fn post_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode
     )
 }
 
-/// Pair `client_id` from a LAN address with `code` and return the session token the pond issued.
+/// Pair `client_id` with `code` and return the session token the pond issued.
+///
+/// Over loopback: `require_lan` classifies a peer against this host's real interfaces, so a
+/// fixed LAN address pairs only on a machine that happens to sit on that subnet.
 async fn pair(h: &Harness, code: &str, client_id: &str) -> String {
     let (status, init) = post_json(
-        &h.remote,
+        &h.loopback,
         "/api/v1/handshake/init",
         serde_json::json!({
             "client_id": client_id,
@@ -505,7 +508,7 @@ async fn pair(h: &Harness, code: &str, client_id: &str) -> String {
     .await;
     assert_eq!(status, StatusCode::OK, "handshake/init: {init}");
     let (status, verified) = post_json(
-        &h.remote,
+        &h.loopback,
         "/api/v1/handshake/verify",
         serde_json::json!({
             "challenge_id": init["challenge_id"],
