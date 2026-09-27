@@ -5327,9 +5327,13 @@ async fn run_server(
         axum_server::from_tcp_rustls(https_listener.into_std()?, tls_config.clone())?
             .handle(tls_handle.clone())
             .serve(companion.into_make_service_with_connect_info::<std::net::SocketAddr>());
+    // A failed renewal keeps serving the current certificate, which is still valid for at least
+    // thirty days, and retries next tick. Returning an error here would end `run_server` and take
+    // the loopback dashboard, chat and voice down with the HTTPS listener.
     let renewal = async {
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(30));
         ticks.tick().await;
+        let mut last_failure: Option<String> = None;
         loop {
             #[cfg(unix)]
             tokio::select! { _ = ticks.tick() => (), _ = embedded.changed.notified() => () }
@@ -5349,17 +5353,34 @@ async fn run_server(
                     names
                 }
             });
-            let names = names?;
-            match tls_identity.renew_if_needed(&names) {
-                Ok(true) => {
+            let renewed = async {
+                let names = names?;
+                if tls_identity.renew_if_needed(&names)? {
                     let (cert, key) = tls_identity.pem();
                     tls_config.reload_from_pem(cert, key).await?;
                 }
-                Ok(false) => {}
-                Err(error) => return Err::<(), anyhow::Error>(error),
+                Ok::<_, anyhow::Error>(names)
             }
-            #[cfg(unix)]
-            embedded.publish_ready(&names);
+            .await;
+            match renewed {
+                Ok(names) => {
+                    if last_failure.take().is_some() {
+                        tracing::info!("TLS certificate renewal recovered");
+                    }
+                    // Only a certificate that covers the new addresses may announce them.
+                    #[cfg(unix)]
+                    embedded.publish_ready(&names);
+                    #[cfg(not(unix))]
+                    let _ = names;
+                }
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    if last_failure.as_deref() != Some(error.as_str()) {
+                        tracing::warn!(%error, "TLS certificate renewal failed; serving the current certificate and retrying");
+                    }
+                    last_failure = Some(error);
+                }
+            }
         }
     };
     let embedded_server = async {
