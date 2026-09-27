@@ -68,11 +68,13 @@ pub fn interfaces() -> std::io::Result<Vec<Interface>> {
 
 #[cfg(unix)]
 fn attached_interface_names() -> std::io::Result<std::collections::HashSet<String>> {
-    let mut head = std::ptr::null_mut();
-    // SAFETY: getifaddrs initializes a linked list owned by libc on success.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+    let mut head = std::mem::MaybeUninit::<*mut libc::ifaddrs>::uninit();
+    // SAFETY: getifaddrs writes the head of a linked list owned by libc when it returns 0.
+    if unsafe { libc::getifaddrs(head.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: written by the successful call above. Null means no interfaces at all.
+    let head = unsafe { head.assume_init() };
     struct List(*mut libc::ifaddrs);
     impl Drop for List {
         fn drop(&mut self) {
@@ -81,11 +83,11 @@ fn attached_interface_names() -> std::io::Result<std::collections::HashSet<Strin
         }
     }
     let list = List(head);
-    let mut current = list.0;
+    let mut current = std::ptr::NonNull::new(list.0);
     let mut names = std::collections::HashSet::new();
-    while !current.is_null() {
-        // SAFETY: the list remains allocated until its guard is dropped.
-        let interface = unsafe { &*current };
+    while let Some(entry) = current {
+        // SAFETY: non-null, and every entry stays allocated until `list` drops at the end.
+        let interface = unsafe { entry.as_ref() };
         let flags = interface.ifa_flags as libc::c_int;
         if flags & libc::IFF_UP != 0
             && flags & libc::IFF_POINTOPOINT == 0
@@ -96,7 +98,7 @@ fn attached_interface_names() -> std::io::Result<std::collections::HashSet<Strin
                 names.insert(name.to_owned());
             }
         }
-        current = interface.ifa_next;
+        current = std::ptr::NonNull::new(interface.ifa_next);
     }
     Ok(names)
 }
@@ -202,5 +204,16 @@ mod tests {
             &[lan("wg0", "192.168.1.2")]
         ));
         assert_eq!(require_lan(None).unwrap_err().0, StatusCode::FORBIDDEN);
+    }
+
+    /// Walks the real getifaddrs list: loopback is up and not point-to-point on every Unix host.
+    #[cfg(unix)]
+    #[test]
+    fn the_interface_walk_reaches_loopback() {
+        let names = attached_interface_names().expect("getifaddrs");
+        assert!(
+            names.iter().any(|n| n == "lo" || n == "lo0"),
+            "no loopback among {names:?}"
+        );
     }
 }
