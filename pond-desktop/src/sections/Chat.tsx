@@ -510,9 +510,7 @@ export function Chat() {
       return;
     }
 
-    // The bubble keeps its own copy of each previewUrl and the store now owns
-    // revoking them, so the tray is cleared here WITHOUT revoking -- doing so
-    // would blank the thumbnail on the message just sent.
+    // The store owns these previews: clear the tray without revoking, or the sent thumbnail blanks.
     sendTurn({ text, attachments });
     setAttachments([]);
     setAttachError(null);

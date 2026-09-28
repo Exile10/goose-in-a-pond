@@ -90,7 +90,6 @@ test("Hub visual tour — light theme", async ({ page }) => {
     results.push({ label: "Notifications", ok: false, note: String(e).slice(0, 200) });
   }
 
-  // Settings sub-tour: navigate to Settings then click each row
   await navigateTo(page, "Settings");
   await expect(page.locator(".set")).toBeVisible({ timeout: 4_000 });
   for (const { row, label } of SETTINGS_TOUR) {
@@ -223,10 +222,7 @@ test("Hub interaction smoke — tile toggle + routine run + bell shortcut", asyn
   await page.goto("/");
   await expect(page.locator(".dash")).toBeVisible({ timeout: 10_000 });
 
-  // First favourite light tile — capture state before/after click
-  // Home's tiles are HomeControlsCard's now. Today's Dashboard rebuild stopped
-  // DashboardGrid rendering DeviceTile, so `.dtile` matches nothing here -- and
-  // this file's serial mode meant a stale `.home2` above hid that for a while.
+  // Home's tiles are HomeControlsCard's now; `.dtile` (DashboardGrid) matches nothing.
   const firstTile = page.locator('[data-hook="home-controls"] .hcc__tile').first();
   const beforeStatus = await firstTile.innerText().catch(() => "n/a");
   await firstTile.click();

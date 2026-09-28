@@ -50,9 +50,7 @@ async fn make_app() -> Harness {
         onboarding_repo: Arc::new(pond_infra::onboarding::SqlxOnboardingRepository::new(
             pool.clone(),
         )),
-        // The real adapter: the whole point is that the route reaches
-        // `issue_pairing_code_for`, and a mock would answer whatever it was
-        // told to.
+        // Real adapter: the route must reach `issue_pairing_code_for`.
         handshake: Arc::new(SqliteHandshakeAdapter::new(pool.clone(), None)),
         whisper_url: "http://127.0.0.1:9000".into(),
         transcribe_audio: None,

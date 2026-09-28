@@ -1871,23 +1871,15 @@ mod tests {
         assert_eq!(s.note_extraction_attempt("gone").await.unwrap(), 0);
     }
 
-    /// The same invariant the title writers carry, on the writer that runs most
-    /// often.
-    ///
-    /// `sessions.updated_at` is one of the two activity sources the idle gate
-    /// reads. The extraction cursor is written once per window of every
-    /// conversation in the backlog, so if it stamped that column the pass's own
-    /// watcher would read its bookkeeping as somebody coming back, cancel the
-    /// pass mid-run, and shove the idle clock forward -- every time, forever.
+    /// Writing the extraction cursor must not bump `sessions.updated_at`: the idle gate reads it,
+    /// so the pass would see its own bookkeeping as activity and cancel itself.
     #[tokio::test]
     async fn extraction_cursor_writes_are_not_mistaken_for_user_activity() {
         let (s, _tmp) = make_storage().await;
         s.create_session("sess-1".to_string()).await.unwrap();
         let before = s.get_session("sess-1").await.unwrap().updated_at;
 
-        // SQLite's datetime('now') has one-second resolution, so without this
-        // a bump inside the same second would be invisible and the test would
-        // pass against code that does bump.
+        // `datetime('now')` has one-second resolution; a same-second bump would be invisible.
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
         s.set_extraction_cursor("sess-1", Some("msg-4"))

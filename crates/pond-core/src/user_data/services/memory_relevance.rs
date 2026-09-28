@@ -397,13 +397,8 @@ pub async fn run_dimension_repair(
     .await
 }
 
-/// The shared batching loop. `stale_dims` selects which rows are fetched: `None`
-/// means "never embedded", `Some(d)` means "embedded at some width other than d".
-///
-/// `cancel` is `None` for the two boot-time passes, which own the process's idle
-/// moment and have nothing to yield to; `max_batches` bounds a scheduled caller
-/// to one bite. Both are inert for those callers rather than absent, so there is
-/// one loop to reason about and not two.
+/// Shared batching loop; `stale_dims`: `None` = never embedded, `Some(d)` = width other than `d`.
+/// `cancel` is `None` for boot-time passes; `max_batches` limits a scheduled caller to one bite.
 #[allow(clippy::too_many_arguments)]
 async fn embed_in_batches(
     repo: &dyn MemoryRepository,

@@ -221,11 +221,8 @@ impl LocalInferenceLlmAdapter {
     //     let entry = registry.get_model(spec.id)?;
     //     entry.local_path.exists().then(|| spec.id.to_string())
     // }
-    /// Stamp the model registry so llama-cpp-2 picks up device settings at load time.
-    ///
-    /// A device profile lets a non-CUDA build take the Jetson branch on purpose: otherwise
-    /// `device_budget::device_window`, the arithmetic that can OOM the board, has no caller
-    /// off-device.
+    /// Stamp device settings into the registry before llama-cpp-2 loads. A device profile sends a
+    /// non-CUDA build down the Jetson path, so `device_budget::device_window` also runs off-device.
     fn apply_model_settings(model_id: &str) {
         #[cfg(feature = "cuda")]
         Self::apply_jetson_settings(model_id);
@@ -453,7 +450,6 @@ impl LocalInferenceLlmAdapter {
             // // creation, and a newly downloaded one is picked up without a
             // // restart.
             // draft_model,
-            // `enable_thinking` is set above from the template, not inherited.
             ..Default::default()
         };
 

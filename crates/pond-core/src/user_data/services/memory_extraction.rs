@@ -1983,11 +1983,8 @@ impl BatchExtractionService {
             }
             outcome.written += 1;
             recent.push(content.to_lowercase());
-            // The fact itself is never logged at INFO. INFO is what the on-disk
-            // log under <data_dir>/logs keeps, so an extracted memory logged
-            // there is the household's private sentence in a second place with
-            // none of the store's scoping, retention or redaction. The id
-            // correlates the line with the row; the row is the record.
+            // Never log the fact itself: INFO lands in the on-disk log, outside the store's
+            // scoping, retention and redaction. The id links the line to the row.
             tracing::info!(
                 memory_id = %id,
                 chars = content.chars().count(),

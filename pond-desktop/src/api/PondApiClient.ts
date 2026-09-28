@@ -291,7 +291,6 @@ export class PondApiClient {
     timeout?: number,
   ): Promise<T> {
     const res = await this.send(method, path, body, timeout);
-    // 204 No Content and any other empty body — return undefined cast to T
     const ct = res.headers.get("content-type") ?? "";
     if (res.status === 204 || !ct.includes("json"))
       return undefined as unknown as T;

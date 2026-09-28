@@ -150,9 +150,7 @@ fn loopback_flag_enabled(value: Option<&str>) -> bool {
 /// Wizard writes must close with the wizard, or any LAN caller could rewrite settings later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exposure {
-    /// Public in every state. Pairing, health, the one question a client must
-    /// be able to ask before it has anything to authenticate with, and the
-    /// discovery information needed to establish the initial connection.
+    /// Public in every state: pairing, health, onboarding status and connection discovery.
     Always,
     /// Only local compatibility callers may omit credentials.
     HostOnly,
@@ -165,10 +163,8 @@ enum Exposure {
     UntilOnboardedThenHostOnly,
 }
 
-/// Every pre-onboarding `(method, path, exposure)` classification, both
-/// method-scoped (`{brace}` matches exactly one segment) and state-scoped (each
-/// entry says when it stops being public). Keep it in step with the public router
-/// in `routes::api_routes` -- `public_router_and_allowlist_agree` fails the build.
+/// Every pre-onboarding `(method, path, exposure)`; `{brace}` is one segment. Must match the
+/// public router in `routes::api_routes` (`public_router_and_allowlist_agree`).
 const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::GET, "/health", Exposure::Always),
     // Pairing precedes any token; the pairing-code routes are loopback-gated in their handlers.
@@ -203,11 +199,8 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::PUT, "/settings", Exposure::UntilOnboarded),
     // Warm-up banner during the wizard; afterwards `PondApiClient.get` sends the bearer token.
     (Method::GET, "/warmup", Exposure::UntilOnboarded),
-    // Local Piper; text -> audio, leaks no user data. Not an onboarding hole:
-    // two shipped callers speak through it with no Authorization header long
-    // after setup -- `playTtsSentence` in WebVoiceBackend.ts and
-    // `fetch_tts_bytes` in audio_cmd.rs. HostOnly preserves those loopback
-    // callers while requiring remote authentication.
+    // Local Piper, no user data. `playTtsSentence` (WebVoiceBackend.ts) and `fetch_tts_bytes`
+    // (audio_cmd.rs) call it tokenless over loopback; HostOnly keeps them and gates remote callers.
     (Method::POST, "/tts", Exposure::HostOnly),
     // Wizard voice setup; afterwards PondApiClient.ts sends the token (verified, unlike /tts).
     (Method::POST, "/voice/tts/apply", Exposure::UntilOnboarded),
@@ -331,11 +324,8 @@ pub async fn log_requests(req: Request, next: Next) -> Response {
     response
 }
 
-/// Global token-based authentication middleware.
-///
-/// Uses `from_fn_with_state` to reach `AppState::handshake` and validate the
-/// Bearer token. Pre-onboarding routes bypass validation only when their
-/// exposure class permits the actual peer and current onboarding state.
+/// Global bearer-token authentication; `PUBLIC_ROUTES` entries bypass it only when their exposure
+/// admits this peer in the current onboarding state.
 pub async fn auth_middleware(
     State(state): State<Arc<crate::AppState>>,
     headers: axum::http::HeaderMap,
@@ -389,10 +379,8 @@ pub async fn auth_middleware(
         return Err(AuthError::InvalidToken);
     }
 
-    // Name the caller for downstream authorization. `caller_for_token` is the ONE
-    // door the device id may come through -- the token this pond issued at pairing.
-    // A client-supplied device would outrank every proof the pond can make, since
-    // `PairedDevice` beats face and explicit id; `device_rung_wiring.rs` guards it.
+    // The device id comes only from `caller_for_token`: a client-supplied one would outrank every
+    // proof (`PairedDevice` beats face and explicit id). `device_rung_wiring.rs` guards this.
     let (mut principal, principal_device) = match state.handshake.caller_for_token(&token).await {
         Ok(Some(caller)) => {
             // Copied out before the principal takes it, so `with_device` is
@@ -571,9 +559,7 @@ mod tests {
 
     #[test]
     fn test_is_public_route() {
-        // Public in every state: pairing, health, the wizard question a client
-        // must be able to ask before it can authenticate. Asserted against the *narrowest*
-        // state, so an entry that quietly became state-dependent fails here.
+        // Asserted in the *narrowest* state, so an entry that became state-dependent fails.
         for (method, path) in [
             (Method::GET, "/api/v1/health"),
             (Method::POST, "/api/v1/handshake"),
@@ -756,17 +742,11 @@ mod tests {
 
         let expected = vec![
             "DELETE /voice/calibrate = UntilOnboarded".to_string(),
-            // The warm-up banner's data source: a phase, the chat model's name
-            // and two timestamps, nothing secret. Open during the wizard
-            // because the boot warm-up runs before any token exists; later
-            // warm-ups go through `PondApiClient.get`, which attaches one.
+            // Nothing secret (phase, model name, timestamps); the boot warm-up precedes any token.
             "GET /test = HostOnly".to_string(),
             "GET /warmup = UntilOnboarded".to_string(),
             "PATCH /profiles/{id} = UntilOnboarded".to_string(),
-            // Detection makes one outbound geocoding call for a place NAME and
-            // answers with a guess at where the caller is. Open during the
-            // wizard because location is configured before any device pairs; no
-            // household data goes outward. Closes when onboarding completes.
+            // One outbound geocoding call for a place NAME; no household data leaves. Wizard-only.
             "POST /handshake/revoke = Authenticated".to_string(),
             "POST /location/detect = UntilOnboarded".to_string(),
             "POST /onboard = UntilOnboarded".to_string(),

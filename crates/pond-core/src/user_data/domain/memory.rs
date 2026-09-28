@@ -1085,31 +1085,9 @@ fn is_clock_token(lower: &str) -> bool {
     false
 }
 
-/// The facts the extraction prompt's own worked example produces.
-///
-/// Compared case-insensitively and ignoring surrounding whitespace, not by
-/// fuzzy similarity: a real user really might have a mother called Florence,
-/// and refusing every fact that merely resembles the example would silently
-/// lose true memories. Only a VERBATIM echo is refused, which is what a copying
-/// model produces.
-///
-/// Kept next to `fact_defect` rather than in the extractor because it is a
-/// property of a fact, and both the LLM extractor and any future one have to
-/// answer to it.
-///
-/// **Empty, and that is the invariant.** The prompt that carried the
-/// Florence-in-Kisumu demonstration is gone: the batch prompt shows a schema
-/// skeleton with `...` for every value and no worked example at all, precisely
-/// because a model at this size copies content it is shown. There is therefore
-/// no example output to refuse.
-///
-/// This list and the prompt are coupled in both directions, and
-/// `conversation_extractor`'s `the_prompt_and_the_echo_gate_agree_about_examples`
-/// asserts it from the side that can see both: every sentence here must appear
-/// in the prompt, and a prompt that grows a worked example must add its output
-/// here. An entry with no demonstration behind it silently refuses a true
-/// memory; a demonstration with no entry is how invented family facts reached
-/// the live store on 2026-08-25.
+/// Facts from the extraction prompt's worked example; only exact, case-insensitive echoes are
+/// refused. Empty because the prompt has no worked example. Keep the two in step: a prompt that
+/// gains one must list its output here (`the_prompt_and_the_echo_gate_agree_about_examples`).
 pub const EXTRACTION_EXAMPLE_FACTS: &[&str] = &[];
 
 fn is_extraction_example(content: &str) -> bool {
@@ -1149,10 +1127,7 @@ pub fn names_user(content: &str) -> bool {
 pub fn names_subject(content: &str, aliases: &[String]) -> bool {
     let tokens = split_tokens(content);
     tokens.iter().any(|(_, normalised)| {
-        // "user's" survives split_tokens as one token (internal apostrophes
-        // are kept on purpose), and the prompt's own canonical example is
-        // "The user's mother Florence lives in Kisumu." — so the possessive
-        // has to match or the example the model is taught would fail.
+        // split_tokens keeps "user's" whole, and the prompt teaches the possessive form.
         if matches!(normalised.as_str(), "user" | "users" | "user's" | "users'") {
             return true;
         }
@@ -1842,8 +1817,7 @@ mod tests {
         "The user grew up in the former Yugoslavia.",
         "The user moved from Nairobi to Kisumu and prefers the latter.",
         "The user compared Rust and Go and prefers the latter.",
-        // A "there" whose place is named in the same sentence — introduced by a
-        // preposition in the first, by a copula in the second and third.
+        // "there" with its place named earlier, via a preposition or a copula.
         "The user moved to Kisumu and still works there.",
         "The user's home town is Kisumu and his parents still live there.",
         "The user's employer is Jarida and the user works there full time.",
@@ -2051,10 +2025,6 @@ mod tests {
 
     #[test]
     fn a_deictic_resolves_to_any_earlier_proper_noun() {
-        // Positional counting only. "Peter" is a person, not a place, so this
-        // row is vaguer than we would like — but demanding a *place* antecedent
-        // (a proper noun after a locative preposition) threw away every fact
-        // whose place arrives through a copula, which is most of them.
         assert!(fact_defect("The user's brother Peter enjoyed that place well enough.").is_none());
         assert!(
             fact_defect("The user's home town is Kisumu and his parents still live there.")
