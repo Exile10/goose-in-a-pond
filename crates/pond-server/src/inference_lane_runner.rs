@@ -221,29 +221,9 @@ fn elapsed_since(now: DateTime<Utc>, then: DateTime<Utc>) -> Duration {
 
 impl InferenceLane {
     /// A lane with no memory of previous processes and nowhere to write.
+    #[cfg(test)]
     pub fn new() -> Arc<Self> {
         Self::restored(HashMap::new(), None)
-    }
-
-    /// How long since this job last ran, from the same clock `acquire` reads.
-    ///
-    /// For a job whose own gate runs BEFORE it asks for the slot. The reviewer
-    /// is the one: its gate layers three refusals the lane knows nothing about
-    /// -- the orchestrator toggle, a run already in flight, and the daily cap
-    /// on interrupting a household -- so it decides whether there is anything
-    /// worth doing before it asks for the machine.
-    ///
-    /// The point of exposing this rather than letting it keep its own clock is
-    /// that two clocks disagreeing is worse than one being wrong. It kept an
-    /// `Option<Instant>` in its own stack frame, which meant its interval floor
-    /// reset on every restart while the lane's did not -- so the two halves of
-    /// one decision could answer differently about the same run.
-    pub fn since_last_run(&self, job: LaneJob) -> Option<Duration> {
-        let last_run = self
-            .last_run
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        last_run.get(&job).map(|t| elapsed_since(Utc::now(), *t))
     }
 
     /// A lane seeded from the durable log, writing new runs back to it.

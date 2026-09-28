@@ -163,6 +163,7 @@ conversation -- do not work out the actual date, and do not invent one.\n";
 /// prompt share one prompt-side clamp, and the two that grow with the
 /// conversation are the ones that must be trimmed when something has to give.
 /// This one is authored, so it is the one that can be asserted.
+#[cfg(test)]
 pub const EXTRACTION_PROMPT_CEILING: usize = 2_300;
 
 /// How much of an unparseable reply is carried into the error.
