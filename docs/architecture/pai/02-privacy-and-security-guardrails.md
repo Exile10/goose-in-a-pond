@@ -346,6 +346,22 @@ MCP connectivity probe).~~ *Superseded 2026-08-06 by P6a: five of the six are ga
 `UNGATED_SENDERS`; this is not done until that list is empty, and the cap is what stops it becoming
 a parking lot.
 
+**2026-09-29 -- the music player adds three outbound paths and one hole that is named, not closed.**
+None is a Rust sender, so none is in `EGRESS_TRACKED`; each is enforced another way.
+(1) *An extension's own calls.* `POST /api/v1/extension/egress` (internal token, loopback only) lets
+an extension ask the host before it sends: the host runs `check_egress_for` and records
+`egress.http` or `egress.denied` attributed to `giap-<extension>`. It is **opt-in for the extension**:
+the Apple provider asks; Spotify's `fetch` calls do not, so under Offline the Spotify extension is
+still not stopped. (2) *The player window.* Chromium makes those requests, so the shell asks
+`POST /api/v1/player/egress-policy` once per host per minute, refuses a host it cannot ask about, and
+sends the origin only, never a path or query; the route is loopback-only and records under
+`giap-player`. Commands to the player follow the same mode, except that transport (pause, next,
+volume) is never refused: a policy that cannot stop music already playing is a bug.
+(3) **The Widevine module.** Chromium's component updater downloads and refreshes it from Google,
+outside both of the above, so **`network_mode = offline` does not stop it.** It is named here so it
+cannot become a footnote. The fix is to hold the updater until the setting allows it, and it is not
+built. Detail and the rest of the player's model: `docs/architecture/music-player.md`.
+
 **A file-level guard is necessary and not sufficient, and P6a is where that stopped being a
 footnote.** `egress_tracked_files_reach_the_tracker` checks for ONE tracker symbol per FILE, so a
 file with several senders goes green on the first one gated. Three files in the list have more than

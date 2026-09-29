@@ -2185,3 +2185,56 @@ and do not establish device-key proof of possession or encrypted transport.
   memory reading with E2B, its drafter and its encoder resident during the boot warm-up (the gate for
   putting E2B on `DEVICE_MEASURED_VISION`), `ENCODER_COMPUTE_MB`, and the PAI-3 re-run after the
   budget move.
+
+**2026-09-29 -- an in-app music player, and a service-agnostic bridge to it. Touches PAI-2 and the extension surface.**
+
+- **What was asked.** Apple Music in the `music` extension, then: play the whole catalog, from inside
+  GIAP, with nothing outside the ecosystem, and agnostic to the service so Tidal or others can follow.
+  The first attempt (drive the Music app, add catalog songs to the library through Apple's REST API)
+  was built, committed, and then retired in favour of this once it was measured: opening a catalog
+  song in Music does not start it, so the library-add workaround was the only way and it edited the
+  user's library.
+- **What landed.** A hidden player window in the shell (its own session partition, Widevine-aware,
+  every request judged by `network_mode`); a `PlayerAdapter` interface with a MusicKit adapter, a
+  bridge, and a small UI; a host bridge in pond-api (`player.rs`: SSE commands to the page, replies,
+  state, an extension-facing command route); host-signed Apple developer tokens (`musickit.rs`);
+  `SecretRequirement.host_only`; and `WebPlayerProvider` in the extension, which falls back to the
+  Music app. Architecture, protocol and measurements: `docs/architecture/music-player.md`.
+- **What is proven and what is not.** Proven by tests over real HTTP and real SSE: the bridge round
+  trip, timeouts, page replacement, detach on close, the internal-token boundary, the exact
+  public-route pin, host-only secrets absent from the environment on install and on restart, and
+  developer-token signing verified against the public key. Proven live against Apple: token signing,
+  MusicKit load, sign-in, catalog search and queueing. **Not proven: audio.** A live run was refused
+  at the license (`MEDIA_LICENSE`, -42605) on Widevine 4.10.3050.0, a module another Apple Music
+  client reports as broken on the same stack. That is the likely cause and not a proven one. The
+  player is also untested under real Electron, and `enqueue`, `playlists` and `library` have only
+  met a fake MusicKit.
+- **Invariants.** *Preamble tokens*: the Spotify tool list is byte-identical to main's (4,281
+  chars); Apple gets five tools with the player, six with the Music app; none added overall.
+  *`profile_id`*: untouched, and **not solved**: like Spotify, the signed-in account is the pond's,
+  so the `library` tool shows that account's library to whoever is talking to it. *Egress*: three new
+  paths and one hole, in `02-privacy-and-security-guardrails.md` under the 2026-09-29 note; the hole
+  is that Chromium's Widevine download and updates are outside both gates, so Offline does not stop
+  them. *Secrets*: the Team ID, Key ID and `.p8` are `host_only`, withheld from an extension's
+  environment on every path that builds one (install, restart, token refresh, startup); the Music
+  User Token never reaches the host at all, because MusicKit keeps it in the page's storage.
+  *Guest*: no change. *Blocking a turn*: `play` waits up to 30 s for audio to be confirmed, longer
+  than any tool here waited before; it answers with a reason at the end, never silently.
+  *Side effects without approval*: playing the song asked for is the request; the window shows
+  itself only to sign in; nothing is added to the user's library (that path is gone).
+- **Deferred, with the reason.** Swapping this repo's Electron for castlabs' (it trails upstream, adds
+  a VMP signing step and a credential to packaging, and needs a decision). The Widevine updater
+  switch under Offline. A permission handler on the player session (a wrong deny would read as a
+  license failure). The dashboard now-playing widget reading the player's state (`GET
+  /player/state` exists; the widget still reads Spotify). Routing Spotify's calls through
+  `/extension/egress`. A CI job for `extensions/music`, which has none.
+- **Verification**: Mac only, 2026-09-29. pond-core and pond-api 2,287 passed, 0 failed, 6 ignored;
+  `pond-server` builds; rustfmt clean; clippy clean on every file changed (the failures it reports in
+  `egress_guard.rs` and `routes.rs` are in code this work did not touch). pond-desktop: typecheck
+  clean and 1,079+ tests including the no-emoji scan. Extension: typecheck clean, 120 tests plus 5
+  live ones behind `GIAP_MUSIC_LIVE`. A real run of the extension process against a fake host chose
+  the player, dropped `devices`, gained `when`, and sent `search` then `play`.
+  `scripts/live-test.sh` passed (135 + 18 checks), including 12 new ones on a real server: the
+  extension-only routes refuse without the internal token, the developer-token route reaches the
+  secret store and says what to add, and the shell's policy route follows the live `network_mode`.
+  Not run: Playwright, the Orin, and anything that needs audio.
