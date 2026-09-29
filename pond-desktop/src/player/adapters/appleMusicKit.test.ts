@@ -170,6 +170,24 @@ describe("AppleMusicKitAdapter: starting up", () => {
     expect(adapter.state().message).toContain("Team ID");
   });
 
+  it("does not load Apple's script for a household that has not set up Apple Music", async () => {
+    let loads = 0;
+    const adapter = new AppleMusicKitAdapter({
+      loadMusicKit: async () => {
+        loads += 1;
+        return fakeKit(new FakeMusic()).kit;
+      },
+      fetchDeveloperToken: async () => {
+        throw new Error("Apple Music is not set up: add your Team ID.");
+      },
+    });
+    // The setup retry asks every ten seconds, so this is asked over and over on a pond with no key.
+    await adapter.init();
+    await adapter.init();
+    await adapter.init();
+    expect(loads).toBe(0);
+  });
+
   it("says so when Apple's script cannot be loaded", async () => {
     const adapter = new AppleMusicKitAdapter({
       loadMusicKit: async () => {

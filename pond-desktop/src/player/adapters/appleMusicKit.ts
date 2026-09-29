@@ -228,8 +228,12 @@ export class AppleMusicKitAdapter implements PlayerAdapter {
         this.set({ ready: false, need: "setup", message: drm });
         return;
       }
-      const mk = await this.deps.loadMusicKit();
+      // The token first, and the script second: with no key set up there is nothing to configure,
+      // and this window runs every service's adapter on every pond, so loading Apple's script
+      // before asking would be a call to Apple, every ten seconds, for a household that never
+      // set up Apple Music.
       const developerToken = await this.deps.fetchDeveloperToken();
+      const mk = await this.deps.loadMusicKit();
       await mk.configure({ developerToken, app: APP });
       this.mk = mk;
       this.music = mk.getInstance();
