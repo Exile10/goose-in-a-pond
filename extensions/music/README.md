@@ -136,6 +136,9 @@ For local development and testing without the GIAP OAuth flow:
    - `playlist-read-private`
    - `playlist-modify-private`
    - `playlist-modify-public`
+   - `user-library-read`, `user-top-read`, `user-read-recently-played`
+   - `streaming`, `user-read-email`, `user-read-private` (only for the in-app player; a
+     Premium account is needed for it)
 3. Set the token as an environment variable:
 
 ```bash

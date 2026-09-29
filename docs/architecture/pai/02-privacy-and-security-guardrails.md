@@ -351,8 +351,9 @@ None is a Rust sender, so none is in `EGRESS_TRACKED`; each is enforced another 
 (1) *An extension's own calls.* `POST /api/v1/extension/egress` (internal token, loopback only) lets
 an extension ask the host before it sends: the host runs `check_egress_for` and records
 `egress.http` or `egress.denied` attributed to `giap-<extension>`. It is **opt-in for the extension**:
-the Apple provider asks; Spotify's `fetch` calls do not, so under Offline the Spotify extension is
-still not stopped. (2) *The player window.* Chromium makes those requests, so the shell asks
+the Apple provider asks; Spotify's `fetch` calls did not, so under Offline the Spotify extension was
+still not stopped. **Corrected later 2026-09-29: Spotify's calls now ask too** (see the last note in
+this list). (2) *The player window.* Chromium makes those requests, so the shell asks
 `POST /api/v1/player/egress-policy` once per host per minute, refuses a host it cannot ask about, and
 sends the origin only, never a path or query; the route is loopback-only and records under
 `giap-player`. Commands to the player follow the same mode, except that transport (pause, next,
@@ -372,6 +373,23 @@ asked, at a time; the service keeps no address, and its proxy has no access log.
 promise is what the hosting provider's network keeps. Whether Apple's terms allow one team's token to
 serve independent installations is unchecked and is a condition for turning it on.
 `docs/architecture/pondcredentials.md`.
+
+**2026-09-29 (later still) -- Spotify gets the same gate, and a third-party script now sees the person's Spotify token.**
+(1) *Closed:* every call the Spotify extension makes to `api.spotify.com` asks `POST /extension/egress`
+first, the retry after a token refresh included, so `network_mode` and the Logs screen cover it as they
+do Apple's; a refusal is the host's own sentence and nothing is sent. The hole in the first player note
+above is closed for the extension. (2) *New:* the in-app Spotify player is a Web Playback SDK device, and
+the SDK signs in with the person's own access token. `GET /api/v1/player/user-token` gives it to the
+paired page (session only; an extension's internal token is refused), and Spotify's script, loaded from
+`sdk.scdn.co`, runs in that window with it. The extension already held the same token; what is new is a
+third party's code seeing it. Renewal goes through the same egress gate. No identifier is sent that was
+not already sent. (3) *Consequence for households:* the sign-in now asks for `streaming`,
+`user-read-email` and `user-read-private`, so everyone signs in to Spotify once more. (4) *Under
+`allowlist` or `offline` the in-app player is refused*, because Spotify's hosts are classed sensitive
+like Apple's; only `open` lets it run. (5) *Not settled:* Spotify's developer terms restrict ingesting
+Spotify Content into an AI model and limit the licence to private personal use; see "Spotify's terms" in
+`docs/architecture/music-player.md`. That predates this change and applies to the Spotify tools that
+already shipped.
 
 **A file-level guard is necessary and not sufficient, and P6a is where that stopped being a
 footnote.** `egress_tracked_files_reach_the_tracker` checks for ONE tracker symbol per FILE, so a

@@ -2269,3 +2269,41 @@ and do not establish device-key proof of possession or encrypted transport.
   build and compose stack run, Caddy has a certificate, Apple's catalog API accepts a token fetched over the
   public endpoint, and a scratch pond fetched one through its own route, logged as `giap-credentials`.
   Still not done: monitoring, a reboot test, a live key rotation, Apple's answer on sharing the token.
+
+**2026-09-29 (later still) -- Spotify gets the same treatment: the in-app player as a Connect device, every call gated, and the shell on castlabs' Electron. Touches PAI-2.**
+
+- **What was asked.** "Finish implementation" of the music work, and Spotify "should also get the same
+  treatment". Decided with Jerry: the full treatment on the branch, and the Electron swap on the branch;
+  nothing merges until audio is verified and the terms are settled.
+- **What landed.** Spotify plays inside the window as a Web Playback SDK **Connect device**, not as a
+  second controller: its control plane is REST and `SpotifyProvider` already drives all of it, so the
+  window is the speaker and the extension plays *to* it when no other device is active (never taking over
+  a phone that is playing). Host: `GET /player/user-token` (session only, renews through the egress gate),
+  Spotify in `/player/status`, and the sign-in scopes `streaming`, `user-read-email`, `user-read-private`.
+  Page: `adapters/spotifyWebPlayback.ts` (transport, a one-second position clock, a `device` op), and one
+  window that runs an adapter per service. Extension: every Spotify call asks the host first, the retry
+  after a refresh included. Shell: castlabs' Electron (`44.1.0+wvcus`) with an install guard and
+  `electronDist`. CI: a job for `extensions/music`, which had none.
+- **Invariants.** *Egress*: the hole named in the first player note is closed for the extension; the
+  window's own traffic is judged per host, and Spotify's hosts are sensitive, so only `open` lets the
+  player run. *Secrets*: the person's Spotify token now reaches the page, and Spotify's script runs
+  with it (documented as new in the PAI-2 note); an extension's internal token is refused on the route
+  that hands it out. *Preamble tokens*: the Spotify tool list and wording are unchanged, by design (the
+  speaker style adds no tool). *Side effects without approval*: playback moves to the in-app device only
+  when Spotify itself says no device is active. *Users*: everyone signs in to Spotify once more.
+- **Not built, on purpose.** Search, queue, library and playlists in the window for Spotify (the
+  extension does them over REST); the Spotify Widevine / castlabs updater hole; a permission handler.
+- **Open questions.** (1) Whether Spotify's terms allow this at all: they restrict ingesting Spotify
+  Content into an AI model and license "private personal use"; this predates the change and covers the
+  tools that already shipped. (2) Whether Spotify accepts this Widevine module: never tried.
+  (3) Packaging with the castlabs binary (`pack:dir`, `bundle:app`), VMP signing, and the Linux smoke job
+  are untried.
+- **Verification**: Mac only, 2026-09-29. pond-core and pond-api 2,302 passed, 0 failed, 6 ignored (5
+  new route tests: the token route for the page only, sign-in errors, one service only, a renewal that
+  cannot happen, Spotify in status); clippy has no warnings in the files touched (the workspace-wide
+  `-D warnings` run stops in `pond-voice`, which this does not touch). Desktop 80 files, 1,124 tests,
+  typecheck clean (25 for the Spotify adapter against a fake SDK, 3 for the multi-service page). Music
+  extension 139 tests, 134 passed, 5 live skipped, and the new CI job's exact steps pass in a clean copy.
+  `scripts/live-test.sh --no-build` passed (135 + 18 checks). **Not verified: Spotify itself, and
+  therefore audio.** A harness that drives the real extension against a signed-in scratch app exists, and
+  needs a Premium account signing in.
