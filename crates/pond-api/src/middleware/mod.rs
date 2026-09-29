@@ -199,16 +199,13 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::PUT, "/settings", Exposure::UntilOnboarded),
     // Warm-up banner during the wizard; afterwards `PondApiClient.get` sends the bearer token.
     (Method::GET, "/warmup", Exposure::UntilOnboarded),
-    // Local Piper, no user data. `playTtsSentence` (WebVoiceBackend.ts) and `fetch_tts_bytes`
-    // (audio_cmd.rs) call it tokenless over loopback; HostOnly keeps them and gates remote callers.
+    // Local Piper, no user data; `playTtsSentence` and `fetch_tts_bytes` call it tokenless.
     (Method::POST, "/tts", Exposure::HostOnly),
     // Wizard voice setup; afterwards PondApiClient.ts sends the token (verified, unlike /tts).
     (Method::POST, "/voice/tts/apply", Exposure::UntilOnboarded),
     (Method::POST, "/voice/calibrate", Exposure::UntilOnboarded),
     (Method::DELETE, "/voice/calibrate", Exposure::UntilOnboarded),
-    // Discovery needs system information before pairing. Test routes retain
-    // local compatibility; network callers must authenticate. Transcription
-    // and agent diagnostics are in the protected router.
+    // Discovery needs system info before pairing; transcription and diagnostics stay protected.
     (Method::GET, "/system/info", Exposure::Always),
     (Method::GET, "/test", Exposure::HostOnly),
     (Method::POST, "/test/speak", Exposure::HostOnly),
@@ -245,8 +242,7 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 
 /// This request's exposure class, or `None` when the route is not on the allowlist.
 fn route_exposure(method: &Method, path: &str) -> Option<Exposure> {
-    // Dashboard assets and development pages are local compatibility surfaces.
-    // A forwarding header cannot grant the actual peer this exemption.
+    // Dashboard and dev pages: tokenless only from loopback, never via a forwarding header.
     if !path.starts_with("/api/") {
         return Some(Exposure::HostOnly);
     }
@@ -324,8 +320,7 @@ pub async fn log_requests(req: Request, next: Next) -> Response {
     response
 }
 
-/// Global bearer-token authentication; `PUBLIC_ROUTES` entries bypass it only when their exposure
-/// admits this peer in the current onboarding state.
+/// Bearer-token auth; a `PUBLIC_ROUTES` entry skips it only if its exposure admits the peer.
 pub async fn auth_middleware(
     State(state): State<Arc<crate::AppState>>,
     headers: axum::http::HeaderMap,
@@ -342,8 +337,7 @@ pub async fn auth_middleware(
         .unwrap_or(false);
 
     if let Some(exposure) = route_exposure(req.method(), path.path()) {
-        // Only onboarding-dependent classes cost a database read. Static
-        // assets, health and local compatibility routes do not need one.
+        // Only onboarding-dependent classes read the database; the rest ignore `onboarded`.
         let onboarded = matches!(
             exposure,
             Exposure::UntilOnboarded | Exposure::UntilOnboardedThenHostOnly
@@ -383,11 +377,7 @@ pub async fn auth_middleware(
     // proof (`PairedDevice` beats face and explicit id). `device_rung_wiring.rs` guards this.
     let (mut principal, principal_device) = match state.handshake.caller_for_token(&token).await {
         Ok(Some(caller)) => {
-            // Copied out before the principal takes it, so `with_device` is
-            // still handed `caller.device_id` and nothing else.
-            // `device_rung_wiring` reads this line to prove that, and a clone
-            // inside the call is enough to fail it -- correctly, because the
-            // next thing to appear there would be a header.
+            // Cloned first: `device_rung_wiring` needs bare `caller.device_id` in the call below.
             let on_lan = caller.device_id.clone();
             (
                 Principal::token(caller.client_id).with_device(caller.device_id),
@@ -403,15 +393,7 @@ pub async fn auth_middleware(
         principal = principal.with_remote_addr(ci.0.to_string());
     }
 
-    // A device that authenticates from the household's own network has just
-    // proved it is still part of the household, which is what its remote access
-    // is renewed by. Recorded here because this is the one place that knows both
-    // facts at once: which device the token belongs to, and that the peer is on
-    // a directly attached LAN rather than the tailnet.
-    //
-    // Through an extension the server installs, so this crate keeps no knowledge
-    // of how presence is stored, and a build without the embedded network simply
-    // has nobody to tell.
+    // Authenticating from the household LAN, not the tailnet, renews a device's remote access.
     if let Some(presence) = req
         .extensions()
         .get::<Arc<dyn pond_core::security::ports::remote_access::DevicePresence>>()

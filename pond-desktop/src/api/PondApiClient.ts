@@ -229,14 +229,7 @@ export class PondApiClient {
     return h;
   }
 
-  /**
-   * Send one authenticated request and hand back the response unread.
-   *
-   * The half every JSON call and every bytes call share: the proactive token
-   * refresh, the timeout, one coalesced re-pair on a 401, and a non-2xx mapped
-   * to `ApiError`. Split out of `request()` so a caller that wants bytes
-   * rather than JSON inherits all four instead of copying three of them.
-   */
+  /** One authenticated request with the response unread, shared by JSON and bytes calls. */
   private async send(
     method: string,
     path: string,
@@ -478,18 +471,8 @@ export class PondApiClient {
   }
 
   /**
-   * Refresh this client's own row in the device registry.
-   *
-   * The desktop registers itself as an ordinary device when it pairs, and the
-   * registry derives `is_online` from `last_seen` against a five-minute
-   * threshold rather than storing it. Pairing was the only thing that ever
-   * wrote the row, so it aged out minutes into a session and the app reported
-   * the machine rendering the Devices list as unreachable.
-   *
-   * The id has to be the one pairing registered -- the server keys the row on
-   * the `client_id` sent at handshake -- so this goes through `clientId()`
-   * rather than taking an argument. A beat against any other id would succeed
-   * and refresh nothing.
+   * Refreshes this client's registry row, which reads offline five minutes after `last_seen`.
+   * Uses `clientId()`: the row is keyed on the handshake id, and any other id refreshes nothing.
    */
   heartbeatSelf(): Promise<void> {
     return this.markDeviceOnline(this.clientId());
@@ -802,14 +785,7 @@ export class PondApiClient {
     return this.post<ContextIndexRebuild>("/api/v1/context/index/rebuild", {});
   }
 
-  /**
-   * Record that a composed suggestion was tapped.
-   *
-   * Only composed ones: a template suggestion is recomputed on every read and
-   * has no row to settle. Without this the queue never drains and a household
-   * reads the same composed questions forever, which is the complaint the whole
-   * surface was built from, one tier up.
-   */
+  /** Settles a tapped composed suggestion (template ones have no row); without it the queue never drains. */
   markSuggestionTaken(id: string): Promise<{ id: string; settled: boolean }> {
     return this.post(`/api/v1/suggestions/${encodeURIComponent(id)}/taken`, {});
   }
@@ -821,13 +797,7 @@ export class PondApiClient {
     return this.get<LaneStatus>("/api/v1/lane");
   }
 
-  /**
-   * Ask one background job to take its next tick now.
-   *
-   * Wakes rather than runs: the work happens in the job's own loop under the
-   * same single slot every scheduled pass takes, so this returns as soon as the
-   * doorbell has been rung. What happened is read back from `laneStatus`.
-   */
+  /** Wakes one background job's loop and returns at once; read the outcome from `laneStatus`. */
   runLaneJob(job: string): Promise<LaneRunResult> {
     return this.post<LaneRunResult>(
       `/api/v1/lane/jobs/${encodeURIComponent(job)}/run`,
@@ -1260,14 +1230,7 @@ export class PondApiClient {
     );
   }
 
-  /**
-   * What the household might want to ask.
-   *
-   * `sessionId` is OPTIONAL, unlike every proposal call, and that is the point:
-   * `state.sessionId` is null on a cold launch and never persisted, so a Home
-   * screen that waited for one would show nothing on exactly the launch this
-   * fills. Passing one when it exists only sharpens the audience.
-   */
+  /** `sessionId` is optional (null on a cold launch); passing one narrows the audience to personal. */
   listSuggestions(sessionId?: string | null): Promise<SuggestionList> {
     const q = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
     return this.get<SuggestionList>(`/api/v1/suggestions${q}`);
@@ -1323,8 +1286,7 @@ export class PondApiClient {
               tool_calls: m.tool_calls as SessionMessageToolCall[] | undefined,
               tool_call_id: m.tool_call_id as string | undefined,
               images: m.images as SessionMessage["images"],
-              // Passed through as sent: absent stays absent and `[]` stays
-              // `[]`, the distinction the type documents.
+              // As sent: absent and `[]` mean different things.
               thinking: m.thinking as SessionMessage["thinking"],
               liked: m.liked as boolean | null | undefined,
             }) satisfies Record<keyof SessionMessage, unknown>,
@@ -1501,13 +1463,8 @@ export class PondApiClient {
   }
 
   /**
-   * The bytes of one persisted chat-image attachment (see SessionMessageImage).
-   *
-   * Fetched, never handed to `<img src>`. The route sits on the protected
-   * router and the server accepts only an `Authorization: Bearer` header, which
-   * an image element cannot send, so a bare URL answers 401 on every pond
-   * started without the loopback dev bypass. Callers show the result through
-   * an object URL they own and revoke.
+   * One persisted chat image's bytes. Never use the URL as `<img src>`: the route needs a Bearer
+   * header an image can't send. Callers show it through an object URL they own and revoke.
    */
   async getSessionAttachment(
     sessionId: string,
