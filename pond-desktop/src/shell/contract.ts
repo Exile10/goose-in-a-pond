@@ -27,6 +27,8 @@ export interface ShellCommands {
   stop_voice_session: { args: void; result: void };
   /** Open a URL in the real browser (`window.open` in the shell opens an in-app window). */
   open_external: { args: { url: string }; result: void };
+  /** Show or hide the music player window; it is hidden unless it needs the user (a sign-in). */
+  player_visibility: { args: { visible: boolean }; result: void };
 }
 
 export type ShellCommand = keyof ShellCommands;
@@ -73,6 +75,7 @@ export const SHELL_COMMANDS = [
   "start_voice_session",
   "stop_voice_session",
   "open_external",
+  "player_visibility",
 ] as const satisfies readonly ShellCommand[];
 
 /** Runtime allowlist for events. Same reasoning as `SHELL_COMMANDS`. */

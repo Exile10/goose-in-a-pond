@@ -13,6 +13,7 @@ import {
   resolveServerBinary,
 } from "./serverProcess";
 import { VoiceChildProcess } from "./voice/VoiceChildProcess";
+import { PlayerWindow } from "./player";
 import { registerIpc } from "./ipc";
 import { installMenu, setAboutPanel } from "./menu";
 import { createTray, setTrayStatus, destroyTray } from "./tray";
@@ -30,6 +31,8 @@ const log = {
 };
 
 let win: BrowserWindow | null = null;
+/** The music player window; null when GIAP_PLAYER=off. It is hidden unless it needs the user. */
+let player: PlayerWindow | null = null;
 /** Set on the way out, so the close handler stops hiding and lets us quit. */
 let quitting = false;
 
@@ -37,8 +40,12 @@ let quitting = false;
 const repoRoot = resolve(app.getAppPath(), "..");
 
 function emit<E extends ShellEvent>(name: E, payload?: ShellEvents[E]): void {
-  if (!win || win.isDestroyed()) return;
-  win.webContents.send(`giap:${name}`, payload);
+  if (win && !win.isDestroyed()) win.webContents.send(`giap:${name}`, payload);
+  // The player talks to the server too, so it must follow a fallback port like the app does.
+  const playerPage = name === "server-url" ? player?.webContents() : null;
+  if (playerPage && !playerPage.isDestroyed()) {
+    playerPage.send(`giap:${name}`, payload);
+  }
 }
 
 /** The port pond-server says it bound, and when; read from the server's data dir, not userData. */
@@ -80,6 +87,16 @@ const voice = new VoiceChildProcess({
   log,
 });
 
+if (process.env["GIAP_PLAYER"] !== "off") {
+  player = new PlayerWindow({
+    preloadPath: join(__dirname, "../preload/index.cjs"),
+    distDir: distRoot(app.getAppPath()),
+    serverUrl: () => server.url,
+    devServerUrl: process.env["GIAP_DEV_SERVER"],
+    log: log.info,
+  });
+}
+
 /** The voice child runs the sidecar's binary, found by the same lookup so they can't disagree. */
 function serverBinaryForVoice(): string | null {
   return resolveServerBinary({
@@ -117,6 +134,7 @@ const teardown = createTeardown({
   releaseUi: () => {
     unregisterHotkeys();
     destroyTray();
+    player?.destroy();
   },
   log,
 });
@@ -138,7 +156,7 @@ if (!app.requestSingleInstanceLock()) {
 
     setAboutPanel();
     installMenu({ emit });
-    registerIpc({ server, voice });
+    registerIpc({ server, voice, player });
 
     win = createMainWindow({
       preloadPath: join(__dirname, "../preload/index.cjs"),
@@ -153,6 +171,9 @@ if (!app.requestSingleInstanceLock()) {
         w.hide();
       },
     });
+
+    // Not awaited: it waits on the Widevine module, and the app must not wait on that.
+    void player?.start();
 
     createTray({
       emit,

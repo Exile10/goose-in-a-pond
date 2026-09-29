@@ -64,6 +64,8 @@ import {
   type DetectedPlace,
 } from "./types";
 import { voiceTitle } from "../voice/voiceCatalogue";
+import { parseSse, type SseFrame } from "../player/sse";
+import type { PlayerReply, PlayerState } from "../player/types";
 
 // All REST calls MUST go through PondApiClient; no fetch() elsewhere.
 
@@ -169,6 +171,13 @@ export class PondApiClient {
     } catch {
       /* ignore */
     }
+  }
+
+  /** How this client introduces itself when it pairs, and so how the devices list names it. */
+  private deviceName = "Pond Desktop";
+
+  setDeviceName(name: string): void {
+    this.deviceName = name;
   }
 
   /** Requests read `this.base` per call, so this retargets the whole singleton. */
@@ -1050,7 +1059,7 @@ export class PondApiClient {
       {
         challenge_id: init.challenge_id,
         mac,
-        device_name: "Pond Desktop",
+        device_name: this.deviceName,
       },
     );
     if (res.accepted && res.session_token) {
@@ -2090,6 +2099,52 @@ export class PondApiClient {
     state: string,
   ): Promise<import("./types").OAuthFlowStatus> {
     return this.get(`/api/v1/oauth/status/${encodeURIComponent(state)}`);
+  }
+
+  // ── Music player bridge ───────────────────────────────────
+
+  /**
+   * The player page's command stream. Long-lived by design, so unlike `streamSse` it has no
+   * timeout: it ends when the server closes it or `signal` aborts. `EventSource` cannot carry the
+   * Authorization header the server requires, hence fetch.
+   */
+  async *streamPlayerEvents(
+    service: string,
+    signal: AbortSignal,
+  ): AsyncGenerator<SseFrame> {
+    await this.ensureTokenFresh();
+    const url = `${this.base}/api/v1/player/events?service=${encodeURIComponent(service)}`;
+    const open = (token: string | null) =>
+      fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        signal,
+      });
+
+    let res = await open(this.token);
+    if (res.status === 401) {
+      const fresh = await this.reauthenticate();
+      if (fresh) res = await open(fresh);
+    }
+    if (!res.ok || !res.body) {
+      throw new ApiError(
+        res.status,
+        res.statusText || "The player stream did not open",
+      );
+    }
+    yield* parseSse(res.body, signal);
+  }
+
+  playerReply(reply: PlayerReply): Promise<unknown> {
+    return this.post("/api/v1/player/reply", reply);
+  }
+
+  playerState(service: string, state: PlayerState): Promise<unknown> {
+    return this.post("/api/v1/player/state", { service, state });
+  }
+
+  /** A developer token signed by the host, which holds the key. 400 says the key is not set up. */
+  musickitDeveloperToken(): Promise<{ token: string; expires_at: number }> {
+    return this.get("/api/v1/musickit/developer-token");
   }
 
   async refreshOAuth(provider: string): Promise<void> {

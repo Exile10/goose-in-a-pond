@@ -4,10 +4,12 @@ import { ipcMain, shell } from "electron";
 import type { ShellCommand } from "../../src/shell/contract";
 import type { ServerProcess } from "./serverProcess";
 import type { VoiceChildProcess } from "./voice/VoiceChildProcess";
+import type { PlayerWindow } from "./player";
 
 export interface IpcTargets {
   server: ServerProcess;
   voice: VoiceChildProcess;
+  player: PlayerWindow | null;
 }
 
 /** Register a handler, with the channel name checked against the contract. */
@@ -30,6 +32,14 @@ export function registerIpc(t: IpcTargets): void {
   });
 
   handle("stop_voice_session", () => t.voice.stop());
+
+  handle("player_visibility", (args) => {
+    const visible = (args as { visible?: unknown } | undefined)?.visible;
+    if (typeof visible !== "boolean") {
+      throw new Error("player_visibility needs { visible: boolean }");
+    }
+    t.player?.setVisible(visible);
+  });
 
   handle("open_external", async (args) => {
     const url = (args as { url?: string } | undefined)?.url;
