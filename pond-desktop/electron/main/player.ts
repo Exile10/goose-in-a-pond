@@ -50,6 +50,7 @@ export interface PlayerWindowOptions {
   /** Read per use: the server may bind a fallback port after the window exists. */
   serverUrl(): string;
   devServerUrl?: string | undefined;
+  /** Narrows the window to some services, comma separated. Omitted, it runs every one it has. */
   service?: string;
   log(message: string): void;
 }
@@ -162,8 +163,8 @@ export class PlayerWindow {
     });
 
     const base = this.opts.devServerUrl ?? APP_ORIGIN;
-    const service = encodeURIComponent(this.opts.service ?? "apple");
-    void win.loadURL(`${base}/player.html?service=${service}`);
+    const query = this.opts.service ? `?service=${encodeURIComponent(this.opts.service)}` : "";
+    void win.loadURL(`${base}/player.html${query}`);
     this.win = win;
   }
 

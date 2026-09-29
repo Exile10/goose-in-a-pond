@@ -2,10 +2,10 @@
 // from the Electron build: stock Electron has no key systems, castlabs' has Widevine once its
 // module has downloaded, and the difference is worth saying in words.
 
-/** A sentence for a person, or null when Widevine is available. */
-export async function widevineProblem(): Promise<string | null> {
+/** A sentence for a person, or null when Widevine is available. `what` is what could not play. */
+export async function widevineProblem(what = "protected music"): Promise<string | null> {
   if (typeof navigator.requestMediaKeySystemAccess !== "function") {
-    return "This window cannot play protected music: it has no DRM support.";
+    return `This window cannot play ${what}: it has no DRM support.`;
   }
   try {
     await navigator.requestMediaKeySystemAccess("com.widevine.alpha", [
@@ -16,6 +16,6 @@ export async function widevineProblem(): Promise<string | null> {
     ]);
     return null;
   } catch {
-    return "This build of Goose In A Pond has no Widevine module, so it cannot play Apple Music. If the module is still downloading, try again in a minute.";
+    return `This build of Goose In A Pond has no Widevine module, so it cannot play ${what}. If the module is still downloading, try again in a minute.`;
   }
 }

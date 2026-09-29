@@ -11,52 +11,70 @@ import { PondApiClient } from "../api/PondApiClient";
 import { invoke, listen } from "../shell";
 import { createAdapter, knownServices } from "./adapters";
 import { PlayerBridge } from "./bridge";
-import { PlayerApp } from "./PlayerApp";
+import { Players } from "./Players";
 import { retrySetup } from "./retry";
 
-const service = new URLSearchParams(window.location.search).get("service") ?? "apple";
+// One window runs every service it has an adapter for: `?service=apple,spotify` narrows it, and
+// none means all. A service that is not set up sits dormant and costs one small request every
+// ten seconds until it is.
+const asked = (new URLSearchParams(window.location.search).get("service") ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const services = asked.length > 0 ? asked : knownServices();
 const api = new PondApiClient();
 api.setDeviceName("GIAP Music Player");
 
-const adapter = createAdapter(service, {
+const context = {
   fetchDeveloperToken: async () => (await api.musickitDeveloperToken()).token,
+  fetchUserToken: async (service: string, refresh: boolean) =>
+    (await api.playerUserToken(service, refresh)).token,
+};
+const adapters = services.flatMap((s) => {
+  const adapter = createAdapter(s, context);
+  return adapter ? [adapter] : [];
 });
 
 const root = ReactDOM.createRoot(document.getElementById("root")!);
 
-if (!adapter) {
+if (adapters.length === 0) {
   root.render(
     <main className="player">
       <p className="player__text">
-        There is no player for "{service}". Available: {knownServices().join(", ")}.
+        There is no player for "{services.join(", ")}". Available: {knownServices().join(", ")}.
       </p>
     </main>,
   );
 } else {
   root.render(
     <React.StrictMode>
-      <PlayerApp adapter={adapter} />
+      <Players adapters={adapters} />
     </React.StrictMode>,
   );
   // The window stays hidden until it needs the user, which is a sign-in and nothing else.
   let shown = false;
-  adapter.onState((s) => {
-    const needsUser = s.need === "authorization";
-    if (needsUser === shown) return;
-    shown = needsUser;
-    void invoke("player_visibility", { visible: needsUser }).catch(() => undefined);
-  });
+  const needsUser = () => adapters.some((a) => a.state().need === "authorization");
+  const syncVisibility = () => {
+    const want = needsUser();
+    if (want === shown) return;
+    shown = want;
+    void invoke("player_visibility", { visible: want }).catch(() => undefined);
+  };
+  for (const adapter of adapters) adapter.onState(syncVisibility);
   // The server may bind another port after this window opened.
   listen("server-url", (url) => api.setBase(url));
 
   void (async () => {
     // Pair first, so the bridge's first request already carries a session.
     await api.connect().catch(() => null);
-    await adapter.init();
-    // The key is added after this window opened; keep asking until it is there.
-    retrySetup(adapter);
-    new PlayerBridge(adapter, api, {
-      log: (message, detail) => console.warn(`[player] ${message}`, detail ?? ""),
-    }).start();
+    await Promise.all(adapters.map((adapter) => adapter.init()));
+    for (const adapter of adapters) {
+      // The key is added after this window opened; keep asking until it is there.
+      retrySetup(adapter);
+      new PlayerBridge(adapter, api, {
+        log: (message, detail) =>
+          console.warn(`[player:${adapter.service}] ${message}`, detail ?? ""),
+      }).start();
+    }
   })();
 }

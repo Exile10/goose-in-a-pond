@@ -237,6 +237,11 @@ export class PlayerBridge {
         }
         return { tracks: await a.library(kind, whole(args, "limit", 20)) };
       }
+      case "device":
+        if (!a.device) {
+          throw new PlayerError("unsupported", `${a.label} has no device to play to.`);
+        }
+        return a.device();
       case "authorize":
         throw new PlayerError(
           "needs_authorization",

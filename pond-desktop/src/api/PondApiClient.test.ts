@@ -164,6 +164,40 @@ describe("listDevices()", () => {
   });
 });
 
+// ── player user token ────────────────────────────────────────────────────────
+
+describe("playerUserToken()", () => {
+  it("asks for the service's token, and says when it wants a renewal", async () => {
+    fetchMock
+      .mockResolvedValueOnce(okJson({ token: "stored" }))
+      .mockResolvedValueOnce(okJson({ token: "renewed" }));
+    expect(await client().playerUserToken("spotify")).toEqual({ token: "stored" });
+    expect(await client().playerUserToken("spotify", true)).toEqual({ token: "renewed" });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://localhost:4000/api/v1/player/user-token?service=spotify",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "http://localhost:4000/api/v1/player/user-token?service=spotify&refresh=true",
+    );
+  });
+
+  it("carries the server's own words when the person has not signed in", async () => {
+    fetchMock.mockResolvedValueOnce(
+      errJson(400, "Spotify is not connected: sign in to Spotify in the Music extension's settings."),
+    );
+    await expect(client().playerUserToken("spotify")).rejects.toMatchObject({
+      message: expect.stringContaining("sign in to Spotify"),
+    });
+  });
+
+  it("refuses a reply that is not a token rather than handing the SDK undefined", async () => {
+    for (const body of [{}, { token: "" }, { token: 7 }, null]) {
+      fetchMock.mockResolvedValueOnce(okJson(body));
+      await expect(client().playerUserToken("spotify")).rejects.toThrow(/no spotify token/i);
+    }
+  });
+});
+
 // ── memory ────────────────────────────────────────────────────────────────────
 
 describe("listMemories()", () => {

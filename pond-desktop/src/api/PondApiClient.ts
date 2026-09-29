@@ -2147,6 +2147,22 @@ export class PondApiClient {
     return this.get("/api/v1/musickit/developer-token");
   }
 
+  /**
+   * The page's access token for a service that signs in as the person (Spotify). 400 says they
+   * have not signed in; `refresh` asks the service for a new token first, for when the SDK found
+   * the last one stale.
+   */
+  async playerUserToken(service: string, refresh = false): Promise<{ token: string }> {
+    const query = new URLSearchParams({ service });
+    if (refresh) query.set("refresh", "true");
+    const reply = await this.get<{ token?: string }>(`/api/v1/player/user-token?${query}`);
+    // `request` can hand back an empty or HTML body; a token that is not a string is not a token.
+    if (typeof reply?.token !== "string" || reply.token === "") {
+      throw new Error(`The pond gave no ${service} token.`);
+    }
+    return { token: reply.token };
+  }
+
   async refreshOAuth(provider: string): Promise<void> {
     await this.post("/api/v1/oauth/refresh", { provider });
   }

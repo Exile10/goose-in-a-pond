@@ -62,6 +62,16 @@ export interface AdapterCapabilities {
 
 export type LibraryKind = "saved" | "recent";
 
+/**
+ * A service that plays through a device other software chooses to play *to* (Spotify Connect)
+ * reports it here: the id that software addresses, and whether it is ready to be addressed.
+ */
+export interface PlayerDevice {
+  device_id: string | null;
+  name: string;
+  ready: boolean;
+}
+
 export type PlayerErrorCode =
   | "needs_authorization"
   | "not_ready"
@@ -113,6 +123,8 @@ export interface PlayerAdapter {
   setRepeat(mode: RepeatMode): Promise<void>;
   playlists(): Promise<PlaylistInfo[]>;
   library(kind: LibraryKind, limit: number): Promise<Track[]>;
+  /** Only for a service whose control plane is not in this window: the speaker it registered. */
+  device?(): PlayerDevice;
 }
 
 /** A command as the host sends it. */

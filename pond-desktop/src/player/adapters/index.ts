@@ -7,9 +7,13 @@ import {
   loadMusicKitFromApple,
 } from "./appleMusicKit";
 import { widevineProblem } from "./drm";
+import { SpotifyWebPlaybackAdapter, loadSpotifySdk } from "./spotifyWebPlayback";
 
 export interface AdapterContext {
+  /** Apple: a developer token the host signs, since the host holds the key. */
   fetchDeveloperToken(): Promise<string>;
+  /** Spotify: the person's own access token, held by the host. `refresh` asks for a new one. */
+  fetchUserToken(service: string, refresh: boolean): Promise<string>;
 }
 
 const ADAPTERS: Record<string, (ctx: AdapterContext) => PlayerAdapter> = {
@@ -17,7 +21,13 @@ const ADAPTERS: Record<string, (ctx: AdapterContext) => PlayerAdapter> = {
     new AppleMusicKitAdapter({
       loadMusicKit: loadMusicKitFromApple,
       fetchDeveloperToken: ctx.fetchDeveloperToken,
-      checkDrm: widevineProblem,
+      checkDrm: () => widevineProblem("Apple Music"),
+    }),
+  spotify: (ctx) =>
+    new SpotifyWebPlaybackAdapter({
+      loadSdk: loadSpotifySdk,
+      fetchUserToken: (refresh) => ctx.fetchUserToken("spotify", refresh),
+      checkDrm: () => widevineProblem("Spotify"),
     }),
 };
 

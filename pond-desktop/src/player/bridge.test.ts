@@ -240,6 +240,21 @@ describe("PlayerBridge", () => {
     ]);
   });
 
+  it("answers the device op for a service that plays to a device, and refuses it for one that does not", async () => {
+    const withDevice = fakeAdapter({
+      device: () => ({ device_id: "device-1", name: "Goose In A Pond", ready: true }),
+    });
+    const bridge = new PlayerBridge(withDevice.adapter, fakeHost().api);
+    expect(await bridge.handle("device", {})).toEqual({
+      device_id: "device-1",
+      name: "Goose In A Pond",
+      ready: true,
+    });
+
+    const without = new PlayerBridge(fakeAdapter().adapter, fakeHost().api);
+    await expect(without.handle("device", {})).rejects.toMatchObject({ code: "unsupported" });
+  });
+
   it("reports its state when the host says it is listening", async () => {
     const f = fakeAdapter();
     f.set(idle({ status: "paused" }));
