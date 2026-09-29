@@ -24,9 +24,34 @@ has not played through it, for either service**: see "What was measured, and wha
 | Host bridge | `crates/pond-api/src/player.rs` | Holds who is attached and what is in flight; relays a command to the page and waits for its reply. |
 | Developer token | `crates/pond-api/src/musickit.rs` | Signs Apple developer tokens (ES256) from the stored key, so the key stays out of every page and extension. |
 | User token | `GET /api/v1/player/user-token` (`player.rs`) | Hands the paired page the person's Spotify access token, and renews it through the egress gate when the SDK says the last one went stale. |
+| Sign-in row | `pond-desktop/src/sections/PlayerSignIn.tsx`, `signInView.ts` | The one "Sign in to Apple Music" button in the Music extension's settings. `signInView` decides what the row shows, so the button is offered only when pressing it can work. |
+| Sign-in bridge | `player_authorize` (`electron/main/ipc.ts`, `player.ts`), `src/player/signIn.ts` | Starts a service's sign-in inside the player window, with a user gesture. |
 | Spotify speaker | `pond-desktop/src/player/adapters/spotifyWebPlayback.ts` | Registers the window as a Spotify Connect device, reports what is playing, and does transport. Search, queue and library stay in the extension. |
 | Extension | `extensions/music/src/providers/web-player.ts` | `WebPlayerProvider`: the extension's `MusicProvider` over the bridge, with the Music app as its fallback. |
 | Spotify in the extension | `providers/spotify.ts`, `providers/player/speaker.ts` | Every call to Spotify asks the host first (`network_mode`); with no active device, playback moves to the in-app device. The tool list and its wording are unchanged. |
+
+## Signing in
+
+The ordinary path is one button. In the Music extension's settings the person sees a sign-in for each
+service: Spotify's opens the browser as before, and **Sign in to Apple Music** does everything else.
+It calls the shell's `player_authorize`, which runs a script in the player window with a user
+gesture (Apple's sign-in is a popup, and Chromium refuses one nobody clicked for); the page starts
+the adapter's `authorize()` without waiting for it, the person finishes in Apple's popup, and the row
+polls the player's state (`GET /player/state`) until it reads "Signed in". If the sign-in cannot
+start, or did not finish, the row says why in the adapter's own words; a pond with no key and no
+shared credentials says so and offers no button, since pressing one could not work.
+
+Everything else is under a closed **Developer settings** disclosure in that same dialog: the service
+picker (`MUSIC_SERVICE`) and the fields for bringing your own Apple key (Team ID, Key ID, private key).
+They are marked `advanced` in the registry, so any extension can do the same, and the summary shows how
+many are already saved so a custom key is not out of sight. An extension with no advanced field looks
+as it always did. Outside the desktop app (a browser, a phone) the row says to sign in from the app,
+because the player lives in the shell. The newer hub UI does not render extension credentials at all
+yet, so this dialog, in the classic Extensions section, is the one place.
+
+Not tried: the click itself against Apple. `executeJavaScript` with a user gesture is what Electron
+offers for this, and the script, the page hook and the row are each tested, but no run has started
+Apple's real popup that way. The earlier live run used a real click in the window.
 
 ## The protocol
 

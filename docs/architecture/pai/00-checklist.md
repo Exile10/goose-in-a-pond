@@ -2307,3 +2307,27 @@ and do not establish device-key proof of possession or encrypted transport.
   `scripts/live-test.sh --no-build` passed (135 + 18 checks). **Not verified: Spotify itself, and
   therefore audio.** A harness that drives the real extension against a signed-in scratch app exists, and
   needs a Premium account signing in.
+
+**2026-09-29 (later still) -- one sign-in button for Apple Music; the advanced fields move under Developer settings. Touches the settings UI and the extension registry only.**
+
+- **What was asked.** "A single button for signing in to Apple Music, then all the advanced things move
+  them to developer settings."
+- **What landed.** A `PlayerSignIn` row in the Music extension's settings whose button starts Apple's
+  sign-in inside the player window (`player_authorize` in the shell contract, run with a user gesture)
+  and follows it to "Signed in"; a closed **Developer settings** disclosure holding the service picker and
+  the three own-key fields; an `advanced` flag on `SecretRequirement` and on those four registry entries,
+  so the split is data and not a hard-coded list; the host's "not set up" message now says shared
+  credentials are unavailable and points at Developer settings.
+- **Invariants.** *Secrets*: unchanged: the four fields are still stored the same way, and the three key
+  fields are still `host_only` and withheld from the extension. *Egress*: nothing new; the sign-in is
+  Apple's own popup. *Preamble tokens*: untouched. *Settings persistence*: no settings field added.
+  *Both UIs*: the hub UI has no extension-credentials screen, so there is one place to change.
+- **Not built, on purpose.** Sign-out; a global "developer mode" (the Settings page's Developer view is
+  per page and does not persist, so nothing was tied to it).
+- **Open.** The button has never started Apple's real popup: it needs a working key or shared credentials
+  and a person to sign in. Whether Apple accepts this build's Widevine module is still unknown.
+- **Verification**: Mac only, 2026-09-29. pond-core and pond-api 2,304 passed, 0 failed, 6 ignored; clippy
+  has no warnings in the files touched; `scripts/live-test.sh --no-build` passed (135 + 18 checks).
+  Desktop 84 files, 1,161 tests, typecheck clean (9 for the sign-in row, 10 for the view logic and the
+  field split, 6 for the page hook, 5 for the shell script and reply, 6 for the dialog's layout). The dialog was also rendered
+  in the browser pane in its three states (ready, signed in, unavailable) and opened and closed by hand.
