@@ -13,7 +13,7 @@ import { createAdapter, knownServices } from "./adapters";
 import { PlayerBridge } from "./bridge";
 import { Players } from "./Players";
 import { retrySetup } from "./retry";
-import { startSignIn } from "./signIn";
+import { needsPerson, startSignIn } from "./signIn";
 
 declare global {
   interface Window {
@@ -35,6 +35,7 @@ api.setDeviceName("GIAP Music Player");
 
 const context = {
   fetchDeveloperToken: async () => (await api.musickitDeveloperToken()).token,
+  probeDeveloperToken: () => api.musickitDeveloperTokenAvailable(),
   fetchUserToken: async (service: string, refresh: boolean) =>
     (await api.playerUserToken(service, refresh)).token,
 };
@@ -61,7 +62,8 @@ if (adapters.length === 0) {
   );
   // The window stays hidden until it needs the user, which is a sign-in and nothing else.
   let shown = false;
-  const needsUser = () => adapters.some((a) => a.state().need === "authorization");
+  // A sleeping adapter offers a sign-in in the settings row, but does not raise this window for it.
+  const needsUser = () => adapters.some((a) => needsPerson(a.state()));
   const syncVisibility = () => {
     const want = needsUser();
     if (want === shown) return;

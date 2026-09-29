@@ -95,6 +95,33 @@ describe("PlayerSignIn", () => {
     expect(screen.getByRole("button", { name: /sign in to apple music/i })).toBeTruthy();
   });
 
+  it("shows it is working at once, while the player wakes, and not after a click that did nothing", async () => {
+    reports({ need: "authorization", dormant: true });
+    let answer: (v: unknown) => void = () => undefined;
+    shell.invoke.mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    render(<PlayerSignIn service="apple" label="Apple Music" />);
+    await settle();
+
+    fireEvent.click(screen.getByRole("button", { name: /sign in to apple music/i }));
+    await settle();
+    expect(screen.getByText(/waiting for apple music's sign-in window/i)).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
+
+    // The player could not wake: the wait ends, the reason shows, and the button is back.
+    answer({ started: false, message: "Apple Music could not get its sign-in token: no network." });
+    await settle();
+    expect(screen.queryByText(/waiting for apple music's sign-in window/i)).toBeNull();
+    expect(screen.getByText(/could not get its sign-in token: no network/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /sign in to apple music/i })).toBeTruthy();
+  });
+
+  it("offers the button for a service that is asleep", async () => {
+    reports({ need: "authorization", dormant: true });
+    render(<PlayerSignIn service="apple" label="Apple Music" />);
+    await settle();
+    expect(screen.getByRole("button", { name: /sign in to apple music/i })).toBeTruthy();
+  });
+
   it("shows why it cannot sign in, and no button, when Apple Music is not set up on this pond", async () => {
     reports({ need: "setup", message: "Apple Music sign-in is not available on this pond yet." });
     render(<PlayerSignIn service="apple" label="Apple Music" />);

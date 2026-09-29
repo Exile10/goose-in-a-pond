@@ -52,6 +52,12 @@ export interface PlayerState {
   repeat: RepeatMode;
   /** The last problem, in words a person can act on. */
   message?: string;
+  /**
+   * Set up and asleep: nothing has been fetched and nothing has left the pond, because nobody has
+   * pressed Sign in and nobody has signed in here before. `need` is "authorization" so a sign-in is
+   * offered, but the window is not raised for it.
+   */
+  dormant?: boolean;
 }
 
 export interface AdapterCapabilities {
@@ -125,6 +131,11 @@ export interface PlayerAdapter {
   library(kind: LibraryKind, limit: number): Promise<Track[]>;
   /** Only for a service whose control plane is not in this window: the speaker it registered. */
   device?(): PlayerDevice;
+  /**
+   * For a service that sleeps until wanted: does the network work a sign-in needs (a token, the
+   * SDK), and throws with words for a person if it cannot. Idempotent, and a no-op once awake.
+   */
+  prepare?(): Promise<void>;
 }
 
 /** A command as the host sends it. */

@@ -472,3 +472,196 @@ describe("AppleMusicKitAdapter: transport", () => {
     expect(seen).toEqual(["paused"]);
   });
 });
+
+/** An adapter that sleeps until someone signs in, with everything that could leave the pond counted. */
+function sleeper(
+  over: {
+    remembered?: boolean;
+    authorised?: boolean;
+    refuseSignIn?: boolean;
+    probe?: () => Promise<void>;
+    token?: () => Promise<string>;
+  } = {},
+) {
+  const log = { tokenAsks: 0, loads: 0, probes: 0, remembered: over.remembered ?? false, remembers: 0 };
+  const music = new FakeMusic();
+  music.isAuthorized = over.authorised ?? false;
+  music.refuseSignIn = over.refuseSignIn ?? false;
+  const { kit, configured } = fakeKit(music);
+  const adapter = new AppleMusicKitAdapter({
+    loadMusicKit: async () => {
+      log.loads += 1;
+      return kit;
+    },
+    fetchDeveloperToken: async () => {
+      log.tokenAsks += 1;
+      return over.token ? over.token() : "dev-token";
+    },
+    lazy: {
+      remembered: () => log.remembered,
+      remember: () => {
+        log.remembered = true;
+        log.remembers += 1;
+      },
+      probe: async () => {
+        log.probes += 1;
+        await over.probe?.();
+      },
+    },
+  });
+  return { adapter, music, log, configured };
+}
+
+describe("AppleMusicKitAdapter: asleep until someone signs in", () => {
+  it("fetches nothing and loads nothing at launch when nobody has signed in here", async () => {
+    const { adapter, log } = sleeper();
+    await adapter.init();
+
+    expect(adapter.state()).toMatchObject({ ready: false, need: "authorization", dormant: true });
+    expect(adapter.state().message).toBeUndefined();
+    expect(log).toMatchObject({ tokenAsks: 0, loads: 0, probes: 1 });
+  });
+
+  it("stays asleep, and quiet, however often the setup retry asks", async () => {
+    const { adapter, log } = sleeper();
+    await adapter.init();
+    await adapter.init();
+    await adapter.init();
+
+    expect(adapter.state().dormant).toBe(true);
+    expect(log.tokenAsks).toBe(0);
+    expect(log.loads).toBe(0);
+  });
+
+  it("still says early that Apple Music cannot work, in the pond's words, and does not sleep", async () => {
+    const { adapter, log } = sleeper({
+      probe: async () => {
+        throw new Error("Apple Music sign-in is not available on this pond yet.");
+      },
+    });
+    await adapter.init();
+
+    expect(adapter.state()).toMatchObject({ ready: false, need: "setup", dormant: false });
+    expect(adapter.state().message).toContain("not available on this pond");
+    expect(log.tokenAsks).toBe(0);
+    expect(log.loads).toBe(0);
+  });
+
+  it("answers a command with a sign-in instruction, which is what lets the extension fall back and say why", async () => {
+    const { adapter } = sleeper();
+    await adapter.init();
+
+    for (const run of [
+      () => adapter.play({ id: "1", kind: "song" }),
+      () => adapter.search("nairobi"),
+      () => adapter.pause(),
+    ]) {
+      const error = await run().catch((e) => e);
+      expect(error).toBeInstanceOf(PlayerError);
+      expect(error.code).toBe("needs_authorization");
+      expect(error.message).toContain("Music extension's settings");
+    }
+  });
+
+  it("wakes on prepare: a token, the script, and a configured player, and no longer dormant", async () => {
+    const { adapter, log, configured } = sleeper();
+    await adapter.init();
+    await adapter.prepare();
+
+    expect(log).toMatchObject({ tokenAsks: 1, loads: 1 });
+    expect(configured).toHaveLength(1);
+    expect(adapter.state()).toMatchObject({ need: "authorization", dormant: false });
+  });
+
+  it("wakes once however many ask at the same moment", async () => {
+    const { adapter, log } = sleeper();
+    await adapter.init();
+    await Promise.all([adapter.prepare(), adapter.prepare(), adapter.prepare()]);
+    await adapter.prepare();
+
+    expect(log.tokenAsks).toBe(1);
+    expect(log.loads).toBe(1);
+  });
+
+  it("stays asleep, and can be woken again, when waking fails", async () => {
+    let fail = true;
+    const { adapter, log } = sleeper({
+      token: async () => {
+        if (fail) throw new Error("Apple Music could not get its sign-in token: no network.");
+        return "dev-token";
+      },
+    });
+    await adapter.init();
+
+    const error = await adapter.prepare().catch((e) => e);
+    expect(error).toBeInstanceOf(PlayerError);
+    expect(error.message).toContain("no network");
+    expect(adapter.state().dormant).toBe(true);
+
+    fail = false;
+    await adapter.prepare();
+    expect(adapter.state().dormant).toBe(false);
+    expect(log.tokenAsks).toBe(2);
+  });
+
+  it("signing in wakes it, signs in, and remembers, so the next launch starts by itself", async () => {
+    const { adapter, log, music } = sleeper();
+    await adapter.init();
+    await adapter.authorize();
+
+    expect(music.isAuthorized).toBe(true);
+    expect(adapter.state()).toMatchObject({ ready: true, need: "none", dormant: false });
+    expect(log.remembers).toBe(1);
+    expect(log.remembered).toBe(true);
+  });
+
+  it("does not remember a sign-in that did not finish", async () => {
+    const { adapter, log } = sleeper({ refuseSignIn: true });
+    await adapter.init();
+    await adapter.authorize();
+
+    expect(adapter.state().message).toContain("Sign-in did not finish");
+    expect(log.remembers).toBe(0);
+  });
+
+  it("starts at launch, with no probe, for someone who has signed in here before", async () => {
+    const { adapter, log } = sleeper({ remembered: true, authorised: true });
+    await adapter.init();
+
+    expect(log).toMatchObject({ tokenAsks: 1, loads: 1, probes: 0 });
+    expect(adapter.state()).toMatchObject({ ready: true, need: "none", dormant: false });
+  });
+
+  it("counts a session MusicKit already held as a sign-in, so it is remembered from then on", async () => {
+    const { adapter, log } = sleeper({ authorised: true });
+    await adapter.init(); // asleep
+    await adapter.prepare(); // woken by a sign-in click; MusicKit finds its stored session
+
+    expect(log.remembers).toBe(1);
+    expect(adapter.state().need).toBe("none");
+  });
+
+  it("asks a remembered service to sign in again, in the window, if its session is gone", async () => {
+    const { adapter } = sleeper({ remembered: true, authorised: false });
+    await adapter.init();
+
+    // Started, not asleep: the person did use it, so the window may ask.
+    expect(adapter.state()).toMatchObject({ need: "authorization", dormant: false });
+  });
+
+  it("behaves as it always did when nothing asks it to sleep", async () => {
+    let tokenAsks = 0;
+    const music = new FakeMusic();
+    const { kit } = fakeKit(music);
+    const adapter = new AppleMusicKitAdapter({
+      loadMusicKit: async () => kit,
+      fetchDeveloperToken: async () => {
+        tokenAsks += 1;
+        return "t";
+      },
+    });
+    await adapter.init();
+    expect(tokenAsks).toBe(1);
+    expect(adapter.state().dormant).toBe(false);
+  });
+});

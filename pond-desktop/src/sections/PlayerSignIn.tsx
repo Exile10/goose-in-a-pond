@@ -63,15 +63,18 @@ export function PlayerSignIn({
 
   async function signIn() {
     setError(null);
+    // At once: waking the player is a token and a script, a second or two, and a button that seems to
+    // do nothing gets pressed again.
+    startedAt.current = Date.now();
+    setPending(true);
     try {
       const result = await invoke("player_authorize", { service });
       if (!result.started) {
+        setPending(false);
         setError(result.message ?? `${label} could not start signing in.`);
-        return;
       }
-      startedAt.current = Date.now();
-      setPending(true);
     } catch (err) {
+      setPending(false);
       setError(err instanceof Error ? err.message : String(err));
     }
   }

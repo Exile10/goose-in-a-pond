@@ -2154,6 +2154,19 @@ export class PondApiClient {
     };
   }
 
+  /**
+   * Whether Apple Music could work at all: a key is stored, or the shared credentials are on. Asked of
+   * the pond alone: no token is signed or fetched and nothing leaves it. Rejects, with the pond's own
+   * words, when nothing could supply a token.
+   */
+  async musickitDeveloperTokenAvailable(): Promise<void> {
+    const reply = await this.get<{ available?: boolean }>(
+      "/api/v1/musickit/developer-token?probe=true",
+    );
+    // `request` can hand back an empty or HTML body; only a plain yes counts.
+    if (reply?.available !== true) throw new Error("Apple Music is not available on this pond.");
+  }
+
   /** A developer token signed by the host, which holds the key. 400 says the key is not set up. */
   musickitDeveloperToken(): Promise<{ token: string; expires_at: number }> {
     return this.get("/api/v1/musickit/developer-token");

@@ -73,6 +73,21 @@ export interface AppleDeps {
   playConfirmMs?: number;
   /** A sentence when this window cannot play protected audio, else null; asked before anything loads. */
   checkDrm?(): Promise<string | null>;
+  /**
+   * When given, the adapter sleeps until someone signs in or has before: no token is asked for, no
+   * script is loaded, and nothing leaves the pond. Without it, it starts at once.
+   */
+  lazy?: {
+    /** Has this person signed in here before? */
+    remembered(): boolean;
+    /** Note that they have. */
+    remember(): void;
+    /**
+     * Whether Apple Music could work at all, asked of the pond alone: no token, no network.
+     * Rejects with words for a person when nothing could supply one.
+     */
+    probe(): Promise<void>;
+  };
 }
 
 const MUSICKIT_URL = "https://js-cdn.music.apple.com/musickit/v3/musickit.js";
@@ -189,6 +204,8 @@ export class AppleMusicKitAdapter implements PlayerAdapter {
   private mk: MusicKitGlobal | null = null;
   private music: MusicKitInstance | null = null;
   private failure: PlayerError | null = null;
+  /** The start in progress, so two clicks (or a click and a retry) make one. */
+  private starting: Promise<void> | null = null;
   private readonly listeners = new Set<(s: PlayerState) => void>();
   private snapshot: PlayerState = {
     service: "apple",
@@ -222,33 +239,70 @@ export class AppleMusicKitAdapter implements PlayerAdapter {
   // ── Starting up ─────────────────────────────────────────────
 
   async init(): Promise<void> {
+    if (this.music) return; // Already up; a retry must not configure a second player.
     try {
       const drm = await this.deps.checkDrm?.();
       if (drm) {
-        this.set({ ready: false, need: "setup", message: drm });
+        this.set({ ready: false, need: "setup", dormant: false, message: drm });
         return;
       }
-      // The token first, and the script second: with no key set up there is nothing to configure,
-      // and this window runs every service's adapter on every pond, so loading Apple's script
-      // before asking would be a call to Apple, every ten seconds, for a household that never
-      // set up Apple Music.
-      const developerToken = await this.deps.fetchDeveloperToken();
-      const mk = await this.deps.loadMusicKit();
-      await mk.configure({ developerToken, app: APP });
-      this.mk = mk;
-      this.music = mk.getInstance();
-      this.wire(this.music);
-      this.refresh();
+      if (this.deps.lazy && !this.deps.lazy.remembered()) {
+        // Nobody has signed in here. Find out, without leaving the pond, whether they could; then
+        // sleep. Nothing is fetched and no script loaded until Sign in is pressed.
+        await this.deps.lazy.probe();
+        this.set({
+          ready: false,
+          need: "authorization",
+          dormant: true,
+          message: undefined,
+        });
+        return;
+      }
+      await this.start();
     } catch (error) {
       this.set({
         ready: false,
         need: "setup",
+        dormant: false,
         message: error instanceof Error ? error.message : String(error),
       });
     }
   }
 
+  /**
+   * Wakes a sleeping adapter: the network work a sign-in needs. Throws with words for a person and
+   * leaves the adapter asleep, so pressing Sign in again tries again.
+   */
+  async prepare(): Promise<void> {
+    if (this.music) return;
+    if (this.snapshot.need === "setup") {
+      throw new PlayerError("not_ready", this.snapshot.message ?? "Apple Music is not set up.");
+    }
+    this.starting ??= this.start().finally(() => {
+      this.starting = null;
+    });
+    try {
+      await this.starting;
+    } catch (error) {
+      throw new PlayerError("not_ready", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /** The token first, and the script second: with no token there is nothing to configure. */
+  private async start(): Promise<void> {
+    const developerToken = await this.deps.fetchDeveloperToken();
+    const mk = await this.deps.loadMusicKit();
+    await mk.configure({ developerToken, app: APP });
+    this.mk = mk;
+    this.music = mk.getInstance();
+    this.wire(this.music);
+    this.refresh();
+    // A session MusicKit already held counts as a sign-in here: the next launch restores it.
+    if (this.music.isAuthorized) this.deps.lazy?.remember();
+  }
+
   async authorize(): Promise<void> {
+    await this.prepare();
     if (!this.music) {
       throw new PlayerError("not_ready", this.snapshot.message ?? "Apple Music is not set up.");
     }
@@ -261,6 +315,8 @@ export class AppleMusicKitAdapter implements PlayerAdapter {
       return;
     }
     this.refresh();
+    // Signing in once is what wakes the adapter at launch from then on.
+    if (this.music.isAuthorized) this.deps.lazy?.remember();
   }
 
   private wire(music: MusicKitInstance): void {
@@ -325,6 +381,7 @@ export class AppleMusicKitAdapter implements PlayerAdapter {
     this.set({
       ready: signedIn,
       need: signedIn ? "none" : "authorization",
+      dormant: false,
       status,
       track,
       position_ms: Math.round((music.currentPlaybackTime || 0) * 1000),
@@ -348,6 +405,14 @@ export class AppleMusicKitAdapter implements PlayerAdapter {
 
   private started(): MusicKitInstance {
     if (!this.music) {
+      // Asleep is not broken: nobody has signed in yet, and the caller is told to, in words that
+      // name the place, so the extension can fall back to the Music app and say why.
+      if (this.snapshot.dormant) {
+        throw new PlayerError(
+          "needs_authorization",
+          "Sign in to Apple Music in the Music extension's settings first.",
+        );
+      }
       throw new PlayerError("not_ready", this.snapshot.message ?? "Apple Music is not set up.");
     }
     return this.music;
