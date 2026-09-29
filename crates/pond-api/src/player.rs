@@ -388,7 +388,7 @@ pub async fn status_handler(State(state): State<Arc<AppState>>, headers: HeaderM
     }
 
     let apple_configured = match &state.secret_repo {
-        Some(repo) => crate::musickit::has_credentials(repo.as_ref()).await,
+        Some(repo) => crate::musickit::has_token_source(repo.as_ref()).await,
         None => false,
     };
     let mut out = serde_json::Map::new();

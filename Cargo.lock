@@ -11445,6 +11445,7 @@ dependencies = [
  "pond-adapters-local-inference",
  "pond-adapters-ollama",
  "pond-adapters-weather",
+ "pond-apple-token",
  "pond-core",
  "pond-hf-cache",
  "pond-infra",
@@ -11465,6 +11466,17 @@ dependencies = [
  "urlencoding",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "pond-apple-token"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

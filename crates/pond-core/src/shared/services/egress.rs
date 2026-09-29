@@ -237,6 +237,8 @@ pub struct EgressCall {
     url: String,
     method: &'static str,
     started: std::time::Instant,
+    /// Named when the call is not a chat tool's, so it is not filed under whatever tool is in flight.
+    tool: Option<String>,
 }
 
 /// Open a gated outbound call to `url`. See [`EgressCall`].
@@ -246,6 +248,19 @@ pub fn begin(url: &str, method: &'static str) -> Result<EgressCall, EgressDenied
         url: url.to_string(),
         method,
         started: std::time::Instant::now(),
+        tool: None,
+    })
+}
+
+/// As [`begin`], attributed to `tool` and not to the process-global one: for a call the host makes
+/// on its own account, such as fetching a credential, rather than on a chat tool's behalf.
+pub fn begin_as(url: &str, method: &'static str, tool: &str) -> Result<EgressCall, EgressDenied> {
+    check_egress_for(url, tool, &current_session_id())?;
+    Ok(EgressCall {
+        url: url.to_string(),
+        method,
+        started: std::time::Instant::now(),
+        tool: Some(tool.to_string()),
     })
 }
 
@@ -253,7 +268,17 @@ impl EgressCall {
     /// Record the completed call. `None` means the request never got a status.
     pub fn finish(self, status: Option<u16>) {
         let latency_ms = self.started.elapsed().as_millis() as u64;
-        record_egress(&self.url, self.method, status, latency_ms);
+        match &self.tool {
+            Some(tool) => record_egress_for(
+                &self.url,
+                self.method,
+                tool,
+                &current_session_id(),
+                status,
+                latency_ms,
+            ),
+            None => record_egress(&self.url, self.method, status, latency_ms),
+        }
     }
 }
 

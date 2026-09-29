@@ -416,10 +416,238 @@ fn verify(token: &str, public: &[u8]) -> Value {
     .claims
 }
 
+// ── Managed credentials ──────────────────────────────────────────────────────
+
+/// `POND_CREDENTIALS_URL` is process-global, so every test that reads or sets it takes a turn.
+/// Where a test also needs the network mode, it takes that turn first, so two never wait on each other.
+static MANAGED_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Points the pond at a credentials service, and back at none when it goes out of scope.
+struct ManagedAt;
+
+impl ManagedAt {
+    fn set(url: &str) -> ManagedAt {
+        std::env::set_var("POND_CREDENTIALS_URL", url);
+        ManagedAt
+    }
+}
+
+impl Drop for ManagedAt {
+    fn drop(&mut self) {
+        std::env::remove_var("POND_CREDENTIALS_URL");
+    }
+}
+
+/// A credentials service on loopback, counting how often it is asked.
+struct CredentialsService {
+    url: String,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn credentials_service(status: StatusCode, body: Value) -> CredentialsService {
+    use axum::extract::State as AxumState;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Clone)]
+    struct Shared {
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+        reply: (StatusCode, Value),
+    }
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route(
+            "/v1/musickit/developer-token",
+            axum::routing::post(|AxumState(s): AxumState<Shared>| async move {
+                s.hits.fetch_add(1, Ordering::SeqCst);
+                (s.reply.0, axum::Json(s.reply.1))
+            }),
+        )
+        .with_state(Shared {
+            hits: hits.clone(),
+            reply: (status, body),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    CredentialsService {
+        url: format!("http://127.0.0.1:{port}"),
+        hits,
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn a_token(days: u64) -> Value {
+    json!({ "token": "aaaa.bbbb.cccc", "expires_at": unix_now() + days * 86_400 })
+}
+
+const DEV_TOKEN: &str = "/api/v1/musickit/developer-token";
+
+#[tokio::test]
+async fn with_no_key_stored_the_shared_token_is_used_and_kept() {
+    let _turn = NETWORK_MODE_TURN.lock().await;
+    let _managed = MANAGED_TURN.lock().await;
+    egress_log();
+    set_network_mode(NetworkMode::Open);
+    let svc = credentials_service(StatusCode::OK, a_token(30)).await;
+    let _at = ManagedAt::set(&svc.url);
+    let pond = pond(None, Installed::none()).await;
+
+    let (status, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["token"], "aaaa.bbbb.cccc");
+
+    let (_, again) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+    assert_eq!(again["token"], "aaaa.bbbb.cccc");
+    assert_eq!(
+        svc.hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a month-long token is fetched once, not on every ask"
+    );
+
+    let event = recorded("egress.http", "127.0.0.1", "giap-credentials").await;
+    assert_eq!(event.attributes.get("method"), Some(&"POST".into()));
+}
+
+#[tokio::test]
+async fn a_key_the_household_stored_beats_the_shared_one() {
+    let _managed = MANAGED_TURN.lock().await;
+    let svc = credentials_service(StatusCode::OK, a_token(30)).await;
+    let _at = ManagedAt::set(&svc.url);
+    let pond = pond(None, Installed::none()).await;
+    let public = pond.store_signing_secrets().await;
+
+    let (status, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["token"], "aaaa.bbbb.cccc");
+    assert_eq!(
+        verify(body["token"].as_str().unwrap(), &public)["iss"],
+        "TEAMID1234"
+    );
+    assert_eq!(
+        svc.hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no network for their own key"
+    );
+}
+
+#[tokio::test]
+async fn a_service_that_fails_says_why_and_is_not_asked_again_at_once() {
+    let _managed = MANAGED_TURN.lock().await;
+    let svc = credentials_service(StatusCode::TOO_MANY_REQUESTS, json!({})).await;
+    let _at = ManagedAt::set(&svc.url);
+    let pond = pond(None, Installed::none()).await;
+
+    let (status, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("busy"), "{body}");
+
+    // The player retries every ten seconds; a service that is down must not be hammered by it.
+    let (again, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+    assert_eq!(again, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body["error"].as_str().unwrap().contains("busy"));
+    assert_eq!(svc.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_reply_that_is_not_a_token_is_refused() {
+    let _managed = MANAGED_TURN.lock().await;
+    for reply in [
+        json!({ "token": "<script>alert(1)</script>", "expires_at": unix_now() + 86_400 * 30 }),
+        json!({ "token": "aaaa.bbbb.cccc", "expires_at": unix_now() + 86_400 * 900 }),
+        json!({ "token": "aaaa.bbbb.cccc" }),
+        json!({}),
+    ] {
+        let svc = credentials_service(StatusCode::OK, reply.clone()).await;
+        let _at = ManagedAt::set(&svc.url);
+        let pond = pond(None, Installed::none()).await;
+        let (status, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reply}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_pond_set_to_offline_sends_nothing_and_says_which_setting() {
+    let _turn = NETWORK_MODE_TURN.lock().await;
+    let _managed = MANAGED_TURN.lock().await;
+    egress_log();
+    set_network_mode(NetworkMode::Offline);
+    let _at = ManagedAt::set("https://credentials.example.invalid");
+    let pond = pond(None, Installed::none()).await;
+
+    let (status, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("network_mode") && error.contains("credentials.example.invalid"),
+        "{error}"
+    );
+    recorded(
+        "egress.denied",
+        "credentials.example.invalid",
+        "giap-credentials",
+    )
+    .await;
+
+    set_network_mode(NetworkMode::Open);
+}
+
+#[tokio::test]
+async fn an_address_that_is_not_https_is_ignored_so_the_pond_falls_back_to_saying_what_to_add() {
+    let _managed = MANAGED_TURN.lock().await;
+    let _at = ManagedAt::set("http://credentials.example.org");
+    let pond = pond(None, Installed::none()).await;
+
+    let (status, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("Team ID"));
+}
+
+async fn apple_configured(pond: &Pond) -> Value {
+    pond.call(
+        "GET",
+        "/api/v1/player/status",
+        Some(internal_extension_token()),
+        None,
+    )
+    .await
+    .1["apple"]["configured"]
+        .clone()
+}
+
+#[tokio::test]
+async fn the_service_counts_as_a_token_source_for_the_status_route() {
+    let _managed = MANAGED_TURN.lock().await;
+    let pond = pond(None, Installed::none()).await;
+    assert_eq!(
+        apple_configured(&pond).await,
+        false,
+        "no key and no service"
+    );
+
+    let _at = ManagedAt::set("https://credentials.example.org");
+    assert_eq!(
+        apple_configured(&pond).await,
+        true,
+        "the extension may now choose the in-app player"
+    );
+}
+
 // ── Developer token ──────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn developer_token_is_for_the_paired_page_and_never_for_an_extension() {
+    let _managed = MANAGED_TURN.lock().await;
     let pond = pond(None, Installed::none()).await;
     pond.store_signing_secrets().await;
     let uri = "/api/v1/musickit/developer-token";
@@ -442,6 +670,7 @@ async fn developer_token_is_for_the_paired_page_and_never_for_an_extension() {
 
 #[tokio::test]
 async fn developer_token_without_the_signing_secrets_says_what_to_add() {
+    let _managed = MANAGED_TURN.lock().await;
     let pond = pond(None, Installed::none()).await;
     let uri = "/api/v1/musickit/developer-token";
     let (status, body) = pond.call("GET", uri, Some("test-token"), None).await;
@@ -471,6 +700,7 @@ async fn developer_token_without_the_signing_secrets_says_what_to_add() {
 
 #[tokio::test]
 async fn developer_token_is_signed_with_the_stored_key_for_a_week() {
+    let _managed = MANAGED_TURN.lock().await;
     let pond = pond(None, Installed::none()).await;
     let public = pond.store_signing_secrets().await;
     let (status, body) = pond
@@ -1078,6 +1308,7 @@ async fn what_the_page_reports_is_readable_and_forgotten_when_it_closes() {
 #[tokio::test]
 async fn status_says_which_services_have_a_page_and_which_have_credentials() {
     let _turn = NETWORK_MODE_TURN.lock().await;
+    let _managed = MANAGED_TURN.lock().await;
     let pond = pond(None, Installed::none()).await;
     let before = player_status(&pond).await;
     assert_eq!(before["apple"]["configured"], false, "{before}");
