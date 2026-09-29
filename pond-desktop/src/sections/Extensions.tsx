@@ -30,6 +30,7 @@ import { api } from "../api/PondApiClient";
 import { invoke, isDesktopShell } from "../shell";
 import { useAppState } from "../state/AppContext";
 import { useConfirm, ErrorBanner } from "../components/shared";
+import { secretStatusOf, type SecretStatus } from "./secretStatus";
 import type { Extension, AddExtensionRequest, MarketplaceExtension, SecretRequirement, AgentTool } from "../api/types";
 
 /** Open a URL in the real browser. In the shell it must go via the main process:
@@ -516,7 +517,7 @@ function ExtensionCard({
   onDelete: (name: string) => void;
   onConfigureSecrets?: (name: string) => void;
   hasSecrets?: boolean;
-  secretStatus?: "configured" | "missing" | "unknown";
+  secretStatus?: SecretStatus;
   disabled: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -1125,7 +1126,7 @@ export function Extensions() {
   // For edit-mode secret modal on installed extensions
   const [marketplaceCache, setMarketplaceCache] = useState<MarketplaceExtension[]>([]);
   const [secretEditState, setSecretEditState] = useState<SecretEditState | null>(null);
-  const [secretStatus, setSecretStatus] = useState<Record<string, "configured" | "missing" | "unknown">>({});
+  const [secretStatus, setSecretStatus] = useState<Record<string, SecretStatus>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1203,11 +1204,7 @@ export function Extensions() {
     for (const ext of extsWithSecrets) {
       api.getExtensionSecrets(ext.name)
         .then((res) => {
-          const allFulfilled = Object.values(res.fulfilled).length > 0 && Object.values(res.fulfilled).every(Boolean);
-          setSecretStatus((prev) => ({
-            ...prev,
-            [ext.name]: allFulfilled ? "configured" : "missing",
-          }));
+          setSecretStatus((prev) => ({ ...prev, [ext.name]: secretStatusOf(res) }));
         })
         .catch(() => {
           setSecretStatus((prev) => ({ ...prev, [ext.name]: "unknown" }));
@@ -1239,11 +1236,7 @@ export function Extensions() {
   function refreshSecretBadge(extName: string) {
     api.getExtensionSecrets(extName)
       .then((res) => {
-        const allFulfilled = Object.values(res.fulfilled).length > 0 && Object.values(res.fulfilled).every(Boolean);
-        setSecretStatus((prev) => ({
-          ...prev,
-          [extName]: allFulfilled ? "configured" : "missing",
-        }));
+        setSecretStatus((prev) => ({ ...prev, [extName]: secretStatusOf(res) }));
       })
       .catch(() => {});
   }
