@@ -12,6 +12,7 @@ import { invoke, listen } from "../shell";
 import { createAdapter, knownServices } from "./adapters";
 import { PlayerBridge } from "./bridge";
 import { PlayerApp } from "./PlayerApp";
+import { retrySetup } from "./retry";
 
 const service = new URLSearchParams(window.location.search).get("service") ?? "apple";
 const api = new PondApiClient();
@@ -52,6 +53,8 @@ if (!adapter) {
     // Pair first, so the bridge's first request already carries a session.
     await api.connect().catch(() => null);
     await adapter.init();
+    // The key is added after this window opened; keep asking until it is there.
+    retrySetup(adapter);
     new PlayerBridge(adapter, api, {
       log: (message, detail) => console.warn(`[player] ${message}`, detail ?? ""),
     }).start();

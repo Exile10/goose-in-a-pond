@@ -33,6 +33,17 @@ const log = {
 let win: BrowserWindow | null = null;
 /** The music player window; null when GIAP_PLAYER=off. It is hidden unless it needs the user. */
 let player: PlayerWindow | null = null;
+let playerStarted = false;
+
+/**
+ * The player asks the server about every host it reaches, and refuses what it cannot ask about, so
+ * opening it before the server is up only makes its first load fail. Once, when the server is healthy.
+ */
+function startPlayerOnce(): void {
+  if (playerStarted || !player) return;
+  playerStarted = true;
+  void player.start();
+}
 /** Set on the way out, so the close handler stops hiding and lets us quit. */
 let quitting = false;
 
@@ -121,6 +132,7 @@ const healthLoop = createHealthLoop({
   onStatus: (healthy) => {
     emit("server-status", healthy);
     setTrayStatus(healthy);
+    if (healthy) startPlayerOnce();
   },
   onStarting: () => emit("server-starting"),
   backoffSeconds: recoveryBackoffSeconds,
@@ -172,9 +184,6 @@ if (!app.requestSingleInstanceLock()) {
       },
     });
 
-    // Not awaited: it waits on the Widevine module, and the app must not wait on that.
-    void player?.start();
-
     createTray({
       emit,
       showWindow,
@@ -191,7 +200,10 @@ if (!app.requestSingleInstanceLock()) {
     // Don't block the window on the server: the startup screen renders while it comes up.
     server
       .ensureRunning()
-      .then((url) => log.info(`pond-server ready at ${url}`))
+      .then((url) => {
+        log.info(`pond-server ready at ${url}`);
+        startPlayerOnce();
+      })
       .catch((e: Error) => log.warn(`pond-server did not start: ${e.message}`));
 
     healthLoop.start();

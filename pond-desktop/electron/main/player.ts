@@ -23,6 +23,14 @@ export function isAppleSignInUrl(rawUrl: string): boolean {
   }
 }
 
+function hostOf(rawUrl: string): string {
+  try {
+    return new URL(rawUrl).host;
+  } catch {
+    return "(unparseable)";
+  }
+}
+
 interface Components {
   whenReady(): Promise<unknown>;
   status(): unknown;
@@ -97,9 +105,19 @@ export class PlayerWindow {
 
     const decide = createRequestPolicy({ serverUrl: this.opts.serverUrl });
     ses.webRequest.onBeforeRequest({ urls: ["<all_urls>"] }, (details, callback) => {
-      void decide(details.url, details.method).then(callback, () =>
-        callback({ cancel: true }),
+      void decide(details.url, details.method).then(
+        (verdict) => {
+          if (verdict.cancel) this.opts.log(`player: blocked ${hostOf(details.url)}`);
+          callback(verdict);
+        },
+        () => callback({ cancel: true }),
       );
+    });
+    // Why a request failed, by host only: a path or query can carry a song or an identifier.
+    ses.webRequest.onErrorOccurred({ urls: ["<all_urls>"] }, (details) => {
+      if (details.error !== "net::ERR_ABORTED") {
+        this.opts.log(`player: request to ${hostOf(details.url)} failed: ${details.error}`);
+      }
     });
 
     const win = new BrowserWindow({
@@ -123,6 +141,13 @@ export class PlayerWindow {
         autoplayPolicy: "no-user-gesture-required",
         additionalArguments: [`--giap-server-url=${this.opts.serverUrl()}`],
       },
+    });
+
+    // Only what needs attention: MusicKit chatters, and the shell's log is not the place for it.
+    win.webContents.on("console-message", (event) => {
+      if (event.level === "warning" || event.level === "error") {
+        this.opts.log(`player page ${event.level}: ${event.message.slice(0, 300)}`);
+      }
     });
 
     win.webContents.setWindowOpenHandler(({ url }) =>
