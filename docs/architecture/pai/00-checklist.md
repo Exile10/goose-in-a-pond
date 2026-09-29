@@ -2238,3 +2238,31 @@ and do not establish device-key proof of possession or encrypted transport.
   extension-only routes refuse without the internal token, the developer-token route reaches the
   secret store and says what to add, and the shell's policy route follows the live `network_mode`.
   Not run: Playwright, the Orin, and anything that needs audio.
+
+**2026-09-29 (later) -- managed credentials: a service the pond can call, and the shared crate under it. Touches PAI-2.**
+
+- **What was asked.** Make the Apple Music extension "managed": a Jarida service serves the
+  credentials, so a household never opens the Apple developer portal.
+- **What landed.** `services/pondcredentials`: a shared signing crate (`pond-apple-token`, used by the
+  pond and the service so they cannot drift) and the service, in its own workspace so a Docker image can
+  copy only it. The pond gains a managed token source in `musickit.rs` (local key wins; cached until a
+  fifth of its life is left; a failure stands for a minute; a reply is validated) and
+  `egress::begin_as`, a call attributed to its own name. `deploy/pondcredentials` holds the Dockerfile,
+  compose, Caddy and a runbook. The "Setup required" badge no longer shows for an extension whose
+  secrets are all optional.
+- **Invariants.** *Egress*: a new outbound path to a Jarida host, gated, recorded as `giap-credentials`,
+  and off until `POND_CREDENTIALS_URL` is set; documented in the PAI-2 note. The egress guard's tracker
+  list gained `egress::begin_as(`, and `musickit.rs` joined `EGRESS_TRACKED`. *Secrets*: the service
+  reads its key from a file, never a variable; the pond's stored key still never reaches an extension.
+  *Preamble tokens*, *`profile_id`*, *guest*: untouched. *Blocking a turn*: a token fetch happens when
+  the player starts, not in a turn. *Side effects without approval*: none while the address is unset.
+- **Not built, on purpose.** The droplet, the domain, and turning it on by default. An assistant cannot
+  create the droplet (it needs the owner's DigitalOcean token and spends money) and must never hold the
+  Apple key; the runbook says who does what.
+- **Open question.** Whether Apple's developer terms allow one team's token to serve independent
+  installations of an open-source app. Unchecked; a condition for turning it on.
+- **Verification**: Mac only, 2026-09-29. Service and shared crate: 29 tests, rustfmt clean. Pond side: 28
+  route tests including 7 for managed mode against a loopback mock. The real service binary served a real
+  pond, which fetched a token that verified against the service's public key, cached it, and logged the
+  call. The Dockerfile's exact `cargo build --release --locked` passes; `docker compose config`
+  validates. Not run: the Docker build (no daemon), the compose stack, Caddy, any `doctl` command.

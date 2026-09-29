@@ -362,6 +362,17 @@ outside both of the above, so **`network_mode = offline` does not stop it.** It 
 cannot become a footnote. The fix is to hold the updater until the setting allows it, and it is not
 built. Detail and the rest of the player's model: `docs/architecture/music-player.md`.
 
+**2026-09-29 (later) -- the pond can now call a Jarida-hosted host, and it is off until told to.**
+`pondcredentials` (`services/pondcredentials`) serves Apple Music developer tokens so a household
+needs no Apple key. A pond with no key of its own asks it, through `egress::begin_as(..,
+"giap-credentials")`: refused under Offline before anything is sent, and logged under that name. It
+calls about once a month (the token lives 30 days), sends no identifier and no body, and only when
+`POND_CREDENTIALS_URL` is set, which nothing sets by default. What the host learns is that an address
+asked, at a time; the service keeps no address, and its proxy has no access log. What it cannot
+promise is what the hosting provider's network keeps. Whether Apple's terms allow one team's token to
+serve independent installations is unchecked and is a condition for turning it on.
+`docs/architecture/pondcredentials.md`.
+
 **A file-level guard is necessary and not sufficient, and P6a is where that stopped being a
 footnote.** `egress_tracked_files_reach_the_tracker` checks for ONE tracker symbol per FILE, so a
 file with several senders goes green on the first one gated. Three files in the list have more than

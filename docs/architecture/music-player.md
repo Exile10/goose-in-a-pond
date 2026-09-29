@@ -46,6 +46,8 @@ stop the music that is already playing is a bug. Ops that reach the service (`se
 
 ## Security model
 
+- **Managed credentials.** A household with no key of its own can use `pondcredentials`, a service
+  that holds Jarida's key (`docs/architecture/pondcredentials.md`). A stored local key always wins.
 - **The signing key never leaves the host.** `APPLE_MUSIC_TEAM_ID`, `_KEY_ID` and `_PRIVATE_KEY` are
   `host_only` secrets (`SecretRequirement.host_only`): stored and reported as saved, withheld from
   every extension's environment on install, restart, token refresh and startup. Proven by tests on
