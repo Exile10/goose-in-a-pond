@@ -2331,3 +2331,31 @@ and do not establish device-key proof of possession or encrypted transport.
   Desktop 84 files, 1,161 tests, typecheck clean (9 for the sign-in row, 10 for the view logic and the
   field split, 6 for the page hook, 5 for the shell script and reply, 6 for the dialog's layout). The dialog was also rendered
   in the browser pane in its three states (ready, signed in, unavailable) and opened and closed by hand.
+
+**2026-09-29 (later still) -- the credentials service is ON BY DEFAULT. Touches PAI-2. A decision of Jerry's, recorded with what it costs.**
+
+- **What was asked.** "Set the managed url." The address had been left unset on purpose, so that turning
+  it on was a decision and not a drift; this is that decision.
+- **What landed.** `DEFAULT_MANAGED_URL` is `https://credentials.jarida.io` (a test pins it and its
+  https). `POND_CREDENTIALS_URL=off` turns it off; any other value replaces it. The route tests and
+  `scripts/live-test.sh` now say `off` themselves, because unset means the real service and no test may
+  call it. The registry's Apple field text no longer says "where this pond is set up for them".
+- **Invariants.** *Egress*: it still goes through `egress::begin_as(.., "giap-credentials")`, is refused
+  under Offline before anything is sent, and shows in the egress log. *Secrets*: a stored local key still
+  wins and means the service is never asked; the signing key is still never on a pond. *Privacy stance*:
+  this is now an outbound call to a Jarida host from every desktop pond, by default; PAI-2 says so and
+  says how to stop it. *Side effects without approval*: none beyond that call and Apple's own script.
+- **Corrections to what I wrote earlier.** The pond's token cache is **in memory**, so it fetches once
+  **per start of the pond**, not "about monthly". And the player window asks for the token as soon as it
+  starts **whether or not Apple Music is used**, then loads Apple's MusicKit script; nothing waits for a
+  sign-in click. Both corrected in `pondcredentials.md` and the PAI-2 note.
+- **Not built, and recommended.** Asking only once someone presses Sign in or has signed in before, and
+  persisting the token across restarts; a household switch for it (offered, declined for now).
+- **Open.** Apple's terms on sharing one team's token (section 2.8) are still unanswered, and it is on
+  regardless.
+- **Verification**: Mac only, 2026-09-29. pond-core and pond-api 2,305 passed, 0 failed, 6 ignored;
+  clippy clean in the files touched; `scripts/live-test.sh --no-build` passed (135 + 18 checks) with managed
+  mode off. A fresh scratch pond with `POND_CREDENTIALS_URL` unset and no key stored fetched a token from
+  the live service through the built-in default (status 200, the service's Key ID and Team ID in the token)
+  and logged `network / egress.http`, tool `giap-credentials`, 736 ms. **Not verified: the whole desktop app
+  with the default on** (the player window asking at start, then loading Apple's script).

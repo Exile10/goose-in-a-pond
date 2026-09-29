@@ -368,11 +368,27 @@ built. Detail and the rest of the player's model: `docs/architecture/music-playe
 needs no Apple key. A pond with no key of its own asks it, through `egress::begin_as(..,
 "giap-credentials")`: refused under Offline before anything is sent, and logged under that name. It
 calls about once a month (the token lives 30 days), sends no identifier and no body, and only when
-`POND_CREDENTIALS_URL` is set, which nothing sets by default. What the host learns is that an address
+`POND_CREDENTIALS_URL` is set, which nothing sets by default **[superseded: see the note below, it is
+now on by default]**. What the host learns is that an address
 asked, at a time; the service keeps no address, and its proxy has no access log. What it cannot
 promise is what the hosting provider's network keeps. Whether Apple's terms allow one team's token to
 serve independent installations is unchecked and is a condition for turning it on.
 `docs/architecture/pondcredentials.md`.
+
+**2026-09-29 (later still) -- the credentials service is now ON BY DEFAULT, and calls more often than the note above said.**
+`DEFAULT_MANAGED_URL` is set to `https://credentials.jarida.io` (Jerry's decision). A pond with no key of
+its own now asks it without being told to. Two things the earlier note got wrong or left out. (1)
+*Frequency:* the pond's token cache is in memory, so it fetches **once per start of the pond**, not about
+monthly; a desktop app opened daily calls daily. (2) *Trigger:* the player window asks for the token as
+soon as it starts, **whether or not the household uses Apple Music**, and once it has one it loads
+Apple's MusicKit script from Apple's CDN. So every desktop pond contacts Jarida's host, then Apple's, at
+every start. Unchanged: the call goes through `egress::begin_as(.., "giap-credentials")` and shows in the
+egress log; `network_mode = offline` refuses it before anything is sent; a stored local key means it is
+never asked; nothing identifying is sent; the service keeps no address. **How to turn it off:**
+`POND_CREDENTIALS_URL=off`, or `network_mode = offline`; there is no UI switch (a household toggle was
+offered and declined for now). Not built, and worth building: asking only after someone presses Sign in
+(or has signed in before), and persisting the token across restarts. Apple's terms on sharing the token
+remain unanswered (section 2.8 of the developer agreement). `docs/architecture/pondcredentials.md`.
 
 **2026-09-29 (later still) -- Spotify gets the same gate, and a third-party script now sees the person's Spotify token.**
 (1) *Closed:* every call the Spotify extension makes to `api.spotify.com` asks `POST /extension/egress`

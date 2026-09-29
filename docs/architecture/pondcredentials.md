@@ -3,7 +3,8 @@
 A household should not need an Apple developer account to play a song. `pondcredentials` is the
 small service that lets that be true: it holds one MusicKit key and hands ponds a signed developer
 token. Status, 2026-09-29: **deployed and verified at `credentials.jarida.io`** (one 512 MB droplet in
-Frankfurt). The pond does not use it by default: `DEFAULT_MANAGED_URL` is unset (see "Turning it on").
+Frankfurt), and **on by default**: `DEFAULT_MANAGED_URL` is `https://credentials.jarida.io`, which was
+Jerry's decision on 2026-09-29 (see "It is on").
 
 ## Why a service, and not a token in the release
 
@@ -53,7 +54,19 @@ limit is memory only; the counters are two numbers; Caddy has no access log). Wh
 what the hosting provider's network keeps.
 
 It is one more outbound path, documented as such in `02-privacy-and-security-guardrails.md`. It is
-**off until an address is set**, so a household that never enables it never calls anyone.
+**on by default**: a pond with no key of its own asks it. `POND_CREDENTIALS_URL=off` turns it off,
+`network_mode = offline` refuses it, and a stored local key means it is never asked. There is no switch
+for it in the UI yet (an explicit household toggle was offered and declined for now).
+
+**When a pond calls it, stated plainly.** The pond's token cache is in memory, so it fetches **once per
+start of the pond**, and again when a fifth of a token's life is left if the pond stays up that long; a
+desktop app that is opened daily calls daily. The service signs one token a day and hands the same one
+to everyone, so this is cheap for it, but it is not "about monthly". And the player window asks for a
+token as soon as it starts, **whether or not the household uses Apple Music**: nothing waits for a
+sign-in click. Once the token arrives the window also loads Apple's MusicKit script from Apple's CDN. So
+every desktop pond contacts Jarida's host, and then Apple's, at every start. Making that lazy (nothing
+leaves until someone presses Sign in, or has signed in before) and persisting the token across restarts
+would cut both, and neither is built.
 
 ## Threat model
 
@@ -64,13 +77,14 @@ It is one more outbound path, documented as such in `02-privacy-and-security-gua
 | Abuse or a flood | Per-address limit (IPv6 by /64, memory bounded), a 1 KB body cap, one route | A wide botnet is not stopped |
 | A network attacker swaps the reply | https only, apart from loopback; the reply is validated | Trusting the certificate authority system |
 | Third parties running the open-source pond | Nothing stops them calling it | Rate limits, and revoking the key |
-| **Apple's terms** | Read, not settled | The Developer Program License Agreement (section 2.8) says not to "share access to mechanisms provided to You by Apple for the use of the Services with any third party", except a Service Provider acting solely on your behalf (2.9), and to use the Services only for "Your Covered Products". An "Application" is software developed by you and distributed under your own brand. Jarida's official builds are defensible; independent forks and self-builds calling the service are not covered by anything read. **Ask Apple, or a lawyer, before this is turned on by default.** |
+| **Apple's terms** | Read, not settled; **on by default anyway** (Jerry, 2026-09-29) | The Developer Program License Agreement (section 2.8) says not to "share access to mechanisms provided to You by Apple for the use of the Services with any third party", except a Service Provider acting solely on your behalf (2.9), and to use the Services only for "Your Covered Products". An "Application" is software developed by you and distributed under your own brand. Jarida's official builds are defensible; independent forks and self-builds calling the service are not covered by anything read. **Ask Apple, or a lawyer, before this is turned on by default.** |
 
-## Turning it on
+## It is on
 
-Deploy it (`deploy/pondcredentials/README.md`), try it on one pond with `POND_CREDENTIALS_URL`, and only
-then put the address in `DEFAULT_MANAGED_URL`. That last step changes what every pond does with no key
-of its own, so it is a decision rather than a default.
+`DEFAULT_MANAGED_URL` in `crates/pond-api/src/musickit.rs` is `https://credentials.jarida.io`, and a test
+pins it. To point a pond elsewhere, set `POND_CREDENTIALS_URL` to another https address; to turn it off,
+set it to `off`. Tests and scratch ponds must say `off` (the route tests and `scripts/live-test.sh` do),
+or they phone home.
 
 ## Verification
 

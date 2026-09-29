@@ -147,14 +147,15 @@ The service refuses to start with a missing setting or a key that cannot sign, a
 
 ## Pointing ponds at it
 
-To try one pond, set `POND_CREDENTIALS_URL=https://<YOUR_DOMAIN>` in its environment. It uses the
-service only when the household has stored no key of its own, fetches about once a month, and every
-fetch goes through `network_mode` and shows in the pond's egress log as `giap-credentials`.
+Every pond already points at `https://credentials.jarida.io`: that address is `DEFAULT_MANAGED_URL` in
+`crates/pond-api/src/musickit.rs`, set on 2026-09-29 and pinned by a test. A pond uses the service only
+when the household has stored no key of its own, and every call goes through `network_mode` and shows in
+the pond's egress log as `giap-credentials`. Its token cache is in memory, so a pond calls once per start.
 
-To make it the default for every pond, put the address in `DEFAULT_MANAGED_URL` in
-`crates/pond-api/src/musickit.rs`. That is a decision, not a step: from the next release every pond
-without its own key calls this server, and the privacy notes (`docs/architecture/pondcredentials.md`)
-should be read first.
+To point a pond at another deployment, set `POND_CREDENTIALS_URL=https://<YOUR_DOMAIN>` in its environment.
+To turn it off, set `POND_CREDENTIALS_URL=off`. **A test or a scratch pond must do that**, or it calls this
+server: the route tests and `scripts/live-test.sh` set it. If you move the service, change the constant,
+and read the privacy notes (`docs/architecture/pondcredentials.md`) first.
 
 ## Rotating the key
 
