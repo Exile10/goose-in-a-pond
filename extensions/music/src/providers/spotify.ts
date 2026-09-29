@@ -1,5 +1,7 @@
 import type { MusicProvider, TrackInfo, PlaylistInfo, AlbumInfo, DeviceInfo, RepeatState, ArtistInfo, TimeRange, PlayTarget, FollowUpResult } from './types.js';
 import { describeError, log } from '../log.js';
+import type { Fetch } from './apple/egress.js';
+import type { Speaker } from './player/speaker.js';
 
 interface SpotifyTrack {
   id: string;
@@ -120,11 +122,53 @@ interface SpotifyPlaylist {
  * scopes: /recommendations, /audio-features, /audio-analysis, /artists/{id}/related-artists and
  * /top-tracks, /browse, /me/tracks/contains, PUT/DELETE /me/tracks; `preview_url` is always null.
  */
+/** Spotify answered, and the answer was no. `body` is what it said, for callers that act on the reason. */
+export class SpotifyApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly body: string,
+  ) {
+    super(message);
+    this.name = 'SpotifyApiError';
+  }
+}
+
+/** Spotify's own reason code for "nothing is the active device". */
+const NO_ACTIVE_DEVICE = 'NO_ACTIVE_DEVICE';
+
+/** Asks the host to authorise and record an outbound call; see `EgressGate`. */
+export interface EgressCheck {
+  allow(url: string, method?: string): Promise<void>;
+}
+
+export interface SpotifyDeps {
+  /** The network; a test passes its own. */
+  fetch?: Fetch;
+  /** Consulted before every call to Spotify, so `network_mode` and the Logs screen cover it. */
+  egress?: EgressCheck;
+  /** The in-app player, when there is one: somewhere to play when no other device is active. */
+  speaker?: Speaker;
+  /** Overrides SPOTIFY_ACCESS_TOKEN, for tests. */
+  token?: string;
+}
+
 export class SpotifyProvider implements MusicProvider {
   id = 'spotify' as const;
   name = 'Spotify';
   capabilities = { devices: true, queue: true, timeRange: true };
   private baseUrl = 'https://api.spotify.com/v1';
+
+  private readonly doFetch: Fetch;
+  private readonly egress: EgressCheck | undefined;
+  private readonly speaker: Speaker | undefined;
+
+  constructor(deps: SpotifyDeps = {}) {
+    this.doFetch = deps.fetch ?? fetch;
+    this.egress = deps.egress;
+    this.speaker = deps.speaker;
+    if (deps.token !== undefined) this.accessToken = deps.token;
+  }
 
   /** Current access token — initialized from env, updated on refresh. */
   private accessToken: string | null = process.env.SPOTIFY_ACCESS_TOKEN ?? null;
@@ -149,7 +193,7 @@ export class SpotifyProvider implements MusicProvider {
     log.debug('token_refresh_started', 'asking GIAP to refresh the Spotify token');
 
     try {
-      const refreshResp = await fetch(`${this.giapUrl}/api/v1/oauth/refresh`, {
+      const refreshResp = await this.doFetch(`${this.giapUrl}/api/v1/oauth/refresh`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -196,14 +240,20 @@ export class SpotifyProvider implements MusicProvider {
   /** Sends a request, refreshing the token and retrying once on 401; the body is left unread. */
   private async request(method: string, path: string, body?: unknown): Promise<Response> {
     // `this.token` is read per attempt so the retry sends the refreshed token.
-    const send = () => fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        'Authorization': `Bearer ${this.token}`,
-        'Content-Type': 'application/json',
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    const send = async () => {
+      const url = `${this.baseUrl}${path}`;
+      // Asked on every attempt, the retry after a refresh included: each is a call to Spotify. A
+      // refusal is the host's own sentence, and nothing has been sent.
+      await this.egress?.allow(url, method);
+      return this.doFetch(url, {
+        method,
+        headers: {
+          'Authorization': `Bearer ${this.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    };
 
     const started = Date.now();
     let resp = await send();
@@ -245,7 +295,7 @@ export class SpotifyProvider implements MusicProvider {
         );
       }
 
-      throw new Error(`Spotify API ${resp.status}${afterRefresh}: ${body}`);
+      throw new SpotifyApiError(`Spotify API ${resp.status}${afterRefresh}: ${body}`, resp.status, body);
     }
 
     log.debug('spotify_api_ok', 'Spotify answered', {
@@ -295,10 +345,29 @@ export class SpotifyProvider implements MusicProvider {
     };
   }
 
+  /**
+   * The in-app player's device id, but only when Spotify has just said no device is active: an
+   * active device, someone's phone or another computer, is never taken over.
+   */
+  private async speakerFor(error: unknown): Promise<string | null> {
+    if (!this.speaker) return null;
+    if (!(error instanceof SpotifyApiError) || error.status !== 404) return null;
+    if (!error.body.includes(NO_ACTIVE_DEVICE)) return null;
+    return this.speaker.deviceId();
+  }
+
   async play(target?: PlayTarget): Promise<string> {
     const body = buildPlayBody(target);
+    const payload = Object.keys(body).length > 0 ? body : undefined;
 
-    await this.command('PUT', '/me/player/play', Object.keys(body).length > 0 ? body : undefined);
+    try {
+      await this.command('PUT', '/me/player/play', payload);
+    } catch (error) {
+      const deviceId = await this.speakerFor(error);
+      if (!deviceId) throw error;
+      log.info('speaker_fallback', 'no Spotify device was active; playing on the in-app player');
+      await this.command('PUT', `/me/player/play?device_id=${encodeURIComponent(deviceId)}`, payload);
+    }
 
     if (!target) return 'Resumed playback';
     const uri = typeof target === 'string' ? target : target.uri;
