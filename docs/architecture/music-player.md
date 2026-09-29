@@ -138,16 +138,33 @@ Measured on macOS 27, arm64, in scratch folders:
   reported the module ready in about 12 s. This is the DRM stack and nothing more: it says nothing
   about whether Apple or Spotify will accept the module. The stock Electron in `node_modules` fails
   the same check with exit code 2 and says why.
-- **A live run with a real MusicKit key got as far as the license**: token signing, MusicKit load,
-  sign-in, catalog search and queueing all worked, then Apple refused the license (MusicKit
-  `MEDIA_LICENSE`, code -42605). Since Widevine itself works, that refusal is Apple's. The same
-  failure on the same module version is reported by another Apple Music client on this stack
-  (castlabs/electron-releases#237, Cider-2#2015), where 4.10.3050.1 and 4.10.3112.0 work. **A newer
-  module is not obtainable, though:** asked the way Chromium's component updater asks, Google's update
-  service serves 4.10.3050.0 for macOS on arm64 at every Chrome version tried (152 to 160), and
-  castlabs' `components` API has no manual update (`whenReady`, `status`, `updatesEnabled` only), so
-  the module-version theory cannot be acted on from here. What is left is castlabs' production VMP
-  signing (their free EVS service), which is untried, and whatever Apple checks on its side.
+- **The module is the cause, and it is Google's module, not our code or a missing signature
+  (2026-09-29).** Widevine 4.10.3050.0, which Google's updater serves castlabs' Electron, is refused
+  by real services (castlabs/electron-releases#237: licenses revoked, playback failing, on properly
+  VMP-signed builds too; a fixed 4.10.3050.1 exists but had not reached that updater). It fits every
+  symptom: Google's public test stream plays (its license server checks nothing), Apple refused the
+  license with `MEDIA_LICENSE` (-42605), and Spotify's SDK started a song, fetched its audio, then
+  reported `Playback error` a few seconds in and moved on to the next track, again and again.
+  **Signing would not have fixed it,** so the earlier suspicion of VMP signing is dropped.
+- **A newer module cannot be had from the updater, but can be used from Chrome.** Asked the way
+  Chromium's component updater asks, Google's service serves 4.10.3050.0 for macOS on arm64 at every
+  Chrome version tried (152 to 160), and castlabs' `components` API has no manual update
+  (`whenReady`, `status`, `updatesEnabled`). Chrome bundles 4.10.3112.0, the version other Apple
+  Music clients report working. castlabs' Electron will use a module placed in its profile, but
+  **only when `components.updatesEnabled` is false**: with updates on, and any update state in the
+  profile, it deletes the newer folder and restores 3050.0 (tried; an earlier note here saying a
+  hand-copied module is ignored was wrong, the copy had simply been pruned). `npm run widevine:pin`
+  does both (close the app first; `widevine:unpin` reverses it), and the check plays on the pinned
+  module (3112.0, licensed in about 1 s, 160 frames, 0 dropped). **Not yet verified against Apple or
+  Spotify themselves**: that needs someone signed in to try. It is a local workaround that copies a
+  file from Chrome into another app, and must never be shipped: Widevine's licence does not let us
+  redistribute the module. The product answer is Google's fixed module reaching the updater.
+- **The app now says so instead of skipping.** The shell tells the player which module it loaded,
+  and Apple Music and Spotify refuse to start on a module on `KNOWN_BAD_MODULES` (today only
+  4.10.3050.0), with a message naming the version and the issue, instead of letting a song start and
+  die. `GIAP_ALLOW_KNOWN_BAD_WIDEVINE=1` lifts the refusal, for anyone testing whether it still
+  holds. Independently, a Spotify playback error now pauses the player, so a refusal that hits every
+  track cannot skip through a whole album.
 - MusicKit reports "playing" for a moment **before** a license failure arrives, so the adapter
   confirms only when the position has advanced.
 - **Spotify has not been run at all.** The adapter is built from the SDK's documented events and
@@ -178,6 +195,10 @@ because stock Electron has no Widevine. Three things came with that, and only th
 last put there, so after pulling this branch run `npm install` in `pond-desktop` (with the app closed:
 it replaces the binary). Until then the shell runs stock Electron and has no Widevine; `npm run
 check:widevine` says which you have.
+
+**The module it downloads is currently a bad one.** See "The module is the cause" above: until Google's
+fix reaches the updater, Apple Music and Spotify do not work in this shell, and the player says why.
+`npm run widevine:pin` is the local workaround on a machine with Chrome; nothing in the product ships it.
 
 It also trails stock (44.1.0, Chrome 152.0.7977.65, against 44.4.2), so it misses whatever
 Electron shipped after 44.1.0. The CI smoke job launches Electron on Linux; whether castlabs'
