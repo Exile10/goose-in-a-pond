@@ -35,27 +35,37 @@ with every capability dropped. The service's own port is on the private Compose 
 
 ## Create the droplet
 
-Nothing here needs the Apple key yet, and **no step should be run by an assistant**: `doctl auth init`
-asks for your DigitalOcean API token, and that token stays yours.
+Nothing here needs the Apple key yet. **The DigitalOcean API token stays yours**: `doctl auth init`
+asks for it, and no assistant should be given it. (An assistant may use a `doctl` you have already
+signed in, on your say-so; it should list what it will create and its price first.)
 
 ```bash
 doctl auth init
-doctl compute ssh-key list
+doctl compute size list --format Slug,Memory,VCPUs,Disk,PriceMonthly
 ```
+
+The service is a few MB of memory and one signature a day. `s-1vcpu-512mb-10gb` ($4 a month at the time
+of writing) runs the service, Caddy and Docker with room to spare (about 250 of 458 MB in use); the
+cloud-init file adds swap for the moments when it does not. **Do not build the image on the droplet**
+(compiling Rust in 512 MB fails); build it on your own computer, below.
+
+**Get your key onto the droplet without the emailed password.** A droplet created without a
+DigitalOcean-registered SSH key gets a root password emailed to you that must be changed at first login,
+and that expiry blocks key logins too (there is no terminal to change it in). `cloud-init.yaml` clears the
+expiry and locks the password. Give it your public key in a private copy (a public key is not a secret, but
+do not commit yours), or pass a registered key with `--ssh-keys` and skip this:
 
 ```bash
+{ cat deploy/pondcredentials/cloud-init.yaml; printf 'ssh_authorized_keys:\n  - %s\n' "$(cat ~/.ssh/<YOUR_KEY>.pub)"; } > /tmp/cloud-init.private.yaml
 doctl compute droplet create pondcredentials \
-  --region fra1 --size s-1vcpu-1gb --image ubuntu-24-04-x64 \
-  --ssh-keys <KEY_ID_OR_FINGERPRINT> --enable-monitoring \
-  --user-data-file deploy/pondcredentials/cloud-init.yaml --wait
+  --region fra1 --size s-1vcpu-512mb-10gb --image ubuntu-24-04-x64 \
+  --user-data-file /tmp/cloud-init.private.yaml --tag-name pondcredentials --wait
 ```
 
-`fra1` and `s-1vcpu-1gb` are examples, not advice: pick a region near your households and check
-sizes and prices with `doctl compute size list`. This service is a few MB of memory and a signature
-a day; the smallest droplet is plenty. The cloud-init file installs Docker and nothing else.
+`fra1` is an example: pick a region near your households. The first boot takes a minute or two.
 
-Lock the droplet down: SSH only from your address, HTTP and HTTPS from anywhere (Caddy needs port 80
-to obtain its certificate).
+Lock the droplet down before anything runs on it: SSH only from your address, HTTP and HTTPS from anywhere
+(Caddy needs port 80 to obtain its certificate).
 
 ```bash
 doctl compute firewall create --name pondcredentials --droplet-ids <DROPLET_ID> \
@@ -63,41 +73,58 @@ doctl compute firewall create --name pondcredentials --droplet-ids <DROPLET_ID> 
   --outbound-rules "protocol:tcp,ports:all,address:0.0.0.0/0,address:::/0 protocol:udp,ports:all,address:0.0.0.0/0,address:::/0"
 ```
 
-If `doctl` objects to the rule syntax, `doctl compute firewall create --help` shows the current form.
+If your address changes you lose SSH until you edit that rule (`doctl compute firewall update`).
 
-Point the name at it, then wait for DNS before the first start (Caddy asks for the certificate on
-boot, and a name that does not resolve yet just delays it):
+Point the name at the droplet. **If your DNS is behind a proxy (Cloudflare's orange cloud), turn the proxy
+off for this record**: a proxy sits between every household and the service, so the per-client rate limit
+and the "no address is kept" promise would no longer be about the households. Start Caddy only once the
+name resolves, or it retries against Let's Encrypt and can hit its failed-validation limit.
 
 ```bash
-doctl compute domain records create <YOUR_DOMAIN> \
-  --record-type A --record-name credentials --record-data <DROPLET_IP>
+dig +short A <YOUR_DOMAIN> @1.1.1.1        # must print the droplet's address
 ```
 
-## First boot, on the droplet
+## Ship the service
+
+Build the image for the droplet's architecture on your own computer, copy it over, and copy the two config
+files. From the repository root:
+
+```bash
+docker build --platform linux/amd64 -f deploy/pondcredentials/Dockerfile -t pondcredentials:local services/pondcredentials
+docker save --platform linux/amd64 pondcredentials:local | gzip | ssh root@<DROPLET_IP> 'gunzip | docker load'
+scp deploy/pondcredentials/compose.yaml deploy/pondcredentials/Caddyfile root@<DROPLET_IP>:/opt/pondcredentials/
+```
+
+The first build takes several minutes on an Apple-silicon Mac (it emulates x86-64) and a few seconds after
+that. Then, on the droplet:
 
 ```bash
 ssh root@<DROPLET_IP>
 cd /opt/pondcredentials
-git clone --depth 1 --filter=blob:none --sparse <REPO_URL> repo
-cd repo && git sparse-checkout set services/pondcredentials deploy/pondcredentials
-cd deploy/pondcredentials
-cp .env.example .env            # set CREDENTIALS_HOST, APPLE_TEAM_ID, APPLE_KEY_ID
 mkdir -p runtime/secrets runtime/caddy-data runtime/caddy-config
+printf 'CREDENTIALS_HOST=<YOUR_DOMAIN>\nAPPLE_TEAM_ID=<TEAM_ID>\nAPPLE_KEY_ID=<KEY_ID>\nTOKEN_TTL_DAYS=30\nRATE_LIMIT_PER_MINUTE=20\n' > .env
+chmod 600 .env
 ```
 
-Then, **from your own computer**, copy the key on. It never goes through this repository or an
-assistant:
+The Team ID and Key ID are public configuration, not secrets. The Key ID is the ten characters in the key's
+file name (`AuthKey_XXXXXXXXXX.p8`); the Team ID is under Membership details on Apple's developer site.
+
+Then, **from your own computer**, copy the key on. It never goes through this repository or an assistant:
 
 ```bash
-scp ~/Downloads/AuthKey_XXXXXXXXXX.p8 root@<DROPLET_IP>:/opt/pondcredentials/repo/deploy/pondcredentials/runtime/secrets/apple.p8
+scp ~/Downloads/AuthKey_XXXXXXXXXX.p8 root@<DROPLET_IP>:/opt/pondcredentials/runtime/secrets/apple.p8
 ```
 
-Back on the droplet, hand the file to the container's user and start:
+Back on the droplet, hand the file to the container's user and start. The image is already loaded, so
+`--no-build`:
 
 ```bash
 chown 65532:65532 runtime/secrets/apple.p8 && chmod 0400 runtime/secrets/apple.p8
-docker compose up -d --build
+docker compose up -d --no-build
 ```
+
+Settings are read at startup. After editing `.env`, `docker compose restart` is **not** enough:
+`docker compose up -d --no-build --force-recreate pondcredentials`.
 
 ## Check it
 
@@ -106,6 +133,14 @@ curl -s -X POST https://<YOUR_DOMAIN>/v1/musickit/developer-token | head -c 160 
 curl -s -o /dev/null -w '%{http_code}\n' https://<YOUR_DOMAIN>/healthz                 # 404: not public
 docker compose logs pondcredentials      # the key id and lifetimes; never the key, never an address
 docker compose exec gateway wget -qO- pondcredentials:8080/healthz                     # the two counters
+```
+
+The check that matters is Apple's. Take the token the service returns and ask Apple's catalog for a song
+(a garbage token gets a 401, which is your control):
+
+```bash
+TOKEN=$(curl -s -X POST https://<YOUR_DOMAIN>/v1/musickit/developer-token | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+curl -s -H "Authorization: Bearer $TOKEN" "https://api.music.apple.com/v1/catalog/us/search?term=coltrane&types=songs&limit=1" -w '\n%{http_code}\n' | tail -c 200
 ```
 
 The service refuses to start with a missing setting or a key that cannot sign, and says which.

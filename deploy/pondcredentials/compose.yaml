@@ -1,6 +1,9 @@
 name: pondcredentials
 services:
   pondcredentials:
+    # The tag lets a small droplet run an image built elsewhere (`docker save | ssh ... docker load`)
+    # instead of compiling Rust in 512 MB; `docker compose up` builds only when it is missing.
+    image: pondcredentials:local
     build:
       context: ../../services/pondcredentials
       dockerfile: ../../deploy/pondcredentials/Dockerfile

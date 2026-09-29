@@ -2265,4 +2265,7 @@ and do not establish device-key proof of possession or encrypted transport.
   route tests including 7 for managed mode against a loopback mock. The real service binary served a real
   pond, which fetched a token that verified against the service's public key, cached it, and logged the
   call. The Dockerfile's exact `cargo build --release --locked` passes; `docker compose config`
-  validates. Not run: the Docker build (no daemon), the compose stack, Caddy, any `doctl` command.
+  validates. **Update, later 2026-09-29: deployed to `credentials.jarida.io` and verified**: the Docker
+  build and compose stack run, Caddy has a certificate, Apple's catalog API accepts a token fetched over the
+  public endpoint, and a scratch pond fetched one through its own route, logged as `giap-credentials`.
+  Still not done: monitoring, a reboot test, a live key rotation, Apple's answer on sharing the token.

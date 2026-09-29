@@ -2,8 +2,8 @@
 
 A household should not need an Apple developer account to play a song. `pondcredentials` is the
 small service that lets that be true: it holds one MusicKit key and hands ponds a signed developer
-token. Status, 2026-09-29: **built and tested; not deployed.** No droplet, no domain, and the pond
-does not use it by default (see "Turning it on").
+token. Status, 2026-09-29: **deployed and verified at `credentials.jarida.io`** (one 512 MB droplet in
+Frankfurt). The pond does not use it by default: `DEFAULT_MANAGED_URL` is unset (see "Turning it on").
 
 ## Why a service, and not a token in the release
 
@@ -64,7 +64,7 @@ It is one more outbound path, documented as such in `02-privacy-and-security-gua
 | Abuse or a flood | Per-address limit (IPv6 by /64, memory bounded), a 1 KB body cap, one route | A wide botnet is not stopped |
 | A network attacker swaps the reply | https only, apart from loopback; the reply is validated | Trusting the certificate authority system |
 | Third parties running the open-source pond | Nothing stops them calling it | Rate limits, and revoking the key |
-| **Apple's terms** | Not established | **Whether Apple permits one team's developer token to serve independent installations of an open-source app is not checked here and should be, before this is turned on.** |
+| **Apple's terms** | Read, not settled | The Developer Program License Agreement (section 2.8) says not to "share access to mechanisms provided to You by Apple for the use of the Services with any third party", except a Service Provider acting solely on your behalf (2.9), and to use the Services only for "Your Covered Products". An "Application" is software developed by you and distributed under your own brand. Jarida's official builds are defensible; independent forks and self-builds calling the service are not covered by anything read. **Ask Apple, or a lawyer, before this is turned on by default.** |
 
 ## Turning it on
 
@@ -82,6 +82,16 @@ garbage is refused, offline sends nothing and says which setting, an insecure ad
 signature verified against the service's public key, a second ask did not reach the service, and the
 pond logged the call as `giap-credentials`.
 
-Not done: building the Docker image (no running daemon on the machine this was written on), starting the
-compose stack, the Caddyfile, and every `doctl` command. Nothing has run against Apple's servers with a
-managed token.
+Deployed and checked against the live service, 2026-09-29: the Dockerfile builds (11.6 MB, non-root,
+reproducible layers) and runs on the droplet; Caddy obtained a Let's Encrypt certificate; over the public
+name, with certificate verification on, the token endpoint answers 200 over HTTP/2, every other path and
+method 404s, a 4 KB body gets 413, plain HTTP redirects; **Apple's catalog API accepts a token fetched
+through it (200, a real song) and rejects a garbage one (401)**; a scratch pond with no key stored fetched
+a token from the live service through its own route, the second ask was served from its cache, and the pond
+logged `network / egress.http` to that host, tool `giap-credentials`. The service uses about 3 MB, Caddy
+37 MB, and the droplet about 250 of 458 MB. No log line carries an address or key text.
+
+Not done: uptime monitoring or alerting (a dead service is noticed by nobody), an unattended-restart test
+of the compose stack after a reboot, rotating the key on the live droplet (the procedure is in the
+runbook, untried), and Apple's answer on the terms above. The deploy key on the droplet has no passphrase
+and should be replaced by its owner's own key.
