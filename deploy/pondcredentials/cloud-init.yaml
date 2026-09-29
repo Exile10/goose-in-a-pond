@@ -1,0 +1,11 @@
+#cloud-config
+# First-boot setup for a DigitalOcean droplet running Ubuntu 24.04: Docker and nothing else. No
+# secret belongs in this file; the Apple key is copied on afterwards, by hand, over ssh.
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - git
+runcmd:
+  - systemctl enable --now docker
+  - mkdir -p /opt/pondcredentials
