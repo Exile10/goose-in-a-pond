@@ -13,6 +13,14 @@ import { createAdapter, knownServices } from "./adapters";
 import { PlayerBridge } from "./bridge";
 import { Players } from "./Players";
 import { retrySetup } from "./retry";
+import { startSignIn } from "./signIn";
+
+declare global {
+  interface Window {
+    /** The shell's hook for starting a sign-in with a user gesture; see electron/main/player.ts. */
+    __giapPlayer?: { authorize(service: string): ReturnType<typeof startSignIn> };
+  }
+}
 
 // One window runs every service it has an adapter for: `?service=apple,spotify` narrows it, and
 // none means all. A service that is not set up sits dormant and costs one small request every
@@ -61,6 +69,7 @@ if (adapters.length === 0) {
     void invoke("player_visibility", { visible: want }).catch(() => undefined);
   };
   for (const adapter of adapters) adapter.onState(syncVisibility);
+  window.__giapPlayer = { authorize: (service) => startSignIn(adapters, service) };
   // The server may bind another port after this window opened.
   listen("server-url", (url) => api.setBase(url));
 

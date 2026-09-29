@@ -41,6 +41,18 @@ export function registerIpc(t: IpcTargets): void {
     t.player?.setVisible(visible);
   });
 
+  handle("player_authorize", async (args) => {
+    const service = (args as { service?: unknown } | undefined)?.service;
+    // The name goes into a script the window runs, so it is held to the shape a service name has.
+    if (typeof service !== "string" || !/^[a-z0-9_-]{1,32}$/.test(service)) {
+      throw new Error("player_authorize needs { service: a short lowercase name }");
+    }
+    if (!t.player) {
+      return { started: false, message: "The music player is turned off." };
+    }
+    return t.player.authorize(service);
+  });
+
   handle("open_external", async (args) => {
     const url = (args as { url?: string } | undefined)?.url;
     if (typeof url !== "string") throw new Error("open_external needs a url");

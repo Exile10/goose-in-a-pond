@@ -5,6 +5,7 @@
 
 import * as electron from "electron";
 import { BrowserWindow, session, type WebContents } from "electron";
+import type { PlayerAuthorizeResult } from "../../src/shell/contract";
 import { createRequestPolicy } from "./playerPolicy";
 import { APP_ORIGIN, serveRendererFrom } from "./protocol";
 
@@ -53,6 +54,20 @@ export interface PlayerWindowOptions {
   /** Narrows the window to some services, comma separated. Omitted, it runs every one it has. */
   service?: string;
   log(message: string): void;
+}
+
+/** The script that asks the page to begin a sign-in. The service name is data, never code. */
+export function authorizeScript(service: string): string {
+  return `window.__giapPlayer ? window.__giapPlayer.authorize(${JSON.stringify(service)}) : { started: false, message: "The music player is still starting. Try again in a moment." }`;
+}
+
+/** Whatever the page answered, reduced to the two fields the renderer is told about. */
+export function readAuthorizeReply(reply: unknown): PlayerAuthorizeResult {
+  const r = (reply ?? {}) as { started?: unknown; message?: unknown };
+  const message = typeof r.message === "string" ? r.message : undefined;
+  return r.started === true
+    ? { started: true }
+    : { started: false, message: message ?? "The sign-in could not be started." };
 }
 
 export class PlayerWindow {
@@ -181,6 +196,30 @@ export class PlayerWindow {
       win.focus();
     } else {
       win.hide();
+    }
+  }
+
+  /**
+   * Starts a service's sign-in inside the window and answers once it has begun. The script runs
+   * with a user gesture, which is what lets Apple's sign-in open as a popup at all; nothing the
+   * page sends back is trusted beyond its two fields.
+   */
+  async authorize(service: string): Promise<PlayerAuthorizeResult> {
+    const win = this.win;
+    if (!win || win.isDestroyed()) {
+      return { started: false, message: "The music player is not running." };
+    }
+    try {
+      const reply: unknown = await win.webContents.executeJavaScript(
+        authorizeScript(service),
+        true,
+      );
+      return readAuthorizeReply(reply);
+    } catch (error) {
+      return {
+        started: false,
+        message: `The music player did not answer: ${error instanceof Error ? error.message : String(error)}`,
+      };
     }
   }
 

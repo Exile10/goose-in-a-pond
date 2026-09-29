@@ -3753,6 +3753,51 @@
   flex-shrink: 0;
 }
 
+/* Developer settings: a closed disclosure, so the ordinary path is a button and not a form. */
+.secret-modal__advanced {
+  border-top: 1px solid var(--grey-100);
+  padding-top: 10px;
+}
+
+.secret-modal__advanced-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--grey-500);
+  list-style: none;
+  user-select: none;
+}
+
+.secret-modal__advanced-summary::-webkit-details-marker { display: none; }
+.secret-modal__advanced-summary:hover { color: var(--fg); }
+
+.secret-modal__advanced-saved {
+  font-weight: var(--weight-regular, 400);
+  color: var(--color-success);
+}
+
+.secret-modal__advanced-chevron {
+  transition: transform 0.15s ease;
+}
+
+.secret-modal__advanced[open] .secret-modal__advanced-chevron {
+  transform: rotate(180deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .secret-modal__advanced-chevron { transition: none; }
+}
+
+.secret-modal__advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 12px;
+}
+
 .secret-modal__divider {
   border: none;
   border-top: 1px solid var(--grey-100);

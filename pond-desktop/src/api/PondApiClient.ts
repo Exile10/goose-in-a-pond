@@ -2142,6 +2142,18 @@ export class PondApiClient {
     return this.post("/api/v1/player/state", { service, state });
   }
 
+  /** What the player page last reported for a service, and whether a page is attached at all. */
+  async getPlayerState(service: string): Promise<{ attached: boolean; state: PlayerState | null }> {
+    const reply = await this.get<{ attached?: boolean; state?: PlayerState | null }>(
+      `/api/v1/player/state?${new URLSearchParams({ service })}`,
+    );
+    // `request` can hand back an empty or HTML body, so nothing is assumed of the shape.
+    return {
+      attached: reply?.attached === true,
+      state: reply?.state && typeof reply.state === "object" ? reply.state : null,
+    };
+  }
+
   /** A developer token signed by the host, which holds the key. 400 says the key is not set up. */
   musickitDeveloperToken(): Promise<{ token: string; expires_at: number }> {
     return this.get("/api/v1/musickit/developer-token");

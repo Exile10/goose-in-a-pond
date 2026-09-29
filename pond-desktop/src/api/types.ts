@@ -1228,6 +1228,10 @@ export interface SecretRequirement {
   description: string;
   required: boolean;
   kind: 'api_key' | 'oauth_flow' | 'generic';
+  /** Kept under "Developer settings": for bringing your own credentials or overriding a default. */
+  advanced?: boolean;
+  /** Used by the host only, never put in the extension's environment. */
+  host_only?: boolean;
 }
 
 export interface MarketplaceExtension {

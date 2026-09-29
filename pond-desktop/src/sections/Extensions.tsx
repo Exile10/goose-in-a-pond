@@ -30,6 +30,8 @@ import { api } from "../api/PondApiClient";
 import { invoke, isDesktopShell } from "../shell";
 import { useAppState } from "../state/AppContext";
 import { useConfirm, ErrorBanner } from "../components/shared";
+import { PlayerSignIn } from "./PlayerSignIn";
+import { splitAdvanced } from "./signInView";
 import { secretStatusOf, type SecretStatus } from "./secretStatus";
 import type { Extension, AddExtensionRequest, MarketplaceExtension, SecretRequirement, AgentTool } from "../api/types";
 
@@ -273,7 +275,15 @@ function OAuthBlock({
   );
 }
 
-function SecretConfigModal({
+/**
+ * Extensions whose sign-in happens in the music player window, not in a browser: the service to
+ * start and what to call it. Only Apple Music today; Spotify signs in with OAuth like any other.
+ */
+const PLAYER_SIGN_INS: Record<string, Array<{ service: string; label: string }>> = {
+  music: [{ service: "apple", label: "Apple Music" }],
+};
+
+export function SecretConfigModal({
   ext,
   mode,
   fulfilledMap = {},
@@ -282,6 +292,11 @@ function SecretConfigModal({
 }: SecretConfigModalProps) {
   const apiKeyReqs = ext.required_secrets.filter((r) => r.kind === "api_key" || r.kind === "generic");
   const oauthReqs = ext.required_secrets.filter((r) => r.kind === "oauth_flow");
+  // The ordinary path is a sign-in; the fields for bringing your own credentials, or overriding a
+  // default, wait under "Developer settings" so nobody has to read past them.
+  const { ordinary: ordinaryKeyReqs, advanced: advancedKeyReqs } = splitAdvanced(apiKeyReqs);
+  const playerSignIns = PLAYER_SIGN_INS[ext.id] ?? [];
+  const savedAdvanced = advancedKeyReqs.filter((r) => fulfilledMap[r.key]).length;
 
   const [values, setValues] = useState<Record<string, string>>(() =>
     Object.fromEntries(apiKeyReqs.map((r) => [r.key, ""])),
@@ -371,7 +386,8 @@ function SecretConfigModal({
     return () => window.removeEventListener("keydown", handleKey);
   }, [onClose]);
 
-  const hasMixedSecrets = apiKeyReqs.length > 0 && oauthReqs.length > 0;
+  const hasSignIns = oauthReqs.length > 0 || playerSignIns.length > 0;
+  const hasMixedSecrets = ordinaryKeyReqs.length > 0 && hasSignIns;
 
   return (
     <div className="secret-modal-backdrop" onClick={handleBackdropClick}>
@@ -408,12 +424,12 @@ function SecretConfigModal({
         <div className="secret-modal__body">
 
           {/* API key / generic fields */}
-          {apiKeyReqs.length > 0 && (
+          {ordinaryKeyReqs.length > 0 && (
             <>
               {hasMixedSecrets && (
                 <p className="secret-modal__section-label">API credentials</p>
               )}
-              {apiKeyReqs.map((req) => (
+              {ordinaryKeyReqs.map((req) => (
                 <SecretField
                   key={req.key}
                   req={req}
@@ -430,8 +446,8 @@ function SecretConfigModal({
           {/* Divider between mixed sections */}
           {hasMixedSecrets && <hr className="secret-modal__divider" />}
 
-          {/* OAuth flow blocks */}
-          {oauthReqs.length > 0 && (
+          {/* Sign-ins: OAuth in the browser, and the player window's own */}
+          {hasSignIns && (
             <>
               {hasMixedSecrets && (
                 <p className="secret-modal__section-label">Account connections</p>
@@ -454,7 +470,46 @@ function SecretConfigModal({
                   )}
                 </div>
               ))}
+              {playerSignIns.map((p) => (
+                <PlayerSignIn key={p.service} service={p.service} label={p.label} disabled={saving} />
+              ))}
             </>
+          )}
+
+          {/* Developer settings: closed unless someone opens it */}
+          {advancedKeyReqs.length > 0 && (
+            <details className="secret-modal__advanced">
+              <summary className="secret-modal__advanced-summary">
+                <Wrench size={12} strokeWidth={1.8} aria-hidden="true" />
+                Developer settings
+                {savedAdvanced > 0 && (
+                  <span className="secret-modal__advanced-saved">{savedAdvanced} saved</span>
+                )}
+                <ChevronDown
+                  size={12}
+                  strokeWidth={2}
+                  className="secret-modal__advanced-chevron"
+                  aria-hidden="true"
+                />
+              </summary>
+              <div className="secret-modal__advanced-body">
+                <p className="secret-modal__field-hint">
+                  For developers, and for anyone using their own credentials. Most people only need
+                  the sign-in buttons above.
+                </p>
+                {advancedKeyReqs.map((req) => (
+                  <SecretField
+                    key={req.key}
+                    req={req}
+                    value={values[req.key] ?? ""}
+                    onChange={(v) => setValue(req.key, v)}
+                    error={fieldErrors[req.key]}
+                    fulfilled={fulfilledMap[req.key]}
+                    disabled={saving}
+                  />
+                ))}
+              </div>
+            </details>
           )}
 
           {/* Global error */}
