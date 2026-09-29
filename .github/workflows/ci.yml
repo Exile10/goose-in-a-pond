@@ -292,6 +292,33 @@ jobs:
       - name: Vitest (unit tests)
         run: npx vitest run
 
+  # The music extension is TypeScript run by tsx, so nothing in the Rust or desktop jobs compiles or
+  # tests it. Its tests use fakes and a fake network; the ones that drive the real Music app
+  # (GIAP_MUSIC_LIVE) are skipped here, and would have no Music app to drive on this runner.
+  music-extension:
+    name: Music extension - typecheck / tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/music
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extensions/music/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
+
   frontend:
     name: Frontend — vitest / playwright
     runs-on: ubuntu-latest
