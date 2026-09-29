@@ -375,12 +375,25 @@ pub async fn get_state_handler(Query(q): Query<ServiceQuery>) -> Response {
     .into_response()
 }
 
+/// Whether the household has signed in to Spotify: a token is stored. Says nothing of whether it
+/// still works; the page reports that when it asks.
+async fn spotify_has_token(state: &AppState) -> bool {
+    let Some(repo) = &state.secret_repo else {
+        return false;
+    };
+    let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
+    let Some(provider) = providers.iter().find(|p| p.id == "spotify") else {
+        return false;
+    };
+    matches!(repo.get(&provider.token_key).await, Ok(Some(t)) if !t.is_empty())
+}
+
 /// `GET /api/v1/player/status` -- which services have a page and which have credentials.
 pub async fn status_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !is_internal_caller(&headers) {
         return unauthorised();
     }
-    let mut services: Vec<String> = vec!["apple".to_string()];
+    let mut services: Vec<String> = vec!["apple".to_string(), "spotify".to_string()];
     for s in bridge().attached_services() {
         if !services.contains(&s) {
             services.push(s);
@@ -391,15 +404,78 @@ pub async fn status_handler(State(state): State<Arc<AppState>>, headers: HeaderM
         Some(repo) => crate::musickit::has_token_source(repo.as_ref()).await,
         None => false,
     };
+    let spotify_configured = spotify_has_token(&state).await;
     let mut out = serde_json::Map::new();
     for s in services {
-        let configured = s != "apple" || apple_configured;
+        let configured = match s.as_str() {
+            "apple" => apple_configured,
+            "spotify" => spotify_configured,
+            _ => true,
+        };
         out.insert(
             s.clone(),
             json!({ "attached": bridge().is_attached(&s), "configured": configured }),
         );
     }
     Json(Value::Object(out)).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UserTokenQuery {
+    service: String,
+    /// Ask the service for a new token first: the SDK asks again when the last one stopped working.
+    #[serde(default)]
+    refresh: bool,
+}
+
+const SPOTIFY_NOT_CONNECTED: &str =
+    "Spotify is not connected: sign in to Spotify in the Music extension's settings.";
+
+/// `GET /api/v1/player/user-token?service=spotify[&refresh=true]` -- the page's access token for
+/// a service whose SDK signs in with the person's own token, not a developer key. For the paired
+/// page only: an extension holds the internal token, which is not a session and is refused here by
+/// the same rule as the developer token. Renewal goes through the same gate as every other
+/// outbound call, so `network_mode = offline` refuses it and the page says so.
+pub async fn user_token_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UserTokenQuery>,
+) -> Response {
+    if q.service != "spotify" {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "That service does not sign in with a user token.",
+        );
+    }
+    let Some(repo) = &state.secret_repo else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Secret storage not available",
+        );
+    };
+    if !spotify_has_token(&state).await {
+        return json_error(StatusCode::BAD_REQUEST, SPOTIFY_NOT_CONNECTED);
+    }
+
+    if q.refresh {
+        return match crate::routes::refresh_spotify_access_token(&state).await {
+            Some(token) => Json(json!({ "token": token })).into_response(),
+            None => json_error(
+                StatusCode::BAD_GATEWAY,
+                "Spotify would not renew the sign-in. Sign in to Spotify again in the Music \
+                 extension's settings, or check the network setting.",
+            ),
+        };
+    }
+
+    let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
+    let stored = match providers.iter().find(|p| p.id == "spotify") {
+        Some(p) => repo.get(&p.token_key).await.ok().flatten(),
+        None => None,
+    };
+    match stored {
+        Some(token) => Json(json!({ "token": token })).into_response(),
+        None => json_error(StatusCode::BAD_REQUEST, SPOTIFY_NOT_CONNECTED),
+    }
 }
 
 #[derive(Deserialize)]

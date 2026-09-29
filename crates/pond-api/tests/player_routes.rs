@@ -1321,6 +1321,115 @@ async fn status_says_which_services_have_a_page_and_which_have_credentials() {
     assert_eq!(after["apple"]["attached"], true);
 }
 
+// ── Spotify: the page's user token ───────────────────────────────────────────
+
+const USER_TOKEN: &str = "/api/v1/player/user-token?service=spotify";
+
+#[tokio::test]
+async fn the_user_token_is_for_the_paired_page_and_never_for_an_extension() {
+    let pond = pond(None, Installed::none()).await;
+    pond.secrets
+        .set("SPOTIFY_ACCESS_TOKEN", "BQD-stored-token")
+        .await
+        .unwrap();
+
+    let (status, body) = pond.call("GET", USER_TOKEN, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, _) = pond
+        .call("GET", USER_TOKEN, Some(internal_extension_token()), None)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an extension holds the internal token, which is not a session"
+    );
+
+    let (status, body) = pond.call("GET", USER_TOKEN, Some("test-token"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["token"], "BQD-stored-token");
+}
+
+#[tokio::test]
+async fn the_user_token_without_a_sign_in_says_where_to_sign_in() {
+    let pond = pond(None, Installed::none()).await;
+    let (status, body) = pond.call("GET", USER_TOKEN, Some("test-token"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("sign in to Spotify"),
+        "{body}"
+    );
+
+    // An empty stored value is not a sign-in either.
+    pond.secrets.set("SPOTIFY_ACCESS_TOKEN", "").await.unwrap();
+    let (status, _) = pond.call("GET", USER_TOKEN, Some("test-token"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn the_user_token_is_for_spotify_and_nothing_else() {
+    let pond = pond(None, Installed::none()).await;
+    pond.secrets
+        .set("SPOTIFY_ACCESS_TOKEN", "BQD-stored-token")
+        .await
+        .unwrap();
+    for service in ["apple", "tidal", "", "spotify%2Fx"] {
+        let uri = format!("/api/v1/player/user-token?service={service}");
+        let (status, body) = pond.call("GET", &uri, Some("test-token"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{service}: {body}");
+        assert!(body.get("token").is_none(), "{service}: {body}");
+    }
+    let (status, _) = pond
+        .call("GET", "/api/v1/player/user-token", Some("test-token"), None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no service named");
+}
+
+#[tokio::test]
+async fn a_renewal_that_cannot_happen_says_so_and_returns_no_stale_token() {
+    let _turn = NETWORK_MODE_TURN.lock().await;
+    let pond = pond(None, Installed::none()).await;
+    pond.secrets
+        .set("SPOTIFY_ACCESS_TOKEN", "BQD-stale")
+        .await
+        .unwrap();
+    // No refresh token is stored, so there is nothing to renew with, and the answer must not be
+    // the token the SDK just told us stopped working.
+    let uri = format!("{USER_TOKEN}&refresh=true");
+    let (status, body) = pond.call("GET", &uri, Some("test-token"), None).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.get("token").is_none(), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Sign in to Spotify again"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn status_reports_whether_spotify_is_signed_in() {
+    let _turn = NETWORK_MODE_TURN.lock().await;
+    let _managed = MANAGED_TURN.lock().await;
+    let pond = pond(None, Installed::none()).await;
+    let before = player_status(&pond).await;
+    assert_eq!(before["spotify"]["configured"], false, "{before}");
+    assert_eq!(before["spotify"]["attached"], false, "{before}");
+
+    pond.secrets
+        .set("SPOTIFY_ACCESS_TOKEN", "BQD-stored-token")
+        .await
+        .unwrap();
+    let _page = attach(&pond, "spotify").await;
+    let after = player_status(&pond).await;
+    assert_eq!(after["spotify"]["configured"], true, "{after}");
+    assert_eq!(after["spotify"]["attached"], true, "{after}");
+}
+
 #[tokio::test]
 async fn offline_refuses_what_reaches_the_service_but_never_the_pause_button() {
     let _turn = NETWORK_MODE_TURN.lock().await;

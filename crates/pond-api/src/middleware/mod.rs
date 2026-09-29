@@ -633,6 +633,7 @@ mod tests {
             (Method::GET, "/api/v1/player/events"),
             (Method::POST, "/api/v1/player/reply"),
             (Method::GET, "/api/v1/musickit/developer-token"),
+            (Method::GET, "/api/v1/player/user-token"),
             (Method::GET, "/api/v1/secrets"),
         ] {
             assert!(

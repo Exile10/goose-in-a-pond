@@ -308,6 +308,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/player/command", post(crate::player::command_handler))
         .route("/player/status", get(crate::player::status_handler))
+        .route("/player/user-token", get(crate::player::user_token_handler))
         .route(
             "/player/egress-policy",
             post(crate::player::player_egress_handler),
@@ -11518,7 +11519,7 @@ async fn oauth_providers_handler(
 
 // ── Music (Spotify) ──────────────────────────────────────────────────────────
 
-async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
+pub(crate) async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
     let repo = state.secret_repo.as_ref()?;
     let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
     let provider = providers.iter().find(|p| p.id == "spotify")?;
