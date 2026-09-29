@@ -21,6 +21,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json",
     "check:widevine": "electron scripts/widevine-check.cjs",
+    "widevine:pin": "electron scripts/widevine-pin.cjs",
+    "widevine:unpin": "electron scripts/widevine-pin.cjs --revert",
     "stage:server": "bash ../scripts/stage-server-sidecar.sh",
     "bundle:app": "npm run stage:server && npm run build:main && bash ../scripts/verify-sidecar.sh && electron-builder --mac",
     "pack:dir": "npm run stage:server && npm run build:main && bash ../scripts/verify-sidecar.sh && electron-builder --mac dir"
@@ -61,5 +63,10 @@
     "vite": "^8.3.0",
     "vitest": "^5.0.1",
     "wait-on": "^9.1.0"
+  },
+  "allowScripts": {
+    "electron-winstaller@5.4.0": true,
+    "esbuild@0.27.7": true,
+    "fsevents@2.3.3": true
   }
 }

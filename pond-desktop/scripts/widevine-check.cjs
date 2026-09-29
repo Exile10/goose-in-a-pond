@@ -20,6 +20,7 @@ const MANIFEST = "https://storage.googleapis.com/shaka-demo-assets/angel-one-wid
 const LICENSE = "https://cwip-shaka-proxy.appspot.com/no_auth";
 const SHAKA = "https://cdnjs.cloudflare.com/ajax/libs/shaka-player/5.2.11/shaka-player.compiled.js";
 const MODULE_WAIT_MS = 150_000;
+const WATCHDOG_MS = MODULE_WAIT_MS + 90_000;
 
 const fresh = !process.env.WV_PROFILE;
 const profile = process.env.WV_PROFILE || fs.mkdtempSync(path.join(os.tmpdir(), "giap-widevine-"));
@@ -28,10 +29,16 @@ app.setPath("userData", profile);
 const t0 = Date.now();
 const lap = () => `${((Date.now() - t0) / 1000).toFixed(1)} s`;
 const say = (s) => console.log(s);
+let stage = "starting";
 function finish(code) {
   if (fresh) fs.rmSync(profile, { recursive: true, force: true });
   app.exit(code);
 }
+// A check that can hang is worse than no check: whatever is stuck, this ends, and says where.
+setTimeout(() => {
+  say(`FAIL: no answer after ${WATCHDOG_MS / 1000} s, while ${stage}`);
+  finish(1);
+}, WATCHDOG_MS).unref();
 
 // The page runs inside the window, so it is a string.
 const PAGE = `(async () => {
@@ -60,6 +67,7 @@ app.whenReady().then(async () => {
     say("FAIL: this Electron has no Widevine (it is stock Electron, not castlabs'). Run `npm install` in pond-desktop.");
     return finish(2);
   }
+  stage = "waiting for the Widevine module";
   try {
     await Promise.race([
       components.whenReady(),
@@ -72,6 +80,7 @@ app.whenReady().then(async () => {
   const mod = Object.values(components.status()).map((c) => `${c.title} ${c.version} (${c.status})`).join(", ");
   say(`module ready after ${lap()}${fresh ? " on a fresh profile" : ""}: ${mod}`);
 
+  stage = "opening the test window";
   const server = http.createServer((_, res) => {
     res.setHeader("content-type", "text/html");
     res.end('<!doctype html><meta charset=utf-8><video id=v muted playsinline width=320></video>');
@@ -80,9 +89,14 @@ app.whenReady().then(async () => {
     const win = new BrowserWindow({ show: false, webPreferences: { autoplayPolicy: "no-user-gesture-required" } });
     await win.loadURL(`http://127.0.0.1:${server.address().port}/`);
     let r;
+    stage = "playing the encrypted stream";
     try { r = await win.webContents.executeJavaScript(PAGE); }
     catch (e) { r = { worked: false, error: String(e.message).slice(0, 200) }; }
     server.close();
+    // WV_HOLD=<ms> keeps the process, and so the Widevine module, alive a little longer, so something
+    // outside can look at which module file the browser really has open.
+    const hold = Number(process.env.WV_HOLD || 0);
+    if (hold > 0) await new Promise((res) => setTimeout(res, hold));
     if (r.worked) {
       say(`PASS: ${r.keySystem} licensed in ${r.licenseSeconds}s and decrypted: played ${r.currentTime} s, ${r.frames} frames, ${r.dropped} dropped, ${r.stalls} stalls`);
       return finish(0);
