@@ -28,11 +28,13 @@ pub const PRIVATE_KEY_KEY: &str = "APPLE_MUSIC_PRIVATE_KEY";
 /// ends the music; Apple's own ceiling is about six months.
 pub const DEVELOPER_TOKEN_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Where managed tokens come from. Unset, or `off`, means managed mode is off.
+/// Where managed tokens come from. Unset means the built-in address below; `off` (or empty) turns
+/// managed mode off, and any other value is used in place of the built-in address.
 pub const MANAGED_URL_ENV: &str = "POND_CREDENTIALS_URL";
-/// Until the service is deployed there is nothing to default to. When it is, its address goes here,
-/// and every pond without its own key starts using it: that is a decision, not a default to drift into.
-const DEFAULT_MANAGED_URL: Option<&str> = None;
+/// Jarida's credentials service (`docs/architecture/pondcredentials.md`). Every pond without a key of
+/// its own asks it for an Apple Music developer token, which was Jerry's decision on 2026-09-29.
+/// A test or a scratch pond must say `off`, or it phones home.
+const DEFAULT_MANAGED_URL: Option<&str> = Some("https://credentials.jarida.io");
 /// The name a fetch is filed under in the egress log, so a person can see the pond called home.
 const MANAGED_TOOL: &str = "giap-credentials";
 
@@ -100,8 +102,9 @@ struct Cached {
 }
 
 impl Cached {
-    /// Time to fetch again: a fifth of its life is left, or under a day. A household then fetches
-    /// about once a month, and always holds a token with weeks on it.
+    /// Time to fetch again: a fifth of its life is left, or under a day. A pond that stays up then
+    /// fetches about once a month and always holds a token with weeks on it. The cache lives in
+    /// memory only, so every start of the pond fetches again.
     fn due(&self, now: u64) -> bool {
         let life = self.expires_at.saturating_sub(self.fetched_at);
         let left = self.expires_at.saturating_sub(now);
@@ -266,6 +269,17 @@ pub async fn developer_token_handler(State(state): State<Arc<AppState>>) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_built_in_address_is_jaridas_service_over_https() {
+        // A change here changes what every pond without its own key does, so it is pinned.
+        assert_eq!(DEFAULT_MANAGED_URL, Some("https://credentials.jarida.io"));
+        assert_eq!(
+            managed_url_from(DEFAULT_MANAGED_URL).as_deref(),
+            Some("https://credentials.jarida.io"),
+            "the built-in address must survive the same checks a configured one does"
+        );
+    }
 
     #[test]
     fn the_service_address_must_be_https_apart_from_loopback() {

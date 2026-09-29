@@ -130,7 +130,7 @@
         {
           "key": "APPLE_MUSIC_TEAM_ID",
           "display_name": "Apple Music Team ID",
-          "description": "Optional. Your own Apple Developer key for the in-app Apple Music player. Leave all three blank to use Jarida's shared credentials, where this pond is set up for them. Your 10-character Team ID.",
+          "description": "Optional. Your own Apple Developer key for the in-app Apple Music player. Leave all three blank to use Jarida's shared credentials. Your 10-character Team ID.",
           "required": false,
           "kind": "generic",
           "host_only": true,

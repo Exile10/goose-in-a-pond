@@ -209,6 +209,11 @@ struct Pond {
 }
 
 async fn pond(manager: Option<Arc<CapturingManager>>, installed: Arc<Installed>) -> Pond {
+    // Unset means the built-in address, which is Jarida's real service. A test that wants managed mode
+    // sets its own mock through `ManagedAt`; every other one must never leave the machine.
+    if std::env::var_os("POND_CREDENTIALS_URL").is_none() {
+        std::env::set_var("POND_CREDENTIALS_URL", "off");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
@@ -434,7 +439,8 @@ impl ManagedAt {
 
 impl Drop for ManagedAt {
     fn drop(&mut self) {
-        std::env::remove_var("POND_CREDENTIALS_URL");
+        // Back to `off`, not to unset: unset now means Jarida's real service, which no test may call.
+        std::env::set_var("POND_CREDENTIALS_URL", "off");
     }
 }
 
