@@ -103,21 +103,52 @@
     {
       "id": "music",
       "name": "Music",
-      "description": "Control music playback, search tracks, and manage playlists via Spotify",
+      "description": "Play songs, playlists and your library, and control playback, on Spotify or Apple Music",
       "kind": "stdio",
       "command": "npx",
       "args": ["-y", "tsx", "extensions/music/src/server.ts"],
       "category": "entertainment",
       "author": "GIAP",
-      "tools": ["play", "play_playlist", "queue", "playlists", "library", "devices", "status", "control"],
+      "tools": ["play", "playlists", "library", "devices", "status", "control"],
       "featured": true,
       "required_secrets": [
         {
           "key": "SPOTIFY_ACCESS_TOKEN",
           "display_name": "Spotify",
-          "description": "Sign in to control playback and manage playlists",
-          "required": true,
+          "description": "Optional. Sign in to play and control music on Spotify.",
+          "required": false,
           "kind": "oauth_flow"
+        },
+        {
+          "key": "MUSIC_SERVICE",
+          "display_name": "Preferred service",
+          "description": "Optional. spotify or apple. Leave blank to choose automatically.",
+          "required": false,
+          "kind": "generic"
+        },
+        {
+          "key": "APPLE_MUSIC_TEAM_ID",
+          "display_name": "Apple Music Team ID",
+          "description": "Optional. Lets the in-app Apple Music player search and play songs. Your 10-character Apple Developer Team ID.",
+          "required": false,
+          "kind": "generic",
+          "host_only": true
+        },
+        {
+          "key": "APPLE_MUSIC_KEY_ID",
+          "display_name": "Apple Music Key ID",
+          "description": "Optional. Lets the in-app Apple Music player search and play songs. The 10-character ID of your MusicKit key.",
+          "required": false,
+          "kind": "generic",
+          "host_only": true
+        },
+        {
+          "key": "APPLE_MUSIC_PRIVATE_KEY",
+          "display_name": "Apple Music private key",
+          "description": "Optional. Lets the in-app Apple Music player search and play songs. Paste the whole contents of the MusicKit .p8 key file; it stays on this device and is never given to the extension.",
+          "required": false,
+          "kind": "api_key",
+          "host_only": true
         }
       ]
     }

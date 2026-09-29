@@ -3486,7 +3486,7 @@ async fn run_server(
                         let mut env = srv.env.clone();
                         if let Some(sr) = &secret_repo {
                             if let Ok(Some(ext)) = marketplace.get_by_id(&srv.name).await {
-                                for secret_req in &ext.required_secrets {
+                                for secret_req in ext.env_secrets() {
                                     if let Ok(Some(val)) = sr.get(&secret_req.key).await {
                                         env.insert(secret_req.key.clone(), val);
                                     }

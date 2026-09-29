@@ -206,6 +206,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn music_installs_with_no_secret_and_never_gets_the_apple_signing_key() {
+        let music = BundledMarketplace::new()
+            .get_by_id("music")
+            .await
+            .unwrap()
+            .expect("music entry");
+        assert!(
+            music.required_secrets.iter().all(|s| !s.required),
+            "an Apple-only or Spotify-only user must be able to install music"
+        );
+        let env: Vec<&str> = music.env_secrets().map(|s| s.key.as_str()).collect();
+        for key in [
+            "APPLE_MUSIC_TEAM_ID",
+            "APPLE_MUSIC_KEY_ID",
+            "APPLE_MUSIC_PRIVATE_KEY",
+        ] {
+            assert!(
+                !env.contains(&key),
+                "the host signs developer tokens, so {key} stays out of the child env"
+            );
+        }
+        for key in ["SPOTIFY_ACCESS_TOKEN", "MUSIC_SERVICE"] {
+            assert!(env.contains(&key), "{key} must reach the extension");
+        }
+    }
+
     #[test]
     fn no_stdio_entry_keeps_a_relative_extensions_path_after_rewrite() {
         let mp = BundledMarketplace::with_asset_root("/opt/giap");

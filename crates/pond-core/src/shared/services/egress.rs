@@ -160,29 +160,39 @@ pub fn egress_verdict(host: &str, mode: NetworkMode) -> Result<(), &'static str>
 pub fn check_egress(url: &str) -> Result<(), EgressDenied> {
     let mode = network_mode();
     let host = extract_host(url);
-    match egress_verdict(host, mode) {
-        Ok(()) => Ok(()),
-        Err(reason) => {
-            let denied = EgressDenied {
-                host: host.to_string(),
-                mode,
-                reason,
-            };
-            tracing::warn!(
-                target: "giap::trace",
-                kind = "egress_denied",
-                host = %denied.host,
-                mode = %mode.as_str(),
-                "{denied}"
-            );
-            append_event(denied_event(
-                &denied,
-                &current_tool(),
-                &current_session_id(),
-            ));
-            Err(denied)
-        }
-    }
+    egress_verdict(host, mode)
+        .map_err(|reason| refuse(host, mode, reason, &current_tool(), &current_session_id()))
+}
+
+/// As [`check_egress`], attributed to the given tool and session instead of the globals, for
+/// callers (extensions) whose request is not the built-in tool in flight.
+pub fn check_egress_for(url: &str, tool: &str, session_id: &str) -> Result<(), EgressDenied> {
+    let mode = network_mode();
+    let host = extract_host(url);
+    egress_verdict(host, mode).map_err(|reason| refuse(host, mode, reason, tool, session_id))
+}
+
+fn refuse(
+    host: &str,
+    mode: NetworkMode,
+    reason: &'static str,
+    tool: &str,
+    session_id: &str,
+) -> EgressDenied {
+    let denied = EgressDenied {
+        host: host.to_string(),
+        mode,
+        reason,
+    };
+    tracing::warn!(
+        target: "giap::trace",
+        kind = "egress_denied",
+        host = %denied.host,
+        mode = %mode.as_str(),
+        "{denied}"
+    );
+    append_event(denied_event(&denied, tool, session_id));
+    denied
 }
 
 /// Build the `Network` event for one refusal; takes tool and session so it stays pure.
@@ -251,18 +261,32 @@ impl EgressCall {
 
 /// Record one outbound call against the in-flight tool/session; appends fire-and-forget.
 pub fn record_egress(url: &str, method: &str, status: Option<u16>, latency_ms: u64) {
-    let Some(sink) = egress_sink() else {
+    if egress_sink().is_none() {
         return;
-    };
-    let host = extract_host(url).to_string();
-    let tool = current_tool();
-    let session_id = current_session_id();
-    let event = egress_event(&host, &tool, &session_id, method, status, latency_ms);
-    tokio::spawn(async move {
-        if let Err(e) = sink.append(event).await {
-            tracing::warn!(target: "giap::trace", error = %e, "failed to record egress event");
-        }
-    });
+    }
+    record_egress_for(
+        url,
+        method,
+        &current_tool(),
+        &current_session_id(),
+        status,
+        latency_ms,
+    );
+}
+
+/// As [`record_egress`], attributed to the given tool and session instead of the globals.
+pub fn record_egress_for(
+    url: &str,
+    method: &str,
+    tool: &str,
+    session_id: &str,
+    status: Option<u16>,
+    latency_ms: u64,
+) {
+    let host = extract_host(url);
+    append_event(egress_event(
+        host, tool, session_id, method, status, latency_ms,
+    ));
 }
 
 /// Build the `Network` event for one outbound call; pure, so it is testable without a sink.

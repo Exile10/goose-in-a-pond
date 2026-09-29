@@ -61,8 +61,13 @@ urlencoding = { workspace = true }
 # Single-executable: embed the built web UI (pond-desktop/dist) into the binary.
 include_dir = { workspace = true }
 mime_guess = "2"
+# ES256 Apple Music developer tokens (`musickit.rs`); already in the graph through pond-infra.
+jsonwebtoken = { workspace = true }
 
 [dev-dependencies]
+# Tests only: generate the P-256 key at run time (gitleaks scans history, so no committed PEM).
+# Already in the graph as jsonwebtoken's and rustls's crypto backend.
+aws-lc-rs = "1"
 async-trait = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }

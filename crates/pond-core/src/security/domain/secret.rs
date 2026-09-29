@@ -12,6 +12,9 @@ pub struct SecretRequirement {
     /// Whether the extension won't work without this secret
     pub required: bool,
     pub kind: SecretKind,
+    /// Used by the host only (e.g. a signing key), so never put in the extension's environment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_only: bool,
 }
 
 /// How a secret is obtained by the user.

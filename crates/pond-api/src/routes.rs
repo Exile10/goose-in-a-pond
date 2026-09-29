@@ -295,6 +295,27 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/oauth/refresh", post(oauth_refresh_handler))
         .route("/oauth/providers", get(oauth_providers_handler))
         .route("/oauth/status/{state}", get(oauth_status_handler))
+        // ── Music player bridge and Apple Music developer tokens ───────────────
+        .route(
+            "/musickit/developer-token",
+            get(crate::musickit::developer_token_handler),
+        )
+        .route("/player/events", get(crate::player::events_handler))
+        .route("/player/reply", post(crate::player::reply_handler))
+        .route(
+            "/player/state",
+            get(crate::player::get_state_handler).post(crate::player::post_state_handler),
+        )
+        .route("/player/command", post(crate::player::command_handler))
+        .route("/player/status", get(crate::player::status_handler))
+        .route(
+            "/player/egress-policy",
+            post(crate::player::player_egress_handler),
+        )
+        .route(
+            "/extension/egress",
+            post(crate::player::extension_egress_handler),
+        )
         // ── Music (Spotify) ────────────────────────────────────────────────────
         .route("/music/now-playing", get(music_now_playing_handler))
         .route("/music/control", post(music_control_handler))
@@ -10610,8 +10631,11 @@ async fn install_marketplace_handler(
     }
 
     let mut env = secrets;
+    for sr in ext.required_secrets.iter().filter(|s| s.host_only) {
+        env.remove(&sr.key);
+    }
     if let Some(repo) = &state.secret_repo {
-        for sr in &ext.required_secrets {
+        for sr in ext.env_secrets() {
             if !env.contains_key(&sr.key) {
                 if let Ok(Some(val)) = repo.get(&sr.key).await {
                     env.insert(sr.key.clone(), val);
@@ -10849,7 +10873,7 @@ async fn restart_extension_with_secrets(state: &AppState, ext_id: &str) -> Resul
     };
 
     let mut env = std::collections::HashMap::new();
-    for sr in &ext.required_secrets {
+    for sr in ext.env_secrets() {
         if let Ok(Some(val)) = secret_repo.get(&sr.key).await {
             env.insert(sr.key.clone(), val);
         }
@@ -11409,7 +11433,7 @@ async fn oauth_refresh_handler(
                                 ext.required_secrets.iter().any(|s| s.key == token_key);
                             if uses_token {
                                 let mut env = std::collections::HashMap::new();
-                                for sr in &ext.required_secrets {
+                                for sr in ext.env_secrets() {
                                     if let Ok(Some(val)) = secret_repo.get(&sr.key).await {
                                         env.insert(sr.key.clone(), val);
                                     }

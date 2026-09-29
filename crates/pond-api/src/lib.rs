@@ -3,8 +3,10 @@
 pub mod cleanup;
 pub(crate) mod image_normalize;
 pub mod middleware;
+pub mod musickit;
 pub mod network;
 pub mod oauth_callback;
+pub mod player;
 pub mod routes;
 pub mod runs;
 pub mod thought_filter;
