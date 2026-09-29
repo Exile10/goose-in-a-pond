@@ -8,6 +8,13 @@ appId: app.goose-in-a-pond.desktop
 productName: Goose In A Pond
 copyright: Copyright (c) 2026 Jarida Open Source Community
 
+# The shell runs on castlabs' Electron ("44.1.0+wvcus"), the one build here with Widevine, which the
+# music player needs to play anything. electron-builder cannot fetch that version (it looks on
+# Electron's own releases), so it packages the binary npm installed. NOT yet run end to end: see
+# "The Electron build" in docs/architecture/music-player.md for what that leaves untried.
+electronVersion: 44.1.0
+electronDist: node_modules/electron/dist
+
 directories:
   output: release
   buildResources: build

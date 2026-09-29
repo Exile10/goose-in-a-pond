@@ -8,6 +8,7 @@
   "main": "dist-electron/main/index.cjs",
   "type": "module",
   "scripts": {
+    "postinstall": "node scripts/install-electron.mjs",
     "dev": "concurrently --kill-others-on-fail -n vite,server -c cyan,green \"vite\" \"npm run dev:server\"",
     "dev:server": "cd .. && cargo run -p pond-server -- serve --native",
     "dev:server:mesh": "cd .. && cargo run -p pond-server --features mesh -- serve --native",
@@ -50,7 +51,7 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.1",
     "concurrently": "^10.0.5",
-    "electron": "^44.4.2",
+    "electron": "git+https://github.com/castlabs/electron-releases.git#v44.1.0+wvcus",
     "electron-builder": "^26.15.3",
     "happy-dom": "^20.14.5",
     "tailwindcss": "^4.2.2",
