@@ -124,7 +124,8 @@
           "display_name": "Preferred service",
           "description": "Optional. spotify or apple. Leave blank to choose automatically.",
           "required": false,
-          "kind": "generic"
+          "kind": "generic",
+          "advanced": true
         },
         {
           "key": "APPLE_MUSIC_TEAM_ID",
@@ -132,7 +133,8 @@
           "description": "Optional. Your own Apple Developer key for the in-app Apple Music player. Leave all three blank to use Jarida's shared credentials, where this pond is set up for them. Your 10-character Team ID.",
           "required": false,
           "kind": "generic",
-          "host_only": true
+          "host_only": true,
+          "advanced": true
         },
         {
           "key": "APPLE_MUSIC_KEY_ID",
@@ -140,7 +142,8 @@
           "description": "Optional. Part of your own Apple Developer key; leave blank to use the shared credentials. The 10-character ID of your MusicKit key.",
           "required": false,
           "kind": "generic",
-          "host_only": true
+          "host_only": true,
+          "advanced": true
         },
         {
           "key": "APPLE_MUSIC_PRIVATE_KEY",
@@ -148,7 +151,8 @@
           "description": "Optional. Part of your own Apple Developer key; leave blank to use the shared credentials. Paste the whole contents of the MusicKit .p8 file; it stays on this device and is never given to the extension.",
           "required": false,
           "kind": "api_key",
-          "host_only": true
+          "host_only": true,
+          "advanced": true
         }
       ]
     }

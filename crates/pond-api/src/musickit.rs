@@ -36,8 +36,9 @@ const DEFAULT_MANAGED_URL: Option<&str> = None;
 /// The name a fetch is filed under in the egress log, so a person can see the pond called home.
 const MANAGED_TOOL: &str = "giap-credentials";
 
-const NOT_SET_UP: &str = "Apple Music is not set up: add your Apple Music Team ID, Key ID and \
-                          private key in the Music extension's settings.";
+const NOT_SET_UP: &str = "Apple Music sign-in is not available on this pond yet: no shared \
+                          credentials are set up. To use your own, add your Apple Music Team ID, Key ID \
+                          and private key under Developer settings in the Music extension.";
 
 async fn stored(repo: &dyn SecretRepository, key: &str) -> Option<String> {
     repo.get(key)

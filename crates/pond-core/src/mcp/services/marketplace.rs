@@ -207,6 +207,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn music_keeps_its_own_key_fields_and_the_service_picker_under_developer_settings() {
+        let music = BundledMarketplace::new()
+            .get_by_id("music")
+            .await
+            .unwrap()
+            .expect("music entry");
+        let mut advanced: Vec<&str> = music
+            .required_secrets
+            .iter()
+            .filter(|s| s.advanced)
+            .map(|s| s.key.as_str())
+            .collect();
+        advanced.sort_unstable();
+        assert_eq!(
+            advanced,
+            [
+                "APPLE_MUSIC_KEY_ID",
+                "APPLE_MUSIC_PRIVATE_KEY",
+                "APPLE_MUSIC_TEAM_ID",
+                "MUSIC_SERVICE"
+            ],
+            "the ordinary path is a sign-in button; everything else is for a developer"
+        );
+        let spotify = music
+            .required_secrets
+            .iter()
+            .find(|s| s.key == "SPOTIFY_ACCESS_TOKEN")
+            .expect("the Spotify sign-in");
+        assert!(!spotify.advanced, "signing in is the ordinary path");
+    }
+
+    #[test]
+    fn a_requirement_says_it_is_advanced_only_when_it_is() {
+        let plain: crate::security::domain::secret::SecretRequirement = serde_json::from_str(
+            r#"{"key":"K","display_name":"K","description":"","required":false,"kind":"generic"}"#,
+        )
+        .unwrap();
+        assert!(!plain.advanced, "absent means an ordinary field");
+        assert!(
+            !serde_json::to_string(&plain).unwrap().contains("advanced"),
+            "an ordinary field's JSON does not change"
+        );
+        let dev: crate::security::domain::secret::SecretRequirement = serde_json::from_str(
+            r#"{"key":"K","display_name":"K","description":"","required":false,"kind":"generic","advanced":true}"#,
+        )
+        .unwrap();
+        assert!(dev.advanced);
+        assert!(serde_json::to_string(&dev)
+            .unwrap()
+            .contains("\"advanced\":true"));
+    }
+
+    #[tokio::test]
     async fn music_installs_with_no_secret_and_never_gets_the_apple_signing_key() {
         let music = BundledMarketplace::new()
             .get_by_id("music")

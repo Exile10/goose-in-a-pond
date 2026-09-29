@@ -15,6 +15,10 @@ pub struct SecretRequirement {
     /// Used by the host only (e.g. a signing key), so never put in the extension's environment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_only: bool,
+    /// For someone bringing their own credentials or overriding a default. The UI keeps these
+    /// under "Developer settings" so the ordinary path is a sign-in button, not a form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub advanced: bool,
 }
 
 /// How a secret is obtained by the user.
