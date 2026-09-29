@@ -545,6 +545,235 @@ async fn a_key_the_household_stored_beats_the_shared_one() {
     );
 }
 
+// ── A kept token survives a restart ──────────────────────────────────────────
+
+const KEPT: &str = "APPLE_MUSIC_MANAGED_TOKEN";
+
+/// What an earlier start would have stored for `url`, with `days` of life left and fetched `ago` ago.
+fn kept(url: &str, days: u64, fetched_days_ago: u64) -> String {
+    let t = a_token(days);
+    json!({
+        "url": url,
+        "token": t["token"],
+        "expires_at": t["expires_at"],
+        "fetched_at": unix_now().saturating_sub(fetched_days_ago * 86_400),
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_token_fetched_once_is_kept_and_a_restart_does_not_ask_again() {
+    let _managed = MANAGED_TURN.lock().await;
+    let svc = credentials_service(StatusCode::OK, a_token(30)).await;
+    let _at = ManagedAt::set(&svc.url);
+    let pond = pond(None, Installed::none()).await;
+
+    let (status, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        pond.secrets.has(KEPT).await.unwrap(),
+        "the token is kept for the next start"
+    );
+
+    // A restart forgets memory and nothing else.
+    pond_api::musickit::forget_managed_memory().await;
+    let (status, again) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["token"], "aaaa.bbbb.cccc");
+    assert_eq!(
+        svc.hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the second start used the kept token and never reached the service"
+    );
+}
+
+#[tokio::test]
+async fn a_kept_token_that_is_due_is_renewed_and_still_served_if_the_renewal_fails() {
+    let _managed = MANAGED_TURN.lock().await;
+    // Down for the renewal: the service answers 503.
+    let down = credentials_service(StatusCode::SERVICE_UNAVAILABLE, json!({})).await;
+    let _at = ManagedAt::set(&down.url);
+    let pond = pond(None, Installed::none()).await;
+    // 4 days left of 30 is under a fifth, so it is due; it has not expired.
+    pond.secrets
+        .set(KEPT, &kept(&down.url, 4, 26))
+        .await
+        .unwrap();
+    pond_api::musickit::forget_managed_memory().await;
+
+    let (status, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a token with days left is not thrown away: {body}"
+    );
+    assert_eq!(body["token"], "aaaa.bbbb.cccc");
+    assert_eq!(
+        down.hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "it did try to renew"
+    );
+}
+
+#[tokio::test]
+async fn a_kept_token_that_is_due_is_replaced_when_the_service_is_up() {
+    let _managed = MANAGED_TURN.lock().await;
+    let fresh = json!({ "token": "dddd.eeee.ffff", "expires_at": unix_now() + 30 * 86_400 });
+    let svc = credentials_service(StatusCode::OK, fresh).await;
+    let _at = ManagedAt::set(&svc.url);
+    let pond = pond(None, Installed::none()).await;
+    pond.secrets
+        .set(KEPT, &kept(&svc.url, 4, 26))
+        .await
+        .unwrap();
+    pond_api::musickit::forget_managed_memory().await;
+
+    let (_, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+
+    assert_eq!(
+        body["token"], "dddd.eeee.ffff",
+        "the due token was replaced"
+    );
+    let stored = pond.secrets.get(KEPT).await.unwrap().unwrap();
+    assert!(
+        stored.contains("dddd.eeee.ffff"),
+        "and the new one is what is kept"
+    );
+}
+
+#[tokio::test]
+async fn a_kept_token_is_not_served_for_another_address_or_after_it_lapses_or_when_damaged() {
+    let _managed = MANAGED_TURN.lock().await;
+    let svc = credentials_service(StatusCode::OK, a_token(30)).await;
+    let _at = ManagedAt::set(&svc.url);
+
+    for (label, raw) in [
+        ("another address", kept("https://other.example.org", 20, 10)),
+        (
+            "a lapsed expiry",
+            json!({"url": svc.url, "token": "aaaa.bbbb.cccc", "expires_at": unix_now() - 1_000, "fetched_at": unix_now() - 40 * 86_400})
+                .to_string(),
+        ),
+        ("damaged text", "not json at all".to_string()),
+        (
+            "a token that is not one",
+            json!({"url": svc.url, "token": "<script>", "expires_at": unix_now() + 86_400 * 20, "fetched_at": unix_now()})
+                .to_string(),
+        ),
+    ] {
+        let before = svc.hits.load(std::sync::atomic::Ordering::SeqCst);
+        let pond = pond(None, Installed::none()).await;
+        pond.secrets.set(KEPT, &raw).await.unwrap();
+        pond_api::musickit::forget_managed_memory().await;
+
+        let (status, body) = pond.call("GET", DEV_TOKEN, Some("test-token"), None).await;
+
+        assert_eq!(status, StatusCode::OK, "{label}: {body}");
+        assert_eq!(
+            svc.hits.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "{label} is ignored, and the pond asks the service"
+        );
+    }
+}
+
+// ── The probe: can a token be had, without having one ────────────────────────
+
+#[tokio::test]
+async fn the_probe_says_a_token_is_possible_and_never_reaches_the_service() {
+    let _managed = MANAGED_TURN.lock().await;
+    let svc = credentials_service(StatusCode::OK, a_token(30)).await;
+    let _at = ManagedAt::set(&svc.url);
+    let pond = pond(None, Installed::none()).await;
+
+    let (status, body) = pond
+        .call(
+            "GET",
+            "/api/v1/musickit/developer-token?probe=true",
+            Some("test-token"),
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], true);
+    assert!(
+        body.get("token").is_none(),
+        "a probe hands out no token: {body}"
+    );
+    assert_eq!(
+        svc.hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a probe is not a call to Jarida"
+    );
+    assert!(!pond.secrets.has(KEPT).await.unwrap(), "and keeps nothing");
+}
+
+#[tokio::test]
+async fn the_probe_says_what_is_missing_when_nothing_could_supply_a_token() {
+    let _managed = MANAGED_TURN.lock().await;
+    let _at = ManagedAt::set("off");
+    let pond = pond(None, Installed::none()).await;
+
+    let (status, body) = pond
+        .call(
+            "GET",
+            "/api/v1/musickit/developer-token?probe=true",
+            Some("test-token"),
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(
+        error.contains("Team ID") && error.contains("Developer settings"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn the_probe_counts_a_stored_key_and_needs_no_network_for_it() {
+    let _managed = MANAGED_TURN.lock().await;
+    let _at = ManagedAt::set("off");
+    let pond = pond(None, Installed::none()).await;
+    pond.store_signing_secrets().await;
+
+    let (status, body) = pond
+        .call(
+            "GET",
+            "/api/v1/musickit/developer-token?probe=true",
+            Some("test-token"),
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["available"], true);
+    assert!(body.get("token").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn the_probe_is_for_the_paired_page_like_the_token_itself() {
+    let _managed = MANAGED_TURN.lock().await;
+    let _at = ManagedAt::set("off");
+    let pond = pond(None, Installed::none()).await;
+    let uri = "/api/v1/musickit/developer-token?probe=true";
+
+    assert_eq!(
+        pond.call("GET", uri, None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        pond.call("GET", uri, Some(internal_extension_token()), None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED,
+        "an extension may not probe either"
+    );
+}
+
 #[tokio::test]
 async fn a_service_that_fails_says_why_and_is_not_asked_again_at_once() {
     let _managed = MANAGED_TURN.lock().await;

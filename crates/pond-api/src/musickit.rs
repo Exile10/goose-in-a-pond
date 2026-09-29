@@ -7,12 +7,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use pond_core::security::ports::secret::SecretRepository;
 use pond_core::shared::services::egress;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use pond_apple_token::{normalize_private_key, SigningCredentials};
@@ -102,9 +103,9 @@ struct Cached {
 }
 
 impl Cached {
-    /// Time to fetch again: a fifth of its life is left, or under a day. A pond that stays up then
-    /// fetches about once a month and always holds a token with weeks on it. The cache lives in
-    /// memory only, so every start of the pond fetches again.
+    /// Time to fetch again: a fifth of its life is left, or under a day. A pond then fetches about
+    /// once a month and always holds a token with weeks on it. The token is kept in the secret store
+    /// and read once per start, so a restart does not ask again while it is still good.
     fn due(&self, now: u64) -> bool {
         let life = self.expires_at.saturating_sub(self.fetched_at);
         let left = self.expires_at.saturating_sub(now);
@@ -112,8 +113,52 @@ impl Cached {
     }
 }
 
+/// Where the managed token is kept between starts, so a pond that restarts does not ask again for a
+/// token it still holds. Not a secret: a developer token is public by design, since every MusicKit page
+/// carries one, and `GET /secrets` lists key names and never values. The secret store is simply the
+/// durable place this crate already has.
+pub const MANAGED_TOKEN_KEY: &str = "APPLE_MUSIC_MANAGED_TOKEN";
+
+/// What is written under [`MANAGED_TOKEN_KEY`]. The address is part of it, so a pond pointed at another
+/// service never serves the token of the last one.
+#[derive(Serialize, Deserialize)]
+struct Persisted {
+    url: String,
+    token: String,
+    expires_at: u64,
+    fetched_at: u64,
+}
+
+impl Persisted {
+    fn of(base: &str, c: &Cached) -> Persisted {
+        Persisted {
+            url: base.to_string(),
+            token: c.token.clone(),
+            expires_at: c.expires_at,
+            fetched_at: c.fetched_at,
+        }
+    }
+
+    /// The token held, if what was stored is for this service and would still be accepted from it:
+    /// anything else (another address, damaged text, a lapsed or implausible expiry) is ignored, and
+    /// the pond simply asks.
+    fn read(raw: &str, base: &str, now: u64) -> Option<Cached> {
+        let p: Persisted = serde_json::from_str(raw).ok()?;
+        if p.url != base || accept(&p.token, p.expires_at, now).is_err() {
+            return None;
+        }
+        Some(Cached {
+            token: p.token,
+            expires_at: p.expires_at,
+            fetched_at: p.fetched_at.min(now),
+        })
+    }
+}
+
 #[derive(Default)]
 struct Slot {
+    /// Whether the stored token has been looked at yet: it is read once per start, not per request.
+    loaded: bool,
     cached: Option<Cached>,
     /// When the last fetch failed, and why, so a service that is down is asked once a minute and
     /// not on every retry the player makes.
@@ -187,9 +232,23 @@ pub async fn managed_token(
     client: &reqwest::Client,
     base: &str,
     now: u64,
+    store: Option<&dyn SecretRepository>,
 ) -> Result<(String, u64), String> {
     let mut slots = MANAGED.get_or_init(Default::default).lock().await;
     let slot = slots.entry(base.to_string()).or_default();
+
+    // The first ask after a start reads what an earlier start stored, so a token with weeks left is
+    // served with no network at all.
+    if !slot.loaded {
+        slot.loaded = true;
+        if slot.cached.is_none() {
+            if let Some(store) = store {
+                if let Ok(Some(raw)) = store.get(MANAGED_TOKEN_KEY).await {
+                    slot.cached = Persisted::read(&raw, base, now);
+                }
+            }
+        }
+    }
 
     if let Some(c) = &slot.cached {
         if !c.due(now) {
@@ -209,6 +268,14 @@ pub async fn managed_token(
         Ok(fresh) => {
             slot.failed = None;
             let out = (fresh.token.clone(), fresh.expires_at);
+            if let Some(store) = store {
+                // Failing to keep it costs a fetch at the next start and nothing else.
+                if let Ok(raw) = serde_json::to_string(&Persisted::of(base, &fresh)) {
+                    if let Err(error) = store.set(MANAGED_TOKEN_KEY, &raw).await {
+                        tracing::debug!(%error, "could not keep the Apple Music token for the next start");
+                    }
+                }
+            }
             slot.cached = Some(fresh);
             Ok(out)
         }
@@ -225,6 +292,15 @@ pub async fn managed_token(
     }
 }
 
+/// Forgets what this process holds in memory, as a restart would, leaving the stored token alone.
+/// For tests: a pond never needs it.
+#[doc(hidden)]
+pub async fn forget_managed_memory() {
+    if let Some(slots) = MANAGED.get() {
+        slots.lock().await.clear();
+    }
+}
+
 // ── The route ────────────────────────────────────────────────
 
 /// Whether a token can be had at all: a stored key, or the credentials service is on. Says nothing
@@ -233,14 +309,34 @@ pub async fn has_token_source(repo: &dyn SecretRepository) -> bool {
     stored_credentials(repo).await.is_some() || managed_url().is_some()
 }
 
-/// `GET /api/v1/musickit/developer-token` -- the player page's developer token.
-pub async fn developer_token_handler(State(state): State<Arc<AppState>>) -> Response {
+#[derive(Deserialize, Default)]
+pub struct TokenQuery {
+    /// Only ask whether a token could be had. Never signs, never reaches the network, so a page can
+    /// find out whether Apple Music is possible without starting anything.
+    #[serde(default)]
+    probe: bool,
+}
+
+/// `GET /api/v1/musickit/developer-token` -- the player page's developer token. With `?probe=true`
+/// it answers `{available: true}` or says what is missing, and does nothing else.
+pub async fn developer_token_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TokenQuery>,
+) -> Response {
     let Some(repo) = &state.secret_repo else {
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Secret storage not available",
         );
     };
+
+    if q.probe {
+        return if has_token_source(repo.as_ref()).await {
+            Json(json!({ "available": true })).into_response()
+        } else {
+            json_error(StatusCode::BAD_REQUEST, NOT_SET_UP)
+        };
+    }
 
     // A key the household stored beats the shared one: it is theirs, and needs no network.
     if let Some(credentials) = stored_credentials(repo.as_ref()).await {
@@ -253,15 +349,17 @@ pub async fn developer_token_handler(State(state): State<Arc<AppState>>) -> Resp
     }
 
     match managed_url() {
-        Some(base) => match managed_token(&state.http_client, &base, now_secs()).await {
-            Ok((token, expires_at)) => {
-                Json(json!({ "token": token, "expires_at": expires_at })).into_response()
+        Some(base) => {
+            match managed_token(&state.http_client, &base, now_secs(), Some(repo.as_ref())).await {
+                Ok((token, expires_at)) => {
+                    Json(json!({ "token": token, "expires_at": expires_at })).into_response()
+                }
+                Err(reason) => json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Apple Music could not get its sign-in token: {reason}."),
+                ),
             }
-            Err(reason) => json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Apple Music could not get its sign-in token: {reason}."),
-            ),
-        },
+        }
         None => json_error(StatusCode::BAD_REQUEST, NOT_SET_UP),
     }
 }
@@ -269,6 +367,80 @@ pub async fn developer_token_handler(State(state): State<Arc<AppState>>) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored(url: &str, expires_at: u64, fetched_at: u64, token: &str) -> String {
+        serde_json::to_string(&Persisted {
+            url: url.into(),
+            token: token.into(),
+            expires_at,
+            fetched_at,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_stored_token_is_read_back_when_it_is_for_this_service_and_still_good() {
+        let now = 1_000_000;
+        let raw = stored(
+            "https://c.example",
+            now + 20 * 86_400,
+            now - 10 * 86_400,
+            "aaaa.bbbb.cccc",
+        );
+        let c = Persisted::read(&raw, "https://c.example", now).expect("still good");
+        assert_eq!(c.token, "aaaa.bbbb.cccc");
+        assert_eq!(c.expires_at, now + 20 * 86_400);
+        assert_eq!(c.fetched_at, now - 10 * 86_400);
+    }
+
+    #[test]
+    fn a_stored_token_is_ignored_when_anything_about_it_is_wrong() {
+        let now = 1_000_000;
+        let good = |url: &str, exp: u64, tok: &str| stored(url, exp, now - 86_400, tok);
+        for (label, raw) in [
+            (
+                "another address",
+                good("https://other.example", now + 86_400 * 20, "aaaa.bbbb.cccc"),
+            ),
+            (
+                "expired",
+                good("https://c.example", now - 1, "aaaa.bbbb.cccc"),
+            ),
+            (
+                "about to expire",
+                good("https://c.example", now + 30, "aaaa.bbbb.cccc"),
+            ),
+            (
+                "a claimed life no service would give",
+                good("https://c.example", now + 86_400 * 900, "aaaa.bbbb.cccc"),
+            ),
+            (
+                "not a token",
+                good("https://c.example", now + 86_400 * 20, "<script>"),
+            ),
+            ("damaged", "{\"url\": ".to_string()),
+            ("empty", String::new()),
+        ] {
+            assert!(
+                Persisted::read(&raw, "https://c.example", now).is_none(),
+                "{label} must not be served"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_fetch_time_cannot_be_in_the_future() {
+        // A clock that moved back would otherwise make a token look fresher than it is.
+        let now = 1_000_000;
+        let raw = stored(
+            "https://c.example",
+            now + 20 * 86_400,
+            now + 5 * 86_400,
+            "aaaa.bbbb.cccc",
+        );
+        let c = Persisted::read(&raw, "https://c.example", now).unwrap();
+        assert_eq!(c.fetched_at, now);
+    }
 
     #[test]
     fn the_built_in_address_is_jaridas_service_over_https() {

@@ -623,6 +623,18 @@ def section_music_player():
         ("names what is missing", lambda b: isinstance(b, dict) and "Team ID" in json.dumps(b)),
     )
 
+    # The probe asks whether a token could be had, and reaches nothing: with managed mode off and no key,
+    # it says what to add, the same way the token route does.
+    code, body = call("GET", "/api/v1/musickit/developer-token?probe=true")
+    expect(
+        "the probe says what is missing, without trying to fetch anything",
+        code,
+        400,
+        body,
+        ("names what is missing", lambda b: isinstance(b, dict) and "Team ID" in json.dumps(b)),
+        ("points at developer settings", lambda b: isinstance(b, dict) and "Developer settings" in json.dumps(b)),
+    )
+
     code, body = call("GET", "/api/v1/player/events")
     expect("the command stream needs a service name", code, 400, body)
 
