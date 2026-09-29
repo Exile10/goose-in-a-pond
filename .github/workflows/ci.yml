@@ -429,6 +429,97 @@ jobs:
   # of pond-server rather than building the real one -- a clean release build
   # of the server is ~35 minutes, and this job is testing the packaging, not
   # the server.
+  # ── Live test ──────────────────────────────────────────────────────────────
+  #
+  # CLAUDE.md calls this required for any change touching a migration, a route,
+  # a handler or startup wiring, and nothing in CI has ever run it. Every Rust
+  # test above builds its database by applying every migration to an empty file,
+  # in one process, with the adapter constructed by hand -- so none of them
+  # exercises startup ordering, migrations against a database that already has
+  # rows, route registration, auth middleware, or the wiring in main.rs. That is
+  # where several real defects have been.
+  #
+  # It is gated twice, because it is slow and because it cannot always run.
+  live-test-gate:
+    name: Live test — gate
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - id: decide
+        # The secret is read here rather than in an `if:`, because the secrets
+        # context is not available to job-level conditions.
+        env:
+          HAS_TOKEN: ${{ secrets.GIAP_PRIVATE_FORK_TOKEN != '' }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          # cargo resolves the whole workspace before building any member, and
+          # pond-adapters-local-inference takes llama-cpp-2 from the private
+          # jarida-io/llama-cpp-rs-giap. Without a credential nothing in this
+          # workspace compiles -- which is also why `Rust — fmt / clippy / test`
+          # is red. Skip rather than add a fifth permanently-failing check.
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Live test skipped::GIAP_PRIVATE_FORK_TOKEN is not set, so cargo cannot fetch jarida-io/llama-cpp-rs-giap. Add the secret to enable this job."
+            exit 0
+          fi
+
+          # A cold build here compiles Goose and llama.cpp, so it is not worth
+          # paying on a change it cannot say anything about. These are the paths
+          # CLAUDE.md names: migrations, routes, handlers, startup wiring.
+          if [ -z "${BASE:-}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0   # push to a trunk branch
+          fi
+          CHANGED=$(git diff --name-only "$BASE"...HEAD || true)
+          if echo "$CHANGED" | grep -qE '^(crates/pond-infra/migrations/|crates/pond-api/src/routes\.rs|crates/pond-server/src/|scripts/live-test\.sh|scripts/live_checks\.py|tests/e2e-live/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Live test skipped::No migration, route, handler or startup-wiring change in this diff."
+          fi
+
+  live-test:
+    name: Live test — HTTP against a server that really started
+    needs: live-test-gate
+    if: needs.live-test-gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # Lets cargo fetch the private fork. Scoped to github.com and torn down
+      # with the runner; the token is never written to a tracked file.
+      - name: Authenticate cargo to the private fork
+        env:
+          TOKEN: ${{ secrets.GIAP_PRIVATE_FORK_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # live-test.sh drives the dashboard the server actually serves when asked
+      # for --ui; without Node it still runs every HTTP assertion.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: pond-desktop/package-lock.json
+
+      # A scratch POND_DATA_DIR, a mock chat model, and the loopback bypass off
+      # for the auth phase are all the script's own doing -- see its header.
+      - name: scripts/live-test.sh
+        run: bash scripts/live-test.sh
+
   desktop-package:
     name: Desktop — package (macOS)
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
