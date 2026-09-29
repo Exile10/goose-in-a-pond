@@ -31,12 +31,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      # The scanner action bundles its own Go, and it was older than the
+      # toolchain native/pondnet/go.mod asks for (1.27.1). Its reachability
+      # analysis could not load the standard library, said so in a line nobody
+      # reads -- "Failed to run code analysis (govulncheck) ... loading
+      # packages" -- and fell back to matching the module graph. A blocking gate
+      # that is red for a version skew teaches people to ignore it.
+      #
+      # go-version-file keeps this pinned to whatever go.mod asks for, so the
+      # analysis cannot silently degrade again the next time that line moves.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: native/pondnet/go.mod
+          cache-dependency-path: native/pondnet/go.sum
+
+      # Reachability, which is the question worth blocking on: govulncheck fails
+      # only when this module actually calls a vulnerable symbol, rather than
+      # when a vulnerable module appears anywhere in the requirement graph.
+      - name: govulncheck (reachable vulnerabilities)
+        working-directory: native/pondnet
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      # Membership, kept alongside: this catches a vulnerable dependency that
+      # reachability analysis cannot see, such as one reached only through
+      # reflection or cgo. Its documented exceptions live in osv-scanner.toml.
+      #
       # This new module has its own blocking gate. Existing Rust advisory
       # deferrals must not suppress findings in shipped networking dependencies.
       - name: Embedded networking dependencies
-        uses: google/osv-scanner-action/osv-scanner-action@v2.5.1
+        uses: google/osv-scanner-action/osv-scanner-action@v2.6.0
         with:
-          scan-args: --lockfile=native/pondnet/go.mod
+          scan-args: --config=osv-scanner.toml --lockfile=native/pondnet/go.mod
 
   rust-audit:
     name: Rust — cargo audit (RustSec)
