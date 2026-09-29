@@ -20,6 +20,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json",
+    "check:widevine": "electron scripts/widevine-check.cjs",
     "stage:server": "bash ../scripts/stage-server-sidecar.sh",
     "bundle:app": "npm run stage:server && npm run build:main && bash ../scripts/verify-sidecar.sh && electron-builder --mac",
     "pack:dir": "npm run stage:server && npm run build:main && bash ../scripts/verify-sidecar.sh && electron-builder --mac dir"

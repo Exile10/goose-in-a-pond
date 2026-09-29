@@ -128,13 +128,26 @@ Measured on macOS 27, arm64, in scratch folders:
 - castlabs `v44.1.0+wvcus` loads Widevine 4.10.3050.0 (about 6 s on first launch), and the module
   answers. Its Chromium (152.0.7977.65) is older than stock's, and castlabs' newest stable for 44 is
   `44.1.0` against this repo's `44.4.2`.
+- **Widevine itself works, verified end to end (2026-09-29).** `npm run check:widevine` plays Google's
+  public Widevine-encrypted test stream, muted, with a license from Google's public test proxy. On
+  castlabs' Electron 44.1.0 the module (4.10.3050.0) downloaded in 8.5 to 29.5 s on a fresh profile,
+  the license came back in 1.2 to 3.6 s, and the protected content decrypted and played (6.2 s, 160
+  frames, 0 dropped, 0 stalls), both with the default robustness and with `SW_SECURE_CRYPTO`. The same
+  test also passed **inside the real player window** (its own partition, the `app://giap` secure
+  origin), which is where MusicKit and Spotify's SDK will run, and the real shell on a fresh profile
+  reported the module ready in about 12 s. This is the DRM stack and nothing more: it says nothing
+  about whether Apple or Spotify will accept the module. The stock Electron in `node_modules` fails
+  the same check with exit code 2 and says why.
 - **A live run with a real MusicKit key got as far as the license**: token signing, MusicKit load,
   sign-in, catalog search and queueing all worked, then Apple refused the license (MusicKit
-  `MEDIA_LICENSE`, code -42605). The same failure on the same module version is reported by another
-  Apple Music client on this stack (castlabs/electron-releases#237, Cider-2#2015), where 4.10.3050.1
-  and 4.10.3112.0 work. **That is the likely cause, not a proven one**: no way was found to load
-  3112.0 into castlabs' build (`--widevine-cdm-path` is ignored, and a hand-copied module directory
-  is ignored), so the other suspect, castlabs' production VMP signing, is not ruled out.
+  `MEDIA_LICENSE`, code -42605). Since Widevine itself works, that refusal is Apple's. The same
+  failure on the same module version is reported by another Apple Music client on this stack
+  (castlabs/electron-releases#237, Cider-2#2015), where 4.10.3050.1 and 4.10.3112.0 work. **A newer
+  module is not obtainable, though:** asked the way Chromium's component updater asks, Google's update
+  service serves 4.10.3050.0 for macOS on arm64 at every Chrome version tried (152 to 160), and
+  castlabs' `components` API has no manual update (`whenReady`, `status`, `updatesEnabled` only), so
+  the module-version theory cannot be acted on from here. What is left is castlabs' production VMP
+  signing (their free EVS service), which is untried, and whatever Apple checks on its side.
 - MusicKit reports "playing" for a moment **before** a license failure arrives, so the adapter
   confirms only when the position has advanced.
 - **Spotify has not been run at all.** The adapter is built from the SDK's documented events and
@@ -160,6 +173,11 @@ because stock Electron has no Widevine. Three things came with that, and only th
   pack:dir` and `bundle:app` have not been run with it.**
 - **Signing.** castlabs' Widevine needs a VMP signature from their EVS service for a production
   build. That has not been set up, and it is the second suspect for Apple's refusal.
+
+**Installing it.** `package.json` names castlabs' Electron, but `node_modules` holds whatever `npm install`
+last put there, so after pulling this branch run `npm install` in `pond-desktop` (with the app closed:
+it replaces the binary). Until then the shell runs stock Electron and has no Widevine; `npm run
+check:widevine` says which you have.
 
 It also trails stock (44.1.0, Chrome 152.0.7977.65, against 44.4.2), so it misses whatever
 Electron shipped after 44.1.0. The CI smoke job launches Electron on Linux; whether castlabs'
