@@ -121,7 +121,9 @@ interface SpotifyPlaylist {
  * /top-tracks, /browse, /me/tracks/contains, PUT/DELETE /me/tracks; `preview_url` is always null.
  */
 export class SpotifyProvider implements MusicProvider {
+  id = 'spotify' as const;
   name = 'Spotify';
+  capabilities = { devices: true, queue: true, timeRange: true };
   private baseUrl = 'https://api.spotify.com/v1';
 
   /** Current access token — initialized from env, updated on refresh. */

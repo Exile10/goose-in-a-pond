@@ -62,8 +62,32 @@ export interface PlaylistInfo {
   is_own: boolean;
 }
 
+export type ServiceId = 'spotify' | 'apple';
+
+/** What a service can do, so the tool list advertises only what will work. */
+export interface ProviderCapabilities {
+  /** `devices` lists and moves playback: Spotify Connect devices, or AirPlay speakers. */
+  devices: boolean;
+  /** Appending to the play queue. Music.app has no queue to append to. */
+  queue: boolean;
+  /** Whether top tracks and artists can be narrowed to a period. */
+  timeRange: boolean;
+}
+
+/** A `play` call as the model made it, for providers that resolve it themselves. */
+export interface PlayRequest {
+  query?: string;
+  uri?: string;
+}
+
+export class UnsupportedError extends Error {}
+
 export interface MusicProvider {
+  id: ServiceId;
   name: string;
+  capabilities: ProviderCapabilities;
+  /** When present, owns the whole `play` intent (search, pick, start) instead of the server's Spotify-shaped flow. */
+  playRequest?(request: PlayRequest): Promise<string>;
   /** Replaces current playback; pass a `TrackInfo`, not its `uri`, so playback continues after it. */
   play(target?: PlayTarget): Promise<string>;
   pause(): Promise<string>;
