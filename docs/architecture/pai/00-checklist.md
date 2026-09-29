@@ -2359,3 +2359,27 @@ and do not establish device-key proof of possession or encrypted transport.
   the live service through the built-in default (status 200, the service's Key ID and Team ID in the token)
   and logged `network / egress.http`, tool `giap-credentials`, 736 ms. **Not verified: the whole desktop app
   with the default on** (the player window asking at start, then loading Apple's script).
+
+**2026-09-29 (last) -- asleep until wanted, and the token kept across restarts. Touches PAI-2.**
+
+- **What was asked.** "Ask only after someone presses Sign in, or has signed in before... Save the token
+  across restarts": the two fixes offered after the managed URL went on by default.
+- **What landed.** *Host:* the managed token is stored under `APPLE_MUSIC_MANAGED_TOKEN` (with its
+  address, so another service's token is never served), read once per start, renewed at a fifth of its
+  life or when damaged, lapsed or foreign, and served if a renewal fails while it still has days; and
+  `GET /musickit/developer-token?probe=true`, which says whether a token could be had and never signs or
+  reaches the network. *Page:* Apple's adapter sleeps (`dormant`) until Sign in is pressed or a sign-in
+  is remembered (`giap.player.apple.signedIn` in the window's storage); waking is a `prepare()` that
+  fetches the token and loads the script and reports failure at once; a sleeping adapter does not raise
+  the window; commands to it answer "sign in first", which lets the extension fall back to the Music app.
+- **Invariants.** *Egress*: fewer calls, same gate and attribution. *Secrets*: the kept token is not a
+  secret (public by design) and shows as a key name only. *Settings persistence*: no settings field added.
+  *Side effects without approval*: none now for a household that never presses Sign in.
+- **Not built.** A sign-out that forgets the remembered flag; migrating a sign-in made before this change
+  (it counts once it is done again).
+- **Verification**: Mac only, 2026-09-29. **In the real app** on castlabs' Electron with an isolated
+  scratch pond, default URL, no key: launch made no calls; the same hook the shell uses, run with a user
+  gesture, opened Apple's real sign-in popup in 1.6 s with one call to the credentials service before it;
+  a restart of pond and app with no finished sign-in made no calls; a restart with a sign-in remembered
+  made none to Jarida (the kept token) and loaded Apple's script. Rust and desktop counts below.
+

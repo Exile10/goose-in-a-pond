@@ -37,7 +37,11 @@ service: Spotify's opens the browser as before, and **Sign in to Apple Music** d
 It calls the shell's `player_authorize`, which runs a script in the player window with a user
 gesture (Apple's sign-in is a popup, and Chromium refuses one nobody clicked for); the page starts
 the adapter's `authorize()` without waiting for it, the person finishes in Apple's popup, and the row
-polls the player's state (`GET /player/state`) until it reads "Signed in". If the sign-in cannot
+polls the player's state (`GET /player/state`) until it reads "Signed in". Until that button is
+pressed, or a sign-in has happened in this window before, Apple's adapter is **asleep** (`dormant` in its
+state): nothing is fetched, no script is loaded, the window is not raised, and the only thing asked is a
+probe of the pond that never reaches the network. Pressing the button wakes it first (a token, the
+script), and tells the person at once if that fails, then opens Apple's sign-in. If the sign-in cannot
 start, or did not finish, the row says why in the adapter's own words; a pond with no key and no
 shared credentials says so and offers no button, since pressing one could not work.
 
@@ -49,9 +53,11 @@ as it always did. Outside the desktop app (a browser, a phone) the row says to s
 because the player lives in the shell. The newer hub UI does not render extension credentials at all
 yet, so this dialog, in the classic Extensions section, is the one place.
 
-Not tried: the click itself against Apple. `executeJavaScript` with a user gesture is what Electron
-offers for this, and the script, the page hook and the row are each tested, but no run has started
-Apple's real popup that way. The earlier live run used a real click in the window.
+Tried, in the real app on castlabs' Electron against a scratch pond: the same hook the shell calls, run
+with a user gesture, woke the adapter and opened Apple's real sign-in popup (`authorize.music.apple.com`)
+in 1.6 s even though a token fetch and a script load come first, so the gesture survives the wait. Not
+tried: finishing a sign-in (that needs a person's Apple ID) and what happens after it. A sign-in made
+before this change is not remembered until it is done once more.
 
 ## The protocol
 
@@ -96,8 +102,9 @@ stop the music that is already playing is a bug. Ops that reach the service (`se
   to Spotify again" instead of failing silently; everyone signs in once more.
 
 - **Managed credentials.** A household with no key of its own uses `pondcredentials`, a service
-  that holds Jarida's key (`docs/architecture/pondcredentials.md`), and that is **on by default**: the
-  pond asks it once per start. A stored local key always wins, and `POND_CREDENTIALS_URL=off` or
+  that holds Jarida's key (`docs/architecture/pondcredentials.md`), and that is **on by default**, but only
+  asked after someone presses Sign in to Apple Music (or has signed in before), and the token is kept
+  across restarts. A stored local key always wins, and `POND_CREDENTIALS_URL=off` or
   `network_mode = offline` stops it.
 - **The signing key never leaves the host.** `APPLE_MUSIC_TEAM_ID`, `_KEY_ID` and `_PRIVATE_KEY` are
   `host_only` secrets (`SecretRequirement.host_only`): stored and reported as saved, withheld from

@@ -390,6 +390,23 @@ offered and declined for now). Not built, and worth building: asking only after 
 (or has signed in before), and persisting the token across restarts. Apple's terms on sharing the token
 remain unanswered (section 2.8 of the developer agreement). `docs/architecture/pondcredentials.md`.
 
+**2026-09-29 (last) -- the credentials service is still on by default, but a pond now calls it only when someone wants Apple Music, and rarely.**
+This replaces the two paragraphs above on *when* a pond calls; everything else in them stands. (1)
+*Trigger:* Apple's adapter sleeps until a person presses **Sign in to Apple Music**, or has signed in in
+that window before. Until then no token is asked for, Apple's MusicKit script is not loaded, and nothing
+leaves the pond; the only thing asked is a probe of the pond itself, which never reaches the network. A
+household that never uses Apple Music never calls Jarida's host and never contacts Apple's. (2)
+*Frequency:* the token is kept in the pond's secret store (`APPLE_MUSIC_MANAGED_TOKEN`, a name only in
+`GET /secrets`; a developer token is public by design), so a restart reads it with no call; the pond asks
+again about every 24 days, or when the kept one is damaged, lapsed, or for another address. (3)
+*Verified in the real app,* on a scratch pond with the default and no key: no calls at launch; one press
+of Sign in gave one call to `credentials.jarida.io` and then Apple's hosts; a restart with no finished
+sign-in made none; a restart with a sign-in remembered made none to Jarida. Unchanged: the call goes
+through `egress::begin_as(.., "giap-credentials")`, is refused under Offline before it is sent, and shows
+in the egress log; `POND_CREDENTIALS_URL=off` turns it off; a stored local key means it is never asked;
+Apple's terms on sharing the token remain unanswered. A sign-in made before this change counts only once
+it is done again.
+
 **2026-09-29 (later still) -- Spotify gets the same gate, and a third-party script now sees the person's Spotify token.**
 (1) *Closed:* every call the Spotify extension makes to `api.spotify.com` asks `POST /extension/egress`
 first, the retry after a token refresh included, so `network_mode` and the Logs screen cover it as they

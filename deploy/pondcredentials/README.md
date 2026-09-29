@@ -150,7 +150,9 @@ The service refuses to start with a missing setting or a key that cannot sign, a
 Every pond already points at `https://credentials.jarida.io`: that address is `DEFAULT_MANAGED_URL` in
 `crates/pond-api/src/musickit.rs`, set on 2026-09-29 and pinned by a test. A pond uses the service only
 when the household has stored no key of its own, and every call goes through `network_mode` and shows in
-the pond's egress log as `giap-credentials`. Its token cache is in memory, so a pond calls once per start.
+the pond's egress log as `giap-credentials`. A pond asks only after its owner presses Sign in to Apple
+Music (or has signed in before), and keeps the token in its secret store, so a restart does not ask again:
+about one call every 24 days for a household that uses it, and none for one that does not.
 
 To point a pond at another deployment, set `POND_CREDENTIALS_URL=https://<YOUR_DOMAIN>` in its environment.
 To turn it off, set `POND_CREDENTIALS_URL=off`. **A test or a scratch pond must do that**, or it calls this

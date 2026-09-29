@@ -58,15 +58,22 @@ It is one more outbound path, documented as such in `02-privacy-and-security-gua
 `network_mode = offline` refuses it, and a stored local key means it is never asked. There is no switch
 for it in the UI yet (an explicit household toggle was offered and declined for now).
 
-**When a pond calls it, stated plainly.** The pond's token cache is in memory, so it fetches **once per
-start of the pond**, and again when a fifth of a token's life is left if the pond stays up that long; a
-desktop app that is opened daily calls daily. The service signs one token a day and hands the same one
-to everyone, so this is cheap for it, but it is not "about monthly". And the player window asks for a
-token as soon as it starts, **whether or not the household uses Apple Music**: nothing waits for a
-sign-in click. Once the token arrives the window also loads Apple's MusicKit script from Apple's CDN. So
-every desktop pond contacts Jarida's host, and then Apple's, at every start. Making that lazy (nothing
-leaves until someone presses Sign in, or has signed in before) and persisting the token across restarts
-would cut both, and neither is built.
+**When a pond calls it, stated plainly.** Not until someone wants Apple Music. The player window keeps
+Apple's adapter **asleep** until a person presses **Sign in to Apple Music**, or has signed in in this
+window before: until then it fetches no token, loads no script, and nothing leaves the pond. It asks the
+pond alone (`GET /musickit/developer-token?probe=true`, which never signs and never reaches the network)
+whether a token could be had at all, so "not available on this pond" still shows early. Pressing Sign in
+wakes it: the pond fetches a token, the window loads Apple's MusicKit script, and Apple's sign-in opens.
+The token is **kept in the pond's secret store** (`APPLE_MUSIC_MANAGED_TOKEN`, under an address check, so
+a pond pointed elsewhere never serves it), so a restart uses it with no call, and the pond asks again
+only when a fifth of its life is left (about every 24 days) or the token is damaged, lapsed or for another
+address. If a renewal fails while the kept token still has days on it, the kept one is served. A pond
+whose owner never presses Sign in never calls Jarida, and never loads Apple's script.
+
+Seen in the real app on a scratch pond, with the built-in default and no key: at launch, no calls at all;
+one press of Sign in produced one call to the credentials service and then Apple's own hosts, and Apple's
+sign-in opened; a restart of both pond and app with no finished sign-in made no calls; a restart with a
+sign-in remembered loaded Apple's script and made **no** call to the credentials service.
 
 ## Threat model
 
