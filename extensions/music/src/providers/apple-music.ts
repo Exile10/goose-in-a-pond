@@ -2,7 +2,6 @@ import { describeError, log } from "../log.js";
 import { normalizeName, pickSong, splitTitleArtist } from "../match.js";
 import { musicAppUrl, songIdFromLink, type CatalogSong, type CatalogSource } from "./apple/catalog.js";
 import type { LibraryTrack, MusicApp } from "./apple/music-app.js";
-import type { AppleMusicApi } from "./apple/rest.js";
 import {
   UnsupportedError,
   type AlbumInfo,
@@ -21,17 +20,10 @@ import {
 const LIBRARY_PREFIX = "apple:library:";
 const PLAYLIST_PREFIX = "apple:playlist:";
 
-/** A song added to the library takes a moment to appear in Music; give it this long. */
-const SYNC_ATTEMPTS = 8;
-const SYNC_WAIT_MS = 1500;
-
 export interface AppleDeps {
   app: MusicApp;
-  /** Keyless catalog search, used whenever the Apple Music API is not set up. */
-  fallbackCatalog: CatalogSource;
-  /** Present when the user has added an Apple Music key; searches the catalog and can add songs. */
-  rest: AppleMusicApi | null;
-  sleep?: (ms: number) => Promise<void>;
+  /** Apple's public, keyless catalog search: names a song and finds its page. */
+  catalog: CatalogSource;
 }
 
 function toTrackInfo(t: LibraryTrack): TrackInfo {
@@ -55,19 +47,22 @@ function longestWord(title: string): string {
 }
 
 /**
- * Apple Music through the Music app. The Music app plays and controls; it cannot search the
- * catalog or play a song that is not in the library, so those go through Apple's catalog APIs.
+ * Apple Music through the Music app. The Music app plays and controls the user's library; it
+ * cannot search Apple's catalog or start a song that is not in the library. So a song the library
+ * lacks is found through the public search and opened in Music, which does not start it. The
+ * in-app player (web-player.ts) is what plays the catalog; this is its fallback.
  */
 export class AppleMusicProvider implements MusicProvider {
   id = "apple" as const;
   name = "Apple Music";
   capabilities = { devices: true, queue: false, timeRange: false };
+  describe = {
+    play:
+      "Play music in Apple Music, through the Music app. A song in the user's library starts at once; one only in the Apple Music catalog is opened in the Music app, which does not start it. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for, and repeat what the result says happened rather than assuming playback started.",
+    playUri: "A pasted Apple Music song link, or a URI from an earlier result. Plays it directly.",
+  };
 
-  private readonly sleep: (ms: number) => Promise<void>;
-
-  constructor(private readonly deps: AppleDeps) {
-    this.sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
-  }
+  constructor(private readonly deps: AppleDeps) {}
 
   private get app(): MusicApp {
     return this.deps.app;
@@ -105,7 +100,7 @@ export class AppleMusicProvider implements MusicProvider {
     const id = songIdFromLink(uri);
     if (!id) return `That does not look like an Apple Music song link: ${uri}`;
 
-    const song = await this.viaCatalog(source => source.lookupSong(id));
+    const song = await this.deps.catalog.lookupSong(id);
     if (!song) return `Apple Music has no song with that link.`;
     return this.playCatalogSong(song, []);
   }
@@ -119,7 +114,7 @@ export class AppleMusicProvider implements MusicProvider {
 
     let songs: CatalogSong[];
     try {
-      songs = await this.viaCatalog(source => source.searchSongs(query, 5));
+      songs = await this.deps.catalog.searchSongs(query, 5);
     } catch (error) {
       log.warn("apple_catalog_search_failed", "could not search the Apple Music catalog", {
         error: describeError(error),
@@ -140,32 +135,13 @@ export class AppleMusicProvider implements MusicProvider {
       return this.nowPlaying(owned, others);
     }
 
-    const rest = await this.restIfReady();
-    let addFailed = "";
-    if (rest) {
-      try {
-        await rest.addSongToLibrary(top.id);
-      } catch (error) {
-        addFailed = describeError(error);
-        log.warn("apple_add_to_library_failed", "could not add the song to the library", { error: addFailed });
-      }
-      if (!addFailed) {
-        const landed = await this.waitForLibrary(top);
-        if (landed) {
-          await this.app.playTrack(landed.pid);
-          return `${this.nowPlaying(landed, others)}\nIt was added to the user's library first, because the Music app can only play songs from it.`;
-        }
-        return `Added ${top.name} by ${top.artist} to the user's library. It has not finished syncing to the Music app yet, so it is not playing; ask again in a moment.`;
-      }
-    }
-
     const page = top.url ? musicAppUrl(top.url) : null;
     if (page) {
       await this.app.openUrl(page);
-      const why = addFailed
-        ? `Adding it to the library failed (${addFailed}).`
-        : `Signing in to Apple Music in the Extensions tab lets songs like this be added and played automatically.`;
-      return `Opened ${top.name} by ${top.artist} in the Music app. It is not in the user's library, so it has NOT started playing — tell them to press play there. ${why}`;
+      return (
+        `Opened ${top.name} by ${top.artist} in the Music app. It is not in the user's library, so it has NOT started playing — tell them to press play there. ` +
+        `Adding an Apple Music key in the Extensions tab lets the app's own player play songs like this.`
+      );
     }
     return `${top.name} by ${top.artist} is in the Apple Music catalog but not the user's library, and there is no link to open it.`;
   }
@@ -193,35 +169,6 @@ export class AppleMusicProvider implements MusicProvider {
   private async findInLibrary(song: CatalogSong): Promise<LibraryTrack | null> {
     const candidates = await this.libraryCandidates(song.name);
     return pickSong(`${song.name} by ${firstArtist(song.artist)}`, candidates);
-  }
-
-  private async waitForLibrary(song: CatalogSong): Promise<LibraryTrack | null> {
-    for (let attempt = 0; attempt < SYNC_ATTEMPTS; attempt++) {
-      await this.sleep(SYNC_WAIT_MS);
-      const found = await this.findInLibrary(song);
-      if (found) return found;
-    }
-    return null;
-  }
-
-  private async restIfReady(): Promise<AppleMusicApi | null> {
-    const rest = this.deps.rest;
-    return rest && (await rest.available()) ? rest : null;
-  }
-
-  /** The Apple Music API when it is set up, else the public search; the public search also stands in if the API fails. */
-  private async viaCatalog<T>(op: (source: CatalogSource) => Promise<T>): Promise<T> {
-    const rest = await this.restIfReady();
-    if (rest) {
-      try {
-        return await op(rest);
-      } catch (error) {
-        log.warn("apple_rest_failed", "the Apple Music API failed; using the public search instead", {
-          error: describeError(error),
-        });
-      }
-    }
-    return op(this.deps.fallbackCatalog);
   }
 
   async searchTracks(query: string, limit: number = 10): Promise<TrackInfo[]> {

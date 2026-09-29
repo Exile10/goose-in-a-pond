@@ -8,7 +8,7 @@ import { isShortRelease } from "./providers/spotify.js";
 import { buildTools } from "./tools.js";
 import type { TimeRange } from "./providers/types.js";
 
-const provider = createProvider();
+const provider = await createProvider();
 const TOOLS = buildTools(provider);
 
 // ── Tool handlers ─────────────────────────────────────────────

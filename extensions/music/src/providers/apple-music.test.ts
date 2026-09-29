@@ -4,7 +4,6 @@ import assert from 'node:assert/strict';
 import { AppleMusicProvider } from './apple-music.js';
 import type { CatalogSong, CatalogSource } from './apple/catalog.js';
 import type { LibraryTrack, MusicApp } from './apple/music-app.js';
-import type { AppleMusicApi } from './apple/rest.js';
 import { UnsupportedError } from './types.js';
 
 /** The decision tree behind `play`, with the Music app and Apple's APIs replaced by fakes. */
@@ -21,7 +20,6 @@ interface Fakes {
   library: LibraryTrack[];
   played: string[];
   opened: string[];
-  added: string[];
   searches: string[];
 }
 
@@ -37,13 +35,8 @@ function fakeApp(f: Fakes): MusicApp {
   } as unknown as MusicApp;
 }
 
-function setup(over: {
-  library?: LibraryTrack[];
-  catalog?: CatalogSong[] | Error;
-  rest?: Partial<Record<'available' | 'addSongToLibrary' | 'searchSongs', unknown>> | null;
-  onSleep?: (f: Fakes) => void;
-} = {}) {
-  const f: Fakes = { library: over.library ?? [], played: [], opened: [], added: [], searches: [] };
+function setup(over: { library?: LibraryTrack[]; catalog?: CatalogSong[] | Error } = {}) {
+  const f: Fakes = { library: over.library ?? [], played: [], opened: [], searches: [] };
 
   const catalog: CatalogSource = {
     searchSongs: async () => {
@@ -53,21 +46,7 @@ function setup(over: {
     lookupSong: async (id: string) => (Array.isArray(over.catalog) ? over.catalog.find(s => s.id === id) ?? null : null),
   };
 
-  const rest = over.rest === null || over.rest === undefined ? null : ({
-    available: async () => true,
-    addSongToLibrary: async (id: string) => { f.added.push(id); },
-    // When the API is set up it is also the catalog, so it answers searches too.
-    searchSongs: catalog.searchSongs,
-    lookupSong: catalog.lookupSong,
-    ...over.rest,
-  } as unknown as AppleMusicApi);
-
-  const provider = new AppleMusicProvider({
-    app: fakeApp(f),
-    fallbackCatalog: catalog,
-    rest,
-    sleep: async () => over.onSleep?.(f),
-  });
+  const provider = new AppleMusicProvider({ app: fakeApp(f), catalog });
   return { provider, f };
 }
 
@@ -81,75 +60,24 @@ test('a song in the library plays without touching the catalog', async () => {
 });
 
 test('a catalog-only song with no Apple Music key is opened, and the result says it is NOT playing', async () => {
-  const { provider, f } = setup({ catalog: [nairobiCat], rest: null });
+  const { provider, f } = setup({ catalog: [nairobiCat] });
 
   const text = await provider.playRequest({ query: 'Nairobi by Bensoul' });
 
   assert.deepEqual(f.played, []);
   assert.deepEqual(f.opened, ['music://music.apple.com/ke/album/nairobi/999?i=1001']);
   assert.match(text, /NOT started playing/);
+  assert.match(text, /app's own player/);
 });
 
-test('with an Apple Music key the song is added to the library, then played', async () => {
-  const { provider, f } = setup({
-    catalog: [nairobiCat],
-    rest: {},
-    // The song lands in the library while the provider waits, as syncing does.
-    onSleep: (fk) => { if (fk.searches.length >= 4 && fk.library.length === 0) fk.library.push(nairobiLib); },
-  });
-
-  const text = await provider.playRequest({ query: 'Nairobi by Bensoul' });
-
-  assert.deepEqual(f.added, ['1001']);
-  assert.deepEqual(f.played, ['PID-NAIROBI']);
-  assert.match(text, /added to the user's library first/);
-});
-
-test('a song that never syncs is reported as added, not as playing', async () => {
-  const { provider, f } = setup({ catalog: [nairobiCat], rest: {} });
-
-  const text = await provider.playRequest({ query: 'Nairobi by Bensoul' });
-
-  assert.deepEqual(f.added, ['1001']);
-  assert.deepEqual(f.played, []);
-  assert.match(text, /not playing/);
-});
-
-test('if the Apple Music API fails, the public search still finds the song', async () => {
-  const { provider } = setup({
-    catalog: [nairobiCat],
-    rest: { searchSongs: async () => { throw new Error('Apple Music rejected the saved sign-in.'); } },
-  });
-
-  const text = await provider.playRequest({ query: 'Nairobi by Bensoul' });
-
-  assert.match(text, /Nairobi by Bensoul/, 'the song was found, not lost to the API error');
-  assert.ok(!/could not be searched/.test(text));
-});
-
-test('if adding to the library fails, the song is opened and the reason is given', async () => {
-  const { provider, f } = setup({
-    catalog: [nairobiCat],
-    rest: { addSongToLibrary: async () => { throw new Error('Apple Music rejected the saved sign-in.'); } },
-  });
-
-  const text = await provider.playRequest({ query: 'Nairobi by Bensoul' });
-
-  assert.equal(f.opened.length, 1);
-  assert.match(text, /Adding it to the library failed/);
-  assert.match(text, /NOT started playing/);
-});
-
-test('a song already in the library under the catalog spelling is found without adding it', async () => {
+test('a song already in the library under the catalog spelling is found and played', async () => {
   const { provider, f } = setup({
     library: [{ ...nairobiLib, name: 'Nairobi (Remastered)' }],
     catalog: [nairobiCat],
-    rest: {},
   });
 
   await provider.playRequest({ query: 'that Bensoul song' });
 
-  assert.deepEqual(f.added, []);
   assert.deepEqual(f.played, ['PID-NAIROBI']);
 });
 
@@ -217,7 +145,7 @@ test('top artists add up plays across their tracks', async () => {
       { pid: '3', name: 'c', artist: 'Sauti Sol, Nviiri', album: '', duration_s: 1, played_count: 4 },
     ],
   } as unknown as MusicApp;
-  const provider = new AppleMusicProvider({ app, fallbackCatalog: {} as never, rest: null });
+  const provider = new AppleMusicProvider({ app, catalog: {} as never });
 
   const artists = await provider.getTopArtists('medium_term');
 
@@ -231,7 +159,7 @@ test('recent plays come back newest first', async () => {
       { pid: '2', name: 'new', artist: 'x', album: '', duration_s: 1, played_count: 1, age_s: 60 },
     ],
   } as unknown as MusicApp;
-  const provider = new AppleMusicProvider({ app, fallbackCatalog: {} as never, rest: null });
+  const provider = new AppleMusicProvider({ app, catalog: {} as never });
 
   assert.deepEqual((await provider.getRecentlyPlayed()).map(t => t.name), ['new', 'old']);
 });
@@ -243,7 +171,7 @@ test('AirPlay devices that are not available are not offered', async () => {
       { name: 'Old TV', kind: 'AppleTV', active: false, selected: false, available: false, volume: 0 },
     ],
   } as unknown as MusicApp;
-  const provider = new AppleMusicProvider({ app, fallbackCatalog: {} as never, rest: null });
+  const provider = new AppleMusicProvider({ app, catalog: {} as never });
 
   assert.deepEqual((await provider.getDevices()).map(d => d.name), ['Kitchen']);
 });

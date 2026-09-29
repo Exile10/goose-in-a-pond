@@ -2,9 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { defaultStorefront, ItunesSearch, musicAppUrl, songIdFromLink } from './catalog.js';
-import { DeveloperTokens, NotConfigured } from './developer-token.js';
 import { EgressGate, EgressRefused, type Fetch } from './egress.js';
-import { AppleMusicApi } from './rest.js';
 
 /** Every network call goes through a fake `fetch`, so nothing here leaves the machine. */
 
@@ -65,42 +63,6 @@ test('with no internal token there is no host to ask', async () => {
   const { fetch, sent } = fakeFetch(() => json({ allowed: false }));
   await new EgressGate(fetch, HOST, '').allow('https://itunes.apple.com/search');
   assert.equal(sent.length, 0);
-});
-
-// ── DeveloperTokens ──────────────────────────────────────────────────────────
-
-test('a developer token is fetched once and reused', async () => {
-  const { fetch, sent } = fakeFetch(() => json({ token: 'jwt-1', expires_at: 2_000_000 }));
-  const tokens = new DeveloperTokens(fetch, HOST, 'internal', () => 1_000_000_000);
-
-  assert.equal(await tokens.get(), 'jwt-1');
-  assert.equal(await tokens.get(), 'jwt-1');
-  assert.equal(sent.length, 1);
-});
-
-test('a token close to expiry is replaced before it is used', async () => {
-  let clock = 1_000_000_000;
-  let n = 0;
-  const { fetch, sent } = fakeFetch(() => json({ token: `jwt-${++n}`, expires_at: clock / 1000 + 600 }));
-  const tokens = new DeveloperTokens(fetch, HOST, 'internal', () => clock);
-
-  assert.equal(await tokens.get(), 'jwt-1');
-  clock += 6 * 60_000;
-  assert.equal(await tokens.get(), 'jwt-2');
-  assert.equal(sent.length, 2);
-});
-
-test('no Apple Music key is NotConfigured, carrying the host\'s instructions', async () => {
-  const { fetch } = fakeFetch(() => json({ error: 'Add your Apple Music Team ID first.' }, 400));
-  await assert.rejects(
-    new DeveloperTokens(fetch, HOST, 'internal').get(),
-    (err: Error) => err instanceof NotConfigured && /Team ID/.test(err.message),
-  );
-});
-
-test('a token with no expiry is refused', async () => {
-  const { fetch } = fakeFetch(() => json({ token: 'jwt' }));
-  await assert.rejects(new DeveloperTokens(fetch, HOST, 'internal').get(), /no expiry/);
 });
 
 // ── catalog helpers ──────────────────────────────────────────────────────────
@@ -170,74 +132,4 @@ test('a refused egress stops the search before anything is sent', async () => {
 test('rate limiting is explained', async () => {
   const { fetch } = fakeFetch(() => json({}, 429));
   await assert.rejects(new ItunesSearch(fetch, allowAll, 'us').searchSongs('x', 5), /rate limiting/);
-});
-
-// ── AppleMusicApi ────────────────────────────────────────────────────────────
-
-function apiFetch(extra?: (s: Sent) => Response | undefined) {
-  let tokenN = 0;
-  return fakeFetch(s => {
-    if (s.url.endsWith('/musickit/developer-token')) return json({ token: `dev-${++tokenN}`, expires_at: 9_999_999_999 });
-    const custom = extra?.(s);
-    if (custom) return custom;
-    if (s.url.endsWith('/v1/me/storefront')) return json({ data: [{ id: 'ke' }] });
-    if (s.url.includes('/search')) {
-      return json({ results: { songs: { data: [{ id: '1001', attributes: { name: 'Nairobi', artistName: 'Bensoul', albumName: 'Q', durationInMillis: 5, url: 'u' } }] } } });
-    }
-    return json({}, 202);
-  });
-}
-
-const restWith = (fetch: Fetch, userToken: string | null = 'MUT') =>
-  new AppleMusicApi(fetch, allowAll, new DeveloperTokens(fetch, HOST, 'internal'), userToken ?? undefined);
-
-test('without a Music User Token the API is simply unavailable', async () => {
-  const { fetch, sent } = apiFetch();
-  assert.equal(await restWith(fetch, null).available(), false);
-  assert.equal(sent.length, 0);
-});
-
-test('without a signing key the API is unavailable, not an error', async () => {
-  const { fetch } = fakeFetch(() => json({ error: 'no key' }, 400));
-  assert.equal(await restWith(fetch).available(), false);
-});
-
-test('with both credentials the API is available', async () => {
-  const { fetch } = apiFetch();
-  assert.equal(await restWith(fetch).available(), true);
-});
-
-test('a catalog search uses the account\'s store and sends both tokens', async () => {
-  const { fetch, sent } = apiFetch();
-  const songs = await restWith(fetch).searchSongs('Nairobi', 5);
-
-  assert.deepEqual(songs.map(s => s.id), ['1001']);
-  const search = sent.find(s => s.url.includes('/search'))!;
-  assert.match(search.url, /\/v1\/catalog\/ke\/search\?/);
-  assert.equal(search.headers.Authorization, 'Bearer dev-1');
-  assert.equal(search.headers['Music-User-Token'], 'MUT');
-});
-
-test('a 401 gets one retry with a fresh developer token', async () => {
-  let searches = 0;
-  const { fetch, sent } = apiFetch(s => (s.url.includes('/search') && ++searches === 1 ? json({}, 401) : undefined));
-
-  const songs = await restWith(fetch).searchSongs('Nairobi', 5);
-
-  assert.equal(songs.length, 1);
-  const auths = sent.filter(s => s.url.includes('/search')).map(s => s.headers.Authorization);
-  assert.deepEqual(auths, ['Bearer dev-1', 'Bearer dev-2']);
-});
-
-test('a 403 tells the user to sign in again', async () => {
-  const { fetch } = apiFetch(s => (s.url.includes('/search') ? json({}, 403) : undefined));
-  await assert.rejects(restWith(fetch).searchSongs('x', 5), /Sign in to Apple Music again/);
-});
-
-test('adding a song posts its id to the library', async () => {
-  const { fetch, sent } = apiFetch();
-  await restWith(fetch).addSongToLibrary('1001');
-
-  const add = sent.find(s => s.method === 'POST' && s.url.includes('/v1/me/library'))!;
-  assert.equal(new URL(add.url).searchParams.get('ids[songs]'), '1001');
 });

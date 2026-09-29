@@ -6,7 +6,7 @@
   "scripts": {
     "start": "npx tsx src/server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/*.test.ts src/providers/*.test.ts src/providers/apple/*.test.ts"
+    "test": "tsx --test src/*.test.ts src/providers/*.test.ts src/providers/apple/*.test.ts src/providers/player/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.1",

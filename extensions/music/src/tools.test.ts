@@ -10,7 +10,7 @@ import type { MusicProvider } from './providers/types.js';
 /** Tool shape only; the Spotify text is compared against the shipped list by hand in the PR. */
 
 function apple(): MusicProvider {
-  return new AppleMusicProvider({ app: {} as never, fallbackCatalog: {} as never, rest: null });
+  return new AppleMusicProvider({ app: {} as never, catalog: {} as never });
 }
 
 const names = (p: MusicProvider) => buildTools(p).map(t => t.name);

@@ -1,14 +1,14 @@
 import { log } from "../log.js";
 import { AppleMusicProvider } from "./apple-music.js";
-import { defaultStorefront, ItunesSearch } from "./apple/catalog.js";
-import { DeveloperTokens } from "./apple/developer-token.js";
-import { EgressGate } from "./apple/egress.js";
+import { defaultStorefront, ItunesSearch, songIdFromLink } from "./apple/catalog.js";
+import { EgressGate, type Fetch } from "./apple/egress.js";
 import { MusicApp } from "./apple/music-app.js";
 import { runAppleScript } from "./apple/osascript.js";
-import { AppleMusicApi } from "./apple/rest.js";
+import { HostPlayer } from "./player/host.js";
 import { chooseService } from "./select.js";
 import { SpotifyProvider } from "./spotify.js";
 import type { MusicProvider } from "./types.js";
+import { WebPlayerProvider } from "./web-player.js";
 
 function createApple(env: NodeJS.ProcessEnv): AppleMusicProvider {
   const hostUrl = env.GIAP_SERVER_URL || "http://127.0.0.1:4000";
@@ -16,22 +16,50 @@ function createApple(env: NodeJS.ProcessEnv): AppleMusicProvider {
 
   const egress = new EgressGate(fetch, hostUrl, internalToken);
   const storefront = defaultStorefront(env.APPLE_MUSIC_STOREFRONT, Intl.DateTimeFormat().resolvedOptions().locale);
-  const tokens = new DeveloperTokens(fetch, hostUrl, internalToken);
 
   return new AppleMusicProvider({
     app: new MusicApp(runAppleScript),
-    fallbackCatalog: new ItunesSearch(fetch, egress, storefront),
-    rest: env.APPLE_MUSIC_USER_TOKEN
-      ? new AppleMusicApi(fetch, egress, tokens, env.APPLE_MUSIC_USER_TOKEN)
-      : null,
+    catalog: new ItunesSearch(fetch, egress, storefront),
   });
 }
 
-export function createProvider(
+/**
+ * The provider for this run. Apple Music plays through the app's own player when the user has
+ * added an Apple Music key, since that plays the whole catalog; otherwise, and whenever the player
+ * cannot be used, through the Music app.
+ */
+export async function createProvider(
   env: NodeJS.ProcessEnv = process.env,
   platform: string = process.platform,
-): MusicProvider {
+  fetchFn: Fetch = fetch,
+): Promise<MusicProvider> {
   const { service, reason } = chooseService(env, platform);
   log.info("service_chosen", `using ${service}`, { service, reason });
-  return service === "apple" ? createApple(env) : new SpotifyProvider();
+  if (service !== "apple") return new SpotifyProvider();
+
+  const local = createApple(env);
+  const host = new HostPlayer(
+    fetchFn,
+    env.GIAP_SERVER_URL || "http://127.0.0.1:4000",
+    env.GIAP_INTERNAL_TOKEN ?? "",
+    "apple",
+  );
+  const status = await host.status();
+  if (!status?.configured) {
+    log.info("apple_backend", "using the Music app: no Apple Music key is set up", {
+      host_reachable: status !== null,
+    });
+    return local;
+  }
+
+  log.info("apple_backend", "using the in-app player, with the Music app as its fallback", {
+    player_attached: status.attached,
+  });
+  return new WebPlayerProvider({
+    host,
+    service: "apple",
+    label: "Apple Music",
+    local,
+    linkToId: songIdFromLink,
+  });
 }

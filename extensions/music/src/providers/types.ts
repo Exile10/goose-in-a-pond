@@ -74,6 +74,16 @@ export interface ProviderCapabilities {
   timeRange: boolean;
 }
 
+/**
+ * Tool wording that only one service can get right, such as what "next" does. Anything left out
+ * falls back to the text every service shares; Spotify's own wording lives in tools.ts.
+ */
+export interface ToolWording {
+  play?: string;
+  playNext?: string;
+  playUri?: string;
+}
+
 /** A `play` call as the model made it, for providers that resolve it themselves. */
 export interface PlayRequest {
   query?: string;
@@ -86,6 +96,7 @@ export interface MusicProvider {
   id: ServiceId;
   name: string;
   capabilities: ProviderCapabilities;
+  describe?: ToolWording;
   /** When present, owns the whole `play` intent (search, pick, start) instead of the server's Spotify-shaped flow. */
   playRequest?(request: PlayRequest): Promise<string>;
   /** Replaces current playback; pass a `TrackInfo`, not its `uri`, so playback continues after it. */

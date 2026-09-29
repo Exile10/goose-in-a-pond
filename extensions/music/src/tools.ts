@@ -10,8 +10,11 @@ export interface Tool {
 const SPOTIFY_PLAY =
   "Play music on Spotify. Music keeps playing afterwards: a song starts inside its album so the album follows on, and a single is topped up with more by the same artist — do not tell the user playback will stop after the song, and do not queue extra songs yourself to keep it going. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for.";
 
-const APPLE_PLAY =
-  "Play music in Apple Music. A song in the user's library starts at once; one only in the Apple Music catalog is added to their library first when catalog sign-in is set up, and is otherwise opened in the Music app. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for, and repeat what the result says happened rather than assuming playback started.";
+const SPOTIFY_NEXT =
+  "'next' appends to the queue and lets the current track finish; Spotify cannot insert at a chosen position, and cannot queue a whole playlist, so this applies to tracks only. Default 'now' replaces what is playing.";
+
+const SPOTIFY_URI =
+  "A pasted Spotify URI or link. Plays it directly, and is the only way to reach a playlist outside the user's library.";
 
 function playTool(provider: MusicProvider): Tool {
   const spotify = provider.id === "spotify";
@@ -35,21 +38,18 @@ function playTool(provider: MusicProvider): Tool {
     properties.when = {
       type: "string",
       enum: ["now", "next"],
-      description:
-        "'next' appends to the queue and lets the current track finish; Spotify cannot insert at a chosen position, and cannot queue a whole playlist, so this applies to tracks only. Default 'now' replaces what is playing.",
+      description: provider.describe?.playNext ?? SPOTIFY_NEXT,
     };
   }
 
   properties.uri = {
     type: "string",
-    description: spotify
-      ? "A pasted Spotify URI or link. Plays it directly, and is the only way to reach a playlist outside the user's library."
-      : "A pasted Apple Music song link, or a URI from an earlier result. Plays it directly.",
+    description: provider.describe?.playUri ?? SPOTIFY_URI,
   };
 
   return {
     name: "play",
-    description: spotify ? SPOTIFY_PLAY : APPLE_PLAY,
+    description: provider.describe?.play ?? SPOTIFY_PLAY,
     inputSchema: { type: "object", properties },
   };
 }

@@ -9,8 +9,9 @@ Install from the GIAP Extensions marketplace with one click.
 
 - **Spotify:** click **Sign in with Spotify** to authorize playback control. GIAP handles the
   entire OAuth flow.
-- **Apple Music (macOS):** nothing to sign in to. The extension drives the Music app; the first
-  time, macOS asks whether Goose In A Pond may control Music. See [Apple Music](#apple-music).
+- **Apple Music (macOS):** works at once through the Music app; the first time, macOS asks whether
+  Goose In A Pond may control Music. Add a MusicKit key to play the whole catalog in the app's own
+  player. See [Apple Music](#apple-music).
 
 Every credential is optional at install time, so an Apple Music user is never asked to sign in to
 Spotify.
@@ -61,71 +62,65 @@ capability a service lacks is left out rather than advertised and refused.
 
 | Tool | What it does | Notes |
 |---|---|---|
-| `play` | Play a song, playlist or link; resume with no arguments | `when: next` (queue) is Spotify only |
+| `play` | Play a song, playlist or link; resume with no arguments | `when: next` needs a queue: Spotify and the in-app player have one, the Music app does not |
 | `playlists` | List the user's playlists | |
 | `library` | Liked or favourite songs, most played, recently played | `time_range` is Spotify only; Apple reports lifetime play counts |
-| `devices` | List playback devices, or move playback to one | Spotify Connect devices, or AirPlay speakers on Apple Music |
+| `devices` | List playback devices, or move playback to one | Spotify Connect devices, or AirPlay speakers through the Music app; absent with the in-app player |
 | `status` | What is playing now | The upcoming queue is Spotify only |
 | `control` | Pause, resume, next, previous, volume, shuffle, seek, repeat | |
 
 ## Apple Music
 
-Apple Music has no single API that does everything, so the extension combines three:
+Apple Music plays through **the app's own player** once you have added an Apple Music key, and
+through the **Music app** otherwise, and whenever the player cannot be used. The extension tells
+you which it used in the result.
 
-| Piece | Used for | Needs |
+| | In-app player | Music app |
 |---|---|---|
-| The **Music app**, scripted with AppleScript (`src/providers/apple/music-app.ts`) | Playing, pausing, volume, shuffle, repeat, seek, now playing, the library, playlists, AirPlay | macOS; permission to control Music |
-| The **iTunes Search API** | Finding a song that is not in the library | Nothing: public and keyless (about 20 requests a minute) |
-| The **Apple Music API** (`src/providers/apple/rest.ts`) | Searching the catalog in the user's store, and adding a song to their library | An Apple Developer key and a Music User Token, both optional |
+| Plays | Any song in the Apple Music catalog, at once | Songs in your library; a catalog-only song is opened in Music and does **not** start |
+| "Play next" | Yes | No queue to add to |
+| Devices | The Mac's sound output (change it in Sound settings) | Music's AirPlay devices, through the `devices` tool |
+| Needs | An Apple Developer MusicKit key, one sign-in click, and a Widevine-capable build of the app | macOS, and permission to control Music |
 
-The Music app cannot search Apple's catalog or play a song that is not in the library, and
-Apple's API cannot play anything. So `play` works like this:
+### Setting up the in-app player
 
-1. A song **in the library** starts at once.
-2. A song **only in the catalog** is added to the library through the Apple Music API when it is
-   set up, waited for, and played. The result says it was added.
-3. Without the API it is opened in the Music app and the result says it has **not** started
-   playing. Checked on macOS 27: opening the page leaves the player where it was, and Apple offers
-   no way to start a catalog song from a script without the library step.
+1. Join the [Apple Developer Program](https://developer.apple.com/programs/), create a **Media ID**
+   and a **MusicKit key** (Certificates, Identifiers & Profiles), and download the `.p8`: Apple
+   allows that once.
+2. Enter the **Team ID**, **Key ID** and the `.p8` text in the extension's settings. The key may be
+   pasted with or without its line breaks. These three are host-only: the app keeps them and signs a
+   short-lived developer token for the player, so **the key is never given to this extension**.
+3. The player window opens once and asks you to **Connect Apple Music**. Sign in with the Apple ID
+   that has the subscription. It then hides itself and keeps playing in the background; closing it
+   only hides it.
 
-A song played from the library carries on through the whole `Music` playlist, in library order,
-not through its album.
+How it fits together, the protocol and the security model are in
+[`docs/architecture/music-player.md`](../../docs/architecture/music-player.md).
 
-There is no queue: the Music app has nothing to append to, so `when: next` is refused rather than
-replacing what is playing.
+### Status
 
-### Setting up the Apple Music API (optional)
+Audio through the in-app player has **not** been confirmed. A live run got as far as Apple's
+license and was refused (`MEDIA_LICENSE`, code -42605), most likely because of a broken Widevine
+module Google is currently serving; see the architecture doc. Until that clears, a refused license
+is reported and the Music app plays instead.
 
-Only needed for step 2. Add these in the extension's settings. They live in GIAP's secret store;
-the Team ID, Key ID and key are host-only and are not passed to the extension, which receives just
-the Music User Token.
+### Music app notes
 
-1. Join the [Apple Developer Program](https://developer.apple.com/programs/) and create a
-   **MusicKit key** under Certificates, Identifiers & Profiles. Download the `.p8` once.
-2. Enter the **Team ID**, the **Key ID** and the `.p8` text. The key may be pasted with or
-   without its line breaks.
-3. Click **Sign in with Apple Music**. A page served by the local GIAP server opens; approve the
-   prompt from Apple.
-
-GIAP signs the short-lived developer token itself (`POST /api/v1/musickit/developer-token`), so the
-private key stays in the host. The Music User Token is issued by Apple's MusicKit JS only, has no
-refresh, and lasts about six months; sign in again when Apple starts refusing it.
+- The scripts read Music's own dictionary (`sdef /System/Applications/Music.app`); favourites use the
+  raw code `pLov`, since the property was `loved` before it was `favorited` and only the code stayed.
+- A song played from the library carries on through the whole `Music` playlist, in library order,
+  not through its album.
+- Opening a catalog song's page in Music does not start it (checked on macOS 27).
+- macOS 26 and later scope Music's commands (`com.apple.Music.playback`, `.library.read`,
+  `.library.read-write`), so a permission prompt may name more than one.
+- `MUSIC_SERVICE=apple` on any other platform falls back to Spotify.
 
 ### Network policy
 
-Every outbound Apple call asks the host first (`POST /api/v1/extension/egress`), so
-`network_mode` applies and the call appears in Logs as `via giap-music`. A host that cannot be
-reached does not block the extension, so a standalone `npm start` still works. Spotify calls are
+The in-app player's every request is judged by `network_mode` in the app; the extension's own
+public-search calls ask the app first too (`POST /api/v1/extension/egress`). A host that cannot be
+reached does not block the extension, so a standalone `npm start` still works. Spotify's calls are
 not routed through this yet.
-
-### Requirements and limits
-
-- macOS with the Music app, and an Apple Music subscription for streaming.
-- `MUSIC_SERVICE=apple` on any other platform falls back to Spotify.
-- Scripts use the raw code `pLov` for favourites: the property was `loved` before it was
-  `favorited`, and only the code stayed the same.
-- Commands are scoped in macOS 26 and later (`com.apple.Music.playback`, `.library.read`,
-  `.library.read-write`), so a permission prompt may name more than one.
 
 ## Manual Setup (Development)
 
