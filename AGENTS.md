@@ -2,6 +2,11 @@
 
 Instructions for AI coding agents working in this repository. Build, test and commit conventions are in [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md); follow it.
 
+## Commits and pull requests
+
+- Don't credit yourself. No `Co-Authored-By:` trailer for an AI tool or model, no "Generated with …" line and no session link, in commits, pull request descriptions or review comments. Human co-authors are fine.
+- Follow the commit format in [docs/CONTRIBUTING.md § Commit Messages](docs/CONTRIBUTING.md#commit-messages).
+
 ## Comments
 
 The full rules are in [docs/CONTRIBUTING.md § Comments](docs/CONTRIBUTING.md#comments). In short:
