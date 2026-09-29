@@ -15,6 +15,8 @@ export interface AdapterContext {
   fetchDeveloperToken(): Promise<string>;
   /** Apple: whether a token could be had at all, asked of the pond alone. Rejects with why not. */
   probeDeveloperToken(): Promise<void>;
+  /** The Widevine module the shell loaded, when it said (`?cdm=` on the page's address). */
+  widevineVersion?: string | undefined;
   /** Spotify: the person's own access token, held by the host. `refresh` asks for a new one. */
   fetchUserToken(service: string, refresh: boolean): Promise<string>;
 }
@@ -24,7 +26,7 @@ const ADAPTERS: Record<string, (ctx: AdapterContext) => PlayerAdapter> = {
     new AppleMusicKitAdapter({
       loadMusicKit: loadMusicKitFromApple,
       fetchDeveloperToken: ctx.fetchDeveloperToken,
-      checkDrm: () => widevineProblem("Apple Music"),
+      checkDrm: () => widevineProblem("Apple Music", ctx.widevineVersion),
       // Asleep until someone presses Sign in, or has before: nothing leaves the pond for a household
       // that never uses Apple Music.
       lazy: {
@@ -36,7 +38,7 @@ const ADAPTERS: Record<string, (ctx: AdapterContext) => PlayerAdapter> = {
     new SpotifyWebPlaybackAdapter({
       loadSdk: loadSpotifySdk,
       fetchUserToken: (refresh) => ctx.fetchUserToken("spotify", refresh),
-      checkDrm: () => widevineProblem("Spotify"),
+      checkDrm: () => widevineProblem("Spotify", ctx.widevineVersion),
     }),
 };
 

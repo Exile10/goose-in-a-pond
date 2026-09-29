@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { authorizeScript, isAppleSignInUrl, readAuthorizeReply, widevineComponents } from "./player";
+import {
+  authorizeScript,
+  isAppleSignInUrl,
+  readAuthorizeReply,
+  widevineComponents,
+  widevineVersionOf,
+} from "./player";
 
 describe("isAppleSignInUrl", () => {
   it("lets Apple's own https pages open as the sign-in popup", () => {
@@ -77,5 +83,21 @@ describe("readAuthorizeReply", () => {
     expect(readAuthorizeReply({ started: false, message: 42 }).message).toBe(
       "The sign-in could not be started.",
     );
+  });
+});
+
+describe("widevineVersionOf", () => {
+  it("reads the module's version from castlabs' status", () => {
+    expect(
+      widevineVersionOf({
+        oimompecagnajdejgnnjijobebaeigek: { status: "updated", title: "Widevine", version: "4.10.3050.0" },
+      }),
+    ).toBe("4.10.3050.0");
+  });
+
+  it("says none for anything that is not a version, so the page is never told a guess", () => {
+    for (const bad of [undefined, null, "x", {}, { a: null }, { a: { version: "" } }, { a: { version: "latest" } }, { a: { version: 3 } }]) {
+      expect(widevineVersionOf(bad), JSON.stringify(bad)).toBeUndefined();
+    }
   });
 });

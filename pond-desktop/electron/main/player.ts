@@ -44,6 +44,16 @@ export function widevineComponents(): Components | undefined {
 
 const WIDEVINE_WAIT_MS = 60_000;
 
+/** The version of the module castlabs' `components.status()` reports, or undefined if it says none. */
+export function widevineVersionOf(status: unknown): string | undefined {
+  if (!status || typeof status !== "object") return undefined;
+  for (const entry of Object.values(status as Record<string, unknown>)) {
+    const v = (entry as { version?: unknown } | null)?.version;
+    if (typeof v === "string" && /^\d+(\.\d+)+$/.test(v)) return v;
+  }
+  return undefined;
+}
+
 export interface PlayerWindowOptions {
   preloadPath: string;
   /** Where the built renderer lives (dist), served at app://giap inside the player's partition. */
@@ -73,6 +83,8 @@ export function readAuthorizeReply(reply: unknown): PlayerAuthorizeResult {
 export class PlayerWindow {
   private win: BrowserWindow | null = null;
   private quitting = false;
+  /** The Widevine module loaded, told to the page so it can refuse one the services are known to reject. */
+  private cdmVersion: string | undefined;
 
   constructor(private readonly opts: PlayerWindowOptions) {}
 
@@ -106,6 +118,7 @@ export class PlayerWindow {
           ),
         ),
       ]);
+      this.cdmVersion = widevineVersionOf(components.status());
       this.opts.log(`player: Widevine ready ${JSON.stringify(components.status())}`);
     } catch (error) {
       this.opts.log(
@@ -178,7 +191,14 @@ export class PlayerWindow {
     });
 
     const base = this.opts.devServerUrl ?? APP_ORIGIN;
-    const query = this.opts.service ? `?service=${encodeURIComponent(this.opts.service)}` : "";
+    const params = new URLSearchParams();
+    if (this.opts.service) params.set("service", this.opts.service);
+    // GIAP_ALLOW_KNOWN_BAD_WIDEVINE=1 stops the page refusing a module it knows the services reject,
+    // for anyone testing whether that is still true.
+    if (this.cdmVersion && !process.env["GIAP_ALLOW_KNOWN_BAD_WIDEVINE"]) {
+      params.set("cdm", this.cdmVersion);
+    }
+    const query = params.size > 0 ? `?${params}` : "";
     void win.loadURL(`${base}/player.html${query}`);
     this.win = win;
   }

@@ -402,6 +402,18 @@ describe("SpotifyWebPlaybackAdapter: the SDK's failures", () => {
     expect(adapter.state().message).toContain("Premium");
   });
 
+  it("stops on a playback error, so a refusal that hits every track cannot skip through an album", async () => {
+    const { adapter, player } = setup();
+    await adapter.init();
+    const pauses = () => player().calls.filter((c) => c[0] === "pause").length;
+
+    player().emit("playback_error", { message: "Playback error" });
+
+    expect(pauses()).toBe(1);
+    expect(adapter.state()).toMatchObject({ status: "error" });
+    expect(adapter.state().message).toContain("Playback error");
+  });
+
   it("marks a playback error and clears it once something plays", async () => {
     const { adapter, player } = setup();
     await adapter.init();

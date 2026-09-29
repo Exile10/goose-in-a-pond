@@ -297,6 +297,10 @@ export class SpotifyWebPlaybackAdapter implements PlayerAdapter {
         status: "error",
         message: `Spotify could not play this${e?.message ? `: ${e.message}` : ""}.`,
       });
+      // Spotify moves on to the next track when one fails, and if the cause is not the track (a
+      // module the service refuses, say) every one fails in turn: a few seconds of each song, then
+      // the next. Stopping here keeps the error where it can be read.
+      void player.pause().catch(() => undefined);
     }) as (p: never) => void);
   }
 

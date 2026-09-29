@@ -33,7 +33,10 @@ const services = asked.length > 0 ? asked : knownServices();
 const api = new PondApiClient();
 api.setDeviceName("GIAP Music Player");
 
+// The shell says which Widevine module it loaded, since the page cannot tell.
+const cdm = new URLSearchParams(window.location.search).get("cdm") ?? undefined;
 const context = {
+  widevineVersion: cdm,
   fetchDeveloperToken: async () => (await api.musickitDeveloperToken()).token,
   probeDeveloperToken: () => api.musickitDeveloperTokenAvailable(),
   fetchUserToken: async (service: string, refresh: boolean) =>
