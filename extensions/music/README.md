@@ -85,7 +85,11 @@ Apple's API cannot play anything. So `play` works like this:
 2. A song **only in the catalog** is added to the library through the Apple Music API when it is
    set up, waited for, and played. The result says it was added.
 3. Without the API it is opened in the Music app and the result says it has **not** started
-   playing. Apple offers no way to start a catalog song from a script without the library step.
+   playing. Checked on macOS 27: opening the page leaves the player where it was, and Apple offers
+   no way to start a catalog song from a script without the library step.
+
+A song played from the library carries on through the whole `Music` playlist, in library order,
+not through its album.
 
 There is no queue: the Music app has nothing to append to, so `when: next` is refused rather than
 replacing what is playing.
@@ -163,6 +167,10 @@ seconds with that advice rather than waiting.
 npm test            # unit tests: no network, no Music app, no Spotify
 npm run typecheck
 ```
+
+`GIAP_MUSIC_LIVE=1 npm test` also runs read-only checks against the real Music app;
+`GIAP_MUSIC_LIVE=play` additionally plays a library track quietly for a few seconds. The fakes
+passed while a position read was failing silently, so these are the ones that vouch for the scripts.
 
 The script tests include a syntax compile of every AppleScript (macOS only). It cannot check that
 a term exists in Music's dictionary, since an unknown name compiles as a variable; read the

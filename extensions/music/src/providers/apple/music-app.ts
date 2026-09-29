@@ -103,13 +103,14 @@ on run argv
     set shuf to (shuffle enabled) as text
     set rep to (song repeat) as text
     try
-      set pos to round (player position)
+      set pos to player position
     end try
     try
       set t to current track
       set row to my trackRow(t)
     end try
   end tell
+  set pos to round pos
   return stateName & tab & vol & tab & shuf & tab & rep & tab & pos & tab & row
 end run
 `);
@@ -189,15 +190,14 @@ const PLAYLISTS = script(`
 on run argv
   set rows to {}
   tell application "Music"
-    repeat with p in (every playlist)
-      try
-        if (special kind of p) is none then
-          set c to class of p
-          if c is not folder playlist then
-            set end of rows to (my clean(persistent ID of p)) & tab & (my clean(name of p)) & tab & (my clean(description of p)) & tab & (count of tracks of p) & tab & (c as text)
-          end if
-        end if
-      end try
+    set pidList to persistent ID of every playlist
+    set nameList to name of every playlist
+    set kindList to special kind of every playlist
+    set classList to class of every playlist
+    repeat with i from 1 to count of pidList
+      if (item i of kindList) is none and (item i of classList) is not folder playlist then
+        set end of rows to (my clean(item i of pidList)) & tab & (my clean(item i of nameList)) & tab & "" & tab & 0 & tab & ((item i of classList) as text)
+      end if
     end repeat
   end tell
   return my join(rows)
