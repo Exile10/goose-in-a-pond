@@ -12,11 +12,34 @@ enrollment service stores household public keys, device/node mappings, permissio
 and replay records. DERP forwards WireGuard ciphertext. This does not complete the
 separate application authorization milestone.
 
-Every image is pinned by digest. The enrollment image runs without a shell, as a
-non-root user. Headscale's HTTP administration API stays on the private Compose
-network; Caddy blocks its public paths. No API key belongs in an image, environment
-file, repository, or phone. The coordinator is Headscale, run here or by the household;
-nothing depends on Tailscale's hosted control plane.
+Every image is pinned by digest, and every container runs as UID 65532 with a
+read-only root, no capabilities and `no-new-privileges`. Caddy listens on 8080 and
+8443 inside its container, so it needs no privilege to bind; Docker maps 80 and 443
+onto them. Three networks separate the traffic (2026-09-30): `edge` carries the
+gateway and the Headscale control plane, `enroll` the gateway and the enrollment
+service, and the internal `admin` network the enrollment service and Headscale's
+administration API alone, so the admin key never crosses the gateway's network.
+Caddy also blocks the administration paths publicly, and both sites send HSTS. No
+API key belongs in an image, environment file, repository, or phone. The
+coordinator is Headscale, run here or by the household; nothing depends on
+Tailscale's hosted control plane, with one exception under Residual risks.
+
+## Upgrading to the hardened layout (2026-09-30)
+
+Existing state was written by root. Before recreating the stack, stop it and hand
+the volumes to the unprivileged user once:
+
+```sh
+docker compose down
+sudo chown -R 65532:65532 runtime/headscale runtime/caddy-data runtime/caddy-config
+install -m 600 backup.env.example runtime/secrets/backup.env   # then set BACKUP_OFFSITE
+docker compose up -d
+```
+
+Then check that the gateway renews certificates, `/health` answers on the
+enrollment host, a paired phone still connects, and `./rotate-admin-key.sh` and
+`./backup.sh` complete. Deploy this service before any Pond that sends a household
+invite.
 
 ## First boot
 
@@ -163,6 +186,12 @@ including any SQLite WAL/SHM files. An independent copy of only enrollment or on
 Headscale can restore inconsistent authorization mappings. Keep the backup key
 outside this host; never store plaintext archives in Git.
 
+Backups must leave this host: `./backup.sh` refuses to run without
+`BACKUP_OFFSITE=user@host:/directory` (the reference unit reads it from
+`runtime/secrets/backup.env`), copies each archive there with rsync over SSH, and
+checks its size there before pruning anything local. Before this a host loss took
+every backup with it.
+
 `./backup.sh` performs exactly this sequence and is driven by the reference units in
 `systemd/`, whose paths assume a deployment at `/opt/goose-remote-access`: it stops gateway, enrollment and Headscale in order, checks
 both stores while nothing is writing, encrypts a single archive to an age recipient
@@ -185,6 +214,11 @@ mapping. The Android emulator and existing iOS simulator also pass active mobile
 reconnection after full infrastructure restoration: retained machine identity,
 authenticated REST, and incremental SSE work with the restored state. These local
 fixtures do not establish public cellular availability.
+
+Key rotation (`./rotate-admin-key.sh`) expires exactly the key enrollment was
+using, named by its own prefix, and only after Headscale lists the new one and
+enrollment is healthy on it. It used to scrape the key table and expire every key
+it could parse.
 
 ## Health, logs, and remaining verification
 
@@ -252,3 +286,18 @@ against real Headscale, but the phone-to-local-dashboard recovery flow is unfini
 It still needs credential revalidation at approval and cancellation/revocation race
 checks. Legacy pending records without machine bindings cannot recover automatically.
 Do not deploy publicly while those lifecycle acceptance items are open.
+
+## Residual risks
+
+**A Pond or phone may ask Tailscale's servers to resolve the coordinator's name.**
+When the system resolver cannot resolve the Headscale host, tsnet's control client
+falls back to the bootstrap-DNS endpoint of DERP servers from a map compiled into
+the Tailscale module (`net/dnsfallback`, wired in `control/controlclient/direct.go`
+line 337 and `control/controlhttp/client.go` line 374 of v1.102.4). Tailscale's
+default regions are always part of that map, whatever the coordinator's own DERP
+map says, and there is no setting or build tag that turns the fallback off. What
+such a request reveals is the client's address and the coordinator's host name; it
+carries no household data and grants Tailscale nothing. It happens only when normal
+DNS has failed. We document it rather than patch the module, and have drafted a
+request for an upstream option in `docs/upstream/tailscale-dnsfallback.md`.
+

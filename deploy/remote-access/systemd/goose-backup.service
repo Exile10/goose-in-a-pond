@@ -8,6 +8,8 @@ Requires=docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/goose-remote-access/deploy/remote-access
+# BACKUP_OFFSITE=user@host:/directory, required; the unit fails without it.
+EnvironmentFile=/opt/goose-remote-access/deploy/remote-access/runtime/secrets/backup.env
 ExecStart=/opt/goose-remote-access/deploy/remote-access/backup.sh
 # The stack is briefly stopped; do not let a hung run hold it down.
 TimeoutStartSec=600

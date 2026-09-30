@@ -1,10 +1,17 @@
+{
+  # Unprivileged listeners; compose maps 80 and 443 onto them.
+  http_port 8080
+  https_port 8443
+}
 {$HEADSCALE_HOST} {
+  header Strict-Transport-Security "max-age=31536000"
   # Administrative API is reachable only on the private container network.
   @administration path /api/* /metrics /debug/* /swagger* /web*
   respond @administration 404
   reverse_proxy headscale:8080
 }
 {$ENROLLMENT_HOST} {
+  header Strict-Transport-Security "max-age=31536000"
   request_body {
     max_size 8KB
   }

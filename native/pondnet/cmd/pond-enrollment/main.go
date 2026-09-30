@@ -44,8 +44,16 @@ func run() error {
 	socket := flag.String("admin-socket", "", "private socket for issuing invites (default: admin.sock in the state directory)")
 	flag.Parse()
 	if *health {
+		// The port the service was told to listen on; a wildcard host is checked on loopback.
+		host, port, err := net.SplitHostPort(*listen)
+		if err != nil {
+			return err
+		}
+		if host == "" || host == "0.0.0.0" || host == "::" {
+			host = "127.0.0.1"
+		}
 		client := http.Client{Timeout: 2 * time.Second}
-		r, e := client.Get("http://127.0.0.1:8081/health")
+		r, e := client.Get("http://" + net.JoinHostPort(host, port) + "/health")
 		if e != nil {
 			return e
 		}
