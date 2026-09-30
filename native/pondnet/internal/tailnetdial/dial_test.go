@@ -14,9 +14,9 @@ import (
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsnet"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/tstest/integration/testcontrol"
-	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
 )
 
