@@ -43,7 +43,7 @@ All errors return JSON:
 | POST | /onboard | Public | Start first-run onboarding flow |
 | POST | /onboard/complete | Public | Mark onboarding finished |
 | GET | /onboard/status | Public | Onboarding progress |
-| GET | /system/info | Public | Hostname, version, platform |
+| GET | /system/info | Public | Connection bootstrap; full record only with a valid bearer |
 | GET | /test | Public | Probe all backend services |
 | POST | /test/speak | Public | Play text on server speakers |
 | GET | /dev/goose | Public | Goose agent + MCP tool status |
@@ -137,17 +137,35 @@ Health check. Always returns 200 even before onboarding.
 
 ### GET /system/info
 
-Returns basic system metadata for device identification.
+Public, so a phone can find the Pond before pairing, but it answers by authentication (`system_info`).
 
-**Response 200**
+**Response 200**, without a valid bearer:
+```json
+{
+  "https_port": 4443,
+  "tailnet_address": "100.64.0.7",
+  "protocol": 2
+}
+```
+
+`protocol: 2` (pinned HTTPS pairing) appears only in this anonymous answer.
+
+**Response 200**, with a valid bearer:
 ```json
 {
   "hostname": "my-pond",
+  "lan_address": "192.168.1.20",
+  "tailnet_address": "100.64.0.7",
+  "https_port": 4443,
+  "tls_spki_sha256": "sha256/...",
+  "port": 4000,
   "version": "0.1.0",
   "platform": "linux",
   "arch": "aarch64"
 }
 ```
+
+`lan_address` and `tailnet_address` are `null` when the Pond has no such route. Pairing material (the addresses and the `tls_spki_sha256` pin) is returned as `pairing` by the host-only `/handshake/pairing-code`, `GET` and `POST`.
 
 ---
 

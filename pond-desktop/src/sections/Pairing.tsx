@@ -33,15 +33,12 @@ export function Pairing() {
     setLoading(true);
     setError(null);
     try {
-      const [sysInfo, pc] = await Promise.all([
-        api.getSystemInfo(),
-        forceNew
-          ? api.issuePairingCode()
-          : api.getPairingCode().then((r) =>
-              r.code ? r : api.issuePairingCode()
-            ),
-      ]);
+      const pc = await (forceNew
+        ? api.issuePairingCode()
+        : api.getPairingCode().then((r) => (r.code ? r : api.issuePairingCode())));
       if (!pc.code) throw new Error("Server returned no pairing code");
+      // Pairing material comes with the code, from the host-only route, not /system/info.
+      const sysInfo = pc.pairing;
       // Every address, tried in this order: mDNS (survives DHCP; Android's resolver has no mDNS),
       // the raw LAN address, then the tailnet address for when the phone is away from home.
       if (!sysInfo.https_port || !sysInfo.tls_spki_sha256) throw new Error(i18n.t('pairing.unavailable'));
