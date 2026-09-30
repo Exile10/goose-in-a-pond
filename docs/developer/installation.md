@@ -91,7 +91,7 @@ Three different floors, each read off the packages that set it, not chosen:
 |-----|-------|---------|
 | The desktop app and the tests (the repo's range) | `^22.12.0 \|\| ^24.0.0 \|\| >=26.0.0` | Electron 44 wants 22.12+; vitest 5 wants that exact range, which rules out the odd-numbered 23 and 25 |
 | Building the web UI | `^20.19.0 \|\| >=22.12.0` | Vite 8. A server (the Jetson) only needs this |
-| The Matter controller | 20.19+ | matter.js; inside the repo's range |
+| The Matter controller | `>=20.19 <22.0 \|\| >=22.13` | matter.js 0.17. One gap in the repo's range: **22.12.x** passes the repo's check and not Matter's, and the doctor says so |
 
 `.nvmrc` says `22`, `pond-desktop/package.json` carries the range as `engines`, and CI's frontend job
 runs on 22. A Node outside the range is the usual reason `npm test` or `npm run dev:electron` fails in a way

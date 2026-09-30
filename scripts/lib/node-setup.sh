@@ -8,7 +8,9 @@
 # The ranges below are not preferences. They are what the dependencies declare, read off the
 # installed packages. The repo's range is the strictest of them: Electron 44 wants >= 22.12, and
 # vitest wants "^22.12.0 || ^24.0.0 || >=26.0.0", which is what rules out the odd-numbered 23 and 25.
-# The Matter controller's lower floor (20.19) is inside it, so one Node serves everything.
+# The Matter controller is nearly inside it: matter.js 0.17 wants `>=20.19.0 <22.0.0 || >=22.13.0`
+# (crates/pond-adapters-matter/src/server_setup.rs), so 22.12.x satisfies the range above and not the
+# controller. node_version_matter_ok carries that hole.
 #
 # Building the web UI needs less: Vite wants "^20.19.0 || >=22.12.0". A server with only that (the
 # Jetson) can still build the UI, so it is a separate question, node_version_ui_ok.
@@ -72,13 +74,29 @@ node_version_ui_ok() {
   [ "$maj" -ge 23 ]
 }
 
-# The Matter controller (matter.js) has a lower floor, and it is a MINOR one: 20.18 satisfies "20+"
-# and does not satisfy matter.js.
+# matter.js 0.17's engine range, `>=20.19.0 <22.0.0 || >=22.13.0`. The floor is a MINOR one (20.18
+# satisfies "20+" and not matter.js) and there is a hole: 22.0 through 22.12. Keep this in step with
+# meets_min_node in crates/pond-adapters-matter/src/server_setup.rs, which is what the server enforces.
 node_version_matter_ok() {
   local maj min
   maj="$(_nv_major "$1")" || return 1
   min="$(_nv_minor "$1")"
-  [ "$maj" -gt 20 ] || { [ "$maj" -eq 20 ] && [ "$min" -ge 19 ]; }
+  if [ "$maj" -eq 20 ]; then [ "$min" -ge 19 ]; return; fi
+  if [ "$maj" -eq 22 ]; then [ "$min" -ge 13 ]; return; fi
+  [ "$maj" -ge 21 ]
+}
+
+# A sentence for a person: why this Node cannot run the Matter controller. Empty when it can.
+node_why_not_matter() {
+  local maj min
+  maj="$(_nv_major "$1")" || { printf 'there is no node to run it'; return 0; }
+  min="$(_nv_minor "$1")"
+  node_version_matter_ok "$1" && return 0
+  if [ "$maj" -eq 22 ]; then
+    printf 'matter.js excludes Node 22.0 through 22.12 (this is 22.%s); 22.13 or newer is fine' "$min"
+  else
+    printf 'matter.js needs Node 20.19 or newer'
+  fi
 }
 
 # A sentence for a person: why this version is outside the range. Empty when it is inside.
@@ -200,7 +218,11 @@ node_use_repo() {
 node_report() {
   local cur line
   cur="$(node --version 2>/dev/null)" || cur=""
-  if [ -n "$cur" ] && node_version_ok "$cur"; then ok "node $cur is inside $NODE_RANGE_TEXT"; return 0; fi
+  if [ -n "$cur" ] && node_version_ok "$cur"; then
+    ok "node $cur is inside $NODE_RANGE_TEXT"
+    node_version_matter_ok "$cur" || warn "but it cannot run the Matter controller: $(node_why_not_matter "$cur")"
+    return 0
+  fi
   if [ -n "$cur" ]; then warn "node $cur on PATH is outside $NODE_RANGE_TEXT: $(node_why_not "$cur")"
   else warn "no node on PATH (this repo needs $NODE_RANGE_TEXT)"; fi
   line="$(node_find_ok)"
@@ -362,6 +384,7 @@ node_ensure() {
   cur="$(node --version 2>/dev/null)" || cur=""
   if [ "$method" = auto ] && [ -n "$cur" ] && node_version_ok "$cur"; then
     ok "node $cur is inside $NODE_RANGE_TEXT"
+    node_version_matter_ok "$cur" || warn "but it cannot run the Matter controller: $(node_why_not_matter "$cur")"
     return 0
   fi
   if [ -n "$cur" ]; then

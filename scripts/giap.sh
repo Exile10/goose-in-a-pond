@@ -574,7 +574,7 @@ doctor() {
   # Only worth warning about when Matter is something this Pond might use; the
   # failure is otherwise invisible until someone flips the toggle months later.
   if [ "$D_NODE_MATTER_OK" = true ]; then ok "node $D_NODE can run the Matter controller"
-  else warn "node ${D_NODE:-absent} cannot run the Matter controller (matter.js needs >= 20.19) — Matter will report it and stay off; bash scripts/giap.sh node fixes it"
+  else warn "node ${D_NODE:-absent} cannot run the Matter controller: $(node_why_not_matter "${D_NODE:-none}") — Matter will report it and stay off; bash scripts/giap.sh node fixes it"
        DOC_WARN=$((DOC_WARN+1)); fi
 
   # 9. desktop app

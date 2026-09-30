@@ -69,15 +69,45 @@ t_ui_range() {
 }
 t_ranges_nest() {
   world
-  # Anything the repo's range accepts can build the UI, and anything it accepts can run matter.js.
-  for v in v22.12.0 v22.30.0 v24.0.0 v24.9.9 v26.0.0 v28.1.0; do
-    node_version_ok "$v" && node_version_ui_ok "$v" && node_version_matter_ok "$v" || { echo "$v breaks the nesting"; return 1; }
+  # Anything the repo's range accepts can build the UI; and can run matter.js, except one gap.
+  for v in v22.12.0 v22.12.9 v22.13.0 v22.30.0 v24.0.0 v24.9.9 v26.0.0 v28.1.0; do
+    node_version_ok "$v" && node_version_ui_ok "$v" || { echo "$v breaks the nesting"; return 1; }
+  done
+  for v in v22.13.0 v22.30.0 v24.0.0 v24.9.9 v26.0.0 v28.1.0; do
+    node_version_matter_ok "$v" || { echo "$v should run matter.js"; return 1; }
+  done
+  # 22.12.x satisfies the repo's range and NOT matter.js 0.17's `>=20.19 <22.0 || >=22.13`.
+  for v in v22.12.0 v22.12.9; do
+    node_version_ok "$v" && ! node_version_matter_ok "$v" || { echo "$v is the gap"; return 1; }
   done
 }
 t_matter_floor() {
   world
-  for v in v20.19.0 v20.20.1 v21.0.0 v22.0.0 v25.8.2; do node_version_matter_ok "$v" || { echo "$v should do for matter.js"; return 1; }; done
-  for v in v20.18.9 v18.20.0 v20.0.0; do ! node_version_matter_ok "$v" || { echo "$v should not"; return 1; }; done
+  # matter.js 0.17: >=20.19.0 <22.0.0 || >=22.13.0 (the same range server_setup.rs enforces).
+  for v in v20.19.0 v20.20.1 v21.0.0 v21.7.3 v22.13.0 v22.14.1 v23.5.0 v24.0.0 v25.8.2 v26.10.0; do
+    node_version_matter_ok "$v" || { echo "$v should do for matter.js"; return 1; }
+  done
+  for v in v20.18.9 v18.20.0 v20.0.0 v22.0.0 v22.5.1 v22.12.0 v22.12.9 v12.22.9 "" garbage; do
+    ! node_version_matter_ok "$v" || { echo "[$v] should not"; return 1; }
+  done
+}
+t_why_not_matter() {
+  world
+  contains "$(node_why_not_matter v22.12.1)" "excludes Node 22.0 through 22.12 (this is 22.12)" || return 1
+  contains "$(node_why_not_matter v22.12.1)" "22.13 or newer" || return 1
+  contains "$(node_why_not_matter v12.22.9)" "needs Node 20.19 or newer" || return 1
+  contains "$(node_why_not_matter v20.18.0)" "needs Node 20.19 or newer" || return 1
+  contains "$(node_why_not_matter garbage)" "no node" || return 1
+  eq "$(node_why_not_matter v24.1.0)" "" || return 1
+}
+t_repo_range_but_not_matter_is_said_out_loud() {
+  world; stubs
+  mk_node "$W/bin" v22.12.1
+  node_report; eq "$?" 0 || return 1                       # the repo is fine with it
+  contains "$(logged)" "warn: but it cannot run the Matter controller: matter.js excludes Node 22.0 through 22.12" || return 1
+  stubs; node_ensure auto || return 1
+  contains "$(logged)" "ok: node v22.12.1 is inside" || return 1
+  contains "$(logged)" "cannot run the Matter controller"
 }
 t_why_not() {
   world
