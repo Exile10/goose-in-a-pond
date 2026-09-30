@@ -340,6 +340,17 @@ t_use_repo_says_so_when_there_is_none() {
   node_use_repo >/dev/null; rc=$?; eq "$rc" 1 || return 1
   eq "$(node --version)" v25.8.2
 }
+# The doctor tells the recorded node (which the pond also starts on) from any other it found.
+t_use_repo_says_where_the_node_came_from() {
+  world; mk_node "$W/bin" v24.1.0
+  node_use_repo >/dev/null; eq "$NODE_USE_FROM" "" || return 1
+  world; mk_node "$W/bin" v25.8.2
+  mk_node "$W/good" v22.14.0; node_record "$W/good" || return 1
+  node_use_repo >/dev/null; eq "$NODE_USE_FROM" recorded || return 1
+  world; mk_node "$W/bin" v25.8.2
+  mk_node "$HOME/.nvm/versions/node/v26.10.0/bin" v26.10.0
+  node_use_repo >/dev/null; eq "$NODE_USE_FROM" nvm
+}
 t_record_goes_under_the_node_home() {
   world; node_record "$W/x"; eq "$(cat "$(node_record_file)")" "$W/x" || return 1
   contains "$(node_record_file)" "$GIAP_NODE_HOME"

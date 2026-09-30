@@ -186,10 +186,13 @@ node_record() {
 # Put the right Node on PATH for this process, if the one there is not it: first the one recorded,
 # then any other that is already installed. Says which on stdout and in NODE_USE_NOTE (for a caller
 # that has to run it in the current shell, where $(...) would lose the PATH change), or says nothing
-# when PATH was fine. Returns 1 when no Node inside the range is to be had.
+# when PATH was fine. NODE_USE_FROM says where it came from: `recorded`, or where an installed one
+# was found (nvm, fnm, volta, asdf, download); empty when PATH was fine. The pond takes the first two
+# steps of this at its own start (crates/pond-server/src/node_path.rs), so it knows the recorded one
+# and not the others. Returns 1 when no Node inside the range is to be had.
 node_use_repo() {
   local cur dir f line
-  NODE_USE_NOTE=""
+  NODE_USE_NOTE=""; NODE_USE_FROM=""
   cur="$(node --version 2>/dev/null)" || cur=""
   if [ -n "$cur" ] && node_version_ok "$cur"; then return 0; fi
   f="$(node_record_file)"
@@ -198,6 +201,7 @@ node_use_repo() {
     if [ -x "$dir/node" ] && node_version_ok "$("$dir/node" --version 2>/dev/null)"; then
       PATH="$dir:$PATH"; export PATH
       NODE_USE_NOTE="using node $("$dir/node" --version) from $dir (recorded by giap.sh node)"
+      NODE_USE_FROM=recorded
       printf '%s\n' "$NODE_USE_NOTE"
       return 0
     fi
@@ -206,7 +210,8 @@ node_use_repo() {
   if [ -n "$line" ]; then
     dir="$(printf '%s' "$line" | cut -d'|' -f2)"
     PATH="$dir:$PATH"; export PATH
-    NODE_USE_NOTE="using node ${line%%|*} from $dir ($(printf '%s' "$line" | cut -d'|' -f3))"
+    NODE_USE_FROM="$(printf '%s' "$line" | cut -d'|' -f3)"
+    NODE_USE_NOTE="using node ${line%%|*} from $dir ($NODE_USE_FROM)"
     printf '%s\n' "$NODE_USE_NOTE"
     return 0
   fi
@@ -399,7 +404,7 @@ node_ensure() {
       ver="${line%%|*}"; dir="$(printf '%s' "$line" | cut -d'|' -f2)"; src="$(printf '%s' "$line" | cut -d'|' -f3)"
       ok "found node $ver in $src ($dir), inside the range; nothing to download"
       if [ "${DRY_RUN:-false}" = true ]; then note "dry run: not recording it"; else
-        node_record "$dir" && note "recorded, so giap.sh and the scripts here use it whatever your shell's default is"
+        node_record "$dir" && note "recorded, so giap.sh, the scripts here and the pond (from its next start) use it whatever your shell's default is"
       fi
       info "in your own shell: $(node_how_to_use "$ver" "$dir" "$src")"
       return 0
@@ -437,7 +442,7 @@ node_ensure() {
   ver="$("$dir/node" --version 2>/dev/null)" || { bad "the installed node does not run"; return 1; }
   node_version_ok "$ver" || { bad "installed node $ver is outside the range, which should not happen"; return 1; }
   ok "node $ver is ready in $dir"
-  node_record "$dir" && note "recorded, so giap.sh and the scripts here use it"
+  node_record "$dir" && note "recorded, so giap.sh, the scripts here and the pond (from its next start) use it"
   info "in your own shell: $(node_how_to_use "$ver" "$dir" "$src")"
   return 0
 }

@@ -418,7 +418,8 @@ enum MemoryAction {
 
 fn main() -> Result<()> {
     // Before the runtime (env mutation must be single-threaded) and any child spawn: a GUI
-    // launch inherits launchd's bare PATH, which hides nvm's node.
+    // launch inherits launchd's bare PATH, which hides nvm's node, and a service can find an old
+    // one first (the Jetson's apt Node 12), which the one `giap.sh node` recorded goes ahead of.
     node_path::ensure_node_on_path();
     // Both rustls backends are on (`aws_lc_rs` from the root Cargo.toml, `ring` via reqwest), so
     // rustls panics wherever it infers one; pin it. `Err` means one is already installed: fine.

@@ -226,6 +226,9 @@ pub fn init_tracing_with_console(
         .with(db_layer)
         .init();
 
+    // Decided at the top of `main`, before there was a subscriber to hear it.
+    crate::node_path::log_decision();
+
     LogDrainHandle { rx, file_guard }
 }
 

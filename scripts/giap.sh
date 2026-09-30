@@ -104,7 +104,7 @@ pause() { [ -t 0 ] || return 0; printf '\n%spress return%s ' "$C_DIM" "$C_RST"; 
 # Plain variables only — bash 3.2 has no associative arrays.
 D_OS=""; D_ARCH=""; D_KERNEL=""; D_BOARD=""; D_IS_JETSON=false; D_L4T=""
 D_CUDA_STATE=""; D_NVCC=""; D_ACCEL=""
-D_RUST=""; D_CMAKE=""; D_NODE=""; D_NODE_OK=false; D_NODE_REPO_OK=false; D_NODE_MATTER_OK=false; D_NODE_NOTE=""
+D_RUST=""; D_CMAKE=""; D_NODE=""; D_NODE_OK=false; D_NODE_REPO_OK=false; D_NODE_MATTER_OK=false; D_NODE_NOTE=""; D_NODE_FROM=""
 D_BRANCH=""; D_SHA=""; D_DIRTY=""; D_SUB_PIN=""; D_SUB_HEAD=""; D_SUB_STATE=""
 D_UI_STATE=""; D_UI_WHEN=""
 D_BIN_REL=""; D_BIN_REL_WHEN=""; D_BIN_DBG=""; D_STAMP=""; D_DESKTOP=""
@@ -558,6 +558,14 @@ doctor() {
   # 8. node capability: the web UI build (Vite's floor), then the range the desktop app and the
   # tests need. A server only needs the first, so the second is a warning only where the desktop runs.
   [ -n "$D_NODE_NOTE" ] && info "$D_NODE_NOTE"
+  # What this run uses and what the pond uses can differ: the pond knows only the node on its own
+  # PATH and the recorded one (crates/pond-server/src/node_path.rs), and reads the record at start.
+  case "$D_NODE_FROM" in
+    "") ;;
+    recorded) note "the pond uses it too when the node on its own PATH is outside the range; it reads the record when it starts" ;;
+    *) note "the pond does not use this one: it knows only the node on its own PATH and the recorded one"
+       note "bash scripts/giap.sh node records it; restart the pond after" ;;
+  esac
   if [ "$D_NODE_OK" = true ]; then ok "node $D_NODE can build the web UI"
   else warn "node ${D_NODE:-absent} cannot build the web UI (Vite needs $NODE_UI_RANGE_TEXT)"
        note "fix: bash scripts/giap.sh node   (finds one already installed, or downloads one after asking)"
@@ -573,9 +581,14 @@ doctor() {
   # 8b. node capability for the Matter controller — a higher, MINOR-level floor.
   # Only worth warning about when Matter is something this Pond might use; the
   # failure is otherwise invisible until someone flips the toggle months later.
+  # Inside the repo's range and still refused is 22.12.x, which giap.sh node keeps, so it has to be
+  # upgraded; anything else giap.sh node replaces, and the pond takes the replacement at its next start.
   if [ "$D_NODE_MATTER_OK" = true ]; then ok "node $D_NODE can run the Matter controller"
-  else warn "node ${D_NODE:-absent} cannot run the Matter controller: $(node_why_not_matter "${D_NODE:-none}") — Matter will report it and stay off; bash scripts/giap.sh node fixes it"
-       DOC_WARN=$((DOC_WARN+1)); fi
+  else
+    if [ "$D_NODE_REPO_OK" = true ]; then local matter_fix="upgrade it to 22.13 or newer"
+    else local matter_fix="bash scripts/giap.sh node fixes it, once the pond is restarted"; fi
+    warn "node ${D_NODE:-absent} cannot run the Matter controller: $(node_why_not_matter "${D_NODE:-none}") — Matter will report it and stay off; $matter_fix"
+    DOC_WARN=$((DOC_WARN+1)); fi
 
   # 9. desktop app
   case "$D_DESKTOP" in
@@ -1199,7 +1212,7 @@ done
 # one is put first on PATH for this run, so the UI build and the tests use it whatever the shell says.
 if [ "$CMD" = node ]; then action_node; exit $?; fi
 node_use_repo >/dev/null 2>&1
-D_NODE_NOTE="$NODE_USE_NOTE"
+D_NODE_NOTE="$NODE_USE_NOTE"; D_NODE_FROM="$NODE_USE_FROM"
 
 detect_all
 

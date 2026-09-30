@@ -129,6 +129,16 @@ range, and says so in the banner and the doctor. Your own shell is left alone; `
 (`nvm use 26.10.0`, `export PATH=...`). `giap.sh build-ui` and `giap.sh install` do the same when they find
 a Node that cannot build the UI, and offer the download before falling back to "build it elsewhere and rsync".
 
+**The pond reads the record too** (`crates/pond-server/src/node_path.rs`). When it starts, if the `node` on
+its own PATH is outside the range, or there is none, it puts the recorded one first, so the Matter controller
+and the stdio extensions it starts run on it. That is the Jetson's case: apt's Node 12 in `/usr/bin` comes
+first on a systemd service's PATH. A `node` inside the range is left alone, which is the order `giap.sh`
+itself takes, and without a record nothing is asked. It asks each binary for its version, as the script does,
+and gives up on one that has not answered in 3 seconds. The record is read only at start, so **restart the
+pond after `giap.sh node`**; its log says what it did (`node_path_recorded`). The doctor says whether the
+pond will use the Node it is reporting on: an installed one that `giap.sh` found but never recorded, it will
+not.
+
 The script is tested in `scripts/lib/node-setup.test.sh` (against a fake nodejs.org, so no network; run by
 CI's `node-setup` job): `bash scripts/lib/node-setup.test.sh`.
 
