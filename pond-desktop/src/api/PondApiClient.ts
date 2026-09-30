@@ -326,7 +326,8 @@ export class PondApiClient {
   enableRemoteAccess(config: { enabled: boolean; controlUrl: string; enrollmentUrl: string }): Promise<unknown> { return this.post('/api/v1/remote-access', config); }
   remoteRecoveryRequests(): Promise<RecoveryRequest[]> { return this.get('/api/v1/remote-access/recovery-requests'); }
   approveRemoteRecovery(id: string): Promise<unknown> { return this.post(`/api/v1/remote-access/recovery-requests/${encodeURIComponent(id)}`, {}); }
-  registerRemotePond(): Promise<unknown> { return this.post('/api/v1/remote-access/register', {}); }
+  /** `invite` is needed only the first time this household registers with a coordinator. */
+  registerRemotePond(invite?: string): Promise<unknown> { return this.post('/api/v1/remote-access/register', invite ? { invite } : {}); }
   disableRemoteAccess(): Promise<unknown> { return this.del('/api/v1/remote-access'); }
 
   // ── Health ────────────────────────────────────────────────

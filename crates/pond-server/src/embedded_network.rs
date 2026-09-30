@@ -1151,25 +1151,78 @@ async fn authority_identity(
     }
     Ok(Json(identity))
 }
+/// Body of `POST /remote-access/register`. `deny_unknown_fields`, so a misspelt field fails
+/// instead of registering without the invite it meant to carry.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RegisterPond {
+    /// The operator's invite, needed once, for a household the coordinator has not seen.
+    #[serde(default)]
+    invite: Option<String>,
+}
+
+/// Loosely the coordinator's invite shape; it decides validity, this only refuses what
+/// could never be one before it reaches the helper.
+fn plausible_invite(invite: &str) -> bool {
+    invite.len() <= 64
+        && invite
+            .get(..10)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("giap-inv1-"))
+        && invite
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b' ')
+}
+
 async fn register_pond(
     State(runtime): State<Arc<Runtime>>,
     peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    local(peer)?;
+    body: Option<Json<RegisterPond>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let refuse =
+        |status: StatusCode, error: &str| (status, Json(serde_json::json!({ "error": error })));
+    local(peer).map_err(|status| refuse(status, "host_only"))?;
+    let invite = body
+        .map(|Json(body)| body.invite)
+        .unwrap_or_default()
+        .map(|invite| invite.trim().to_owned())
+        .filter(|invite| !invite.is_empty());
+    if invite
+        .as_deref()
+        .is_some_and(|invite| !plausible_invite(invite))
+    {
+        return Err(refuse(StatusCode::BAD_REQUEST, "invite_invalid"));
+    }
     let current = runtime
         .status
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
     let registration = Registration {
-        auth_url: current.auth_url.ok_or(StatusCode::CONFLICT)?,
+        auth_url: current
+            .auth_url
+            .ok_or_else(|| refuse(StatusCode::CONFLICT, "no_pending_registration"))?,
         node_key: current.node_key,
         machine_key: current.machine_key,
     };
-    // Register the household first; idempotent for one an operator already created.
-    if let Err(error) = runtime.authority("register", serde_json::Value::Null).await {
-        tracing::warn!(%error, "household registration failed");
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    // Register the household first; idempotent for one already registered, which needs no
+    // invite. The invite goes to the helper on stdin and is never stored here.
+    if let Err(error) = runtime
+        .authority(
+            "register",
+            serde_json::json!({ "invite": invite.unwrap_or_default() }),
+        )
+        .await
+    {
+        let reason = error
+            .downcast_ref::<RefusedByCoordinator>()
+            .and_then(|refused| refused.reason.clone());
+        tracing::warn!(%error, reason = ?reason, "household registration failed");
+        return Err(match reason.as_deref() {
+            Some(
+                reason @ ("invite_required" | "invite_invalid" | "invite_expired" | "invite_used"),
+            ) => refuse(StatusCode::FORBIDDEN, reason),
+            _ => refuse(StatusCode::SERVICE_UNAVAILABLE, "registration_unavailable"),
+        });
     }
     runtime
         .enroll("pond000000000001", "pond", &registration)
@@ -1177,7 +1230,7 @@ async fn register_pond(
         .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, operation = "enroll", "embedded enrollment failed");
-            StatusCode::SERVICE_UNAVAILABLE
+            refuse(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable")
         })
 }
 async fn remote_configuration(
@@ -1941,5 +1994,66 @@ mod tests {
             );
             assert_eq!(payload.is_ok(), ok, "{node_key:?} {machine_key:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn registration_carries_the_invite_and_explains_its_refusal() {
+        use tower::ServiceExt;
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        runtime.publish(Status {
+            state: "NeedsLogin".into(),
+            addresses: vec![],
+            auth_url: Some("https://coord.example/register/abcdefghijklmnop".into()),
+            node_key: format!("nodekey:{}", "b".repeat(64)),
+            machine_key: format!("mkey:{}", "a".repeat(64)),
+        });
+        let router = management(runtime);
+        let register = |body: &str| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/remote-access/register")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+            router.clone().oneshot(request)
+        };
+        let body = |response: axum::response::Response| async {
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        let response = register(r#"{"invite":"not an invite"}"#).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            helper.calls().is_empty(),
+            "a malformed invite reached the helper"
+        );
+
+        helper.answer("register", 3, r#"{"refused":"invite_expired"}"#);
+        let response = register(r#"{"invite":"giap-inv1-ABCD-EFGH"}"#)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body(response).await["error"], "invite_expired");
+        let sent = std::fs::read_to_string(helper.dir.path().join("calls")).unwrap();
+        assert!(
+            sent.contains(r#"register {"invite":"giap-inv1-ABCD-EFGH"}"#),
+            "{sent}"
+        );
+
+        // A household already registered sends no invite at all.
+        helper.answer("register", 0, r#"{"household":"h"}"#);
+        let response = register("{}").await.unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+        assert!(std::fs::read_to_string(helper.dir.path().join("calls"))
+            .unwrap()
+            .contains(r#"register {"invite":""}"#));
     }
 }

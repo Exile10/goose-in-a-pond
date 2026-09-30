@@ -2,13 +2,17 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Button, Switch } from '@heroui/react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api/PondApiClient';
-import type { RecoveryRequest } from '../api/types';
+import { ApiError, type RecoveryRequest } from '../api/types';
+
+/** The coordinator's refusals over an invite, each with its own `remote.*` message. */
+const INVITE_REFUSALS = ['invite_required', 'invite_invalid', 'invite_expired', 'invite_used'];
 
 /** Household activation stays on the Pond's protected local dashboard. */
 export function RemoteAccess() {
   const { t } = useTranslation();
   const [control, setControl] = useState('');
   const [enrollment, setEnrollment] = useState('');
+  const [invite, setInvite] = useState('');
   const [identity, setIdentity] = useState<{ household: string; publicKey: string } | null>(null);
   const [state, setState] = useState('connecting');
   const [requests, setRequests] = useState<RecoveryRequest[]>([]);
@@ -74,14 +78,16 @@ export function RemoteAccess() {
           if (status.authUrl && !registered) {
             registered = true;
             // Never retry registration automatically after an ambiguous response.
-            await api.registerRemotePond();
+            await api.registerRemotePond(invite.trim() || undefined);
           }
           await new Promise<void>((resolve) => setTimeout(resolve, 2000));
         }
         throw new Error('activation timeout');
       }
-    } catch {
-      if (current === generation.current) setState('failed');
+    } catch (error) {
+      // The coordinator names which invite refusal it was; each has its own explanation.
+      const refusal = error instanceof ApiError && INVITE_REFUSALS.includes(error.message) ? error.message : null;
+      if (current === generation.current) setState(refusal ?? 'failed');
       console.warn('[remote] local activation operation failed');
     } finally { if (current === generation.current) setBusy(false); }
   };
@@ -108,6 +114,12 @@ export function RemoteAccess() {
         <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
       </Switch>
     </div>
+
+    <label style={field}>
+      <span>{t('remote.invite')}</span>
+      <input type="text" autoCapitalize="characters" autoComplete="off" spellCheck={false} placeholder="giap-inv1-..." value={invite} onChange={(e) => setInvite(e.target.value)} disabled={busy || on} />
+      <span style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-sm)' }}>{t('remote.inviteHint')}</span>
+    </label>
 
     <details>
       <summary>{t('remote.advanced')}</summary>

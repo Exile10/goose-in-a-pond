@@ -15,6 +15,13 @@ profiles do not start a node or contact a coordination service. Remote operation
 uses only the explicitly configured Goose-operated Headscale and DERP endpoints;
 there is no fallback to hosted Tailscale or a separate VPN app.
 
+The first time a Pond joins a coordination service it needs an invite from whoever
+runs that service (2026-09-30), pasted into **Remote access** on the dashboard. The
+Pond hands it to the helper on stdin and never stores it; once the household is
+registered no invite is needed again. The dashboard explains each refusal
+(`invite_required`, `invite_invalid`, `invite_expired`, `invite_used`). Operators
+issue invites as described in [the deployment guide](../deploy/remote-access/README.md).
+
 This branch prepares a locally tested pilot deployment. Public domains and hosting
 are still prerequisites for cellular use. Follow
 [the deployment guide](../deploy/remote-access/README.md) to provision a pilot
@@ -189,6 +196,14 @@ coordinator's status and its error identifier. On exit 3 the helper also prints
 `{"refused": "<identifier>"}` on stdout, the coordinator's own reason, so the Pond
 can act on which refusal it was. The revocation queue drops an entry refused with
 `enrollment_missing`, since there is nothing to revoke.
+
+`POST /api/v1/remote-access/register` (loopback only, `403 host_only` otherwise) takes
+an optional `{"invite"?: string}` and refuses unknown fields with `422`. It answers
+`400 invite_invalid`, without running the helper, for a string that could never be an
+invite; `403` with the coordinator's reason (`invite_required`, `invite_invalid`,
+`invite_expired`, `invite_used`); `409 no_pending_registration` when the node has no
+pending registration; `503 registration_unavailable` for any other registration
+failure; and `503 enrollment_unavailable` when enrolling the Pond's own node fails.
 
 ### Disabling and signing out
 
