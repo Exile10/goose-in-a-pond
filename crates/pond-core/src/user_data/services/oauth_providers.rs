@@ -1,4 +1,4 @@
-//! Built-in OAuth PKCE providers; `{PROVIDER_ID}_CLIENT_ID` secrets override the client id.
+//! Built-in OAuth PKCE providers. Each household's client ID is the `{PROVIDER_ID}_CLIENT_ID` secret.
 
 use crate::security::domain::oauth_provider::OAuthProviderConfig;
 
@@ -20,7 +20,10 @@ pub fn builtin_oauth_providers() -> Vec<OAuthProviderConfig> {
             "user-read-email".to_string(),
             "user-read-private".to_string(),
         ],
-        bundled_client_id: "9aa8d81a57624c87b392bf242c872224".to_string(),
+        // Spotify's Developer Terms VI.1: a client ID is a Security Code, not to be disclosed, and
+        // development mode admits five allowlisted users. So none ships here: each household
+        // registers its own app and stores its ID as SPOTIFY_CLIENT_ID.
+        bundled_client_id: None,
         token_key: "SPOTIFY_ACCESS_TOKEN".to_string(),
         refresh_key: "SPOTIFY_REFRESH_TOKEN".to_string(),
     }]
@@ -57,6 +60,10 @@ mod tests {
                 "user-read-private",
             ],
             "the assistant never controls Spotify, so no playlist, library or history scope"
+        );
+        assert_eq!(
+            providers[0].bundled_client_id, None,
+            "no Spotify client ID ships with GIAP: each household uses its own"
         );
         assert_eq!(providers[0].token_key, "SPOTIFY_ACCESS_TOKEN");
         assert_eq!(providers[0].refresh_key, "SPOTIFY_REFRESH_TOKEN");

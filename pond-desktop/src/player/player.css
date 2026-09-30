@@ -80,12 +80,12 @@
 }
 
 /* A service's own logo, as its brand rules give it: unaltered, with clear space around it. Spotify's
-   full logo is at least 70px wide; 24px tall gives it about 79. */
+   full logo is at least 70px wide (24px tall gives it 88), with clear space of half its icon's height. */
 .player__logo {
   display: block;
   height: 24px;
   width: auto;
-  margin: 6px 0;
+  margin: 12px 12px 12px 0;
 }
 
 /* The link back to the item on the service, in the words its guidelines give. */

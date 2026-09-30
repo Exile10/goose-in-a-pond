@@ -529,10 +529,14 @@
 .np__bar span { display: block; height: 100%; background: var(--pp); border-radius: 2px; }
 
 /* Spotify's credit: its logo, then the link back to the item in the guidelines' own words. */
-.np__credit { display: flex; align-items: center; gap: 8px; margin-top: 4px; min-height: 24px; }
+.np__credit { display: flex; align-items: center; min-height: 24px; }
 .np--tile .np__credit { justify-content: center; }
-.np__logo { height: 21px; width: auto; display: block; }
-.np__brand { font-size: 11px; font-weight: 700; color: var(--ink); }
+/* Spotify's full logo, unaltered, 21px tall (77px wide: its minimum is 70), black on the light theme and
+   white on the dark one, with clear space of at least half the icon's height around it. */
+.np__logo { height: 21px; width: auto; display: block; margin: 11px 11px 11px 0; }
+.np__logo--on-dark { display: none; }
+:root[data-theme="dark"] .np__logo--on-light { display: none; }
+:root[data-theme="dark"] .np__logo--on-dark { display: block; }
 .np__link {
   font-family: inherit;
   font-size: 11px;

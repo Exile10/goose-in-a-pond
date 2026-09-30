@@ -235,9 +235,35 @@ mod tests {
             .find(|s| s.key == "SPOTIFY_ACCESS_TOKEN")
             .expect("the Spotify sign-in");
         assert!(!spotify.advanced, "signing in is the ordinary path");
-        assert!(
-            music.required_secrets.iter().all(|s| s.key != "MUSIC_SERVICE"),
-            "there is no service to pick: the assistant plays Apple Music only"
+        // The service and the player are ordinary choices, shown to everyone, not developer fields.
+        for key in ["MUSIC_SERVICE", "MUSIC_PLAYER"] {
+            let choice = music
+                .required_secrets
+                .iter()
+                .find(|s| s.key == key)
+                .expect("the music choice");
+            assert_eq!(
+                choice.kind,
+                crate::security::domain::secret::SecretKind::Choice
+            );
+            assert!(
+                !choice.advanced && !choice.host_only,
+                "{key} is for the person, and for the extension"
+            );
+        }
+        let services: Vec<&str> = music
+            .required_secrets
+            .iter()
+            .find(|s| s.key == "MUSIC_SERVICE")
+            .unwrap()
+            .options
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect();
+        assert_eq!(
+            services,
+            ["apple", "spotify"],
+            "Apple Music first: it is the default"
         );
     }
 
@@ -285,11 +311,14 @@ mod tests {
             );
         }
         // Spotify's developer rules forbid voice and AI control of Spotify, so the extension, which
-        // is the assistant's, never holds the token; the pond keeps it for the app's own controls.
-        assert!(
-            !env.contains(&"SPOTIFY_ACCESS_TOKEN"),
-            "the Spotify token stays with the pond"
-        );
+        // is the assistant's, never holds the token or the client ID; the pond keeps both for the
+        // app's own controls. The music choice does reach it: the extension follows it.
+        for key in ["SPOTIFY_ACCESS_TOKEN", "SPOTIFY_CLIENT_ID"] {
+            assert!(!env.contains(&key), "{key} stays with the pond");
+        }
+        for key in ["MUSIC_SERVICE", "MUSIC_PLAYER"] {
+            assert!(env.contains(&key), "{key} must reach the extension");
+        }
     }
 
     #[test]

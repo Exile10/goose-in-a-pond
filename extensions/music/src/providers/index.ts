@@ -24,23 +24,25 @@ function createApple(env: NodeJS.ProcessEnv): AppleMusicProvider {
 
 /**
  * The provider for this run, or null when the assistant has no music service here (see
- * `chooseService`). Apple Music plays through the music player page when an Apple Music key is set
- * up, since that plays the whole catalog; otherwise, and whenever the page cannot be used, through
- * the Music app.
+ * `chooseService`). With the player page chosen, Apple Music plays there when an Apple Music key or the
+ * shared credentials are set up, since that plays the whole catalog; otherwise, and whenever the page
+ * cannot be used, through the Music app. With the Music app chosen, only there.
  */
 export async function createProvider(
   env: NodeJS.ProcessEnv = process.env,
   platform: string = process.platform,
   fetchFn: Fetch = fetch,
 ): Promise<MusicProvider | null> {
-  const { service, reason } = chooseService(platform);
+  const { service, player, reason } = chooseService(platform, env);
   log.info("service_chosen", service ? `using ${service}` : "no music service for the assistant", {
     service,
+    player,
     reason,
   });
   if (service !== "apple") return null;
 
   const local = createApple(env);
+  if (player === "app") return local;
   const host = new HostPlayer(
     fetchFn,
     env.GIAP_SERVER_URL || "http://127.0.0.1:4000",

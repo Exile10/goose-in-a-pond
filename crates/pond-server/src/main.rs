@@ -3436,6 +3436,15 @@ async fn run_server(
     if let Some(repo) = &secret_repo {
         pond_mcp_server::init_secret_deps(repo.clone());
 
+        // Before any extension starts, so the Music extension reads it: an install from before the
+        // music choice existed, signed in to Spotify, keeps Spotify rather than the new default.
+        if let Some(kept) = pond_api::music_choice::keep_an_existing_choice(repo.as_ref()).await {
+            tracing::info!(
+                service = kept,
+                "music: kept the service this install was already using"
+            );
+        }
+
         // Move API keys out of the settings table; `Settings` no longer reads them.
         match pond_infra::secret_migration::migrate_api_keys_to_secret_repository(
             &settings_repo,
@@ -4410,12 +4419,21 @@ async fn run_server(
                         _ => continue,
                     };
 
-                    let client_id = repo
+                    // The household's own client ID; Spotify ships none (Developer Terms VI.1).
+                    let own = repo
                         .get(&format!("{}_CLIENT_ID", provider.id.to_uppercase()))
                         .await
                         .ok()
                         .flatten()
-                        .unwrap_or_else(|| provider.bundled_client_id.clone());
+                        .map(|id| id.trim().to_string())
+                        .filter(|id| !id.is_empty());
+                    let Some(client_id) = own.or_else(|| provider.bundled_client_id.clone()) else {
+                        tracing::info!(
+                            provider = %provider.id,
+                            "OAuth auto-refresh skipped: no client ID is set; sign in again after adding one"
+                        );
+                        continue;
+                    };
 
                     // On refusal skip this tick only; the user may loosen network_mode later.
                     let call = match pond_core::shared::services::egress::begin(

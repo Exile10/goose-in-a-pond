@@ -137,10 +137,27 @@ documentation, and is controlled by hand, never by the assistant. Spotify's
 | Policy II.4, II.5; design guidelines | Attribute with Spotify's logo, link back, show cover art and metadata during playback; artwork uncropped with no overlay, 4 px corners; play and pause as the only control | The page and the music controls show the artwork as an image, the metadata as sent, **LISTEN ON SPOTIFY** linking to the track, play or pause only, and nothing Spotify's `disallows` forbids right now |
 | Policy III.7 | No mixing or overlapping Spotify audio with other audio | **Not yet handled**: a spoken reply while Spotify plays would overlap it |
 | Policy III.5 | No product integrated with streams or content from another service | Accepted by Jarida with Apple Music in the same app; the two never share a queue, a view or a player |
-| Terms VI.1; quota modes | The client ID is a Security Code kept from third parties; development mode is 5 allowlisted users | **Open**: the bundled client ID is still in the source (`oauth_providers.rs`); removing it means each household registers its own Spotify app |
-| Design guidelines, logo | Spotify's official logo, unaltered, beside Spotify content | **Open**: the logo files are not in the repo yet (`src/player/brand.ts`), so the word Spotify stands in |
+| Terms VI.1; quota modes | The client ID is a Security Code kept from third parties; development mode is 5 allowlisted users | No client ID ships with GIAP. Each household registers its own Spotify app and pastes its Client ID (`SPOTIFY_CLIENT_ID`, host-only) in the Music extension's settings, which show the exact redirect URI to register; with none, signing in and every token refresh say so instead of trying |
+| Design guidelines, logo | Spotify's official logo, unaltered, beside Spotify content | Spotify's own full logo (`public/brand/spotify/`, from its design page's download, byte for byte): black on light grounds, white on dark ones, at least 70 px wide, with clear space of half the icon's height |
 
 The only voice route Spotify offers is its Commercial Hardware programme, for organisations.
+
+## Choosing the service and the player
+
+The Music extension's settings lead with two choices, `MUSIC_SERVICE` and `MUSIC_PLAYER`. They are
+`choice` requirements: fixed answers, validated when saved, and not secrets, so the settings read back
+and show what was chosen (the first answer applies until one is saved). What each combination does:
+
+| Service | Player | The assistant | The settings show | The music controls |
+|---|---|---|---|---|
+| Apple Music (default) | Player page (default) | Plays it on the page, the Music app as its fallback | Open the music player; the Apple key fields under Developer settings | Say where Apple Music plays, and open the page |
+| Apple Music | The service's own app | Plays it in the Music app only | The Apple key fields | Say it plays in the Music app |
+| Spotify | Player page | No music tools, and it says why | Spotify client ID, Sign in with Spotify, Open the Spotify player | Spotify's play or pause, drawn to its guidelines |
+| Spotify | The service's own app | No music tools, and it says why | Spotify client ID, Sign in with Spotify | The same, for whichever device plays |
+
+With Apple Music chosen, the pond does not ask Spotify for what is playing at all. An install from before
+the choice existed that is signed in to Spotify keeps Spotify: the pond stores that once at startup
+(`music_choice::keep_an_existing_choice`), so the new default does not switch it.
 
 ## What was measured
 

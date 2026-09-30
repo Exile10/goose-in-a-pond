@@ -10623,6 +10623,10 @@ async fn install_marketplace_handler(
         }
     }
 
+    if let Some(reason) = refused_choice(&ext, &secrets) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
+    }
+
     if let Some(repo) = &state.secret_repo {
         for (key, value) in &secrets {
             if let Err(e) = repo.set(key, value).await {
@@ -10843,17 +10847,47 @@ async fn get_extension_secrets_handler(
     };
 
     let mut fulfilled = std::collections::HashMap::new();
+    // A choice is not a secret, so what is chosen is read back and shown: the stored answer when it is
+    // still one the choice takes, else the choice's first answer, which is what applies.
+    let mut values = std::collections::HashMap::new();
     if let Some(repo) = &state.secret_repo {
         for sr in &ext.required_secrets {
             fulfilled.insert(sr.key.clone(), repo.has(&sr.key).await.unwrap_or(false));
+            if let Some(default) = sr.default_value() {
+                let stored = repo.get(&sr.key).await.ok().flatten();
+                let value = stored
+                    .filter(|v| sr.accepts(v))
+                    .unwrap_or_else(|| default.to_string());
+                values.insert(sr.key.clone(), value);
+            }
         }
     }
 
     Json(json!({
         "requirements": ext.required_secrets,
         "fulfilled": fulfilled,
+        "values": values,
     }))
     .into_response()
+}
+
+/// Why `secrets` cannot be stored for `ext`: a choice given an answer it does not take. `None` when
+/// every value is acceptable.
+fn refused_choice(
+    ext: &pond_core::mcp::domain::marketplace::MarketplaceExtension,
+    secrets: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    ext.required_secrets.iter().find_map(|req| {
+        let given = secrets.get(&req.key)?;
+        (!req.accepts(given)).then(|| {
+            let answers: Vec<&str> = req.options.iter().map(|o| o.value.as_str()).collect();
+            format!(
+                "{} must be one of: {}.",
+                req.display_name,
+                answers.join(", ")
+            )
+        })
+    })
 }
 
 /// Respawns a marketplace extension so it reads current secrets (stdio env is fixed at spawn).
@@ -10938,9 +10972,10 @@ async fn set_extension_secrets_handler(
             .into_response();
     };
 
+    let mut ext = None;
     if let Some(mp) = &state.marketplace {
         match mp.get_by_id(&name).await {
-            Ok(Some(_)) => {}
+            Ok(Some(found)) => ext = Some(found),
             Ok(None) => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -10968,6 +11003,10 @@ async fn set_extension_secrets_handler(
                 .into_response()
         }
     };
+
+    if let Some(reason) = ext.as_ref().and_then(|e| refused_choice(e, &secrets)) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
+    }
 
     for (key, value) in &secrets {
         if let Err(e) = repo.set(key, value).await {
@@ -11027,6 +11066,36 @@ fn client_id_secret_key(provider_id: &str) -> String {
     format!("{}_CLIENT_ID", provider_id.to_uppercase())
 }
 
+/// The client ID for `provider`: the household's own, else one the provider's terms let every install
+/// share. Spotify's do not (Developer Terms VI.1), so for Spotify `None` means nobody has added theirs.
+async fn resolve_client_id(
+    state: &AppState,
+    provider: &pond_core::security::domain::oauth_provider::OAuthProviderConfig,
+) -> Option<String> {
+    let own = match &state.secret_repo {
+        Some(repo) => repo
+            .get(&client_id_secret_key(&provider.id))
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    own.map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .or_else(|| provider.bundled_client_id.clone())
+}
+
+/// What to do when there is no client ID, with the redirect URI the household's app must register.
+fn missing_client_id_message(provider: &str, api_port: u16) -> String {
+    format!(
+        "Add your {provider} client ID first. {provider}'s developer terms do not allow one app ID for \
+         every household, so each registers its own: create an app at \
+         https://developer.spotify.com/dashboard, add the redirect URI \
+         http://127.0.0.1:{api_port}/api/v1/oauth/callback, add your {provider} account under User \
+         Management, then paste the app's Client ID into the Music extension's settings."
+    )
+}
+
 /// `POST /api/v1/oauth/authorize` — starts PKCE; the client opens the returned `auth_url`.
 async fn oauth_authorize_handler(
     State(state): State<Arc<AppState>>,
@@ -11054,15 +11123,15 @@ async fn oauth_authorize_handler(
         }
     };
 
-    let client_id = if let Some(repo) = &state.secret_repo {
-        let key = client_id_secret_key(&provider.id);
-        repo.get(&key)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| provider.bundled_client_id.clone())
-    } else {
-        provider.bundled_client_id.clone()
+    let Some(client_id) = resolve_client_id(&state, provider).await else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": missing_client_id_message(&provider.display_name, state.api_port),
+                "code": "client_id_missing",
+            })),
+        )
+            .into_response();
     };
 
     let (code_verifier, code_challenge) = oauth_callback::generate_pkce();
@@ -11173,15 +11242,14 @@ async fn oauth_callback_handler(
         }
     };
 
-    let client_id = if let Some(repo) = &state.secret_repo {
-        let key = client_id_secret_key(&session.provider_id);
-        repo.get(&key)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| provider.bundled_client_id.clone())
-    } else {
-        provider.bundled_client_id.clone()
+    let Some(client_id) = resolve_client_id(&state, provider).await else {
+        let message = missing_client_id_message(&provider.display_name, state.api_port);
+        fail(&message).await;
+        return Html(format!(
+            "<h1>Authorization failed</h1><p>{}</p>",
+            html_escape(&message)
+        ))
+        .into_response();
     };
 
     // redirect_uri must exactly match the one sent in the authorize request.
@@ -11375,13 +11443,15 @@ async fn oauth_refresh_handler(
         }
     };
 
-    let client_id = {
-        let key = client_id_secret_key(&provider.id);
-        repo.get(&key)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| provider.bundled_client_id.clone())
+    let Some(client_id) = resolve_client_id(&state, provider).await else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": missing_client_id_message(&provider.display_name, state.api_port),
+                "code": "client_id_missing",
+            })),
+        )
+            .into_response();
     };
 
     let call = match pond_core::shared::services::egress::begin(&provider.token_url, "POST") {
@@ -11525,12 +11595,7 @@ pub(crate) async fn refresh_spotify_access_token(state: &AppState) -> Option<Str
     let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
     let provider = providers.iter().find(|p| p.id == "spotify")?;
     let refresh_token = repo.get(&provider.refresh_key).await.ok().flatten()?;
-    let client_id = repo
-        .get(&client_id_secret_key(&provider.id))
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| provider.bundled_client_id.clone());
+    let client_id = resolve_client_id(state, provider).await?;
 
     // Each hop is gated where it's made: one gate up front lets a copy-pasted retry slip past.
     let call = pond_core::shared::services::egress::begin(&provider.token_url, "POST").ok()?;
@@ -11664,6 +11729,16 @@ fn spotify_error_hint(status: StatusCode) -> (&'static str, &'static str) {
 async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
 
+    // The music controls follow the household's choice. With Apple Music chosen, Spotify is not asked
+    // at all: the controls say where Apple Music plays instead.
+    if let Some(repo) = &state.secret_repo {
+        if crate::music_choice::chosen_service(repo.as_ref()).await == "apple" {
+            let player = crate::music_choice::chosen_player(repo.as_ref()).await;
+            return Json(json!({ "connected": false, "service": "apple", "player": player }))
+                .into_response();
+        }
+    }
+
     let resp = match spotify_api_call(&state, reqwest::Method::GET, "/me/player/currently-playing")
         .await
     {
@@ -11776,6 +11851,7 @@ fn now_playing_snapshot(body: &serde_json::Value) -> serde_json::Value {
 
     json!({
         "connected": true,
+        "service": "spotify",
         "playing": is_playing,
         "track": track,
         "artist": artist,

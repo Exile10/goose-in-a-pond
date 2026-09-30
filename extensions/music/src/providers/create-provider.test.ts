@@ -14,11 +14,25 @@ const host = (reply: () => Response | Error): Fetch =>
 
 test('a Spotify sign-in does not bring Spotify to the assistant: a Mac still gets Apple Music', async () => {
   const p = await createProvider(
-    { SPOTIFY_ACCESS_TOKEN: 't', MUSIC_SERVICE: 'spotify', GIAP_INTERNAL_TOKEN: 'x' },
+    { SPOTIFY_ACCESS_TOKEN: 't', GIAP_INTERNAL_TOKEN: 'x' },
     'darwin',
     host(() => json({ apple: { attached: false, configured: false } })),
   );
   assert.equal(p?.id, 'apple');
+});
+
+test('a household that chose Spotify gets no provider, and the host is not asked', async () => {
+  const p = await createProvider({ MUSIC_SERVICE: 'spotify' }, 'darwin', host(() => new Error('not asked')));
+  assert.equal(p, null);
+});
+
+test('with the Music app chosen, the page is never used, even when a key is set up', async () => {
+  const p = await createProvider(
+    { MUSIC_PLAYER: 'app', GIAP_INTERNAL_TOKEN: 'x' },
+    'darwin',
+    host(() => new Error('not asked')),
+  );
+  assert.deepEqual(p?.capabilities, { devices: true, queue: false, timeRange: false });
 });
 
 test('off a Mac there is no provider, and the host is not even asked', async () => {

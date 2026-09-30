@@ -1057,10 +1057,17 @@ async fn a_secrets_change_restarts_the_extension_without_the_host_only_ones() {
 
     let env = manager.last_env();
     assert_env_withholds_signing_secrets(&env);
-    // A restart passes what the registry declares for the extension and nothing else: the service
-    // picker is gone (the assistant plays Apple Music only), and Spotify's token is host-only.
-    assert!(env.get("MUSIC_SERVICE").is_none(), "an undeclared key reached the extension");
-    assert!(env.get("SPOTIFY_ACCESS_TOKEN").is_none(), "Spotify's token reached the extension");
+    // A restart passes what the registry declares for the extension: the music choice reaches it,
+    // since the extension follows it; Spotify's token and client ID are host-only and never do.
+    assert_eq!(env.get("MUSIC_SERVICE").map(String::as_str), Some("apple"));
+    assert!(
+        env.get("SPOTIFY_ACCESS_TOKEN").is_none(),
+        "Spotify's token reached the extension"
+    );
+    assert!(
+        env.get("SPOTIFY_CLIENT_ID").is_none(),
+        "Spotify's client ID reached the extension"
+    );
     for key in HOST_ONLY {
         assert!(pond.secrets.has(key).await.unwrap(), "{key} was not stored");
     }

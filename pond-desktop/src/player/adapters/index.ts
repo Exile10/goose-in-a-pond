@@ -32,7 +32,7 @@ const ADAPTERS: Record<string, (ctx: AdapterContext) => PlayerAdapter> = {
         fetchUserToken: (refresh) => ctx.fetchUserToken("spotify", refresh),
         networkAllows: ctx.networkAllows,
       },
-      SPOTIFY_LOGO_URL ? { logoUrl: SPOTIFY_LOGO_URL } : {},
+      { logoUrl: SPOTIFY_LOGO_URL },
     ),
 };
 

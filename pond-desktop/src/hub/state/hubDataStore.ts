@@ -407,6 +407,21 @@ function setNowPlayingBackoff(np: NowPlayingApiResponse | null): void {
 }
 
 function nowPlayingFromApi(np: NowPlayingApiResponse | null): NowPlayingData {
+  // Apple Music chosen: the assistant and its page play it, so the card says where, not what.
+  if (np?.service === "apple") {
+    return {
+      track: "",
+      artist: "",
+      elapsed: 0,
+      hue: EMPTY_HOME.nowPlaying.hue,
+      connected: false,
+      playing: false,
+      progressMs: null,
+      durationMs: null,
+      service: "apple",
+      player: np.player ?? "page",
+    };
+  }
   if (!np || !np.connected) {
     // Not the mock track with `connected` flipped: that put "Weightless /
     // Marconi Union" on the screen of every fresh install, which is the exact

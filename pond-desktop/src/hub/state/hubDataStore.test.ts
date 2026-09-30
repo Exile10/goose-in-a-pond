@@ -431,6 +431,25 @@ describe("hubDataStore", () => {
     return getHomeData().nowPlaying;
   }
 
+  it("follows the household's choice: with Apple Music chosen, the card is Apple Music's", async () => {
+    const np = await loadWithNowPlaying({ connected: false, service: "apple", player: "app" });
+    expect(np).toMatchObject({ service: "apple", player: "app", connected: false, playing: false });
+  });
+
+  it("carries the Spotify item's link and what Spotify allows now into the card", async () => {
+    const np = await loadWithNowPlaying({
+      connected: true,
+      service: "spotify",
+      playing: true,
+      track: "So What",
+      artist: "Miles Davis",
+      link: "https://open.spotify.com/track/abc",
+      can: { pause: false, resume: true, next: true, previous: true },
+    });
+    expect(np.link).toBe("https://open.spotify.com/track/abc");
+    expect(np.can).toEqual({ pause: false, resume: true, next: true, previous: true });
+  });
+
   it("surfaces a Spotify authorisation failure instead of an idle player", async () => {
     const np = await loadWithNowPlaying({
       connected: true,

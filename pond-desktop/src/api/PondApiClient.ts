@@ -1945,6 +1945,8 @@ export class PondApiClient {
   ): Promise<{
     requirements: SecretRequirement[];
     fulfilled: Record<string, boolean>;
+    /** What each `choice` is set to: the stored answer, or the one that applies until one is saved. */
+    values?: Record<string, string>;
   }> {
     return this.get(`/api/v1/extensions/${encodeURIComponent(name)}/secrets`);
   }

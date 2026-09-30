@@ -54,6 +54,8 @@ interface SecretConfigModalProps {
   mode: SecretModalMode;
   /** fulfilled map for edit mode — key → already stored */
   fulfilledMap?: Record<string, boolean>;
+  /** What each `choice` is set to now, for edit mode; a choice not in here starts on its first answer. */
+  choiceValues?: Record<string, string>;
   onClose: () => void;
   onComplete: (secrets: Record<string, string>) => Promise<void>;
 }
@@ -125,6 +127,72 @@ function SecretField({
       )}
     </div>
   );
+}
+
+/**
+ * One `choice`: its answers as radio buttons. The chosen one rises on the ink offset and the others lie
+ * flat on a hairline (DESIGN.md: state is elevation, not hue).
+ */
+function ChoiceField({
+  req,
+  value,
+  onChange,
+  disabled,
+}: {
+  req: SecretRequirement;
+  value: string;
+  onChange: (v: string) => void;
+  disabled: boolean;
+}) {
+  return (
+    <fieldset className="secret-modal__field secret-modal__choice">
+      <legend className="secret-modal__field-label">{req.display_name}</legend>
+      {req.description && <p className="secret-modal__field-hint">{req.description}</p>}
+      {(req.options ?? []).map((o) => (
+        <label
+          key={o.value}
+          className={`secret-modal__choice-option${value === o.value ? " secret-modal__choice-option--on" : ""}`}
+        >
+          <input
+            type="radio"
+            name={`choice-${req.key}`}
+            value={o.value}
+            checked={value === o.value}
+            onChange={() => onChange(o.value)}
+            disabled={disabled}
+          />
+          <span className="secret-modal__choice-text">
+            <span className="secret-modal__choice-label">{o.label}</span>
+            {o.description && <span className="secret-modal__choice-desc">{o.description}</span>}
+          </span>
+        </label>
+      ))}
+    </fieldset>
+  );
+}
+
+/**
+ * What an extension shows for the choices made in it. The Music extension shows only the chosen
+ * service's setup: Apple Music's key fields, or Spotify's client ID and sign-in.
+ */
+const SHOWN_FOR: Record<string, (key: string, choices: Record<string, string>) => boolean> = {
+  music: (key, choices) => {
+    const service = choices.MUSIC_SERVICE ?? "apple";
+    if (key.startsWith("SPOTIFY_")) return service === "spotify";
+    if (key.startsWith("APPLE_MUSIC_")) return service === "apple";
+    return true;
+  },
+};
+
+/** The redirect URI the pond sends Spotify, which the household's own Spotify app must register. */
+function spotifyRedirectUri(): string {
+  let port = "4000";
+  try {
+    port = new URL(api.serverUrl()).port || port;
+  } catch {
+    /* the default port */
+  }
+  return `http://127.0.0.1:${port}/api/v1/oauth/callback`;
 }
 
 /** Browser hand-off timeout; generous because the user may have to log in and pick an account. */
@@ -294,19 +362,39 @@ export function SecretConfigModal({
   ext,
   mode,
   fulfilledMap = {},
+  choiceValues = {},
   onClose,
   onComplete,
 }: SecretConfigModalProps) {
-  const apiKeyReqs = ext.required_secrets.filter((r) => r.kind === "api_key" || r.kind === "generic");
-  const oauthReqs = ext.required_secrets.filter((r) => r.kind === "oauth_flow");
+  const choiceReqs = ext.required_secrets.filter((r) => r.kind === "choice");
+  const [choices, setChoices] = useState<Record<string, string>>(() =>
+    Object.fromEntries(
+      choiceReqs.map((r) => [r.key, choiceValues[r.key] ?? r.options?.[0]?.value ?? ""]),
+    ),
+  );
+  // Only what the choices call for is shown, and only what is shown is checked or saved.
+  const shown = (r: SecretRequirement) => SHOWN_FOR[ext.id]?.(r.key, choices) ?? true;
+  const apiKeyReqs = ext.required_secrets.filter(
+    (r) => (r.kind === "api_key" || r.kind === "generic") && shown(r),
+  );
+  const oauthReqs = ext.required_secrets.filter((r) => r.kind === "oauth_flow" && shown(r));
   // The ordinary path is a sign-in; the fields for bringing your own credentials, or overriding a
   // default, wait under "Developer settings" so nobody has to read past them.
   const { ordinary: ordinaryKeyReqs, advanced: advancedKeyReqs } = splitAdvanced(apiKeyReqs);
-  const playerSignIns = PLAYER_SIGN_INS[ext.id] ?? [];
+  // A service's player page is offered when that service, and the page, are the ones chosen.
+  const playerSignIns = (PLAYER_SIGN_INS[ext.id] ?? []).filter(
+    (p) =>
+      choiceReqs.length === 0 ||
+      ((choices.MUSIC_SERVICE ?? "apple") === p.service && choices.MUSIC_PLAYER !== "app"),
+  );
   const savedAdvanced = advancedKeyReqs.filter((r) => fulfilledMap[r.key]).length;
 
   const [values, setValues] = useState<Record<string, string>>(() =>
-    Object.fromEntries(apiKeyReqs.map((r) => [r.key, ""])),
+    Object.fromEntries(
+      ext.required_secrets
+        .filter((r) => r.kind === "api_key" || r.kind === "generic")
+        .map((r) => [r.key, ""]),
+    ),
   );
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [globalError, setGlobalError] = useState<string | null>(null);
@@ -373,6 +461,9 @@ export function SecretConfigModal({
           secrets[req.key] = values[req.key].trim();
         }
       }
+      for (const req of choiceReqs) {
+        if (choices[req.key]) secrets[req.key] = choices[req.key];
+      }
       await onComplete(secrets);
     } catch (err) {
       setGlobalError(err instanceof Error ? err.message : String(err));
@@ -395,6 +486,14 @@ export function SecretConfigModal({
 
   const hasSignIns = oauthReqs.length > 0 || playerSignIns.length > 0;
   const hasMixedSecrets = ordinaryKeyReqs.length > 0 && hasSignIns;
+  const noteAfter = (key: string) =>
+    key === "SPOTIFY_CLIENT_ID" ? (
+      <p className="secret-modal__field-hint">
+        In your Spotify app at developer.spotify.com/dashboard, choose Web API and Web Playback SDK,
+        add the redirect URI <code>{spotifyRedirectUri()}</code>, and add your Spotify account under
+        User Management.
+      </p>
+    ) : null;
 
   return (
     <div className="secret-modal-backdrop" onClick={handleBackdropClick}>
@@ -430,6 +529,18 @@ export function SecretConfigModal({
         {/* Body */}
         <div className="secret-modal__body">
 
+          {/* Choices first: they decide which of the rest applies */}
+          {choiceReqs.map((req) => (
+            <ChoiceField
+              key={req.key}
+              req={req}
+              value={choices[req.key] ?? ""}
+              onChange={(v) => setChoices((prev) => ({ ...prev, [req.key]: v }))}
+              disabled={saving}
+            />
+          ))}
+          {choiceReqs.length > 0 && <hr className="secret-modal__divider" />}
+
           {/* API key / generic fields */}
           {ordinaryKeyReqs.length > 0 && (
             <>
@@ -437,15 +548,17 @@ export function SecretConfigModal({
                 <p className="secret-modal__section-label">API credentials</p>
               )}
               {ordinaryKeyReqs.map((req) => (
-                <SecretField
-                  key={req.key}
-                  req={req}
-                  value={values[req.key] ?? ""}
-                  onChange={(v) => setValue(req.key, v)}
-                  error={fieldErrors[req.key]}
-                  fulfilled={fulfilledMap[req.key]}
-                  disabled={saving}
-                />
+                <div key={req.key}>
+                  <SecretField
+                    req={req}
+                    value={values[req.key] ?? ""}
+                    onChange={(v) => setValue(req.key, v)}
+                    error={fieldErrors[req.key]}
+                    fulfilled={fulfilledMap[req.key]}
+                    disabled={saving}
+                  />
+                  {noteAfter(req.key)}
+                </div>
               ))}
             </>
           )}
@@ -1180,6 +1293,8 @@ interface SecretEditState {
   /** Marketplace entry, for its required_secrets list. */
   mktExt: MarketplaceExtension | null;
   fulfilledMap: Record<string, boolean>;
+  /** What each `choice` is set to. */
+  choiceValues: Record<string, string>;
 }
 
 export function Extensions() {
@@ -1289,14 +1404,16 @@ export function Extensions() {
     if (!mktExt || mktExt.required_secrets.length === 0) return;
 
     let fulfilledMap: Record<string, boolean> = {};
+    let choiceValues: Record<string, string> = {};
     try {
       const res = await api.getExtensionSecrets(extName);
       fulfilledMap = res.fulfilled;
+      choiceValues = res.values ?? {};
     } catch {
       // ignore — we'll show unfilled state
     }
 
-    setSecretEditState({ extName, mktExt, fulfilledMap });
+    setSecretEditState({ extName, mktExt, fulfilledMap, choiceValues });
   }
 
   /** Refresh one extension's auth badge. Call it on every `handleSecretEditComplete` path that
@@ -1508,6 +1625,7 @@ export function Extensions() {
           ext={secretEditState.mktExt}
           mode="edit"
           fulfilledMap={secretEditState.fulfilledMap}
+          choiceValues={secretEditState.choiceValues}
           onClose={() => setSecretEditState(null)}
           onComplete={handleSecretEditComplete}
         />

@@ -1,30 +1,40 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { chooseService, NO_MUSIC_INSTRUCTIONS } from './select.js';
+import { chooseService, noMusicInstructions } from './select.js';
 
-test('a Mac gets Apple Music', () => {
-  assert.equal(chooseService('darwin').service, 'apple');
+test('nothing chosen means Apple Music on the player page, on a Mac', () => {
+  assert.deepEqual(chooseService('darwin'), {
+    service: 'apple',
+    player: 'page',
+    reason: 'Apple Music, on the music player page',
+  });
 });
 
-test('anything else gets no music service at all, and says why', () => {
-  for (const platform of ['linux', 'win32', 'freebsd']) {
-    const choice = chooseService(platform);
-    assert.equal(choice.service, null, platform);
-    assert.match(choice.reason, /Apple Music needs macOS/);
+test('the Music app is used when it is the chosen player', () => {
+  const choice = chooseService('darwin', { MUSIC_SERVICE: 'apple', MUSIC_PLAYER: 'app' });
+  assert.equal(choice.service, 'apple');
+  assert.equal(choice.player, 'app');
+});
+
+test('a household that chose Spotify gets no assistant service, whatever the player, and says why', () => {
+  for (const player of ['page', 'app']) {
+    const choice = chooseService('darwin', { MUSIC_SERVICE: 'spotify', MUSIC_PLAYER: player });
+    assert.equal(choice.service, null);
     assert.match(choice.reason, /Spotify cannot be controlled by the assistant/);
+    assert.match(noMusicInstructions(choice), /This household chose Spotify/);
+    assert.match(noMusicInstructions(choice), /never controlled by the assistant/);
   }
 });
 
-test('Spotify is never a choice, whatever is signed in or asked for', () => {
-  // The choice no longer reads the environment: a Spotify sign-in or MUSIC_SERVICE=spotify cannot
-  // bring Spotify to the assistant, because Spotify's rules forbid voice and AI control of it.
-  assert.equal(chooseService.length, 1);
-  for (const platform of ['darwin', 'linux']) assert.notEqual(chooseService(platform).service, 'spotify');
+test('off a Mac Apple Music is not available, and the words say so', () => {
+  const choice = chooseService('linux', { MUSIC_SERVICE: 'apple' });
+  assert.equal(choice.service, null);
+  assert.match(noMusicInstructions(choice), /Apple Music needs a Mac/);
 });
 
-test('the words the assistant gets with no tools explain the rule and where Spotify is played', () => {
-  assert.match(NO_MUSIC_INSTRUCTIONS, /never controlled by the assistant/);
-  assert.match(NO_MUSIC_INSTRUCTIONS, /Spotify player page/);
-  assert.match(NO_MUSIC_INSTRUCTIONS, /music controls/);
+test('an answer the choice does not have is read as the default', () => {
+  const choice = chooseService('darwin', { MUSIC_SERVICE: 'tidal', MUSIC_PLAYER: 'radio' });
+  assert.equal(choice.service, 'apple');
+  assert.equal(choice.player, 'page');
 });

@@ -5,10 +5,12 @@ import { describeError, log } from "./log.js";
 import { normalizeName, playlistMatchScore } from "./match.js";
 import { createProvider } from "./providers/index.js";
 import { buildTools } from "./tools.js";
-import { NO_MUSIC_INSTRUCTIONS } from "./providers/select.js";
+import { chooseService, noMusicInstructions } from "./providers/select.js";
 import type { MusicProvider, TimeRange } from "./providers/types.js";
 
 const available = await createProvider();
+// Said to the model when there is no provider, so it can tell the person why.
+const NO_MUSIC_INSTRUCTIONS = noMusicInstructions(chooseService(process.platform, process.env));
 // Every handler below runs only when there is a provider: `tools/call` refuses first when there is not.
 const provider = available as MusicProvider;
 const TOOLS = available ? buildTools(available) : [];

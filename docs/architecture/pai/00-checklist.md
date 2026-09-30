@@ -2410,3 +2410,20 @@ and do not establish device-key proof of possession or encrypted transport.
   pond-core and pond-api tests for the registry, scopes and now-playing snapshot passed. The Apple page ran
   in a browser tab against a scratch pond up to Apple's sign-in window. Not run: Apple sign-in and full
   playback, and the Spotify page against Spotify, both of which need Jerry signed in.
+
+**2026-09-30 (later) -- a service and player choice, no bundled Spotify client ID, and Spotify's own logo. Touches PAI-2.**
+
+- **What was asked.** "Download the logos and remove the bundled client ID and then finally allow the user
+  to choose what player and service they want to use on the extensions page."
+- **What landed.** A `choice` kind of extension requirement (fixed answers, validated on save, read back
+  since it is not a secret) and two of them on the Music extension, `MUSIC_SERVICE` and `MUSIC_PLAYER`,
+  shown first in its settings; the settings show only the chosen service's setup; the extension, the
+  now-playing route and the hub's music card follow the choice. No Spotify client ID ships: signing in and
+  every refresh need the household's own `SPOTIFY_CLIENT_ID` (host-only) and say so without one. Spotify's
+  official full logo, black and white, byte for byte from its design page.
+- **Invariants.** *Egress*: with Apple Music chosen the now-playing route never calls Spotify.
+  *Secrets*: a new host-only secret (`SPOTIFY_CLIENT_ID`); choice values are readable, and only their
+  values. *Settings persistence*: no settings field; the choices live with the extension's other values.
+  *Side effects without approval*: at startup, one write of `MUSIC_SERVICE=spotify` for an install already
+  signed in to Spotify with no choice stored, so an upgrade does not switch its service.
+- **Not built.** Pausing Spotify while GIAP speaks (Policy III.7).

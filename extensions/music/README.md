@@ -13,6 +13,18 @@ built to Spotify's Web Playback SDK documentation), or with the app's own music 
 sign-in in this extension's settings is for those; the pond keeps the token and never gives it to this
 extension. See [`docs/architecture/music-player.md`](../../docs/architecture/music-player.md).
 
+## Choosing the service and the player
+
+The extension's settings lead with two choices. **Music service**: Apple Music (the default), which the
+assistant can play, or Spotify, which is played by hand. **Player**: the player page in your web browser
+(the default), or the service's own app. With Apple Music, the page plays the whole catalog and the
+Music app plays your library; with Spotify, the assistant has no music tools whichever player is chosen,
+and says why. The extension reads the choices as `MUSIC_SERVICE` and `MUSIC_PLAYER`.
+
+To sign in to Spotify, first register your own Spotify app (developer.spotify.com/dashboard; Spotify's
+terms do not allow one app for every household) and paste its Client ID in the settings, which show the
+redirect URI to add to it.
+
 ## Installation
 
 Install from the GIAP Extensions marketplace with one click. Apple Music works at once through the

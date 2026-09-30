@@ -60,9 +60,10 @@ describe("NowPlaying", () => {
     expect(card.className).not.toMatch(/np--has-art/);
   });
 
-  it("credits Spotify and links back to the item in the guidelines' own words", () => {
+  it("credits Spotify with its official logo, and links back to the item in the guidelines' own words", () => {
     render(<NowPlaying />);
-    expect(screen.getByText("Spotify")).toBeTruthy();
+    const logo = screen.getByRole("img", { name: "Spotify" }) as HTMLImageElement;
+    expect(logo.getAttribute("src")).toBe("/brand/spotify/Full_Logo_Black_RGB.svg");
     const link = screen.getByRole("link", { name: "LISTEN ON SPOTIFY" });
     expect(link.getAttribute("href")).toBe("https://open.spotify.com/track/blue");
     expect(link.getAttribute("rel")).toBe("noopener noreferrer");
@@ -88,7 +89,7 @@ describe("NowPlaying", () => {
     render(<NowPlaying />);
     expect(screen.getByText("Spotify is not connected")).toBeTruthy();
     expect((screen.getByLabelText("Play") as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.queryByText("Spotify", { exact: true })).toBeNull();
+    expect(screen.queryByRole("img", { name: "Spotify" })).toBeNull();
   });
 
   // Polling has stopped on this refusal, so nothing else will bring the widget back.
@@ -131,5 +132,22 @@ describe("NowPlaying", () => {
     };
     render(<NowPlaying />);
     expect(screen.getByText(/rate-limiting/)).toBeTruthy();
+  });
+
+  it("with Apple Music chosen, says where it plays, offers its page, and shows nothing of Spotify", () => {
+    store.nowPlaying = { track: "", artist: "", elapsed: 0, hue: 260, connected: false, playing: false, service: "apple", player: "page" };
+    render(<NowPlaying />);
+    expect(screen.getByText("Apple Music")).toBeTruthy();
+    expect(screen.getByText(/plays on the music player page/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open the music player" })).toBeTruthy();
+    expect(screen.queryByRole("img", { name: "Spotify" })).toBeNull();
+    expect(screen.queryByLabelText("Play")).toBeNull();
+  });
+
+  it("with Apple Music in the Music app chosen, offers no page", () => {
+    store.nowPlaying = { track: "", artist: "", elapsed: 0, hue: 260, connected: false, playing: false, service: "apple", player: "app" };
+    render(<NowPlaying />);
+    expect(screen.getByText(/plays in the Music app/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open the music player" })).toBeNull();
   });
 });

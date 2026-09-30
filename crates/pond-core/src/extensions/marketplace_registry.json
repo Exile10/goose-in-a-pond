@@ -113,6 +113,52 @@
       "featured": true,
       "required_secrets": [
         {
+          "key": "MUSIC_SERVICE",
+          "display_name": "Music service",
+          "description": "Which service this household plays.",
+          "required": false,
+          "kind": "choice",
+          "options": [
+            {
+              "value": "apple",
+              "label": "Apple Music",
+              "description": "The assistant can play it for you, by voice or in chat."
+            },
+            {
+              "value": "spotify",
+              "label": "Spotify",
+              "description": "Played by hand, on its page, in the Spotify app, or with the music controls. The assistant never controls Spotify: Spotify's developer rules do not allow voice or AI control."
+            }
+          ]
+        },
+        {
+          "key": "MUSIC_PLAYER",
+          "display_name": "Player",
+          "description": "Where the music plays.",
+          "required": false,
+          "kind": "choice",
+          "options": [
+            {
+              "value": "page",
+              "label": "The player page, in your web browser",
+              "description": "Apple Music's whole catalog, or Spotify as a device called Goose In A Pond."
+            },
+            {
+              "value": "app",
+              "label": "The service's own app",
+              "description": "The Music app on this Mac for Apple Music. The Spotify app, or another of your devices, for Spotify."
+            }
+          ]
+        },
+        {
+          "key": "SPOTIFY_CLIENT_ID",
+          "display_name": "Spotify client ID",
+          "description": "Needed before you can sign in to Spotify: its developer terms do not allow one app for every household, so each uses its own.",
+          "required": false,
+          "kind": "generic",
+          "host_only": true
+        },
+        {
           "key": "SPOTIFY_ACCESS_TOKEN",
           "display_name": "Spotify",
           "description": "Optional. Sign in so the app's music controls and the Spotify player page can play Spotify. The assistant never controls Spotify: Spotify's developer rules do not allow voice or AI control.",
