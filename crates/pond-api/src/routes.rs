@@ -1256,6 +1256,55 @@ struct TtsRequest {
     text: String,
 }
 
+/// A browser plays what `/tts` returns as soon as it has it, so other audio is paused before it goes
+/// out and stays paused for as long as it plays (Spotify's Developer Policy III.7).
+async fn quiet_while_a_browser_plays(wav: &[u8]) {
+    use pond_core::models::services::voice::{quiet, quiet_voice_output::WAIT_FOR_QUIET};
+    /// From the reply leaving here to the browser playing it, plus the pond's usual grace.
+    const SLACK: std::time::Duration = std::time::Duration::from_secs(3);
+    /// For audio whose length this cannot read: longer than any one sentence.
+    const UNREAD: std::time::Duration = std::time::Duration::from_secs(15);
+
+    if let Some(quiet) = quiet::installed() {
+        quiet.linger(wav_duration(wav).unwrap_or(UNREAD) + SLACK);
+        quiet.until_quiet(WAIT_FOR_QUIET).await;
+    }
+}
+
+/// How long a WAV plays for, read off its header; `None` for anything this cannot read.
+fn wav_duration(wav: &[u8]) -> Option<std::time::Duration> {
+    let le32 = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(wav.get(at..at + 4)?.try_into().ok()?))
+    };
+    if wav.get(0..4)? != b"RIFF" || wav.get(8..12)? != b"WAVE" {
+        return None;
+    }
+    let mut byte_rate = None;
+    let mut at = 12;
+    while let (Some(id), Some(size)) = (wav.get(at..at + 4), le32(at + 4)) {
+        let body = at + 8;
+        let size = size as usize;
+        match id {
+            b"fmt " => byte_rate = le32(body + 8).filter(|rate| *rate > 0),
+            b"data" => {
+                // A streamed WAV can carry 0 or u32::MAX here; what is actually there is the length.
+                let there = wav.len().saturating_sub(body);
+                let len = if size == 0 || size > there {
+                    there
+                } else {
+                    size
+                };
+                return Some(std::time::Duration::from_secs_f64(
+                    len as f64 / f64::from(byte_rate?),
+                ));
+            }
+            _ => {}
+        }
+        at = body.checked_add(size)?.checked_add(size & 1)?; // chunks are word-aligned
+    }
+    None
+}
+
 /// Synthesises WAV: in-process `AppState.tts` first, else the legacy Piper HTTP server.
 async fn tts_synthesise(
     State(state): State<Arc<AppState>>,
@@ -1279,6 +1328,7 @@ async fn tts_synthesise(
     if let Some(tts) = &state.tts {
         match tts.synthesize(text).await {
             Ok(Some(wav_bytes)) => {
+                quiet_while_a_browser_plays(&wav_bytes).await;
                 return Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "audio/wav")
@@ -1349,6 +1399,7 @@ async fn tts_synthesise(
             Json(json!({"error": format!("Failed reading Piper audio response: {}", e)})),
         )
     })?;
+    quiet_while_a_browser_plays(&bytes).await;
 
     Response::builder()
         .status(StatusCode::OK)
@@ -11072,7 +11123,15 @@ async fn resolve_client_id(
     state: &AppState,
     provider: &pond_core::security::domain::oauth_provider::OAuthProviderConfig,
 ) -> Option<String> {
-    let own = match &state.secret_repo {
+    client_id_from(state.secret_repo.as_deref(), provider).await
+}
+
+/// [`resolve_client_id`] from a secret store alone, for a caller with no `AppState`.
+async fn client_id_from(
+    repo: Option<&(dyn pond_core::security::ports::secret::SecretRepository + Send + Sync)>,
+    provider: &pond_core::security::domain::oauth_provider::OAuthProviderConfig,
+) -> Option<String> {
+    let own = match repo {
         Some(repo) => repo
             .get(&client_id_secret_key(&provider.id))
             .await
@@ -11591,16 +11650,23 @@ async fn oauth_providers_handler(
 // ── Music (Spotify) ──────────────────────────────────────────────────────────
 
 pub(crate) async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
-    let repo = state.secret_repo.as_ref()?;
+    refresh_spotify_token(state.secret_repo.as_deref()?, &state.http_client).await
+}
+
+/// Refreshes Spotify's access token and stores it, with the new refresh token when Spotify sends
+/// one. Only the pond's own store may do this: an unstored refresh token loses the sign-in.
+pub(crate) async fn refresh_spotify_token(
+    repo: &(dyn pond_core::security::ports::secret::SecretRepository + Send + Sync),
+    http: &reqwest::Client,
+) -> Option<String> {
     let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
     let provider = providers.iter().find(|p| p.id == "spotify")?;
     let refresh_token = repo.get(&provider.refresh_key).await.ok().flatten()?;
-    let client_id = resolve_client_id(state, provider).await?;
+    let client_id = client_id_from(Some(repo), provider).await?;
 
     // Each hop is gated where it's made: one gate up front lets a copy-pasted retry slip past.
     let call = pond_core::shared::services::egress::begin(&provider.token_url, "POST").ok()?;
-    let sent = state
-        .http_client
+    let sent = http
         .post(&provider.token_url)
         .form(&[
             ("grant_type", "refresh_token"),
@@ -16987,6 +17053,73 @@ mod tests {
     }
 
     // ── Spotify failure classification ───────────────────────────
+
+    /// A 16-bit mono WAV at 24 kHz (Kokoro's), with `extra` chunks before its data.
+    fn wav(extra: &[(&[u8; 4], &[u8])], data_len: usize, declared: Option<u32>) -> Vec<u8> {
+        let mut chunks = Vec::new();
+        let mut fmt = Vec::new();
+        fmt.extend(1u16.to_le_bytes()); // PCM
+        fmt.extend(1u16.to_le_bytes()); // mono
+        fmt.extend(24_000u32.to_le_bytes());
+        fmt.extend(48_000u32.to_le_bytes()); // bytes a second
+        fmt.extend(2u16.to_le_bytes());
+        fmt.extend(16u16.to_le_bytes());
+        let mut chunk = |id: &[u8; 4], body: &[u8], size: u32| {
+            chunks.extend_from_slice(id);
+            chunks.extend(size.to_le_bytes());
+            chunks.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                chunks.push(0);
+            }
+        };
+        chunk(b"fmt ", &fmt, fmt.len() as u32);
+        for (id, body) in extra {
+            chunk(id, body, body.len() as u32);
+        }
+        chunk(
+            b"data",
+            &vec![0u8; data_len],
+            declared.unwrap_or(data_len as u32),
+        );
+        let mut out = b"RIFF".to_vec();
+        out.extend((chunks.len() as u32 + 4).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend(chunks);
+        out
+    }
+
+    #[test]
+    fn a_wavs_length_is_read_off_its_header() {
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(wav_duration(&wav(&[], 48_000, None)), Some(second));
+        assert_eq!(
+            wav_duration(&wav(&[(b"LIST", b"odd")], 24_000, None)),
+            Some(second / 2),
+            "an odd-sized chunk before the data is padded to a word"
+        );
+        assert_eq!(
+            wav_duration(&wav(&[], 96_000, Some(0))),
+            Some(second * 2),
+            "a streamed WAV that does not say its length is as long as what it holds"
+        );
+        assert_eq!(
+            wav_duration(&wav(&[], 48_000, Some(u32::MAX))),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_readable_wav_has_no_length() {
+        assert_eq!(wav_duration(b""), None);
+        assert_eq!(wav_duration(b"ID3\x04 an mp3"), None);
+        let mut no_fmt = b"RIFF\x0c\x00\x00\x00WAVEdata".to_vec();
+        no_fmt.extend(4u32.to_le_bytes());
+        no_fmt.extend([0u8; 4]);
+        assert_eq!(wav_duration(&no_fmt), None, "no byte rate to divide by");
+        let mut cut_short = wav(&[], 48_000, None);
+        cut_short.truncate(30);
+        assert_eq!(wav_duration(&cut_short), None);
+    }
 
     #[test]
     fn spotify_403_is_reported_as_an_authorisation_problem() {

@@ -1061,11 +1061,11 @@ async fn a_secrets_change_restarts_the_extension_without_the_host_only_ones() {
     // since the extension follows it; Spotify's token and client ID are host-only and never do.
     assert_eq!(env.get("MUSIC_SERVICE").map(String::as_str), Some("apple"));
     assert!(
-        env.get("SPOTIFY_ACCESS_TOKEN").is_none(),
+        !env.contains_key("SPOTIFY_ACCESS_TOKEN"),
         "Spotify's token reached the extension"
     );
     assert!(
-        env.get("SPOTIFY_CLIENT_ID").is_none(),
+        !env.contains_key("SPOTIFY_CLIENT_ID"),
         "Spotify's client ID reached the extension"
     );
     for key in HOST_ONLY {

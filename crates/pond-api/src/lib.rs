@@ -10,6 +10,7 @@ pub mod oauth_callback;
 pub mod player;
 pub mod routes;
 pub mod runs;
+pub mod spotify_focus;
 pub mod thought_filter;
 pub mod tool_context;
 

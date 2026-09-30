@@ -1265,11 +1265,23 @@ async fn run_server(
         }
     };
 
+    // Spotify's Developer Policy III.7: Spotify pauses while the pond speaks, here and in what
+    // browsers play from `/tts`. Its token comes from the secret store, which exists further down.
+    let spotify_focus = pond_api::spotify_focus::SpotifyFocus::new(true);
+    let quiet = {
+        use pond_core::models::services::voice::quiet;
+        let started = quiet::Quiet::start(spotify_focus.clone(), quiet::GRACE);
+        quiet::install(started.clone());
+        started
+    };
+
     let tts: Option<Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>> =
         match &kokoro_engine {
             Some(kokoro) => {
+                use pond_core::models::services::voice::quiet_voice_output::QuietVoiceOutput;
                 println!("  ✅ TTS: kokoro");
-                Some(kokoro.clone() as Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>)
+                let voice = QuietVoiceOutput::new(kokoro.clone(), quiet.clone());
+                Some(Arc::new(voice) as Arc<dyn VoiceOutput>)
             }
             None => {
                 println!("  ⚠  TTS: unavailable — responses will be text-only");
@@ -3436,6 +3448,7 @@ async fn run_server(
     // `set`, so a second one would serve stale data and clobber writes.
     if let Some(repo) = &secret_repo {
         pond_mcp_server::init_secret_deps(repo.clone());
+        spotify_focus.use_secrets(repo.clone());
 
         // Before any extension starts, so the Music extension reads it: an install from before the
         // music choice existed, signed in to Spotify, keeps Spotify rather than the new default.
@@ -5525,6 +5538,20 @@ async fn run_chat(
     chat_service =
         chat_service.with_speech_energy(Arc::new(pond_audio::MicEnergy::new(&mic_handle)));
 
+    // Spotify's Developer Policy III.7: Spotify pauses while this process makes a sound, its wake
+    // ping included, so whatever the TTS. The server writes the secret store and refreshes the
+    // token; this process only reads the store, and never refreshes.
+    let quiet = {
+        use pond_core::models::services::voice::quiet;
+        let spotify_focus = pond_api::spotify_focus::SpotifyFocus::new(false);
+        spotify_focus.use_secrets(Arc::new(
+            pond_infra::file_secret_repository::ReadOnlySecretStore::new(&data_dir),
+        ));
+        let started = quiet::Quiet::start(spotify_focus, quiet::GRACE);
+        quiet::install(started.clone());
+        started
+    };
+
     // ── Wire TTS output ──
     // Never stdout under --json-events: the text already streams as NDJSON `token` events.
     let text_fallback = || -> Arc<dyn VoiceOutput> {
@@ -5582,7 +5609,9 @@ async fn run_chat(
                             Some(sink) => out.with_audio_level_sink(sink.clone()),
                             None => out,
                         };
+                        use pond_core::models::services::voice::quiet_voice_output::QuietVoiceOutput;
                         out!("  Speak    {} @ {:.2}x", out.voice().await, out.speed());
+                        let out = QuietVoiceOutput::new(Arc::new(out), quiet.clone());
                         Arc::new(out) as Arc<dyn VoiceOutput>
                     }
                     Err(e) => {

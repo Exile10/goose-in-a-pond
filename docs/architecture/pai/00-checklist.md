@@ -2427,3 +2427,22 @@ and do not establish device-key proof of possession or encrypted transport.
   *Side effects without approval*: at startup, one write of `MUSIC_SERVICE=spotify` for an install already
   signed in to Spotify with no choice stored, so an upgrade does not switch its service.
 - **Not built.** Pausing Spotify while GIAP speaks (Policy III.7).
+
+**2026-09-30 (later still) -- Spotify pauses while GIAP speaks (Policy III.7). Touches PAI-2.**
+
+- **What was asked.** "Fix III.7 too, pause Spotify while GIAP speaks."
+- **What landed.** A `Quiet` controller in `pond-core` (an `AudioFocus` port; holds, lingers, a 2 s
+  grace) and a `QuietVoiceOutput` around the TTS in both processes that speak: a voice turn is quiet from
+  `begin_utterance` to `end_utterance`, and a new `TurnEnds` guard ends every turn, a failed one too. The
+  wake ping, the thinking tone and `/tts` audio a browser plays ask for quiet as well. `SpotifyFocus`
+  (`pond-api`) pauses what the Web API says is playing and resumes it only if nobody changed it since.
+  The desktop's voice child reads the secret store through a new `ReadOnlySecretStore` (`pond-infra`).
+- **Invariants.** *Egress*: every Spotify call, from either process, goes through the `network_mode`
+  gate. *Secrets*: the Spotify token is read by the voice child now, a pond process, still never an
+  extension. The child cannot write the store and never refreshes: the server's `FileSecretRepository`
+  rewrites the whole file from its cache, and a refresh can replace the refresh token. *Settings
+  persistence*: none. *Side effects without approval*: GIAP pauses and resumes the household's Spotify
+  on whatever device is playing, including one away from home. That is the literal reading of III.7's
+  "any device or system", asked for by Jarida.
+- **Not built.** Resuming Spotify when a voice session is killed mid-speech; asking where the playing
+  device is before pausing it.

@@ -32,6 +32,8 @@ const EGRESS_TRACKED: &[&str] = &[
     "crates/pond-api/src/routes.rs",
     // Fetches the managed Apple Music developer token from the credentials service.
     "crates/pond-api/src/musickit.rs",
+    // Pauses Spotify while the pond speaks, and resumes it (Developer Policy III.7).
+    "crates/pond-api/src/spotify_focus.rs",
     "crates/pond-adapters-caldav/src/lib.rs",
     "crates/pond-adapters-weather/src/lib.rs",
     "crates/pond-hf-cache/src/lib.rs",

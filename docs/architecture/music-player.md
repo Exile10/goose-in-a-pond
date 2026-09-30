@@ -135,12 +135,45 @@ documentation, and is controlled by hand, never by the assistant. Spotify's
 | Web Playback SDK | `onSpotifyWebPlaybackSDKReady` before the script; `Spotify.Player({name, getOAuthToken})`; every documented event; `connect()`; `activateElement()` from a click; `autoplay_failed` asks for it again | Exactly that. The page's **Play Spotify here** button calls `activateElement()` in the click, then the Web API's Transfer Playback to this device with `play: true` |
 | Reference, `playback_error` | Loading or playing a track failed; no remedy given | The words are shown; nothing else is done (the earlier pause-on-error is gone) |
 | Policy II.4, II.5; design guidelines | Attribute with Spotify's logo, link back, show cover art and metadata during playback; artwork uncropped with no overlay, 4 px corners; play and pause as the only control | The page and the music controls show the artwork as an image, the metadata as sent, **LISTEN ON SPOTIFY** linking to the track, play or pause only, and nothing Spotify's `disallows` forbids right now |
-| Policy III.7 | No mixing or overlapping Spotify audio with other audio | **Not yet handled**: a spoken reply while Spotify plays would overlap it |
+| Policy III.7 | "Do not permit any device or system to segue, mix, re-mix, or overlap any Spotify Content with any other audio content" | Spotify pauses while GIAP makes any sound, its wake ping, thinking tone and speech, and what a browser plays from `/tts`, then resumes where it was (below) |
 | Policy III.5 | No product integrated with streams or content from another service | Accepted by Jarida with Apple Music in the same app; the two never share a queue, a view or a player |
 | Terms VI.1; quota modes | The client ID is a Security Code kept from third parties; development mode is 5 allowlisted users | No client ID ships with GIAP. Each household registers its own Spotify app and pastes its Client ID (`SPOTIFY_CLIENT_ID`, host-only) in the Music extension's settings, which show the exact redirect URI to register; with none, signing in and every token refresh say so instead of trying |
 | Design guidelines, logo | Spotify's official logo, unaltered, beside Spotify content | Spotify's own full logo (`public/brand/spotify/`, from its design page's download, byte for byte): black on light grounds, white on dark ones, at least 70 px wide, with clear space of half the icon's height |
 
 The only voice route Spotify offers is its Commercial Hardware programme, for organisations.
+
+## Spotify pauses while GIAP speaks
+
+Policy III.7, as Jarida asked on 2026-09-30: "pause Spotify while GIAP speaks". Every sound the pond
+makes asks for quiet first (`pond-core` `models/services/voice/quiet.rs`), and the Spotify side
+(`pond-api` `spotify_focus.rs`) pauses what the Web API says is playing, on the device playing it: the
+Spotify app, a speaker, a phone, or the pond's own Spotify page.
+
+| Sound | Asks for quiet | Spotify comes back |
+|---|---|---|
+| A voice turn | At `begin_utterance`, before inference, so the pause is done before there is anything to say | 2 s after `end_utterance`, however long the gaps between sentences; a turn that fails still ends (`TurnEnds`) |
+| The wake ping | Before it plays (it waits up to 400 ms for the pause); the quiet is renewed while the words after it are captured, and lasts 5 s after, for the turn to take over | When nothing holds it: a false wake gives Spotify back about 5 s after capture |
+| The thinking tone | Starts only once Spotify is paused (up to 1.5 s); a tone stopped before then never starts | With the turn |
+| Speech outside a turn (greeting, announcements, `/test/speak`) | Around each `speak` | 2 s after, unless another sound starts first |
+| `/tts`, played by a browser (the web voice path, the voice preview) | Before the audio is returned | When it has played: its length from the WAV header, plus 3 s |
+
+It resumes only what it paused, and only if nobody has changed it since: still paused, on the same
+device, on the same track or episode. Pressing play, choosing another song or moving the music to
+another device while GIAP talks is left as it is. A Spotify that disallows pausing right now
+(`actions.disallows.pausing`) is left playing.
+
+Two processes make sounds, and only one may write the secret store. The server pauses with its own
+store and refreshes the token after a 401. The desktop's voice child reads the store fresh on each call
+through `ReadOnlySecretStore` (`pond-infra`), which creates, migrates and writes nothing, and never
+refreshes: a refresh can replace the refresh token, which it could not store. The server refreshes
+every 45 minutes and a token lasts an hour, so the child's is current while the server runs; when it has
+expired the child says so once in its log and GIAP speaks over Spotify. Every call goes through the
+`network_mode` gate, and a sound waits at most 1.5 s for the pause.
+
+**Policy III.3.** III.3 forbids a "voice-enabled SDA that enables a user to control Spotify with their
+voice". The pause gives nobody that: nothing said to GIAP plays, skips or stops Spotify, the music comes
+back by itself, and the pause happens because GIAP is about to make a sound, not because of anything
+asked for. That is Jarida's reading of it, not Spotify's.
 
 ## Choosing the service and the player
 
@@ -198,7 +231,16 @@ deleted rather than kept.
 - **Loopback only.** The page pairs through the loopback pairing endpoint, so it runs on the pond's own
   computer. A Jetson has no documented environment for either SDK: Linux on arm64 has no browser with
   a Widevine module the services accept. There the assistant has no music tools, and says why.
-- **Spotify and spoken replies overlap** (Policy III.7, above): nothing pauses Spotify while GIAP speaks.
+- **Spotify pauses wherever it is playing.** III.7 names "any device or system", so the pause does not
+  ask where the device is: someone listening on their phone away from home hears it pause whenever
+  GIAP speaks at home, for the length of the exchange.
+- **A voice session killed mid-speech leaves Spotify paused.** What was paused is resumed by the
+  process that paused it, and a killed one resumes nothing.
+- **Spotify is spoken over when it cannot be paused**: signed out, `network_mode` refusing it, a token
+  the voice child may not refresh, a Web API call slower than 1.5 s, or Spotify disallowing the pause.
+- **The browser's voice path makes two sounds of its own** (`playPingTone`, `playThinkingTone` in
+  `webAudioUtils.ts`), which do not ask the pond for quiet; its speech, from `/tts`, does. It is a
+  development surface; the desktop's voice runs in the voice child, where every sound asks.
 - **Requests after the script loads are not judged** by `network_mode` (see Security model).
 
 ## Adding a service (Tidal...)
@@ -224,8 +266,11 @@ playback that an existing provider already speaks (a speaker, as Spotify)?
 reference (configure's instance, `startPlaying`, MKError codes, every playback state, pagination),
 the page UI (artwork, the three controls, sign in and out), the music player row, the bridge and the
 SSE reader. `cargo test -p pond-api --lib player` and `--test player_routes` drive the bridge.
-`npm test` in `extensions/music` covers the providers over a fake host.
+`npm test` in `extensions/music` covers the providers over a fake host. The pause while GIAP speaks:
+`cargo test -p pond-core --lib quiet`, `cargo test -p pond-api --lib spotify_focus` (the Web API by a
+mock server, and the whole chain from a turn to the resume), `cargo test -p pond-infra --lib read_only`.
 
 Not verified yet: signing in to Apple Music and full playback in Safari or Chrome (needs a person's
-Apple Account), and the Spotify page against Spotify in Chrome or Safari (needs a Premium sign-in and
-a click on the page).
+Apple Account), the Spotify page against Spotify in Chrome or Safari (needs a Premium sign-in and
+a click on the page), and Spotify pausing and resuming against the real Web API while GIAP speaks
+(needs the same sign-in).
