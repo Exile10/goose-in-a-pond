@@ -78,3 +78,30 @@ func TestAuthorityRefusesDamagedState(t *testing.T) {
 		})
 	}
 }
+
+func TestACrashBeforeTheFirstAuthorityIsRecoverable(t *testing.T) {
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "authority")
+	// What an interrupted creation leaves: a staging directory, never the real one.
+	if err := os.Mkdir(directory+".new-interrupted", 0700); err != nil {
+		t.Fatal(err)
+	}
+	first, err := LoadAuthority(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(parent, "authority.new-*")); len(leftovers) != 0 {
+		t.Fatalf("staging directories left behind: %v", leftovers)
+	}
+	again, err := LoadAuthority(directory)
+	if err != nil || again.Household != first.Household {
+		t.Fatalf("the created authority was not the one loaded again: %v", err)
+	}
+	// An existing directory whose identity is gone was lost, not interrupted.
+	if err := os.Remove(filepath.Join(directory, "identity.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAuthority(directory); err == nil {
+		t.Fatal("a lost authority was silently replaced")
+	}
+}
