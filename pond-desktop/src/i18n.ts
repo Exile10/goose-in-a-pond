@@ -6,7 +6,9 @@ void i18n.use(initReactI18next).init({
   resources: { en: { translation: { remote: {
     title: 'Remote access',
     recoveryTitle: 'Phone recovery requests',
-    recoveryDescription: 'After pairing the phone locally again, match its request identifier here before approving. Approval expires after two minutes and must be completed by that phone on your home network.',
+    recoveryDescription: 'After pairing the phone locally again, check that the name and key below match what the phone shows before approving. Approval expires after two minutes and must be completed by that phone on your home network.',
+    reviewDevice: 'Phone: {{name}}', reviewUnnamed: 'Phone: name unavailable',
+    reviewKey: 'Key begins: {{key}}',
     reviewCode: 'Request: {{id}}', reviewApprove: 'Approve this phone recovery', reviewApproved: 'Approved; waiting for phone',
     reviewFailed: 'Recovery requests could not be loaded or approved. Check the local connection and retry.',
     description: 'Reach this Pond from outside your home. Until you turn this on, your Pond contacts no coordination service at all.',
