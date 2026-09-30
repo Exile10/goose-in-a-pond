@@ -492,7 +492,8 @@ mod tests {
             .recovery
             .insert("device".into(), [1; 32], serde_json::Value::Null, 0)
             .unwrap();
-        let router = management(runtime.clone());
+        let credential = pond_api::host_guard::HostCredential::generate();
+        let router = management(runtime.clone(), credential.clone());
         for peer in ["100.64.0.2:1234", "192.168.1.2:1234"] {
             let response = router
                 .clone()
@@ -502,6 +503,7 @@ mod tests {
                         .header("content-type", "application/json")
                         .uri(format!("/api/v1/remote-access/recovery-requests/{id}"))
                         .header("x-forwarded-for", "127.0.0.1")
+                        .header(pond_api::host_guard::CREDENTIAL_HEADER, credential.as_str())
                         .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()))
                         .body(Body::from("{}"))
                         .unwrap(),
@@ -516,6 +518,7 @@ mod tests {
                     .method("POST")
                     .header("content-type", "application/json")
                     .uri(format!("/api/v1/remote-access/recovery-requests/{id}"))
+                    .header(pond_api::host_guard::CREDENTIAL_HEADER, credential.as_str())
                     .extension(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()))
                     .body(Body::from("{}"))
                     .unwrap(),

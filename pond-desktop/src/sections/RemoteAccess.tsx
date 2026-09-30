@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Button, Switch } from '@heroui/react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api/PondApiClient';
+import { isSignInRequired } from '../api/hostCredential';
 
 /** Household activation stays on the Pond's protected local dashboard. */
 export function RemoteAccess() {
@@ -13,12 +14,15 @@ export function RemoteAccess() {
   const [requests, setRequests] = useState<{ id: string; device: string; approved: boolean }[]>([]);
   const [reviewFailed, setReviewFailed] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Every call here needs the host credential; a restart rotates it out from under this tab.
+  const [signInLost, setSignInLost] = useState(false);
+  const noteRefusal = (error: unknown) => { if (isSignInRequired(error)) setSignInLost(true); };
   const generation = useRef(0);
   useEffect(() => {
     const current = ++generation.current;
     void api.remoteStatus().then((status) => {
       if (current === generation.current) setState(status.state === 'Running' ? 'enabled' : status.state === 'Stopped' ? 'local' : 'failed');
-    }).catch(() => { if (current === generation.current) setState('failed'); });
+    }).catch((error: unknown) => { noteRefusal(error); if (current === generation.current) setState('failed'); });
     return () => { generation.current++; };
   }, []);
   useEffect(() => {
@@ -28,7 +32,7 @@ export function RemoteAccess() {
       try {
         const pending = await api.remoteRecoveryRequests();
         if (active) { setRequests(pending); setReviewFailed(false); }
-      } catch { if (active) setReviewFailed(true); }
+      } catch (error) { noteRefusal(error); if (active) setReviewFailed(true); }
       if (active) timer = setTimeout(() => void poll(), 5000);
     };
     void poll();
@@ -40,7 +44,7 @@ export function RemoteAccess() {
       await api.approveRemoteRecovery(id);
       setRequests((pending) => pending.map((request) => request.id === id ? { ...request, approved: true } : request));
       setReviewFailed(false);
-    } catch { setReviewFailed(true); console.warn('[remote] recovery approval failed'); }
+    } catch (error) { noteRefusal(error); setReviewFailed(true); console.warn('[remote] recovery approval failed'); }
     finally { setBusy(false); }
   };
   const run = async (operation: 'identity' | 'enable' | 'disable') => {
@@ -79,7 +83,8 @@ export function RemoteAccess() {
         }
         throw new Error('activation timeout');
       }
-    } catch {
+    } catch (error) {
+      noteRefusal(error);
       if (current === generation.current) setState('failed');
       console.warn('[remote] local activation operation failed');
     } finally { if (current === generation.current) setBusy(false); }
@@ -91,6 +96,7 @@ export function RemoteAccess() {
     <div style={{ display: 'grid', gap: 6 }}>
       <h2 id="remote-access-title" style={{ margin: 0 }}>{t('remote.title')}</h2>
       <p style={{ margin: 0 }}>{t('remote.description')}</p>
+      {signInLost && <p role="alert" style={{ margin: 0 }}>{t('signIn.hostOnly')}</p>}
     </div>
 
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: 'var(--space-3) var(--space-4)', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-md)' }}>

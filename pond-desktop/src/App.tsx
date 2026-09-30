@@ -4,6 +4,7 @@ import { useAppState, useAppDispatch } from "./state/AppContext";
 import { GuiMode } from "./modes/GuiMode";
 import { VoiceMode } from "./modes/voice";
 import { OnboardingWizard } from "./components/onboarding";
+import { SignInRequired } from "./components/SignInRequired";
 import { api } from "./api/PondApiClient";
 import { useTheme } from "./hub/state/themeStore";
 
@@ -21,8 +22,16 @@ function InkScope({ children }: { children: React.ReactNode }) {
 }
 
 export function App() {
-  const { mode, needsOnboarding } = useAppState();
+  const { mode, needsOnboarding, signInRequired } = useAppState();
   const dispatch = useAppDispatch();
+
+  if (signInRequired) {
+    return (
+      <InkScope>
+        <SignInRequired />
+      </InkScope>
+    );
+  }
 
   if (needsOnboarding) {
     return (

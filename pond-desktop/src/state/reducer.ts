@@ -54,6 +54,8 @@ export interface AppState {
   serverStarting: boolean;
   serverUrl: string;
   sessionToken: string | null;
+  /** This browser tab lacks the host credential, so it cannot sign in or pair phones. */
+  signInRequired: boolean;
   sessionId: string | null;
   needsOnboarding: boolean;
   voiceState: VoiceState;
@@ -79,6 +81,7 @@ export type AppAction =
   | { type: "SERVER_STARTING" }
   | { type: "SET_SERVER_URL"; payload: string }
   | { type: "SET_SESSION_TOKEN"; payload: string | null }
+  | { type: "SET_SIGN_IN_REQUIRED"; payload: boolean }
   | { type: "SET_SESSION_ID"; payload: string | null }
   | { type: "SET_VOICE_STATE"; payload: VoiceState }
   | { type: "SET_VOICE_ERROR"; payload: string | null }
@@ -144,6 +147,7 @@ export function buildInitialState(): AppState {
     serverStarting: true,
     serverUrl: storedUrl,
     sessionToken: storedToken,
+    signInRequired: false,
     sessionId: null,
     needsOnboarding: false,
     voiceState: "idle",
@@ -194,6 +198,9 @@ export function reducer(state: AppState, action: AppAction): AppState {
       }
       return { ...state, sessionToken: action.payload };
     }
+
+    case "SET_SIGN_IN_REQUIRED":
+      return { ...state, signInRequired: action.payload };
 
     case "SET_SESSION_ID":
       return { ...state, sessionId: action.payload };

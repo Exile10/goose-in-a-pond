@@ -18,8 +18,10 @@ def run(*args, **kwargs):
     return subprocess.run(args, check=True, capture_output=True, **kwargs).stdout
 
 
-def curl(url, certificate=None, pin=None, expect=200, data=None):
+def curl(url, certificate=None, pin=None, expect=200, data=None, headers=()):
     args = ["curl", "--silent", "--show-error", "--max-time", "10", "--write-out", "\n%{http_code}"]
+    for header in headers:
+        args += ["--header", header]
     if certificate:
         args += ["--cacert", str(certificate), "--pinnedpubkey", pin.replace("sha256/", "sha256//", 1)]
     if data is not None:
@@ -32,7 +34,7 @@ def curl(url, certificate=None, pin=None, expect=200, data=None):
 def start(data, log):
     env = {**os.environ, "POND_DATA_DIR": str(data), "RUST_LOG": "info"}
     env.pop("POND_DEV_ALLOW_LOOPBACK", None)
-    for name in [".runtime_api_port", ".runtime_https_port"]:
+    for name in [".runtime_api_port", ".runtime_https_port", ".runtime_host_credential"]:
         (data / name).unlink(missing_ok=True)
     with open("/dev/zero", "rb") as stdin:
         process = subprocess.Popen([str(BINARY), "serve", "--port", "4500", "--https-port", "4543"],
@@ -103,7 +105,10 @@ def main():
                     curl(https + "/api/v1/devices", certificate, pin, expect=401)
                     for path in ["/", "/dev/test", "/dev/face", "/assets/index.js"]:
                         curl(https + path, certificate, pin, expect=404)
-                    curl(http + "/api/v1/handshake/pairing-code")
+                    curl(http + "/api/v1/handshake/pairing-code", expect=403)
+                    host_credential = (data / ".runtime_host_credential").read_text().strip()
+                    curl(http + "/api/v1/handshake/pairing-code",
+                         headers=["X-Pond-Host-Credential: " + host_credential])
                     curl(https + "/api/v1/handshake/init", certificate, pin,
                          data={"client_id": "scratch-phone", "client_type": "gotg", "client_version": "test"})
                     bad = subprocess.run(["curl", "--silent", "--max-time", "10", "--cacert", str(certificate),

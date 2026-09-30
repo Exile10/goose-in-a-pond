@@ -57,6 +57,8 @@ def main():
 
                     def request(path, body=None, method=None, timeout=180):
                         headers = {'Content-Type': 'application/json'}
+                        if path == '/api/v1/handshake/pairing-code':
+                            headers['X-Pond-Host-Credential'] = (data / '.runtime_host_credential').read_text().strip()
                         if token:
                             headers['Authorization'] = 'Bearer ' + token
                         req = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(), headers=headers, method=method)
