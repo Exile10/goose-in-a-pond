@@ -10,8 +10,20 @@ SECRET=runtime/secrets/headscale_admin
 strip() { sed 's/\x1b\[[0-9;]*m//g'; }
 hs() { docker compose exec -T headscale headscale "$@" < /dev/null; }
 
-old_prefix="$(hs apikeys list | strip | awk -F'|' 'NR>1 && $2 ~ /hskey/ {gsub(/ /,"",$2); sub(/-\*\*\*$/,"",$2); print $2}')"
-echo "current key prefix(es): ${old_prefix:-none}"
+# The key being replaced is the one enrollment holds, named by its own prefix
+# (hskey-api-<prefix>-<secret>), not guessed from a table: scraping `apikeys list`
+# expired every key it could parse, including ones other tools rely on.
+old_prefix="$(sed -n 's/^hskey-api-\([A-Za-z0-9_]*\)-.*/\1/p' "$SECRET" | head -1)"
+[ -n "$old_prefix" ] || { echo "cannot read the current key's prefix from $SECRET; aborting" >&2; exit 1; }
+listed() {
+  hs apikeys list -o json | python3 -c '
+import json, sys
+wanted = sys.argv[1]
+keys = json.load(sys.stdin) or []
+sys.exit(0 if any(k.get("prefix") == wanted for k in keys) else 1)' "$1"
+}
+listed "$old_prefix" || { echo "the current key ($old_prefix) is not listed by Headscale; aborting" >&2; exit 1; }
+echo "current key prefix: $old_prefix"
 
 echo "minting a ${EXPIRY} key"
 ( umask 077; hs apikeys create --expiration "$EXPIRY" > "$SECRET.new" )
@@ -40,10 +52,13 @@ if [ "${state:-unknown}" != healthy ]; then
 fi
 echo "enrollment healthy on the new key"
 
-for p in $old_prefix; do
-  echo "expiring previous key $p"
-  hs apikeys expire --prefix "$p" | strip
-done
+new_prefix="$(sed -n 's/^hskey-api-\([A-Za-z0-9_]*\)-.*/\1/p' "$SECRET" | head -1)"
+if [ -z "$new_prefix" ] || [ "$new_prefix" = "$old_prefix" ] || ! listed "$new_prefix"; then
+  echo "the new key is not the one Headscale lists; keeping the previous key ($old_prefix) live" >&2
+  exit 1
+fi
+echo "expiring previous key $old_prefix"
+hs apikeys expire --prefix "$old_prefix" | strip
 rm -f "$SECRET.prev"
 
 echo "=== keys after ==="

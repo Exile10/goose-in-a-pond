@@ -17,6 +17,13 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 ARCHIVE="$OUT/control-plane-$STAMP.tar.age"
 
 [ -s "$RECIPIENTS" ] || { echo "no age recipients in $RECIPIENTS; refusing to write an unencrypted backup" >&2; exit 1; }
+# A backup that exists only on this host is lost with it. BACKUP_OFFSITE names an
+# rsync-over-ssh destination, user@host:/directory, on another machine.
+BACKUP_OFFSITE="${BACKUP_OFFSITE:-}"
+case "$BACKUP_OFFSITE" in
+  *@*:/*) ;;
+  *) echo "set BACKUP_OFFSITE=user@host:/directory; refusing to keep backups only on this host" >&2; exit 1 ;;
+esac
 mkdir -p "$OUT"; chmod 700 "$OUT"
 
 restarted=0
@@ -77,6 +84,14 @@ mv "$ARCHIVE.part" "$ARCHIVE"
 chmod 600 "$ARCHIVE"
 
 restart
+
+# Copied off-host and checked there before anything local is pruned.
+echo "copying off-site to $BACKUP_OFFSITE"
+rsync -a --checksum "$ARCHIVE" "$BACKUP_OFFSITE/"
+local_size="$(stat -c %s "$ARCHIVE")"
+remote_size="$(ssh -- "${BACKUP_OFFSITE%%:*}" stat -c %s "${BACKUP_OFFSITE#*:}/$(basename "$ARCHIVE")")"
+[ "$remote_size" = "$local_size" ] || { echo "off-site copy is $remote_size bytes, expected $local_size; keeping every local archive" >&2; exit 1; }
+echo "off-site copy verified ($remote_size bytes)"
 
 ls -1t "$OUT"/control-plane-*.tar.age 2>/dev/null | tail -n +$((KEEP+1)) | while read -r old; do
   echo "pruning $(basename "$old")"; rm -f -- "$old"
