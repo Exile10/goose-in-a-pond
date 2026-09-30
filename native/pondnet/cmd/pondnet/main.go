@@ -52,7 +52,17 @@ func main() {
 			return
 		}
 		if *authorityAction == "register" {
-			household, err := authority.Register(context.Background(), *enrollmentOrigin, uint16(*port))
+			// The invite arrives on stdin, never as an argument other accounts could read.
+			var input struct {
+				Invite string `json:"invite"`
+			}
+			decoder := json.NewDecoder(io.LimitReader(os.Stdin, 8192))
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&input); err != nil && err != io.EOF {
+				fmt.Fprintln(os.Stderr, "invalid registration input")
+				os.Exit(2)
+			}
+			household, err := authority.Register(context.Background(), *enrollmentOrigin, uint16(*port), input.Invite)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "household registration incomplete:", err)
 				os.Exit(1)
