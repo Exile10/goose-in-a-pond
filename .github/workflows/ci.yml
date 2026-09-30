@@ -319,6 +319,18 @@ jobs:
       - name: Tests
         run: npm test
 
+  # The Node setup in scripts/giap.sh (`giap.sh node`) decides which Node every developer builds on
+  # and can download one, so it is tested like code: the range, the checksum check, the download and
+  # its refusals, against a fake nodejs.org. Nothing here touches the network or the runner's home.
+  node-setup:
+    name: Node setup script - bash tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tests
+        run: bash scripts/lib/node-setup.test.sh
+
   frontend:
     name: Frontend — vitest / playwright
     runs-on: ubuntu-latest
@@ -330,7 +342,10 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          # 22, not 20: vitest 5 declares `^22.12.0 || ^24.0.0 || >=26.0.0` and this job runs it, so
+          # 20 was below the package's own stated minimum. .nvmrc and package.json's `engines` say
+          # the same; scripts/giap.sh node is what gets a developer onto it.
+          node-version: 22
           cache: npm
           cache-dependency-path: pond-desktop/package-lock.json
 
