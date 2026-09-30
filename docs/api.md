@@ -39,7 +39,7 @@ All errors return JSON:
 | Method | Path | Auth | Summary |
 |--------|------|------|---------|
 | GET | /health | Public | Service health check |
-| POST | /handshake | Public | GIAP ↔ GOTG authentication handshake |
+| POST | /handshake | Loopback only (legacy) | GIAP ↔ GOTG authentication handshake |
 | POST | /onboard | Public | Start first-run onboarding flow |
 | POST | /onboard/complete | Public | Mark onboarding finished |
 | GET | /onboard/status | Public | Onboarding progress |
@@ -218,6 +218,8 @@ Reports Goose agent status and loaded MCP tools. Useful for verifying the GIAP b
 
 Exchanges a session token between a GOTG mobile client and GIAP. Returns connection details.
 
+Legacy single-step pairing. It carries the code in the body and binds nothing, so it is refused from any peer but loopback: a tailnet or unclassifiable peer gets `403 {"error":"pairing_requires_lan"}`, and any other non-loopback peer `403 {"error":"legacy_pairing_host_only"}` (`handshake_handler`). Phones use `/handshake/init` and `/handshake/verify`, and must send `channel_binding`.
+
 > **Status**: Token validation is real. `SqliteHandshakeAdapter::validate_token` (`crates/pond-infra/src/sqlite_handshake.rs`) looks the token up by SHA-256 hash and accepts it only when it is unrevoked and unexpired, touching `last_seen_at` on success. Tokens are hashed at rest, and pairing is a two-phase HMAC challenge.
 
 **Request**
@@ -242,6 +244,7 @@ Exchanges a session token between a GOTG mobile client and GIAP. Returns connect
 | Code | Meaning |
 |------|---------|
 | 400 | Invalid request body |
+| 403 | `legacy_pairing_host_only` or `pairing_requires_lan`: the caller is not on this host |
 | 500 | Handshake handler error |
 
 ---

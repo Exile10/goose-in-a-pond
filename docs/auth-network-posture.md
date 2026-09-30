@@ -202,18 +202,22 @@ leaves a MAC over a transcript the Pond no longer computes (`invalid_mac`); and
 answering the client directly fails the server proof. A wrong pin therefore ends
 pairing in a visible failure rather than a successful pair with the wrong Pond.
 
-The binding is optional because the desktop dashboard pairs over loopback HTTP,
-where there is no certificate and nothing in the middle. Optional is not
-downgradable: a client that binds always binds, and computing *either*
+The binding is required from every peer except loopback (2026-09-30). The desktop
+dashboard pairs over loopback HTTP, where there is no certificate and nothing in
+the middle, so it may send the unbound transcript; any other peer that omits
+`channel_binding` gets `403 channel_binding_required`, recorded as a failed pairing,
+without the challenge being consumed. Before this, a phone on the LAN could still
+pair unbound, and an interceptor that stripped the binding from a client willing to
+send either shape got a proof it could brute-force offline. Computing *either*
 transcript needs the pairing code. A binding is rejected outright, before the
 challenge is consumed, when it is not this Pond's pin — including when the Pond
 has no TLS identity to compare against, so the field can never be advisory. The
 five `sqlite_handshake.rs` tests under `// ---- Channel binding` hold each of
 those down.
 
-Not covered: the legacy single-shot `POST /handshake`, which carries the code in
-the request body and so has no MAC to bind. It is LAN-gated like the rest and no
-shipped client uses it.
+The legacy single-shot `POST /handshake` carries the code in the request body and
+so has no MAC to bind. It is refused from any peer but loopback with
+`403 legacy_pairing_host_only`; only local scripts use it.
 
 Legacy handshake, initialization, and verification require loopback or a peer
 within an active directly attached LAN interface's netmask. Tunnel interfaces,

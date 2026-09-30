@@ -64,7 +64,10 @@ scan; an unauthenticated HTTP response cannot establish trust.
 The phone stages the pin before contacting the Pond. It probes only local
 candidates for initial pairing. The server independently guards legacy handshake,
 challenge initialization, and verification, returning 403 `pairing_requires_lan`
-for tailnet or unclassifiable peers. Knowing a code or starting a challenge at
+for tailnet or unclassifiable peers. A verify that omits `channel_binding` is
+refused from any peer but loopback with 403 `channel_binding_required`, without
+consuming the challenge; the legacy single-step `/handshake` answers 403
+`legacy_pairing_host_only` off the host. Knowing a code or starting a challenge at
 home does not permit completing it remotely. Code issuance remains loopback-only.
 Existing sessions and refresh tokens continue to work remotely.
 
