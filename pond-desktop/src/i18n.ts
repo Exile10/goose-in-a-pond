@@ -20,6 +20,11 @@ void i18n.use(initReactI18next).init({
     local: 'Remote access is disabled.', connecting: 'Registering this Pond with the coordinator.',
     enabled: 'Remote access is enabled. Paired phones can now request enrollment on your LAN.',
     failed: 'Remote access did not complete. Check the local server logs and pilot provisioning before retrying.',
+  }, signIn: {
+    title: 'Sign in to this Pond',
+    instructions: 'This browser has not been signed in. On the Pond, run this command and open the link it prints:',
+    restart: 'The link stops working when the Pond restarts. Run the command again for a new one.',
+    hostOnly: 'This browser is no longer signed in to the Pond, probably because it restarted. Run `pond-server dashboard` on the Pond and open the new link.',
   }, pairing: {
     unavailable: 'HTTPS pairing is unavailable. Check the Pond server logs.',
     fingerprint: 'Public-key fingerprint', address: 'HTTPS address',

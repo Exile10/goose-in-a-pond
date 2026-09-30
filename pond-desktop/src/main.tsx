@@ -1,5 +1,6 @@
 // Must stay first: applies the stored theme to <html> before React renders (no flash).
 import "./hub/state/themeBootstrap";
+import { captureSignInLink } from "./api/hostCredential";
 
 import React, { useState } from "react";
 import ReactDOM from "react-dom/client";
@@ -21,6 +22,13 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { App } from "./App";
 // One-time move of member preferences from localStorage to the server; never throws or blocks.
 import { migrateLocalProfileToServer } from "./api/migrateLocalProfile";
+
+// Before anything renders or logs the URL: moves a `#host=` credential out of the address bar.
+try {
+  captureSignInLink(window.location, window.history, window.sessionStorage);
+} catch (e) {
+  console.warn("[host] session storage is unavailable; this tab cannot be signed in", e);
+}
 
 void migrateLocalProfileToServer();
 

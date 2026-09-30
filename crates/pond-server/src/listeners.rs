@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{Extension, Router};
+use pond_api::host_guard::HostCredential;
 use pond_api::network::CompanionTransport;
 use pond_api::AppState;
 
@@ -15,7 +16,8 @@ use pond_core::security::ports::remote_access::{DevicePresence, RemoteRevocation
 
 /// The routers for every listener `serve()` binds.
 pub struct Listeners {
-    /// Plain HTTP on `127.0.0.1`: the dashboard, its API, and remote-access management.
+    /// Plain HTTP on `127.0.0.1`: the dashboard, its API, and remote-access management,
+    /// answering only loopback names and first-party pages.
     pub dashboard: Router,
     /// HTTPS on every interface: the companion API, without desktop assets.
     pub companion: Router,
@@ -29,6 +31,7 @@ pub fn compose(
     state: Arc<AppState>,
     static_dir: PathBuf,
     transport: CompanionTransport,
+    credential: HostCredential,
     #[cfg(unix)] embedded: Arc<Runtime>,
 ) -> Listeners {
     let companion =
@@ -47,7 +50,16 @@ pub fn compose(
         .layer(Extension(embedded.clone() as Arc<dyn DevicePresence>))
         .layer(Extension(embedded.clone() as Arc<dyn RemoteRevocation>))
         .layer(Extension(embedded.address.clone()))
-        .merge(embedded_network::management(embedded.clone()));
+        .merge(embedded_network::management(
+            embedded.clone(),
+            credential.clone(),
+        ));
+    // Outermost, so no route, merged router or fallback answers a rebound or cross-site request.
+    let dashboard = dashboard
+        .layer(Extension(credential))
+        .layer(axum::middleware::from_fn(
+            pond_api::host_guard::loopback_only,
+        ));
     #[cfg(unix)]
     let embedded = embedded_network::private_companion(companion.clone());
     Listeners {

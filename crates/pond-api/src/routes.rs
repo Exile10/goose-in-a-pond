@@ -788,10 +788,13 @@ async fn handshake_revoke(
     Ok(Json(json!({"revoked": true})))
 }
 
-/// Re-displays the current pairing code. Loopback-only: the host's CLI/dashboard.
+/// Re-displays the current pairing code. Loopback and the host credential: the host's
+/// CLI and dashboard.
 async fn handshake_pairing_code(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    credential: Option<axum::Extension<crate::host_guard::HostCredential>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !peer.ip().is_loopback() {
         return Err((
@@ -799,6 +802,11 @@ async fn handshake_pairing_code(
             Json(json!({"error": "pairing code is only viewable on the host"})),
         ));
     }
+    crate::host_guard::require_credential(
+        credential.as_ref().map(|axum::Extension(c)| c),
+        &headers,
+        "pairing_code_view",
+    )?;
     let code = state
         .handshake
         .current_pairing_code()
@@ -829,10 +837,13 @@ struct IssuePairingCodeRequest {
     unattributed: bool,
 }
 
-/// Issues a fresh single-use pairing code, optionally bound to a member. Loopback-only.
+/// Issues a fresh single-use pairing code, optionally bound to a member. Loopback and the
+/// host credential.
 async fn handshake_issue_pairing_code(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    credential: Option<axum::Extension<crate::host_guard::HostCredential>>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !peer.ip().is_loopback() {
@@ -841,6 +852,11 @@ async fn handshake_issue_pairing_code(
             Json(json!({"error": "pairing codes can only be issued on the host"})),
         ));
     }
+    crate::host_guard::require_credential(
+        credential.as_ref().map(|axum::Extension(c)| c),
+        &headers,
+        "pairing_code_issue",
+    )?;
     // Raw bytes, not `Json`: the CLI and dashboard POST with no body or content type. A present
     // but unreadable body is refused, not defaulted, so a mistyped binding can't silently issue.
     let request: IssuePairingCodeRequest = if body.is_empty() {

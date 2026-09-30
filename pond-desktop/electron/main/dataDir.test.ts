@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolveDataDir, readRuntimePort } from "./dataDir";
+import { resolveDataDir, readRuntimePort, readHostCredential } from "./dataDir";
 
 // Disagreeing with the server here means a missing port file and a silently stale port.
 
@@ -83,5 +83,24 @@ describe("readRuntimePort", () => {
     expect(readRuntimePort("0")).toBe(null);
     expect(readRuntimePort("65536")).toBe(null);
     expect(readRuntimePort("65535")).toBe(65_535);
+  });
+});
+
+describe("readHostCredential", () => {
+  const credential = "A".repeat(20) + "-_" + "z9".repeat(10) + "Q";
+
+  it("reads the credential the server wrote", () => {
+    expect(credential).toHaveLength(43);
+    expect(readHostCredential(credential)).toBe(credential);
+    expect(readHostCredential(`${credential}\n`)).toBe(credential);
+  });
+
+  it("rejects anything that is not one base64url credential", () => {
+    expect(readHostCredential(null)).toBe(null);
+    expect(readHostCredential("")).toBe(null);
+    expect(readHostCredential(credential.slice(1))).toBe(null);
+    expect(readHostCredential(`${credential}A`)).toBe(null);
+    expect(readHostCredential(credential.replace("-", "+"))).toBe(null);
+    expect(readHostCredential(`${credential.slice(0, 20)} ${credential.slice(21)}`)).toBe(null);
   });
 });

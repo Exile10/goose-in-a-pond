@@ -47,9 +47,17 @@ To view the dashboard from another computer, use an authenticated SSH tunnel to
 the loopback HTTP port. Preserve the existing OAuth redirect port. Such tunnels
 are administrative access, not a supported remote mobile pairing mechanism.
 
+A browser must be signed in before it can pair phones or manage remote access. On
+the Pond, run `pond-server dashboard` and open the link it prints; through a tunnel
+(`ssh -L 9000:localhost:4000 <pond>`), change only the port. The link carries the
+host credential after `#`, is good until the server restarts, and should not be
+shared. The desktop app needs no link. See
+[the loopback listener](auth-network-posture.md#the-loopback-listener-2026-09-30).
+
 ## Pairing and identity
 
-Open the local dashboard or run the `pairing` CLI command. The dashboard, CLI,
+Open the local dashboard or run `pond-server pairing`, which prints the QR in the
+terminal and works over SSH on a headless Pond. The dashboard, CLI,
 and startup output use the same payload contract:
 
 ```text

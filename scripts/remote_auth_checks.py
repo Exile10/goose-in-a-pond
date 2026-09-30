@@ -15,10 +15,11 @@ from pathlib import Path
 def run():
     data = Path(os.environ["POND_DATA_DIR"])
     port = int((data / ".runtime_api_port").read_text())
+    host_credential = (data / ".runtime_host_credential").read_text().strip()
 
-    def call(method, path, body=None, token=None, expected=200):
+    def call(method, path, body=None, token=None, expected=200, extra=None):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", **(extra or {})}
         if token:
             headers["Authorization"] = "Bearer " + token
         try:
@@ -32,13 +33,25 @@ def run():
         finally:
             conn.close()
 
+    host_only = {"X-Pond-Host-Credential": host_credential}
+
     def pair(client):
-        code = call("POST", "/handshake/pairing-code")["code"]
+        code = call("POST", "/handshake/pairing-code", extra=host_only)["code"]
         challenge = call("POST", "/handshake/init", {"client_id": client, "client_type": "gotg", "client_version": "w3-live"})
         mac = hmac.new(code.encode(), base64.b64decode(challenge["challenge"]) + client.encode(), hashlib.sha256).hexdigest()
         result = call("POST", "/handshake/verify", {"challenge_id": challenge["challenge_id"], "mac": mac, "device_name": client})
         assert result["accepted"] is True
         return result
+
+    # Loopback alone does not mint a code: the host credential, a loopback name and a
+    # first-party origin are each required.
+    call("POST", "/handshake/pairing-code", expected=403)
+    call("POST", "/handshake/pairing-code", expected=403, extra={"X-Pond-Host-Credential": "A" * 43})
+    call("GET", "/remote-access", expected=403)
+    call("POST", "/handshake/pairing-code", expected=421, extra={**host_only, "Host": "attacker.example:%d" % port})
+    call("POST", "/handshake/pairing-code", expected=403, extra={**host_only, "Origin": "http://attacker.example"})
+    call("GET", "/remote-access", extra=host_only)
+    print("PASS  host-only routes need the host credential, a loopback Host and a first-party Origin")
 
     a, b = pair("w3-live-a"), pair("w3-live-b")
     for method, path in [("POST", "/transcribe"), ("GET", "/dev/goose"), ("POST", "/handshake/revoke")]:
