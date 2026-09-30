@@ -11446,6 +11446,7 @@ dependencies = [
  "pond-adapters-local-inference",
  "pond-adapters-ollama",
  "pond-adapters-weather",
+ "pond-api",
  "pond-apple-token",
  "pond-core",
  "pond-hf-cache",

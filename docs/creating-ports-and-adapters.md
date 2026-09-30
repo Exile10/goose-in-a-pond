@@ -287,11 +287,22 @@ let state = Arc::new(AppState {
 });
 ```
 
+If handlers reach the port as an axum `Extension` rather than through `AppState`, attach it
+in `listeners::compose()` (`crates/pond-server/src/listeners.rs`) on the listener that
+should serve it, not in `serve()`, and add an assertion to
+`crates/pond-server/tests/listener_wiring.rs` that the other listeners do not. Which
+listener carries an extension is a security decision: device presence attached to the
+loopback dashboard meant no phone's remote access ever lapsed.
+
 ---
 
 ## Workspace Note for Goose-dependent Crates
 
-If your adapter imports from `goose::*`, it must be listed in `workspace.exclude` in the root `Cargo.toml` and use `default-features = false` on the `goose` dependency. See `AGENTS.md` for the full explanation of the `rmcp` version conflict.
+If your adapter imports from `goose::*`, use `default-features = false` on the `goose`
+dependency and never enable `code-mode`. The crate is a normal workspace member (there is
+no `workspace.exclude`), but it must stay out of the fast-crate lists in
+`.github/workflows/ci.yml`, which exist to prove the core builds without Goose. See
+`AGENTS.md` for the `rmcp` version pin.
 
 ---
 
