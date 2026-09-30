@@ -106,6 +106,8 @@ pub struct Runtime {
     /// Serialises helper calls about one device, so enrolling and revoking it cannot
     /// interleave, without making every other device wait for a slow coordinator.
     device_locks: std::sync::Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    /// When each device's sighting was last written, to throttle presence writes.
+    sightings_written: std::sync::Mutex<BTreeMap<String, std::time::Instant>>,
     recovery: recovery::Queue,
     /// Address published by system information and pairing QR producers.
     pub address: EmbeddedAddress,
@@ -164,6 +166,7 @@ impl Runtime {
                 generation: AtomicU64::new(0),
                 files: std::sync::Mutex::new(()),
                 device_locks: std::sync::Mutex::new(BTreeMap::new()),
+                sightings_written: std::sync::Mutex::new(BTreeMap::new()),
                 recovery: recovery::Queue::default(),
                 address: EmbeddedAddress::default(),
                 changed: tokio::sync::Notify::new(),
@@ -732,35 +735,74 @@ fn valid_device(id: &str) -> bool {
 }
 
 /// When each device was last seen at home; kept with the remote-access files, not in `devices`.
+/// Keyed by network-hashed id, like the queue and the enrollment record.
 const PRESENCE_FILE: &str = "presence.json";
+/// Bounds on the presence file; a household has far fewer devices.
+const PRESENCE_MAX_BYTES: u64 = 256 * 1024;
+const PRESENCE_MAX_DEVICES: usize = 1024;
+/// A sighting is written at most this often per device: every authenticated request is one.
+const PRESENCE_WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 impl Runtime {
+    /// Sightings by network id. A corrupt file must not stop devices lapsing, which is how it
+    /// failed open before: it is moved aside, and every enrolled phone is treated as last seen
+    /// when the file was last written, so each still lapses within the window.
     fn presence(&self) -> Result<BTreeMap<String, String>> {
         let path = self.directory.join(PRESENCE_FILE);
-        match std::fs::read(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-            Err(error) => Err(error.into()),
-            Ok(bytes) => {
-                ensure!(bytes.len() <= 1 << 20, "implausible presence record");
-                Ok(serde_json::from_slice(&bytes)?)
+        match revocation::read_private_json::<BTreeMap<String, String>>(&path, PRESENCE_MAX_BYTES) {
+            Ok(None) => Ok(BTreeMap::new()),
+            Ok(Some(seen)) if seen.len() <= PRESENCE_MAX_DEVICES => Ok(seen
+                .into_iter()
+                .map(|(device, at)| {
+                    // Written before sightings were hashed.
+                    let device = if valid_device(&device) && device.len() == 64 {
+                        device
+                    } else {
+                        network_device(&device).unwrap_or(device)
+                    };
+                    (device, at)
+                })
+                .collect()),
+            outcome => {
+                let reason = match outcome {
+                    Err(error) => format!("{error:#}"),
+                    _ => "too many devices".to_owned(),
+                };
+                let written = std::fs::symlink_metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(DateTime::<Utc>::from)
+                    .unwrap_or_else(|_| Utc::now());
+                let aside = self.directory.join(format!(
+                    "{PRESENCE_FILE}.corrupt-{}",
+                    Utc::now().timestamp()
+                ));
+                std::fs::rename(&path, &aside)?;
+                let seen: BTreeMap<String, String> = revocation::load_enrolled(&self.directory)?
+                    .devices
+                    .into_iter()
+                    .map(|device| (device, written.to_rfc3339()))
+                    .collect();
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "presence_record_replaced",
+                    %reason,
+                    aside = %aside.display(),
+                    devices = seen.len(),
+                    "the presence record was unreadable; enrolled phones now lapse from its last write"
+                );
+                self.save_presence(&seen)?;
+                Ok(seen)
             }
         }
     }
 
     fn save_presence(&self, seen: &BTreeMap<String, String>) -> Result<()> {
-        let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
-        serde_json::to_writer(&mut file, seen)?;
-        file.as_file().sync_all()?;
-        file.persist(self.directory.join(PRESENCE_FILE))?;
-        std::fs::File::open(&self.directory)?.sync_all()?;
-        Ok(())
+        revocation::write_private_json(&self.directory, PRESENCE_FILE, seen)
     }
 
     /// Queue revocation for every device not home within the window; the retry loop sends them.
     async fn sweep_absent_devices(&self) -> Result<()> {
-        use pond_core::security::ports::remote_access::{
-            DevicePresence, RemoteRevocation, LAN_PRESENCE_WINDOW_DAYS,
-        };
+        use pond_core::security::ports::remote_access::{DevicePresence, LAN_PRESENCE_WINDOW_DAYS};
         // A local-only household must not contact coordination.
         if self.config()?.enrollment_url.is_empty() {
             return Ok(());
@@ -776,11 +818,8 @@ impl Runtime {
                  the window, so its remote access is being revoked. Local pairing is untouched, \
                  and bringing it home restores it."
             );
-            self.queue(&device).await?;
-            // Forget the sighting, or every sweep re-queues this revocation.
-            let mut seen = self.presence()?;
-            seen.remove(&device);
-            self.save_presence(&seen)?;
+            // Also forgets the sighting, or every sweep would re-queue this revocation.
+            self.queue_network(&device)?;
         }
         Ok(())
     }
@@ -789,18 +828,38 @@ impl Runtime {
 #[async_trait::async_trait]
 impl pond_core::security::ports::remote_access::DevicePresence for Runtime {
     async fn seen_on_lan(&self, device_id: &str) {
-        // Keyed by the pond's own id, unhashed: `queue` hashes it when revoking.
-        if device_id.is_empty() || device_id.len() > 256 {
+        let Ok(device) = network_device(device_id) else {
             return;
+        };
+        {
+            let mut written = self
+                .sightings_written
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if written
+                .get(&device)
+                .is_some_and(|at| at.elapsed() < PRESENCE_WRITE_INTERVAL)
+            {
+                return;
+            }
+            written.insert(device.clone(), std::time::Instant::now());
         }
         let write = || -> Result<()> {
+            let _files = self.files.lock().unwrap_or_else(|p| p.into_inner());
             let mut seen = self.presence()?;
-            seen.insert(device_id.to_string(), Utc::now().to_rfc3339());
+            if !seen.contains_key(&device) && seen.len() >= PRESENCE_MAX_DEVICES {
+                bail!("the presence record is full");
+            }
+            seen.insert(device.clone(), Utc::now().to_rfc3339());
             self.save_presence(&seen)
         };
         if let Err(error) = write() {
             // Never fails the request; a lost sighting only brings the device's reminder forward.
-            tracing::warn!(%error, device = %device_id, "could not record a LAN sighting");
+            self.sightings_written
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&device);
+            tracing::warn!(%error, %device, "could not record a LAN sighting");
         }
     }
 
@@ -820,7 +879,8 @@ impl pond_core::security::ports::remote_access::DevicePresence for Runtime {
 
     async fn lapses_at(&self, device_id: &str) -> Result<Option<DateTime<Utc>>> {
         use pond_core::security::ports::remote_access::LAN_PRESENCE_WINDOW_DAYS;
-        Ok(self.presence()?.get(device_id).and_then(|seen| {
+        let device = network_device(device_id)?;
+        Ok(self.presence()?.get(&device).and_then(|seen| {
             DateTime::parse_from_rfc3339(seen)
                 .ok()
                 .map(|at| at.with_timezone(&Utc) + chrono::Duration::days(LAN_PRESENCE_WINDOW_DAYS))
@@ -831,13 +891,24 @@ impl pond_core::security::ports::remote_access::DevicePresence for Runtime {
 #[async_trait::async_trait]
 impl pond_core::security::ports::remote_access::RemoteRevocation for Runtime {
     async fn queue(&self, device_id: &str) -> Result<()> {
+        self.queue_network(&network_device(device_id)?)
+    }
+}
+
+impl Runtime {
+    /// Queue the revocation of a network-hashed device, and forget its sightings.
+    fn queue_network(&self, device: &str) -> Result<()> {
         // A local-only household has never registered a node and must not contact coordination.
         if self.config()?.enrollment_url.is_empty() {
             return Ok(());
         }
-        let device = network_device(device_id)?;
+        let device = device.to_owned();
         self.recovery.revoke(&device);
         let _files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        let mut seen = self.presence()?;
+        if seen.remove(&device).is_some() {
+            self.save_presence(&seen)?;
+        }
         let verify = match revocation::plan(&revocation::load_enrolled(&self.directory)?, &device) {
             revocation::Plan::Revoke => false,
             revocation::Plan::VerifyThenRevoke => true,
@@ -1192,13 +1263,15 @@ pub fn companion_management(runtime: Arc<Runtime>, state: Arc<pond_api::AppState
         )
         .merge(recovery::phone_routes(state.handshake.clone()))
         .with_state(runtime)
-        .layer(axum::extract::DefaultBodyLimit::max(4096))
-        .layer(axum::Extension(state.handshake.clone()))
-        .layer(middleware::from_fn_with_state(
+        // route_layer, not layer: merged into the companion, a layer would also wrap its
+        // fallback, charging every unknown path to this 20-a-minute budget.
+        .route_layer(axum::extract::DefaultBodyLimit::max(4096))
+        .route_layer(axum::Extension(state.handshake.clone()))
+        .route_layer(middleware::from_fn_with_state(
             state,
             pond_api::middleware::auth_middleware,
         ))
-        .layer(middleware::from_fn(move |request: Request, next: Next| {
+        .route_layer(middleware::from_fn(move |request: Request, next: Next| {
             let limiter = limiter.clone();
             async move {
                 let peer = request
@@ -1330,8 +1403,8 @@ mod tests {
             1,
             "exactly the absent device, not the household"
         );
-        // The queue holds the coordinator's (hashed) id; presence holds the pond's own.
-        assert!(queued.contains_key(&network_device(&key).unwrap()));
+        // Presence and the queue are both keyed by the coordinator's (hashed) id.
+        assert!(queued.contains_key(&key));
 
         assert!(!runtime.presence().unwrap().contains_key(&key));
         runtime.sweep_absent_devices().await.unwrap();
@@ -1691,5 +1764,69 @@ mod tests {
         assert!(runtime.ensure_not_revoked_meanwhile(&device).is_ok());
         runtime.queue("phone000000000001").await.unwrap();
         assert!(runtime.ensure_not_revoked_meanwhile(&device).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_presence_record_still_lets_enrolled_phones_lapse() {
+        use pond_core::security::ports::remote_access::LAN_PRESENCE_WINDOW_DAYS;
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        enrolled(&runtime, true, &["phone000000000001"]);
+        let path = runtime.directory.join(PRESENCE_FILE);
+        std::fs::write(&path, b"{not json").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let written = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(60 * 60 * 24 * (LAN_PRESENCE_WINDOW_DAYS as u64 + 1));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+
+        runtime.sweep_absent_devices().await.unwrap();
+        let queued = runtime.pending_revocations().unwrap();
+        assert!(queued.contains_key(&network_device("phone000000000001").unwrap()));
+        let aside = std::fs::read_dir(&runtime.directory)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("presence.json.corrupt-")
+            });
+        assert!(aside, "the unreadable record was not kept for inspection");
+    }
+
+    #[tokio::test]
+    async fn sightings_are_written_at_most_hourly_and_read_from_older_keys() {
+        use pond_core::security::ports::remote_access::DevicePresence;
+        let data = tempfile::tempdir().unwrap();
+        let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
+        // A record from before sightings were hashed.
+        let old = (Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+        runtime
+            .save_presence(&BTreeMap::from([(
+                "phone000000000001".to_owned(),
+                old.clone(),
+            )]))
+            .unwrap();
+        assert!(runtime
+            .lapses_at("phone000000000001")
+            .await
+            .unwrap()
+            .is_some());
+
+        runtime.seen_on_lan("phone000000000001").await;
+        let first = runtime.presence().unwrap();
+        let device = network_device("phone000000000001").unwrap();
+        assert_ne!(first[&device], old);
+        // Put the old sighting back; within the hour a second request must not rewrite it.
+        runtime
+            .save_presence(&BTreeMap::from([(device.clone(), old.clone())]))
+            .unwrap();
+        runtime.seen_on_lan("phone000000000001").await;
+        assert_eq!(runtime.presence().unwrap()[&device], old);
     }
 }

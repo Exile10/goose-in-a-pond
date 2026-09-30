@@ -48,6 +48,8 @@ const TOKEN: &str = "wiring-test-token";
 
 struct Harness {
     listeners: Listeners,
+    #[cfg(unix)]
+    presence: std::sync::Arc<dyn pond_core::security::ports::remote_access::DevicePresence>,
     _dir: tempfile::TempDir,
 }
 
@@ -60,6 +62,8 @@ async fn harness() -> Harness {
     #[cfg(unix)]
     let (embedded, _socket) =
         pond_server::embedded_network::Runtime::new(test.dir.path(), 4000).unwrap();
+    #[cfg(unix)]
+    let presence = embedded.clone();
     let listeners = compose(
         std::sync::Arc::new(pond_api::AppState {
             handshake: std::sync::Arc::new(PairedPhone),
@@ -72,6 +76,8 @@ async fn harness() -> Harness {
     );
     Harness {
         listeners,
+        #[cfg(unix)]
+        presence,
         _dir: test.dir,
     }
 }
@@ -182,4 +188,49 @@ async fn the_embedded_socket_admits_only_forwarded_tailnet_peers() {
         StatusCode::NOT_FOUND,
         "management reached the tailnet"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn only_an_https_request_from_home_renews_remote_access() {
+    // An authenticated route: public ones skip the middleware that records a sighting.
+    let tailnet = harness().await;
+    let (status, _) = send(
+        tailnet.listeners.embedded.clone(),
+        Request::get("/api/v1/devices")
+            .header("x-pond-embedded-peer", "100.64.0.9:1234")
+            .header("Authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        tailnet.presence.lapses_at("phone").await.unwrap().is_none(),
+        "a tailnet request counted as being at home"
+    );
+
+    let dashboard = harness().await;
+    let (status, _) = get(&dashboard.listeners.dashboard, LOOPBACK, "/api/v1/devices").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        dashboard
+            .presence
+            .lapses_at("phone")
+            .await
+            .unwrap()
+            .is_none(),
+        "the desktop dashboard recorded a phone sighting"
+    );
+
+    // A directly attached peer; loopback stands in for the LAN, which this host may not have.
+    let companion = harness().await;
+    let (status, _) = get(&companion.listeners.companion, LOOPBACK, "/api/v1/devices").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(companion
+        .presence
+        .lapses_at("phone")
+        .await
+        .unwrap()
+        .is_some());
 }
