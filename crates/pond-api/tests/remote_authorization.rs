@@ -442,3 +442,55 @@ async fn revocation_waits_for_durable_queue_and_uses_authenticated_device() {
         Some("phone000000000001")
     );
 }
+
+#[tokio::test]
+async fn removing_a_device_queues_its_remote_revocation_first() {
+    use pond_core::security::ports::remote_access::RemoteRevocation;
+    struct Queue {
+        failed: std::sync::atomic::AtomicBool,
+        devices: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl RemoteRevocation for Queue {
+        async fn queue(&self, id: &str) -> anyhow::Result<()> {
+            if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("storage unavailable");
+            }
+            self.devices.lock().unwrap().push(id.to_owned());
+            Ok(())
+        }
+    }
+    let h = make_app().await;
+    let admin = pair(&h, "desktop0000000001").await;
+    let admin = admin.session_token.as_deref().unwrap();
+    let phone = pair(&h, "phone000000000001").await;
+    let phone = phone.session_token.as_deref().unwrap();
+    let queue = Arc::new(Queue {
+        failed: true.into(),
+        devices: Default::default(),
+    });
+    let router = h
+        .loopback
+        .clone()
+        .layer(axum::Extension(queue.clone() as Arc<dyn RemoteRevocation>));
+    let remove = || {
+        send(
+            &router,
+            Method::DELETE,
+            "/api/v1/devices/phone000000000001",
+            Some(admin),
+            json!({}),
+        )
+    };
+
+    // Without a durable revocation, the phone keeps its tokens and its row.
+    assert_eq!(remove().await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(h.handshake.validate_token(phone).await.unwrap());
+
+    queue
+        .failed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(remove().await.status().is_success());
+    assert!(!h.handshake.validate_token(phone).await.unwrap());
+    assert_eq!(*queue.devices.lock().unwrap(), ["phone000000000001"]);
+}

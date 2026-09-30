@@ -166,14 +166,17 @@ answers `409` for a decision and `503` for an outage, and the app can tell a
 household whose phone is already enrolled from one whose coordinator is
 unreachable. Every layer carries the cause it was given: the Pond captures the
 helper's stderr, the helper prints `Submit`'s error, and `Submit` carries the
-coordinator's status and its error identifier.
+coordinator's status and its error identifier. On exit 3 the helper also prints
+`{"refused": "<identifier>"}` on stdout, the coordinator's own reason, so the Pond
+can act on which refusal it was. The revocation queue drops an entry refused with
+`enrollment_missing`, since there is nothing to revoke.
 
 ### Disabling and signing out
 
 Disabling remote access stops local networking and preserves the pairing. Logout
 waits for acknowledged Pond revocation before clearing credentials, and also
 removes the device from the registry so it does not linger as one that is merely
-offline. The Pond queues
+offline. Removing the phone in the dashboard does the same. The Pond queues
 network revocation durably and retries while coordination is unavailable; application
 session and refresh credentials are revoked together. Corrupt identity files cause
 visible failure. Restore the private identity backup rather than deleting it to

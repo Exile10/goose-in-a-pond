@@ -4467,6 +4467,7 @@ async fn run_server(
             std::future::pending::<Result<()>>().await
         }
     };
+    // Never completes: its faults are logged and retried rather than ending the server.
     let revocations = async {
         #[cfg(unix)]
         {
@@ -4474,11 +4475,11 @@ async fn run_server(
         }
         #[cfg(not(unix))]
         {
-            std::future::pending::<Result<()>>().await
+            std::future::pending::<std::convert::Infallible>().await
         }
     };
     let serve_result = tokio::select! {
-        result = revocations => result,
+        never = revocations => match never {},
         result = embedded_server => result,
         result = axum::serve(listener, listeners.dashboard.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result.map_err(anyhow::Error::from),
         result = https_server => result.map_err(anyhow::Error::from),
