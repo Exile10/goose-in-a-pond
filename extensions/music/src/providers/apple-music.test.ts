@@ -134,7 +134,6 @@ test('something that is not an Apple Music link is refused plainly', async () =>
 test('there is no queue to add to', async () => {
   const { provider } = setup();
   await assert.rejects(provider.addToQueue(), UnsupportedError);
-  await assert.rejects(provider.queueFollowUps(), UnsupportedError);
 });
 
 test('top artists add up plays across their tracks', async () => {

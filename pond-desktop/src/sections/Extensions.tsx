@@ -276,12 +276,18 @@ function OAuthBlock({
 }
 
 /**
- * Extensions whose service signs in on the music player page (which opens in the browser), not
- * through OAuth here: the service and what to call it. Only Apple Music today; Spotify signs in with
- * OAuth like any other.
+ * Extensions whose services play on the music player page (which opens in the browser): the service,
+ * what to call it, and what is done on the page. Apple Music signs in there; Spotify signs in with
+ * OAuth above and is armed there with Play here.
  */
-const PLAYER_SIGN_INS: Record<string, Array<{ service: string; label: string }>> = {
-  music: [{ service: "apple", label: "Apple Music" }],
+const PLAYER_SIGN_INS: Record<
+  string,
+  Array<{ service: string; label: string; kind: "sign_in" | "play_here" }>
+> = {
+  music: [
+    { service: "apple", label: "Apple Music", kind: "sign_in" },
+    { service: "spotify", label: "Spotify", kind: "play_here" },
+  ],
 };
 
 export function SecretConfigModal({
@@ -472,7 +478,13 @@ export function SecretConfigModal({
                 </div>
               ))}
               {playerSignIns.map((p) => (
-                <PlayerSignIn key={p.service} service={p.service} label={p.label} disabled={saving} />
+                <PlayerSignIn
+                  key={p.service}
+                  service={p.service}
+                  label={p.label}
+                  kind={p.kind}
+                  disabled={saving}
+                />
               ))}
             </>
           )}

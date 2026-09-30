@@ -12,23 +12,32 @@ const host = (reply: () => Response | Error): Fetch =>
     return out;
   }) as unknown as Fetch;
 
-test('Spotify is chosen when the user is signed in to it', async () => {
-  const p = await createProvider({ SPOTIFY_ACCESS_TOKEN: 't' }, 'darwin', host(() => new Error('not asked')));
-  assert.equal(p.id, 'spotify');
+test('a Spotify sign-in does not bring Spotify to the assistant: a Mac still gets Apple Music', async () => {
+  const p = await createProvider(
+    { SPOTIFY_ACCESS_TOKEN: 't', MUSIC_SERVICE: 'spotify', GIAP_INTERNAL_TOKEN: 'x' },
+    'darwin',
+    host(() => json({ apple: { attached: false, configured: false } })),
+  );
+  assert.equal(p?.id, 'apple');
 });
 
-test('Apple Music plays through the in-app player once a key is set up', async () => {
+test('off a Mac there is no provider, and the host is not even asked', async () => {
+  const p = await createProvider({ SPOTIFY_ACCESS_TOKEN: 't' }, 'linux', host(() => new Error('not asked')));
+  assert.equal(p, null);
+});
+
+test('Apple Music plays through the music player page once a key is set up', async () => {
   const p = await createProvider({ GIAP_INTERNAL_TOKEN: 'x' }, 'darwin', host(() => json({ apple: { attached: true, configured: true } })));
-  assert.equal(p.id, 'apple');
-  assert.deepEqual(p.capabilities, { devices: false, queue: true, timeRange: false });
+  assert.equal(p?.id, 'apple');
+  assert.deepEqual(p?.capabilities, { devices: false, queue: true, timeRange: false });
 });
 
 test('with no key, Apple Music plays through the Music app', async () => {
   const p = await createProvider({ GIAP_INTERNAL_TOKEN: 'x' }, 'darwin', host(() => json({ apple: { attached: false, configured: false } })));
-  assert.deepEqual(p.capabilities, { devices: true, queue: false, timeRange: false });
+  assert.deepEqual(p?.capabilities, { devices: true, queue: false, timeRange: false });
 });
 
 test('with the host unreachable, Apple Music plays through the Music app', async () => {
   const p = await createProvider({}, 'darwin', host(() => new TypeError('connection refused')));
-  assert.deepEqual(p.capabilities, { devices: true, queue: false, timeRange: false });
+  assert.deepEqual(p?.capabilities, { devices: true, queue: false, timeRange: false });
 });

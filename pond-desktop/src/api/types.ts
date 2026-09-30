@@ -43,6 +43,10 @@ export interface NowPlayingApiResponse {
   upstream_status?: number;
   /** Human-readable explanation for `error`, safe to show as-is. */
   message?: string;
+  /** The item's page on Spotify, which the design guidelines ask to link back to. */
+  link?: string | null;
+  /** What Spotify allows right now (its `actions.disallows`, inverted). */
+  can?: { pause: boolean; resume: boolean; next: boolean; previous: boolean };
 }
 
 export type MusicControlAction = "play" | "pause" | "next" | "previous";

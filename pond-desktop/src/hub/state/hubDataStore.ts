@@ -453,6 +453,8 @@ function nowPlayingFromApi(np: NowPlayingApiResponse | null): NowPlayingData {
     // the snapshot has always sent. Null, not 0, when Spotify did not send them.
     progressMs: typeof np.progress_ms === "number" ? np.progress_ms : null,
     durationMs: typeof np.duration_ms === "number" ? np.duration_ms : null,
+    link: np.link ?? null,
+    ...(np.can ? { can: np.can } : {}),
   };
 }
 

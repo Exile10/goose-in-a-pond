@@ -11,6 +11,7 @@ export type PlayerView =
   | { kind: "closed"; note: string }
   | { kind: "unavailable"; note: string }
   | { kind: "needs_sign_in"; note: string }
+  | { kind: "needs_click"; note: string }
   | { kind: "signed_in" };
 
 /**
@@ -36,6 +37,12 @@ export function playerView(input: {
     return {
       kind: "unavailable",
       note: state.message ?? `${label} is not set up on this pond yet.`,
+    };
+  }
+  if (state.need === "interaction") {
+    return {
+      kind: "needs_click",
+      note: state.message ?? `Press Play ${label} here on the music player page.`,
     };
   }
   return {

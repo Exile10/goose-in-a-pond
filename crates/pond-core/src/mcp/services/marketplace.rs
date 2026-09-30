@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn music_keeps_its_own_key_fields_and_the_service_picker_under_developer_settings() {
+    async fn music_keeps_its_own_key_fields_under_developer_settings() {
         let music = BundledMarketplace::new()
             .get_by_id("music")
             .await
@@ -225,8 +225,7 @@ mod tests {
             [
                 "APPLE_MUSIC_KEY_ID",
                 "APPLE_MUSIC_PRIVATE_KEY",
-                "APPLE_MUSIC_TEAM_ID",
-                "MUSIC_SERVICE"
+                "APPLE_MUSIC_TEAM_ID"
             ],
             "the ordinary path is a sign-in button; everything else is for a developer"
         );
@@ -236,6 +235,10 @@ mod tests {
             .find(|s| s.key == "SPOTIFY_ACCESS_TOKEN")
             .expect("the Spotify sign-in");
         assert!(!spotify.advanced, "signing in is the ordinary path");
+        assert!(
+            music.required_secrets.iter().all(|s| s.key != "MUSIC_SERVICE"),
+            "there is no service to pick: the assistant plays Apple Music only"
+        );
     }
 
     #[test]
@@ -281,9 +284,12 @@ mod tests {
                 "the host signs developer tokens, so {key} stays out of the child env"
             );
         }
-        for key in ["SPOTIFY_ACCESS_TOKEN", "MUSIC_SERVICE"] {
-            assert!(env.contains(&key), "{key} must reach the extension");
-        }
+        // Spotify's developer rules forbid voice and AI control of Spotify, so the extension, which
+        // is the assistant's, never holds the token; the pond keeps it for the app's own controls.
+        assert!(
+            !env.contains(&"SPOTIFY_ACCESS_TOKEN"),
+            "the Spotify token stays with the pond"
+        );
     }
 
     #[test]

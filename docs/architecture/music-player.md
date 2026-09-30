@@ -18,11 +18,11 @@ A service plugs in one of two ways, decided by where its control plane is:
 | Style | Service | The page is | The extension |
 |---|---|---|---|
 | **Controller** | Apple Music (MusicKit is JavaScript-only) | Everything: search, queue, library, playback | `WebPlayerProvider`, over the bridge |
-| **Speaker** | Spotify (a REST Web API drives playback) | One Connect device, named "Goose In A Pond" | The existing `SpotifyProvider`, which plays *to* that device when no other is active |
+| **Speaker** | Spotify (a REST Web API drives playback) | One Connect device, named "Goose In A Pond", started and controlled by hand | Nothing: the assistant never controls Spotify. The app's music controls use Spotify's Web API through the pond |
 
 Status, 2026-09-30: Apple Music is built to its documentation and ran in a browser tab against a
 scratch pond, up to Apple's sign-in window (which opened). **Signing in and full playback have not
-been run**: they need a person's Apple Account. Spotify is on hold; see "Spotify: on hold".
+been run**: they need a person's Apple Account. Spotify is played by hand only; see "Spotify, by hand".
 
 ## Parts
 
@@ -32,10 +32,11 @@ been run**: they need a person's Apple Account. Spotify is on hold; see "Spotify
 | Host bridge | `crates/pond-api/src/player.rs` | Holds who is attached and what is in flight; relays a command to the page and waits for its reply. One page per service: a newer one replaces the older. |
 | Network check | `POST /api/v1/player/egress-policy` | The page asks, before it loads a service's script, whether the network setting allows it. The pond logs a yes as the player's request. |
 | Developer token | `crates/pond-api/src/musickit.rs` | Signs Apple developer tokens (ES256) from the stored key, or fetches one from Jarida's credentials service, so the key stays out of every page and extension. |
-| User token | `GET /api/v1/player/user-token` (`player.rs`) | Hands the paired page the person's Spotify access token, for Spotify's SDK. |
+| User token | `GET /api/v1/player/user-token` (`player.rs`) | Hands the paired page the person's Spotify access token, for Spotify's SDK. The token is `host_only`: the pond keeps it, and the Music extension never gets it. |
+| Music controls | `pond-desktop/src/hub/primitives/NowPlaying.tsx`; `GET /api/v1/music/now-playing`, `POST /api/v1/music/control` | The app's own Spotify control, by hand: what is playing, drawn to Spotify's design guidelines, and play or pause through the Web API. |
 | Music player row | `pond-desktop/src/sections/PlayerSignIn.tsx`, `signInView.ts` | In the Music extension's settings: **Open the music player** opens the page in the default browser (the shell's `open_external`), and the row says what the page last reported. |
-| Spotify speaker | `pond-desktop/src/player/adapters/spotifyWebPlayback.ts` | Registers the page as a Spotify Connect device, reports what is playing, and does transport. Not started by the app today (see "Spotify: on hold"). |
-| Extension | `extensions/music/src/providers/web-player.ts` | `WebPlayerProvider`: the extension's `MusicProvider` over the bridge, with the Music app as its fallback. |
+| Spotify page | `pond-desktop/src/player/adapters/spotifyWebPlayback.ts` | Registers the page as a Spotify Connect device, armed by a click, and plays and pauses by hand. Opened with `?service=spotify` from the settings row or the music controls. |
+| Extension | `extensions/music/src/providers/web-player.ts` | `WebPlayerProvider`: the extension's `MusicProvider` over the bridge, with the Music app as its fallback. Apple Music only. |
 
 ## Apple Music, by the documentation
 
@@ -115,29 +116,31 @@ signing in needs a click on the page. Transport ops (`pause`, `next`, `volume`..
 - **Managed credentials.** A household with no key of its own uses `pondcredentials`
   (`docs/architecture/pondcredentials.md`); a stored local key always wins, and
   `POND_CREDENTIALS_URL=off` or `network_mode = offline` stops it.
-- **Spotify's user token would go to the page** for Spotify's SDK, as before; not exercised while
-  Spotify is on hold.
+- **Spotify's user token goes to the Spotify page**, since the SDK signs in as the person, and to
+  nothing else: it is `host_only`, so the Music extension (the assistant's) never holds it. The page
+  uses it for the SDK and for one Web API call, Transfer Playback, from its own Play here button.
 
-## Spotify: on hold
+## Spotify, by hand
 
-The adapter and the extension's Spotify path still exist and are unchanged. The app opens the page for
-Apple Music only (`?service=apple`); `/player.html` with no service, or `?service=spotify`, still starts
-Spotify's SDK. It is held because Spotify's own rules forbid what GIAP does with it. Read from the
+Jarida's decision (2026-09-30, option B): Spotify plays in its own page, built to the Web Playback SDK
+documentation, and is controlled by hand, never by the assistant. Spotify's
 [Developer Policy](https://developer.spotify.com/policy) and [Developer Terms](https://developer.spotify.com/terms)
-(version 10, both effective 15 May 2025):
+(version 10, both effective 15 May 2025), against what is built:
 
-| Rule | Says | Effect on GIAP |
+| Rule | Says | What GIAP does |
 |---|---|---|
-| Policy III.3 | Do not create a voice-enabled app that lets users control Spotify by voice | The assistant may not play Spotify from voice at all; there is no exception clause |
-| Terms IV.2.a.i, Policy III.14 | No training an AI model on Spotify Content or otherwise ingesting it into one; Spotify Content includes metadata and user data | The model may not see track names, search results or playlists; today the music tool hands them to it |
-| Policy III.5 | No product integrated with streams or content from another service | Offering Apple Music in the same product is unclear at best |
-| Policy III.7 | No mixing or overlapping Spotify audio with other audio | Spoken replies would have to pause the music |
-| Policy II.4, II.5 | Attribute with Spotify's marks, link back, and show cover art and metadata during playback | A visible now-playing view with Spotify's logo |
-| Terms VI.1; quota modes | The client ID is a Security Code kept from third parties; development mode is 5 allowlisted users, and extended quota is for organisations with 250k monthly users | One bundled client ID for every household cannot work; each would register its own app |
-| Web Playback SDK | Supported: Chrome, Firefox, Safari, Edge; `activateElement()` from a click in autoplay-restricted browsers | A visible tab, armed with a click |
+| Policy III.3 | Do not create a voice-enabled app that lets users control Spotify by voice | The assistant has no Spotify tool at all, in chat or voice: the Music extension is Apple Music only and tells the model why |
+| Terms IV.2.a.i, Policy III.14 | No training an AI model on Spotify Content or otherwise ingesting it into one | No Spotify search result, track or playlist reaches the model; the token never reaches the extension (`host_only`) |
+| Terms V.3 | Ask only for the data and scopes you need | Six scopes, down from twelve: the SDK's three, and reading and changing playback |
+| Web Playback SDK | `onSpotifyWebPlaybackSDKReady` before the script; `Spotify.Player({name, getOAuthToken})`; every documented event; `connect()`; `activateElement()` from a click; `autoplay_failed` asks for it again | Exactly that. The page's **Play Spotify here** button calls `activateElement()` in the click, then the Web API's Transfer Playback to this device with `play: true` |
+| Reference, `playback_error` | Loading or playing a track failed; no remedy given | The words are shown; nothing else is done (the earlier pause-on-error is gone) |
+| Policy II.4, II.5; design guidelines | Attribute with Spotify's logo, link back, show cover art and metadata during playback; artwork uncropped with no overlay, 4 px corners; play and pause as the only control | The page and the music controls show the artwork as an image, the metadata as sent, **LISTEN ON SPOTIFY** linking to the track, play or pause only, and nothing Spotify's `disallows` forbids right now |
+| Policy III.7 | No mixing or overlapping Spotify audio with other audio | **Not yet handled**: a spoken reply while Spotify plays would overlap it |
+| Policy III.5 | No product integrated with streams or content from another service | Accepted by Jarida with Apple Music in the same app; the two never share a queue, a view or a player |
+| Terms VI.1; quota modes | The client ID is a Security Code kept from third parties; development mode is 5 allowlisted users | **Open**: the bundled client ID is still in the source (`oauth_providers.rs`); removing it means each household registers its own Spotify app |
+| Design guidelines, logo | Spotify's official logo, unaltered, beside Spotify content | **Open**: the logo files are not in the repo yet (`src/player/brand.ts`), so the word Spotify stands in |
 
-The only voice route Spotify offers is its Commercial Hardware programme, for organisations. Which
-way to go (drop Spotify, or a hand-controlled Spotify page with no assistant) is Jarida's decision.
+The only voice route Spotify offers is its Commercial Hardware programme, for organisations.
 
 ## What was measured
 
@@ -161,12 +164,15 @@ way to go (drop Spotify, or a hand-controlled Spotify page with no assistant) is
 
 ## The Electron build
 
-The app still depends on castlabs' Electron (`v44.1.0+wvcus`), which was only there for the in-app
-player; nothing needs it now. Going back to stock Electron (`^44.4.2`, and dropping the
-`postinstall`, `scripts/install-electron.mjs`, the two `electron-builder.yml` keys and the Widevine
-check and pin scripts) is the next clean-up, and needs `npm install` with the app closed. A profile
-pinned with `npm run widevine:pin` should be unpinned first (`npm run widevine:unpin`), since it holds a
-copy of Chrome's module that must not be kept or shipped.
+Stock Electron (`^44.4.2`) again, 2026-09-30. castlabs' Electron was only there for the old in-app
+player, and nothing needs DRM in the app now: the player pages run in the person's browser, which brings
+its own. Its `postinstall`, `scripts/install-electron.mjs`, the two `electron-builder.yml` keys, and the
+Widevine check and pin scripts are gone; the lockfile entry is the one from before the swap. After
+pulling, `npm install` in `pond-desktop` with the app closed, then `npx install-electron` for the
+binary (stock Electron 44 has no postinstall; CI does the same). A profile pinned earlier with the old
+`widevine:pin` still holds a copy of Chrome's Widevine module in
+`~/Library/Application Support/pond-desktop/WidevineCdm`; stock Electron ignores it, and it should be
+deleted rather than kept.
 
 ## Known holes
 
@@ -174,7 +180,8 @@ copy of Chrome's module that must not be kept or shipped.
   been clicked in; after the browser restarts, the first play asks for a press of Play on the page.
 - **Loopback only.** The page pairs through the loopback pairing endpoint, so it runs on the pond's own
   computer. A Jetson has no documented environment for either SDK: Linux on arm64 has no browser with
-  a Widevine module the services accept.
+  a Widevine module the services accept. There the assistant has no music tools, and says why.
+- **Spotify and spoken replies overlap** (Policy III.7, above): nothing pauses Spotify while GIAP speaks.
 - **Requests after the script loads are not judged** by `network_mode` (see Security model).
 
 ## Adding a service (Tidal...)
@@ -203,4 +210,5 @@ SSE reader. `cargo test -p pond-api --lib player` and `--test player_routes` dri
 `npm test` in `extensions/music` covers the providers over a fake host.
 
 Not verified yet: signing in to Apple Music and full playback in Safari or Chrome (needs a person's
-Apple Account), and anything Spotify under the new design.
+Apple Account), and the Spotify page against Spotify in Chrome or Safari (needs a Premium sign-in and
+a click on the page).

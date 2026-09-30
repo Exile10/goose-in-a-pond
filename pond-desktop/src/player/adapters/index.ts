@@ -4,6 +4,7 @@
 import type { PlayerAdapter } from "../types";
 import { AppleMusicKitAdapter, loadMusicKitFromApple } from "./appleMusicKit";
 import { SpotifyWebPlaybackAdapter, loadSpotifySdk } from "./spotifyWebPlayback";
+import { SPOTIFY_LOGO_URL } from "../brand";
 
 export interface AdapterContext {
   /** Apple: a developer token the pond signs, since the pond holds the key. */
@@ -25,10 +26,14 @@ const ADAPTERS: Record<string, (ctx: AdapterContext) => PlayerAdapter> = {
       networkAllows: ctx.networkAllows,
     }),
   spotify: (ctx) =>
-    new SpotifyWebPlaybackAdapter({
-      loadSdk: loadSpotifySdk,
-      fetchUserToken: (refresh) => ctx.fetchUserToken("spotify", refresh),
-    }),
+    new SpotifyWebPlaybackAdapter(
+      {
+        loadSdk: loadSpotifySdk,
+        fetchUserToken: (refresh) => ctx.fetchUserToken("spotify", refresh),
+        networkAllows: ctx.networkAllows,
+      },
+      SPOTIFY_LOGO_URL ? { logoUrl: SPOTIFY_LOGO_URL } : {},
+    ),
 };
 
 export function knownServices(): string[] {

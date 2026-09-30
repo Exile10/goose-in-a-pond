@@ -362,6 +362,13 @@ volume) is never refused: a policy that cannot stop music already playing is a b
 outside both of the above, so **`network_mode = offline` does not stop it.** It is named here so it
 cannot become a footnote. The fix is to hold the updater until the setting allows it, and it is not
 built. Detail and the rest of the player's model: `docs/architecture/music-player.md`.
+**Superseded 2026-09-30:** the player is no longer in the app. It is a page the pond serves, in the
+person's own browser (the services document nothing else), so the app ships stock Electron with no
+Widevine module and hole (3) is gone. A browser offers no per-request filter to a page, so (2) is
+narrower now: the page asks `/player/egress-policy` before it loads a service's script, and under
+Offline loads nothing; what the service's script then fetches, the pond does not see. Spotify's token is
+`host_only` and no longer reaches the Music extension, because the assistant no longer controls
+Spotify (Spotify's Developer Policy III.3, Terms IV.2.a.i).
 
 **2026-09-29 (later) -- the pond can now call a Jarida-hosted host, and it is off until told to.**
 `pondcredentials` (`services/pondcredentials`) serves Apple Music developer tokens so a household

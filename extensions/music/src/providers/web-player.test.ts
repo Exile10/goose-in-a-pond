@@ -250,11 +250,12 @@ test('it advertises a queue and no devices or time range', () => {
   assert.deepEqual(make(host).capabilities, { devices: false, queue: true, timeRange: false });
 });
 
-test('its wording names its own service and none other', () => {
+test('its wording names its own service, and Spotify only to say the assistant cannot control it', () => {
   const { host } = player();
   const text = JSON.stringify(make(host).describe);
   assert.match(text, /Apple Music/);
-  assert.ok(!/spotify/i.test(text));
+  assert.match(text, /say the assistant cannot control Spotify, and do not play it on Apple Music instead/);
+  assert.equal(text.match(/Spotify/g)?.length, 2, 'Spotify is named in that one sentence and nowhere else');
 });
 
 test('a service is only a name: a second one needs no new code here', async () => {

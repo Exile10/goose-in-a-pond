@@ -1,39 +1,30 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { chooseService } from './select.js';
+import { chooseService, NO_MUSIC_INSTRUCTIONS } from './select.js';
 
-test('a Spotify sign-in wins when nothing is asked for', () => {
-  assert.equal(chooseService({ SPOTIFY_ACCESS_TOKEN: 'tok' }, 'darwin').service, 'spotify');
+test('a Mac gets Apple Music', () => {
+  assert.equal(chooseService('darwin').service, 'apple');
 });
 
-test('a Mac with no Spotify sign-in gets Apple Music', () => {
-  assert.equal(chooseService({}, 'darwin').service, 'apple');
-});
-
-test('a machine that is not a Mac never gets Apple Music', () => {
-  assert.equal(chooseService({}, 'linux').service, 'spotify');
-  assert.equal(chooseService({ MUSIC_SERVICE: 'apple' }, 'linux').service, 'spotify');
-});
-
-test('an explicit choice beats the sign-in', () => {
-  assert.equal(chooseService({ MUSIC_SERVICE: 'apple', SPOTIFY_ACCESS_TOKEN: 'tok' }, 'darwin').service, 'apple');
-  assert.equal(chooseService({ MUSIC_SERVICE: 'spotify' }, 'darwin').service, 'spotify');
-});
-
-test('the name may be spelled the way a person would', () => {
-  for (const spelling of ['Apple Music', 'apple-music', 'APPLE_MUSIC', ' apple ']) {
-    assert.equal(chooseService({ MUSIC_SERVICE: spelling }, 'darwin').service, 'apple', spelling);
+test('anything else gets no music service at all, and says why', () => {
+  for (const platform of ['linux', 'win32', 'freebsd']) {
+    const choice = chooseService(platform);
+    assert.equal(choice.service, null, platform);
+    assert.match(choice.reason, /Apple Music needs macOS/);
+    assert.match(choice.reason, /Spotify cannot be controlled by the assistant/);
   }
 });
 
-test('blank and auto both mean choose for me', () => {
-  assert.equal(chooseService({ MUSIC_SERVICE: '' }, 'darwin').service, 'apple');
-  assert.equal(chooseService({ MUSIC_SERVICE: 'auto' }, 'darwin').service, 'apple');
+test('Spotify is never a choice, whatever is signed in or asked for', () => {
+  // The choice no longer reads the environment: a Spotify sign-in or MUSIC_SERVICE=spotify cannot
+  // bring Spotify to the assistant, because Spotify's rules forbid voice and AI control of it.
+  assert.equal(chooseService.length, 1);
+  for (const platform of ['darwin', 'linux']) assert.notEqual(chooseService(platform).service, 'spotify');
 });
 
-test('a value that is no service is ignored, and the log says so', () => {
-  const choice = chooseService({ MUSIC_SERVICE: 'tidal', SPOTIFY_ACCESS_TOKEN: 'tok' }, 'darwin');
-  assert.equal(choice.service, 'spotify');
-  assert.match(choice.reason, /tidal/);
+test('the words the assistant gets with no tools explain the rule and where Spotify is played', () => {
+  assert.match(NO_MUSIC_INSTRUCTIONS, /never controlled by the assistant/);
+  assert.match(NO_MUSIC_INSTRUCTIONS, /Spotify player page/);
+  assert.match(NO_MUSIC_INSTRUCTIONS, /music controls/);
 });

@@ -3,10 +3,8 @@ import { pickSong } from "../match.js";
 import { PlayerFailure, PlayerUnavailable, type PlayerHost } from "./player/host.js";
 import {
   UnsupportedError,
-  type AlbumInfo,
   type ArtistInfo,
   type DeviceInfo,
-  type FollowUpResult,
   type MusicProvider,
   type PlayRequest,
   type PlayTarget,
@@ -77,7 +75,7 @@ export class WebPlayerProvider implements MusicProvider {
     this.id = deps.service;
     this.name = deps.label;
     this.describe = {
-      play: `Play music in ${deps.label}, in the app's own player. Songs from the whole ${deps.label} catalog start at once. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for, and repeat what the result says happened rather than assuming playback started. If the result says the player needs the user, such as a sign-in, tell them exactly that.`,
+      play: `Play music in ${deps.label}, in the music player page, which plays in the user's web browser. Songs from the whole ${deps.label} catalog start at once. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for, and repeat what the result says happened rather than assuming playback started. If the result says the player needs the user, such as a sign-in or a click on the page, tell them exactly that. This plays ${deps.label} only: if the user asks for Spotify, say the assistant cannot control Spotify, and do not play it on ${deps.label} instead.`,
       playNext: "'next' puts the song right after the current one and lets the current track finish. Default 'now' replaces what is playing.",
       playUri: `A pasted ${deps.label} song link, or a URI from an earlier result. Plays it directly.`,
     };
@@ -221,10 +219,6 @@ export class WebPlayerProvider implements MusicProvider {
     return "Added to queue";
   }
 
-  async queueFollowUps(): Promise<FollowUpResult> {
-    throw new UnsupportedError(`${this.name} continues playing without a top-up.`);
-  }
-
   // ── Transport ──────────────────────────────────────────────
 
   async pause(): Promise<string> {
@@ -362,13 +356,6 @@ export class WebPlayerProvider implements MusicProvider {
     return this.local.getTopArtists(range, limit);
   }
 
-  async searchAlbums(): Promise<AlbumInfo[]> {
-    throw new UnsupportedError(`${this.name} album search is not available; ask for a song or a playlist.`);
-  }
-
-  async getTrack(): Promise<TrackInfo | null> {
-    return null;
-  }
 
   async getDevices(): Promise<DeviceInfo[]> {
     throw new UnsupportedError(`The ${this.name} player plays through the Mac's sound output; change it in the Sound settings.`);

@@ -1057,7 +1057,10 @@ async fn a_secrets_change_restarts_the_extension_without_the_host_only_ones() {
 
     let env = manager.last_env();
     assert_env_withholds_signing_secrets(&env);
-    assert_eq!(env.get("MUSIC_SERVICE").map(String::as_str), Some("apple"));
+    // A restart passes what the registry declares for the extension and nothing else: the service
+    // picker is gone (the assistant plays Apple Music only), and Spotify's token is host-only.
+    assert!(env.get("MUSIC_SERVICE").is_none(), "an undeclared key reached the extension");
+    assert!(env.get("SPOTIFY_ACCESS_TOKEN").is_none(), "Spotify's token reached the extension");
     for key in HOST_ONLY {
         assert!(pond.secrets.has(key).await.unwrap(), "{key} was not stored");
     }
@@ -1394,7 +1397,10 @@ async fn no_page_is_reported_as_no_player() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], false);
     assert_eq!(body["code"], "no_player");
-    assert!(body["error"].as_str().unwrap().contains("Goose In A Pond"));
+    // The page is in the browser now, so the words say where to open it.
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("The music player is not open"), "{error}");
+    assert!(error.contains("web browser"), "{error}");
 }
 
 #[tokio::test]

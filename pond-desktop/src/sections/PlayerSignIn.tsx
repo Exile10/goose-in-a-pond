@@ -8,18 +8,25 @@ import { playerView, type PlayerReply } from "./signInView";
 const POLL_MS = 3_000;
 
 /**
- * Where a music service is signed in and played: the music player page, which opens in the person's
- * own web browser because that is where the service documents its player running. This row opens
- * the page and says what the page last reported. The sign-in is a button on the page itself, since
- * the service's sign-in window may only open from a click there.
+ * How a service is started on its page: signed in there (Apple Music, whose sign-in window may only
+ * open from a click on the page), or armed there with Play here after signing in above (Spotify).
+ */
+export type PlayerPageKind = "sign_in" | "play_here";
+
+/**
+ * Where a music service plays: the music player page, which opens in the person's own web browser
+ * because that is where the service documents its player running. This row opens the page and says
+ * what the page last reported; what has to be done is done on the page itself.
  */
 export function PlayerSignIn({
   service,
   label,
+  kind = "sign_in",
   disabled = false,
 }: {
   service: string;
   label: string;
+  kind?: PlayerPageKind;
   disabled?: boolean;
 }) {
   const desktop = isDesktopShell();
@@ -58,14 +65,15 @@ export function PlayerSignIn({
   return (
     <div className="secret-modal__oauth-block" data-testid={`player-sign-in-${service}`}>
       <p className="secret-modal__oauth-desc">
-        {label} plays in the music player, a page that opens in your web browser on this computer.
-        Sign in there.
+        {kind === "sign_in"
+          ? `${label} plays in the music player, a page that opens in your web browser on this computer. Sign in there.`
+          : `${label} plays in its own player page, which opens in your web browser on this computer: sign in above, then press Play ${label} here on that page. You control it by hand there, in the ${label} app, or with the music controls; the assistant never controls ${label}, because its developer rules do not allow that.`}
       </p>
 
       {view.kind === "signed_in" && (
         <div className="secret-modal__fulfilled-indicator">
           <Check size={13} strokeWidth={2.5} />
-          Signed in to {label}
+          {kind === "sign_in" ? `Signed in to ${label}` : `${label} can play on this computer`}
         </div>
       )}
 
@@ -76,7 +84,7 @@ export function PlayerSignIn({
         disabled={disabled}
       >
         <ExternalLink size={13} strokeWidth={1.8} />
-        Open the music player
+        {kind === "sign_in" ? "Open the music player" : `Open the ${label} player`}
       </button>
 
       {view.kind !== "signed_in" && <p className="secret-modal__oauth-note">{view.note}</p>}

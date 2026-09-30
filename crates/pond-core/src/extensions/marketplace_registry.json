@@ -103,7 +103,7 @@
     {
       "id": "music",
       "name": "Music",
-      "description": "Play songs, playlists and your library, and control playback, on Spotify or Apple Music",
+      "description": "Play songs, playlists and your library on Apple Music, and sign in to Spotify for the app's music controls",
       "kind": "stdio",
       "command": "npx",
       "args": ["-y", "tsx", "extensions/music/src/server.ts"],
@@ -115,22 +115,15 @@
         {
           "key": "SPOTIFY_ACCESS_TOKEN",
           "display_name": "Spotify",
-          "description": "Optional. Sign in to play and control music on Spotify.",
+          "description": "Optional. Sign in so the app's music controls and the Spotify player page can play Spotify. The assistant never controls Spotify: Spotify's developer rules do not allow voice or AI control.",
           "required": false,
-          "kind": "oauth_flow"
-        },
-        {
-          "key": "MUSIC_SERVICE",
-          "display_name": "Preferred service",
-          "description": "Optional. spotify or apple. Leave blank to choose automatically.",
-          "required": false,
-          "kind": "generic",
-          "advanced": true
+          "kind": "oauth_flow",
+          "host_only": true
         },
         {
           "key": "APPLE_MUSIC_TEAM_ID",
           "display_name": "Apple Music Team ID",
-          "description": "Optional. Your own Apple Developer key for the in-app Apple Music player. Leave all three blank to use Jarida's shared credentials. Your 10-character Team ID.",
+          "description": "Optional. Your own Apple Developer key for the Apple Music player page. Leave all three blank to use Jarida's shared credentials. Your 10-character Team ID.",
           "required": false,
           "kind": "generic",
           "host_only": true,

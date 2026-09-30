@@ -10,8 +10,11 @@ export type PlaybackStatus =
   | "ended"
   | "error";
 
-/** What the user has to do before commands can work. */
-export type Need = "none" | "authorization" | "setup";
+/**
+ * What the user has to do before commands can work. "interaction": press the button on the player
+ * page, since a browser only lets a page play sound after a click on it.
+ */
+export type Need = "none" | "authorization" | "setup" | "interaction";
 
 export type ItemKind = "song" | "album" | "playlist";
 
@@ -29,6 +32,8 @@ export interface Track {
   album: string;
   duration_ms: number;
   artwork_url?: string;
+  /** The item's own page on the service, which its design rules may require the player to link. */
+  link?: string;
 }
 
 export interface PlaylistInfo {
@@ -52,6 +57,19 @@ export interface PlayerState {
   repeat: RepeatMode;
   /** The last problem, in words a person can act on. */
   message?: string;
+  /** What the service allows right now (Spotify's `disallows`); absent means everything. */
+  can?: { pause: boolean; resume: boolean; next: boolean; previous: boolean; seek: boolean };
+}
+
+/** The controls a player page shows. A service's own rules decide which. */
+export type PlayerControl = "previous" | "playPause" | "next";
+
+/** How a service is credited on the player page, by its own brand rules. */
+export interface PlayerBrand {
+  /** Its official logo, served by the pond, shown instead of the name when present. */
+  logoUrl?: string;
+  /** The words of the link back to the item, as the service's guidelines give them. */
+  linkLabel: string;
 }
 
 export interface AdapterCapabilities {
@@ -109,6 +127,15 @@ export interface PlayerAdapter {
   authorize(): Promise<void>;
   /** Signs this page out of the service, for a service that signs in on the page. */
   signOut?(): Promise<void>;
+  /**
+   * For a service that must be armed by a click on the page before it may play (`need` is
+   * "interaction"): called from that click, and only from it.
+   */
+  activate?(): Promise<void>;
+  /** The controls to show; absent means previous, play or pause, and next. */
+  readonly controls?: readonly PlayerControl[];
+  /** How to credit the service on the page, when its rules say how. */
+  readonly brand?: PlayerBrand;
 
   state(): PlayerState;
   onState(listener: (state: PlayerState) => void): Unsubscribe;

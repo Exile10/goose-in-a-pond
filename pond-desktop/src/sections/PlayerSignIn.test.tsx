@@ -119,4 +119,27 @@ describe("PlayerSignIn: the row that sends you to the music player page", () => 
     await settle();
     expect(screen.getByText(/refusing to open/)).toBeTruthy();
   });
+
+  it("opens the Spotify player page, and says the assistant never controls Spotify", async () => {
+    getPlayerState.mockResolvedValue({ attached: true, state: state({ service: "spotify", need: "interaction" }) });
+    shell.invoke.mockResolvedValue(undefined);
+    render(<PlayerSignIn service="spotify" label="Spotify" kind="play_here" />);
+    await settle();
+
+    expect(screen.getByText(/the assistant never controls Spotify/)).toBeTruthy();
+    expect(screen.getByText("Press Play Spotify here on the music player page.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open the Spotify player" }));
+    await settle();
+    expect(shell.invoke).toHaveBeenCalledWith("open_external", {
+      url: "http://127.0.0.1:4000/player.html?service=spotify",
+    });
+  });
+
+  it("says Spotify can play here once the page is armed, not that anyone signed in there", async () => {
+    getPlayerState.mockResolvedValue({ attached: true, state: state({ service: "spotify", need: "none", ready: true }) });
+    render(<PlayerSignIn service="spotify" label="Spotify" kind="play_here" />);
+    await settle();
+    expect(screen.getByText("Spotify can play on this computer")).toBeTruthy();
+    expect(screen.queryByText(/Signed in to Spotify/)).toBeNull();
+  });
 });

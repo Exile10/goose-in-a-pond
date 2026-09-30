@@ -11430,8 +11430,9 @@ async fn oauth_refresh_handler(
                 if let (Some(mgr), Some(mp), Some(secret_repo)) = (mgr, mp, secret_repo) {
                     if let Ok(available) = mp.list_available().await {
                         for ext in available {
-                            let uses_token =
-                                ext.required_secrets.iter().any(|s| s.key == token_key);
+                            // Host-only tokens never reach the extension, so a refresh is no reason
+                            // to restart it.
+                            let uses_token = ext.env_secrets().any(|s| s.key == token_key);
                             if uses_token {
                                 let mut env = std::collections::HashMap::new();
                                 for sr in ext.env_secrets() {
@@ -11767,6 +11768,12 @@ fn now_playing_snapshot(body: &serde_json::Value) -> serde_json::Value {
         artist
     };
 
+    // Spotify's design guidelines: what is shown links back to the item on Spotify, and a control
+    // Spotify disallows right now (`actions.disallows`) is not offered. Absent means allowed.
+    let link = item["external_urls"]["spotify"].as_str();
+    let disallows = &body["actions"]["disallows"];
+    let allowed = |key: &str| disallows[key].as_bool() != Some(true);
+
     json!({
         "connected": true,
         "playing": is_playing,
@@ -11775,6 +11782,13 @@ fn now_playing_snapshot(body: &serde_json::Value) -> serde_json::Value {
         "album_art": album_art,
         "progress_ms": body["progress_ms"].as_i64().unwrap_or(0),
         "duration_ms": duration_ms,
+        "link": link,
+        "can": {
+            "pause": allowed("pausing"),
+            "resume": allowed("resuming"),
+            "next": allowed("skipping_next"),
+            "previous": allowed("skipping_prev"),
+        },
     })
 }
 
@@ -16450,6 +16464,36 @@ mod tests {
     mod now_playing_snapshot_tests {
         use super::now_playing_snapshot;
         use serde_json::json;
+
+        #[test]
+        fn it_carries_the_link_back_to_spotify_and_what_spotify_disallows_now() {
+            let body = json!({
+                "is_playing": true,
+                "currently_playing_type": "track",
+                "actions": {"disallows": {"pausing": false, "resuming": true, "skipping_prev": true}},
+                "item": {
+                    "name": "So What",
+                    "artists": [{"name": "Miles Davis"}],
+                    "external_urls": {"spotify": "https://open.spotify.com/track/abc"},
+                },
+            });
+            let snap = now_playing_snapshot(&body);
+            assert_eq!(snap["link"], "https://open.spotify.com/track/abc");
+            assert_eq!(
+                snap["can"],
+                json!({"pause": true, "resume": false, "next": true, "previous": false})
+            );
+        }
+
+        #[test]
+        fn with_no_actions_everything_is_allowed_and_with_no_item_there_is_no_link() {
+            let snap = now_playing_snapshot(&json!({"is_playing": false}));
+            assert!(snap["link"].is_null());
+            assert_eq!(
+                snap["can"],
+                json!({"pause": true, "resume": true, "next": true, "previous": true})
+            );
+        }
 
         #[test]
         fn a_normal_track_reads_its_own_fields() {

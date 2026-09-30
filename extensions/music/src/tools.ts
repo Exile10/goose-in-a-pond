@@ -7,18 +7,11 @@ export interface Tool {
   inputSchema: Record<string, unknown>;
 }
 
-const SPOTIFY_PLAY =
-  "Play music on Spotify. Music keeps playing afterwards: a song starts inside its album so the album follows on, and a single is topped up with more by the same artist — do not tell the user playback will stop after the song, and do not queue extra songs yourself to keep it going. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for.";
-
-const SPOTIFY_NEXT =
-  "'next' appends to the queue and lets the current track finish; Spotify cannot insert at a chosen position, and cannot queue a whole playlist, so this applies to tracks only. Default 'now' replaces what is playing.";
-
-const SPOTIFY_URI =
-  "A pasted Spotify URI or link. Plays it directly, and is the only way to reach a playlist outside the user's library.";
+/** Used when a provider does not word `when: next` itself. */
+const PLAY_NEXT =
+  "'next' puts the song after the current one and lets the current track finish. Default 'now' replaces what is playing.";
 
 function playTool(provider: MusicProvider): Tool {
-  const spotify = provider.id === "spotify";
-
   const properties: Record<string, unknown> = {
     query: {
       type: "string",
@@ -28,9 +21,7 @@ function playTool(provider: MusicProvider): Tool {
     target: {
       type: "string",
       enum: ["track", "playlist"],
-      description: spotify
-        ? "'playlist' matches the user's own playlists loosely by name, preferring ones they created. Default 'track' searches songs, artists and albums."
-        : "'playlist' matches the user's playlists loosely by name. Default 'track' searches songs.",
+      description: "'playlist' matches the user's playlists loosely by name. Default 'track' searches songs.",
     },
   };
 
@@ -38,18 +29,18 @@ function playTool(provider: MusicProvider): Tool {
     properties.when = {
       type: "string",
       enum: ["now", "next"],
-      description: provider.describe?.playNext ?? SPOTIFY_NEXT,
+      description: provider.describe.playNext ?? PLAY_NEXT,
     };
   }
 
   properties.uri = {
     type: "string",
-    description: provider.describe?.playUri ?? SPOTIFY_URI,
+    description: provider.describe.playUri,
   };
 
   return {
     name: "play",
-    description: provider.describe?.play ?? SPOTIFY_PLAY,
+    description: provider.describe.play,
     inputSchema: { type: "object", properties },
   };
 }
@@ -58,23 +49,18 @@ function playlistsTool(provider: MusicProvider): Tool {
   return {
     name: "playlists",
     description:
-      provider.id === "spotify"
-        ? "List every playlist in the user's Spotify library, separated into ones they created and ones they follow from other people. Use this to answer 'what playlists do I have' or 'which of these are mine', and to find the exact name before playing one with the 'play' tool."
-        : "List every playlist in the user's Music library. Use this to answer 'what playlists do I have', and to find the exact name before playing one with the 'play' tool.",
+      "List every playlist in the user's Music library. Use this to answer 'what playlists do I have', and to find the exact name before playing one with the 'play' tool.",
     inputSchema: { type: "object", properties: {} },
   };
 }
 
 function libraryTool(provider: MusicProvider): Tool {
-  const spotify = provider.id === "spotify";
-
   const properties: Record<string, unknown> = {
     action: {
       type: "string",
       enum: ["saved", "top_tracks", "top_artists", "recent"],
-      description: spotify
-        ? "saved = list liked songs; top_tracks / top_artists = what they listen to most; recent = recently played."
-        : "saved = list favourite songs; top_tracks / top_artists = what they have played most, by lifetime play count; recent = recently played.",
+      description:
+        "saved = list favourite songs; top_tracks / top_artists = what they have played most, by lifetime play count; recent = recently played.",
     },
   };
 
@@ -94,20 +80,17 @@ function libraryTool(provider: MusicProvider): Tool {
 
   return {
     name: "library",
-    description: spotify
-      ? "The user's own Spotify library and listening history: their liked songs, what they listen to most, and what they played recently. Read-only — Spotify does not let this app change what is liked. Use for 'what are my liked songs', 'what do I listen to most', 'what was I playing yesterday'."
-      : "The user's own Apple Music library and listening history, read from the Music app: their favourite songs, what they have played most, and what they played recently. Read-only. Use for 'what are my favourite songs', 'what do I listen to most', 'what was I playing yesterday'.",
+    description:
+      "The user's own Apple Music library and listening history, read from the Music app: their favourite songs, what they have played most, and what they played recently. Read-only. Use for 'what are my favourite songs', 'what do I listen to most', 'what was I playing yesterday'.",
     inputSchema: { type: "object", properties, required: ["action"] },
   };
 }
 
-function devicesTool(provider: MusicProvider): Tool {
-  const spotify = provider.id === "spotify";
+function devicesTool(): Tool {
   return {
     name: "devices",
-    description: spotify
-      ? "List the devices Spotify can play on (phone, computer, speaker, TV), or move playback to one of them. Call with no arguments to see what is available; pass transfer_to with a device name to move the music there without interrupting it. Use this for 'play this on the speaker', 'move it to my phone', 'where can I play this'."
-      : "List the AirPlay speakers and devices Music can play to, or switch to one of them. Call with no arguments to see what is available; pass transfer_to with a device name to send the music there. Use this for 'play this on the speaker', 'where can I play this'.",
+    description:
+      "List the AirPlay speakers and devices Music can play to, or switch to one of them. Call with no arguments to see what is available; pass transfer_to with a device name to send the music there. Use this for 'play this on the speaker', 'where can I play this'.",
     inputSchema: {
       type: "object",
       properties: {
@@ -121,13 +104,10 @@ function devicesTool(provider: MusicProvider): Tool {
   };
 }
 
-function statusTool(provider: MusicProvider): Tool {
+function statusTool(): Tool {
   return {
     name: "status",
-    description:
-      provider.id === "spotify"
-        ? "Get what is currently playing on Spotify — track name, artist, album, progress, and upcoming queue."
-        : "Get what is currently playing in Apple Music — track name, artist, album and progress.",
+    description: "Get what is currently playing in Apple Music — track name, artist, album and progress.",
     inputSchema: { type: "object", properties: {} },
   };
 }
@@ -180,8 +160,8 @@ export function buildTools(provider: MusicProvider): Tool[] {
     playTool(provider),
     playlistsTool(provider),
     libraryTool(provider),
-    ...(provider.capabilities.devices ? [devicesTool(provider)] : []),
-    statusTool(provider),
+    ...(provider.capabilities.devices ? [devicesTool()] : []),
+    statusTool(),
     controlTool(provider),
   ];
 }

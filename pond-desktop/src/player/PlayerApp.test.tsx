@@ -169,4 +169,52 @@ describe("PlayerApp", () => {
     await Promise.resolve();
     expect(screen.getByText("Nairobi")).toBeTruthy();
   });
+  it("arms a service that needs a click, from that click, with Play here", () => {
+    const { adapter } = adapterIn(state({ service: "spotify", need: "interaction" }));
+    const activate = vi.fn(async () => undefined);
+    Object.assign(adapter, { label: "Spotify", activate });
+    render(<PlayerApp adapter={adapter} />);
+    fireEvent.click(screen.getByRole("button", { name: "Play Spotify here" }));
+    expect(activate).toHaveBeenCalledOnce();
+    expect(screen.queryByLabelText("Next")).toBeNull();
+  });
+
+  it("shows only the controls the service calls for, and disables what it does not allow now", () => {
+    const { adapter } = adapterIn(
+      state({
+        status: "playing",
+        track,
+        can: { pause: false, resume: true, next: false, previous: true, seek: true },
+      }),
+    );
+    Object.assign(adapter, { controls: ["playPause"] });
+    render(<PlayerApp adapter={adapter} />);
+    expect(screen.queryByLabelText("Previous")).toBeNull();
+    expect(screen.queryByLabelText("Next")).toBeNull();
+    expect((screen.getByLabelText("Pause") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("credits the service by its brand rules: its logo, and the link back in its own words", () => {
+    const { adapter } = adapterIn(
+      state({ status: "playing", track: { ...track, link: "https://open.spotify.com/track/1" } }),
+    );
+    Object.assign(adapter, {
+      label: "Spotify",
+      brand: { logoUrl: "/brand/spotify-logo.png", linkLabel: "LISTEN ON SPOTIFY" },
+    });
+    render(<PlayerApp adapter={adapter} />);
+    expect(screen.getByRole("img", { name: "Spotify" }).getAttribute("src")).toBe("/brand/spotify-logo.png");
+    const link = screen.getByRole("link", { name: "LISTEN ON SPOTIFY" });
+    expect(link.getAttribute("href")).toBe("https://open.spotify.com/track/1");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+  });
+
+  it("names the service in text, and shows no link, when it has no brand rules", () => {
+    const { adapter } = adapterIn(
+      state({ status: "playing", track: { ...track, link: "https://music.apple.com/x" } }),
+    );
+    render(<PlayerApp adapter={adapter} />);
+    expect(screen.getByRole("heading", { name: "Apple Music" })).toBeTruthy();
+    expect(screen.queryByRole("link")).toBeNull();
+  });
 });

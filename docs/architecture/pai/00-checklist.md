@@ -2383,3 +2383,30 @@ and do not establish device-key proof of possession or encrypted transport.
   a restart of pond and app with no finished sign-in made no calls; a restart with a sign-in remembered
   made none to Jarida (the kept token) and loaded Apple's script. Rust and desktop counts below.
 
+**2026-09-30 -- the player moves to the browser; Spotify is played by hand only; stock Electron again. Touches PAI-2.**
+
+- **What was asked.** "Build the player from both Spotify and MusicKit's official SDKs and guides, no
+  exceptions, follow those to a tee", then "go with B, and revert to stock Electron and just use GIAP as
+  a controller".
+- **Why.** Songs skipped because Spotify's licence server answered HTTP 500 to castlabs' development-signed
+  Electron (18 of 18 licence requests, measured). Both SDKs document an ordinary page in a mainstream
+  browser. Spotify's Developer Policy III.3 forbids voice control of Spotify and Terms IV.2.a.i forbid
+  feeding Spotify content into an AI model.
+- **What landed.** The player is the pond's `/player.html` in the person's browser; Apple Music built to
+  MusicKit on the Web v3 step by step (commit 9366e56b). Spotify: the Music extension offers no Spotify
+  tool and tells the model why; the Spotify token is `host_only`; six OAuth scopes instead of twelve; the
+  Spotify page follows the Web Playback SDK (click to `activateElement()`, Transfer Playback, every
+  documented event, no pause-on-error); the page and the hub's music controls follow Spotify's design
+  guidelines (artwork as an image, uncropped; link back; play or pause only; `disallows` honoured).
+  castlabs' Electron and its Widevine tooling are removed.
+- **Invariants.** *Egress*: the page asks `/player/egress-policy` before loading a script; requests the
+  service's script makes afterwards are the browser's and are not seen. *Secrets*: one more `host_only`
+  secret (Spotify's token), never in an extension's environment, and a token refresh no longer restarts
+  an extension that does not hold the token. *Settings persistence*: no settings field added; the
+  `MUSIC_SERVICE` registry field is removed.
+- **Not built.** Pausing Spotify while GIAP speaks (Policy III.7); removing the bundled Spotify client ID
+  (Terms VI.1, a decision for Jerry); Spotify's official logo files (waiting on permission to download).
+- **Verification**: Mac only, 2026-09-30. Desktop 1166 passed, Music extension 99 passed (5 live skipped),
+  pond-core and pond-api tests for the registry, scopes and now-playing snapshot passed. The Apple page ran
+  in a browser tab against a scratch pond up to Apple's sign-in window. Not run: Apple sign-in and full
+  playback, and the Spotify page against Spotify, both of which need Jerry signed in.

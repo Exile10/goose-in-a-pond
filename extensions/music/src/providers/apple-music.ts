@@ -4,10 +4,8 @@ import { musicAppUrl, songIdFromLink, type CatalogSong, type CatalogSource } fro
 import type { LibraryTrack, MusicApp } from "./apple/music-app.js";
 import {
   UnsupportedError,
-  type AlbumInfo,
   type ArtistInfo,
   type DeviceInfo,
-  type FollowUpResult,
   type MusicProvider,
   type PlayRequest,
   type PlayTarget,
@@ -58,7 +56,7 @@ export class AppleMusicProvider implements MusicProvider {
   capabilities = { devices: true, queue: false, timeRange: false };
   describe = {
     play:
-      "Play music in Apple Music, through the Music app. A song in the user's library starts at once; one only in the Apple Music catalog is opened in the Music app, which does not start it. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for, and repeat what the result says happened rather than assuming playback started.",
+      "Play music in Apple Music, through the Music app. A song in the user's library starts at once; one only in the Apple Music catalog is opened in the Music app, which does not start it. Search picks the closest match, which is not always what was asked for — tell the user the track name and artist FROM THE RESULT, never the name they asked for, and repeat what the result says happened rather than assuming playback started. This plays Apple Music only: if the user asks for Spotify, say the assistant cannot control Spotify, and do not play it on Apple Music instead.",
     playUri: "A pasted Apple Music song link, or a URI from an earlier result. Plays it directly.",
   };
 
@@ -176,13 +174,6 @@ export class AppleMusicProvider implements MusicProvider {
     return found.slice(0, limit).map(toTrackInfo);
   }
 
-  async searchAlbums(): Promise<AlbumInfo[]> {
-    throw new UnsupportedError("Apple Music album search is not available; ask for a song or a playlist.");
-  }
-
-  async getTrack(): Promise<TrackInfo | null> {
-    return null;
-  }
 
   // ── Transport ──────────────────────────────────────────────
 
@@ -315,7 +306,4 @@ export class AppleMusicProvider implements MusicProvider {
     throw new UnsupportedError("Apple Music has no queue that can be added to.");
   }
 
-  async queueFollowUps(): Promise<FollowUpResult> {
-    throw new UnsupportedError("Apple Music has no queue that can be added to.");
-  }
 }

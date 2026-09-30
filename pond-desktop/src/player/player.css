@@ -79,6 +79,27 @@
   border-radius: 4px;
 }
 
+/* A service's own logo, as its brand rules give it: unaltered, with clear space around it. Spotify's
+   full logo is at least 70px wide; 24px tall gives it about 79. */
+.player__logo {
+  display: block;
+  height: 24px;
+  width: auto;
+  margin: 6px 0;
+}
+
+/* The link back to the item on the service, in the words its guidelines give. */
+.player__link {
+  align-self: flex-start;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-text);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
 .player__about {
   display: flex;
   flex-direction: column;
@@ -104,6 +125,12 @@
   background: transparent;
   color: var(--color-text);
   cursor: pointer;
+}
+
+/* A control the service does not allow right now (Spotify's disallows) is shown, and cannot be used. */
+.player__key:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .player__primary {
@@ -145,6 +172,7 @@
   cursor: pointer;
 }
 
+.player__link:focus-visible,
 .player__key:focus-visible,
 .player__quiet:focus-visible,
 .player__primary:focus-visible {

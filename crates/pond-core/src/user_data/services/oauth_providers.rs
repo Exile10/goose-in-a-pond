@@ -8,21 +8,14 @@ pub fn builtin_oauth_providers() -> Vec<OAuthProviderConfig> {
         display_name: "Spotify".to_string(),
         authorize_url: "https://accounts.spotify.com/authorize".to_string(),
         token_url: "https://accounts.spotify.com/api/token".to_string(),
+        // Only what the app's own Spotify features use (Developer Terms V.3: ask for no more): the
+        // Web Playback SDK needs the last three, the music controls read and change playback. The
+        // assistant never controls Spotify, so nothing here reads playlists, the library or history.
+        // New scopes only reach tokens issued after the user signs in again.
         scopes: vec![
             "user-read-playback-state".to_string(),
             "user-modify-playback-state".to_string(),
             "user-read-currently-playing".to_string(),
-            "playlist-read-private".to_string(),
-            "playlist-modify-public".to_string(),
-            "playlist-modify-private".to_string(),
-            // Read-only: Spotify 403s PUT/DELETE /me/tracks here even with user-library-modify.
-            // New scopes only reach tokens issued after the user signs in again.
-            "user-library-read".to_string(),
-            "user-top-read".to_string(),
-            "user-read-recently-played".to_string(),
-            // The in-app player is a Spotify Web Playback SDK device, and the SDK will not start
-            // without these three. A token issued before they were asked for makes the player say
-            // "sign in again" rather than fail silently.
             "streaming".to_string(),
             "user-read-email".to_string(),
             "user-read-private".to_string(),
@@ -47,9 +40,24 @@ mod tests {
         for needed in ["streaming", "user-read-email", "user-read-private"] {
             assert!(
                 providers[0].scopes.iter().any(|s| s == needed),
-                "the in-app player's SDK needs the {needed} scope"
+                "the Spotify player page's SDK needs the {needed} scope"
             );
         }
+        // Developer Terms V.3: no more than the app's own features use.
+        let mut asked: Vec<&str> = providers[0].scopes.iter().map(String::as_str).collect();
+        asked.sort_unstable();
+        assert_eq!(
+            asked,
+            [
+                "streaming",
+                "user-modify-playback-state",
+                "user-read-currently-playing",
+                "user-read-email",
+                "user-read-playback-state",
+                "user-read-private",
+            ],
+            "the assistant never controls Spotify, so no playlist, library or history scope"
+        );
         assert_eq!(providers[0].token_key, "SPOTIFY_ACCESS_TOKEN");
         assert_eq!(providers[0].refresh_key, "SPOTIFY_REFRESH_TOKEN");
     }

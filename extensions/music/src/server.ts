@@ -1,127 +1,25 @@
 #!/usr/bin/env node
-/** GIAP Music MCP server for Spotify or Apple Music: a few intent-shaped tools, not one per endpoint. */
+/** GIAP Music MCP server for Apple Music: a few intent-shaped tools, not one per endpoint. */
 import * as readline from "readline";
 import { describeError, log } from "./log.js";
 import { normalizeName, playlistMatchScore } from "./match.js";
 import { createProvider } from "./providers/index.js";
-import { isShortRelease } from "./providers/spotify.js";
 import { buildTools } from "./tools.js";
-import type { TimeRange } from "./providers/types.js";
+import { NO_MUSIC_INSTRUCTIONS } from "./providers/select.js";
+import type { MusicProvider, TimeRange } from "./providers/types.js";
 
-const provider = await createProvider();
-const TOOLS = buildTools(provider);
+const available = await createProvider();
+// Every handler below runs only when there is a provider: `tools/call` refuses first when there is not.
+const provider = available as MusicProvider;
+const TOOLS = available ? buildTools(available) : [];
 
 // ── Tool handlers ─────────────────────────────────────────────
 
 async function handlePlay(args: Record<string, unknown>): Promise<string> {
-  const query = args.query as string | undefined;
-  const uri = args.uri as string | undefined;
-
-  if (provider.playRequest) return provider.playRequest({ query, uri });
-
-  if (uri) {
-    // Resolve the album so playback continues; on any failure, play the URI as given.
-    if (uri.startsWith("spotify:track:")) {
-      try {
-        const track = await provider.getTrack(uri);
-        if (track) {
-          const result = await provider.play(track);
-          if (isShortRelease(track)) {
-            try {
-              await provider.queueFollowUps(track);
-            } catch (err) {
-              log.warn("follow_up_failed", "could not queue follow-ups", {
-                seed: track.uri,
-                error: describeError(err),
-              });
-            }
-          }
-          return result;
-        }
-      } catch (err) {
-        log.warn("track_lookup_failed", "playing the URI without its album context", {
-          uri,
-          error: describeError(err),
-        });
-      }
-    }
-    return await provider.play(uri);
-  }
-
-  // A query saying "playlist" counts even with `type` unset: models often fail to set it.
-  const saysPlaylist = !!query && /\bplaylists?\b/i.test(query);
-  if (query && ((args.type as string | undefined) === "playlist" || saysPlaylist)) {
-    const { uri: playlistUri, name } = await resolvePlaylist(query);
-    await provider.play(playlistUri);
-    return `Now playing playlist: ${name}`;
-  }
-
-  // Album: play the whole record in order, same context_uri mechanism.
-  if (query && (args.type as string | undefined) === "album") {
-    const albums = await provider.searchAlbums(query, 5);
-    if (albums.length === 0) {
-      return `No album found for "${query}". Try a different search.`;
-    }
-    const top = albums[0];
-    await provider.play(top.uri);
-
-    let text = `Now playing album: ${top.name} by ${top.artist} (${top.total_tracks} tracks, ${top.release_date})`;
-    const others = albums.slice(1, 4);
-    if (others.length > 0) {
-      text +=
-        "\n\nOther matches:\n" +
-        others.map((a, i) => `${i + 2}. ${a.name} by ${a.artist}`).join("\n");
-    }
-    return text;
-  }
-
-  if (query) {
-    const tracks = await provider.searchTracks(query, 5);
-    if (tracks.length === 0) {
-      return `No results found for "${query}". Try a different search.`;
-    }
-
-    const top = tracks[0];
-    // Pass the TrackInfo, not `top.uri`: its album lets playback continue past the track.
-    await provider.play(top);
-
-    // Top up a short release; the song has already started, so a failure here is only logged.
-    let toppedUp: { queued: number; source: "artist" | "listener" } | null = null;
-    if (isShortRelease(top)) {
-      try {
-        toppedUp = await provider.queueFollowUps(top);
-      } catch (err) {
-        log.warn("follow_up_failed", "could not queue follow-ups", {
-          seed: top.uri,
-          error: describeError(err),
-        });
-      }
-    }
-
-    const others = tracks.slice(1, 4);
-    // "track" outright, so the model can't pass this off as the playlist it was asked for.
-    let text = `Now playing track: ${top.name} by ${top.artist} (${top.album})`;
-    // Say what follows, naming the source: the fallback queues the listener's favourites.
-    if (toppedUp && toppedUp.queued > 0) {
-      text +=
-        toppedUp.source === "artist"
-          ? `\nThen ${toppedUp.queued} more by ${top.artist}.`
-          : `\nThen ${toppedUp.queued} more from your top tracks.`;
-    } else if (!isShortRelease(top) && top.album_uri) {
-      // Only claim the album follows when a context was actually sent.
-      text += `\nThe rest of the album follows.`;
-    }
-    if (others.length > 0) {
-      text +=
-        "\n\nOther matches:\n" +
-        others.map((t, i) => `${i + 2}. ${t.name} by ${t.artist}`).join("\n");
-    }
-    return text;
-  }
-
-  // No query, no URI — resume
-  const result = await provider.play();
-  return result;
+  return provider.playRequest({
+    query: args.query as string | undefined,
+    uri: args.uri as string | undefined,
+  });
 }
 
 async function handleQueue(args: Record<string, unknown>): Promise<string> {
@@ -211,7 +109,7 @@ async function resolvePlaylist(query: string): Promise<{ uri: string; name: stri
     `No playlist matching "${name}"${scope} in this library. ` +
       `Closest${scope}: ${suggestions || "(none)"}. ` +
       `Only playlists the user created or follows are visible — if it belongs to someone else, ` +
-      `they can add it to their library in ${provider.name}${provider.id === "spotify" ? ", or paste its link to play it directly" : ""}.`
+      `they can add it to their library in ${provider.name}.`
   );
 }
 
@@ -219,17 +117,11 @@ async function handlePlayPlaylist(args: Record<string, unknown>): Promise<string
   // A link or URI is the only way to reach a playlist outside the library.
   const given = (args.uri ?? args.url) as string | undefined;
   if (given) {
-    if (provider.id !== "spotify") {
-      return `${provider.name} can only play playlists in the user's library; ask for one by name.`;
-    }
-    const id = given.match(/playlist[/:]([A-Za-z0-9]+)/)?.[1];
-    if (!id) return `That does not look like a Spotify playlist link: ${given}`;
-    await provider.play(`spotify:playlist:${id}`);
-    return `Now playing playlist from the link provided.`;
+    return `${provider.name} can only play playlists in the user's library; ask for one by name.`;
   }
 
   const name = (args.name ?? args.query) as string | undefined;
-  if (!name) return `Which playlist? Give me its name${provider.id === "spotify" ? ", or a Spotify playlist link" : ""}.`;
+  if (!name) return "Which playlist? Give me its name.";
 
   const { uri, name: actual } = await resolvePlaylist(name);
   await provider.play(uri);
@@ -301,7 +193,7 @@ function describeRange(range: TimeRange): string {
 async function handleDevices(args: Record<string, unknown>): Promise<string> {
   const devices = await provider.getDevices();
   if (devices.length === 0) {
-    return `No ${provider.name} devices are available.` + (provider.id === "spotify" ? " Open Spotify on a phone, computer or speaker first." : "");
+    return `No ${provider.name} devices are available.`;
   }
 
   const target = args.transfer_to as string | undefined;
@@ -472,7 +364,8 @@ async function handleRequest(
         result: {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "giap-music", version: "0.3.0" },
+          serverInfo: { name: "giap-music", version: "0.4.0" },
+          ...(available ? {} : { instructions: NO_MUSIC_INSTRUCTIONS }),
         },
       };
 
@@ -491,6 +384,14 @@ async function handleRequest(
           string,
           unknown
         >) ?? {};
+
+      if (!available) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: NO_MUSIC_INSTRUCTIONS },
+        };
+      }
 
       const started = Date.now();
       log.info("tool_call", `handling ${toolName}`, { tool: toolName });

@@ -54,6 +54,13 @@ describe("playerView", () => {
     expect(view(reply({ need: "setup" }))).toMatchObject({ kind: "unavailable" });
   });
 
+  it("points at the page's Play here button while the page waits for a click", () => {
+    expect(playerView({ label: "Spotify", reply: reply({ need: "interaction" }) })).toEqual({
+      kind: "needs_click",
+      note: "Press Play Spotify here on the music player page.",
+    });
+  });
+
   it("is signed in once the page says the service needs nothing", () => {
     expect(view(reply({ need: "none", ready: true }))).toEqual({ kind: "signed_in" });
   });

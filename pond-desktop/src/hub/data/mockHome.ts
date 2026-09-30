@@ -94,6 +94,10 @@ export interface NowPlayingData {
    */
   progressMs: number | null;
   durationMs: number | null;
+  /** The item's page on Spotify, linked from the card as Spotify's design guidelines ask. */
+  link?: string | null;
+  /** What Spotify allows right now; absent means everything. */
+  can?: { pause: boolean; resume: boolean; next: boolean; previous: boolean };
 }
 
 /**
