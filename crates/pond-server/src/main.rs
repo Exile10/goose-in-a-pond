@@ -9064,30 +9064,32 @@ async fn run_pairing(refresh: bool) -> Result<()> {
     struct CodeResp {
         code: Option<String>,
         expires_at: Option<String>,
+        /// Where the phone connects and which key it pins.
+        pairing: serde_json::Value,
     }
     let body: CodeResp = resp.json().await?;
 
     // A GET can return {"code": null} when no live code exists — mint one via POST.
-    let (code, expires_at) = match (body.code, body.expires_at) {
-        (Some(c), Some(e)) => (c, e),
+    let (code, expires_at, info) = match (body.code, body.expires_at) {
+        (Some(c), Some(e)) => (c, e, body.pairing),
         _ => {
-            let minted: CodeResp = client.post(&base).send().await?.json().await?;
+            let minted: CodeResp = client
+                .post(&base)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
             (
                 minted
                     .code
                     .ok_or_else(|| anyhow::anyhow!("server did not return a pairing code"))?,
                 minted.expires_at.unwrap_or_default(),
+                minted.pairing,
             )
         }
     };
 
-    let info: serde_json::Value = client
-        .get(format!("http://127.0.0.1:{port}/api/v1/system/info"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
     let host = info["hostname"]
         .as_str()
         .context("server omitted hostname")?;

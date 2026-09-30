@@ -193,6 +193,16 @@ Health, onboarding status and `/system/info` remain public for connection and
 pairing bootstrap; discovery information must never establish trust in a new TLS
 key. Existing onboarding and OAuth-specific guards remain in place.
 
+`/system/info` answers by authentication (2026-09-30). Without a valid bearer it
+returns only `https_port`, `tailnet_address` and `protocol: 2`, which is what a
+phone needs to connect; with one, the full record (host name, LAN address, public
+key pin, version, platform). Before this, every tailnet node could read the
+household's host name, addresses and software version before pairing. The pairing
+material the desktop and `pond-server pairing` put in the QR now comes back with the
+code from the host-only `/handshake/pairing-code` as `pairing`. The mDNS record
+still advertises the host name, version and pin to the LAN, by design: that is how
+discovery works, and the pin it publishes is confirmed against the Pond's screen.
+
 Denials emit a structured `device_mismatch` warning with the operation name;
 accepted device checks emit debug events, and successful revocation emits an
 info event. Tokens, notification contents and claimed identifiers are excluded
