@@ -979,6 +979,17 @@ export interface ChallengeResponse {
 }
 
 /** Response from the loopback-only GET /api/v1/handshake/pairing-code. */
+/** A phone asking to replace its remote identity, awaiting approval on this Pond. */
+export interface RecoveryRequest {
+  id: string;
+  device: string;
+  /** The name the household gave the phone; null when it could not be read. */
+  deviceName: string | null;
+  /** The start of the replacement's machine key, which the phone also shows. */
+  keyPreview: string;
+  approved: boolean;
+}
+
 export interface PairingCodeResponse {
   code: string | null;
   expires_at?: string;

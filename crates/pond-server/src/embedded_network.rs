@@ -118,10 +118,17 @@ pub struct Runtime {
 impl Runtime {
     /// Create the private bridge; the short random socket path fits macOS's sockaddr_un limit.
     pub fn new(data: &Path, port: u16) -> Result<(Arc<Self>, tokio::net::UnixListener)> {
-        let helper = std::env::var_os("POND_NETWORK_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_exe()?.with_file_name("pondnet"));
-        Self::with_helper(data, port, helper)
+        // The helper holds the household's network identity, so which binary runs is not
+        // something the environment decides in a release build.
+        #[cfg(debug_assertions)]
+        if let Some(helper) = std::env::var_os("POND_NETWORK_BINARY") {
+            return Self::with_helper(data, port, PathBuf::from(helper));
+        }
+        Self::with_helper(
+            data,
+            port,
+            std::env::current_exe()?.with_file_name("pondnet"),
+        )
     }
 
     fn with_helper(
@@ -245,7 +252,8 @@ impl Runtime {
     ) -> Result<serde_json::Value> {
         use tokio::io::AsyncWriteExt;
         let config = self.config()?;
-        let mut child = Command::new(&self.helper)
+        let mut child = self
+            .helper_command()?
             .arg("--authority-action")
             .arg(action)
             .arg("--state")
@@ -319,6 +327,38 @@ impl Runtime {
         let enrolled = self.authority("enroll", payload).await?;
         self.ensure_not_revoked_meanwhile(&device)?;
         Ok(enrolled)
+    }
+
+    /// A command for the helper, refusing one another account could have replaced, and
+    /// passing it only the environment it needs. An inherited `TS_AUTHKEY` could join the
+    /// node to another tailnet and an inherited `HTTPS_PROXY` could route its coordinator
+    /// traffic, so nothing else is passed through.
+    fn helper_command(&self) -> Result<Command> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&self.helper).with_context(|| {
+            format!(
+                "bundled pondnet helper is missing at {}; build native/pondnet first",
+                self.helper.display()
+            )
+        })?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        ensure!(
+            metadata.is_file()
+                && (metadata.uid() == euid || metadata.uid() == 0)
+                && metadata.mode() & 0o022 == 0,
+            "refusing the pondnet helper at {}: it must be a file owned by this account or root \
+             and writable by no one else",
+            self.helper.display()
+        );
+        let mut command = Command::new(&self.helper);
+        command.env_clear();
+        for name in ["HOME", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        Ok(command)
     }
 
     /// The lock that serialises helper calls about `device`.
@@ -406,6 +446,15 @@ impl Runtime {
         ensure!(
             !auth_id.contains('/') && (16..=256).contains(&auth_id.len()),
             "invalid pending registration"
+        );
+        // The coordinator checks the same shapes; checked here too so a malformed key is
+        // refused before anything is signed for it, and so an empty machine key can never
+        // compare equal to an enrollment that lacks one.
+        ensure!(
+            hex_key(&registration.machine_key, "mkey:")
+                && (registration.node_key.is_empty()
+                    || hex_key(&registration.node_key, "nodekey:")),
+            "invalid node or machine key"
         );
         Ok(
             serde_json::json!({"household":"", "device":device,"role":role,"action":"enroll","authId":auth_id,"nodeKey":registration.node_key,"machineKey":registration.machine_key,"nonce":"","expires":0}),
@@ -587,11 +636,8 @@ impl Runtime {
             }
             *process = None;
         }
-        ensure!(
-            self.helper.is_file(),
-            "bundled pondnet helper is missing; build native/pondnet first"
-        );
-        let mut child = Command::new(&self.helper)
+        let mut child = self
+            .helper_command()?
             .arg("--state")
             .arg(self.directory.join("node"))
             .arg("--hostname")
@@ -604,11 +650,6 @@ impl Runtime {
             .arg(&self.identity)
             .arg("--port")
             .arg(self.port.to_string())
-            .env_remove("TS_AUTHKEY")
-            .env_remove("TS_CLIENT_ID")
-            .env_remove("TS_CLIENT_SECRET")
-            .env_remove("TS_ID_TOKEN")
-            .env_remove("TS_AUDIENCE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -725,6 +766,16 @@ fn network_device(id: &str) -> Result<String> {
     digest.update(b"goose-enrollment-device-v1\0");
     digest.update(id.as_bytes());
     Ok(format!("{:x}", digest.finalize()))
+}
+
+/// `prefix` followed by 64 lowercase hex digits, as the coordinator writes keys.
+fn hex_key(key: &str, prefix: &str) -> bool {
+    key.strip_prefix(prefix).is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 fn valid_device(id: &str) -> bool {
@@ -1169,7 +1220,7 @@ async fn register_phone(
     Json(registration): Json<Registration>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     pond_api::network::require_lan(Some(ConnectInfo(peer))).map_err(|_| StatusCode::FORBIDDEN)?;
-    let (device, _) = recovery::caller(&headers, handshake.as_ref()).await?;
+    let device = recovery::caller(&headers, handshake.as_ref()).await?.device;
     let lock = runtime.device_lock(&device);
     let _held = lock.lock().await;
     let store_failed = |error: anyhow::Error| {
@@ -1261,7 +1312,10 @@ pub fn companion_management(runtime: Arc<Runtime>, state: Arc<pond_api::AppState
             "/api/v1/remote-access/enrollment",
             axum::routing::post(register_phone),
         )
-        .merge(recovery::phone_routes(state.handshake.clone()))
+        .merge(recovery::phone_routes(
+            state.handshake.clone(),
+            state.device_registry.clone(),
+        ))
         .with_state(runtime)
         // route_layer, not layer: merged into the companion, a layer would also wrap its
         // fallback, charging every unknown path to this 20-a-minute budget.
@@ -1584,6 +1638,7 @@ mod tests {
                  dir=$(dirname \"$0\")\n\
                  payload=$(cat)\n\
                  echo \"$2 $payload\" >> \"$dir/calls\"\n\
+                 env > \"$dir/env\"\n\
                  if [ -f \"$dir/$2.out\" ]; then cat \"$dir/$2.out\"; else echo '{}'; fi\n\
                  exit $(cat \"$dir/$2.code\" 2>/dev/null || echo 0)\n",
             )
@@ -1828,5 +1883,63 @@ mod tests {
             .unwrap();
         runtime.seen_on_lan("phone000000000001").await;
         assert_eq!(runtime.presence().unwrap()[&device], old);
+    }
+
+    #[tokio::test]
+    async fn the_helper_inherits_no_environment_and_must_not_be_replaceable() {
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        runtime
+            .authority("inspect", serde_json::json!({}))
+            .await
+            .unwrap();
+        let env = std::fs::read_to_string(helper.dir.path().join("env")).unwrap();
+        // Cargo sets these for every test process; none may reach the helper.
+        for inherited in ["CARGO_PKG_NAME=", "RUST_TEST_THREADS=", "\nPATH="] {
+            assert!(
+                !format!("\n{env}").contains(inherited),
+                "{inherited} reached the helper"
+            );
+        }
+
+        let script = helper.dir.path().join("pondnet");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o720)).unwrap();
+        let refused = runtime.authority("inspect", serde_json::json!({})).await;
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("writable by no one else")),
+            "a group-writable helper was run"
+        );
+    }
+
+    #[test]
+    fn a_registration_names_well_formed_keys() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        let registration = |node: &str, machine: &str| Registration {
+            auth_url: "https://coord.example/register/abcdefghijklmnop".into(),
+            node_key: node.into(),
+            machine_key: machine.into(),
+        };
+        let machine = format!("mkey:{}", "a".repeat(64));
+        let node = format!("nodekey:{}", "b".repeat(64));
+        for (node_key, machine_key, ok) in [
+            (node.as_str(), machine.as_str(), true),
+            ("", machine.as_str(), true),
+            (node.as_str(), "", false),
+            (node.as_str(), "mkey:ABC", false),
+            (node.as_str(), &format!("mkey:{}", "A".repeat(64)), false),
+            ("nodekey:1", machine.as_str(), false),
+        ] {
+            let payload = runtime.registration_payload(
+                "device0000000001",
+                "phone",
+                &registration(node_key, machine_key),
+            );
+            assert_eq!(payload.is_ok(), ok, "{node_key:?} {machine_key:?}");
+        }
     }
 }
