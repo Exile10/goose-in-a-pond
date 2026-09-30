@@ -59,6 +59,10 @@ function speaker(id: string | null) {
       asks += 1;
       return id;
     },
+    // These tests are about the gate and the fallback, not the check afterwards: a player that cannot
+    // be seen is not waited on.
+    status: async () => null,
+    unavailableBecause: async () => null,
   };
   return { speaker: s, asks: () => asks };
 }

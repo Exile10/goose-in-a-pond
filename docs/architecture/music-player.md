@@ -165,6 +165,17 @@ Measured on macOS 27, arm64, in scratch folders:
   die. `GIAP_ALLOW_KNOWN_BAD_WIDEVINE=1` lifts the refusal, for anyone testing whether it still
   holds. Independently, a Spotify playback error now pauses the player, so a refusal that hits every
   track cannot skip through a whole album.
+- **The assistant checks the player after a Spotify play.** Spotify answers a play request before
+  anything has played, so the tool used to say "Playing" whatever happened next. It now looks at the
+  in-app player (the `state` op) before and then every 0.6 s for up to six seconds, and: reports an
+  error the player shows ("Spotify accepted the request, but the in-app player could not play it:
+  ... Nothing is playing."); waits through buffering until the position moves; says so when it is
+  still loading at the end; and leaves alone a request that went to another device (an idle player
+  is not waited on) or a player it cannot see. An error already showing before the request is not
+  taken for this one unless it is still there after it had time to be replaced. When there is no
+  device at all and the in-app player cannot be used, the error gives the player's reason (the
+  refused module, say) instead of Spotify's bare 404. Not yet run against a real failing Spotify,
+  only against a scripted player.
 - MusicKit reports "playing" for a moment **before** a license failure arrives, so the adapter
   confirms only when the position has advanced.
 - **Spotify has not been run at all.** The adapter is built from the SDK's documented events and

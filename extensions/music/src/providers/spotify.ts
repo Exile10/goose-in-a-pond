@@ -1,7 +1,7 @@
 import type { MusicProvider, TrackInfo, PlaylistInfo, AlbumInfo, DeviceInfo, RepeatState, ArtistInfo, TimeRange, PlayTarget, FollowUpResult } from './types.js';
 import { describeError, log } from '../log.js';
 import type { Fetch } from './apple/egress.js';
-import type { Speaker } from './player/speaker.js';
+import type { Speaker, SpeakerStatus } from './player/speaker.js';
 
 interface SpotifyTrack {
   id: string;
@@ -151,7 +151,15 @@ export interface SpotifyDeps {
   speaker?: Speaker;
   /** Overrides SPOTIFY_ACCESS_TOKEN, for tests. */
   token?: string;
+  /** How a wait is made, so a test does not have to sit through one. */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/** How often, and how many times, the in-app player is looked at after a play: about six seconds. */
+const CONFIRM_GAP_MS = 600;
+const CONFIRM_LOOKS = 10;
+/** A song that has got this far is really playing, not just announced. */
+const PLAYING_AFTER_MS = 500;
 
 export class SpotifyProvider implements MusicProvider {
   id = 'spotify' as const;
@@ -162,8 +170,10 @@ export class SpotifyProvider implements MusicProvider {
   private readonly doFetch: Fetch;
   private readonly egress: EgressCheck | undefined;
   private readonly speaker: Speaker | undefined;
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(deps: SpotifyDeps = {}) {
+    this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.doFetch = deps.fetch ?? fetch;
     this.egress = deps.egress;
     this.speaker = deps.speaker;
@@ -356,22 +366,89 @@ export class SpotifyProvider implements MusicProvider {
     return this.speaker.deviceId();
   }
 
+  /**
+   * The error for a play that found no device. Spotify's own is a 404 with a JSON body, which tells
+   * a person nothing; when the in-app player could have been the device but cannot be used, its own
+   * reason (a Widevine module the services refuse, say) is the useful part and goes first.
+   */
+  private async noDeviceError(error: unknown): Promise<unknown> {
+    if (!this.speaker) return error;
+    if (!(error instanceof SpotifyApiError) || error.status !== 404) return error;
+    if (!error.body.includes(NO_ACTIVE_DEVICE)) return error;
+    const why = await this.speaker.unavailableBecause();
+    if (!why) return error;
+    return new Error(
+      `No Spotify device is playing, and the in-app player cannot be used: ${why} ` +
+        'Open Spotify on a phone or computer and try again.',
+    );
+  }
+
+  /**
+   * Spotify answers a play request before anything has played, so "accepted" is not "playing". When
+   * the in-app player is where it landed, look at what it then did: an error it reports is the
+   * truth, and it is said, instead of a song that never sounds. Returns a note to add to the reply,
+   * or throws. A player that cannot be seen, or that is not the one playing, is not second-guessed.
+   *
+   * `targeted` is true when the request named the in-app device, so nothing else can be playing.
+   */
+  private async confirmOnSpeaker(targeted: boolean, before: SpeakerStatus | null): Promise<string> {
+    if (!this.speaker || !before) return '';
+    // An error the player was already showing may be last time's; it only counts once it has had
+    // time to be replaced, or if it is still there after that.
+    const mayBeStale = before.status === 'error';
+    let sawOurs = targeted;
+
+    for (let look = 0; look < CONFIRM_LOOKS; look++) {
+      await this.sleep(CONFIRM_GAP_MS);
+      const now = await this.speaker.status();
+      if (!now) return '';
+
+      if (now.status === 'error') {
+        if (mayBeStale && look < 2) continue;
+        throw new Error(
+          `Spotify accepted the request, but the in-app player could not play it: ` +
+            `${now.message ?? 'it reported an error'} Nothing is playing.`,
+        );
+      }
+      if (now.status === 'playing') {
+        if (now.position_ms >= PLAYING_AFTER_MS) return '';
+        sawOurs = true;
+        continue;
+      }
+      if (now.status === 'buffering') {
+        sawOurs = true;
+        continue;
+      }
+      // idle, paused or ended: if the request went to this player the state has not caught up yet;
+      // if it did not, something else is playing and there is nothing to confirm here.
+      if (!sawOurs) return '';
+    }
+    return sawOurs
+      ? ` The in-app player was still loading it after ${Math.round((CONFIRM_LOOKS * CONFIRM_GAP_MS) / 1000)} seconds.`
+      : '';
+  }
+
   async play(target?: PlayTarget): Promise<string> {
     const body = buildPlayBody(target);
     const payload = Object.keys(body).length > 0 ? body : undefined;
+    // Looked at before, so an error left from last time is not taken for this one.
+    const before = this.speaker ? await this.speaker.status() : null;
+    let onSpeaker = false;
 
     try {
       await this.command('PUT', '/me/player/play', payload);
     } catch (error) {
       const deviceId = await this.speakerFor(error);
-      if (!deviceId) throw error;
+      if (!deviceId) throw await this.noDeviceError(error);
       log.info('speaker_fallback', 'no Spotify device was active; playing on the in-app player');
       await this.command('PUT', `/me/player/play?device_id=${encodeURIComponent(deviceId)}`, payload);
+      onSpeaker = true;
     }
 
-    if (!target) return 'Resumed playback';
+    const note = await this.confirmOnSpeaker(onSpeaker, before);
+    if (!target) return `Resumed playback${note}`;
     const uri = typeof target === 'string' ? target : target.uri;
-    return `Playing ${uri}`;
+    return `Playing ${uri}${note}`;
   }
 
   async pause(): Promise<string> {
