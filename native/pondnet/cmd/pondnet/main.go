@@ -55,6 +55,12 @@ func main() {
 			household, err := authority.Register(context.Background(), *enrollmentOrigin, uint16(*port))
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "household registration incomplete:", err)
+				// A refusal, like one from Submit, is a decision the Pond must report as one.
+				var refused *pondnet.Refused
+				if errors.As(err, &refused) {
+					json.NewEncoder(os.Stdout).Encode(map[string]string{"refused": refused.Reason})
+					os.Exit(3)
+				}
 				os.Exit(1)
 			}
 			json.NewEncoder(os.Stdout).Encode(map[string]string{"household": household})

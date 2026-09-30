@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"github.com/Exile10/goose-in-a-pond/native/pondnet/enrollment"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -76,5 +78,41 @@ func TestAuthorityRefusesDamagedState(t *testing.T) {
 				t.Fatal("damaged identity accepted")
 			}
 		})
+	}
+}
+
+func TestCoordinatorAnswersMustDescribeTheDeviceAsked(t *testing.T) {
+	machine := "mkey:" + strings.Repeat("a", 64)
+	enroll := enrollment.Approval{Action: "enroll", Role: "phone", MachineKey: machine}
+	good := enrollment.Device{Role: "phone", Status: "pending", MachineKey: machine, Revision: "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}
+	if err := answered(enroll, good); err != nil {
+		t.Fatal(err)
+	}
+	for name, device := range map[string]enrollment.Device{
+		"unknown status": {Role: "phone", Status: "granted", MachineKey: machine},
+		"unknown role":   {Role: "admin", Status: "pending", MachineKey: machine},
+		"other device":   {Role: "phone", Status: "pending", MachineKey: "mkey:" + strings.Repeat("b", 64)},
+		"other role":     {Role: "pond", Status: "pending", MachineKey: machine},
+		"odd revision":   {Role: "phone", Status: "pending", MachineKey: machine, Revision: "a/b"},
+		"long revision":  {Role: "phone", Status: "pending", MachineKey: machine, Revision: strings.Repeat("a", 81)},
+	} {
+		if answered(enroll, device) == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	revoke := enrollment.Approval{Action: "revoke", Role: "phone"}
+	if answered(revoke, enrollment.Device{Role: "phone", Status: "revoking"}) == nil {
+		t.Error("an unconfirmed revocation accepted")
+	}
+	if err := answered(revoke, enrollment.Device{Role: "phone", Status: "revoked"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTheCoordinatorClientIgnoresProxySettings(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+	transport, ok := coordinatorClient().Transport.(*http.Transport)
+	if !ok || transport.Proxy != nil {
+		t.Fatal("the coordinator client would use an environment proxy")
 	}
 }

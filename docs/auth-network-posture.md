@@ -44,7 +44,9 @@ private Unix socket. Only that private router accepts its peer-identity header;
 public listeners ignore caller-supplied forwarding identity. The shared auth and
 rate-limit middleware sees the actual embedded peer. LAN-only pairing and
 loopback-only management therefore remain enforced. Remote addresses are published
-only after the listener and certificate are ready.
+only after the listener and certificate are ready. The helper forwards only
+`/api/v1/` requests, and its coordinator client never uses a proxy from the
+environment.
 
 GOTG connects remote endpoints through a credentialed, allowlisted loopback CONNECT
 proxy; proxy credentials remain native-only. The Go dialer uses the embedded
