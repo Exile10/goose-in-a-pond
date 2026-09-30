@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"github.com/Exile10/goose-in-a-pond/native/pondnet/internal/privatefile"
 	"golang.org/x/sys/unix"
 	"io"
 	"net/netip"
@@ -75,8 +76,8 @@ func Open(directory string) (*Store, error) {
 	}
 	s := &Store{directory: directory, lock: lock, value: state{Households: map[string]Household{}, Devices: map[string]map[string]Device{}, Requests: map[string]int64{}}}
 	path := filepath.Join(directory, "state.json")
-	info, err = os.Lstat(path)
-	if os.IsNotExist(err) {
+	f, err := privatefile.Open(path, 16<<20)
+	if errors.Is(err, os.ErrNotExist) {
 		if _, e := os.Stat(filepath.Join(directory, "initialized")); e == nil {
 			s.Close()
 			return nil, errors.New("enrollment state is missing")
@@ -84,22 +85,16 @@ func Open(directory string) (*Store, error) {
 		if err = s.save(); err == nil {
 			err = writeMarker(directory)
 		}
+	} else if errors.Is(err, privatefile.ErrNotPrivate) {
+		err = errors.New("invalid enrollment state file")
 	} else if err == nil {
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 16<<20 {
-			err = errors.New("invalid enrollment state file")
-		} else {
-			var f *os.File
-			f, err = os.Open(path)
-			if err == nil {
-				d := json.NewDecoder(io.LimitReader(f, 16<<20))
-				d.DisallowUnknownFields()
-				err = d.Decode(&s.value)
-				if err == nil && d.Decode(new(any)) != io.EOF {
-					err = errors.New("trailing state data")
-				}
-				f.Close()
-			}
+		d := json.NewDecoder(io.LimitReader(f, 16<<20))
+		d.DisallowUnknownFields()
+		err = d.Decode(&s.value)
+		if err == nil && d.Decode(new(any)) != io.EOF {
+			err = errors.New("trailing state data")
 		}
+		f.Close()
 	}
 	if err == nil {
 		if s.value.Retired == nil {

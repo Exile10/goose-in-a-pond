@@ -211,6 +211,11 @@ of `pond_system.db` and `pond_vectors.db` taken through SQLite's online backup A
 the Pond keeps serving. It deliberately omits `models/`, `hf_cache/`, `bin/`, `lib/` and
 the logs, which are gigabytes and all refetchable; the remainder is under a megabyte.
 
+An `embedded-network/authority/` directory with no `identity.json` is refused as a lost
+key (`authority identity is missing; restore its backup`). If a crash during first setup
+on a build before 2026-09-30 left it that way, and no household was ever registered,
+remove the directory and the Pond creates a new authority.
+
 Run it from an operator machine so the Pond needs no additional software, no elevated
 privileges and no writable scratch space, and so the archive lands somewhere the Pond's
 own disk failure cannot reach:

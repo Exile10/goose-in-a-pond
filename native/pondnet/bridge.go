@@ -10,9 +10,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"strconv"
 	"time"
+
+	"github.com/Exile10/goose-in-a-pond/native/pondnet/internal/privatefile"
 )
 
 // PeerHeader is accepted only by the Pond's private Unix listener. Never trust
@@ -22,14 +23,10 @@ const PeerHeader = "X-Pond-Embedded-Peer"
 // LoadCertificate reads the existing Pond identity without creating or changing
 // a key. Reloading on each handshake preserves Rust's certificate-renewal policy.
 func LoadCertificate(path string) (*tls.Certificate, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 65536 {
+	file, err := privatefile.Open(path, 65536)
+	if errors.Is(err, privatefile.ErrNotPrivate) {
 		return nil, errors.New("Pond TLS identity must be a private regular file")
 	}
-	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}

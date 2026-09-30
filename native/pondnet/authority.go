@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/Exile10/goose-in-a-pond/native/pondnet/enrollment"
+	"github.com/Exile10/goose-in-a-pond/native/pondnet/internal/privatefile"
 	"golang.org/x/sys/unix"
 	"io"
 	"net/http"
@@ -35,10 +36,7 @@ func LoadAuthority(directory string) (Authority, error) {
 	if !filepath.IsAbs(directory) {
 		return out, errors.New("authority directory must be absolute")
 	}
-	created := false
-	if err := os.Mkdir(directory, 0700); err == nil {
-		created = true
-	} else if !os.IsExist(err) {
+	if err := createAuthority(directory); err != nil {
 		return out, err
 	}
 	info, err := os.Lstat(directory)
@@ -57,65 +55,24 @@ func LoadAuthority(directory string) (Authority, error) {
 	if err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return out, err
 	}
-	path := filepath.Join(directory, "identity.json")
+	file, err := privatefile.Open(filepath.Join(directory, "identity.json"), 4096)
+	if errors.Is(err, os.ErrNotExist) {
+		return out, errors.New("authority identity is missing; restore its backup")
+	}
+	if err != nil {
+		return out, errors.New("invalid authority identity")
+	}
+	defer file.Close()
 	var stored struct {
 		Seed string `json:"seed"`
 	}
-	if created {
-		seed := make([]byte, ed25519.SeedSize)
-		if _, err = rand.Read(seed); err != nil {
-			return out, err
-		}
-		stored.Seed = base64.StdEncoding.EncodeToString(seed)
-		data, _ := json.Marshal(stored)
-		f, e := os.CreateTemp(directory, ".identity-")
-		if e != nil {
-			return out, e
-		}
-		defer os.Remove(f.Name())
-		_, err = f.Write(data)
-		if err == nil {
-			err = f.Sync()
-		}
-		closeErr := f.Close()
-		if err == nil {
-			err = closeErr
-		}
-		if err == nil {
-			err = os.Rename(f.Name(), path)
-		}
-		if err != nil {
-			return out, err
-		}
-		dir, e := os.Open(directory)
-		if e != nil {
-			return out, e
-		}
-		err = dir.Sync()
-		dir.Close()
-		if err != nil {
-			return out, err
-		}
-	} else {
-		info, err = os.Lstat(path)
-		if err != nil {
-			return out, err
-		}
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 4096 {
-			return out, errors.New("invalid authority identity")
-		}
-		data, e := os.ReadFile(path)
-		if e != nil {
-			return out, e
-		}
-		decoder := json.NewDecoder(bytes.NewReader(data))
-		decoder.DisallowUnknownFields()
-		if err = decoder.Decode(&stored); err != nil {
-			return out, err
-		}
-		if decoder.Decode(new(any)) != io.EOF {
-			return out, errors.New("trailing identity data")
-		}
+	decoder := json.NewDecoder(io.LimitReader(file, 4097))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&stored); err != nil {
+		return out, err
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return out, errors.New("trailing identity data")
 	}
 	seed, err := base64.StdEncoding.DecodeString(stored.Seed)
 	if err != nil || len(seed) != ed25519.SeedSize {
@@ -127,6 +84,76 @@ func LoadAuthority(directory string) (Authority, error) {
 	out.Household = hex.EncodeToString(digest[:16])
 	out.PublicKey = base64.StdEncoding.EncodeToString(public)
 	return out, nil
+}
+
+// createAuthority makes a household identity only when the directory does not exist. It
+// is built in a staging directory beside the final one and renamed into place, so a crash
+// part-way leaves nothing or a whole identity. It used to create the directory first, and
+// a crash before the key was written left an empty directory every later start refused.
+func createAuthority(directory string) error {
+	if _, err := os.Lstat(directory); !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	parent, base := filepath.Dir(directory), filepath.Base(directory)
+	// Earlier attempts that crashed before their rename.
+	if stale, err := filepath.Glob(filepath.Join(parent, base+".new-*")); err == nil {
+		for _, leftover := range stale {
+			os.RemoveAll(leftover)
+		}
+	}
+	staging, err := os.MkdirTemp(parent, base+".new-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+	if err = os.Chmod(staging, 0700); err != nil {
+		return err
+	}
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err = rand.Read(seed); err != nil {
+		return err
+	}
+	data, _ := json.Marshal(struct {
+		Seed string `json:"seed"`
+	}{base64.StdEncoding.EncodeToString(seed)})
+	if err = writeSynced(filepath.Join(staging, "identity.json"), data); err != nil {
+		return err
+	}
+	if err = syncDirectory(staging); err != nil {
+		return err
+	}
+	if err = os.Rename(staging, directory); err != nil {
+		// Another process created it first; use theirs.
+		if _, statErr := os.Lstat(directory); statErr == nil {
+			return nil
+		}
+		return err
+	}
+	return syncDirectory(parent)
+}
+
+func writeSynced(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // Register introduces this household to the enrollment service, so that a
