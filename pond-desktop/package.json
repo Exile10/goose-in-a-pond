@@ -11,7 +11,6 @@
     "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
   },
   "scripts": {
-    "postinstall": "node scripts/install-electron.mjs",
     "dev": "concurrently --kill-others-on-fail -n vite,server -c cyan,green \"vite\" \"npm run dev:server\"",
     "dev:server": "cd .. && cargo run -p pond-server -- serve --native",
     "dev:server:mesh": "cd .. && cargo run -p pond-server --features mesh -- serve --native",
@@ -23,9 +22,6 @@
     "preview": "vite preview",
     "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json",
-    "check:widevine": "electron scripts/widevine-check.cjs",
-    "widevine:pin": "electron scripts/widevine-pin.cjs",
-    "widevine:unpin": "electron scripts/widevine-pin.cjs --revert",
     "stage:server": "bash ../scripts/stage-server-sidecar.sh",
     "bundle:app": "npm run stage:server && npm run build:main && bash ../scripts/verify-sidecar.sh && electron-builder --mac",
     "pack:dir": "npm run stage:server && npm run build:main && bash ../scripts/verify-sidecar.sh && electron-builder --mac dir"
@@ -57,7 +53,7 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.1",
     "concurrently": "^10.0.5",
-    "electron": "git+https://github.com/castlabs/electron-releases.git#v44.1.0+wvcus",
+    "electron": "^44.4.2",
     "electron-builder": "^26.15.3",
     "happy-dom": "^20.14.5",
     "tailwindcss": "^4.2.2",
