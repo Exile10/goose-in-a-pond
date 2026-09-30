@@ -30,7 +30,9 @@ pub fn is_tailnet(ip: IpAddr) -> bool {
     }
 }
 
-/// Exclude tunnels and container-only networks from the home LAN boundary.
+/// Exclude tunnels and container-only networks from the home LAN boundary. Overlay VPNs
+/// that present as Ethernet (ZeroTier, NetBird, Hamachi, Nebula) are not point-to-point, so
+/// only their names give them away; a peer reached through one is not in the house.
 pub fn is_lan_interface(interface: &Interface) -> bool {
     !interface.is_loopback()
         && !interface.is_link_local()
@@ -41,7 +43,14 @@ pub fn is_lan_interface(interface: &Interface) -> bool {
             "tun",
             "tap",
             "wg",
+            "wt",
+            "zt",
+            "feth",
+            "ham",
+            "nebula",
             "ipsec",
+            "gif",
+            "stf",
             "ppp",
             "docker",
             "veth",
@@ -198,10 +207,15 @@ mod tests {
         ] {
             assert!(!is_lan_peer(ip.parse().unwrap(), &interfaces), "{ip}");
         }
-        assert!(!is_lan_peer(
-            "192.168.1.3".parse().unwrap(),
-            &[lan("wg0", "192.168.1.2")]
-        ));
+        for tunnel in ["wg0", "zt5u4y6j", "feth2921", "wt0", "ham0", "nebula1"] {
+            assert!(
+                !is_lan_peer(
+                    "192.168.1.3".parse().unwrap(),
+                    &[lan(tunnel, "192.168.1.2")]
+                ),
+                "{tunnel}"
+            );
+        }
         assert_eq!(require_lan(None).unwrap_err().0, StatusCode::FORBIDDEN);
     }
 
