@@ -4287,35 +4287,13 @@ async fn run_server(
         state.agent.prepare_model(&settings.chat_model);
     }
 
-    let companion =
-        pond_api::build_companion_router(state.clone()).layer(axum::Extension(transport.clone()));
-    let app =
-        pond_api::build_router(state.clone(), static_dir).layer(axum::Extension(transport.clone()));
-    #[cfg(unix)]
-    let companion = companion
-        .layer(axum::Extension(embedded.clone()
-            as Arc<
-                dyn pond_core::security::ports::remote_access::RemoteRevocation,
-            >))
-        .layer(axum::Extension(embedded.address.clone()))
-        .merge(pond_server::embedded_network::companion_management(
-            embedded.clone(),
-            state.clone(),
-        ));
-    #[cfg(unix)]
-    let app = app
-        .layer(axum::Extension(embedded.clone()
-            as Arc<
-                dyn pond_core::security::ports::remote_access::DevicePresence,
-            >))
-        .layer(axum::Extension(embedded.clone()
-            as Arc<
-                dyn pond_core::security::ports::remote_access::RemoteRevocation,
-            >))
-        .layer(axum::Extension(embedded.address.clone()))
-        .merge(pond_server::embedded_network::management(embedded.clone()));
-    #[cfg(unix)]
-    let embedded_router = pond_server::embedded_network::private_companion(companion.clone());
+    let listeners = pond_server::listeners::compose(
+        state.clone(),
+        static_dir,
+        transport.clone(),
+        #[cfg(unix)]
+        embedded.clone(),
+    );
     #[cfg(unix)]
     match embedded.config() {
         Ok(config) if config.enabled => {
@@ -4360,7 +4338,11 @@ async fn run_server(
     let https_server =
         axum_server::from_tcp_rustls(https_listener.into_std()?, tls_config.clone())?
             .handle(tls_handle.clone())
-            .serve(companion.into_make_service_with_connect_info::<std::net::SocketAddr>());
+            .serve(
+                listeners
+                    .companion
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            );
     // A failed renewal keeps the current cert (valid 30+ more days) and retries next tick;
     // returning an error would end `run_server` and take the loopback dashboard down too.
     let renewal = async {
@@ -4419,7 +4401,7 @@ async fn run_server(
     let embedded_server = async {
         #[cfg(unix)]
         {
-            axum::serve(embedded_listener, embedded_router.into_make_service())
+            axum::serve(embedded_listener, listeners.embedded.into_make_service())
                 .await
                 .map_err(anyhow::Error::from)
         }
@@ -4441,7 +4423,7 @@ async fn run_server(
     let serve_result = tokio::select! {
         result = revocations => result,
         result = embedded_server => result,
-        result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result.map_err(anyhow::Error::from),
+        result = axum::serve(listener, listeners.dashboard.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result.map_err(anyhow::Error::from),
         result = https_server => result.map_err(anyhow::Error::from),
         result = renewal => result,
         _ = shutdown_signal() => {

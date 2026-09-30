@@ -7,6 +7,8 @@ pub mod network;
 pub mod oauth_callback;
 pub mod routes;
 pub mod runs;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod thought_filter;
 pub mod tool_context;
 

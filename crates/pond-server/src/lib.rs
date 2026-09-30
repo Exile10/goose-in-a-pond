@@ -3,6 +3,7 @@
 pub mod account_sync;
 pub mod conversation_extractor;
 pub mod hf_cache_migration;
+pub mod listeners;
 pub mod llm_memory_consolidator;
 pub mod schedule_executors;
 pub mod startup;

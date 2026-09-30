@@ -11,6 +11,8 @@ build = "build.rs"
 [features]
 # Enable in-process GGUF inference routing (mirrors pond-server's local-inference feature).
 local-inference = ["dep:pond-adapters-local-inference"]
+# `test_support::app_state()` for integration tests here and in pond-server.
+test-support = ["dep:tempfile", "pond-core/test-mocks"]
 
 [dependencies]
 libc = "0.2"
@@ -61,8 +63,10 @@ urlencoding = { workspace = true }
 # Single-executable: embed the built web UI (pond-desktop/dist) into the binary.
 include_dir = { workspace = true }
 mime_guess = "2"
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+pond-api = { path = ".", features = ["test-support"] }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
