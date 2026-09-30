@@ -1,21 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, Music } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Check, ExternalLink } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { invoke, isDesktopShell } from "../shell";
-import { signInView, type PlayerReply } from "./signInView";
+import { playerView, type PlayerReply } from "./signInView";
 
-/** While idle the player is asked now and then, so a sign-in made elsewhere shows up. */
-const IDLE_POLL_MS = 3_000;
-/** While a sign-in is under way it is watched closely, since the person is waiting on it. */
-const PENDING_POLL_MS = 1_500;
-/** Generous: they may be typing a password and a code. */
-const PENDING_TIMEOUT_MS = 3 * 60 * 1000;
+/** The page is asked now and then, so a sign-in made there shows up here. */
+const POLL_MS = 3_000;
 
 /**
- * One button that signs in to a music service through the player window. The person clicks here,
- * Apple's own sign-in opens, and this row turns to "Signed in" when the player reports it; there is
- * no second click in another window and no key to paste. Whether the button can work at all is
- * decided by `signInView`, so it is only offered when it can.
+ * Where a music service is signed in and played: the music player page, which opens in the person's
+ * own web browser because that is where the service documents its player running. This row opens
+ * the page and says what the page last reported. The sign-in is a button on the page itself, since
+ * the service's sign-in window may only open from a click there.
  */
 export function PlayerSignIn({
   service,
@@ -28,53 +24,33 @@ export function PlayerSignIn({
 }) {
   const desktop = isDesktopShell();
   const [reply, setReply] = useState<PlayerReply | null>(null);
-  const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const startedAt = useRef(0);
 
   const refresh = useCallback(async () => {
-    if (!desktop) return;
     try {
       setReply(await api.getPlayerState(service));
     } catch {
-      // Not being able to ask reads the same as the player not being there yet.
+      // Not being able to ask reads the same as the page not being open.
       setReply(null);
     }
-  }, [desktop, service]);
+  }, [service]);
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => {
-      if (pending && Date.now() - startedAt.current > PENDING_TIMEOUT_MS) {
-        setPending(false);
-        setError(`${label} did not finish signing in. Please try again.`);
-      }
-      void refresh();
-    }, pending ? PENDING_POLL_MS : IDLE_POLL_MS);
+    const timer = setInterval(() => void refresh(), POLL_MS);
     return () => clearInterval(timer);
-  }, [refresh, pending, label]);
+  }, [refresh]);
 
-  const view = signInView({ desktop, reply, pending, label });
+  const view = playerView({ reply, label });
+  const url = `${api.serverUrl()}/player.html?service=${encodeURIComponent(service)}`;
 
-  // The wait is over as soon as the player says so, not when the timer would have run out.
-  useEffect(() => {
-    if (view.kind === "signed_in" && pending) setPending(false);
-  }, [view.kind, pending]);
-
-  async function signIn() {
+  async function open() {
     setError(null);
-    // At once: waking the player is a token and a script, a second or two, and a button that seems to
-    // do nothing gets pressed again.
-    startedAt.current = Date.now();
-    setPending(true);
     try {
-      const result = await invoke("player_authorize", { service });
-      if (!result.started) {
-        setPending(false);
-        setError(result.message ?? `${label} could not start signing in.`);
-      }
+      // In the app, `window.open` would open an in-app window; the page belongs in the real browser.
+      if (desktop) await invoke("open_external", { url });
+      else window.open(url, "_blank", "noopener");
     } catch (err) {
-      setPending(false);
       setError(err instanceof Error ? err.message : String(err));
     }
   }
@@ -82,27 +58,9 @@ export function PlayerSignIn({
   return (
     <div className="secret-modal__oauth-block" data-testid={`player-sign-in-${service}`}>
       <p className="secret-modal__oauth-desc">
-        Sign in with the Apple ID that has your {label} subscription.
+        {label} plays in the music player, a page that opens in your web browser on this computer.
+        Sign in there.
       </p>
-
-      {view.kind === "ready" && (
-        <button
-          type="button"
-          className="secret-modal__oauth-btn"
-          onClick={() => void signIn()}
-          disabled={disabled}
-        >
-          <Music size={13} strokeWidth={1.8} />
-          Sign in to {label}
-        </button>
-      )}
-
-      {view.kind === "signing_in" && (
-        <div className="secret-modal__oauth-polling">
-          <div className="secret-modal__oauth-spinner" />
-          <span>Waiting for {label}'s sign-in window…</span>
-        </div>
-      )}
 
       {view.kind === "signed_in" && (
         <div className="secret-modal__fulfilled-indicator">
@@ -111,13 +69,17 @@ export function PlayerSignIn({
         </div>
       )}
 
-      {(view.kind === "starting" || view.kind === "unavailable" || view.kind === "not_in_shell") && (
-        <p className="secret-modal__oauth-note">{view.note}</p>
-      )}
-      {(view.kind === "ready" || view.kind === "signing_in") && view.note && (
-        <p className="secret-modal__oauth-note">{view.note}</p>
-      )}
+      <button
+        type="button"
+        className="secret-modal__oauth-btn"
+        onClick={() => void open()}
+        disabled={disabled}
+      >
+        <ExternalLink size={13} strokeWidth={1.8} />
+        Open the music player
+      </button>
 
+      {view.kind !== "signed_in" && <p className="secret-modal__oauth-note">{view.note}</p>}
       {error && <p className="secret-modal__field-error">{error}</p>}
     </div>
   );

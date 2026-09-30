@@ -12,7 +12,9 @@ vi.mock("../shell", () => ({
   isDesktopShell: () => shell.desktop,
   invoke: shell.invoke,
 }));
-vi.mock("../api/PondApiClient", () => ({ api: { getPlayerState } }));
+vi.mock("../api/PondApiClient", () => ({
+  api: { getPlayerState, serverUrl: () => "http://127.0.0.1:4000" },
+}));
 
 import { PlayerSignIn } from "./PlayerSignIn";
 
@@ -39,6 +41,8 @@ async function settle() {
   });
 }
 
+const PAGE = "http://127.0.0.1:4000/player.html?service=apple";
+
 beforeEach(() => {
   vi.useFakeTimers();
   shell.desktop = true;
@@ -50,138 +54,69 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("PlayerSignIn", () => {
-  it("is one button when the player is waiting for a sign-in", async () => {
+describe("PlayerSignIn: the row that sends you to the music player page", () => {
+  it("opens the pond's player page in the real browser from the app, not an in-app window", async () => {
     reports({ need: "authorization" });
+    shell.invoke.mockResolvedValue(undefined);
     render(<PlayerSignIn service="apple" label="Apple Music" />);
     await settle();
 
-    expect(screen.getAllByRole("button")).toHaveLength(1);
-    expect(screen.getByRole("button", { name: /sign in to apple music/i })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /open the music player/i }));
+    await settle();
+
+    expect(shell.invoke).toHaveBeenCalledWith("open_external", { url: PAGE });
   });
 
-  it("starts the sign-in in the player window with one click, then follows it to signed in", async () => {
+  it("opens the page with the browser's own window.open outside the app", async () => {
+    shell.desktop = false;
     reports({ need: "authorization" });
-    shell.invoke.mockResolvedValue({ started: true });
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
     render(<PlayerSignIn service="apple" label="Apple Music" />);
     await settle();
 
-    fireEvent.click(screen.getByRole("button", { name: /sign in to apple music/i }));
-    await settle();
-
-    expect(shell.invoke).toHaveBeenCalledWith("player_authorize", { service: "apple" });
-    expect(screen.getByText(/waiting for apple music's sign-in window/i)).toBeTruthy();
-    expect(screen.queryByRole("button")).toBeNull();
-
-    // The person finishes in Apple's popup; the player reports it.
-    reports({ need: "none", ready: true });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1_600);
-    });
-    expect(screen.getByText(/signed in to apple music/i)).toBeTruthy();
-    expect(screen.queryByRole("button")).toBeNull();
-  });
-
-  it("says why when the sign-in could not be started, and keeps the button", async () => {
-    reports({ need: "authorization" });
-    shell.invoke.mockResolvedValue({ started: false, message: "The music player is still starting." });
-    render(<PlayerSignIn service="apple" label="Apple Music" />);
-    await settle();
-
-    fireEvent.click(screen.getByRole("button", { name: /sign in to apple music/i }));
-    await settle();
-
-    expect(screen.getByText("The music player is still starting.")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /sign in to apple music/i })).toBeTruthy();
-  });
-
-  it("shows it is working at once, while the player wakes, and not after a click that did nothing", async () => {
-    reports({ need: "authorization", dormant: true });
-    let answer: (v: unknown) => void = () => undefined;
-    shell.invoke.mockReturnValue(new Promise((resolve) => (answer = resolve)));
-    render(<PlayerSignIn service="apple" label="Apple Music" />);
-    await settle();
-
-    fireEvent.click(screen.getByRole("button", { name: /sign in to apple music/i }));
-    await settle();
-    expect(screen.getByText(/waiting for apple music's sign-in window/i)).toBeTruthy();
-    expect(screen.queryByRole("button")).toBeNull();
-
-    // The player could not wake: the wait ends, the reason shows, and the button is back.
-    answer({ started: false, message: "Apple Music could not get its sign-in token: no network." });
-    await settle();
-    expect(screen.queryByText(/waiting for apple music's sign-in window/i)).toBeNull();
-    expect(screen.getByText(/could not get its sign-in token: no network/)).toBeTruthy();
-    expect(screen.getByRole("button", { name: /sign in to apple music/i })).toBeTruthy();
-  });
-
-  it("offers the button for a service that is asleep", async () => {
-    reports({ need: "authorization", dormant: true });
-    render(<PlayerSignIn service="apple" label="Apple Music" />);
-    await settle();
-    expect(screen.getByRole("button", { name: /sign in to apple music/i })).toBeTruthy();
-  });
-
-  it("shows why it cannot sign in, and no button, when Apple Music is not set up on this pond", async () => {
-    reports({ need: "setup", message: "Apple Music sign-in is not available on this pond yet." });
-    render(<PlayerSignIn service="apple" label="Apple Music" />);
-    await settle();
-
-    expect(screen.getByText("Apple Music sign-in is not available on this pond yet.")).toBeTruthy();
-    expect(screen.queryByRole("button")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /open the music player/i }));
+    expect(open).toHaveBeenCalledWith(PAGE, "_blank", "noopener");
     expect(shell.invoke).not.toHaveBeenCalled();
+    open.mockRestore();
   });
 
-  it("shows signed in, and no button, when the player is already signed in", async () => {
-    reports({ need: "none", ready: true });
-    render(<PlayerSignIn service="apple" label="Apple Music" />);
-    await settle();
-
-    expect(screen.getByText(/signed in to apple music/i)).toBeTruthy();
-    expect(screen.queryByRole("button")).toBeNull();
-  });
-
-  it("waits quietly while the player has not come up", async () => {
+  it("says the page is not open when no page is attached", async () => {
     getPlayerState.mockResolvedValue({ attached: false, state: null });
     render(<PlayerSignIn service="apple" label="Apple Music" />);
     await settle();
-
-    expect(screen.getByText(/music player is starting/i)).toBeTruthy();
-    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.getByText(/The music player is not open/)).toBeTruthy();
   });
 
-  it("does not offer a button outside the desktop app, and does not ask the player", async () => {
-    shell.desktop = false;
-    render(<PlayerSignIn service="apple" label="Apple Music" />);
-    await settle();
-
-    expect(screen.getByText(/from the goose in a pond app/i)).toBeTruthy();
-    expect(screen.queryByRole("button")).toBeNull();
-    expect(getPlayerState).not.toHaveBeenCalled();
-  });
-
-  it("gives up after three minutes with a reason instead of waiting for ever", async () => {
+  it("points at the page's Sign in button while the page waits for one", async () => {
     reports({ need: "authorization" });
-    shell.invoke.mockResolvedValue({ started: true });
     render(<PlayerSignIn service="apple" label="Apple Music" />);
     await settle();
-    fireEvent.click(screen.getByRole("button", { name: /sign in to apple music/i }));
-    await settle();
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(3 * 60 * 1000 + 2_000);
-    });
-
-    expect(screen.getByText(/did not finish signing in/i)).toBeTruthy();
-    expect(screen.getByRole("button", { name: /sign in to apple music/i })).toBeTruthy();
+    expect(screen.getByText("Press Sign in to Apple Music on the music player page.")).toBeTruthy();
+    // There is no sign-in button here: the sign-in may only open from a click on the page.
+    expect(screen.queryByRole("button", { name: /^sign in/i })).toBeNull();
   });
 
-  it("shows the reason the last sign-in failed, as the adapter reported it", async () => {
-    reports({ need: "authorization", message: "Sign-in did not finish: the window was closed" });
+  it("shows signed in once the page reports it, picked up by the poll", async () => {
+    reports({ need: "authorization" });
+    render(<PlayerSignIn service="apple" label="Apple Music" />);
+    await settle();
+    expect(screen.queryByText(/Signed in to Apple Music/)).toBeNull();
+
+    reports({ need: "none", ready: true });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    expect(screen.getByText(/Signed in to Apple Music/)).toBeTruthy();
+  });
+
+  it("shows why it could not open the page", async () => {
+    reports({ need: "authorization" });
+    shell.invoke.mockRejectedValue(new Error("refusing to open a file: URL externally"));
     render(<PlayerSignIn service="apple" label="Apple Music" />);
     await settle();
 
-    expect(screen.getByText("Sign-in did not finish: the window was closed")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /sign in to apple music/i })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /open the music player/i }));
+    await settle();
+    expect(screen.getByText(/refusing to open/)).toBeTruthy();
   });
 });

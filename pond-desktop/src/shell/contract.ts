@@ -27,20 +27,6 @@ export interface ShellCommands {
   stop_voice_session: { args: void; result: void };
   /** Open a URL in the real browser (`window.open` in the shell opens an in-app window). */
   open_external: { args: { url: string }; result: void };
-  /** Show or hide the music player window; it is hidden unless it needs the user (a sign-in). */
-  player_visibility: { args: { visible: boolean }; result: void };
-  /**
-   * Start a music service's sign-in inside the player window. It resolves as soon as the sign-in
-   * has begun (or cannot); the person finishes it in the popup, and the caller watches the
-   * player's state for the result.
-   */
-  player_authorize: { args: { service: string }; result: PlayerAuthorizeResult };
-}
-
-/** What starting a sign-in answers: whether it began, and if not, why, in words for a person. */
-export interface PlayerAuthorizeResult {
-  started: boolean;
-  message?: string;
 }
 
 export type ShellCommand = keyof ShellCommands;
@@ -87,8 +73,6 @@ export const SHELL_COMMANDS = [
   "start_voice_session",
   "stop_voice_session",
   "open_external",
-  "player_visibility",
-  "player_authorize",
 ] as const satisfies readonly ShellCommand[];
 
 /** Runtime allowlist for events. Same reasoning as `SHELL_COMMANDS`. */

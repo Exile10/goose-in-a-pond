@@ -6,7 +6,11 @@ const getPlayerState = vi.hoisted(() => vi.fn());
 vi.mock("../shell", () => ({ isDesktopShell: () => true, invoke: vi.fn() }));
 vi.mock("../api/PondApiClient", async (importOriginal) => {
   const original = await importOriginal<typeof import("../api/PondApiClient")>();
-  return { ...original, api: { ...original.api, getPlayerState } };
+  // Spreading the client copies its fields, not its prototype, so the methods used are listed.
+  return {
+    ...original,
+    api: { ...original.api, getPlayerState, serverUrl: () => "http://127.0.0.1:4000" },
+  };
 });
 
 import { SecretConfigModal } from "./Extensions";
@@ -67,9 +71,11 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("the Music extension's settings", () => {
-  it("leads with a sign-in for each service, and Apple Music's is one button", async () => {
+  it("leads with the way in to each service: the music player page for Apple Music, a sign-in for Spotify", async () => {
     render(<SecretConfigModal ext={music} {...props} />);
-    expect(await screen.findByRole("button", { name: /sign in to apple music/i })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /open the music player/i })).toBeTruthy();
+    // Apple Music signs in on the player page itself, so there is no Apple sign-in button here.
+    expect(screen.queryByRole("button", { name: /sign in to apple music/i })).toBeNull();
     expect(screen.getByRole("button", { name: /sign in with spotify/i })).toBeTruthy();
   });
 
@@ -121,7 +127,7 @@ describe("an extension with no advanced fields", () => {
     render(<SecretConfigModal ext={github} {...props} />);
     expect(screen.getByText("GitHub token")).toBeTruthy();
     expect(screen.queryByText("Developer settings")).toBeNull();
-    expect(screen.queryByRole("button", { name: /apple music/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /open the music player/i })).toBeNull();
     expect(getPlayerState).not.toHaveBeenCalled();
   });
 });

@@ -52,12 +52,6 @@ export interface PlayerState {
   repeat: RepeatMode;
   /** The last problem, in words a person can act on. */
   message?: string;
-  /**
-   * Set up and asleep: nothing has been fetched and nothing has left the pond, because nobody has
-   * pressed Sign in and nobody has signed in here before. `need` is "authorization" so a sign-in is
-   * offered, but the window is not raised for it.
-   */
-  dormant?: boolean;
 }
 
 export interface AdapterCapabilities {
@@ -80,6 +74,8 @@ export interface PlayerDevice {
 
 export type PlayerErrorCode =
   | "needs_authorization"
+  /** The browser will not play sound until the person clicks on the player page (autoplay rules). */
+  | "needs_interaction"
   | "not_ready"
   | "drm_refused"
   | "unsupported"
@@ -99,7 +95,7 @@ export class PlayerError extends Error {
 
 export type Unsubscribe = () => void;
 
-/** One music service, driven from inside the shell. */
+/** One music service, driven from the player page in the person's browser. */
 export interface PlayerAdapter {
   /** The label the host and the extension use for this service, e.g. "apple". */
   readonly service: string;
@@ -111,6 +107,8 @@ export interface PlayerAdapter {
   init(): Promise<void>;
   /** Needs a user gesture: called from a button, never from a command. */
   authorize(): Promise<void>;
+  /** Signs this page out of the service, for a service that signs in on the page. */
+  signOut?(): Promise<void>;
 
   state(): PlayerState;
   onState(listener: (state: PlayerState) => void): Unsubscribe;
@@ -131,11 +129,6 @@ export interface PlayerAdapter {
   library(kind: LibraryKind, limit: number): Promise<Track[]>;
   /** Only for a service whose control plane is not in this window: the speaker it registered. */
   device?(): PlayerDevice;
-  /**
-   * For a service that sleeps until wanted: does the network work a sign-in needs (a token, the
-   * SDK), and throws with words for a person if it cannot. Idempotent, and a no-op once awake.
-   */
-  prepare?(): Promise<void>;
 }
 
 /** A command as the host sends it. */

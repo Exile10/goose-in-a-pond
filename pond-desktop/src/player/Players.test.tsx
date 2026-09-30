@@ -48,7 +48,7 @@ describe("Players", () => {
     });
     render(<Players adapters={[apple.adapter, spotify.adapter]} />);
 
-    expect(screen.getByRole("button", { name: "Connect Apple Music" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Sign in to Apple Music" })).toBeTruthy();
     expect(screen.queryByText("Spotify is not connected.")).toBeNull();
   });
 

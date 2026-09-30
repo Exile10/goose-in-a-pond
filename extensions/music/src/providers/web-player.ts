@@ -62,8 +62,8 @@ function canUseFallback(error: unknown): boolean {
 }
 
 /**
- * A music service driven through the in-app player: the page holds the service's SDK and its DRM,
- * and this reaches it through the host. Knows no service; it is handed a name and a label. When the
+ * A music service driven through the music player page, which runs in the person's browser: the page
+ * holds the service's SDK, the browser its DRM, and this reaches it through the host. Knows no service; it is handed a name and a label. When the
  * player cannot be used it says so and, if there is a fallback, uses it.
  */
 export class WebPlayerProvider implements MusicProvider {
@@ -130,7 +130,7 @@ export class WebPlayerProvider implements MusicProvider {
     } catch (error) {
       const local = this.local;
       if (!fallback || !local || !canUseFallback(error)) throw error;
-      log.warn("web_player_fallback", "the in-app player could not be used", {
+      log.warn("web_player_fallback", "the music player page could not be used", {
         error: describeError(error),
       });
       return fallback(local);
@@ -139,7 +139,7 @@ export class WebPlayerProvider implements MusicProvider {
 
   private static because(error: unknown): string {
     const why = error instanceof Error ? error.message : String(error);
-    return `The in-app player could not be used (${why}) so the Music app was used instead.\n\n`;
+    return `The music player page could not be used (${why}), so the Music app was used instead.\n\n`;
   }
 
   // ── Playing ────────────────────────────────────────────────
@@ -150,7 +150,7 @@ export class WebPlayerProvider implements MusicProvider {
     } catch (error) {
       const local = this.local;
       if (!local?.playRequest || !canUseFallback(error)) throw error;
-      log.warn("web_player_fallback", "the in-app player could not be used", {
+      log.warn("web_player_fallback", "the music player page could not be used", {
         error: describeError(error),
       });
       return WebPlayerProvider.because(error) + (await local.playRequest(request));

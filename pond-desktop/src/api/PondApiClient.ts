@@ -185,6 +185,11 @@ export class PondApiClient {
     this.base = url.replace(/\/$/, "");
   }
 
+  /** The pond this client talks to, e.g. to link to a page the pond serves. */
+  serverUrl(): string {
+    return this.base;
+  }
+
   /** `expiresAt` (RFC3339) arms proactive refresh; omit to keep the expiry, `null` to clear it. */
   setToken(token: string | null, expiresAt?: string | null): void {
     this.token = token;
@@ -2170,6 +2175,23 @@ export class PondApiClient {
   /** A developer token signed by the host, which holds the key. 400 says the key is not set up. */
   musickitDeveloperToken(): Promise<{ token: string; expires_at: number }> {
     return this.get("/api/v1/musickit/developer-token");
+  }
+
+  /**
+   * Whether the pond's network setting lets the player page reach `url`: null when it does, else the
+   * pond's reason. The page asks before it loads a service's script, since in a browser nothing else
+   * stands between it and the internet; the pond also logs the request as the player's.
+   */
+  async playerNetworkAllows(url: string): Promise<string | null> {
+    const reply = await this.post<{ allowed?: boolean; reason?: string }>(
+      "/api/v1/player/egress-policy",
+      { url, method: "GET" },
+    );
+    // `request` can hand back an empty or HTML body; only a plain yes counts as allowed.
+    if (reply?.allowed === true) return null;
+    return typeof reply?.reason === "string" && reply.reason !== ""
+      ? reply.reason
+      : "The pond's network setting does not allow the music player to reach the internet.";
   }
 
   /**

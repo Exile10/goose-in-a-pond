@@ -13,7 +13,6 @@ import {
   resolveServerBinary,
 } from "./serverProcess";
 import { VoiceChildProcess } from "./voice/VoiceChildProcess";
-import { PlayerWindow } from "./player";
 import { registerIpc } from "./ipc";
 import { installMenu, setAboutPanel } from "./menu";
 import { createTray, setTrayStatus, destroyTray } from "./tray";
@@ -31,19 +30,6 @@ const log = {
 };
 
 let win: BrowserWindow | null = null;
-/** The music player window; null when GIAP_PLAYER=off. It is hidden unless it needs the user. */
-let player: PlayerWindow | null = null;
-let playerStarted = false;
-
-/**
- * The player asks the server about every host it reaches, and refuses what it cannot ask about, so
- * opening it before the server is up only makes its first load fail. Once, when the server is healthy.
- */
-function startPlayerOnce(): void {
-  if (playerStarted || !player) return;
-  playerStarted = true;
-  void player.start();
-}
 /** Set on the way out, so the close handler stops hiding and lets us quit. */
 let quitting = false;
 
@@ -52,11 +38,6 @@ const repoRoot = resolve(app.getAppPath(), "..");
 
 function emit<E extends ShellEvent>(name: E, payload?: ShellEvents[E]): void {
   if (win && !win.isDestroyed()) win.webContents.send(`giap:${name}`, payload);
-  // The player talks to the server too, so it must follow a fallback port like the app does.
-  const playerPage = name === "server-url" ? player?.webContents() : null;
-  if (playerPage && !playerPage.isDestroyed()) {
-    playerPage.send(`giap:${name}`, payload);
-  }
 }
 
 /** The port pond-server says it bound, and when; read from the server's data dir, not userData. */
@@ -98,16 +79,6 @@ const voice = new VoiceChildProcess({
   log,
 });
 
-if (process.env["GIAP_PLAYER"] !== "off") {
-  player = new PlayerWindow({
-    preloadPath: join(__dirname, "../preload/index.cjs"),
-    distDir: distRoot(app.getAppPath()),
-    serverUrl: () => server.url,
-    devServerUrl: process.env["GIAP_DEV_SERVER"],
-    log: log.info,
-  });
-}
-
 /** The voice child runs the sidecar's binary, found by the same lookup so they can't disagree. */
 function serverBinaryForVoice(): string | null {
   return resolveServerBinary({
@@ -132,7 +103,6 @@ const healthLoop = createHealthLoop({
   onStatus: (healthy) => {
     emit("server-status", healthy);
     setTrayStatus(healthy);
-    if (healthy) startPlayerOnce();
   },
   onStarting: () => emit("server-starting"),
   backoffSeconds: recoveryBackoffSeconds,
@@ -146,7 +116,6 @@ const teardown = createTeardown({
   releaseUi: () => {
     unregisterHotkeys();
     destroyTray();
-    player?.destroy();
   },
   log,
 });
@@ -168,7 +137,7 @@ if (!app.requestSingleInstanceLock()) {
 
     setAboutPanel();
     installMenu({ emit });
-    registerIpc({ server, voice, player });
+    registerIpc({ server, voice });
 
     win = createMainWindow({
       preloadPath: join(__dirname, "../preload/index.cjs"),
@@ -200,10 +169,7 @@ if (!app.requestSingleInstanceLock()) {
     // Don't block the window on the server: the startup screen renders while it comes up.
     server
       .ensureRunning()
-      .then((url) => {
-        log.info(`pond-server ready at ${url}`);
-        startPlayerOnce();
-      })
+      .then((url) => log.info(`pond-server ready at ${url}`))
       .catch((e: Error) => log.warn(`pond-server did not start: ${e.message}`));
 
     healthLoop.start();

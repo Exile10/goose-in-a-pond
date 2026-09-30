@@ -50,7 +50,7 @@ function longestWord(title: string): string {
  * Apple Music through the Music app. The Music app plays and controls the user's library; it
  * cannot search Apple's catalog or start a song that is not in the library. So a song the library
  * lacks is found through the public search and opened in Music, which does not start it. The
- * in-app player (web-player.ts) is what plays the catalog; this is its fallback.
+ * music player page (web-player.ts) is what plays the catalog; this is its fallback.
  */
 export class AppleMusicProvider implements MusicProvider {
   id = "apple" as const;

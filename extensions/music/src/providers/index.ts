@@ -66,7 +66,7 @@ export async function createProvider(
     return local;
   }
 
-  log.info("apple_backend", "using the in-app player, with the Music app as its fallback", {
+  log.info("apple_backend", "using the music player page, with the Music app as its fallback", {
     player_attached: status.attached,
   });
   return new WebPlayerProvider({

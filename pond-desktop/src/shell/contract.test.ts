@@ -15,8 +15,6 @@ const EVERY_COMMAND: Record<ShellCommand, true> = {
   start_voice_session: true,
   stop_voice_session: true,
   open_external: true,
-  player_visibility: true,
-  player_authorize: true,
 };
 
 const EVERY_EVENT: Record<ShellEvent, true> = {

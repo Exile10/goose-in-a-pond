@@ -2,22 +2,18 @@
 // bridge, the host and the extension already speak only in the player's own terms.
 
 import type { PlayerAdapter } from "../types";
-import {
-  AppleMusicKitAdapter,
-  loadMusicKitFromApple,
-} from "./appleMusicKit";
-import { widevineProblem } from "./drm";
-import { rememberedIn } from "./remembered";
+import { AppleMusicKitAdapter, loadMusicKitFromApple } from "./appleMusicKit";
 import { SpotifyWebPlaybackAdapter, loadSpotifySdk } from "./spotifyWebPlayback";
 
 export interface AdapterContext {
-  /** Apple: a developer token the host signs, since the host holds the key. */
+  /** Apple: a developer token the pond signs, since the pond holds the key. */
   fetchDeveloperToken(): Promise<string>;
-  /** Apple: whether a token could be had at all, asked of the pond alone. Rejects with why not. */
-  probeDeveloperToken(): Promise<void>;
-  /** The Widevine module the shell loaded, when it said (`?cdm=` on the page's address). */
-  widevineVersion?: string | undefined;
-  /** Spotify: the person's own access token, held by the host. `refresh` asks for a new one. */
+  /**
+   * Whether the pond's network setting lets this page reach `url`: null when it does, else the
+   * reason in words for a person. Asked before a service's script is loaded.
+   */
+  networkAllows(url: string): Promise<string | null>;
+  /** Spotify: the person's own access token, held by the pond. `refresh` asks for a new one. */
   fetchUserToken(service: string, refresh: boolean): Promise<string>;
 }
 
@@ -26,19 +22,12 @@ const ADAPTERS: Record<string, (ctx: AdapterContext) => PlayerAdapter> = {
     new AppleMusicKitAdapter({
       loadMusicKit: loadMusicKitFromApple,
       fetchDeveloperToken: ctx.fetchDeveloperToken,
-      checkDrm: () => widevineProblem("Apple Music", ctx.widevineVersion),
-      // Asleep until someone presses Sign in, or has before: nothing leaves the pond for a household
-      // that never uses Apple Music.
-      lazy: {
-        ...rememberedIn("giap.player.apple.signedIn"),
-        probe: ctx.probeDeveloperToken,
-      },
+      networkAllows: ctx.networkAllows,
     }),
   spotify: (ctx) =>
     new SpotifyWebPlaybackAdapter({
       loadSdk: loadSpotifySdk,
       fetchUserToken: (refresh) => ctx.fetchUserToken("spotify", refresh),
-      checkDrm: () => widevineProblem("Spotify", ctx.widevineVersion),
     }),
 };
 

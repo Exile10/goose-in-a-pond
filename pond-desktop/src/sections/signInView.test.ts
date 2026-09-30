@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { signInView, splitAdvanced, type PlayerReply } from "./signInView";
+import { playerView, splitAdvanced, type PlayerReply } from "./signInView";
 import type { PlayerState } from "../player/types";
 
 function state(over: Partial<PlayerState> = {}): PlayerState {
@@ -20,61 +20,42 @@ const reply = (over: Partial<PlayerState> = {}, attached = true): PlayerReply =>
   attached,
   state: state(over),
 });
-const view = (
-  r: PlayerReply | null,
-  over: { desktop?: boolean; pending?: boolean } = {},
-) => signInView({ desktop: true, pending: false, label: "Apple Music", reply: r, ...over });
+const view = (r: PlayerReply | null) => playerView({ label: "Apple Music", reply: r });
 
-describe("signInView", () => {
-  it("offers the one button when the player is waiting for a sign-in", () => {
-    expect(view(reply({ need: "authorization" }))).toEqual({ kind: "ready" });
+describe("playerView", () => {
+  it("says the player is not open when no page is attached, or the pond could not be asked", () => {
+    for (const r of [null, reply({}, false), { attached: true, state: null }]) {
+      const v = view(r);
+      expect(v.kind).toBe("closed");
+      expect("note" in v && v.note).toMatch(/not open/);
+      expect("note" in v && v.note).toMatch(/sign in to Apple Music on that page/);
+    }
   });
 
-  it("shows signed in, and no button, once it is", () => {
-    expect(view(reply({ need: "none", ready: true }))).toEqual({ kind: "signed_in" });
-  });
-
-  it("says a sign-in is under way while one is pending", () => {
-    expect(view(reply(), { pending: true })).toEqual({ kind: "signing_in" });
-  });
-
-  it("ends the wait as soon as the player reports signed in", () => {
-    expect(view(reply({ need: "none", ready: true }), { pending: true })).toEqual({
-      kind: "signed_in",
+  it("points at the page's Sign in button while the page waits for one", () => {
+    expect(view(reply({ need: "authorization" }))).toEqual({
+      kind: "needs_sign_in",
+      note: "Press Sign in to Apple Music on the music player page.",
     });
   });
 
-  it("carries the reason a sign-in did not finish, so it is not a silent failure", () => {
-    const failed = reply({ message: "Sign-in did not finish: the window was closed" });
-    expect(view(failed)).toEqual({
-      kind: "ready",
-      note: "Sign-in did not finish: the window was closed",
-    });
-    expect(view(failed, { pending: true })).toMatchObject({
-      kind: "signing_in",
-      note: "Sign-in did not finish: the window was closed",
+  it("passes on the page's own words when a sign-in failed there", () => {
+    expect(view(reply({ need: "authorization", message: "The Apple Music sign-in did not finish." }))).toEqual({
+      kind: "needs_sign_in",
+      note: "The Apple Music sign-in did not finish.",
     });
   });
 
-  it("does not offer a button that cannot work: setup comes first, in the adapter's own words", () => {
-    const v = view(reply({ need: "setup", message: "Apple Music sign-in is not available on this pond yet." }));
-    expect(v).toEqual({
+  it("says why when the service is not set up on this pond", () => {
+    expect(view(reply({ need: "setup", message: "Add your Team ID." }))).toEqual({
       kind: "unavailable",
-      note: "Apple Music sign-in is not available on this pond yet.",
+      note: "Add your Team ID.",
     });
     expect(view(reply({ need: "setup" }))).toMatchObject({ kind: "unavailable" });
   });
 
-  it("waits, rather than offering anything, until the player is there", () => {
-    expect(view(null).kind).toBe("starting");
-    expect(view(reply({}, false)).kind).toBe("starting");
-    expect(view({ attached: true, state: null }).kind).toBe("starting");
-  });
-
-  it("sends a browser or a phone to the desktop app instead of a button that would do nothing", () => {
-    const v = view(reply(), { desktop: false });
-    expect(v.kind).toBe("not_in_shell");
-    expect((v as { note: string }).note).toContain("Goose In A Pond app");
+  it("is signed in once the page says the service needs nothing", () => {
+    expect(view(reply({ need: "none", ready: true }))).toEqual({ kind: "signed_in" });
   });
 });
 

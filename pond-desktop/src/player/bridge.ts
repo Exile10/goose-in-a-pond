@@ -245,7 +245,7 @@ export class PlayerBridge {
       case "authorize":
         throw new PlayerError(
           "needs_authorization",
-          `Sign in to ${a.label} in the player window; it cannot be done from a command.`,
+          `Sign in to ${a.label} on the music player page; it cannot be done from a command.`,
         );
       default:
         throw new PlayerError("unsupported", `The player has no "${op}" command.`);

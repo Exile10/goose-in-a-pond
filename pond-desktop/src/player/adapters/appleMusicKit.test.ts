@@ -1,26 +1,36 @@
 import { describe, expect, it } from "vitest";
 import {
   AppleMusicKitAdapter,
+  MUSICKIT_URL,
+  describeMkError,
   type AppleDeps,
+  type MediaItem,
   type MusicKitGlobal,
   type MusicKitInstance,
 } from "./appleMusicKit";
 import { PlayerError } from "../types";
 
-type Scenario = "plays" | "license" | "silent" | "announces-only";
+type Scenario = "plays" | "license" | "silent" | "announces-only" | "needs-click" | "unsupported";
 
-/** MusicKit as the live run showed it: it says "playing" first, and a license error can follow. */
+/** An MKError as MusicKit throws it: its code is `errorCode` (the MKError reference). */
+const mkError = (errorCode: string, description = "") => Object.assign(new Error(description), { errorCode, description });
+
+const PLAYBACK = {
+  none: 0, loading: 1, playing: 2, paused: 3, stopped: 4, ended: 5, seeking: 6, waiting: 8, stalled: 9, completed: 10,
+};
+
+/** MusicKit as the Instance, Queue and Events references describe it. */
 class FakeMusic implements MusicKitInstance {
   isAuthorized = false;
-  storefrontId = "us";
   volume = 1;
   shuffleMode = 0;
   repeatMode = 0;
-  playbackState = 0;
+  playbackState = PLAYBACK.none;
   currentPlaybackTime = 0;
-  nowPlayingItem: unknown = null;
+  nowPlayingItem: MediaItem | undefined = undefined;
   scenario: Scenario = "plays";
-  refuseSignIn = false;
+  signIn: "grants" | "cancels" | "throws" = "grants";
+  clicked = false;
   calls: Array<[string, ...unknown[]]> = [];
   apiCalls: Array<[string, Record<string, unknown> | undefined]> = [];
   replies = new Map<string, unknown>();
@@ -46,62 +56,85 @@ class FakeMusic implements MusicKitInstance {
     this.listeners.get(name)?.forEach((l) => l(payload));
   }
 
+  /** Resolves with a user string, or with nothing when the sign-in did not finish. */
   async authorize() {
-    if (this.refuseSignIn) throw new Error("the window was closed");
+    this.calls.push(["authorize"]);
+    if (this.signIn === "throws") throw mkError("AUTHORIZATION_ERROR", "rejected");
+    if (this.signIn === "cancels") return undefined;
     this.isAuthorized = true;
     this.emit("authorizationStatusDidChange");
-    return "user-token";
+    return "a-user";
   }
-  async setQueue(o: Record<string, string>) {
-    this.calls.push(["setQueue", o]);
-    if (o.song === "reject") throw new Error("no such song");
-    this.nowPlayingItem = {
-      id: Object.values(o)[0],
-      title: "Nairobi",
-      artistName: "Bensoul",
-      albumName: "Qwarantunes",
-      attributes: { durationInMillis: 210_000, artwork: { url: "https://x/{w}x{h}.jpg" } },
-    };
-    this.emit("nowPlayingItemDidChange");
+  async unauthorize() {
+    this.calls.push(["unauthorize"]);
+    this.isAuthorized = false;
+    this.emit("authorizationStatusDidChange");
   }
-  async play() {
-    this.calls.push(["play"]);
+  private start() {
     if (this.scenario === "silent") return;
-    this.playbackState = 2;
+    this.playbackState = PLAYBACK.playing;
     this.emit("playbackStateDidChange");
     if (this.scenario === "announces-only") return;
     setTimeout(() => {
       if (this.scenario === "license") {
-        this.emit("mediaPlaybackError", {
-          description: "MEDIA_LICENSE",
-          data: { errorCode: -42605 },
-        });
+        this.emit("mediaPlaybackError", mkError("MEDIA_LICENSE", "Error acquiring license"));
       } else {
         this.currentPlaybackTime = 1;
         this.emit("playbackTimeDidChange");
       }
     }, 0);
   }
+  async setQueue(o: Record<string, unknown>) {
+    this.calls.push(["setQueue", o]);
+    if (o.song === "reject") throw mkError("CONTENT_UNAVAILABLE");
+    if (this.scenario === "unsupported") return undefined;
+    const id = String(o.song ?? o.album ?? o.playlist);
+    this.nowPlayingItem = {
+      id,
+      attributes: {
+        name: "Nairobi",
+        artistName: "Bensoul",
+        albumName: "Qwarantunes",
+        durationInMillis: 210_000,
+        artwork: { url: "https://x/{w}x{h}.jpg", width: 3000, height: 3000 },
+      },
+    };
+    this.emit("nowPlayingItemDidChange", { item: this.nowPlayingItem });
+    if (o.startPlaying === true) {
+      if (this.scenario === "needs-click" && !this.clicked) throw mkError("USER_INTERACTION_REQUIRED");
+      this.start();
+    }
+    return { items: [this.nowPlayingItem] };
+  }
+  play() {
+    this.calls.push(["play"]);
+    if (this.scenario === "needs-click" && !this.clicked) return Promise.reject(mkError("USER_INTERACTION_REQUIRED"));
+    this.start();
+    return Promise.resolve();
+  }
   pause() {
     this.calls.push(["pause"]);
-    this.playbackState = 3;
+    this.playbackState = PLAYBACK.paused;
     this.emit("playbackStateDidChange");
   }
   async skipToNextItem() { this.calls.push(["next"]); }
   async skipToPreviousItem() { this.calls.push(["previous"]); }
   async seekToTime(s: number) { this.calls.push(["seek", s]); }
-  async playNext(o: Record<string, string>) { this.calls.push(["playNext", o]); }
-  async playLater(o: Record<string, string>) { this.calls.push(["playLater", o]); }
+  async playNext(o: Record<string, unknown>) { this.calls.push(["playNext", o]); }
+  async playLater(o: Record<string, unknown>) { this.calls.push(["playLater", o]); }
 }
 
+/** The MusicKit global: `configure` resolves with the instance (the MusicKit reference). */
 function fakeKit(music: FakeMusic) {
   const configured: unknown[] = [];
   const kit: MusicKitGlobal = {
-    configure: async (c) => void configured.push(c),
-    getInstance: () => music,
-    PlaybackStates: {
-      playing: 2, paused: 3, loading: 1, waiting: 7, stalled: 8, seeking: 6, ended: 5, completed: 9,
+    configure: async (c) => {
+      configured.push(c);
+      return music;
     },
+    getInstance: () => music,
+    formatArtworkURL: (art, w, h) => (art.url ?? "").replace("{w}", String(w ?? art.width)).replace("{h}", String(h ?? art.height)),
+    PlaybackStates: PLAYBACK,
     PlayerShuffleMode: { off: 0, songs: 1 },
     PlayerRepeatMode: { none: 0, one: 1, all: 2 },
   };
@@ -116,6 +149,7 @@ async function ready(over: { authorised?: boolean; scenario?: Scenario; playConf
   const deps: AppleDeps = {
     loadMusicKit: async () => kit,
     fetchDeveloperToken: async () => "dev-token",
+    networkAllows: async () => null,
     playConfirmMs: over.playConfirmMs ?? 200,
   };
   const adapter = new AppleMusicKitAdapter(deps);
@@ -123,15 +157,15 @@ async function ready(over: { authorised?: boolean; scenario?: Scenario; playConf
   return { adapter, music, configured };
 }
 
-describe("AppleMusicKitAdapter: starting up", () => {
-  it("configures MusicKit with the host's developer token", async () => {
-    const { configured } = await ready();
-    expect(configured).toEqual([
-      { developerToken: "dev-token", app: { name: "Goose In A Pond", build: "1.0" } },
-    ]);
+describe("AppleMusicKitAdapter: starting up, as Getting Started does", () => {
+  it("configures MusicKit with the pond's developer token and the app's name, and uses the instance configure returns", async () => {
+    const { adapter, configured } = await ready();
+    expect(configured).toEqual([{ developerToken: "dev-token", app: { name: "Goose In A Pond" } }]);
+    expect(adapter.state()).toMatchObject({ ready: true, need: "none" });
   });
 
-  it("says so, and loads nothing, when this window cannot play protected audio", async () => {
+  it("asks the pond's network setting before loading Apple's script, and loads nothing when it says no", async () => {
+    const asked: string[] = [];
     let loaded = false;
     const adapter = new AppleMusicKitAdapter({
       loadMusicKit: async () => {
@@ -139,38 +173,19 @@ describe("AppleMusicKitAdapter: starting up", () => {
         return fakeKit(new FakeMusic()).kit;
       },
       fetchDeveloperToken: async () => "t",
-      checkDrm: async () => "This build has no Widevine module.",
-    });
-    await adapter.init();
-    expect(loaded).toBe(false);
-    expect(adapter.state()).toMatchObject({ ready: false, need: "setup" });
-    expect(adapter.state().message).toContain("Widevine");
-  });
-
-  it("asks for sign-in when nobody is signed in", async () => {
-    const { adapter } = await ready({ authorised: false });
-    expect(adapter.state()).toMatchObject({ ready: false, need: "authorization" });
-    expect(adapter.state().message).toMatch(/sign in/i);
-  });
-
-  it("is ready at once when a sign-in is remembered", async () => {
-    const { adapter } = await ready({ authorised: true });
-    expect(adapter.state()).toMatchObject({ ready: true, need: "none" });
-  });
-
-  it("says what is missing when the host has no key", async () => {
-    const adapter = new AppleMusicKitAdapter({
-      loadMusicKit: async () => fakeKit(new FakeMusic()).kit,
-      fetchDeveloperToken: async () => {
-        throw new Error("Apple Music is not set up: add your Team ID.");
+      networkAllows: async (url) => {
+        asked.push(url);
+        return "This pond is set to stay offline.";
       },
     });
     await adapter.init();
-    expect(adapter.state()).toMatchObject({ ready: false, need: "setup" });
-    expect(adapter.state().message).toContain("Team ID");
+    expect(asked).toEqual([MUSICKIT_URL]);
+    expect(loaded).toBe(false);
+    expect(adapter.state()).toMatchObject({ ready: false, need: "setup", message: "This pond is set to stay offline." });
   });
 
-  it("does not load Apple's script for a household that has not set up Apple Music", async () => {
+  it("asks the network question only once there is a token, so a pond with no key logs nothing", async () => {
+    let asked = 0;
     let loads = 0;
     const adapter = new AppleMusicKitAdapter({
       loadMusicKit: async () => {
@@ -180,12 +195,22 @@ describe("AppleMusicKitAdapter: starting up", () => {
       fetchDeveloperToken: async () => {
         throw new Error("Apple Music is not set up: add your Team ID.");
       },
+      networkAllows: async () => {
+        asked += 1;
+        return null;
+      },
     });
-    // The setup retry asks every ten seconds, so this is asked over and over on a pond with no key.
+    // The setup retry asks every ten seconds, so this runs over and over on a pond with no key.
     await adapter.init();
     await adapter.init();
-    await adapter.init();
-    expect(loads).toBe(0);
+    expect({ asked, loads }).toEqual({ asked: 0, loads: 0 });
+    expect(adapter.state()).toMatchObject({ ready: false, need: "setup" });
+    expect(adapter.state().message).toContain("Team ID");
+  });
+
+  it("asks for a sign-in when nobody is signed in, and is ready at once when MusicKit still holds one", async () => {
+    expect((await ready({ authorised: false })).adapter.state()).toMatchObject({ ready: false, need: "authorization" });
+    expect((await ready({ authorised: true })).adapter.state()).toMatchObject({ ready: true, need: "none" });
   });
 
   it("says so when Apple's script cannot be loaded", async () => {
@@ -200,25 +225,56 @@ describe("AppleMusicKitAdapter: starting up", () => {
     expect(adapter.state().message).toContain("MusicKit");
   });
 
-  it("signs in on request and becomes ready", async () => {
+  it("configures once: a second init is a no-op, since the instance is a singleton", async () => {
+    const { adapter, configured } = await ready();
+    await adapter.init();
+    expect(configured).toHaveLength(1);
+  });
+});
+
+describe("AppleMusicKitAdapter: User Authorization", () => {
+  it("signs in and becomes ready", async () => {
     const { adapter } = await ready({ authorised: false });
     await adapter.authorize();
     expect(adapter.state()).toMatchObject({ ready: true, need: "none" });
   });
 
-  it("reports a sign-in window closed early, without throwing", async () => {
+  it("treats a sign-in that resolves with nothing as not finished, and says so", async () => {
     const { adapter, music } = await ready({ authorised: false });
-    music.refuseSignIn = true;
+    music.signIn = "cancels";
     await adapter.authorize();
     expect(adapter.state().ready).toBe(false);
-    expect(adapter.state().message).toContain("did not finish");
+    expect(adapter.state().message).toMatch(/did not finish/);
+  });
+
+  it("reports a refused sign-in without throwing", async () => {
+    const { adapter, music } = await ready({ authorised: false });
+    music.signIn = "throws";
+    await adapter.authorize();
+    expect(adapter.state().ready).toBe(false);
+    expect(adapter.state().message).toMatch(/sign in again/);
+  });
+
+  it("calls MusicKit's authorize before its first await, so the sign-in window opens inside the click", async () => {
+    const { adapter, music } = await ready({ authorised: false });
+    void adapter.authorize();
+    expect(music.calls).toEqual([["authorize"]]);
+  });
+
+  it("signs out with unauthorize", async () => {
+    const { adapter, music } = await ready();
+    await adapter.signOut();
+    expect(music.calls).toEqual([["unauthorize"]]);
+    expect(adapter.state()).toMatchObject({ ready: false, need: "authorization" });
   });
 });
 
 describe("AppleMusicKitAdapter: guards", () => {
-  it("refuses everything before it has started", async () => {
+  it("refuses everything before it has been configured", async () => {
     const adapter = new AppleMusicKitAdapter({
-      loadMusicKit: async () => { throw new Error("offline"); },
+      loadMusicKit: async () => {
+        throw new Error("offline");
+      },
       fetchDeveloperToken: async () => "t",
     });
     await adapter.init();
@@ -228,7 +284,7 @@ describe("AppleMusicKitAdapter: guards", () => {
 
   it("can search without a sign-in but cannot play or read the library", async () => {
     const { adapter, music } = await ready({ authorised: false });
-    music.replies.set("/v1/catalog/us/search", { data: { results: { songs: { data: [] } } } });
+    music.replies.set("/v1/catalog/{{storefrontId}}/search", { data: { results: { songs: { data: [] } } } });
     await expect(adapter.search("x")).resolves.toEqual([]);
     await expect(adapter.play({ id: "1", kind: "song" })).rejects.toMatchObject({ code: "needs_authorization" });
     await expect(adapter.playlists()).rejects.toMatchObject({ code: "needs_authorization" });
@@ -236,11 +292,10 @@ describe("AppleMusicKitAdapter: guards", () => {
   });
 });
 
-describe("AppleMusicKitAdapter: finding things", () => {
-  it("searches the account's store and maps the songs", async () => {
+describe("AppleMusicKitAdapter: finding things, through the Passthrough API", () => {
+  it("searches with the {{storefrontId}} path token and maps the songs, artwork through formatArtworkURL", async () => {
     const { adapter, music } = await ready();
-    music.storefrontId = "ke";
-    music.replies.set("/v1/catalog/ke/search", {
+    music.replies.set("/v1/catalog/{{storefrontId}}/search", {
       data: {
         results: {
           songs: {
@@ -252,7 +307,7 @@ describe("AppleMusicKitAdapter: finding things", () => {
                   artistName: "Bensoul",
                   albumName: "Qwarantunes",
                   durationInMillis: 210_000,
-                  artwork: { url: "https://x/{w}x{h}.jpg" },
+                  artwork: { url: "https://x/{w}x{h}.jpg", width: 3000, height: 3000 },
                 },
               },
               { id: "no-name", attributes: {} },
@@ -265,7 +320,7 @@ describe("AppleMusicKitAdapter: finding things", () => {
     const tracks = await adapter.search("nairobi bensoul", { limit: 3 });
 
     expect(music.apiCalls[0]).toEqual([
-      "/v1/catalog/ke/search",
+      "/v1/catalog/{{storefrontId}}/search",
       { term: "nairobi bensoul", types: "songs", limit: 3 },
     ]);
     expect(tracks).toEqual([
@@ -281,14 +336,6 @@ describe("AppleMusicKitAdapter: finding things", () => {
     ]);
   });
 
-  it("reads a reply that is not wrapped in data", async () => {
-    const { adapter, music } = await ready();
-    music.replies.set("/v1/catalog/us/search", {
-      results: { songs: { data: [{ id: "7", attributes: { name: "A", artistName: "B" } }] } },
-    });
-    expect((await adapter.search("a")).map((t) => t.id)).toEqual(["7"]);
-  });
-
   it("keeps the search limit within what Apple allows", async () => {
     const { adapter, music } = await ready();
     await adapter.search("a", { limit: 500 });
@@ -298,13 +345,12 @@ describe("AppleMusicKitAdapter: finding things", () => {
 
   it("turns an Apple API failure into a player error", async () => {
     const { adapter, music } = await ready();
-    music.replies.set("/v1/catalog/us/search", new Error("429"));
+    music.replies.set("/v1/catalog/{{storefrontId}}/search", mkError("QUOTA_EXCEEDED"));
     await expect(adapter.search("a")).rejects.toBeInstanceOf(PlayerError);
   });
 
-  it("lists library playlists across pages", async () => {
+  it("follows next across pages and passes the limit each time, since next does not carry it", async () => {
     const { adapter, music } = await ready();
-    // The shape MusicKit really returns: the API's body wrapped in `data`.
     music.replies.set("/v1/me/library/playlists", {
       data: {
         data: [{ id: "p.1", attributes: { name: "Road trip" } }],
@@ -318,14 +364,7 @@ describe("AppleMusicKitAdapter: finding things", () => {
       { id: "p.1", name: "Road trip" },
       { id: "p.2", name: "Focus" },
     ]);
-  });
-
-  it("also reads a list reply that arrives without the wrapper", async () => {
-    const { adapter, music } = await ready();
-    music.replies.set("/v1/me/library/playlists", {
-      data: [{ id: "p.9", attributes: { name: "Unwrapped" } }],
-    });
-    expect(await adapter.playlists()).toEqual([{ id: "p.9", name: "Unwrapped" }]);
+    expect(music.apiCalls.map((c) => c[1])).toEqual([{ limit: 100 }, { limit: 100 }]);
   });
 
   it("reads the library and prefers the catalog id of what it finds", async () => {
@@ -348,27 +387,48 @@ describe("AppleMusicKitAdapter: finding things", () => {
   });
 });
 
-describe("AppleMusicKitAdapter: playing", () => {
-  it("queues the song and resolves once audio has really advanced", async () => {
+describe("AppleMusicKitAdapter: playing, with setQueue and startPlaying", () => {
+  it("queues the song with startPlaying and resolves once audio has really advanced", async () => {
     const { adapter, music } = await ready();
     await adapter.play({ id: "1001", kind: "song" });
-    expect(music.calls).toEqual([["setQueue", { song: "1001" }], ["play"]]);
-    expect(adapter.state()).toMatchObject({ status: "playing", track: { title: "Nairobi" } });
+    expect(music.calls).toEqual([["setQueue", { song: "1001", startPlaying: true }]]);
+    expect(adapter.state()).toMatchObject({
+      status: "playing",
+      track: { id: "1001", title: "Nairobi", artist: "Bensoul", album: "Qwarantunes", artwork_url: "https://x/300x300.jpg" },
+    });
   });
 
   it("queues an album or a playlist under its own key", async () => {
     const { adapter, music } = await ready();
     await adapter.play({ id: "p.1", kind: "playlist" });
-    expect(music.calls[0]).toEqual(["setQueue", { playlist: "p.1" }]);
+    expect(music.calls[0]).toEqual(["setQueue", { playlist: "p.1", startPlaying: true }]);
   });
 
-  it("reports a refused license, with its code, even though MusicKit said playing first", async () => {
+  it("says so when setQueue resolves with nothing, which means this environment cannot play", async () => {
+    const { adapter } = await ready({ scenario: "unsupported" });
+    await expect(adapter.play({ id: "1", kind: "song" })).rejects.toMatchObject({ code: "unsupported" });
+  });
+
+  it("reports a refused licence with its code, even though MusicKit said playing first", async () => {
     const { adapter } = await ready({ scenario: "license" });
     const outcome = adapter.play({ id: "1001", kind: "song" });
     await expect(outcome).rejects.toMatchObject({ code: "drm_refused" });
-    await expect(outcome).rejects.toThrow(/Apple refused the playback license/);
     expect(adapter.state().status).toBe("error");
-    expect(adapter.state().message).toContain("-42605");
+    expect(adapter.state().message).toContain("MEDIA_LICENSE");
+  });
+
+  it("asks for a click on the page when the browser wants one, and plays once Play is pressed", async () => {
+    const { adapter, music } = await ready({ scenario: "needs-click" });
+    await expect(adapter.play({ id: "1", kind: "song" })).rejects.toMatchObject({ code: "needs_interaction" });
+    expect(adapter.state()).toMatchObject({ status: "error" });
+    expect(adapter.state().message).toMatch(/Press Play there once/);
+
+    // The page's Play button is the click; it resumes the queued song.
+    music.clicked = true;
+    await adapter.resume();
+    expect(music.calls.at(-1)).toEqual(["play"]);
+    expect(adapter.state()).toMatchObject({ status: "playing" });
+    expect(adapter.state().message).toBeUndefined();
   });
 
   it("does not count 'playing' as playing until the position moves", async () => {
@@ -407,10 +467,17 @@ describe("AppleMusicKitAdapter: playing", () => {
     expect(adapter.state().message).toBeUndefined();
   });
 
-  it("explains a missing subscription", async () => {
+  it("says so when playback falls back to previews because DRM cannot be set up (drmUnsupported)", async () => {
     const { adapter, music } = await ready();
-    music.emit("mediaPlaybackError", { description: "SUBSCRIPTION_ERROR" });
-    expect(adapter.state().message).toMatch(/subscription/i);
+    music.emit("drmUnsupported");
+    expect(adapter.state()).toMatchObject({ status: "error" });
+    expect(adapter.state().message).toMatch(/only previews/);
+  });
+
+  it("says so when another tab of the player took over playback (primaryPlayerDidChange)", async () => {
+    const { adapter, music } = await ready();
+    music.emit("primaryPlayerDidChange");
+    expect(adapter.state().message).toMatch(/another tab/);
   });
 
   it("puts a song at the front or the back of the queue", async () => {
@@ -421,7 +488,7 @@ describe("AppleMusicKitAdapter: playing", () => {
   });
 });
 
-describe("AppleMusicKitAdapter: transport", () => {
+describe("AppleMusicKitAdapter: transport and state", () => {
   it("maps each control onto MusicKit and reflects it in the state", async () => {
     const { adapter, music } = await ready();
 
@@ -444,6 +511,28 @@ describe("AppleMusicKitAdapter: transport", () => {
     expect(adapter.state().repeat).toBe("one");
   });
 
+  it("maps every documented playback state", async () => {
+    const { adapter, music } = await ready();
+    const seen: Record<string, string> = {};
+    for (const [name, value] of Object.entries(PLAYBACK)) {
+      music.playbackState = value;
+      music.emit("playbackStateDidChange");
+      seen[name] = adapter.state().status;
+    }
+    expect(seen).toEqual({
+      none: "idle",
+      loading: "buffering",
+      playing: "playing",
+      paused: "paused",
+      stopped: "idle",
+      ended: "ended",
+      seeking: "buffering",
+      waiting: "buffering",
+      stalled: "buffering",
+      completed: "ended",
+    });
+  });
+
   it("keeps volume within 0 to 100 and seek from going negative", async () => {
     const { adapter, music } = await ready();
     await adapter.setVolume(500);
@@ -464,204 +553,44 @@ describe("AppleMusicKitAdapter: transport", () => {
     const { adapter, music } = await ready();
     const seen: string[] = [];
     const off = adapter.onState((s) => seen.push(s.status));
-    music.playbackState = 3;
+    music.playbackState = PLAYBACK.paused;
     music.emit("playbackStateDidChange");
     off();
-    music.playbackState = 2;
+    music.playbackState = PLAYBACK.playing;
     music.emit("playbackStateDidChange");
     expect(seen).toEqual(["paused"]);
   });
 });
 
-/** An adapter that sleeps until someone signs in, with everything that could leave the pond counted. */
-function sleeper(
-  over: {
-    remembered?: boolean;
-    authorised?: boolean;
-    refuseSignIn?: boolean;
-    probe?: () => Promise<void>;
-    token?: () => Promise<string>;
-  } = {},
-) {
-  const log = { tokenAsks: 0, loads: 0, probes: 0, remembered: over.remembered ?? false, remembers: 0 };
-  const music = new FakeMusic();
-  music.isAuthorized = over.authorised ?? false;
-  music.refuseSignIn = over.refuseSignIn ?? false;
-  const { kit, configured } = fakeKit(music);
-  const adapter = new AppleMusicKitAdapter({
-    loadMusicKit: async () => {
-      log.loads += 1;
-      return kit;
-    },
-    fetchDeveloperToken: async () => {
-      log.tokenAsks += 1;
-      return over.token ? over.token() : "dev-token";
-    },
-    lazy: {
-      remembered: () => log.remembered,
-      remember: () => {
-        log.remembered = true;
-        log.remembers += 1;
-      },
-      probe: async () => {
-        log.probes += 1;
-        await over.probe?.();
-      },
-    },
-  });
-  return { adapter, music, log, configured };
-}
-
-describe("AppleMusicKitAdapter: asleep until someone signs in", () => {
-  it("fetches nothing and loads nothing at launch when nobody has signed in here", async () => {
-    const { adapter, log } = sleeper();
-    await adapter.init();
-
-    expect(adapter.state()).toMatchObject({ ready: false, need: "authorization", dormant: true });
-    expect(adapter.state().message).toBeUndefined();
-    expect(log).toMatchObject({ tokenAsks: 0, loads: 0, probes: 1 });
+describe("describeMkError: the MKError codes, in words", () => {
+  it.each([
+    ["USER_INTERACTION_REQUIRED", "needs_interaction", /Press Play there once/],
+    ["AUTHORIZATION_ERROR", "needs_authorization", /sign in again/],
+    ["TOKEN_EXPIRED", "needs_authorization", /sign in again/],
+    ["SUBSCRIPTION_ERROR", "player_error", /no active Apple Music subscription/],
+    ["STREAM_UPSELL", "player_error", /another device/],
+    ["DEVICE_LIMIT", "player_error", /limit of devices/],
+    ["MEDIA_LICENSE", "drm_refused", /MEDIA_LICENSE/],
+    ["WIDEVINE_CDM_EXPIRED", "drm_refused", /too old/],
+    ["OUTPUT_RESTRICTED", "drm_refused", /HDCP/],
+    ["CONTENT_UNAVAILABLE", "player_error", /not available/],
+    ["UNAUTHORIZED_ERROR", "not_ready", /developer token/],
+    ["NETWORK_ERROR", "player_error", /could not be reached/],
+  ])("%s", (code, expected, words) => {
+    const e = describeMkError(mkError(code));
+    expect(e.code).toBe(expected);
+    expect(e.message).toMatch(words);
   });
 
-  it("stays asleep, and quiet, however often the setup retry asks", async () => {
-    const { adapter, log } = sleeper();
-    await adapter.init();
-    await adapter.init();
-    await adapter.init();
-
-    expect(adapter.state().dormant).toBe(true);
-    expect(log.tokenAsks).toBe(0);
-    expect(log.loads).toBe(0);
+  it("names an unlisted code and its description rather than guessing at a fix", () => {
+    const e = describeMkError(mkError("PARSE_ERROR", "bad json"));
+    expect(e).toMatchObject({ code: "player_error" });
+    expect(e.message).toContain("bad json");
+    expect(e.message).toContain("PARSE_ERROR");
   });
 
-  it("still says early that Apple Music cannot work, in the pond's words, and does not sleep", async () => {
-    const { adapter, log } = sleeper({
-      probe: async () => {
-        throw new Error("Apple Music sign-in is not available on this pond yet.");
-      },
-    });
-    await adapter.init();
-
-    expect(adapter.state()).toMatchObject({ ready: false, need: "setup", dormant: false });
-    expect(adapter.state().message).toContain("not available on this pond");
-    expect(log.tokenAsks).toBe(0);
-    expect(log.loads).toBe(0);
-  });
-
-  it("answers a command with a sign-in instruction, which is what lets the extension fall back and say why", async () => {
-    const { adapter } = sleeper();
-    await adapter.init();
-
-    for (const run of [
-      () => adapter.play({ id: "1", kind: "song" }),
-      () => adapter.search("nairobi"),
-      () => adapter.pause(),
-    ]) {
-      const error = await run().catch((e) => e);
-      expect(error).toBeInstanceOf(PlayerError);
-      expect(error.code).toBe("needs_authorization");
-      expect(error.message).toContain("Music extension's settings");
-    }
-  });
-
-  it("wakes on prepare: a token, the script, and a configured player, and no longer dormant", async () => {
-    const { adapter, log, configured } = sleeper();
-    await adapter.init();
-    await adapter.prepare();
-
-    expect(log).toMatchObject({ tokenAsks: 1, loads: 1 });
-    expect(configured).toHaveLength(1);
-    expect(adapter.state()).toMatchObject({ need: "authorization", dormant: false });
-  });
-
-  it("wakes once however many ask at the same moment", async () => {
-    const { adapter, log } = sleeper();
-    await adapter.init();
-    await Promise.all([adapter.prepare(), adapter.prepare(), adapter.prepare()]);
-    await adapter.prepare();
-
-    expect(log.tokenAsks).toBe(1);
-    expect(log.loads).toBe(1);
-  });
-
-  it("stays asleep, and can be woken again, when waking fails", async () => {
-    let fail = true;
-    const { adapter, log } = sleeper({
-      token: async () => {
-        if (fail) throw new Error("Apple Music could not get its sign-in token: no network.");
-        return "dev-token";
-      },
-    });
-    await adapter.init();
-
-    const error = await adapter.prepare().catch((e) => e);
-    expect(error).toBeInstanceOf(PlayerError);
-    expect(error.message).toContain("no network");
-    expect(adapter.state().dormant).toBe(true);
-
-    fail = false;
-    await adapter.prepare();
-    expect(adapter.state().dormant).toBe(false);
-    expect(log.tokenAsks).toBe(2);
-  });
-
-  it("signing in wakes it, signs in, and remembers, so the next launch starts by itself", async () => {
-    const { adapter, log, music } = sleeper();
-    await adapter.init();
-    await adapter.authorize();
-
-    expect(music.isAuthorized).toBe(true);
-    expect(adapter.state()).toMatchObject({ ready: true, need: "none", dormant: false });
-    expect(log.remembers).toBe(1);
-    expect(log.remembered).toBe(true);
-  });
-
-  it("does not remember a sign-in that did not finish", async () => {
-    const { adapter, log } = sleeper({ refuseSignIn: true });
-    await adapter.init();
-    await adapter.authorize();
-
-    expect(adapter.state().message).toContain("Sign-in did not finish");
-    expect(log.remembers).toBe(0);
-  });
-
-  it("starts at launch, with no probe, for someone who has signed in here before", async () => {
-    const { adapter, log } = sleeper({ remembered: true, authorised: true });
-    await adapter.init();
-
-    expect(log).toMatchObject({ tokenAsks: 1, loads: 1, probes: 0 });
-    expect(adapter.state()).toMatchObject({ ready: true, need: "none", dormant: false });
-  });
-
-  it("counts a session MusicKit already held as a sign-in, so it is remembered from then on", async () => {
-    const { adapter, log } = sleeper({ authorised: true });
-    await adapter.init(); // asleep
-    await adapter.prepare(); // woken by a sign-in click; MusicKit finds its stored session
-
-    expect(log.remembers).toBe(1);
-    expect(adapter.state().need).toBe("none");
-  });
-
-  it("asks a remembered service to sign in again, in the window, if its session is gone", async () => {
-    const { adapter } = sleeper({ remembered: true, authorised: false });
-    await adapter.init();
-
-    // Started, not asleep: the person did use it, so the window may ask.
-    expect(adapter.state()).toMatchObject({ need: "authorization", dormant: false });
-  });
-
-  it("behaves as it always did when nothing asks it to sleep", async () => {
-    let tokenAsks = 0;
-    const music = new FakeMusic();
-    const { kit } = fakeKit(music);
-    const adapter = new AppleMusicKitAdapter({
-      loadMusicKit: async () => kit,
-      fetchDeveloperToken: async () => {
-        tokenAsks += 1;
-        return "t";
-      },
-    });
-    await adapter.init();
-    expect(tokenAsks).toBe(1);
-    expect(adapter.state().dormant).toBe(false);
+  it("copes with something that is not an MKError at all", () => {
+    expect(describeMkError(undefined).code).toBe("player_error");
+    expect(describeMkError("boom").message).toMatch(/could not play/);
   });
 });

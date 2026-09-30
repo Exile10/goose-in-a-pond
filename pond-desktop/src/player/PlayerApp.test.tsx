@@ -65,7 +65,7 @@ describe("PlayerApp", () => {
     const { adapter, spies } = adapterIn(state({ ready: false, need: "authorization" }));
     render(<PlayerApp adapter={adapter} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Connect Apple Music" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sign in to Apple Music" }));
 
     expect(spies.authorize).toHaveBeenCalledOnce();
     expect(screen.queryByLabelText("Play")).toBeNull();
@@ -100,8 +100,36 @@ describe("PlayerApp", () => {
     const { adapter } = adapterIn(state({ status: "playing", track, position_ms: 65_000 }));
     render(<PlayerApp adapter={adapter} />);
     expect(screen.getByText("Nairobi")).toBeTruthy();
-    expect(screen.getByText("Bensoul - Qwarantunes")).toBeTruthy();
+    expect(screen.getByText("Bensoul")).toBeTruthy();
+    expect(screen.getByText("Qwarantunes")).toBeTruthy();
     expect(screen.getByText("1:05 / 3:30")).toBeTruthy();
+  });
+
+  it("shows the artwork as the service supplies it, with words for it", () => {
+    const art = "https://x/300x300.jpg";
+    const { adapter } = adapterIn(state({ status: "playing", track: { ...track, artwork_url: art } }));
+    render(<PlayerApp adapter={adapter} />);
+    const img = screen.getByRole("img", { name: "Artwork for Qwarantunes" }) as HTMLImageElement;
+    expect(img.getAttribute("src")).toBe(art);
+  });
+
+  it("keeps the standard controls on screen whenever the service can play, even with nothing playing", () => {
+    const { adapter } = adapterIn(state());
+    render(<PlayerApp adapter={adapter} />);
+    for (const name of ["Previous", "Play", "Next"]) expect(screen.getByLabelText(name)).toBeTruthy();
+  });
+
+  it("offers a sign-out for a service that signs in on the page, and only then", () => {
+    const signed = adapterIn(state());
+    const signOut = vi.fn(async () => undefined);
+    (signed.adapter as unknown as { signOut: () => Promise<void> }).signOut = signOut;
+    render(<PlayerApp adapter={signed.adapter} />);
+    fireEvent.click(screen.getByRole("button", { name: "Sign out of Apple Music" }));
+    expect(signOut).toHaveBeenCalledOnce();
+    cleanup();
+
+    render(<PlayerApp adapter={adapterIn(state()).adapter} />);
+    expect(screen.queryByRole("button", { name: /Sign out/ })).toBeNull();
   });
 
   it("pauses while playing and resumes while paused", () => {

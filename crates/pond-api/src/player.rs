@@ -1,5 +1,6 @@
-//! The player bridge. A music player page in the shell (Widevine lives there, not here) listens
-//! on `/player/events`; extensions send it commands through `/player/command` and get its reply.
+//! The player bridge. The music player page, which runs in the person's own browser (the services'
+//! SDKs and the browser's DRM live there, not here), listens on `/player/events`; extensions send it
+//! commands through `/player/command` and get its reply.
 //! Nothing here knows a service: `service` is a label the page's adapter answers to.
 
 use std::collections::HashMap;
@@ -534,7 +535,8 @@ pub async fn command_handler(
         Ok(reply) => reply,
         Err(DispatchError::NoPlayer) => Reply::failure(
             "no_player",
-            "The music player is not running. It runs inside the Goose In A Pond app.",
+            "The music player is not open. Open it from the Music extension's settings: it is a page \
+             in your web browser on the pond's computer.",
         ),
         Err(DispatchError::Timeout) => Reply::failure(
             "timeout",
@@ -612,8 +614,8 @@ pub struct PolicyRequest {
     method: Option<String>,
 }
 
-/// `POST /api/v1/player/egress-policy` -- the shell asks about a request the player window is
-/// about to make. Loopback only, like every route the shell's main process calls untokened.
+/// `POST /api/v1/player/egress-policy` -- the player page asks, before it loads a service's script,
+/// whether the network setting allows it. Loopback only, and untokened.
 pub async fn player_egress_handler(body: Result<Json<PolicyRequest>, JsonRejection>) -> Response {
     let request = match body {
         Ok(Json(r)) if r.url.contains("://") => r,

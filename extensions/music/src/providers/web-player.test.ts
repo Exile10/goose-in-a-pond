@@ -109,7 +109,7 @@ test('with no player running, the Music app plays instead and the result says wh
 
   const text = await make(host, local).playRequest({ query: 'Nairobi' });
 
-  assert.match(text, /The in-app player could not be used \(The music player is not running\.\)/);
+  assert.match(text, /The music player page could not be used \(The music player is not running\.\), so/);
   assert.match(text, /Music app was used instead/);
   assert.match(text, /From the Music app/);
   assert.deepEqual(calls, ['playRequest']);

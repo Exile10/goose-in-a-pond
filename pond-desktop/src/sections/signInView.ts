@@ -1,44 +1,35 @@
 import type { PlayerState } from "../player/types";
 
-/** What the player last reported for a service, as `GET /player/state` answers it. */
+/** What the player page last reported for a service, as `GET /player/state` answers it. */
 export interface PlayerReply {
   attached: boolean;
   state: PlayerState | null;
 }
 
-/** What the sign-in row shows. `note` is a sentence for a person, when there is one to say. */
-export type SignInView =
-  | { kind: "not_in_shell"; note: string }
-  | { kind: "starting"; note: string }
+/** What the music player row shows. `note` is a sentence for a person. */
+export type PlayerView =
+  | { kind: "closed"; note: string }
   | { kind: "unavailable"; note: string }
-  | { kind: "ready"; note?: string }
-  | { kind: "signing_in"; note?: string }
+  | { kind: "needs_sign_in"; note: string }
   | { kind: "signed_in" };
 
 /**
- * One decision, kept out of the component so it can be tested: given what the desktop shell and the
- * player say, what does the person see. The one button appears only when pressing it can work.
+ * One decision, kept out of the component so it can be tested: given what the player page last
+ * reported, what the person sees. The sign-in itself is on the page, so this only ever says where
+ * to go and what the page is waiting for.
  */
-export function signInView(input: {
-  /** The music player lives in the desktop shell; a browser or a phone cannot sign in to it. */
-  desktop: boolean;
-  /** Null when the player could not be asked. */
+export function playerView(input: {
+  /** Null when the pond could not be asked. */
   reply: PlayerReply | null;
-  /** The button was pressed and the sign-in has not finished. */
-  pending: boolean;
   label: string;
-}): SignInView {
-  const { desktop, reply, pending, label } = input;
-  if (!desktop) {
+}): PlayerView {
+  const { reply, label } = input;
+  if (!reply || !reply.attached || !reply.state) {
     return {
-      kind: "not_in_shell",
-      note: `Sign in to ${label} from the Goose In A Pond app on the computer that plays your music.`,
+      kind: "closed",
+      note: `The music player is not open. Open it, then sign in to ${label} on that page.`,
     };
   }
-  if (!reply || !reply.attached || !reply.state) {
-    return { kind: "starting", note: "The music player is starting. This takes a few seconds." };
-  }
-
   const state = reply.state;
   if (state.need === "none") return { kind: "signed_in" };
   if (state.need === "setup") {
@@ -47,10 +38,10 @@ export function signInView(input: {
       note: state.message ?? `${label} is not set up on this pond yet.`,
     };
   }
-  // Waiting for a sign-in. While one is under way, a message here is why the last try failed.
-  return pending
-    ? { kind: "signing_in", ...(state.message ? { note: state.message } : {}) }
-    : { kind: "ready", ...(state.message ? { note: state.message } : {}) };
+  return {
+    kind: "needs_sign_in",
+    note: state.message ?? `Press Sign in to ${label} on the music player page.`,
+  };
 }
 
 /** Advanced fields sit apart from the ordinary ones; the order within each is the registry's. */
