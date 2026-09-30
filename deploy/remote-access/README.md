@@ -70,6 +70,20 @@ HTTPS port and nothing more. Registration is rate limited per source address, th
 source table is capped, and the number of households is capped, because
 `--provision` used to be the only thing bounding what admission could consume.
 
+Source addresses come from the gateway's `X-Forwarded-For`, believed only from
+`--trusted-proxy` (the pinned `172.31.250.0/28` compose network); without it every
+client would share the gateway's budget. Only the last hop counts, IPv6 clients are
+grouped by /64, and a full table refuses new sources instead of forgetting every
+budget. Approvals are limited per source and, after the signature is checked, per
+household.
+
+The service enrolls at most 4096 devices across every household and refuses more
+with `503 capacity`. Each enrolled device is a coordinator node the policy must
+read, so this is what keeps the inventory readable; it is streamed node by node and
+refused past 8192 nodes, leaving room for nodes added by hand. Before this, enough
+registered nodes pushed the inventory past a 1 MiB read limit, after which every
+policy update failed and revocations stopped taking effect.
+
 The manual path below remains for an operator-created household and for anyone
 running their own coordination service.
 
@@ -153,7 +167,12 @@ fixtures do not establish public cellular availability.
 ## Health, logs, and remaining verification
 
 Enrollment exposes `/health`, limits request bodies to 8 KiB, concurrent operations
-to eight, and public requests to 10/s with a burst of 20. Logs name transitions and
+to eight, and public requests to 10/s with a burst of 20. A coordinator that cannot
+be reconciled at startup leaves the service running but degraded, reported as
+`"degraded":true` on `/health` (still 200, so the gateway keeps serving) and in the
+log, until a reconciliation succeeds; it used to exit and restart into the same
+failure. A signed approval is spent as soon as its signature checks out, even if it
+is then refused. Logs name transitions and
 failures, never signatures, auth IDs, QR payloads, or credentials. Container logs
 rotate at 10 MiB with three files. Alerts, off-host metrics, disk thresholds, and
 credential-expiry notifications must be configured for public operation.
