@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use pond_api::network::{is_tailnet, EmbeddedAddress};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::Write,
     net::SocketAddr,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
@@ -32,6 +32,7 @@ use tokio::{
 };
 
 mod recovery;
+mod revocation;
 
 const PEER_HEADER: &str = "x-pond-embedded-peer";
 
@@ -94,10 +95,17 @@ pub struct Runtime {
     socket: PathBuf,
     _socket_dir: tempfile::TempDir,
     port: u16,
+    /// The bundled `pondnet` helper, resolved once at startup.
+    helper: PathBuf,
     status: RwLock<Status>,
     process: Mutex<Option<Process>>,
     generation: AtomicU64,
-    revocations: Mutex<()>,
+    /// Held only across a read-modify-write of the revocation queue or enrollment record,
+    /// never across a helper call.
+    files: std::sync::Mutex<()>,
+    /// Serialises helper calls about one device, so enrolling and revoking it cannot
+    /// interleave, without making every other device wait for a slow coordinator.
+    device_locks: std::sync::Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     recovery: recovery::Queue,
     /// Address published by system information and pairing QR producers.
     pub address: EmbeddedAddress,
@@ -108,6 +116,17 @@ pub struct Runtime {
 impl Runtime {
     /// Create the private bridge; the short random socket path fits macOS's sockaddr_un limit.
     pub fn new(data: &Path, port: u16) -> Result<(Arc<Self>, tokio::net::UnixListener)> {
+        let helper = std::env::var_os("POND_NETWORK_BINARY")
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_exe()?.with_file_name("pondnet"));
+        Self::with_helper(data, port, helper)
+    }
+
+    fn with_helper(
+        data: &Path,
+        port: u16,
+        helper: PathBuf,
+    ) -> Result<(Arc<Self>, tokio::net::UnixListener)> {
         let directory = data.join("embedded-network");
         match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
             Ok(()) => (),
@@ -133,6 +152,7 @@ impl Runtime {
                 socket,
                 _socket_dir: socket_dir,
                 port,
+                helper,
                 status: RwLock::new(Status {
                     state: "Stopped".into(),
                     addresses: vec![],
@@ -142,7 +162,8 @@ impl Runtime {
                 }),
                 process: Mutex::new(None),
                 generation: AtomicU64::new(0),
-                revocations: Mutex::new(()),
+                files: std::sync::Mutex::new(()),
+                device_locks: std::sync::Mutex::new(BTreeMap::new()),
                 recovery: recovery::Queue::default(),
                 address: EmbeddedAddress::default(),
                 changed: tokio::sync::Notify::new(),
@@ -221,10 +242,7 @@ impl Runtime {
     ) -> Result<serde_json::Value> {
         use tokio::io::AsyncWriteExt;
         let config = self.config()?;
-        let helper = std::env::var_os("POND_NETWORK_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_exe()?.with_file_name("pondnet"));
-        let mut child = Command::new(helper)
+        let mut child = Command::new(&self.helper)
             .arg("--authority-action")
             .arg(action)
             .arg("--state")
@@ -246,7 +264,18 @@ impl Runtime {
                 .await??;
         // Exit 3: the coordinator refused the request, as opposed to being unreachable.
         if output.status.code() == Some(3) {
-            bail!(RefusedByCoordinator(helper_complaint(&output.stderr)));
+            #[derive(Deserialize)]
+            struct Refusal {
+                refused: String,
+            }
+            let reason =
+                serde_json::from_slice::<Refusal>(&output.stdout[..output.stdout.len().min(1024)])
+                    .ok()
+                    .map(|refusal| refusal.refused);
+            bail!(RefusedByCoordinator {
+                complaint: helper_complaint(&output.stderr),
+                reason,
+            });
         }
         ensure!(
             output.status.success(),
@@ -277,13 +306,76 @@ impl Runtime {
         } else {
             device.to_owned()
         };
-        let _revocations = self.revocations.lock().await;
+        let lock = self.device_lock(&device);
+        let _held = lock.lock().await;
         ensure!(
-            !self.pending_revocations()?.contains(&device),
+            !self.pending_revocations()?.contains_key(&device),
             "device revocation is pending"
         );
         let payload = self.registration_payload(&device, role, registration)?;
-        self.authority("enroll", payload).await
+        let enrolled = self.authority("enroll", payload).await?;
+        self.ensure_not_revoked_meanwhile(&device)?;
+        Ok(enrolled)
+    }
+
+    /// The lock that serialises helper calls about `device`.
+    fn device_lock(&self, device: &str) -> Arc<Mutex<()>> {
+        self.device_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(device.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// A revocation queued while a helper call was in flight wins: the call must not report a
+    /// success that the queued revocation is about to undo.
+    fn ensure_not_revoked_meanwhile(&self, device: &str) -> Result<()> {
+        ensure!(
+            !self.pending_revocations()?.contains_key(device),
+            "a revocation was queued for this device while it was being enrolled"
+        );
+        Ok(())
+    }
+
+    /// Note that `device` holds an enrollment, so a later revocation is sent without a check.
+    fn record_enrolled(&self, device: &str) -> Result<()> {
+        let _files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        let mut record = revocation::load_enrolled(&self.directory)?;
+        if record.devices.insert(device.to_owned()) {
+            ensure!(
+                record.devices.len() <= revocation::MAX_DEVICES,
+                "enrollment record is full"
+            );
+            revocation::write_private_json(&self.directory, revocation::ENROLLED_FILE, &record)?;
+        }
+        Ok(())
+    }
+
+    /// Begin a complete record for a household created just now; an existing one is kept.
+    fn start_enrollment_record(&self) -> Result<()> {
+        let _files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.directory.join(revocation::ENROLLED_FILE).exists() {
+            revocation::write_private_json(
+                &self.directory,
+                revocation::ENROLLED_FILE,
+                &revocation::Enrolled {
+                    complete: true,
+                    devices: Default::default(),
+                },
+            )?;
+            tracing::info!("remote access: keeping a complete record of enrolled phones");
+        }
+        Ok(())
+    }
+
+    fn forget_enrolled(&self, device: &str) -> Result<()> {
+        let _files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        let mut record = revocation::load_enrolled(&self.directory)?;
+        if record.devices.remove(device) {
+            revocation::write_private_json(&self.directory, revocation::ENROLLED_FILE, &record)?;
+        }
+        Ok(())
     }
 
     fn registration_payload(
@@ -317,41 +409,18 @@ impl Runtime {
         )
     }
 
-    fn pending_revocations(&self) -> Result<BTreeSet<String>> {
-        let path = self.directory.join("revocations.json");
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeSet::new())
-            }
-            other => other?,
-        };
-        ensure!(
-            metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.permissions().mode() & 0o077 == 0
-                && metadata.len() <= 65536,
-            "invalid remote revocation queue"
-        );
-        let pending: BTreeSet<String> = serde_json::from_slice(&std::fs::read(path)?)?;
-        ensure!(
-            pending.len() <= 256 && pending.iter().all(|id| valid_device(id)),
-            "invalid remote revocation entries"
-        );
-        Ok(pending)
+    fn pending_revocations(&self) -> Result<revocation::Queue> {
+        revocation::load_queue(&self.directory, Utc::now())
     }
 
-    fn save_revocations(&self, pending: &BTreeSet<String>) -> Result<()> {
-        let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
-        file.write_all(&serde_json::to_vec(pending)?)?;
-        file.as_file().sync_all()?;
-        file.persist(self.directory.join("revocations.json"))?;
-        std::fs::File::open(&self.directory)?.sync_all()?;
-        Ok(())
+    fn save_revocations(&self, pending: &revocation::Queue) -> Result<()> {
+        revocation::write_private_json(&self.directory, revocation::QUEUE_FILE, pending)
     }
 
     /// Retry durable revocations at a bounded rate, including while networking is disabled.
-    /// Dropping this future on shutdown cancels the current helper operation.
-    pub async fn reconcile_revocations(&self) -> Result<()> {
+    /// Never returns: a fault is logged and retried, because ending this future would end
+    /// `serve()` and take the dashboard down with it.
+    pub async fn reconcile_revocations(&self) -> std::convert::Infallible {
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(30));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -360,39 +429,102 @@ impl Runtime {
             if let Err(error) = self.sweep_absent_devices().await {
                 tracing::warn!(%error, "could not check which devices have been away too long");
             }
-            let pending = {
-                let _guard = self.revocations.lock().await;
-                self.pending_revocations()?
-            };
-            for device in pending.iter().take(4) {
-                let _guard = self.revocations.lock().await;
-                if !self.pending_revocations()?.contains(device) {
-                    continue;
-                }
-                match self
-                    .authority(
-                        "revoke",
-                        serde_json::json!({
-                            "household":"", "device":device, "role":"phone", "action":"revoke",
-                            "authId":"", "nodeKey":"", "nonce":"", "expires":0
-                        }),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        let mut current = self.pending_revocations()?;
-                        current.remove(device);
-                        self.save_revocations(&current)?;
-                        tracing::info!("queued remote network revocation completed");
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "remote network revocation remains queued; coordination unavailable"
-                        );
-                        break;
-                    }
-                }
+            if let Err(error) = self.reconcile_due().await {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "remote_revocation_store_unavailable",
+                    %error,
+                    "the remote revocation queue could not be read or written; retrying"
+                );
             }
+        }
+    }
+
+    /// Send the revocations that are due, backing off each failure on its own.
+    async fn reconcile_due(&self) -> Result<()> {
+        let due = revocation::due(&self.pending_revocations()?, Utc::now());
+        for (device, entry) in due {
+            let outcome = self.send_revocation(&device, entry.verify).await;
+            let unavailable = self.settle(&device, outcome)?;
+            // Unreachable is unreachable for every device; a refusal is about this one.
+            if unavailable {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record what became of one attempt; true when the coordinator could not be reached.
+    fn settle(&self, device: &str, outcome: Sent) -> Result<bool> {
+        let files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        let mut queue = self.pending_revocations()?;
+        let (reason, unavailable) = match outcome {
+            Sent::Revoked | Sent::NeverEnrolled => {
+                queue.remove(device);
+                self.save_revocations(&queue)?;
+                drop(files);
+                self.forget_enrolled(device)?;
+                if matches!(outcome, Sent::Revoked) {
+                    tracing::info!(%device, "queued remote network revocation completed");
+                } else {
+                    tracing::info!(
+                        %device,
+                        "queued remote revocation dropped: the coordinator has no enrollment for this device"
+                    );
+                }
+                return Ok(false);
+            }
+            Sent::Refused(reason) => (reason, false),
+            Sent::Unavailable(reason) => (reason, true),
+        };
+        if let Some(entry) = queue.get_mut(device) {
+            entry.back_off(Utc::now());
+            tracing::warn!(
+                %device,
+                attempts = entry.attempts,
+                next_attempt = %entry.next_attempt,
+                unavailable,
+                %reason,
+                "remote network revocation remains queued"
+            );
+        }
+        self.save_revocations(&queue)?;
+        Ok(unavailable)
+    }
+
+    async fn send_revocation(&self, device: &str, verify: bool) -> Sent {
+        let lock = self.device_lock(device);
+        let _held = lock.lock().await;
+        let classify = |error: anyhow::Error| match error.downcast_ref::<RefusedByCoordinator>() {
+            Some(refused) if refused.reason.as_deref() == Some("enrollment_missing") => {
+                Sent::NeverEnrolled
+            }
+            Some(refused) => Sent::Refused(refused.to_string()),
+            None => Sent::Unavailable(format!("{error:#}")),
+        };
+        if verify {
+            if let Err(error) = self
+                .authority(
+                    "inspect",
+                    serde_json::json!({"device": device, "role": "phone"}),
+                )
+                .await
+            {
+                return classify(error);
+            }
+        }
+        match self
+            .authority(
+                "revoke",
+                serde_json::json!({
+                    "household":"", "device":device, "role":"phone", "action":"revoke",
+                    "authId":"", "nodeKey":"", "nonce":"", "expires":0
+                }),
+            )
+            .await
+        {
+            Ok(_) => Sent::Revoked,
+            Err(error) => classify(error),
         }
     }
 
@@ -452,14 +584,11 @@ impl Runtime {
             }
             *process = None;
         }
-        let helper = std::env::var_os("POND_NETWORK_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_exe()?.with_file_name("pondnet"));
         ensure!(
-            helper.is_file(),
+            self.helper.is_file(),
             "bundled pondnet helper is missing; build native/pondnet first"
         );
-        let mut child = Command::new(helper)
+        let mut child = Command::new(&self.helper)
             .arg("--state")
             .arg(self.directory.join("node"))
             .arg("--hostname")
@@ -702,21 +831,33 @@ impl pond_core::security::ports::remote_access::DevicePresence for Runtime {
 #[async_trait::async_trait]
 impl pond_core::security::ports::remote_access::RemoteRevocation for Runtime {
     async fn queue(&self, device_id: &str) -> Result<()> {
-        let _guard = self.revocations.lock().await;
         // A local-only household has never registered a node and must not contact coordination.
         if self.config()?.enrollment_url.is_empty() {
             return Ok(());
         }
-        let device_id = network_device(device_id)?;
-        self.recovery.revoke(&device_id);
+        let device = network_device(device_id)?;
+        self.recovery.revoke(&device);
+        let _files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+        let verify = match revocation::plan(&revocation::load_enrolled(&self.directory)?, &device) {
+            revocation::Plan::Revoke => false,
+            revocation::Plan::VerifyThenRevoke => true,
+            revocation::Plan::NothingToRevoke => {
+                tracing::debug!(%device, "no remote revocation needed: this device was never enrolled");
+                return Ok(());
+            }
+        };
         let mut pending = self.pending_revocations()?;
         ensure!(
-            pending.contains(&device_id) || pending.len() < 256,
+            pending.contains_key(&device) || pending.len() < revocation::MAX_DEVICES,
             "remote revocation queue is full"
         );
-        pending.insert(device_id);
+        let entry = pending
+            .entry(device.clone())
+            .or_insert_with(|| revocation::Pending::new(verify, Utc::now()));
+        // A device learned to be enrolled since it was queued needs no check any more.
+        entry.verify &= verify;
         self.save_revocations(&pending)?;
-        tracing::info!("remote network revocation queued durably");
+        tracing::info!(%device, verify, "remote network revocation queued durably");
         Ok(())
     }
 }
@@ -816,12 +957,26 @@ struct Registration {
 
 /// A coordinator refusal rather than a fault, typed so the handler can pick a distinct status.
 #[derive(Debug)]
-pub struct RefusedByCoordinator(pub String);
+pub struct RefusedByCoordinator {
+    /// The helper's stderr, bounded and redacted.
+    pub complaint: String,
+    /// The coordinator's own error identifier, e.g. `enrollment_missing`.
+    pub reason: Option<String>,
+}
 
 impl std::fmt::Display for RefusedByCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.complaint)
     }
+}
+
+/// What became of one attempt to send a queued revocation.
+enum Sent {
+    Revoked,
+    /// The coordinator has no such enrollment: nothing to revoke, and no tombstone written.
+    NeverEnrolled,
+    Refused(String),
+    Unavailable(String),
 }
 
 impl std::error::Error for RefusedByCoordinator {}
@@ -857,14 +1012,22 @@ async fn authority_identity(
     peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     local(peer)?;
-    runtime
+    // No authority yet means no phone was ever enrolled, so the record can start complete.
+    let first = !runtime.directory.join("authority").exists();
+    let identity = runtime
         .authority("identity", serde_json::Value::Null)
         .await
-        .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, operation = "identity", "embedded enrollment failed");
             StatusCode::SERVICE_UNAVAILABLE
-        })
+        })?;
+    if first {
+        runtime.start_enrollment_record().map_err(|error| {
+            tracing::warn!(%error, operation = "enrollment_record", "embedded enrollment failed");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+    }
+    Ok(Json(identity))
 }
 async fn register_pond(
     State(runtime): State<Arc<Runtime>>,
@@ -935,15 +1098,17 @@ async fn register_phone(
     Json(registration): Json<Registration>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     pond_api::network::require_lan(Some(ConnectInfo(peer))).map_err(|_| StatusCode::FORBIDDEN)?;
-    let _guard = runtime.revocations.lock().await;
     let (device, _) = recovery::caller(&headers, handshake.as_ref()).await?;
+    let lock = runtime.device_lock(&device);
+    let _held = lock.lock().await;
+    let store_failed = |error: anyhow::Error| {
+        tracing::warn!(%error, %device, operation = "enrollment_store", "embedded enrollment failed");
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     if runtime
         .pending_revocations()
-        .map_err(|error| {
-            tracing::warn!(%error, operation = "pending_revocations", "embedded enrollment failed");
-            StatusCode::SERVICE_UNAVAILABLE
-        })?
-        .contains(&device)
+        .map_err(store_failed)?
+        .contains_key(&device)
     {
         return Err(StatusCode::CONFLICT);
     }
@@ -975,6 +1140,7 @@ async fn register_phone(
                     %device,
                     "remote access: already enrolled with this identity and active; nothing to do"
                 );
+                runtime.record_enrolled(&device).map_err(store_failed)?;
                 return Ok(Json(existing));
             }
             tracing::info!(
@@ -988,10 +1154,9 @@ async fn register_phone(
         }
     }
 
-    runtime
+    let enrolled = runtime
         .authority("enroll", payload)
         .await
-        .map(Json)
         .map_err(|error| {
             let refused = error.downcast_ref::<RefusedByCoordinator>().is_some();
             tracing::warn!(%error, %device, refused, operation = "enroll_phone", "embedded enrollment failed");
@@ -1000,7 +1165,15 @@ async fn register_phone(
             } else {
                 StatusCode::SERVICE_UNAVAILABLE
             }
-        })
+        })?;
+    // Recorded even if a revocation raced in: the queued revocation then goes out unchecked.
+    runtime.record_enrolled(&device).map_err(store_failed)?;
+    if let Err(error) = runtime.ensure_not_revoked_meanwhile(&device) {
+        tracing::warn!(%error, %device, "embedded enrollment superseded by a revocation");
+        return Err(StatusCode::CONFLICT);
+    }
+    tracing::info!(%device, "remote access: phone enrolled");
+    Ok(Json(enrolled))
 }
 /// Companion enrollment uses the same bearer middleware and actual-peer LAN checks.
 pub fn companion_management(runtime: Arc<Runtime>, state: Arc<pond_api::AppState>) -> Router {
@@ -1158,7 +1331,7 @@ mod tests {
             "exactly the absent device, not the household"
         );
         // The queue holds the coordinator's (hashed) id; presence holds the pond's own.
-        assert!(queued.contains(&network_device(&key).unwrap()));
+        assert!(queued.contains_key(&network_device(&key).unwrap()));
 
         assert!(!runtime.presence().unwrap().contains_key(&key));
         runtime.sweep_absent_devices().await.unwrap();
@@ -1243,7 +1416,7 @@ mod tests {
         assert!(restored
             .pending_revocations()
             .unwrap()
-            .contains(&network_device("phone000000000001").unwrap()));
+            .contains_key(&network_device("phone000000000001").unwrap()));
         std::fs::write(restored.directory.join("revocations.json"), b"corrupt").unwrap();
         assert!(restored.queue("phone000000000002").await.is_err());
     }
@@ -1320,5 +1493,203 @@ mod tests {
             runtime.address.0.read().unwrap().as_deref(),
             Some("100.64.0.2")
         );
+    }
+
+    /// A stand-in helper: records each call, and answers an action from `<action>.out` and
+    /// `<action>.code` beside it (exit 0 with `{}` when neither exists).
+    struct FakeHelper {
+        dir: tempfile::TempDir,
+    }
+
+    impl FakeHelper {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("pondnet");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\n\
+                 dir=$(dirname \"$0\")\n\
+                 payload=$(cat)\n\
+                 echo \"$2 $payload\" >> \"$dir/calls\"\n\
+                 if [ -f \"$dir/$2.out\" ]; then cat \"$dir/$2.out\"; else echo '{}'; fi\n\
+                 exit $(cat \"$dir/$2.code\" 2>/dev/null || echo 0)\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self { dir }
+        }
+
+        fn answer(&self, action: &str, code: i32, stdout: &str) {
+            std::fs::write(
+                self.dir.path().join(format!("{action}.code")),
+                code.to_string(),
+            )
+            .unwrap();
+            std::fs::write(self.dir.path().join(format!("{action}.out")), stdout).unwrap();
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.split(' ').next().unwrap().to_owned())
+                .collect()
+        }
+
+        fn runtime(&self, data: &Path) -> Arc<Runtime> {
+            let (runtime, _listener) =
+                Runtime::with_helper(data, 4443, self.dir.path().join("pondnet")).unwrap();
+            runtime
+                .persist(&Config {
+                    enabled: true,
+                    control_url: "https://coord.example".into(),
+                    enrollment_url: "https://enroll.example".into(),
+                })
+                .unwrap();
+            runtime
+        }
+    }
+
+    fn enrolled(runtime: &Runtime, complete: bool, devices: &[&str]) {
+        revocation::write_private_json(
+            &runtime.directory,
+            revocation::ENROLLED_FILE,
+            &revocation::Enrolled {
+                complete,
+                devices: devices.iter().map(|d| network_device(d).unwrap()).collect(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_enrolled_phone_is_revoked_and_a_device_that_never_enrolled_is_left_alone() {
+        use pond_core::security::ports::remote_access::RemoteRevocation;
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        enrolled(&runtime, true, &["phone000000000001"]);
+
+        runtime.queue("phone000000000001").await.unwrap();
+        // A desktop session or a Matter device: nothing enrolled, so nothing to revoke.
+        runtime.queue("desktop0000000001").await.unwrap();
+        let queued = runtime.pending_revocations().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(!queued.values().next().unwrap().verify);
+
+        runtime.reconcile_due().await.unwrap();
+        assert!(runtime.pending_revocations().unwrap().is_empty());
+        assert_eq!(helper.calls(), ["revoke"]);
+        assert!(revocation::load_enrolled(&runtime.directory)
+            .unwrap()
+            .devices
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_older_pond_checks_an_unrecorded_device_and_writes_no_tombstone() {
+        use pond_core::security::ports::remote_access::RemoteRevocation;
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        // No record at all: this Pond enrolled phones before it kept one.
+        runtime.queue("matter-000000000001").await.unwrap();
+        assert!(runtime
+            .pending_revocations()
+            .unwrap()
+            .values()
+            .all(|e| e.verify));
+
+        helper.answer("inspect", 3, r#"{"refused":"enrollment_missing"}"#);
+        runtime.reconcile_due().await.unwrap();
+        assert!(runtime.pending_revocations().unwrap().is_empty());
+        assert_eq!(
+            helper.calls(),
+            ["inspect"],
+            "revoked a device that never enrolled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_backs_off_one_device_and_an_outage_waits_for_all() {
+        use pond_core::security::ports::remote_access::RemoteRevocation;
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        enrolled(&runtime, true, &["phone000000000001", "phone000000000002"]);
+        runtime.queue("phone000000000001").await.unwrap();
+        runtime.queue("phone000000000002").await.unwrap();
+
+        helper.answer("revoke", 3, r#"{"refused":"revocation_conflict"}"#);
+        runtime.reconcile_due().await.unwrap();
+        assert_eq!(
+            helper.calls().len(),
+            2,
+            "a refusal stopped the devices behind it"
+        );
+        let queued = runtime.pending_revocations().unwrap();
+        assert!(queued
+            .values()
+            .all(|e| e.attempts == 1 && e.next_attempt > Utc::now()));
+        // Backed off, so the next tick sends nothing.
+        runtime.reconcile_due().await.unwrap();
+        assert_eq!(helper.calls().len(), 2);
+
+        let mut due_now = runtime.pending_revocations().unwrap();
+        for entry in due_now.values_mut() {
+            entry.next_attempt = Utc::now();
+        }
+        runtime.save_revocations(&due_now).unwrap();
+        helper.answer("revoke", 1, "");
+        runtime.reconcile_due().await.unwrap();
+        assert_eq!(
+            helper.calls().len(),
+            3,
+            "an unreachable coordinator was tried again"
+        );
+        let attempts: Vec<u32> = runtime
+            .pending_revocations()
+            .unwrap()
+            .values()
+            .map(|e| e.attempts)
+            .collect();
+        assert_eq!(attempts.iter().filter(|a| **a == 2).count(), 1);
+        assert_eq!(attempts.iter().filter(|a| **a == 1).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_new_household_records_every_enrollment_so_nothing_is_checked() {
+        use pond_core::security::ports::remote_access::RemoteRevocation;
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        runtime.start_enrollment_record().unwrap();
+        runtime.queue("desktop0000000001").await.unwrap();
+        assert!(runtime.pending_revocations().unwrap().is_empty());
+        // A second start keeps what is recorded.
+        runtime
+            .record_enrolled(&network_device("phone000000000001").unwrap())
+            .unwrap();
+        runtime.start_enrollment_record().unwrap();
+        assert_eq!(
+            revocation::load_enrolled(&runtime.directory)
+                .unwrap()
+                .devices
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revocation_queued_during_enrollment_wins() {
+        use pond_core::security::ports::remote_access::RemoteRevocation;
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        let device = network_device("phone000000000001").unwrap();
+        runtime.record_enrolled(&device).unwrap();
+        assert!(runtime.ensure_not_revoked_meanwhile(&device).is_ok());
+        runtime.queue("phone000000000001").await.unwrap();
+        assert!(runtime.ensure_not_revoked_meanwhile(&device).is_err());
     }
 }

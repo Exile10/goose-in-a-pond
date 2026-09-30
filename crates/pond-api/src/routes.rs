@@ -3840,6 +3840,9 @@ fn bridged_children_of(
 async fn unregister_device(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    remote: Option<
+        axum::Extension<Arc<dyn pond_core::security::ports::remote_access::RemoteRevocation>>,
+    >,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     use pond_core::user_data::ports::device_commissioning::{
         matter_bridged_endpoint, matter_node_id,
@@ -3913,6 +3916,19 @@ async fn unregister_device(
             children = children.len(),
             "devices: removed a hub and the devices behind it"
         );
+    }
+
+    // A paired phone may also hold a tailnet enrollment, which outlives its tokens. Queued
+    // durably first, as sign-out does, so a removed phone cannot keep reaching the Pond from
+    // outside. Matter devices never enroll.
+    if let (Some(axum::Extension(remote)), None) = (remote, matter_node_id(&id)) {
+        remote.queue(&id).await.map_err(|error| {
+            tracing::error!(device = %id, %error, "devices: could not queue the remote revocation; refusing to remove the device while its remote access would survive");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "revocation_unavailable"})),
+            )
+        })?;
     }
 
     // Revoke its tokens too: `session_tokens` has no FK to `devices`, so nothing cascades.

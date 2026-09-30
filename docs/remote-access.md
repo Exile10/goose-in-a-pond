@@ -173,7 +173,7 @@ coordinator's status and its error identifier.
 Disabling remote access stops local networking and preserves the pairing. Logout
 waits for acknowledged Pond revocation before clearing credentials, and also
 removes the device from the registry so it does not linger as one that is merely
-offline. The Pond queues
+offline. Removing the phone in the dashboard does the same. The Pond queues
 network revocation durably and retries while coordination is unavailable; application
 session and refresh credentials are revoked together. Corrupt identity files cause
 visible failure. Restore the private identity backup rather than deleting it to

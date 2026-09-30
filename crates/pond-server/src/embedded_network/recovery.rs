@@ -126,12 +126,13 @@ async fn request(
     Json(registration): Json<Registration>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     pond_api::network::require_lan(Some(ConnectInfo(peer))).map_err(|_| StatusCode::FORBIDDEN)?;
-    let _guard = runtime.revocations.lock().await;
     let (device, hash) = caller(&headers, handshake.as_ref()).await?;
+    let lock = runtime.device_lock(&device);
+    let _held = lock.lock().await;
     if runtime
         .pending_revocations()
         .map_err(failed)?
-        .contains(&device)
+        .contains_key(&device)
     {
         return Err(StatusCode::CONFLICT);
     }
@@ -197,7 +198,6 @@ async fn approve(
     Json(_approval): Json<LocalApproval>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     local(peer)?;
-    let _guard = runtime.revocations.lock().await;
     runtime
         .recovery
         .prune(runtime.generation.load(Ordering::SeqCst));
@@ -220,12 +220,13 @@ async fn operation(
     action: &str,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     pond_api::network::require_lan(Some(ConnectInfo(peer))).map_err(|_| StatusCode::FORBIDDEN)?;
-    let _guard = runtime.revocations.lock().await;
     let (device, hash) = caller(&headers, handshake.as_ref()).await?;
+    let lock = runtime.device_lock(&device);
+    let _held = lock.lock().await;
     if runtime
         .pending_revocations()
         .map_err(failed)?
-        .contains(&device)
+        .contains_key(&device)
     {
         return Err(StatusCode::CONFLICT);
     }
@@ -289,6 +290,13 @@ async fn operation(
             .authority("replace", payload)
             .await
             .map_err(failed)?;
+        runtime.record_enrolled(&device).map_err(failed)?;
+        runtime
+            .ensure_not_revoked_meanwhile(&device)
+            .map_err(|error| {
+                tracing::warn!(%error, %device, "remote recovery superseded by a revocation");
+                StatusCode::CONFLICT
+            })?;
         tracing::info!("remote recovery registration completed");
         return Ok(Json(result));
     }
