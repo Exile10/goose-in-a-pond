@@ -67,6 +67,7 @@ reminders: anything that happens on one named day or at one named time. In\n\
 conversation -- do not work out the actual date, and do not invent one.\n";
 
 /// Max rendered system-prompt length, in chars: the one fixed-size part of the prompt budget.
+#[cfg(test)]
 pub const EXTRACTION_PROMPT_CEILING: usize = 2_300;
 
 /// Max chars of an unparseable reply kept in `Unparseable::raw_head`.
