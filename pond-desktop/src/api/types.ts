@@ -31,6 +31,10 @@ export interface WeatherApiResponse {
 // ── Music ────────────────────────────────────────────────────
 export interface NowPlayingApiResponse {
   connected: boolean;
+  /** The household's chosen service. With Apple Music chosen, Spotify is not asked at all. */
+  service?: "apple" | "spotify";
+  /** The chosen player: the player page, or the service's own app. */
+  player?: "page" | "app";
   playing?: boolean;
   track?: string;
   artist?: string;
@@ -43,6 +47,10 @@ export interface NowPlayingApiResponse {
   upstream_status?: number;
   /** Human-readable explanation for `error`, safe to show as-is. */
   message?: string;
+  /** The item's page on Spotify, which the design guidelines ask to link back to. */
+  link?: string | null;
+  /** What Spotify allows right now (its `actions.disallows`, inverted). */
+  can?: { pause: boolean; resume: boolean; next: boolean; previous: boolean };
 }
 
 export type MusicControlAction = "play" | "pause" | "next" | "previous";
@@ -1140,12 +1148,26 @@ export interface AddExtensionRequest {
   env?: Record<string, string>;
 }
 
+/** One answer a `choice` takes. */
+export interface SecretOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
 export interface SecretRequirement {
   key: string;
   display_name: string;
   description: string;
   required: boolean;
-  kind: 'api_key' | 'oauth_flow' | 'generic';
+  /** `choice`: one of `options`; not a secret, so its value is read back and shown. */
+  kind: 'api_key' | 'oauth_flow' | 'generic' | 'choice';
+  /** For a `choice`: its answers, the first being what applies until one is saved. */
+  options?: SecretOption[];
+  /** Kept under "Developer settings": for bringing your own credentials or overriding a default. */
+  advanced?: boolean;
+  /** Used by the host only, never put in the extension's environment. */
+  host_only?: boolean;
 }
 
 export interface MarketplaceExtension {
