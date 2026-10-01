@@ -216,10 +216,8 @@ pub async fn collect_disk_usage(data_dir: &Path) -> anyhow::Result<DiskUsage> {
             "llm",
             "mmproj",
         ] {
-            // "whisper" is virtual — files live in models/ root as ggml-*.bin,
-            // and "llm" is the on-disk dir for llamafile binaries. "mmproj" is
-            // picture support: one encoder per model family, about 941 MB each,
-            // which went uncounted while it sat beside the models it serves.
+            // "whisper" is virtual (models/ggml-*.bin); "llm" holds llamafile binaries and
+            // "mmproj" the vision encoders (~941 MB each).
             match *cat {
                 "whisper" => {
                     let bytes = sum_files_matching(&models_root, |n| {

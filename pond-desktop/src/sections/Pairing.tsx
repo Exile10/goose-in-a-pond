@@ -41,12 +41,8 @@ export function Pairing() {
             ),
       ]);
       if (!pc.code) throw new Error("Server returned no pairing code");
-      // Every address this Pond has, because none of them works everywhere.
-      // The mDNS name survives a DHCP lease change and is what an iPhone
-      // resolves happily; Android's resolver does no mDNS at all, so
-      // `<host>.local` fails there and the phone needs the raw address; and
-      // neither reaches the Pond once the phone leaves the house, which is what
-      // the tailnet address is for. The client tries them in that order.
+      // Every address, tried in this order: mDNS (survives DHCP; Android's resolver has no mDNS),
+      // the raw LAN address, then the tailnet address for when the phone is away from home.
       if (!sysInfo.https_port || !sysInfo.tls_spki_sha256) throw new Error(i18n.t('pairing.unavailable'));
       const params = new URLSearchParams({
         v: "2",

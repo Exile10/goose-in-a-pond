@@ -194,27 +194,8 @@ pub fn should_review(inputs: &ReviewInputs) -> ReviewDecision {
     }
 }
 
-/// The refusals that are about whether a review is WORTH running, with no
-/// timing in them at all.
-///
-/// Split out because the reviewer runs on the shared inference lane, and the
-/// lane owns the timing half: `InferenceLane::acquire` applies the enable
-/// toggle, the never-at-startup guard, the quiet threshold and the interval
-/// floor, for this job and six others, and decides which of them gets the one
-/// slot. What it cannot know is that this particular job has nothing worth
-/// doing — and a job must not take the only inference slot in order to discover
-/// that.
-///
-/// Neither refusal here is waivable, and that is the point of their being
-/// separate from the timing ones. A person pressing "Run now" is asking the
-/// pond to skip its politeness, not to interrupt a household past the one limit
-/// it has on being interrupted — `MAX_PROPOSALS_PER_DAY` is that limit, and a
-/// button that could be pressed past it would turn a cap into a suggestion.
-///
-/// `orchestrator_enabled` is deliberately NOT here: it is the pond's own enable
-/// toggle for this job, so it belongs in the `enabled` argument the lane
-/// already takes, where it is counted and reported as `disabled` like every
-/// other job's switch.
+/// Refusals about whether a review is worth running, with no timing (the inference lane owns
+/// that). Never waived, even by "Run now"; `orchestrator_enabled` goes in the lane's `enabled`.
 pub fn reviewer_refusal(run_in_flight: bool, proposals_today: usize) -> Option<ReviewSkip> {
     if run_in_flight {
         return Some(ReviewSkip::RunInFlight);
@@ -326,45 +307,8 @@ pub fn reviewable(event: &BusEvent) -> Option<BusEventRef> {
     }
 }
 
-/// The member one review is addressed to, or nobody.
-///
-/// Invariant 4 says a proposal is addressed to a profile and never broadcast,
-/// and this is where that gets decided. The answer is the most recently active
-/// conversation that (a) a person held — [`SessionOrigin::is_human`], so the
-/// pond's own `sched-` rows can never nominate an audience, which matters
-/// doubly here because a review's own session id starts with `sched-` — and
-/// (b) carries an attribution, inside [`AUDIENCE_WINDOW`].
-///
-/// **`None` is a first-class answer and the loop must treat it as "no review".**
-/// On a pond with no profiles, or one where nobody has been identified in six
-/// hours, there is no member to address, and the alternative to skipping is a
-/// suggestion sent to the household — which is the broadcast this workstream
-/// exists to avoid. [`ProposalAudience`] cannot express one, so a caller that
-/// ignored this would have nothing to pass.
-///
-/// # The sole-member fallthrough, and why it is not a hole in invariant 4
-///
-/// `members` is the household roster, and when it holds exactly one person an
-/// unattributed conversation is addressed to them. Nothing is broadcast: the
-/// fallthrough RESOLVES a member and returns an `Owner` audience, so no
-/// downstream caller ever sees "the household". With two members it answers
-/// `None` exactly as before, because picking one would be attribution by row
-/// order, which is evidence of nothing — the rule PAI-1 P3 refused.
-///
-/// This is the same call `881da889` made for `context_source_owner` and the one
-/// `proposal_caller` now makes on the read side: a one-member pond has exactly
-/// one possible answer to "whose is this?", and requiring proof of it means
-/// requiring a paired, attributed device that most desktop ponds do not have.
-///
-/// It was measured, not assumed. On a real pond: 961 sessions, **0** carrying a
-/// `profile_id`, because `resolve_turn_scope` only writes one on the
-/// `DeviceRung::Member` arm and the desktop's own device row is never
-/// attributed. So this function returned `None` on every tick of every process
-/// the reviewer has ever run — which made PAI-7's entire model-backed producer
-/// unreachable, and left the Home column showing only the template-tier
-/// suggestions, which is what a household actually notices.
-///
-/// [`SessionOrigin::is_human`]: crate::shared::domain::session_activity::SessionOrigin::is_human
+/// The member of the most recent attributed human session in [`AUDIENCE_WINDOW`], else the
+/// sole member of `members` if anyone was here; else `None` (no broadcast, no row-order pick).
 pub fn audience_for_review(
     sessions: &[Session],
     now: DateTime<Utc>,
@@ -379,15 +323,11 @@ pub fn audience_for_review(
         .max_by_key(|(at, _)| *at)
         .map(|(_, profile_id)| profile_id.to_string());
 
-    // An attribution the pond actually made always wins. The roster is only
-    // consulted when there is none, so this can never override a face match or
-    // a paired device with a guess.
+    // A real attribution (face, paired device) always beats the roster.
     let profile_id = match attributed {
         Some(id) => id,
         None => {
-            // Still requires SOMEBODY to have been here inside the window. A
-            // pond nobody has talked to in six hours has nothing to review, and
-            // the roster does not change that.
+            // The roster still needs someone to have been here inside the window.
             let anyone_here = sessions
                 .iter()
                 .filter(|s| SessionOrigin::of(&s.id).is_human())
@@ -929,12 +869,6 @@ mod tests {
         assert_eq!(should_review(&inputs()), ReviewDecision::Run);
     }
 
-    /// The reviewer runs on the lane now, and calls this half directly.
-    ///
-    /// The lane owns the timing -- enable toggle, never-at-startup, quiet
-    /// threshold, interval floor -- for this job and six others, because it is
-    /// what decides which of them gets the one slot. What is left here is the
-    /// question the lane cannot answer: is a review worth running at all?
     #[test]
     fn the_reviewers_own_refusals_are_the_cap_and_a_run_in_flight() {
         assert_eq!(reviewer_refusal(false, 0), None);
@@ -953,18 +887,10 @@ mod tests {
         );
     }
 
-    /// Splitting the gate must not have made a second copy of the timing rules.
-    ///
-    /// The whole reason `should_run` is shared is that a second copy is what
-    /// reintroduces the failure it was written to fix -- a background loop
-    /// firing fifteen minutes after every boot on a machine nobody has touched.
-    /// This half takes no clock, no duration and no activity reading, and its
-    /// signature is what enforces that: there is nothing here to get wrong.
+    /// Timing rules live only in the shared `should_run`; this half's signature takes no clock.
     #[test]
     fn the_reviewers_own_half_of_the_gate_has_no_timing_in_it() {
-        // Two calls that differ in nothing but the caller's imagination about
-        // when they happened. A timing rule hiding in here would have to read
-        // something, and there is nothing to read.
+        // Identical calls must agree: nothing here could carry a time.
         assert_eq!(reviewer_refusal(false, 3), reviewer_refusal(false, 3));
         assert_eq!(
             should_review(&ReviewInputs::for_tick(
@@ -1899,22 +1825,14 @@ mod tests {
         );
     }
 
-    /// The measured blocker, and the fallthrough that clears it.
-    ///
-    /// On a real pond: 961 sessions, zero carrying a `profile_id`, because the
-    /// only writer is `resolve_turn_scope`'s `DeviceRung::Member` arm and the
-    /// desktop's own device row is never attributed. So this returned `None` on
-    /// every tick the reviewer has ever run, and PAI-7's model-backed producer
-    /// was unreachable — which is why Home only ever showed the template-tier
-    /// suggestions.
+    /// Desktop sessions are never attributed (only `DeviceRung::Member` writes `profile_id`).
     #[test]
     fn a_one_member_pond_is_addressed_even_when_nothing_is_attributed() {
         let now = Utc::now();
         let roster = vec![EXEMPLAR_OWNER_ID.to_string()];
         let unattributed = session("chat-1", None, now - Duration::minutes(2));
 
-        // The control first: the same pond with no roster still answers None,
-        // so what follows is the fallthrough and not some other admission.
+        // Control: with no roster the same pond answers None.
         assert!(
             audience_for_review(&[unattributed.clone()], now, &[]).is_none(),
             "with no roster there is nobody to fall through to"
@@ -1928,9 +1846,6 @@ mod tests {
         );
     }
 
-    /// Invariant 4, held. Two members and no attribution is the case where
-    /// picking would be attribution by row order — the rule PAI-1 P3 refused —
-    /// so the answer stays "no review".
     #[test]
     fn two_members_and_no_attribution_is_still_nobody() {
         let now = Utc::now();
@@ -1943,9 +1858,6 @@ mod tests {
         );
     }
 
-    /// The roster never overrides an attribution the pond actually made. A face
-    /// match or a paired device outranks a guess, even a guess with only one
-    /// candidate.
     #[test]
     fn an_attribution_the_pond_made_outranks_the_roster() {
         let now = Utc::now();
@@ -1965,9 +1877,6 @@ mod tests {
         );
     }
 
-    /// The fallthrough does not wake a pond nobody has touched. `AUDIENCE_WINDOW`
-    /// still has to hold, or a one-member pond would be proposed to forever on
-    /// the strength of a conversation from last March.
     #[test]
     fn a_silent_pond_is_not_addressed_just_because_it_has_one_member() {
         let now = Utc::now();

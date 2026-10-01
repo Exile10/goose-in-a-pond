@@ -70,9 +70,6 @@ impl Drop for MdnsHandle {
 }
 
 /// Advertise `_pond._tcp.local.` on `port` using `hostname` as the instance label.
-///
-/// Returns [`None`] (with a warning log) rather than propagating the error, so
-/// a missing mDNS stack never prevents the server from starting.
 pub fn advertise(hostname: &str, port: u16, version: &str, pin: &str) -> Result<MdnsHandle> {
     let daemon = ServiceDaemon::new()?;
 
@@ -96,12 +93,7 @@ pub fn advertise(hostname: &str, port: u16, version: &str, pin: &str) -> Result<
     let mut properties = std::collections::HashMap::new();
     properties.insert("v".to_string(), version.to_string());
     properties.insert("scheme".to_string(), "https".to_string());
-    // The public-key pin, so a phone on this LAN can offer it rather than asking
-    // someone to copy fifty-one characters of base64 off a screen. This is a
-    // convenience, not an authentication: mDNS is unauthenticated and anything on
-    // the network can claim it, so a client must still confirm the value against
-    // the Pond before trusting it. It is public information either way, published
-    // in the pairing QR and recoverable from any TLS handshake with this Pond.
+    // Public, and only a convenience: mDNS is spoofable, so clients must confirm the pin.
     properties.insert("pin".to_string(), pin.to_string());
 
     let service = ServiceInfo::new(

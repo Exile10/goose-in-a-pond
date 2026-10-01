@@ -480,10 +480,8 @@ async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     let data_dir = default_data_dir();
     pin_goose_state_under(&data_dir);
-    // The Orin's memory policy, set before any subcommand builds an adapter that asks whether a
-    // model fits beside picture support. `cuda` is a feature of pond-adapters-local-inference, so
-    // only its const can say (see `report_acceleration`). pond-core also counts a device profile
-    // or Tegra host evidence as budgeted, so a build that misses this still fails closed.
+    // Before any adapter asks whether a model fits beside picture support; only local-inference
+    // knows its `cuda` feature. Without it, pond-core's Tegra/profile checks still fail closed.
     #[cfg(feature = "local-inference")]
     pond_core::models::domain::device_budget::set_budgeted_device(
         pond_adapters_local_inference::CUDA_ENABLED,
@@ -956,19 +954,10 @@ const INDEX_MAINTENANCE_DELAY_SECS: u64 = 60;
 /// How often a pass is considered after that; the lane decides whether one runs.
 const INDEX_MAINTENANCE_POLL_SECS: u64 = 15 * 60;
 
-/// How often the batch memory-extraction engine CONSIDERS a pass.
-///
-/// A minute, which is also the floor on how often a pass may actually run. The
-/// gate in front of it is much longer -- fifteen minutes of household quiet --
-/// so this is not "every minute", it is "within a minute of the household
-/// having been quiet long enough".
+/// How often extraction considers a pass; the idle gate decides whether one runs.
 const MEMORY_EXTRACTION_POLL_SECS: u64 = 60;
 
-/// How long after boot the engine first considers a pass.
-///
-/// Same reasoning as the index sweep's delay, and the same number: a
-/// household's first turn after an upgrade must not be slow because the pond
-/// chose that moment to start reading its own history.
+/// Delay after boot before the first pass, so the first turn after an upgrade isn't slowed.
 const MEMORY_EXTRACTION_DELAY_SECS: u64 = 60;
 
 /// Logs an error when this build can't use the host's GPU; a CPU build is silently ~30x slower.
@@ -1516,19 +1505,7 @@ async fn run_server(
     );
     // A member's first turn must not queue behind the pond indexing itself.
     let index_maintenance_cancel = tokio_util::sync::CancellationToken::new();
-    // Somebody asked for a reindex. Held here rather than inside the sweep so
-    // the route can reach it: clearing the index without a way to refill it on
-    // demand leaves a member staring at an empty panel until the next scheduled
-    // pass, which is the shape of "the button did nothing".
-    // Filled in when the sweep actually spawns, which is also exactly when
-    // there is anything to wake. It used to be a `Notify` created here
-    // unconditionally and handed to `AppState` behind `index_sweep_running`,
-    // which said the same thing twice; now the handle's existence IS the fact.
-    //
-    // ONE doorbell, two ringers: the Reindex button clears the index and rings
-    // it, and the lane's own "run now" rings it directly. A second `Notify`
-    // would have given the sweep two ways to be woken and the lane's button
-    // would have reached neither.
+    // Held here so the reindex route can trigger a refill; `Some` once the sweep spawns.
     let mut index_reindex_handle: Option<Arc<tokio::sync::Notify>> = None;
     let vector_model_id = embedding_provider.as_ref().map(|p| p.model_id());
 
@@ -1619,8 +1596,7 @@ async fn run_server(
     let effective_chat_provider = settings.chat_provider.clone();
     let effective_chat_model = settings.chat_model.clone();
 
-    // Speculative decoding was taken out of the llama.cpp engine on 2026-09-24 (goose 743649d98),
-    // so this is commented out rather than deleted; restore it if it returns.
+    // Speculative decoding is out of the engine: restore this if it returns.
     // // The speculative-decoding drafter, provisioned the way the TTS engine is:
     // // a helper model nobody asked for and nobody should have to think about.
     // // Measured on the Orin, it takes a real turn from 31 to 49 tok/s.
@@ -1824,16 +1800,8 @@ async fn run_server(
         pond_core::user_data::ports::memory_consolidator::ConsolidationEvent,
     >(64);
 
-    // The single inference slot every background job takes turns on. Each job
-    // keeps its own poll cadence and body; what it no longer keeps is a private
-    // answer to "may I run now?", which could only ever account for the jobs its
-    // author happened to know about. See `inference_lane_runner`.
-    //
-    // Seeded from `lane_job_runs` so a restart does not hand every job a clean
-    // slate. `since_last_run: None` means "never ran", which both outranks
-    // every real wait and skips the interval floor -- correct for a job that
-    // has genuinely never run, and badly wrong for one that ran four minutes
-    // ago in the process before this one. See `0059_lane_job_runs.sql`.
+    // The one inference slot all background jobs share; the lane decides when each may run.
+    // Seeded from `lane_job_runs`: after a restart, a job must not look never-run.
     let lane_runs: Arc<dyn pond_core::user_data::ports::lane_run_log::LaneRunLog> = Arc::new(
         pond_infra::sqlite_lane_run_log::SqliteLaneRunLog::new(db.system.clone()),
     );
@@ -1844,8 +1812,7 @@ async fn run_server(
             }
             rows.into_iter().collect()
         }
-        // Degrade to the empty clock every release before this one booted with,
-        // rather than refusing to start over a log.
+        // Degrade to an empty clock rather than refuse to start over a log.
         Err(e) => {
             tracing::warn!(error = %e, "lane clock could not be read; starting with none");
             std::collections::HashMap::new()
@@ -1855,18 +1822,14 @@ async fn run_server(
     let inference_lane =
         crate::inference_lane_runner::InferenceLane::restored(lane_history, Some(lane_run_tx));
 
-    // One writer, draining what the slot guard's `Drop` posted. Separate from
-    // the loops so a slow disk cannot hold the lane, and unbounded so `Drop`
-    // never blocks: the queue's depth is bounded by how often a job can finish,
-    // which is at most once per lane slot.
+    // Separate writer so a slow disk can't hold the lane; unbounded so the slot guard's `Drop`
+    // never blocks (depth is at most one per finished slot).
     {
         let lane_runs = lane_runs.clone();
         tokio::spawn(async move {
             while let Some((job, at)) = lane_run_rx.recv().await {
                 if let Err(e) = lane_runs.record(job, at).await {
-                    // The in-memory clock already advanced, so this process
-                    // still schedules correctly; only a restart loses the
-                    // stamp. Worth a line, not worth a retry loop.
+                    // In-memory clock already advanced; only a restart loses the stamp.
                     tracing::warn!(
                         job = job.as_str(),
                         error = %e,
@@ -1938,10 +1901,7 @@ async fn run_server(
         let inact_settings_repo = settings_repo.clone();
         let inact_storage = session_storage.clone();
         let inact_lane = inference_lane.clone();
-        // Claimed at spawn, not per tick: `claim` is what records that a loop
-        // for this job exists in this process, which is what the status route
-        // reports as `present` and what stops the button ringing a doorbell
-        // nobody is behind.
+        // Claimed at spawn, not per tick: that is what the status route reports as `present`.
         let inact_wake = inference_lane.claim(LaneJob::Consolidation);
 
         // Baselines for the "never on startup" guard; captured before the server binds.
@@ -1981,13 +1941,8 @@ async fn run_server(
                 let idle_for =
                     sched::combined_idle_for(in_process_at, db_activity, chrono::Utc::now());
 
-                // The lane owns the gate now: it applies the same
-                // activity/interval rules this block used to apply alone, but
-                // decides against EVERY registered job rather than this one, and
-                // hands back the slot itself so nothing else can be mid-run.
-                // Never exempt on a scheduled tick: a pond nobody has talked
-                // to has nothing to consolidate. A hand-asked one is exempt,
-                // because the asking is the activity.
+                // The lane gates across all jobs; holding `slot` means no other job is mid-run.
+                // Exempt only when asked by hand: the asking is the activity.
                 let cadence = crate::inference_lane_runner::Cadence::new(
                     sched::interval_floor_from_hours(settings.memory_consolidation_interval_hours),
                     idle_threshold,
@@ -2089,11 +2044,7 @@ async fn run_server(
         use pond_core::user_data::services::consolidation_schedule as sched;
         use pond_core::user_data::services::inference_lane::LaneJob;
 
-        // Conversations summarised per pass. This sweep used to be unbounded --
-        // every session touched since boot, one model call each, in a single
-        // tick. On a pond with a busy afternoon behind it that is an arbitrary
-        // number of decodes holding the machine, and the next pass is only
-        // thirty seconds away. Titling took the same bound for the same reason.
+        // Sessions summarised per pass; bounds how long one tick holds the machine.
         const MAX_PER_PASS: usize = 5;
 
         let sum_storage = session_storage.clone();
@@ -2104,16 +2055,12 @@ async fn run_server(
         let idle_secs = settings.summary_idle_secs.max(30) as u64;
         let sum_wake = inference_lane.claim(LaneJob::SummaryRefresh);
 
-        // Baselines for the "never on startup" guard, captured before the
-        // server binds so no request can have been served yet.
+        // Baselines for the "never on startup" guard; captured before the server binds.
         let started_at_instant = std::time::Instant::now();
         let started_at_utc = chrono::Utc::now();
 
         tokio::spawn(async move {
-            // "Never at startup": only sessions that saw a message AFTER this
-            // process started are candidates. Separate from the lane's own
-            // activity gate and kept alongside it -- this one is about which
-            // sessions are candidates, not about whether the pond is quiet.
+            // "Never at startup": only sessions updated since this process started.
             let started_at = started_at_utc;
             loop {
                 let tick = crate::inference_lane_runner::wait_for_tick(
@@ -2122,11 +2069,7 @@ async fn run_server(
                 )
                 .await;
 
-                // Re-read every tick so the toggle takes effect without a
-                // restart. This used to be read once, at boot, from the
-                // settings snapshot that decided whether to spawn the loop at
-                // all -- so switching hybrid compaction off left the sweep
-                // running until the pond was restarted.
+                // Re-read every tick so the toggle takes effect without a restart.
                 let settings = match sum_settings_repo.get().await {
                     Ok(s) => s,
                     Err(e) => {
@@ -2135,11 +2078,7 @@ async fn run_server(
                     }
                 };
 
-                // Both activity sources, not just the in-process one. The
-                // terminal voice loop runs in a SEPARATE process and can never
-                // touch this server's clock, so a pond being talked to by voice
-                // looked perfectly idle here -- and this was the one background
-                // loop that did not consult the database for it.
+                // Both activity sources: the voice loop is a separate process.
                 let db_activity = newest_session_activity(sum_storage.as_ref()).await;
                 let in_process_at = *sum_activity.read().await;
                 let now = chrono::Utc::now();
@@ -2151,15 +2090,7 @@ async fn run_server(
                 );
                 let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
 
-                // On the lane as of this change. It was decoding beside
-                // whichever job already held the machine, which is the single
-                // thing the lane exists to prevent -- and it is the most
-                // frequent poller of the lot, so it was the likeliest to be the
-                // second decoder.
-                //
-                // The interval floor is the poll interval: this job is cheap
-                // per session and wants to run whenever the pond is quiet. The
-                // bound on its cost is MAX_PER_PASS, not a long floor.
+                // Floor is the poll interval; MAX_PER_PASS, not the floor, bounds the cost.
                 let cadence = crate::inference_lane_runner::Cadence::new(
                     std::time::Duration::from_secs(30),
                     std::time::Duration::from_secs(idle_secs),
@@ -2238,11 +2169,8 @@ async fn run_server(
                     watcher.abort();
                 }
 
-                // An attempt spends the interval budget whether or not it
-                // summarised anything, and releases the slot on every path out
-                // -- including the two `continue`s above, which return before
-                // this line and drop the guard on the way. That is the whole
-                // reason the slot is a guard rather than a flag.
+                // An attempt spends the interval budget whether or not it summarised anything.
+                // A guard, not a flag, so the `continue`s above release the slot too.
                 drop(slot);
             }
         });
@@ -2307,17 +2235,8 @@ async fn run_server(
                 );
                 let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
 
-                // The pairwise "stand down while consolidation is mid-run" check
-                // that used to live here is gone, and deliberately so: it only
-                // ever ran in ONE direction — consolidation never learned to
-                // yield to titling — and every job added after it would have
-                // needed its own check against every existing job. The lane
-                // holds one slot, so exclusion is now a property of asking
-                // rather than a list of jobs to remember.
-                // The tick IS the floor on a scheduled pass: a pass is bounded
-                // and cheap, so there is no reason to space passes further
-                // apart than the poll already does. Never exempt either — no
-                // turn since boot means no conversation to name.
+                // The poll tick is the floor, as a pass is cheap. Never exempt: with no turn since
+                // boot there is nothing to name.
                 let cadence = crate::inference_lane_runner::Cadence::new(
                     std::time::Duration::from_secs(POLL_SECS),
                     idle_threshold,
@@ -2625,30 +2544,14 @@ async fn run_server(
         });
     }
 
-    // ── Personal-context index maintenance (phases B + D) ────────────────────
-    // One pass, composed rather than three ad-hoc spawns: adopt existing vectors
-    // (free, pure SQL), embed the summaries that have none (the only step that
-    // costs inference), prune orphans, then REPORT what is still wrong.
-    //
-    // Order matters and is asserted in `run_index_maintenance`: pruning before
-    // adopting would delete rows adoption is about to legitimately re-create.
-    //
-    // Deferred by `index_maintenance_delay_secs` rather than run at boot: a
-    // household's first turn after an upgrade must not be slow because the pond
-    // chose that moment to index itself. It is cancellable for the same reason.
-    // Whether the sweep below exists at all is now carried by
-    // `index_reindex_handle` rather than by a separate boolean: the handle is
-    // taken inside the block that spawns the sweep, so it cannot disagree with
-    // whether the sweep exists. The boolean it replaces was derived from the
-    // same two options as this `if let` and could only ever have drifted from
-    // it by somebody editing one of the two.
+    // ── Personal-context index maintenance ───────────────────────────────────
+    // `index_reindex_handle` is set only inside this block, so it can't disagree with the sweep.
     if let (Some(provider), Some(_)) = (embedding_provider.clone(), vector_model_id.clone()) {
         use pond_core::user_data::services::inference_lane::LaneJob;
 
         let index = vector_index.clone();
         let storage = session_storage.clone();
-        // Step 2c's repairer. The startup backfill above runs once; this is what
-        // keeps an unembedded row from surviving until the next restart.
+        // Backfill runs once at startup; this repairs rows left unembedded after it.
         let sweep_memories = memory_repo.clone();
         let cancel = index_maintenance_cancel.clone();
         let sweep_lane = inference_lane.clone();
@@ -2679,9 +2582,6 @@ async fn run_server(
             }
 
             loop {
-                // Woken either by the clock or by somebody asking. Which one it
-                // was changes the gate below, so it is remembered rather than
-                // collapsed into "something happened".
                 let woke = tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(poll) => crate::inference_lane_runner::Tick::Poll,
@@ -2716,20 +2616,15 @@ async fn run_server(
                         LaneJob::IndexMaintenance,
                         // No toggle of its own: an unmaintained index silently goes stale.
                         true,
-                        // The standing cadence. `floor` and `idle_threshold`
-                        // are already zeroed above when `asked`, which is this
-                        // job's own older waiver and stays -- `plan_sweep` also
-                        // uses it to decide an exhaustive first pass. The
-                        // exemption is likewise the sweep's own, from
-                        // `plan_sweep`, not the lane's hand waiver.
+                        // `floor` and `idle_threshold` are zeroed above when `asked`; the
+                        // exemption comes from `plan_sweep`, not the lane's hand waiver.
                         crate::inference_lane_runner::Cadence::new(
                             floor,
                             idle_threshold,
                             tick.exempt_from_activity_gate,
                         ),
-                        // A person asking is itself the activity this guard
-                        // wants to have seen; so is the first pass after boot,
-                        // on a pond that would otherwise refuse forever.
+                        // A request or the first post-boot pass is exempt, or a quiet pond
+                        // would refuse forever.
                         woke.waives(),
                         saw_activity_since_start,
                         idle_for,
@@ -2792,18 +2687,8 @@ async fn run_server(
     }
 
     // ── Batch memory extraction ──────────────────────────────────────────────
-    //
-    // This is now the ONLY thing that writes an extracted memory. It reads one
-    // window of one conversation per lane slot, in the pond's idle time, and
-    // there is no longer a per-turn path above it: every surface that persists
-    // a turn -- including `/chat` and the voice loop, which never extracted at
-    // all -- reaches memory through this walk.
-    //
-    // The whole block is gated on an embedder being present. Without one there
-    // is no cosine, so there is no dedup: every candidate would look new, and
-    // the pond would fill its own store with restatements of things it already
-    // knows. Reading nothing is the better failure, and it is the one that says
-    // so out loud through `blocked_on`.
+    // The only writer of extracted memories. Without an embedder there's no cosine dedup, so it
+    // reads nothing and says so via `blocked_on`.
     let extraction_status = Arc::new(tokio::sync::RwLock::new(
         pond_core::user_data::services::memory_extraction::ExtractionEngineStatus {
             mode: pond_core::user_data::services::memory_extraction::ExtractionMode::parse(
@@ -2822,26 +2707,17 @@ async fn run_server(
         };
         use pond_core::user_data::services::reminder_proposal;
 
-        /// How many pending reminders one tick will consider.
-        ///
-        /// Bounded for the same reason the pass itself is: a first walk over a
-        /// year of history can file a great many, and the daily cap means only a
-        /// handful of them could become proposals anyway.
+        /// Pending reminders per tick; the daily cap lets only a handful become proposals anyway.
         const REMINDER_PROMOTION_LIMIT: usize = 50;
 
-        // Where a dated utterance goes once the date rule has refused it as a
-        // memory. Wired here rather than left to a later phase because the
-        // engine is the only producer: without it the refusal throws the date
-        // away, which is the one outcome the rule was justified on not having.
+        // Where a date the rule refuses as a memory goes; without it the date is lost.
         let reminder_repo: Arc<
             dyn pond_core::user_data::ports::reminder_repository::ReminderRepository + Send + Sync,
         > = Arc::new(pond_infra::sqlite_reminder::SqliteReminderRepository::new(
             db.system.clone(),
         ));
 
-        // The same store the engine writes through, kept for the promotion run
-        // below. One store, so a reminder written by the pass is one the
-        // promotion can see in the same tick.
+        // The engine's own store, so promotion sees a reminder in the tick that wrote it.
         let promotion_reminders = reminder_repo.clone();
         let promotion_proposals = Arc::new(
             pond_infra::sqlite_proposal::SqliteProposalRepository::new(db.system.clone()),
@@ -2862,8 +2738,7 @@ async fn run_server(
         let extraction_profiles = profile_repo.clone();
         let status = extraction_status.clone();
 
-        // Baselines for the "never on startup" guard, captured before the
-        // server binds so no request can have been served yet.
+        // Baselines for the "never on startup" guard; captured before the server binds.
         let started_at = std::time::Instant::now();
         let started_at_utc = chrono::Utc::now();
 
@@ -2886,17 +2761,8 @@ async fn run_server(
                         continue;
                     }
                 };
-                // Who lives here, read fresh each pass. It decides whether an
-                // unattributed conversation may be mined under the pond-wide
-                // name or has to be left alone, so a stale roster is the
-                // difference between remembering somebody's habits and filing
-                // them under the wrong person.
-                //
-                // A failed read is treated as SEVERAL members. That is the
-                // narrowing direction: it makes every unattributed window
-                // unnameable, so the pass reads nothing rather than attributing
-                // everything to one name on the strength of a query that did
-                // not answer.
+                // Fresh each pass: it decides whether unattributed windows get the sole name.
+                // A failed read counts as several members, so nothing is misattributed.
                 let roster = match extraction_profiles.list().await {
                     Ok(profiles) => HouseholdRoster::new(
                         profiles
@@ -2925,13 +2791,8 @@ async fn run_server(
                 );
                 let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
 
-                // The poll is the floor on a scheduled tick, unless the
-                // operator has asked for a longer one. Never exempt either: no
-                // turn since boot means no conversation anybody is waiting to
-                // have remembered, and this is the most expensive job in the
-                // lane to spend on a guess. A hand-asked tick drops both --
-                // this is the job most likely to have been waiting longest, and
-                // the one a household pressing the button is usually after.
+                // Floor: the poll or a longer operator interval. Never exempt: with no turn since
+                // boot there's nothing to remember. A hand-asked tick waives both.
                 let cadence = crate::inference_lane_runner::Cadence::new(
                     poll.max(std::time::Duration::from_secs(
                         settings.memory_extraction_interval_secs as u64,
@@ -2943,20 +2804,9 @@ async fn run_server(
                 let Some(slot) = extraction_lane
                     .acquire(
                         LaneJob::MemoryExtraction,
-                        // Health, never emptiness. The rejected predicate --
-                        // "stand down while any memory row lacks a vector" --
-                        // is a latch that cannot re-open inside a process:
-                        // three ordinary paths mint unembedded rows and only a
-                        // one-shot startup backfill fills them, so the design's
-                        // own restate path would have disabled the engine
-                        // permanently.
+                        // Embedder health, never "every row has a vector": unembedded
+                        // rows are routine, so that gate would latch shut for good.
                         settings.memory_extraction_enabled && service.embedder_is_usable(),
-                        // The poll is the floor, unless the operator has asked
-                        // for a longer one. The key now has exactly one reader
-                        // and one meaning -- how rarely a pass may take the
-                        // slot -- and taking the larger of the two keeps it
-                        // one-directional: it can make passes rarer than the
-                        // tick and never more frequent.
                         cadence,
                         tick.waives(),
                         saw_activity_since_start,
@@ -2967,10 +2817,7 @@ async fn run_server(
                     continue;
                 };
 
-                // One token for the whole pass, checked before each window: a
-                // pass that loses the household mid-window loses at most that
-                // one window's inference rather than three windows' worth of
-                // work nobody will use.
+                // Checked before each window: activity costs at most one window's inference.
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let watcher_cancel = cancel.clone();
                 let watcher_activity = extraction_activity.clone();
@@ -2981,10 +2828,7 @@ async fn run_server(
                         if watcher_cancel.is_cancelled() {
                             break;
                         }
-                        // The in-process clock only: it is written the moment a
-                        // turn starts, whereas the database one lags by however
-                        // long that turn takes to persist. This is the signal
-                        // that says somebody is here NOW.
+                        // In-process clock only: the DB one lags until the turn persists.
                         if *watcher_activity.read().await > baseline {
                             tracing::debug!(
                                 "user activity resumed — ending the memory-extraction pass"
@@ -3008,17 +2852,7 @@ async fn run_server(
 
                 status.write().await.record(config.mode, &report);
 
-                // What a stored reminder can become, attempted after the pass
-                // rather than inside it. The table is the durable half and it
-                // has already been written by this point; this is the best-effort
-                // half, and running it separately is what keeps a proposal
-                // failure from ever being a reason a date was not kept.
-                //
-                // On a pond with no profile rows -- every pond today -- this
-                // promotes nothing and says so per reminder, because
-                // `ProposalAudience` cannot address `Household`. That is the
-                // expected answer here, not a fault, and the reminder stays
-                // pending and readable either way.
+                // After the pass, not inside it, so a proposal failure never costs a stored date.
                 match reminder_proposal::promote_pending_reminders(
                     promotion_reminders.as_ref(),
                     promotion_proposals.as_ref(),
@@ -3028,16 +2862,13 @@ async fn run_server(
                 .await
                 {
                     Ok(promotion) if promotion.considered > 0 => {
-                        // Counts only. The reminder's own sentence is the
-                        // household's private words and never rises above DEBUG,
-                        // the same rule the pass line above follows.
+                        // Counts only: a reminder's words never rise above DEBUG.
                         tracing::info!(
                             target: "giap::trace",
                             kind = "reminder_promotion",
                             considered = promotion.considered,
                             proposed = promotion.proposed,
-                            // Expected on a pond with nobody on file, and the
-                            // reason the table is the deliverable.
+                            // Expected on a pond with nobody on file.
                             unaddressable = promotion.unaddressable,
                             capped = promotion.capped,
                             // The only one of the four that is a fault.
@@ -3047,37 +2878,24 @@ async fn run_server(
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        // The dates are still in the table. Said at WARN anyway:
-                        // a promotion that never runs is a queue the household
-                        // never sees fill.
+                        // Dates are kept, but a promotion that never runs never fills the queue.
                         tracing::warn!(
                             "[reminders] could not consider pending reminders for proposals: {e}"
                         );
                     }
                 }
 
-                // Anything that SPENT the slot is logged, not only anything
-                // that succeeded. A pass whose every call came back unparseable
-                // examines no window and is not blocked -- the model is
-                // answering, just not in the schema -- and gating this line on
-                // success would make the most expensive failure mode the
-                // quietest one.
+                // Logged whenever the slot was spent, not only on success: an all-unparseable
+                // pass examines no window and isn't blocked, yet is the costliest failure.
                 if report.model_calls > 0 || report.blocked_on.is_some() {
-                    // Counts and bands only. The notes themselves go to DEBUG
-                    // inside the service and never to INFO: INFO is what the
-                    // on-disk log under <data_dir>/logs keeps, and a would-be
-                    // memory written there is the household's private sentence
-                    // in a second place with none of the store's scoping,
-                    // retention or redaction.
+                    // Counts only: INFO is kept on disk, beyond the store's scoping, retention
+                    // and redaction, so the notes themselves stay at DEBUG.
                     tracing::info!(
                         target: "giap::trace",
                         kind = "memory_extraction_pass",
                         mode = config.mode.as_str(),
                         windows = report.windows_examined,
-                        // What the pass actually spent on the inference slot.
-                        // Logged beside `windows` because the two differ
-                        // exactly when something is wrong, and the gap is the
-                        // number worth watching.
+                        // A gap between this and `windows` means something is wrong.
                         model_calls = report.model_calls,
                         deadline_reached = report.deadline_reached,
                         skipped = report.windows_skipped,
@@ -3088,17 +2906,12 @@ async fn run_server(
                         written = report.memories_written,
                         dropped = report.memories_dropped,
                         refused = report.memories_refused,
-                        // What the date rule cost, and what it cost that
-                        // nothing else recovered. `dates_lost` above zero is a
-                        // model ignoring the reminders half of the prompt.
+                        // `dates_lost` > 0: the model ignored the reminders half of the prompt.
                         dated = report.memories_dated,
                         dates_lost = report.memories_dates_lost,
                         demoted = report.memories_demoted,
                         reminders_captured = report.reminders_captured,
-                        // What the pass KEPT, beside what it read. The two
-                        // differ when the store refused a write, and that gap
-                        // is a date the pond no longer has -- invisible from
-                        // every other number on this line.
+                        // Kept vs captured: a gap is a date the store refused and the pond lost.
                         reminders_written = report.reminders_written,
                         reminders_lost = report.reminders_lost,
                         offered = report.memories_offered,
@@ -3116,12 +2929,8 @@ async fn run_server(
                     );
                 }
 
-                // Dropping the guard records the run and releases the slot, on
-                // every path out. That is the whole reason it is a guard: a job
-                // that returns early without recording a run keeps
-                // `since_last_run: None`, which the lane treats as infinitely
-                // starved, so it would win every tick forever and lock every
-                // other job out.
+                // The guard records the run on every path: an unrecorded job stays
+                // `since_last_run: None`, reads as starved, and wins every tick.
                 drop(slot);
             }
         });
@@ -3132,9 +2941,7 @@ async fn run_server(
             settings.memory_extraction_idle_secs / 60,
         );
     } else {
-        // Said in the status as well as the log. A field nobody reads is not a
-        // surface, and from the outside a pond whose embedder never loaded is
-        // indistinguishable from one with nothing left to extract.
+        // In the status too: otherwise a missing embedder looks like nothing left to extract.
         extraction_status.write().await.blocked_on = Some("no_embedder".to_string());
         tracing::info!(
             "batch memory extraction inactive — no embedding provider, so nothing could be \
@@ -3664,8 +3471,7 @@ async fn run_server(
         pond_infra::sqlite_notification_queue::SqliteNotificationQueue::new(db.system.clone()),
     );
 
-    // Speculative decoding was taken out of the llama.cpp engine on 2026-09-24 (goose 743649d98),
-    // so this is commented out rather than deleted; restore it if it returns.
+    // Speculative decoding is out of the engine: restore this if it returns.
     // // Last resort: the pond goes on without the helper and nothing else would
     // // ever say so. In the words of the switch that controls it, and with no
     // // claim about speed: guessing ahead measured faster on the Orin and slower
@@ -3692,10 +3498,7 @@ async fn run_server(
     //     let _ = notification_queue.enqueue(notice.clone()).await;
     //     let _ = notification_tx.send(notice);
     // }
-    // Real FCM relay when a service-account key is present (Path B: direct
-    // FCM v1, data-only wake pings — no Expo hop, no content through Google);
-    // otherwise the logging stub. Key location:
-    // `<data_dir>/secrets/fcm-service-account.json`, override POND_FCM_KEY_PATH.
+    // FCM v1 when a service-account key exists (data-only wake pings, no content via Google).
     let fcm_key_path = std::env::var("POND_FCM_KEY_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| data_dir.join("secrets").join("fcm-service-account.json"));
@@ -3874,12 +3677,7 @@ async fn run_server(
     }
 
     // ── Composing suggestions out of the household's own memories ────────
-    //
-    // The other tier of `GET /api/v1/suggestions`. `suggestion.rs` picks among
-    // seven fixed prompt strings and attaches a measured count; this composes a
-    // question from one of the household's own notes. Queued rather than
-    // generated on demand, because Home is glanced at from across a room and a
-    // model call on this board is measured in seconds.
+    // Queued ahead, not composed on request: a model call on this board takes seconds.
     {
         use pond_core::user_data::domain::profile::ProfileScope;
         use pond_core::user_data::services::consolidation_schedule as sched;
@@ -3887,10 +3685,7 @@ async fn run_server(
 
         /// How often a pass is considered. The gate decides whether one runs.
         const POLL_SECS: u64 = 10 * 60;
-        /// How deep into the store a pass looks for notes nobody has been asked
-        /// about. Larger than `MEMORIES_PER_PASS` because the live queue is
-        /// subtracted first, and on a pond with a full queue the first N would
-        /// otherwise all be ones already used.
+        /// Notes scanned per pass; exceeds `MEMORIES_PER_PASS` since queued ones are subtracted.
         const MEMORY_SCAN: usize = 200;
 
         let gen_settings = settings_repo.clone();
@@ -3907,8 +3702,7 @@ async fn run_server(
             pond_infra::sqlite_suggestion_queue::SqliteSuggestionQueue::new(db.system.clone()),
         );
 
-        // Baselines for the "never on startup" guard, captured before the
-        // server binds so no request can have been served yet.
+        // Baselines for the "never on startup" guard; captured before the server binds.
         let started_at = std::time::Instant::now();
         let started_at_utc = chrono::Utc::now();
 
@@ -3941,10 +3735,7 @@ async fn run_server(
                 );
                 let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
 
-                // Never exempt on a scheduled tick: a pond nobody has talked to
-                // has no new notes to compose from. A hand-asked one is exempt,
-                // because somebody pressing Run now IS the activity -- and this
-                // is the job they are most likely to be pressing it for.
+                // Scheduled ticks are never exempt (no talk, no new notes); a hand-asked one is.
                 let cadence = crate::inference_lane_runner::Cadence::new(
                     std::time::Duration::from_secs(POLL_SECS),
                     idle_threshold,
@@ -3965,12 +3756,7 @@ async fn run_server(
                     continue;
                 };
 
-                // Re-read per tick, so adding a member takes effect on the
-                // next pass rather than at the next restart. `user_name` is
-                // included because on a pond with no profile rows it is the
-                // only name the household has -- and that is exactly the pond
-                // where every note is unattributed, so it is the name a model
-                // reaches for when it starts addressing somebody.
+                // Re-read per tick, plus `user_name`: the only name on a pond with no profile rows.
                 let mut subjects: Vec<String> = gen_profiles
                     .list()
                     .await
@@ -3988,11 +3774,7 @@ async fn run_server(
                 )
                 .await;
 
-                // Said on EVERY pass that did anything at all, including one
-                // that composed nothing -- which is the pass a reader most
-                // needs explained. The titling loop's empty match arm is the
-                // shape this is avoiding: a correct no-op and a silent bail
-                // were indistinguishable there for 554 passes.
+                // Logged even when nothing was composed: silent, a no-op looks like a bail.
                 match outcome {
                     Ok(report) => {
                         if report.considered > 0 {
@@ -4015,9 +3797,7 @@ async fn run_server(
                     Err(e) => tracing::warn!(error = %e, "suggestion generation failed"),
                 }
 
-                // Dropping the guard records the run and releases the slot on
-                // every path out, including the early returns inside the call
-                // above.
+                // Dropping the guard records the run and frees the slot on every path out.
                 drop(slot);
             }
         });
@@ -4237,9 +4017,7 @@ async fn run_server(
         }
     }
 
-    // DB-backed handshake/pairing (#93). Construct before `db` is moved into
-    // AppState, then issue a fresh pairing code the operator reads off the CLI
-    // to pair a GOTG device.
+    // Before `db` moves into AppState.
     let handshake: Arc<dyn pond_core::security::ports::handshake::Handshake> = Arc::new(
         SqliteHandshakeAdapter::new(db.system.clone(), Some(pairing_pin.clone())),
     );
@@ -4279,8 +4057,7 @@ async fn run_server(
 
     let state = Arc::new(AppState {
         tts_control: tts_control.clone(),
-        // Before `db`, and that is not cosmetic: struct-literal fields evaluate
-        // in source order and `db` is moved by the next line.
+        // Before `db`: fields evaluate in source order and `db` is moved below.
         suggestion_queue: Arc::new(
             pond_infra::sqlite_suggestion_queue::SqliteSuggestionQueue::new(db.system.clone()),
         ),
@@ -4304,10 +4081,7 @@ async fn run_server(
         embedding_provider,
         // Same handle the repos write through and the sweep repairs; never construct a second one.
         vector_index: Some(vector_index.clone()),
-        // Some only when the sweep above actually spawned. Handing the route a
-        // notify with nothing listening would have it answer `refilling: true`
-        // on a pond where nothing is going to refill, which is a lie that reads
-        // as success -- the caller waits for a rebuild that never happens.
+        // Some only if the sweep spawned, or the route would report `refilling: true` forever.
         index_reindex: index_reindex_handle,
         lane: Some(inference_lane.clone()),
         account_sync: account_syncer.clone(),
@@ -4479,9 +4253,7 @@ async fn run_server(
         tracing::info!("OAuth auto-refresh worker started — runs every 45 minutes");
     }
 
-    // Advertise _pond._tcp.local. so phones on the LAN can discover this hub.
-    // The handle is kept alive for the duration of the server; dropping it
-    // deregisters the service gracefully.
+    // Named binding, not `_`: dropping the handle deregisters the mDNS service.
     let _mdns_handle = match mdns_advertiser::advertise(
         &pairing_hostname,
         https_port,
@@ -4509,10 +4281,8 @@ async fn run_server(
 
     // Load the model and prefill the static prompt prefix at boot, so turn 1 reuses it.
     pond_api::spawn_prefix_prewarm(state.clone(), false);
-    // Picture support for the active chat model, verified or fetched in the
-    // background. The warm-up above reaches the same single-flight ensure through
-    // the provider build; this also covers POND_DISABLE_PREWARM. Never awaited:
-    // the encoder is about a gigabyte.
+    // Picture support in the background (~1 GB, never awaited). Single-flight with the prewarm's
+    // ensure, and still runs under POND_DISABLE_PREWARM.
     if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
         state.agent.prepare_model(&settings.chat_model);
     }
@@ -4585,17 +4355,14 @@ async fn run_server(
         spawn_desktop_app(api_port).await;
     }
 
-    // Serve until a shutdown signal. We race the server against the signal
-    // rather than using graceful shutdown so long-lived SSE streams (chat,
-    // notifications) can't hold shutdown open indefinitely.
+    // Race rather than graceful shutdown: long-lived SSE streams would hold it open forever.
     let tls_handle = axum_server::Handle::new();
     let https_server =
         axum_server::from_tcp_rustls(https_listener.into_std()?, tls_config.clone())?
             .handle(tls_handle.clone())
             .serve(companion.into_make_service_with_connect_info::<std::net::SocketAddr>());
-    // A failed renewal keeps serving the current certificate, which is still valid for at least
-    // thirty days, and retries next tick. Returning an error here would end `run_server` and take
-    // the loopback dashboard, chat and voice down with the HTTPS listener.
+    // A failed renewal keeps the current cert (valid 30+ more days) and retries next tick;
+    // returning an error would end `run_server` and take the loopback dashboard down too.
     let renewal = async {
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(30));
         ticks.tick().await;
@@ -6014,35 +5781,7 @@ async fn run_session_activity_observer(
     }
 }
 
-/// PAI-7 P4: think about what has happened, in idle time, and propose.
-///
-/// `proactive_review.rs` decides everything of consequence and this is the
-/// loop it was written for. What is decided *here* — and therefore what is
-/// unguarded, because `ci.yml` runs `cargo check` for this crate and never
-/// `cargo test` — is `POLL_SECS`, the store reads, and the failure direction
-/// of each of them. Those directions are the part worth reading:
-///
-/// - **A settings or session read that fails skips the tick.** Nothing is
-///   assumed about a pond that cannot be read.
-/// - **A proposal count that fails reads as the cap.** An unreadable count
-///   means no review, never an unlimited one.
-/// - **A decision read that fails skips the tick**, and this one is the least
-///   obvious. An empty ledger suppresses nothing, so treating the failure as
-///   "no decisions" would re-propose exactly the things a member has already
-///   said no to — the widening direction, reached by a plausible default.
-/// - **No orchestrator means no review.** When Goose init fell back to the mock
-///   agent there is nothing in the `OnceLock`, and the loop returns rather than
-///   running with a second one it made itself.
-///
-/// The ring is DRAINED when a review starts, so a brief says what has happened
-/// *since the last review* — which is what the brief claims when it is empty.
-/// A run that then fails loses those events; the alternative is re-reviewing
-/// the same evening forever, which is worse and much harder to notice.
-/// What one composing pass did.
-///
-/// `considered` is the count of memories the model was actually shown, and it
-/// is what tells a zero-yield pass apart from a pass with nothing to do — the
-/// distinction the titling loop's empty match arm threw away for 554 passes.
+/// One composing pass's result; `considered` tells a zero-yield pass from an idle one.
 struct ComposeReport {
     considered: usize,
     queued: usize,
@@ -6050,22 +5789,15 @@ struct ComposeReport {
     unparseable: bool,
 }
 
-/// One pass: pick notes nobody has been asked about, compose questions, queue
-/// them.
-///
-/// Split out of the loop so the ordering below is readable in one screen, and
-/// because every early return here is a path that still has to spend the lane's
-/// interval budget — which it does, because the caller holds the slot guard
-/// across this call.
+/// One pass: pick notes nobody has been asked about, compose questions, queue them.
+/// Early returns still spend the lane's interval: the caller holds the slot guard.
 async fn compose_suggestions(
     memories: &dyn pond_core::user_data::ports::memory_repository::MemoryRepository,
     queue: &dyn pond_core::user_data::ports::suggestion_queue::SuggestionQueueRepository,
     provider: Arc<
         tokio::sync::RwLock<Option<Arc<dyn pond_core::models::ports::provider::LlmProvider>>>,
     >,
-    // The names the household goes by. A question that opens by addressing one
-    // of them is the pond talking TO the household, and this card's contract is
-    // that the question shown IS the message sent when it is tapped.
+    // Household names: the shown question is sent as-is when tapped, so it must not address one.
     subjects: &[String],
     scan: usize,
     now: chrono::DateTime<chrono::Utc>,
@@ -6081,36 +5813,24 @@ async fn compose_suggestions(
         unparseable: false,
     };
 
-    // Subtract what is already queued FIRST. A pass that composed a question
-    // the unique index then refused would spend the same inference and yield
-    // nothing, and on a pond with a full queue that is every pass.
+    // Subtract the queued first, or the unique index refuses what inference just composed.
     let already: std::collections::HashSet<String> =
         queue.live_memory_ids().await?.into_iter().collect();
 
-    // `Household` because this reads the whole store to choose from; the
-    // suggestion carries its source memory's own `profile_id`, and the READ
-    // path is what scopes it to an audience. Reading at `Owner` here would
-    // silently stop composing anything from unattributed notes, which on this
-    // pond is all of them.
+    // `Household` to choose from the whole store; each suggestion keeps its memory's
+    // `profile_id`, and the read path scopes it. `Owner` here would skip unattributed notes.
     let mut pool: Vec<_> = memories
         .search_recent(&ProfileScope::Household, scan)
         .await?
         .into_iter()
         .filter(|m| !already.contains(&m.id))
-        // A note too short to be about anything cannot carry a question, and
-        // asking a model about it spends a slot to be told so.
+        // Too short to carry a question; asking would spend a slot to learn that.
         .filter(|m| m.content.trim().chars().count() >= 20)
         .collect();
 
-    // WHICH twelve is most of the quality. `search_recent` hands them over
-    // newest first; this puts habits and preferences in front of the trivia the
-    // pond itself said in a conversation, and keeps recency inside each rank.
-    // See `order_candidates`.
+    // Which twelve matters most: habits and preferences before trivia, recency within each rank.
     gen::order_candidates(&mut pool);
-    // One owner's notes per call, never a mix -- see `one_owners_candidates`.
-    // The model names the note a question came from, and that number is the
-    // only attribution there is; over a mixed prompt a misnumbered question
-    // leaves the member it is about.
+    // One owner per call: the model's note number is the only attribution, so a mix could leak.
     let candidates = gen::one_owners_candidates(pool);
 
     if candidates.is_empty() {
@@ -6118,9 +5838,6 @@ async fn compose_suggestions(
     }
 
     let Some(provider) = provider.read().await.clone() else {
-        // Logged rather than silent, unlike the titling loop's own version of
-        // this line, which is invisible at every level and cost an evening to
-        // find.
         tracing::debug!("[suggestions] no language model is configured");
         return Ok(empty);
     };
@@ -6147,6 +5864,7 @@ async fn compose_suggestions(
     })
 }
 
+/// Idle-time proactive review; every failed read fails closed (skips the tick or hits the cap).
 async fn run_proactive_reviewer(
     settings_repo: Arc<dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync>,
     storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>,
@@ -6197,19 +5915,7 @@ async fn run_proactive_reviewer(
          `ext_orchestrator_enabled` are set"
     );
 
-    // Claimed HERE, after the two early returns above, because `claim` is what
-    // makes the status route say a loop exists — and on a pond with no
-    // orchestrator, or a role that does not parse, one does not. Claiming at
-    // the call site would have given a household a button whose job had already
-    // returned.
-    //
-    // The reviewer is on the lane, but its gate runs in two halves and the
-    // order matters. `should_review` goes first because its three extra
-    // refusals -- the orchestrator toggle, a run in flight, the daily cap on
-    // interrupting a household -- are about whether there is anything worth
-    // doing at all, and a job should not take the only inference slot in order
-    // to discover it has nothing to do with it. `acquire` goes second, for the
-    // machine itself and for the tie-break against the other six jobs.
+    // Claimed after the early returns: `claim` is what makes the status route report a loop.
     let wake = lane.claim(LaneJob::ProactiveReview);
 
     loop {
@@ -6240,40 +5946,16 @@ async fn run_proactive_reviewer(
             tracing::debug!(error = %e, "proactive reviewer: expiry sweep failed");
         }
 
-        // Invariant 4. `None` here is the whole household and an unidentified
-        // speaker both answering "not addressable", and the answer is no review.
-        //
-        // It is TRACED rather than skipped in silence, and that is a repair
-        // rather than a nicety: on a pond where nobody has been identified —
-        // which is every pond until PAI-1's identification routes get a caller —
-        // this is where the reviewer stops, on every tick, and the first probe
-        // of this loop produced no output at all. A feature that is switched on
-        // and says nothing is indistinguishable from one that is broken, and
-        // this programme has spent whole phases on that distinction.
-        // The roster, re-read per tick so adding a second member takes effect on
-        // the next review rather than at the next restart -- and it MATTERS
-        // which way that lands: a second member is what closes the sole-member
-        // fallthrough, so a stale roster of one would keep addressing reviews
-        // to the first member after somebody else moved in.
-        //
-        // A failed read is treated as NO members, which makes the fallthrough
-        // unavailable and the tick a no-op. That is the narrowing direction: the
-        // alternative is addressing a proposal to whoever a failed query last
-        // returned.
+        // Re-read per tick so a new member is seen; a failed read counts as none, so nothing runs.
         let members: Vec<String> = profiles
             .list()
             .await
             .map(|p| p.into_iter().map(|p| p.id).collect())
             .unwrap_or_default();
 
-        // Deliberately NOT a `continue`. Every refusal between here and
-        // `acquire` has to reach the lane as `enabled: false` rather than as an
-        // early return, because a registered job that stops asking leaves a
-        // stale registration behind -- and a stale registration keeps winning
-        // tie-breaks it will not act on. "Nobody has been identified" is a
-        // state a pond can sit in for months, so this is the one most likely to
-        // do it.
+        // Not a `continue`: see the one `acquire` below.
         let audience = review::audience_for_review(&sessions, now, &members);
+        // Nobody addressable means no review; traced, as silence would look like a broken feature.
         if audience.is_none() {
             tracing::trace!(
                 sessions = sessions.len(),
@@ -6286,28 +5968,18 @@ async fn run_proactive_reviewer(
             pond_core::shared::domain::session_activity::human_activity(&sessions).newest_activity;
         let in_process_at = *last_user_activity.read().await;
 
-        // A rolling 24 hours, not a calendar day: the cap is about how often
-        // somebody is interrupted, and midnight is not a fact about that.
+        // Rolling 24 h rather than a calendar day: the cap is about interruption frequency.
         let proposals_today = match &audience {
             Some(a) => proposals
                 .count_made_since(a.profile_id(), now - chrono::Duration::days(1))
                 .await
                 .unwrap_or(review::MAX_PROPOSALS_PER_DAY),
-            // No audience means no review either way, and the cap is per
-            // member, so there is nothing to count. `wants` below is already
-            // false; this value never reaches a decision.
+            // Unused: without an audience, `enabled` below is false anyway.
             None => 0,
         };
 
-        // The reviewer's own half of the gate: is a review WORTH running?
-        // Neither of these is waivable, and that is why they are separate from
-        // the timing rules the lane applies. A hand-asked tick drops only the
-        // gates about whether now is a polite moment; the daily cap especially
-        // must survive it, or the one limit a household has on being
-        // interrupted becomes a suggestion.
-        //
-        // This runs BEFORE `acquire` because a job must not take the only
-        // inference slot in order to discover it has nothing to do with it.
+        // Whether a review is worth running: not waivable by a hand-asked tick (the daily cap
+        // must hold), and before `acquire` so the slot isn't taken just to find no work.
         let refusal = review::reviewer_refusal(
             // This loop awaits its own run, so runs never overlap here.
             false,
@@ -6320,24 +5992,8 @@ async fn run_proactive_reviewer(
             );
         }
 
-        // One `acquire`, reached on every tick. That is the invariant the other
-        // six jobs keep by construction and the reason none of the refusals
-        // above is an early return: `acquire` is what refreshes this job's
-        // registration, and a job whose registration goes stale keeps the
-        // longest apparent wait on the lane, wins every tie-break it is offered,
-        // and -- since a losing tick now nudges the winner -- gets woken again
-        // and again to decline. Registering as disabled is how a job says "not
-        // me" without leaving that hole.
-        //
-        // `enabled` therefore carries four facts: the household asked for
-        // proactive review; there is `delegate` machinery to run a child at all
-        // (`ext_orchestrator_enabled` ships off, so folding it in here is what
-        // keeps PAI-6's posture structural); somebody has been identified to
-        // address; and the reviewer's own cap has room.
-        //
-        // The floor borrows `memory_consolidation_interval_hours` because that
-        // is what this loop has always used -- worth revisiting, but not in the
-        // change that moves it onto the lane.
+        // One `acquire` per tick, refusals as `enabled: false`: a stale registration wins
+        // every tie-break and gets woken again and again to decline.
         let cadence = crate::inference_lane_runner::Cadence::new(
             sched::interval_floor_from_hours(settings.memory_consolidation_interval_hours),
             idle_threshold,
@@ -6365,9 +6021,7 @@ async fn run_proactive_reviewer(
             continue;
         };
 
-        // Unreachable when the lane granted the slot -- `enabled` above is
-        // false without an audience -- but written as a refusal rather than an
-        // unwrap, because a panic in a background loop takes the pond with it.
+        // Unreachable (`enabled` needs an audience), but a panic here would take the pond down.
         let Some(audience) = audience else {
             continue;
         };
@@ -6464,17 +6118,7 @@ async fn run_proactive_reviewer(
         let run = orchestrator.spawn(spec).await;
         watcher.abort();
         drop(lease);
-        // An attempt spends the interval budget whether or not it produced
-        // anything, for the reason the consolidation scheduler records: retrying
-        // after the next idle window reintroduces the repeated-expensive-attempt
-        // churn the gate exists to remove.
-        //
-        // Dropping the slot is what spends it now, and what writes the stamp to
-        // `lane_job_runs`. The explicit drop is for the same reason every other
-        // job has one: the remainder of this iteration persists proposals and
-        // sends notifications, none of which needs the model, and holding the
-        // only inference slot through that would block every other job for no
-        // reason.
+        // Spends the interval (failures too, or retries churn) and frees the model early.
         drop(slot);
 
         let run = match run {
@@ -8060,9 +7704,7 @@ async fn build_goose_backend(
     // Supply it: without the catalog an Ollama model's context window is guessed from its name.
     model_repo: Option<Arc<dyn ModelRepository>>,
     voice_mode: bool,
-    // Whether THIS process repairs and fetches companion files (the vision
-    // encoder, and a drafter the speculation switch turns on without). The serve
-    // process only; see `GooseAdapter::enable_model_provisioning`.
+    // True only in serve: this process fetches and repairs companion files like the encoder.
     model_provisioning: bool,
     // Locked so mesh enabled at runtime applies next turn; CLI callers pass a permanent `None`.
     mesh_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
@@ -8814,8 +8456,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     // pond_core::models::domain::drafter::set_speculation_enabled(
     //     settings.speculative_decoding_enabled,
     // );
-    // Use the configured LLM server URL (llamafile default). GooseAdapter uses this to
-    // route requests when chat_provider = "llamafile"; for ollama/local it uses its own logic.
+    // Used only when chat_provider = "llamafile"; other providers route themselves.
     let llamafile_url = format!("http://127.0.0.1:{}", ports::llamafile_port());
 
     let weather: Option<Arc<dyn WeatherProvider>> = match (
@@ -9449,15 +9090,7 @@ async fn run_pairing(refresh: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// The composing pass hands the model one owner's notes, never a mix.
-    ///
-    /// `one_owners_candidates` is proven in the generator's own tests; this
-    /// proves it is what the pass calls. A revert to "take the top twelve from
-    /// anyone" passes every one of those tests and reopens the leak they close:
-    /// the model names the note a question came from, that number is the only
-    /// attribution there is, and over a mixed prompt a misnumbered question
-    /// about one member is queued under another -- or under nobody, and offered
-    /// to everyone.
+    /// The generator's tests prove `one_owners_candidates`; this proves the pass calls it.
     #[test]
     fn the_composing_pass_gives_the_model_one_owners_notes() {
         let src = include_str!("main.rs");

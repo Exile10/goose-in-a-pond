@@ -105,8 +105,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Public: the wizard sets location before any device pairs (see PUBLIC_ROUTES).
         .route("/time/zones", get(list_time_zones))
         .route("/location/detect", post(detect_location))
-        // Local voice preview can synthesize before pairing. The allowlist
-        // grants this compatibility exemption only to actual loopback peers.
+        // Voice preview before pairing; the allowlist exempts only real loopback peers.
         .route("/tts", post(tts_synthesise))
         .route("/voice/tts/apply", post(apply_tts_settings))
         // Wake-word phrase calibration (public — used during onboarding WakeWord step)
@@ -343,26 +342,17 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/memories", get(list_memories).post(save_memory))
         // Before the `{id}` route, or axum matches "extraction-status" as an id.
         .route("/memories/extraction-status", get(extraction_status))
-        // The background jobs that spend inference: what each is waiting for,
-        // and a way to stop waiting. See `ports::lane_control` for why both
-        // halves are needed.
         .route("/suggestions/{id}/taken", post(suggestion_taken))
+        // Background inference jobs: what each waits for, and a way to stop waiting.
         .route("/lane", get(lane_status))
         .route("/lane/jobs/{job}/run", post(run_lane_job))
         .route("/memories/{id}", delete(delete_memory).put(update_memory))
         // ── Reminders ─────────────────────────────────────────────────────────
-        //
-        // The literal segment comes first here for the same reason
-        // `extraction-status` does above. Nothing under `/reminders/` is a bare
-        // `{id}` today -- `dismiss` is a literal suffix -- but the next route
-        // added here is exactly where that stops being true, and the ordering
-        // costs nothing to keep. `live-test.sh` asserts it from outside.
+        // Keep literal segments before `{id}` routes, as above; `live-test.sh` asserts it.
         .route("/reminders", get(list_reminders))
         .route("/reminders/{id}/dismiss", post(dismiss_reminder))
         // ── Suggestions ──────────────────────────────────────────────────────
-        // Deliberately beside `/reminders` and not beside `/proposals`: both of
-        // these are ungated reads that a pond with nobody identified still has
-        // to answer. See `list_suggestions` for the whole argument.
+        // Beside `/reminders`, not `/proposals`: both answer even with nobody identified.
         .route("/suggestions", get(list_suggestions))
         // ── Memory Consolidation ─────────────────────────────────────────────
         .route("/memory/consolidate", post(start_consolidation))
@@ -724,9 +714,8 @@ async fn handshake_refresh(
     Ok(Json(resp))
 }
 
-/// Revoke only the authenticated session and its associated refresh credential.
-/// Legacy clients may still send a JSON token field; it never selects the target.
-/// Kept outside the onboarding guard so a paired client can always log out.
+/// Revoke only the caller's session and refresh credential; a legacy body token is ignored.
+/// Outside the onboarding guard so a paired client can always log out.
 async fn handshake_revoke(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -752,8 +741,6 @@ async fn handshake_revoke(
             Json(json!({"error": "invalid_token"})),
         ));
     }
-    // Named once, and used for both the network revocation and the registry
-    // removal below.
     let caller = state
         .handshake
         .caller_for_token(&token)
@@ -778,16 +765,8 @@ async fn handshake_revoke(
         .await
         .map_err(|e| handshake_error("revoke", e))?;
 
-    // A device that signed out has left the household, so it leaves the
-    // registry with its credentials. It used to keep its tile on the devices
-    // screen -- offline, last seen minutes ago -- which reads as a device that
-    // is merely away rather than one that is gone, and leaves the operator
-    // removing by hand something that already removed itself.
-    //
-    // After the credentials, deliberately. If this fails the device has still
-    // lost its access and the row can be deleted by hand, which is the
-    // recoverable order; the reverse would leave a device listed as gone while
-    // its token still worked.
+    // A signed-out device leaves the registry too, after revocation: if this fails, only a
+    // stale row remains, never a working token for a device listed as gone.
     match state.device_registry.unregister(&caller.device_id).await {
         Ok(()) => tracing::info!(
             target: "giap::trace",
@@ -1375,10 +1354,7 @@ async fn chat_stream(
     // Before the stream opens, so the client gets a real HTTP status, not an SSE error event.
     image_limit_response(&req.images)?;
 
-    // Picture support, for the same reason and at the same point: before the run
-    // permit, the registry and `spawn_run`, because the user message is persisted
-    // inside the spawned turn and a refusal after that could only be an SSE frame
-    // over a question already saved with no answer under it.
+    // Picture support too, before the run permit and `spawn_run`, which saves the user message.
     req.images = prepare_turn_images(&state, std::mem::take(&mut req.images)).await?;
 
     if !req.resumable {
@@ -1460,14 +1436,8 @@ fn image_limit_response(
 
 // ── Picture support, before a turn is persisted ───────────────────────────────
 
-/// The two pre-stream picture checks both chat handlers run after `image_limit_response`,
-/// returning the attachments the engine should see.
-///
-/// First the model: an image turn the active model cannot take is refused with a 409 while
-/// nothing is saved, so the client can hand the draft back. It goes first because a picture the
-/// model will never see is not worth decoding. Then the bytes: a WebP is re-encoded, a picture
-/// that is no accepted container is a 415, and the result is checked against the limits again,
-/// since a re-encode can change the size. A text-only turn does neither and reads nothing.
+/// Pre-stream picture checks for both chat handlers, run before anything is saved.
+/// Model check (409) first, then WebP re-encode, 415 if unreadable, and the limits again.
 async fn prepare_turn_images(
     state: &Arc<AppState>,
     images: Vec<pond_core::models::domain::message::ImageAttachment>,
@@ -1475,8 +1445,7 @@ async fn prepare_turn_images(
     if images.is_empty() {
         return Ok(images);
     }
-    // Unreadable settings fail OPEN, to the adapter's own backstop: refusing on no
-    // information would block every picture whenever the store hiccups.
+    // Unreadable settings fail open to the adapter's backstop; a store hiccup blocks nothing.
     if let Ok(settings) = state.settings_repo.get().await {
         let reported =
             read_vision_state(state, &settings.chat_provider, &settings.chat_model).await;
@@ -1493,9 +1462,8 @@ async fn prepare_turn_images(
     Ok(images)
 }
 
-/// The agent's picture-support state for `model` under `provider`, read on the blocking pool:
-/// the port promises a pure read, but it may open the encoder's header and sidecar, which on an
-/// SD card is not something to do on the executor. A join failure reads as unknown.
+/// The agent's picture-support state for `model`; a join failure reads as unknown.
+/// Runs on the blocking pool, since the read may open encoder files on a slow SD card.
 async fn read_vision_state(
     state: &Arc<AppState>,
     provider: &str,
@@ -1509,9 +1477,8 @@ async fn read_vision_state(
         .flatten()
 }
 
-/// Map pond-core's refusal verdict onto the wire: `None` (the agent does not report), unknown
-/// and ready pass; anything else is a 409 carrying the household copy, the code the client keys
-/// its restore clause on, and the state itself so the client need not ask again.
+/// Map the refusal verdict to the wire: no report, unknown and ready pass; else a 409.
+/// The 409 carries the household copy, the code the client's restore keys on, and the state.
 fn vision_refusal_response(
     reported: Option<&pond_core::models::domain::vision_encoder::EncoderState>,
     provider: &str,
@@ -1555,11 +1522,8 @@ fn image_unreadable_response(
     )
 }
 
-/// The status-line sentence for the active model, or `None` where the desktop shows nothing of
-/// the server's (ready, unknown, and not_declared, which the client already knows how to say).
-///
-/// The mesh provider is the exception to the last rule: the adapter reports `not_declared` for
-/// it, but the reason is the wire, not the model, so the line is the mesh one the 409 would carry.
+/// The status-line sentence, or `None` where the desktop shows nothing of the server's.
+/// Mesh's `not_declared` is the wire's fault, not the model's, so it gets the mesh line.
 fn vision_status_message(
     provider: &str,
     state: &pond_core::models::domain::vision_encoder::EncoderState,
@@ -1574,9 +1538,7 @@ fn vision_status_message(
     status_message(state, spec)
 }
 
-/// The bytes the status line may quote: the encoder's size where one is involved. `ready` says
-/// for itself (`None` there means no encoder is involved, as for an HTTP provider), and nothing
-/// is quoted for a model with no picture support or an agent that does not report.
+/// Encoder bytes the status line may quote; `Ready` carries its own (`None`: no encoder).
 fn vision_status_size(
     state: &pond_core::models::domain::vision_encoder::EncoderState,
     spec: Option<&pond_core::models::domain::vision_encoder::EncoderSpec>,
@@ -1590,15 +1552,11 @@ fn vision_status_size(
 }
 
 /// `GET /api/v1/models/vision-status` — picture support for the active chat model.
-///
-/// `{model, state, size_bytes, message}`: `state` is the `EncoderState` union, `message` the
-/// pond-core household copy. A pure read the desktop polls every 2 s while something moves, so
-/// it never starts a fetch or a hash; `prepare_model` is what does that.
+/// Polled every 2 s, so a pure read: fetching and hashing belong to `prepare_model`.
 async fn get_vision_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     use pond_core::models::domain::vision_encoder::{encoder_for, EncoderState};
 
-    // Unreadable settings name no model, and asking the agent about "" would answer for a
-    // model nobody chose: unknown, which the desktop reads as "say nothing, block nothing".
+    // Unreadable settings name no model: unknown, which the desktop neither shows nor blocks.
     let (provider, model, reported) = match state.settings_repo.get().await {
         Ok(s) => {
             let reported = read_vision_state(&state, &s.chat_provider, &s.chat_model)
@@ -1617,11 +1575,8 @@ async fn get_vision_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
-/// What a GGUF row says about pictures: `(reads_images, image_support_bytes)`.
-///
-/// The agent's device-aware verdict under the `local` provider (what activating the row would
-/// select), falling back to pond-core's pinned table when the agent does not report. A pure read:
-/// listing models must never prepare or fetch anything.
+/// A GGUF row's `(reads_images, image_support_bytes)`, from the agent's `local` verdict.
+/// Falls back to the pinned table; a pure read, as listing must never prepare or fetch.
 fn gguf_vision_facts(
     agent: &dyn pond_core::models::ports::agent::Agent,
     model: &str,
@@ -1640,9 +1595,8 @@ fn gguf_vision_facts(
     (reads, bytes)
 }
 
-/// A GGUF that pairs WITH a chat model rather than being one: a vision encoder (`mmproj-*`) or
-/// a speculative drafter (`mtp-*`, and the older Gemma 4 `-assistant` drafters). Offered as a
-/// chat model, the encoder downloads into `models/gguf`, where every scan would take it for one.
+/// Whether a GGUF is an encoder (`mmproj-*`) or drafter (`mtp-*`, Gemma 4 `-assistant`).
+/// Offered as a chat model it would land in `models/gguf`, where every scan takes it for one.
 fn is_companion_gguf(file_name: &str) -> bool {
     let base = file_name
         .rsplit('/')
@@ -1659,13 +1613,8 @@ fn is_companion_architecture(architecture: Option<&str>) -> bool {
     architecture.is_some_and(|a| a == "clip" || a.ends_with("-assistant"))
 }
 
-/// After a GGUF is deleted: if no other GGUF left on this pond uses its picture support, remove
-/// `models/mmproj/<dir>/` too, as the delete confirmation promised. Links go at once; a blob they
-/// pointed into is reclaimed by the next cleanup sweep, which no longer sees anything protect it.
-///
-/// "Uses" is checked two ways, because either alone misses a case: a catalogue row still marked
-/// downloaded, and a `.gguf` in `models/gguf` that no scan has registered yet. The directory is
-/// matched without regard to case, since the Mac's older encoder dirs are mixed-case.
+/// After a GGUF delete, remove its `models/mmproj/<dir>/` if nothing else uses it.
+/// A downloaded row or an unscanned `.gguf` counts as a use; names match case-insensitively.
 async fn remove_orphaned_encoder_dir(
     data_dir: &std::path::Path,
     deleted: &ModelRecord,
@@ -1738,10 +1687,8 @@ async fn remove_orphaned_encoder_dir(
     }
 }
 
-/// Whether a settings save leaves the engine's warmed prefix stale, so exactly one warm-up
-/// should follow: a different provider or model. (The speculation switch was a third reason while
-/// the engine had speculative decoding; it is commented out with it.) A PUT that re-sends an
-/// unchanged value is no change, and must not put the Warming banner up.
+/// Whether a save leaves the warmed prefix stale (new provider or model): one warm-up follows.
+/// The speculation switch is commented out with speculative decoding; restore it if it returns.
 fn save_needs_prewarm(current: &Settings, merged: &Settings) -> bool {
     current.chat_provider != merged.chat_provider || current.chat_model != merged.chat_model
     // || current.speculative_decoding_enabled != merged.speculative_decoding_enabled
@@ -2354,22 +2301,7 @@ async fn drive_turn(
     }
 
     // ── Persist the assistant turn ────────────────────────────────────
-    // Persistence is now the whole of what a handler owes memory. The turn is
-    // written to `session_messages`, and the batch engine reads it out of
-    // there in the pond's idle time -- which is also why the voice loop and
-    // `/chat`, which never extracted inline, now contribute like everything
-    // else.
-    // Nothing was said, and nothing is coming.
-    //
-    // The user's message was committed before inference began. Leaving it shows
-    // a question the pond visibly never answered, and hands the NEXT turn a
-    // prompt ending on a user line nothing replied to. `delete_messages_from`
-    // is the same primitive the edit-and-resend path uses.
-    //
-    // Deliberately narrow. A turn that produced ANY text or tool result keeps
-    // both halves — a barge-in should not erase the sentence the user heard.
-    // A TIMEOUT keeps them too: the same words are worth retrying, and the
-    // error frame already said what happened.
+    // A cancel with no output drops the orphaned user message; output or a timeout keeps both.
     let said_nothing = turn.full_text.trim().is_empty() && turn.tool_results.is_empty();
     if cancelled && said_nothing {
         match state
@@ -3307,10 +3239,7 @@ async fn get_session_messages(
                     }))
                     .collect::<Vec<_>>());
             }
-            // Phase F2: attachments are referenced, never inlined. Base64 in a
-            // history read would turn a routine page load into megabytes; the
-            // client fetches each image once from the URL below, WITH its bearer
-            // token -- the route is protected, so a bare `<img src>` gets a 401.
+            // Referenced by URL, never inlined: base64 would make a history read megabytes.
             if let Some(atts) = attachments_by_message.get(&m.id) {
                 obj["images"] = json!(atts
                     .iter()
@@ -3440,50 +3369,15 @@ async fn compact_session(
     ))
 }
 
-/// POST /api/v1/sessions/retitle — ask the titling job to run its next pass now.
-///
-/// The attended counterpart to the background pass in `pond-server`. It skips
-/// the *scheduling* gate only: you asked for it, so the pond does not argue
-/// about whether now is a good moment. Every per-conversation rule still
-/// applies, because the same job does the work —
-///
-/// - a name somebody typed is never overwritten,
-/// - a conversation too short to describe is left to the six-word fallback,
-/// - a model-written name that still fits its conversation is not rebuilt just
-///   to spend a model call arriving at the same words.
-///
-/// Deliberately independent of `session_titling_enabled`. That setting governs
-/// whether the pond does this *unattended*; pressing a button is not that, and
-/// a control that silently does nothing because of a switch somewhere else is
-/// the worse surprise. The lane applies the waiver to the asking job's own gate
-/// for exactly this reason.
-///
-/// # This route used to do the work itself, and that was the wrong shape
-///
-/// It ran up to twenty model calls sequentially inside the request handler,
-/// taking no lane slot — so it could decode beside whichever background job was
-/// already holding the machine, which is the single thing the lane exists to
-/// prevent. This port's own docs named it as the precedent not to follow.
-///
-/// It also could not finish. The desktop client's default timeout is 30 s
-/// (`PondApiClient.request`), and on the Orin at roughly 16 tok/s twenty titles
-/// is minutes of decode — so the button reliably returned a timeout error while
-/// the work carried on invisibly behind it. Answering "the pass is starting" in
-/// milliseconds is not a smaller promise than that one; it is the first honest
-/// one this button has made.
-///
-/// What is lost is the "renamed 7 of 12" summary, which could only ever be
-/// produced by blocking. The Automations panel shows the job running, and the
-/// conversation list shows the names.
+/// POST /api/v1/sessions/retitle — run the titling job's next pass now, answering at once.
+/// Bypasses only the schedule and `session_titling_enabled`; per-conversation rules hold.
 async fn retitle_sessions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     use pond_core::user_data::ports::lane_control::WakeOutcome;
     use pond_core::user_data::services::inference_lane::LaneJob;
 
-    // Checked here rather than left to the job, because the job's own answer to
-    // "no model configured" is to skip the tick silently — correct for a
-    // background loop and useless to somebody who just pressed a button.
+    // Checked here: the job silently skips a tick with no model, useless after a click.
     if state.llm_provider.read().await.is_none() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3507,9 +3401,7 @@ async fn retitle_sessions(
             );
             Ok(Json(json!({ "started": true })))
         }
-        // Not an error: a pond whose titling loop never spawned genuinely has
-        // nothing to wake, and that is a fact about this pond rather than a
-        // fault in the request.
+        // Not an error: a pond whose titling loop never spawned has nothing to wake.
         WakeOutcome::NotPresent => Ok(Json(json!({
             "started": false,
             "reason": "the titling job has no loop in this process",
@@ -3600,17 +3492,8 @@ fn urlencoding_lite(s: &str) -> String {
     out
 }
 
-/// Serve one persisted image attachment's raw bytes (phase F2).
-///
-/// Bytes, not base64: the client displays them as they come, and re-encoding
-/// only to have it decode again is pure waste. This sits on the PROTECTED
-/// router and the middleware reads only an `Authorization: Bearer` header, so
-/// the URL is not usable as a bare `<img src>`: an image element cannot send
-/// that header, and every such load is a 401 unless `POND_DEV_ALLOW_LOOPBACK`
-/// is set. The desktop fetches the bytes with its token and shows them through
-/// an object URL (`PondApiClient.getSessionAttachment`). The `session_id` path
-/// segment is checked against the stored row so an attachment id from one
-/// conversation cannot be read through another's URL.
+/// Serves one attachment's raw bytes; `session_id` must own it, so ids can't cross sessions.
+/// Bearer-protected, so not usable as a bare `<img src>`; the desktop fetches it with its token.
 async fn get_session_attachment(
     State(state): State<Arc<AppState>>,
     Path((session_id, attachment_id)): Path<(String, String)>,
@@ -3725,9 +3608,7 @@ async fn system_info(
         "hostname": hostname,
         // Null without a LAN route; for clients that can't resolve `<hostname>.local`.
         "lan_address": lan_address(),
-        // Null unless this Pond is on a tailnet. Reachable from outside the
-        // house, so it is what a paired phone falls back to when the LAN
-        // address does not answer.
+        // Null off a tailnet; the phone's fallback when the LAN address doesn't answer.
         "tailnet_address": match embedded { Some(e) => e.0.0.read().ok().and_then(|v| v.clone()), None => tailnet_address() },
         "https_port": https_port,
         "tls_spki_sha256": tls_spki_sha256,
@@ -4034,12 +3915,8 @@ async fn unregister_device(
         );
     }
 
-    // Take the device's access with it. `session_tokens` carries no foreign key
-    // onto `devices` and nothing cascades, so without this the row vanishes from
-    // the list while every token it was issued keeps validating -- an operator
-    // removing a lost phone would be told it was gone while it carried on
-    // working. Revoked BEFORE the row is dropped: if this fails, the device is
-    // still listed and still deletable, which is the recoverable order.
+    // Revoke its tokens too: `session_tokens` has no FK to `devices`, so nothing cascades.
+    // Before the row goes, so a failure leaves the device listed and still deletable.
     match state.handshake.revoke_device(&id).await {
         Ok(revoked) => {
             if revoked > 0 {
@@ -4072,21 +3949,8 @@ async fn unregister_device(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /api/v1/devices/self` -- the caller's own device, and the household member it is
-/// attributed to if anyone has claimed it.
-///
-/// For display: the name in a greeting, the header of a profile screen. It proves nothing and
-/// grants nothing. `Principal::profile_id` stays `None` -- its own doc explains why populating it
-/// is a separate phase -- and nothing here feeds `ProfileScope`. The attribution is read in this
-/// one handler, not on the auth path.
-///
-/// Scoped to the caller rather than adding `profile_id` to every row of `GET /devices`: a phone
-/// needs only its own, and the list would hand every paired client the whole device-to-member
-/// map, the shared tablet in the kitchen included. The device comes from [`proven_device`], so it
-/// is the one the token was issued to and never anything the client says about itself.
-///
-/// Every [`DeviceRung`] is answered by name. `Unavailable` is the one that matters: a failed read
-/// reported as "no member" would look exactly like an unclaimed phone.
+/// `GET /api/v1/devices/self` -- the caller's own device and the member it's attributed to.
+/// Display only; not on `GET /devices`, which would leak the whole device-to-member map.
 async fn device_self(
     State(state): State<Arc<AppState>>,
     principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
@@ -4114,9 +3978,7 @@ async fn device_self(
                     "profile": {"id": member.id, "display_name": member.display_name},
                 })),
             ),
-            // Removing a member sets their devices' `profile_id` to NULL (migration 0043's ON
-            // DELETE SET NULL), so an attribution naming nobody is a race with that delete. The
-            // device is, as of now, unclaimed.
+            // A member deleted mid-read (ON DELETE SET NULL): the device is now unclaimed.
             Ok(None) => (
                 StatusCode::OK,
                 Json(json!({"device_id": device_id, "profile": null})),
@@ -4127,8 +3989,7 @@ async fn device_self(
             StatusCode::OK,
             Json(json!({"device_id": device_id, "profile": null})),
         ),
-        // `rung` answers this only for a device with no id, which returned above. Named because
-        // the match is wildcard-free on purpose.
+        // Only for a device with no id, handled above; listed since the match has no wildcard.
         DeviceRung::NoDevice => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "this request did not come from a paired device"})),
@@ -4803,8 +4664,7 @@ async fn update_settings(
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
 
-    // Speculative decoding was taken out of the llama.cpp engine on 2026-09-24 (goose 743649d98),
-    // so this is commented out rather than deleted; restore it if it returns.
+    // Speculative decoding was removed from the llama.cpp engine; restore this if it returns.
     // // The speculation switch, and it must land HERE, before either
     // // `rebuild_llm_provider` below: the rebuild constructs the local-inference
     // // adapter, whose device settings re-stamp `draft_model` from this gate, so a
@@ -4813,10 +4673,7 @@ async fn update_settings(
     // pond_core::models::domain::drafter::set_speculation_enabled(
     //     merged.speculative_decoding_enabled,
     // );
-    // Same reasoning as the mic gate directly above: a network restriction the
-    // user has to restart the pond to apply is not one. Unconditional rather
-    // than keyed on the patch, because it is a cheap idempotent write and a
-    // missed re-install is a privacy control that silently did not take.
+    // Unconditional: it's cheap, and a skipped re-install would silently drop the restriction.
     pond_core::shared::services::egress::set_network_mode(
         pond_core::shared::services::egress::NetworkMode::parse(&merged.network_mode),
     );
@@ -4882,18 +4739,11 @@ async fn update_settings(
         }
     }
 
-    // A provider or model change makes the engine's warmed prefix stale, so
-    // re-run the warm-up in the background. Fire-and-forget: the save must not
-    // wait on a model load. So does the speculation switch, which the engine
-    // applies by evicting and reloading the model; the warm-up is what reloads it
-    // in the background instead of in front of the next reply. One condition, so
-    // a save that changes the model AND the switch still starts one warm-up.
+    // The warmed prefix is now stale; re-warm in the background so the save doesn't wait.
     if save_needs_prewarm(&current, &merged) {
         crate::spawn_prefix_prewarm(state.clone(), false);
     }
-    // A newly chosen local model may need picture support fetched; returns at once. Only a
-    // GGUF has an encoder to provision, and the port takes no provider, so an Ollama tag that
-    // happens to name a Gemma family must not be handed to it.
+    // Fetch a new GGUF's picture support; the port takes no provider, so Ollama tags stay out.
     let chat_changed =
         current.chat_model != merged.chat_model || current.chat_provider != merged.chat_provider;
     if chat_changed
@@ -5263,8 +5113,7 @@ fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelS
         asr_size: m.asr_size.clone(),
         tts_engine: m.tts_engine.clone(),
         config_filename: m.config_filename.clone(),
-        // Filled by `list_models` for GGUF rows, from the agent: this conversion is sync and
-        // per row, and the agent's verdict can read a header.
+        // `list_models` fills these for GGUF rows: the agent's verdict may read a header.
         reads_images: None,
         image_support_bytes: None,
     }
@@ -5340,10 +5189,7 @@ async fn scan_filesystem_extras(
                     } else {
                         None
                     };
-                    // An encoder or a drafter is not a chat model, and a row for one is a
-                    // "Load as chat model" button that loads something that cannot chat. Judged
-                    // by name first and by the header's own architecture second, for a
-                    // companion saved under a name that does not say so.
+                    // Skip companions; the header catches one whose name doesn't say so.
                     if fname.ends_with(".gguf")
                         && (is_companion_gguf(&fname)
                             || is_companion_architecture(
@@ -5442,10 +5288,7 @@ async fn scan_filesystem_extras(
     extras_from_disk
 }
 
-/// The completion hook for a download that names its file rather than a catalogue row: a GGUF
-/// is handed to `Agent::prepare_model` under the name a scan will give it (the file's stem), so
-/// its picture support starts as soon as the weights are on disk. Anything else has nothing to
-/// prepare.
+/// On download completion, prepare a GGUF under its file stem, the name a scan will give it.
 fn prepare_after_download(
     state: &Arc<AppState>,
     category: &str,
@@ -5605,9 +5448,7 @@ async fn list_models(
     })?;
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
 
-    // Picture support per GGUF row, asked of the agent on the blocking pool in one batch: its
-    // verdict may read a header per row, and this page loads on every visit. A pure read, so
-    // listing never starts a fetch; a failed batch just leaves the fields out.
+    // One blocking-pool batch: the verdict may read a header per row, on every page visit.
     let gguf_names: Vec<String> = records
         .iter()
         .filter(|m| m.category == ModelCategory::Gguf)
@@ -5921,8 +5762,7 @@ async fn download_model(
     let cfg_client = state.http_client.clone();
     let cfg_data_dir = data_dir.clone();
     let dl_data_dir = data_dir.clone();
-    // A GGUF that just arrived may need its picture support, and waiting for the household to
-    // activate it would put that download in front of their first photo.
+    // Prepare on arrival, or the encoder download would wait for the first photo.
     let prepare = (cat == ModelCategory::Gguf).then(|| (state.agent.clone(), name.clone()));
 
     tokio::spawn(async move {
@@ -6063,8 +5903,7 @@ async fn delete_model(
             )
         })?;
 
-    // After the row reads not-downloaded, so this model no longer counts as a user of its own
-    // picture support. Best-effort: the model itself is gone either way.
+    // After the row reads not-downloaded, or the model counts as its own encoder's user.
     if cat == ModelCategory::Gguf {
         if let Some(data_dir) = &state.data_dir {
             remove_orphaned_encoder_dir(data_dir, &m, &model_repo).await;
@@ -6238,8 +6077,7 @@ async fn activate_model(
             )
         })?;
 
-    // What the chat role held before this activation, so the warm-up below runs only on a real
-    // change, the same rule PUT /settings follows.
+    // So the warm-up below runs only on a real change, as in PUT /settings.
     let chat_before = if role == "chat" {
         state
             .settings_repo
@@ -6294,9 +6132,7 @@ async fn activate_model(
         rebuild_llm_provider(&state, &settings).await;
     }
 
-    // "Use" on the Models page is a model change like any other: the new model's picture support
-    // starts now rather than on the first photo, and its prefix is warmed in the background as
-    // PUT /settings does, rather than in front of the first reply.
+    // As in PUT /settings: prepare picture support and warm the prefix now, in the background.
     if role == "chat" {
         if cat == ModelCategory::Gguf {
             state.agent.prepare_model(&name);
@@ -6547,9 +6383,7 @@ async fn list_hf_model_files(
                 .as_array()
                 .map(|siblings| {
                     siblings.iter()
-                        // Chat models only: an encoder or drafter picked here would land in
-                        // models/gguf and be offered back as a chat model. Picture support and
-                        // the helper model arrive by themselves, into their own places.
+                        // Chat models only; companions arrive by themselves, elsewhere.
                         .filter(|s| {
                             s["rfilename"].as_str()
                                 .map(|n| n.ends_with(".gguf") && !is_companion_gguf(n))
@@ -9653,9 +9487,8 @@ async fn resume_rule(
     }
 }
 
-/// Check device-scoped delivery against the identity resolved from the session.
-/// This is bearer authorization, not device-key proof of possession. Neither
-/// network addresses nor arbitrary smart-home device targets establish ownership.
+/// Check a device-scoped delivery against the session's resolved identity.
+/// Bearer authorization, not proof of possession; addresses and device targets prove nothing.
 fn require_own_device(
     principal: &pond_core::security::ports::policy::Principal,
     claimed: &str,
@@ -10047,9 +9880,7 @@ async fn agent_chat_stream(
     if let Err(resp) = image_limit_response(&images) {
         return resp.into_response();
     }
-    // Before the stream is built, as in `/chat/stream`: the user message is persisted inside
-    // `stream!`, so this is the last point a refused picture leaves nothing behind. It is also
-    // this route's one settings read outside the stream, and only an image turn pays for it.
+    // Before `stream!`, which persists the user message, as in `/chat/stream`.
     let images = match prepare_turn_images(&state, images).await {
         Ok(images) => images,
         Err(resp) => return resp.into_response(),
@@ -10197,9 +10028,7 @@ async fn agent_chat_stream(
         }
 
         // ── Persist assistant turn ──────────────────────────────────────────
-        // And that is all. Extraction is no longer a thing a handler can forget
-        // to wire: the batch engine walks `session_messages`, so a turn that
-        // was persisted is a turn that will be read.
+        // No extraction wiring: the batch engine reads every persisted turn.
         let _ = chat_service.persist_assistant_turn(
             std::mem::take(&mut turn.tool_results),
             &turn.full_text,
@@ -12232,31 +12061,8 @@ async fn update_memory(
     }
 }
 
-/// `GET /api/v1/memories/extraction-status` -- what the batch engine is doing.
-///
-/// Exists because the failure this engine can have is silent by construction. A
-/// pond whose embedder never loaded, one whose model cannot emit the schema,
-/// and one that has finished reading its whole history all look identical from
-/// the outside: no new memories appear. `blocked_on` is the difference, and a
-/// field that only ever reached a `tracing` line is not a surface -- an index
-/// that was 2% full survived six landed phases that way.
-///
-/// `unattributed_sessions` is the other silent one, and it is not a failure of
-/// the engine: on a pond with more than one member, a conversation nothing has
-/// identified is never mined at all rather than mined under one of their names,
-/// and the surface that produces most of them cannot be fixed from here. The
-/// voice child is spawned as its own process with no HTTP request behind it, so
-/// none of the three things that bind a session to a member -- a paired
-/// device's token, a face match, a member picking themselves -- ever reaches
-/// it. The number is a total over the store, not a count of what one pass
-/// looked at, because the pond it matters most on is the one where a pass full
-/// of identified typed chats would otherwise report zero.
-///
-/// `sessions_pending` is deliberately APPROXIMATE, and cheap. It counts
-/// conversations whose activity is newer than the last time the walk looked at
-/// them, which is one indexed read per conversation. The exact answer would
-/// need the message count and the watermark's position for every conversation
-/// in the store -- three queries each, on a status endpoint a panel polls.
+/// `GET /api/v1/memories/extraction-status` -- what the batch engine is doing, or why not.
+/// `unattributed_sessions` totals the store; `sessions_pending` is cheap and approximate.
 async fn extraction_status(
     State(state): State<Arc<AppState>>,
 ) -> impl axum::response::IntoResponse {
@@ -12292,9 +12098,7 @@ async fn extraction_status(
         None => None,
     };
 
-    // `null` rather than a zeroed pass when the engine is not running in this
-    // process at all. "It has read nothing" and "it does not exist here" are
-    // different answers and the caller is owed the true one.
+    // `null`, not zeros, when no engine runs here: "read nothing" and "absent" differ.
     Json(json!({
         "sessions_total": sessions_total,
         "sessions_pending": sessions_pending,
@@ -12302,21 +12106,10 @@ async fn extraction_status(
         "last_pass_at": engine.as_ref().and_then(|e| e.last_pass_at),
         "last_pass_windows": engine.as_ref().map(|e| e.last_pass_windows),
         "last_pass_written": engine.as_ref().map(|e| e.last_pass_written),
-        // What the date rule refused, and what that cost. `dates_lost` above
-        // zero means no reminder row was written for the window, so that date
-        // is gone -- either because the model answered half the schema, or
-        // because the store would not take the row. The two are told apart by
-        // `last_pass_reminders_lost`, which speaks only for the second.
-        //
-        // Zero is NOT a receipt that anything was kept, and no caller may read
-        // it as one: what was kept is `last_pass_reminders_written` and only
-        // that. The distinction is the whole defect this pair was added for --
-        // for one release nothing stored a reminder at all, so every refused
-        // date was gone while this number sat honestly at zero.
+        // A lost date got no reminder row; `last_pass_reminders_lost` counts the store's failures.
+        // Zero is not a receipt: only `last_pass_reminders_written` says what was kept.
         "last_pass_dated": engine.as_ref().map(|e| e.last_pass_dated),
         "last_pass_dates_lost": engine.as_ref().map(|e| e.last_pass_dates_lost),
-        // Reminder rows the last pass wrote, and candidates it could not store.
-        // The rows themselves are readable at `GET /api/v1/reminders`.
         "last_pass_reminders_written": engine.as_ref().map(|e| e.last_pass_reminders_written),
         "last_pass_reminders_lost": engine.as_ref().map(|e| e.last_pass_reminders_lost),
         "unattributed_sessions": engine.as_ref().map(|e| e.unattributed_sessions),
@@ -12326,22 +12119,10 @@ async fn extraction_status(
 }
 
 // ── The inference lane ───────────────────────────────────────────────────────
-//
-// One slot, six background jobs, and until now no way to see which one had it
-// or to ask for a different one. `ports::lane_control` carries the reasoning.
-//
-// Both routes answer with a `lane` key that is `false` when this process has no
-// lane at all, rather than with an empty job list. A household reading six rows
-// of "never" is owed the difference between "the lane says never" and "there is
-// no lane here to ask".
+// Both routes answer `lane: false` when this process has no lane, not an empty job list.
 
 /// `GET /api/v1/lane` — what every background job is doing and waiting for.
-///
-/// The numbers are as fresh as the last tick that produced them, which is up to
-/// that job's own poll old — fifteen minutes for the index sweep. That is
-/// reported per job as `observed_secs_ago` rather than smoothed over, because a
-/// reading presented as live when it is a quarter of an hour stale is how this
-/// surface would come to mislead exactly the person debugging with it.
+/// Figures are up to one poll old (15 min for the index sweep), hence `observed_secs_ago`.
 async fn lane_status(State(state): State<Arc<AppState>>) -> impl axum::response::IntoResponse {
     let Some(lane) = state.lane.as_ref() else {
         return Json(json!({ "lane": false, "jobs": [] }));
@@ -12361,13 +12142,10 @@ async fn lane_status(State(state): State<Arc<AppState>>) -> impl axum::response:
                 "since_last_run_secs": j.since_last_run_secs,
                 "interval_floor_secs": j.interval_floor_secs,
                 "idle_threshold_secs": j.idle_threshold_secs,
-                // `null` when it would run right now. A reason and "no reason"
-                // are different answers and the caller is owed the true one.
+                // `null` when it would run right now.
                 "blocked_by": j.blocked_by.map(|r| r.as_str()),
                 "would_run_next": snapshot.would_run == Some(j.job),
-                // The HISTORY beside the instant. `blocked_by` cannot tell a
-                // job that is eligible and losing from one that is switched
-                // off; these can.
+                // History: unlike `blocked_by`, tells eligible-but-losing from switched off.
                 "granted": j.history.granted,
                 "nudged": j.history.nudged,
                 "slot_busy": j.history.slot_busy,
@@ -12392,26 +12170,15 @@ async fn lane_status(State(state): State<Arc<AppState>>) -> impl axum::response:
         "idle_for_secs": snapshot.idle_for_secs,
         "saw_activity_since_start": snapshot.saw_activity_since_start,
         "slot_busy": snapshot.slot_busy,
-        // What the watcher draws. `slot_busy` could always say something was
-        // running; these say what, and for how long.
+        // What the watcher draws: which job holds the slot, and for how long.
         "running": snapshot.running.map(|j| j.as_str()),
         "running_title": snapshot.running.map(|j| j.title()),
         "running_for_secs": snapshot.running_for_secs,
     }))
 }
 
-/// `POST /api/v1/lane/jobs/{job}/run` — ask one job to take its next tick now.
-///
-/// Wakes; does not run. The work happens in the job's own loop, under the same
-/// single slot every scheduled pass takes, so pressing this during another
-/// job's run queues behind it rather than decoding beside it.
-///
-/// It deliberately does NOT call `note_user_activity`. Every other route that
-/// starts work on the user's behalf does, and here it would be precisely
-/// backwards: the activity clock is what the idle gate measures, so recording
-/// the press as activity would reset the quiet period the woken job is about to
-/// skip — and push every OTHER job's next turn fifteen minutes further out. The
-/// person pressing the button is the reason to run, not a reason to wait.
+/// `POST /api/v1/lane/jobs/{job}/run` — wake one job; it still waits for the single slot.
+/// Deliberately no `note_user_activity`: it would restart the idle gate for every job.
 async fn run_lane_job(
     State(state): State<Arc<AppState>>,
     Path(job): Path<String>,
@@ -12419,9 +12186,7 @@ async fn run_lane_job(
     use pond_core::user_data::ports::lane_control::WakeOutcome;
     use pond_core::user_data::services::inference_lane::LaneJob;
 
-    // An unknown name is a 404, never a cheerful OK. A typo that answered
-    // "asked" would be a button that reports success and does nothing, which is
-    // the failure mode this whole surface was built to end.
+    // Unknown name: 404, or a typo would report success and do nothing.
     let Some(job) = LaneJob::from_wire(&job) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -12447,9 +12212,7 @@ async fn run_lane_job(
             "job": job.as_str(),
             "woken": true,
         }))),
-        // Not an error: a pond with no embedder genuinely has no extraction
-        // loop, and that is a fact about this pond rather than a fault in the
-        // request. The caller renders it as "nothing here to run".
+        // Not an error: e.g. a pond with no embedder has no extraction loop.
         WakeOutcome::NotPresent => Ok(Json(json!({
             "lane": true,
             "job": job.as_str(),
@@ -12473,82 +12236,17 @@ async fn delete_memory(
     }
 }
 
-// ── Reminders ────────────────────────────────────────────────────────────────
-//
-// Where a dated utterance ends up, and until now the one thing on this pond
-// that could not be looked at. The extraction gate refuses any memory whose note
-// carries a one-off calendar date, and that refusal is affordable only because
-// the date is kept as a `reminders` row (migration 0057) instead. A row nothing
-// can read is not a place the date was kept; it is a quieter way of losing it.
-//
-// # No member gate, deliberately, and it is the opposite call from `/proposals`
-//
-// `proposal_caller` refuses anything that is not one household member, because a
-// proposal is ADDRESSED to somebody and invariant 4 forbids a broadcast. A
-// reminder is not addressed to anybody: `profile_id` is NULL on every row a live
-// pond has, which is precisely why the table exists rather than the proposal
-// queue alone. Gating this read behind an audience would make the surface
-// unusable on every pond it was written for, and would leave the date in a table
-// only SQL could reach. It sits behind the same auth as `/memories`, which is
-// the panel this belongs beside.
-
 // ── Suggestions: what the household might want to ask ────────────────────────
-//
-// `GET /api/v1/suggestions`. The other half of Home's left column, and the half
-// that works on a pond's first evening.
-//
-// # Why this is not `/proposals`
-//
-// A proposal is a staged action addressed to one member, so `ProposalAudience`
-// makes "the household" and "a guest" unrepresentable rather than merely
-// refused. That is right for something that will act on somebody's behalf, and
-// it is why that route answers 403 wherever nobody has been identified. A
-// suggestion performs nothing until it is tapped, and **the tap is the
-// consent**, so there is no audience to name and nothing to approve.
-//
-// # No member gate, deliberately -- the same call `/reminders` made
-//
-// `list_reminders` records the reasoning in full and it applies here more
-// strongly, because this is the surface that has to be non-empty before
-// anybody has identified themselves to anything.
-//
-// # This route must not write, and that is a real hazard rather than a style note
-//
-// It does NOT call `resolve_turn_scope`. That function is not a pure read: its
-// `DeviceRung::Member` arm calls `set_session_identity_if_stronger`, and
-// `IdentificationSource::PairedDevice` outranks `Face`. A Dashboard polling
-// this route through `resolve_turn_scope` would overwrite a face match with a
-// device claim on every tick. Scope is resolved here from the same three
-// inputs through `identity_resolution::resolve` directly, and nothing is
-// written back.
+// No member gate: unlike a proposal, nothing is addressed and the tap is the consent.
+// Must not write, so no `resolve_turn_scope` (it persists the device rung as a claim).
 
-/// How many memories are counted before the number stops being interesting.
-///
-/// A ceiling rather than a `COUNT(*)`, because `MemoryRepository` has no
-/// windowed count and adding one for a headline number is more port surface
-/// than the sentence is worth. Note what is NOT used: `count_for_profile` has
-/// no lifecycle predicate, so it counts archived and superseded rows the read
-/// path would never return -- a number strictly larger than anything an answer
-/// could draw on.
+/// Memory count cap for the headline; `count_for_profile` would count archived rows too.
 const SUGGESTION_MEMORY_CEILING: usize = 500;
 
-/// How far back "this week" reaches for the inbox suggestor.
-///
-/// Seven days rather than "today" because a mail sync runs on a thirty-minute
-/// timer and may not have run yet today; a today-count would read zero on a
-/// pond with a full inbox and the card would be silent for the wrong reason.
+/// The inbox suggestor's window: a week, since today's mail sync may not have run yet.
 const SUGGESTION_MAIL_WINDOW_DAYS: i64 = 7;
 
-/// What the caller may be shown, resolved without writing anything.
-///
-/// `Guest` maps to `Shared` and everything else to `Personal`. The reason it is
-/// not "`Owner` is personal, the rest is shared" is in `Audience`'s own docs:
-/// `identity_resolution::resolve` returns `Guest` only when the household has
-/// more than one member, so `Household` is reachable only on a pond of at most
-/// one -- where `Household` IS that member. Gating on `Owner` would make the
-/// personal half unreachable on every desktop pond that has not paired an
-/// attributed device, which is most of them, and is the same call commit
-/// `881da889` made for connecting a context source.
+/// The caller's read scope, resolved without writing anything back.
 async fn read_only_caller_scope(
     state: &Arc<AppState>,
     principal: Option<&pond_core::security::ports::policy::Principal>,
@@ -12557,8 +12255,7 @@ async fn read_only_caller_scope(
     use pond_core::user_data::domain::session::SessionIdentity;
     use pond_core::user_data::services::identity_resolution;
 
-    // A failed read counts as "more than one member", which resolves to Guest
-    // and shows less. Every unknown here narrows.
+    // A failed read counts as several members, i.e. Guest: every unknown here narrows.
     let members = match state.profile_repo.list().await {
         Ok(p) => p.len(),
         Err(e) => {
@@ -12567,18 +12264,8 @@ async fn read_only_caller_scope(
         }
     };
 
-    // The device rung, built exactly as `resolve_turn_scope` builds it and then
-    // NOT written back -- the whole difference between the two functions.
-    //
-    // Routed through `ProvenDevice::rung` rather than a local
-    // `.ok().flatten()`, which behaves identically and is not the same thing:
-    // `device_rung_wiring.rs` walks every production site filling this rung and
-    // fails any that does not hand over a bare `DeviceRung::profile_id()`,
-    // because `.or(..)` and `.unwrap_or(..)` look like the same line in a diff
-    // and mean the strongest rung answers `Some` when the pond knows nothing.
-    // `IdentificationSource::PairedDevice` outranks every proof the pond can
-    // make, so a default here would outrank all of them. The guard caught this
-    // function on its first run, which is what the guard is for.
+    // Built as `resolve_turn_scope` builds it, but not written back. Via `ProvenDevice::rung`:
+    // `device_rung_wiring.rs` fails any site that fills this rung another way.
     let device = principal
         .map(ProvenDevice::from_principal)
         .unwrap_or_else(ProvenDevice::none);
@@ -12587,8 +12274,7 @@ async fn read_only_caller_scope(
         Some(device_id) => device.rung(device_attribution(state).device_profile(device_id).await),
     };
 
-    // The session rung. Absent when the caller has no session, which is the
-    // normal state of a cold Dashboard and is not an error here.
+    // No session is normal for a cold Dashboard, not an error.
     let session_identity = match session_id {
         Some(sid) => state
             .session_storage
@@ -12604,25 +12290,12 @@ async fn read_only_caller_scope(
         household_has_multiple_members: members > 1,
     });
 
-    // The scope itself, not a two-valued audience. An audience says how to
-    // PHRASE a suggestion; the scope says whose rows may be READ, and
-    // collapsing the second into the first is how `Owner(them)` became
-    // `Household`.
+    // Return the scope, not an audience: the scope decides whose rows may be read.
     resolved.scope
 }
 
-/// What is known about the tool groups this pond has.
-///
-/// `enabled` AND `status == "connected"`, so a registered extension that failed
-/// to start does not put a card on screen whose prompt the model cannot serve.
-///
-/// But an EMPTY answer is `Unknown`, not "none" -- see [`GroupsKnown`]. The
-/// manager answers from a live agent session, so a pond whose model provider is
-/// not up yet reports nothing at all rather than failing, and treating that as
-/// "no extensions exist" silences the whole column exactly when it is most
-/// wanted. Observed live on a scratch pond: two devices registered, weather on,
-/// and both suggestors refused with "is not installed" because the log said
-/// `LLM: llamafile skipped (provider = )`.
+/// Connected, enabled tool groups; a failed extension must not offer a card it can't serve.
+/// An empty list is `Unknown`: the manager reports nothing until the model provider is up.
 async fn suggestion_groups(state: &Arc<AppState>) -> GroupsKnown {
     let Some(manager) = state.extension_manager.as_ref() else {
         return GroupsKnown::Unknown;
@@ -12650,9 +12323,7 @@ async fn suggestion_schedules_before(
     let Some(scheduler) = state.scheduler.as_ref() else {
         return (0, None);
     };
-    // A generous limit: `list_upcoming` is ordered, and the count is over a
-    // window far narrower than the fetch, so the cap cannot truncate the answer
-    // unless a household has more than fifty routines due before midnight.
+    // Ordered, so the cap of 50 only truncates past 50 routines due before `until`.
     let Ok(all) = scheduler.list_upcoming(50).await else {
         return (0, None);
     };
@@ -12669,9 +12340,7 @@ async fn suggestion_schedules_before(
 
 #[derive(serde::Deserialize)]
 struct ListSuggestionsQuery {
-    /// Optional, unlike every proposal route. A cold Dashboard has no session
-    /// -- `state.sessionId` starts null and is never persisted -- and requiring
-    /// one would blank the column on exactly the launch it exists to fill.
+    /// Optional: a cold Dashboard has no session (`state.sessionId` starts null, unpersisted).
     session_id: Option<String>,
 }
 
@@ -12701,26 +12370,11 @@ async fn list_suggestions(
     let (day_start, day_end) = place.day_bounds(now);
     let week_start = now - chrono::Duration::days(SUGGESTION_MAIL_WINDOW_DAYS);
 
-    // Every repository below is read at `read_scope` -- the scope identity
-    // resolution produced, NOT a widening of it. `Guest` has the SQL predicate
-    // `AND 1 = 0`, so the read fails closed even if a suggestor forgets to
-    // check its own audience: the engine's check is what produces the honest
-    // silence message, and this is what makes a missing check harmless rather
-    // than a disclosure.
-    //
-    // This used to map every non-Guest caller to `Household`, whose predicate
-    // is empty. That is safe for exactly the case it was written for --
-    // `Household` is only ever resolved on a pond of one, where it IS that
-    // member -- and a disclosure for the case it was not: an identified member
-    // on a pond of two resolves to `Owner(them)`, was widened to `Household`,
-    // and was shown the other member's composed questions, memories, and
-    // calendar and mail counts. `Owner` reads their own rows and the
-    // unattributed ones, which is the whole point of having resolved them.
+    // Read at `read_scope`, never widened to `Household`: `Guest` is SQL `AND 1 = 0`, so a
+    // suggestor that skips its own audience check still discloses nothing.
 
     let repo = context_repo(&state);
-    // One read of the source list, used for both context suggestors.
-    // A `Vec`, not a set: `SourceKind` is not `Ord` and there are eight of them,
-    // so a linear scan of at most eight is cheaper than the trait bound is worth.
+    // A `Vec`, not a set: `SourceKind` isn't `Ord`, and scanning eight is cheap.
     let connected: Vec<SourceKind> = match repo.list_sources(&read_scope).await {
         Ok(sources) => sources
             .iter()
@@ -12733,10 +12387,7 @@ async fn list_suggestions(
         }
     };
 
-    // `None` and `Some(0)` are different answers and the engine phrases them
-    // differently: no account connected, versus a connected account with an
-    // empty day. Collapsing them would lose the one sentence that tells a
-    // household their calendar is working and simply has nothing on it.
+    // `None` (no calendar connected) and `Some(0)` (an empty day) are phrased differently.
     let calendar_events_today = if connected.contains(&SourceKind::Calendar) {
         repo.count_in_window(&read_scope, SourceKind::Calendar, day_start, day_end)
             .await
@@ -12798,33 +12449,8 @@ async fn list_suggestions(
 
     let set = suggestion::suggest(&snapshot);
 
-    // COMPOSED FIRST, TEMPLATES TO FILL.
-    //
-    // The two tiers answer the same question and only one of them is about this
-    // household. `suggestion.rs` picks among seven fixed strings and attaches a
-    // measured count -- correct, free, and identical on every pond that has
-    // mail, memories and devices, which is what a household calls a
-    // placeholder. A composed one is a question written from one of their own
-    // notes.
-    //
-    // So composed rows take the slots and the template tier fills whatever is
-    // left. It is NOT removed: it is what answers on a pond with no model, on
-    // one whose queue has drained, and on the first evening of every install.
-    //
-    // Scope, not audience, does the gating here. `read_scope` is `Guest` for a
-    // shared audience, and the adapter's own predicate then returns nothing --
-    // so a note belonging to a member cannot reach a shared screen even if this
-    // function forgot to check, which is the same belt-and-braces the context
-    // reads above use.
-    //
-    // And only while the household wants composed questions at all. The toggle
-    // tells them "Off, Home still suggests -- but only the same general
-    // questions every day", and switching it off has to mean that at once. It
-    // used to stop only NEW composition: every question already queued -- each
-    // built from somebody's own note -- stayed on Home until tapped, which is
-    // precisely the screen a household turns this off to keep their notes off.
-    // The rows are left in the queue rather than discarded, so switching back
-    // on restores them instead of waiting a night for a pass to rebuild them.
+    // Composed questions take the slots and templates fill the rest (a pond with no model, a
+    // drained queue, a first evening). Hidden at once when the toggle is off, but kept queued.
     let composed = if settings.suggestion_generation_enabled {
         state
             .suggestion_queue
@@ -12842,16 +12468,12 @@ async fn list_suggestions(
         .iter()
         .map(|c| {
             json!({
-                // The queue row's id, so tapping it can settle the row. A
-                // composed suggestion is a thing that exists, unlike a template
-                // one, which is recomputed on every read.
+                // The queue row's id, so a tap can settle it.
                 "id": c.id,
                 "prompt": c.prompt,
                 "because": c.reason,
                 "answered_by": "giap-memory",
-                // What lets the client tell them apart -- and it has to, because
-                // only one of the two is worth telling the pond about when it
-                // is tapped.
+                // Only composed ones are reported back when tapped.
                 "composed": true,
             })
         })
@@ -12873,10 +12495,7 @@ async fn list_suggestions(
 
     Json(json!({
         "suggestions": offered,
-        // Every suggestor that ran, and why each silent one was silent. Without
-        // this, a quiet house and a broken engine are the same empty array --
-        // which is the state the proposal column has been in since it shipped,
-        // and the reason nobody noticed.
+        // Why each silent suggestor was silent: tells a quiet house from a broken engine.
         "considered": set.considered,
         "audience": set_audience_label(audience),
     }))
@@ -12884,18 +12503,7 @@ async fn list_suggestions(
 }
 
 /// `POST /api/v1/suggestions/{id}/taken` — the household tapped a composed one.
-///
-/// Only composed suggestions have an id that means anything: a template one is
-/// recomputed on every read, so there is no row to settle and the client does
-/// not call this for them.
-///
-/// **Without this the queue never drains**, and a household would read the same
-/// three composed questions forever — which is the complaint the whole surface
-/// was built from, reproduced one tier up.
-///
-/// `false` for "no queued suggestion by that id" is a real answer and a 200,
-/// not a 404: a double tap on a touch panel is a household being quick, and the
-/// second tap must not look like a failure to them.
+/// Settling drains the queue. An unknown id is 200 `false`, not 404: double taps happen.
 async fn suggestion_taken(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -12924,19 +12532,15 @@ fn set_audience_label(a: pond_core::user_data::services::suggestion::Audience) -
     }
 }
 
-/// The reminder store, built from the pool `AppState` already holds -- same
-/// story as [`proposal_repo`], and the same one-line swap when it moves onto
-/// `AppState` proper.
+// ── Reminders ────────────────────────────────────────────────────────────────
+// No member gate, unlike `/proposals`: reads are narrowed to the caller's scope instead.
+
+/// The reminder store, built from `AppState`'s pool like [`proposal_repo`].
 fn reminder_repo(state: &Arc<AppState>) -> pond_infra::sqlite_reminder::SqliteReminderRepository {
     pond_infra::sqlite_reminder::SqliteReminderRepository::new(state.db.system.clone())
 }
 
-/// The wire shape of a reminder.
-///
-/// Built field by field rather than by serialising the domain type, so the JSON
-/// is a decision. `when_said` goes out as the words it is -- there is no
-/// `due_at` here because there is no `due_at` column, and inventing one at the
-/// edge would be the guess the whole design refuses.
+/// A reminder's wire shape, field by field; `when_said` stays words, never a parsed `due_at`.
 fn reminder_json(r: &pond_core::user_data::domain::reminder::CapturedReminder) -> Value {
     json!({
         "id": r.id,
@@ -12944,30 +12548,23 @@ fn reminder_json(r: &pond_core::user_data::domain::reminder::CapturedReminder) -
         "when_said": r.when_said,
         "subject": r.subject,
         "profile_id": r.profile_id,
-        // Both stamps, because they answer different questions and differ by the
-        // whole length of a backlog walk: when it was said, and when the pond
-        // got to it.
+        // Said vs captured: they differ by as much as a whole backlog walk.
         "said_at": r.said_at.to_rfc3339(),
         "captured_at": r.captured_at.to_rfc3339(),
         "disposition": r.disposition.as_str(),
-        // Provenance. `session_id` may name a conversation that has since been
-        // deleted -- the table has no foreign key on it on purpose -- so a client
-        // must treat this as a label, not a link it can always follow.
+        // A label, not a reliable link: no FK, so the session may have been deleted.
         "session_id": r.session_id,
         "window_id": r.window_id,
     })
 }
 
-/// How many to return. Bounded rather than unbounded for the ordinary reason:
-/// a first backlog walk over a year of history can file a lot of these.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListRemindersQuery {
+    /// Page size; capped, since a first backlog walk over a year can file a lot of these.
     #[serde(default)]
     limit: Option<usize>,
-    /// Optional, for the same reason as on `/suggestions`: a cold client has
-    /// no session. Absent means the caller is resolved from their device alone
-    /// -- which on a pond of two, with no device, is `Guest`, and reads nothing.
+    /// Optional, as on `/suggestions`; absent, the caller resolves from their device alone.
     #[serde(default)]
     session_id: Option<String>,
 }
@@ -12979,18 +12576,10 @@ struct DismissReminderQuery {
     session_id: Option<String>,
 }
 
-/// The largest page this route will answer with, and what it answers without a
-/// `limit`.
 const REMINDERS_PAGE_MAX: usize = 500;
 const REMINDERS_PAGE_DEFAULT: usize = 100;
 
-/// `GET /api/v1/reminders` -- the dates the pond is holding and nothing has
-/// acted on, most recently SAID first.
-///
-/// Pending only, because that is the question: what is still live. The port has
-/// no "list everything" read and this route does not want one -- a dismissed
-/// reminder is a decision the household already made, and showing it back would
-/// be asking again.
+/// `GET /api/v1/reminders` -- pending reminders only, most recently said first.
 async fn list_reminders(
     State(state): State<Arc<AppState>>,
     principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
@@ -12998,10 +12587,7 @@ async fn list_reminders(
 ) -> impl axum::response::IntoResponse {
     use pond_core::user_data::ports::reminder_repository::ReminderRepository;
 
-    // Read at the caller's own scope, resolved without writing anything back.
-    // A reminder carries its member's `profile_id` -- the batch engine stamps
-    // it -- so an unscoped read handed one member's dated reminders ("the
-    // clinic on the 14th") to anybody who asked, a guest's phone included.
+    // Scoped: rows carry their member's `profile_id`, so an unscoped read would leak them.
     let principal_ref = principal.as_ref().map(|axum::Extension(p)| p);
     let scope = read_only_caller_scope(&state, principal_ref, query.session_id.as_deref()).await;
 
@@ -13013,8 +12599,7 @@ async fn list_reminders(
     match reminder_repo(&state).list_pending(&scope, limit).await {
         Ok(reminders) => Json(json!({
             "reminders": reminders.iter().map(reminder_json).collect::<Vec<_>>(),
-            // What was asked for, so a client that got exactly `limit` rows
-            // knows there may be more rather than guessing.
+            // Echoed so a client with exactly `limit` rows knows there may be more.
             "limit": limit,
         }))
         .into_response(),
@@ -13029,22 +12614,8 @@ async fn list_reminders(
     }
 }
 
-/// `POST /api/v1/reminders/{id}/dismiss` -- somebody said no.
-///
-/// The only disposition this edge may write. `proposed` belongs to the
-/// promotion run and `expired` to 0057's profile-delete trigger; both are the
-/// pond saying what happened, and neither is a thing a person does. Dismissing
-/// is.
-///
-/// Nothing expires a reminder for being old. There is no time-based sweep in
-/// this pond, so a reminder whose day has passed stays `pending` and stays
-/// listed until somebody dismisses it -- which makes dismissal the only way one
-/// ever leaves the list. This said "and to time" before, and meant a path that
-/// was never built.
-///
-/// 404 when nothing moved -- an unknown id, or one already decided. The store
-/// answers that rather than this handler guessing, because a check followed by a
-/// write would let two callers disagree about which decision stuck.
+/// `POST /api/v1/reminders/{id}/dismiss` -- the only way a reminder leaves the list.
+/// 404 when nothing moved; the store decides that atomically, never check-then-write.
 async fn dismiss_reminder(
     State(state): State<Arc<AppState>>,
     principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
@@ -13054,9 +12625,7 @@ async fn dismiss_reminder(
     use pond_core::user_data::domain::reminder::ReminderDisposition;
     use pond_core::user_data::ports::reminder_repository::ReminderRepository;
 
-    // Scoped like the read. A reminder outside the caller's scope answers 404,
-    // exactly as one that does not exist, so a caller learns nothing about a
-    // reminder it may not touch -- and cannot delete somebody else's date.
+    // Scoped like the read: out of scope is a 404, indistinguishable from a missing id.
     let principal_ref = principal.as_ref().map(|axum::Extension(p)| p);
     let scope = read_only_caller_scope(&state, principal_ref, query.session_id.as_deref()).await;
 
@@ -15039,89 +14608,11 @@ async fn delete_user_biometrics(
     })))
 }
 
-// ── Proactive proposals (PAI-7 P3b) ──────────────────────────────────────────
-//
-// P3a landed the `Proposal` domain, `ProposalRepository`, `SqliteProposalRepository`
-// and migrations 0041/0042, and said in its own stamp that NOTHING constructed
-// any of it. This is the surface that lets a person see and dispose of one.
-//
-// # Reusing the drafts machinery is the design decision, not an implementation
-// # shortcut
-//
-// A proposal IS a `drafts` row (`origin = 'proactive'`), so disposing of one is
-// `DraftRepository::update_status` and the ownership question is
-// `is_draft_decision_permitted` -- the same function `giap-draft`'s
-// `DraftMcpServer::decide` asks. That means a proactive suggestion inherits an
-// approval flow that already exists rather than growing a second one, and a
-// later change to the ownership rule reaches both callers.
-//
-// **Approving does not execute anything.** It moves the row to `approved`,
-// exactly as `DraftMcpServer::apply` does. Invariant 1 is "GIAP proposes; the
-// user disposes", and the executor is PAI-7 P4's business.
-//
-// # Why the decide route reads the PROPOSAL repository and not the draft one
-//
-// `DraftRepository::get` would answer for any draft id, and this route would
-// then be a second way to decide a user-staged draft -- one that skips the
-// policy tally and the audit entry `DraftMcpServer::decide` records, which is
-// the telemetry PAI-2 P8b's enforce flip is waiting on. `get_live` answers only
-// for a row that is proactive, pending and unexpired, so an id that is anything
-// else is a 404 here and stays the MCP path's business.
-//
-// The cost of that is real and deliberate: rejecting an EXPIRED proposal is not
-// possible at this edge, though section 3.5 wants rejections as feedback. The
-// MCP path still allows it (`decide` gates only approval on liveness). Rather
-// than widen this route to every draft to get it, the honest fix is a
-// `ProposalRepository` read that returns a decided-or-expired proposal, which
-// belongs with the phase that builds the feedback loop.
-/// The caller of a proposal route, as one member.
-///
-/// Invariants 4 and 5 at the HTTP edge, answered by the domain's own door
-/// rather than by a check written here. [`ProposalAudience::from_scope`] admits
-/// `Owner(id)` and refuses the other two, for opposite reasons that both land
-/// on "not one member": `Guest` generates and receives nothing, and `Household`
-/// is not a weaker address than `Owner` — it *is* the broadcast.
-///
-/// **The cliff this used to describe is gone, and the paragraph that argued for
-/// it is kept below because the argument was half right.**
-///
-/// It said: a draft can be unowned and a proposal never is, so "to LIST one I
-/// would have to pick a member, and picking is the fallback PAI-1 P3 refused."
-/// That holds for a household of two or more, where picking would address
-/// somebody's suggestion by row order. It does not hold for a household of
-/// **one**, where there is no picking to do -- the set of candidates has one
-/// element and choosing from it is not a choice. So `Household` now falls
-/// through to [`member_attribution::sole_member`], and two or more members
-/// still refuse, which is exactly where the original reasoning survives.
-///
-/// This is the same call `881da889` made for connecting a context source, in
-/// the same file, four hundred lines below -- `context_source_owner` has the
-/// identical shape. Its commit message is the argument: connecting a calendar
-/// "required first starting a conversation AND being on an attributed device,
-/// to establish something a one-member pond has exactly one possible answer
-/// to." Reading a proposal required the same thing, for the same non-reason,
-/// and the consequence was measurable: `select count(*) from drafts where
-/// origin='proactive'` is 0 on a pond that has had `proactive_review_enabled`
-/// switched on, because the column that would have shown them answered 403.
-///
-/// The write path was already there. `is_draft_decision_permitted` admits
-/// `Household` for an owned draft under the comment "Single-member pond: there
-/// is no other member to protect from", pinned by
-/// `household_decides_anything_because_a_household_pond_has_one_member`. So
-/// until now the READ refused what the WRITE permitted -- the exact inversion
-/// this function's last sentence says it exists to prevent.
-///
-/// **`session_id` stays required.** Making it optional is a separate and
-/// riskier change: `is_draft_decision_permitted`'s first rung refuses a blank
-/// actor session outright, so an optional session would 403 every decide after
-/// letting the list through. A cold Dashboard reaches this surface once it has
-/// a session, and `GET /api/v1/suggestions` -- which needs none -- is what
-/// fills the column before then.
-/// The one 403 both refusal paths in [`proposal_caller`] return.
-///
-/// A free function so the two arms cannot drift into saying different things
-/// about the same refusal -- which is how a caller ends up debugging two
-/// distinct-looking errors that mean one thing.
+// ── Proactive proposals ──────────────────────────────────────────────────────
+// Proposals are `drafts` rows (`origin = 'proactive'`) sharing their ownership rule; approving
+// executes nothing. Decide reads via `get_live` so user-staged drafts keep the audited MCP path.
+
+/// The one 403 both refusal paths in [`proposal_caller`] return, so they can't drift apart.
 fn proposal_caller_refusal(session_id: &str, reason: &str) -> (StatusCode, Json<Value>) {
     tracing::info!(
         target: "giap::trace",
@@ -15140,6 +14631,8 @@ fn proposal_caller_refusal(session_id: &str, reason: &str) -> (StatusCode, Json<
     )
 }
 
+/// The caller as exactly one member: `Household` only on a one-member pond, never `Guest`.
+/// `session_id` stays required: a blank actor session fails `is_draft_decision_permitted`.
 async fn proposal_caller(
     state: &Arc<AppState>,
     session_id: &str,
@@ -15148,10 +14641,7 @@ async fn proposal_caller(
     let scope = resolve_turn_scope(state, session_id, device).await;
     match ProposalAudience::from_scope(&scope) {
         Ok(audience) => Ok((scope, audience)),
-        // `Household` only, and only when the household really is one person.
-        // `Guest` is NOT admitted here and must not be: `identity_resolution`
-        // answers `Guest` exactly when the pond has more than one member, so a
-        // guest fallthrough would be the row-order pick PAI-1 P3 refused.
+        // Never `Guest`: that means 2+ members, so a fallthrough would pick one by row order.
         Err(_) if matches!(scope, ProfileScope::Household) => {
             let members: Vec<String> = state
                 .profile_repo
@@ -15380,32 +14870,8 @@ async fn resolve_turn_scope(
                 profile_id = %profile_id,
                 "the paired device this turn arrived on belongs to a household member"
             );
-            // Write it back onto the session, because a background job cannot
-            // reconstruct it.
-            //
-            // This rung is a property of the REQUEST -- a bearer token from a
-            // paired device -- and until now it was used for the turn and then
-            // thrown away: only the face and pairing routes ever persisted an
-            // identity. That was harmless while extraction happened inside the
-            // turn that resolved it. It is not harmless now: batch extraction
-            // has no request, reads `SessionIdentity` to decide whose
-            // conversation a window is, and on a multi-member pond a window it
-            // cannot attribute is deliberately never mined at all. Without this
-            // line an identified member's chats would be the ones the pond
-            // refuses to remember.
-            //
-            // A CLAIM, not `_if_stronger`: it binds an unattributed session or
-            // strengthens this member's own binding, and never moves a session
-            // to a different member. This function also resolves scope for
-            // read routes -- GET /proposals, the context routes -- that take a
-            // session id straight from the query string, so under strength
-            // alone (and `PairedDevice` is the strongest source there is) Liz's
-            // phone merely LOOKING at Jerry's conversation would have taken it.
-            // Jerry's next turn at the kiosk would then be answered with Liz's
-            // context, and the batch extractor would file his words as her
-            // memories. The comparison is inside the write, so a face match
-            // landing a millisecond later still cannot downgrade the binding.
-            // A refusal is a normal outcome and is not logged as a failure.
+            // Persist it: batch extraction has no request to read it from. As a claim, not by
+            // strength: read routes resolve here too, so a viewer must never take the session.
             let proposed = SessionIdentity {
                 profile_id: Some(profile_id.clone()),
                 source: IdentificationSource::PairedDevice,
@@ -17627,7 +17093,7 @@ mod tests {
         }
     }
 
-    // ── picture support before a turn is persisted (design_v2 F) ────────
+    // ── picture support before a turn is persisted ──────────────────────
     mod vision_gate {
         use super::*;
         use pond_core::models::domain::vision_encoder::{

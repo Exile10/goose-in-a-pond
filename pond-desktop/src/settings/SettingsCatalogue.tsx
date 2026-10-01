@@ -57,9 +57,7 @@ function Mark({ consumer }: { consumer: Consumer }) {
 /** Terse retitle summary that tells "nothing needed doing" from "nothing was allowed" (all hand-named). */
 export function summariseRetitle(r: RetitleResult): string {
   if (r.started) return "Renaming — names appear as it goes";
-  // A pond with no titling loop is not a broken pond, and saying so is the
-  // distinction this line exists for: the person must be able to tell "nothing
-  // here does this" from "it did not work".
+  // No titling loop is not a failure, so don't say "it did not work".
   return r.reason ?? "Nothing here to run";
 }
 
@@ -139,17 +137,10 @@ const NULLABLE_TEXT = new Set([
   "voice_kws_whisper_url",
 ]);
 
-/** Inverse of `textValue`. Returns the shape the server expects for this key. */
-/**
- * Text boxes whose server value is a LIST: typed comma-separated, sent as an
- * array. Named once, because a list field missing from here is sent as the raw
- * string -- `suggestions_muted` was, and the server's `Vec<String>` refused it
- * with a 422 that took every other edit in the same Save down with it. Merely
- * typing a character and deleting it marked the page dirty (`""` is not `[]`)
- * with a change it could never save.
- */
+/** List-valued text boxes, typed comma-separated; one left out is sent raw and 422s the whole Save. */
 const LIST_TEXT = new Set(["voice_wake_word_transcriptions", "suggestions_muted"]);
 
+/** Inverse of `textValue`. Returns the shape the server expects for this key. */
 export function parseText(key: string, raw: string): unknown {
   if (LIST_TEXT.has(key)) {
     return raw
@@ -403,9 +394,7 @@ function EntryRow({
                 min={control.min}
                 max={control.max}
                 value={value == null ? "" : String(value)}
-                // Emptying a number box means "unset", which is not 0 — sending
-                // 0 for a blank latitude would move the home to the Gulf of
-                // Guinea without anyone asking for it.
+                // Emptied means unset, not 0 (a blank latitude must not become 0°).
                 onChange={(e) =>
                   onChange(
                     entry.key,
@@ -580,13 +569,7 @@ export function SettingsCatalogueView({
     setSettings((prev) => ({ ...prev, [key]: value }));
   }, []);
 
-  /**
-   * The banner and the search box both start folded on a short screen.
-   *
-   * A 7-inch panel is 1024x600. The banner is ~180px and the masthead another
-   * ~90, so unfolded they take nearly half the height before a single setting
-   * is visible. On a desktop there is room for both, so nothing folds.
-   */
+  /** Fold the banner and search on short screens: on a 1024x600 panel they'd take half the height. */
   const short =
     typeof window !== "undefined" &&
     window.matchMedia?.("(max-height: 720px)").matches === true;
@@ -642,11 +625,7 @@ export function SettingsCatalogueView({
     setSaveError(null);
     try {
       const updated = await api.updateSettings(body);
-      // Fold against the patch we SENT, not the pre-save baseline — the rule
-      // the classic Settings panel follows. The server can answer with a value
-      // it derived rather than the one we sent (geocoding rewrites the
-      // coordinates), and that echo has to be adopted or every later save
-      // re-sends a stale value forever.
+      // Fold against what was sent: the server may echo derived values (geocoded coordinates) to adopt.
       setSettings((prev) =>
         foldServerState(prev, { ...baseline, ...body }, updated),
       );
@@ -1198,10 +1177,7 @@ export function SettingsCatalogueView({
                           error={errors[e.key] ?? null}
                           options={
                             e.control.kind === "lookup"
-                              ? // Zones do not wait on the model registry: they come
-                                // from a different call, and gating them on `models`
-                                // would leave the zone picker as a text box on any
-                                // pond with no models installed.
+                              ? // Zones come from their own call, so they must not wait on `models`.
                                 e.control.source === "time-zones"
                                 ? zones.length
                                   ? optionsFor(e.control.source, [], zones)

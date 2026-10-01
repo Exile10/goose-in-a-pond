@@ -60,13 +60,8 @@ const GOOSE_MAX_TURNS_MESSAGE: &str = "I've reached the maximum number of action
 const GOOSE_EMPTY_TURN_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
 
-/// How goose's agent loop opens the assistant text it writes in place of a provider error
-/// (`agents/agent.rs`, the generic `Err(ref provider_err)` arm).
-///
-/// Used only to pick WHICH text to replace, never to decide that a picture failed: that comes
-/// typed, from the provider shim's count of engine refusals on image-bearing requests. For a
-/// picture the engine's own sentence sends the household to "Settings > Local Inference", a
-/// screen GIAP does not have. Canary: `goose_still_prefixes_a_provider_error_the_same_way`.
+/// How goose's agent loop opens the text it writes in place of a provider error.
+/// Only picks which text to replace; a picture failure comes typed from the provider shim.
 const GOOSE_PROVIDER_ERROR_PREFIX: &str = "Ran into this error: ";
 
 /// Verbatim prefix of goose's notification each time its completeness check re-arms.
@@ -155,16 +150,7 @@ const EMPTY_TURN_EXHAUSTED_MESSAGE: &str =
     "I could not produce a response to that, even after retrying. \
 This usually clears if you reword the question — or start a new chat if it keeps happening.";
 
-/// Goose environment knobs GIAP owns, as `(key, Some(value) | None)` where
-/// `None` means "unset this key".
-///
-/// Split out as a pure function for two reasons: it is the decision table worth
-/// unit-testing, and its result doubles as the change signature that stops
-/// `set_var` from firing on every turn (`set_var` is documented-unsound in a
-/// multi-threaded process, so it runs only when something actually changed).
-/// The goose env knobs GIAP sets. `hybrid_compaction` used to be a parameter;
-/// since C1/C2 it governs none of them, so taking it would be a lie the
-/// signature tells.
+/// Goose env knobs GIAP owns (`None` = unset); also the change signature gating `set_var`.
 fn goose_env_knobs(provider: &str, effective_ctx: usize) -> [(&'static str, Option<String>); 6] {
     let local = matches!(provider, "local" | "gguf");
     [
@@ -182,17 +168,7 @@ fn goose_env_knobs(provider: &str, effective_ctx: usize) -> [(&'static str, Opti
             "GOOSE_MAX_TOOL_RESPONSE_SIZE",
             local.then(|| ((effective_ctx / 4) * 4).to_string()),
         ),
-        // Goose's `<turn-context>` is duplicate information on this host: the
-        // envelope already carries the time, the turn budget and the memories,
-        // the working directory means nothing to a household assistant, and no
-        // extension contributes to the block. It is also injected on a clone
-        // the engine never sees stored, so a prefix cache re-prefilled it plus
-        // whatever followed it on every provider call. Measured 2026-09-24 on
-        // the Mac (E2B, release): the completeness-check inference redid 471
-        // tokens with the block prepended, 130-161 appended, 58 with it off;
-        // a no-tool turn prefilled a quarter fewer tokens. Local providers
-        // only, where every token is prefilled on the pond's own GPU; an HTTP
-        // provider keeps goose's default. Fork `d4157795d` reads this.
+        // Goose's `<turn-context>` repeats the envelope and defeats the prefix cache; local only.
         ("GOOSE_DISABLE_MOIM", local.then(|| "1".to_string())),
     ]
 }
@@ -280,12 +256,9 @@ pub struct GooseAdapter {
     session_permitted_groups: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
     /// Group-description embeddings. No `Option` inside: a failed first try must not stick.
     group_embeddings: tokio::sync::OnceCell<Vec<(String, Vec<f32>)>>,
-    /// Picture support for the in-process engine: the ONE status map, in-flight set and
-    /// backoff behind the provider-build stamp, the chat-stream backstop, `vision_state` and
-    /// `prepare_model`. Shared with the tasks it spawns, hence the `Arc`.
+    /// In-process picture support: the one state every vision path shares.
     pictures: Arc<crate::vision_encoder::PictureSupport>,
-    // Speculative decoding was taken out of the llama.cpp engine on 2026-09-24 (goose 743649d98),
-    // so this is commented out rather than deleted; restore it if it returns.
+    // Speculation left the engine; kept commented out in case it returns.
     // /// Which speculation-switch position the engine's loaded slot reflects. See
     // /// `mtp_drafter::SpeculationLedger`; shared with the turn's stream, which reports cold
     // /// loads back into it.
@@ -419,14 +392,8 @@ impl GooseAdapter {
         })
     }
 
-    /// Opt this process in to provisioning companion files: hashing, repairing and fetching the
-    /// vision encoder, and fetching the drafter when the speculation switch turns on without it.
-    ///
-    /// The serve process only. The voice child, `pond chat` and `pond agent` build adapters on
-    /// the same data directory; they validate and stamp what is on disk, and report the rest as
-    /// absent or verifying, because a short-lived process that starts a gigabyte transfer, or
-    /// renames a file a sibling is reading, helps nobody. Takes the `Arc` so background work can
-    /// reach this adapter's own warm-up later without keeping it alive.
+    /// Lets this process fetch and repair the vision encoder. Serve process only: short-lived
+    /// processes on the same data directory must not start downloads or rename files in use.
     pub fn enable_model_provisioning(self: &Arc<Self>) {
         self.pictures.enable_provisioning();
         // let _ = self.self_handle.set(Arc::downgrade(self));
@@ -1168,23 +1135,9 @@ impl GooseAdapter {
         }
     }
 
-    /// Whether the ACTIVE model can accept image content, provider by provider.
-    ///
-    /// For the in-process engine this is pond-core's device-aware declaration:
-    /// the model has a pinned encoder, and on a budgeted device (the Orin) the
-    /// encoder fits beside it and has been measured there. HTTP providers have
-    /// no encoder to ask about, so they get `ModelCapabilities::name_implies_vision`,
-    /// which recognises the vision models an Ollama install actually serves. The
-    /// mesh wire carries text only, and a mistral.rs server has never been
-    /// checked with a picture: both would drop one silently while the prompt
-    /// told the model it could see, so neither claims vision.
-    ///
-    /// DECLARED, not downloaded. The encoder is ~941 MB and lands in the
-    /// background, so "the bytes exist" flips mid-session; this does not. Two
-    /// things depend on that stability: `ModelCapabilities.vision`, and the
-    /// `<vision>` section of the system prompt, which sits inside the KV-cached
-    /// static prefix. A turn that actually needs the encoder before it is ready
-    /// is refused up front in `chat_stream`, with the household's own copy.
+    /// Whether the active model DECLARES vision, regardless of whether its encoder has downloaded.
+    /// Must not flip mid-session: the `<vision>` prompt section sits in the KV-cached prefix.
+    /// Mesh and mistral.rs never claim it: both would drop a picture silently.
     fn model_supports_vision(
         provider: &str,
         model: &str,
@@ -1199,13 +1152,7 @@ impl GooseAdapter {
         }
     }
 
-    /// Where picture support stands for `model` under `provider`, as a pure read. The body of
-    /// `AgentPort::vision_state`, over its inputs.
-    ///
-    /// In-process: the encoder's state, or `None` (unknown, callers fail open) without a data
-    /// directory to look in. Mesh and mistral.rs: not declared, which the API refuses as
-    /// unsupported. Anything else carries its own pictures, so it is ready exactly when the
-    /// model is declared to see.
+    /// Pure body of `AgentPort::vision_state`; `None` means unknown and callers fail open.
     fn vision_state_for(
         pictures: &crate::vision_encoder::PictureSupport,
         data_dir: Option<&std::path::Path>,
@@ -1222,21 +1169,8 @@ impl GooseAdapter {
         }
     }
 
-    /// Whether THIS turn's system prompt should carry the `<vision>` section.
-    ///
-    /// Model capability is necessary but not sufficient: `capabilities()`
-    /// reports `vision = false` in voice mode, and a prompt that asserts a
-    /// capability the adapter simultaneously denies is a contradiction the model
-    /// pays for. Voice turns are transcribed speech with no attachment path, so
-    /// the section is pure prompt cost there — the same trade `thinking` already
-    /// makes in voice mode.
-    ///
-    /// `voice` is the INSTANCE-level flag (CLI `--voice`), not the
-    /// per-request one, for two reasons. It is the only signal `capabilities()`
-    /// can see, so keying off it is what makes the two agree on every input. And
-    /// it is fixed for the life of the process, so it cannot flip the static
-    /// prefix between turns of one session and forfeit the KV cache — which a
-    /// per-request flag, alternating text and voice turns, would.
+    /// Whether this turn's prompt carries `<vision>`. `voice` is the INSTANCE flag: it matches
+    /// `capabilities()` and, fixed per process, can't flip the KV-cached prefix between turns.
     fn vision_section_applies(
         provider: &str,
         model: &str,
@@ -1517,9 +1451,7 @@ impl GooseAdapter {
                     {
                         self.pictures.spawn_ensure(dd, &settings.chat_model);
                     }
-                    // Speculative decoding was taken out of the llama.cpp engine on 2026-09-24
-                    // (goose 743649d98), so this is commented out rather than deleted; restore it
-                    // if it returns.
+                    // Speculation left the engine; kept commented out in case it returns.
                     // // Speculative decoding's drafter, for the same reason and on
                     // // the same terms as the encoder above: the engine resolves it
                     // // by name through the registry, so a drafter file with no row
@@ -2264,9 +2196,7 @@ impl GooseAdapter {
         stem
     }
 
-    /// The file a registry row names, resolved through symlinks: the GGUF the engine loads for
-    /// that id, and so the one every other row naming the same file shares a slot with. The
-    /// guard is dropped before this returns.
+    /// The resolved GGUF a registry row names; the registry guard is dropped before returning.
     fn registry_row_path(&self, registry_key: &str) -> Option<PathBuf> {
         use goose::providers::local_inference::local_model_registry::get_registry;
         let path = get_registry()
@@ -2277,8 +2207,7 @@ impl GooseAdapter {
         Some(crate::registry_rows::resolve(&path))
     }
 
-    // Speculative decoding was taken out of the llama.cpp engine on 2026-09-24 (goose 743649d98),
-    // so this is commented out rather than deleted; restore it if it returns.
+    // Speculation left the engine; kept commented out in case it returns.
     // /// Apply the speculation switch to the loaded model before a local turn streams.
     // ///
     // /// Compares (canonical key, switch as THIS turn's settings row has it, drafter on disk)
@@ -2438,15 +2367,7 @@ impl GooseAdapter {
         let session_id = request.session_id.clone();
         let model_role = request.model_role.clone();
 
-        // Phase F1: fail an image turn EARLY and specifically.
-        //
-        // Without this the engine silently rewrites each image part into
-        // "[Image attached - image input is not supported with the currently
-        // selected model]" and the model answers as if it had looked, which is
-        // the worst possible outcome. This is the backstop: the API refuses the
-        // same turns before anything is persisted, with the same pond-core copy,
-        // and this catches every other caller. It covers every provider, since
-        // the mesh wire and a model that cannot see drop pictures too.
+        // API backstop: the engine would swap images for a note and the model would bluff.
         if !request.images.is_empty() {
             use pond_core::models::domain::vision_encoder::{
                 encoder_for, refusal_for, RefusalCode,
@@ -2740,8 +2661,7 @@ impl GooseAdapter {
             }
         }
 
-        // The appendix is published further down, once the dormant tool-groups
-        // note exists to ride it.
+        // The appendix is published below, once the dormant tool-groups note exists.
 
         // ── Token-budgeted memory injection ──────────────────────────────
         // Memories ride the user message's <system-context> to keep the prefix KV-stable.
@@ -2831,8 +2751,7 @@ impl GooseAdapter {
             );
         }
 
-        // Speculative decoding was taken out of the llama.cpp engine on 2026-09-24 (goose
-        // 743649d98), so this is commented out rather than deleted; restore it if it returns.
+        // Speculation left the engine; kept commented out in case it returns.
         // // ── 5a. The speculation switch ────────────────────────────────────────
         // // After the provider is current (so the canonical key is known) and before
         // // this turn streams, so the load it may trigger resolves the new rows.
@@ -3016,33 +2935,7 @@ impl GooseAdapter {
             allowed_tools
         };
 
-        // ── 6d. PAI-1 P5, enforced in BOTH selection modes ───────────────────
-        //
-        // The group-level subtraction lives inside `resolve_session_tool_groups`,
-        // which is only reached from the `tool_selection_narrows()` branch
-        // above. `default_tool_selection_mode()` is "all", so on a DEFAULT
-        // install that branch never runs and this set went to the model
-        // untouched -- a Guest kept `giap-memory` and could recall, search or
-        // `forget_memory` the entire household. P5 was recorded as landed while
-        // being inert on every default pond.
-        //
-        // This set is what gets published to the shim, so it is the only place
-        // every mode converges. Subtracting here is idempotent with the
-        // group-level pass, which stays because it is what bounds
-        // `enable_tool_group` and what the dormant-groups note is built from.
-        //
-        // The sentence that used to end this paragraph said the group pass "keeps
-        // withheld groups out of the dormant-groups note". It did the opposite:
-        // the note was built from `registered_extensions()`, so every withheld
-        // group appeared on it. `permitted_groups` is what makes the claim true.
-        // D2, moved off the per-turn envelope on 2026-09-24. What the model
-        // could load but cannot see rides the system appendix now. It is
-        // session-scoped and changes only when a group is enabled -- the moment
-        // the tools block changes anyway -- so it never moves the prefix on its
-        // own, and in "minimal" mode every session starts with the same dormant
-        // set, so the boot-time warm-up covers it for all of them. In the
-        // envelope it was ~150 tokens re-prefilled on every turn; here it is
-        // prefilled once per session.
+        // Appendix, not envelope: it only changes with the tools block, so it's prefilled once.
         if !dormant_groups_note.is_empty() {
             shim_appendix.push(dormant_groups_note.clone());
         }
@@ -3054,6 +2947,9 @@ impl GooseAdapter {
                 Some(shim_appendix.join("\n\n"))
             });
 
+        // ── 6d. Guest tool subtraction, in BOTH selection modes ──────────────
+        // The group-level pass only runs when narrowing (not the default "all"); this set is
+        // what the shim gets, so every mode must subtract here.
         let allowed_tools = if turn_scope.excludes_everything() {
             let before = allowed_tools.len();
             let kept: HashSet<String> =
@@ -3119,9 +3015,7 @@ impl GooseAdapter {
         let session_controls = self.shim_controls.session(&goose_sid);
         session_controls.set_allowed_tools(allowed_tools.clone());
 
-        // CR-9 and CR-2. Whether a picture a TOOL returns may be shown to the model, and which
-        // encoder to hold at could-not-start if the engine refuses this turn's picture. Only
-        // the in-process engine needs either: every other provider carries its own pictures.
+        // In-process only: gates tool-returned pictures and names the encoder a refusal marks.
         let local_picture_spec = if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
             let state = Self::vision_state_for(
                 &self.pictures,
@@ -3176,9 +3070,6 @@ impl GooseAdapter {
                 msg.push_str(&memory_block_for_user_msg);
                 msg.push_str("\n</memories>\n");
             }
-            // The dormant tool-groups note used to ride here; it is in the
-            // system appendix now (see where `set_turn_appendix` is called),
-            // so it is prefilled once per session instead of once per turn.
             msg.push_str(&turn_budget_block);
             msg.push('\n');
             // Last, nearest where the model writes: restates the part of the prefix that decays.
@@ -3279,7 +3170,6 @@ impl GooseAdapter {
             // ── Repetition guard ─────────────────────────────────────────────
             // Outside `'attempts`: re-engaging is the same question, so no fresh budget.
             let mut goal_rechecks: u32 = 0;
-            // Whether this turn already reported the engine refusing its picture.
             let mut picture_failure_reported = false;
             let mut tool_call_counts: HashMap<(String, u64), usize> = HashMap::new();
             let mut guard_tripped = false;
@@ -3578,12 +3468,8 @@ impl GooseAdapter {
                                 // Raw: the SSE ThoughtFilter strips think tags across chunks, and a
                                 // per-chunk strip here would eat close tags it is waiting for.
                                 let raw_text = msg.as_concat_text();
-                                // CR-2. The engine refused this turn's picture (the shim
-                                // counted it, typed) and goose wrote its own prose for it,
-                                // which names a settings screen GIAP does not have. The
-                                // household gets pond-core's line instead, and the encoder is
-                                // held at could-not-start so the next picture is refused
-                                // honestly rather than failing the same way.
+                                // Refused picture: goose's prose names a screen GIAP lacks, so
+                                // use pond-core's line and hold the encoder at could-not-start.
                                 let raw_text = match local_picture_spec {
                                     Some(spec)
                                         if guard_controls.image_failures() > image_failures_at_start
@@ -3788,7 +3674,7 @@ impl GooseAdapter {
             // `attempt` already counts attempts beyond the first (0 on an ordinary turn).
             turn_stats.reengagements = attempt as u32;
 
-            // CR-2, the other way goose can surface the refusal: as an error, not prose.
+            // The refusal surfaced as an error rather than prose.
             if !picture_failure_reported
                 && guard_controls.image_failures() > image_failures_at_start
             {
@@ -3853,8 +3739,7 @@ impl AgentPort for GooseAdapter {
         voice_mode: bool,
         progress: std::sync::Arc<dyn Fn(WarmupPhase) + Send + Sync>,
     ) {
-        // Held for the whole warm-up, every exit included: a budgeted device's companion
-        // worker waits on it before it moves or hashes a gigabyte under a -ngl 99 cold load.
+        // Held through every exit: companion workers wait on it before moving gigabytes mid-load.
         let _warming = self.pictures.warmup().begin();
         if std::env::var("POND_DISABLE_PREWARM").as_deref() == Ok("1") {
             progress(WarmupPhase::Skipped {
@@ -3969,8 +3854,7 @@ impl AgentPort for GooseAdapter {
         Self::vision_state_for(&self.pictures, self.data_dir.as_deref(), provider, model)
     }
 
-    /// A model arrived or became active: start its encoder's ensure in the background. A no-op
-    /// outside the serve process, and for a model that declares no encoder on this device.
+    /// Starts the model's encoder ensure in the background; no-op outside the serve process.
     fn prepare_model(&self, model: &str) {
         if let Some(ref dd) = self.data_dir {
             self.pictures.spawn_ensure(dd, model);
@@ -4453,7 +4337,6 @@ fn attach_images(
         .fold(msg, |m, img| m.with_image(&img.data, &img.mime_type))
 }
 
-/// Number of image parts carried by a Goose message.
 pub(crate) fn image_part_count(msg: &Message) -> usize {
     msg.content
         .iter()
@@ -4461,14 +4344,7 @@ pub(crate) fn image_part_count(msg: &Message) -> usize {
         .count()
 }
 
-/// True when the message carries a tool request or response part.
-///
-/// The image cap never rewrites these. Tool request/response pairing is
-/// load-bearing — an orphaned or re-keyed response is rejected outright by the
-/// provider — and the one path allowed to rebuild such a message is
-/// `truncate_tool_response_text`, which preserves ids and error flags
-/// byte-for-byte. Camera tools DO return images inside a tool response; those
-/// ride the tool-result truncation path, not this one.
+/// True for messages the image cap must not touch: providers reject re-keyed tool responses.
 pub(crate) fn has_tool_parts(msg: &Message) -> bool {
     use goose::conversation::message::MessageContent as C;
     msg.content.iter().any(|c| {
@@ -4484,28 +4360,8 @@ pub(crate) fn has_tool_parts(msg: &Message) -> bool {
     })
 }
 
-/// Rebuild `original` with at most `keep` of its image parts, its text replaced
-/// by `text`, and ONE placeholder describing whatever images were dropped.
-///
-/// The message is CLONED and only its `content` replaced, so id, timestamp,
-/// role and metadata survive exactly. The LEADING images are the ones kept, so
-/// ordinal 0 stays ordinal 0 — the same rule the hydration replay uses.
-///
-/// Text parts collapse into the position of the first one. That keeps the text
-/// on the same side of the images as the model originally saw it, which is the
-/// only ordering property a multimodal template cares about.
-///
-/// # Exactly one placeholder, whatever the state
-///
-/// Capping is STAGED: with a budget of one, a two-image message is capped 2 to 1
-/// when it becomes history, then 1 to 0 when a newer image turn arrives. By the
-/// second pass the first pass's placeholder is already part of the message — and
-/// part of `as_concat_text()`, so `text` carries it too and the text does not
-/// even register as changed. Appending unconditionally would leave the model
-/// reading two stand-ins for the same attachment, one of them stale. So every
-/// existing placeholder is stripped first and exactly one is re-emitted for the
-/// state the message ends up in: the partial wording while an image survives,
-/// the all-dropped wording once none do.
+/// Keeps the leading `keep` images and swaps the text for `text`, with exactly one placeholder.
+/// Capping is staged (2 to 1, then 1 to 0): old placeholders are stripped, never stacked.
 pub(crate) fn cap_message_images(original: &Message, keep: usize, text: &str) -> Message {
     use goose::conversation::message::MessageContent as C;
     use pond_core::models::services::context::image_history::{
@@ -6124,10 +5980,7 @@ mod tests {
         }
     }
 
-    /// CR-6. The mesh wire carries text only and a mistral.rs server has never been checked
-    /// with a picture, so neither claims vision, whatever the (stale, local) chat model is.
-    /// Switching to mesh sets only `chat_provider`, so `chat_model` still names the last
-    /// local Gemma, which the name rule would call a vision model.
+    /// Switching to mesh keeps the last local `chat_model`, which the name rule calls vision.
     #[test]
     fn providers_that_drop_pictures_never_claim_vision() {
         for provider in ["mesh", "mistralrs"] {
@@ -6143,10 +5996,6 @@ mod tests {
         }
     }
 
-    /// `vision_state`, provider by provider: the in-process engine reports its encoder, a
-    /// provider that drops pictures reports not-declared (which the API refuses as unsupported,
-    /// with the mesh line for mesh), and one that carries its own pictures is ready exactly when
-    /// the model can see.
     #[test]
     fn vision_state_is_provider_aware() {
         use pond_core::models::domain::vision_encoder::{refusal_for, EncoderState, RefusalCode};
@@ -6201,9 +6050,7 @@ mod tests {
         );
     }
 
-    /// Canary for [`GOOSE_PROVIDER_ERROR_PREFIX`]: the CR-2 backstop replaces the assistant
-    /// text goose writes for a refused picture, and finds it by this opening. A fork sync that
-    /// reworded it would leave the household reading "Settings > Local Inference" again.
+    /// Canary for [`GOOSE_PROVIDER_ERROR_PREFIX`], which the refused-picture backstop matches on.
     #[test]
     fn goose_still_prefixes_a_provider_error_the_same_way() {
         let agent_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
