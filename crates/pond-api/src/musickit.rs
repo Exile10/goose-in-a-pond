@@ -32,9 +32,9 @@ pub const DEVELOPER_TOKEN_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Where managed tokens come from. Unset means the built-in address below; `off` (or empty) turns
 /// managed mode off, and any other value is used in place of the built-in address.
 pub const MANAGED_URL_ENV: &str = "POND_CREDENTIALS_URL";
-/// Jarida's credentials service (`docs/architecture/pondcredentials.md`). Every pond without a key of
-/// its own asks it for an Apple Music developer token, which was Jerry's decision on 2026-09-29.
-/// A test or a scratch pond must say `off`, or it phones home.
+/// Jarida's credentials service (`docs/architecture/pondcredentials.md`), which every pond without a
+/// key of its own asks for an Apple Music developer token. A test or a scratch pond must say `off`, or
+/// it phones home.
 const DEFAULT_MANAGED_URL: Option<&str> = Some("https://credentials.jarida.io");
 /// The name a fetch is filed under in the egress log, so a person can see the pond called home.
 const MANAGED_TOOL: &str = "giap-credentials";
