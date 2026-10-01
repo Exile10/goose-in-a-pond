@@ -423,12 +423,6 @@ jobs:
       - name: Launch headless and assert the bridge
         run: xvfb-run -a node scripts/smoke.mjs
 
-  # Packages a real .app and checks its shape. Gated to manual dispatch and
-  # tags ONLY: macOS runners bill at 10x, and nothing here changes often
-  # enough to justify that per PR. It also fabricates a tiny Mach-O in place
-  # of pond-server rather than building the real one -- a clean release build
-  # of the server is ~35 minutes, and this job is testing the packaging, not
-  # the server.
   # ── Live test ──────────────────────────────────────────────────────────────
   #
   # CLAUDE.md calls this required for any change touching a migration, a route,
@@ -520,6 +514,12 @@ jobs:
       - name: scripts/live-test.sh
         run: bash scripts/live-test.sh
 
+  # Packages a real .app and checks its shape. Gated to manual dispatch and
+  # tags ONLY: macOS runners bill at 10x, and nothing here changes often
+  # enough to justify that per PR. It also fabricates a tiny Mach-O in place
+  # of pond-server rather than building the real one -- a clean release build
+  # of the server is ~35 minutes, and this job is testing the packaging, not
+  # the server.
   desktop-package:
     name: Desktop — package (macOS)
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
