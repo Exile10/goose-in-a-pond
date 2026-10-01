@@ -295,12 +295,8 @@ describe("deleteSession()", () => {
   });
 });
 
-// PAI-5 P6. What a live pond-server returned for one turn recorded with
-// `persist_thinking` on -- captured over real HTTP on 2026-09-24, ids shortened.
-// It goes through the REAL mapping from a raw fetch body. The replay tests in
-// `Chat.test.tsx` mock `getSessionMessages` itself, which skips the one piece
-// of code that dropped `thinking`; that is how every reloaded conversation lost
-// its reasoning while those tests stayed green.
+// A real pond-server turn with `persist_thinking` on (ids shortened), through the real mapping:
+// Chat.test.tsx mocks `getSessionMessages` and so skips it.
 describe("getSessionMessages()", () => {
   const userRow = {
     id: "m-user",
@@ -331,8 +327,7 @@ describe("getSessionMessages()", () => {
   it("keeps the persisted reasoning on the assistant row", async () => {
     fetchMock.mockResolvedValueOnce(okJson({ messages: [userRow, replyRow] }));
     const msgs = await client().getSessionMessages("sess-1");
-    // Both passages, in order: a mapping that kept only the first would pass
-    // a check on presence.
+    // Both passages, in order; a presence check would pass a mapping that kept one.
     expect(msgs[1].thinking).toEqual([
       "It is a 1x1 PNG.",
       "So: one pixel, white.",
@@ -342,8 +337,7 @@ describe("getSessionMessages()", () => {
   it("drops nothing else the server sent", async () => {
     fetchMock.mockResolvedValueOnce(okJson({ messages: [userRow, replyRow] }));
     const msgs = await client().getSessionMessages("sess-1");
-    // Against the wire rows themselves, so any field the mapping forgets
-    // fails here rather than in some screen that quietly shows less.
+    // Against the wire rows, so any field the mapping drops fails here.
     expect(msgs).toEqual([userRow, replyRow]);
   });
 
