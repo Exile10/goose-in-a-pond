@@ -24,9 +24,10 @@ eq()       { [ "$1" = "$2" ] || { printf 'expected [%s] got [%s]\n' "$2" "$1"; r
 contains() { case "$1" in *"$2"*) return 0 ;; *) printf 'expected to contain [%s] in [%s]\n' "$2" "$1"; return 1 ;; esac; }
 lacks()    { case "$1" in *"$2"*) printf 'expected NOT to contain [%s] in [%s]\n' "$2" "$1"; return 1 ;; *) return 0 ;; esac; }
 
-# A directory of symlinks to the real tools the code needs, and nothing else: no node on it.
+# A directory of symlinks to the real tools the code needs, and nothing else: no node on it. gzip
+# because GNU tar runs it for `-z`, where macOS's tar decompresses by itself.
 TOOLS="$SCRATCH/tools"; mkdir -p "$TOOLS"
-for tool in curl tar mktemp ln mv rm mkdir cat tr head cut grep sed awk dirname basename uname sha256sum shasum chmod printf sort wc env bash sh date touch ls; do
+for tool in curl tar gzip mktemp ln mv rm mkdir cat tr head cut grep sed awk dirname basename uname sha256sum shasum chmod printf sort wc env bash sh date touch ls; do
   p="$(command -v "$tool" 2>/dev/null)" && [ -n "$p" ] && [ -x "$p" ] && ln -sf "$p" "$TOOLS/$tool"
 done
 
