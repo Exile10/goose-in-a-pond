@@ -318,16 +318,9 @@ fn provider_relocates_tool_images(provider_name: &str) -> bool {
     !matches!(provider_name, "local" | "gguf")
 }
 
-/// Lift images out of tool responses into a top-level user message (phase F3). Two fork-side gaps
-/// in the goose local-inference engine stop nested images reaching mtmd: `multimodal.rs` extracts
-/// only top-level `MessageContent::Image`, and `lib.rs` strips `image_url` parts with no vision
-/// guard. A no-op once the fork handles tool-result images; `None` means nothing to promote.
-///
-/// `readable` is whether the model can look at a picture right now (its encoder is ready). When
-/// it cannot, the frames are NOT promoted: a promoted image on a model without a working encoder
-/// fails the whole tool loop mid-turn and poisons the conversation, and on a text-only model it
-/// becomes a "not supported" marker under a carrier that says "describe what you can see". The
-/// carrier then says what happened instead, so the model does not answer as if it had looked.
+/// Lift tool-response images into a top-level user message: goose's local engine passes only
+/// top-level `MessageContent::Image` to mtmd. `None` means nothing to promote. Unless `readable`
+/// (encoder ready), nothing is promoted and the carrier says so, or the tool loop fails mid-turn.
 fn promote_tool_result_images(
     messages: &[Message],
     max_images: usize,

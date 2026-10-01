@@ -23,15 +23,8 @@ export function modelFit(
 }
 
 /**
- * Best residency-size estimate (MB) for a model.
- *
- * Prefers `size_mb` (on-disk weight residency — what actually has to fit in the
- * GPU budget) and falls back to `ram_estimate_mb`. Returns `null` when neither
- * is known.
- *
- * A declared-vision model keeps its encoder resident too (it loads eagerly,
- * on the GPU, at every model load — see `models/domain/vision_encoder.rs`),
- * so `image_support_bytes` is added on top whenever `reads_images` is true.
+ * Prefers `size_mb` (weights that must fit the GPU budget) over `ram_estimate_mb`. Adds
+ * `image_support_bytes` when `reads_images`: a vision encoder loads on the GPU with the model.
  */
 export function modelResidencyMb(
   m: Pick<ModelEntry, "size_mb" | "ram_estimate_mb" | "reads_images" | "image_support_bytes">,

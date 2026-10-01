@@ -326,45 +326,10 @@ pub fn reviewable(event: &BusEvent) -> Option<BusEventRef> {
     }
 }
 
-/// The member one review is addressed to, or nobody.
-///
-/// Invariant 4 says a proposal is addressed to a profile and never broadcast,
-/// and this is where that gets decided. The answer is the most recently active
-/// conversation that (a) a person held — [`SessionOrigin::is_human`], so the
-/// pond's own `sched-` rows can never nominate an audience, which matters
-/// doubly here because a review's own session id starts with `sched-` — and
-/// (b) carries an attribution, inside [`AUDIENCE_WINDOW`].
-///
-/// **`None` is a first-class answer and the loop must treat it as "no review".**
-/// On a pond with no profiles, or one where nobody has been identified in six
-/// hours, there is no member to address, and the alternative to skipping is a
-/// suggestion sent to the household — which is the broadcast this workstream
-/// exists to avoid. [`ProposalAudience`] cannot express one, so a caller that
-/// ignored this would have nothing to pass.
-///
-/// # The sole-member fallthrough, and why it is not a hole in invariant 4
-///
-/// `members` is the household roster, and when it holds exactly one person an
-/// unattributed conversation is addressed to them. Nothing is broadcast: the
-/// fallthrough RESOLVES a member and returns an `Owner` audience, so no
-/// downstream caller ever sees "the household". With two members it answers
-/// `None` exactly as before, because picking one would be attribution by row
-/// order, which is evidence of nothing — the rule PAI-1 P3 refused.
-///
-/// This is the same call `881da889` made for `context_source_owner` and the one
-/// `proposal_caller` now makes on the read side: a one-member pond has exactly
-/// one possible answer to "whose is this?", and requiring proof of it means
-/// requiring a paired, attributed device that most desktop ponds do not have.
-///
-/// It was measured, not assumed. On a real pond: 961 sessions, **0** carrying a
-/// `profile_id`, because `resolve_turn_scope` only writes one on the
-/// `DeviceRung::Member` arm and the desktop's own device row is never
-/// attributed. So this function returned `None` on every tick of every process
-/// the reviewer has ever run — which made PAI-7's entire model-backed producer
-/// unreachable, and left the Home column showing only the template-tier
-/// suggestions, which is what a household actually notices.
-///
-/// [`SessionOrigin::is_human`]: crate::shared::domain::session_activity::SessionOrigin::is_human
+/// The member of the most recent attributed human session in [`AUDIENCE_WINDOW`], or `None`,
+/// which means no review: the alternative is a household broadcast. With exactly one member in
+/// `members`, an unattributed session resolves to them (an `Owner`, never a broadcast); with two
+/// or more it stays `None`, as picking one would be attribution by row order.
 pub fn audience_for_review(
     sessions: &[Session],
     now: DateTime<Utc>,

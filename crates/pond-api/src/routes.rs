@@ -2427,22 +2427,8 @@ async fn drive_turn(
     }
 
     // ── Persist the assistant turn ────────────────────────────────────
-    // Persistence is now the whole of what a handler owes memory. The turn is
-    // written to `session_messages`, and the batch engine reads it out of
-    // there in the pond's idle time -- which is also why the voice loop and
-    // `/chat`, which never extracted inline, now contribute like everything
-    // else.
-    // Nothing was said, and nothing is coming.
-    //
-    // The user's message was committed before inference began. Leaving it shows
-    // a question the pond visibly never answered, and hands the NEXT turn a
-    // prompt ending on a user line nothing replied to. `delete_messages_from`
-    // is the same primitive the edit-and-resend path uses.
-    //
-    // Deliberately narrow. A turn that produced ANY text or tool result keeps
-    // both halves — a barge-in should not erase the sentence the user heard.
-    // A TIMEOUT keeps them too: the same words are worth retrying, and the
-    // error frame already said what happened.
+    // Memory extraction reads `session_messages` later, in idle time. A cancel before any output
+    // removes the orphaned user message; any output, or a timeout, keeps both.
     let said_nothing = turn.full_text.trim().is_empty() && turn.tool_results.is_empty();
     if cancelled && said_nothing {
         match state
@@ -3380,10 +3366,8 @@ async fn get_session_messages(
                     }))
                     .collect::<Vec<_>>());
             }
-            // Phase F2: attachments are referenced, never inlined. Base64 in a
-            // history read would turn a routine page load into megabytes; the
-            // client fetches each image once from the URL below, WITH its bearer
-            // token -- the route is protected, so a bare `<img src>` gets a 401.
+            // Referenced by URL, never inlined: base64 would make a history read megabytes. It's a
+            // protected route: fetch with the bearer token, as a bare `<img src>` gets a 401.
             if let Some(atts) = attachments_by_message.get(&m.id) {
                 obj["images"] = json!(atts
                     .iter()
@@ -3514,40 +3498,8 @@ async fn compact_session(
 }
 
 /// POST /api/v1/sessions/retitle — ask the titling job to run its next pass now.
-///
-/// The attended counterpart to the background pass in `pond-server`. It skips
-/// the *scheduling* gate only: you asked for it, so the pond does not argue
-/// about whether now is a good moment. Every per-conversation rule still
-/// applies, because the same job does the work —
-///
-/// - a name somebody typed is never overwritten,
-/// - a conversation too short to describe is left to the six-word fallback,
-/// - a model-written name that still fits its conversation is not rebuilt just
-///   to spend a model call arriving at the same words.
-///
-/// Deliberately independent of `session_titling_enabled`. That setting governs
-/// whether the pond does this *unattended*; pressing a button is not that, and
-/// a control that silently does nothing because of a switch somewhere else is
-/// the worse surprise. The lane applies the waiver to the asking job's own gate
-/// for exactly this reason.
-///
-/// # This route used to do the work itself, and that was the wrong shape
-///
-/// It ran up to twenty model calls sequentially inside the request handler,
-/// taking no lane slot — so it could decode beside whichever background job was
-/// already holding the machine, which is the single thing the lane exists to
-/// prevent. This port's own docs named it as the precedent not to follow.
-///
-/// It also could not finish. The desktop client's default timeout is 30 s
-/// (`PondApiClient.request`), and on the Orin at roughly 16 tok/s twenty titles
-/// is minutes of decode — so the button reliably returned a timeout error while
-/// the work carried on invisibly behind it. Answering "the pass is starting" in
-/// milliseconds is not a smaller promise than that one; it is the first honest
-/// one this button has made.
-///
-/// What is lost is the "renamed 7 of 12" summary, which could only ever be
-/// produced by blocking. The Automations panel shows the job running, and the
-/// conversation list shows the names.
+/// Skips only the scheduling gate and `session_titling_enabled`; per-conversation rules hold.
+/// Answers at once; the lane runs the pass, since a pass would outlast the client's timeout.
 async fn retitle_sessions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -3673,17 +3625,8 @@ fn urlencoding_lite(s: &str) -> String {
     out
 }
 
-/// Serve one persisted image attachment's raw bytes (phase F2).
-///
-/// Bytes, not base64: the client displays them as they come, and re-encoding
-/// only to have it decode again is pure waste. This sits on the PROTECTED
-/// router and the middleware reads only an `Authorization: Bearer` header, so
-/// the URL is not usable as a bare `<img src>`: an image element cannot send
-/// that header, and every such load is a 401 unless `POND_DEV_ALLOW_LOOPBACK`
-/// is set. The desktop fetches the bytes with its token and shows them through
-/// an object URL (`PondApiClient.getSessionAttachment`). The `session_id` path
-/// segment is checked against the stored row so an attachment id from one
-/// conversation cannot be read through another's URL.
+/// Serves one attachment's raw bytes; `session_id` must own it, so ids can't cross sessions.
+/// Bearer-protected, so not usable as a bare `<img src>`; the desktop fetches it with its token.
 async fn get_session_attachment(
     State(state): State<Arc<AppState>>,
     Path((session_id, attachment_id)): Path<(String, String)>,
@@ -3798,9 +3741,7 @@ async fn system_info(
         "hostname": hostname,
         // Null without a LAN route; for clients that can't resolve `<hostname>.local`.
         "lan_address": lan_address(),
-        // Null unless this Pond is on a tailnet. Reachable from outside the
-        // house, so it is what a paired phone falls back to when the LAN
-        // address does not answer.
+        // Null off a tailnet; the phone's fallback when the LAN address doesn't answer.
         "tailnet_address": match embedded { Some(e) => e.0.0.read().ok().and_then(|v| v.clone()), None => tailnet_address() },
         "https_port": https_port,
         "tls_spki_sha256": tls_spki_sha256,
@@ -4886,10 +4827,7 @@ async fn update_settings(
     // pond_core::models::domain::drafter::set_speculation_enabled(
     //     merged.speculative_decoding_enabled,
     // );
-    // Same reasoning as the mic gate directly above: a network restriction the
-    // user has to restart the pond to apply is not one. Unconditional rather
-    // than keyed on the patch, because it is a cheap idempotent write and a
-    // missed re-install is a privacy control that silently did not take.
+    // Unconditional: it's cheap, and a skipped re-install would silently drop the restriction.
     pond_core::shared::services::egress::set_network_mode(
         pond_core::shared::services::egress::NetworkMode::parse(&merged.network_mode),
     );
@@ -4955,12 +4893,7 @@ async fn update_settings(
         }
     }
 
-    // A provider or model change makes the engine's warmed prefix stale, so
-    // re-run the warm-up in the background. Fire-and-forget: the save must not
-    // wait on a model load. So does the speculation switch, which the engine
-    // applies by evicting and reloading the model; the warm-up is what reloads it
-    // in the background instead of in front of the next reply. One condition, so
-    // a save that changes the model AND the switch still starts one warm-up.
+    // The warmed prefix is now stale; re-warm in the background so the save doesn't wait.
     if save_needs_prewarm(&current, &merged) {
         crate::spawn_prefix_prewarm(state.clone(), false);
     }
@@ -15220,89 +15153,11 @@ async fn delete_user_biometrics(
     })))
 }
 
-// ── Proactive proposals (PAI-7 P3b) ──────────────────────────────────────────
-//
-// P3a landed the `Proposal` domain, `ProposalRepository`, `SqliteProposalRepository`
-// and migrations 0041/0042, and said in its own stamp that NOTHING constructed
-// any of it. This is the surface that lets a person see and dispose of one.
-//
-// # Reusing the drafts machinery is the design decision, not an implementation
-// # shortcut
-//
-// A proposal IS a `drafts` row (`origin = 'proactive'`), so disposing of one is
-// `DraftRepository::update_status` and the ownership question is
-// `is_draft_decision_permitted` -- the same function `giap-draft`'s
-// `DraftMcpServer::decide` asks. That means a proactive suggestion inherits an
-// approval flow that already exists rather than growing a second one, and a
-// later change to the ownership rule reaches both callers.
-//
-// **Approving does not execute anything.** It moves the row to `approved`,
-// exactly as `DraftMcpServer::apply` does. Invariant 1 is "GIAP proposes; the
-// user disposes", and the executor is PAI-7 P4's business.
-//
-// # Why the decide route reads the PROPOSAL repository and not the draft one
-//
-// `DraftRepository::get` would answer for any draft id, and this route would
-// then be a second way to decide a user-staged draft -- one that skips the
-// policy tally and the audit entry `DraftMcpServer::decide` records, which is
-// the telemetry PAI-2 P8b's enforce flip is waiting on. `get_live` answers only
-// for a row that is proactive, pending and unexpired, so an id that is anything
-// else is a 404 here and stays the MCP path's business.
-//
-// The cost of that is real and deliberate: rejecting an EXPIRED proposal is not
-// possible at this edge, though section 3.5 wants rejections as feedback. The
-// MCP path still allows it (`decide` gates only approval on liveness). Rather
-// than widen this route to every draft to get it, the honest fix is a
-// `ProposalRepository` read that returns a decided-or-expired proposal, which
-// belongs with the phase that builds the feedback loop.
-/// The caller of a proposal route, as one member.
-///
-/// Invariants 4 and 5 at the HTTP edge, answered by the domain's own door
-/// rather than by a check written here. [`ProposalAudience::from_scope`] admits
-/// `Owner(id)` and refuses the other two, for opposite reasons that both land
-/// on "not one member": `Guest` generates and receives nothing, and `Household`
-/// is not a weaker address than `Owner` — it *is* the broadcast.
-///
-/// **The cliff this used to describe is gone, and the paragraph that argued for
-/// it is kept below because the argument was half right.**
-///
-/// It said: a draft can be unowned and a proposal never is, so "to LIST one I
-/// would have to pick a member, and picking is the fallback PAI-1 P3 refused."
-/// That holds for a household of two or more, where picking would address
-/// somebody's suggestion by row order. It does not hold for a household of
-/// **one**, where there is no picking to do -- the set of candidates has one
-/// element and choosing from it is not a choice. So `Household` now falls
-/// through to [`member_attribution::sole_member`], and two or more members
-/// still refuse, which is exactly where the original reasoning survives.
-///
-/// This is the same call `881da889` made for connecting a context source, in
-/// the same file, four hundred lines below -- `context_source_owner` has the
-/// identical shape. Its commit message is the argument: connecting a calendar
-/// "required first starting a conversation AND being on an attributed device,
-/// to establish something a one-member pond has exactly one possible answer
-/// to." Reading a proposal required the same thing, for the same non-reason,
-/// and the consequence was measurable: `select count(*) from drafts where
-/// origin='proactive'` is 0 on a pond that has had `proactive_review_enabled`
-/// switched on, because the column that would have shown them answered 403.
-///
-/// The write path was already there. `is_draft_decision_permitted` admits
-/// `Household` for an owned draft under the comment "Single-member pond: there
-/// is no other member to protect from", pinned by
-/// `household_decides_anything_because_a_household_pond_has_one_member`. So
-/// until now the READ refused what the WRITE permitted -- the exact inversion
-/// this function's last sentence says it exists to prevent.
-///
-/// **`session_id` stays required.** Making it optional is a separate and
-/// riskier change: `is_draft_decision_permitted`'s first rung refuses a blank
-/// actor session outright, so an optional session would 403 every decide after
-/// letting the list through. A cold Dashboard reaches this surface once it has
-/// a session, and `GET /api/v1/suggestions` -- which needs none -- is what
-/// fills the column before then.
-/// The one 403 both refusal paths in [`proposal_caller`] return.
-///
-/// A free function so the two arms cannot drift into saying different things
-/// about the same refusal -- which is how a caller ends up debugging two
-/// distinct-looking errors that mean one thing.
+// ── Proactive proposals ──────────────────────────────────────────────────────
+// Proposals are `drafts` rows (`origin = 'proactive'`) sharing their ownership rule; approving
+// executes nothing. Decide reads via `get_live` so user-staged drafts keep the audited MCP path.
+
+/// The one 403 both refusal paths in [`proposal_caller`] return, so they can't drift apart.
 fn proposal_caller_refusal(session_id: &str, reason: &str) -> (StatusCode, Json<Value>) {
     tracing::info!(
         target: "giap::trace",
@@ -15321,6 +15176,10 @@ fn proposal_caller_refusal(session_id: &str, reason: &str) -> (StatusCode, Json<
     )
 }
 
+/// The caller as exactly one member ([`ProposalAudience::from_scope`]). `Household` resolves to
+/// the sole member on a one-member pond ([`member_attribution::sole_member`]) and is refused
+/// with two or more, as is `Guest`. `session_id` stays required: a blank actor session fails
+/// `is_draft_decision_permitted`'s first rung.
 async fn proposal_caller(
     state: &Arc<AppState>,
     session_id: &str,

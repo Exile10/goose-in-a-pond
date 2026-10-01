@@ -155,16 +155,7 @@ const EMPTY_TURN_EXHAUSTED_MESSAGE: &str =
     "I could not produce a response to that, even after retrying. \
 This usually clears if you reword the question — or start a new chat if it keeps happening.";
 
-/// Goose environment knobs GIAP owns, as `(key, Some(value) | None)` where
-/// `None` means "unset this key".
-///
-/// Split out as a pure function for two reasons: it is the decision table worth
-/// unit-testing, and its result doubles as the change signature that stops
-/// `set_var` from firing on every turn (`set_var` is documented-unsound in a
-/// multi-threaded process, so it runs only when something actually changed).
-/// The goose env knobs GIAP sets. `hybrid_compaction` used to be a parameter;
-/// since C1/C2 it governs none of them, so taking it would be a lie the
-/// signature tells.
+/// Goose env knobs GIAP owns (`None` = unset); also the change signature gating `set_var`.
 fn goose_env_knobs(provider: &str, effective_ctx: usize) -> [(&'static str, Option<String>); 6] {
     let local = matches!(provider, "local" | "gguf");
     [
@@ -1168,23 +1159,10 @@ impl GooseAdapter {
         }
     }
 
-    /// Whether the ACTIVE model can accept image content, provider by provider.
-    ///
-    /// For the in-process engine this is pond-core's device-aware declaration:
-    /// the model has a pinned encoder, and on a budgeted device (the Orin) the
-    /// encoder fits beside it and has been measured there. HTTP providers have
-    /// no encoder to ask about, so they get `ModelCapabilities::name_implies_vision`,
-    /// which recognises the vision models an Ollama install actually serves. The
-    /// mesh wire carries text only, and a mistral.rs server has never been
-    /// checked with a picture: both would drop one silently while the prompt
-    /// told the model it could see, so neither claims vision.
-    ///
-    /// DECLARED, not downloaded. The encoder is ~941 MB and lands in the
-    /// background, so "the bytes exist" flips mid-session; this does not. Two
-    /// things depend on that stability: `ModelCapabilities.vision`, and the
-    /// `<vision>` section of the system prompt, which sits inside the KV-cached
-    /// static prefix. A turn that actually needs the encoder before it is ready
-    /// is refused up front in `chat_stream`, with the household's own copy.
+    /// Whether the active model DECLARES vision, regardless of whether its encoder has downloaded.
+    /// Must not flip mid-session: the `<vision>` prompt section sits in the KV-cached prefix.
+    /// HTTP providers go by `ModelCapabilities::name_implies_vision`; mesh and mistral.rs never
+    /// claim vision, as both would drop a picture silently.
     fn model_supports_vision(
         provider: &str,
         model: &str,
@@ -1222,21 +1200,8 @@ impl GooseAdapter {
         }
     }
 
-    /// Whether THIS turn's system prompt should carry the `<vision>` section.
-    ///
-    /// Model capability is necessary but not sufficient: `capabilities()`
-    /// reports `vision = false` in voice mode, and a prompt that asserts a
-    /// capability the adapter simultaneously denies is a contradiction the model
-    /// pays for. Voice turns are transcribed speech with no attachment path, so
-    /// the section is pure prompt cost there — the same trade `thinking` already
-    /// makes in voice mode.
-    ///
-    /// `voice` is the INSTANCE-level flag (CLI `--voice`), not the
-    /// per-request one, for two reasons. It is the only signal `capabilities()`
-    /// can see, so keying off it is what makes the two agree on every input. And
-    /// it is fixed for the life of the process, so it cannot flip the static
-    /// prefix between turns of one session and forfeit the KV cache — which a
-    /// per-request flag, alternating text and voice turns, would.
+    /// Whether this turn's prompt carries `<vision>`. `voice` is the INSTANCE flag: it matches
+    /// `capabilities()` and, fixed per process, can't flip the KV-cached prefix between turns.
     fn vision_section_applies(
         provider: &str,
         model: &str,
@@ -2438,15 +2403,8 @@ impl GooseAdapter {
         let session_id = request.session_id.clone();
         let model_role = request.model_role.clone();
 
-        // Phase F1: fail an image turn EARLY and specifically.
-        //
-        // Without this the engine silently rewrites each image part into
-        // "[Image attached - image input is not supported with the currently
-        // selected model]" and the model answers as if it had looked, which is
-        // the worst possible outcome. This is the backstop: the API refuses the
-        // same turns before anything is persisted, with the same pond-core copy,
-        // and this catches every other caller. It covers every provider, since
-        // the mesh wire and a model that cannot see drop pictures too.
+        // Fail early: otherwise the engine swaps images for a note and the model bluffs. The API
+        // refuses these turns first; this is the backstop for every other caller and provider.
         if !request.images.is_empty() {
             use pond_core::models::domain::vision_encoder::{
                 encoder_for, refusal_for, RefusalCode,
@@ -3016,33 +2974,8 @@ impl GooseAdapter {
             allowed_tools
         };
 
-        // ── 6d. PAI-1 P5, enforced in BOTH selection modes ───────────────────
-        //
-        // The group-level subtraction lives inside `resolve_session_tool_groups`,
-        // which is only reached from the `tool_selection_narrows()` branch
-        // above. `default_tool_selection_mode()` is "all", so on a DEFAULT
-        // install that branch never runs and this set went to the model
-        // untouched -- a Guest kept `giap-memory` and could recall, search or
-        // `forget_memory` the entire household. P5 was recorded as landed while
-        // being inert on every default pond.
-        //
-        // This set is what gets published to the shim, so it is the only place
-        // every mode converges. Subtracting here is idempotent with the
-        // group-level pass, which stays because it is what bounds
-        // `enable_tool_group` and what the dormant-groups note is built from.
-        //
-        // The sentence that used to end this paragraph said the group pass "keeps
-        // withheld groups out of the dormant-groups note". It did the opposite:
-        // the note was built from `registered_extensions()`, so every withheld
-        // group appeared on it. `permitted_groups` is what makes the claim true.
-        // D2, moved off the per-turn envelope on 2026-09-24. What the model
-        // could load but cannot see rides the system appendix now. It is
-        // session-scoped and changes only when a group is enabled -- the moment
-        // the tools block changes anyway -- so it never moves the prefix on its
-        // own, and in "minimal" mode every session starts with the same dormant
-        // set, so the boot-time warm-up covers it for all of them. In the
-        // envelope it was ~150 tokens re-prefilled on every turn; here it is
-        // prefilled once per session.
+        // Dormant groups ride the system appendix, not the per-turn envelope: the note changes only
+        // when a group is enabled (when the tools block changes anyway), so it's prefilled once.
         if !dormant_groups_note.is_empty() {
             shim_appendix.push(dormant_groups_note.clone());
         }
@@ -3054,6 +2987,9 @@ impl GooseAdapter {
                 Some(shim_appendix.join("\n\n"))
             });
 
+        // ── 6d. Guest tool subtraction, in BOTH selection modes ──────────────
+        // The group-level pass only runs when narrowing (not the default "all"); this set is
+        // what the shim gets, so every mode must subtract here.
         let allowed_tools = if turn_scope.excludes_everything() {
             let before = allowed_tools.len();
             let kept: HashSet<String> =
@@ -4453,7 +4389,6 @@ fn attach_images(
         .fold(msg, |m, img| m.with_image(&img.data, &img.mime_type))
 }
 
-/// Number of image parts carried by a Goose message.
 pub(crate) fn image_part_count(msg: &Message) -> usize {
     msg.content
         .iter()
@@ -4461,14 +4396,7 @@ pub(crate) fn image_part_count(msg: &Message) -> usize {
         .count()
 }
 
-/// True when the message carries a tool request or response part.
-///
-/// The image cap never rewrites these. Tool request/response pairing is
-/// load-bearing — an orphaned or re-keyed response is rejected outright by the
-/// provider — and the one path allowed to rebuild such a message is
-/// `truncate_tool_response_text`, which preserves ids and error flags
-/// byte-for-byte. Camera tools DO return images inside a tool response; those
-/// ride the tool-result truncation path, not this one.
+/// True for messages the image cap must not touch: providers reject re-keyed tool responses.
 pub(crate) fn has_tool_parts(msg: &Message) -> bool {
     use goose::conversation::message::MessageContent as C;
     msg.content.iter().any(|c| {
@@ -4484,28 +4412,8 @@ pub(crate) fn has_tool_parts(msg: &Message) -> bool {
     })
 }
 
-/// Rebuild `original` with at most `keep` of its image parts, its text replaced
-/// by `text`, and ONE placeholder describing whatever images were dropped.
-///
-/// The message is CLONED and only its `content` replaced, so id, timestamp,
-/// role and metadata survive exactly. The LEADING images are the ones kept, so
-/// ordinal 0 stays ordinal 0 — the same rule the hydration replay uses.
-///
-/// Text parts collapse into the position of the first one. That keeps the text
-/// on the same side of the images as the model originally saw it, which is the
-/// only ordering property a multimodal template cares about.
-///
-/// # Exactly one placeholder, whatever the state
-///
-/// Capping is STAGED: with a budget of one, a two-image message is capped 2 to 1
-/// when it becomes history, then 1 to 0 when a newer image turn arrives. By the
-/// second pass the first pass's placeholder is already part of the message — and
-/// part of `as_concat_text()`, so `text` carries it too and the text does not
-/// even register as changed. Appending unconditionally would leave the model
-/// reading two stand-ins for the same attachment, one of them stale. So every
-/// existing placeholder is stripped first and exactly one is re-emitted for the
-/// state the message ends up in: the partial wording while an image survives,
-/// the all-dropped wording once none do.
+/// Keeps the leading `keep` images and swaps the text for `text`, with exactly one placeholder.
+/// Capping is staged (2 to 1, then 1 to 0): old placeholders are stripped, never stacked.
 pub(crate) fn cap_message_images(original: &Message, keep: usize, text: &str) -> Message {
     use goose::conversation::message::MessageContent as C;
     use pond_core::models::services::context::image_history::{

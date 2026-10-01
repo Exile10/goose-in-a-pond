@@ -25,12 +25,8 @@ pub struct LaneSlot<'a> {
 /// as infinitely starved in `select_next` and would win every tie forever.
 impl Drop for LaneSlot<'_> {
     fn drop(&mut self) {
-        // A std mutex, not tokio's, so this is lockable from `drop`. Safe
-        // against the lock order in `acquire`, which releases `last_run` before
-        // it ever reaches for the slot.
-        //
-        // A wall clock and not an `Instant`, because this stamp outlives the
-        // process: see `InferenceLane::last_run`.
+        // Lock order is safe: `acquire` releases `last_run` before it takes the slot. Wall clock,
+        // not `Instant`: the stamp outlives the process (see `InferenceLane::last_run`).
         let at = Utc::now();
         match self.lane.last_run.lock() {
             Ok(mut last_run) => {
@@ -158,19 +154,9 @@ struct Tally {
 /// The shared inference slot and the registry of what wants it.
 pub struct InferenceLane {
     slot: tokio::sync::Mutex<()>,
-    /// Std rather than tokio so [`LaneSlot`]'s `Drop` can record a run. Only
-    /// ever held for a map insert or read, never across an await.
-    ///
-    /// A wall clock, not an `Instant`, and that is the whole point: this map is
-    /// seeded from `lane_job_runs` at boot, so it has to hold a time that means
-    /// something in another process. Reconstructing an `Instant` from a stored
-    /// age would also be a real hazard rather than an aesthetic one --
-    /// `Instant::now() - age` panics outright on a machine whose monotonic
-    /// clock started later than the age being subtracted, which is every Jetson
-    /// boot.
-    ///
-    /// The cost is that this clock can now go backwards (an NTP step, a board
-    /// with no RTC). `elapsed_since` is where that is handled.
+    /// Std, so [`LaneSlot`]'s `Drop` can lock it; never held across an await. Wall clock, not
+    /// `Instant`: it's seeded from `lane_job_runs`, and `Instant::now() - age` can panic after a
+    /// fresh boot. It can go backwards; `elapsed_since` handles that.
     last_run: std::sync::Mutex<HashMap<LaneJob, DateTime<Utc>>>,
     /// Where released slots are written down. `None` on a lane with no log --
     /// every test, and any pond whose log failed to open.

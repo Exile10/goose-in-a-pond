@@ -41,11 +41,6 @@ beforeEach(() => {
 });
 
 describe("the default", () => {
-  /**
-   * Home was pared back deliberately, and this file is where that decision
-   * still lives. A card arriving in the default is a product decision; a card
-   * arriving on one household's Home is theirs.
-   */
   it("is two pages and nothing more", () => {
     expect(ids()).toEqual([["weather", "devices"], ["nowPlaying"]]);
     expect(getDashboardLayout().hidden).toEqual([]);

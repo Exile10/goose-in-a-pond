@@ -1,60 +1,20 @@
-//! Driven Port: Handshake
-//!
-//! Device authentication and pairing between GIAP (server) and connecting
-//! clients (the GOTG mobile app, other pond instances, the CLI, …).
-//!
-//! # Two-phase pairing protocol
-//!
-//! Pairing proves that the client holds a short-lived **pairing code** that the
-//! operator read off this server's CLI/dashboard, without ever sending the code
-//! over the wire:
-//!
-//! 1. `init_handshake(InitRequest) -> ChallengeResponse`
-//!    The server mints a random 32-byte challenge bound to `client_id`,
-//!    persists it with a short TTL, and returns it (base64) to the client.
-//! 2. `verify_handshake(VerifyRequest)`
-//!    The client computes a MAC over the challenge, keyed by the pairing code,
-//!    and submits it. On success the server consumes the challenge + pairing
-//!    code, registers the device, and mints a session+refresh token pair.
+//! Driven port: device pairing and session tokens.
+//! Two-phase pairing proves the client holds the single-use pairing code without sending it.
 //!
 //! # Channel binding
 //!
-//! A client that reached this server over pinned TLS names the key it pinned to
-//! in [`VerifyRequest::channel_binding`] and folds it into the MAC. The server
-//! recomputes with **its own** key, so the two agree only when the client is
-//! talking to this server directly:
+//! A client on pinned TLS folds the pinned key into the MAC ([`VerifyRequest::channel_binding`]);
+//! the server recomputes with its own key, so the two agree only on a direct connection:
 //!
 //! ```text
 //! bound   mac = HMAC(code, "goose-pair-client-v1\0" || challenge || \0 || client_id || \0 || spki)
 //! unbound mac = HMAC(code, challenge || client_id)
 //! ```
 //!
-//! and the server answers with [`HandshakeResponse::server_proof`] over the same
-//! transcript under `goose-pair-server-v1`, which only something holding the
-//! pairing code can produce.
-//!
-//! What this buys: the pin no longer has to be carried to the phone by a
-//! trustworthy route. Somebody who intercepts the connection and presents their
-//! own certificate -- by answering an mDNS query, say -- gets a client that
-//! MACs over *their* key. Relaying that to this server fails the recomputation;
-//! stripping the binding and relaying leaves a MAC over a transcript this
-//! server no longer computes; and answering the client themselves fails the
-//! server proof. A wrong pin therefore ends pairing in a visible failure
-//! instead of a successful pair with the wrong pond.
-//!
-//! The binding is optional because one real caller has no channel to bind: the
-//! desktop dashboard pairs over loopback HTTP, where there is no certificate
-//! and no interceptor. Optional does not mean downgradable -- a client that
-//! binds always binds, and nobody in the middle can compute the unbound MAC
-//! either, because both forms need the pairing code.
-//!
-//! `refresh` rotates an expiring session token; `revoke_token` disconnects a
-//! client. Pairing codes are issued by the server via `issue_pairing_code`
-//! (shown on the CLI/dashboard) and are single-use.
-//!
-//! The legacy single-shot `handshake()` method is retained for the in-memory
-//! `MockHandshake` (tests) and for already-paired clients that present a
-//! pairing code directly.
+//! The server proves itself with [`HandshakeResponse::server_proof`] over the same transcript
+//! under `goose-pair-server-v1`, so a wrong pin fails pairing visibly instead of pairing with the
+//! wrong pond. Binding is optional only for the loopback dashboard; it can't be downgraded in
+//! transit, since both forms need the pairing code.
 
 use anyhow::Result;
 use async_trait::async_trait;

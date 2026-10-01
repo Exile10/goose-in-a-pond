@@ -269,9 +269,7 @@ export function ChatHubView() {
 
       setText("");
 
-      // The bubble keeps its own copy of each previewUrl and the store owns
-      // revoking them, so clear the tray WITHOUT revoking -- doing so would
-      // blank the thumbnail on the message just sent.
+      // The store owns revoking previewUrls; revoking here would blank the sent message's thumbnail.
       sendTurn({ text: t, attachments });
       setAttachments([]);
       setAttachError(null);

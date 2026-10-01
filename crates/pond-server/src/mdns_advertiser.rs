@@ -70,9 +70,6 @@ impl Drop for MdnsHandle {
 }
 
 /// Advertise `_pond._tcp.local.` on `port` using `hostname` as the instance label.
-///
-/// Returns [`None`] (with a warning log) rather than propagating the error, so
-/// a missing mDNS stack never prevents the server from starting.
 pub fn advertise(hostname: &str, port: u16, version: &str, pin: &str) -> Result<MdnsHandle> {
     let daemon = ServiceDaemon::new()?;
 

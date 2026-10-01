@@ -56,9 +56,7 @@ export function homeLine({ user, devices, weather, now }: HomeLineInput): string
   // Same rule for the things that can be on.
   const allOff = pow.total > 0 && pow.known === pow.total && lit.length === 0;
 
-  // 1. An unlocked door after dark. The one thing worth interrupting for, and
-  //    still phrased as a report — the household can see the locks on screen.
-  //    Counted over the locks that answered; a silent lock is not an open one.
+  // 1. An unlocked door after dark, counted over the locks that answered (silent isn't open).
   if (evening && lockKnown > 0 && locked < lockKnown) {
     const open = lockKnown - locked;
     return open === lockKnown && lockKnown === lockTotal

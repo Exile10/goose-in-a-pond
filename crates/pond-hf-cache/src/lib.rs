@@ -1363,10 +1363,8 @@ mod tests {
 
     static MODE_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Restores `NetworkMode::Open` however the test exits, including a panic
-    /// inside an assertion -- otherwise one failing test takes the rest of the
-    /// binary offline and the report blames the wrong thing. The mode is put
-    /// back before the lock is released (fields drop after `drop` runs).
+    /// Restores `NetworkMode::Open` on drop, so a panicking test can't leave the binary offline.
+    /// The mode is restored before the lock is released (fields drop after `drop` runs).
     struct ModeGuard {
         previous: NetworkMode,
         _lock: std::sync::MutexGuard<'static, ()>,
