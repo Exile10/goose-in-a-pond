@@ -297,6 +297,7 @@ pub async fn ensure_espeak_ng_data(data_dir: &Path) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {

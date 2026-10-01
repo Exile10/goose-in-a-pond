@@ -128,17 +128,9 @@ fn elapsed_since(now: DateTime<Utc>, then: DateTime<Utc>) -> Duration {
 
 impl InferenceLane {
     /// A lane with no memory of previous processes and nowhere to write.
+    #[cfg(test)]
     pub fn new() -> Arc<Self> {
         Self::restored(HashMap::new(), None)
-    }
-
-    /// Time since `job` last ran, by `acquire`'s clock, for a gate that runs before asking.
-    pub fn since_last_run(&self, job: LaneJob) -> Option<Duration> {
-        let last_run = self
-            .last_run
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        last_run.get(&job).map(|t| elapsed_since(Utc::now(), *t))
     }
 
     /// Seeded from the durable log and writing new runs back; the caller does the fallible load.
