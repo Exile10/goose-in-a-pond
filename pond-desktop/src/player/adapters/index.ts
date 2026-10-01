@@ -18,26 +18,34 @@ export interface AdapterContext {
   fetchUserToken(service: string, refresh: boolean): Promise<string>;
 }
 
-const ADAPTERS: Record<string, (ctx: AdapterContext) => PlayerAdapter> = {
-  apple: (ctx) =>
-    new AppleMusicKitAdapter({
-      loadMusicKit: loadMusicKitFromApple,
-      fetchDeveloperToken: ctx.fetchDeveloperToken,
-      networkAllows: ctx.networkAllows,
-    }),
-  spotify: (ctx) =>
-    new SpotifyWebPlaybackAdapter(
-      {
-        loadSdk: loadSpotifySdk,
-        fetchUserToken: (refresh) => ctx.fetchUserToken("spotify", refresh),
+// A Map, not an object: `service` comes from the page's URL, and an object would answer
+// "constructor" or "toString" with Object's own functions.
+const ADAPTERS = new Map<string, (ctx: AdapterContext) => PlayerAdapter>([
+  [
+    "apple",
+    (ctx) =>
+      new AppleMusicKitAdapter({
+        loadMusicKit: loadMusicKitFromApple,
+        fetchDeveloperToken: ctx.fetchDeveloperToken,
         networkAllows: ctx.networkAllows,
-      },
-      { logoUrl: SPOTIFY_LOGO_URL },
-    ),
-};
+      }),
+  ],
+  [
+    "spotify",
+    (ctx) =>
+      new SpotifyWebPlaybackAdapter(
+        {
+          loadSdk: loadSpotifySdk,
+          fetchUserToken: (refresh) => ctx.fetchUserToken("spotify", refresh),
+          networkAllows: ctx.networkAllows,
+        },
+        { logoUrl: SPOTIFY_LOGO_URL },
+      ),
+  ],
+]);
 
 export function knownServices(): string[] {
-  return Object.keys(ADAPTERS);
+  return [...ADAPTERS.keys()];
 }
 
 /** The adapter for `service`, or null when the player has none. */
@@ -45,5 +53,5 @@ export function createAdapter(
   service: string,
   ctx: AdapterContext,
 ): PlayerAdapter | null {
-  return ADAPTERS[service]?.(ctx) ?? null;
+  return ADAPTERS.get(service)?.(ctx) ?? null;
 }
