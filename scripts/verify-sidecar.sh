@@ -17,6 +17,10 @@
 #   3. its architecture matches the one being packaged
 #   4. it actually runs
 #   5. the dist it was built against is the dist about to be shipped
+#   6. the LiteRT-LM library in resources/litert-lm, when one is staged, is the
+#      package its manifest describes: arm64 Mach-O, dependencies resolved
+#      inside that directory or by macOS, validly signed, and loadable; and
+#      every dylib in it is named under mac.binaries
 #
 # Usage:
 #   bash scripts/verify-sidecar.sh
@@ -81,4 +85,27 @@ if [ "${EXPECTED}" != "${ACTUAL}" ]; then
   dist at compile time."
 fi
 
-echo "OK: sidecar verified ($(du -h "${SIDECAR}" | cut -f1)), dist matches."
+# 6. The LiteRT-LM library. Without it the app runs and .litertlm models do not load, so its
+#    absence is a warning; a staged copy that fails its checks is native code the server would
+#    load into its own process, so that stops the packaging.
+LITERT_STAGED="${DESKTOP_DIR}/resources/litert-lm"
+LITERT_SUMMARY="no LiteRT-LM library"
+if [ -d "${LITERT_STAGED}" ]; then
+  # shellcheck source=lib/litert-setup.sh
+  source "${SCRIPT_DIR}/lib/litert-setup.sh"
+  if ! litert_verify "${LITERT_STAGED}"; then
+    fail "the staged LiteRT-LM library fails verification:
+${LITERT_VERIFY_PROBLEMS}"
+  fi
+  for LIB in "${LITERT_STAGED}"/*.dylib; do
+    grep -qF "Contents/Resources/litert-lm/${LIB##*/}" "${DESKTOP_DIR}/electron-builder.yml" \
+      || fail "${LIB##*/} is staged but not named under mac.binaries in electron-builder.yml."
+  done
+  LITERT_SUMMARY="LiteRT-LM verified (${LITERT_VERIFY_FILES} files)"
+  [ -z "${LITERT_VERIFY_NOTES}" ] || echo "  note: ${LITERT_VERIFY_NOTES}"
+else
+  echo "  warning: no LiteRT-LM library staged; this app will not load .litertlm models"
+  echo "  (bash scripts/giap.sh litert build macos-arm64, then npm run stage:server)"
+fi
+
+echo "OK: sidecar verified ($(du -h "${SIDECAR}" | cut -f1)), dist matches, ${LITERT_SUMMARY}."

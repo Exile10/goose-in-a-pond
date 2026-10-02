@@ -8,6 +8,8 @@
 #   bash scripts/giap.sh doctor       # non-interactive: health report, exit 1 on FAIL
 #   bash scripts/giap.sh status       # non-interactive: detection banner only
 #   bash scripts/giap.sh build        # non-interactive: build UI + server for THIS host
+#   bash scripts/giap.sh litert status       # the LiteRT-LM library (.litertlm models): recorded packages, verified
+#   bash scripts/giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]   # build, package, verify, record
 #   bash scripts/giap.sh --dry-run …  # print every command instead of running it
 #
 # It auto-detects the host (Jetson / Linux / macOS), whether CUDA is usable, and
@@ -35,6 +37,8 @@ fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/macos-sdk.sh
 source "$HERE/lib/macos-sdk.sh"
+# shellcheck source=lib/litert-setup.sh
+source "$HERE/lib/litert-setup.sh"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
@@ -105,6 +109,8 @@ D_DATA_DIR=""; D_PORT=""; D_HEALTH=""; D_PROCS=0
 D_RAM_TOTAL=""; D_RAM_AVAIL=""; D_DISK_FREE=""; D_TGT_DBG=""; D_TGT_REL=""
 D_PWR=""; D_OC=""; D_DISPLAY=""; D_SUDO=""
 D_ENGINE=""; D_SETTINGS=""
+D_LITERT_MAC=""; D_LITERT_MAC_TAG=""; D_LITERT_MAC_DIR=""; D_LITERT_LNX=""; D_LITERT_LNX_TAG=""; D_LITERT_LNX_DIR=""
+D_LITERT_DEV=""; D_LITERT_DEV_TAG=""; D_LITERT_DEV_DIR=""
 
 human_mb() { # $1 = MB
   local m="${1:-0}"
@@ -340,6 +346,30 @@ detect_engine() {
   esac
 }
 
+# The recorded LiteRT-LM packages, and on Linux the one deployed under the data dir. Reads each
+# manifest's first line and hashes nothing: doctor and `litert status` do the verifying.
+detect_litert() {
+  litert_state macos-arm64
+  D_LITERT_MAC="$LITERT_STATE"; D_LITERT_MAC_TAG="$LITERT_STATE_TAG"; D_LITERT_MAC_DIR="$LITERT_STATE_DIR"
+  litert_state linux-arm64
+  D_LITERT_LNX="$LITERT_STATE"; D_LITERT_LNX_TAG="$LITERT_STATE_TAG"; D_LITERT_LNX_DIR="$LITERT_STATE_DIR"
+  D_LITERT_DEV=""; D_LITERT_DEV_TAG=""; D_LITERT_DEV_DIR=""
+  if [ "$D_OS" = "linux" ]; then
+    D_LITERT_DEV_DIR="$D_DATA_DIR/$(litert_device_subdir)"
+    _litert_dir_state "$D_LITERT_DEV_DIR"
+    D_LITERT_DEV="$LITERT_STATE"; D_LITERT_DEV_TAG="$LITERT_STATE_TAG"
+  fi
+}
+
+litert_state_text() { # $1 = state, $2 = tag
+  case "$1" in
+    present)   printf '%s' "$2" ;;
+    other-pin) printf '%s (the pin is %s)' "$2" "$(litert_tag)" ;;
+    missing)   printf 'MISSING' ;;
+    *)         printf 'none' ;;
+  esac
+}
+
 sqlite_setting() { # $1 = key
   command -v sqlite3 >/dev/null 2>&1 || return 1
   [ -f "$D_DATA_DIR/pond_system.db" ] || return 1
@@ -350,7 +380,7 @@ sqlite_setting() { # $1 = key
 detect_all() {
   detect_host; detect_accel; detect_toolchain; detect_repo; detect_ui
   detect_binaries; detect_service; detect_runtime; detect_resources
-  detect_jetson_power; detect_capabilities; detect_engine
+  detect_jetson_power; detect_capabilities; detect_engine; detect_litert
 }
 
 # ── banner ───────────────────────────────────────────────────────────────────
@@ -371,6 +401,12 @@ banner() {
   printf '  %-9s server %s%s · desktop %s\n' "Binaries" "$D_BIN_REL" \
     "$( [ -n "$D_BIN_REL_WHEN" ] && echo " ($D_BIN_REL_WHEN)" )" "$D_DESKTOP"
   [ -n "$D_STAMP" ] && note "stamp: $D_STAMP"
+  if [ "$D_IS_JETSON" = true ]; then
+    printf '  %-9s installed %s\n' "LiteRT-LM" "$(litert_state_text "$D_LITERT_DEV" "$D_LITERT_DEV_TAG")"
+  else
+    printf '  %-9s macos-arm64 %s · linux-arm64 %s\n' "LiteRT-LM" \
+      "$(litert_state_text "$D_LITERT_MAC" "$D_LITERT_MAC_TAG")" "$(litert_state_text "$D_LITERT_LNX" "$D_LITERT_LNX_TAG")"
+  fi
   printf '  %-9s %s%s\n' "Service" "$D_SVC_SCOPE" \
     "$( [ -n "$D_SVC_ACTIVE" ] && echo " · $D_SVC_ACTIVE · $D_SVC_ENABLED${D_LINGER:+ · linger=$D_LINGER}" )"
   printf '  %-9s %s process(es)%s · health %s · engine %s\n' "Runtime" "$D_PROCS" \
@@ -672,9 +708,61 @@ doctor() {
     note "see docs/remote-access.md to give a paired phone access from outside the house"
   fi
 
+  # 14. LiteRT-LM library, which goose's litert backend loads into the server process for
+  # .litertlm models. Having none is a note; one that fails its manifest is a FAIL.
+  doctor_litert
+
   printf '\n  %sVerdict: %s FAIL · %s WARN · %s UNKNOWN%s\n' \
     "$C_B" "$DOC_FAIL" "$DOC_WARN" "$DOC_UNK" "$C_RST"
   [ "$DOC_UNK" -gt 0 ] && note "UNKNOWN is never counted as OK — absence of evidence is not health"
+  return 0
+}
+
+# Every file of each recorded package is hashed against its manifest, then inspected and loaded.
+doctor_litert() {
+  local p state tag dir
+  if [ "$D_OS" = "linux" ] && { [ "$D_IS_JETSON" = true ] || [ "$D_LITERT_DEV" != "missing" ]; }; then
+    case "$D_LITERT_DEV" in
+      missing)
+        info "no LiteRT-LM library installed (only .litertlm models need it)"
+        note "it comes from the Mac: bash scripts/giap.sh litert build linux-arm64, then scripts/jetson.sh deploy" ;;
+      *)
+        if ! litert_report_dir "LiteRT-LM library installed" "$D_LITERT_DEV_DIR"; then
+          note "fix: redeploy it from the Mac (scripts/jetson.sh deploy), which copies and re-checks it"
+          DOC_FAIL=$((DOC_FAIL+1))
+        fi
+        if [ "$D_LITERT_DEV" = "other-pin" ]; then
+          warn "the installed LiteRT-LM is $D_LITERT_DEV_TAG; this checkout pins $(litert_tag)"
+          DOC_WARN=$((DOC_WARN+1))
+        fi ;;
+    esac
+  fi
+  [ "$D_IS_JETSON" = true ] && return 0
+  for p in macos-arm64 linux-arm64; do
+    if [ "$p" = macos-arm64 ]; then state="$D_LITERT_MAC"; tag="$D_LITERT_MAC_TAG"; dir="$D_LITERT_MAC_DIR"
+    else state="$D_LITERT_LNX"; tag="$D_LITERT_LNX_TAG"; dir="$D_LITERT_LNX_DIR"; fi
+    case "$state" in
+      none)
+        if [ "$p" = macos-arm64 ] && [ "$D_OS" = "macos" ]; then
+          info "no LiteRT-LM library recorded (only .litertlm models need it)"
+          note "build: bash scripts/giap.sh litert build macos-arm64   (linux-arm64 for the Jetson)"
+        fi ;;
+      missing)
+        warn "the recorded LiteRT-LM $p package is gone ($dir)"
+        note "fix: bash scripts/giap.sh litert build $p"
+        DOC_WARN=$((DOC_WARN+1)) ;;
+      *)
+        if ! litert_report_dir "LiteRT-LM $p" "$dir"; then
+          note "fix: bash scripts/giap.sh litert build $p"
+          DOC_FAIL=$((DOC_FAIL+1))
+        fi
+        if [ "$state" = "other-pin" ]; then
+          warn "the LiteRT-LM $p package is $tag; this checkout pins $(litert_tag)"
+          note "fix: bash scripts/giap.sh litert build $p"
+          DOC_WARN=$((DOC_WARN+1))
+        fi ;;
+    esac
+  done
   return 0
 }
 
@@ -851,6 +939,50 @@ action_build_desktop() {
   detect_binaries
   [ $rc -eq 0 ] && ok "desktop app built: $D_DESKTOP" || bad "desktop build failed"
   return $rc
+}
+
+# `giap.sh litert status|build [platform]`: the LiteRT-LM C API library for goose's litert backend.
+action_litert() {
+  local sub="${1:-status}" platform="${2:-}" rc
+  case "$sub" in
+    status)
+      head1 "LiteRT-LM library  (goose's litert backend loads it for .litertlm models)"
+      if [ "$D_OS" = "linux" ]; then litert_status "$D_DATA_DIR"; else litert_status; fi ;;
+    build)
+      if [ "$D_IS_JETSON" = true ]; then
+        bad "LiteRT-LM is never built on the device"
+        note "build it on the Mac (bash scripts/giap.sh litert build linux-arm64), then deploy from there"
+        return 1
+      fi
+      [ -n "$platform" ] || platform="$(litert_default_platform)"
+      head1 "Build LiteRT-LM C API $LITERT_CAPI_VERSION for $platform"
+      case "$platform" in
+        macos-arm64) info "a native Bazel build: about 22 minutes cold on an M4, a minute when nothing changed" ;;
+        linux-arm64) info "Bazel inside $LITERT_LINUX_IMAGE (linux/arm64, glibc 2.35 as on JetPack 6) under Docker" ;;
+      esac
+      litert_build "$platform"; rc=$?
+      detect_litert
+      return $rc ;;
+    *)
+      bad "unknown: litert $sub"
+      note "usage: giap.sh litert status | giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]"
+      return 2 ;;
+  esac
+}
+
+action_litert_menu() {
+  action_litert status
+  [ -t 0 ] || return 0
+  [ "$D_IS_JETSON" = true ] && return 0
+  say ""
+  if [ "$D_OS" = "macos" ]; then say "  m) build macos-arm64 here    l) build linux-arm64 in Docker (for the Jetson)    return) back"
+  else say "  l) build linux-arm64 in Docker (for the Jetson)    return) back"; fi
+  local c=""; printf '  > '; read -r c
+  case "$c" in
+    m|M) [ "$D_OS" = "macos" ] && action_litert build macos-arm64 ;;
+    l|L) action_litert build linux-arm64 ;;
+  esac
+  return 0
 }
 
 # ── service actions ──────────────────────────────────────────────────────────
@@ -1070,6 +1202,7 @@ show_menu() {
   say "  12) Build pond-server (release, correct features for this host)"
   say "  13) Build both (UI then server)"
   [ "$D_IS_JETSON" = false ] && say "  14) Deploy to the Jetson (from this dev machine)"
+  say "  15) LiteRT-LM library — status, and building it (for .litertlm models)"
   say ""
   say "  ${C_B}Service${C_RST}"
   say "  20) Install the service"
@@ -1105,6 +1238,7 @@ menu_loop() {
       12) action_build_server; pause ;;
       13) action_build_ui && action_build_server; pause ;;
       14) action_deploy; pause ;;
+      15) action_litert_menu; pause ;;
       20) action_service_install; pause ;;
       21) svc_ctl start;   detect_service; detect_runtime; pause ;;
       22) svc_ctl stop;    detect_service; detect_runtime; pause ;;
@@ -1126,19 +1260,29 @@ menu_loop() {
 }
 
 usage() {
-  sed -n '3,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # The header comment, up to the line before the bash 3.2 note.
+  sed -n '3,/^# Written for bash/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
 # ── entry ────────────────────────────────────────────────────────────────────
-CMD=""
+# The first word is the command; only `litert` takes more (a subcommand and a platform).
+CMD=""; CMD_SUB=""; CMD_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift ;;
+    --distdir) [ $# -ge 2 ] || { bad "--distdir needs a directory"; exit 2; }; LITERT_DISTDIR="$2"; shift 2 ;;
     -y|--yes)  ASSUME_YES=true; shift ;;
     -h|--help|help) usage; exit 0 ;;
-    *) CMD="$1"; shift ;;
+    *) if [ -z "$CMD" ]; then CMD="$1"
+       elif [ -z "$CMD_SUB" ]; then CMD_SUB="$1"
+       elif [ -z "$CMD_ARG" ]; then CMD_ARG="$1"
+       else bad "unexpected argument: $1"; usage; exit 2; fi
+       shift ;;
   esac
 done
+if [ "$CMD" != "litert" ] && [ -n "$CMD_SUB" ]; then
+  bad "'$CMD' takes no arguments (got: $CMD_SUB)"; exit 2
+fi
 
 detect_all
 
@@ -1153,5 +1297,6 @@ case "$CMD" in
   deploy)    action_deploy ;;
   logs)      action_logs ;;
   gui)       action_launch_gui ;;
+  litert)    action_litert "$CMD_SUB" "$CMD_ARG" ;;
   *)         bad "unknown command: $CMD"; usage; exit 1 ;;
 esac

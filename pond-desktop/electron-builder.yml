@@ -36,6 +36,14 @@ extraResources:
     to: "pond-server"
   - from: "resources/pondnet"
     to: "pondnet"
+  # The LiteRT-LM C API library and the LiteRT runtime it loads, staged by
+  # scripts/stage-server-sidecar.sh from the package `giap.sh litert build`
+  # records. goose's litert backend looks in a litert-lm/ directory beside the
+  # pond-server executable, so it lands at Contents/Resources/litert-lm/. When
+  # nothing is staged, electron-builder skips this entry with a warning and the
+  # app ships without the litert backend.
+  - from: "resources/litert-lm"
+    to: "litert-lm"
   # The Matter controller's sources. pond-server copies these to a writable
   # directory and runs `npm ci` there on first use; it finds them by walking up
   # from its own path, and Contents/Resources/matter-server is the first
@@ -79,10 +87,21 @@ mac:
   hardenedRuntime: false
 
   # The sidecar is a nested Mach-O binary; naming it here is what gets it
-  # signed too, once signing is on.
+  # signed too, once signing is on. So is every LiteRT-LM dylib, which
+  # scripts/verify-sidecar.sh checks against what is staged. They carry ad-hoc
+  # signatures until then, and signing rewrites them, so the MANIFEST.sha256
+  # staged beside them has to be written again after signing.
   binaries:
     - "Contents/Resources/pond-server"
     - "Contents/Resources/pondnet"
+    - "Contents/Resources/litert-lm/liblitert-lm.dylib"
+    - "Contents/Resources/litert-lm/libLiteRt.dylib"
+    - "Contents/Resources/litert-lm/libGemmaModelConstraintProvider.dylib"
+    - "Contents/Resources/litert-lm/libLiteRtWebGpuAccelerator.dylib"
+    - "Contents/Resources/litert-lm/libLiteRtTopKWebGpuSampler.dylib"
+    - "Contents/Resources/litert-lm/libwebgpu_dawn.dylib"
+    - "Contents/Resources/litert-lm/libLiteRtMetalAccelerator.dylib"
+    - "Contents/Resources/litert-lm/libLiteRtTopKMetalSampler.dylib"
 
   extendInfo:
     NSMicrophoneUsageDescription: >-
