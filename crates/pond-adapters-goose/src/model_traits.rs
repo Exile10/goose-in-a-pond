@@ -16,7 +16,8 @@ pub fn probe_for_model(
     model_name: &str,
     data_dir: Option<&Path>,
 ) -> Option<ModelProbe> {
-    if !is_local_gguf(provider) {
+    // A `.litertlm` file has no GGUF header; its traits come from the name heuristic.
+    if !is_local_gguf(provider) || pond_core::models::domain::litert::is_litert_model(model_name) {
         return None;
     }
     let gguf_dir = data_dir?.join("models").join("gguf");
@@ -142,6 +143,20 @@ mod tests {
     #[test]
     fn a_local_model_with_no_data_dir_falls_back_rather_than_panicking() {
         assert!(probe_for_model("local", "gemma-4-E2B-it", None).is_none());
+    }
+
+    /// No GGUF header to read, so the Gemma 4 name answers: it reasons and calls tools natively.
+    #[test]
+    fn a_litert_model_takes_its_traits_from_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = "gemma-4-E2B-it.litertlm";
+        assert!(probe_for_model("local", model, Some(tmp.path())).is_none());
+        assert!(model_reasons("local", model, Some(tmp.path())));
+        assert!(model_uses_native_tools("local", model, Some(tmp.path())));
+        assert_eq!(
+            trained_context_window("local", model, Some(tmp.path())),
+            None
+        );
     }
 
     #[test]

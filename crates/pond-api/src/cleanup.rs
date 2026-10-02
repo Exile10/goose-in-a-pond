@@ -209,6 +209,7 @@ pub async fn collect_disk_usage(data_dir: &Path) -> anyhow::Result<DiskUsage> {
     if fs::metadata(&models_root).await.is_ok() {
         for cat in &[
             "gguf",
+            "litertlm",
             "whisper",
             "tts",
             "embedding",
@@ -423,6 +424,9 @@ async fn sum_files_matching(dir: &Path, predicate: impl Fn(&str) -> bool) -> u64
 /// Coarse category for the response only; deletion never depends on it.
 fn infer_category(path: &Path) -> String {
     let s = path.display().to_string().to_ascii_lowercase();
+    if s.contains("litert") {
+        return "litert".to_string();
+    }
     if s.contains("/gguf") || s.contains("--gguf") || s.ends_with(".gguf") {
         return "gguf".to_string();
     }
@@ -661,5 +665,23 @@ mod tests {
         let usage = collect_disk_usage(tmp.path()).await.unwrap();
         assert_eq!(usage.by_category.get("mmproj").copied(), Some(10));
         assert_eq!(usage.total_bytes, 10);
+    }
+
+    /// A LiteRT-LM model is counted through its link, under its own directory's name.
+    #[tokio::test]
+    async fn disk_usage_counts_litert_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = make_blob(
+            tmp.path(),
+            "models--litert-community--gemma-4-E2B-it-litert-lm",
+            "18193810",
+            b"LLLLLLLL",
+        );
+        link_flat(tmp.path(), "litertlm/gemma-4-E2B-it.litertlm", &blob);
+
+        let usage = collect_disk_usage(tmp.path()).await.unwrap();
+        assert_eq!(usage.by_category.get("litertlm").copied(), Some(8));
+        assert_eq!(usage.total_bytes, 8);
+        assert_eq!(infer_category(&blob), "litert");
     }
 }

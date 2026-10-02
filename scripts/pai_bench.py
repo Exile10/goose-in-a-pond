@@ -253,8 +253,11 @@ def probe_context_and_compaction():
     })
 
     lt = logtext()
-    plans = [l for l in lt.splitlines() if "prefill plan" in l]
-    reuse = [l for l in plans if "ReusePrefix" in l]
+    # llama.cpp logs a prefill plan; the LiteRT-LM backend a conversation plan, where Extend
+    # sends only the new messages to the retained conversation.
+    plans = [l for l in lt.splitlines()
+             if "prefill plan" in l or "LiteRT-LM conversation plan" in l]
+    reuse = [l for l in plans if "ReusePrefix" in l or "Extend" in l]
     if not plans:
         record(4, "the KV prefix is reused across turns", "SKIP",
                "no 'prefill plan' lines -- not the in-process engine, or debug logging off")

@@ -99,6 +99,10 @@ pub const ENCODER_SPECS: &[EncoderSpec] = &[
 /// The encoder `chat_model` needs, biased to `None`: a false positive tells a blind model it
 /// can see. Matched on lowercase substrings so every spelling of one model finds its row.
 pub fn encoder_for(chat_model: &str) -> Option<EncoderSpec> {
+    // A `.litertlm` Gemma 4 carries the family's name but reads no mmproj.
+    if super::litert::is_litert_model(chat_model) {
+        return None;
+    }
     let m = chat_model.to_ascii_lowercase();
     if !m.contains("gemma-4") && !m.contains("gemma4") {
         return None;
@@ -957,6 +961,9 @@ mod tests {
             ("gemma-4-E2B-it-qat-mobile", None),
             ("gemma-4-12b-it-qat", None),
             ("gemma-3-4b-it", None),
+            // LiteRT-LM files: the family's name, no mmproj
+            ("gemma-4-E2B-it.litertlm", None),
+            ("gemma-4-E4B-it.litertlm", None),
             ("", None),
         ];
         for (name, want) in cases {

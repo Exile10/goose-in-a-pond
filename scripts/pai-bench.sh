@@ -5,7 +5,9 @@
 #
 #   scripts/pai-bench.sh                 build if needed, run every probe
 #   scripts/pai-bench.sh --no-build      use the existing binary
-#   scripts/pai-bench.sh --model NAME    pick the GGUF (default: first found)
+#   scripts/pai-bench.sh --model NAME    pick the model: a GGUF stem, or a
+#                                        LiteRT-LM file (NAME.litertlm)
+#                                        (default: this pond's chat_model)
 #   scripts/pai-bench.sh --slow          include the probes that need real time
 #                                        (PAI-7's reviewer needs 15 min idle)
 #   scripts/pai-bench.sh --only 1,5,8    run a subset
@@ -58,7 +60,7 @@ while [ $# -gt 0 ]; do
     --model)    MODEL="${2:-}"; shift ;;
     --only)     ONLY="${2:-}"; shift ;;
     --json)     JSON_OUT="${2:-}"; shift ;;
-    -h|--help)  sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,41p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
   shift
@@ -103,8 +105,8 @@ case "$(uname -s)" in
   *)      REAL_MODELS="$HOME/.local/share/goose-in-a-pond/models" ;;
 esac
 
-if [ ! -d "$REAL_MODELS/gguf" ]; then
-  echo "FATAL: no GGUF models at $REAL_MODELS/gguf" >&2
+if [ ! -d "$REAL_MODELS/gguf" ] && [ ! -d "$REAL_MODELS/litertlm" ]; then
+  echo "FATAL: no models at $REAL_MODELS/gguf or $REAL_MODELS/litertlm" >&2
   echo "       This benchmark needs a real model; there is nothing to measure" >&2
   echo "       without one. Download one through the app first." >&2
   exit 1
@@ -220,6 +222,14 @@ fi
 say "Starting a scratch pond with real weights"
 mkdir -p "$DATA_DIR/models/gguf"
 
+# A LiteRT-LM model's id IS its file name (`gemma-4-E2B-it.litertlm`) and it lives in
+# models/litertlm, so it has no stem to bridge; the two identities below still hold.
+MODEL_DIR="gguf"
+case "$MODEL" in
+  *.litertlm) MODEL_DIR="litertlm" ;;
+esac
+mkdir -p "$DATA_DIR/models/$MODEL_DIR"
+
 # Resolve the model to a real file. TWO identities matter here and conflating
 # them breaks the run in two different ways.
 #
@@ -244,16 +254,24 @@ mkdir -p "$DATA_DIR/models/gguf"
 # path with an asterisk in it. The failure looked exactly like a missing model
 # while the model was in the list the error message printed.
 ENTRY=""
-for path in "$REAL_MODELS/gguf/$MODEL.gguf" "$REAL_MODELS/gguf/$MODEL"-*.gguf; do
-  if [ -e "$path" ]; then ENTRY="$(basename "$path")"; break; fi
-done
+if [ "$MODEL_DIR" = "litertlm" ]; then
+  if [ -e "$REAL_MODELS/litertlm/$MODEL" ]; then ENTRY="$MODEL"; fi
+else
+  for path in "$REAL_MODELS/gguf/$MODEL.gguf" "$REAL_MODELS/gguf/$MODEL"-*.gguf; do
+    if [ -e "$path" ]; then ENTRY="$(basename "$path")"; break; fi
+  done
+fi
 if [ -z "$ENTRY" ]; then
-  echo "FATAL: could not resolve $MODEL to a file under $REAL_MODELS/gguf" >&2
-  echo "       (tried '$MODEL.gguf' and '$MODEL-<quant>.gguf'; present:)" >&2
-  ls -1 "$REAL_MODELS/gguf" 2>/dev/null | sed 's/^/         /' >&2
+  echo "FATAL: could not resolve $MODEL to a file under $REAL_MODELS/$MODEL_DIR" >&2
+  if [ "$MODEL_DIR" = "litertlm" ]; then
+    echo "       (tried '$MODEL'; present:)" >&2
+  else
+    echo "       (tried '$MODEL.gguf' and '$MODEL-<quant>.gguf'; present:)" >&2
+  fi
+  ls -1 "$REAL_MODELS/$MODEL_DIR" 2>/dev/null | sed 's/^/         /' >&2
   exit 1
 fi
-SRC="$REAL_MODELS/gguf/$ENTRY"
+SRC="$REAL_MODELS/$MODEL_DIR/$ENTRY"
 SRC="$(readlink -f "$SRC" 2>/dev/null || python3 -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "$SRC")"
 if [ ! -f "$SRC" ]; then
   echo "FATAL: $ENTRY points at $SRC, which is not a file." >&2
@@ -261,14 +279,29 @@ if [ ! -f "$SRC" ]; then
   echo "       was pruned from hf_cache." >&2
   exit 1
 fi
-if ! ln "$SRC" "$DATA_DIR/models/gguf/$ENTRY" 2>/dev/null; then
+if ! ln "$SRC" "$DATA_DIR/models/$MODEL_DIR/$ENTRY" 2>/dev/null; then
   # Different filesystem: copy rather than symlink. Slower, still isolated.
   echo "  (hard link failed -- copying $ENTRY; scratch is on another filesystem)"
-  cp "$SRC" "$DATA_DIR/models/gguf/$ENTRY" || exit 1
+  cp "$SRC" "$DATA_DIR/models/$MODEL_DIR/$ENTRY" || exit 1
 fi
 echo "model:     $MODEL   (chosen by: ${MODEL_SOURCE:-unknown})"
 echo "weights:   hard-linked from $SRC"
 echo "data dir:  $DATA_DIR"
+
+# The scratch pond has no lib/ of its own, so the server's search of <data dir>/lib/litert-lm
+# finds nothing there: hand it the real pond's newest package, which is where deploy.sh puts it
+# on a device. Without one the server falls back to the recorded package (a Mac's ~/.giap).
+if [ "$MODEL_DIR" = "litertlm" ] && [ -z "${GOOSE_LITERT_LIB_DIR:-}" ]; then
+  REAL_LIBS="$(dirname "$REAL_MODELS")/lib/litert-lm"
+  LITERT_LIB="$(ls -t "$REAL_LIBS"/*/liblitert-lm.so "$REAL_LIBS"/*/liblitert-lm.dylib 2>/dev/null | head -1)"
+  if [ -n "$LITERT_LIB" ]; then
+    GOOSE_LITERT_LIB_DIR="$(dirname "$LITERT_LIB")"
+    export GOOSE_LITERT_LIB_DIR
+  fi
+fi
+if [ "$MODEL_DIR" = "litertlm" ]; then
+  echo "litert:    ${GOOSE_LITERT_LIB_DIR:-left to the server (recorded package or next to the binary)}"
+fi
 
 # giap::trace at info carries the per-turn metrics; the adapter at debug carries
 # the KV prefill plan and the provider payload size. Both are needed and neither
@@ -280,7 +313,7 @@ echo "data dir:  $DATA_DIR"
 START_PORT="${PAI_BENCH_PORT_START:-4970}"
 
 POND_DATA_DIR="$DATA_DIR" POND_DEV_ALLOW_LOOPBACK=1 \
-RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,goose_local_inference=debug,llama_cpp_2=info" \
+RUST_LOG="warn,giap::trace=info,giap::kv=debug,pond_server=info,pond_adapters_goose=debug,goose_local_inference=debug,llama_cpp_2=info" \
   "$BIN" serve --port "$START_PORT" > "$DATA_DIR/server.out" 2>&1 < /dev/zero &
 SERVER_PID=$!
 
@@ -320,7 +353,7 @@ wait "$SERVER_PID" 2>/dev/null
 rm -f "$DATA_DIR/.runtime_api_port"
 
 POND_DATA_DIR="$DATA_DIR" POND_DEV_ALLOW_LOOPBACK=1 \
-RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,goose_local_inference=debug,llama_cpp_2=info" \
+RUST_LOG="warn,giap::trace=info,giap::kv=debug,pond_server=info,pond_adapters_goose=debug,goose_local_inference=debug,llama_cpp_2=info" \
   "$BIN" serve --port "$START_PORT" >> "$DATA_DIR/server.out" 2>&1 < /dev/zero &
 SERVER_PID=$!
 

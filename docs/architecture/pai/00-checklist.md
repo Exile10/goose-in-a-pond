@@ -2185,3 +2185,40 @@ and do not establish device-key proof of possession or encrypted transport.
   memory reading with E2B, its drafter and its encoder resident during the boot warm-up (the gate for
   putting E2B on `DEVICE_MEASURED_VISION`), `ENCODER_COMPUTE_MB`, and the PAI-3 re-run after the
   budget move.
+
+**2026-10-02 — LiteRT-LM models in the local provider (GIAP wiring; not a PAI milestone).**
+
+- **What landed.** A `.litertlm` file runs on goose's `litert` backend under `chat_provider =
+  "local"`: catalogue category `litert` whose runtime provider is `local` (so the boot-time
+  assignment sync no longer turns it into llamafile), id = file name with the extension, one
+  registration for the chat path and the side-call adapter (entry-level `backend_id`,
+  `ManualPath`, `ForceNative`, no picture support), and a device stamp that writes only
+  `context_size` and the `litert` block. No GGUF probe, encoder lookup or `device_window` runs on
+  one. Two pinned catalogue rows; startup points `GOOSE_LITERT_LIB_DIR` at an installed package.
+- **Interdependency check (2.2), run against all eight.** KV prefix: the backend keeps one
+  Conversation per model, and follow-up inferences and the next turn are `Extend` (measured
+  below); with thinking on, LiteRT rewinds to step 0 when it filters thought channels, so the first
+  follow-up re-prefills once. Preamble: unchanged; `<vision>` is never claimed, `structured_output`
+  is false. `profile_id`: untouched. Egress: no new sender; both Hugging Face download paths apply
+  the pin (size + sha256); library discovery downloads nothing. Secrets: none; no `Settings` field
+  (two env overrides, `GIAP_LITERT_BACKEND` and `GIAP_LITERT_SPECULATIVE`). Guest, turn blocking,
+  side effects: none.
+- **PAI-3, provisional.** The window is 16384 off the budgeted device and 4096 on it, LiteRT-LM's
+  own GPU default and not an Orin measurement. 4096 cannot hold this Mac's 4.0K-token turn-1
+  prompt (27 tools) plus an answer; the Orin's KV reading must replace it before the board runs it.
+- **Found, not fixed here: on this Mac's GPU (WebGPU on Metal) the output is corrupt whenever the
+  conversation carries tools.** Digits are dropped, repeated and reordered ("19:23 on 2 October 2026,
+  code 1234567890" came back "19:226 on October 2206, code 13123456890"), tool names arrive garbled
+  and are dropped by the shim, and one turn ran away for 11,164 tokens. It is deterministic and
+  holds with MTP off, greedy sampling, temperature 0.2-0.8, top_p 1.0, windows 8192/16384 and
+  thinking off. Without tools the same GPU repeats the line exactly at 623, 2,017 and 3,716 prompt
+  tokens; on the CPU (XNNPACK) with tools it is exact. A goose-backend or LiteRT-LM fix; until then
+  `GIAP_LITERT_BACKEND=cpu` gives correct output at CPU speed.
+- **Verification**: Mac only (M4, E2B, debug GIAP over the prebuilt library). Suites: pond-core
+  1,721, pond-api 546, pond-infra 446, goose adapter 263, local-inference 42, pond-server bin 145,
+  all green; `cargo check -p pond-server -p pond-adapters-goose --all-targets` clean;
+  `scripts/live-test.sh` 123 + 18 checks passed. Scratch pond, CPU: turn 1 ttft 18.5 s (prefill
+  4,024 tokens at ~220 tok/s), turn 2 `get_system_info` called and answered, `Extend`, ttft 1.8 s,
+  `reused_prefix_tokens` 12,622 across its three inferences, decode ~16 tok/s; GPU: ttft 3.5 s,
+  decode 62 tok/s, output corrupt as above. A restart kept `chat_provider = local` and the litert
+  `chat_model`. Not run: the Orin, the pai-bench head-to-head, the KV-cost measurement.

@@ -358,6 +358,10 @@ async fn download_via_hf_cache(
         .repo(repo_id.to_string())
         .with_revision(revision.to_string());
     let fetch = repo.file(filename.to_string());
+    let fetch = match pond_core::models::domain::litert::pinned(repo_id, revision, filename) {
+        Some(pin) => fetch.expect_size(pin.size_bytes).expect_etag(pin.sha256),
+        None => fetch,
+    };
 
     let approx_total = approx_size_mb * 1_048_576;
     let mut last_printed = 0u64;

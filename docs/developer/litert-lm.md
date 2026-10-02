@@ -99,10 +99,13 @@ can. A package that fails its hashes is never loaded.
 | Jetson | `~/.local/share/goose-in-a-pond/lib/litert-lm/1.0.0-3dbb23e1/` | `bash scripts/jetson.sh deploy` copies the recorded linux-arm64 package and runs `sha256sum -c` and `ldd` there; `JETSON_DATA_DIR` if the pond's data dir is elsewhere |
 | A pond run from `target/` | the recorded package directory | found through `~/.giap/litert-lm/.path-<platform>` |
 
-At startup pond-server sets `GOOSE_LITERT_LIB_DIR`, unless it is already set, to the newest package
-under `<data dir>/lib/litert-lm/` and otherwise to the recorded one
-(`crates/pond-server/src/litert_runtime.rs`). Left unset, the backend looks in `litert-lm/` beside
-the executable, which is where the app bundle carries it.
+At startup pond-server decides which library the backend loads and logs the decision
+(`crates/pond-server/src/litert_runtime.rs`). A `GOOSE_LITERT_LIB_DIR` that is already set wins. A
+library in `litert-lm/` beside the executable, the app bundle's, is left for the backend to find
+there, so an app always loads the copy it was built and verified with. Otherwise pond-server sets
+`GOOSE_LITERT_LIB_DIR` to the newest package under `<data dir>/lib/litert-lm/` (the Jetson), then to
+the recorded one (`~/.giap/litert-lm/.path-<platform>`, under `GIAP_LITERT_HOME` when that is set).
+With none of them the backend falls back to its own search.
 
 With nothing recorded, staging and deploy warn and carry on: the app or the device then runs without
 the litert backend. A recorded package that fails verification stops them.

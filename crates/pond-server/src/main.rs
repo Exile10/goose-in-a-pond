@@ -9,6 +9,7 @@ mod filesystem_model_storage;
 mod http_model_downloader;
 mod inference_lane_runner;
 mod kokoro_control;
+mod litert_runtime;
 mod llamafile_process;
 mod llm_memory_consolidator;
 mod mdns_advertiser;
@@ -1056,6 +1057,8 @@ async fn run_server(
     // After `set_network_mode` (it may download ~100 MB from github.com) and before any
     // ONNX-dependent init (face recognition, embeddings).
     ensure_onnx_runtime();
+    // Before any provider is built: goose reads it when it first loads a `.litertlm` model.
+    litert_runtime::ensure_library_dir(&data_dir);
 
     // The stored setting wins unless the CLI flag names a backend other than the "goose" default.
     let agent_backend = if agent_backend == "goose" && !settings.agent_backend.is_empty() {
@@ -4742,6 +4745,7 @@ async fn run_chat(
     // Before any ONNX init (else ORT_DYLIB_PATH is unset and Piper::new() hangs), and after the
     // egress mode install, since it may download ~100 MB.
     ensure_onnx_runtime();
+    litert_runtime::ensure_library_dir(&data_dir);
 
     let settings_provider = settings.chat_provider.clone();
     let effective_provider: &str = provider.unwrap_or(&settings_provider);
@@ -8111,12 +8115,11 @@ async fn sync_assignments_to_settings(
     }
 }
 
+/// The runtime provider for a catalog category; one it does not know is llamafile.
 fn category_to_provider(category: &str) -> String {
-    match category {
-        "ollama" => "ollama".to_string(),
-        "gguf" => "local".to_string(),
-        _ => "llamafile".to_string(),
-    }
+    ModelCategory::from_str(category)
+        .map_or("llamafile", |c| c.runtime_provider())
+        .to_string()
 }
 
 /// Direct-SQLite model management CLI — no HTTP server started.
@@ -8410,6 +8413,7 @@ async fn stream_agent_response(
 async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
+    litert_runtime::ensure_library_dir(&data_dir);
 
     let settings_repo: Arc<
         dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
@@ -9127,6 +9131,12 @@ mod tests {
         assert_eq!(category_to_provider("llamafile"), "llamafile");
     }
 
+    /// Unmapped, a LiteRT-LM chat assignment would turn into llamafile at every restart.
+    #[test]
+    fn litert_category_maps_to_local_provider() {
+        assert_eq!(category_to_provider("litert"), "local");
+    }
+
     #[test]
     fn unknown_category_defaults_to_llamafile() {
         assert_eq!(category_to_provider("tts_piper"), "llamafile");
@@ -9238,6 +9248,29 @@ mod tests {
             settings.chat_model, "llama-3b",
             "model name should be extracted from id"
         );
+    }
+
+    /// The restart path: a LiteRT-LM chat assignment must come back as the local provider.
+    #[tokio::test]
+    async fn sync_litert_chat_assignment_keeps_the_local_provider() {
+        use pond_core::user_data::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+        repo.set_assignment("chat", "litert/gemma-4-E2B-it.litertlm")
+            .await
+            .unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        let settings = settings_repo.get().await.unwrap();
+        assert_eq!(settings.chat_provider, "local");
+        assert_eq!(settings.chat_model, "gemma-4-E2B-it.litertlm");
     }
 
     #[tokio::test]

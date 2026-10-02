@@ -2340,7 +2340,7 @@ async fn drive_turn(
     let catalog_context_length = match &state.model_repo {
         Some(repo) => {
             let id = ModelRecord::id_for(
-                &ModelCategory::for_chat_provider(&settings.chat_provider),
+                &ModelCategory::for_chat_model(&settings.chat_provider, &settings.chat_model),
                 &settings.chat_model,
             );
             repo.get_by_id(&id)
@@ -4730,7 +4730,7 @@ async fn update_settings(
                     let category = match *role {
                         "asr" => "whisper",
                         "tts" => "tts_piper",
-                        _ => ModelCategory::for_chat_provider(provider).as_str(),
+                        _ => ModelCategory::for_chat_model(provider, model_name).as_str(),
                     };
                     let model_id = format!("{}/{}", category, model_name);
                     let _ = repo.set_assignment(role, &model_id).await;
@@ -4747,7 +4747,8 @@ async fn update_settings(
     let chat_changed =
         current.chat_model != merged.chat_model || current.chat_provider != merged.chat_provider;
     if chat_changed
-        && ModelCategory::for_chat_provider(&merged.chat_provider) == ModelCategory::Gguf
+        && ModelCategory::for_chat_model(&merged.chat_provider, &merged.chat_model)
+            == ModelCategory::Gguf
     {
         state.agent.prepare_model(&merged.chat_model);
     }
@@ -5256,6 +5257,11 @@ async fn scan_filesystem_extras(
             &[".gguf"],
         ));
         extras.extend(scan_dir(
+            pond_core::models::domain::litert::models_dir(&data_dir_owned),
+            ModelCategory::Litert,
+            &[".litertlm"],
+        ));
+        extras.extend(scan_dir(
             data_dir_owned.join("models").join("llm"),
             ModelCategory::Llamafile,
             &[".llamafile", ".exe"],
@@ -5316,6 +5322,7 @@ fn model_dest_path(
         "whisper" => data_dir.join("models").join(filename),
         "llamafile" => data_dir.join("models").join("llm").join(filename),
         "gguf" => data_dir.join("models").join("gguf").join(filename),
+        "litert" => pond_core::models::domain::litert::models_dir(data_dir).join(filename),
         "tts" | "tts_piper" => data_dir.join("models").join("tts").join(filename),
         "tts_kokoro" => data_dir
             .join("models")
@@ -5414,7 +5421,7 @@ async fn list_models(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(model_repo) = &state.model_repo else {
         return Ok(Json(
-            json!({"whisper": [], "llamafile": [], "tts": [], "gguf": []}),
+            json!({"whisper": [], "llamafile": [], "tts": [], "gguf": [], "litert": []}),
         ));
     };
 
@@ -5472,6 +5479,7 @@ async fn list_models(
     let mut llamafile = vec![];
     let mut tts = vec![];
     let mut gguf = vec![];
+    let mut litert = vec![];
     let mut ollama = vec![];
     let mut embedding = vec![];
 
@@ -5492,13 +5500,14 @@ async fn list_models(
                 tts.push(v)
             }
             ModelCategory::Gguf => gguf.push(v),
+            ModelCategory::Litert => litert.push(v),
             ModelCategory::Ollama => ollama.push(v),
             ModelCategory::Embedding => embedding.push(v),
         }
     }
 
     Ok(Json(
-        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf, "ollama": ollama, "embedding": embedding}),
+        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf, "litert": litert, "ollama": ollama, "embedding": embedding}),
     ))
 }
 
@@ -5617,6 +5626,11 @@ async fn refresh_model_registry(
                             }
                             pond_core::models::domain::model_record::ModelCategory::Gguf => {
                                 data_dir.join("models").join("gguf").join(f).exists()
+                            }
+                            pond_core::models::domain::model_record::ModelCategory::Litert => {
+                                pond_core::models::domain::litert::models_dir(&data_dir)
+                                    .join(f)
+                                    .exists()
                             }
                             pond_core::models::domain::model_record::ModelCategory::TtsPiper => {
                                 data_dir.join("models").join("tts").join(f).exists()
@@ -5738,6 +5752,9 @@ async fn download_model(
         ModelCategory::Whisper => data_dir.join("models").join(&filename),
         ModelCategory::Llamafile => data_dir.join("models").join("llm").join(&filename),
         ModelCategory::Gguf => data_dir.join("models").join("gguf").join(&filename),
+        ModelCategory::Litert => {
+            pond_core::models::domain::litert::models_dir(&data_dir).join(&filename)
+        }
         ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
             data_dir.join("models").join("tts").join(&filename)
         }
@@ -5864,6 +5881,9 @@ async fn delete_model(
             ModelCategory::Whisper => data_dir.join("models").join(filename),
             ModelCategory::Llamafile => data_dir.join("models").join("llm").join(filename),
             ModelCategory::Gguf => data_dir.join("models").join("gguf").join(filename),
+            ModelCategory::Litert => {
+                pond_core::models::domain::litert::models_dir(data_dir).join(filename)
+            }
             ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
                 data_dir.join("models").join("tts").join(filename)
             }
@@ -6030,7 +6050,7 @@ async fn activate_model(
             Json(json!({
                 "error": format!(
                     "Category '{}' cannot be assigned to role '{}'. \
-                     LLM roles (chat/think/task) require gguf/llamafile/ollama; \
+                     LLM roles (chat/think/task) require gguf/litert/llamafile/ollama; \
                      asr requires whisper; tts requires tts_piper/tts_http.",
                     category, role
                 )
@@ -6057,7 +6077,7 @@ async fn activate_model(
 
     // Runtime provider names, not category names (gguf runs as "local").
     let provider = match cat {
-        ModelCategory::Gguf => "local",
+        ModelCategory::Gguf | ModelCategory::Litert => "local",
         ModelCategory::Llamafile => "llamafile",
         ModelCategory::Ollama => "ollama",
         ModelCategory::Whisper => "asr",
@@ -6614,6 +6634,10 @@ async fn download_via_hf_cache_tracked(
         .repo(repo_id.to_string())
         .with_revision(revision.to_string());
     let fetch = repo.file(fname.to_string());
+    let fetch = match pond_core::models::domain::litert::pinned(repo_id, revision, fname) {
+        Some(pin) => fetch.expect_size(pin.size_bytes).expect_etag(pin.sha256),
+        None => fetch,
+    };
 
     // The per-chunk callback is sync and can't take the async tracker lock, so share the atomic.
     let control = {

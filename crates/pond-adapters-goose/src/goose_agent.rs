@@ -939,7 +939,7 @@ impl GooseAdapter {
         model: &str,
     ) -> Option<u32> {
         let repo = repo?;
-        let id = ModelRecord::id_for(&ModelCategory::for_chat_provider(provider), model);
+        let id = ModelRecord::id_for(&ModelCategory::for_chat_model(provider, model), model);
         match repo.get_by_id(&id).await {
             Ok(Some(record)) => record.context_length,
             Ok(None) => None,
@@ -1426,21 +1426,25 @@ impl GooseAdapter {
                     None
                 }
             },
-            // In-process llama.cpp; LocalInferenceProvider finds the .gguf via Goose's registry.
+            // In-process; LocalInferenceProvider finds the file, and its backend, via Goose's
+            // registry: llama.cpp for a .gguf, LiteRT-LM for a .litertlm.
             "local" | "gguf" => {
                 let model_name = if settings.chat_model.is_empty() {
                     "llamafile".to_string()
                 } else {
                     settings.chat_model.clone()
                 };
+                let litert = pond_core::models::domain::litert::is_litert_model(&model_name);
                 // Canonical key, so aliases of one GGUF can't load it twice under two ids.
                 let registry_key = match self.data_dir {
+                    Some(ref dd) if litert => crate::litert_model::register(&model_name, dd),
                     Some(ref dd) => Self::register_gguf_model(&model_name, dd),
                     None => model_name.trim_end_matches(".gguf").to_string(),
                 };
                 // Registration leaves `mmproj_path` (the engine's vision gate) None. Non-blocking
                 // (~1 GB fetch); the path is resolved per generation, so no restart is needed.
-                if let Some(ref dd) = self.data_dir {
+                // A LiteRT-LM model reads no pictures.
+                if let Some(dd) = self.data_dir.as_ref().filter(|_| !litert) {
                     let gguf = self
                         .registry_row_path(&registry_key)
                         .unwrap_or_else(|| crate::vision_encoder::chat_gguf_path(dd, &model_name));
@@ -1675,7 +1679,9 @@ impl GooseAdapter {
                 &settings.chat_model,
                 self.data_dir.as_deref(),
             );
-            if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
+            if matches!(settings.chat_provider.as_str(), "local" | "gguf")
+                && !pond_core::models::domain::litert::is_litert_model(&settings.chat_model)
+            {
                 // llama.cpp can GBNF-constrain any GGUF, quant tag in its name or not.
                 caps.structured_output = true;
             }
