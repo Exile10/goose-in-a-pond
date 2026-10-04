@@ -2477,3 +2477,30 @@ runaway (measured; nothing shipped).**
   honest figure.
 - **PAI.** Nothing changed in the product: the prompt override lived in a scratch pond and was
   removed after the runs.
+
+**2026-10-04 — Fewer LiteRT-LM KV snapshots, and what actually fills the Orin's memory (goose patch;
+not a PAI milestone).**
+
+- **What changed** (goose `6c38f5b32`, bumped in `aa92fc6d`, at Jerry's choice of keeping fewer
+  snapshots). A conversation set aside is saved as a KV snapshot only when it carries tools, and two
+  files are kept instead of three. Every in-turn compaction had also saved the compaction call's own
+  conversation (5,261 tokens, 235 MB, 1.5 s), which nothing resumes, while memory was tightest; two
+  files cover the chats a household switches between, typed and spoken.
+- **What it does not do: relieve memory.** A one-second sampler (MemAvailable, page cache, swap, the
+  pond's RSS and swapped-out size, anonymous memory, and what meminfo leaves unaccounted, which on
+  the Orin is mostly the GPU's share of RAM) over 8 turns of the household conversation with E4B. No
+  snapshot save or restore moved free memory or swap on its own (save 1.5-1.8 s, restore 0.6-0.9 s).
+  Before the change: lowest free 46 MB, swap 2.89 GB at peak, 2.34 GB of the pond swapped out. After
+  it, one save per compaction instead of two and two files (470 MB) instead of three (705 MB):
+  lowest free 41 MB, swap 2.78 GB, 2.24 GB of the pond swapped out. What fills memory is the GPU's
+  share: it grew from 4.7 GB at the first turn to 6.6 GB by the eighth, in steps at long prefills
+  (+0.6 GB in a turn that prefilled a long tool result, +0.76 GB in the 20 s after the first whole
+  prompt following a compaction) and never fell back, which matches the earlier finding that
+  LiteRT-LM's GPU pool releases nothing when idle. As it grew, the kernel swapped out the pond's own
+  memory: 2.4 GB resident at the start, 0.44 GB at the end, and prefill slowed to about 100 tok/s.
+  Fewer and shorter long prefills (the bounded compaction prompt among them) or a pool that gives
+  memory back are the levers; the number of snapshot files is not. This run also compacted at two
+  turns in a row with goose's own prompt.
+- **Verification.** LiteRT backend tests 41 passed, including the rule and pruning to two; the live
+  test (tool round, a side call that sets the chat aside and restores it, a regenerated turn, a
+  cancel) passed on the Mac GPU with E2B; the Orin probes above.
