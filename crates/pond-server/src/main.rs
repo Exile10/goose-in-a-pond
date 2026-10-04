@@ -4284,6 +4284,12 @@ async fn run_server(
 
     // Load the model and prefill the static prompt prefix at boot, so turn 1 reuses it.
     pond_api::spawn_prefix_prewarm(state.clone(), false);
+    // Compacts a conversation near the edge of its window while the household is quiet.
+    tokio::spawn(run_quiet_compaction(
+        state.clone(),
+        inference_lane.clone(),
+        last_user_activity.clone(),
+    ));
     // Picture support in the background (~1 GB, never awaited). Single-flight with the prewarm's
     // ensure, and still runs under POND_DISABLE_PREWARM.
     if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
@@ -5866,6 +5872,147 @@ async fn compose_suggestions(
         refused: outcome.refused.len(),
         unparseable: outcome.unparseable,
     })
+}
+
+/// Compacts conversations near the edge of their window while the household is quiet.
+///
+/// goose compacts a conversation whose last turn passed 80% of its window before that
+/// conversation's next turn can start, summarising all of it. On the Orin's 8k LiteRT-LM window
+/// that came every two to five turns, and the turn's first word waited for it: 24-51 s with E2B
+/// on the Mac, about two minutes with E4B on the Orin (the turn's `ttft_ms` leaves it out). The
+/// context monitor already knows which conversations are under pressure (`should_compact`); this
+/// pass compacts them one at a time after a short quiet and gives up the moment someone is back,
+/// so the summary is paid while nobody is waiting. Needs the monitor on, which supplies the
+/// pressure, and hybrid compaction on, whose idle summary refresh already shares the lane.
+async fn run_quiet_compaction(
+    state: Arc<AppState>,
+    lane: Arc<crate::inference_lane_runner::InferenceLane>,
+    last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
+) {
+    use pond_core::user_data::services::consolidation_schedule as sched;
+    use pond_core::user_data::services::inference_lane::LaneJob;
+
+    /// How often the monitor is asked.
+    const POLL_SECS: u64 = 15;
+    /// Quiet before a pass, so a pause in a conversation is not mistaken for its end.
+    const QUIET_SECS: u64 = 30;
+
+    // Baselines for the never-at-startup guard, captured before the first poll.
+    let started_at = std::time::Instant::now();
+    let started_at_utc = chrono::Utc::now();
+    let wake = lane.claim(LaneJob::Compaction);
+
+    loop {
+        let tick = crate::inference_lane_runner::wait_for_tick(
+            std::time::Duration::from_secs(POLL_SECS),
+            &wake,
+        )
+        .await;
+
+        let settings = match state.settings_repo.get().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "quiet compaction: settings read failed");
+                continue;
+            }
+        };
+        // Read before `acquire`, so a tick with nothing due never takes the lane.
+        let due = state.context_monitor.sessions_due_compaction();
+
+        let db_activity = newest_session_activity(state.session_storage.as_ref()).await;
+        let in_process_at = *last_user_activity.read().await;
+        let now = chrono::Utc::now();
+        let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
+        // Activity is stamped when a turn starts and again when it ends, so a turn answering for
+        // longer than the quiet threshold looks idle in between: its run is the only sign of it.
+        let turn_running = state.runs.registry.any_running();
+        let cadence = crate::inference_lane_runner::Cadence::new(
+            std::time::Duration::from_secs(POLL_SECS),
+            std::time::Duration::from_secs(QUIET_SECS),
+            false,
+        );
+        // One `acquire` per tick, "nothing due" as `enabled: false`, as the reviewer does.
+        let Some(slot) = lane
+            .acquire(
+                LaneJob::Compaction,
+                settings.context_monitor_enabled
+                    && settings.hybrid_compaction_enabled
+                    && !due.is_empty()
+                    && !turn_running,
+                cadence,
+                tick.waives(),
+                sched::saw_activity_since_start(
+                    started_at,
+                    in_process_at,
+                    started_at_utc,
+                    db_activity,
+                ),
+                idle_for,
+            )
+            .await
+        else {
+            continue;
+        };
+
+        for session_id in due {
+            if !state.context_monitor.claim_compaction(&session_id) {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            // A returning user wins: dropping the pass cancels its generation, and goose's own
+            // compaction still covers the turn if it needs one.
+            let user_back = async {
+                loop {
+                    // Short: until the pass is dropped, a returning turn waits behind it.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if last_user_activity.read().await.elapsed() < idle_for
+                        || state.runs.registry.any_running()
+                    {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                outcome = state.agent.compact_session(&session_id) => match outcome {
+                    Ok(Some(retained)) => {
+                        state.context_monitor.note_compacted(&session_id);
+                        tracing::info!(
+                            target: "giap::trace",
+                            kind = "quiet_compaction",
+                            session_id = %session_id,
+                            retained_tokens = retained,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "compacted a conversation near the edge of its window while the \
+                             household was quiet"
+                        );
+                    }
+                    Ok(None) => tracing::debug!(
+                        session_id = %session_id,
+                        "quiet compaction: nothing to summarise"
+                    ),
+                    Err(e) => tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "quiet compaction failed"
+                    ),
+                },
+                () = user_back => {
+                    tracing::info!(
+                        target: "giap::trace",
+                        kind = "quiet_compaction_cancelled",
+                        session_id = %session_id,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "someone came back during a quiet compaction; the turn compacts itself \
+                         if it needs to"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Dropping the guard records the run and frees the slot on every path out.
+        drop(slot);
+    }
 }
 
 /// Idle-time proactive review; every failed read fails closed (skips the tick or hits the cap).

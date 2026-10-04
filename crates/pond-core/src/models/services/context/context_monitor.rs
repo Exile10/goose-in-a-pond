@@ -116,18 +116,29 @@ impl ContextMonitor {
             return false;
         };
 
-        if !health_of(state).should_compact {
+        if !due_for_compaction(state) {
             return false;
-        }
-
-        if let Some(last) = state.turns_at_last_compaction {
-            if state.turns.saturating_sub(last) < COMPACTION_COOLDOWN_TURNS {
-                return false;
-            }
         }
 
         state.turns_at_last_compaction = Some(state.turns);
         true
+    }
+
+    /// The sessions [`ContextMonitor::claim_compaction`] would accept now, sorted; nothing is
+    /// claimed. A background pass reads it before taking the inference lane, so a tick with no
+    /// work never holds the lane.
+    pub fn sessions_due_compaction(&self) -> Vec<String> {
+        let sessions = self
+            .session_contexts
+            .lock()
+            .expect("context monitor lock poisoned");
+        let mut due: Vec<String> = sessions
+            .iter()
+            .filter(|(_, state)| due_for_compaction(state))
+            .map(|(id, _)| id.clone())
+            .collect();
+        due.sort();
+        due
     }
 
     /// Claim a pass the user asked for. Skips the cooldown check but still stamps it, so the
@@ -169,6 +180,17 @@ impl ContextMonitor {
             .lock()
             .expect("context monitor lock poisoned");
         sessions.remove(session_id);
+    }
+}
+
+/// Pressure and cooldown, shared by claiming and listing so they cannot drift apart.
+fn due_for_compaction(state: &ContextState) -> bool {
+    if !health_of(state).should_compact {
+        return false;
+    }
+    match state.turns_at_last_compaction {
+        Some(last) => state.turns.saturating_sub(last) >= COMPACTION_COOLDOWN_TURNS,
+        None => true,
     }
 }
 
@@ -276,6 +298,20 @@ mod tests {
         assert!(h2.utilization_pct > 60.0);
         assert!(h2.warning.is_some());
         assert!(h2.warning.as_ref().unwrap().contains("Context window"));
+    }
+
+    #[test]
+    fn the_sessions_due_compaction_are_the_ones_a_claim_would_take() {
+        let monitor = ContextMonitor::new();
+        monitor.record_turn("calm", 1000, 8192);
+        monitor.record_turn("full", 6500, 8192);
+        monitor.record_turn("just-compacted", 6500, 8192);
+        assert!(monitor.claim_compaction("just-compacted"));
+
+        assert_eq!(monitor.sessions_due_compaction(), vec!["full".to_string()]);
+        // Listing claims nothing: the claim still succeeds after it, and then the cooldown holds.
+        assert!(monitor.claim_compaction("full"));
+        assert!(monitor.sessions_due_compaction().is_empty());
     }
 
     #[test]
