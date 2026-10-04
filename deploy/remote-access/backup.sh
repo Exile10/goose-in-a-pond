@@ -17,12 +17,14 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 ARCHIVE="$OUT/control-plane-$STAMP.tar.age"
 
 [ -s "$RECIPIENTS" ] || { echo "no age recipients in $RECIPIENTS; refusing to write an unencrypted backup" >&2; exit 1; }
-# A backup that exists only on this host is lost with it. BACKUP_OFFSITE names an
-# rsync-over-ssh destination, user@host:/directory, on another machine.
+# A backup that exists only on this host is lost with it, so where it goes must be
+# stated. BACKUP_OFFSITE is either an rsync-over-ssh destination, user@host:/directory,
+# that this host pushes to, or `pull`: another machine collects runtime/backups and
+# verifies what it collected (the pilot's Mac does), and this host holds no key to it.
 BACKUP_OFFSITE="${BACKUP_OFFSITE:-}"
 case "$BACKUP_OFFSITE" in
-  *@*:/*) ;;
-  *) echo "set BACKUP_OFFSITE=user@host:/directory; refusing to keep backups only on this host" >&2; exit 1 ;;
+  pull|*@*:/*) ;;
+  *) echo "set BACKUP_OFFSITE=user@host:/directory, or BACKUP_OFFSITE=pull when another machine collects backups; refusing to keep backups only on this host" >&2; exit 1 ;;
 esac
 mkdir -p "$OUT"; chmod 700 "$OUT"
 
@@ -85,13 +87,18 @@ chmod 600 "$ARCHIVE"
 
 restart
 
-# Copied off-host and checked there before anything local is pruned.
-echo "copying off-site to $BACKUP_OFFSITE"
-rsync -a --checksum "$ARCHIVE" "$BACKUP_OFFSITE/"
-local_size="$(stat -c %s "$ARCHIVE")"
-remote_size="$(ssh -- "${BACKUP_OFFSITE%%:*}" stat -c %s "${BACKUP_OFFSITE#*:}/$(basename "$ARCHIVE")")"
-[ "$remote_size" = "$local_size" ] || { echo "off-site copy is $remote_size bytes, expected $local_size; keeping every local archive" >&2; exit 1; }
-echo "off-site copy verified ($remote_size bytes)"
+if [ "$BACKUP_OFFSITE" = pull ]; then
+  # The collector verifies its copies; this host only keeps KEEP of them for it.
+  echo "off-site copy is pulled by another machine; not pushing"
+else
+  # Copied off-host and checked there before anything local is pruned.
+  echo "copying off-site to $BACKUP_OFFSITE"
+  rsync -a --checksum "$ARCHIVE" "$BACKUP_OFFSITE/"
+  local_size="$(stat -c %s "$ARCHIVE")"
+  remote_size="$(ssh -- "${BACKUP_OFFSITE%%:*}" stat -c %s "${BACKUP_OFFSITE#*:}/$(basename "$ARCHIVE")")"
+  [ "$remote_size" = "$local_size" ] || { echo "off-site copy is $remote_size bytes, expected $local_size; keeping every local archive" >&2; exit 1; }
+  echo "off-site copy verified ($remote_size bytes)"
+fi
 
 ls -1t "$OUT"/control-plane-*.tar.age 2>/dev/null | tail -n +$((KEEP+1)) | while read -r old; do
   echo "pruning $(basename "$old")"; rm -f -- "$old"

@@ -32,6 +32,7 @@ the volumes to the unprivileged user once:
 ```sh
 docker compose down
 sudo chown -R 65532:65532 runtime/headscale runtime/caddy-data runtime/caddy-config
+sudo chown 65532:65532 runtime/headscale.yaml && sudo chmod 400 runtime/headscale.yaml
 install -m 600 backup.env.example runtime/secrets/backup.env   # then set BACKUP_OFFSITE
 docker compose up -d
 ```
@@ -186,11 +187,13 @@ including any SQLite WAL/SHM files. An independent copy of only enrollment or on
 Headscale can restore inconsistent authorization mappings. Keep the backup key
 outside this host; never store plaintext archives in Git.
 
-Backups must leave this host: `./backup.sh` refuses to run without
-`BACKUP_OFFSITE=user@host:/directory` (the reference unit reads it from
-`runtime/secrets/backup.env`), copies each archive there with rsync over SSH, and
-checks its size there before pruning anything local. Before this a host loss took
-every backup with it.
+Backups must leave this host, and `./backup.sh` refuses to run until
+`BACKUP_OFFSITE` says how (the reference unit reads it from
+`runtime/secrets/backup.env`). Set it to `user@host:/directory` and each archive is
+copied there with rsync over SSH and its size checked there before anything local
+is pruned. Set it to `pull` when another machine collects `runtime/backups` and
+verifies what it collected, as the pilot's Mac does; this host then holds no
+credential to anywhere.
 
 `./backup.sh` performs exactly this sequence and is driven by the reference units in
 `systemd/`, whose paths assume a deployment at `/opt/goose-remote-access`: it stops gateway, enrollment and Headscale in order, checks
