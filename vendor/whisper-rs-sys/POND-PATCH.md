@@ -46,4 +46,6 @@ returns an error.
 `build.rs` declares the native sources with `rerun-if-changed` and refreshes the copy
 in `OUT_DIR` file by file. Before, the copy was made once per `OUT_DIR` and only
 `wrapper.h` and `namespace.rs` were watched, so an edit to a native source compiled
-nothing and the earlier library shipped with no error.
+nothing and the earlier library shipped with no error. `namespace.rs` leaves the
+forced-include header alone when its content is unchanged: every native file includes
+it, so rewriting it recompiled all of them (44 minutes on the Jetson) for a one-file edit.
