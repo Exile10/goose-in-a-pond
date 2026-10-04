@@ -5,6 +5,7 @@
 # Run from the repo root ON THE DEV MACHINE (not the Jetson):
 #   bash scripts/jetson.sh deploy                # deploy origin/main
 #   bash scripts/jetson.sh deploy --branch mybr  # deploy another pushed branch
+#   bash scripts/jetson.sh deploy --no-restart   # build and install, but leave the service as it is
 #   JETSON_HOST=nano-ip bash scripts/jetson.sh deploy   # alternate ssh host
 #   JETSON_DATA_DIR=path …   # the pond's data dir on the device, if not ~/.local/share/goose-in-a-pond
 #
@@ -22,6 +23,7 @@
 #   4. Jetson: release build with CUDA (sm_87; .cargo/config.toml's
 #      target-cpu=native is correct for an on-device build).
 #   5. Jetson: restart the user-level systemd service and health-check the API.
+#      --no-restart skips this, so a stopped or disabled service stays that way.
 #
 # Prereqs (already true on nano.local):
 #   - ssh alias in ~/.ssh/config (Host nano → nano.local, key nano_jetson)
@@ -32,9 +34,11 @@ set -euo pipefail
 
 HOST="${JETSON_HOST:-nano}"
 BRANCH="main"
+RESTART=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --branch) BRANCH="$2"; shift 2 ;;
+    --no-restart) RESTART=0; shift ;;
     *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
@@ -92,6 +96,12 @@ ssh "$HOST" "cd ~/${REMOTE_REPO} \
      cargo build -p pond-server \
        --features pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda \
        --release"
+
+if [ "${RESTART}" -eq 0 ]; then
+  echo "==> [5/5] Service left as it is (--no-restart)"
+  echo "    Start it with: ssh ${HOST} systemctl --user start goose-in-a-pond.service"
+  exit 0
+fi
 
 echo "==> [5/5] Restarting service + health check"
 # POLL, do not sleep-and-hope. The pond applies migrations, sizes the Jetson
