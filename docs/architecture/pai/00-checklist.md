@@ -2290,3 +2290,33 @@ side calls (GIAP wiring; not a PAI milestone).**
   from the C API. A snapshot that writes only the positions it holds. Rematching across a
   tools-only change without the disk round trip. Side calls told apart by a signal from GIAP rather
   than by weight: a guest's chat weighs under half a long member chat and runs as a side call.
+
+**2026-10-04 — LiteRT-LM on the Orin: an 8k window and no MTP; rejected tool calls kept; compaction
+at 8k measured, not yet fixed (GIAP wiring; not a PAI milestone).**
+
+- **What landed.** On the budgeted device a LiteRT-LM engine gets an 8192-token window and no
+  speculative decoding (`88cea41b`). 4096 cannot hold the pond's first prompt (about 5,100 tokens),
+  and 16384 ran out of memory on the Orin. With E4B on the GPU, alternated on, off, on, off over the
+  pond's prompt, MTP decoded prose at 9.3-9.8 tok/s against 14.1-14.2 without, and finished copied
+  text and tool calls only 4-16% sooner. goose `bf5d9d524` (bumped in `29c9e1fd`) keeps a tool call
+  LiteRT-LM's parser rejects and reads it leniently: gemma-4-E2B's `segment:knowledge,tier:permanent`
+  had failed a turn.
+- **PAI-3 and PAI-4 at 8k**, measured on the Mac with the Orin emulated (`POND_DEVICE_PROFILE=
+  orin-nano-8gb`, E2B, 16 turns in one session). The preamble (system prompt and 21-29 tools, about
+  3,800 tokens) takes almost half the window. goose compacts when the last turn's tokens pass 80%
+  of the window (6,553), so it compacted every 2-5 turns, each time summarising the whole
+  conversation with its coding-agent prompt before the turn could start: 24-51 s on the Mac, which
+  would be minutes on the Orin. GIAP's own turn budget does not act on the live goose path
+  (`trim_history` has no production caller, and the rolling summary is used only when a session is
+  hydrated). No turn overflowed (the peak prompt was 7,216 tokens, 88%), and a fact from turn 1 was
+  recalled at turn 15, through the pond's memory as much as the summary.
+- **Tried, not shipped:** household compaction prompts, installed as goose's `compaction.md` override
+  (goose reads `<engine>/config/prompts/`). Three runs each of a manual compaction followed by a
+  how-to question: goose's own prompt 37-51 s, answered 2 of 3; a household note 16-22 s, answered
+  0 of 3; goose's fields without the verbose ones 21-25 s, answered 1 of 3. Faster, but E2B declined
+  the next question more often, and three runs cannot separate the variants. The prompts and the
+  harness are kept for E4B on the Orin to decide.
+- **Owed.** Compaction at 8k on the Orin with E4B: how long it takes and how the next answer fares.
+  Then one or more of: a bounded compaction prompt that holds up on E4B; compaction run during
+  household quiet (`compact_session`) instead of at the start of a turn; per-session tool groups on
+  the Orin, which measured 59 tools in 6,539 tokens against 17 in 2,386.
