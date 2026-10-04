@@ -13,17 +13,21 @@ hs() { docker compose exec -T headscale headscale "$@" < /dev/null; }
 # The key being replaced is the one enrollment holds, named by its own prefix
 # (hskey-api-<prefix>-<secret>), not guessed from a table: scraping `apikeys list`
 # expired every key it could parse, including ones other tools rely on.
-old_prefix="$(sed -n 's/^hskey-api-\([A-Za-z0-9_]*\)-.*/\1/p' "$SECRET" | head -1)"
-[ -n "$old_prefix" ] || { echo "cannot read the current key's prefix from $SECRET; aborting" >&2; exit 1; }
-listed() {
+# Headscale lists a key as `hskey-api-<12-character prefix>-***`; the prefix may hold `_`.
+key_prefix() { sed -n 's/^hskey-api-\(.\{12\}\)-.*/\1/p' "$1" | head -1; }
+# The ID of the one key Headscale lists under this prefix, or nothing.
+key_id() {
   hs apikeys list -o json | python3 -c '
 import json, sys
-wanted = sys.argv[1]
-keys = json.load(sys.stdin) or []
-sys.exit(0 if any(k.get("prefix") == wanted for k in keys) else 1)' "$1"
+wanted = "hskey-api-" + sys.argv[1] + "-***"
+ids = [str(k["id"]) for k in (json.load(sys.stdin) or []) if k.get("prefix") == wanted]
+print(ids[0] if len(ids) == 1 else "")' "$1"
 }
-listed "$old_prefix" || { echo "the current key ($old_prefix) is not listed by Headscale; aborting" >&2; exit 1; }
-echo "current key prefix: $old_prefix"
+old_prefix="$(key_prefix "$SECRET")"
+[ -n "$old_prefix" ] || { echo "cannot read the current key's prefix from $SECRET; aborting" >&2; exit 1; }
+old_id="$(key_id "$old_prefix")"
+[ -n "$old_id" ] || { echo "the current key ($old_prefix) is not listed by Headscale; aborting" >&2; exit 1; }
+echo "current key: $old_prefix (id $old_id)"
 
 echo "minting a ${EXPIRY} key"
 ( umask 077; hs apikeys create --expiration "$EXPIRY" > "$SECRET.new" )
@@ -52,13 +56,13 @@ if [ "${state:-unknown}" != healthy ]; then
 fi
 echo "enrollment healthy on the new key"
 
-new_prefix="$(sed -n 's/^hskey-api-\([A-Za-z0-9_]*\)-.*/\1/p' "$SECRET" | head -1)"
-if [ -z "$new_prefix" ] || [ "$new_prefix" = "$old_prefix" ] || ! listed "$new_prefix"; then
+new_prefix="$(key_prefix "$SECRET")"
+if [ -z "$new_prefix" ] || [ "$new_prefix" = "$old_prefix" ] || [ -z "$(key_id "$new_prefix")" ]; then
   echo "the new key is not the one Headscale lists; keeping the previous key ($old_prefix) live" >&2
   exit 1
 fi
-echo "expiring previous key $old_prefix"
-hs apikeys expire --prefix "$old_prefix" | strip
+echo "expiring previous key $old_prefix (id $old_id)"
+hs apikeys expire --id "$old_id" | strip
 rm -f "$SECRET.prev"
 
 echo "=== keys after ==="

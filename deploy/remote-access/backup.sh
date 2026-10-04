@@ -21,6 +21,10 @@ ARCHIVE="$OUT/control-plane-$STAMP.tar.age"
 # stated. BACKUP_OFFSITE is either an rsync-over-ssh destination, user@host:/directory,
 # that this host pushes to, or `pull`: another machine collects runtime/backups and
 # verifies what it collected (the pilot's Mac does), and this host holds no key to it.
+# Read the same file the systemd unit names, so a run by hand behaves like the nightly one.
+if [ -z "${BACKUP_OFFSITE:-}" ] && [ -r runtime/secrets/backup.env ]; then
+  BACKUP_OFFSITE="$(sed -n 's/^BACKUP_OFFSITE=//p' runtime/secrets/backup.env | tail -1)"
+fi
 BACKUP_OFFSITE="${BACKUP_OFFSITE:-}"
 case "$BACKUP_OFFSITE" in
   pull|*@*:/*) ;;
