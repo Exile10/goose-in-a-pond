@@ -394,12 +394,6 @@ impl RunRegistry {
         self.inner.lock().expect("run registry poisoned").runs.len()
     }
 
-    /// Whether any turn is still being answered; a background pass that needs the model waits.
-    pub fn any_running(&self) -> bool {
-        let inner = self.inner.lock().expect("run registry poisoned");
-        inner.runs.values().any(|h| !h.state().is_terminal())
-    }
-
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -413,6 +407,18 @@ pub struct RunSupervisor {
     pub permits: Arc<tokio::sync::Semaphore>,
     /// Identifies this process, so a client can tell "pond restarted" from "run aged out".
     pub epoch: String,
+    /// Turns being answered now, registered or not: only a resumable turn joins `registry`.
+    turns_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A turn being answered, counted until it drops; see [`RunSupervisor::turn_started`].
+#[must_use = "the turn stops counting as in flight when this drops"]
+pub struct TurnInFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for TurnInFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl RunSupervisor {
@@ -421,7 +427,23 @@ impl RunSupervisor {
             registry: RunRegistry::new(max_runs, retention),
             permits: Arc::new(tokio::sync::Semaphore::new(max_runs)),
             epoch: uuid::Uuid::new_v4().to_string(),
+            turns_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Counts a turn as being answered until the guard drops, a panic or a cancelled stream
+    /// included. Every turn path holds one, whether or not its run is registered.
+    pub fn turn_started(&self) -> TurnInFlight {
+        self.turns_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        TurnInFlight(self.turns_in_flight.clone())
+    }
+
+    /// Whether any turn is being answered; background work that needs the model waits.
+    pub fn turn_in_flight(&self) -> bool {
+        self.turns_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
     }
 }
 
@@ -440,24 +462,15 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_says_whether_a_turn_is_running() {
-        let registry = RunRegistry::new(4, Duration::from_secs(60));
-        assert!(!registry.any_running());
-
-        let first = handle(RunPolicy::Detached);
-        registry.insert(first.clone()).unwrap();
-        assert!(registry.any_running());
-        first.finish(RunState::Finished);
-        assert!(
-            !registry.any_running(),
-            "a finished run is history, not work"
-        );
-
-        let second = RunHandle::new("sess-2".into(), RunOwner::Unattributed, RunPolicy::Detached);
-        registry.insert(second.clone()).unwrap();
-        assert!(registry.any_running(), "one running run is enough");
-        second.finish(RunState::Cancelled);
-        assert!(!registry.any_running());
+    fn a_turn_counts_as_in_flight_until_its_guard_drops() {
+        let runs = RunSupervisor::default();
+        assert!(!runs.turn_in_flight());
+        let first = runs.turn_started();
+        let second = runs.turn_started();
+        drop(first);
+        assert!(runs.turn_in_flight(), "one turn is enough");
+        drop(second);
+        assert!(!runs.turn_in_flight());
     }
 
     #[test]

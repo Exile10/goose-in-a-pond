@@ -73,16 +73,21 @@ impl ContextMonitor {
                 turns_at_last_compaction: None,
             });
 
-        let growth = estimated_tokens.saturating_sub(state.estimated_tokens);
+        // A first turn has no baseline: its size is the preamble plus one exchange, not growth.
+        // Counted, it read as no turns left at 60% full, and every conversation looked due.
+        let growth =
+            (state.turns > 0).then(|| estimated_tokens.saturating_sub(state.estimated_tokens));
 
         state.estimated_tokens = estimated_tokens;
         state.context_limit = context_limit;
         state.turns += 1;
 
-        if state.growth_rates.len() >= MAX_GROWTH_SAMPLES {
-            state.growth_rates.remove(0);
+        if let Some(growth) = growth {
+            if state.growth_rates.len() >= MAX_GROWTH_SAMPLES {
+                state.growth_rates.remove(0);
+            }
+            state.growth_rates.push(growth);
         }
-        state.growth_rates.push(growth);
     }
 
     /// A zero-state snapshot when the session has no recorded turns.
@@ -139,6 +144,19 @@ impl ContextMonitor {
             .collect();
         due.sort();
         due
+    }
+
+    /// Starts the cooldown after a pass that ran to an end, whatever it found: the session is not
+    /// due again for [`COMPACTION_COOLDOWN_TURNS`] recorded turns. A pass the household
+    /// interrupted starts none, so the next quiet tries again.
+    pub fn start_compaction_cooldown(&self, session_id: &str) {
+        let mut sessions = self
+            .session_contexts
+            .lock()
+            .expect("context monitor lock poisoned");
+        if let Some(state) = sessions.get_mut(session_id) {
+            state.turns_at_last_compaction = Some(state.turns);
+        }
     }
 
     /// Claim a pass the user asked for. Skips the cooldown check but still stamps it, so the
@@ -272,7 +290,7 @@ mod tests {
         monitor.record_turn("s1", 500, 4096);
         let h1 = monitor.check_context_health("s1");
         assert!(h1.utilization_pct > 12.0 && h1.utilization_pct < 13.0);
-        assert_eq!(h1.avg_growth_rate, 500);
+        assert_eq!(h1.avg_growth_rate, 0, "a first turn is not growth");
 
         monitor.record_turn("s1", 1000, 4096);
         let h2 = monitor.check_context_health("s1");
@@ -282,6 +300,7 @@ mod tests {
         monitor.record_turn("s1", 1800, 4096);
         let h3 = monitor.check_context_health("s1");
         assert!(h3.utilization_pct > 43.0 && h3.utilization_pct < 44.0);
+        assert_eq!(h3.avg_growth_rate, 650);
     }
 
     #[test]
@@ -347,8 +366,9 @@ mod tests {
     fn should_compact_fires_when_few_turns_remaining() {
         let monitor = ContextMonitor::new();
 
-        // ~32% used, but only 2 turns remain at 1000/turn.
-        monitor.record_turn("s1", 1000, 3072);
+        // ~49% used, but only one turn remains at 1000/turn.
+        monitor.record_turn("s1", 500, 3072);
+        monitor.record_turn("s1", 1500, 3072);
         let h1 = monitor.check_context_health("s1");
         assert!(h1.utilization_pct < 75.0, "Utilization should be below 75%");
         assert!(
@@ -362,6 +382,47 @@ mod tests {
             "Should compact when estimated_turns_remaining < {}",
             MIN_TURNS_REMAINING
         );
+    }
+
+    #[test]
+    fn a_first_turn_is_not_growth() {
+        let monitor = ContextMonitor::new();
+
+        // The Orin's first turn: a 4,000-token preamble and one exchange, 60% of an 8k window.
+        monitor.record_turn("s1", 4921, 8192);
+        let h = monitor.check_context_health("s1");
+        assert_eq!(h.avg_growth_rate, 0, "nothing to measure growth from yet");
+        assert_eq!(h.estimated_turns_remaining, u32::MAX);
+        assert!(!h.should_compact, "60% full after one turn is not pressure");
+        assert!(monitor.sessions_due_compaction().is_empty());
+
+        monitor.record_turn("s1", 5642, 8192);
+        let h = monitor.check_context_health("s1");
+        assert_eq!(
+            h.avg_growth_rate, 721,
+            "the second turn is the first growth"
+        );
+        assert_eq!(h.estimated_turns_remaining, 3);
+        assert!(!h.should_compact);
+    }
+
+    #[test]
+    fn an_interrupted_pass_leaves_the_session_due_and_a_finished_one_does_not() {
+        let monitor = ContextMonitor::new();
+        monitor.record_turn("s1", 6000, 8192);
+        monitor.record_turn("s1", 6600, 8192);
+        assert_eq!(monitor.sessions_due_compaction(), vec!["s1".to_string()]);
+
+        // Interrupted: nothing is stamped, so the next quiet tries again.
+        assert_eq!(monitor.sessions_due_compaction(), vec!["s1".to_string()]);
+
+        // Ran to an end: not due again until the cooldown has passed.
+        monitor.start_compaction_cooldown("s1");
+        assert!(monitor.sessions_due_compaction().is_empty());
+        for _ in 0..COMPACTION_COOLDOWN_TURNS {
+            monitor.record_turn("s1", 7000, 8192);
+        }
+        assert_eq!(monitor.sessions_due_compaction(), vec!["s1".to_string()]);
     }
 
     #[test]
@@ -415,6 +476,8 @@ mod tests {
 
         monitor.record_turn("s1", 1000, 4096);
         monitor.record_turn("s2", 500, 8192);
+        monitor.record_turn("s1", 2000, 4096);
+        monitor.record_turn("s2", 1000, 8192);
 
         let h1 = monitor.check_context_health("s1");
         let h2 = monitor.check_context_health("s2");

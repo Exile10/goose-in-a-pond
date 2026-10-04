@@ -4287,7 +4287,7 @@ async fn run_server(
     // Every lane job: a turn in flight is not quiet, however long it has been answering.
     {
         let runs = state.runs.clone();
-        inference_lane.watch_turns(move || runs.registry.any_running());
+        inference_lane.watch_turns(move || runs.turn_in_flight());
     }
     // Compacts a conversation near the edge of its window while the household is quiet.
     tokio::spawn(run_quiet_compaction(
@@ -5930,7 +5930,7 @@ async fn run_quiet_compaction(
         let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
         // Never during a turn, even by hand: the lane counts a running turn as no quiet, but a
         // hand-asked tick waives that, and this pass rewrites the history a turn is answering in.
-        let turn_running = state.runs.registry.any_running();
+        let turn_running = state.runs.turn_in_flight();
         let cadence = crate::inference_lane_runner::Cadence::new(
             std::time::Duration::from_secs(POLL_SECS),
             std::time::Duration::from_secs(QUIET_SECS),
@@ -5960,9 +5960,6 @@ async fn run_quiet_compaction(
         };
 
         for session_id in due {
-            if !state.context_monitor.claim_compaction(&session_id) {
-                continue;
-            }
             let started = std::time::Instant::now();
             // A returning user wins: dropping the pass cancels its generation, and goose's own
             // compaction still covers the turn if it needs one.
@@ -5971,36 +5968,42 @@ async fn run_quiet_compaction(
                     // Short: until the pass is dropped, a returning turn waits behind it.
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     if last_user_activity.read().await.elapsed() < idle_for
-                        || state.runs.registry.any_running()
+                        || state.runs.turn_in_flight()
                     {
                         break;
                     }
                 }
             };
             tokio::select! {
-                outcome = state.agent.compact_session(&session_id) => match outcome {
-                    Ok(Some(retained)) => {
-                        state.context_monitor.note_compacted(&session_id);
-                        tracing::info!(
-                            target: "giap::trace",
-                            kind = "quiet_compaction",
+                outcome = state.agent.compact_session(&session_id) => {
+                    // Whatever it found, so a pass that fails or finds nothing is not retried
+                    // every quiet tick.
+                    state.context_monitor.start_compaction_cooldown(&session_id);
+                    match outcome {
+                        Ok(Some(retained)) => {
+                            state.context_monitor.note_compacted(&session_id);
+                            tracing::info!(
+                                target: "giap::trace",
+                                kind = "quiet_compaction",
+                                session_id = %session_id,
+                                retained_tokens = retained,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "compacted a conversation near the edge of its window while the \
+                                 household was quiet"
+                            );
+                        }
+                        Ok(None) => tracing::debug!(
                             session_id = %session_id,
-                            retained_tokens = retained,
-                            elapsed_ms = started.elapsed().as_millis() as u64,
-                            "compacted a conversation near the edge of its window while the \
-                             household was quiet"
-                        );
+                            "quiet compaction: nothing to summarise"
+                        ),
+                        Err(e) => tracing::warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "quiet compaction failed"
+                        ),
                     }
-                    Ok(None) => tracing::debug!(
-                        session_id = %session_id,
-                        "quiet compaction: nothing to summarise"
-                    ),
-                    Err(e) => tracing::warn!(
-                        session_id = %session_id,
-                        error = %e,
-                        "quiet compaction failed"
-                    ),
-                },
+                }
+                // No cooldown: the conversation is still due, and the next quiet tries again.
                 () = user_back => {
                     tracing::info!(
                         target: "giap::trace",

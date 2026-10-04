@@ -1102,6 +1102,8 @@ async fn chat(
 
     // Resets the inactivity clock and interrupts any background consolidation.
     state.note_user_activity().await;
+    // Held until the reply is back: this turn is never a registered run.
+    let _in_flight = state.runs.turn_started();
 
     let Json(req) = body.map_err(|e| {
         (
@@ -1959,6 +1961,8 @@ async fn run_turn(
 ) {
     // Released when the task ends, not when a reader goes away.
     let _run_permit = run_permit;
+    // Dropped last, after the end-of-turn stamp below, so idle work never sees a gap.
+    let _in_flight = state.runs.turn_started();
     drive_turn(&state, &run, req, device).await;
     // Re-stamp now the turn is over: idle work (summaries, consolidation) must measure from a
     // turn's end, not its start, or a long turn looks idle mid-generation.
@@ -9912,9 +9916,12 @@ async fn agent_chat_stream(
 
     let agent = state.agent.clone();
     let storage = state.session_storage.clone();
+    // Moved into the stream: it lives as long as the turn, not as long as this handler.
+    let in_flight = state.runs.turn_started();
 
     let stream = async_stream::stream! {
         let _permit = permit;
+        let _in_flight = in_flight;
 
         // Fail closed: unreadable settings mean reasoning is not persisted.
         let persist_thinking = state
