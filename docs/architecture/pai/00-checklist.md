@@ -2321,3 +2321,81 @@ at 8k measured, not yet fixed (GIAP wiring; not a PAI milestone).**
   Then one or more of: a bounded compaction prompt that holds up on E4B; compaction run during
   household quiet (`compact_session`) instead of at the start of a turn; per-session tool groups on
   the Orin, which measured 59 tools in 6,539 tokens against 17 in 2,386.
+
+**2026-10-04 — Compaction moved to household quiet, measured on the Orin with E4B (GIAP wiring;
+not a PAI milestone).**
+
+- **What landed** (`95254bb9`, `15e1885c`, `134b3f40`). A new inference-lane job,
+  `compaction` ("Make room in long conversations"), first in tie-break order. Every 15 s it asks
+  the context monitor which conversations are under pressure (`sessions_due_compaction`: above
+  75% of the window or under 3 turns left, outside the 3-turn cooldown) and, after 30 s with no
+  activity and no turn being answered, compacts them through `compact_session`, one at a time. A
+  turn that starts, or any other activity, cancels the pass within 100 ms; goose's own compaction
+  still covers that turn, and the conversation stays due for the next quiet. Only a pass that runs
+  to an end starts the cooldown. Gated on `context_monitor_enabled` and
+  `hybrid_compaction_enabled`; that setting's doc claimed goose's own compaction goes off, which
+  the live path has not done since goose was given context management, and now says so.
+- **Three defects the Orin found that the Mac did not** (`134b3f40`), all from one pass that
+  started 37 s into a conversation's second turn, on that conversation. (1) The context monitor
+  counted a first turn's whole size, preamble included, as growth, so it reported no turns left at
+  60% full and every conversation was due from its first turn; a first turn now records no growth.
+  (2) Only a resumable turn joins the run registry, so no turn looked to be running during most
+  turns; every turn path now holds a count on the run supervisor (`TurnInFlight`), and the lane
+  and the job read it. (3) The pass claimed its cooldown before running, so an interrupted pass
+  blocked quiet compaction for three turns. On the Mac turns were shorter than the 30 s quiet, so
+  none of the three showed.
+- **The cost it moves, on the Orin** (E4B, LiteRT-LM GPU, 8k window, release build at `3b6300a8`,
+  16 turns in one session, no pauses). goose compacted five times, before turns 5, 9, 10, 12 and
+  15. Each compaction took 113-232 s, and the turn's first word waited 121-290 s; the turn's
+  `ttft_ms` (2-11 s) leaves that out. Turns without one took 20-76 s at 13.4-13.8 tok/s. Free
+  memory fell to 280 MB with 1.3 GB in swap, and nothing was killed. The turn-1 fact was recalled
+  at turn 15.
+- **Found on the way: lane jobs ran inside long turns** (`15e1885c`). In that run the summary
+  refresh took the lane inside four turns, and each of its calls held the engine for 58-62 s while
+  the turn waited. Jobs measure quiet from activity, stamped when a turn starts and when it ends,
+  so a turn longer than a job's threshold read as quiet in between. The lane now counts a running
+  turn as no quiet at all, so every idle-gated job is refused as still active; a hand-asked run
+  still waives it.
+- **On the Mac** (E2B, Orin emulated, 8k). After a 150 s pause the pass took 43.7 s and kept 809
+  tokens of conversation, and the next turn took 14.1 s, against 58.3 s when a 75 s pause was too
+  short and goose compacted inside the turn. The fact from turn 1 was recalled at turn 15 both
+  times.
+- **On the Orin with the job** (same model and window, one session, a 300 s pause after turn 4).
+  On `15e1885c` the pass in the pause took 126 s and kept 835 tokens, and the next turn took 45 s
+  against 156 s when goose compacted inside it; that build also ran the pass inside turn 2, which
+  is how the three defects above surfaced. On `134b3f40` no pass ran inside a turn, and none ran in
+  the pause either, correctly: goose had compacted inside turn 4 and left the conversation at 61%.
+  A pass pays off only when the household pauses with a conversation near the edge.
+- **What still costs the Orin a first word over 5 s: KV reuse after a rewrite.** Before the first
+  compaction a turn's first prefill took 1.5-3.0 s. After it, 9 of the next 12 turns re-prefilled
+  4,750-6,000 tokens (6-11 s): the five that compacted, which must, and four that did not (turns 6,
+  11, 13 and 16), whose plans came back `Recreate` or `Rematch` instead of `Extend`. A turn after a
+  compaction or a side call (the summary refresh) restored a 235 MB KV snapshot and prefilled the
+  whole prompt anyway: 5,274 tokens in 15.5 s after a 0.7 s restore. The turn after the quiet pass
+  did the same, 4,983 tokens in 11.9 s. The snapshot copies also cost memory: in the save and
+  restore after goose's compaction, free memory fell to 102 MB and swap rose from 1.1 to 2.8 GB (the
+  board began that run with 0.5 GB already in swap). Next: log how many tokens the engine matched on
+  `Rematch` and after a restore, and fix whichever side drifts; warming the compacted conversation
+  at the end of a pass only pays once that holds.
+- **PAI.** Preamble: unchanged. `profile_id`: untouched; the job compacts the session goose holds,
+  whoever owns it, exactly as goose would at the next turn. Egress: none. Secrets: none; no new
+  `Settings` field. Guest: nothing new is reachable. Turn blocking: the job never runs during a
+  turn and yields to one within 100 ms. Side effects: a conversation is summarised sooner than
+  goose would have done it, with goose's own prompt.
+- **Limits.** Turns the desktop's voice child answers, in its own process, are not counted. A
+  pass the household interrupts near its end is wasted: the returning turn compacts from scratch.
+- **Per-session tool groups (`tool_selection_mode = minimal`), measured and not a default.** The
+  model sees only the two toolkit tools and loads a group itself. On the Mac (E2B, Orin emulated, 16
+  turns) the turn-1 prompt fell from 4,256-4,307 tokens to 1,485 and goose's first compaction came
+  at turn 13 instead of 5-7, but E2B never loaded a group: no tool call in 16 turns, a turn-1 "I
+  have saved that" with nothing saved, and "I do not have that information" at the turn-15 recall.
+  On the Orin, E4B loaded `giap-memory` on turn 1 and saved the fact (turn 1 took 118 s against 76
+  s, every load changing the conversation's identity), goose compacted once in 16 turns instead of
+  five, and the fact was recalled at turn 15. But after that compaction E4B refused three plain
+  questions in a row ("I cannot provide a packing list ... because the necessary knowledge tool is
+  unavailable"), which it had answered with every tool offered, and free memory fell to 51 MB with
+  3.0 GB in swap. A smaller preamble is still the lever; this mode is not how to get it. (`relevant`
+  mode pre-classifies the opening message by embedding, which the working agreement rules out.)
+- **Verification.** pond-core and pond-api 2,272 passed; pond-server's binary 146; clippy as CI
+  runs it, clean; `scripts/live-test.sh` 158 checks passed on each of the three commits, the lane
+  listing 8 jobs; the Mac and Orin runs above.
