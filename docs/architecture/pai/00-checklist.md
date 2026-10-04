@@ -2366,17 +2366,19 @@ not a PAI milestone).**
   is how the three defects above surfaced. On `134b3f40` no pass ran inside a turn, and none ran in
   the pause either, correctly: goose had compacted inside turn 4 and left the conversation at 61%.
   A pass pays off only when the household pauses with a conversation near the edge.
-- **What still costs the Orin a first word over 5 s: KV reuse after a rewrite.** Before the first
-  compaction a turn's first prefill took 1.5-3.0 s. After it, 9 of the next 12 turns re-prefilled
-  4,750-6,000 tokens (6-11 s): the five that compacted, which must, and four that did not (turns 6,
-  11, 13 and 16), whose plans came back `Recreate` or `Rematch` instead of `Extend`. A turn after a
-  compaction or a side call (the summary refresh) restored a 235 MB KV snapshot and prefilled the
-  whole prompt anyway: 5,274 tokens in 15.5 s after a 0.7 s restore. The turn after the quiet pass
-  did the same, 4,983 tokens in 11.9 s. The snapshot copies also cost memory: in the save and
-  restore after goose's compaction, free memory fell to 102 MB and swap rose from 1.1 to 2.8 GB (the
-  board began that run with 0.5 GB already in swap). Next: log how many tokens the engine matched on
-  `Rematch` and after a restore, and fix whichever side drifts; warming the compacted conversation
-  at the end of a pass only pays once that holds.
+- **What still costs the Orin a first word over 5 s: re-prefilling the conversation.** LiteRT-LM
+  logs where reuse stops (`Prefill after rewind: reused N of M`). An `Extend` reuses everything but
+  the new message, and before the first compaction a turn's first prefill took 1.5-3.0 s. A whole
+  prompt sent after a compaction, or after the conversation was set aside and restored from its 235
+  MB snapshot, matched only the ~3,800-token preamble and re-prefilled the conversation behind it:
+  950-2,200 tokens, 6-11 s at E4B's 150-250 tok/s, and 1,182-1,474 tokens in 12-16 s while the board
+  swapped (the turns after the quiet pass and after the pause above). After a compaction that is the
+  price of a new history; on four turns that compacted nothing (6, 11, 13 and 16, plans `Recreate`
+  or `Rematch`), whose history was unchanged, it is a defect. The snapshot copies also cost memory:
+  in the save and restore after goose's compaction, free memory fell to 102 MB and swap rose from
+  1.1 to 2.8 GB (the board began that run with 0.5 GB already in swap). Next: find why a re-rendered
+  prompt parts from the KV right after the preamble (once it matched 4,819 of 5,187, so not always);
+  warming the compacted conversation at the end of a pass pays only once that holds.
 - **PAI.** Preamble: unchanged. `profile_id`: untouched; the job compacts the session goose holds,
   whoever owns it, exactly as goose would at the next turn. Egress: none. Secrets: none; no new
   `Settings` field. Guest: nothing new is reachable. Turn blocking: the job never runs during a
