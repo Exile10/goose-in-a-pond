@@ -2438,3 +2438,42 @@ PAI milestone).**
 - **Verification.** goose `context_mgmt` tests 11 passed, the new one failing without the fix;
   clippy clean on the change; the Mac and Orin runs above. In `goose/` on this Mac, sqlx's
   proc-macro needs `--config 'profile.dev.package.sqlx-macros.debug=true'` or dyld rejects it.
+
+**2026-10-04 — Compaction A/B rerun on the in-turn path: a bounded summary stops the Orin's
+runaway (measured; nothing shipped).**
+
+- **Why rerun, and how.** The earlier A/B compacted by hand (`compact_session`, goose's manual
+  path), which keeps no copy of the user's message, so the reordering bug never touched it. The
+  household's path is goose's in-turn compaction. The new driver (`compaction_ab2.py`) sends
+  household requests until the last turn passes 80% of the window, asks a how-to on the turn that
+  compacts, then a recall the memory store also holds, then one only the conversation holds
+  (Monday's dish from an earlier menu), then three more requests. Arms, switched with goose's prompt
+  override: goose's own `compaction.md` (built-in) and `compaction-trimmed.md` (bounded: goose's
+  schema cut to `user_intent`, `pending_tasks`, `current_work`, `next_step`, at most eight short
+  lines a list).
+- **Mac** (E2B, Orin emulated, six per arm). Summary call, median: 49.9 s built-in, 24.1 s bounded.
+  First prompt after a compaction: 5,125 tokens (63% of the window) against 4,381 (53%). How-to on
+  the compacting turn answered 5 of 6 in both; the declines in both arms cite a missing tool or API
+  key. Memory-store fact recalled 6 of 6 in both; the conversation-only detail 2 of 5 built-in, 0 of
+  5 bounded.
+- **Orin** (E4B, two per arm). Summary call 126 s against 79 s; first prompt after 4,737 (58%)
+  against 4,340 (53%); how-to answered 2 of 2 against 1 of 2 (E4B looked mandazi up on Wikipedia and
+  gave no steps); memory-store fact 2 of 2 in both.
+- **Orin, the 16-turn conversation with the bounded prompt.** Compactions at turns 4, 8, 10 and 14,
+  each leaving 52.9-54.1% of the window, flat; compaction turns 105-157 s; all 16 turns in 1,100 s.
+  With the built-in prompt on the same build goose compacted at turns 4, 6, 7 and 8, the prompt
+  after each rising from 5,772 to 6,093 tokens as the summary carried every earlier request forward,
+  and seven turns took 1,067 s; before the reordering fix the built-in run took 1,851 s for 16. The
+  fact from turn 1 was recalled at turn 15. Memory pressure is unchanged: 43 MB free, 2.8 GB of
+  swap.
+- **Verdict.** On an 8k window the bounded prompt is what keeps compaction from returning every
+  turn, and it cuts the summary call by a third to a half. Its cost is conversation detail: eight
+  short lines do not carry a dish named earlier, and the memory store holds only what extraction or
+  the model saved. Not shipped. Jerry decides whether the device takes it, and whether a field for
+  named details is worth trying first.
+- **A measurement trap.** The driver's first post-compaction figure read the turn's last inference,
+  which includes that turn's own first reply (300-800 tokens) and hid a 750-token difference between
+  the arms; the first inference after each compaction in the server trace (`ab2_trace.py`) is the
+  honest figure.
+- **PAI.** Nothing changed in the product: the prompt override lived in a scratch pond and was
+  removed after the runs.
