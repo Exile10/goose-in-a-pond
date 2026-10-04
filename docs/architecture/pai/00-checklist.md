@@ -2222,3 +2222,71 @@ and do not establish device-key proof of possession or encrypted transport.
   `reused_prefix_tokens` 12,622 across its three inferences, decode ~16 tok/s; GPU: ttft 3.5 s,
   decode 62 tok/s, output corrupt as above. A restart kept `chat_provider = local` and the litert
   `chat_model`. Not run: the Orin, the pai-bench head-to-head, the KV-cost measurement.
+
+**2026-10-04 — LiteRT-LM on GIAP's giap-main: exact GPU tool calls, and the chat set aside for
+side calls (GIAP wiring; not a PAI milestone).**
+
+- **What landed.** The library pin moves from upstream LiteRT-LM `3dbb23e1` to GIAP's fork
+  `giap-main` at `a5dd27b5` (upstream `b320801b` plus GIAP's fixes; no public remote yet, so it is
+  built from `LITERT_LM_SRC`). goose `e27ad7334` uses the fork's three extra C functions. A diverged
+  or repeated history is rematched: its whole prompt is prefilled into the retained conversation
+  from step 0 over what its KV cache holds. A side call no longer runs beside the chat, which made
+  LiteRT copy the whole KV cache into the idle conversation; the chat is set aside as a KV snapshot
+  on disk, and the next request of its family restores it. On upstream LiteRT-LM the backend
+  behaves as before.
+- **Fixed: the GPU fault recorded on 2026-10-02.** With giap-main's fp32 activations the tool round
+  on this Mac's GPU is exact (live test: the weather call, its answer and five follow-ups), so
+  `GIAP_LITERT_BACKEND=cpu` is no longer needed for correct output here.
+- **Interdependency check (2.2), run against all eight.**
+  - PAI-3 and PAI-4 (KV prefix): Extend is unchanged. Compaction, an edited history, a regenerated
+    reply and a new session with the same system prompt and tools now rematch instead of
+    prefilling from nothing: a new session's first turn reused 3,001 of 3,224 tokens. Side calls
+    (batch memory extraction and titling after 15 minutes of quiet, PAI-7's review) no longer cost
+    the chat its prefix. The startup prewarm warms the household's full tool set; a turn whose tool
+    set differs (one with no identified member keeps 21 of 29 tools) shares only the system prompt
+    with it, so its first turn is effectively cold on either engine.
+  - PAI-2 (privacy): a snapshot holds the chat's KV cache and its token ids, so the conversation's
+    text, in `<goose data>/litert-lm/kv-snapshots/`: three kept, each the whole KV window whatever
+    it holds (151 MB for E2B at 16384 tokens), mode 0644 like the pond's databases. Local disk
+    only, the trust boundary of `pond_system.db`; no egress, no secret. **Owed:** forgetting a
+    member or wiping the pond does not delete these files. They are overwritten as other
+    conversations are set aside; they should go with the member's data.
+  - PAI-1 (profile boundaries): a family is keyed by the whole identity (the system message, which
+    carries the member's name, the tools and thinking), so a member's chat and a guest's never
+    share a file. A restore reuses only the tokens identical to the new prompt in any case, so
+    nothing of one conversation reaches another's turn.
+  - PAI-5 (reasoning): with thinking on, rematch and restore drop earlier thoughts as the template
+    does; verified live (thinking on, turn 3 extended a restored conversation, 992 tokens reused).
+  - PAI-6, PAI-7, PAI-8: no change beyond the side calls above. `profile_id`, egress, secrets,
+    guest, turn blocking: none.
+- **Verification** (Mac only: M4, gemma-4-E2B `.litertlm`, debug GIAP over the packaged library).
+  - goose-local-inference: 31 LiteRT unit tests pass; clippy clean. The live test passes on the GPU
+    and the CPU, thinking off and on, with upstream `3dbb23e1` on the CPU as the control. A turn
+    after the side call restored the chat (745 of 814 tokens reused, TTFT 155 ms on the GPU); a
+    second side call while nothing was retained wrote nothing; a regenerated turn rematched (TTFT
+    165 ms on the GPU, 315 ms on the CPU, against 1,531 ms cold on upstream); a cancel recovered
+    from the snapshot (158 ms).
+  - `scripts/pai_bench.py` against a scratch pond on the debug binary (`pai-bench.sh` needs a
+    release build and a model in the real pond, and this Mac had neither): 12 pass, 0 fail, PAI-7
+    not run. Cold TTFT 6.76 s (4,437 tokens), warm 623 ms, decode 64 tok/s. Snapshots of 3,600 to
+    4,400 tokens saved in 100 to 161 ms and loaded in 98 to 150 ms. `pai_bench.py` now counts
+    Rematch as prefix reuse.
+  - Quiet-time check in that pond (two chat turns, 15 minutes of household quiet so the batch jobs
+    run, a third turn): titling set the chat aside (3,833 tokens, 117 ms) and turn 3 restored it
+    (127 ms) and reused 3,658 of 4,072 tokens, TTFT 836 ms. Its first run found a fault, fixed
+    before the commit: families were keyed on the first 512 characters of the system message, the
+    proactive review opens like the chat, and when the extraction pass set the review aside its
+    snapshot replaced the chat's, so turn 3 reused 474 tokens at a TTFT of 4,497 ms. Families are
+    now the whole identity; while nothing is retained the conversation last set aside is weighed in
+    its place, so a second titling call no longer takes the slot and saves itself; three snapshots
+    are kept. The rerun's batch jobs were lighter (no review; extraction made no model call), so
+    the review case rests on the unit tests and the live test's second side call.
+  - The lib suite's three llama.cpp context-cap failures predate this work; they are tracked
+    separately.
+- **Owed.** The Orin: a linux-arm64 package of `a5dd27b5` (Docker Desktop's VM is down on this Mac,
+  so `giap.sh litert build linux-arm64` cannot run), then snapshot save and load times and memory
+  on the device. Erasing snapshots with a member's data. The reuse count of a whole-prompt turn:
+  LiteRT counts the skipped tokens as prefilled, so the backend reports none; it needs a figure
+  from the C API. A snapshot that writes only the positions it holds. Rematching across a
+  tools-only change without the disk round trip. Side calls told apart by a signal from GIAP rather
+  than by weight: a guest's chat weighs under half a long member chat and runs as a side call.

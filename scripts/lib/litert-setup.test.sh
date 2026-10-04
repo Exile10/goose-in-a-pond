@@ -235,13 +235,14 @@ t_bazel_flags_and_header() {
   eq "$(_litert_header_platform "$h")" linux-arm64 && eq "$(_litert_header_commit "$h")" "$LITERT_COMMIT" \
     && eq "$(_litert_header_capi "$h")" "$LITERT_CAPI_VERSION"
 }
-# The package made by hand on 2026-10-02, which the backend was first tested against, must read
-# as this pin's package.
+# The package made by hand on 2026-10-02 from upstream 3dbb23e1, which the backend was first tested
+# against, still reads correctly: an older package is recognised as older, not as unreadable.
 t_header_reads_the_hand_made_package() {
   world
   h='litert-lm C API 1.0.0 | LiteRT-LM 3dbb23e1e31f085a2222515282419ed470af590f | built 2026-10-02T14:54Z on macos-arm64 | bazel -c opt --config=macos_arm64 --define=litert_runtime_link_mode=dynamic //c:litert-lm'
-  eq "$(_litert_header_platform "$h")" macos-arm64 && eq "$(_litert_header_commit "$h")" "$LITERT_COMMIT" \
-    && eq "$(_litert_header_capi "$h")" "$LITERT_CAPI_VERSION"
+  eq "$(_litert_header_platform "$h")" macos-arm64 \
+    && eq "$(_litert_header_commit "$h")" 3dbb23e1e31f085a2222515282419ed470af590f \
+    && eq "$(_litert_header_capi "$h")" 1.0.0
 }
 
 # ── packaging ────────────────────────────────────────────────────────────────

@@ -26,16 +26,33 @@ is why it stays behind `RTLD_LOCAL`. Their third-party notices are not collected
 
 ## The pin
 
-`LITERT_COMMIT` and `LITERT_CAPI_VERSION` in `scripts/lib/litert-setup.sh`: LiteRT-LM
-`3dbb23e1e31f085a2222515282419ed470af590f`, whose `version.bzl` says `VERSION = "0.18.0"` and
-`C_API_VERSION = "1.0.0"`. C API 1.0.0 is on `main`, not yet in a release, so a `main` commit is
-pinned rather than a tag.
+`LITERT_COMMIT` and `LITERT_CAPI_VERSION` in `scripts/lib/litert-setup.sh`:
+`a5dd27b5bd363be38feb62af637facbdb043b11c` on `giap-main`, GIAP's fork of LiteRT-LM. That is
+LiteRT-LM `main` at `b320801b` (`version.bzl`: `VERSION = "0.18.0"`, `C_API_VERSION = "1.0.0"`; C
+API 1.0.0 is on `main`, in no release yet) plus GIAP's fixes, among them:
+
+- **fp32 activations on the GPU.** With fp16, a conversation carrying tools decoded corrupt text on
+  the Mac's GPU.
+- **KV snapshots and whole-prompt prefill.** `litert_lm_conversation_save_kv_snapshot` and
+  `litert_lm_conversation_load_kv_snapshot` write a conversation's KV cache to a file and read it
+  back; `litert_lm_conversation_send_prefill_text_stream` rewinds the cache and prefills a whole
+  prompt, skipping the leading tokens the cache already holds. The backend sets the chat aside
+  through them before a side call runs and restores it afterwards (the goose patch ledger has the
+  details).
+- **KV reuse through an unchanged image**: a key per picture, prefill chunks aligned to images, and
+  a cache of encoded images.
+
+The fork has no public remote yet, so a build cannot fetch the pin: set `LITERT_LM_SRC` to a
+`giap-main` clone at that commit. The backend still runs on upstream LiteRT-LM. Without the GIAP
+calls it never sets a conversation aside or rematches one, and its GPU path keeps the fp16 fault.
 
 To move it:
 
-1. Pick the commit and read its `version.bzl`. A different `C_API_VERSION` means the goose binding
-   has to be checked against `c/*.h` before anything else.
-2. Set `LITERT_COMMIT` (and `LITERT_CAPI_VERSION`), then `bash scripts/lib/litert-setup.test.sh`.
+1. Rebase `giap-main` onto the upstream commit you want, run the fork's tests, and read
+   `version.bzl` at the result. A different `C_API_VERSION` means the goose binding has to be
+   checked against `c/*.h` before anything else.
+2. Set `LITERT_COMMIT` (and `LITERT_CAPI_VERSION`) to the rebased head, then
+   `bash scripts/lib/litert-setup.test.sh`.
 3. Build both platforms. Packages live under `<capi>-<commit8>/`, so the old one stays until you
    delete it.
 4. If the prebuilt set changed, `LITERT_REQUIRED_LIBS` and `mac.binaries` in
@@ -75,8 +92,8 @@ a failed build leaves the previous package as it was.
 ```
 ~/.giap/litert-lm/
   .path-macos-arm64    .path-linux-arm64      the package each platform last built and verified
-  1.0.0-3dbb23e1/macos-arm64/                 liblitert-lm.dylib, lib*.dylib, include/, LICENSE, MANIFEST.sha256
-  1.0.0-3dbb23e1/linux-arm64/                 liblitert-lm.so, lib*.so, include/, LICENSE, MANIFEST.sha256
+  1.0.0-a5dd27b5/macos-arm64/                 liblitert-lm.dylib, lib*.dylib, include/, LICENSE, MANIFEST.sha256
+  1.0.0-a5dd27b5/linux-arm64/                 liblitert-lm.so, lib*.so, include/, LICENSE, MANIFEST.sha256
 ```
 
 Packaging rewrites how the libraries find each other. On macOS: `liblitert-lm.dylib` is renamed
@@ -96,7 +113,7 @@ can. A package that fails its hashes is never loaded.
 | Target | Location | How |
 |---|---|---|
 | Desktop app | `Contents/Resources/litert-lm/`, beside `pond-server` | `npm run stage:server` copies the recorded macos-arm64 dylibs and LICENSE to `pond-desktop/resources/litert-lm/`; `scripts/verify-sidecar.sh` checks and loads them; electron-builder ships them |
-| Jetson | `~/.local/share/goose-in-a-pond/lib/litert-lm/1.0.0-3dbb23e1/` | `bash scripts/jetson.sh deploy` copies the recorded linux-arm64 package and runs `sha256sum -c` and `ldd` there; `JETSON_DATA_DIR` if the pond's data dir is elsewhere |
+| Jetson | `~/.local/share/goose-in-a-pond/lib/litert-lm/1.0.0-a5dd27b5/` | `bash scripts/jetson.sh deploy` copies the recorded linux-arm64 package and runs `sha256sum -c` and `ldd` there; `JETSON_DATA_DIR` if the pond's data dir is elsewhere |
 | A pond run from `target/` | the recorded package directory | found through `~/.giap/litert-lm/.path-<platform>` |
 
 At startup pond-server decides which library the backend loads and logs the decision

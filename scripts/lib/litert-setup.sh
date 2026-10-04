@@ -30,9 +30,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 LITERT_REPO_URL="https://github.com/google-ai-edge/LiteRT-LM.git"
-# C API 1.0.0 is on LiteRT-LM's main branch but in no release yet, so one main commit is pinned.
-# docs/developer/litert-lm.md says how to move it.
-LITERT_COMMIT="3dbb23e1e31f085a2222515282419ed470af590f"
+# The pin is GIAP's fork, giap-main: LiteRT-LM main (b320801b, C API 1.0.0, in no release yet) plus
+# GIAP's fixes, among them fp32 activations on the GPU (fp16 garbled tool calls), KV snapshots and
+# KV reuse through an unchanged image. It is not public yet, so LITERT_REPO_URL cannot provide it:
+# build with LITERT_LM_SRC set to a giap-main clone. docs/developer/litert-lm.md says how to move it.
+LITERT_COMMIT="a5dd27b5bd363be38feb62af637facbdb043b11c"
 LITERT_CAPI_VERSION="1.0.0"
 LITERT_TARGET="//c:litert-lm"
 LITERT_HEADERS="api_export.h engine.h conversation.h model_info.h error_reporter.h experimental.h embedding_engine.h"
@@ -591,7 +593,11 @@ litert_prepare_source() {
       fi
       if [ "$fresh" != true ]; then run git -C "$src" fetch origin || return 1; fi
       if [ "${DRY_RUN:-false}" != true ] && ! git -C "$src" cat-file -e "$LITERT_COMMIT^{commit}" 2>/dev/null; then
-        run git -C "$src" fetch origin "$LITERT_COMMIT" || return 1
+        if ! run git -C "$src" fetch origin "$LITERT_COMMIT"; then
+          note "the pin is GIAP's giap-main, which $LITERT_REPO_URL does not have"
+          note "fix: LITERT_LM_SRC=<a giap-main clone at $LITERT_COMMIT> bash scripts/giap.sh litert build $platform"
+          return 1
+        fi
       fi
       run env GIT_LFS_SKIP_SMUDGE=1 git -C "$src" -c advice.detachedHead=false checkout --detach "$LITERT_COMMIT" || return 1
     fi
