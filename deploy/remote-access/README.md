@@ -14,8 +14,9 @@ separate application authorization milestone.
 
 Every image is pinned by digest, and every container runs as UID 65532 with a
 read-only root, no capabilities and `no-new-privileges`. Caddy listens on 8080 and
-8443 inside its container, so it needs no privilege to bind; Docker maps 80 and 443
-onto them. Three networks separate the traffic (2026-09-30): `edge` carries the
+8443 inside its container and Docker maps 80 and 443 onto them. It keeps one
+capability, `NET_BIND_SERVICE`, only because its image marks the binary with it and
+the kernel refuses to start such a binary without it. Three networks separate the traffic (2026-09-30): `edge` carries the
 gateway and the Headscale control plane, `enroll` the gateway and the enrollment
 service, and the internal `admin` network the enrollment service and Headscale's
 administration API alone, so the admin key never crosses the gateway's network.

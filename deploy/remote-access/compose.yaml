@@ -48,12 +48,15 @@ services:
         condition: service_healthy
     image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
     restart: unless-stopped
-    # No root and no capabilities: Caddy listens on 8080/8443 inside and Docker maps the
-    # public ports. no-new-privileges would anyway withhold the binary's file capability.
+    # No root: Caddy listens on 8080/8443 inside and Docker maps the public ports. The
+    # image marks /usr/bin/caddy with cap_net_bind_service, and the kernel refuses to
+    # exec such a binary ("operation not permitted") when that capability is not in the
+    # bounding set, so it is the one capability kept. Nothing binds below 1024.
     user: '65532:65532'
     read_only: true
     tmpfs: ['/tmp:uid=65532,gid=65532']
     cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
     security_opt: [no-new-privileges:true]
     environment:
       HEADSCALE_HOST: '${HEADSCALE_HOST:?Set the Headscale domain}'
