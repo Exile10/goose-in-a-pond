@@ -4284,6 +4284,11 @@ async fn run_server(
 
     // Load the model and prefill the static prompt prefix at boot, so turn 1 reuses it.
     pond_api::spawn_prefix_prewarm(state.clone(), false);
+    // Every lane job: a turn in flight is not quiet, however long it has been answering.
+    {
+        let runs = state.runs.clone();
+        inference_lane.watch_turns(move || runs.registry.any_running());
+    }
     // Compacts a conversation near the edge of its window while the household is quiet.
     tokio::spawn(run_quiet_compaction(
         state.clone(),
@@ -5923,8 +5928,8 @@ async fn run_quiet_compaction(
         let in_process_at = *last_user_activity.read().await;
         let now = chrono::Utc::now();
         let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
-        // Activity is stamped when a turn starts and again when it ends, so a turn answering for
-        // longer than the quiet threshold looks idle in between: its run is the only sign of it.
+        // Never during a turn, even by hand: the lane counts a running turn as no quiet, but a
+        // hand-asked tick waives that, and this pass rewrites the history a turn is answering in.
         let turn_running = state.runs.registry.any_running();
         let cadence = crate::inference_lane_runner::Cadence::new(
             std::time::Duration::from_secs(POLL_SECS),

@@ -116,7 +116,12 @@ pub struct InferenceLane {
     observed: std::sync::Mutex<Option<Observation>>,
     /// What has happened to each job since boot. See [`Tally`].
     tallies: std::sync::Mutex<HashMap<LaneJob, Tally>>,
+    /// Whether a turn is being answered; see [`InferenceLane::watch_turns`]. Unset in tests and
+    /// before the API state exists, when no turn can be running.
+    turns: std::sync::OnceLock<TurnProbe>,
 }
+
+type TurnProbe = Box<dyn Fn() -> bool + Send + Sync>;
 
 /// Saturating elapsed time between wall-clock stamps. A future `then` (NTP step, RTC-less boot)
 /// reads as zero, holding the job behind its floor rather than firing every job at once.
@@ -159,7 +164,20 @@ impl InferenceLane {
                 .collect(),
             observed: std::sync::Mutex::new(None),
             tallies: std::sync::Mutex::new(HashMap::new()),
+            turns: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Lets the lane see a turn in flight. Jobs measure quiet from activity, which is stamped
+    /// when a turn starts and again when it ends, so a turn answering for longer than a job's
+    /// quiet threshold read as quiet in between: on the Orin the summary refresh started two
+    /// minutes into a turn that was compacting, and slowed it. Set once; later calls are ignored.
+    pub fn watch_turns(&self, turn_running: impl Fn() -> bool + Send + Sync + 'static) {
+        let _ = self.turns.set(Box::new(turn_running));
+    }
+
+    fn turn_running(&self) -> bool {
+        self.turns.get().is_some_and(|running| running())
     }
 
     fn tally(&self, job: LaneJob, f: impl FnOnce(&mut Tally)) {
@@ -197,6 +215,14 @@ impl InferenceLane {
         saw_activity_since_start: bool,
         idle_for: Duration,
     ) -> Option<LaneSlot<'_>> {
+        // A turn in flight is no quiet at all, however long ago its request arrived; a hand-asked
+        // tick still waives the quiet period, as it always has.
+        let idle_for = if self.turn_running() {
+            Duration::ZERO
+        } else {
+            idle_for
+        };
+
         {
             let mut registry = self.registry.lock().await;
             registry.insert(
@@ -1309,6 +1335,57 @@ mod tests {
             )
             .await;
         assert!(slot.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_turn_in_flight_is_not_quiet_however_long_it_has_run() {
+        use pond_core::user_data::ports::lane_control::LaneControl;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let running = Arc::new(AtomicBool::new(true));
+        let lane = InferenceLane::new();
+        let probe = running.clone();
+        lane.watch_turns(move || probe.load(Ordering::Relaxed));
+        let cadence = Cadence::new(Duration::ZERO, IDLE_THRESHOLD, false);
+
+        // An hour since the request arrived, and the turn is still being answered.
+        assert!(lane
+            .acquire(
+                LaneJob::SummaryRefresh,
+                true,
+                cadence,
+                false,
+                true,
+                LONG_IDLE
+            )
+            .await
+            .is_none());
+        let snapshot = lane.snapshot().await;
+        let job = snapshot
+            .jobs
+            .iter()
+            .find(|j| j.job == LaneJob::SummaryRefresh)
+            .expect("listed");
+        assert_eq!(
+            job.history.refused,
+            [0, 0, 1, 0],
+            "still_active, nothing else"
+        );
+
+        running.store(false, Ordering::Relaxed);
+        assert!(
+            lane.acquire(
+                LaneJob::SummaryRefresh,
+                true,
+                cadence,
+                false,
+                true,
+                LONG_IDLE
+            )
+            .await
+            .is_some(),
+            "the same quiet with the turn over"
+        );
     }
 
     #[tokio::test]
