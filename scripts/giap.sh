@@ -10,6 +10,7 @@
 #   bash scripts/giap.sh build        # non-interactive: build UI + server for THIS host
 #   bash scripts/giap.sh litert status       # the LiteRT-LM library (.litertlm models): recorded packages, verified
 #   bash scripts/giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]   # build, package, verify, record
+#   bash scripts/giap.sh litert import DIR  # take in a package built on another host (the Jetson)
 #   bash scripts/giap.sh --dry-run …  # print every command instead of running it
 #
 # It auto-detects the host (Jetson / Linux / macOS), whether CUDA is usable, and
@@ -949,23 +950,31 @@ action_litert() {
       head1 "LiteRT-LM library  (goose's litert backend loads it for .litertlm models)"
       if [ "$D_OS" = "linux" ]; then litert_status "$D_DATA_DIR"; else litert_status; fi ;;
     build)
-      if [ "$D_IS_JETSON" = true ]; then
-        bad "LiteRT-LM is never built on the device"
-        note "build it on the Mac (bash scripts/giap.sh litert build linux-arm64), then deploy from there"
-        return 1
-      fi
       [ -n "$platform" ] || platform="$(litert_default_platform)"
       head1 "Build LiteRT-LM C API $LITERT_CAPI_VERSION for $platform"
-      case "$platform" in
-        macos-arm64) info "a native Bazel build: about 22 minutes cold on an M4, a minute when nothing changed" ;;
-        linux-arm64) info "Bazel inside $LITERT_LINUX_IMAGE (linux/arm64, glibc 2.35 as on JetPack 6) under Docker" ;;
+      case "$platform/$(litert_build_mode "$platform")" in
+        macos-arm64/*) info "a native Bazel build: about 22 minutes cold on an M4, a minute when nothing changed" ;;
+        linux-arm64/native)
+          info "a native Bazel build on this board, with the flags its own builds have always used"
+          info "minutes when its Bazel cache is warm, hours cold; the pond service should be stopped" ;;
+        linux-arm64/*) info "Bazel inside $LITERT_LINUX_IMAGE (linux/arm64, glibc 2.35 as on JetPack 6) under Docker" ;;
       esac
       litert_build "$platform"; rc=$?
+      detect_litert
+      return $rc ;;
+    import)
+      if [ -z "$platform" ]; then
+        bad "usage: giap.sh litert import DIR   (a package directory built on another host)"
+        return 2
+      fi
+      head1 "Import a LiteRT-LM package"
+      litert_import "$platform"; rc=$?
       detect_litert
       return $rc ;;
     *)
       bad "unknown: litert $sub"
       note "usage: giap.sh litert status | giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]"
+      note "       giap.sh litert import DIR"
       return 2 ;;
   esac
 }
@@ -973,9 +982,9 @@ action_litert() {
 action_litert_menu() {
   action_litert status
   [ -t 0 ] || return 0
-  [ "$D_IS_JETSON" = true ] && return 0
   say ""
   if [ "$D_OS" = "macos" ]; then say "  m) build macos-arm64 here    l) build linux-arm64 in Docker (for the Jetson)    return) back"
+  elif [ "$(litert_build_mode linux-arm64)" = native ]; then say "  l) build linux-arm64 on this board    return) back"
   else say "  l) build linux-arm64 in Docker (for the Jetson)    return) back"; fi
   local c=""; printf '  > '; read -r c
   case "$c" in

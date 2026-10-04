@@ -92,14 +92,31 @@ litert_default_platform() {
   case "$(uname -s)/$(uname -m)" in Darwin/arm64) printf 'macos-arm64' ;; *) printf 'linux-arm64' ;; esac
 }
 
-# The flags that decide what Bazel builds. The manifest's first line records exactly these.
-litert_bazel_flags() {
-  printf -- '-c opt --config=%s --define=litert_runtime_link_mode=dynamic' "$(_litert_config "$1")"
+# How <platform> builds on this host: `native` with the host's own Bazel, or `docker`. linux-arm64
+# builds natively on an arm64 Linux host, the Jetson itself, and in a container anywhere else.
+litert_build_mode() {
+  case "$1/$(uname -s)/$(uname -m)" in
+    linux-arm64/Linux/aarch64) printf 'native' ;;
+    linux-arm64/*) printf 'docker' ;;
+    *) printf 'native' ;;
+  esac
 }
 
-litert_manifest_header() { # <platform> <commit>
+# The flags that decide what Bazel builds. The manifest's first line records exactly these.
+# A native linux-arm64 build, on the Jetson, uses the flags the board's own builds have always
+# used and every Orin measurement was made with: no --config=linux_arm64 (-march=armv8-a, -O3,
+# YNNPACK), which would also recompile every target there, for hours, and no header parsing.
+litert_bazel_flags() { # <platform> [mode]
+  if [ "$1" = linux-arm64 ] && [ "${2:-$(litert_build_mode "$1")}" = native ]; then
+    printf -- '-c opt --define=litert_runtime_link_mode=dynamic --features=-parse_headers'
+  else
+    printf -- '-c opt --config=%s --define=litert_runtime_link_mode=dynamic' "$(_litert_config "$1")"
+  fi
+}
+
+litert_manifest_header() { # <platform> <commit> [bazel flags]
   printf 'litert-lm C API %s | LiteRT-LM %s | built %s on %s | bazel %s %s' \
-    "$LITERT_CAPI_VERSION" "$2" "$(date -u '+%Y-%m-%dT%H:%MZ')" "$1" "$(litert_bazel_flags "$1")" "$LITERT_TARGET"
+    "$LITERT_CAPI_VERSION" "$2" "$(date -u '+%Y-%m-%dT%H:%MZ')" "$1" "${3:-$(litert_bazel_flags "$1")}" "$LITERT_TARGET"
 }
 _litert_header_capi()     { printf '%s\n' "$1" | sed -n 's/^litert-lm C API \([^ ]*\) |.*/\1/p'; }
 _litert_header_commit()   { printf '%s\n' "$1" | sed -n 's/.*| LiteRT-LM \([0-9a-f]\{40\}\) |.*/\1/p'; }
@@ -203,11 +220,12 @@ litert_write_manifest() { # <dir> <header>
   )
 }
 
-# litert_package <platform> <src> <built-library> <dest> <commit>
-# Assemble a package in <dest> from a LiteRT-LM checkout and the library Bazel built from it.
-# Runs on the Mac for macos-arm64 and inside the build container for linux-arm64.
+# litert_package <platform> <src> <built-library> <dest> <commit> [bazel flags]
+# Assemble a package in <dest> from a LiteRT-LM checkout and the library Bazel built from it, and
+# record the flags it was built with (by default, this host's for <platform>). Runs where the build
+# ran: on the Mac, on the Jetson, or inside the build container.
 litert_package() {
-  local platform="$1" src="$2" built="$3" dest="$4" commit="$5" cfg ext f h n=0
+  local platform="$1" src="$2" built="$3" dest="$4" commit="$5" flags="${6:-}" cfg ext f h n=0
   litert_platform_ok "$platform" || { echo "unknown platform: $platform" >&2; return 2; }
   cfg="$(_litert_config "$platform")"; ext="$(_litert_ext "$platform")"
   [ -f "$built" ] || { echo "no built library at $built" >&2; return 1; }
@@ -232,7 +250,7 @@ litert_package() {
     cp "$src/c/$h" "$dest/include/$h" || return 1
   done
   cp "$src/LICENSE" "$dest/LICENSE" || return 1
-  litert_write_manifest "$dest" "$(litert_manifest_header "$platform" "$commit")"
+  litert_write_manifest "$dest" "$(litert_manifest_header "$platform" "$commit" "$flags")"
 }
 
 # Move a finished package into place. A process already running from the old copy keeps its files.
@@ -549,12 +567,25 @@ litert_check_prereqs() {
         fi
       done ;;
     linux-arm64)
-      if ! command -v docker >/dev/null 2>&1; then
+      if [ "$(litert_build_mode linux-arm64)" = native ]; then
+        if ! command -v bazelisk >/dev/null 2>&1 && ! command -v bazel >/dev/null 2>&1; then
+          bad "neither bazelisk nor bazel is installed"
+          note "fix: put bazelisk-linux-arm64 from github.com/bazelbuild/bazelisk/releases on PATH as bazelisk"
+          bad_count=$((bad_count + 1))
+        fi
+        for t in clang patchelf readelf; do
+          if ! command -v "$t" >/dev/null 2>&1; then
+            bad "$t is not installed"; note "fix: sudo apt-get install clang patchelf binutils"
+            bad_count=$((bad_count + 1))
+          fi
+        done
+      elif ! command -v docker >/dev/null 2>&1; then
         bad "docker is not installed (linux-arm64 builds in a $LITERT_LINUX_IMAGE container)"
         bad_count=$((bad_count + 1))
       elif ! _litert_docker_ok; then
         bad "docker is installed but its daemon does not answer"
         note "fix: restart Docker Desktop, then check that 'docker info' reports a server version"
+        note "or build on the Jetson itself: bash scripts/giap.sh litert build linux-arm64 there"
         bad_count=$((bad_count + 1))
       fi ;;
   esac
@@ -612,30 +643,34 @@ _litert_bazel_extra() { # <distdir as Bazel will see it>
   if [ -n "${LITERT_BAZEL_JOBS:-}" ]; then printf -- ' --jobs=%s' "$LITERT_BAZEL_JOBS"; fi
 }
 
-_litert_build_macos() { # <src> <stage>
-  local src="$1" stage="$2" built
-  # shellcheck disable=SC2046
-  set -- build $(litert_bazel_flags macos-arm64) --curses=no --color=no
+# A build with this host's own Bazel: macos-arm64 on a Mac, linux-arm64 on the Jetson.
+_litert_build_native() { # <platform> <src> <stage>
+  local platform="$1" src="$2" stage="$3" flags bazel=bazelisk built
+  flags="$(litert_bazel_flags "$platform" native)"
+  if [ "$platform" = linux-arm64 ] && ! command -v bazelisk >/dev/null 2>&1; then bazel=bazel; fi
+  # shellcheck disable=SC2086
+  set -- build $flags --curses=no --color=no
   if [ -n "${LITERT_DISTDIR:-}" ]; then set -- "$@" "--distdir=$LITERT_DISTDIR"; fi
   if [ -n "${LITERT_BAZEL_JOBS:-}" ]; then set -- "$@" "--jobs=$LITERT_BAZEL_JOBS"; fi
   set -- "$@" "$LITERT_TARGET"
   info "in $src:"
-  if [ "${DRY_RUN:-false}" = true ]; then run bazelisk "$@"; return 0; fi
-  ( cd "$src" && run bazelisk "$@" ) || return 1
-  built="$src/bazel-bin/c/liblitert-lm.dylib"
+  if [ "${DRY_RUN:-false}" = true ]; then run "$bazel" "$@"; return 0; fi
+  ( cd "$src" && run "$bazel" "$@" ) || return 1
+  built="$src/bazel-bin/c/liblitert-lm.$(_litert_ext "$platform")"
   if [ ! -f "$built" ]; then
     bad "Bazel finished, but $built is not there"
     note "it built: $(ls "$src/bazel-bin/c" 2>/dev/null | tr '\n' ' ')"
     return 1
   fi
-  litert_package macos-arm64 "$src" "$built" "$stage" "$LITERT_COMMIT"
+  litert_package "$platform" "$src" "$built" "$stage" "$LITERT_COMMIT" "$flags"
 }
 
 # The script the linux-arm64 container runs. Values from this side are written in; \$ is the
 # container's own. It builds, then packages and verifies with this same file, mounted at /giap.
 _litert_container_script() {
-  local flags
-  flags="$(litert_bazel_flags linux-arm64) $(_litert_bazel_extra "${LITERT_DISTDIR:+/distdir}") --symlink_prefix=/"
+  local build_flags flags
+  build_flags="$(litert_bazel_flags linux-arm64 docker)"
+  flags="$build_flags $(_litert_bazel_extra "${LITERT_DISTDIR:+/distdir}") --symlink_prefix=/"
   cat <<EOF
 set -eu
 export DEBIAN_FRONTEND=noninteractive
@@ -667,7 +702,7 @@ if [ ! -f "\$bin/c/liblitert-lm.so" ]; then
 fi
 echo '==> package and verify'
 . /giap/litert-setup.sh
-litert_package linux-arm64 /src "\$bin/c/liblitert-lm.so" /out $LITERT_COMMIT
+litert_package linux-arm64 /src "\$bin/c/liblitert-lm.so" /out $LITERT_COMMIT '$build_flags'
 if ! litert_verify /out; then printf 'verify: %s\\n' "\$LITERT_VERIFY_PROBLEMS" >&2; exit 1; fi
 [ -z "\$LITERT_VERIFY_NOTES" ] || printf 'note: %s\\n' "\$LITERT_VERIFY_NOTES"
 echo "==> \$LITERT_VERIFY_FILES files verified in the container"
@@ -705,9 +740,9 @@ litert_build() {
   dest="$(litert_package_dir "$platform")"
   if [ "$dry" = true ]; then
     stage="$(litert_home)/.stage-$platform.XXXXXX"
-    case "$platform" in
-      macos-arm64) _litert_build_macos "$src" "$stage" ;;
-      linux-arm64) _litert_build_linux "$src" "$stage" ;;
+    case "$(litert_build_mode "$platform")" in
+      native) _litert_build_native "$platform" "$src" "$stage" ;;
+      docker) _litert_build_linux "$src" "$stage" ;;
     esac
     info "then: package (the library, prebuilt/$(_litert_config "$platform")/*.$(_litert_ext "$platform"), rpath fixes, headers, LICENSE, MANIFEST.sha256),"
     info "verify it, move it to $dest and record it in $(litert_record_file "$platform")"
@@ -718,9 +753,9 @@ litert_build() {
   stage="$(mktemp -d "$(litert_home)/.stage-$platform.XXXXXX")" || return 1
   # mktemp makes it 0700; the package is read by whatever runs the pond, and rsync keeps the mode.
   chmod 755 "$stage" || { rm -rf "$stage"; return 1; }
-  case "$platform" in
-    macos-arm64) _litert_build_macos "$src" "$stage" ;;
-    linux-arm64) _litert_build_linux "$src" "$stage" ;;
+  case "$(litert_build_mode "$platform")" in
+    native) _litert_build_native "$platform" "$src" "$stage" ;;
+    docker) _litert_build_linux "$src" "$stage" ;;
   esac || { rm -rf "$stage"; bad "the $platform build did not finish; nothing was installed"; return 1; }
   if ! litert_verify "$stage"; then
     bad "the new $platform package fails verification; nothing was installed"
@@ -737,9 +772,47 @@ litert_build() {
       note "the desktop app ships it: npm run stage:server copies it into pond-desktop/resources/litert-lm"
       note "a pond started from target/ finds it through the record when it starts" ;;
     linux-arm64)
-      note "bash scripts/jetson.sh deploy copies it to the device and checks it there" ;;
+      if [ "$(litert_build_mode linux-arm64)" = native ]; then
+        note "a pond started on this host finds it through the record"
+        note "scripts/jetson.sh deploy ships what the dev machine records: copy $dest there, then"
+        note "bash scripts/giap.sh litert import <that copy>"
+      else
+        note "bash scripts/jetson.sh deploy copies it to the device and checks it there"
+      fi ;;
   esac
   return 0
+}
+
+# litert_import <dir>: a package built on another host, the Jetson, taken in as if it had been
+# built here: verified, held to the pin, copied into place and recorded, so that
+# scripts/jetson.sh deploy ships it. Under DRY_RUN=true it checks and changes nothing.
+litert_import() {
+  local src="$1" platform dest stage
+  if ! litert_verify "$src"; then
+    bad "$src is not a package that verifies; nothing was imported"
+    printf '%s\n' "$LITERT_VERIFY_PROBLEMS" | while IFS= read -r line; do note "$line"; done
+    return 1
+  fi
+  platform="$LITERT_VERIFY_PLATFORM"
+  if [ "$LITERT_VERIFY_COMMIT" != "$LITERT_COMMIT" ] \
+     || [ "$(_litert_header_capi "$LITERT_VERIFY_HEADER")" != "$LITERT_CAPI_VERSION" ]; then
+    bad "$src was built from LiteRT-LM ${LITERT_VERIFY_COMMIT:-an unknown commit}; the pin is $LITERT_COMMIT (C API $LITERT_CAPI_VERSION)"
+    return 1
+  fi
+  dest="$(litert_package_dir "$platform")"
+  if [ "${DRY_RUN:-false}" = true ]; then
+    info "would copy $src to $dest and record it in $(litert_record_file "$platform")"
+    return 0
+  fi
+  mkdir -p "$(litert_home)" || return 1
+  stage="$(mktemp -d "$(litert_home)/.stage-$platform.XXXXXX")" || return 1
+  if ! { chmod 755 "$stage" && cp -R "$src/." "$stage/" && litert_verify "$stage"; }; then
+    rm -rf "$stage"; bad "the copy of $src does not verify; nothing was imported"; return 1
+  fi
+  _litert_install "$stage" "$dest" || { rm -rf "$stage"; bad "could not move the package to $dest"; return 1; }
+  litert_record "$platform" "$dest" || { bad "could not write $(litert_record_file "$platform")"; return 1; }
+  ok "LiteRT-LM C API $LITERT_CAPI_VERSION for $platform: $LITERT_VERIFY_FILES files imported into $dest"
+  note "recorded in $(litert_record_file "$platform")"
 }
 
 # ── reporting ────────────────────────────────────────────────────────────────

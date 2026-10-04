@@ -63,7 +63,8 @@ To move it:
 
 ```bash
 bash scripts/giap.sh litert build macos-arm64      # on an Apple Silicon Mac
-bash scripts/giap.sh litert build linux-arm64      # anywhere Docker runs linux/arm64; for the Jetson
+bash scripts/giap.sh litert build linux-arm64      # in Docker anywhere it runs linux/arm64; natively on the Jetson
+bash scripts/giap.sh litert import DIR             # take in a package built on the Jetson, for deploy
 bash scripts/giap.sh litert status                 # what is recorded, each verified; exit 1 on a failure
 bash scripts/giap.sh --dry-run litert build linux-arm64   # every command, nothing run
 ```
@@ -81,7 +82,15 @@ must already be at the pin; it is never moved.
   output root persists in the Docker volume `giap-litert-lm-linux-arm64`
   (`docker volume rm giap-litert-lm-linux-arm64` reclaims it). The container packages and verifies
   the result with the same script, including a `dlopen` of the library on that glibc.
-  LiteRT-LM is never built on the Jetson itself.
+- **linux-arm64 on the Jetson itself** builds natively, with the board's own Bazel (bazelisk or
+  bazel), clang and patchelf, and the flags its own builds have always used: `-c opt
+  --define=litert_runtime_link_mode=dynamic --features=-parse_headers`, without
+  `--config=linux_arm64` (`-march=armv8-a -O3`, YNNPACK). Every Orin measurement was made with that
+  build, and switching flags would recompile every target, hours on the board. The manifest records
+  the flags either way. Bazel folds `PATH` into its C++ actions, so run it with the `PATH` the
+  board's cache was built under or it recompiles everything. Stop the pond service first. Then copy
+  the package to the dev machine and `giap.sh litert import` it there, because `scripts/jetson.sh
+  deploy` ships the package the dev machine records.
 - `LITERT_BAZEL_JOBS=N` caps Bazel's jobs, for a Docker VM that runs out of memory.
 
 A build is staged beside its destination, verified, and only then moved into place and recorded, so

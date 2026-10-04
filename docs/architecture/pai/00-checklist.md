@@ -2283,9 +2283,9 @@ side calls (GIAP wiring; not a PAI milestone).**
     the review case rests on the unit tests and the live test's second side call.
   - The lib suite's three llama.cpp context-cap failures predate this work; they are tracked
     separately.
-- **Owed.** The Orin: a linux-arm64 package of `a5dd27b5` (Docker Desktop's VM is down on this Mac,
-  so `giap.sh litert build linux-arm64` cannot run), then snapshot save and load times and memory
-  on the device. Erasing snapshots with a member's data. The reuse count of a whole-prompt turn:
+- **Owed.** The Orin: snapshot save and load times and memory on the device. The linux-arm64
+  package of `a5dd27b5` is built: on the board itself (Docker Desktop's VM is down on this Mac), in
+  28 s from its warm cache, verified there and imported on the Mac. Erasing snapshots with a member's data. The reuse count of a whole-prompt turn:
   LiteRT counts the skipped tokens as prefilled, so the backend reports none; it needs a figure
   from the C API. A snapshot that writes only the positions it holds. Rematching across a
   tools-only change without the disk round trip. Side calls told apart by a signal from GIAP rather

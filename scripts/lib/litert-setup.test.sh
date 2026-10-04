@@ -114,7 +114,8 @@ exit 0'
   fake bazelisk '
 echo "bazelisk $* (in $PWD)" >> "$TOOL_LOG"
 [ -n "${FAKE_BAZEL_FAIL:-}" ] && exit 1
-mkdir -p bazel-bin/c && printf "built by bazel\n" > bazel-bin/c/liblitert-lm.dylib'
+mkdir -p bazel-bin/c && printf "built by bazel\n" > bazel-bin/c/liblitert-lm.dylib
+printf "built by bazel\n" > bazel-bin/c/liblitert-lm.so'
   # docker info answers unless FAKE_DOCKER_DOWN; docker run plays the container: it packages a
   # stand-in library into the /out mount with this same library, as the real container does.
   fake docker '
@@ -225,7 +226,7 @@ t_platforms() {
   fake_host Linux aarch64; eq "$(litert_default_platform)" linux-arm64
 }
 t_bazel_flags_and_header() {
-  world
+  world; fakes; fake_host Darwin arm64
   eq "$(litert_bazel_flags macos-arm64)" "-c opt --config=macos_arm64 --define=litert_runtime_link_mode=dynamic" || return 1
   h="$(litert_manifest_header linux-arm64 "$LITERT_COMMIT")"
   case "$h" in
@@ -577,7 +578,7 @@ t_build_linux_runs_the_container() {
   contains "$s" "build -c opt --config=linux_arm64 --define=litert_runtime_link_mode=dynamic --curses=no --color=no --distdir=/distdir --symlink_prefix=/ //c:litert-lm" || return 1
   contains "$s" "$LITERT_BAZELISK_LINUX_ARM64_SHA256" && contains "$s" "bazelisk/releases/download/$LITERT_BAZELISK_VERSION/bazelisk-linux-arm64" || return 1
   contains "$s" "clang-$LITERT_LINUX_CLANG" && contains "$s" "patchelf" || return 1
-  contains "$s" "litert_package linux-arm64 /src \"\$bin/c/liblitert-lm.so\" /out $LITERT_COMMIT" || return 1
+  contains "$s" "litert_package linux-arm64 /src \"\$bin/c/liblitert-lm.so\" /out $LITERT_COMMIT '-c opt --config=linux_arm64 --define=litert_runtime_link_mode=dynamic'" || return 1
   contains "$s" "litert_verify /out"
 }
 # The container's bazelisk download, run for real from the generated script with a fake curl: a
@@ -612,6 +613,66 @@ t_build_macos_needs_an_apple_silicon_mac_and_its_tools() {
   fake_host Darwin arm64; rm "$W/bin/bazelisk" "$W/bin/git-lfs"; stubs
   litert_check_prereqs macos-arm64 && return 1
   contains "$(logged)" "bazelisk is not installed" && contains "$(logged)" "git-lfs is not installed"
+}
+# On an arm64 Linux host, the Jetson, linux-arm64 builds there with the board's own flags.
+t_build_mode_follows_the_host() {
+  world; fakes
+  fake_host Darwin arm64
+  eq "$(litert_build_mode linux-arm64)" docker && eq "$(litert_build_mode macos-arm64)" native || return 1
+  fake_host Linux x86_64; eq "$(litert_build_mode linux-arm64)" docker || return 1
+  fake_host Linux aarch64; eq "$(litert_build_mode linux-arm64)" native || return 1
+  eq "$(litert_bazel_flags linux-arm64)" "-c opt --define=litert_runtime_link_mode=dynamic --features=-parse_headers" || return 1
+  eq "$(litert_bazel_flags linux-arm64 docker)" "-c opt --config=linux_arm64 --define=litert_runtime_link_mode=dynamic" || return 1
+  h="$(litert_manifest_header linux-arm64 "$LITERT_COMMIT" "-c opt --features=-x")"
+  contains "$h" "on linux-arm64 | bazel -c opt --features=-x //c:litert-lm" || return 1
+  eq "$(_litert_header_platform "$h")" linux-arm64
+}
+# Native on the Jetson: no container, the host's Bazel, the board's flags in the manifest.
+t_build_linux_native_end_to_end() {
+  world; fakes; stubs; fake_host Linux aarch64; fake clang 'exit 0'; own_src_at_pin linux-arm64
+  mk_built "$W/fixtures/liblitert-lm.so" linux-arm64
+  litert_build linux-arm64 || { logged; return 1; }
+  dest="$(litert_package_dir linux-arm64)"
+  eq "$(litert_recorded_dir linux-arm64)" "$dest" && litert_verify "$dest" || { echo "$LITERT_VERIFY_PROBLEMS"; return 1; }
+  contains "$(tools_log)" "bazelisk build -c opt --define=litert_runtime_link_mode=dynamic --features=-parse_headers --curses=no --color=no //c:litert-lm (in $W/LiteRT-LM)" || return 1
+  [ ! -e "$W/docker-args" ] || { echo "ran docker: $(cat "$W/docker-args")"; return 1; }
+  contains "$(sed -n 1p "$dest/MANIFEST.sha256")" "on linux-arm64 | bazel -c opt --define=litert_runtime_link_mode=dynamic --features=-parse_headers //c:litert-lm" || return 1
+  contains "$(logged)" "note: bash scripts/giap.sh litert import <that copy>"
+}
+t_build_linux_native_falls_back_to_bazel() {
+  world; fakes; stubs; fake_host Linux aarch64; fake clang 'exit 0'; own_src_at_pin linux-arm64
+  mk_built "$W/fixtures/liblitert-lm.so" linux-arm64
+  mv "$W/bin/bazelisk" "$W/bin/bazel"
+  litert_build linux-arm64 || { logged; return 1; }
+  contains "$(tools_log)" "--features=-parse_headers" && contains "$(logged)" "run: bazel build -c opt"
+}
+t_build_linux_native_needs_its_tools() {
+  world; fakes; stubs; fake_host Linux aarch64; rm "$W/bin/bazelisk" "$W/bin/patchelf"
+  litert_check_prereqs linux-arm64 && return 1
+  contains "$(logged)" "bad: neither bazelisk nor bazel is installed" || return 1
+  contains "$(logged)" "bad: clang is not installed" && contains "$(logged)" "bad: patchelf is not installed" || return 1
+  lacks "$(logged)" docker
+}
+# A package built on the Jetson, taken in on the dev machine for jetson.sh deploy.
+t_import_takes_in_a_package_built_elsewhere() {
+  world; stubs; mk_pkg linux-arm64
+  litert_import "$PKG" || { logged; return 1; }
+  dest="$(litert_package_dir linux-arm64)"
+  eq "$(litert_recorded_dir linux-arm64)" "$dest" && litert_verify "$dest" || { echo "$LITERT_VERIFY_PROBLEMS"; return 1; }
+  cmp -s "$PKG/MANIFEST.sha256" "$dest/MANIFEST.sha256" || return 1
+  contains "$(logged)" "files imported into $dest" || return 1
+  eq "$(ls -A "$GIAP_LITERT_HOME" | grep -c '^\.stage')" 0
+}
+t_import_refuses_another_pin_or_a_broken_package() {
+  world; stubs; mk_pkg linux-arm64
+  printf 'x\n' >> "$PKG/LICENSE"
+  litert_import "$PKG" && return 1
+  contains "$(logged)" "is not a package that verifies; nothing was imported" || return 1
+  world; stubs; mk_pkg linux-arm64; pin="$LITERT_COMMIT"
+  LITERT_COMMIT=0123456789abcdef0123456789abcdef01234567
+  litert_import "$PKG" && return 1
+  contains "$(logged)" "was built from LiteRT-LM $pin; the pin is $LITERT_COMMIT" || return 1
+  [ ! -e "$(litert_record_file linux-arm64)" ]
 }
 t_build_dry_run_changes_nothing() {
   world; fakes; stubs; fake_host Darwin arm64; DRY_RUN=true; export FAKE_DOCKER_DOWN=1

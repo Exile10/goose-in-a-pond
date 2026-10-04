@@ -10,9 +10,10 @@
 #
 # What it does:
 #   1. Dev machine -> Jetson: the LiteRT-LM library that `giap.sh litert build
-#      linux-arm64` recorded, verified here, copied to
+#      linux-arm64` recorded (or `giap.sh litert import` took in from a build on
+#      the device), verified here, copied to
 #      <data dir>/lib/litert-lm/<capi>-<commit8>/ and verified again there.
-#      It is never built on the device. With none recorded this warns and skips.
+#      With none recorded this warns and skips.
 #   2. Jetson: fetch + hard-reset the checkout to origin/<branch>, sync the
 #      goose submodule to the pinned SHA.
 #   3. Dev machine: build the web UI (Vite needs Node >= 18, which the Jetson
