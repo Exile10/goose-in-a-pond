@@ -2401,3 +2401,40 @@ not a PAI milestone).**
 - **Verification.** pond-core and pond-api 2,272 passed; pond-server's binary 146; clippy as CI
   runs it, clean; `scripts/live-test.sh` 158 checks passed on each of the three commits, the lane
   listing 8 jobs; the Mac and Orin runs above.
+
+**2026-10-04 — A compaction no longer rewrites the history the next turn sends (goose patch; not a
+PAI milestone).**
+
+- **Cause.** goose's `compact_messages` stamped the copy of the user's last message, the one it
+  keeps after the summary, before running the summary. A session reloads its messages
+  `ORDER BY created_timestamp, id`, seconds then insertion, so once the summary took a second or
+  more the copy sorted ahead of the summary and the continuation note on the next turn, and
+  `merge_consecutive_messages` folded it into the summary and the note into the reply after it.
+  Found with a temporary dump of what the LiteRT-LM backend received: on the turn after each
+  compaction the request held one message fewer than the conversation the backend had consumed,
+  so it could not extend, and the re-rendered prompt parted from the KV right after the
+  ~3,800-token preamble. This was the defect in the entry above: the four Orin turns that
+  re-prefilled with an unchanged history each followed a compaction turn.
+- **Fix:** goose `f06a009b8` (bumped in `d0054b32`). The copy is stamped when it is pushed, never
+  earlier than the message ahead of it. The regression test's summary takes 1.1 s; without the
+  fix the reload order is `[0, 1, 2, 5, 3, 4]`. A manual compaction (the quiet pass) keeps no copy
+  and was never affected.
+- **Measured.** Mac (E2B, Orin emulated, 16 turns, three compactions): the turn after each
+  compaction extended (LiteRT: "from step 5610: reused 264 of 327") instead of re-sending its prompt
+  from step 0 ("reused 3800 of 5,388-5,523"), TTFT 2.3-2.9 s before and 0.7-1.3 s after. Orin (E4B,
+  8k, release `d0054b32`, stopped after 8 turns): the turn after the first compaction extended with
+  an 83-token prefill, where the baseline re-sent 1,476-2,178 tokens on each such turn; every
+  compaction now makes one whole-prompt send, its own. The same run showed what is next. From turn 6
+  goose compacted on every turn: after each compaction the prompt already stood at 5,772-6,093
+  tokens (72-77% of the window) and grew with each one, as the summary carries every earlier request
+  forward, so the next turn passed 80% again; each of those turns took 4-5 minutes. And the board
+  swapped to 3.1 GB with 54 MB free, where prefill ran at ~100 tok/s instead of 150-250, and even an
+  83-token extend took 5.3 s.
+- **Also.** Until now the model read, on every turn after a compaction, its previous question with
+  the summary glued after it and the continuation note glued to its previous answer. Sessions
+  compacted before the fix stay that way until their next compaction rewrites the tail.
+- **PAI.** Preamble, `profile_id`, egress, secrets, guest, turn blocking: unchanged. Side effect:
+  compaction's output keeps the order it was built in.
+- **Verification.** goose `context_mgmt` tests 11 passed, the new one failing without the fix;
+  clippy clean on the change; the Mac and Orin runs above. In `goose/` on this Mac, sqlx's
+  proc-macro needs `--config 'profile.dev.package.sqlx-macros.debug=true'` or dyld rejects it.
