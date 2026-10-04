@@ -2285,11 +2285,12 @@ side calls (GIAP wiring; not a PAI milestone).**
     separately.
 - **Owed.** The Orin: snapshot save and load times and memory on the device. The linux-arm64
   package of `a5dd27b5` is built: on the board itself (Docker Desktop's VM is down on this Mac), in
-  28 s from its warm cache, verified there and imported on the Mac. Erasing snapshots with a member's data. The reuse count of a whole-prompt turn:
-  LiteRT counts the skipped tokens as prefilled, so the backend reports none; it needs a figure
-  from the C API. A snapshot that writes only the positions it holds. Rematching across a
-  tools-only change without the disk round trip. Side calls told apart by a signal from GIAP rather
-  than by weight: a guest's chat weighs under half a long member chat and runs as a side call.
+  28 s from its warm cache, verified there and imported on the Mac. Erasing snapshots with a
+  member's data. The reuse count of a whole-prompt turn: LiteRT counts the skipped tokens as
+  prefilled, so the backend reports none; it needs a figure from the C API. A snapshot that writes
+  only the positions it holds. Rematching across a tools-only change without the disk round trip.
+  Side calls told apart by a signal from GIAP rather than by weight: a guest's chat weighs under
+  half a long member chat and runs as a side call.
 
 **2026-10-04 — LiteRT-LM on the Orin: an 8k window and no MTP; rejected tool calls kept; compaction
 at 8k measured, not yet fixed (GIAP wiring; not a PAI milestone).**
