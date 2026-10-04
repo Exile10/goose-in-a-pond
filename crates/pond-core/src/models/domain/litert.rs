@@ -16,8 +16,11 @@ pub const EXECUTION_ENV: &str = "GIAP_LITERT_BACKEND";
 pub const SPECULATIVE_ENV: &str = "GIAP_LITERT_SPECULATIVE";
 /// Engine context off the budgeted device.
 pub const PLATFORM_CONTEXT_TOKENS: u32 = 16384;
-/// Engine context on the budgeted device: LiteRT-LM's own GPU default, not an Orin measurement.
-pub const DEVICE_CONTEXT_TOKENS: u32 = 4096;
+/// Engine context on the budgeted device, measured on the Orin with E4B on the GPU under the
+/// pond's workload: 4096 cannot hold the pond's first prompt (about 5,100 tokens with its 41
+/// tools), 16384 ran out of memory, and 8192 ran, with little to spare (about 50 MB free and
+/// 1.6 GB in swap at its lowest).
+pub const DEVICE_CONTEXT_TOKENS: u32 = 8192;
 
 /// Whether `model` names a LiteRT-LM model.
 pub fn is_litert_model(model: &str) -> bool {
@@ -117,12 +120,21 @@ pub fn engine_options(model: &str, budgeted_device: bool, overrides: Overrides) 
         execution,
         speculative_decoding: overrides
             .speculative_decoding
-            .unwrap_or_else(|| speculative_decoding(model, execution)),
+            .unwrap_or_else(|| !budgeted_device && speculative_decoding(model, execution)),
     }
 }
 
-/// Multi-token prediction, off only where it loses. Measured on the Orin, real prompts: GPU E2B
-/// 1.18x, GPU E4B 1.47x, CPU E4B 1.39x, CPU E2B 0.95x.
+/// Multi-token prediction off the budgeted device: off only where it loses. On the Orin it is off
+/// for every model (see [`engine_options`]).
+///
+/// The Orin's first measurement, before the GPU ran in fp32, favoured it: E4B 1.47x and E2B 1.18x
+/// over summaries, code and rewrites, whose drafts copy the prompt (E2B on the CPU 0.95x). Its
+/// free-form row already pointed the other way (E2B 0.88x, 22% of drafts accepted; E4B 1.16x,
+/// 25%). The GPU now runs fp32, which tool calls need, and rejected drafts cost more there: the
+/// pond's own prompts with E4B (2026-10-04) decoded prose at 9.3-9.8 tok/s with it and 14.1-14.2
+/// without, finishing a 45-token answer 1.4 s later, while copied text and tool calls finished
+/// 4-16% sooner. Household replies are mostly prose. Off the device it has not been measured
+/// again since the switch to fp32.
 pub fn speculative_decoding(model: &str, execution: Execution) -> bool {
     !(execution == Execution::Cpu && model.to_ascii_lowercase().contains("e2b"))
 }
@@ -256,6 +268,19 @@ mod tests {
             ..Overrides::default()
         };
         assert!(!engine_options(e2b, true, cpu).speculative_decoding);
+    }
+
+    #[test]
+    fn the_budgeted_device_does_not_speculate_unless_told_to() {
+        let on = Overrides {
+            speculative_decoding: Some(true),
+            ..Overrides::default()
+        };
+        for model in ["gemma-4-E2B-it.litertlm", "gemma-4-E4B-it.litertlm"] {
+            assert!(!engine_options(model, true, Overrides::default()).speculative_decoding);
+            assert!(engine_options(model, false, Overrides::default()).speculative_decoding);
+            assert!(engine_options(model, true, on).speculative_decoding);
+        }
     }
 
     #[test]
