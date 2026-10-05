@@ -64,6 +64,8 @@ import {
   type DetectedPlace,
 } from "./types";
 import { voiceTitle } from "../voice/voiceCatalogue";
+import { parseSse, type SseFrame } from "../player/sse";
+import type { PlayerReply, PlayerState } from "../player/types";
 
 // All REST calls MUST go through PondApiClient; no fetch() elsewhere.
 
@@ -171,9 +173,21 @@ export class PondApiClient {
     }
   }
 
+  /** How this client introduces itself when it pairs, and so how the devices list names it. */
+  private deviceName = "Pond Desktop";
+
+  setDeviceName(name: string): void {
+    this.deviceName = name;
+  }
+
   /** Requests read `this.base` per call, so this retargets the whole singleton. */
   setBase(url: string): void {
     this.base = url.replace(/\/$/, "");
+  }
+
+  /** The pond this client talks to, e.g. to link to a page the pond serves. */
+  serverUrl(): string {
+    return this.base;
   }
 
   /** `expiresAt` (RFC3339) arms proactive refresh; omit to keep the expiry, `null` to clear it. */
@@ -1019,7 +1033,7 @@ export class PondApiClient {
       {
         challenge_id: init.challenge_id,
         mac,
-        device_name: "Pond Desktop",
+        device_name: this.deviceName,
       },
     );
     if (res.accepted && res.session_token) {
@@ -1887,6 +1901,8 @@ export class PondApiClient {
   ): Promise<{
     requirements: SecretRequirement[];
     fulfilled: Record<string, boolean>;
+    /** What each `choice` is set to: the stored answer, or the one that applies until one is saved. */
+    values?: Record<string, string>;
   }> {
     return this.get(`/api/v1/extensions/${encodeURIComponent(name)}/secrets`);
   }
@@ -2046,6 +2062,110 @@ export class PondApiClient {
     state: string,
   ): Promise<import("./types").OAuthFlowStatus> {
     return this.get(`/api/v1/oauth/status/${encodeURIComponent(state)}`);
+  }
+
+  // ── Music player bridge ───────────────────────────────────
+
+  /**
+   * The player page's command stream. Long-lived by design, so unlike `streamSse` it has no
+   * timeout: it ends when the server closes it or `signal` aborts. `EventSource` cannot carry the
+   * Authorization header the server requires, hence fetch.
+   */
+  async *streamPlayerEvents(
+    service: string,
+    signal: AbortSignal,
+  ): AsyncGenerator<SseFrame> {
+    await this.ensureTokenFresh();
+    const url = `${this.base}/api/v1/player/events?service=${encodeURIComponent(service)}`;
+    const open = (token: string | null) =>
+      fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        signal,
+      });
+
+    let res = await open(this.token);
+    if (res.status === 401) {
+      const fresh = await this.reauthenticate();
+      if (fresh) res = await open(fresh);
+    }
+    if (!res.ok || !res.body) {
+      throw new ApiError(
+        res.status,
+        res.statusText || "The player stream did not open",
+      );
+    }
+    yield* parseSse(res.body, signal);
+  }
+
+  playerReply(reply: PlayerReply): Promise<unknown> {
+    return this.post("/api/v1/player/reply", reply);
+  }
+
+  playerState(service: string, state: PlayerState): Promise<unknown> {
+    return this.post("/api/v1/player/state", { service, state });
+  }
+
+  /** What the player page last reported for a service, and whether a page is attached at all. */
+  async getPlayerState(service: string): Promise<{ attached: boolean; state: PlayerState | null }> {
+    const reply = await this.get<{ attached?: boolean; state?: PlayerState | null }>(
+      `/api/v1/player/state?${new URLSearchParams({ service })}`,
+    );
+    // `request` can hand back an empty or HTML body, so nothing is assumed of the shape.
+    return {
+      attached: reply?.attached === true,
+      state: reply?.state && typeof reply.state === "object" ? reply.state : null,
+    };
+  }
+
+  /**
+   * Whether Apple Music could work at all: a key is stored, or the shared credentials are on. Asked of
+   * the pond alone: no token is signed or fetched and nothing leaves it. Rejects, with the pond's own
+   * words, when nothing could supply a token.
+   */
+  async musickitDeveloperTokenAvailable(): Promise<void> {
+    const reply = await this.get<{ available?: boolean }>(
+      "/api/v1/musickit/developer-token?probe=true",
+    );
+    // `request` can hand back an empty or HTML body; only a plain yes counts.
+    if (reply?.available !== true) throw new Error("Apple Music is not available on this pond.");
+  }
+
+  /** A developer token signed by the host, which holds the key. 400 says the key is not set up. */
+  musickitDeveloperToken(): Promise<{ token: string; expires_at: number }> {
+    return this.get("/api/v1/musickit/developer-token");
+  }
+
+  /**
+   * Whether the pond's network setting lets the player page reach `url`: null when it does, else the
+   * pond's reason. The page asks before it loads a service's script, since in a browser nothing else
+   * stands between it and the internet; the pond also logs the request as the player's.
+   */
+  async playerNetworkAllows(url: string): Promise<string | null> {
+    const reply = await this.post<{ allowed?: boolean; reason?: string }>(
+      "/api/v1/player/egress-policy",
+      { url, method: "GET" },
+    );
+    // `request` can hand back an empty or HTML body; only a plain yes counts as allowed.
+    if (reply?.allowed === true) return null;
+    return typeof reply?.reason === "string" && reply.reason !== ""
+      ? reply.reason
+      : "The pond's network setting does not allow the music player to reach the internet.";
+  }
+
+  /**
+   * The page's access token for a service that signs in as the person (Spotify). 400 says they
+   * have not signed in; `refresh` asks the service for a new token first, for when the SDK found
+   * the last one stale.
+   */
+  async playerUserToken(service: string, refresh = false): Promise<{ token: string }> {
+    const query = new URLSearchParams({ service });
+    if (refresh) query.set("refresh", "true");
+    const reply = await this.get<{ token?: string }>(`/api/v1/player/user-token?${query}`);
+    // `request` can hand back an empty or HTML body; a token that is not a string is not a token.
+    if (typeof reply?.token !== "string" || reply.token === "") {
+      throw new Error(`The pond gave no ${service} token.`);
+    }
+    return { token: reply.token };
   }
 
   async refreshOAuth(provider: string): Promise<void> {

@@ -345,6 +345,21 @@ function setNowPlayingBackoff(np: NowPlayingApiResponse | null): void {
 }
 
 function nowPlayingFromApi(np: NowPlayingApiResponse | null): NowPlayingData {
+  // Apple Music chosen: the assistant and its page play it, so the card says where, not what.
+  if (np?.service === "apple") {
+    return {
+      track: "",
+      artist: "",
+      elapsed: 0,
+      hue: EMPTY_HOME.nowPlaying.hue,
+      connected: false,
+      playing: false,
+      progressMs: null,
+      durationMs: null,
+      service: "apple",
+      player: np.player ?? "page",
+    };
+  }
   if (!np || !np.connected) {
     // Blank, never a mock track: that would pass for working playback.
     return {
@@ -387,6 +402,8 @@ function nowPlayingFromApi(np: NowPlayingApiResponse | null): NowPlayingData {
     // For mm:ss (the fraction above can't give it); null, not 0, when Spotify omits them.
     progressMs: typeof np.progress_ms === "number" ? np.progress_ms : null,
     durationMs: typeof np.duration_ms === "number" ? np.duration_ms : null,
+    link: np.link ?? null,
+    ...(np.can ? { can: np.can } : {}),
   };
 }
 
