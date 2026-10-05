@@ -33,6 +33,8 @@ goose keeps its own copy private.
   embeddings) altogether.
 - **Acquire**: `download`, `external` (Ollama, HTTP voices, self-fetching embeddings) or
   `unavailable` (a file with no source).
+- **Title**: a pick's own title; else, for a llama.cpp file the pairing table lists, the table's
+  name for it ("SmolVLM 256M"); else a found file's header name; else the file's stem.
 
 ## The curated list
 
@@ -86,15 +88,25 @@ it will fetch:
 - `POST /api/v1/models/{category}/{name}/companions/pictures`: the add-on alone, for an installed
   model.
 
+A model file whose size nothing has stated (a file named by URL, typically) is asked for it with
+a HEAD chain gated hop by hop before anything is fetched, so the announcement and the parts carry
+the number first, and the row keeps it. A host that does not say leaves the number out rather
+than guessing it.
+
 Every file goes through the download tracker (`GET /models/download/progress`), whose entries
-carry `model_id` and `part` (`model` or `pictures`). Pause keeps the partial file, cancel deletes
-it, and a paused entry is never evicted. When the model file arrives its row is marked downloaded,
+carry `model_id` and `part` (`model` or `pictures`). `POST /models/download/control` takes
+`{filename, action}` for one file or `{model_id, action}` for every part of a model, with
+`action` one of `pause`, `resume` or `cancel`. Pause keeps the partial file, cancel deletes it,
+cancelling a model's own file cancels its add-on too, and a paused entry is never evicted. A
+row's `companions` read `downloading` while the add-on comes down, `verifying` while its hash is
+checked, then `installed`. When the model file arrives its row is marked downloaded,
 and when either part arrives the agent registers the model by the file its row names and verifies
 and attaches the add-on (`Agent::prepare_model`, which never downloads). Nothing else starts a
 fetch: not choosing a model, not saving settings, not a provider build, not a refused picture
-turn. The boot restore (`restore_assigned_models`) fetches only an assigned model whose file is
-missing and of which no other quant is on disk, and its add-on only if it had one, through the
-same tracker.
+turn. The boot restore (`restore_assigned_models`) fetches only a model whose file is missing,
+of which no other quant is on disk, and which is assigned to a role that loads a model (chat,
+tool, asr, tts or embedding; never think or task, which select nothing yet), and its add-on only
+if it had one, through the same tracker.
 
 ## Storage layout
 

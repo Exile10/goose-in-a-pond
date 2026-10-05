@@ -3053,3 +3053,14 @@ windows; not a PAI milestone completion).**
   pond-inference. `scripts/live-test.sh` passed on the final commit: 172 checks, 0 failed, across
   the first start, the restart against the populated database and the auth pass with the loopback
   bypass off. Nothing has run on the Orin.
+- **Fix round, 2026-10-06** (from a live run of adbee00a). Cancelling a model's own file cancels
+  its add-on, and `/models/download/control` also takes `{model_id, action}`. The boot restore
+  fetches only for roles that load a model (chat, tool, asr, tts, embedding; tool because
+  `tool_model` loads the FunctionGemma specialist), never think or task. A download whose size
+  nothing has stated asks for it first through pond-hf-cache's HEAD chain, gated hop by hop, so
+  PAI-2 is unchanged: no new sender, no new `.send()` in `routes.rs` (`EXPECTED_SENDS` stays 15).
+  Added and found files take the pairing table's name, an arrived add-on reads `verifying` until
+  its hash is checked, and the boot log no longer says "provisioning". Verification: fast-crate
+  tests 3,651 passed, 0 failed, 26 ignored (`model_integration_test` 38); clippy exit 0 with no new
+  warning; the goose adapter's lib tests 271; pond-server's bin tests 161 and its four integration
+  binaries; the four checks; `scripts/live-test.sh` on port 4979, 172 checks, 0 failed.
