@@ -2899,21 +2899,27 @@ milestone).**
 - **The summary call's own conversation is the jump.** Within 4-8 s of the compaction starting,
   the moment goose's summary call opens its conversation, the GPU's share of RAM rose by 413-466 MB
   and held there into the summary's decode. In two of the three it drained away before the summary
-  ended; in the first it stayed until that conversation was dropped for the restore. The likeliest
-  reading, not yet tested: a second conversation's KV state (about 235 MB per bank for E4B at 8k),
-  allocated before the memory of the conversation set aside a moment earlier is released. The
-  backend deletes the held conversation before it opens the summary's, so the release would have to
-  lag behind the delete.
+  ended; in the first it stayed until that conversation was dropped for the restore. It is not a
+  second conversation's KV state, the reading this entry first gave: LiteRT-LM gives a new
+  conversation no KV state of its own (`CreateNewContext`), the switch copies none from a released
+  one, and the backend releases the held conversation before it opens the summary's. The first
+  conversation after the model loads cost 150-250 MB; this is about twice that. A bisection with an
+  experimental switch (one compaction each, same probe) split it: with the snapshot save the GPU's
+  share rose by 506-511 MB, without it by 353-374 MB, and with the held conversation kept alive by
+  664-666 MB, since LiteRT-LM then copies its KV cache aside. So about 140 MB is the save, and about
+  360 MB is held by the summary's own conversation until it is dropped for the restore. What inside
+  LiteRT-LM holds that is not settled.
 - **The pond's file-backed pages rise too, and do not matter.** During the same call its resident
   file pages went from 312-514 MB to 666-698 MB, the model file read for the summary's long prefill.
   They are clean, so the kernel drops them first: 30 s after the restore they were at 218-359 MB.
 - **What stays behind.** About 50 MB of the GPU's share and 45 MB of anonymous memory per
   compaction (4.05 to 4.30 GB GPU over the five compactions of the 16-turn run), consistent with
   the swapping beginning only at the fourth.
-- **The lever.** The backend already prefills a whole prompt into the conversation it holds,
-  rewinding to what its KV cache shares (the Rematch plan), and the held conversation's snapshot is
-  saved before any side call. Running the summary, and the other side calls, in that conversation's
-  buffers instead of a new conversation's would not allocate a second KV state at all. Not built.
+- **The lever first named here is withdrawn.** Running the summary in the held conversation's
+  buffers would not avoid a second KV state that is not there, and a LiteRT-LM conversation is
+  created with its system prompt, tools, thinking switch and output limit, so a side call borrowing
+  the chat's conversation would run with the chat's. The save is the part the backend can avoid,
+  in a goose change of its own.
 
 **2026-10-05 — A turn waits for the quiet compaction it would otherwise redo (GIAP; not a PAI
 milestone).**
