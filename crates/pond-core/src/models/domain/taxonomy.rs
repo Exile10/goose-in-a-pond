@@ -248,6 +248,8 @@ mod tests {
             "mtp-gemma-4-E2B-it.gguf",
             "gemma-4-E2B-it-assistant-F16.gguf",
             "gemma-4-E4B-it-assistant-Q8_0.gguf",
+            "dflash-gemma-4-26B-A4B-it-BF16.gguf",
+            "sub/DFlash-gemma-4-31B-it-Q8_0.gguf",
         ] {
             assert!(is_companion_file(companion), "{companion}");
         }
@@ -261,6 +263,8 @@ mod tests {
         }
         assert!(is_companion_architecture(Some("clip")));
         assert!(is_companion_architecture(Some("gemma4-assistant")));
+        assert!(is_companion_architecture(Some("dflash")));
+        assert!(is_helper_architecture(Some("dflash")));
         assert!(!is_companion_architecture(Some("gemma4")));
         assert!(!is_companion_architecture(None));
     }
@@ -318,6 +322,33 @@ mod tests {
         assert_eq!(
             ModelKind::of(&row(ModelCategory::Whisper, "base")),
             ModelKind::Helper
+        );
+    }
+
+    /// An Ollama tag names no file, so a file-name rule never makes it a helper; its words do.
+    #[test]
+    fn an_ollama_tag_is_a_helper_by_its_words_and_never_by_a_file_name_rule() {
+        let kind = |name: &str| ModelKind::of(&row(ModelCategory::Ollama, name));
+        for persona in [
+            "gemma4-assistant:latest",
+            "gemma-4-assistant",
+            "mtp-friend:7b",
+            "dflash-notes:1b",
+            "llama3.2",
+        ] {
+            assert_eq!(kind(persona), ModelKind::Conversation, "{persona}");
+        }
+        for helper in [
+            "nomic-embed-text:latest",
+            "mxbai-embed-large",
+            "dimavz/whisper-tiny",
+        ] {
+            assert_eq!(kind(helper), ModelKind::Helper, "{helper}");
+        }
+        assert_eq!(
+            ModelKind::of(&row(ModelCategory::Gguf, "dflash-gemma-4-26B-A4B-it-Q8_0")),
+            ModelKind::Helper,
+            "the same words as a file are a drafter"
         );
     }
 
