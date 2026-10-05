@@ -179,6 +179,79 @@ session and refresh credentials are revoked together. Corrupt identity files cau
 visible failure. Restore the private identity backup rather than deleting it to
 create an unrelated household.
 
+### Cached network map on phones (2026-10-05)
+
+A phone's embedded node keeps its last network map on disk and, at a cold start,
+runs from it at once instead of waiting for the coordinator. Without it, a phone
+that cannot reach the coordinator straight away cannot reach its Pond either, even
+when the Pond and the relay are both up. tailscale (v1.102.4, pinned in
+`native/pondnet/go.mod`) writes the cache only for a node the coordinator grants
+the `cache-network-maps` node attribute. Before this change no node had it, which
+is why phones logged `load netmap from cache: netmap cache is not available` at
+every start.
+
+**What it stores.** The node's own entry, its peers, the relay map, DNS
+configuration, the packet filter and user profiles, one file per item, mode
+`0600` in a `0700` directory at `<state>/profile-data/<profile>/netmap-cache/`.
+It holds no private keys; those stay in the identity store. The tsnet test in
+`native/pondnet/netmapcache_test.go` asserts the file modes and the absence of
+private key text.
+
+**Where.** `<state>` is the node's private directory, which is outside every
+backup: Android `noBackupFilesDir/pond-network/<profile>`, iOS Application Support
+marked `isExcludedFromBackup`. A restored phone starts without a cache and waits
+for a live map.
+
+**Who gets it.** Phones only. The enrollment service adds one `nodeAttrs` entry to
+the policy it installs. Its targets are the addresses of every active, verified
+phone across households, sorted so an unchanged store gives an unchanged entry:
+
+```json
+"nodeAttrs": [{"target": ["100.64.0.2", "100.64.0.3"], "attr": ["cache-network-maps"]}]
+```
+
+With no such phone the list is empty. A Pond's address is never a target.
+
+**Why not the Pond.** The Pond enforces access: its packet filter decides which
+phones may reach it. A Pond starting from a cached map would enforce the rules as
+they were when the map was written, so a phone revoked while the Pond was down
+could get through until the coordinator answered. The Pond helper (`cmd/pondnet`)
+therefore sets `TS_USE_CACHED_NETMAP=false` before it starts its node, so it
+neither reads nor writes a cache even if a policy granted it one.
+
+**The stale-peer window.** A phone running from its cache may hold peers and
+rules the coordinator has since changed, until its first live map replaces them,
+which happens as soon as the coordinator answers. That is acceptable because the
+phone decides nothing about access: the Pond always runs from a live map, so a
+revoked phone's packets are dropped there, and a removed phone's application
+credentials are revoked with it. A cache cannot get a phone anything the Pond does
+not currently allow. A phone whose node was deleted keeps its cache until remote
+access is disabled on it, because tailscale does not erase the cache on logout.
+
+**Erasing it.** `mobile.Disable(directory)` stops the node and erases the cache.
+It asks the running backend to clear it (`clear-netmap-cache`, which also drops
+the backend's in-memory copy), stops the node, then removes the cache directories
+from disk. The removal comes last so a map that arrived in between does not
+survive, and because the backend's own call does not report a failed delete. A
+failure is returned and written to the event log. The identity is kept, so
+enabling again needs no new enrollment. `mobile.Stop` still keeps the cache, so a
+profile switch or a service stop does not throw it away. As of this date the
+Android and iOS `disable()` paths in the companion app still call `Stop`; they
+must call `Disable` with the profile's state directory before the cache is erased
+when remote access is switched off.
+
+**Kill switch.** `TS_USE_CACHED_NETMAP=false` in a node's environment turns the
+cache off. tailscale reads the knob on every check, and with it off it neither
+loads nor writes a cache.
+
+**Rollout.** The attribute is part of the coordinator's policy, so it takes effect
+only once the enrollment service is redeployed; the service reinstalls its policy
+on start and on every enrollment change. Headscale 0.29 accepts `nodeAttrs` with
+address targets and passes this attribute through. Whether a phone on the deployed
+coordinator actually receives it is checked by the live Headscale test
+(`enrollment/headscale_live_test.go`), not by the default test run, and that has
+not yet been run against Headscale 0.29.3.
+
 ## Verification
 
 Use the security tests and `scripts/live-test.sh` against scratch data, including
