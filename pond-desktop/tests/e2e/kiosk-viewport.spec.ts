@@ -1,10 +1,11 @@
 /**
  * Kiosk panels, 1024×600 (primary) and 800×480: no horizontal overflow, icon-only rail,
- * content fills the rest, 40px touch targets; classic and hub UIs screenshotted.
+ * content fills the rest, 40px touch targets; classic and hub UIs screenshotted, Models included.
  */
 
 import { test, expect, Page } from "@playwright/test";
 import { mockAllApiRoutes } from "./helpers/api-mocks";
+import { mockModels } from "./helpers/model-mocks";
 import { navigateTo, openDrawer } from "./helpers/nav";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -73,6 +74,22 @@ async function checkDrawerFits(page: Page): Promise<void> {
   await page.keyboard.press("Escape");
 }
 
+/** A pond with a model in use and picks still to get, so a capture shows what the screen is for. */
+async function mockModelsForCapture(page: Page): Promise<void> {
+  await mockModels(page);
+}
+
+/** Targets a finger drives on the hub's Models screen clear 44px; the add-on link reaches it by `.reach`. */
+async function checkModelsTargets(page: Page): Promise<void> {
+  const small = await page.evaluate(() =>
+    Array.from(document.querySelectorAll<HTMLElement>(".setd button, .setd label.mm-choice"))
+      .filter((el) => !el.matches(".setd__back"))
+      .map((el) => ({ text: (el.textContent ?? "").trim().slice(0, 30), h: Math.round(el.getBoundingClientRect().height) }))
+      .filter((t) => t.h < 44 && !t.text.startsWith("Add pictures")),
+  );
+  expect(small, `Models targets under 44px: ${JSON.stringify(small)}`).toEqual([]);
+}
+
 // ── Classic sections UI — 1024×600 ───────────────────────────────────────────
 
 test.describe("Classic sections UI — 1024×600", () => {
@@ -120,9 +137,10 @@ test.describe("Classic sections UI — 1024×600", () => {
   });
 
   test("models page renders without overflow", async ({ page }) => {
+    await mockModelsForCapture(page);
     await page.goto("/");
     await navigateTo(page, "Models");
-    await page.waitForTimeout(500);
+    await expect(page.getByRole("heading", { name: "Recommended for this pond" })).toBeVisible();
     await checkNoHorizOverflow(page);
     await page.screenshot({ path: "kiosk-screenshots/sections-models-1024x600.png" });
   });
@@ -157,6 +175,15 @@ test.describe("Classic sections UI — 800×480", () => {
     await page.goto("/");
     await page.waitForSelector(".app-shell", { timeout: 8000 });
     await checkDrawerFits(page);
+  });
+
+  test("models page renders without overflow", async ({ page }) => {
+    await mockModelsForCapture(page);
+    await page.goto("/");
+    await navigateTo(page, "Models");
+    await expect(page.getByRole("heading", { name: "Recommended for this pond" })).toBeVisible();
+    await checkNoHorizOverflow(page);
+    await page.screenshot({ path: "kiosk-screenshots/sections-models-800x480.png" });
   });
 });
 
@@ -202,6 +229,18 @@ test.describe("Hub UI — 1024×600", () => {
     await checkHomeControlsAreOnScreen(page);
     await page.screenshot({ path: "kiosk-screenshots/hub-home-1024x600.png" });
   });
+
+  test("hub models renders without overflow, with 44px targets", async ({ page }) => {
+    await mockModelsForCapture(page);
+    await page.goto("/");
+    await page.waitForSelector(".ghub", { timeout: 10_000 });
+    await navigateTo(page, "Models");
+    await expect(page.getByRole("heading", { name: "Models" })).toBeVisible();
+    await expect(page.locator(".hm-tile").first()).toBeVisible();
+    await checkNoHorizOverflow(page);
+    await checkModelsTargets(page);
+    await page.screenshot({ path: "kiosk-screenshots/hub-models-1024x600.png" });
+  });
 });
 
 // ── Hub UI — 800×480 ─────────────────────────────────────────────────────────
@@ -223,5 +262,17 @@ test.describe("Hub UI — 800×480", () => {
     await checkNoHorizOverflow(page);
     await checkHomeControlsAreOnScreen(page);
     await page.screenshot({ path: "kiosk-screenshots/hub-home-800x480.png" });
+  });
+
+  test("hub models renders without overflow at 800×480, with 44px targets", async ({ page }) => {
+    await mockModelsForCapture(page);
+    await page.goto("/");
+    await page.waitForSelector(".ghub", { timeout: 10_000 });
+    await navigateTo(page, "Models");
+    await expect(page.getByRole("heading", { name: "Models" })).toBeVisible();
+    await expect(page.locator(".hm-tile").first()).toBeVisible();
+    await checkNoHorizOverflow(page);
+    await checkModelsTargets(page);
+    await page.screenshot({ path: "kiosk-screenshots/hub-models-800x480.png" });
   });
 });
