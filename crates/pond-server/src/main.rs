@@ -4740,6 +4740,17 @@ async fn run_chat(
     // Held until after `ready`, which the NDJSON contract requires to be the first line.
     let deferred_diagnostics: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
 
+    // Said up front; each turn is refused the same way until a model is chosen.
+    if let Err(no) = pond_core::models::domain::conversation_model::require_conversation_model(
+        effective_provider,
+        effective_model,
+    ) {
+        out!("  Think    {no}");
+        if json_events {
+            deferred_diagnostics.borrow_mut().push(no.to_string());
+        }
+    }
+
     let effective_tts_owned: String;
     let effective_tts: &str = match tts {
         Some(t) => t,
@@ -5898,7 +5909,13 @@ async fn run_quiet_compaction(
                 continue;
             }
         };
-        let enabled = settings.context_monitor_enabled && settings.hybrid_compaction_enabled;
+        // With no conversation model chosen there is nothing to compact with.
+        let enabled = settings.context_monitor_enabled
+            && settings.hybrid_compaction_enabled
+            && pond_core::models::domain::conversation_model::conversation_model_chosen(
+                &settings.chat_provider,
+                &settings.chat_model,
+            );
         // Never during a turn, even by hand: the lane counts a running turn as no quiet, but a
         // hand-asked tick waives that, and this pass rewrites the history a turn is answering in.
         let turn_running = state.runs.turn_in_flight();

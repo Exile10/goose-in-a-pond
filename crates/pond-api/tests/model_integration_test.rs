@@ -1250,3 +1250,67 @@ async fn a_refresh_prunes_stale_rows_and_keeps_downloaded_and_assigned_ones() {
         "pruning never touches a file"
     );
 }
+
+/// An agent with no conversation model chosen.
+struct NoModelAgent(MockAgent);
+
+#[async_trait::async_trait]
+impl pond_core::models::ports::agent::Agent for NoModelAgent {
+    async fn chat(
+        &self,
+        request: pond_core::shared::domain::agent::AgentRequest,
+    ) -> anyhow::Result<pond_core::shared::domain::agent::AgentResponse> {
+        self.0.chat(request).await
+    }
+    async fn chat_stream(
+        &self,
+        request: pond_core::shared::domain::agent::AgentRequest,
+    ) -> anyhow::Result<
+        futures::stream::BoxStream<
+            'static,
+            anyhow::Result<pond_core::shared::domain::agent::AgentStreamEvent>,
+        >,
+    > {
+        self.0.chat_stream(request).await
+    }
+    async fn ensure_conversation_model(
+        &self,
+    ) -> Result<(), pond_core::models::domain::conversation_model::NoConversationModel> {
+        Err(pond_core::models::domain::conversation_model::NoConversationModel)
+    }
+}
+
+/// With no model chosen every chat route answers `no_model` and saves nothing; nothing is
+/// downloaded or picked in its place.
+#[tokio::test]
+async fn every_chat_route_answers_no_model_and_saves_nothing() {
+    let f = pond_with(Arc::new(NoModelAgent(MockAgent::new()))).await;
+    for (uri, body) in [
+        (
+            "/api/v1/chat",
+            serde_json::json!({"message": "hello", "session_id": "no-model-a"}),
+        ),
+        (
+            "/api/v1/chat/stream",
+            serde_json::json!({"message": "hello", "session_id": "no-model-b"}),
+        ),
+        (
+            "/api/v1/agent/chat/stream",
+            serde_json::json!({"message": "hello", "session_id": "no-model-c"}),
+        ),
+    ] {
+        let (status, reply) = post_json(&f.app, uri, Some(body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{uri}: {reply}");
+        assert_eq!(reply["code"], "no_model", "{uri}");
+        assert!(
+            reply["error"].as_str().unwrap().contains("Models page"),
+            "{uri}"
+        );
+    }
+    assert!(f.tracker.read().await.is_empty(), "nothing is downloaded");
+    let sessions = f.state.session_storage.list_sessions().await.unwrap();
+    assert!(
+        sessions.iter().all(|s| !s.id.starts_with("no-model")),
+        "no session was created for a refused turn"
+    );
+}

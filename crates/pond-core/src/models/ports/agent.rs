@@ -1,3 +1,4 @@
+use crate::models::domain::conversation_model::NoConversationModel;
 use crate::models::domain::model_capabilities::ModelCapabilities;
 use crate::models::domain::vision_encoder::EncoderState;
 use crate::models::services::context::prefix_cache::PrefixCacheState;
@@ -26,6 +27,12 @@ pub trait Agent: Send + Sync {
 
     fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities::default()
+    }
+
+    /// `Err` when no conversation model is chosen, so a turn is refused before anything is saved.
+    /// An agent that needs no model choice (mocks, HTTP agents) always answers `Ok`.
+    async fn ensure_conversation_model(&self) -> Result<(), NoConversationModel> {
+        Ok(())
     }
 
     /// Picture support for `model`: a pure read (no hash, rename or fetch), safe per list row.

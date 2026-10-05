@@ -1413,12 +1413,10 @@ impl GooseAdapter {
             },
             // In-process; LocalInferenceProvider finds the file, and its backend, via Goose's
             // registry: llama.cpp for a .gguf, LiteRT-LM for a .litertlm.
+            // No model chosen: nothing to build, and no placeholder stands in for one.
+            "local" | "gguf" if settings.chat_model.trim().is_empty() => None,
             "local" | "gguf" => {
-                let model_name = if settings.chat_model.is_empty() {
-                    "llamafile".to_string()
-                } else {
-                    settings.chat_model.clone()
-                };
+                let model_name = settings.chat_model.clone();
                 let litert = pond_core::models::domain::litert::is_litert_model(&model_name);
                 // Canonical key, so aliases of one GGUF can't load it twice under two ids.
                 let registry_key = match self.data_dir {
@@ -1475,14 +1473,11 @@ impl GooseAdapter {
                 }
             }
             // llamafile uses the Ollama wire protocol over HTTP.
+            "llamafile" if settings.chat_model.trim().is_empty() => None,
             "llamafile" => {
                 std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
                 std::env::set_var("OLLAMA_TIMEOUT", "600");
-                let model_name = if settings.chat_model.is_empty() {
-                    "llamafile".to_string()
-                } else {
-                    settings.chat_model.clone()
-                };
+                let model_name = settings.chat_model.clone();
                 let cfg = goose_providers::model::ModelConfig::new(&model_name);
                 tracing::debug!(
                     "[model-switch] building llamafile OllamaProvider for '{}'...",
@@ -2215,6 +2210,12 @@ impl GooseAdapter {
         let settings = self.settings_repo.get().await.unwrap_or_default();
         let session_id = request.session_id.clone();
         let model_role = request.model_role.clone();
+
+        pond_core::models::domain::conversation_model::require_conversation_model(
+            &settings.chat_provider,
+            &settings.chat_model,
+        )
+        .map_err(anyhow::Error::new)?;
 
         // API backstop: the engine would swap images for a note and the model would bluff.
         if !request.images.is_empty() {
@@ -3575,6 +3576,15 @@ impl AgentPort for GooseAdapter {
             return;
         }
         let settings = self.settings_repo.get().await.unwrap_or_default();
+        if !pond_core::models::domain::conversation_model::conversation_model_chosen(
+            &settings.chat_provider,
+            &settings.chat_model,
+        ) {
+            progress(WarmupPhase::Skipped {
+                reason: "no conversation model is chosen".to_string(),
+            });
+            return;
+        }
         if !matches!(settings.chat_provider.as_str(), "local" | "gguf") {
             progress(WarmupPhase::Skipped {
                 reason: format!(
@@ -3692,6 +3702,17 @@ impl AgentPort for GooseAdapter {
         }
         Self::register_gguf_model(model, dd);
         self.pictures.spawn_settle(dd, model);
+    }
+
+    async fn ensure_conversation_model(
+        &self,
+    ) -> std::result::Result<(), pond_core::models::domain::conversation_model::NoConversationModel>
+    {
+        let settings = self.settings_repo.get().await.unwrap_or_default();
+        pond_core::models::domain::conversation_model::require_conversation_model(
+            &settings.chat_provider,
+            &settings.chat_model,
+        )
     }
 
     fn forget_model_file(&self, path: &std::path::Path) {

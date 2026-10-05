@@ -1142,6 +1142,7 @@ async fn chat(
             Json(json!({"error": format!("Invalid request: {}", e)})),
         )
     })?;
+    refuse_without_a_model(&state).await?;
 
     let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let storage = &state.session_storage;
@@ -1441,6 +1442,7 @@ async fn chat_stream(
     })?;
 
     // Before the stream opens, so the client gets a real HTTP status, not an SSE error event.
+    refuse_without_a_model(&state).await?;
     image_limit_response(&req.images)?;
 
     // Picture support too, before the run permit and `spawn_run`, which saves the user message.
@@ -1521,6 +1523,18 @@ fn image_limit_response(
             Err((status, Json(json!({"error": e.to_string()}))))
         }
     }
+}
+
+/// A turn with no conversation model chosen is refused before anything is saved; nothing is
+/// picked or downloaded in its place.
+async fn refuse_without_a_model(state: &AppState) -> Result<(), (StatusCode, Json<Value>)> {
+    use pond_core::models::domain::conversation_model::NoConversationModel;
+    state.agent.ensure_conversation_model().await.map_err(|no| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error": no.to_string(), "code": NoConversationModel::CODE})),
+        )
+    })
 }
 
 // ── Picture support, before a turn is persisted ───────────────────────────────
@@ -9873,6 +9887,9 @@ async fn agent_chat_stream(
         .get("images")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+    if let Err(resp) = refuse_without_a_model(&state).await {
+        return resp.into_response();
+    }
     if let Err(resp) = image_limit_response(&images) {
         return resp.into_response();
     }
