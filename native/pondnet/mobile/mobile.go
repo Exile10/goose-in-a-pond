@@ -2,6 +2,7 @@
 package mobile
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -12,6 +13,9 @@ import (
 var lock sync.Mutex
 var node *pondnet.Node
 var proxy *pondnet.Proxy
+
+// stopWatching ends the running node's ForgetNetworkMapWhenRefused.
+var stopWatching context.CancelFunc
 
 // Diagnostics receives redacted backend log lines through the binding boundary.
 // The native layer installs one only for a debuggable build; a release build
@@ -92,6 +96,9 @@ func Start(directory, hostname, control string) error {
 	}
 	node = n
 	proxy = p
+	ctx, cancel := context.WithCancel(context.Background())
+	stopWatching = cancel
+	go n.ForgetNetworkMapWhenRefused(ctx, diagnose)
 	return nil
 }
 
@@ -170,6 +177,10 @@ func Disable(directory string) error {
 }
 
 func stopLocked() {
+	if stopWatching != nil {
+		stopWatching()
+		stopWatching = nil
+	}
 	if proxy != nil {
 		proxy.Close()
 		proxy = nil

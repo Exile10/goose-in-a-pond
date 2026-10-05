@@ -33,12 +33,21 @@ import (
 
 // cacheControl is a test coordinator that can be made unreachable. While closed,
 // every new HTTP request is refused; a node that already holds a control session
-// keeps it, as a Pond with a live map would while a phone restarts.
+// keeps it, as a Pond with a live map would while a phone restarts. After forget
+// it answers as a coordinator that has removed every node.
 type cacheControl struct {
 	*testcontrol.Server
-	URL     string
-	closed  atomic.Bool
-	refused atomic.Int32
+	URL       string
+	closed    atomic.Bool
+	refused   atomic.Int32
+	forgotten atomic.Pointer[testcontrol.Server]
+}
+
+// forget replaces the coordinator with one that knows no node and answers each
+// registration with a login URL, which is how Headscale answers a removed device.
+func (c *cacheControl) forget() {
+	c.forgotten.Store(&testcontrol.Server{DERPMap: c.DERPMap, RequireAuth: true,
+		ExplicitBaseURL: c.URL, Logf: logger.Discard})
 }
 
 func startCacheControl(t *testing.T) *cacheControl {
@@ -55,6 +64,10 @@ func startCacheControl(t *testing.T) *cacheControl {
 		if c.closed.Load() {
 			c.refused.Add(1)
 			http.Error(w, "coordinator unreachable", http.StatusServiceUnavailable)
+			return
+		}
+		if forgetful := c.forgotten.Load(); forgetful != nil {
+			forgetful.ServeHTTP(w, r)
 			return
 		}
 		c.Server.ServeHTTP(w, r)
@@ -289,6 +302,81 @@ func TestGrantedNodeRestartsFromCachedNetworkMapWithoutControl(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(grantedDir, "tailscaled.state")); err != nil {
 		t.Fatalf("erasing the cache took the identity with it: %v", err)
+	}
+}
+
+// A removed phone still starts from its cached map, and the backend keeps that
+// cache after the coordinator refuses it. ForgetNetworkMapWhenRefused is what
+// erases it, and it keeps the identity.
+func TestARefusedNodeErasesItsCachedNetworkMap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	control := startCacheControl(t)
+	pond := echoPond(t, ctx, control.URL)
+	dir := filepath.Join(t.TempDir(), "removed")
+	phone := persistentNode(t, dir, control.URL, "removed", new(lines))
+	status, err := phone.Up(ctx)
+	if err != nil {
+		t.Fatalf("phone did not come up: %v", err)
+	}
+	control.SetNodeCapMap(status.Self.PublicKey, tailcfg.NodeCapMap{tailcfg.NodeAttrCacheNetworkMaps: nil})
+	await(t, ctx, "the grant reaches the phone", func() bool {
+		_, sees, has := selfStatus(t, ctx, phone, pond)
+		return sees && has
+	})
+	if len(cachedFiles(t, dir)) == 0 {
+		t.Fatal("a granted phone wrote no network-map cache")
+	}
+	phone.Close()
+	control.forget()
+
+	restartedLog := new(lines)
+	restarted := persistentNode(t, dir, control.URL, "removed", restartedLog)
+	if err := restarted.Start(); err != nil {
+		t.Fatal(err)
+	}
+	client, err := restarted.LocalClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	await(t, ctx, "the coordinator refuses the restarted phone", func() bool {
+		status, err := client.Status(ctx)
+		return err == nil && status.AuthURL != ""
+	})
+	if !restartedLog.contains("loaded netmap from disk cache") {
+		t.Fatal("the restarted phone did not start from its cache, so erasing it proves nothing")
+	}
+	if len(cachedFiles(t, dir)) == 0 {
+		t.Fatal("the backend erased the cache itself once refused; the watcher is not needed")
+	}
+
+	reports := make(chan string, 4)
+	watching, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		(&Node{Server: restarted}).ForgetNetworkMapWhenRefused(watching, func(line string) { reports <- line })
+		close(done)
+	}()
+	select {
+	case line := <-reports:
+		if !strings.Contains(line, "cached network map was erased") {
+			t.Fatalf("unexpected report: %s", line)
+		}
+	case <-ctx.Done():
+		t.Fatal("the refused phone kept its cached network map")
+	}
+	if files := cachedFiles(t, dir); len(files) != 0 {
+		t.Fatalf("the cache survived: %v", files)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tailscaled.state")); err != nil {
+		t.Fatalf("erasing the cache took the identity with it: %v", err)
+	}
+	stop()
+	<-done
+	select {
+	case line := <-reports:
+		t.Fatalf("stopping the watcher was reported: %s", line)
+	default:
 	}
 }
 

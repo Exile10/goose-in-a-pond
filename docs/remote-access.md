@@ -225,8 +225,23 @@ which happens as soon as the coordinator answers. That is acceptable because the
 phone decides nothing about access: the Pond always runs from a live map, so a
 revoked phone's packets are dropped there, and a removed phone's application
 credentials are revoked with it. A cache cannot get a phone anything the Pond does
-not currently allow. A phone whose node was deleted keeps its cache until remote
-access is disabled on it, because tailscale does not erase the cache on logout.
+not currently allow.
+
+**A removed phone.** tailscale does not erase the cache when the coordinator stops
+accepting a node. A removed phone still loads it at every start, reports
+`Running` on it, and is refused only when the coordinator answers its
+registration with a login URL. The phone learns it was forgotten only from its
+Pond, which it can reach only on the home network, so without help it would carry
+the Pond's addresses and the access rules indefinitely. `mobile.Start` therefore
+runs `Node.ForgetNetworkMapWhenRefused` alongside the node: on a login URL,
+whether announced on the IPN bus or already in the status when the watch begins,
+it clears and removes the cache, keeps the identity, and writes one event-log
+line, `the coordinator no longer accepts this device, so its cached network map
+was erased`. A node enrolling for the first time has no cache and is left alone.
+Measured on the Galaxy A57 on 2026-10-05: after the phone was removed in the
+dashboard, a cold start loaded the cache, got `machineAuthorized=false;
+authURL=true` from the coordinator, and stayed `disconnected` from the Pond; the
+cache stayed on disk until this watcher was added.
 
 **Erasing it.** `mobile.Disable(directory)` stops the node and erases the cache.
 It asks the running backend to clear it (`clear-netmap-cache`, which also drops
@@ -235,10 +250,9 @@ from disk. The removal comes last so a map that arrived in between does not
 survive, and because the backend's own call does not report a failed delete. A
 failure is returned and written to the event log. The identity is kept, so
 enabling again needs no new enrollment. `mobile.Stop` still keeps the cache, so a
-profile switch or a service stop does not throw it away. As of this date the
-Android and iOS `disable()` paths in the companion app still call `Stop`; they
-must call `Disable` with the profile's state directory before the cache is erased
-when remote access is switched off.
+profile switch or a service stop does not throw it away. The companion app's
+Android and iOS plugins call `Disable` when remote access is switched off or the
+pairing is forgotten (goose-on-the-go `feature/phone-netmap-cache`, 2026-10-05).
 
 **Kill switch.** `TS_USE_CACHED_NETMAP=false` in a node's environment turns the
 cache off. tailscale reads the knob on every check, and with it off it neither
