@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 pub const EXTENSION: &str = "litertlm";
 /// Directory under `<data_dir>/models/` the files live in.
 pub const MODELS_SUBDIR: &str = "litertlm";
-/// The goose registry's backend id for these models.
-pub const BACKEND_ID: &str = "litert";
 /// Overrides the execution backend: `gpu` or `cpu`.
 pub const EXECUTION_ENV: &str = "GIAP_LITERT_BACKEND";
 /// Overrides multi-token prediction: `on` or `off`.

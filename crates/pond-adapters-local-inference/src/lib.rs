@@ -248,10 +248,10 @@ impl LocalInferenceLlmAdapter {
     /// Whether goose runs `model_id` on its LiteRT-LM backend, as the row's entry-level id says.
     fn is_litert_row(model_id: &str) -> bool {
         use goose::providers::local_inference::local_model_registry::get_registry;
-        use pond_core::models::domain::litert::BACKEND_ID;
+        use pond_core::models::domain::engine::LITERT_BACKEND_ID;
         get_registry().lock().ok().is_some_and(|reg| {
             reg.get_model(model_id)
-                .is_some_and(|e| e.backend_id.as_deref() == Some(BACKEND_ID))
+                .is_some_and(|e| e.backend_id.as_deref() == Some(LITERT_BACKEND_ID))
         })
     }
 

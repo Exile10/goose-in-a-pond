@@ -53,6 +53,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
+use pond_core::models::domain::taxonomy::{
+    is_companion_file, is_helper_architecture, ON_DISK_PLACEHOLDER,
+};
 use pond_core::user_data::domain::memory::MemoryFragment;
 use pond_core::user_data::domain::prompt_extra::PromptExtra;
 use pond_core::user_data::domain::prompt_template::PromptTemplate;
@@ -60,7 +63,8 @@ use pond_core::user_data::domain::recipe::AgentRecipe;
 use pond_core::user_data::domain::skill::UserSkill;
 
 use crate::middleware::onboarding_guard::require_onboarding_complete;
-use crate::{AppState, DownloadEntry, ModelStatusEntry};
+use crate::model_views::record_to_dto;
+use crate::{AppState, DownloadEntry};
 use pond_core::context::ports::ContextRepository;
 use pond_core::security::ports::policy::is_draft_decision_permitted;
 use pond_core::user_data::domain::draft::DraftStatus;
@@ -1675,24 +1679,6 @@ fn gguf_vision_facts(
     (reads, bytes)
 }
 
-/// Whether a GGUF is an encoder (`mmproj-*`) or drafter (`mtp-*`, Gemma 4 `-assistant`).
-/// Offered as a chat model it would land in `models/gguf`, where every scan takes it for one.
-fn is_companion_gguf(file_name: &str) -> bool {
-    let base = file_name
-        .rsplit('/')
-        .next()
-        .unwrap_or(file_name)
-        .to_ascii_lowercase();
-    base.starts_with("mmproj")
-        || base.starts_with("mtp-")
-        || ((base.contains("gemma-4") || base.contains("gemma4")) && base.contains("-assistant"))
-}
-
-/// The header's own word for a companion: `clip` is an encoder, `*-assistant` a drafter.
-fn is_companion_architecture(architecture: Option<&str>) -> bool {
-    architecture.is_some_and(|a| a == "clip" || a.ends_with("-assistant"))
-}
-
 /// After a GGUF delete, remove its `models/mmproj/<dir>/` if nothing else uses it.
 /// A downloaded row or an unscanned `.gguf` counts as a use; names match case-insensitively.
 async fn remove_orphaned_encoder_dir(
@@ -1719,7 +1705,7 @@ async fn remove_orphaned_encoder_dir(
     if let Ok(mut entries) = tokio::fs::read_dir(&gguf_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
-            if Some(name.as_str()) == deleted_file || is_companion_gguf(&name) {
+            if Some(name.as_str()) == deleted_file || is_companion_file(&name) {
                 continue;
             }
             if let Some(stem) = name.strip_suffix(".gguf") {
@@ -5188,31 +5174,6 @@ async fn find_model_forgiving_tts(
     Ok(None)
 }
 
-fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelStatusEntry {
-    let active = assignments.iter().any(|a| a.model_id == m.id);
-    ModelStatusEntry {
-        category: m.category.as_str().to_string(),
-        name: m.name.clone(),
-        description: m.description.clone(),
-        size_mb: m.size_mb,
-        downloaded: m.downloaded,
-        active,
-        url: m.url.clone(),
-        hf_id: m.hf_id.clone(),
-        filename: m.filename.clone(),
-        ram_estimate_mb: m.ram_estimate_mb,
-        recommended_role: m.recommended_role.clone(),
-        context_length: m.context_length,
-        asr_language: m.asr_language.clone(),
-        asr_size: m.asr_size.clone(),
-        tts_engine: m.tts_engine.clone(),
-        config_filename: m.config_filename.clone(),
-        // `list_models` fills these for GGUF rows: the agent's verdict may read a header.
-        reads_images: None,
-        image_support_bytes: None,
-    }
-}
-
 /// Parses a GGUF header from the first MiB, which holds every useful key; `None` if not GGUF.
 fn read_gguf_head(path: &std::path::Path) -> Option<pond_core::models::domain::gguf::GgufInfo> {
     use std::io::Read as _;
@@ -5283,10 +5244,11 @@ async fn scan_filesystem_extras(
                     } else {
                         None
                     };
-                    // Skip companions; the header catches one whose name doesn't say so.
+                    // Companions and speech or embedding weights are never conversation rows;
+                    // the header catches one whose name doesn't say so.
                     if fname.ends_with(".gguf")
-                        && (is_companion_gguf(&fname)
-                            || is_companion_architecture(
+                        && (is_companion_file(&fname)
+                            || is_helper_architecture(
                                 gguf.as_ref().and_then(|g| g.architecture.as_deref()),
                             ))
                     {
@@ -5312,7 +5274,7 @@ async fn scan_filesystem_extras(
                         .as_ref()
                         .and_then(|g| g.name.clone())
                         .filter(|n| !n.trim().is_empty())
-                        .unwrap_or_else(|| "(detected on disk)".to_string());
+                        .unwrap_or_else(|| ON_DISK_PLACEHOLDER.to_string());
 
                     found.push(ModelRecord {
                         id: ModelRecord::id_for(&category, &name),
@@ -5396,7 +5358,7 @@ fn prepare_after_download(
     let prepare = (category == "gguf")
         .then(|| filename.strip_suffix(".gguf"))
         .flatten()
-        .filter(|stem| !is_companion_gguf(filename) && !stem.is_empty())
+        .filter(|stem| !is_companion_file(filename) && !stem.is_empty())
         .map(|stem| (state.agent.clone(), stem.to_string()));
     async move {
         if let Some((agent, model)) = prepare {
@@ -6499,7 +6461,7 @@ async fn list_hf_model_files(
                         // Chat models only; companions arrive by themselves, elsewhere.
                         .filter(|s| {
                             s["rfilename"].as_str()
-                                .map(|n| n.ends_with(".gguf") && !is_companion_gguf(n))
+                                .map(|n| n.ends_with(".gguf") && !is_companion_file(n))
                                 .unwrap_or(false)
                         })
                         .map(|s| {
@@ -17600,31 +17562,6 @@ mod tests {
             other.assistant_name = "Heron".into();
             other.mic_enabled = !current.mic_enabled;
             assert!(!save_needs_prewarm(&current, &other));
-        }
-
-        #[test]
-        fn encoders_and_drafters_are_companions_and_chat_models_are_not() {
-            for companion in [
-                "mmproj-BF16.gguf",
-                "subdir/mmproj-F16.gguf",
-                "mtp-gemma-4-E2B-it.gguf",
-                "gemma-4-E2B-it-assistant-F16.gguf",
-                "gemma-4-E4B-it-assistant-Q8_0.gguf",
-            ] {
-                assert!(is_companion_gguf(companion), "{companion}");
-            }
-            for chat in [
-                "gemma-4-E2B-it-Q4_K_M.gguf",
-                "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
-                "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-                "Nemotron3-Nano-4B.gguf",
-            ] {
-                assert!(!is_companion_gguf(chat), "{chat}");
-            }
-            assert!(is_companion_architecture(Some("clip")));
-            assert!(is_companion_architecture(Some("gemma4-assistant")));
-            assert!(!is_companion_architecture(Some("gemma4")));
-            assert!(!is_companion_architecture(None));
         }
 
         /// An agent that answers `vision_state` from a fixed table, for `gguf_vision_facts`.

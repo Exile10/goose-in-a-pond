@@ -3,6 +3,7 @@
 pub mod cleanup;
 pub(crate) mod image_normalize;
 pub mod middleware;
+pub(crate) mod model_views;
 pub mod music_choice;
 pub mod musickit;
 pub mod network;
@@ -423,6 +424,44 @@ pub struct ModelStatusEntry {
     /// Image-support download in bytes (the encoder's pinned size); set only when `reads_images`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_support_bytes: Option<u64>,
+    /// `"{category}/{name}"`, the id activation and role assignments use.
+    #[serde(default)]
+    pub id: String,
+    /// What the household reads as the model's name; never a placeholder.
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    /// The engine that runs it; `None` for speech, voice and embedding rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<ModelEngineDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<pond_core::models::domain::taxonomy::Provenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<pond_core::models::domain::taxonomy::ModelKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquire: Option<pond_core::models::domain::taxonomy::Acquisition>,
+}
+
+/// The engine a conversation model runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelEngineDto {
+    pub id: String,
+    pub label: String,
+    /// The file extension it loads, e.g. `.gguf`; `None` for Ollama.
+    pub file_format: Option<String>,
+    pub in_process: bool,
+}
+
+impl From<pond_core::models::domain::engine::Engine> for ModelEngineDto {
+    fn from(engine: pond_core::models::domain::engine::Engine) -> Self {
+        Self {
+            id: engine.id().to_string(),
+            label: engine.label().to_string(),
+            file_format: engine.file_format().map(str::to_string),
+            in_process: engine.in_process(),
+        }
+    }
 }
 
 /// True when the web UI is embedded in this binary (`pond-desktop/dist` existed at build).
