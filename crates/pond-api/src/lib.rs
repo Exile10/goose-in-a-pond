@@ -738,6 +738,27 @@ mod rate_limit_tests {
         }
     }
 
+    /// An entry is running while a transfer holds a clone of its flag, and only then: a status
+    /// left at "downloading" by a task that died or by a writer that never held the flag is not.
+    #[test]
+    fn an_entry_is_running_only_while_a_transfer_holds_its_flag() {
+        let mut entry = DownloadEntry::starting("m.gguf", "gguf");
+        assert!(!entry.is_running(), "nothing holds the flag yet");
+
+        let transfer = std::sync::Arc::clone(&entry.control);
+        assert!(entry.is_running());
+        entry.status = "paused".to_string();
+        assert!(!entry.is_running(), "a paused transfer is not running");
+        entry.status = "downloading".to_string();
+        assert!(entry.is_running());
+
+        drop(transfer);
+        assert!(
+            !entry.is_running(),
+            "the task ended or died: nothing holds it"
+        );
+    }
+
     #[tokio::test]
     async fn exhausting_the_api_budget_leaves_pairing_available() {
         let api = middleware::RateLimiter::new(2, std::time::Duration::from_secs(60));
