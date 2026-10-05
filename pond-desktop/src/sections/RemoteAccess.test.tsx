@@ -49,6 +49,28 @@ describe("RemoteAccess admission", () => {
     expect(screen.getByPlaceholderText("giap-inv1-...")).toBeTruthy();
   });
 
+  it("shows phone recovery only when there is a request to approve", async () => {
+    vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: false, registered: true });
+    const first = render(<RemoteAccess />);
+    await waitFor(() => expect(api.remoteRecoveryRequests).toHaveBeenCalled());
+    expect(screen.queryByText("Phone recovery requests")).toBeNull();
+    first.unmount();
+
+    vi.mocked(api.remoteRecoveryRequests).mockResolvedValue([
+      { id: "a1b2c3d4", device: "d", approved: false, deviceName: "A57", keyPreview: "0123456789abcdef" },
+    ]);
+    render(<RemoteAccess />);
+    await waitFor(() => expect(screen.getByText("Phone recovery requests")).toBeTruthy());
+  });
+
+  it("says so when recovery requests cannot be read", async () => {
+    vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: false, registered: true });
+    vi.mocked(api.remoteRecoveryRequests).mockRejectedValue(new Error("unavailable"));
+    render(<RemoteAccess />);
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(screen.getByText("Phone recovery requests")).toBeTruthy();
+  });
+
   it("keeps the invite field when provisioning cannot be read", async () => {
     vi.mocked(api.remoteDevice).mockRejectedValue(new Error("unavailable"));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);

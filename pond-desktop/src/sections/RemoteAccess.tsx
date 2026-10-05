@@ -162,7 +162,10 @@ export function RemoteAccess() {
       </div>
     </details>
 
-    <div style={{ display: 'grid', gap: 6 }}>
+    {/* Only when there is something to approve, or the requests could not be read: recovery is the
+        rare path, for a phone whose identity changed while its enrollment was still active, and a
+        removed or lapsed phone now comes back without it. Polling continues, so a request appears. */}
+    {(requests.length > 0 || reviewFailed) && <div style={{ display: 'grid', gap: 6 }}>
       <h3 style={{ margin: 0 }}>{t('remote.recoveryTitle')}</h3>
       <p style={{ margin: 0 }}>{t('remote.recoveryDescription')}</p>
       {reviewFailed && <p role="alert" style={{ margin: 0 }}>{t('remote.reviewFailed')}</p>}
@@ -174,6 +177,6 @@ export function RemoteAccess() {
           <Button variant="secondary" isDisabled={busy || request.approved} onPress={() => void approve(request.id)}>{t(request.approved ? 'remote.reviewApproved' : 'remote.reviewApprove')}</Button>
         </div>
       </div>)}
-    </div>
+    </div>}
   </section>;
 }

@@ -187,7 +187,10 @@ the Pond**. It is not done at request time: that route needs only a LAN peer and
 a bearer token, so revoking there would let anyone with both drop the household's
 remote access without approving anything. The revision is re-read from the
 stand-down's own answer, because standing an enrollment down gives it a new one --
-assuming otherwise cost a household its enrollment without a replacement.
+assuming otherwise cost a household its enrollment without a replacement. The
+dashboard's **Phone recovery requests** section appears only while a request is
+waiting, or when the requests cannot be read (2026-10-05); it polls every five
+seconds, so a new request shows without a reload.
 
 The review names what is being approved (2026-09-30): the phone's name from the
 device list and the first sixteen hex digits of the replacement's machine key,
