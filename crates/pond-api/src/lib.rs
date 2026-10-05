@@ -1,6 +1,7 @@
 //! REST API under `/api/v1/`; protected routes take a Bearer token from `POST /api/v1/handshake`.
 
 pub mod cleanup;
+pub(crate) mod download_failure;
 pub(crate) mod image_normalize;
 pub mod middleware;
 pub mod model_acquisition;
@@ -417,6 +418,13 @@ impl DownloadEntry {
             partial: None,
             error: None,
         }
+    }
+
+    /// Whether a transfer is attached to this entry. A running one holds a clone of `control` until
+    /// it ends, so an entry left at "downloading" by a task that died, or by a writer that never
+    /// held the flag (the voice downloads), is not running.
+    pub fn is_running(&self) -> bool {
+        self.status == "downloading" && std::sync::Arc::strong_count(&self.control) > 1
     }
 
     /// Paused entries wait for the household, so only finished ones age out.

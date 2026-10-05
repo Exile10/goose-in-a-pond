@@ -98,6 +98,38 @@ pub(crate) fn pictures_for(data_dir: &Path, record: &ModelRecord) -> Pictures {
     }
 }
 
+/// Whether this device carries `spec` for a file it has not downloaded yet, which can never prove
+/// a fit: off the budgeted device always, on it only for an encoder measured there.
+pub(crate) fn carries_pictures(spec: &EncoderSpec, budgeted: bool) -> bool {
+    device_budget::declare(
+        Some(*spec),
+        budgeted,
+        device_budget::DEVICE_MEASURED_VISION,
+        |_| VisionFit::CostsWindow {
+            window_without: device_budget::MIN_CTX,
+            window_with: device_budget::MIN_CTX,
+        },
+    )
+    .is_declared()
+}
+
+/// One file of a Hugging Face repository as "Add a model" lists it; `None` for a file that is no
+/// chat model. `pictures` is the add-on a download would bring, where this device carries it.
+pub(crate) fn hf_file_entry(repo: &str, sibling: &Value, budgeted: bool) -> Option<Value> {
+    let filename = sibling["rfilename"]
+        .as_str()
+        .filter(|n| n.ends_with(".gguf") && !taxonomy::is_companion_file(n))?;
+    let pictures = encoder_for_source(repo, filename)
+        .filter(|spec| carries_pictures(spec, budgeted))
+        .map(|spec| json!({"size_bytes": spec.size_bytes, "label": spec.label}));
+    Some(json!({
+        "filename": filename,
+        "size_mb": sibling["size"].as_u64().map(|b| b / 1_048_576),
+        "url": format!("https://huggingface.co/{repo}/resolve/main/{filename}"),
+        "pictures": pictures,
+    }))
+}
+
 /// The model file itself, from its pin when it is one of GIAP's picks.
 fn model_file(data_dir: &Path, record: &ModelRecord) -> Result<TrackedFile, Refusal> {
     if matches!(
@@ -212,15 +244,25 @@ fn check_egress(files: &[TrackedFile]) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Register every part with the tracker at once, so progress lists them all, then fetch.
-async fn start(state: &Arc<AppState>, files: Vec<TrackedFile>) {
-    for f in &files {
-        crate::routes::begin_tracking(&state.download_tracker, f).await;
-    }
+/// Register every part with the tracker at once, so progress lists them all, then fetch each one
+/// no transfer already holds; two requests for one file share the one transfer. Returns how many
+/// parts this call started.
+pub(crate) async fn start(state: &Arc<AppState>, files: Vec<TrackedFile>) -> usize {
+    let mut claimed = Vec::new();
     for f in files {
-        let state = state.clone();
-        tokio::spawn(async move { run(state, f).await });
+        if let Some(hold) = crate::routes::claim_tracking(&state.download_tracker, &f).await {
+            claimed.push((f, hold));
+        }
     }
+    let started = claimed.len();
+    for (f, hold) in claimed {
+        let state = state.clone();
+        tokio::spawn(async move {
+            run(state, f).await;
+            drop(hold);
+        });
+    }
+    started
 }
 
 async fn run(state: Arc<AppState>, file: TrackedFile) {
@@ -357,9 +399,9 @@ pub(crate) async fn acquire(
     let parts = parts_json(&plan.files);
     let pictures = plan.pictures.wire(plan.include_pictures);
     let message = plan.message();
-    start(state, plan.files).await;
+    let started = start(state, plan.files).await;
     Ok(json!({
-        "status": "download_started",
+        "status": if started == 0 { "already_downloading" } else { "download_started" },
         "name": record.name,
         "category": record.category.as_str(),
         "model_id": record.id,
@@ -477,9 +519,9 @@ pub(crate) async fn add_pictures(
             let files = vec![file];
             check_egress(&files)?;
             let parts = parts_json(&files);
-            start(&state, files).await;
+            let started = start(&state, files).await;
             Ok(Json(json!({
-                "status": "download_started",
+                "status": if started == 0 { "already_downloading" } else { "download_started" },
                 "model_id": record.id,
                 "parts": parts,
                 "message": message,
@@ -539,8 +581,9 @@ pub async fn restore_assigned_models(state: Arc<AppState>) -> usize {
             continue;
         }
         tracing::info!(model = %record.id, parts = files.len(), "restore: fetching an assigned model whose file is missing");
-        start(&state, files).await;
-        started += 1;
+        if start(&state, files).await > 0 {
+            started += 1;
+        }
     }
     started
 }
@@ -775,6 +818,118 @@ mod tests {
             tmp.path().join("models/gguf/escape.gguf")
         );
         assert_eq!(plan.files[0].key, "escape.gguf");
+    }
+
+    #[test]
+    fn a_search_result_offers_pictures_only_where_the_device_carries_them() {
+        let listed = |file: &str, budgeted: bool| {
+            hf_file_entry(
+                "ggml-org/SmolVLM-256M-Instruct-GGUF",
+                &json!({"rfilename": file, "size": 290_000_000u64}),
+                budgeted,
+            )
+        };
+        let desktop = listed("SmolVLM-256M-Instruct-Q8_0.gguf", false).unwrap();
+        assert_eq!(desktop["pictures"]["label"], "SmolVLM 256M");
+        assert_eq!(desktop["pictures"]["size_bytes"], 190_031_616u64);
+        assert_eq!(desktop["size_mb"], 276);
+        assert_eq!(
+            desktop["url"],
+            "https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/SmolVLM-256M-Instruct-Q8_0.gguf"
+        );
+        let orin = listed("SmolVLM-256M-Instruct-Q8_0.gguf", true).unwrap();
+        assert!(
+            orin["pictures"].is_null(),
+            "a download there brings no add-on, so none is promised"
+        );
+        let unlisted = hf_file_entry(
+            "someone/text-only-GGUF",
+            &json!({"rfilename": "text-only-Q4_K_M.gguf"}),
+            false,
+        )
+        .unwrap();
+        assert!(unlisted["pictures"].is_null());
+        assert!(unlisted["size_mb"].is_null());
+    }
+
+    /// Encoders and drafters beside a model are no models: neither name offers a download.
+    #[test]
+    fn a_search_result_leaves_out_what_is_no_chat_model() {
+        for file in [
+            "mmproj-BF16.gguf",
+            "sub/mmproj-F16.gguf",
+            "mtp-gemma-4-E2B-it.gguf",
+            "gemma-4-E2B-it-assistant-F16.gguf",
+            "dflash-gemma-4-26B-A4B-it-Q8_0.gguf",
+            "README.md",
+            "model.safetensors",
+        ] {
+            assert!(
+                hf_file_entry(
+                    "ggml-org/gemma-4-26B-A4B-it-GGUF",
+                    &json!({"rfilename": file}),
+                    false
+                )
+                .is_none(),
+                "{file}"
+            );
+        }
+        assert!(hf_file_entry(
+            "ggml-org/gemma-4-26B-A4B-it-GGUF",
+            &json!({"rfilename": "gemma-4-26B-A4B-it-Q8_0.gguf"}),
+            false
+        )
+        .is_some());
+    }
+
+    const SOON: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// A host that does not answer a HEAD in time, or refuses one, leaves the size unknown and
+    /// the request unharmed: the announcement then names no number.
+    #[tokio::test]
+    async fn a_size_probe_that_hangs_or_is_refused_learns_nothing_and_fails_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A server that takes the connection and never answers.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/m.gguf", silent.local_addr().unwrap());
+        let started = std::time::Instant::now();
+        assert_eq!(
+            crate::routes::remote_size_within(tmp.path(), &url, SOON).await,
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        let host = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+            .and(wiremock::matchers::path("/no-head.gguf"))
+            .respond_with(wiremock::ResponseTemplate::new(405))
+            .mount(&host)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+            .and(wiremock::matchers::path("/mute.gguf"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&host)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+            .and(wiremock::matchers::path("/sized.gguf"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).insert_header("content-length", "42"),
+            )
+            .mount(&host)
+            .await;
+        let ask = |file: &str| {
+            let url = format!("{}/{file}", host.uri());
+            let dir = tmp.path().to_path_buf();
+            async move { crate::routes::remote_size_within(&dir, &url, SOON).await }
+        };
+        assert_eq!(
+            ask("no-head.gguf").await,
+            None,
+            "a host that refuses a HEAD"
+        );
+        assert_eq!(ask("mute.gguf").await, None, "a HEAD that states no length");
+        assert_eq!(ask("sized.gguf").await, Some(42));
     }
 
     #[test]
