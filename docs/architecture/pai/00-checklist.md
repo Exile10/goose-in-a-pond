@@ -2914,3 +2914,58 @@ milestone).**
   rewinding to what its KV cache shares (the Rematch plan), and the held conversation's snapshot is
   saved before any side call. Running the summary, and the other side calls, in that conversation's
   buffers instead of a new conversation's would not allocate a second KV state at all. Not built.
+
+**2026-10-05 — A turn waits for the quiet compaction it would otherwise redo (GIAP; not a PAI
+milestone).**
+
+- **What landed** (GIAP `e86dcb03`, branch `feat/litert-quiet-compaction`, at Jerry's call). goose
+  compacts a conversation at the start of the turn after it passes 80% of its window, so the first
+  word waits for the summary. The quiet-time job helped only when 30 s of quiet and the whole
+  summary fitted into one pause, and a turn that arrived meanwhile threw the pass away.
+  - The pass asks the agent whether goose would compact the conversation at the start of its next
+    turn (`Agent::compacts_on_next_turn`, goose's own `check_if_compaction_needed`). If so it
+    starts after 5 s of quiet, and a turn for that conversation waits for it rather than stopping
+    it; only a turn for another conversation, or one that never checked in, stops it. A pass that
+    is only getting ahead keeps the 30 s and gives up as before. The monitor is asked every 5 s,
+    not 15.
+  - Every turn path checks in before the model (`RunSupervisor::quiet_passes`,
+    `pond-api/src/quiet_pass.rs`); a waiting turn shows "Compacting context...".
+  - `compact_session` records the size compaction left as goose's session size, as goose's own
+    `/compact` does. Without it goose's check kept reading the size from before, and the turn after
+    any quiet pass compacted a second time. Reproduced on the Mac before the fix: the quiet pass
+    ran, goose's recorded size stayed at 6,964 tokens, and the next turn compacted again (first word
+    22.8 s); after it the recorded size was 302 and the next turn did not (7.6 s).
+- **Measured on the Mac** (E2B, Orin emulated, 16 turns, 20 s after each answer, `mac-paced.sh`):
+
+  | | Before | After |
+  |---|---|---|
+  | Compactions inside a turn | 2 | 0 |
+  | Quiet passes a turn waited for | 0 | 3 |
+  | First word, a turn that compacted or waited | 26.3-28.5 s | 13.0-16.0 s |
+  | First word, every other turn (median) | 4.7 s | 4.4 s |
+
+- **Measured on the Orin** (E4B, release `69f5815f` against `e86dcb03`, 16 turns, 30 s after each
+  answer, `nano-memprobe2.sh` with `paced16.py`):
+
+  | | Before | After |
+  |---|---|---|
+  | Compactions inside a turn | 4 | 0 |
+  | Quiet passes a turn waited for | 0 | 4 |
+  | First word, a turn that compacted or waited | 73.7-99.5 s | 61.1-90.7 s |
+  | ... median | 89.8 s | 78.5 s |
+  | First word, every other turn (median) | 12.8 s | 15.0 s |
+
+  Each pass started 7-10 s after the previous answer, and the next question came 20-23 s into it,
+  so the turn waited the 41-82 s left of a 64-102 s summary, then 9-26 s more for its own answer
+  (restore, prefill, tool calls). The gain is the head start the pause allows: about 20 s at 30 s,
+  more after a spoken answer, all of it once the pause covers the summary. The other turns' median
+  moved within the two runs' spread (their first words ran 7-47 s with tool calls). Memory was
+  unchanged: lowest free 131 MB against 144, the pond's swap at most 257 MB against 267.
+- **PAI.** Preamble, egress, secrets, guest: none. Turn blocking: a turn may now wait for a quiet
+  pass on its own conversation, but only when it would otherwise have compacted that conversation
+  itself, which takes longer. No `Settings` field.
+- **Verification.** `quiet_pass` unit tests 6 passed (a turn waits for the pass doing its work, a
+  turn for another conversation stops it, a pass only getting ahead is stopped by its own turn, an
+  abandoned wait is uncounted, an old pass ending leaves a newer one standing, no pass no wait);
+  `cargo test -p pond-api` 632 passed, `pond-core` 1,706, the adapter's 269; clippy shows nothing on
+  the changed lines; `scripts/live-test.sh` 156 checks passed.
