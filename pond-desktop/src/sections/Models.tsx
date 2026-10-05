@@ -231,11 +231,6 @@ export function Models() {
 
   // ── Actions ──
   async function remove(model: ModelEntry) {
-    // Nothing to ask: the pond refuses it, so say why before a confirmation promises otherwise.
-    if (isInUse(model, roles)) {
-      say(`${modelLabel(model)} is doing a job right now. Give that job to another model first.`, false);
-      return;
-    }
     const freed = formatSize(model.size_mb);
     const size = freed || "the file";
     // The encoder file is shared per family, so its bytes return only if no other model uses it.
@@ -255,7 +250,7 @@ export function Models() {
       await data.reload();
       say(`Deleted ${modelLabel(model)}.${freed ? ` ${freed} freed.` : ""}`);
     } catch (e) {
-      // A refusal the pond words itself (a file another model still uses, say) is shown as it is.
+      // The pond refuses a model in use, or one whose file another model uses, in its own words.
       say(e instanceof Error ? e.message : String(e), false);
     } finally { actions.setBusy(false); }
   }

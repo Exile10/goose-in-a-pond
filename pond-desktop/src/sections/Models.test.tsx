@@ -299,16 +299,19 @@ describe("On this device", () => {
     expect(within(row).queryByText(/\d%/)).toBeNull();
   });
 
-  it("explains, without asking first, why the model in use cannot be deleted", async () => {
+  it("asks first like any delete, and shows the pond's own sentence for the model in use", async () => {
+    const refusal = "Gemma 4 E2B is doing a job right now (Conversation). Give that job to another model first.";
+    vi.mocked(api.deleteModel).mockRejectedValue(new ApiError(409, refusal));
     setup({ models: [e2b(HERE), foundOnDisk()], roles: rolesWith({ provider: "local", model: e2b().name }) });
     renderModels();
     const device = await band("On this device");
     const row = within(device).getByText("Gemma 4 E2B").closest(".mdl-row") as HTMLElement;
     fireEvent.click(within(row).getByRole("button", { name: "Delete Gemma 4 E2B, llama.cpp" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(api.deleteModel).toHaveBeenCalledWith("gguf", e2b().name));
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toBe("Gemma 4 E2B is doing a job right now. Give that job to another model first.");
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(api.deleteModel).not.toHaveBeenCalled();
+    expect(alert.textContent).toBe(refusal);
+    expect(screen.queryByText(/freed/)).toBeNull();
   });
 
   it("says what was freed when a model is deleted", async () => {
@@ -330,8 +333,8 @@ describe("On this device", () => {
   });
 
   it("asks before deleting, and shows a refusal in the pond's own words", async () => {
-    // Another row names the same file: the pond keeps it, and says which row and why.
-    const refusal = "'Gemma 4 E2B (older)' uses the same file and is assigned to role 'chat'. Deactivate it first.";
+    // Another row names the same file: the pond keeps it, and names that model as it names any other.
+    const refusal = "Gemma 4 E2B is doing a job right now (Conversation). Give that job to another model first.";
     vi.mocked(api.deleteModel).mockRejectedValue(new ApiError(409, refusal));
     setup({ models: [e2b(HERE), foundOnDisk()] });
     renderModels();

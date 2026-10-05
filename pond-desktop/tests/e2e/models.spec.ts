@@ -193,18 +193,24 @@ test.describe("Models section", () => {
       expect(asked).toBe(1);
     });
 
-    test("says In use for the model in use and offers it no Use; Delete explains why not", async ({ page }) => {
+    test("says In use for the model in use and offers it no Use; the pond refuses its Delete in its own words", async ({ page }) => {
+      const refusal = "Gemma 4 E2B is doing a job right now (Conversation). Give that job to another model first.";
       await mockModels(page);
+      await page.route("**/api/v1/models/gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL", (route) =>
+        route.fulfill({ status: 409, json: { error: refusal } }),
+      );
       await goToModels(page);
       const row = page.locator(".mdl-row", { hasText: "Gemma 4 E2B" }).first();
       await expect(row.getByText("In use")).toBeVisible();
       await expect(row.getByRole("button", { name: /^Use / })).toHaveCount(0);
-      await row.getByRole("button", { name: /Delete/ }).click();
-      await expect(page.getByRole("alert")).toContainText("is doing a job right now");
+      await row.getByRole("button", { name: /^Delete/ }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page.getByRole("alert")).toHaveText(refusal);
+      await expect(row).toBeVisible();
     });
 
     test("shows a refused delete in the pond's own words, and keeps the model listed", async ({ page }) => {
-      const refusal = "'Gemma 4 E2B (older)' uses the same file and is assigned to role 'chat'. Deactivate it first.";
+      const refusal = "Gemma 4 E2B is doing a job right now (Conversation). Give that job to another model first.";
       await mockModels(page, { models: typicalModels({ gguf: [e2bQat({ downloaded: true }), foundGguf({ downloaded: true })] }) });
       await page.route("**/api/v1/models/gguf/Llama-3.2-3B-Instruct-Q4_K_M", (route) =>
         route.fulfill({ status: 409, json: { error: refusal } }),
