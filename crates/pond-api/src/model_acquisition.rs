@@ -372,10 +372,15 @@ async fn learn_model_size(
     };
     model.size_bytes = Some(bytes);
     if let (0, Some(repo)) = (record.size_mb, state.model_repo.as_ref()) {
-        let mut sized = record.clone();
-        sized.size_mb = bytes / 1_048_576;
-        if let Err(e) = repo.upsert(&sized).await {
-            tracing::warn!(model = %record.id, error = %e, "could not record the size learned");
+        // The row may have moved on while the host answered: write onto it as it is now.
+        let Ok(Some(mut current)) = repo.get_by_id(&record.id).await else {
+            return;
+        };
+        if current.size_mb == 0 {
+            current.size_mb = bytes / 1_048_576;
+            if let Err(e) = repo.upsert(&current).await {
+                tracing::warn!(model = %record.id, error = %e, "could not record the size learned");
+            }
         }
     }
 }

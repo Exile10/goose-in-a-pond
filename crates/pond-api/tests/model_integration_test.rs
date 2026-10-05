@@ -1996,3 +1996,60 @@ async fn a_download_whose_host_refuses_a_head_still_starts_and_arrives() {
     })
     .await;
 }
+
+/// While a host takes its time to state a size, the row can change; recording the size must not
+/// put back what the row was when the request began.
+#[tokio::test]
+async fn learning_a_size_does_not_undo_what_the_row_became_meanwhile() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let weights = vec![5u8; 3 * 1_048_576];
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+        .and(wiremock::matchers::path("/slow-head.gguf"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-length", weights.len().to_string())
+                .set_delay(std::time::Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/slow-head.gguf"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_bytes(weights.clone())
+                .set_delay(std::time::Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+    let mut row = gguf_record("slow-head");
+    row.size_mb = 0;
+    row.downloaded = false;
+    row.url = Some(format!("{}/slow-head.gguf", server.uri()));
+    f.repo.upsert(&row).await.unwrap();
+
+    let app = f.app.clone();
+    let request = tokio::spawn(async move {
+        post_json(&app, "/api/v1/models/gguf/slow-head/download", None).await
+    });
+    let host = &server;
+    eventually("the size probe to reach the host", || async move {
+        host.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.method.as_str() == "HEAD")
+    })
+    .await;
+    // Another client changes the row while the probe waits.
+    f.repo.set_downloaded("gguf/slow-head", true).await.unwrap();
+
+    let (status, body) = request.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after = f.repo.get_by_id("gguf/slow-head").await.unwrap().unwrap();
+    assert_eq!(after.size_mb, 3, "the size learned is kept");
+    assert!(
+        after.downloaded,
+        "and the change made meanwhile is not undone"
+    );
+}
