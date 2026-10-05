@@ -73,6 +73,38 @@ describe("Hub Models, while speculative decoding is out of the engine", () => {
   });
 });
 
+describe("Hub Models, a chat model on this device's own engine", () => {
+  // As the server answers: rows carry their category, the chat role the stored provider.
+  const LOCAL = [
+    { id: "gguf/llama-3.2-3b", provider: "gguf", name: "llama-3.2-3b", is_active: false, downloaded: true, recommended_role: "chat" },
+    { id: "litert/gemma-4-E2B-it.litertlm", provider: "litert", name: "gemma-4-E2B-it.litertlm", is_active: true, downloaded: true, recommended_role: "chat" },
+    { id: "litert/gemma-4-E4B-it.litertlm", provider: "litert", name: "gemma-4-E4B-it.litertlm", is_active: false, downloaded: false, recommended_role: "chat" },
+  ];
+
+  beforeEach(() => {
+    vi.mocked(api.listModels).mockResolvedValue(LOCAL as never);
+    vi.mocked(api.getActiveRoles).mockResolvedValue({
+      ...ROLES,
+      chat: { provider: "local", model: "gemma-4-E2B-it.litertlm" },
+    } as never);
+  });
+
+  it("shows the model the role holds as Loaded, though the role reads local", async () => {
+    render(<ModelsDetail go={() => {}} />);
+    await screen.findByText("Language models");
+    expect(await screen.findByText("Loaded")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Load gemma-4-E2B-it.litertlm as chat model" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Load llama-3.2-3b as chat model" })).toBeTruthy();
+  });
+
+  it("offers no Load for a model that is not downloaded", async () => {
+    render(<ModelsDetail go={() => {}} />);
+    const missing = await screen.findByRole("button", { name: "gemma-4-E4B-it.litertlm is not downloaded" });
+    expect((missing as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: "Load gemma-4-E4B-it.litertlm as chat model" })).toBeNull();
+  });
+});
+
 // Commented out with the Speed card (speculative decoding left the engine); restore with it.
 // // The hub Toggle seeds its own state from its `on` prop once (controls.tsx),
 // // and settings arrive a render after mount — these assert what is DRAWN

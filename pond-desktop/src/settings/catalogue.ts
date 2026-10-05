@@ -18,8 +18,9 @@ export type Consumer =
   /** Nothing reads it anywhere. The control is inert. */
   | "none";
 
-/** Where a picker's options come from when they are not a fixed list. */
-export type OptionSource = "llm-models" | "whisper-models" | "tts-voices" | "embedding-models" | "llm-providers" | "time-zones";
+/** Where a picker's options come from when they are not a fixed list. `chat-models` adds LiteRT-LM
+ *  models to `llm-models`: they can hold the conversation, the tool-call helper cannot. */
+export type OptionSource = "llm-models" | "chat-models" | "whisper-models" | "tts-voices" | "embedding-models" | "llm-providers" | "time-zones";
 
 export type Control =
   | { kind: "toggle" }
@@ -218,9 +219,9 @@ export const CATALOGUE: CatalogueCategory[] = [
         name: "Chat model",
         entries: [
           { key: "chat_provider", label: "Provider", description: "Where conversation runs. Leave unset to use the same place as everything else.", control: { kind: "lookup", source: "llm-providers", placeholder: "Choose a provider" }, consumer: "live" },
-          { key: "chat_model", label: "Model", description: "Which model handles conversation. Leave unset to use the one on the Models page.", control: { kind: "lookup", source: "llm-models", placeholder: "Choose a downloaded model" }, consumer: "live" },
+          { key: "chat_model", label: "Model", description: "Which model handles conversation. Leave unset to use the one on the Models page.", control: { kind: "lookup", source: "chat-models", placeholder: "Choose a downloaded model" }, consumer: "live" },
           { key: "llm_provider", label: "Startup provider", description: "Where the pond runs its thinking.", control: { kind: "lookup", source: "llm-providers", placeholder: "Same as above" }, consumer: "live", proposed: true },
-          { key: "active_llm_model", label: "Last selected model", ownedBy: "models", description: "The model that does the thinking. Chosen on the Models page.", control: { kind: "lookup", source: "llm-models", placeholder: "Not set" }, consumer: "live", proposed: true },
+          { key: "active_llm_model", label: "Last selected model", ownedBy: "models", description: "The model that does the thinking. Chosen on the Models page.", control: { kind: "lookup", source: "chat-models", placeholder: "Not set" }, consumer: "live", proposed: true },
         ],
       },
       {
