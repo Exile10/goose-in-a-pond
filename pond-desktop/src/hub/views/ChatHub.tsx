@@ -20,7 +20,9 @@ import type { SubagentRun } from "../../components/SubagentTree";
 import { AttachmentTray } from "../../components/AttachmentTray";
 import {
   ImageSupportStatus,
+  ATTACH_BLOCKED_COPY,
   COMPOSER_GATE_LINE,
+  NOT_DECLARED_COPY,
   refusalClientClause,
 } from "../../components/ImageSupportStatus";
 import { useVisionStatus } from "../../api/useVisionStatus";
@@ -155,9 +157,7 @@ export function ChatHubView() {
   const attachTitle = !gateBlocked
     ? "Attach image"
     : (visionStatus?.message ??
-        (visionKind === "not_declared"
-          ? "This model cannot look at pictures. To send one, choose a model marked Reads pictures on the Models page."
-          : "The active model cannot read images. Switch to a model marked Reads pictures on the Models page."));
+        (visionKind === "not_declared" ? NOT_DECLARED_COPY : ATTACH_BLOCKED_COPY));
 
   // A refused turn (409/413/415...) hands its draft back here, once: `takeRefusedDraft` clears
   // it, so a StrictMode re-run can't restore it twice.

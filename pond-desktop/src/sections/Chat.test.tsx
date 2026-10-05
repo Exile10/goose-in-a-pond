@@ -5,6 +5,7 @@ import { api } from "../api/PondApiClient";
 import { __resetChatRunForTests, setChatRunBridge } from "../state/chatRunStore";
 import { ApiError } from "../api/types";
 import type { ChatEvent, VisionStatus } from "../api/types";
+import { ATTACH_BLOCKED_COPY, NOT_DECLARED_COPY } from "../components/ImageSupportStatus";
 import { prepareImage } from "../lib/imageAttach";
 import type { PreparedImage } from "../lib/imageAttach";
 
@@ -617,6 +618,28 @@ describe("Chat — picture support", () => {
     );
     // No error bubble for a refused turn -- it never reached the transcript.
     expect(screen.queryByText(/^error:/i)).toBeNull();
+  });
+});
+
+/** The paperclip says why a model cannot take pictures, in the label the Models page shows. */
+describe("Chat — the paperclip's reason", () => {
+  it("names Pictures included when the model cannot look at pictures", async () => {
+    vi.mocked(api.getVisionStatus).mockResolvedValue({
+      model: "x", state: { kind: "not_declared" }, size_bytes: null, message: null,
+    } satisfies VisionStatus);
+    render(<Chat />);
+    const clip = await screen.findByRole("button", { name: "Attach image" });
+    await waitFor(() => expect(clip.getAttribute("title")).toBe(NOT_DECLARED_COPY));
+    expect(clip.getAttribute("title")).not.toMatch(/Reads pictures/);
+  });
+
+  it("says the same label when the pond has nothing more to say about why it is blocked", async () => {
+    vi.mocked(api.getVisionStatus).mockResolvedValue({
+      model: "x", state: { kind: "absent" }, size_bytes: null, message: null,
+    } satisfies VisionStatus);
+    render(<Chat />);
+    const clip = await screen.findByRole("button", { name: "Attach image" });
+    await waitFor(() => expect(clip.getAttribute("title")).toBe(ATTACH_BLOCKED_COPY));
   });
 });
 

@@ -9,9 +9,13 @@ const PERSISTENT_KINDS = new Set(["absent", "downloading", "verifying", "failed"
 const SPINNING_KINDS = new Set(["downloading", "verifying"]);
 const MUTED_KINDS = new Set(["failed", "blocked"]);
 
-/** Copy for `not_declared`, which has no server prose; pinned to design_v2.md §B1. */
+/** Copy for `not_declared`, which has no server prose; the pond's own refusal reads the same. */
 export const NOT_DECLARED_COPY =
-  "This model cannot look at pictures. To send one, choose a model marked Reads pictures on the Models page.";
+  "This model cannot look at pictures. To send one, choose a model marked Pictures included on the Models page.";
+
+/** The paperclip's reason while the active model cannot take pictures and the pond says nothing more. */
+export const ATTACH_BLOCKED_COPY =
+  "The active model cannot read images. Switch to a model marked Pictures included on the Models page.";
 
 /** Under-composer line when a send waits on picture support; shared so both shells agree. */
 export const COMPOSER_GATE_LINE =

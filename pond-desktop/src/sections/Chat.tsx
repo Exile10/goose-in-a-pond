@@ -24,7 +24,9 @@ import { ThinkingDisclosure } from "../hub/views/chat/ThinkingDisclosure";
 import { AttachmentTray } from "../components/AttachmentTray";
 import {
   ImageSupportStatus,
+  ATTACH_BLOCKED_COPY,
   COMPOSER_GATE_LINE,
+  NOT_DECLARED_COPY,
   refusalClientClause,
 } from "../components/ImageSupportStatus";
 import { useVisionStatus } from "../api/useVisionStatus";
@@ -105,9 +107,7 @@ export function Chat() {
   const attachTitle = !gateBlocked
     ? "Attach image"
     : (visionStatus?.message ??
-        (visionKind === "not_declared"
-          ? "This model cannot look at pictures. To send one, choose a model marked Reads pictures on the Models page."
-          : "The active model cannot read images. Switch to a model marked Reads pictures on the Models page."));
+        (visionKind === "not_declared" ? NOT_DECLARED_COPY : ATTACH_BLOCKED_COPY));
 
   // On unmount, revoke unsent tray previews (sent ones belong to the store). Via a ref: a cleanup
   // depending on `attachments` would revoke a live thumbnail each time an image was added.

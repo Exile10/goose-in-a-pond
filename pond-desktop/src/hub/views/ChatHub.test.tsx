@@ -8,6 +8,7 @@ import { api } from "../../api/PondApiClient";
 import { ApiError } from "../../api/types";
 import type { VisionStatus } from "../../api/types";
 import { __resetChatRunForTests, openSession } from "../../state/chatRunStore";
+import { ATTACH_BLOCKED_COPY, NOT_DECLARED_COPY } from "../../components/ImageSupportStatus";
 import { prepareImage } from "../../lib/imageAttach";
 import type { PreparedImage } from "../../lib/imageAttach";
 
@@ -226,6 +227,27 @@ describe("ChatHubView — picture support", () => {
 });
 
 /** With none chosen the pond refuses a turn and picks nothing, so the screen offers its suggestions. */
+describe("ChatHubView — the paperclip's reason", () => {
+  it("names Pictures included when the model cannot look at pictures", async () => {
+    vi.mocked(api.getVisionStatus).mockResolvedValue({
+      model: "x", state: { kind: "not_declared" }, size_bytes: null, message: null,
+    } satisfies VisionStatus);
+    render(<ChatHubView />);
+    const clip = await screen.findByRole("button", { name: "Attach image" });
+    await waitFor(() => expect(clip.getAttribute("title")).toBe(NOT_DECLARED_COPY));
+    expect(clip.getAttribute("title")).not.toMatch(/Reads pictures/);
+  });
+
+  it("says the same label when the pond has nothing more to say about why it is blocked", async () => {
+    vi.mocked(api.getVisionStatus).mockResolvedValue({
+      model: "x", state: { kind: "absent" }, size_bytes: null, message: null,
+    } satisfies VisionStatus);
+    render(<ChatHubView />);
+    const clip = await screen.findByRole("button", { name: "Attach image" });
+    await waitFor(() => expect(clip.getAttribute("title")).toBe(ATTACH_BLOCKED_COPY));
+  });
+});
+
 describe("ChatHubView — no conversation model", () => {
   let added: string[] = [];
 
