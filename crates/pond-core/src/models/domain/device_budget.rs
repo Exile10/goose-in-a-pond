@@ -46,6 +46,24 @@ pub fn llm_budget_mb() -> u64 {
     total_ram_mb().saturating_sub(RESERVED_MB)
 }
 
+// ── Desktop budget ──────────────────────────────────────────────────────────
+// Not Orin measurements: a desktop reports its own memory, and these only decide how much of it
+// the LLM slot may take.
+
+/// The least a desktop keeps from the LLM slot (MB): the system, the household's other programs
+/// and the rest of the pond.
+pub const HOST_RESERVED_MIN_MB: u64 = 4096;
+/// The share of a desktop's memory it keeps from the LLM slot (percent), when larger than the
+/// floor. A quarter is what macOS keeps back from Metal's working set on most Macs.
+pub const HOST_RESERVED_PERCENT: u64 = 25;
+
+/// The LLM slot's budget on a desktop with `total_mb` of memory: total less the larger of the
+/// floor and the share. A budgeted device uses [`llm_budget_mb`] instead.
+pub fn host_llm_budget_mb(total_mb: u64) -> u64 {
+    let reserve = (total_mb * HOST_RESERVED_PERCENT / 100).max(HOST_RESERVED_MIN_MB);
+    total_mb.saturating_sub(reserve)
+}
+
 // ── Window arithmetic ───────────────────────────────────────────────────────
 
 /// KV KiB/token of the widest shipped geometry (E4B; E2B is 18), measured on the Orin. Unpadded
@@ -620,6 +638,15 @@ mod tests {
         // No live reading: available is the budget, so nothing is held back.
         assert_eq!(reclaimable_mb(4020, BUDGET, BUDGET), 0);
         assert_eq!(reclaimable_mb(0, BUDGET, 100), 0);
+    }
+
+    #[test]
+    fn a_desktop_keeps_a_quarter_of_its_memory_and_never_less_than_the_floor() {
+        assert_eq!(host_llm_budget_mb(65_536), 49_152);
+        assert_eq!(host_llm_budget_mb(32_768), 24_576);
+        assert_eq!(host_llm_budget_mb(16_384), 12_288);
+        assert_eq!(host_llm_budget_mb(8_192), 4_096, "the floor, not a quarter");
+        assert_eq!(host_llm_budget_mb(3_000), 0);
     }
 
     #[test]

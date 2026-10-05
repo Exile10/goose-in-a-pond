@@ -5116,9 +5116,10 @@ async fn get_active_roles(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
-/// GET /api/v1/models/memory-status — returns current LLM memory budget snapshot.
-/// `reclaimable_mb` is what switching away from the model in use would free, so a fit check can
-/// count it.
+/// GET /api/v1/models/memory-status — returns current LLM memory budget snapshot: the board's on
+/// a budgeted device, the machine's own elsewhere. `budget_mb` is the most the LLM slot may ever
+/// hold here; `reclaimable_mb` is what switching away from the model in use would free, so a fit
+/// check can count it.
 async fn get_memory_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let status = state
         .model_scheduler
@@ -5130,6 +5131,7 @@ async fn get_memory_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "total_mb":             status.total_mb,
         "available_for_llm_mb": status.available_for_llm_mb,
+        "budget_mb":            status.budget_mb,
         "loaded_model":         status.loaded_model,
         "reclaimable_mb":       reclaimable_mb,
     }))
@@ -16836,6 +16838,13 @@ mod tests {
     fn model_spills_budget_fits_small_model() {
         // gemma-2-2b (~1600 MB) fits a 4096 MB budget (effective 3072 after headroom).
         assert_eq!(model_spills_budget(1600, 4096), Some(false));
+    }
+
+    #[test]
+    fn a_desktop_reading_lets_the_primary_pick_fit() {
+        // Gemma 4 E4B QAT (4,020 MB) against a 32 GB desktop's own reading, then the board's.
+        assert_eq!(model_spills_budget(4_020, 22_000), Some(false));
+        assert_eq!(model_spills_budget(4_020, 1_000 + 3_000), Some(true));
     }
 
     #[test]
