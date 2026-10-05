@@ -1,0 +1,87 @@
+{
+ "id": "example/subdirs-GGUF",
+ "sha": "3333333333333333333333333333333333333333",
+ "siblings": [
+  {
+   "rfilename": "BF16/subdirs-BF16-00001-of-00002.gguf",
+   "size": 40000000000,
+   "lfs": {
+    "sha256": "0e95556c1b75f2aa0f4c299caf119ce91d84f2d8069e65565aa1014c88913f72",
+    "size": 40000000000,
+    "pointerSize": 134
+   }
+  },
+  {
+   "rfilename": "BF16/subdirs-BF16-00002-of-00002.gguf",
+   "size": 9000000000,
+   "lfs": {
+    "sha256": "488f4a51f4565ab70b1cb12584cb0db22e27bf920187190ec26e854b00e9d22f",
+    "size": 9000000000,
+    "pointerSize": 134
+   }
+  },
+  {
+   "rfilename": "BF16/mmproj-BF16.gguf",
+   "size": 131072,
+   "lfs": {
+    "sha256": "2186c25c1d6a73054738f985223988498abb8111af5ef3a87dcce398fa4f160c",
+    "size": 131072,
+    "pointerSize": 134
+   }
+  },
+  {
+   "rfilename": "Q8_0/subdirs-Q8_0.gguf",
+   "size": 26000000000,
+   "lfs": {
+    "sha256": "ffc171cc90b57912cc2b4c1688baa89f0ba100a9d32d88ee9e4c86a0eaa530cd",
+    "size": 26000000000,
+    "pointerSize": 134
+   }
+  },
+  {
+   "rfilename": "subdirs-Q4_K_M.gguf",
+   "size": 14000000000,
+   "lfs": {
+    "sha256": "b8d3f1f10321fe3bfc70a0a7eba73f27182d6ab87d4658c8a7c7d047f49d6e88",
+    "size": 14000000000,
+    "pointerSize": 134
+   }
+  },
+  {
+   "rfilename": "mmproj-F16.gguf",
+   "size": 98304,
+   "lfs": {
+    "sha256": "d8219ba087173a83612ae7a480b15545c2adeae0253519d7d256ecdb76dbf614",
+    "size": 98304,
+    "pointerSize": 134
+   }
+  },
+  {
+   "rfilename": "mmproj-F32.gguf",
+   "size": 163840,
+   "lfs": {
+    "sha256": "2dbfaf67d5ce42bc07744686530b2e93e66cdb0c72106424f6ecf7dacdd82a13",
+    "size": 163840,
+    "pointerSize": 134
+   }
+  },
+  {
+   "rfilename": "imatrix_unsloth.gguf_file",
+   "size": 7000000,
+   "lfs": {
+    "sha256": "5f37bd49f26d3638eecaecd46967d6332439d5f5419280014235ae29c6bf30f4",
+    "size": 7000000,
+    "pointerSize": 134
+   }
+  },
+  {
+   "rfilename": "subdirs-imatrix.gguf",
+   "size": 7000000,
+   "lfs": {
+    "sha256": "9419e4740b133003e32da5db1d2e6bbaa29d9c41d8efa4b171910e868120b3c8",
+    "size": 7000000,
+    "pointerSize": 134
+   }
+  }
+ ]
+}

@@ -1,0 +1,38 @@
+[
+ {
+  "id": "bartowski/google_gemma-4-E2B-it-GGUF"
+ },
+ {
+  "id": "bartowski/google_gemma-4-26B-A4B-it-GGUF"
+ },
+ {
+  "id": "bartowski/google_gemma-4-31B-it-GGUF"
+ },
+ {
+  "id": "bartowski/gemma-4-12B-it-GGUF"
+ },
+ {
+  "id": "bartowski/google_gemma-4-E4B-it-GGUF"
+ },
+ {
+  "id": "bartowski/google_gemma-3-4b-it-GGUF"
+ },
+ {
+  "id": "bartowski/ReadyArt_gemma-4-31B-it-scotoma-2-GGUF"
+ },
+ {
+  "id": "bartowski/Ateron_Gemma-4-Dark-Thoughts-31B-GGUF"
+ },
+ {
+  "id": "bartowski/Ateron_Gemma-4-Novelist-Eclipse-31B-GGUF"
+ },
+ {
+  "id": "bartowski/Gryphe_Gemma-4-31B-StyleTune-GGUF"
+ },
+ {
+  "id": "bartowski/mlabonne_gemma-3-4b-it-abliterated-GGUF"
+ },
+ {
+  "id": "bartowski/Ateron_Gemma-4-MoonGem-31B-GGUF"
+ }
+]
