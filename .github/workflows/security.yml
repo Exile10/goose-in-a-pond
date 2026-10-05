@@ -41,7 +41,7 @@ jobs:
       #
       # go-version-file keeps this pinned to whatever go.mod asks for, so the
       # analysis cannot silently degrade again the next time that line moves.
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: native/pondnet/go.mod
           cache-dependency-path: native/pondnet/go.sum
