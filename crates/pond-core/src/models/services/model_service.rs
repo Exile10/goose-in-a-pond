@@ -118,8 +118,9 @@ pub async fn apply_catalog(
     Ok(applied)
 }
 
-/// What a boot restore does: correct the flag of an assigned file that is on disk, and fetch an
-/// assigned model whose file is missing. Only the household's own assignments; nothing else.
+/// What a boot restore does: correct the flag of an assigned file that is on disk, and fetch a
+/// model whose file is missing when a role that loads a model has it (never think or task).
+/// Only the household's own assignments; nothing else.
 #[derive(Debug, Default)]
 pub struct RestorePlan {
     pub mark_downloaded: Vec<String>,
@@ -133,6 +134,12 @@ pub fn restore_plan(
     records: &[ModelRecord],
     present: impl Fn(&ModelRecord) -> Option<bool>,
 ) -> RestorePlan {
+    use crate::models::domain::model_role::ModelRole;
+    let loaded = |id: &str| {
+        assignments.iter().any(|a| {
+            a.model_id == id && ModelRole::from_str(&a.role).is_some_and(|r| r.loads_a_model())
+        })
+    };
     let mut plan = RestorePlan::default();
     let mut seen = std::collections::HashSet::new();
     for a in assignments {
@@ -149,7 +156,7 @@ pub fn restore_plan(
             Some(false) => {
                 let fetchable = record.url.is_some()
                     || crate::models::domain::curated::for_record(record).is_some();
-                if fetchable {
+                if fetchable && loaded(&record.id) {
                     plan.fetch.push(record.clone());
                 }
             }
@@ -891,6 +898,29 @@ mod tests {
             plan.fetch.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["gguf/gone"],
             "once each, never an unassigned row or one with no source"
+        );
+    }
+
+    /// Think and task select nothing yet: a missing file of theirs is never fetched, while the
+    /// same file assigned to a role that loads it is, whatever order the assignments come in.
+    #[test]
+    fn think_and_task_never_fetch() {
+        let url = Some("https://example.com/m.gguf");
+        let thought = stub_model("gguf/qwen2.5-3b", "qwen2.5-3b.gguf", true, url);
+        let tasked = stub_model("gguf/task-model", "task-model.gguf", true, url);
+        let shared = stub_model("gguf/shared", "shared.gguf", true, url);
+        let records = vec![thought, tasked, shared];
+        let assignments = vec![
+            assigned("think", "gguf/qwen2.5-3b"),
+            assigned("task", "gguf/task-model"),
+            assigned("think", "gguf/shared"),
+            assigned("chat", "gguf/shared"),
+            assigned("unknown-role", "gguf/qwen2.5-3b"),
+        ];
+        let plan = restore_plan(&assignments, &records, |_| Some(false));
+        assert_eq!(
+            plan.fetch.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["gguf/shared"]
         );
     }
 

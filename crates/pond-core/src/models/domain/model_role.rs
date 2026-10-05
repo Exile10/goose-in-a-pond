@@ -92,6 +92,13 @@ impl ModelRole {
         matches!(self, Self::Chat)
     }
 
+    /// Whether a running path loads this role's model: chat, the tool-calling specialist that
+    /// `tool_model` names, speech both ways and embeddings. Think and task select nothing yet, so
+    /// nothing done on behalf of an assignment (a boot restore included) acts on theirs.
+    pub fn loads_a_model(&self) -> bool {
+        !matches!(self, Self::Think | Self::Task)
+    }
+
     /// Settings keys this role owns; a patch touching one must re-sync this role's assignment.
     pub fn settings_keys(&self) -> &'static [&'static str] {
         match self {
@@ -206,6 +213,16 @@ mod tests {
             assert!(role.settings_mirror(&ModelCategory::Gguf, "m").is_empty());
             assert!(role.settings_keys().is_empty());
         }
+    }
+
+    #[test]
+    fn every_role_loads_its_model_except_think_and_task() {
+        let loaded: Vec<&str> = ModelRole::ALL
+            .iter()
+            .filter(|r| r.loads_a_model())
+            .map(|r| r.as_str())
+            .collect();
+        assert_eq!(loaded, ["chat", "tool", "asr", "tts", "embedding"]);
     }
 
     #[test]

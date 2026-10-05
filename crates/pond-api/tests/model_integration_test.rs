@@ -1335,6 +1335,24 @@ async fn the_boot_restore_fetches_an_assigned_missing_model_through_the_tracker(
     );
 }
 
+/// Think and task select nothing yet, so a boot never fetches a missing model of theirs.
+#[tokio::test]
+async fn the_boot_restore_never_fetches_for_think_or_task() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let server = weights_server("qwen2.5-3b.gguf").await;
+    for (name, role) in [("qwen2.5-3b", "think"), ("task-model", "task")] {
+        let mut row = gguf_record(name);
+        row.url = Some(format!("{}/{name}.gguf", server.uri()));
+        f.repo.upsert(&row).await.unwrap();
+        f.repo.set_assignment(role, &row.id).await.unwrap();
+    }
+    assert_eq!(
+        pond_api::model_acquisition::restore_assigned_models(f.state.clone()).await,
+        0
+    );
+    assert!(f.tracker.read().await.is_empty());
+}
+
 /// Another quant of an assigned model already on disk is the household's copy: no fetch at boot.
 #[tokio::test]
 async fn the_boot_restore_leaves_a_model_whose_other_quant_is_on_disk() {
