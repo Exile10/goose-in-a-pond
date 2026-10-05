@@ -142,7 +142,10 @@ func LoadAuthority(directory string) (Authority, error) {
 //
 // It is safe to repeat: the service answers with the same household rather than
 // conflicting, which is how a lost response is recovered.
-func (a Authority) Register(ctx context.Context, origin string, port uint16, invite string) (string, error) {
+//
+// A Pond provisioned with a device certificate sends a proof bound to this registration,
+// which admits a new household without an invite; device is nil on one that was not.
+func (a Authority) Register(ctx context.Context, origin string, port uint16, invite string, device *Device) (string, error) {
 	u, e := url.Parse(origin)
 	if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return "", errors.New("enrollment requires an HTTPS origin")
@@ -150,12 +153,16 @@ func (a Authority) Register(ctx context.Context, origin string, port uint16, inv
 	if port == 0 {
 		return "", errors.New("a companion port is required")
 	}
-	envelope, e := enrollment.SignHousehold(enrollment.HouseholdRegistration{
+	registration := enrollment.HouseholdRegistration{
 		PublicKey: a.PublicKey,
 		Port:      port,
 		Expires:   time.Now().Add(2 * time.Minute).Unix(),
 		Invite:    invite,
-	}, a.key)
+	}
+	if device != nil {
+		registration.Device = device.Prove(registration.PublicKey, registration.Expires)
+	}
+	envelope, e := enrollment.SignHousehold(registration, a.key)
 	if e != nil {
 		return "", e
 	}

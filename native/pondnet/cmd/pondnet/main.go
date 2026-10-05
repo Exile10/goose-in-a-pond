@@ -30,10 +30,14 @@ func main() {
 	port := flag.Int("port", 4443, "tailnet HTTPS port")
 	authorityAction := flag.String("authority-action", "", "local authority operation: identity, register, inspect, enroll, replace or revoke")
 	enrollmentOrigin := flag.String("enrollment", "", "enrollment HTTPS origin")
+	deviceAction := flag.String("device-action", "", "provisioning operation on the device directory named by --state: create or install")
 	flag.Parse()
 	if *notices {
 		fmt.Print(pondnet.ThirdPartyNotices)
 		return
+	}
+	if *deviceAction != "" {
+		os.Exit(runDeviceAction(*deviceAction, *state))
 	}
 	if *authorityAction != "" {
 		if *authorityAction != "identity" {
@@ -62,7 +66,14 @@ func main() {
 				fmt.Fprintln(os.Stderr, "invalid registration input")
 				os.Exit(2)
 			}
-			household, err := authority.Register(context.Background(), *enrollmentOrigin, uint16(*port), input.Invite)
+			// A device directory that exists but cannot be read stops here rather than
+			// registering without the certificate the Pond was imaged with.
+			device, err := pondnet.LoadDevice(pondnet.DeviceDirectory(*state))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "device certificate unavailable:", err)
+				os.Exit(1)
+			}
+			household, err := authority.Register(context.Background(), *enrollmentOrigin, uint16(*port), input.Invite, device)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "household registration incomplete:", err)
 				os.Exit(1)
@@ -146,4 +157,36 @@ func main() {
 		case <-ticker.C:
 		}
 	}
+}
+
+// runDeviceAction provisions a Pond while it is imaged: create prints the new device key's
+// public half for the operator to sign, and install reads the signed certificate on stdin.
+func runDeviceAction(action, directory string) int {
+	switch action {
+	case "create":
+		public, err := pondnet.CreateDevice(directory)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "device key not created:", err)
+			return 1
+		}
+		json.NewEncoder(os.Stdout).Encode(map[string]string{"devicePublicKey": public})
+		return 0
+	case "install":
+		var certificate enrollment.Envelope
+		decoder := json.NewDecoder(io.LimitReader(os.Stdin, 8192))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&certificate) != nil || decoder.Decode(new(any)) != io.EOF {
+			fmt.Fprintln(os.Stderr, "invalid device certificate input")
+			return 2
+		}
+		if err := pondnet.InstallDeviceCertificate(directory, certificate); err != nil {
+			fmt.Fprintln(os.Stderr, "device certificate not installed:", err)
+			return 1
+		}
+		read, _ := enrollment.ReadDeviceCertificate(certificate)
+		json.NewEncoder(os.Stdout).Encode(map[string]string{"serial": read.Serial})
+		return 0
+	}
+	fmt.Fprintln(os.Stderr, "unknown device action:", action)
+	return 2
 }
