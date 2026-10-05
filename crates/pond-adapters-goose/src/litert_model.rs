@@ -10,6 +10,33 @@ use pond_core::models::domain::device_budget;
 use pond_core::models::domain::litert::{self, EngineOptions, Overrides};
 use std::path::Path;
 
+/// Before any LiteRT-LM engine loads: on the budgeted device, compile only the 128-token prefill
+/// chunk (see [`litert::DEVICE_PREFILL_SIGNATURES`]), unless the environment already sets it.
+/// Process-wide in the library, so it is set here once rather than per registry row; llama.cpp
+/// never reads it.
+pub fn apply_device_environment() {
+    let current = std::env::var(litert::PREFILL_SIGNATURES_ENV).ok();
+    let budgeted = device_budget::budgeted_device();
+    match litert::prefill_signatures(budgeted, current.as_deref()) {
+        Some(value) => {
+            std::env::set_var(litert::PREFILL_SIGNATURES_ENV, value);
+            tracing::info!(
+                target: "giap::trace",
+                kind = "litert_device_environment",
+                prefill_signatures = value,
+                "LiteRT-LM compiles only the 128-token prefill chunk on this device"
+            );
+        }
+        None if budgeted => tracing::info!(
+            target: "giap::trace",
+            kind = "litert_device_environment",
+            prefill_signatures = current.as_deref().unwrap_or_default(),
+            "LiteRT-LM prefill chunk sizes left as the environment sets them"
+        ),
+        None => {}
+    }
+}
+
 /// A LiteRT-LM row's settings: the engine options, and nothing only llama.cpp reads.
 pub fn registry_settings(options: &EngineOptions) -> ModelSettings {
     ModelSettings {

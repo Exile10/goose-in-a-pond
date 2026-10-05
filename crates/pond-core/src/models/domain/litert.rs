@@ -21,6 +21,24 @@ pub const PLATFORM_CONTEXT_TOKENS: u32 = 16384;
 /// tools), 16384 ran out of memory, and 8192 ran, with little to spare (about 50 MB free and
 /// 1.6 GB in swap at its lowest).
 pub const DEVICE_CONTEXT_TOKENS: u32 = 8192;
+/// giap-main's switch (87e4a9e7) for the prefill chunk sizes LiteRT-LM compiles, read by the
+/// engine at creation. Unset or empty keeps every size the model ships; a list that leaves a model
+/// none of its prefill signatures fails engine creation.
+pub const PREFILL_SIGNATURES_ENV: &str = "LITERT_PREFILL_SIGNATURES";
+/// The only prefill chunk compiled on the budgeted device. Gemma 4 ships 128 and 1024, and on the
+/// Orin's WebGPU path each compiled chunk size keeps attention scratch sized by the whole context,
+/// which the GPU's pool never gives back. Over eight turns with one compaction (E4B, 8k) the GPU's
+/// share of RAM grew from 4.8 to 6.6 GB with both sizes and the kernel swapped 2.2 GB of the pond
+/// out; with 128 alone it stayed at 4.1 GB, nothing was swapped, and the first token after the
+/// compaction came in 4.1 s instead of 10-16 s.
+pub const DEVICE_PREFILL_SIGNATURES: &str = "128";
+
+/// The value to give [`PREFILL_SIGNATURES_ENV`] on this device, or `None` to leave it alone: off
+/// the budgeted device, and whenever it is already set, empty included, because an explicit
+/// setting wins.
+pub fn prefill_signatures(budgeted_device: bool, current: Option<&str>) -> Option<&'static str> {
+    (budgeted_device && current.is_none()).then_some(DEVICE_PREFILL_SIGNATURES)
+}
 
 /// Whether `model` names a LiteRT-LM model.
 pub fn is_litert_model(model: &str) -> bool {
@@ -243,6 +261,18 @@ mod tests {
                 .find(|(k, _)| *k == key)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    #[test]
+    fn the_budgeted_device_compiles_only_the_short_prefill_chunk_unless_told_otherwise() {
+        assert_eq!(prefill_signatures(true, None), Some("128"));
+        assert_eq!(prefill_signatures(false, None), None);
+        assert_eq!(
+            prefill_signatures(true, Some("")),
+            None,
+            "an empty value asks for every size the model ships"
+        );
+        assert_eq!(prefill_signatures(true, Some("128,1024")), None);
     }
 
     #[test]

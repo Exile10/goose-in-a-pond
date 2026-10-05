@@ -477,6 +477,14 @@ fn pin_goose_state_under(data_dir: &std::path::Path) {
     std::env::set_var("GOOSE_PATH_ROOT", &engine_root);
 }
 
+/// The budgeted device's choices that must be in place before an engine loads or a turn compacts:
+/// goose's compaction prompt and summary, and the LiteRT-LM prefill chunk sizes. Called after
+/// logging starts, so their decisions are on record.
+fn apply_device_choices() {
+    pond_adapters_goose::compaction_prompts::apply_for_this_device();
+    pond_adapters_goose::litert_model::apply_device_environment();
+}
+
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     let data_dir = default_data_dir();
@@ -500,8 +508,7 @@ async fn async_main() -> Result<()> {
             native,
         }) => {
             let drain = tracing_setup::init_tracing(debug, &data_dir);
-            // Before any turn can compact; goose reads both templates afresh at every compaction.
-            pond_adapters_goose::compaction_prompts::apply_for_this_device();
+            apply_device_choices();
             run_server(
                 static_dir, open, debug, &agent, port, https_port, native, drain,
             )
@@ -525,7 +532,7 @@ async fn async_main() -> Result<()> {
             };
             // Console: WARN+ only (turn lines use diag!/out!); the log file keeps full detail.
             let _log = tracing_setup::init_tracing_with_console(false, &data_dir, console, true);
-            pond_adapters_goose::compaction_prompts::apply_for_this_device();
+            apply_device_choices();
             run_chat(
                 provider.as_deref(),
                 model.as_deref(),
@@ -564,7 +571,7 @@ async fn async_main() -> Result<()> {
         None => {
             // No subcommand: interactive text chat, provider from Settings.
             let _log = tracing_setup::init_tracing(false, &data_dir);
-            pond_adapters_goose::compaction_prompts::apply_for_this_device();
+            apply_device_choices();
             run_chat(None, None, false, None, true, Some("none"), None, false).await
         }
     }
