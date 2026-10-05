@@ -14,6 +14,7 @@
 #   bash scripts/giap.sh litert status       # the LiteRT-LM library (.litertlm models): recorded packages, verified
 #   bash scripts/giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]   # build, package, verify, record
 #   bash scripts/giap.sh litert import DIR  # take in a package built on another host (the Jetson)
+#   bash scripts/giap.sh provision --host HOST --key FILE  # give a Pond a device certificate (operator)
 #   bash scripts/giap.sh --dry-run …  # print every command instead of running it
 #
 # It auto-detects the host (Jetson / Linux / macOS), whether CUDA is usable, and
@@ -39,6 +40,12 @@ if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 3 ]; then
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Provisioning runs on the operator's machine against a Pond over SSH, so it skips this
+# host's detection and takes its own options.
+if [ "${1:-}" = provision ]; then
+  shift
+  exec bash "$HERE/provision-device.sh" "$@"
+fi
 # shellcheck source=lib/macos-sdk.sh
 source "$HERE/lib/macos-sdk.sh"
 # shellcheck source=lib/litert-setup.sh
