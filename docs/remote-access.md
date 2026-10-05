@@ -179,6 +179,25 @@ session and refresh credentials are revoked together. Corrupt identity files cau
 visible failure. Restore the private identity backup rather than deleting it to
 create an unrelated household.
 
+### A phone's superseded node identities (2026-10-05)
+
+A phone runs each pairing's node in its own directory, named after the pairing's
+profile: Android `noBackupFilesDir/pond-network/<profile>`, iOS Application
+Support `pond-network/<profile>`. Each holds that node's private key and machine
+key in `tailscaled.state`. A new pairing gets a new profile, and nothing used to
+delete the old directory: on 2026-10-05 the test Galaxy A57 held 33, every one
+with keys, from earlier pairings whose identities the app had already discarded.
+
+`mobile.Prune(base, keep)` erases every directory under `base` except `keep`'s.
+The companion keeps one pairing at a time, so the native plugins call it on every
+`activate`, with the active profile as `keep`, once that profile's node has
+started or, with no coordinator, stopped. A forgotten pairing activates with no
+profile and keeps none. Local-only keeps its profile, so enabling again reuses the
+enrolled node. Prune never touches the running node's directory, and it refuses
+any directory whose node lock is held, whatever it believes is running. It removes
+a symbolic link rather than following it. It writes the number erased, and every
+failure, to the event log, and returns the failures to the plugin, which logs them.
+
 ## Verification
 
 Use the security tests and `scripts/live-test.sh` against scratch data, including
