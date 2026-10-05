@@ -14,6 +14,8 @@
 #   bash scripts/giap.sh litert status       # the LiteRT-LM library (.litertlm models): recorded packages, verified
 #   bash scripts/giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]   # build, package, verify, record
 #   bash scripts/giap.sh litert import DIR  # take in a package built on another host (the Jetson)
+#   bash scripts/giap.sh models pairings         # regenerate the vision pairing table from Hugging Face
+#   bash scripts/giap.sh models pairings --check # only compare it (exit 1 if the committed table is stale)
 #   bash scripts/giap.sh --dry-run …  # print every command instead of running it
 #
 # It auto-detects the host (Jetson / Linux / macOS), whether CUDA is usable, and
@@ -43,6 +45,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib/macos-sdk.sh"
 # shellcheck source=lib/litert-setup.sh
 source "$HERE/lib/litert-setup.sh"
+# shellcheck source=lib/model-pairings.sh
+source "$HERE/lib/model-pairings.sh"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 # Which Node the repo runs on, finding one, and downloading one. REPO_ROOT has to be set first: the
@@ -53,7 +57,7 @@ source "$HERE/lib/node-setup.sh"
 DRY_RUN=false
 ASSUME_YES=false
 SERVICE_NAME="goose-in-a-pond.service"
-NODE_METHOD=auto; NODE_MAJOR=""; NODE_CHECK=false; NODE_DEPS=false
+NODE_METHOD=auto; NODE_MAJOR=""; CHECK_ONLY=false; NODE_DEPS=false
 
 # ── output ───────────────────────────────────────────────────────────────────
 if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
@@ -744,6 +748,9 @@ doctor() {
   # .litertlm models. Having none is a note; one that fails its manifest is a FAIL.
   doctor_litert
 
+  # 15. The vision pairing table pond-core embeds. Information only, never a FAIL.
+  pairings_report
+
   printf '\n  %sVerdict: %s FAIL · %s WARN · %s UNKNOWN%s\n' \
     "$C_B" "$DOC_FAIL" "$DOC_WARN" "$DOC_UNK" "$C_RST"
   [ "$DOC_UNK" -gt 0 ] && note "UNKNOWN is never counted as OK — absence of evidence is not health"
@@ -918,7 +925,7 @@ ensure_node_for_ui() {
 action_node() {
   head1 "Node for this repo  (needs $NODE_RANGE_TEXT)"
   case "$NODE_MAJOR" in ''|[0-9]*) ;; *) bad "--major must be a number"; return 2 ;; esac
-  if [ "$NODE_CHECK" = true ]; then node_report; return $?; fi
+  if [ "$CHECK_ONLY" = true ]; then node_report; return $?; fi
   node_ensure "$NODE_METHOD" "$NODE_MAJOR" || return 1
   node_use_repo >/dev/null 2>&1
   detect_toolchain
@@ -1035,6 +1042,21 @@ action_litert() {
       bad "unknown: litert $sub"
       note "usage: giap.sh litert status | giap.sh litert build [macos-arm64|linux-arm64] [--distdir DIR]"
       note "       giap.sh litert import DIR"
+      return 2 ;;
+  esac
+}
+
+# `giap.sh models pairings [--check]`: the vision pairing table, regenerated from Hugging Face or compared.
+action_models() {
+  case "${1:-}" in
+    pairings)
+      if [ "$CHECK_ONLY" = true ]; then head1 "Vision pairing table: compare with Hugging Face (changes nothing)"
+      else head1 "Vision pairing table: regenerate from Hugging Face"; fi
+      info "which encoder (mmproj) each known model needs; pond-core embeds $(pairings_file_shown)"
+      pairings_generate "$CHECK_ONLY" ;;
+    *)
+      bad "unknown: models ${1:-(no subcommand)}"
+      note "usage: giap.sh models pairings [--check]"
       return 2 ;;
   esac
 }
@@ -1336,14 +1358,15 @@ usage() {
 }
 
 # ── entry ────────────────────────────────────────────────────────────────────
-# The first word is the command; only `litert` takes more (a subcommand and a platform).
+# The first word is the command; only `litert` (a subcommand and a platform) and `models` (a
+# subcommand) take more.
 CMD=""; CMD_SUB=""; CMD_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift ;;
     --distdir) [ $# -ge 2 ] || { bad "--distdir needs a directory"; exit 2; }; LITERT_DISTDIR="$2"; shift 2 ;;
     -y|--yes)  ASSUME_YES=true; shift ;;
-    --check)   NODE_CHECK=true; shift ;;
+    --check)   CHECK_ONLY=true; shift ;;
     --install-deps) NODE_DEPS=true; shift ;;
     --method)  [ $# -ge 2 ] || { bad "--method needs a value"; exit 2; }; NODE_METHOD="$2"; shift 2 ;;
     --major)   [ $# -ge 2 ] || { bad "--major needs a value"; exit 2; }; NODE_MAJOR="$2"; shift 2 ;;
@@ -1356,9 +1379,11 @@ while [ $# -gt 0 ]; do
        shift ;;
   esac
 done
-if [ "$CMD" != "litert" ] && [ -n "$CMD_SUB" ]; then
-  bad "'$CMD' takes no arguments (got: $CMD_SUB)"; exit 2
-fi
+case "$CMD" in
+  litert) ;;
+  models) if [ -n "$CMD_ARG" ]; then bad "unexpected argument: $CMD_ARG"; usage; exit 2; fi ;;
+  *)      if [ -n "$CMD_SUB" ]; then bad "'$CMD' takes no arguments (got: $CMD_SUB)"; exit 2; fi ;;
+esac
 
 # `node` looks at the shell's own node, so PATH is left alone until it has reported. Every other
 # command runs on the right Node: if the shell's is outside the range, a recorded or already-installed
@@ -1381,5 +1406,6 @@ case "$CMD" in
   logs)      action_logs ;;
   gui)       action_launch_gui ;;
   litert)    action_litert "$CMD_SUB" "$CMD_ARG" ;;
+  models)    action_models "$CMD_SUB" ;;
   *)         bad "unknown command: $CMD"; usage; exit 1 ;;
 esac
