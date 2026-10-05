@@ -2504,3 +2504,38 @@ not a PAI milestone).**
 - **Verification.** LiteRT backend tests 41 passed, including the rule and pruning to two; the live
   test (tool round, a side call that sets the chat aside and restores it, a regenerated turn, a
   cancel) passed on the Mac GPU with E2B; the Orin probes above.
+
+**2026-10-05 — The bounded compaction pair ships on the Orin (GIAP wiring; not a PAI milestone).**
+
+- **What landed** (GIAP `0f5b5df3`, at Jerry's call). On the budgeted device the pond installs two
+  of goose's prompt overrides at startup, in goose's own `<engine>/config/prompts/`:
+  `compaction.md`, the bounded prompt exactly as measured, and `compaction_summary.md`, which renders
+  only its four fields and the eight most recent requests. Off the device it removes its copies. A
+  file there without the pond's first-line mark is never replaced or removed.
+  `GIAP_COMPACTION_PROMPT=bounded|builtin` overrides the device's choice. It runs in `serve`, in
+  `chat` (the voice child) and in the bare interactive chat, after logging starts.
+- **Why the summary render too.** In the 16-turn Orin run E4B did not hold the prompt's "at most 8
+  items": the request list went 4, 8, 10, 14 lines over four compactions. goose renders the summary
+  through `compaction_summary.md` and documents it as overridable for exactly this
+  (`user_intent[:3]`). The pond's copy keeps `user_intent[-8:]` (the prompt asks for them oldest
+  first, so the eight most recent), the first eight pending tasks, current work and the next step,
+  and drops whatever else the model adds.
+- **Measured** (the A/B entry above). Summary call 79 s against 126 s on the Orin, 53% of the window
+  in use after a compaction against 58-63%, and 16 turns in 1,100 s with four compactions, where
+  goose's own prompt compacted on every turn from the sixth. The cost: a detail only the
+  conversation held was recalled 0 of 5 times against 2 of 5.
+- **PAI.** Preamble: unchanged. Egress, secrets, guest, turn blocking: none. No `Settings` field;
+  one environment override. Side effect: a compaction on the Orin keeps less of the conversation.
+- **Verification.** pond-adapters-goose `compaction_prompts` tests 6 passed: the device decision,
+  install, refresh, removal, a file someone else wrote, and the summary rendered through goose's own
+  `render_string` and `StructuredSummary::parse` (14 requests in, the eight most recent out, four
+  sections). Clippy clean on the change; `scripts/live-test.sh` 158 checks passed. Mac (E2B, Orin
+  emulated): the pond installed both files at startup and removed them when restarted as itself; the
+  one compaction in 10 turns came out in the bounded shape, seven requests in 851 characters. Orin
+  (E4B, release `0f5b5df3`, no manual override): the pond installed both files itself (`bounded=true
+  budgeted_device=true`); 16 turns took 952 s with three compactions (turns 6, 9 and 14), each
+  leaving 52-53% of the window in use; the second structured summary carried exactly eight requests;
+  the fact from turn 1 was recalled at turn 15. One of the three summaries was not JSON: E4B wrote
+  its own markdown (510 characters), which goose keeps as it is, so the cap did not apply, but it
+  was short. That message also carried about 900 empty thinking parts from the stream (41 KB of JSON
+  for 510 characters), harmless to the prompt and worth trimming in the backend.
