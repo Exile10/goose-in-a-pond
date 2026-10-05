@@ -102,8 +102,10 @@ which is how an entry left at `downloading` by a task that died is told from a l
 failed entry's `error` says what happened and what to do in plain words
 (`crates/pond-api/src/download_failure.rs`); the raw error goes to the log. `POST /models/download/control` takes
 `{filename, action}` for one file or `{model_id, action}` for every part of a model, with
-`action` one of `pause`, `resume` or `cancel`. Pause keeps the partial file, cancel deletes it,
-cancelling a model's own file cancels its add-on too, and a paused entry is never evicted. A
+`action` one of `pause`, `resume` or `cancel`. Pause keeps a Hugging Face transfer's partial file
+to resume from (a transfer from any other host has no range resume, so its pause discards the
+partial and a resume starts over), cancel deletes it, cancelling a model's own file cancels its
+add-on too, and a paused entry is never evicted. A
 row's `companions` read `downloading` while the add-on comes down, `verifying` while its hash is
 checked, then `installed`. When the model file arrives its row is marked downloaded,
 and when either part arrives the agent registers the model by the file its row names and verifies
