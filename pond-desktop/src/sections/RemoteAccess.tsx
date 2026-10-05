@@ -32,7 +32,12 @@ export function RemoteAccess() {
       try {
         const pending = await api.remoteRecoveryRequests();
         if (active) { setRequests(pending); setReviewFailed(false); }
-      } catch (error) { noteRefusal(error); if (active) setReviewFailed(true); }
+      } catch (error) {
+        // Signed out: every later poll would be refused the same way, and logged by the Pond each
+        // time, until a new sign-in link reloads the page. Say so once and stop.
+        if (isSignInRequired(error)) { if (active) setSignInLost(true); return; }
+        if (active) setReviewFailed(true);
+      }
       if (active) timer = setTimeout(() => void poll(), 5000);
     };
     void poll();

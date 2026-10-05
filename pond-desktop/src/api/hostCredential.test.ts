@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { captureSignInLink, isSignInRequired } from "./hostCredential";
+import { captureSignInLink, followSignInLinks, isSignInRequired } from "./hostCredential";
 import { ApiError } from "./types";
 
 const credential = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ-_01234";
@@ -37,6 +37,36 @@ describe("captureSignInLink", () => {
     expect(kept).toBe(false);
     expect(storage.setItem).not.toHaveBeenCalled();
     expect(history.replaceState).not.toHaveBeenCalled();
+  });
+});
+
+describe("followSignInLinks", () => {
+  function tab(hash: string) {
+    let listener: (() => void) | undefined;
+    const target = {
+      addEventListener: vi.fn((_: string, handler: () => void) => { listener = handler; }),
+      location: { hash, pathname: "/", search: "" },
+      history: { replaceState: vi.fn() },
+      sessionStorage: { setItem: vi.fn() },
+    };
+    const reload = vi.fn();
+    followSignInLinks(target, reload);
+    return { open: (next: string) => { target.location.hash = next; listener?.(); }, reload, target };
+  }
+
+  it("signs in again from a link opened in a running tab, and reloads", () => {
+    const { open, reload, target } = tab("");
+    expect(target.addEventListener).toHaveBeenCalledWith("hashchange", expect.any(Function));
+    open(`#host=${credential}`);
+    expect(target.sessionStorage.setItem).toHaveBeenCalledWith("giap-host-credential", credential);
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reload for any other change of fragment", () => {
+    const { open, reload } = tab("");
+    open("#section=pairing");
+    open("#host=not-a-credential");
+    expect(reload).not.toHaveBeenCalled();
   });
 });
 

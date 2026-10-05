@@ -38,6 +38,32 @@ export function captureSignInLink(
   return true;
 }
 
+/**
+ * Take a sign-in link opened in a tab that is already running.
+ *
+ * A new link differs from the current address only after `#`, and the browser does not reload
+ * the page for that. The credential captured at startup would stay the old one, and every
+ * request would go on being refused although the user did what the page asked. Once the new
+ * credential is kept, `reload` starts every section again with it.
+ */
+export function followSignInLinks(
+  target: {
+    addEventListener(type: "hashchange", listener: () => void): void;
+    location: Pick<Location, "hash" | "pathname" | "search">;
+    history: Pick<History, "replaceState">;
+    sessionStorage: Pick<Storage, "setItem">;
+  },
+  reload: () => void,
+): void {
+  target.addEventListener("hashchange", () => {
+    try {
+      if (captureSignInLink(target.location, target.history, target.sessionStorage)) reload();
+    } catch (e) {
+      console.warn("[host] session storage is unavailable; this tab cannot be signed in", e);
+    }
+  });
+}
+
 /** The current credential, or null when this browser tab has not been signed in. */
 export async function hostCredential(): Promise<string | null> {
   if (isDesktopShell()) return invoke("host_credential");

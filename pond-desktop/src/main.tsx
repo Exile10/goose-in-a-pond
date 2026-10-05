@@ -1,6 +1,6 @@
 // Must stay first: applies the stored theme to <html> before React renders (no flash).
 import "./hub/state/themeBootstrap";
-import { captureSignInLink } from "./api/hostCredential";
+import { captureSignInLink, followSignInLinks } from "./api/hostCredential";
 
 import React, { useState } from "react";
 import ReactDOM from "react-dom/client";
@@ -29,6 +29,7 @@ try {
 } catch (e) {
   console.warn("[host] session storage is unavailable; this tab cannot be signed in", e);
 }
+followSignInLinks(window, () => window.location.reload());
 
 void migrateLocalProfileToServer();
 

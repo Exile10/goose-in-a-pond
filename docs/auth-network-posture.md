@@ -48,7 +48,13 @@ The desktop app reads the credential over IPC (`host_credential`). A browser get
 from the sign-in link `pond-server dashboard` prints,
 `http://localhost:<port>/#host=<credential>`: the fragment is never sent over the
 network or logged, and the page moves it into that tab's session storage and out of
-the address bar. The link stops working at the next restart. `pond-server pairing`
+the address bar. The link stops working at the next restart. A new link opened in a
+tab that is already running is taken too (2026-10-05): it differs only after `#`, which
+does not reload the page, so the page listens for the change, keeps the new credential
+and reloads. A tab refused for want of the current credential says so and stops polling
+for recovery requests; before, it asked every five seconds and the Pond logged a
+`host_credential_rejected` warning each time, for as long as the tab stayed open.
+`pond-server pairing`
 reads the file itself. `POND_DEV_ALLOW_LOOPBACK` admits a missing credential for
 local development; the Host and Origin checks still apply.
 
