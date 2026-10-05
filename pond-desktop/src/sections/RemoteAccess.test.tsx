@@ -29,14 +29,21 @@ describe("RemoteAccess admission", () => {
 
   it("asks a provisioned Pond for no invite and shows the serial to revoke it by", async () => {
     const serial = "0f".repeat(16);
-    vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: true, serial });
+    vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: true, serial, registered: false });
     render(<RemoteAccess />);
     await waitFor(() => expect(screen.getByText(new RegExp(serial))).toBeTruthy());
     expect(screen.queryByPlaceholderText("giap-inv1-...")).toBeNull();
   });
 
-  it("offers the invite field to a Pond nobody provisioned", async () => {
-    vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: false });
+  it("asks a household already registered for no invite", async () => {
+    vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: false, registered: true });
+    render(<RemoteAccess />);
+    await waitFor(() => expect(screen.getByText(/already registered/)).toBeTruthy());
+    expect(screen.queryByPlaceholderText("giap-inv1-...")).toBeNull();
+  });
+
+  it("offers the invite field to a Pond nobody provisioned that never registered", async () => {
+    vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: false, registered: false });
     render(<RemoteAccess />);
     await waitFor(() => expect(api.remoteDevice).toHaveBeenCalled());
     expect(screen.getByPlaceholderText("giap-inv1-...")).toBeTruthy();
