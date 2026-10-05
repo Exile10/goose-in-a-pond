@@ -409,6 +409,8 @@ pub struct RunSupervisor {
     pub epoch: String,
     /// Turns being answered now, registered or not: only a resumable turn joins `registry`.
     turns_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// The quiet-time compaction pass, which every turn path checks in with before the model.
+    quiet_passes: crate::quiet_pass::QuietPasses,
 }
 
 /// A turn being answered, counted until it drops; see [`RunSupervisor::turn_started`].
@@ -428,6 +430,7 @@ impl RunSupervisor {
             permits: Arc::new(tokio::sync::Semaphore::new(max_runs)),
             epoch: uuid::Uuid::new_v4().to_string(),
             turns_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            quiet_passes: crate::quiet_pass::QuietPasses::default(),
         }
     }
 
@@ -441,9 +444,18 @@ impl RunSupervisor {
 
     /// Whether any turn is being answered; background work that needs the model waits.
     pub fn turn_in_flight(&self) -> bool {
+        self.turns_in_flight() > 0
+    }
+
+    /// How many turns are being answered.
+    pub fn turns_in_flight(&self) -> usize {
         self.turns_in_flight
             .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
+    }
+
+    /// The quiet-time compaction pass, if one is running, and the turns waiting on it.
+    pub fn quiet_passes(&self) -> &crate::quiet_pass::QuietPasses {
+        &self.quiet_passes
     }
 }
 

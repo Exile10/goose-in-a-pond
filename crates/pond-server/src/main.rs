@@ -5943,11 +5943,17 @@ async fn compose_suggestions(
 /// goose compacts a conversation whose last turn passed 80% of its window before that
 /// conversation's next turn can start, summarising all of it. On the Orin's 8k LiteRT-LM window
 /// that came every two to five turns, and the turn's first word waited for it: 24-51 s with E2B
-/// on the Mac, about two minutes with E4B on the Orin (the turn's `ttft_ms` leaves it out). The
-/// context monitor already knows which conversations are under pressure (`should_compact`); this
-/// pass compacts them one at a time after a short quiet and gives up the moment someone is back,
-/// so the summary is paid while nobody is waiting. Needs the monitor on, which supplies the
-/// pressure, and hybrid compaction on, whose idle summary refresh already shares the lane.
+/// on the Mac, 64-87 s with E4B on the Orin (the turn's `ttft_ms` leaves it out). The context
+/// monitor already knows which conversations are under pressure (`should_compact`); this pass
+/// compacts them one at a time after a short quiet, so the summary is paid while nobody is waiting.
+/// Needs the monitor on, which supplies the pressure, and hybrid compaction on, whose idle summary
+/// refresh already shares the lane.
+///
+/// Two kinds of pass. One that is only getting ahead of its conversation waits for 30 s of quiet
+/// and gives up the moment someone is back. One whose conversation's next turn would start by
+/// compacting it anyway (goose's own rule, asked of the agent) starts after 5 s, and that turn
+/// waits for it rather than stopping it: stopping it would throw the summary away for the turn to
+/// write it again from the start. Only a turn for another conversation stops it.
 async fn run_quiet_compaction(
     state: Arc<AppState>,
     lane: Arc<crate::inference_lane_runner::InferenceLane>,
@@ -5955,11 +5961,19 @@ async fn run_quiet_compaction(
 ) {
     use pond_core::user_data::services::consolidation_schedule as sched;
     use pond_core::user_data::services::inference_lane::LaneJob;
+    use std::time::Duration;
 
     /// How often the monitor is asked.
-    const POLL_SECS: u64 = 15;
-    /// Quiet before a pass, so a pause in a conversation is not mistaken for its end.
+    const POLL_SECS: u64 = 5;
+    /// Quiet before a pass that is only getting ahead, so a pause in a conversation is not
+    /// mistaken for its end.
     const QUIET_SECS: u64 = 30;
+    /// Quiet before a pass the next turn would otherwise repeat: enough for the end of an answer
+    /// (its last sentences sent to speech) to clear the model first.
+    const QUIET_SECS_FOR_ITS_TURN: u64 = 5;
+    /// A turn in flight that has not announced itself to the pass (every turn path does) stops
+    /// even a pass its turn would wait for, once it has had this long to announce itself.
+    const UNANNOUNCED_TURN_GRACE: Duration = Duration::from_secs(2);
 
     // Baselines for the never-at-startup guard, captured before the first poll.
     let started_at = std::time::Instant::now();
@@ -5967,11 +5981,9 @@ async fn run_quiet_compaction(
     let wake = lane.claim(LaneJob::Compaction);
 
     loop {
-        let tick = crate::inference_lane_runner::wait_for_tick(
-            std::time::Duration::from_secs(POLL_SECS),
-            &wake,
-        )
-        .await;
+        let tick =
+            crate::inference_lane_runner::wait_for_tick(Duration::from_secs(POLL_SECS), &wake)
+                .await;
 
         let settings = match state.settings_repo.get().await {
             Ok(s) => s,
@@ -5980,29 +5992,41 @@ async fn run_quiet_compaction(
                 continue;
             }
         };
+        let enabled = settings.context_monitor_enabled && settings.hybrid_compaction_enabled;
+        // Never during a turn, even by hand: the lane counts a running turn as no quiet, but a
+        // hand-asked tick waives that, and this pass rewrites the history a turn is answering in.
+        let turn_running = state.runs.turn_in_flight();
         // Read before `acquire`, so a tick with nothing due never takes the lane.
-        let due = state.context_monitor.sessions_due_compaction();
+        let due = if enabled && !turn_running {
+            state.context_monitor.sessions_due_compaction()
+        } else {
+            Vec::new()
+        };
+        // Which of them goose would compact at the start of their next turn anyway.
+        let mut its_turn_compacts = Vec::with_capacity(due.len());
+        for session_id in &due {
+            its_turn_compacts.push(state.agent.compacts_on_next_turn(session_id).await);
+        }
 
         let db_activity = newest_session_activity(state.session_storage.as_ref()).await;
         let in_process_at = *last_user_activity.read().await;
         let now = chrono::Utc::now();
         let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
-        // Never during a turn, even by hand: the lane counts a running turn as no quiet, but a
-        // hand-asked tick waives that, and this pass rewrites the history a turn is answering in.
-        let turn_running = state.runs.turn_in_flight();
+        let quiet = if its_turn_compacts.contains(&true) {
+            QUIET_SECS_FOR_ITS_TURN
+        } else {
+            QUIET_SECS
+        };
         let cadence = crate::inference_lane_runner::Cadence::new(
-            std::time::Duration::from_secs(POLL_SECS),
-            std::time::Duration::from_secs(QUIET_SECS),
+            Duration::from_secs(POLL_SECS),
+            Duration::from_secs(quiet),
             false,
         );
         // One `acquire` per tick, "nothing due" as `enabled: false`, as the reviewer does.
         let Some(slot) = lane
             .acquire(
                 LaneJob::Compaction,
-                settings.context_monitor_enabled
-                    && settings.hybrid_compaction_enabled
-                    && !due.is_empty()
-                    && !turn_running,
+                enabled && !due.is_empty() && !turn_running,
                 cadence,
                 tick.waives(),
                 sched::saw_activity_since_start(
@@ -6018,22 +6042,38 @@ async fn run_quiet_compaction(
             continue;
         };
 
-        for session_id in due {
+        for (session_id, its_turn_waits) in due.into_iter().zip(its_turn_compacts) {
             let started = std::time::Instant::now();
-            // A returning user wins: dropping the pass cancels its generation, and goose's own
-            // compaction still covers the turn if it needs one.
-            let user_back = async {
+            let pass = state.runs.quiet_passes().begin(&session_id, its_turn_waits);
+            // A returning user wins, unless the turn they start is one this pass is doing the
+            // work for. Dropping the pass cancels its generation, and goose's own compaction
+            // still covers the turn if it needs one.
+            let someone_back = async {
+                let mut unannounced_since: Option<std::time::Instant> = None;
                 loop {
                     // Short: until the pass is dropped, a returning turn waits behind it.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    if last_user_activity.read().await.elapsed() < idle_for
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if pass.stop_requested() {
+                        break;
+                    }
+                    if its_turn_waits {
+                        if state.runs.turns_in_flight() > pass.turns_waiting() {
+                            let since =
+                                *unannounced_since.get_or_insert_with(std::time::Instant::now);
+                            if since.elapsed() >= UNANNOUNCED_TURN_GRACE {
+                                break;
+                            }
+                        } else {
+                            unannounced_since = None;
+                        }
+                    } else if last_user_activity.read().await.elapsed() < idle_for
                         || state.runs.turn_in_flight()
                     {
                         break;
                     }
                 }
             };
-            tokio::select! {
+            let stopped = tokio::select! {
                 outcome = state.agent.compact_session(&session_id) => {
                     // Whatever it found, so a pass that fails or finds nothing is not retried
                     // every quiet tick.
@@ -6046,6 +6086,8 @@ async fn run_quiet_compaction(
                                 kind = "quiet_compaction",
                                 session_id = %session_id,
                                 retained_tokens = retained,
+                                its_turn_waits,
+                                turns_waited = pass.turns_waiting(),
                                 elapsed_ms = started.elapsed().as_millis() as u64,
                                 "compacted a conversation near the edge of its window while the \
                                  household was quiet"
@@ -6061,19 +6103,26 @@ async fn run_quiet_compaction(
                             "quiet compaction failed"
                         ),
                     }
+                    false
                 }
                 // No cooldown: the conversation is still due, and the next quiet tries again.
-                () = user_back => {
+                () = someone_back => {
                     tracing::info!(
                         target: "giap::trace",
                         kind = "quiet_compaction_cancelled",
                         session_id = %session_id,
+                        its_turn_waits,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "someone came back during a quiet compaction; the turn compacts itself \
                          if it needs to"
                     );
-                    break;
+                    true
                 }
+            };
+            // Ends the pass, releasing any turn waiting on it, once the compaction is over.
+            drop(pass);
+            if stopped {
+                break;
             }
         }
 

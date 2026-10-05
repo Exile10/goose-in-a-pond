@@ -3942,6 +3942,35 @@ impl AgentPort for GooseAdapter {
                 anyhow::anyhow!("compaction produced a conversation we could not store: {e}")
             })?;
 
+        // What goose's own `/compact` records next (`handle_compact_command`): the size compaction
+        // left as the session's size, and the summary call in its usage ledger. goose's check at
+        // the start of a turn reads that size, so without it the next turn compacts again.
+        let left = goose_providers::conversation::token_usage::Usage::new(
+            Some(result.retained_context_tokens),
+            None,
+            Some(result.retained_context_tokens),
+        );
+        if let Err(e) = self
+            .session_manager
+            .record_usage_metrics(
+                &goose_sid,
+                session.schedule_id.clone(),
+                left,
+                &result.usage.model,
+                &goose::conversation::message::MessageUsage::from_provider_usage(
+                    &result.usage,
+                    true,
+                ),
+            )
+            .await
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "compacted, but could not record the size it left; the next turn may compact again"
+            );
+        }
+
         // The KV-cached prefix is gone; noting it keeps the next cold turn attributable.
         self.note_prefix_invalidated(InvalidationReason::PromptChanged);
 
@@ -3955,6 +3984,37 @@ impl AgentPort for GooseAdapter {
             "compacted on request"
         );
         Ok(retained)
+    }
+
+    /// goose's own check at the start of a turn (`check_if_compaction_needed`), asked between
+    /// turns. Only for a conversation already paired with a goose session: resolving one would
+    /// create it.
+    async fn compacts_on_next_turn(&self, session_id: &str) -> bool {
+        let Some(goose_sid) = self
+            .goose_session_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let Ok(session) = self.session_manager.get_session(&goose_sid, true).await else {
+            return false;
+        };
+        let (Some(conversation), Ok(provider)) =
+            (session.conversation.as_ref(), self.agent.provider().await)
+        else {
+            return false;
+        };
+        goose::context_mgmt::check_if_compaction_needed(
+            provider.as_ref(),
+            conversation,
+            None,
+            &session,
+        )
+        .await
+        .unwrap_or(false)
     }
 
     async fn chat_stream(
