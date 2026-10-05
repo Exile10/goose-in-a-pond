@@ -5117,17 +5117,21 @@ async fn get_active_roles(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 /// GET /api/v1/models/memory-status — returns current LLM memory budget snapshot.
+/// `reclaimable_mb` is what switching away from the model in use would free, so a fit check can
+/// count it.
 async fn get_memory_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let status = state
         .model_scheduler
         .as_ref()
         .map(|s| s.memory_status())
         .unwrap_or_default();
+    let reclaimable_mb = crate::model_views::reclaimable_mb(&state, &status).await;
 
     Json(json!({
         "total_mb":             status.total_mb,
         "available_for_llm_mb": status.available_for_llm_mb,
         "loaded_model":         status.loaded_model,
+        "reclaimable_mb":       reclaimable_mb,
     }))
 }
 
@@ -6049,15 +6053,16 @@ async fn warn_if_model_spills(state: &Arc<AppState>, record: &ModelRecord) {
     } else {
         record.ram_estimate_mb.unwrap_or(0)
     };
+    // What the switch away from the model in use frees counts, as the desktop's check counts it.
+    let available =
+        status.available_for_llm_mb + crate::model_views::reclaimable_mb(state, &status).await;
 
-    if model_spills_budget(residency_mb, status.available_for_llm_mb) == Some(true) {
-        let budget = status
-            .available_for_llm_mb
-            .saturating_sub(MEMORY_FIT_HEADROOM_MB);
+    if model_spills_budget(residency_mb, available) == Some(true) {
+        let budget = available.saturating_sub(MEMORY_FIT_HEADROOM_MB);
         tracing::warn!(
             model = %record.name,
             model_size_mb = residency_mb,
-            available_for_llm_mb = status.available_for_llm_mb,
+            available_for_llm_mb = available,
             budget_mb = budget,
             "model exceeds device LLM memory budget — it will spill to CPU and \
              run slowly. On Jetson, enable the fail-closed loader path \

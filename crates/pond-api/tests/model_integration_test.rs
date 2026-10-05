@@ -113,20 +113,55 @@ async fn pond_with(agent: Arc<dyn pond_core::models::ports::agent::Agent>) -> Fi
     pond_with_catalog(agent, None).await
 }
 
+type Catalog =
+    Option<Arc<dyn pond_core::models::ports::model_catalog_provider::ModelCatalogProvider>>;
+type Scheduler = Option<Arc<dyn pond_core::models::ports::model_scheduler::ModelScheduler>>;
+
+/// What a test may swap in behind the router.
+#[derive(Default)]
+struct Parts {
+    catalog: Catalog,
+    scheduler: Scheduler,
+    /// The real settings store, for a test that reads `chat_provider` back through `get`.
+    sqlite_settings: bool,
+}
+
 async fn pond_with_catalog(
     agent: Arc<dyn pond_core::models::ports::agent::Agent>,
-    catalog: Option<
-        Arc<dyn pond_core::models::ports::model_catalog_provider::ModelCatalogProvider>,
-    >,
+    catalog: Catalog,
 ) -> Fixture {
+    pond_with_parts(
+        agent,
+        Parts {
+            catalog,
+            ..Parts::default()
+        },
+    )
+    .await
+}
+
+async fn pond_with_parts(
+    agent: Arc<dyn pond_core::models::ports::agent::Agent>,
+    parts: Parts,
+) -> Fixture {
+    let Parts {
+        catalog,
+        scheduler,
+        sqlite_settings,
+    } = parts;
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
 
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
     let model_repo: Arc<dyn ModelRepository + Send + Sync> =
         Arc::new(SqliteModelRepository::new(db.system.clone()));
-    let settings_repo: Arc<dyn SettingsRepository + Send + Sync> =
-        Arc::new(MockSettingsRepository::new());
+    let settings_repo: Arc<dyn SettingsRepository + Send + Sync> = if sqlite_settings {
+        Arc::new(pond_infra::sqlite_settings::SqliteSettingsRepository::new(
+            db.system.clone(),
+        ))
+    } else {
+        Arc::new(MockSettingsRepository::new())
+    };
     let tracker: Tracker = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
     let mock_hs = MockHandshake::new();
@@ -166,7 +201,7 @@ async fn pond_with_catalog(
         data_dir: Some(tmp.path().to_path_buf()),
         skip_onboarding: true,
         scheduler: None,
-        model_scheduler: None,
+        model_scheduler: scheduler,
         mcp_memory: None,
         extension_manager: None,
         mcp_server_repo: None,
@@ -1313,4 +1348,73 @@ async fn every_chat_route_answers_no_model_and_saves_nothing() {
         sessions.iter().all(|s| !s.id.starts_with("no-model")),
         "no session was created for a refused turn"
     );
+}
+
+/// The Orin's reading with a model loaded: little free of the budget.
+struct LoadedScheduler;
+
+#[async_trait::async_trait]
+impl pond_core::models::ports::model_scheduler::ModelScheduler for LoadedScheduler {
+    async fn notify_wake_word(&self) {}
+    fn memory_status(&self) -> pond_core::models::ports::model_scheduler::MemoryStatus {
+        pond_core::models::ports::model_scheduler::MemoryStatus {
+            total_mb: 7620,
+            available_for_llm_mb: 1000,
+            loaded_model: None,
+        }
+    }
+}
+
+/// What a switch away from the model in use would free is reported, from the file itself.
+#[tokio::test]
+async fn memory_status_counts_what_a_switch_would_free() {
+    let f = pond_with_parts(
+        Arc::new(MockAgent::new()),
+        Parts {
+            scheduler: Some(Arc::new(LoadedScheduler)),
+            sqlite_settings: true,
+            ..Parts::default()
+        },
+    )
+    .await;
+    let gguf = f.tmp.path().join("models/gguf");
+    std::fs::create_dir_all(&gguf).unwrap();
+    let file = std::fs::File::create(gguf.join("in-use.gguf")).unwrap();
+    file.set_len(3000 * 1_048_576).unwrap();
+    f.repo.upsert(&gguf_record("in-use")).await.unwrap();
+    f.settings
+        .set_key("chat_provider", "local".into())
+        .await
+        .unwrap();
+    f.settings
+        .set_key("chat_model", "in-use".into())
+        .await
+        .unwrap();
+
+    let resp = f
+        .app
+        .clone()
+        .oneshot(auth_req("GET", "/api/v1/models/memory-status", None))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["available_for_llm_mb"], 1000);
+    let budget = pond_core::models::domain::device_budget::llm_budget_mb();
+    assert_eq!(
+        body["reclaimable_mb"],
+        3000u64.min(budget.saturating_sub(1000))
+    );
+
+    // Another program's model frees nothing the pond holds.
+    f.settings
+        .set_key("chat_provider", "ollama".into())
+        .await
+        .unwrap();
+    let resp = f
+        .app
+        .clone()
+        .oneshot(auth_req("GET", "/api/v1/models/memory-status", None))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["reclaimable_mb"], 0);
 }

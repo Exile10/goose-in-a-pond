@@ -164,6 +164,64 @@ pub(crate) async fn gguf_vision_batch(
     .unwrap_or_default()
 }
 
+/// MB the in-use in-process chat model holds (with its add-on when attached), from its file.
+/// Zero for a model another program runs, or when none is chosen.
+pub(crate) async fn in_use_mb(state: &AppState) -> u64 {
+    let Ok(settings) = state.settings_repo.get().await else {
+        return 0;
+    };
+    let category = ModelCategory::for_chat_model(&settings.chat_provider, &settings.chat_model);
+    let in_process = Engine::for_category(&category).is_some_and(Engine::in_process);
+    if !in_process || settings.chat_model.trim().is_empty() {
+        return 0;
+    }
+    let record = match &state.model_repo {
+        Some(repo) => repo
+            .get_by_id(&ModelRecord::id_for(&category, &settings.chat_model))
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let filename = record
+        .as_ref()
+        .and_then(|r| r.filename.clone())
+        .unwrap_or_else(|| match category {
+            ModelCategory::Gguf => gguf_file_name(&settings.chat_model),
+            _ => settings.chat_model.clone(),
+        });
+    let on_disk = state
+        .data_dir
+        .as_ref()
+        .and_then(|dd| model_layout::path_for(dd, &category, &filename))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len() / 1_048_576);
+    let weights = on_disk.or(record.map(|r| r.size_mb)).unwrap_or(0);
+    let add_on = match state.agent.vision_state("local", &settings.chat_model) {
+        Some(EncoderState::Ready { bytes: Some(b) }) if category == ModelCategory::Gguf => {
+            b / 1_048_576
+        }
+        _ => 0,
+    };
+    weights + add_on
+}
+
+/// [`device_budget::reclaimable_mb`](pond_core::models::domain::device_budget::reclaimable_mb)
+/// for this pond right now; zero where memory is managed by another program.
+pub(crate) async fn reclaimable_mb(
+    state: &AppState,
+    status: &pond_core::models::ports::model_scheduler::MemoryStatus,
+) -> u64 {
+    if status.total_mb == 0 {
+        return 0;
+    }
+    pond_core::models::domain::device_budget::reclaimable_mb(
+        in_use_mb(state).await,
+        pond_core::models::domain::device_budget::llm_budget_mb(),
+        status.available_for_llm_mb,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

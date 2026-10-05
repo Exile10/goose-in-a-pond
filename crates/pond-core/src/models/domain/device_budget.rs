@@ -126,6 +126,13 @@ pub fn context_size_with_encoder(
     window_for_tokens(tokens_for(kv_mb, slope(kv_kib_per_token)))
 }
 
+/// MB a model switch would free: the in-use in-process model's weights (and add-on), but never
+/// more than the budget is short of right now. Where `available` is the budget itself (no live
+/// reading, as off Linux), nothing is held back from it, so nothing is reclaimable.
+pub fn reclaimable_mb(in_use_mb: u64, budget_mb: u64, available_for_llm_mb: u64) -> u64 {
+    in_use_mb.min(budget_mb.saturating_sub(available_for_llm_mb))
+}
+
 // ── The header slope ────────────────────────────────────────────────────────
 
 /// Architectures whose global:SWA layer ratio was confirmed against llama.cpp's KV-cache log
@@ -602,6 +609,17 @@ mod tests {
     #[test]
     fn a_useless_slope_falls_back_rather_than_dividing_by_zero() {
         assert_eq!(jetson(E4B_Q4_K_M, Some(0)), jetson(E4B_Q4_K_M, None));
+    }
+
+    #[test]
+    fn a_switch_frees_the_model_in_use_and_never_more_than_is_missing() {
+        // The Orin with E4B loaded: 1 GB free of the 5,820 MB budget, the model holds 4,020.
+        assert_eq!(reclaimable_mb(4020, BUDGET, 1000), 4020);
+        // Never past what the budget is short of.
+        assert_eq!(reclaimable_mb(4020, BUDGET, 3000), BUDGET - 3000);
+        // No live reading: available is the budget, so nothing is held back.
+        assert_eq!(reclaimable_mb(4020, BUDGET, BUDGET), 0);
+        assert_eq!(reclaimable_mb(0, BUDGET, 100), 0);
     }
 
     #[test]
