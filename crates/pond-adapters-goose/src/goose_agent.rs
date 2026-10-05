@@ -1423,7 +1423,10 @@ impl GooseAdapter {
                 // Canonical key, so aliases of one GGUF can't load it twice under two ids.
                 let registry_key = match self.data_dir {
                     Some(ref dd) if litert => crate::litert_model::register(&model_name, dd),
-                    Some(ref dd) => Self::register_gguf_model(&model_name, dd),
+                    Some(ref dd) => {
+                        let recorded = self.recorded_gguf_file(&model_name).await;
+                        Self::register_gguf_model_from(&model_name, dd, recorded.as_deref())
+                    }
                     None => model_name.trim_end_matches(".gguf").to_string(),
                 };
                 // Registration leaves `mmproj_path` (the engine's vision gate) None. Attaches an
@@ -2095,9 +2098,28 @@ impl GooseAdapter {
         self
     }
 
+    /// The file the catalogue row for a llama.cpp model names, if the row has one.
+    async fn recorded_gguf_file(&self, model_name: &str) -> Option<String> {
+        let repo = self.model_repo.as_ref()?;
+        let id = pond_core::models::domain::model_record::ModelRecord::id_for(
+            &pond_core::models::domain::model_record::ModelCategory::Gguf,
+            model_name.trim_end_matches(".gguf"),
+        );
+        repo.get_by_id(&id).await.ok().flatten()?.filename
+    }
+
     /// Registers a `$data_dir/models/gguf/` model (bare stem or filename) with Goose.
     /// Returns the canonical key (quant suffix collapsed); build `ModelConfig` from it.
     fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) -> String {
+        Self::register_gguf_model_from(model_name, data_dir, None)
+    }
+
+    /// [`Self::register_gguf_model`] for the file its catalogue row names, when that is on disk.
+    fn register_gguf_model_from(
+        model_name: &str,
+        data_dir: &std::path::Path,
+        recorded: Option<&str>,
+    ) -> String {
         use goose::providers::local_inference::local_model_registry::{
             get_registry, LocalModelEntry, LocalModelStorage,
         };
@@ -2106,7 +2128,7 @@ impl GooseAdapter {
 
         // The file comes from the ORIGINAL name, so an explicit quant still pins its exact file.
         let stem = canonical_model_stem(model_name, &gguf_dir);
-        let filename = resolve_gguf_filename(model_name, &gguf_dir);
+        let filename = registration_file(model_name, &gguf_dir, recorded);
         let local_path = gguf_dir.join(&filename);
         if !local_path.exists() {
             tracing::warn!(
@@ -2118,10 +2140,14 @@ impl GooseAdapter {
         match get_registry().lock() {
             Ok(mut registry) => {
                 let registry: &mut goose::providers::local_inference::local_model_registry::LocalModelRegistry = &mut registry;
-                // Re-register stale rows whose file is gone too; `add_model` upserts in place.
+                // Re-register a row whose file is gone or is another file; `add_model` upserts.
                 let needs_register = registry
                     .get_model(&stem)
-                    .map(|entry| !entry.local_path.exists())
+                    .map(|entry| {
+                        !entry.local_path.exists()
+                            || crate::registry_rows::resolve(&entry.local_path)
+                                != crate::registry_rows::resolve(&local_path)
+                    })
                     .unwrap_or(true);
 
                 if needs_register {
@@ -3668,6 +3694,13 @@ impl AgentPort for GooseAdapter {
         self.pictures.spawn_settle(dd, model);
     }
 
+    fn forget_model_file(&self, path: &std::path::Path) {
+        let ids = crate::registry_rows::forget_file(&crate::registry_rows::GooseRegistry, path);
+        if !ids.is_empty() {
+            tracing::info!(file = %path.display(), rows = ?ids, "forgot the registry rows of a deleted model");
+        }
+    }
+
     async fn chat(&self, request: AgentRequest) -> Result<AgentResponse> {
         let mut stream: futures::stream::BoxStream<'static, Result<AgentStreamEvent>> =
             self.chat_stream(request).await?;
@@ -4158,6 +4191,20 @@ impl GooseAdapter {
             loaded_extensions,
         })
     }
+}
+
+/// The file to register for `model_name`: the one its catalogue row names when that is on
+/// disk, else [`resolve_gguf_filename`]'s guess from the name.
+fn registration_file(
+    model_name: &str,
+    gguf_dir: &std::path::Path,
+    recorded: Option<&str>,
+) -> String {
+    recorded
+        .and_then(pond_core::models::domain::model_layout::file_name)
+        .filter(|f| gguf_dir.join(f).exists())
+        .map(str::to_string)
+        .unwrap_or_else(|| resolve_gguf_filename(model_name, gguf_dir))
 }
 
 /// The `.gguf` file for a model name that may lack its quant suffix (a catalog display name).
@@ -6554,6 +6601,54 @@ mod tests {
                 rmcp::model::Content::text(body.to_string()),
             ])),
         )
+    }
+
+    /// The row's own file wins over the name scan, which picks the first quant on disk.
+    #[test]
+    fn registration_takes_the_file_the_row_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        for f in [
+            "gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+            "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+        ] {
+            std::fs::write(tmp.path().join(f), b"gguf").unwrap();
+        }
+        assert_eq!(
+            resolve_gguf_filename("gemma-4-E4B-it-qat", tmp.path()),
+            "gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+            "the name scan alone takes whichever quant sorts first"
+        );
+        assert_eq!(
+            registration_file(
+                "gemma-4-E4B-it-qat",
+                tmp.path(),
+                Some("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
+            ),
+            "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
+        );
+        // An uncatalogued spelling the name scan cannot find is still found by its row.
+        std::fs::write(tmp.path().join("Odd.Name.v2.gguf"), b"gguf").unwrap();
+        assert_eq!(
+            registration_file("odd-name", tmp.path(), Some("Odd.Name.v2.gguf")),
+            "Odd.Name.v2.gguf"
+        );
+        // A row naming a missing file, or a path, falls back to the name.
+        assert_eq!(
+            registration_file(
+                "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+                tmp.path(),
+                Some("gone.gguf")
+            ),
+            "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
+        );
+        assert_eq!(
+            registration_file(
+                "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+                tmp.path(),
+                Some("../gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
+            ),
+            "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
+        );
     }
 
     #[test]

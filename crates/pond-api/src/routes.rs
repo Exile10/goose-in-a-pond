@@ -5796,6 +5796,9 @@ async fn delete_model(
                 )
             })?;
         }
+        if matches!(m.category, ModelCategory::Gguf | ModelCategory::Litert) {
+            state.agent.forget_model_file(&path);
+        }
         // Also delete companion config file for TTS models (.onnx.json)
         if let Some(cfg_path) = m
             .config_filename

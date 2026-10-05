@@ -38,6 +38,9 @@ pub trait Agent: Send + Sync {
     /// attach what is on disk. Never downloads; must return at once and never fail the caller.
     fn prepare_model(&self, _model: &str) {}
 
+    /// A model's file was deleted: forget every engine registration that names it.
+    fn forget_model_file(&self, _path: &std::path::Path) {}
+
     /// Compact this session now, on the user's instruction; returns tokens retained if reported.
     /// `Ok(None)`: the backend has no manual compaction; the caller must say so, not claim success.
     async fn compact_session(&self, _session_id: &str) -> Result<Option<u32>> {

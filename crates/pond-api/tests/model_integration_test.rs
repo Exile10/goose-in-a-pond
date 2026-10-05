@@ -1088,3 +1088,80 @@ async fn the_boot_restore_fetches_an_assigned_missing_model_through_the_tracker(
         0
     );
 }
+
+/// Records what the routes hand the agent.
+struct RecordingAgent {
+    inner: MockAgent,
+    prepared: std::sync::Mutex<Vec<String>>,
+    forgotten: std::sync::Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl Default for RecordingAgent {
+    fn default() -> Self {
+        Self {
+            inner: MockAgent::new(),
+            prepared: Default::default(),
+            forgotten: Default::default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl pond_core::models::ports::agent::Agent for RecordingAgent {
+    async fn chat(
+        &self,
+        request: pond_core::shared::domain::agent::AgentRequest,
+    ) -> anyhow::Result<pond_core::shared::domain::agent::AgentResponse> {
+        self.inner.chat(request).await
+    }
+    async fn chat_stream(
+        &self,
+        request: pond_core::shared::domain::agent::AgentRequest,
+    ) -> anyhow::Result<
+        futures::stream::BoxStream<
+            'static,
+            anyhow::Result<pond_core::shared::domain::agent::AgentStreamEvent>,
+        >,
+    > {
+        self.inner.chat_stream(request).await
+    }
+    fn prepare_model(&self, model: &str) {
+        self.prepared.lock().unwrap().push(model.to_string());
+    }
+    fn forget_model_file(&self, path: &std::path::Path) {
+        self.forgotten.lock().unwrap().push(path.to_path_buf());
+    }
+}
+
+/// An arrived file is registered through the agent; a deleted one is forgotten by it.
+#[tokio::test]
+async fn arrival_registers_through_the_agent_and_delete_forgets_the_file() {
+    let agent = Arc::new(RecordingAgent::default());
+    let f = pond_with(agent.clone()).await;
+    let server = weights_server("fresh.gguf").await;
+    let mut row = gguf_record("fresh");
+    row.downloaded = false;
+    row.url = Some(format!("{}/fresh.gguf", server.uri()));
+    f.repo.upsert(&row).await.unwrap();
+
+    let (status, body) = post_json(&f.app, "/api/v1/models/gguf/fresh/download", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let watched = agent.clone();
+    eventually("the agent to be handed the model", || {
+        let watched = watched.clone();
+        async move { watched.prepared.lock().unwrap().as_slice() == ["fresh"] }
+    })
+    .await;
+
+    let resp = f
+        .app
+        .clone()
+        .oneshot(auth_req("DELETE", "/api/v1/models/gguf/fresh", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        agent.forgotten.lock().unwrap().as_slice(),
+        [f.tmp.path().join("models/gguf/fresh.gguf")]
+    );
+}

@@ -41,6 +41,20 @@ pub trait RegistryRows: Send + Sync {
 
     /// Run `edit` on every row (true = changed) and save once if any changed; returns the count.
     fn edit(&self, edit: &mut dyn FnMut(&mut LocalModelEntry) -> bool) -> usize;
+
+    /// Drop every row `doomed` picks, saving once if any went; returns their ids. Files stay.
+    fn remove(&self, doomed: &dyn Fn(&LocalModelEntry) -> bool) -> Vec<String>;
+}
+
+/// Ids of the rows naming `file`, compared through its directory so two spellings of one path
+/// agree even after the file itself is gone.
+pub fn forget_file(rows: &dyn RegistryRows, file: &Path) -> Vec<String> {
+    let place = |p: &Path| match (p.parent(), p.file_name()) {
+        (Some(dir), Some(name)) => resolve(dir).join(name),
+        _ => p.to_path_buf(),
+    };
+    let target = place(file);
+    rows.remove(&|entry| place(&entry.local_path) == target)
 }
 
 /// goose's registry, the one the engine resolves models through.
@@ -81,6 +95,28 @@ impl RegistryRows for GooseRegistry {
             }
         }
         changed
+    }
+
+    fn remove(&self, doomed: &dyn Fn(&LocalModelEntry) -> bool) -> Vec<String> {
+        let mut registry = match get_registry().lock() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("registry lock poisoned; removing no rows: {e}");
+                return Vec::new();
+            }
+        };
+        let ids: Vec<String> = registry
+            .list_models()
+            .iter()
+            .filter(|e| doomed(e))
+            .map(|e| e.id.clone())
+            .collect();
+        for id in &ids {
+            if let Err(e) = registry.remove_model(id) {
+                tracing::warn!("could not remove registry row {id}: {e}");
+            }
+        }
+        ids
     }
 }
 
@@ -136,6 +172,47 @@ impl RegistryRows for MemoryRows {
             self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         changed
+    }
+
+    fn remove(&self, doomed: &dyn Fn(&LocalModelEntry) -> bool) -> Vec<String> {
+        let mut rows = self.rows.lock().unwrap();
+        let ids: Vec<String> = rows
+            .iter()
+            .filter(|e| doomed(e))
+            .map(|e| e.id.clone())
+            .collect();
+        rows.retain(|e| !doomed(e));
+        if !ids.is_empty() {
+            self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        ids
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleting_a_file_forgets_every_row_naming_it_and_only_those() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("gone.gguf");
+        let kept = tmp.path().join("kept.gguf");
+        std::fs::write(&kept, b"x").unwrap();
+        let rows = MemoryRows::with(vec![
+            test_entry("gone", &gone),
+            test_entry("gone-Q4_K_M", &gone),
+            test_entry("kept", &kept),
+        ]);
+        let mut forgotten = forget_file(&rows, &gone);
+        forgotten.sort();
+        assert_eq!(forgotten, ["gone", "gone-Q4_K_M"]);
+        assert_eq!(rows.rows.lock().unwrap().len(), 1);
+        assert_eq!(rows.get("kept").id, "kept");
+        assert!(
+            forget_file(&rows, &gone).is_empty(),
+            "nothing left to forget"
+        );
     }
 }
 
