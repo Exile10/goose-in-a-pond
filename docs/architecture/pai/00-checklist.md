@@ -2975,3 +2975,39 @@ milestone).**
   abandoned wait is uncounted, an old pass ending leaves a newer one standing, no pass no wait);
   `cargo test -p pond-api` 632 passed, `pond-core` 1,706, the adapter's 269; clippy shows nothing on
   the changed lines; `scripts/live-test.sh` 156 checks passed.
+
+**2026-10-05 — A compaction no longer saves a KV snapshot it does not need (goose patch; not a PAI
+milestone).**
+
+- **What landed** (goose `e45f6b357`, bumped in GIAP `5830dcce`, branch
+  `feat/litert-compaction-no-save`, at Jerry's call to build the step after the measurement above).
+  goose runs a compaction's summary call inside `request_context::replacing_history`, a task-local
+  in `goose-provider-types` beside the session id goose already carries to providers. The local
+  provider reads it before it spawns and hands it to its backend, and LiteRT-LM no longer saves the
+  chat it sets aside for that call when the chat's family already has a snapshot. The first
+  compaction in a family with no snapshot still saves, and so do side calls that leave the history
+  alone (titling, extraction), which resume the chat whole.
+- **Why.** The bisection above: about 140 MB of the GPU's jump during a compaction was the snapshot
+  saved first, and after a compaction the chat shares only its preamble with what it held, which
+  every snapshot of its family holds. The turn after a compaction reused the same 3,800 tokens
+  either way.
+- **Measured on the Orin** (E4B, 8k, release of this branch against `69f5815f`; the same probes):
+
+  | | With the save | Save skipped |
+  |---|---|---|
+  | GPU step at each compaction (12 turns) | +454, +417, +466 MB | +429, +364, +278 MB |
+  | Lowest free memory at each compaction | 241, 189, 170 MB | 335, 247, 281 MB |
+  | GPU step, lowest free (8 turns) | +511 MB, 204 MB | +449 MB, 252 MB |
+
+  About 80 MB less at the peak on average and the worst moment 77 MB better, with one compaction's
+  spread between runs close to 100 MB, which is why it took eight compactions to say. The log says
+  "Did not save the retained LiteRT-LM conversation" at each one, no snapshot file is written (about
+  300 MB and 0.7 s each before), and the turn after still reused 3,800 tokens from the older
+  snapshot. The other 360 MB or so, held by the summary's own conversation, is inside LiteRT-LM and
+  untouched.
+- **PAI.** Preamble, egress, secrets, guest, turn blocking: none. No `Settings` field.
+- **Verification.** `request_context` tests 2 (in scope, not in a spawned task); goose
+  `the_summary_call_reaches_the_provider_marked_as_replacing_history` (through `complete_fast` and
+  its session scope; an ordinary call is not marked) with the other 21 `context_mgmt` tests; LiteRT
+  `a_chat_about_to_be_compacted_is_saved_only_when_its_family_has_no_snapshot` with the other 41;
+  `cargo check -p pond-server -p pond-adapters-goose --all-targets`; the Orin runs above.
