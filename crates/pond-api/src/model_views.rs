@@ -120,12 +120,14 @@ pub(crate) fn gguf_vision(agent: &dyn Agent, model: &str, spec: Option<EncoderSp
     }
 }
 
-/// The add-on's state on the wire, from picture support's own state.
+/// The add-on's state on the wire, from picture support's own state. A file that has arrived
+/// reads `verifying` until its hash is checked, then `installed`.
 pub(crate) fn companion_state(state: Option<&EncoderState>) -> &'static str {
     match state {
         Some(EncoderState::Ready { .. }) => "installed",
         Some(EncoderState::NotOnThisDevice) => "not_on_this_device",
-        Some(EncoderState::Downloading { .. } | EncoderState::Verifying) => "downloading",
+        Some(EncoderState::Verifying) => "verifying",
+        Some(EncoderState::Downloading { .. }) => "downloading",
         _ => "available",
     }
 }
@@ -313,7 +315,8 @@ mod tests {
         );
         assert_eq!(
             companion_state(Some(&EncoderState::Verifying)),
-            "downloading"
+            "verifying",
+            "arrived and being checked, between the tracker's done and installed"
         );
         assert_eq!(
             companion_state(Some(&EncoderState::NotOnThisDevice)),

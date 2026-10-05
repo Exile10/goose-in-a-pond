@@ -503,7 +503,7 @@ pub struct CompanionDto {
     /// What the household reads, e.g. "Gemma 4 E4B".
     pub label: String,
     pub size_bytes: u64,
-    /// `installed` | `available` | `downloading` | `not_on_this_device`.
+    /// `installed` | `available` | `downloading` | `verifying` | `not_on_this_device`.
     pub state: String,
 }
 
