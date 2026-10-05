@@ -455,23 +455,38 @@ describe("what is coming down", () => {
     expect(await screen.findByText("Stopped Gemma 4 E4B. Nothing was kept.")).toBeTruthy();
   });
 
-  it("pauses the model, and promises nothing about what had arrived", async () => {
-    setup({ downloads: both() });
+  it("pauses the model, and says what a pause keeps where the pond can resume it", async () => {
+    setup({ downloads: both({ resumable: true }) });
     renderModels();
     const recommended = await band("Recommended for this pond");
     fireEvent.click(within(recommended).getByRole("button", { name: "Pause" }));
     await waitFor(() => expect(api.controlModelDownload).toHaveBeenCalledWith(e4b().id, "pause"));
-    expect(await screen.findByText("Paused Gemma 4 E4B.")).toBeTruthy();
+    expect(await screen.findByText("Paused Gemma 4 E4B. What has arrived so far is kept.")).toBeTruthy();
+  });
+
+  it("says it will start again from the beginning when the pond cannot resume it", async () => {
+    setup({ downloads: both({ resumable: false }) });
+    renderModels();
+    const recommended = await band("Recommended for this pond");
+    fireEvent.click(within(recommended).getByRole("button", { name: "Pause" }));
+    expect(await screen.findByText("Paused Gemma 4 E4B. It will start again from the beginning.")).toBeTruthy();
     expect(screen.queryByText(/is kept/)).toBeNull();
   });
 
-  it("offers Resume and Stop for a paused model, and says what each does", async () => {
-    setup({ downloads: both({ status: "paused" }) });
+  it("offers Resume and Stop for a paused model, and says what the pause kept", async () => {
+    setup({ downloads: both({ status: "paused", resumable: true }) });
     renderModels();
     const recommended = await band("Recommended for this pond");
-    expect(within(recommended).getByText("Paused. Resume to continue, or Stop to throw it away.")).toBeTruthy();
+    expect(within(recommended).getByText("Paused. What has arrived so far is kept.")).toBeTruthy();
     expect(within(recommended).getByRole("button", { name: "Resume" })).toBeTruthy();
     expect(within(recommended).getByRole("button", { name: "Stop" })).toBeTruthy();
+  });
+
+  it("says a paused model that cannot resume will start again from the beginning", async () => {
+    setup({ downloads: both({ status: "paused", resumable: false }) });
+    renderModels();
+    const recommended = await band("Recommended for this pond");
+    expect(within(recommended).getByText("Paused. It will start again from the beginning.")).toBeTruthy();
   });
 
   it("shows why one part failed in the pond's own sentence, and offers to try it again", async () => {

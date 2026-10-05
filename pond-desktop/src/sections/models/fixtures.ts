@@ -267,6 +267,7 @@ export function entry(over: Partial<DownloadEntry> & Pick<DownloadEntry, "filena
     downloaded_bytes: 0,
     total_bytes: null,
     status: "downloading",
+    resumable: true,
     ...over,
   };
 }

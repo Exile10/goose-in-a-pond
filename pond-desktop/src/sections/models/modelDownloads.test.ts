@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { controlResult, downloadPercent, isInFlight, startedText, transferOf } from "./modelDownloads";
+import { controlResult, downloadPercent, isInFlight, pausedText, startedText, transferOf } from "./modelDownloads";
 import { entry } from "./fixtures";
 
 const ID = "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL";
@@ -86,12 +86,40 @@ describe("pause, resume and stop", () => {
     expect(t.parts.map((p) => p.filename)).toEqual([MODEL, PICTURES]);
   });
 
-  it("say what happened: a stop deletes what had arrived, and a pause promises nothing about it", () => {
-    // Only a Hugging Face transfer keeps its partial file on a pause, and an entry does not say
-    // which host a transfer is from.
+  it("say what happened: a stop deletes what had arrived, and a pause says what it keeps where the pond says", () => {
+    expect(controlResult("pause", "Gemma 4 E4B", true)).toBe("Paused Gemma 4 E4B. What has arrived so far is kept.");
+    expect(controlResult("pause", "Gemma 4 E4B", false)).toBe("Paused Gemma 4 E4B. It will start again from the beginning.");
+    // An older pond does not say, so a pause promises nothing.
     expect(controlResult("pause", "Gemma 4 E4B")).toBe("Paused Gemma 4 E4B.");
     expect(controlResult("cancel", "Gemma 4 E4B")).toBe("Stopped Gemma 4 E4B. Nothing was kept.");
     expect(controlResult("resume", "Gemma 4 E4B")).toBe("Resuming Gemma 4 E4B.");
+  });
+
+  it("word the paused note the same way, without a name", () => {
+    expect(pausedText(true)).toBe("Paused. What has arrived so far is kept.");
+    expect(pausedText(false)).toBe("Paused. It will start again from the beginning.");
+    expect(pausedText(null)).toBe("Paused.");
+  });
+});
+
+describe("whether a pause keeps what has arrived", () => {
+  it("is true when every file still coming down can resume, as a Hugging Face transfer can", () => {
+    expect(transferOf(ID, [model({ resumable: true }), pictures({ resumable: true })])!.resumable).toBe(true);
+  });
+
+  it("is false when one file cannot, so the household is never promised what a pause would throw away", () => {
+    expect(transferOf(ID, [model({ resumable: false }), pictures({ resumable: true })])!.resumable).toBe(false);
+  });
+
+  it("ignores a file that has already arrived", () => {
+    const t = transferOf(ID, [model({ resumable: false, status: "done" }), pictures({ resumable: true })])!;
+    expect(t.resumable).toBe(true);
+  });
+
+  it("is unknown when the pond does not say", () => {
+    const t = transferOf(ID, [model({ resumable: undefined }), pictures({ resumable: true })])!;
+    expect(t.resumable).toBeNull();
+    expect(t.parts[0].resumable).toBeNull();
   });
 });
 

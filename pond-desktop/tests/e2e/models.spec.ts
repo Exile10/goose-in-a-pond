@@ -232,10 +232,14 @@ test.describe("Models section", () => {
   });
 
   test.describe("what is coming down", () => {
-    const parts = (status = "downloading", extra: Record<string, unknown> = {}) => [
-      { filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", category: "gguf", downloaded_bytes: 1_200_000_000, total_bytes: 4_215_695_776, status, model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "model", ...extra },
-      { filename: "mmproj/gemma-4-e4b-it-qat/mmproj-BF16.gguf", category: "mmproj", downloaded_bytes: 500_000_000, total_bytes: 991_552_320, status, model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "pictures" },
-    ];
+    // `resumable`: true for a Hugging Face transfer, whose pause keeps the partial file; "unsaid" omits it.
+    const parts = (status = "downloading", extra: Record<string, unknown> = {}, resumable: boolean | "unsaid" = true) => {
+      const said = resumable === "unsaid" ? {} : { resumable };
+      return [
+        { filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", category: "gguf", downloaded_bytes: 1_200_000_000, total_bytes: 4_215_695_776, status, model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "model", ...said, ...extra },
+        { filename: "mmproj/gemma-4-e4b-it-qat/mmproj-BF16.gguf", category: "mmproj", downloaded_bytes: 500_000_000, total_bytes: 991_552_320, status, model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "pictures", ...said },
+      ];
+    };
 
     test("sits on the row it belongs to, a bar per file, one set of controls for the model", async ({ page }) => {
       await mockModels(page, { downloads: parts() });
@@ -272,12 +276,22 @@ test.describe("Models section", () => {
       await expect(page.getByRole("button", { name: "Try again" })).toBeVisible();
     });
 
-    test("a pause promises nothing about what had arrived", async ({ page }) => {
+    test("a pause says what it keeps where the pond can resume the transfer", async ({ page }) => {
       await mockModels(page, { downloads: parts("paused") });
       await goToModels(page);
-      const card = page.locator(".mm-pick", { hasText: "llama.cpp" }).first();
-      await expect(card).toContainText("Paused. Resume to continue, or Stop to throw it away.");
-      await expect(card).not.toContainText("is kept");
+      await expect(page.locator(".mm-xfer__note")).toHaveText("Paused. What has arrived so far is kept.");
+    });
+
+    test("a pause says the transfer will start again when the pond cannot resume it", async ({ page }) => {
+      await mockModels(page, { downloads: parts("paused", {}, false) });
+      await goToModels(page);
+      await expect(page.locator(".mm-xfer__note")).toHaveText("Paused. It will start again from the beginning.");
+    });
+
+    test("a pause promises nothing when the pond does not say", async ({ page }) => {
+      await mockModels(page, { downloads: parts("paused", {}, "unsaid") });
+      await goToModels(page);
+      await expect(page.locator(".mm-xfer__note")).toHaveText("Paused.");
     });
   });
 

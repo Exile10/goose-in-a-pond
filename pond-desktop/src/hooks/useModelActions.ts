@@ -107,7 +107,7 @@ export function useModelActions(
     (m: ModelEntry, transfer: ModelTransfer, action: TransferAction) =>
       attempt(async () => {
         await api.controlModelDownload(transfer.modelId, action);
-        say(controlResult(action, modelLabel(m)));
+        say(controlResult(action, modelLabel(m), transfer.resumable));
         await reloadDownloads();
         if (action === "resume") watchDownloads();
       }),

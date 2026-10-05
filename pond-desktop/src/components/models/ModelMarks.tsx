@@ -4,7 +4,7 @@ import {
 } from "lucide-react";
 import type { ModelEngine } from "../../api/types";
 import type { AddOn, FitReading, SourceChip as Chip } from "../../sections/models/modelsView";
-import type { ModelTransfer, TransferAction } from "../../sections/models/modelDownloads";
+import { pausedText, type ModelTransfer, type TransferAction } from "../../sections/models/modelDownloads";
 import "../../styles/model-marks.css";
 
 // The small, repeated words of a Models screen. Both surfaces compose them, so an engine, a
@@ -227,7 +227,7 @@ export function TransferView({
       ))}
 
       {transfer.state === "paused" && (
-        <p className="mm-xfer__note">Paused. Resume to continue, or Stop to throw it away.</p>
+        <p className="mm-xfer__note">{pausedText(transfer.resumable)}</p>
       )}
       {finishing && (
         <p className="mm-xfer__note" role="status">

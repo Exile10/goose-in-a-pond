@@ -27,6 +27,8 @@ export interface PartProgress {
   /** "1.2 GB of 4.2 GB", or just what has arrived while the total is unknown. */
   bytes: string;
   error: string | null;
+  /** Whether a pause keeps what has arrived; null when the pond did not say. */
+  resumable: boolean | null;
 }
 
 export interface ModelTransfer {
@@ -36,6 +38,9 @@ export interface ModelTransfer {
   /** `finishing`: every part has arrived and the row has not caught up yet. */
   state: "downloading" | "paused" | "error" | "finishing";
   error: string | null;
+  /** Whether a pause keeps what has arrived: true when every file still coming down can resume,
+   *  false when one cannot, null when the pond did not say. */
+  resumable: boolean | null;
 }
 
 const PART_LABEL: Record<PartProgress["part"], string> = {
@@ -59,7 +64,14 @@ function partOf(d: DownloadEntry): PartProgress {
       ? `${formatBytes(d.downloaded_bytes)} of ${formatBytes(total)}`
       : formatBytes(d.downloaded_bytes),
     error: d.status === "error" ? (d.error?.trim() || "The download did not finish.") : null,
+    resumable: typeof d.resumable === "boolean" ? d.resumable : null,
   };
+}
+
+function resumableOf(parts: PartProgress[]): boolean | null {
+  const coming = parts.filter((p) => p.status !== "done");
+  if (coming.some((p) => p.resumable === false)) return false;
+  return coming.length > 0 && coming.every((p) => p.resumable === true) ? true : null;
 }
 
 /** What is coming down for one model, or null when nothing is: a stopped transfer left nothing.
@@ -85,17 +97,27 @@ export function transferOf(
           ? "finishing"
           : null;
   if (state === null) return null;
-  return { modelId, parts, state, error: failed?.error ?? null };
+  return { modelId, parts, state, error: failed?.error ?? null, resumable: resumableOf(parts) };
 }
 
 export type TransferAction = "pause" | "resume" | "cancel";
 
-/** What happened. A stop deletes what had arrived; a pause promises nothing about it, because only a
- *  Hugging Face transfer keeps its partial file and the progress entry does not say which this is. */
-export function controlResult(action: TransferAction, title: string): string {
+/** What a pause means for what has arrived, said only once the pond says whether it can resume. */
+export function pausedText(resumable: boolean | null, subject = ""): string {
+  const kept =
+    resumable === true
+      ? " What has arrived so far is kept."
+      : resumable === false
+        ? " It will start again from the beginning."
+        : "";
+  return `Paused${subject ? ` ${subject}` : ""}.${kept}`;
+}
+
+/** What happened. A stop deletes what had arrived; a pause says what it keeps where the pond says. */
+export function controlResult(action: TransferAction, title: string, resumable: boolean | null = null): string {
   switch (action) {
     case "pause":
-      return `Paused ${title}.`;
+      return pausedText(resumable, title);
     case "resume":
       return `Resuming ${title}.`;
     case "cancel":

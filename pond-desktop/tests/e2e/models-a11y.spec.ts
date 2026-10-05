@@ -14,8 +14,8 @@ const NO_ROLES = {
 const FAILURE = "The download site is having trouble (error 503). Try again later.";
 
 const COMING_DOWN = [
-  { filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", category: "gguf", downloaded_bytes: 1_200_000_000, total_bytes: 4_215_695_776, status: "downloading", model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "model" },
-  { filename: "mmproj/gemma-4-e4b-it-qat/mmproj-BF16.gguf", category: "mmproj", downloaded_bytes: 500_000_000, total_bytes: 991_552_320, status: "error", error: FAILURE, model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "pictures" },
+  { filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", category: "gguf", downloaded_bytes: 1_200_000_000, total_bytes: 4_215_695_776, status: "downloading", model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "model", resumable: true },
+  { filename: "mmproj/gemma-4-e4b-it-qat/mmproj-BF16.gguf", category: "mmproj", downloaded_bytes: 500_000_000, total_bytes: 991_552_320, status: "error", error: FAILURE, model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "pictures", resumable: false },
 ];
 
 async function scan(page: Page, within: string, label: string) {

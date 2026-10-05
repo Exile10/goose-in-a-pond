@@ -1144,14 +1144,16 @@ export interface DownloadEntry {
   category: string;
   downloaded_bytes: number;
   total_bytes: number | null;
-  /** `paused` keeps a Hugging Face transfer's partial file; any other host has no range resume, so its
-   *  pause discards it. `cancelled` deletes it. */
+  /** `paused` keeps the partial file where `resumable`; `cancelled` deletes it. */
   status: "downloading" | "paused" | "done" | "error" | "cancelled";
   /** The row this file belongs to, `"{category}/{name}"`. */
   model_id?: string;
   part?: DownloadPart;
   /** Why it stopped, on an `error` entry: a sentence for the household, shown as given. */
   error?: string;
+  /** Whether a pause keeps the partial file to resume from: true for a Hugging Face transfer, false for
+   *  any other host, whose pause discards it and whose resume starts again from the beginning. */
+  resumable?: boolean;
 }
 
 /** The server's answer to pausing, resuming or stopping a model's download: each part it moved. */
