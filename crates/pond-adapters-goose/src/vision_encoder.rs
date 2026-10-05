@@ -1024,7 +1024,7 @@ mod tests {
         vouch(&path, &e2b);
         let pictures = PictureSupport::with_rows(Arc::new(MemoryRows::default()));
         assert_eq!(
-            pictures.state(tmp.path(), "gemma-4-E2B-it"),
+            pictures.state(tmp.path(), "gemma-4-E2B-it-Q4_K_M"),
             EncoderState::Absent,
             "even a sidecar cannot vouch for a file shorter than its own tensor table"
         );
@@ -1071,7 +1071,9 @@ mod tests {
             "gemma-4-e2b-it-qat",
             Some(EncoderState::Downloading { done: 5, total: 9 }),
         );
-        assert!(pictures.state(tmp.path(), "gemma-4-E2B-it").is_ready());
+        assert!(pictures
+            .state(tmp.path(), "gemma-4-E2B-it-Q4_K_M")
+            .is_ready());
         assert_eq!(
             pictures.state(tmp.path(), "gemma-4-E2B-it-qat"),
             EncoderState::Downloading { done: 5, total: 9 }
@@ -1337,7 +1339,7 @@ mod tests {
         let pictures = PictureSupport::with_rows(Arc::new(MemoryRows::default()));
         pictures.mark_could_not_start(&e2b);
         assert!(matches!(
-            pictures.state(tmp.path(), "gemma-4-E2B-it"),
+            pictures.state(tmp.path(), "gemma-4-E2B-it-Q4_K_M"),
             EncoderState::Failed {
                 reason: FailReason::CouldNotStart,
                 ..
@@ -1350,7 +1352,9 @@ mod tests {
                 retry_at_unix_ms: 1,
             })
         });
-        assert!(pictures.state(tmp.path(), "gemma-4-E2B-it").is_ready());
+        assert!(pictures
+            .state(tmp.path(), "gemma-4-E2B-it-Q4_K_M")
+            .is_ready());
     }
 
     #[test]

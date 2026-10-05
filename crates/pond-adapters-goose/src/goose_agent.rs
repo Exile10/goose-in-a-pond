@@ -5785,7 +5785,7 @@ mod tests {
         let declared = !pond_core::models::domain::device_budget::budgeted_device();
         for provider in ["local", "gguf"] {
             for model in [
-                "gemma-4-E2B-it",
+                "gemma-4-E2B-it-Q4_K_M",
                 "gemma-4-E4B-it-Q4_K_M",
                 "gemma-4-E4B-it-qat-UD-Q4_K_XL",
             ] {
