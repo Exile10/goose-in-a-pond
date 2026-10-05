@@ -23,7 +23,7 @@ pub enum Pruned {
     Ghost,
     /// Once bundled, bundled no more, and never downloaded.
     Retired,
-    /// An Ollama model the Ollama server no longer lists.
+    /// An Ollama model a running Ollama server no longer lists.
     Unlisted,
 }
 
@@ -31,13 +31,15 @@ pub enum Pruned {
 #[derive(Debug, Default, PartialEq)]
 pub struct PrunePlan {
     pub delete: Vec<(String, Pruned)>,
-    /// Assigned Ollama rows the server no longer lists: kept for the assignment, unavailable.
+    /// Assigned Ollama rows a running server no longer lists: kept for the assignment,
+    /// unavailable.
     pub unavailable: Vec<String>,
 }
 
 /// The rows `catalogue` (this seed's fetch) leaves stale. An assigned row is never deleted, and
 /// nothing on disk is touched: a downloaded row stays unless it is a companion, whose file the
-/// scan's companion filter keeps from coming back as a row.
+/// scan's companion filter keeps from coming back as a row. A fetch with no Ollama rows says
+/// nothing about Ollama (the composite skips a server that does not answer), so it changes none.
 pub fn prune_plan(
     records: &[ModelRecord],
     catalogue: &[ModelRecord],
@@ -47,11 +49,15 @@ pub fn prune_plan(
     let assigned: std::collections::HashSet<&str> =
         assignments.iter().map(|a| a.model_id.as_str()).collect();
     let listed: std::collections::HashSet<&str> = catalogue.iter().map(|m| m.id.as_str()).collect();
+    let ollama_answered = catalogue
+        .iter()
+        .any(|m| m.category == ModelCategory::Ollama);
     let mut plan = PrunePlan::default();
     for r in records {
         let in_listing = listed.contains(r.id.as_str());
+        let unlisted_ollama = r.category == ModelCategory::Ollama && ollama_answered && !in_listing;
         if assigned.contains(r.id.as_str()) {
-            if r.category == ModelCategory::Ollama && !in_listing && r.downloaded {
+            if unlisted_ollama && r.downloaded {
                 plan.unavailable.push(r.id.clone());
             }
             continue;
@@ -62,7 +68,7 @@ pub fn prune_plan(
         let why = if companion {
             Some(Pruned::Companion)
         } else if r.category == ModelCategory::Ollama {
-            (!in_listing).then_some(Pruned::Unlisted)
+            unlisted_ollama.then_some(Pruned::Unlisted)
         } else if r.is_custom {
             (!r.downloaded && r.url.is_none()).then_some(Pruned::Ghost)
         } else {
@@ -773,6 +779,21 @@ mod tests {
             ]
         );
         assert_eq!(plan.unavailable, ["ollama/mistral"]);
+    }
+
+    #[test]
+    fn an_ollama_server_that_did_not_answer_changes_none_of_its_rows() {
+        use ModelCategory::{Ollama, Whisper};
+        let unassigned = row("ollama/llama3.2", Ollama, false, true);
+        let assigned = row("ollama/mistral", Ollama, false, true);
+        let bundled = row("whisper/base", Whisper, false, false);
+        let records = vec![unassigned, assigned, bundled.clone()];
+        let plan = prune_plan(
+            &records,
+            &[bundled],
+            &[assigned_one("chat", "ollama/mistral")],
+        );
+        assert_eq!(plan, PrunePlan::default());
     }
 
     fn assigned_one(role: &str, id: &str) -> ModelRoleAssignment {
