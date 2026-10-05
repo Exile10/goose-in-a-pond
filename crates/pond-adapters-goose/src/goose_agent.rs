@@ -1422,7 +1422,8 @@ impl GooseAdapter {
                 let registry_key = match self.data_dir {
                     Some(ref dd) if litert => crate::litert_model::register(&model_name, dd),
                     Some(ref dd) => {
-                        let recorded = self.recorded_gguf_file(&model_name).await;
+                        let recorded =
+                            recorded_gguf_file(self.model_repo.as_deref(), &model_name).await;
                         Self::register_gguf_model_from(&model_name, dd, recorded.as_deref())
                     }
                     None => model_name.trim_end_matches(".gguf").to_string(),
@@ -2093,23 +2094,9 @@ impl GooseAdapter {
         self
     }
 
-    /// The file the catalogue row for a llama.cpp model names, if the row has one.
-    async fn recorded_gguf_file(&self, model_name: &str) -> Option<String> {
-        let repo = self.model_repo.as_ref()?;
-        let id = pond_core::models::domain::model_record::ModelRecord::id_for(
-            &pond_core::models::domain::model_record::ModelCategory::Gguf,
-            model_name.trim_end_matches(".gguf"),
-        );
-        repo.get_by_id(&id).await.ok().flatten()?.filename
-    }
-
-    /// Registers a `$data_dir/models/gguf/` model (bare stem or filename) with Goose.
-    /// Returns the canonical key (quant suffix collapsed); build `ModelConfig` from it.
-    fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) -> String {
-        Self::register_gguf_model_from(model_name, data_dir, None)
-    }
-
-    /// [`Self::register_gguf_model`] for the file its catalogue row names, when that is on disk.
+    /// Registers a `$data_dir/models/gguf/` model (bare stem or filename) with Goose, from the
+    /// file its catalogue row names when that is on disk. Returns the canonical key (quant suffix
+    /// collapsed); build `ModelConfig` from it.
     fn register_gguf_model_from(
         model_name: &str,
         data_dir: &std::path::Path,
@@ -3691,7 +3678,8 @@ impl AgentPort for GooseAdapter {
         Self::vision_state_for(&self.pictures, self.data_dir.as_deref(), provider, model)
     }
 
-    /// Registers a model whose file just arrived and settles its add-on; never downloads.
+    /// Registers a model whose file just arrived, from the file its row names, then settles its
+    /// add-on; never downloads. A no-op for llama.cpp without a Tokio runtime.
     fn prepare_model(&self, model: &str) {
         let Some(ref dd) = self.data_dir else {
             return;
@@ -3700,8 +3688,16 @@ impl AgentPort for GooseAdapter {
             crate::litert_model::register(model, dd);
             return;
         }
-        Self::register_gguf_model(model, dd);
-        self.pictures.spawn_settle(dd, model);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (dd, model) = (dd.clone(), model.to_string());
+        let (repo, pictures) = (self.model_repo.clone(), self.pictures.clone());
+        handle.spawn(async move {
+            let recorded = recorded_gguf_file(repo.as_deref(), &model).await;
+            Self::register_gguf_model_from(&model, &dd, recorded.as_deref());
+            pictures.spawn_settle(&dd, &model);
+        });
     }
 
     async fn ensure_conversation_model(
@@ -4212,6 +4208,18 @@ impl GooseAdapter {
             loaded_extensions,
         })
     }
+}
+
+/// The file the catalogue row for a llama.cpp model names, if the row has one.
+async fn recorded_gguf_file(
+    repo: Option<&dyn ModelRepository>,
+    model_name: &str,
+) -> Option<String> {
+    let id = pond_core::models::domain::model_record::ModelRecord::id_for(
+        &pond_core::models::domain::model_record::ModelCategory::Gguf,
+        model_name.trim_end_matches(".gguf"),
+    );
+    repo?.get_by_id(&id).await.ok().flatten()?.filename
 }
 
 /// The file to register for `model_name`: the one its catalogue row names when that is on
@@ -6673,6 +6681,27 @@ mod tests {
             ),
             "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
         );
+    }
+
+    #[tokio::test]
+    async fn the_recorded_file_comes_from_the_gguf_row_the_name_keys() {
+        let mut stub = StubCatalog::holding("gguf/gemma-4-e4b", None);
+        if let Some(row) = stub.record.as_mut() {
+            row.category = ModelCategory::Gguf;
+            row.filename = Some("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf".to_string());
+        }
+        let repo: Arc<dyn ModelRepository> = Arc::new(stub);
+        for name in ["gemma-4-e4b", "gemma-4-e4b.gguf"] {
+            assert_eq!(
+                recorded_gguf_file(Some(repo.as_ref()), name)
+                    .await
+                    .as_deref(),
+                Some("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"),
+                "{name}"
+            );
+        }
+        assert_eq!(recorded_gguf_file(Some(repo.as_ref()), "other").await, None);
+        assert_eq!(recorded_gguf_file(None, "gemma-4-e4b").await, None);
     }
 
     #[test]

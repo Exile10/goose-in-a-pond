@@ -1657,7 +1657,7 @@ fn vision_status_size(
 }
 
 /// `GET /api/v1/models/vision-status` — picture support for the active chat model.
-/// Polled every 2 s, so a pure read: fetching and hashing belong to `prepare_model`.
+/// Polled every 2 s, so a pure read: hashing an add-on belongs to `prepare_model`.
 async fn get_vision_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     use pond_core::models::domain::vision_encoder::EncoderState;
 
