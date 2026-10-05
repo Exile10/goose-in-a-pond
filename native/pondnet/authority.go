@@ -153,16 +153,7 @@ func (a Authority) Register(ctx context.Context, origin string, port uint16, inv
 	if port == 0 {
 		return "", errors.New("a companion port is required")
 	}
-	registration := enrollment.HouseholdRegistration{
-		PublicKey: a.PublicKey,
-		Port:      port,
-		Expires:   time.Now().Add(2 * time.Minute).Unix(),
-		Invite:    invite,
-	}
-	if device != nil {
-		registration.Device = device.Prove(registration.PublicKey, registration.Expires)
-	}
-	envelope, e := enrollment.SignHousehold(registration, a.key)
+	envelope, e := enrollment.SignHousehold(a.registration(port, invite, device, time.Now()), a.key)
 	if e != nil {
 		return "", e
 	}
@@ -193,6 +184,21 @@ func (a Authority) Register(ctx context.Context, origin string, port uint16, inv
 		return "", errors.New("coordinator named a different household")
 	}
 	return result.Household, nil
+}
+
+// registration is what Register signs: this household's key and companion port, any
+// invite, and, on a provisioned Pond, a device proof bound to this household and expiry.
+func (a Authority) registration(port uint16, invite string, device *Device, now time.Time) enrollment.HouseholdRegistration {
+	registration := enrollment.HouseholdRegistration{
+		PublicKey: a.PublicKey,
+		Port:      port,
+		Expires:   now.Add(2 * time.Minute).Unix(),
+		Invite:    invite,
+	}
+	if device != nil {
+		registration.Device = device.Prove(registration.PublicKey, registration.Expires)
+	}
+	return registration
 }
 
 // Submit sends a narrowly scoped approval to the configured enrollment origin.

@@ -1,14 +1,9 @@
 package pondnet
 
 import (
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,28 +102,16 @@ func TestRegisterSendsAProofTheServiceAccepts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var received enrollment.HouseholdRegistration
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		data, _ := io.ReadAll(r.Body)
-		var envelope enrollment.Envelope
-		json.Unmarshal(data, &envelope)
-		payload, _ := base64.StdEncoding.DecodeString(envelope.Payload)
-		json.Unmarshal(payload, &received)
-		json.NewEncoder(w).Encode(map[string]string{"household": authority.Household})
-	}))
-	defer server.Close()
-	http.DefaultTransport.(*http.Transport).TLSClientConfig = server.Client().Transport.(*http.Transport).TLSClientConfig
-	defer func() { http.DefaultTransport.(*http.Transport).TLSClientConfig = nil }()
-
-	if _, err = authority.Register(context.Background(), server.URL, 4443, "", device); err != nil {
-		t.Fatal(err)
-	}
-	if received.Device == nil {
+	sent := authority.registration(4443, "", device, time.Now())
+	if sent.Device == nil {
 		t.Fatal("a provisioned Pond registered without its device proof")
 	}
-	// The service's own check, over exactly what was sent.
-	serial, refusal := enrollment.VerifyDeviceProof(received.Device, []ed25519.PublicKey{provisioningPublic}, received.PublicKey, received.Expires)
+	// The service's own check, over exactly what Register signs.
+	serial, refusal := enrollment.VerifyDeviceProof(sent.Device, []ed25519.PublicKey{provisioningPublic}, sent.PublicKey, sent.Expires)
 	if refusal != "" || serial == "" {
-		t.Fatalf("the service would refuse the proof Register sent: %q", refusal)
+		t.Fatalf("the service would refuse the proof Register sends: %q", refusal)
+	}
+	if unprovisioned := authority.registration(4443, "", nil, time.Now()); unprovisioned.Device != nil {
+		t.Fatal("a Pond that was never provisioned sent a device proof")
 	}
 }
