@@ -1,3 +1,4 @@
+pub mod compaction_prompts;
 pub mod extension_manager;
 pub mod giap_registration;
 pub mod goose_agent;
