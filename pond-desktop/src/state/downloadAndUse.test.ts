@@ -115,9 +115,12 @@ describe("Download and use", () => {
     await tick();
     expect(result.current[0]?.state).toBe("downloading");
 
-    progress(file({ status: "error", error: "HTTP 503" }));
+    progress(file({ status: "error", error: "The download site is having trouble (error 503). Try again later." }));
     await tick();
-    expect(result.current[0]).toMatchObject({ state: "failed", message: "HTTP 503" });
+    expect(result.current[0]).toMatchObject({
+      state: "failed",
+      message: "The download site is having trouble (error 503). Try again later.",
+    });
     expect(api.activateModel).not.toHaveBeenCalled();
 
     act(() => dismissPending(ID));

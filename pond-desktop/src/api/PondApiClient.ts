@@ -1696,7 +1696,8 @@ export class PondApiClient {
     });
   }
 
-  /** Pause keeps the partial file (resume re-requests with a range header); cancel deletes it. */
+  /** Pause keeps a Hugging Face transfer's partial file to resume from; another host has no range resume,
+   *  so its pause discards it. Cancel deletes it. */
   controlDownload(
     filename: string,
     action: "pause" | "resume" | "cancel",
@@ -1731,7 +1732,8 @@ export class PondApiClient {
     return this.get("/api/v1/models/disk-usage");
   }
 
-  // Delete model file from disk (409 ApiError if model is active in a role)
+  // Delete model file from disk (409 ApiError, in the server's words, if the model is active in a role
+  // or another row names the same file)
   deleteModel(category: string, name: string): Promise<void> {
     return this.del(
       `/api/v1/models/${encodeURIComponent(category)}/${encodeURIComponent(name)}`,

@@ -5,7 +5,7 @@ import { useCallback, useState } from "react";
 import { api } from "../api/PondApiClient";
 import type { ModelEntry } from "../api/types";
 import type { UseModels } from "./useModels";
-import { controlResult, type ModelTransfer, type TransferAction } from "../sections/models/modelDownloads";
+import { controlResult, startedText, type ModelTransfer, type TransferAction } from "../sections/models/modelDownloads";
 import { ROLES, type RoleKey, modelLabel, offersPictures } from "../sections/models/modelsView";
 
 export interface ModelActions {
@@ -75,7 +75,7 @@ export function useModelActions(
           m.name,
           offersPictures(m) ? { pictures: withPictures(m) } : undefined,
         );
-        say(started?.message ?? `Downloading ${modelLabel(m)}.`);
+        say(startedText(started, modelLabel(m)));
         await Promise.all([reloadModels(), reloadDownloads()]);
         watchDownloads();
       }),
@@ -87,7 +87,15 @@ export function useModelActions(
     (m: ModelEntry) =>
       attempt(async () => {
         const started = await api.addPictures(m.category ?? m.provider, m.name);
-        say(started?.message ?? `Adding picture support to ${modelLabel(m)}.`);
+        say(
+          started?.status === "already_installed"
+            ? `${modelLabel(m)} already has picture support.`
+            : startedText(
+                started,
+                `Picture support for ${modelLabel(m)}`,
+                `Adding picture support to ${modelLabel(m)}.`,
+              ),
+        );
         await Promise.all([reloadModels(), reloadDownloads()]);
         watchDownloads();
       }),

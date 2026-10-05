@@ -173,6 +173,20 @@ describe("Recommended for this pond", () => {
     expect(await screen.findByText("Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)")).toBeTruthy();
   });
 
+  it("says a file already coming down is already on its way, and not as a failure", async () => {
+    vi.mocked(api.downloadModel).mockResolvedValue({
+      status: "already_downloading",
+      message: "Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)",
+    });
+    renderModels();
+    const recommended = await band("Recommended for this pond");
+    const card = within(recommended).getByRole("article", { name: "Gemma 4 E4B, llama.cpp" });
+    fireEvent.click(within(card).getByRole("button", { name: "Download Gemma 4 E4B, llama.cpp" }));
+    const note = await screen.findByText("Gemma 4 E4B is already on its way.");
+    expect(note.getAttribute("role")).toBe("status");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("offers no add-on for a text-only engine, and sends no body for it", async () => {
     renderModels();
     const recommended = await band("Recommended for this pond");
@@ -315,8 +329,10 @@ describe("On this device", () => {
     expect(within(device).getByText("Runs in Ollama")).toBeTruthy();
   });
 
-  it("asks before deleting, and says plainly when the model is doing a job", async () => {
-    vi.mocked(api.deleteModel).mockRejectedValue(new ApiError(409, "Model is assigned to role 'chat'. Deactivate it first."));
+  it("asks before deleting, and shows a refusal in the pond's own words", async () => {
+    // Another row names the same file: the pond keeps it, and says which row and why.
+    const refusal = "'Gemma 4 E2B (older)' uses the same file and is assigned to role 'chat'. Deactivate it first.";
+    vi.mocked(api.deleteModel).mockRejectedValue(new ApiError(409, refusal));
     setup({ models: [e2b(HERE), foundOnDisk()] });
     renderModels();
     const device = await band("On this device");
@@ -324,7 +340,9 @@ describe("On this device", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
     await waitFor(() => expect(api.deleteModel).toHaveBeenCalledWith("gguf", "Llama-3.2-3B-Instruct-Q4_K_M"));
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/is doing a job right now/);
+    expect(alert.textContent).toBe(refusal);
+    // Still on the device, and nothing is claimed freed.
+    expect(screen.queryByText(/freed/)).toBeNull();
   });
 });
 
@@ -434,30 +452,32 @@ describe("what is coming down", () => {
     expect(await screen.findByText("Stopped Gemma 4 E4B. Nothing was kept.")).toBeTruthy();
   });
 
-  it("pauses the model and says what a pause keeps", async () => {
+  it("pauses the model, and promises nothing about what had arrived", async () => {
     setup({ downloads: both() });
     renderModels();
     const recommended = await band("Recommended for this pond");
     fireEvent.click(within(recommended).getByRole("button", { name: "Pause" }));
     await waitFor(() => expect(api.controlModelDownload).toHaveBeenCalledWith(e4b().id, "pause"));
-    expect(await screen.findByText("Paused Gemma 4 E4B. What has arrived so far is kept.")).toBeTruthy();
+    expect(await screen.findByText("Paused Gemma 4 E4B.")).toBeTruthy();
+    expect(screen.queryByText(/is kept/)).toBeNull();
   });
 
-  it("offers Resume and Stop for a paused model, and says it is kept", async () => {
+  it("offers Resume and Stop for a paused model, and says what each does", async () => {
     setup({ downloads: both({ status: "paused" }) });
     renderModels();
     const recommended = await band("Recommended for this pond");
-    expect(within(recommended).getByText("Paused. What has arrived so far is kept.")).toBeTruthy();
+    expect(within(recommended).getByText("Paused. Resume to continue, or Stop to throw it away.")).toBeTruthy();
     expect(within(recommended).getByRole("button", { name: "Resume" })).toBeTruthy();
     expect(within(recommended).getByRole("button", { name: "Stop" })).toBeTruthy();
   });
 
-  it("says why one part failed, and offers to try it again while the other carries on", async () => {
-    setup({ downloads: [both()[0], { ...both()[1], status: "error", error: "HTTP 503" }] });
+  it("shows why one part failed in the pond's own sentence, and offers to try it again", async () => {
+    const reason = "The download site is having trouble (error 503). Try again later.";
+    setup({ downloads: [both()[0], { ...both()[1], status: "error", error: reason }] });
     renderModels();
     const recommended = await band("Recommended for this pond");
     const alert = within(recommended).getByRole("alert");
-    expect(alert.textContent).toContain("Could not finish: HTTP 503");
+    expect(alert.textContent).toBe(reason);
     fireEvent.click(within(recommended).getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(api.controlModelDownload).toHaveBeenCalledWith(e4b().id, "resume"));
   });
@@ -608,6 +628,44 @@ describe("Get more", () => {
     expect(within(row).getAllByRole("progressbar")).toHaveLength(2);
     expect(within(row).getByText("Added")).toBeTruthy();
     expect(within(row).getByRole("button", { name: "Pause" })).toBeTruthy();
+  });
+
+  it("lists no add-on where the pond sends none, as it does on a device with a memory budget", async () => {
+    vi.mocked(api.searchGgufModels).mockResolvedValue({ models: [{ id: "u/r", downloads: 1, likes: 0, tags: [], url: "x" }] });
+    vi.mocked(api.listHfModelFiles).mockResolvedValue({
+      files: [{ filename: "m.gguf", size_mb: 2000, url: "https://huggingface.co/u/r/resolve/main/m.gguf", pictures: null }],
+    });
+    vi.mocked(api.downloadModelFromUrl).mockResolvedValue({ status: "download_started", message: "Downloading m (2.1 GB)" });
+    renderModels();
+    const more = await band("Get more");
+    fireEvent.change(within(more).getByRole("searchbox"), { target: { value: "r" } });
+    fireEvent.click(within(more).getByRole("button", { name: "Search" }));
+    fireEvent.click(await within(more).findByRole("button", { name: /u\/r/ }));
+    expect(await within(more).findByText("2.1 GB")).toBeTruthy();
+    expect(within(more).queryByText(/for pictures/)).toBeNull();
+    expect(within(more).queryByRole("checkbox")).toBeNull();
+
+    // And the request does not ask about an add-on the file does not have.
+    fireEvent.click(within(more).getByRole("button", { name: "Download m.gguf" }));
+    await waitFor(() =>
+      expect(api.downloadModelFromUrl).toHaveBeenCalledWith("https://huggingface.co/u/r/resolve/main/m.gguf", "gguf", "m.gguf", undefined),
+    );
+  });
+
+  it("says a file named by URL is already on its way when the pond is already fetching it", async () => {
+    vi.mocked(api.searchGgufModels).mockResolvedValue({ models: [{ id: "u/r", downloads: 1, likes: 0, tags: [], url: "x" }] });
+    vi.mocked(api.listHfModelFiles).mockResolvedValue({
+      files: [{ filename: "m.gguf", size_mb: 2000, url: "https://huggingface.co/u/r/resolve/main/m.gguf", pictures: null }],
+    });
+    vi.mocked(api.downloadModelFromUrl).mockResolvedValue({ status: "already_downloading", message: "Downloading m (2.1 GB)" });
+    renderModels();
+    const more = await band("Get more");
+    fireEvent.change(within(more).getByRole("searchbox"), { target: { value: "r" } });
+    fireEvent.click(within(more).getByRole("button", { name: "Search" }));
+    fireEvent.click(await within(more).findByRole("button", { name: /u\/r/ }));
+    fireEvent.click(await within(more).findByRole("button", { name: "Download m.gguf" }));
+    expect(await screen.findByText("m.gguf is already on its way.")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("does not promise picture support on a device that will not carry it", async () => {

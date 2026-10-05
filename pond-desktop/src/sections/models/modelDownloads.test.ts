@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { controlResult, downloadPercent, isInFlight, transferOf } from "./modelDownloads";
+import { controlResult, downloadPercent, isInFlight, startedText, transferOf } from "./modelDownloads";
 import { entry } from "./fixtures";
 
 const ID = "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL";
@@ -86,9 +86,31 @@ describe("pause, resume and stop", () => {
     expect(t.parts.map((p) => p.filename)).toEqual([MODEL, PICTURES]);
   });
 
-  it("say what happened: a pause keeps the file, a stop deletes it", () => {
-    expect(controlResult("pause", "Gemma 4 E4B")).toBe("Paused Gemma 4 E4B. What has arrived so far is kept.");
+  it("say what happened: a stop deletes what had arrived, and a pause promises nothing about it", () => {
+    // Only a Hugging Face transfer keeps its partial file on a pause, and an entry does not say
+    // which host a transfer is from.
+    expect(controlResult("pause", "Gemma 4 E4B")).toBe("Paused Gemma 4 E4B.");
     expect(controlResult("cancel", "Gemma 4 E4B")).toBe("Stopped Gemma 4 E4B. Nothing was kept.");
     expect(controlResult("resume", "Gemma 4 E4B")).toBe("Resuming Gemma 4 E4B.");
+  });
+});
+
+describe("what a download request says", () => {
+  const sentence = "Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)";
+
+  it("uses the pond's own sentence about what it will fetch", () => {
+    expect(startedText({ status: "download_started", message: sentence }, "Gemma 4 E4B")).toBe(sentence);
+  });
+
+  it("says a file already coming down is already on its way, not that it started", () => {
+    expect(startedText({ status: "already_downloading", message: sentence }, "Gemma 4 E4B")).toBe(
+      "Gemma 4 E4B is already on its way.",
+    );
+  });
+
+  it("falls back to a plain line when the pond sent no sentence", () => {
+    expect(startedText({ status: "download_started" }, "Gemma 4 E4B")).toBe("Downloading Gemma 4 E4B.");
+    expect(startedText(null, "Gemma 4 E4B")).toBe("Downloading Gemma 4 E4B.");
+    expect(startedText(undefined, "X", "Adding picture support to X.")).toBe("Adding picture support to X.");
   });
 });

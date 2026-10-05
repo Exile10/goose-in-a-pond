@@ -1,4 +1,4 @@
-import type { DownloadEntry, DownloadPart } from "../../api/types";
+import type { DownloadEntry, DownloadPart, DownloadStarted } from "../../api/types";
 import { formatBytes } from "./modelsView";
 
 // A model comes down as one or two files (the model, and the picture add-on). The server tracks
@@ -90,14 +90,26 @@ export function transferOf(
 
 export type TransferAction = "pause" | "resume" | "cancel";
 
-/** What happened, in the words the control used: a pause keeps the partial file, a stop deletes it. */
+/** What happened. A stop deletes what had arrived; a pause promises nothing about it, because only a
+ *  Hugging Face transfer keeps its partial file and the progress entry does not say which this is. */
 export function controlResult(action: TransferAction, title: string): string {
   switch (action) {
     case "pause":
-      return `Paused ${title}. What has arrived so far is kept.`;
+      return `Paused ${title}.`;
     case "resume":
       return `Resuming ${title}.`;
     case "cancel":
       return `Stopped ${title}. Nothing was kept.`;
   }
+}
+
+/** What to say once the pond has answered a download request: its own sentence about what it will
+ *  fetch, except that a file already coming down is not a new start. */
+export function startedText(
+  started: Pick<DownloadStarted, "status" | "message"> | null | undefined,
+  title: string,
+  fallback = `Downloading ${title}.`,
+): string {
+  if (started?.status === "already_downloading") return `${title} is already on its way.`;
+  return started?.message ?? fallback;
 }

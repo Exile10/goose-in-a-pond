@@ -227,7 +227,7 @@ export function TransferView({
       ))}
 
       {transfer.state === "paused" && (
-        <p className="mm-xfer__note">Paused. What has arrived so far is kept.</p>
+        <p className="mm-xfer__note">Paused. Resume to continue, or Stop to throw it away.</p>
       )}
       {finishing && (
         <p className="mm-xfer__note" role="status">
@@ -238,7 +238,7 @@ export function TransferView({
       {transfer.error && (
         <p className="mm-xfer__error" role="alert">
           <AlertTriangle size={14} aria-hidden="true" />
-          <span>Could not finish: {transfer.error}</span>
+          <span>{transfer.error}</span>
         </p>
       )}
 

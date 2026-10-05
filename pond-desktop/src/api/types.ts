@@ -1130,7 +1130,8 @@ export interface HfModelFile {
   filename: string;
   size_mb?: number;
   url: string;
-  /** The picture add-on a download of this file brings, when its pairing is known. */
+  /** The picture add-on a download of this file brings. Null where the pairing is not known, and on
+   *  a device that carries no add-ons. */
   pictures?: { size_bytes: number; label: string } | null;
 }
 
@@ -1143,12 +1144,13 @@ export interface DownloadEntry {
   category: string;
   downloaded_bytes: number;
   total_bytes: number | null;
-  /** `paused` keeps the partial file for resuming; `cancelled` deletes it. */
+  /** `paused` keeps a Hugging Face transfer's partial file; any other host has no range resume, so its
+   *  pause discards it. `cancelled` deletes it. */
   status: "downloading" | "paused" | "done" | "error" | "cancelled";
   /** The row this file belongs to, `"{category}/{name}"`. */
   model_id?: string;
   part?: DownloadPart;
-  /** Why it stopped, on an `error` entry. */
+  /** Why it stopped, on an `error` entry: a sentence for the household, shown as given. */
   error?: string;
 }
 
@@ -1160,6 +1162,7 @@ export interface DownloadControlResult {
 
 /** The server's answer to a download request: what it will fetch, before anything starts. */
 export interface DownloadStarted {
+  /** `download_started`, or `already_downloading` when every file asked for was already coming down. */
   status: string;
   model_id?: string;
   parts?: { part: DownloadPart; filename: string; size_bytes: number | null }[];

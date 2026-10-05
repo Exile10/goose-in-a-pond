@@ -151,6 +151,17 @@ test.describe("Models section", () => {
       await page.locator(".mm-pick", { hasText: "llama.cpp" }).first().getByRole("button", { name: /^Download/ }).click();
       await expect.poll(() => body).toEqual({ pictures: true });
     });
+
+    test("says a file already coming down is already on its way, and not as a failure", async ({ page }) => {
+      await mockModels(page, { roles: { chat: null, tool: null, asr: null, tts: null, embedding: null } });
+      await page.route("**/api/v1/models/gguf/*/download", (route) =>
+        route.fulfill({ json: { status: "already_downloading", message: "Downloading Gemma 4 E4B (4.2 GB)" } }),
+      );
+      await goToModels(page);
+      await page.locator(".mm-pick", { hasText: "llama.cpp" }).first().getByRole("button", { name: /^Download/ }).click();
+      await expect(page.getByRole("status").filter({ hasText: "Gemma 4 E4B is already on its way." })).toBeVisible();
+      await expect(page.getByRole("alert")).toHaveCount(0);
+    });
   });
 
   test.describe("On this device", () => {
@@ -192,6 +203,20 @@ test.describe("Models section", () => {
       await expect(page.getByRole("alert")).toContainText("is doing a job right now");
     });
 
+    test("shows a refused delete in the pond's own words, and keeps the model listed", async ({ page }) => {
+      const refusal = "'Gemma 4 E2B (older)' uses the same file and is assigned to role 'chat'. Deactivate it first.";
+      await mockModels(page, { models: typicalModels({ gguf: [e2bQat({ downloaded: true }), foundGguf({ downloaded: true })] }) });
+      await page.route("**/api/v1/models/gguf/Llama-3.2-3B-Instruct-Q4_K_M", (route) =>
+        route.fulfill({ status: 409, json: { error: refusal } }),
+      );
+      await goToModels(page);
+      const row = page.locator(".mdl-row", { hasText: "Llama-3.2-3B" }).first();
+      await row.getByRole("button", { name: /^Delete/ }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page.getByRole("alert")).toHaveText(refusal);
+      await expect(row).toBeVisible();
+    });
+
     test("keeps a helper out of Conversation", async ({ page }) => {
       const helper = { ...e2bQat(), id: "gguf/functiongemma", name: "functiongemma", title: "FunctionGemma 270M", downloaded: true, kind: "helper", recommended_role: "tool", recommended: undefined, companions: [] };
       await mockModels(page, { models: typicalModels({ gguf: [e2bQat({ downloaded: true }), helper] }) });
@@ -231,13 +256,22 @@ test.describe("Models section", () => {
       await expect(page.getByText("Stopped Gemma 4 E4B. Nothing was kept.")).toBeVisible();
     });
 
-    test("says why a part failed", async ({ page }) => {
+    test("says why a part failed, in the pond's own sentence", async ({ page }) => {
+      const reason = "The download site is having trouble (error 503). Try again later.";
       const failed = parts();
-      failed[1] = { ...failed[1], status: "error", error: "HTTP 503" } as never;
+      failed[1] = { ...failed[1], status: "error", error: reason } as never;
       await mockModels(page, { downloads: failed });
       await goToModels(page);
-      await expect(page.getByRole("alert").filter({ hasText: "Could not finish: HTTP 503" })).toBeVisible();
+      await expect(page.locator(".mm-xfer__error")).toHaveText(reason);
       await expect(page.getByRole("button", { name: "Try again" })).toBeVisible();
+    });
+
+    test("a pause promises nothing about what had arrived", async ({ page }) => {
+      await mockModels(page, { downloads: parts("paused") });
+      await goToModels(page);
+      const card = page.locator(".mm-pick", { hasText: "llama.cpp" }).first();
+      await expect(card).toContainText("Paused. Resume to continue, or Stop to throw it away.");
+      await expect(card).not.toContainText("is kept");
     });
   });
 

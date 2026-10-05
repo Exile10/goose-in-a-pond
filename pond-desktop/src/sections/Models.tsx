@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { AlertTriangle, HardDrive, RefreshCw } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useConfirm, ErrorBanner } from "../components/shared";
-import { ApiError } from "../api/types";
 import type { ModelEngine, ModelEntry } from "../api/types";
 import { useModels } from "../hooks/useModels";
 import { useModelActions } from "../hooks/useModelActions";
@@ -256,11 +255,8 @@ export function Models() {
       await data.reload();
       say(`Deleted ${modelLabel(model)}.${freed ? ` ${freed} freed.` : ""}`);
     } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
-        say(`${modelLabel(model)} is doing a job right now. Give that job to another model first.`, false);
-      } else {
-        say(e instanceof Error ? e.message : String(e), false);
-      }
+      // A refusal the pond words itself (a file another model still uses, say) is shown as it is.
+      say(e instanceof Error ? e.message : String(e), false);
     } finally { actions.setBusy(false); }
   }
 
@@ -447,7 +443,7 @@ export function Models() {
         <AddBand
           carriesPictures={carriesPictures(models)}
           onStarted={(message) => {
-            say(message ?? "Downloading.");
+            say(message);
             // A file named by URL becomes a row of its own, which the transfer then sits on.
             void data.reloadModels();
             void data.reloadDownloads();

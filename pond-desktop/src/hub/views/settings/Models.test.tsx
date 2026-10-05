@@ -19,6 +19,7 @@ vi.mock("../../../api/PondApiClient", () => ({
 
 import { ModelsDetail } from "./Models";
 import { api } from "../../../api/PondApiClient";
+import { ApiError } from "../../../api/types";
 import type { DownloadEntry, ModelEntry, ModelMemoryStatus } from "../../../api/types";
 import {
   E4B_ORIN, e2b, e4b, entry, foundOnDisk, litertE2b, litertE4b, llamafile, NO_ROLES, ollama,
@@ -166,6 +167,41 @@ describe("Hub Models: what to get", () => {
     fireEvent.click(within(pick).getByRole("button", { name: "Stop" }));
     await waitFor(() => expect(api.controlModelDownload).toHaveBeenCalledWith(e4b().id, "cancel"));
     expect(await screen.findByText("Stopped Gemma 4 E4B. Nothing was kept.")).toBeTruthy();
+  });
+
+  it("shows why a part failed in the pond's own sentence, with a way to try again", async () => {
+    const reason = "There is no room left on this device to save the download. Free some space, then try again.";
+    const downloads = [
+      entry({ filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", model_id: e4b().id, part: "model", total_bytes: 4_215_695_776, downloaded_bytes: 2_000_000_000, status: "error", error: reason }),
+    ];
+    setup({ downloads });
+    renderHub();
+    const recommended = await card("Recommended for this pond");
+    expect(within(recommended).getByRole("alert").textContent).toBe(reason);
+    expect(within(recommended).getByRole("button", { name: "Try again" })).toBeTruthy();
+  });
+
+  it("says a pick already coming down is already on its way, and not as a failure", async () => {
+    vi.mocked(api.downloadModel).mockResolvedValue({
+      status: "already_downloading",
+      message: "Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)",
+    });
+    renderHub();
+    const recommended = await card("Recommended for this pond");
+    const pick = within(recommended).getByRole("article", { name: "Gemma 4 E4B, llama.cpp" });
+    fireEvent.click(within(pick).getByRole("button", { name: "Download Gemma 4 E4B, llama.cpp" }));
+    expect((await screen.findByRole("status")).textContent).toBe("Gemma 4 E4B is already on its way.");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("shows a refused download in the pond's words, and nothing of its own", async () => {
+    const refusal = "This model has no file name, so the pond cannot save it.";
+    vi.mocked(api.downloadModel).mockRejectedValue(new ApiError(400, refusal, "no_file"));
+    renderHub();
+    const recommended = await card("Recommended for this pond");
+    const pick = within(recommended).getByRole("article", { name: "Gemma 4 E4B, llama.cpp" });
+    fireEvent.click(within(pick).getByRole("button", { name: "Download Gemma 4 E4B, llama.cpp" }));
+    expect((await screen.findByRole("alert")).textContent).toBe(refusal);
   });
 });
 

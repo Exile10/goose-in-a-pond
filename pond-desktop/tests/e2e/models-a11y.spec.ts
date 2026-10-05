@@ -11,9 +11,11 @@ const NO_ROLES = {
   embedding: { model_id: null, model: "", provider: "fastembed" },
 };
 
+const FAILURE = "The download site is having trouble (error 503). Try again later.";
+
 const COMING_DOWN = [
   { filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", category: "gguf", downloaded_bytes: 1_200_000_000, total_bytes: 4_215_695_776, status: "downloading", model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "model" },
-  { filename: "mmproj/gemma-4-e4b-it-qat/mmproj-BF16.gguf", category: "mmproj", downloaded_bytes: 500_000_000, total_bytes: 991_552_320, status: "error", error: "HTTP 503", model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "pictures" },
+  { filename: "mmproj/gemma-4-e4b-it-qat/mmproj-BF16.gguf", category: "mmproj", downloaded_bytes: 500_000_000, total_bytes: 991_552_320, status: "error", error: FAILURE, model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "pictures" },
 ];
 
 async function scan(page: Page, within: string, label: string) {
@@ -48,7 +50,7 @@ for (const scheme of ["Light", "Dark"] as const) {
       await page.setViewportSize({ width: 1280, height: 900 });
       await page.goto("/");
       await expect(page.getByRole("heading", { name: "Jobs" })).toBeVisible({ timeout: 10_000 });
-      await expect(page.getByRole("alert").filter({ hasText: "Could not finish: HTTP 503" })).toBeVisible();
+      await expect(page.getByRole("alert").filter({ hasText: FAILURE })).toBeVisible();
       await scan(page, ".mdl", "classic Models");
     });
 

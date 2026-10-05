@@ -4,6 +4,7 @@ import { useModels } from "../../hooks/useModels";
 import { useModelActions } from "../../hooks/useModelActions";
 import { dismissPending, downloadAndUse, usePendingUse } from "../../state/downloadAndUse";
 import { PickCard } from "../../sections/models/PickCard";
+import { startedText } from "../../sections/models/modelDownloads";
 import { askingPick, modelLabel, raisedPick, recommendedPicks } from "../../sections/models/modelsView";
 import type { ModelEntry } from "../../api/types";
 import "../../styles/no-model.css";
@@ -41,7 +42,7 @@ export function NoModelPicks() {
     setProblem(null);
     try {
       const started = await downloadAndUse(m, modelLabel(m), actions.withPictures(m));
-      setNote(started?.message ?? null);
+      setNote(started ? startedText(started, modelLabel(m)) : null);
       await data.reloadDownloads();
       data.watchDownloads();
     } catch (e) {

@@ -3,6 +3,7 @@ import { Download, ImagePlus, Loader2, Search } from "lucide-react";
 import { api } from "../../api/PondApiClient";
 import { ErrorBanner } from "../../components/shared";
 import type { HfModel, HfModelFile } from "../../api/types";
+import { startedText } from "./modelDownloads";
 import { formatBytes, formatSize } from "./modelsView";
 
 /** Search Hugging Face for a model to add. A file with a known picture add-on says its size first. */
@@ -12,8 +13,8 @@ export function AddBand({
 }: {
   /** False when this device will not carry picture support; null when nothing says. */
   carriesPictures: boolean | null;
-  /** A download began; `message` is the pond's own sentence about what it will fetch. */
-  onStarted: (message: string | undefined) => void;
+  /** A download began, or was already on its way; `message` says which, in the pond's words. */
+  onStarted: (message: string) => void;
 }) {
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
@@ -63,10 +64,15 @@ export function AddBand({
   async function download(file: HfModelFile) {
     setStarting(file.filename);
     try {
-      const started = await api.downloadModelFromUrl(file.url, "gguf", file.filename, {
-        pictures: withPictures,
-      });
-      onStarted(started?.message);
+      // The add-on is only asked about for a file that has one on a device that carries it.
+      const asksPictures = carriesPictures !== false && !!file.pictures;
+      const started = await api.downloadModelFromUrl(
+        file.url,
+        "gguf",
+        file.filename,
+        asksPictures ? { pictures: withPictures } : undefined,
+      );
+      onStarted(startedText(started, file.filename));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

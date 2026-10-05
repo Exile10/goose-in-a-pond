@@ -350,7 +350,9 @@
   }
 }
 
-.mm-xfer__part[data-status="paused"] .mm-xfer__fill {
+/* A part that is not moving is not the accent: slate on the track, 5.97:1 light and 5.30:1 dark. */
+.mm-xfer__part[data-status="paused"] .mm-xfer__fill,
+.mm-xfer__part[data-status="error"] .mm-xfer__fill {
   background: var(--color-text-tertiary);
 }
 

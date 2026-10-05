@@ -16,6 +16,7 @@ vi.mock("../../api/PondApiClient", () => ({
 import { api } from "../../api/PondApiClient";
 import { NoModelPicks } from "./NoModelPicks";
 import { __resetDownloadAndUseForTests } from "../../state/downloadAndUse";
+import { ApiError } from "../../api/types";
 import type { DownloadEntry, ModelEntry } from "../../api/types";
 import { E4B_ORIN, e2b, e4b, entry, litertE4b, NO_ROLES, ORIN_MEMORY } from "../../sections/models/fixtures";
 
@@ -98,13 +99,27 @@ describe("no conversation model", () => {
     expect(api.activateModel).not.toHaveBeenCalled();
   });
 
-  it("says how a refused download failed, and promises nothing", async () => {
-    vi.mocked(api.downloadModel).mockRejectedValue(new Error("Network mode refuses huggingface.co"));
+  it("shows a refused download in the pond's own words, and promises nothing", async () => {
+    const refusal = "This pond's network setting does not allow it to reach huggingface.co. Change the setting, then try again.";
+    vi.mocked(api.downloadModel).mockRejectedValue(new ApiError(403, refusal));
     render(<NoModelPicks />);
     const best = await pickCard("Gemma 4 E4B, llama.cpp");
     fireEvent.click(within(best).getByRole("button", { name: "Download and use Gemma 4 E4B, llama.cpp" }));
-    expect((await screen.findByRole("alert")).textContent).toContain("Network mode refuses huggingface.co");
+    expect((await screen.findByRole("alert")).textContent).toBe(refusal);
     expect(screen.queryByText(/starts answering as soon as it arrives/)).toBeNull();
+  });
+
+  it("says a model already coming down is already on its way, and still uses it on arrival", async () => {
+    vi.mocked(api.downloadModel).mockResolvedValue({
+      status: "already_downloading",
+      message: "Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)",
+    });
+    render(<NoModelPicks />);
+    const best = await pickCard("Gemma 4 E4B, llama.cpp");
+    fireEvent.click(within(best).getByRole("button", { name: "Download and use Gemma 4 E4B, llama.cpp" }));
+    expect(await screen.findByText("Gemma 4 E4B is already on its way.")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(await screen.findByText(/starts answering as soon as it arrives/)).toBeTruthy();
   });
 
   it("uses a pick already on the device when asked, and downloads nothing", async () => {
