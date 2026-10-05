@@ -15,6 +15,7 @@ use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
 
 use pond_infra::db::Database;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
+use pond_infra::sqlite_event_log::SqliteEventLog;
 use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use pond_infra::sqlite_profile::SqliteProfileRepository;
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
@@ -26,6 +27,8 @@ struct Harness {
     remote: axum::Router,
     handshake: Arc<SqliteHandshakeAdapter>,
     companion: axum::Router,
+    state: Arc<AppState>,
+    event_log: Arc<SqliteEventLog>,
     _tmp: tempfile::TempDir,
 }
 
@@ -33,6 +36,7 @@ async fn make_app() -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
+    let event_log = Arc::new(SqliteEventLog::new(db.logs.clone()));
     let db = Arc::new(db);
 
     let profiles = Arc::new(SqliteProfileRepository::new(pool.clone()));
@@ -90,7 +94,7 @@ async fn make_app() -> Harness {
         llamafile_manager: None,
         operational_log: None,
         event_bus: None,
-        event_log: None,
+        event_log: Some(event_log.clone()),
         push_token_repo: None,
         notification_tx: tokio::sync::broadcast::channel::<Notification>(16).0,
         notification_queue: None,
@@ -138,7 +142,7 @@ async fn make_app() -> Harness {
     let loopback = build_router(state.clone(), dist.clone())
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
     let companion = pond_api::build_companion_router(state.clone());
-    let remote = build_router(state, dist).layer(MockConnectInfo(SocketAddr::from((
+    let remote = build_router(state.clone(), dist).layer(MockConnectInfo(SocketAddr::from((
         [100, 64, 0, 44],
         40_000,
     ))));
@@ -148,6 +152,8 @@ async fn make_app() -> Harness {
         remote,
         handshake,
         companion,
+        state,
+        event_log,
         _tmp: tmp,
     }
 }
@@ -321,4 +327,134 @@ async fn companion_never_serves_dashboard_and_missing_peer_fails_closed() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "pairing_requires_lan");
+}
+
+/// A phone on the companion router as a loopback peer, so the LAN guard passes on any host.
+fn on_loopback(router: axum::Router) -> axum::Router {
+    router.layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_001))))
+}
+
+/// The original unbound transcript, `challenge || client_id`, keyed by the pairing code: what a
+/// client with no TLS key to bind (Expo Go over the plaintext listener) sends.
+fn unbound_mac(code: &str, challenge_b64: &str, client_id: &str) -> String {
+    use base64::Engine as _;
+    use hmac::Mac as _;
+    let challenge = base64::engine::general_purpose::STANDARD
+        .decode(challenge_b64)
+        .unwrap();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(code.as_bytes()).unwrap();
+    mac.update(&challenge);
+    mac.update(client_id.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Pair unbound through `router` and return the `transport` attribute of the audit event.
+async fn pair_unbound(h: &Harness, router: &axum::Router, client_id: &str) -> Option<String> {
+    let code = h.handshake.issue_pairing_code().await.unwrap().code;
+    let (status, challenge) = post(
+        router,
+        "/api/v1/handshake/init",
+        json!({"client_id": client_id, "client_type": "gotg", "client_version": "test"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let mac = unbound_mac(&code, challenge["challenge"].as_str().unwrap(), client_id);
+    let (status, body) = post(
+        router,
+        "/api/v1/handshake/verify",
+        json!({
+            "challenge_id": challenge["challenge_id"], "mac": mac,
+            "device_name": client_id, "channel_binding": null
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], true, "{body}");
+    assert!(
+        body["server_proof"].is_null(),
+        "an unbound pair has nothing to prove over"
+    );
+
+    use pond_core::security::domain::event::{AttributeValue, EventCategory, EventQuery};
+    use pond_core::security::ports::event_log::EventLog;
+    let events = h
+        .event_log
+        .query(EventQuery {
+            category: Some(EventCategory::Auth),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| {
+            e.action == "auth.device_paired"
+                && e.attributes.get("device_name") == Some(&AttributeValue::Text(client_id.into()))
+        })
+        .expect("the pairing is audited");
+    match event.attributes.get("transport") {
+        Some(AttributeValue::Text(transport)) => Some(transport.clone()),
+        None => None,
+        Some(other) => panic!("unexpected transport attribute {other:?}"),
+    }
+}
+
+/// The plaintext development listener pairs unbound, because there is no TLS key to bind, and
+/// the audit trail records that it did. The HTTPS listener's pairing is unchanged by the flag.
+#[tokio::test]
+async fn unbound_pairing_on_the_insecure_listener_is_audited_as_plaintext() {
+    use pond_api::insecure_dev::{advertise, router, InsecureDevLan};
+    let h = make_app().await;
+    let lan = Some(InsecureDevLan { port: 4080 });
+    let https = on_loopback(advertise(h.companion.clone(), lan));
+    let insecure = on_loopback(router(advertise(h.companion.clone(), lan)));
+
+    assert_eq!(
+        pair_unbound(&h, &insecure, "expo-go").await.as_deref(),
+        Some("insecure_dev")
+    );
+    assert_eq!(pair_unbound(&h, &https, "release-phone").await, None);
+}
+
+async fn system_info(router: &axum::Router, bearer: Option<&str>) -> Value {
+    let mut request = Request::builder().uri("/api/v1/system/info");
+    if let Some(token) = bearer {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = router
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn system_info_names_the_insecure_listener_only_while_it_runs() {
+    use pond_api::insecure_dev::{advertise, router, InsecureDevLan};
+    let h = make_app().await;
+    let token = session_token(&h).await;
+    let lan = Some(InsecureDevLan { port: 4080 });
+    let off = on_loopback(advertise(
+        pond_api::build_companion_router(h.state.clone()),
+        None,
+    ));
+    let https = on_loopback(advertise(h.companion.clone(), lan));
+    let insecure = on_loopback(router(advertise(h.companion.clone(), lan)));
+
+    for bearer in [None, Some(token.as_str())] {
+        let info = system_info(&off, bearer).await;
+        assert!(info.get("insecure_dev").is_none(), "{info}");
+        for on in [&https, &insecure] {
+            assert_eq!(system_info(on, bearer).await["insecure_dev"], true);
+        }
+    }
 }

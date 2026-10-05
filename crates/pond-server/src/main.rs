@@ -3450,6 +3450,9 @@ async fn run_server(
         ports::bind_with_fallback("127.0.0.1", port.unwrap_or(ports::API_SERVER)).await?;
     let (https_listener, https_port) =
         ports::bind_with_fallback("0.0.0.0", https_port.unwrap_or(ports::HTTPS_SERVER)).await?;
+    // Debug builds only, and only on request: plaintext companion API for Expo Go.
+    let insecure_dev = pond_api::insecure_dev::from_env()?;
+    let insecure_listener = pond_api::insecure_dev::bind(insecure_dev).await?;
     let tls_hostname = hostname::get()?
         .to_string_lossy()
         .trim_end_matches(".local")
@@ -4344,21 +4347,29 @@ async fn run_server(
         state.agent.prepare_model(&settings.chat_model);
     }
 
-    let companion =
-        pond_api::build_companion_router(state.clone()).layer(axum::Extension(transport.clone()));
-    let app =
-        pond_api::build_router(state.clone(), static_dir).layer(axum::Extension(transport.clone()));
+    let companion = pond_api::insecure_dev::advertise(
+        pond_api::build_companion_router(state.clone()).layer(axum::Extension(transport.clone())),
+        insecure_dev.marker(),
+    );
+    let app = pond_api::insecure_dev::advertise(
+        pond_api::build_router(state.clone(), static_dir).layer(axum::Extension(transport.clone())),
+        insecure_dev.marker(),
+    );
     #[cfg(unix)]
     let companion = companion
         .layer(axum::Extension(embedded.clone()
             as Arc<
                 dyn pond_core::security::ports::remote_access::RemoteRevocation,
             >))
-        .layer(axum::Extension(embedded.address.clone()))
-        .merge(pond_server::embedded_network::companion_management(
-            embedded.clone(),
-            state.clone(),
-        ));
+        .layer(axum::Extension(embedded.address.clone()));
+    // Taken before remote-access enrollment is merged in: a node's enrollment never crosses
+    // plaintext. Revocation stays, so signing out over this listener still reaches the tailnet.
+    let insecure_router = pond_api::insecure_dev::router(companion.clone());
+    #[cfg(unix)]
+    let companion = companion.merge(pond_server::embedded_network::companion_management(
+        embedded.clone(),
+        state.clone(),
+    ));
     #[cfg(unix)]
     let app = app
         .layer(axum::Extension(embedded.clone()
@@ -4400,6 +4411,12 @@ async fn run_server(
     println!("Local dashboard: http://127.0.0.1:{api_port}");
     println!("Companion API: https://{hostname}.local:{https_port}/api/v1/health");
     println!("Pond public-key fingerprint: {}", transport.tls_spki_sha256);
+    if let Some(lan) = insecure_dev.marker() {
+        println!(
+            "INSECURE development API (plaintext, unpinned): http://{hostname}.local:{}/api/v1/health",
+            lan.port
+        );
+    }
 
     if open || (debug && has_display()) {
         let url = format!("http://localhost:{}", api_port);
@@ -4500,6 +4517,7 @@ async fn run_server(
         result = embedded_server => result,
         result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result.map_err(anyhow::Error::from),
         result = https_server => result.map_err(anyhow::Error::from),
+        result = pond_api::insecure_dev::serve(insecure_listener, insecure_router) => result,
         result = renewal => result,
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received -- stopping both listeners");

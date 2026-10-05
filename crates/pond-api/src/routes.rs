@@ -583,11 +583,14 @@ fn verify_limiter() -> &'static crate::middleware::RateLimiter {
 
 /// Logs, records and notifies a pairing outcome; best-effort, never alters the response.
 /// `reason` is a closed set of rejection codes, safe to log: none carries the code or MAC.
+/// `insecure_dev` marks an attempt that arrived on the plaintext development listener, so the
+/// audit trail says which devices were paired where anyone on the network could watch.
 async fn emit_pairing_outcome(
     state: &AppState,
     paired: bool,
     device_name: Option<&str>,
     reason: Option<&str>,
+    insecure_dev: bool,
 ) {
     use pond_core::security::domain::event::{Event, EventCategory, PrivacySensitivity};
 
@@ -618,6 +621,9 @@ async fn emit_pairing_outcome(
         }
         if let Some(reason) = reason.filter(|_| !paired) {
             event = event.attr("rejection_reason", reason);
+        }
+        if insecure_dev {
+            event = event.attr("transport", "insecure_dev");
         }
         if let Err(e) = event_log.append(event).await {
             tracing::warn!(error = %e, action, "failed to record pairing event");
@@ -678,10 +684,12 @@ async fn handshake_verify(
         axum::extract::ConnectInfo<std::net::SocketAddr>,
         axum::extract::rejection::ExtensionRejection,
     >,
+    insecure: Option<axum::Extension<crate::insecure_dev::InsecureDevTransport>>,
     body: Result<Json<VerifyRequest>, JsonRejection>,
 ) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
     let peer = peer.ok();
     crate::network::require_lan(peer)?;
+    let insecure_dev = insecure.is_some();
     let peer = peer.expect("LAN guard requires a connection address").0;
     // Per source IP, loopback included.
     if let Err(remaining) = verify_limiter()
@@ -699,6 +707,16 @@ async fn handshake_verify(
     }
     let Json(request) = body.map_err(|_| bad_body())?;
     let device_name = request.device_name.clone();
+    // Plaintext has no TLS key to bind, so this listener pairs unbound by construction, and
+    // the six digits can be recovered offline from what crosses the wire. Say so every time.
+    if insecure_dev {
+        tracing::warn!(
+            kind = "insecure_dev_pairing",
+            peer = %peer.ip(),
+            bound = request.channel_binding.is_some(),
+            "pairing over the plaintext development listener; anyone on this network can take it over"
+        );
+    }
     let resp = match state.handshake.verify_handshake(request).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -707,6 +725,7 @@ async fn handshake_verify(
                 false,
                 device_name.as_deref(),
                 Some("internal_error"),
+                insecure_dev,
             )
             .await;
             return Err(handshake_error("verify", e));
@@ -717,6 +736,7 @@ async fn handshake_verify(
         resp.accepted,
         device_name.as_deref(),
         resp.rejection_reason.as_deref(),
+        insecure_dev,
     )
     .await;
     Ok(Json(resp))
@@ -3687,6 +3707,7 @@ async fn system_info(
     State(state): State<Arc<AppState>>,
     transport: Option<axum::Extension<crate::network::CompanionTransport>>,
     embedded: Option<axum::Extension<crate::network::EmbeddedAddress>>,
+    insecure_dev: Option<axum::Extension<crate::insecure_dev::InsecureDevLan>>,
 ) -> Json<Value> {
     let (https_port, tls_spki_sha256) = crate::network::transport_fields(transport);
     let hostname = hostname::get()
@@ -3697,7 +3718,7 @@ async fn system_info(
         .unwrap_or(&hostname)
         .to_string();
 
-    Json(json!({
+    let mut info = json!({
         "hostname": hostname,
         // Null without a LAN route; for clients that can't resolve `<hostname>.local`.
         "lan_address": lan_address(),
@@ -3709,7 +3730,12 @@ async fn system_info(
         "version": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
-    }))
+    });
+    // Present only while the plaintext development listener runs, so its absence is the norm.
+    if insecure_dev.is_some() {
+        info["insecure_dev"] = json!(true);
+    }
+    Json(info)
 }
 
 async fn list_devices(
