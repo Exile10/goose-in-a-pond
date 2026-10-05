@@ -360,6 +360,10 @@ async fn delete_model_409_when_model_has_active_role() {
     let req = auth_req("DELETE", "/api/v1/models/gguf/test-model", None);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(resp).await["error"],
+        "test-model is doing a job right now (Conversation). Give that job to another model first."
+    );
 }
 
 #[tokio::test]
@@ -1986,9 +1990,11 @@ async fn deleting_a_row_leaves_the_file_of_an_assigned_row_that_shares_it() {
     };
     let (status, body) = del("gemma-4-E4B-it-Q4_K_M").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(
-        body["error"].as_str().unwrap().contains("gemma-4-e4b"),
-        "{body}"
+    assert_eq!(
+        body["error"],
+        "Gemma 4 E4B uses the same file and is doing a job right now (Conversation). Give that \
+         job to another model first.",
+        "the other row by the name the household reads, and its job"
     );
     assert!(gguf.join("gemma-4-E4B-it-Q4_K_M.gguf").exists());
     assert!(

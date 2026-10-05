@@ -56,6 +56,11 @@ pub(crate) fn record_to_dto(
     }
 }
 
+/// The name the household reads for `m`.
+pub(crate) fn title_of(m: &ModelRecord) -> String {
+    taxonomy::title(m, curated::for_record(m).map(|p| p.title))
+}
+
 /// The suggestion for `model_id`, carrying numbers only measured on `device`'s class.
 pub(crate) fn recommendation(model_id: &str, device: DeviceClass) -> Option<RecommendedDto> {
     let r = recommended::recommendation_for(model_id)?;

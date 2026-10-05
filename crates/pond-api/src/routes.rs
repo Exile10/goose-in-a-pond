@@ -54,6 +54,7 @@ use uuid::Uuid;
 
 use pond_core::models::domain::model_layout;
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
+use pond_core::models::domain::model_role::ModelRole;
 use pond_core::models::domain::taxonomy::{
     is_companion_file, is_helper_architecture, ON_DISK_PLACEHOLDER,
 };
@@ -5846,11 +5847,27 @@ async fn delete_model(
     let model_id = m.id.clone();
 
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
-    if let Some(a) = assignments.iter().find(|a| a.model_id == model_id) {
+    // The job a row is doing, if any; the first in the roles' own order when it has several.
+    let job_of = |id: &str| {
+        assignments
+            .iter()
+            .filter(|a| a.model_id == id)
+            .min_by_key(|a| {
+                ModelRole::ALL
+                    .iter()
+                    .position(|r| r.as_str() == a.role)
+                    .unwrap_or(ModelRole::ALL.len())
+            })
+            .map(|a| ModelRole::job_for(&a.role).to_string())
+    };
+    if let Some(job) = job_of(&model_id) {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
-                "error": format!("Model is assigned to role '{}'. Deactivate it first.", a.role)
+                "error": format!(
+                    "{} is doing a job right now ({job}). Give that job to another model first.",
+                    crate::model_views::title_of(&m)
+                )
             })),
         ));
     }
@@ -5860,19 +5877,14 @@ async fn delete_model(
     let in_use_by = rows
         .iter()
         .filter(|r| r.id != model_id && model_layout::share_a_file(r, &m))
-        .find_map(|r| {
-            assignments
-                .iter()
-                .find(|a| a.model_id == r.id)
-                .map(|a| (r.name.clone(), a.role.clone()))
-        });
-    if let Some((other, role)) = in_use_by {
+        .find_map(|r| job_of(&r.id).map(|job| (crate::model_views::title_of(r), job)));
+    if let Some((other, job)) = in_use_by {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
                 "error": format!(
-                    "'{other}' uses the same file and is assigned to role '{role}'. \
-                     Deactivate it first."
+                    "{other} uses the same file and is doing a job right now ({job}). Give that \
+                     job to another model first."
                 )
             })),
         ));

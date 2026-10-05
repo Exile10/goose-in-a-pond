@@ -8431,9 +8431,11 @@ async fn run_models(action: ModelAction) -> Result<()> {
 
             let assignments = repo.list_assignments().await?;
             if let Some(a) = assignments.iter().find(|a| a.model_id == id) {
+                use pond_core::models::domain::{curated, model_role::ModelRole, taxonomy};
                 anyhow::bail!(
-                    "Model is assigned to role '{}'. Deactivate it first.",
-                    a.role
+                    "{} is doing a job right now ({}). Give that job to another model first.",
+                    taxonomy::title(&record, curated::for_record(&record).map(|p| p.title)),
+                    ModelRole::job_for(&a.role)
                 );
             }
 
