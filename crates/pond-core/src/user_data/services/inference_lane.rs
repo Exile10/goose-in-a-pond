@@ -11,6 +11,9 @@ use super::consolidation_schedule::{self, GateInputs, SkipReason};
 /// [`select_next`]'s tie-break; callers sort jobs by it (a `HashMap` would randomise ties).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LaneJob {
+    /// Compact a conversation near the edge of its window while the household is quiet, so its
+    /// next turn does not wait for the summary. First, to win ties: a returning user feels it.
+    Compaction,
     /// Merge and score the memory store.
     Consolidation,
     /// Give conversations readable names.
@@ -33,6 +36,7 @@ pub enum LaneJob {
 impl LaneJob {
     /// Every job, in declaration (tie-break) order; `every_job_is_in_all` catches omissions.
     pub const ALL: &'static [LaneJob] = &[
+        LaneJob::Compaction,
         LaneJob::Consolidation,
         LaneJob::Titling,
         LaneJob::ProactiveReview,
@@ -45,6 +49,7 @@ impl LaneJob {
     /// Stable label for logs, metrics and `POST /lane/jobs/{job}/run`; renaming breaks scripts.
     pub fn as_str(self) -> &'static str {
         match self {
+            LaneJob::Compaction => "compaction",
             LaneJob::Consolidation => "consolidation",
             LaneJob::Titling => "titling",
             LaneJob::ProactiveReview => "proactive_review",
@@ -58,6 +63,7 @@ impl LaneJob {
     /// What a household calls it. The panel shows this; the wire never does.
     pub fn title(self) -> &'static str {
         match self {
+            LaneJob::Compaction => "Make room in long conversations",
             LaneJob::Consolidation => "Tidy the memory store",
             LaneJob::Titling => "Name conversations",
             LaneJob::ProactiveReview => "Look for something to suggest",
@@ -268,6 +274,7 @@ mod tests {
     fn every_job_is_in_all() {
         // Named one by one: a loop over `ALL` against `ALL` passes on an empty slice.
         for job in [
+            LaneJob::Compaction,
             LaneJob::Consolidation,
             LaneJob::Titling,
             LaneJob::ProactiveReview,
@@ -282,7 +289,7 @@ mod tests {
                 job.as_str()
             );
         }
-        assert_eq!(LaneJob::ALL.len(), 7, "a job was added or removed");
+        assert_eq!(LaneJob::ALL.len(), 8, "a job was added or removed");
     }
 
     #[test]

@@ -1124,6 +1124,8 @@ async fn chat(
 
     // Resets the inactivity clock and interrupts any background consolidation.
     state.note_user_activity().await;
+    // Held until the reply is back: this turn is never a registered run.
+    let _in_flight = state.runs.turn_started();
 
     let Json(req) = body.map_err(|e| {
         (
@@ -1152,6 +1154,11 @@ async fn chat(
     // Scope resolved exactly as /chat/stream does, so both endpoints agree on the speaker.
     let service = ChatService::new(state.agent.clone(), session_id.clone(), storage.clone())
         .with_profile_scope(resolve_turn_scope(&state, &session_id, &device).await);
+
+    // As every turn path does before the model: wait out a quiet compaction in the way.
+    if let Some(wait) = state.runs.quiet_passes().turn_arrives(&session_id) {
+        wait.until_the_pass_ends().await;
+    }
 
     let response_text = service.chat_once(req.message).await.map_err(|e| {
         (
@@ -2032,6 +2039,8 @@ async fn run_turn(
 ) {
     // Released when the task ends, not when a reader goes away.
     let _run_permit = run_permit;
+    // Dropped last, after the end-of-turn stamp below, so idle work never sees a gap.
+    let _in_flight = state.runs.turn_started();
     drive_turn(&state, &run, req, device).await;
     // Re-stamp now the turn is over: idle work (summaries, consolidation) must measure from a
     // turn's end, not its start, or a long turn looks idle mid-generation.
@@ -2106,6 +2115,17 @@ async fn drive_turn(
             return;
         }
     };
+
+    // ── A quiet compaction in the way ───────────────────────────────────
+    // One writing the summary this turn would otherwise start by writing is waited for; any other
+    // is stopped, which takes a moment.
+    if let Some(wait) = state.runs.quiet_passes().turn_arrives(&session_id) {
+        if wait.compacting_for_this_turn() {
+            let status = json!({"type": "status", "content": "Compacting context..."}).to_string();
+            run.push(status, false);
+        }
+        wait.until_the_pass_ends().await;
+    }
 
     // ── On-demand llamafile startup ─────────────────────────────────────
     {
@@ -2413,7 +2433,7 @@ async fn drive_turn(
     let catalog_context_length = match &state.model_repo {
         Some(repo) => {
             let id = ModelRecord::id_for(
-                &ModelCategory::for_chat_provider(&settings.chat_provider),
+                &ModelCategory::for_chat_model(&settings.chat_provider, &settings.chat_model),
                 &settings.chat_model,
             );
             repo.get_by_id(&id)
@@ -4803,7 +4823,7 @@ async fn update_settings(
                     let category = match *role {
                         "asr" => "whisper",
                         "tts" => "tts_piper",
-                        _ => ModelCategory::for_chat_provider(provider).as_str(),
+                        _ => ModelCategory::for_chat_model(provider, model_name).as_str(),
                     };
                     let model_id = format!("{}/{}", category, model_name);
                     let _ = repo.set_assignment(role, &model_id).await;
@@ -4820,7 +4840,8 @@ async fn update_settings(
     let chat_changed =
         current.chat_model != merged.chat_model || current.chat_provider != merged.chat_provider;
     if chat_changed
-        && ModelCategory::for_chat_provider(&merged.chat_provider) == ModelCategory::Gguf
+        && ModelCategory::for_chat_model(&merged.chat_provider, &merged.chat_model)
+            == ModelCategory::Gguf
     {
         state.agent.prepare_model(&merged.chat_model);
     }
@@ -5329,6 +5350,11 @@ async fn scan_filesystem_extras(
             &[".gguf"],
         ));
         extras.extend(scan_dir(
+            pond_core::models::domain::litert::models_dir(&data_dir_owned),
+            ModelCategory::Litert,
+            &[".litertlm"],
+        ));
+        extras.extend(scan_dir(
             data_dir_owned.join("models").join("llm"),
             ModelCategory::Llamafile,
             &[".llamafile", ".exe"],
@@ -5389,6 +5415,7 @@ fn model_dest_path(
         "whisper" => data_dir.join("models").join(filename),
         "llamafile" => data_dir.join("models").join("llm").join(filename),
         "gguf" => data_dir.join("models").join("gguf").join(filename),
+        "litert" => pond_core::models::domain::litert::models_dir(data_dir).join(filename),
         "tts" | "tts_piper" => data_dir.join("models").join("tts").join(filename),
         "tts_kokoro" => data_dir
             .join("models")
@@ -5487,7 +5514,7 @@ async fn list_models(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(model_repo) = &state.model_repo else {
         return Ok(Json(
-            json!({"whisper": [], "llamafile": [], "tts": [], "gguf": []}),
+            json!({"whisper": [], "llamafile": [], "tts": [], "gguf": [], "litert": []}),
         ));
     };
 
@@ -5545,6 +5572,7 @@ async fn list_models(
     let mut llamafile = vec![];
     let mut tts = vec![];
     let mut gguf = vec![];
+    let mut litert = vec![];
     let mut ollama = vec![];
     let mut embedding = vec![];
 
@@ -5565,13 +5593,14 @@ async fn list_models(
                 tts.push(v)
             }
             ModelCategory::Gguf => gguf.push(v),
+            ModelCategory::Litert => litert.push(v),
             ModelCategory::Ollama => ollama.push(v),
             ModelCategory::Embedding => embedding.push(v),
         }
     }
 
     Ok(Json(
-        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf, "ollama": ollama, "embedding": embedding}),
+        json!({"whisper": whisper, "llamafile": llamafile, "tts": tts, "gguf": gguf, "litert": litert, "ollama": ollama, "embedding": embedding}),
     ))
 }
 
@@ -5690,6 +5719,11 @@ async fn refresh_model_registry(
                             }
                             pond_core::models::domain::model_record::ModelCategory::Gguf => {
                                 data_dir.join("models").join("gguf").join(f).exists()
+                            }
+                            pond_core::models::domain::model_record::ModelCategory::Litert => {
+                                pond_core::models::domain::litert::models_dir(&data_dir)
+                                    .join(f)
+                                    .exists()
                             }
                             pond_core::models::domain::model_record::ModelCategory::TtsPiper => {
                                 data_dir.join("models").join("tts").join(f).exists()
@@ -5811,6 +5845,9 @@ async fn download_model(
         ModelCategory::Whisper => data_dir.join("models").join(&filename),
         ModelCategory::Llamafile => data_dir.join("models").join("llm").join(&filename),
         ModelCategory::Gguf => data_dir.join("models").join("gguf").join(&filename),
+        ModelCategory::Litert => {
+            pond_core::models::domain::litert::models_dir(&data_dir).join(&filename)
+        }
         ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
             data_dir.join("models").join("tts").join(&filename)
         }
@@ -5937,6 +5974,9 @@ async fn delete_model(
             ModelCategory::Whisper => data_dir.join("models").join(filename),
             ModelCategory::Llamafile => data_dir.join("models").join("llm").join(filename),
             ModelCategory::Gguf => data_dir.join("models").join("gguf").join(filename),
+            ModelCategory::Litert => {
+                pond_core::models::domain::litert::models_dir(data_dir).join(filename)
+            }
             ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
                 data_dir.join("models").join("tts").join(filename)
             }
@@ -6103,7 +6143,7 @@ async fn activate_model(
             Json(json!({
                 "error": format!(
                     "Category '{}' cannot be assigned to role '{}'. \
-                     LLM roles (chat/think/task) require gguf/llamafile/ollama; \
+                     LLM roles (chat/think/task) require gguf/litert/llamafile/ollama; \
                      asr requires whisper; tts requires tts_piper/tts_http.",
                     category, role
                 )
@@ -6130,7 +6170,7 @@ async fn activate_model(
 
     // Runtime provider names, not category names (gguf runs as "local").
     let provider = match cat {
-        ModelCategory::Gguf => "local",
+        ModelCategory::Gguf | ModelCategory::Litert => "local",
         ModelCategory::Llamafile => "llamafile",
         ModelCategory::Ollama => "ollama",
         ModelCategory::Whisper => "asr",
@@ -6687,6 +6727,10 @@ async fn download_via_hf_cache_tracked(
         .repo(repo_id.to_string())
         .with_revision(revision.to_string());
     let fetch = repo.file(fname.to_string());
+    let fetch = match pond_core::models::domain::litert::pinned(repo_id, revision, fname) {
+        Some(pin) => fetch.expect_size(pin.size_bytes).expect_etag(pin.sha256),
+        None => fetch,
+    };
 
     // The per-chunk callback is sync and can't take the async tracker lock, so share the atomic.
     let control = {
@@ -9961,9 +10005,12 @@ async fn agent_chat_stream(
 
     let agent = state.agent.clone();
     let storage = state.session_storage.clone();
+    // Moved into the stream: it lives as long as the turn, not as long as this handler.
+    let in_flight = state.runs.turn_started();
 
     let stream = async_stream::stream! {
         let _permit = permit;
+        let _in_flight = in_flight;
 
         // Fail closed: unreadable settings mean reasoning is not persisted.
         let persist_thinking = state
@@ -9999,6 +10046,14 @@ async fn agent_chat_stream(
         if let Err(e) = chat_service.persist_user_message_with_images(&message, images.clone()).await {
             yield Ok(Event::default().data(json!({"error": format!("Failed to persist user message: {}", e)}).to_string()));
             return;
+        }
+
+        // As every turn path does before the model: wait out a quiet compaction in the way.
+        if let Some(wait) = state.runs.quiet_passes().turn_arrives(&session_id) {
+            if wait.compacting_for_this_turn() {
+                yield Ok(Event::default().data(json!({"type": "status", "content": "Compacting context..."}).to_string()));
+            }
+            wait.until_the_pass_ends().await;
         }
 
         // Shared with `/chat/stream` so both routes fold engine events into a turn identically.

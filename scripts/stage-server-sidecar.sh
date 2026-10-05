@@ -2,9 +2,10 @@
 # -----------------------------------------------------------------------------
 # stage-server-sidecar.sh - Build pond-server and stage it for the desktop app
 #
-# Produces the file electron-builder ships as an extraResource:
+# Produces the files electron-builder ships as extraResources:
 #
 #     pond-desktop/resources/pond-server
+#     pond-desktop/resources/litert-lm/     (when a LiteRT-LM package is recorded)
 #
 # It lands in <App>.app/Contents/Resources/pond-server, which the main process
 # finds via process.resourcesPath. There is no target-triple suffix any more:
@@ -13,6 +14,12 @@
 # path, so the name is just the name.
 #
 # Steps (each fails loudly if it fails):
+#   0. Stage the LiteRT-LM library that `giap.sh litert build macos-arm64`
+#      recorded: its dylibs and LICENSE, verified first, into
+#      resources/litert-lm/. goose's litert backend looks for it in a
+#      litert-lm/ directory beside the pond-server executable. With nothing
+#      recorded this warns and the app ships without it; a recorded package
+#      that fails verification stops here, before the long build.
 #   1. Build the web UI (pond-desktop/dist). The pond-server build embeds
 #      pond-desktop/dist at COMPILE TIME (crates/pond-api/build.rs +
 #      include_dir!). Skipping this yields a binary that serves the build.rs
@@ -64,6 +71,24 @@ fail() {
 }
 
 echo "==> Staging the pond-server sidecar for the desktop app"
+
+# --- 0. The LiteRT-LM library, when one is recorded ---------------------------
+# shellcheck source=lib/litert-setup.sh
+source "${SCRIPT_DIR}/lib/litert-setup.sh"
+LITERT_STAGED="${RESOURCES_DIR}/litert-lm"
+echo "==> [0/3] Staging the LiteRT-LM library -> ${LITERT_STAGED}"
+LITERT_RC=0
+litert_stage_desktop "${LITERT_STAGED}" || LITERT_RC=$?
+case "${LITERT_RC}" in
+  0) echo "    from $(litert_recorded_dir macos-arm64)" ;;
+  3) rm -rf "${LITERT_STAGED}"
+     echo "WARNING: no LiteRT-LM macos-arm64 package is recorded, so this app will not load .litertlm models." >&2
+     echo "  Build one with: bash scripts/giap.sh litert build macos-arm64" >&2 ;;
+  *) fail "the recorded LiteRT-LM package ($(litert_recorded_dir macos-arm64)) cannot be staged:
+${LITERT_VERIFY_PROBLEMS}
+  Rebuild it with 'bash scripts/giap.sh litert build macos-arm64', or delete
+  $(litert_record_file macos-arm64) to ship without it." ;;
+esac
 
 # --- 1. Build the web UI (embedded into the release binary) -------------------
 echo "==> [1/3] Building web UI (pond-desktop/dist) ..."

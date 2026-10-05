@@ -54,11 +54,17 @@ impl LocalInferenceLlmAdapter {
     }
 
     /// Like `new`, but points Goose's registry at `$data_dir/models/gguf/` instead of Goose's own
-    /// models dir. `model_id` is a `repo:QUANT` id or a `.gguf` file already in that dir.
+    /// models dir. `model_id` is a `repo:QUANT` id, a `.gguf` file already in that dir, or a
+    /// `.litertlm` file in `$data_dir/models/litertlm/`.
     pub async fn new_with_data_dir(model_id: &str, data_dir: &std::path::Path) -> Result<Self> {
         use goose::providers::local_inference::local_model_registry::{
             get_registry, model_id_from_repo, LocalModelEntry, LocalModelStorage, ModelSettings,
         };
+
+        if pond_core::models::domain::litert::is_litert_model(model_id) {
+            let id = pond_adapters_goose::litert_model::register(model_id, data_dir);
+            return Self::new(&id).await;
+        }
 
         let gguf_dir = data_dir.join("models").join("gguf");
 
@@ -223,6 +229,11 @@ impl LocalInferenceLlmAdapter {
     /// Stamp device settings into the registry before llama-cpp-2 loads. A device profile sends a
     /// non-CUDA build down the Jetson path, so `device_budget::device_window` also runs off-device.
     fn apply_model_settings(model_id: &str) {
+        if Self::is_litert_row(model_id) {
+            Self::apply_litert_settings(model_id);
+            return;
+        }
+
         #[cfg(feature = "cuda")]
         Self::apply_jetson_settings(model_id);
 
@@ -231,6 +242,47 @@ impl LocalInferenceLlmAdapter {
             Self::apply_jetson_settings(model_id);
         } else {
             Self::apply_platform_settings(model_id);
+        }
+    }
+
+    /// Whether goose runs `model_id` on its LiteRT-LM backend, as the row's entry-level id says.
+    fn is_litert_row(model_id: &str) -> bool {
+        use goose::providers::local_inference::local_model_registry::get_registry;
+        use pond_core::models::domain::litert::BACKEND_ID;
+        get_registry().lock().ok().is_some_and(|reg| {
+            reg.get_model(model_id)
+                .is_some_and(|e| e.backend_id.as_deref() == Some(BACKEND_ID))
+        })
+    }
+
+    /// LiteRT-LM's settings on the path the llama.cpp stamp would take: the engine window and the
+    /// `litert` block. No GGUF header is read, and no llama.cpp knob is written.
+    fn apply_litert_settings(model_id: &str) {
+        use goose::providers::local_inference::local_model_registry::get_registry;
+        use pond_core::models::domain::litert::{engine_options, Overrides};
+
+        let jetson = cfg!(feature = "cuda")
+            || pond_core::models::domain::device_profile::stamping_device_model_settings();
+        let options = engine_options(model_id, jetson, Overrides::from_env());
+        let settings = pond_adapters_goose::litert_model::registry_settings(&options);
+        match get_registry().lock() {
+            Ok(mut registry) => {
+                let applied = Self::stamp_every_row_naming(&mut registry, model_id, &settings);
+                tracing::info!(
+                    rows = ?applied,
+                    jetson,
+                    context_size = options.context_tokens,
+                    execution = options.execution.as_str(),
+                    speculative_decoding = options.speculative_decoding,
+                    "Applied LiteRT-LM settings"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Could not acquire model registry lock for LiteRT-LM settings: {}",
+                    e
+                );
+            }
         }
     }
 

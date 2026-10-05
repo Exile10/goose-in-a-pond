@@ -71,6 +71,25 @@ jobs:
           GOARCH: arm64
         run: go build -mod=readonly -trimpath -o "$RUNNER_TEMP/pondnet-linux-arm64" ./cmd/pondnet
 
+  # scripts/lib/litert-setup.sh packages and verifies the LiteRT-LM library that goose's litert
+  # backend loads into the server process, so it is tested like code: against stand-in files and
+  # fake tools, and here also against real ELF libraries that a real patchelf rewrites. No Bazel,
+  # no Docker and no network. LITERT_TEST_REQUIRE_NATIVE makes the ELF test fail rather than skip
+  # when a tool it needs is missing here.
+  litert-setup:
+    name: LiteRT-LM packaging - bash tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: patchelf
+        run: command -v patchelf || { sudo apt-get update -qq && sudo apt-get install -y -qq patchelf; }
+
+      - name: Tests
+        env:
+          LITERT_TEST_REQUIRE_NATIVE: "1"
+        run: bash scripts/lib/litert-setup.test.sh
+
   # 1: Rust ─────────────────────────────────────────────────────────────
   # Formatting, lints and the fast test suite. Excludes crates that pull the Goose submodule or
   # native system libs (pond-adapters-goose, pond-adapters-local-inference,

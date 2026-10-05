@@ -4,6 +4,7 @@ pub mod device_profile;
 pub mod drafter;
 pub mod gguf;
 pub mod image_limits;
+pub mod litert;
 pub mod message;
 pub mod mic_gate;
 pub mod model_capabilities;

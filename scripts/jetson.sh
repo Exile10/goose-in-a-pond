@@ -3,7 +3,7 @@
 # jetson.sh — single entry point for everything Jetson (Orin Nano).
 #
 # Usage:
-#   bash scripts/jetson.sh deploy [--branch BR]               # dev machine: one-command deploy to the nano
+#   bash scripts/jetson.sh deploy [--branch BR] [--no-restart]  # dev machine: one-command deploy to the nano
 #   bash scripts/jetson.sh build [--cuda]                     # ON the Jetson: native build (GPU builds MUST be on-device)
 #   bash scripts/jetson.sh docker-build [--full]              # off-device: aarch64 CPU binary via linux/arm64 container
 #   bash scripts/jetson.sh optimize                           # ON the Jetson: llama.cpp perf suite (deps, perf mode, bench)

@@ -44,6 +44,7 @@ impl ModelStorage for MockModelStorage {
                     ModelCategory::Whisper => "models",
                     ModelCategory::Llamafile => "models/llm",
                     ModelCategory::Gguf => "models/gguf",
+                    ModelCategory::Litert => "models/litertlm",
                     ModelCategory::TtsPiper => "models/tts",
                     ModelCategory::TtsKokoro => "models/kokoro/voices",
                     ModelCategory::Ollama | ModelCategory::TtsHttp | ModelCategory::Embedding => {

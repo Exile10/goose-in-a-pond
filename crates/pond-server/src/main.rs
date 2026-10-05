@@ -9,6 +9,7 @@ mod filesystem_model_storage;
 mod http_model_downloader;
 mod inference_lane_runner;
 mod kokoro_control;
+mod litert_runtime;
 mod llamafile_process;
 mod llm_memory_consolidator;
 mod mdns_advertiser;
@@ -477,6 +478,14 @@ fn pin_goose_state_under(data_dir: &std::path::Path) {
     std::env::set_var("GOOSE_PATH_ROOT", &engine_root);
 }
 
+/// The budgeted device's choices that must be in place before an engine loads or a turn compacts:
+/// goose's compaction prompt and summary, and the LiteRT-LM prefill chunk sizes. Called after
+/// logging starts, so their decisions are on record.
+fn apply_device_choices() {
+    pond_adapters_goose::compaction_prompts::apply_for_this_device();
+    pond_adapters_goose::litert_model::apply_device_environment();
+}
+
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     let data_dir = default_data_dir();
@@ -500,6 +509,7 @@ async fn async_main() -> Result<()> {
             native,
         }) => {
             let drain = tracing_setup::init_tracing(debug, &data_dir);
+            apply_device_choices();
             run_server(
                 static_dir, open, debug, &agent, port, https_port, native, drain,
             )
@@ -523,6 +533,7 @@ async fn async_main() -> Result<()> {
             };
             // Console: WARN+ only (turn lines use diag!/out!); the log file keeps full detail.
             let _log = tracing_setup::init_tracing_with_console(false, &data_dir, console, true);
+            apply_device_choices();
             run_chat(
                 provider.as_deref(),
                 model.as_deref(),
@@ -561,6 +572,7 @@ async fn async_main() -> Result<()> {
         None => {
             // No subcommand: interactive text chat, provider from Settings.
             let _log = tracing_setup::init_tracing(false, &data_dir);
+            apply_device_choices();
             run_chat(None, None, false, None, true, Some("none"), None, false).await
         }
     }
@@ -1057,6 +1069,8 @@ async fn run_server(
     // After `set_network_mode` (it may download ~100 MB from github.com) and before any
     // ONNX-dependent init (face recognition, embeddings).
     ensure_onnx_runtime();
+    // Before any provider is built: goose reads it when it first loads a `.litertlm` model.
+    litert_runtime::ensure_library_dir(&data_dir);
 
     // The stored setting wins unless the CLI flag names a backend other than the "goose" default.
     let agent_backend = if agent_backend == "goose" && !settings.agent_backend.is_empty() {
@@ -4313,6 +4327,17 @@ async fn run_server(
 
     // Load the model and prefill the static prompt prefix at boot, so turn 1 reuses it.
     pond_api::spawn_prefix_prewarm(state.clone(), false);
+    // Every lane job: a turn in flight is not quiet, however long it has been answering.
+    {
+        let runs = state.runs.clone();
+        inference_lane.watch_turns(move || runs.turn_in_flight());
+    }
+    // Compacts a conversation near the edge of its window while the household is quiet.
+    tokio::spawn(run_quiet_compaction(
+        state.clone(),
+        inference_lane.clone(),
+        last_user_activity.clone(),
+    ));
     // Picture support in the background (~1 GB, never awaited). Single-flight with the prewarm's
     // ensure, and still runs under POND_DISABLE_PREWARM.
     if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
@@ -4774,6 +4799,7 @@ async fn run_chat(
     // Before any ONNX init (else ORT_DYLIB_PATH is unset and Piper::new() hangs), and after the
     // egress mode install, since it may download ~100 MB.
     ensure_onnx_runtime();
+    litert_runtime::ensure_library_dir(&data_dir);
 
     let settings_provider = settings.chat_provider.clone();
     let effective_provider: &str = provider.unwrap_or(&settings_provider);
@@ -5910,6 +5936,199 @@ async fn compose_suggestions(
         refused: outcome.refused.len(),
         unparseable: outcome.unparseable,
     })
+}
+
+/// Compacts conversations near the edge of their window while the household is quiet.
+///
+/// goose compacts a conversation whose last turn passed 80% of its window before that
+/// conversation's next turn can start, summarising all of it. On the Orin's 8k LiteRT-LM window
+/// that came every two to five turns, and the turn's first word waited for it: 24-51 s with E2B
+/// on the Mac, 64-87 s with E4B on the Orin (the turn's `ttft_ms` leaves it out). The context
+/// monitor already knows which conversations are under pressure (`should_compact`); this pass
+/// compacts them one at a time after a short quiet, so the summary is paid while nobody is waiting.
+/// Needs the monitor on, which supplies the pressure, and hybrid compaction on, whose idle summary
+/// refresh already shares the lane.
+///
+/// Two kinds of pass. One that is only getting ahead of its conversation waits for 30 s of quiet
+/// and gives up the moment someone is back. One whose conversation's next turn would start by
+/// compacting it anyway (goose's own rule, asked of the agent) starts after 5 s, and that turn
+/// waits for it rather than stopping it: stopping it would throw the summary away for the turn to
+/// write it again from the start. Only a turn for another conversation stops it.
+async fn run_quiet_compaction(
+    state: Arc<AppState>,
+    lane: Arc<crate::inference_lane_runner::InferenceLane>,
+    last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
+) {
+    use pond_core::user_data::services::consolidation_schedule as sched;
+    use pond_core::user_data::services::inference_lane::LaneJob;
+    use std::time::Duration;
+
+    /// How often the monitor is asked.
+    const POLL_SECS: u64 = 5;
+    /// Quiet before a pass that is only getting ahead, so a pause in a conversation is not
+    /// mistaken for its end.
+    const QUIET_SECS: u64 = 30;
+    /// Quiet before a pass the next turn would otherwise repeat: enough for the end of an answer
+    /// (its last sentences sent to speech) to clear the model first.
+    const QUIET_SECS_FOR_ITS_TURN: u64 = 5;
+    /// A turn in flight that has not announced itself to the pass (every turn path does) stops
+    /// even a pass its turn would wait for, once it has had this long to announce itself.
+    const UNANNOUNCED_TURN_GRACE: Duration = Duration::from_secs(2);
+
+    // Baselines for the never-at-startup guard, captured before the first poll.
+    let started_at = std::time::Instant::now();
+    let started_at_utc = chrono::Utc::now();
+    let wake = lane.claim(LaneJob::Compaction);
+
+    loop {
+        let tick =
+            crate::inference_lane_runner::wait_for_tick(Duration::from_secs(POLL_SECS), &wake)
+                .await;
+
+        let settings = match state.settings_repo.get().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "quiet compaction: settings read failed");
+                continue;
+            }
+        };
+        let enabled = settings.context_monitor_enabled && settings.hybrid_compaction_enabled;
+        // Never during a turn, even by hand: the lane counts a running turn as no quiet, but a
+        // hand-asked tick waives that, and this pass rewrites the history a turn is answering in.
+        let turn_running = state.runs.turn_in_flight();
+        // Read before `acquire`, so a tick with nothing due never takes the lane.
+        let due = if enabled && !turn_running {
+            state.context_monitor.sessions_due_compaction()
+        } else {
+            Vec::new()
+        };
+        // Which of them goose would compact at the start of their next turn anyway.
+        let mut its_turn_compacts = Vec::with_capacity(due.len());
+        for session_id in &due {
+            its_turn_compacts.push(state.agent.compacts_on_next_turn(session_id).await);
+        }
+
+        let db_activity = newest_session_activity(state.session_storage.as_ref()).await;
+        let in_process_at = *last_user_activity.read().await;
+        let now = chrono::Utc::now();
+        let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
+        let quiet = if its_turn_compacts.contains(&true) {
+            QUIET_SECS_FOR_ITS_TURN
+        } else {
+            QUIET_SECS
+        };
+        let cadence = crate::inference_lane_runner::Cadence::new(
+            Duration::from_secs(POLL_SECS),
+            Duration::from_secs(quiet),
+            false,
+        );
+        // One `acquire` per tick, "nothing due" as `enabled: false`, as the reviewer does.
+        let Some(slot) = lane
+            .acquire(
+                LaneJob::Compaction,
+                enabled && !due.is_empty() && !turn_running,
+                cadence,
+                tick.waives(),
+                sched::saw_activity_since_start(
+                    started_at,
+                    in_process_at,
+                    started_at_utc,
+                    db_activity,
+                ),
+                idle_for,
+            )
+            .await
+        else {
+            continue;
+        };
+
+        for (session_id, its_turn_waits) in due.into_iter().zip(its_turn_compacts) {
+            let started = std::time::Instant::now();
+            let pass = state.runs.quiet_passes().begin(&session_id, its_turn_waits);
+            // A returning user wins, unless the turn they start is one this pass is doing the
+            // work for. Dropping the pass cancels its generation, and goose's own compaction
+            // still covers the turn if it needs one.
+            let someone_back = async {
+                let mut unannounced_since: Option<std::time::Instant> = None;
+                loop {
+                    // Short: until the pass is dropped, a returning turn waits behind it.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if pass.stop_requested() {
+                        break;
+                    }
+                    if its_turn_waits {
+                        if state.runs.turns_in_flight() > pass.turns_waiting() {
+                            let since =
+                                *unannounced_since.get_or_insert_with(std::time::Instant::now);
+                            if since.elapsed() >= UNANNOUNCED_TURN_GRACE {
+                                break;
+                            }
+                        } else {
+                            unannounced_since = None;
+                        }
+                    } else if last_user_activity.read().await.elapsed() < idle_for
+                        || state.runs.turn_in_flight()
+                    {
+                        break;
+                    }
+                }
+            };
+            let stopped = tokio::select! {
+                outcome = state.agent.compact_session(&session_id) => {
+                    // Whatever it found, so a pass that fails or finds nothing is not retried
+                    // every quiet tick.
+                    state.context_monitor.start_compaction_cooldown(&session_id);
+                    match outcome {
+                        Ok(Some(retained)) => {
+                            state.context_monitor.note_compacted(&session_id);
+                            tracing::info!(
+                                target: "giap::trace",
+                                kind = "quiet_compaction",
+                                session_id = %session_id,
+                                retained_tokens = retained,
+                                its_turn_waits,
+                                turns_waited = pass.turns_waiting(),
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "compacted a conversation near the edge of its window while the \
+                                 household was quiet"
+                            );
+                        }
+                        Ok(None) => tracing::debug!(
+                            session_id = %session_id,
+                            "quiet compaction: nothing to summarise"
+                        ),
+                        Err(e) => tracing::warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "quiet compaction failed"
+                        ),
+                    }
+                    false
+                }
+                // No cooldown: the conversation is still due, and the next quiet tries again.
+                () = someone_back => {
+                    tracing::info!(
+                        target: "giap::trace",
+                        kind = "quiet_compaction_cancelled",
+                        session_id = %session_id,
+                        its_turn_waits,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "someone came back during a quiet compaction; the turn compacts itself \
+                         if it needs to"
+                    );
+                    true
+                }
+            };
+            // Ends the pass, releasing any turn waiting on it, once the compaction is over.
+            drop(pass);
+            if stopped {
+                break;
+            }
+        }
+
+        // Dropping the guard records the run and frees the slot on every path out.
+        drop(slot);
+    }
 }
 
 /// Idle-time proactive review; every failed read fails closed (skips the tick or hits the cap).
@@ -8159,12 +8378,11 @@ async fn sync_assignments_to_settings(
     }
 }
 
+/// The runtime provider for a catalog category; one it does not know is llamafile.
 fn category_to_provider(category: &str) -> String {
-    match category {
-        "ollama" => "ollama".to_string(),
-        "gguf" => "local".to_string(),
-        _ => "llamafile".to_string(),
-    }
+    ModelCategory::from_str(category)
+        .map_or("llamafile", |c| c.runtime_provider())
+        .to_string()
 }
 
 /// Direct-SQLite model management CLI — no HTTP server started.
@@ -8458,6 +8676,7 @@ async fn stream_agent_response(
 async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
+    litert_runtime::ensure_library_dir(&data_dir);
 
     let settings_repo: Arc<
         dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
@@ -9175,6 +9394,12 @@ mod tests {
         assert_eq!(category_to_provider("llamafile"), "llamafile");
     }
 
+    /// Unmapped, a LiteRT-LM chat assignment would turn into llamafile at every restart.
+    #[test]
+    fn litert_category_maps_to_local_provider() {
+        assert_eq!(category_to_provider("litert"), "local");
+    }
+
     #[test]
     fn unknown_category_defaults_to_llamafile() {
         assert_eq!(category_to_provider("tts_piper"), "llamafile");
@@ -9286,6 +9511,29 @@ mod tests {
             settings.chat_model, "llama-3b",
             "model name should be extracted from id"
         );
+    }
+
+    /// The restart path: a LiteRT-LM chat assignment must come back as the local provider.
+    #[tokio::test]
+    async fn sync_litert_chat_assignment_keeps_the_local_provider() {
+        use pond_core::user_data::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+        repo.set_assignment("chat", "litert/gemma-4-E2B-it.litertlm")
+            .await
+            .unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        let settings = settings_repo.get().await.unwrap();
+        assert_eq!(settings.chat_provider, "local");
+        assert_eq!(settings.chat_model, "gemma-4-E2B-it.litertlm");
     }
 
     #[tokio::test]

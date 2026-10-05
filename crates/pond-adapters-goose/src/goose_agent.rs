@@ -939,7 +939,7 @@ impl GooseAdapter {
         model: &str,
     ) -> Option<u32> {
         let repo = repo?;
-        let id = ModelRecord::id_for(&ModelCategory::for_chat_provider(provider), model);
+        let id = ModelRecord::id_for(&ModelCategory::for_chat_model(provider, model), model);
         match repo.get_by_id(&id).await {
             Ok(Some(record)) => record.context_length,
             Ok(None) => None,
@@ -1426,21 +1426,25 @@ impl GooseAdapter {
                     None
                 }
             },
-            // In-process llama.cpp; LocalInferenceProvider finds the .gguf via Goose's registry.
+            // In-process; LocalInferenceProvider finds the file, and its backend, via Goose's
+            // registry: llama.cpp for a .gguf, LiteRT-LM for a .litertlm.
             "local" | "gguf" => {
                 let model_name = if settings.chat_model.is_empty() {
                     "llamafile".to_string()
                 } else {
                     settings.chat_model.clone()
                 };
+                let litert = pond_core::models::domain::litert::is_litert_model(&model_name);
                 // Canonical key, so aliases of one GGUF can't load it twice under two ids.
                 let registry_key = match self.data_dir {
+                    Some(ref dd) if litert => crate::litert_model::register(&model_name, dd),
                     Some(ref dd) => Self::register_gguf_model(&model_name, dd),
                     None => model_name.trim_end_matches(".gguf").to_string(),
                 };
                 // Registration leaves `mmproj_path` (the engine's vision gate) None. Non-blocking
                 // (~1 GB fetch); the path is resolved per generation, so no restart is needed.
-                if let Some(ref dd) = self.data_dir {
+                // A LiteRT-LM model reads no pictures.
+                if let Some(dd) = self.data_dir.as_ref().filter(|_| !litert) {
                     let gguf = self
                         .registry_row_path(&registry_key)
                         .unwrap_or_else(|| crate::vision_encoder::chat_gguf_path(dd, &model_name));
@@ -1675,7 +1679,9 @@ impl GooseAdapter {
                 &settings.chat_model,
                 self.data_dir.as_deref(),
             );
-            if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
+            if matches!(settings.chat_provider.as_str(), "local" | "gguf")
+                && !pond_core::models::domain::litert::is_litert_model(&settings.chat_model)
+            {
                 // llama.cpp can GBNF-constrain any GGUF, quant tag in its name or not.
                 caps.structured_output = true;
             }
@@ -3936,6 +3942,35 @@ impl AgentPort for GooseAdapter {
                 anyhow::anyhow!("compaction produced a conversation we could not store: {e}")
             })?;
 
+        // What goose's own `/compact` records next (`handle_compact_command`): the size compaction
+        // left as the session's size, and the summary call in its usage ledger. goose's check at
+        // the start of a turn reads that size, so without it the next turn compacts again.
+        let left = goose_providers::conversation::token_usage::Usage::new(
+            Some(result.retained_context_tokens),
+            None,
+            Some(result.retained_context_tokens),
+        );
+        if let Err(e) = self
+            .session_manager
+            .record_usage_metrics(
+                &goose_sid,
+                session.schedule_id.clone(),
+                left,
+                &result.usage.model,
+                &goose::conversation::message::MessageUsage::from_provider_usage(
+                    &result.usage,
+                    true,
+                ),
+            )
+            .await
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "compacted, but could not record the size it left; the next turn may compact again"
+            );
+        }
+
         // The KV-cached prefix is gone; noting it keeps the next cold turn attributable.
         self.note_prefix_invalidated(InvalidationReason::PromptChanged);
 
@@ -3949,6 +3984,37 @@ impl AgentPort for GooseAdapter {
             "compacted on request"
         );
         Ok(retained)
+    }
+
+    /// goose's own check at the start of a turn (`check_if_compaction_needed`), asked between
+    /// turns. Only for a conversation already paired with a goose session: resolving one would
+    /// create it.
+    async fn compacts_on_next_turn(&self, session_id: &str) -> bool {
+        let Some(goose_sid) = self
+            .goose_session_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let Ok(session) = self.session_manager.get_session(&goose_sid, true).await else {
+            return false;
+        };
+        let (Some(conversation), Ok(provider)) =
+            (session.conversation.as_ref(), self.agent.provider().await)
+        else {
+            return false;
+        };
+        goose::context_mgmt::check_if_compaction_needed(
+            provider.as_ref(),
+            conversation,
+            None,
+            &session,
+        )
+        .await
+        .unwrap_or(false)
     }
 
     async fn chat_stream(

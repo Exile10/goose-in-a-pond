@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub enum ModelCategory {
     /// Local GGUF file loaded in-process via llama-cpp.
     Gguf,
+    /// Local `.litertlm` file loaded in-process via LiteRT-LM.
+    Litert,
     /// Self-contained llamafile executable (HTTP server on port 8080).
     Llamafile,
     /// Model served by a running Ollama instance.
@@ -30,6 +32,7 @@ impl ModelCategory {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Gguf => "gguf",
+            Self::Litert => "litert",
             Self::Llamafile => "llamafile",
             Self::Ollama => "ollama",
             Self::Whisper => "whisper",
@@ -43,6 +46,7 @@ impl ModelCategory {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "gguf" => Some(Self::Gguf),
+            "litert" => Some(Self::Litert),
             "llamafile" => Some(Self::Llamafile),
             "ollama" => Some(Self::Ollama),
             "whisper" => Some(Self::Whisper),
@@ -63,10 +67,19 @@ impl ModelCategory {
         }
     }
 
-    /// Runtime provider serving this category; inverse of [`Self::for_chat_provider`] for LLMs.
+    /// Catalog category for a chat provider and model: [`Self::for_chat_provider`], except that
+    /// the local provider's `.litertlm` models are [`Self::Litert`].
+    pub fn for_chat_model(provider: &str, model: &str) -> Self {
+        match Self::for_chat_provider(provider) {
+            Self::Gguf if super::litert::is_litert_model(model) => Self::Litert,
+            category => category,
+        }
+    }
+
+    /// Runtime provider serving this category; inverse of [`Self::for_chat_model`] for LLMs.
     pub fn runtime_provider(&self) -> &'static str {
         match self {
-            Self::Gguf => "local",
+            Self::Gguf | Self::Litert => "local",
             Self::Ollama => "ollama",
             _ => "llamafile",
         }
@@ -74,7 +87,10 @@ impl ModelCategory {
 
     /// True for LLM categories (chat/think/task/tool roles).
     pub fn is_llm(&self) -> bool {
-        matches!(self, Self::Gguf | Self::Llamafile | Self::Ollama)
+        matches!(
+            self,
+            Self::Gguf | Self::Litert | Self::Llamafile | Self::Ollama
+        )
     }
 
     pub fn is_asr(&self) -> bool {
@@ -229,6 +245,7 @@ mod tests {
     fn category_roundtrip() {
         let cats = [
             ModelCategory::Gguf,
+            ModelCategory::Litert,
             ModelCategory::Llamafile,
             ModelCategory::Ollama,
             ModelCategory::Whisper,
@@ -276,11 +293,55 @@ mod tests {
         }
     }
 
+    /// Both run in the local provider, so only the model id tells a LiteRT row from a GGUF one.
+    #[test]
+    fn a_local_litert_model_addresses_the_litert_catalog() {
+        assert_eq!(
+            ModelCategory::for_chat_model("local", "gemma-4-E2B-it.litertlm"),
+            ModelCategory::Litert
+        );
+        assert_eq!(
+            ModelCategory::for_chat_model("gguf", "gemma-4-E2B-it.litertlm"),
+            ModelCategory::Litert
+        );
+        assert_eq!(
+            ModelCategory::for_chat_model("local", "gemma-4-E2B-it"),
+            ModelCategory::Gguf
+        );
+        // Only the local provider runs LiteRT-LM.
+        assert_eq!(
+            ModelCategory::for_chat_model("ollama", "x.litertlm"),
+            ModelCategory::Ollama
+        );
+        assert_eq!(ModelCategory::Litert.runtime_provider(), "local");
+        assert!(ModelCategory::Litert.is_llm());
+    }
+
+    /// The boot-time sync maps a category back to a provider; a category it does not know
+    /// becomes llamafile on the next restart.
+    #[test]
+    fn every_llm_category_round_trips_through_its_runtime_provider() {
+        for (cat, model) in [
+            (ModelCategory::Gguf, "gemma-4-E2B-it"),
+            (ModelCategory::Litert, "gemma-4-E2B-it.litertlm"),
+            (ModelCategory::Llamafile, "llama"),
+            (ModelCategory::Ollama, "llama3.2"),
+        ] {
+            assert_eq!(
+                ModelCategory::for_chat_model(cat.runtime_provider(), model),
+                cat,
+                "{} does not survive a provider round trip",
+                cat.as_str()
+            );
+        }
+    }
+
     #[test]
     fn category_families() {
         assert!(ModelCategory::Gguf.is_llm());
         assert!(ModelCategory::Llamafile.is_llm());
         assert!(ModelCategory::Ollama.is_llm());
+        assert!(ModelCategory::Litert.is_llm());
         assert!(!ModelCategory::Whisper.is_llm());
         assert!(ModelCategory::Whisper.is_asr());
         assert!(!ModelCategory::Gguf.is_asr());

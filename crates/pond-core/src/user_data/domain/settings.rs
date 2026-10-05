@@ -427,8 +427,9 @@ pub struct Settings {
     #[serde(default)]
     pub show_turn_stats: bool,
 
-    /// Deterministic trim + idle summary; Goose's own compaction and tool-pair summaries go off.
-    /// Default on: Goose's reactive LLM compaction stalls an on-device turn mid-conversation.
+    /// Idle work on long conversations: the rolling-summary refresh, and compaction while the
+    /// household is quiet. goose's own compaction runs either way (goose owns context management),
+    /// but a conversation compacted in quiet does not stall its next on-device turn for it.
     #[serde(default = "Settings::default_hybrid_compaction_enabled")]
     pub hybrid_compaction_enabled: bool,
 

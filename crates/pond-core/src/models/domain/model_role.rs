@@ -4,8 +4,9 @@
 use crate::models::domain::model_record::ModelCategory;
 
 /// Categories that can serve a language-model role.
-const LLM_CATEGORIES: [ModelCategory; 3] = [
+const LLM_CATEGORIES: [ModelCategory; 4] = [
     ModelCategory::Gguf,
+    ModelCategory::Litert,
     ModelCategory::Llamafile,
     ModelCategory::Ollama,
 ];
@@ -165,7 +166,9 @@ mod tests {
     #[test]
     fn a_role_accepts_exactly_the_categories_that_can_serve_it() {
         assert!(ModelRole::Chat.accepts(&ModelCategory::Gguf));
+        assert!(ModelRole::Chat.accepts(&ModelCategory::Litert));
         assert!(ModelRole::Tool.accepts(&ModelCategory::Ollama));
+        assert!(!ModelRole::Asr.accepts(&ModelCategory::Litert));
         assert!(!ModelRole::Chat.accepts(&ModelCategory::Whisper));
         assert!(ModelRole::Asr.accepts(&ModelCategory::Whisper));
         assert!(!ModelRole::Asr.accepts(&ModelCategory::Gguf));
@@ -217,6 +220,13 @@ mod tests {
         assert_eq!(
             ModelRole::Chat.settings_mirror(&ModelCategory::Ollama, "llama3.2")[0].1,
             "ollama"
+        );
+        assert_eq!(
+            ModelRole::Chat.settings_mirror(&ModelCategory::Litert, "gemma-4-E2B-it.litertlm"),
+            vec![
+                ("chat_provider", "local".to_string()),
+                ("chat_model", "gemma-4-E2B-it.litertlm".to_string()),
+            ]
         );
     }
 

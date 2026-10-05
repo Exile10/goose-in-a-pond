@@ -61,6 +61,7 @@ fn static_models() -> Vec<ModelRecord> {
     out.extend(kokoro_tts_voices());
     out.extend(llamafile_models());
     out.extend(gguf_models());
+    out.extend(litert_models());
     out.extend(embedding_models());
     out
 }
@@ -586,6 +587,45 @@ fn gguf_models() -> Vec<ModelRecord> {
     entries.iter().map(gguf_record).collect()
 }
 
+// ── LiteRT-LM ─────────────────────────────────────────────────────────────────
+
+/// The pinned `.litertlm` files; the name is the file name, which is also the registry id.
+fn litert_models() -> Vec<ModelRecord> {
+    pond_core::models::domain::litert::CURATED
+        .iter()
+        .map(litert_record)
+        .collect()
+}
+
+fn litert_record(spec: &pond_core::models::domain::litert::LiteRtModelSpec) -> ModelRecord {
+    let size_mb = spec.size_bytes / (1024 * 1024);
+    ModelRecord {
+        id: ModelRecord::id_for(&ModelCategory::Litert, spec.filename),
+        category: ModelCategory::Litert,
+        name: spec.filename.to_string(),
+        filename: Some(spec.filename.to_string()),
+        description: spec.description.to_string(),
+        size_mb,
+        url: Some(spec.url()),
+        hf_id: None,
+        // Weights + 25% for the run, the catalogue's own rule of thumb.
+        ram_estimate_mb: Some(size_mb + size_mb / 4),
+        recommended_role: Some("chat".to_string()),
+        context_length: Some(spec.context_length),
+        quantization: None,
+        asr_language: None,
+        asr_size: None,
+        tts_engine: None,
+        tts_voice_name: None,
+        config_filename: None,
+        config_url: None,
+        tts_url: None,
+        sample_rate: None,
+        downloaded: false,
+        is_custom: false,
+    }
+}
+
 // ── Embedding ────────────────────────────────────────────────────────────────
 
 fn embedding_models() -> Vec<ModelRecord> {
@@ -778,7 +818,12 @@ mod tests {
     fn every_chat_capable_entry_declares_a_context_window() {
         let chat_capable: Vec<ModelRecord> = static_models()
             .into_iter()
-            .filter(|m| matches!(m.category, ModelCategory::Gguf | ModelCategory::Llamafile))
+            .filter(|m| {
+                matches!(
+                    m.category,
+                    ModelCategory::Gguf | ModelCategory::Litert | ModelCategory::Llamafile
+                )
+            })
             .collect();
 
         // A floor, so a broken filter cannot pass by matching nothing.
@@ -797,6 +842,27 @@ mod tests {
                  rung 3 of the context governor reads this field",
                 m.name
             );
+        }
+    }
+
+    /// The download pins what the URL names; a `main` URL would fetch whatever is there now.
+    #[test]
+    fn litert_entries_download_their_pinned_revision() {
+        let litert: Vec<ModelRecord> = static_models()
+            .into_iter()
+            .filter(|m| m.category == ModelCategory::Litert)
+            .collect();
+        assert_eq!(litert.len(), 2, "the E2B and E4B files");
+        for m in &litert {
+            let url = m.url.as_deref().expect("a download URL");
+            let (repo, revision, file) = pond_hf_cache::parse_hf_url(url).expect("an HF URL");
+            let pin = pond_core::models::domain::litert::pinned(&repo, &revision, &file)
+                .unwrap_or_else(|| panic!("{} downloads an unpinned file: {url}", m.name));
+            assert_eq!(m.name, pin.filename, "the name is the file name");
+            assert_eq!(m.filename.as_deref(), Some(pin.filename));
+            assert_eq!(m.id, format!("litert/{}", pin.filename));
+            assert!(pond_core::models::domain::litert::is_litert_model(&m.name));
+            assert!(m.context_length.unwrap_or(0) >= 2048, "{}", m.name);
         }
     }
 

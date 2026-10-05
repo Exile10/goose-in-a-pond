@@ -407,6 +407,20 @@ pub struct RunSupervisor {
     pub permits: Arc<tokio::sync::Semaphore>,
     /// Identifies this process, so a client can tell "pond restarted" from "run aged out".
     pub epoch: String,
+    /// Turns being answered now, registered or not: only a resumable turn joins `registry`.
+    turns_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// The quiet-time compaction pass, which every turn path checks in with before the model.
+    quiet_passes: crate::quiet_pass::QuietPasses,
+}
+
+/// A turn being answered, counted until it drops; see [`RunSupervisor::turn_started`].
+#[must_use = "the turn stops counting as in flight when this drops"]
+pub struct TurnInFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for TurnInFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl RunSupervisor {
@@ -415,7 +429,33 @@ impl RunSupervisor {
             registry: RunRegistry::new(max_runs, retention),
             permits: Arc::new(tokio::sync::Semaphore::new(max_runs)),
             epoch: uuid::Uuid::new_v4().to_string(),
+            turns_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            quiet_passes: crate::quiet_pass::QuietPasses::default(),
         }
+    }
+
+    /// Counts a turn as being answered until the guard drops, a panic or a cancelled stream
+    /// included. Every turn path holds one, whether or not its run is registered.
+    pub fn turn_started(&self) -> TurnInFlight {
+        self.turns_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        TurnInFlight(self.turns_in_flight.clone())
+    }
+
+    /// Whether any turn is being answered; background work that needs the model waits.
+    pub fn turn_in_flight(&self) -> bool {
+        self.turns_in_flight() > 0
+    }
+
+    /// How many turns are being answered.
+    pub fn turns_in_flight(&self) -> usize {
+        self.turns_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The quiet-time compaction pass, if one is running, and the turns waiting on it.
+    pub fn quiet_passes(&self) -> &crate::quiet_pass::QuietPasses {
+        &self.quiet_passes
     }
 }
 
@@ -431,6 +471,18 @@ mod tests {
 
     fn handle(policy: RunPolicy) -> Arc<RunHandle> {
         RunHandle::new("sess-1".into(), RunOwner::Unattributed, policy)
+    }
+
+    #[test]
+    fn a_turn_counts_as_in_flight_until_its_guard_drops() {
+        let runs = RunSupervisor::default();
+        assert!(!runs.turn_in_flight());
+        let first = runs.turn_started();
+        let second = runs.turn_started();
+        drop(first);
+        assert!(runs.turn_in_flight(), "one turn is enough");
+        drop(second);
+        assert!(!runs.turn_in_flight());
     }
 
     #[test]

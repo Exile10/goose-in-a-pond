@@ -1,8 +1,10 @@
+pub mod compaction_prompts;
 pub mod extension_manager;
 pub mod giap_registration;
 pub mod goose_agent;
 #[cfg(test)]
 mod goose_nudges;
+pub mod litert_model;
 pub mod logging;
 pub mod mesh_provider;
 pub mod model_traits;

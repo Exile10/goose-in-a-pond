@@ -2446,3 +2446,568 @@ and do not establish device-key proof of possession or encrypted transport.
   "any device or system", asked for by Jarida.
 - **Not built.** Resuming Spotify when a voice session is killed mid-speech; asking where the playing
   device is before pausing it.
+
+**2026-10-02 — LiteRT-LM models in the local provider (GIAP wiring; not a PAI milestone).**
+
+- **What landed.** A `.litertlm` file runs on goose's `litert` backend under `chat_provider =
+  "local"`: catalogue category `litert` whose runtime provider is `local` (so the boot-time
+  assignment sync no longer turns it into llamafile), id = file name with the extension, one
+  registration for the chat path and the side-call adapter (entry-level `backend_id`,
+  `ManualPath`, `ForceNative`, no picture support), and a device stamp that writes only
+  `context_size` and the `litert` block. No GGUF probe, encoder lookup or `device_window` runs on
+  one. Two pinned catalogue rows; startup points `GOOSE_LITERT_LIB_DIR` at an installed package.
+- **Interdependency check (2.2), run against all eight.** KV prefix: the backend keeps one
+  Conversation per model, and follow-up inferences and the next turn are `Extend` (measured
+  below); with thinking on, LiteRT rewinds to step 0 when it filters thought channels, so the first
+  follow-up re-prefills once. Preamble: unchanged; `<vision>` is never claimed, `structured_output`
+  is false. `profile_id`: untouched. Egress: no new sender; both Hugging Face download paths apply
+  the pin (size + sha256); library discovery downloads nothing. Secrets: none; no `Settings` field
+  (two env overrides, `GIAP_LITERT_BACKEND` and `GIAP_LITERT_SPECULATIVE`). Guest, turn blocking,
+  side effects: none.
+- **PAI-3, provisional.** The window is 16384 off the budgeted device and 4096 on it, LiteRT-LM's
+  own GPU default and not an Orin measurement. 4096 cannot hold this Mac's 4.0K-token turn-1
+  prompt (27 tools) plus an answer; the Orin's KV reading must replace it before the board runs it.
+- **Found, not fixed here: on this Mac's GPU (WebGPU on Metal) the output is corrupt whenever the
+  conversation carries tools.** Digits are dropped, repeated and reordered ("19:23 on 2 October 2026,
+  code 1234567890" came back "19:226 on October 2206, code 13123456890"), tool names arrive garbled
+  and are dropped by the shim, and one turn ran away for 11,164 tokens. It is deterministic and
+  holds with MTP off, greedy sampling, temperature 0.2-0.8, top_p 1.0, windows 8192/16384 and
+  thinking off. Without tools the same GPU repeats the line exactly at 623, 2,017 and 3,716 prompt
+  tokens; on the CPU (XNNPACK) with tools it is exact. A goose-backend or LiteRT-LM fix; until then
+  `GIAP_LITERT_BACKEND=cpu` gives correct output at CPU speed.
+- **Verification**: Mac only (M4, E2B, debug GIAP over the prebuilt library). Suites: pond-core
+  1,721, pond-api 546, pond-infra 446, goose adapter 263, local-inference 42, pond-server bin 145,
+  all green; `cargo check -p pond-server -p pond-adapters-goose --all-targets` clean;
+  `scripts/live-test.sh` 123 + 18 checks passed. Scratch pond, CPU: turn 1 ttft 18.5 s (prefill
+  4,024 tokens at ~220 tok/s), turn 2 `get_system_info` called and answered, `Extend`, ttft 1.8 s,
+  `reused_prefix_tokens` 12,622 across its three inferences, decode ~16 tok/s; GPU: ttft 3.5 s,
+  decode 62 tok/s, output corrupt as above. A restart kept `chat_provider = local` and the litert
+  `chat_model`. Not run: the Orin, the pai-bench head-to-head, the KV-cost measurement.
+
+**2026-10-04 — LiteRT-LM on GIAP's giap-main: exact GPU tool calls, and the chat set aside for
+side calls (GIAP wiring; not a PAI milestone).**
+
+- **What landed.** The library pin moves from upstream LiteRT-LM `3dbb23e1` to GIAP's fork
+  `giap-main` at `a5dd27b5` (upstream `b320801b` plus GIAP's fixes; no public remote yet, so it is
+  built from `LITERT_LM_SRC`). goose `e27ad7334` uses the fork's three extra C functions. A diverged
+  or repeated history is rematched: its whole prompt is prefilled into the retained conversation
+  from step 0 over what its KV cache holds. A side call no longer runs beside the chat, which made
+  LiteRT copy the whole KV cache into the idle conversation; the chat is set aside as a KV snapshot
+  on disk, and the next request of its family restores it. On upstream LiteRT-LM the backend
+  behaves as before.
+- **Fixed: the GPU fault recorded on 2026-10-02.** With giap-main's fp32 activations the tool round
+  on this Mac's GPU is exact (live test: the weather call, its answer and five follow-ups), so
+  `GIAP_LITERT_BACKEND=cpu` is no longer needed for correct output here.
+- **Interdependency check (2.2), run against all eight.**
+  - PAI-3 and PAI-4 (KV prefix): Extend is unchanged. Compaction, an edited history, a regenerated
+    reply and a new session with the same system prompt and tools now rematch instead of
+    prefilling from nothing: a new session's first turn reused 3,001 of 3,224 tokens. Side calls
+    (batch memory extraction and titling after 15 minutes of quiet, PAI-7's review) no longer cost
+    the chat its prefix. The startup prewarm warms the household's full tool set; a turn whose tool
+    set differs (one with no identified member keeps 21 of 29 tools) shares only the system prompt
+    with it, so its first turn is effectively cold on either engine.
+  - PAI-2 (privacy): a snapshot holds the chat's KV cache and its token ids, so the conversation's
+    text, in `<goose data>/litert-lm/kv-snapshots/`: three kept, each the whole KV window whatever
+    it holds (151 MB for E2B at 16384 tokens), mode 0644 like the pond's databases. Local disk
+    only, the trust boundary of `pond_system.db`; no egress, no secret. **Owed:** forgetting a
+    member or wiping the pond does not delete these files. They are overwritten as other
+    conversations are set aside; they should go with the member's data.
+  - PAI-1 (profile boundaries): a family is keyed by the whole identity (the system message, which
+    carries the member's name, the tools and thinking), so a member's chat and a guest's never
+    share a file. A restore reuses only the tokens identical to the new prompt in any case, so
+    nothing of one conversation reaches another's turn.
+  - PAI-5 (reasoning): with thinking on, rematch and restore drop earlier thoughts as the template
+    does; verified live (thinking on, turn 3 extended a restored conversation, 992 tokens reused).
+  - PAI-6, PAI-7, PAI-8: no change beyond the side calls above. `profile_id`, egress, secrets,
+    guest, turn blocking: none.
+- **Verification** (Mac only: M4, gemma-4-E2B `.litertlm`, debug GIAP over the packaged library).
+  - goose-local-inference: 31 LiteRT unit tests pass; clippy clean. The live test passes on the GPU
+    and the CPU, thinking off and on, with upstream `3dbb23e1` on the CPU as the control. A turn
+    after the side call restored the chat (745 of 814 tokens reused, TTFT 155 ms on the GPU); a
+    second side call while nothing was retained wrote nothing; a regenerated turn rematched (TTFT
+    165 ms on the GPU, 315 ms on the CPU, against 1,531 ms cold on upstream); a cancel recovered
+    from the snapshot (158 ms).
+  - `scripts/pai_bench.py` against a scratch pond on the debug binary (`pai-bench.sh` needs a
+    release build and a model in the real pond, and this Mac had neither): 12 pass, 0 fail, PAI-7
+    not run. Cold TTFT 6.76 s (4,437 tokens), warm 623 ms, decode 64 tok/s. Snapshots of 3,600 to
+    4,400 tokens saved in 100 to 161 ms and loaded in 98 to 150 ms. `pai_bench.py` now counts
+    Rematch as prefix reuse.
+  - Quiet-time check in that pond (two chat turns, 15 minutes of household quiet so the batch jobs
+    run, a third turn): titling set the chat aside (3,833 tokens, 117 ms) and turn 3 restored it
+    (127 ms) and reused 3,658 of 4,072 tokens, TTFT 836 ms. Its first run found a fault, fixed
+    before the commit: families were keyed on the first 512 characters of the system message, the
+    proactive review opens like the chat, and when the extraction pass set the review aside its
+    snapshot replaced the chat's, so turn 3 reused 474 tokens at a TTFT of 4,497 ms. Families are
+    now the whole identity; while nothing is retained the conversation last set aside is weighed in
+    its place, so a second titling call no longer takes the slot and saves itself; three snapshots
+    are kept. The rerun's batch jobs were lighter (no review; extraction made no model call), so
+    the review case rests on the unit tests and the live test's second side call.
+  - The lib suite's three llama.cpp context-cap failures predate this work; they are tracked
+    separately.
+- **Owed.** The Orin: snapshot save and load times and memory on the device. The linux-arm64
+  package of `a5dd27b5` is built: on the board itself (Docker Desktop's VM is down on this Mac), in
+  28 s from its warm cache, verified there and imported on the Mac. Erasing snapshots with a
+  member's data. The reuse count of a whole-prompt turn: LiteRT counts the skipped tokens as
+  prefilled, so the backend reports none; it needs a figure from the C API. A snapshot that writes
+  only the positions it holds. Rematching across a tools-only change without the disk round trip.
+  Side calls told apart by a signal from GIAP rather than by weight: a guest's chat weighs under
+  half a long member chat and runs as a side call.
+
+**2026-10-04 — LiteRT-LM on the Orin: an 8k window and no MTP; rejected tool calls kept; compaction
+at 8k measured, not yet fixed (GIAP wiring; not a PAI milestone).**
+
+- **What landed.** On the budgeted device a LiteRT-LM engine gets an 8192-token window and no
+  speculative decoding (`88cea41b`). 4096 cannot hold the pond's first prompt (about 5,100 tokens),
+  and 16384 ran out of memory on the Orin. With E4B on the GPU, alternated on, off, on, off over the
+  pond's prompt, MTP decoded prose at 9.3-9.8 tok/s against 14.1-14.2 without, and finished copied
+  text and tool calls only 4-16% sooner. goose `bf5d9d524` (bumped in `29c9e1fd`) keeps a tool call
+  LiteRT-LM's parser rejects and reads it leniently: gemma-4-E2B's `segment:knowledge,tier:permanent`
+  had failed a turn.
+- **PAI-3 and PAI-4 at 8k**, measured on the Mac with the Orin emulated (`POND_DEVICE_PROFILE=
+  orin-nano-8gb`, E2B, 16 turns in one session). The preamble (system prompt and 21-29 tools, about
+  3,800 tokens) takes almost half the window. goose compacts when the last turn's tokens pass 80%
+  of the window (6,553), so it compacted every 2-5 turns, each time summarising the whole
+  conversation with its coding-agent prompt before the turn could start: 24-51 s on the Mac, which
+  would be minutes on the Orin. GIAP's own turn budget does not act on the live goose path
+  (`trim_history` has no production caller, and the rolling summary is used only when a session is
+  hydrated). No turn overflowed (the peak prompt was 7,216 tokens, 88%), and a fact from turn 1 was
+  recalled at turn 15, through the pond's memory as much as the summary.
+- **Tried, not shipped:** household compaction prompts, installed as goose's `compaction.md` override
+  (goose reads `<engine>/config/prompts/`). Three runs each of a manual compaction followed by a
+  how-to question: goose's own prompt 37-51 s, answered 2 of 3; a household note 16-22 s, answered
+  0 of 3; goose's fields without the verbose ones 21-25 s, answered 1 of 3. Faster, but E2B declined
+  the next question more often, and three runs cannot separate the variants. The prompts and the
+  harness are kept for E4B on the Orin to decide.
+- **Owed.** Compaction at 8k on the Orin with E4B: how long it takes and how the next answer fares.
+  Then one or more of: a bounded compaction prompt that holds up on E4B; compaction run during
+  household quiet (`compact_session`) instead of at the start of a turn; per-session tool groups on
+  the Orin, which measured 59 tools in 6,539 tokens against 17 in 2,386.
+
+**2026-10-04 — Compaction moved to household quiet, measured on the Orin with E4B (GIAP wiring;
+not a PAI milestone).**
+
+- **What landed** (`95254bb9`, `15e1885c`, `134b3f40`). A new inference-lane job,
+  `compaction` ("Make room in long conversations"), first in tie-break order. Every 15 s it asks
+  the context monitor which conversations are under pressure (`sessions_due_compaction`: above
+  75% of the window or under 3 turns left, outside the 3-turn cooldown) and, after 30 s with no
+  activity and no turn being answered, compacts them through `compact_session`, one at a time. A
+  turn that starts, or any other activity, cancels the pass within 100 ms; goose's own compaction
+  still covers that turn, and the conversation stays due for the next quiet. Only a pass that runs
+  to an end starts the cooldown. Gated on `context_monitor_enabled` and
+  `hybrid_compaction_enabled`; that setting's doc claimed goose's own compaction goes off, which
+  the live path has not done since goose was given context management, and now says so.
+- **Three defects the Orin found that the Mac did not** (`134b3f40`), all from one pass that
+  started 37 s into a conversation's second turn, on that conversation. (1) The context monitor
+  counted a first turn's whole size, preamble included, as growth, so it reported no turns left at
+  60% full and every conversation was due from its first turn; a first turn now records no growth.
+  (2) Only a resumable turn joins the run registry, so no turn looked to be running during most
+  turns; every turn path now holds a count on the run supervisor (`TurnInFlight`), and the lane
+  and the job read it. (3) The pass claimed its cooldown before running, so an interrupted pass
+  blocked quiet compaction for three turns. On the Mac turns were shorter than the 30 s quiet, so
+  none of the three showed.
+- **The cost it moves, on the Orin** (E4B, LiteRT-LM GPU, 8k window, release build at `3b6300a8`,
+  16 turns in one session, no pauses). goose compacted five times, before turns 5, 9, 10, 12 and
+  15. Each compaction took 113-232 s, and the turn's first word waited 121-290 s; the turn's
+  `ttft_ms` (2-11 s) leaves that out. Turns without one took 20-76 s at 13.4-13.8 tok/s. Free
+  memory fell to 280 MB with 1.3 GB in swap, and nothing was killed. The turn-1 fact was recalled
+  at turn 15.
+- **Found on the way: lane jobs ran inside long turns** (`15e1885c`). In that run the summary
+  refresh took the lane inside four turns, and each of its calls held the engine for 58-62 s while
+  the turn waited. Jobs measure quiet from activity, stamped when a turn starts and when it ends,
+  so a turn longer than a job's threshold read as quiet in between. The lane now counts a running
+  turn as no quiet at all, so every idle-gated job is refused as still active; a hand-asked run
+  still waives it.
+- **On the Mac** (E2B, Orin emulated, 8k). After a 150 s pause the pass took 43.7 s and kept 809
+  tokens of conversation, and the next turn took 14.1 s, against 58.3 s when a 75 s pause was too
+  short and goose compacted inside the turn. The fact from turn 1 was recalled at turn 15 both
+  times.
+- **On the Orin with the job** (same model and window, one session, a 300 s pause after turn 4).
+  On `15e1885c` the pass in the pause took 126 s and kept 835 tokens, and the next turn took 45 s
+  against 156 s when goose compacted inside it; that build also ran the pass inside turn 2, which
+  is how the three defects above surfaced. On `134b3f40` no pass ran inside a turn, and none ran in
+  the pause either, correctly: goose had compacted inside turn 4 and left the conversation at 61%.
+  A pass pays off only when the household pauses with a conversation near the edge.
+- **What still costs the Orin a first word over 5 s: re-prefilling the conversation.** LiteRT-LM
+  logs where reuse stops (`Prefill after rewind: reused N of M`). An `Extend` reuses everything but
+  the new message, and before the first compaction a turn's first prefill took 1.5-3.0 s. A whole
+  prompt sent after a compaction, or after the conversation was set aside and restored from its 235
+  MB snapshot, matched only the ~3,800-token preamble and re-prefilled the conversation behind it:
+  950-2,200 tokens, 6-11 s at E4B's 150-250 tok/s, and 1,182-1,474 tokens in 12-16 s while the board
+  swapped (the turns after the quiet pass and after the pause above). After a compaction that is the
+  price of a new history; on four turns that compacted nothing (6, 11, 13 and 16, plans `Recreate`
+  or `Rematch`), whose history was unchanged, it is a defect. The snapshot copies also cost memory:
+  in the save and restore after goose's compaction, free memory fell to 102 MB and swap rose from
+  1.1 to 2.8 GB (the board began that run with 0.5 GB already in swap). Next: find why a re-rendered
+  prompt parts from the KV right after the preamble (once it matched 4,819 of 5,187, so not always);
+  warming the compacted conversation at the end of a pass pays only once that holds.
+- **PAI.** Preamble: unchanged. `profile_id`: untouched; the job compacts the session goose holds,
+  whoever owns it, exactly as goose would at the next turn. Egress: none. Secrets: none; no new
+  `Settings` field. Guest: nothing new is reachable. Turn blocking: the job never runs during a
+  turn and yields to one within 100 ms. Side effects: a conversation is summarised sooner than
+  goose would have done it, with goose's own prompt.
+- **Limits.** Turns the desktop's voice child answers, in its own process, are not counted. A
+  pass the household interrupts near its end is wasted: the returning turn compacts from scratch.
+- **Per-session tool groups (`tool_selection_mode = minimal`), measured and not a default.** The
+  model sees only the two toolkit tools and loads a group itself. On the Mac (E2B, Orin emulated, 16
+  turns) the turn-1 prompt fell from 4,256-4,307 tokens to 1,485 and goose's first compaction came
+  at turn 13 instead of 5-7, but E2B never loaded a group: no tool call in 16 turns, a turn-1 "I
+  have saved that" with nothing saved, and "I do not have that information" at the turn-15 recall.
+  On the Orin, E4B loaded `giap-memory` on turn 1 and saved the fact (turn 1 took 118 s against 76
+  s, every load changing the conversation's identity), goose compacted once in 16 turns instead of
+  five, and the fact was recalled at turn 15. But after that compaction E4B refused three plain
+  questions in a row ("I cannot provide a packing list ... because the necessary knowledge tool is
+  unavailable"), which it had answered with every tool offered, and free memory fell to 51 MB with
+  3.0 GB in swap. A smaller preamble is still the lever; this mode is not how to get it. (`relevant`
+  mode pre-classifies the opening message by embedding, which the working agreement rules out.)
+- **Verification.** pond-core and pond-api 2,272 passed; pond-server's binary 146; clippy as CI
+  runs it, clean; `scripts/live-test.sh` 158 checks passed on each of the three commits, the lane
+  listing 8 jobs; the Mac and Orin runs above.
+
+**2026-10-04 — A compaction no longer rewrites the history the next turn sends (goose patch; not a
+PAI milestone).**
+
+- **Cause.** goose's `compact_messages` stamped the copy of the user's last message, the one it
+  keeps after the summary, before running the summary. A session reloads its messages
+  `ORDER BY created_timestamp, id`, seconds then insertion, so once the summary took a second or
+  more the copy sorted ahead of the summary and the continuation note on the next turn, and
+  `merge_consecutive_messages` folded it into the summary and the note into the reply after it.
+  Found with a temporary dump of what the LiteRT-LM backend received: on the turn after each
+  compaction the request held one message fewer than the conversation the backend had consumed,
+  so it could not extend, and the re-rendered prompt parted from the KV right after the
+  ~3,800-token preamble. This was the defect in the entry above: the four Orin turns that
+  re-prefilled with an unchanged history each followed a compaction turn.
+- **Fix:** goose `f06a009b8` (bumped in `d0054b32`). The copy is stamped when it is pushed, never
+  earlier than the message ahead of it. The regression test's summary takes 1.1 s; without the
+  fix the reload order is `[0, 1, 2, 5, 3, 4]`. A manual compaction (the quiet pass) keeps no copy
+  and was never affected.
+- **Measured.** Mac (E2B, Orin emulated, 16 turns, three compactions): the turn after each
+  compaction extended (LiteRT: "from step 5610: reused 264 of 327") instead of re-sending its prompt
+  from step 0 ("reused 3800 of 5,388-5,523"), TTFT 2.3-2.9 s before and 0.7-1.3 s after. Orin (E4B,
+  8k, release `d0054b32`, stopped after 8 turns): the turn after the first compaction extended with
+  an 83-token prefill, where the baseline re-sent 1,476-2,178 tokens on each such turn; every
+  compaction now makes one whole-prompt send, its own. The same run showed what is next. From turn 6
+  goose compacted on every turn: after each compaction the prompt already stood at 5,772-6,093
+  tokens (72-77% of the window) and grew with each one, as the summary carries every earlier request
+  forward, so the next turn passed 80% again; each of those turns took 4-5 minutes. And the board
+  swapped to 3.1 GB with 54 MB free, where prefill ran at ~100 tok/s instead of 150-250, and even an
+  83-token extend took 5.3 s.
+- **Also.** Until now the model read, on every turn after a compaction, its previous question with
+  the summary glued after it and the continuation note glued to its previous answer. Sessions
+  compacted before the fix stay that way until their next compaction rewrites the tail.
+- **PAI.** Preamble, `profile_id`, egress, secrets, guest, turn blocking: unchanged. Side effect:
+  compaction's output keeps the order it was built in.
+- **Verification.** goose `context_mgmt` tests 11 passed, the new one failing without the fix;
+  clippy clean on the change; the Mac and Orin runs above. In `goose/` on this Mac, sqlx's
+  proc-macro needs `--config 'profile.dev.package.sqlx-macros.debug=true'` or dyld rejects it.
+
+**2026-10-04 — Compaction A/B rerun on the in-turn path: a bounded summary stops the Orin's
+runaway (measured; nothing shipped).**
+
+- **Why rerun, and how.** The earlier A/B compacted by hand (`compact_session`, goose's manual
+  path), which keeps no copy of the user's message, so the reordering bug never touched it. The
+  household's path is goose's in-turn compaction. The new driver (`compaction_ab2.py`) sends
+  household requests until the last turn passes 80% of the window, asks a how-to on the turn that
+  compacts, then a recall the memory store also holds, then one only the conversation holds
+  (Monday's dish from an earlier menu), then three more requests. Arms, switched with goose's prompt
+  override: goose's own `compaction.md` (built-in) and `compaction-trimmed.md` (bounded: goose's
+  schema cut to `user_intent`, `pending_tasks`, `current_work`, `next_step`, at most eight short
+  lines a list).
+- **Mac** (E2B, Orin emulated, six per arm). Summary call, median: 49.9 s built-in, 24.1 s bounded.
+  First prompt after a compaction: 5,125 tokens (63% of the window) against 4,381 (53%). How-to on
+  the compacting turn answered 5 of 6 in both; the declines in both arms cite a missing tool or API
+  key. Memory-store fact recalled 6 of 6 in both; the conversation-only detail 2 of 5 built-in, 0 of
+  5 bounded.
+- **Orin** (E4B, two per arm). Summary call 126 s against 79 s; first prompt after 4,737 (58%)
+  against 4,340 (53%); how-to answered 2 of 2 against 1 of 2 (E4B looked mandazi up on Wikipedia and
+  gave no steps); memory-store fact 2 of 2 in both.
+- **Orin, the 16-turn conversation with the bounded prompt.** Compactions at turns 4, 8, 10 and 14,
+  each leaving 52.9-54.1% of the window, flat; compaction turns 105-157 s; all 16 turns in 1,100 s.
+  With the built-in prompt on the same build goose compacted at turns 4, 6, 7 and 8, the prompt
+  after each rising from 5,772 to 6,093 tokens as the summary carried every earlier request forward,
+  and seven turns took 1,067 s; before the reordering fix the built-in run took 1,851 s for 16. The
+  fact from turn 1 was recalled at turn 15. Memory pressure is unchanged: 43 MB free, 2.8 GB of
+  swap.
+- **Verdict.** On an 8k window the bounded prompt is what keeps compaction from returning every
+  turn, and it cuts the summary call by a third to a half. Its cost is conversation detail: eight
+  short lines do not carry a dish named earlier, and the memory store holds only what extraction or
+  the model saved. Not shipped. Jerry decides whether the device takes it, and whether a field for
+  named details is worth trying first.
+- **A measurement trap.** The driver's first post-compaction figure read the turn's last inference,
+  which includes that turn's own first reply (300-800 tokens) and hid a 750-token difference between
+  the arms; the first inference after each compaction in the server trace (`ab2_trace.py`) is the
+  honest figure.
+- **PAI.** Nothing changed in the product: the prompt override lived in a scratch pond and was
+  removed after the runs.
+
+**2026-10-04 — Fewer LiteRT-LM KV snapshots, and what actually fills the Orin's memory (goose patch;
+not a PAI milestone).**
+
+- **What changed** (goose `6c38f5b32`, bumped in `aa92fc6d`, at Jerry's choice of keeping fewer
+  snapshots). A conversation set aside is saved as a KV snapshot only when it carries tools, and two
+  files are kept instead of three. Every in-turn compaction had also saved the compaction call's own
+  conversation (5,261 tokens, 235 MB, 1.5 s), which nothing resumes, while memory was tightest; two
+  files cover the chats a household switches between, typed and spoken.
+- **What it does not do: relieve memory.** A one-second sampler (MemAvailable, page cache, swap, the
+  pond's RSS and swapped-out size, anonymous memory, and what meminfo leaves unaccounted, which on
+  the Orin is mostly the GPU's share of RAM) over 8 turns of the household conversation with E4B. No
+  snapshot save or restore moved free memory or swap on its own (save 1.5-1.8 s, restore 0.6-0.9 s).
+  Before the change: lowest free 46 MB, swap 2.89 GB at peak, 2.34 GB of the pond swapped out. After
+  it, one save per compaction instead of two and two files (470 MB) instead of three (705 MB):
+  lowest free 41 MB, swap 2.78 GB, 2.24 GB of the pond swapped out. What fills memory is the GPU's
+  share: it grew from 4.7 GB at the first turn to 6.6 GB by the eighth, in steps at long prefills
+  (+0.6 GB in a turn that prefilled a long tool result, +0.76 GB in the 20 s after the first whole
+  prompt following a compaction) and never fell back, which matches the earlier finding that
+  LiteRT-LM's GPU pool releases nothing when idle. As it grew, the kernel swapped out the pond's own
+  memory: 2.4 GB resident at the start, 0.44 GB at the end, and prefill slowed to about 100 tok/s.
+  Fewer and shorter long prefills (the bounded compaction prompt among them) or a pool that gives
+  memory back are the levers; the number of snapshot files is not. This run also compacted at two
+  turns in a row with goose's own prompt.
+- **Verification.** LiteRT backend tests 41 passed, including the rule and pruning to two; the live
+  test (tool round, a side call that sets the chat aside and restores it, a regenerated turn, a
+  cancel) passed on the Mac GPU with E2B; the Orin probes above.
+
+**2026-10-05 — The bounded compaction pair ships on the Orin (GIAP wiring; not a PAI milestone).**
+
+- **What landed** (GIAP `0f5b5df3`, at Jerry's call). On the budgeted device the pond installs two
+  of goose's prompt overrides at startup, in goose's own `<engine>/config/prompts/`:
+  `compaction.md`, the bounded prompt exactly as measured, and `compaction_summary.md`, which renders
+  only its four fields and the eight most recent requests. Off the device it removes its copies. A
+  file there without the pond's first-line mark is never replaced or removed.
+  `GIAP_COMPACTION_PROMPT=bounded|builtin` overrides the device's choice. It runs in `serve`, in
+  `chat` (the voice child) and in the bare interactive chat, after logging starts.
+- **Why the summary render too.** In the 16-turn Orin run E4B did not hold the prompt's "at most 8
+  items": the request list went 4, 8, 10, 14 lines over four compactions. goose renders the summary
+  through `compaction_summary.md` and documents it as overridable for exactly this
+  (`user_intent[:3]`). The pond's copy keeps `user_intent[-8:]` (the prompt asks for them oldest
+  first, so the eight most recent), the first eight pending tasks, current work and the next step,
+  and drops whatever else the model adds.
+- **Measured** (the A/B entry above). Summary call 79 s against 126 s on the Orin, 53% of the window
+  in use after a compaction against 58-63%, and 16 turns in 1,100 s with four compactions, where
+  goose's own prompt compacted on every turn from the sixth. The cost: a detail only the
+  conversation held was recalled 0 of 5 times against 2 of 5.
+- **PAI.** Preamble: unchanged. Egress, secrets, guest, turn blocking: none. No `Settings` field;
+  one environment override. Side effect: a compaction on the Orin keeps less of the conversation.
+- **Verification.** pond-adapters-goose `compaction_prompts` tests 6 passed: the device decision,
+  install, refresh, removal, a file someone else wrote, and the summary rendered through goose's own
+  `render_string` and `StructuredSummary::parse` (14 requests in, the eight most recent out, four
+  sections). Clippy clean on the change; `scripts/live-test.sh` 158 checks passed. Mac (E2B, Orin
+  emulated): the pond installed both files at startup and removed them when restarted as itself; the
+  one compaction in 10 turns came out in the bounded shape, seven requests in 851 characters. Orin
+  (E4B, release `0f5b5df3`, no manual override): the pond installed both files itself (`bounded=true
+  budgeted_device=true`); 16 turns took 952 s with three compactions (turns 6, 9 and 14), each
+  leaving 52-53% of the window in use; the second structured summary carried exactly eight requests;
+  the fact from turn 1 was recalled at turn 15. One of the three summaries was not JSON: E4B wrote
+  its own markdown (510 characters), which goose keeps as it is, so the cap did not apply, but it
+  was short. That message also carried about 900 empty thinking parts from the stream (41 KB of JSON
+  for 510 characters), harmless to the prompt and worth trimming in the backend.
+
+**2026-10-05 — LiteRT-LM compiles only the 128-token prefill chunk on the Orin (GIAP wiring; not a
+PAI milestone).**
+
+- **What landed** (GIAP `69f5815f`, at Jerry's request to make LiteRT give GPU memory back). On the
+  budgeted device the pond sets giap-main's `LITERT_PREFILL_SIGNATURES=128` (87e4a9e7) at startup,
+  before any engine loads, unless the environment already sets it; an empty value asks for every
+  size the model ships. It runs in `serve`, `chat` and the bare interactive chat, beside the
+  compaction prompts.
+- **Why this and not a release.** The GPU growth in the snapshot entry above came mostly from the
+  1024-token prefill chunk: Gemma 4 ships 128- and 1024-token prefill signatures, each compiled
+  signature keeps attention scratch sized by the whole context, and the GPU layer (Dawn under the
+  closed ML Drift) pools freed memory inside the process; the earlier vision work found that only
+  destroying the Dawn device returns it. Compiling only the 128-token chunk means that memory is
+  never taken.
+- **Measured before the first compaction**, where the compaction prompt plays no part (E4B, 8k
+  window, one-second sampler, the same conversation script). Sampling made the third turn differ:
+  it prefilled a 1,997-token tool result with both chunk sizes, a 948-token one in the 16-turn run
+  with 128 only, and none in the 8-turn run with 128 only.
+
+  | | Both chunk sizes | 128 only (8- and 16-turn runs) |
+  |---|---|---|
+  | GPU share of RAM after the first turn | 4.77 GB | 4.07-4.09 GB |
+  | GPU share at the first compaction | 5.36 GB | 4.03-4.11 GB |
+  | Free memory before each turn | 164-250 MB | 694-812 MB |
+  | Pond swapped out by the first compaction | 757 MB | 0 |
+
+  Past the first compaction the 8-turn runs also differ in the compaction prompt, because the run
+  with both chunk sizes predates the bounded pair. With both sizes and goose's own prompt the GPU
+  share rose to 6.9 GB, 2.24 GB of the pond was swapped out and free memory fell to 41 MB. With 128
+  only and the bounded pair it peaked at 4.51 GB in its one compaction, nothing was swapped and free
+  memory stayed at or above 204 MB. E2B and E4B both ship the 128-token chunk; the backend's live
+  test passes on the Mac's GPU with only it compiled.
+- **Orin, 16 turns, the bounded pair in both runs** (release `0f5b5df3` with both chunk sizes,
+  release `69f5815f` with 128 only; the second set the switch itself: its trace shows
+  `prefill_signatures="128"` and the engine printed "compiling decode, prefill_128, verify; not
+  compiling prefill_1024"):
+
+  | | Both chunk sizes | 128 only |
+  |---|---|---|
+  | Compactions (summary call) | 3 (67-98 s) | 5 (60-83 s) |
+  | Model's first token, turn after a compaction | 5.7-10.1 s | 3.6-4.3 s |
+  | Model's first token, every other turn | 2.8-4.1 s | 2.3-4.1 s |
+  | First word on a compacting turn (summary call first) | 73-108 s | 64-87 s |
+  | Output, wall time | 7,117 tokens, 952 s | 10,471 tokens, 1,254 s |
+  | Wall time per output token | 0.134 s | 0.120 s |
+
+  Memory was sampled in the second run only. Through the first three compactions free memory stayed
+  at or above 239 MB and nothing was swapped. At the fourth and fifth (turns 13 and 16) it fell to
+  148 and 125 MB, and the kernel swapped out 87 MB, then 204 MB of the pond (system swap 488 to 696
+  MB). The GPU share sat at 4.0-4.2 GB between turns, about 0.1 GB higher by the end, and peaked at
+  4.4-4.7 GB in each compaction. So the GPU share no longer grows by gigabytes, but a long run still
+  runs short of memory at its compactions. E4B wrote 47% more in the second run, hence the extra
+  compactions, and decoded at 13.6 tok/s against 13.0; both recalled the fact from turn 1 at turn
+  15. The 5 s gate holds for the model's first token on every turn but not for a turn that
+  compacts: goose runs the summary call inside the turn, and only the quiet-time job moves it out.
+- **PAI.** Preamble, egress, secrets, guest, turn blocking: none. No `Settings` field; the switch is
+  an environment variable. Side effect: long prompts prefill in 128-token chunks.
+- **Verification.** pond-core LiteRT tests 12 passed, including the new rule; the adapter's
+  `litert_model` and `compaction_prompts` tests 12 passed; clippy clean; `scripts/live-test.sh` 158
+  checks passed; the live LiteRT test on the Mac with only the 128 chunk; the Orin runs above.
+
+**2026-10-05 — The 128-token prefill chunk, measured against its own control on the Orin
+(measurement; not a PAI milestone).**
+
+- **Why.** The entry above leads with the turns before the first compaction because its 8-turn run
+  with both chunk sizes predates the bounded compaction pair, so past that point it changed two
+  things at once. This is the control: the same release build (`69f5815f`), the same bounded pair,
+  the same 8-turn probe and one-second sampler, with `LITERT_PREFILL_SIGNATURES` set empty so the
+  engine compiles both chunk sizes. The pond logged `prefill_signatures=""` and left it alone.
+- **Measured** (E4B, 8k window):
+
+  | | Both chunk sizes | 128 only |
+  |---|---|---|
+  | GPU share of RAM at the first turn | 4.78 GB | 4.13 GB |
+  | GPU share at its highest | 6.80 GB | 4.51 GB |
+  | Lowest free memory | 43 MB | 204 MB |
+  | Pond swapped out, at most | 2.05 GB | 0 |
+  | Compactions (summary call) | 2 (44 s, 92 s) | 1 (85 s) |
+  | Model's first token, every turn | 2.5-7.5 s | 2.3-4.1 s |
+
+  With both sizes the GPU share was already 4.78 GB at the first turn and the pond had 92 MB in
+  swap, rose to 5.21 GB by the first compaction and to 6.3-6.5 GB after it, and never came back. So
+  the chunk accounts for the growth on its own, with the compaction prompt held fixed. The run with
+  both sizes wrote 48% more (5,641 tokens against 3,810), so it compacted twice.
+
+**2026-10-05 — What a compaction does to the Orin's memory, at 250 ms (measurement; not a PAI
+milestone).**
+
+- **Why.** In the 16-turn run on the shipped build free memory fell to 148 and 125 MB at the fourth
+  and fifth compactions and the pond began to swap. A one-second sampler put the jump at the KV
+  snapshot save. A 250 ms sampler that splits the pond's memory into anonymous, file-backed and
+  shared says otherwise (`nano-memprobe2.sh`, 12 turns, E4B, 8k, release `69f5815f`, three
+  compactions; `compaction_phases2.py`).
+- **The snapshot save costs nothing measurable.** Across its 0.7 s free memory and the GPU's share
+  moved by less than 70 MB, and the pond's anonymous memory by under 40 MB.
+- **The summary call's own conversation is the jump.** Within 4-8 s of the compaction starting,
+  the moment goose's summary call opens its conversation, the GPU's share of RAM rose by 413-466 MB
+  and held there into the summary's decode. In two of the three it drained away before the summary
+  ended; in the first it stayed until that conversation was dropped for the restore. It is not a
+  second conversation's KV state, the reading this entry first gave: LiteRT-LM gives a new
+  conversation no KV state of its own (`CreateNewContext`), the switch copies none from a released
+  one, and the backend releases the held conversation before it opens the summary's. The first
+  conversation after the model loads cost 150-250 MB; this is about twice that. A bisection with an
+  experimental switch (one compaction each, same probe) split it: with the snapshot save the GPU's
+  share rose by 506-511 MB, without it by 353-374 MB, and with the held conversation kept alive by
+  664-666 MB, since LiteRT-LM then copies its KV cache aside. So about 140 MB is the save, and about
+  360 MB is held by the summary's own conversation until it is dropped for the restore. What inside
+  LiteRT-LM holds that is not settled.
+- **The pond's file-backed pages rise too, and do not matter.** During the same call its resident
+  file pages went from 312-514 MB to 666-698 MB, the model file read for the summary's long prefill.
+  They are clean, so the kernel drops them first: 30 s after the restore they were at 218-359 MB.
+- **What stays behind.** About 50 MB of the GPU's share and 45 MB of anonymous memory per
+  compaction (4.05 to 4.30 GB GPU over the five compactions of the 16-turn run), consistent with
+  the swapping beginning only at the fourth.
+- **The lever first named here is withdrawn.** Running the summary in the held conversation's
+  buffers would not avoid a second KV state that is not there, and a LiteRT-LM conversation is
+  created with its system prompt, tools, thinking switch and output limit, so a side call borrowing
+  the chat's conversation would run with the chat's. The save is the part the backend can avoid,
+  in a goose change of its own.
+
+**2026-10-05 — A turn waits for the quiet compaction it would otherwise redo (GIAP; not a PAI
+milestone).**
+
+- **What landed** (GIAP `e86dcb03`, branch `feat/litert-quiet-compaction`, at Jerry's call). goose
+  compacts a conversation at the start of the turn after it passes 80% of its window, so the first
+  word waits for the summary. The quiet-time job helped only when 30 s of quiet and the whole
+  summary fitted into one pause, and a turn that arrived meanwhile threw the pass away.
+  - The pass asks the agent whether goose would compact the conversation at the start of its next
+    turn (`Agent::compacts_on_next_turn`, goose's own `check_if_compaction_needed`). If so it
+    starts after 5 s of quiet, and a turn for that conversation waits for it rather than stopping
+    it; only a turn for another conversation, or one that never checked in, stops it. A pass that
+    is only getting ahead keeps the 30 s and gives up as before. The monitor is asked every 5 s,
+    not 15.
+  - Every turn path checks in before the model (`RunSupervisor::quiet_passes`,
+    `pond-api/src/quiet_pass.rs`); a waiting turn shows "Compacting context...".
+  - `compact_session` records the size compaction left as goose's session size, as goose's own
+    `/compact` does. Without it goose's check kept reading the size from before, and the turn after
+    any quiet pass compacted a second time. Reproduced on the Mac before the fix: the quiet pass
+    ran, goose's recorded size stayed at 6,964 tokens, and the next turn compacted again (first word
+    22.8 s); after it the recorded size was 302 and the next turn did not (7.6 s).
+- **Measured on the Mac** (E2B, Orin emulated, 16 turns, 20 s after each answer, `mac-paced.sh`):
+
+  | | Before | After |
+  |---|---|---|
+  | Compactions inside a turn | 2 | 0 |
+  | Quiet passes a turn waited for | 0 | 3 |
+  | First word, a turn that compacted or waited | 26.3-28.5 s | 13.0-16.0 s |
+  | First word, every other turn (median) | 4.7 s | 4.4 s |
+
+- **Measured on the Orin** (E4B, release `69f5815f` against `e86dcb03`, 16 turns, 30 s after each
+  answer, `nano-memprobe2.sh` with `paced16.py`):
+
+  | | Before | After |
+  |---|---|---|
+  | Compactions inside a turn | 4 | 0 |
+  | Quiet passes a turn waited for | 0 | 4 |
+  | First word, a turn that compacted or waited | 73.7-99.5 s | 61.1-90.7 s |
+  | ... median | 89.8 s | 78.5 s |
+  | First word, every other turn (median) | 12.8 s | 15.0 s |
+
+  Each pass started 7-10 s after the previous answer, and the next question came 20-23 s into it,
+  so the turn waited the 41-82 s left of a 64-102 s summary, then 9-26 s more for its own answer
+  (restore, prefill, tool calls). The gain is the head start the pause allows: about 20 s at 30 s,
+  more after a spoken answer, all of it once the pause covers the summary. The other turns' median
+  moved within the two runs' spread (their first words ran 7-47 s with tool calls). Memory was
+  unchanged: lowest free 131 MB against 144, the pond's swap at most 257 MB against 267.
+- **PAI.** Preamble, egress, secrets, guest: none. Turn blocking: a turn may now wait for a quiet
+  pass on its own conversation, but only when it would otherwise have compacted that conversation
+  itself, which takes longer. No `Settings` field.
+- **Verification.** `quiet_pass` unit tests 6 passed (a turn waits for the pass doing its work, a
+  turn for another conversation stops it, a pass only getting ahead is stopped by its own turn, an
+  abandoned wait is uncounted, an old pass ending leaves a newer one standing, no pass no wait);
+  `cargo test -p pond-api` 632 passed, `pond-core` 1,706, the adapter's 269; clippy shows nothing on
+  the changed lines; `scripts/live-test.sh` 156 checks passed.
+
+**2026-10-05 — A compaction no longer saves a KV snapshot it does not need (goose patch; not a PAI
+milestone).**
+
+- **What landed** (goose `e45f6b357`, bumped in GIAP `5830dcce`, branch
+  `feat/litert-compaction-no-save`, at Jerry's call to build the step after the measurement above).
+  goose runs a compaction's summary call inside `request_context::replacing_history`, a task-local
+  in `goose-provider-types` beside the session id goose already carries to providers. The local
+  provider reads it before it spawns and hands it to its backend, and LiteRT-LM no longer saves the
+  chat it sets aside for that call when the chat's family already has a snapshot. The first
+  compaction in a family with no snapshot still saves, and so do side calls that leave the history
+  alone (titling, extraction), which resume the chat whole.
+- **Why.** The bisection above: about 140 MB of the GPU's jump during a compaction was the snapshot
+  saved first, and after a compaction the chat shares only its preamble with what it held, which
+  every snapshot of its family holds. The turn after a compaction reused the same 3,800 tokens
+  either way.
+- **Measured on the Orin** (E4B, 8k, release of this branch against `69f5815f`; the same probes):
+
+  | | With the save | Save skipped |
+  |---|---|---|
+  | GPU step at each compaction (12 turns) | +454, +417, +466 MB | +429, +364, +278 MB |
+  | Lowest free memory at each compaction | 241, 189, 170 MB | 335, 247, 281 MB |
+  | GPU step, lowest free (8 turns) | +511 MB, 204 MB | +449 MB, 252 MB |
+
+  About 80 MB less at the peak on average and the worst moment 77 MB better, with one compaction's
+  spread between runs close to 100 MB, which is why it took eight compactions to say. The log says
+  "Did not save the retained LiteRT-LM conversation" at each one, no snapshot file is written (about
+  300 MB and 0.7 s each before), and the turn after still reused 3,800 tokens from the older
+  snapshot. The other 360 MB or so, held by the summary's own conversation, is inside LiteRT-LM and
+  untouched.
+- **PAI.** Preamble, egress, secrets, guest, turn blocking: none. No `Settings` field.
+- **Verification.** `request_context` tests 2 (in scope, not in a spawned task); goose
+  `the_summary_call_reaches_the_provider_marked_as_replacing_history` (through `complete_fast` and
+  its session scope; an ordinary call is not marked) with the other 21 `context_mgmt` tests; LiteRT
+  `a_chat_about_to_be_compacted_is_saved_only_when_its_family_has_no_snapshot` with the other 41;
+  `cargo check -p pond-server -p pond-adapters-goose --all-targets`; the Orin runs above.

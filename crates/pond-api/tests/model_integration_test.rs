@@ -507,3 +507,136 @@ async fn activating_a_kokoro_voice_sets_voice_tts_voice() {
     let s = settings.get().await.unwrap();
     assert_eq!(s.voice_tts_voice, "bf_emma");
 }
+
+// ── LiteRT-LM models ──────────────────────────────────────────────────────────
+
+/// The id is the file name, extension included.
+const LITERT: &str = "gemma-4-E2B-it.litertlm";
+
+fn litert_record(name: &str) -> ModelRecord {
+    ModelRecord {
+        id: ModelRecord::id_for(&ModelCategory::Litert, name),
+        category: ModelCategory::Litert,
+        name: name.to_string(),
+        filename: Some(name.to_string()),
+        description: format!("{name} model"),
+        size_mb: 2468,
+        url: Some("https://example.com/model.litertlm".into()),
+        hf_id: None,
+        ram_estimate_mb: None,
+        recommended_role: Some("chat".into()),
+        context_length: Some(32768),
+        quantization: None,
+        asr_language: None,
+        asr_size: None,
+        tts_engine: None,
+        tts_voice_name: None,
+        config_filename: None,
+        config_url: None,
+        tts_url: None,
+        sample_rate: None,
+        downloaded: true,
+        is_custom: false,
+    }
+}
+
+async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// LiteRT-LM runs in the local provider; its assignment names the litert row.
+#[tokio::test]
+async fn activate_litert_model_sets_local_provider_in_settings() {
+    let (app, repo, settings_repo, _tmp) = make_app_with_settings_repo().await;
+    repo.upsert(&litert_record(LITERT)).await.unwrap();
+
+    let req = auth_req(
+        "POST",
+        &format!("/api/v1/models/litert/{LITERT}/activate"),
+        Some(serde_json::json!({ "role": "chat" })),
+    );
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let provider = settings_repo.get_key("chat_provider").await.unwrap();
+    let model = settings_repo.get_key("chat_model").await.unwrap();
+    assert_eq!(provider.as_deref(), Some("local"));
+    assert_eq!(model.as_deref(), Some(LITERT));
+    let assignment = repo.get_assignment("chat").await.unwrap().unwrap();
+    assert_eq!(assignment.model_id, format!("litert/{LITERT}"));
+}
+
+/// A chat model saved through settings must keep pointing at the litert row, not a gguf one.
+#[tokio::test]
+async fn saving_a_litert_chat_model_assigns_the_litert_row() {
+    let (app, repo, _settings_repo, _tmp) = make_app_with_settings_repo().await;
+    repo.upsert(&litert_record(LITERT)).await.unwrap();
+
+    let req = auth_req(
+        "PUT",
+        "/api/v1/settings",
+        Some(serde_json::json!({ "chat_provider": "local", "chat_model": LITERT })),
+    );
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let assignment = repo.get_assignment("chat").await.unwrap().unwrap();
+    assert_eq!(assignment.model_id, format!("litert/{LITERT}"));
+}
+
+#[tokio::test]
+async fn delete_litert_model_removes_its_file() {
+    let (app, repo, tmp) = make_app().await;
+    let dir = tmp.path().join("models").join("litertlm");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(LITERT);
+    std::fs::write(&file, b"litertlm").unwrap();
+    repo.upsert(&litert_record(LITERT)).await.unwrap();
+
+    let req = auth_req("DELETE", &format!("/api/v1/models/litert/{LITERT}"), None);
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        !file.exists(),
+        "the .litertlm file should have been deleted"
+    );
+    let row = repo
+        .get_by_id(&format!("litert/{LITERT}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!row.downloaded);
+}
+
+/// A hand-copied file is found by a scan and listed in its own group, named by its file name.
+#[tokio::test]
+async fn a_litert_file_on_disk_is_listed_under_litert() {
+    let (app, _repo, tmp) = make_app().await;
+    let dir = tmp.path().join("models").join("litertlm");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(LITERT), b"litertlm").unwrap();
+
+    let scan = app
+        .clone()
+        .oneshot(auth_req("POST", "/api/v1/models/scan", None))
+        .await
+        .unwrap();
+    assert_eq!(scan.status(), StatusCode::OK);
+    let scan = body_json(scan).await;
+    assert_eq!(scan["found"], 1, "{scan}");
+    assert_eq!(scan["entries"][0]["category"], "litert");
+    assert_eq!(scan["entries"][0]["name"], LITERT);
+
+    let list = app
+        .oneshot(auth_req("GET", "/api/v1/models", None))
+        .await
+        .unwrap();
+    let list = body_json(list).await;
+    let litert = list["litert"].as_array().expect("a litert group");
+    assert!(litert.iter().any(|m| m["name"] == LITERT), "{list}");
+    let gguf = list["gguf"].as_array().cloned().unwrap_or_default();
+    assert!(gguf.iter().all(|m| m["name"] != LITERT), "{list}");
+}
