@@ -72,9 +72,9 @@ function retitleReply(over: Record<string, unknown> = {}) {
 }
 
 /** Render and wait for the first paint after settings load. */
-async function renderPage(overrides: Record<string, unknown> = {}) {
+async function renderPage(overrides: Record<string, unknown> = {}, models: unknown[] = MODELS) {
   mockApi.getSettings.mockResolvedValue(serverSettings(overrides));
-  mockApi.listModels.mockResolvedValue(MODELS);
+  mockApi.listModels.mockResolvedValue(models);
   mockApi.listTimeZones.mockResolvedValue({
     zones: [
       { zone: "Africa/Nairobi", offset: "+03:00", place: "Nairobi" },
@@ -411,6 +411,42 @@ describe("SettingsCatalogue", () => {
     const model = screen.getByLabelText("Model") as HTMLSelectElement;
     expect(model.value).toBe("some-model-i-removed");
     expect([...model.options].map((o) => o.text)).toContain("some-model-i-removed — not installed");
+  });
+
+  describe("a model on this device's own engine", () => {
+    const WITH_LITERT = [
+      ...MODELS,
+      { id: "4", provider: "litert", name: "gemma-4-E2B-it.litertlm", is_active: true, downloaded: true },
+    ];
+    const texts = (select: HTMLSelectElement) => [...select.options].map((o) => o.text);
+
+    it("offers a LiteRT-LM model for conversation, under the provider the server stores", async () => {
+      await renderPage({ chat_provider: "local", chat_model: "gemma-4-E2B-it.litertlm" }, WITH_LITERT);
+      fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
+      const model = screen.getByLabelText("Model") as HTMLSelectElement;
+      expect(model.value).toBe("gemma-4-E2B-it.litertlm");
+      expect(texts(model)).not.toContain("gemma-4-E2B-it.litertlm — not installed");
+      const provider = screen.getByLabelText("Provider") as HTMLSelectElement;
+      expect(provider.value).toBe("local");
+      expect(texts(provider)).toContain("local");
+      expect(texts(provider).some((t) => t.includes("not installed"))).toBe(false);
+      expect(texts(provider)).not.toContain("gguf");
+    });
+
+    it("keeps a LiteRT-LM model off the tool-call helper, which cannot run one", async () => {
+      await renderPage({}, WITH_LITERT);
+      fireEvent.click(screen.getByRole("button", { name: /^Extensions/ }));
+      const helper = screen.getByLabelText("Tool-call helper model") as HTMLSelectElement;
+      expect(texts(helper)).toContain("qwen3-1.7b");
+      expect(texts(helper)).not.toContain("gemma-4-E2B-it.litertlm");
+    });
+
+    it("shows a provider saved as gguf as local, without counting it as a change", async () => {
+      await renderPage({ chat_provider: "gguf" });
+      fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
+      expect((screen.getByLabelText("Provider") as HTMLSelectElement).value).toBe("local");
+      expect(screen.queryByRole("button", { name: /Save \d+ change/ })).toBeNull();
+    });
   });
 
   it("offers the device's own time zone when it differs from the saved one", async () => {

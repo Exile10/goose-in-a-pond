@@ -17,6 +17,7 @@ import type {
   ZoneChoice,
 } from "../api/types";
 import { allZones, detectPlace, deviceZone } from "../lib/place";
+import { providerOf } from "../lib/modelProvider";
 import { diffSettings, foldServerState } from "./state";
 import { ErrorBanner, SkeletonList } from "../components/shared";
 import {
@@ -69,6 +70,8 @@ const PROVIDERS: Record<
   (m: ModelEntry) => boolean
 > = {
   "llm-models": (m) => ["gguf", "llamafile", "ollama"].includes(m.provider),
+  "chat-models": (m) =>
+    ["gguf", "litert", "llamafile", "ollama"].includes(m.provider),
   "whisper-models": (m) => m.provider === "whisper",
   "tts-voices": (m) =>
     ["tts", "tts_piper", "tts_kokoro", "tts_http"].includes(m.provider),
@@ -79,6 +82,12 @@ const PROVIDERS: Record<
 interface Option {
   value: string;
   label: string;
+}
+
+/** A stored value as its picker shows it: the server reads a provider of `gguf`, which this page
+ *  once offered, as `local`. Display only, so it is never saved as a change. */
+function shownValue(source: OptionSource, value: string): string {
+  return source === "llm-providers" ? providerOf(value) : value;
 }
 
 function optionsFor(
@@ -98,7 +107,9 @@ function optionsFor(
   }
   if (source === "llm-providers") {
     const seen = [
-      ...new Set(models.filter(PROVIDERS["llm-models"]).map((m) => m.provider)),
+      ...new Set(
+        models.filter(PROVIDERS["chat-models"]).map((m) => providerOf(m.provider)),
+      ),
     ];
     // "mesh" (a peer's compute) has no catalogue row, so add it, but only while mesh is enabled.
     const providers = meshEnabled ? [...seen, "mesh"] : seen;
@@ -360,7 +371,7 @@ function EntryRow({
                 aria-label={entry.label}
                 aria-describedby={described}
                 disabled={inert}
-                value={String(value ?? "")}
+                value={shownValue(control.source, String(value ?? ""))}
                 onChange={(e) => onChange(entry.key, e.target.value)}
               >
                 <option value="">{control.placeholder ?? "Not set"}</option>
@@ -368,7 +379,9 @@ function EntryRow({
                     so opening this page can never silently drop a model that is
                     configured but not currently installed. */}
                 {Boolean(value) &&
-                  !options.some((o) => o.value === String(value)) && (
+                  !options.some(
+                    (o) => o.value === shownValue(control.source, String(value)),
+                  ) && (
                     <option value={String(value)}>
                       {String(value)} — not installed
                     </option>

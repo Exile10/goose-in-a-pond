@@ -7,6 +7,7 @@ import { Card /* , Row, Toggle */ } from "./controls";
 import { api } from "../../../api/PondApiClient";
 import { voiceTitle } from "../../../voice/voiceCatalogue";
 import { useVisionStatus } from "../../../api/useVisionStatus";
+import { providerOf } from "../../../lib/modelProvider";
 import type { ModelEntry, ModelActiveRoles /* , Settings */ } from "../../../api/types";
 
 // ─── Icon path strings for this view ─────────────────────────
@@ -205,10 +206,12 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
   }
 
   // ── Chat role active check ─────────────────────────────────
+  // The role carries the stored provider ("local" for a GGUF or LiteRT-LM model), the row its
+  // category, so both go through `providerOf`: compared as they were, no local model was Loaded.
   function isChatActive(m: ModelEntry): boolean {
     const a = activeRoles.chat;
     if (!a) return false;
-    return a.provider === m.provider && a.model === m.name;
+    return providerOf(a.provider) === providerOf(m.provider) && a.model === m.name;
   }
 
   function isAsrActive(m: ModelEntry): boolean {
@@ -359,6 +362,17 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
                     <span className="mrow__loaded">
                       <Check size={12} color="#16A34A" strokeWidth={3} /> Loaded
                     </span>
+                  ) : m.downloaded === false ? (
+                    // The server accepts any catalogued model, so a file not on disk would only
+                    // fail at the next turn; the classic Models page downloads it.
+                    <button
+                      className="mrow__btn"
+                      type="button"
+                      disabled
+                      aria-label={`${m.name} is not downloaded`}
+                    >
+                      Not downloaded
+                    </button>
                   ) : (
                     <button
                       className="mrow__btn"
