@@ -145,7 +145,10 @@ enrollment when the device is already **active and still holds the identity it
 enrolled with**. Pressing the button on a pond where remote access already works
 is a no-op rather than a conflict. A mismatched identity -- a phone that re-paired
 and regenerated its tailnet keys -- is a real conflict: the enrollment is refused
-with `409` and the app points at recovery.
+with `409` and the app points at recovery. Because every re-pair takes this path,
+the Pond logs it at `INFO` as `kind="remote_access_recovery_required"`, not as a
+failure; `embedded enrollment failed` at `WARN` is kept for refusals with no
+enrollment to recover and for a coordinator that could not be reached.
 
 Recovery replaces an enrollment. The coordinator replaces one that has been stood
 down rather than a live one, so the Pond revokes the existing enrollment itself
