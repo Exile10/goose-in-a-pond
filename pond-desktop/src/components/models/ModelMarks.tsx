@@ -149,7 +149,7 @@ export function PicturesChoice({
   disabled?: boolean;
 }) {
   return (
-    <label className="mm-choice reach">
+    <label className="mm-choice">
       <input
         type="checkbox"
         checked={checked}

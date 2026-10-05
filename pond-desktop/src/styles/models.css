@@ -163,9 +163,10 @@
   border-radius: var(--radius-lg);
 }
 
-/* An unfilled job is the one thing on this page that needs doing. */
+/* An unfilled job is the one thing on this page that needs doing: dashed, and said in words
+   (--color-warning-fg, 7.09:1 light and 10.15:1 dark on --color-surface), not a hue on the edge. */
 .mdl-role[data-empty="true"] {
-  border-color: var(--color-warning);
+  border-style: dashed;
 }
 
 .mdl-role__job {
@@ -506,6 +507,11 @@
 }
 
 /* ── Narrow panes ───────────────────────────────────────────────────────── */
+
+/* Four jobs read as two and two on a small panel, not three and one. */
+@media (max-width: 900px) {
+  .mdl-roles { grid-template-columns: repeat(2, 1fr); }
+}
 
 @media (max-width: 620px) {
   .mdl { padding: var(--space-4) var(--space-4) var(--space-6); }

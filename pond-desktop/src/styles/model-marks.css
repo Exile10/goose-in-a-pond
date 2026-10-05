@@ -15,6 +15,10 @@
  *   --color-destructive-fg   6.47:1,  6.12:1   a failed download, Stop
  * --color-destructive (3.55:1) and --color-warning (2.20:1) miss the 4.5:1 normal
  * text needs in light, so text uses the -fg tokens.
+ *
+ * On the tints a hover or a chip lays down, at the Purple accent (light, dark):
+ *   --color-text on --color-accent-subtle                  16.52:1, 14.29:1
+ *   --color-destructive-fg on --color-destructive-soft      5.65:1,  5.22:1
  */
 
 /* ── Buttons ────────────────────────────────────────────────────────────── */
@@ -189,6 +193,7 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
+  min-height: var(--tap-min);
   font-family: var(--font-body);
   font-size: var(--text-sm);
   color: var(--color-text);
