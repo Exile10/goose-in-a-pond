@@ -137,18 +137,19 @@ Two `GooseAdapter` behaviours matter more than the table suggests.
 
 **`vision` does not come from the name alone on the in-process engine.**
 `GooseAdapter::model_supports_vision` asks pond-core's device-aware declaration
-(`device_budget::vision_declaration`): does the model have a pinned encoder
-(`vision_encoder::encoder_for`, keyed by family AND qat-ness, because qat and non-qat Gemma 4
-encoders are different files of identical size), and, on a budgeted device such as the Orin, does
-that encoder fit without costing the window anything and has it been measured there
+(`device_budget::vision_declaration`): does the model have a pinned encoder in the pairing
+table (`vision_pairing`, matched by the model's file name or, failing that, its GGUF header, with
+the qat flag from the name, because qat and non-qat Gemma 4 encoders are different files of
+identical size), and, on a budgeted device such as the Orin, does that encoder fit without costing
+the window anything and has it been measured there
 (`DEVICE_MEASURED_VISION`, empty as of 2026-09-24, so the Orin declares no vision). HTTP providers
 fall back to `name_implies_vision`; `mesh` and `mistralrs` declare none, because the mesh wire is
 text-only and a mistral.rs server has never been checked with a picture, and both would drop a
 photo silently while the prompt said the model could see. It reports what is **declared**, not what
-is downloaded: the encoder is ~941 MB and lands in the background, and a flag that flipped
-mid-session would move the `<vision>` prompt section, which sits inside the KV-cached static
-prefix. Whether the bytes are there, verified and ready is a separate question with its own answer,
-`GET /api/v1/models/vision-status` (below), which never feeds the prompt.
+is downloaded: the encoder is ~941 MB and arrives only when the household adds it, and a flag that
+flipped mid-session would move the `<vision>` prompt section, which sits inside the KV-cached
+static prefix. Whether the bytes are there, verified and ready is a separate question with its own
+answer, `GET /api/v1/models/vision-status` (below), which never feeds the prompt.
 
 **The cache is stale on turn one, and that stale read once cost 3.7 s per session.** The cache is
 refreshed only inside the swap branch, which runs *later* in the same turn that builds the prompt,

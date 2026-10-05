@@ -3011,3 +3011,44 @@ milestone).**
   its session scope; an ordinary call is not marked) with the other 21 `context_mgmt` tests; LiteRT
   `a_chat_about_to_be_compacted_is_saved_only_when_its_family_has_no_snapshot` with the other 41;
   `cargo check -p pond-server -p pond-adapters-goose --all-targets`; the Orin runs above.
+
+**2026-10-05 — Models streamline, internals (PAI-2 egress for model acquisition, PAI-3 catalogue
+windows; not a PAI milestone completion).**
+
+- **What landed** (branch `feat/models-streamline-internals`; `docs/developer/models.md` describes
+  the result). Every model row derives its engine, provenance, kind and acquisition. The
+  catalogue's conversation rows are GIAP's pinned short list (Gemma 4 E4B and E2B QAT on llama.cpp,
+  the two LiteRT-LM files), with three suggestions only the REST view reads. Picture add-ons pair
+  from the generated `crates/pond-core/data/vision-pairings.jsonl` instead of name matching. One
+  pipeline (`crates/pond-api/src/model_acquisition.rs`) downloads a model and, by default, its
+  add-on through the tracker, and every silent add-on fetch is gone. One storage layout, pruning at
+  seed, a typed `no_model` state in place of the llamafile auto-pick, `reclaimable_mb` on
+  memory-status, and the drafter remnants deleted.
+- **PAI-2 (egress).** No new sender file: `model_acquisition.rs` sends nothing; every transfer is
+  the tracked download in `routes.rs` (pond-hf-cache for Hugging Face, the gated `.part` path
+  otherwise), so `egress_guard` keeps `UNGATED_SENDERS` empty at cap 0. Its `DOWNLOAD_CALLS` now
+  names the boot restore (`restore_assigned_models(`), the only download the pond starts on its own
+  and only for an assigned model, instead of `agent.prepare_model(`, which no longer downloads.
+  Acquisition refuses up front what the network mode would refuse, and a pinned file (picks and
+  encoders, `curated::file_pin`) must arrive at its pinned size and LFS sha256. The pond still never
+  fetches the pairing table.
+- **PAI-3 (catalogue windows).** Every pick declares `context_length` (131,072 for the GGUF picks,
+  32,768 for LiteRT-LM), which `WindowSource::CatalogRecord` reads; the catalogue test asserts
+  every pick rather than a floor of 20. Device windows are unchanged: the drafter charge
+  (57 MiB + 64 MB) is gone and E2B and E4B stay at the 16,384 clamp
+  (`the_e2b_and_e4b_picks_keep_the_16384_clamp`). **Owed on the Orin:** the "Jetson context
+  sized" log line should still read 16384 for E4B, nothing should download at boot, and E2B QAT's
+  suggested numbers are still unmeasured.
+- **Other invariants.** Preamble: none (`<vision>` still comes from the device-aware declaration,
+  now through the pairing). Secrets, guest, turn blocking: none. No `Settings` field, no migration.
+- **Verification.** `cargo fmt --check`; the ci.yml fast-crate clippy (exit 0, no warning on a line
+  this branch wrote) and test lists verbatim: 3,636 passed, 0 failed, 26 ignored, among them
+  `egress_guard`, `egress_offline_routes`, `recommendations_are_never_imposed`, pond-api's
+  `model_integration_test` (30) and `vision_turn_gate` (18). `cargo test -p pond-adapters-goose
+  --lib` 271 passed; `cargo test -p pond-server --bins` 161 passed, with its `cli_test` (32),
+  `json_events_contract_test`, `hf_cache_migration_test` and `pipeline_integration_test`. The four
+  `cargo check` gates ci.yml runs past the fast crates: pond-server with the goose adapter
+  `--all-targets`, `--features mesh`, `--features mistralrs-agent`, and pond-agent with
+  pond-inference. `scripts/live-test.sh` passed on the final commit: 172 checks, 0 failed, across
+  the first start, the restart against the populated database and the auth pass with the loopback
+  bypass off. Nothing has run on the Orin.
