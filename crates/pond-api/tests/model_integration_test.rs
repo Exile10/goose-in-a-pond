@@ -1133,6 +1133,30 @@ async fn the_boot_restore_fetches_an_assigned_missing_model_through_the_tracker(
     );
 }
 
+/// Another quant of an assigned model already on disk is the household's copy: no fetch at boot.
+#[tokio::test]
+async fn the_boot_restore_leaves_a_model_whose_other_quant_is_on_disk() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let server = weights_server("gemma-4-E4B-it-Q4_K_M.gguf").await;
+    let gguf = f.tmp.path().join("models/gguf");
+    std::fs::create_dir_all(&gguf).unwrap();
+    std::fs::write(gguf.join("gemma-4-E4B-it-Q4_K_S.gguf"), b"weights").unwrap();
+    let mut assigned = gguf_record("gemma-4-E4B-it-Q4_K_M");
+    assigned.url = Some(format!("{}/gemma-4-E4B-it-Q4_K_M.gguf", server.uri()));
+    f.repo.upsert(&assigned).await.unwrap();
+    f.repo
+        .set_assignment("chat", "gguf/gemma-4-E4B-it-Q4_K_M")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pond_api::model_acquisition::restore_assigned_models(f.state.clone()).await,
+        0
+    );
+    assert!(f.tracker.read().await.is_empty());
+    assert!(!gguf.join("gemma-4-E4B-it-Q4_K_M.gguf").exists());
+}
+
 /// Records what the routes hand the agent.
 struct RecordingAgent {
     inner: MockAgent,

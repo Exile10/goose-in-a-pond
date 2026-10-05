@@ -474,6 +474,16 @@ pub async fn restore_assigned_models(state: Arc<AppState>) -> usize {
     }
     let mut started = 0usize;
     for record in &plan.fetch {
+        let target = record
+            .filename
+            .as_deref()
+            .and_then(|f| model_layout::path_for(&data_dir, &record.category, f));
+        if record.category == ModelCategory::Gguf
+            && target.as_deref().is_some_and(other_quant_on_disk)
+        {
+            tracing::info!(model = %record.id, "restore: another quant of this model is on disk; not fetching");
+            continue;
+        }
         let model = match model_file(&data_dir, record) {
             Ok(f) => f,
             Err((_, Json(why))) => {
@@ -497,6 +507,30 @@ pub async fn restore_assigned_models(state: Arc<AppState>) -> usize {
         started += 1;
     }
     started
+}
+
+/// Whether another quant of the model `target` names is on disk: a `.gguf` sharing the stem before
+/// its last `-Q`, then `-Q`. A restore leaves such a household's copy alone rather than fetch one.
+fn other_quant_on_disk(target: &Path) -> bool {
+    let (Some(dir), Some(stem)) = (target.parent(), target.file_stem().and_then(|s| s.to_str()))
+    else {
+        return false;
+    };
+    let Some(prefix) = stem
+        .rfind("-Q")
+        .map(|i| &stem[..i])
+        .filter(|p| !p.is_empty())
+    else {
+        return false;
+    };
+    let lead = format!("{prefix}-Q");
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            e.path() != target && name.starts_with(&lead) && name.ends_with(".gguf")
+        })
+    })
 }
 
 /// Whether anything is left of the add-on's install, which is how a restore knows it was wanted.
@@ -682,5 +716,24 @@ mod tests {
         assert_eq!(Pictures::Installed(spec).wire(false), "installed");
         assert_eq!(Pictures::Available(spec).wire(true), "included");
         assert_eq!(Pictures::Available(spec).wire(false), "left_out");
+    }
+
+    #[test]
+    fn another_quant_is_the_same_model_and_a_qat_build_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("gemma-4-E4B-it-Q4_K_M.gguf");
+        assert!(!other_quant_on_disk(&target));
+        std::fs::write(tmp.path().join("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"), b"x").unwrap();
+        std::fs::write(tmp.path().join("gemma-4-E4B-it-Q4_K_S.gguf.part"), b"x").unwrap();
+        assert!(
+            !other_quant_on_disk(&target),
+            "a qat build or a partial file"
+        );
+        std::fs::write(tmp.path().join("gemma-4-E4B-it-Q4_K_S.gguf"), b"x").unwrap();
+        assert!(other_quant_on_disk(&target));
+        assert!(
+            !other_quant_on_disk(&tmp.path().join("gemma-4-E4B-it.gguf")),
+            "a name with no quant has no other quant"
+        );
     }
 }

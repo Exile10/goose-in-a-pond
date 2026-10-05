@@ -93,7 +93,8 @@ and when either part arrives the agent registers the model by the file its row n
 and attaches the add-on (`Agent::prepare_model`, which never downloads). Nothing else starts a
 fetch: not choosing a model, not saving settings, not a provider build, not a refused picture
 turn. The boot restore (`restore_assigned_models`) fetches only an assigned model whose file is
-missing, and its add-on only if it had one, through the same tracker.
+missing and of which no other quant is on disk, and its add-on only if it had one, through the
+same tracker.
 
 ## Storage layout
 

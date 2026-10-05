@@ -3027,8 +3027,9 @@ windows; not a PAI milestone completion).**
 - **PAI-2 (egress).** No new sender file: `model_acquisition.rs` sends nothing; every transfer is
   the tracked download in `routes.rs` (pond-hf-cache for Hugging Face, the gated `.part` path
   otherwise), so `egress_guard` keeps `UNGATED_SENDERS` empty at cap 0. Its `DOWNLOAD_CALLS` now
-  names the boot restore (`restore_assigned_models(`), the only download the pond starts on its own
-  and only for an assigned model, instead of `agent.prepare_model(`, which no longer downloads.
+  names the boot restore (`restore_assigned_models(`), the only download the pond starts on its own,
+  and only for an assigned model whose file is missing with no other quant of it on disk, instead
+  of `agent.prepare_model(`, which no longer downloads.
   Acquisition refuses up front what the network mode would refuse, and a pinned file (picks and
   encoders, `curated::file_pin`) must arrive at its pinned size and LFS sha256. The pond still never
   fetches the pairing table.
@@ -3042,10 +3043,10 @@ windows; not a PAI milestone completion).**
 - **Other invariants.** Preamble: none (`<vision>` still comes from the device-aware declaration,
   now through the pairing). Secrets, guest, turn blocking: none. No `Settings` field, no migration.
 - **Verification.** `cargo fmt --check`; the ci.yml fast-crate clippy (exit 0, no warning on a line
-  this branch wrote) and test lists verbatim: 3,636 passed, 0 failed, 26 ignored, among them
-  `egress_guard`, `egress_offline_routes`, `recommendations_are_never_imposed`, pond-api's
-  `model_integration_test` (30) and `vision_turn_gate` (18). `cargo test -p pond-adapters-goose
-  --lib` 271 passed; `cargo test -p pond-server --bins` 161 passed, with its `cli_test` (32),
+  this branch wrote) and test lists verbatim: 3,638 passed, 0 failed, 26 ignored, among them
+  `egress_guard` (7), `egress_offline_routes` (8), `recommendations_are_never_imposed` (1),
+  pond-api's `model_integration_test` (31) and `vision_turn_gate` (18). The goose adapter's lib
+  tests, 271 passed; pond-server's bin tests, 161 passed, with its `cli_test` (32),
   `json_events_contract_test`, `hf_cache_migration_test` and `pipeline_integration_test`. The four
   `cargo check` gates ci.yml runs past the fast crates: pond-server with the goose adapter
   `--all-targets`, `--features mesh`, `--features mistralrs-agent`, and pond-agent with
