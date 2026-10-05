@@ -997,6 +997,208 @@ async fn pause_cancel_and_resume_keep_their_own_statuses() {
     assert_eq!(status, StatusCode::CONFLICT);
 }
 
+const CONTROL: &str = "/api/v1/models/download/control";
+
+/// A tracker entry for one part of a model.
+fn part_of(filename: &str, model_id: &str, part: &str, status: &str) -> DownloadEntry {
+    let mut entry = tracked(filename, status);
+    entry.model_id = Some(model_id.to_string());
+    entry.part = Some(part.to_string());
+    entry
+}
+
+async fn flag(tracker: &Tracker, key: &str) -> u8 {
+    tracker.read().await[key]
+        .control
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn filenames(body: &serde_json::Value) -> Vec<String> {
+    body["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["filename"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Cancelling a model's own file cancels its add-on, which is no use without it, and nothing of
+/// another model's; cancelling an add-on alone leaves its model coming down.
+#[tokio::test]
+async fn cancelling_a_models_file_cancels_its_add_on_too() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    for (key, model, part) in [
+        ("e2b.gguf", "gguf/e2b", "model"),
+        ("mmproj/e2b/mmproj.gguf", "gguf/e2b", "pictures"),
+        ("other.gguf", "gguf/other", "model"),
+        ("mmproj/other/mmproj.gguf", "gguf/other", "pictures"),
+    ] {
+        f.tracker
+            .write()
+            .await
+            .insert(key.into(), part_of(key, model, part, "downloading"));
+    }
+
+    let (status, body) = post_json(
+        &f.app,
+        CONTROL,
+        Some(serde_json::json!({"filename": "mmproj/other/mmproj.gguf", "action": "cancel"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(filenames(&body), ["mmproj/other/mmproj.gguf"]);
+    assert_eq!(flag(&f.tracker, "other.gguf").await, pond_api::DL_RUN);
+
+    let (status, body) = post_json(
+        &f.app,
+        CONTROL,
+        Some(serde_json::json!({"filename": "e2b.gguf", "action": "cancel"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "cancelling");
+    assert_eq!(filenames(&body), ["e2b.gguf", "mmproj/e2b/mmproj.gguf"]);
+    assert_eq!(flag(&f.tracker, "e2b.gguf").await, pond_api::DL_CANCEL);
+    assert_eq!(
+        flag(&f.tracker, "mmproj/e2b/mmproj.gguf").await,
+        pond_api::DL_CANCEL
+    );
+    assert_eq!(flag(&f.tracker, "other.gguf").await, pond_api::DL_RUN);
+}
+
+/// A paused model and its paused add-on are both thrown away, partial files and all, by one
+/// cancel of the model's file.
+#[tokio::test]
+async fn a_paused_models_add_on_goes_with_it() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let mut partials = Vec::new();
+    for (key, part) in [
+        ("e4b.gguf", "model"),
+        ("mmproj/e4b/mmproj.gguf", "pictures"),
+    ] {
+        let partial = f.tmp.path().join(format!("{part}.incomplete"));
+        std::fs::write(&partial, b"half").unwrap();
+        let mut entry = part_of(key, "gguf/e4b", part, "paused");
+        entry.partial = Some(partial.clone());
+        partials.push(partial);
+        f.tracker.write().await.insert(key.into(), entry);
+    }
+    let (status, body) = post_json(
+        &f.app,
+        CONTROL,
+        Some(serde_json::json!({"filename": "e4b.gguf", "action": "cancel"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "cancelled");
+    for key in ["e4b.gguf", "mmproj/e4b/mmproj.gguf"] {
+        assert_eq!(f.tracker.read().await[key].status, "cancelled", "{key}");
+    }
+    assert!(
+        partials.iter().all(|p| !p.exists()),
+        "no partial file is left"
+    );
+}
+
+/// `model_id` acts on every part of that model the action can move, and nothing else; a model
+/// with nothing to move, or a request naming neither, is refused.
+#[tokio::test]
+async fn control_by_model_id_moves_every_part_it_can() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    for entry in [
+        part_of("e2b.gguf", "gguf/e2b", "model", "downloading"),
+        part_of("mmproj/e2b/mmproj.gguf", "gguf/e2b", "pictures", "done"),
+        part_of("other.gguf", "gguf/other", "model", "downloading"),
+    ] {
+        f.tracker
+            .write()
+            .await
+            .insert(entry.filename.clone(), entry);
+    }
+    let by_model = |action: &str| serde_json::json!({"model_id": "gguf/e2b", "action": action});
+
+    let (status, body) = post_json(&f.app, CONTROL, Some(by_model("pause"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "pausing");
+    assert_eq!(
+        filenames(&body),
+        ["e2b.gguf"],
+        "a finished part is left alone"
+    );
+    assert_eq!(flag(&f.tracker, "e2b.gguf").await, pond_api::DL_PAUSE);
+    assert_eq!(flag(&f.tracker, "other.gguf").await, pond_api::DL_RUN);
+
+    f.tracker.write().await.get_mut("e2b.gguf").unwrap().status = "paused".into();
+    let (status, body) = post_json(&f.app, CONTROL, Some(by_model("cancel"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "cancelled");
+    assert_eq!(f.tracker.read().await["e2b.gguf"].status, "cancelled");
+
+    let (status, _) = post_json(&f.app, CONTROL, Some(by_model("cancel"))).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "nothing of that model is left to cancel"
+    );
+    let (status, _) = post_json(
+        &f.app,
+        CONTROL,
+        Some(serde_json::json!({"action": "pause"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post_json(
+        &f.app,
+        CONTROL,
+        Some(serde_json::json!({"model_id": "gguf/e2b", "action": "stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Resuming a model resumes each of its paused parts, and each arrives.
+#[tokio::test]
+async fn resuming_a_model_resumes_each_paused_part() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let server = wiremock::MockServer::start().await;
+    for file in ["two-part.gguf", "two-part-mmproj.gguf"] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{file}")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+            .mount(&server)
+            .await;
+    }
+    for (file, part) in [
+        ("two-part.gguf", "model"),
+        ("two-part-mmproj.gguf", "pictures"),
+    ] {
+        let mut entry = part_of(file, "gguf/two-part", part, "paused");
+        entry.url = Some(format!("{}/{file}", server.uri()));
+        entry.dest = Some(f.tmp.path().join("models/gguf").join(file));
+        f.tracker.write().await.insert(file.into(), entry);
+    }
+    let (status, body) = post_json(
+        &f.app,
+        CONTROL,
+        Some(serde_json::json!({"model_id": "gguf/two-part", "action": "resume"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "resuming");
+    assert_eq!(filenames(&body), ["two-part.gguf", "two-part-mmproj.gguf"]);
+    let tracker = f.tracker.clone();
+    eventually("both parts to arrive", || {
+        let tracker = tracker.clone();
+        async move {
+            let t = tracker.read().await;
+            ["two-part.gguf", "two-part-mmproj.gguf"]
+                .iter()
+                .all(|k| t[*k].status == "done")
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_paused_download_is_never_evicted_and_a_finished_one_is() {
     let f = pond_with(Arc::new(MockAgent::new())).await;

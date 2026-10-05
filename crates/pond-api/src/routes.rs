@@ -5356,8 +5356,38 @@ fn model_dest_path(
     model_layout::path_for(data_dir, &category, filename)
 }
 
-/// `POST /api/v1/models/download/control` — pause, resume or cancel. Filename is in the body
-/// (it has dots and slashes). Pause keeps the partial file for a resume; cancel deletes it.
+/// What a control request asks of a download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadAction {
+    Pause,
+    Resume,
+    Cancel,
+}
+
+impl DownloadAction {
+    fn parse(action: &str) -> Option<Self> {
+        match action {
+            "pause" => Some(Self::Pause),
+            "resume" => Some(Self::Resume),
+            "cancel" => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+
+    /// Whether a request for a whole model moves a part that is `status`.
+    fn moves(self, status: &str) -> bool {
+        match self {
+            Self::Pause => status == "downloading",
+            Self::Resume => matches!(status, "paused" | "error"),
+            Self::Cancel => matches!(status, "downloading" | "paused"),
+        }
+    }
+}
+
+/// `POST /api/v1/models/download/control` — pause, resume or cancel one file (`filename`, in
+/// the body since it has dots and slashes) or every part of a model (`model_id`). Pause keeps
+/// the partial file for a resume; cancel deletes it, and cancelling a model's own file cancels
+/// its add-ons too, which are no use without it.
 async fn download_control(
     State(state): State<Arc<AppState>>,
     body: Result<Json<Value>, JsonRejection>,
@@ -5368,81 +5398,162 @@ async fn download_control(
             Json(json!({"error": "invalid request body"})),
         );
     };
-
-    let filename = body["filename"].as_str().unwrap_or_default().to_string();
-    let action = body["action"].as_str().unwrap_or_default().to_string();
-    if filename.is_empty() {
+    let Some(action) = body["action"].as_str().and_then(DownloadAction::parse) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "filename is required"})),
+            Json(json!({"error": "action must be pause, resume or cancel"})),
+        );
+    };
+    let filename = body["filename"].as_str().filter(|s| !s.is_empty());
+    let model_id = body["model_id"].as_str().filter(|s| !s.is_empty());
+
+    let keys: Vec<String> = {
+        let t = state.download_tracker.read().await;
+        // The model's own file first, then its add-ons by name.
+        let parts_of = |id: &str, except: Option<&str>, action: DownloadAction| {
+            let mut parts: Vec<(bool, String)> = t
+                .iter()
+                .filter(|(key, e)| {
+                    Some(key.as_str()) != except
+                        && e.model_id.as_deref() == Some(id)
+                        && action.moves(&e.status)
+                })
+                .map(|(key, e)| {
+                    let add_on = e.part.as_deref() != Some(crate::model_acquisition::PART_MODEL);
+                    (add_on, key.clone())
+                })
+                .collect();
+            parts.sort();
+            parts.into_iter().map(|(_, key)| key).collect::<Vec<_>>()
+        };
+        match (model_id, filename) {
+            (Some(id), _) => parts_of(id, None, action),
+            (None, Some(name)) => {
+                let Some(entry) = t.get(name) else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": format!("no download named {name}")})),
+                    );
+                };
+                let mut keys = vec![name.to_string()];
+                let own_file = entry.part.as_deref() == Some(crate::model_acquisition::PART_MODEL);
+                if let (DownloadAction::Cancel, true, Some(id)) =
+                    (action, own_file, entry.model_id.as_deref())
+                {
+                    keys.extend(parts_of(id, Some(name), DownloadAction::Cancel));
+                }
+                keys
+            }
+            (None, None) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "filename or model_id is required"})),
+                )
+            }
+        }
+    };
+    if keys.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!(
+                "{} has no download that can be told to {}",
+                model_id.unwrap_or_default(),
+                body["action"].as_str().unwrap_or_default()
+            )})),
         );
     }
 
+    let mut outcomes = Vec::with_capacity(keys.len());
+    for key in &keys {
+        outcomes.push(control_one(&state, key, action).await);
+    }
+    let files: Vec<Value> = keys
+        .iter()
+        .zip(&outcomes)
+        .map(|(key, outcome)| match outcome {
+            Ok(status) => json!({"filename": key, "status": status}),
+            Err((_, Json(why))) => json!({"filename": key, "error": why["error"]}),
+        })
+        .collect();
+    // The named file answers for a file; for a model, any part that moved.
+    let lead = match model_id {
+        Some(_) => outcomes.iter().position(Result::is_ok).unwrap_or(0),
+        None => 0,
+    };
+    match outcomes.swap_remove(lead) {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(json!({"status": status, "files": files})),
+        ),
+        Err(refused) => refused,
+    }
+}
+
+/// Applies `action` to the tracker entry `key`: the status it reports, or why it cannot.
+async fn control_one(
+    state: &Arc<AppState>,
+    key: &str,
+    action: DownloadAction,
+) -> Result<&'static str, (StatusCode, Json<Value>)> {
     let resume = {
         let mut t = state.download_tracker.write().await;
-        let Some(entry) = t.get_mut(&filename) else {
-            return (
+        let Some(entry) = t.get_mut(key) else {
+            return Err((
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("no download named {filename}")})),
-            );
+                Json(json!({"error": format!("no download named {key}")})),
+            ));
         };
-        match action.as_str() {
-            "pause" => {
+        match action {
+            DownloadAction::Pause => {
                 entry
                     .control
                     .store(crate::DL_PAUSE, std::sync::atomic::Ordering::Relaxed);
-                return (StatusCode::OK, Json(json!({"status": "pausing"})));
+                return Ok("pausing");
             }
-            "cancel" if entry.status == "paused" => {
+            DownloadAction::Cancel if entry.status == "paused" => {
                 // No transfer is running to see the flag: throw the partial file away here.
                 if let Some(partial) = entry.partial.take() {
                     let _ = tokio::fs::remove_file(&partial).await;
                 }
                 entry.status = "cancelled".to_string();
                 entry.finished_at = Some(std::time::Instant::now());
-                return (StatusCode::OK, Json(json!({"status": "cancelled"})));
+                return Ok("cancelled");
             }
-            "cancel" => {
+            DownloadAction::Cancel => {
                 entry
                     .control
                     .store(crate::DL_CANCEL, std::sync::atomic::Ordering::Relaxed);
-                return (StatusCode::OK, Json(json!({"status": "cancelling"})));
+                return Ok("cancelling");
             }
-            "resume" => (
+            DownloadAction::Resume => (
                 entry.url.clone(),
                 entry.dest.clone(),
                 entry.category.clone(),
                 entry.model_id.clone(),
                 entry.part.clone(),
             ),
-            _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "action must be pause, resume or cancel"})),
-                )
-            }
         }
     };
     let (url, dest, category, model_id, part) = resume;
 
     // A fresh transfer resumes: the HF cache finds its `.incomplete` and sends a Range header.
     let Some(url) = url else {
-        return (
+        return Err((
             StatusCode::CONFLICT,
             Json(json!({"error": "this download cannot be resumed — its source was not recorded"})),
-        );
+        ));
     };
     let Some(data_dir) = state.data_dir.clone() else {
-        return (
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "data_dir not configured"})),
-        );
+        ));
     };
-    let Some(dest) = dest.or_else(|| model_dest_path(&data_dir, &category, &filename)) else {
-        return (
+    let Some(dest) = dest.or_else(|| model_dest_path(&data_dir, &category, key)) else {
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "this download has no file to resume"})),
-        );
+        ));
     };
     let part = match part.as_deref() {
         Some(crate::model_acquisition::PART_MODEL) => Some(crate::model_acquisition::PART_MODEL),
@@ -5454,7 +5565,7 @@ async fn download_control(
     let file = TrackedFile {
         url,
         dest,
-        key: filename,
+        key: key.to_string(),
         category,
         model_id: model_id.clone(),
         part,
@@ -5468,7 +5579,7 @@ async fn download_control(
         spawn_tracked_download(file, tracker, client, data_dir, on_done).await;
     });
 
-    (StatusCode::OK, Json(json!({"status": "resuming"})))
+    Ok("resuming")
 }
 
 /// GET /api/v1/models — returns all catalog models with downloaded/active flags.
