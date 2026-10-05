@@ -1418,6 +1418,29 @@ mod tests {
         );
     }
 
+    /// The size probe is a sender like any other: a hop that leaves loopback under the allowlist
+    /// is refused at the hop, by name, and nothing is asked of that host.
+    #[tokio::test]
+    async fn a_remote_length_is_refused_at_a_hop_the_network_mode_refuses() {
+        let server = redirector("https://cdn.invalid/blob").await;
+        let _mode = ModeGuard::set(NetworkMode::Allowlist);
+
+        let client = build_redirect_aware_client(None).expect("client builds");
+        let err = remote_length(&client, &format!("{}/start", server.uri()), None)
+            .await
+            .expect_err("the second hop leaves loopback and must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("cdn.invalid") && rendered.contains("network_mode"),
+            "{rendered}"
+        );
+        assert!(
+            err.chain()
+                .any(|cause| cause.downcast_ref::<EgressDenied>().is_some()),
+            "a refusal is typed, so a caller can tell it from the network being down"
+        );
+    }
+
     /// The size a download would arrive at, learned without a GET: HF's first-hop
     /// `x-linked-size` when the final hop states none, else the final hop's own length.
     #[tokio::test]

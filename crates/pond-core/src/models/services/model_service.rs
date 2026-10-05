@@ -62,9 +62,15 @@ pub fn prune_plan(
             }
             continue;
         }
-        let companion = is_companion_file(&r.name)
-            || r.filename.as_deref().is_some_and(is_companion_file)
-            || r.recommended_role.as_deref() == Some("draft");
+        // What this very fetch lists is never stale, whatever its name looks like.
+        if in_listing {
+            continue;
+        }
+        // File-name rules do not apply to an Ollama tag, which names no file.
+        let companion = r.category != ModelCategory::Ollama
+            && (is_companion_file(&r.name)
+                || r.filename.as_deref().is_some_and(is_companion_file)
+                || r.recommended_role.as_deref() == Some("draft"));
         let why = if companion {
             Some(Pruned::Companion)
         } else if r.category == ModelCategory::Ollama {
@@ -72,7 +78,7 @@ pub fn prune_plan(
         } else if r.is_custom {
             (!r.downloaded && r.url.is_none()).then_some(Pruned::Ghost)
         } else {
-            (!in_listing && !r.downloaded).then_some(Pruned::Retired)
+            (!r.downloaded).then_some(Pruned::Retired)
         };
         if let Some(why) = why {
             plan.delete.push((r.id.clone(), why));
@@ -107,6 +113,14 @@ pub async fn apply_catalog(
     let assignments = repo.list_assignments().await?;
     let plan = prune_plan(&records, &models, &assignments);
     for (id, why) in &plan.delete {
+        // A flag can lag the disk: a row whose file is there is not stale, unless it is a companion.
+        let on_disk = records
+            .iter()
+            .find(|r| &r.id == id)
+            .is_some_and(|r| present(r) == Some(true));
+        if on_disk && *why != Pruned::Companion {
+            continue;
+        }
         if repo.delete(id).await? {
             tracing::info!(model = %id, reason = ?why, "pruned a stale catalogue row");
             applied.pruned += 1;
@@ -803,6 +817,152 @@ mod tests {
         assert_eq!(plan, PrunePlan::default());
     }
 
+    /// An Ollama that answers with no models reads the same as one that did not answer: the
+    /// fetch carries no Ollama row either way, so a model removed from it leaves its row behind.
+    #[test]
+    fn an_ollama_server_that_lists_nothing_changes_none_of_its_rows() {
+        use ModelCategory::{Ollama, Whisper};
+        let removed_since = row("ollama/llama3.2", Ollama, false, true);
+        let bundled = row("whisper/base", Whisper, false, false);
+        let plan = prune_plan(&[removed_since, bundled.clone()], &[bundled], &[]);
+        assert_eq!(plan, PrunePlan::default());
+    }
+
+    /// An Ollama tag names no file, so the file-name rules for drafters and encoders never read
+    /// it: a persona built on Gemma 4 is a model, and the server lists it again every seed.
+    #[test]
+    fn an_ollama_tag_that_reads_like_a_drafter_file_is_kept_while_the_server_lists_it() {
+        use ModelCategory::Ollama;
+        let persona = row("ollama/gemma4-assistant:latest", Ollama, false, true);
+        let other = row("ollama/qwen3:4b", Ollama, false, true);
+        let plan = prune_plan(
+            &[persona.clone(), other.clone()],
+            &[persona.clone(), other],
+            &[],
+        );
+        assert_eq!(plan, PrunePlan::default());
+
+        let gone_from_ollama = row("ollama/mtp-gemma-4:2b", Ollama, false, true);
+        let plan = prune_plan(&[gone_from_ollama], &[persona], &[]);
+        assert_eq!(
+            plan.delete,
+            [("ollama/mtp-gemma-4:2b".to_string(), Pruned::Unlisted)],
+            "an unlisted tag goes as an unlisted tag, not as a companion"
+        );
+    }
+
+    /// Rows are told apart by id exactly: a row never shields or loses another that differs only
+    /// in case, in either direction.
+    #[test]
+    fn ids_that_differ_only_in_case_are_rows_of_their_own() {
+        use ModelCategory::Gguf;
+        let upper = row("gguf/Gemma-Mine", Gguf, true, false);
+        let lower = row("gguf/gemma-mine", Gguf, true, false);
+        let plan = prune_plan(
+            &[upper.clone(), lower.clone()],
+            &[],
+            &[assigned_one("chat", "gguf/Gemma-Mine")],
+        );
+        assert_eq!(
+            plan.delete,
+            [("gguf/gemma-mine".to_string(), Pruned::Ghost)],
+            "the assignment protects its own id only"
+        );
+
+        let mut kept = lower;
+        kept.downloaded = true;
+        let plan = prune_plan(&[upper, kept], &[], &[]);
+        assert_eq!(
+            plan.delete,
+            [("gguf/Gemma-Mine".to_string(), Pruned::Ghost)],
+            "a file under one spelling keeps that row, not its twin"
+        );
+    }
+
+    /// Every kind of row against every state of the world: whatever the plan deletes, it never
+    /// deletes an assigned row, a row the fetch lists, or a downloaded model row; and an
+    /// Ollama row only when the server answered and no longer lists it.
+    #[test]
+    fn no_plan_deletes_an_assigned_row_a_listed_row_or_a_downloaded_model() {
+        use ModelCategory::{
+            Embedding, Gguf, Litert, Llamafile, Ollama, TtsHttp, TtsKokoro, TtsPiper, Whisper,
+        };
+        let categories = [
+            Gguf, Litert, Llamafile, Ollama, Whisper, TtsPiper, TtsKokoro, TtsHttp, Embedding,
+        ];
+        let flags = [false, true];
+        for category in categories {
+            for (custom, downloaded, has_url, assigned, listed, companion, answered) in
+                every_combination(flags)
+            {
+                let name = if companion { "mmproj-x" } else { "plain-x" };
+                let mut subject = row(
+                    &format!("{}/{name}", category.as_str()),
+                    category.clone(),
+                    custom,
+                    downloaded,
+                );
+                subject.url = has_url.then(|| "https://example.com/x".to_string());
+                let mut catalogue = Vec::new();
+                if listed {
+                    catalogue.push(subject.clone());
+                }
+                if answered {
+                    catalogue.push(row("ollama/other", Ollama, false, true));
+                }
+                let assignments = if assigned {
+                    vec![assigned_one("chat", &subject.id)]
+                } else {
+                    vec![]
+                };
+                let plan = prune_plan(std::slice::from_ref(&subject), &catalogue, &assignments);
+                let ctx = format!(
+                    "{category:?} custom={custom} downloaded={downloaded} url={has_url} \
+                     assigned={assigned} listed={listed} companion={companion} answered={answered}"
+                );
+                let deleted = plan.delete.iter().any(|(id, _)| *id == subject.id);
+                if assigned || listed {
+                    assert!(!deleted, "{ctx}");
+                }
+                if downloaded && !companion && category != Ollama {
+                    assert!(!deleted, "{ctx}");
+                }
+                if category == Ollama {
+                    let server_dropped_it = !assigned && !listed && answered_by(&catalogue);
+                    assert_eq!(deleted, server_dropped_it, "{ctx}");
+                    assert!(
+                        plan.delete.iter().all(|(_, why)| *why == Pruned::Unlisted),
+                        "{ctx}"
+                    );
+                }
+                assert!(
+                    plan.unavailable.is_empty() || (assigned && category == Ollama && downloaded),
+                    "{ctx}"
+                );
+                assert!(
+                    !(deleted && plan.unavailable.contains(&subject.id)),
+                    "{ctx}"
+                );
+            }
+        }
+    }
+
+    fn answered_by(catalogue: &[ModelRecord]) -> bool {
+        catalogue
+            .iter()
+            .any(|m| m.category == ModelCategory::Ollama)
+    }
+
+    /// The seven yes-or-no facts about a row and its world, in every combination.
+    fn every_combination(
+        flags: [bool; 2],
+    ) -> impl Iterator<Item = (bool, bool, bool, bool, bool, bool, bool)> {
+        (0..1u32 << 7).map(move |bits| {
+            let f = |i: u32| flags[((bits >> i) & 1) as usize];
+            (f(0), f(1), f(2), f(3), f(4), f(5), f(6))
+        })
+    }
+
     fn assigned_one(role: &str, id: &str) -> ModelRoleAssignment {
         ModelRoleAssignment {
             role: role.into(),
@@ -847,6 +1007,40 @@ mod tests {
                 .unwrap()
                 .downloaded,
             "a listed Ollama model is available: it has no file to check"
+        );
+    }
+
+    /// The flag is the row's memory of the disk and can lag it: a row whose file is there is not
+    /// stale, however its flag reads, and only a companion's row goes with a file present.
+    #[tokio::test]
+    async fn a_row_whose_file_is_on_disk_survives_a_stale_flag() {
+        use crate::models::mocks::mock_model_repository::MockModelRepository as Repo;
+        let repo = Repo::new();
+        let mut copied_back = row("gguf/copied-back", ModelCategory::Gguf, true, false);
+        copied_back.url = None;
+        let mut retired = row("gguf/retired-with-file", ModelCategory::Gguf, false, false);
+        retired.url = None;
+        let ghost = row("gguf/ghost", ModelCategory::Gguf, true, false);
+        let drafter = row("gguf/mtp-gemma-4-E2B-it", ModelCategory::Gguf, true, false);
+        for r in [&copied_back, &retired, &ghost, &drafter] {
+            repo.upsert(r).await.unwrap();
+        }
+        let present = |r: &ModelRecord| r.filename.as_deref().map(|f| f != "ghost.gguf");
+        let applied = apply_catalog(&repo, vec![], &present).await.unwrap();
+        assert_eq!(applied.pruned, 2);
+        assert!(repo.get_by_id("gguf/copied-back").await.unwrap().is_some());
+        assert!(repo
+            .get_by_id("gguf/retired-with-file")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(repo.get_by_id("gguf/ghost").await.unwrap().is_none());
+        assert!(
+            repo.get_by_id("gguf/mtp-gemma-4-E2B-it")
+                .await
+                .unwrap()
+                .is_none(),
+            "a drafter's row goes though its file stays"
         );
     }
 

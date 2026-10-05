@@ -302,6 +302,15 @@ class FilesTest(unittest.TestCase):
             self.assertFalse(vp.is_model_file(name), name)
         self.assertTrue(vp.is_model_file("BF16/m-BF16-00001-of-00003.gguf"))
 
+    def test_a_dflash_drafter_is_no_chat_model_by_name_or_by_header(self):
+        # ggml-org ships `dflash-<model>-<quant>.gguf` beside each model; sorted first, it was the file
+        # whose header named the pairing's architecture, and its name was listed as a chat model.
+        for name in ("dflash-gemma-4-26B-A4B-it-BF16.gguf", "sub/dflash-gemma-4-31B-it-Q8_0.gguf"):
+            self.assertFalse(vp.is_model_file(name), name)
+        self.assertTrue(vp.is_model_file("gemma-4-26B-A4B-it-Q8_0.gguf"))
+        self.assertIn("companion", vp.model_problem(vp.parse_gguf(model_head("dflash", 2816))))
+        self.assertIsNone(vp.model_problem(vp.parse_gguf(model_head("gemma4", 2816))))
+
     def test_quantisation_is_read_as_goose_reads_it(self):
         for name, quant in (("mmproj-BF16.gguf", "BF16"), ("mmproj-model-f16.gguf", "f16"),
                             ("Q4_K_M/m-Q4_K_M-00001-of-00002.gguf", "Q4_K_M"), ("model.Q8_0.gguf", "Q8_0"),

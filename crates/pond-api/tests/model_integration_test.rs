@@ -1014,6 +1014,15 @@ async fn a_url_download_becomes_an_added_row_and_a_failure_keeps_its_reason() {
         }
     })
     .await;
+    let reason = f.tracker.read().await["escaped.gguf"]
+        .error
+        .clone()
+        .unwrap();
+    assert!(reason.contains("could not be reached"), "{reason}");
+    assert!(
+        !reason.contains("127.0.0.1") && !reason.contains("http"),
+        "the reason names no address: {reason}"
+    );
     assert!(!f.tmp.path().join("escaped.gguf").exists());
     assert!(!f.tmp.path().join("models/gguf/escaped.gguf.part").exists());
 }
@@ -1574,10 +1583,21 @@ async fn a_refresh_prunes_stale_rows_and_keeps_downloaded_and_assigned_ones() {
 
     let (status, body) = post_json(&f.app, "/api/v1/models/registry/refresh", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // The prune deletes row by row, so wait for the last of them, not the first.
     let repo = f.repo.clone();
     eventually("the stale rows to be pruned", || {
         let repo = repo.clone();
-        async move { repo.get_by_id("gguf/llama-3.2-3b").await.unwrap().is_none() }
+        async move {
+            let mut left = 0;
+            for id in [
+                "gguf/llama-3.2-3b",
+                "gguf/lost-by-hand",
+                "gguf/mtp-gemma-4-E2B-it",
+            ] {
+                left += usize::from(repo.get_by_id(id).await.unwrap().is_some());
+            }
+            left == 0
+        }
     })
     .await;
 
@@ -1741,4 +1761,295 @@ async fn memory_status_counts_what_a_switch_would_free() {
         .await
         .unwrap();
     assert_eq!(body_json(resp).await["reclaimable_mb"], 0);
+}
+
+/// A model's download served slowly, so a second request lands while the first is in flight.
+async fn slow_weights(file: &str, weights: &[u8]) -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!("/{file}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_bytes(weights.to_vec())
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn gets(server: &wiremock::MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "GET")
+        .count()
+}
+
+/// Two requests for one download (two clients, or a click while a boot restore is fetching it)
+/// are one transfer: the second joins the first rather than racing it for the same partial file,
+/// which ended the finished download as an error.
+#[tokio::test]
+async fn asking_twice_for_a_download_in_flight_runs_it_once() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let weights = vec![9u8; 4 * 1_048_576];
+    let server = slow_weights("twice.gguf", &weights).await;
+    let mut row = gguf_record("twice");
+    row.downloaded = false;
+    row.url = Some(format!("{}/twice.gguf", server.uri()));
+    f.repo.upsert(&row).await.unwrap();
+
+    let uri = "/api/v1/models/gguf/twice/download";
+    let ((first, a), (second, b)) =
+        tokio::join!(post_json(&f.app, uri, None), post_json(&f.app, uri, None));
+    assert_eq!((first, second), (StatusCode::OK, StatusCode::OK));
+    let mut statuses = [a["status"].as_str().unwrap(), b["status"].as_str().unwrap()];
+    statuses.sort();
+    assert_eq!(statuses, ["already_downloading", "download_started"]);
+
+    let tracker = f.tracker.clone();
+    eventually("the transfer to end", || {
+        let tracker = tracker.clone();
+        async move {
+            tracker
+                .read()
+                .await
+                .get("twice.gguf")
+                .is_some_and(|e| e.status != "downloading")
+        }
+    })
+    .await;
+    let entry = f.tracker.read().await.get("twice.gguf").cloned().unwrap();
+    assert_eq!(entry.status, "done", "{:?}", entry.error);
+    assert_eq!(gets(&server).await, 1, "one transfer, not two");
+    assert_eq!(
+        std::fs::read(f.tmp.path().join("models/gguf/twice.gguf")).unwrap(),
+        weights
+    );
+    assert!(
+        f.repo
+            .get_by_id("gguf/twice")
+            .await
+            .unwrap()
+            .unwrap()
+            .downloaded
+    );
+
+    // Done is not running: asking again after it finished fetches again.
+    f.repo.set_downloaded("gguf/twice", false).await.unwrap();
+    let (_, again) = post_json(&f.app, uri, None).await;
+    assert_eq!(again["status"], "download_started");
+}
+
+/// An entry left at downloading by nothing (a task that died) must not lock its file out.
+#[tokio::test]
+async fn a_download_left_at_downloading_by_nothing_can_be_asked_for_again() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let server = weights_server("stranded.gguf").await;
+    let mut row = gguf_record("stranded");
+    row.downloaded = false;
+    row.url = Some(format!("{}/stranded.gguf", server.uri()));
+    f.repo.upsert(&row).await.unwrap();
+    let mut left = tracked("stranded.gguf", "downloading");
+    left.control
+        .store(pond_api::DL_PAUSE, std::sync::atomic::Ordering::Relaxed);
+    f.tracker.write().await.insert("stranded.gguf".into(), left);
+
+    let (status, body) = post_json(&f.app, "/api/v1/models/gguf/stranded/download", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "download_started");
+    let tracker = f.tracker.clone();
+    eventually("the transfer to arrive", || {
+        let tracker = tracker.clone();
+        async move {
+            tracker
+                .read()
+                .await
+                .get("stranded.gguf")
+                .is_some_and(|e| e.status == "done")
+        }
+    })
+    .await;
+    assert!(f.tmp.path().join("models/gguf/stranded.gguf").exists());
+}
+
+/// Resuming a file whose transfer is running starts nothing, and says so.
+#[tokio::test]
+async fn resuming_a_download_that_is_running_starts_no_second_transfer() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let server = weights_server("running.gguf").await;
+    let mut live = part_of("running.gguf", "gguf/running", "model", "downloading");
+    live.url = Some(format!("{}/running.gguf", server.uri()));
+    live.dest = Some(f.tmp.path().join("models/gguf/running.gguf"));
+    // The transfer holds a clone of the flag for as long as it runs.
+    let transfer = live.control.clone();
+    f.tracker.write().await.insert("running.gguf".into(), live);
+
+    let (status, body) = post_json(
+        &f.app,
+        CONTROL,
+        Some(serde_json::json!({"filename": "running.gguf", "action": "resume"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "downloading");
+    assert_eq!(gets(&server).await, 0, "nothing was started");
+    assert_eq!(f.tracker.read().await["running.gguf"].status, "downloading");
+    drop(transfer);
+}
+
+/// Two rows can name one file (an older row under another id). Deleting the one that is not in use
+/// must not take the file from the one that is.
+#[tokio::test]
+async fn deleting_a_row_leaves_the_file_of_an_assigned_row_that_shares_it() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let gguf = f.tmp.path().join("models/gguf");
+    std::fs::create_dir_all(&gguf).unwrap();
+    std::fs::write(gguf.join("gemma-4-E4B-it-Q4_K_M.gguf"), b"weights").unwrap();
+    let mut older = gguf_record("gemma-4-e4b");
+    older.filename = Some("gemma-4-E4B-it-Q4_K_M.gguf".into());
+    f.repo.upsert(&older).await.unwrap();
+    let mut added = gguf_record("gemma-4-E4B-it-Q4_K_M");
+    added.is_custom = true;
+    f.repo.upsert(&added).await.unwrap();
+    f.repo
+        .set_assignment("chat", "gguf/gemma-4-e4b")
+        .await
+        .unwrap();
+
+    let del = |name: &str| {
+        let app = f.app.clone();
+        let uri = format!("/api/v1/models/gguf/{name}");
+        async move {
+            let resp = app.oneshot(auth_req("DELETE", &uri, None)).await.unwrap();
+            let status = resp.status();
+            (status, body_json(resp).await)
+        }
+    };
+    let (status, body) = del("gemma-4-E4B-it-Q4_K_M").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("gemma-4-e4b"),
+        "{body}"
+    );
+    assert!(gguf.join("gemma-4-E4B-it-Q4_K_M.gguf").exists());
+    assert!(
+        f.repo
+            .get_by_id("gguf/gemma-4-E4B-it-Q4_K_M")
+            .await
+            .unwrap()
+            .unwrap()
+            .downloaded
+    );
+
+    // Nothing in use shares it any more: the delete goes through.
+    f.repo.delete("gguf/gemma-4-e4b").await.unwrap();
+    f.repo
+        .set_assignment("chat", "gguf/some-other-model")
+        .await
+        .unwrap();
+    let resp = f
+        .app
+        .clone()
+        .oneshot(auth_req(
+            "DELETE",
+            "/api/v1/models/gguf/gemma-4-E4B-it-Q4_K_M",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(!gguf.join("gemma-4-E4B-it-Q4_K_M.gguf").exists());
+}
+
+/// A host that refuses the size probe does not stop the download: it starts with no number named
+/// in the announcement and arrives all the same.
+#[tokio::test]
+async fn a_download_whose_host_refuses_a_head_still_starts_and_arrives() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let server = weights_server("no-head.gguf").await;
+    wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+        .respond_with(wiremock::ResponseTemplate::new(405))
+        .mount(&server)
+        .await;
+    let mut row = gguf_record("no-head");
+    row.size_mb = 0;
+    row.downloaded = false;
+    row.url = Some(format!("{}/no-head.gguf", server.uri()));
+    f.repo.upsert(&row).await.unwrap();
+
+    let (status, body) = post_json(&f.app, "/api/v1/models/gguf/no-head/download", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["message"], "Downloading no-head");
+    assert!(body["parts"][0]["size_bytes"].is_null());
+    let repo = f.repo.clone();
+    eventually("the model to arrive", || {
+        let repo = repo.clone();
+        async move {
+            repo.get_by_id("gguf/no-head")
+                .await
+                .unwrap()
+                .is_some_and(|m| m.downloaded)
+        }
+    })
+    .await;
+}
+
+/// While a host takes its time to state a size, the row can change; recording the size must not
+/// put back what the row was when the request began.
+#[tokio::test]
+async fn learning_a_size_does_not_undo_what_the_row_became_meanwhile() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let weights = vec![5u8; 3 * 1_048_576];
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+        .and(wiremock::matchers::path("/slow-head.gguf"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-length", weights.len().to_string())
+                .set_delay(std::time::Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/slow-head.gguf"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_bytes(weights.clone())
+                .set_delay(std::time::Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+    let mut row = gguf_record("slow-head");
+    row.size_mb = 0;
+    row.downloaded = false;
+    row.url = Some(format!("{}/slow-head.gguf", server.uri()));
+    f.repo.upsert(&row).await.unwrap();
+
+    let app = f.app.clone();
+    let request = tokio::spawn(async move {
+        post_json(&app, "/api/v1/models/gguf/slow-head/download", None).await
+    });
+    let host = &server;
+    eventually("the size probe to reach the host", || async move {
+        host.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.method.as_str() == "HEAD")
+    })
+    .await;
+    // Another client changes the row while the probe waits.
+    f.repo.set_downloaded("gguf/slow-head", true).await.unwrap();
+
+    let (status, body) = request.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let after = f.repo.get_by_id("gguf/slow-head").await.unwrap().unwrap();
+    assert_eq!(after.size_mb, 3, "the size learned is kept");
+    assert!(
+        after.downloaded,
+        "and the change made meanwhile is not undone"
+    );
 }

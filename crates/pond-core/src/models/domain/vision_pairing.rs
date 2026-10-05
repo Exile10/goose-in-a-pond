@@ -338,6 +338,12 @@ mod tests {
             assert!(!p.label.contains(".gguf"), "{}: a label", p.model_repo);
             assert_eq!(p.checked_at.len(), 10, "{}: a date", p.model_repo);
             assert!(!p.model_files.is_empty(), "{}", p.model_repo);
+            assert!(
+                !crate::models::domain::taxonomy::is_companion_architecture(Some(&p.architecture)),
+                "{}: {} is a drafter's or an encoder's architecture, not a chat model's",
+                p.model_repo,
+                p.architecture
+            );
             for f in &p.model_files {
                 assert!(
                     files.insert((p.model_repo.as_str(), f.as_str())),
@@ -479,6 +485,32 @@ mod tests {
         );
     }
 
+    /// Two repositories of one publisher may list a file name; the line that wins is then the one
+    /// that sorts first, which is only safe while the other would have named the same encoder.
+    #[test]
+    fn a_file_name_two_repositories_of_one_publisher_list_pairs_one_encoder_either_way() {
+        let mut by_name: HashMap<&str, Vec<&VisionPairing>> = HashMap::new();
+        for p in pairings() {
+            for f in &p.model_files {
+                by_name.entry(base_name(f)).or_default().push(p);
+            }
+        }
+        for (name, lines) in by_name {
+            let best = lines.iter().map(|p| p.publisher_rank()).min().unwrap();
+            let tied: Vec<_> = lines
+                .iter()
+                .filter(|p| p.publisher_rank() == best)
+                .collect();
+            for other in &tied[1..] {
+                assert_eq!(
+                    other.encoder.sha256, tied[0].encoder.sha256,
+                    "{name}: {} and {} are tied for it with different encoders",
+                    tied[0].model_repo, other.model_repo
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_publisher_preference_is_the_generators() {
         let sources = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -510,6 +542,9 @@ mod tests {
             ("DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M", None),
             ("mtp-gemma-4-E2B-it", None),
             ("gemma-4-E2B-it-assistant-F16", None),
+            // A DFlash drafter beside the model it drafts for is no model, though its repo pairs.
+            ("dflash-gemma-4-26B-A4B-it-Q8_0", None),
+            ("gemma-4-26B-A4B-it-Q8_0", Some("gemma-4-26b-a4b-it")),
             ("gemma-4-E2B-it.litertlm", None),
             ("gemma-4-E4B-it.litertlm", None),
             // A bare family name names no file, and there is no header to read.

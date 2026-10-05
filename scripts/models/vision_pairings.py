@@ -53,7 +53,7 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SHARD = re.compile(r"-(\d+)-of-(\d+)\.gguf$")
-COMPANION_TOKENS = {"mtp", "assistant", "draft", "drafter", "imatrix"}
+COMPANION_TOKENS = {"mtp", "dflash", "assistant", "draft", "drafter", "imatrix"}
 PRECISION = {"BF16": 3, "F16": 2, "F32": 1}
 LABEL_DROP = {"it", "qat", "instruct", "gguf", "ud"}
 SIZE_TOKEN = re.compile(r"^[ea]?\d+(\.\d+)?[bmk]$", re.I)
@@ -504,7 +504,7 @@ def model_problem(head: GgufHead):
     arch = head.string("general.architecture")
     if not arch:
         return head.problem or "no general.architecture in its header"
-    if arch == "clip" or arch.endswith("-assistant"):
+    if arch in ("clip", "dflash") or arch.endswith("-assistant"):
         return "general.architecture %s is a companion, not a chat model" % arch
     if not head.embedding_length():
         return "no embedding_length in its header"

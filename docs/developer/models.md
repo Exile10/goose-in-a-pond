@@ -28,9 +28,10 @@ goose keeps its own copy private.
   `ollama` (listed by the Ollama server), `added` (has a download URL), `on_disk` (found by the
   scan). A pick that leaves the list but is still downloaded reads `added`.
 - **Kind**: `conversation` or `helper`. FunctionGemma, `tool`- and `draft`-role rows, encoders,
-  drafters and speech or embedding files are helpers and are never offered as conversation. The
-  disk scan skips companion files and helper GGUF architectures (`clip`, `*-assistant`, ASR,
-  embeddings) altogether.
+  drafters (`mtp-*`, `dflash-*`, Gemma 4 `-assistant`) and speech or embedding files are helpers
+  and are never offered as conversation. The disk scan skips companion files and helper GGUF
+  architectures (`clip`, `dflash`, `*-assistant`, ASR, embeddings) altogether. An Ollama tag
+  names no file, so only its words (asr, whisper, embed, functiongemma) make it a helper.
 - **Acquire**: `download`, `external` (Ollama, HTTP voices, self-fetching embeddings) or
   `unavailable` (a file with no source).
 - **Title**: a pick's own title; else, for a llama.cpp file the pairing table lists, the table's
@@ -94,10 +95,17 @@ the number first, and the row keeps it. A host that does not say leaves the numb
 than guessing it.
 
 Every file goes through the download tracker (`GET /models/download/progress`), whose entries
-carry `model_id` and `part` (`model` or `pictures`). `POST /models/download/control` takes
+carry `model_id` and `part` (`model` or `pictures`). One transfer runs per tracker key: a second
+request for a file in flight starts nothing and answers `already_downloading`, and a resume of
+a running transfer does the same. A running transfer holds a clone of its entry's control flag,
+which is how an entry left at `downloading` by a task that died is told from a live one. A
+failed entry's `error` says what happened and what to do in plain words
+(`crates/pond-api/src/download_failure.rs`); the raw error goes to the log. `POST /models/download/control` takes
 `{filename, action}` for one file or `{model_id, action}` for every part of a model, with
-`action` one of `pause`, `resume` or `cancel`. Pause keeps the partial file, cancel deletes it,
-cancelling a model's own file cancels its add-on too, and a paused entry is never evicted. A
+`action` one of `pause`, `resume` or `cancel`. Pause keeps a Hugging Face transfer's partial file
+to resume from (a transfer from any other host has no range resume, so its pause discards the
+partial and a resume starts over), cancel deletes it, cancelling a model's own file cancels its
+add-on too, and a paused entry is never evicted. A
 row's `companions` read `downloading` while the add-on comes down, `verifying` while its hash is
 checked, then `installed`. When the model file arrives its row is marked downloaded,
 and when either part arrives the agent registers the model by the file its row names and verifies
@@ -119,8 +127,14 @@ it.
 Every seed upserts the catalogue and prunes what it leaves stale
 (`model_service::apply_catalog`): companion rows, custom rows that lost their file and have no
 source, bundled rows no longer bundled and never downloaded, and Ollama rows a running Ollama
-server no longer lists (one that does not answer changes none of them). Anything assigned stays,
-and no file is touched.
+server no longer lists. Anything assigned stays, nothing the fetch itself lists is pruned, a row
+whose file is on disk stays unless it is a companion (the downloaded flag can lag the disk), and
+no file is touched. An Ollama that does not answer, or answers with no models, changes none of
+its rows: the fetch cannot tell the two apart, so the last model removed from Ollama leaves its
+row behind. Rows are told apart by exact id; `Foo` and `foo` are two rows.
+
+Deleting a model refuses when another row that is assigned names the same file (an older row
+under another id, or another spelling of the name).
 
 ## No model chosen
 

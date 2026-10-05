@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::model_record::ModelCategory;
+use super::model_record::{ModelCategory, ModelRecord};
 
 /// The directory a category's files live in; `None` for categories with no local file.
 pub fn dir_for(data_dir: &Path, category: &ModelCategory) -> Option<PathBuf> {
@@ -36,6 +36,24 @@ pub fn path_for(data_dir: &Path, category: &ModelCategory, filename: &str) -> Op
         return Some(dir.join(format!("{name}.exe")));
     }
     Some(dir.join(name))
+}
+
+/// Whether two rows name one file: the same directory and a file name that is the same on a disk
+/// that ignores case, so a row under another id or another spelling of it is found too.
+pub fn share_a_file(a: &ModelRecord, b: &ModelRecord) -> bool {
+    fn name(r: &ModelRecord) -> Option<&str> {
+        r.filename.as_deref().and_then(file_name)
+    }
+    let root = Path::new("");
+    match (
+        name(a),
+        name(b),
+        dir_for(root, &a.category),
+        dir_for(root, &b.category),
+    ) {
+        (Some(x), Some(y), Some(dx), Some(dy)) => dx == dy && x.eq_ignore_ascii_case(y),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +111,73 @@ mod tests {
         assert_eq!(path_for(dd, &ModelCategory::Gguf, ".."), None);
         assert_eq!(path_for(dd, &ModelCategory::Gguf, ""), None);
         assert_eq!(path_for(dd, &ModelCategory::Ollama, "llama3.2"), None);
+    }
+
+    fn row(category: ModelCategory, id: &str, filename: Option<&str>) -> ModelRecord {
+        let name = id.split_once('/').map_or(id, |(_, n)| n);
+        ModelRecord {
+            id: id.to_string(),
+            category,
+            name: name.to_string(),
+            filename: filename.map(str::to_string),
+            description: String::new(),
+            size_mb: 0,
+            url: None,
+            hf_id: None,
+            ram_estimate_mb: None,
+            recommended_role: None,
+            context_length: None,
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: true,
+            is_custom: false,
+        }
+    }
+
+    #[test]
+    fn rows_share_a_file_by_directory_and_name_whatever_their_ids_and_case() {
+        use ModelCategory::{Gguf, Litert, Ollama, Whisper};
+        let a = row(Gguf, "gguf/gemma-4-e4b", Some("gemma-4-E4B-it-Q4_K_M.gguf"));
+        let renamed = row(
+            Gguf,
+            "gguf/gemma-4-E4B-it-Q4_K_M",
+            Some("gemma-4-E4B-it-Q4_K_M.gguf"),
+        );
+        let shouted = row(Gguf, "gguf/GEMMA", Some("GEMMA-4-E4B-IT-Q4_K_M.GGUF"));
+        assert!(share_a_file(&a, &renamed));
+        assert!(share_a_file(&a, &shouted), "a case-blind disk has one file");
+        assert!(share_a_file(
+            &a,
+            &row(Gguf, "gguf/x", Some("sub/gemma-4-E4B-it-Q4_K_M.gguf"))
+        ));
+        assert!(!share_a_file(
+            &a,
+            &row(Gguf, "gguf/y", Some("gemma-4-E4B-it-Q8_0.gguf"))
+        ));
+        assert!(
+            !share_a_file(
+                &a,
+                &row(Litert, "litert/z", Some("gemma-4-E4B-it-Q4_K_M.gguf"))
+            ),
+            "another directory is another file"
+        );
+        assert!(!share_a_file(
+            &a,
+            &row(Whisper, "whisper/w", Some("gemma-4-E4B-it-Q4_K_M.gguf"))
+        ));
+        let nameless = row(Ollama, "ollama/llama3.2", None);
+        assert!(
+            !share_a_file(&nameless, &nameless),
+            "no file, nothing shared"
+        );
+        assert!(!share_a_file(&a, &row(Gguf, "gguf/none", None)));
     }
 
     #[test]

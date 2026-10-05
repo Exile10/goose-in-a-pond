@@ -962,6 +962,35 @@ mod tests {
         assert!(budgeted_declaration(None, "gemma-4-E2B-it-Q4_K_M", false).is_declared());
     }
 
+    /// Nothing is measured on the Orin, so no model the pairing table knows reads pictures there,
+    /// by its file name, by the name a household gives the row, or by an encoder's own `dir`.
+    #[test]
+    fn the_budgeted_policy_declares_no_model_the_table_lists() {
+        use crate::models::domain::vision_pairing::pairings;
+        assert!(DEVICE_MEASURED_VISION.is_empty());
+        let never = |_: &EncoderSpec| -> VisionFit { panic!("an unlisted encoder costs no I/O") };
+        for p in pairings() {
+            assert!(
+                matches!(
+                    declare(Some(p.spec()), true, DEVICE_MEASURED_VISION, never),
+                    VisionDeclaration::NotOnThisDevice(_)
+                ),
+                "{}",
+                p.encoder.dir
+            );
+            for file in &p.model_files {
+                let stem = file.rsplit('/').next().unwrap_or(file);
+                let stem = stem.strip_suffix(".gguf").unwrap_or(stem);
+                let declared = budgeted_declaration(None, stem, true);
+                assert!(!declared.is_declared(), "{file}");
+                assert!(
+                    matches!(declared, VisionDeclaration::NotOnThisDevice(_)),
+                    "{file}: a paired file is refused for the device, not unknown to it"
+                );
+            }
+        }
+    }
+
     #[test]
     fn any_one_signal_makes_the_device_budgeted() {
         assert!(!budgeted_from(false, false, false));

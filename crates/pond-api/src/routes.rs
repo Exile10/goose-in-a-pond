@@ -5567,18 +5567,13 @@ async fn control_one(
         dest,
         key: key.to_string(),
         category,
-        model_id: model_id.clone(),
+        model_id,
         part,
         size_bytes: None,
     };
-    let tracker = Arc::clone(&state.download_tracker);
-    let client = state.http_client.clone();
-    let on_done = crate::model_acquisition::arrival(state.clone(), model_id, part);
-
-    tokio::spawn(async move {
-        spawn_tracked_download(file, tracker, client, data_dir, on_done).await;
-    });
-
+    if crate::model_acquisition::start(state, vec![file]).await == 0 {
+        return Ok("downloading");
+    }
     Ok("resuming")
 }
 
@@ -5854,6 +5849,29 @@ async fn delete_model(
             StatusCode::CONFLICT,
             Json(json!({
                 "error": format!("Model is assigned to role '{}'. Deactivate it first.", a.role)
+            })),
+        ));
+    }
+    // Another row may name the same file (an older row, or one spelled in another case): deleting
+    // it would take the file from a model in use.
+    let rows = model_repo.list_all().await.unwrap_or_default();
+    let in_use_by = rows
+        .iter()
+        .filter(|r| r.id != model_id && model_layout::share_a_file(r, &m))
+        .find_map(|r| {
+            assignments
+                .iter()
+                .find(|a| a.model_id == r.id)
+                .map(|a| (r.name.clone(), a.role.clone()))
+        });
+    if let Some((other, role)) = in_use_by {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "'{other}' uses the same file and is assigned to role '{role}'. \
+                     Deactivate it first."
+                )
             })),
         ));
     }
@@ -6371,31 +6389,13 @@ async fn list_hf_model_files(
     match sent {
         Ok(resp) if resp.status().is_success() => {
             let meta: Value = resp.json().await.unwrap_or_default();
+            let budgeted = pond_core::models::domain::device_budget::budgeted_device();
             let files: Vec<Value> = meta["siblings"]
                 .as_array()
                 .map(|siblings| {
-                    siblings.iter()
-                        // Chat models only; companions arrive by themselves, elsewhere.
-                        .filter(|s| {
-                            s["rfilename"].as_str()
-                                .map(|n| n.ends_with(".gguf") && !is_companion_file(n))
-                                .unwrap_or(false)
-                        })
-                        .map(|s| {
-                            let filename = s["rfilename"].as_str().unwrap_or("").to_string();
-                            let size_mb  = s["size"].as_u64().map(|b| b / 1_048_576);
-                            // The add-on a download of this file would bring, by the pairing table.
-                            let pictures = pond_core::models::domain::vision_pairing::encoder_for_source(
-                                &repo, &filename,
-                            )
-                            .map(|e| json!({"size_bytes": e.size_bytes, "label": e.label}));
-                            json!({
-                                "filename": filename,
-                                "size_mb":  size_mb,
-                                "url": format!("https://huggingface.co/{}/resolve/main/{}", repo, filename),
-                                "pictures": pictures,
-                            })
-                        })
+                    siblings
+                        .iter()
+                        .filter_map(|s| crate::model_acquisition::hf_file_entry(&repo, s, budgeted))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -6511,12 +6511,34 @@ type Tracker = Arc<tokio::sync::RwLock<std::collections::HashMap<String, Downloa
 
 /// Put `file` in the tracker as downloading, keeping the bytes a resumed transfer already has.
 pub(crate) async fn begin_tracking(tracker: &Tracker, file: &TrackedFile) {
+    register(&mut *tracker.write().await, file, false);
+}
+
+/// Registers `file` as downloading unless a transfer already holds its key. The flag it returns
+/// goes with the transfer and is how a later claim sees the entry is still running.
+pub(crate) async fn claim_tracking(
+    tracker: &Tracker,
+    file: &TrackedFile,
+) -> Option<Arc<std::sync::atomic::AtomicU8>> {
     let mut t = tracker.write().await;
+    if t.get(&file.key).is_some_and(DownloadEntry::is_running) {
+        return None;
+    }
+    register(&mut t, file, true);
+    t.get(&file.key).map(|e| Arc::clone(&e.control))
+}
+
+/// `fresh_flag` drops a pause or cancel an earlier transfer was sent; otherwise a transfer that
+/// is already registered keeps its flag, so a pause sent before it began still holds.
+fn register(
+    t: &mut std::collections::HashMap<String, DownloadEntry>,
+    file: &TrackedFile,
+    fresh_flag: bool,
+) {
     let entry = t
         .entry(file.key.clone())
         .or_insert_with(|| DownloadEntry::starting(&file.key, &file.category));
-    // A transfer already registered keeps its flag, so a pause sent before it began still holds.
-    if entry.status != "downloading" {
+    if fresh_flag || entry.status != "downloading" {
         entry.control = Arc::new(std::sync::atomic::AtomicU8::new(crate::DL_RUN));
     }
     entry.category = file.category.clone();
@@ -6582,12 +6604,14 @@ pub(crate) async fn spawn_tracked_download<F>(
             let fetched = async {
                 // Gated here as well as in callers: every non-HF transfer passes this point.
                 let call = pond_core::shared::services::egress::begin(&url, "GET")
-                    .map_err(|denied| denied.to_string())?;
+                    .map_err(|denied| crate::download_failure::plain_denied(&denied))?;
                 let sent = client.get(&url).send().await;
                 call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
-                let resp = sent.map_err(|e| e.to_string())?;
+                let resp = sent.map_err(|e| crate::download_failure::plain_request(&e))?;
                 if !resp.status().is_success() {
-                    return Err(format!("HTTP {}", resp.status()));
+                    return Err(crate::download_failure::plain_status(
+                        resp.status().as_u16(),
+                    ));
                 }
 
                 let total = resp.content_length();
@@ -6600,12 +6624,18 @@ pub(crate) async fn spawn_tracked_download<F>(
 
                 let mut out = tokio::fs::File::create(&partial)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| crate::download_failure::plain_io(&e))?;
 
                 let mut downloaded: u64 = 0;
                 let mut resp = resp;
-                while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-                    out.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                while let Some(chunk) = resp
+                    .chunk()
+                    .await
+                    .map_err(|e| crate::download_failure::plain_request(&e))?
+                {
+                    out.write_all(&chunk)
+                        .await
+                        .map_err(|e| crate::download_failure::plain_io(&e))?;
                     downloaded += chunk.len() as u64;
                     {
                         let mut t = tracker.write().await;
@@ -6619,11 +6649,13 @@ pub(crate) async fn spawn_tracked_download<F>(
                         _ => return Err("paused".to_string()),
                     }
                 }
-                out.flush().await.map_err(|e| e.to_string())?;
+                out.flush()
+                    .await
+                    .map_err(|e| crate::download_failure::plain_io(&e))?;
                 drop(out);
                 tokio::fs::rename(&partial, &dest)
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| crate::download_failure::plain_io(&e))
             }
             .await;
             match &fetched {
@@ -6689,8 +6721,8 @@ async fn download_via_hf_cache_tracked(
 ) -> Result<(), String> {
     let cache = pond_hf_cache::HfCache::new(data_dir);
     let token: Option<String> = hf_token_from_env().or_else(|| cache.token().map(String::from));
-    let client =
-        pond_hf_cache::build_redirect_aware_client(token.as_deref()).map_err(|e| e.to_string())?;
+    let client = pond_hf_cache::build_redirect_aware_client(token.as_deref())
+        .map_err(|e| crate::download_failure::plain_failure(&e))?;
 
     let repo = cache
         .repo(repo_id.to_string())
@@ -6749,7 +6781,7 @@ async fn download_via_hf_cache_tracked(
             }
             return Err(if cancelled { "cancelled" } else { "paused" }.to_string());
         }
-        Err(e) => return Err(format!("{e:#}")),
+        Err(e) => return Err(crate::download_failure::plain_failure(&e)),
     };
 
     if let Some(parent) = dest.parent() {
@@ -6758,7 +6790,7 @@ async fn download_via_hf_cache_tracked(
     let _ = tokio::fs::remove_file(dest).await;
     link_or_copy_blob(&blob_path, dest)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::download_failure::plain_failure(&e))?;
     Ok(())
 }
 
@@ -6801,6 +6833,14 @@ const SIZE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8
 /// The size the file at `url` would download at, asked before anything is fetched (a HEAD
 /// chain, gated hop by hop); `None` when the host does not say or does not answer in time.
 pub(crate) async fn remote_size(data_dir: &std::path::Path, url: &str) -> Option<u64> {
+    remote_size_within(data_dir, url, SIZE_PROBE_TIMEOUT).await
+}
+
+pub(crate) async fn remote_size_within(
+    data_dir: &std::path::Path,
+    url: &str,
+    limit: std::time::Duration,
+) -> Option<u64> {
     let token = pond_hf_cache::parse_hf_url(url).and_then(|_| {
         hf_token_from_env().or_else(|| {
             pond_hf_cache::HfCache::new(data_dir)
@@ -6810,7 +6850,7 @@ pub(crate) async fn remote_size(data_dir: &std::path::Path, url: &str) -> Option
     });
     let client = pond_hf_cache::build_redirect_aware_client(token.as_deref()).ok()?;
     let asked = pond_hf_cache::remote_length(&client, url, token.as_deref());
-    match tokio::time::timeout(SIZE_PROBE_TIMEOUT, asked).await {
+    match tokio::time::timeout(limit, asked).await {
         Ok(Ok(size)) => size,
         Ok(Err(e)) => {
             tracing::info!(url, error = %e, "the size could not be learned before downloading");
