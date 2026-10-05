@@ -187,6 +187,16 @@ pub fn vision_pairing_for(q: &PairingQuery<'_>) -> Option<&'static VisionPairing
     })
 }
 
+/// The table's name for a file it lists by base name (the preferred line's), e.g.
+/// "SmolVLM 256M". A map read, never a header.
+pub fn label_for_file(file: &str) -> Option<&'static str> {
+    vision_pairing_for(&PairingQuery {
+        file_names: &[file],
+        ..PairingQuery::default()
+    })
+    .map(|p| p.label.as_str())
+}
+
 /// The file name a catalogue model name stands for: a bare stem gains `.gguf`.
 pub fn gguf_file_name(model: &str) -> String {
     let base = model.rsplit('/').next().unwrap_or(model);
@@ -573,5 +583,25 @@ mod tests {
         assert_eq!(encoder_pinned(spec.repo, "main", spec.filename), None);
         assert_eq!(gguf_file_name("a/b/c-Q4_K_M"), "c-Q4_K_M.gguf");
         assert_eq!(gguf_file_name("c-Q4_K_M.gguf"), "c-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn a_listed_file_is_named_by_its_line() {
+        for file in [
+            "SmolVLM-256M-Instruct-Q8_0.gguf",
+            "models/gguf/SmolVLM-256M-Instruct-Q8_0.gguf",
+        ] {
+            assert_eq!(label_for_file(file), Some("SmolVLM 256M"), "{file}");
+        }
+        assert_eq!(
+            label_for_file("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"),
+            Some("Gemma 4 E4B")
+        );
+        assert_eq!(label_for_file("some-unlisted-model-Q4_K_M.gguf"), None);
+        assert_eq!(
+            label_for_file("mmproj-BF16.gguf"),
+            None,
+            "an encoder is no model"
+        );
     }
 }

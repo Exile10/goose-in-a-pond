@@ -898,6 +898,86 @@ async fn an_ollama_model_is_never_downloaded_by_the_pond() {
     assert_eq!(body["code"], "external");
 }
 
+/// A model whose size nothing has said is asked for it first: the parts and the announcement
+/// carry the number before anything is fetched, and the row keeps it.
+#[tokio::test]
+async fn a_download_learns_an_unknown_size_before_it_starts() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let weights = vec![7u8; 3 * 1_048_576 + 5];
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+        .and(wiremock::matchers::path("/sized-model.gguf"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-length", weights.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/sized-model.gguf"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(weights.clone()))
+        .mount(&server)
+        .await;
+    let mut row = gguf_record("sized-model");
+    row.size_mb = 0;
+    row.downloaded = false;
+    row.url = Some(format!("{}/sized-model.gguf", server.uri()));
+    f.repo.upsert(&row).await.unwrap();
+
+    let (status, body) = post_json(
+        &f.app,
+        "/api/v1/models/gguf/sized-model/download",
+        Some(serde_json::json!({"pictures": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["parts"][0]["size_bytes"], weights.len() as u64);
+    assert_eq!(body["message"], "Downloading sized-model (3 MB)");
+    let stored = f.repo.get_by_id("gguf/sized-model").await.unwrap().unwrap();
+    assert_eq!(stored.size_mb, 3);
+}
+
+/// A file named by URL that the pairing table lists reads as the table names it.
+#[tokio::test]
+async fn a_listed_file_named_by_url_reads_as_the_table_names_it() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let (status, body) = post_json(
+        &f.app,
+        "/api/v1/models/download/url",
+        Some(serde_json::json!({
+            "url": "https://127.0.0.1:9/SmolVLM-256M-Instruct-Q8_0.gguf",
+            "category": "gguf",
+            "filename": "SmolVLM-256M-Instruct-Q8_0.gguf",
+            "pictures": false,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Downloading SmolVLM 256M"),
+        "{body}"
+    );
+    let resp = f
+        .app
+        .clone()
+        .oneshot(auth_req("GET", "/api/v1/models", None))
+        .await
+        .unwrap();
+    let list = body_json(resp).await;
+    let row = list["gguf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "SmolVLM-256M-Instruct-Q8_0")
+        .cloned()
+        .unwrap();
+    assert_eq!(row["title"], "SmolVLM 256M");
+    assert_eq!(row["provenance"], "added");
+}
+
 /// A file named by URL becomes an Added row under its sanitised name, and a failure says why.
 #[tokio::test]
 async fn a_url_download_becomes_an_added_row_and_a_failure_keeps_its_reason() {

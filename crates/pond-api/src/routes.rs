@@ -6795,6 +6795,34 @@ pub(crate) async fn fetch_tts_config(state: &AppState, record: &ModelRecord) {
     }
 }
 
+/// How long learning a file's size may hold up the request that names it.
+const SIZE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The size the file at `url` would download at, asked before anything is fetched (a HEAD
+/// chain, gated hop by hop); `None` when the host does not say or does not answer in time.
+pub(crate) async fn remote_size(data_dir: &std::path::Path, url: &str) -> Option<u64> {
+    let token = pond_hf_cache::parse_hf_url(url).and_then(|_| {
+        hf_token_from_env().or_else(|| {
+            pond_hf_cache::HfCache::new(data_dir)
+                .token()
+                .map(String::from)
+        })
+    });
+    let client = pond_hf_cache::build_redirect_aware_client(token.as_deref()).ok()?;
+    let asked = pond_hf_cache::remote_length(&client, url, token.as_deref());
+    match tokio::time::timeout(SIZE_PROBE_TIMEOUT, asked).await {
+        Ok(Ok(size)) => size,
+        Ok(Err(e)) => {
+            tracing::info!(url, error = %e, "the size could not be learned before downloading");
+            None
+        }
+        Err(_) => {
+            tracing::info!(url, "the host did not say the size in time");
+            None
+        }
+    }
+}
+
 fn hf_token_from_env() -> Option<String> {
     for var in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"] {
         if let Ok(v) = std::env::var(var) {

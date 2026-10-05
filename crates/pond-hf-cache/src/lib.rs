@@ -880,6 +880,18 @@ async fn head_with_redirects(
     Err(anyhow!("too many redirects following HEAD {url}"))
 }
 
+/// The length `url` would download at, asked with a HEAD chain gated hop by hop and fetching
+/// nothing: the final hop's length, else the first `x-linked-size`; `None` when no hop states
+/// one. The token reaches only Hugging Face hosts, as for a download.
+pub async fn remote_length(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<Option<u64>> {
+    let head = head_with_redirects(client, url, token).await?;
+    Ok(plain_len(head.headers()).or(head.linked_size))
+}
+
 /// GET `url` following redirects like `head_with_redirects`, re-sending `Range` on every hop.
 async fn get_with_redirects(
     client: &reqwest::Client,
@@ -1403,6 +1415,50 @@ mod tests {
         assert_eq!(
             head.headers().get("etag").and_then(|v| v.to_str().ok()),
             Some("\"deadbeef\"")
+        );
+    }
+
+    /// The size a download would arrive at, learned without a GET: HF's first-hop
+    /// `x-linked-size` when the final hop states none, else the final hop's own length.
+    #[tokio::test]
+    async fn a_remote_length_is_asked_with_a_head_and_fetches_nothing() {
+        let cdn = MockServer::start().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/blob"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"cafe\""))
+            .mount(&cdn)
+            .await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/sized"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "4321"))
+            .mount(&cdn)
+            .await;
+        Mock::given(wm_method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&cdn)
+            .await;
+        let origin = redirector(&format!("{}/blob", cdn.uri())).await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/linked"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/blob", cdn.uri()))
+                    .insert_header("x-linked-size", "1000"),
+            )
+            .mount(&origin)
+            .await;
+        let client = build_redirect_aware_client(None).expect("client builds");
+
+        let linked = remote_length(&client, &format!("{}/linked", origin.uri()), None).await;
+        assert_eq!(linked.expect("the chain answers"), Some(1000));
+        let sized = remote_length(&client, &format!("{}/sized", cdn.uri()), None).await;
+        assert_eq!(sized.expect("the host answers"), Some(4321));
+        let silent = remote_length(&client, &format!("{}/start", origin.uri()), None).await;
+        assert_eq!(
+            silent.expect("the chain answers"),
+            None,
+            "no hop states a length"
         );
     }
 

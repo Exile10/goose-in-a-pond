@@ -64,11 +64,15 @@ pub fn is_helper_name(name: &str) -> bool {
         })
 }
 
-/// The name the household reads: a pick's title, a scanned file's own header name, a bundled
-/// speech or voice row's description, and otherwise the row's name. Never the placeholder.
+/// The name the household reads: a pick's title, the pairing table's name for a llama.cpp file it
+/// lists, a scanned file's own header name, a bundled speech or voice row's description, and
+/// otherwise the row's name. Never the placeholder.
 pub fn title(record: &ModelRecord, pick_title: Option<&str>) -> String {
     if let Some(title) = pick_title {
         return title.to_string();
+    }
+    if let Some(label) = listed_label(record) {
+        return label.to_string();
     }
     let description = record.description.trim();
     let described = !description.is_empty() && description != ON_DISK_PLACEHOLDER;
@@ -76,6 +80,18 @@ pub fn title(record: &ModelRecord, pick_title: Option<&str>) -> String {
         return description.to_string();
     }
     record.name.clone()
+}
+
+/// What the pairing table calls a llama.cpp row's file, when it lists the file.
+fn listed_label(record: &ModelRecord) -> Option<&'static str> {
+    if record.category != ModelCategory::Gguf {
+        return None;
+    }
+    let file = record
+        .filename
+        .clone()
+        .unwrap_or_else(|| super::vision_pairing::gguf_file_name(&record.name));
+    super::vision_pairing::label_for_file(&file)
 }
 
 /// The catalogue name a file goes by: a LiteRT-LM file keeps its whole name (its extension is
@@ -361,6 +377,34 @@ mod tests {
         let mut voice = row(ModelCategory::TtsKokoro, "af_heart");
         voice.description = "American female — Heart".to_string();
         assert_eq!(title(&voice, None), "American female — Heart");
+    }
+
+    /// An added or found file the pairing table lists reads as the table names it; any other
+    /// falls back as before, ending at its stem.
+    #[test]
+    fn a_listed_file_reads_as_the_pairing_table_names_it() {
+        let mut added = row(ModelCategory::Gguf, "SmolVLM-256M-Instruct-Q8_0");
+        added.is_custom = true;
+        added.filename = Some("SmolVLM-256M-Instruct-Q8_0.gguf".to_string());
+        added.url = Some("https://huggingface.co/x/resolve/main/SmolVLM.gguf".to_string());
+        assert_eq!(title(&added, None), "SmolVLM 256M");
+
+        let mut found = added.clone();
+        found.url = None;
+        found.description = "Smolvlm 256M Instruct".to_string();
+        assert_eq!(title(&found, None), "SmolVLM 256M", "the table's name wins");
+
+        let mut fileless = row(ModelCategory::Gguf, "SmolVLM-256M-Instruct-Q8_0");
+        fileless.filename = None;
+        assert_eq!(title(&fileless, None), "SmolVLM 256M", "by the name's file");
+
+        let mut unlisted = row(ModelCategory::Gguf, "my-own-finetune-Q4_K_M");
+        unlisted.is_custom = true;
+        assert_eq!(title(&unlisted, None), "my-own-finetune-Q4_K_M");
+
+        let litert = row(ModelCategory::Litert, "SmolVLM-256M-Instruct-Q8_0.gguf");
+        assert_eq!(title(&litert, None), "SmolVLM-256M-Instruct-Q8_0.gguf");
+        assert_eq!(title(&added, Some("A pick")), "A pick");
     }
 
     #[test]

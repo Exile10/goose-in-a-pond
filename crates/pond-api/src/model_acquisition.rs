@@ -276,7 +276,15 @@ pub(crate) struct Plan {
     pub files: Vec<TrackedFile>,
     pub pictures: Pictures,
     pub include_pictures: bool,
-    pub message: String,
+    pub title: String,
+}
+
+impl Plan {
+    /// What the household reads when the download starts, from the parts as they now stand.
+    pub fn message(&self) -> String {
+        let part = |name| self.files.iter().find(|f| f.part == Some(name));
+        announcement(&self.title, part(PART_MODEL), part(PART_PICTURES))
+    }
 }
 
 /// `record`'s file, and the picture add-on when the model has one, this device carries it and
@@ -294,14 +302,40 @@ pub(crate) fn plan(
         }
         _ => None,
     };
-    let title = taxonomy::title(record, curated::for_record(record).map(|p| p.title));
-    let message = announcement(&title, Some(&model), picture.as_ref());
     Ok(Plan {
         files: std::iter::once(model).chain(picture).collect(),
         pictures,
         include_pictures,
-        message,
+        title: taxonomy::title(record, curated::for_record(record).map(|p| p.title)),
     })
+}
+
+/// A model file whose size nothing has stated is asked for it before anything is fetched, so
+/// the announcement says the number first; the row keeps what was learned.
+async fn learn_model_size(
+    state: &AppState,
+    data_dir: &Path,
+    record: &ModelRecord,
+    plan: &mut Plan,
+) {
+    let Some(model) = plan
+        .files
+        .iter_mut()
+        .find(|f| f.part == Some(PART_MODEL) && f.size_bytes.is_none())
+    else {
+        return;
+    };
+    let Some(bytes) = crate::routes::remote_size(data_dir, &model.url).await else {
+        return;
+    };
+    model.size_bytes = Some(bytes);
+    if let (0, Some(repo)) = (record.size_mb, state.model_repo.as_ref()) {
+        let mut sized = record.clone();
+        sized.size_mb = bytes / 1_048_576;
+        if let Err(e) = repo.upsert(&sized).await {
+            tracing::warn!(model = %record.id, error = %e, "could not record the size learned");
+        }
+    }
 }
 
 /// Plan and start `record`'s download; see [`plan`].
@@ -317,10 +351,12 @@ pub(crate) async fn acquire(
             "data_dir not configured",
         )
     })?;
-    let plan = plan(&data_dir, record, include_pictures)?;
+    let mut plan = plan(&data_dir, record, include_pictures)?;
     check_egress(&plan.files)?;
+    learn_model_size(state, &data_dir, record, &mut plan).await;
     let parts = parts_json(&plan.files);
     let pictures = plan.pictures.wire(plan.include_pictures);
+    let message = plan.message();
     start(state, plan.files).await;
     Ok(json!({
         "status": "download_started",
@@ -329,7 +365,7 @@ pub(crate) async fn acquire(
         "model_id": record.id,
         "parts": parts,
         "pictures": pictures,
-        "message": plan.message,
+        "message": message,
     }))
 }
 
@@ -651,13 +687,50 @@ mod tests {
             "the add-on downloads its pinned revision"
         );
         assert_eq!(
-            plan.message,
+            plan.message(),
             "Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)"
         );
 
         let without = super::plan(tmp.path(), &row, false).unwrap();
         assert_eq!(without.files.len(), 1, "unticked: no add-on is fetched");
         assert_eq!(without.pictures.wire(false), "left_out");
+    }
+
+    /// A file named by URL is planned like a pick: a listed file brings its add-on, and once its
+    /// own size is learned the announcement names both numbers under the table's name for it.
+    #[test]
+    fn a_file_named_by_url_announces_both_sizes_once_learned() {
+        if device_budget::budgeted_device() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut row = row_for_pick(&curated::CURATED[0]);
+        row.name = "SmolVLM-256M-Instruct-Q8_0".into();
+        row.id = ModelRecord::id_for(&ModelCategory::Gguf, &row.name);
+        row.filename = Some("SmolVLM-256M-Instruct-Q8_0.gguf".into());
+        row.url = Some(
+            "https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/\
+             SmolVLM-256M-Instruct-Q8_0.gguf"
+                .into(),
+        );
+        row.size_mb = 0;
+        row.is_custom = true;
+
+        let mut plan = plan(tmp.path(), &row, true).unwrap();
+        assert_eq!(plan.files.len(), 2);
+        assert_eq!(
+            plan.files[0].size_bytes, None,
+            "nothing has said its size yet"
+        );
+        assert_eq!(
+            plan.message(),
+            "Downloading SmolVLM 256M and picture support (181 MB)"
+        );
+        plan.files[0].size_bytes = Some(290_000_000);
+        assert_eq!(
+            plan.message(),
+            "Downloading SmolVLM 256M (276 MB) and picture support (181 MB)"
+        );
     }
 
     #[test]
