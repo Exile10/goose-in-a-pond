@@ -1,0 +1,407 @@
+/* ─── Model marks ───────────────────────────────────────────────────────────
+ *
+ * The repeated words of a Models screen: engine, source, picture support, fit
+ * and what is coming down. The classic page and the hub both compose them from
+ * tokens, so dark mode and the chosen accent reach both.
+ *
+ * No engine has a hue: the data does not say one engine is "blue", and a colour
+ * per engine would teach a pattern that is not there. The one accent here is a
+ * download's progress, the only thing that moves.
+ *
+ * Text, measured with @jarida/ink's ratio on --color-surface (light, dark):
+ *   --color-text            18.06:1, 15.12:1
+ *   --color-text-secondary   6.22:1,  5.45:1   meta, formats, sizes
+ *   --color-warning-fg       7.09:1, 10.15:1   "Too big for this pond"
+ *   --color-destructive-fg   6.47:1,  6.12:1   a failed download, Stop
+ * --color-destructive (3.55:1) and --color-warning (2.20:1) miss the 4.5:1 normal
+ * text needs in light, so text uses the -fg tokens.
+ */
+
+/* ── Buttons ────────────────────────────────────────────────────────────── */
+
+.mm-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color var(--dur-fast), background var(--dur-fast), opacity var(--dur-fast);
+}
+
+.mm-btn:hover:not(:disabled) {
+  border-color: var(--color-text);
+  background: var(--color-accent-subtle);
+}
+
+.mm-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.mm-btn--danger {
+  color: var(--color-destructive-fg);
+}
+
+.mm-btn--danger:hover:not(:disabled) {
+  border-color: var(--color-destructive-fg);
+  background: var(--color-destructive-soft);
+}
+
+/* The one control a screen asks a question with, raised on the ink offset rather
+   than filled: charcoal on paper reads at 18:1 whatever the accent, where white
+   on Coral is 2.80:1. */
+.mm-btn--ask {
+  border: 2px solid var(--color-text);
+  box-shadow: var(--shadow-ink);
+  font-weight: var(--weight-bold);
+  transition:
+    transform var(--dur-fast),
+    box-shadow var(--dur-fast),
+    background var(--dur-fast),
+    opacity var(--dur-fast);
+}
+
+.mm-btn--ask:hover:not(:disabled) {
+  border-color: var(--color-text);
+}
+
+.mm-btn--ask:active:not(:disabled) {
+  transform: translate(
+    calc(var(--ink-rest) - var(--ink-press-compact)),
+    calc(var(--ink-rest) - var(--ink-press-compact))
+  );
+  box-shadow: var(--ink-press-compact) var(--ink-press-compact) 0 var(--border-ink);
+}
+
+.mm-spin {
+  animation: mm-spin 0.9s linear infinite;
+}
+
+@keyframes mm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── Engine ─────────────────────────────────────────────────────────────── */
+
+.mm-engine {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+}
+
+.mm-engine__icon {
+  flex-shrink: 0;
+  color: var(--color-text-secondary);
+}
+
+.mm-engine__format {
+  margin-left: var(--space-1);
+  font-family: var(--font-mono);
+  font-weight: var(--weight-regular);
+  color: var(--color-text-secondary);
+}
+
+/* ── Source chip ────────────────────────────────────────────────────────── */
+
+.mm-chip {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 1px var(--space-2);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-base);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+/* A quiet tint, not a hue: the word does the telling. */
+.mm-chip--pick {
+  background: var(--color-accent-subtle);
+  color: var(--color-text);
+}
+
+/* ── Picture support ────────────────────────────────────────────────────── */
+
+.mm-addon {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+.mm-addon svg {
+  flex-shrink: 0;
+}
+
+.mm-addon--on {
+  color: var(--color-text);
+}
+
+/* Fetching picture support is a choice, so it is a button, set as a link
+   because a pill per row would shout down the rows. It reaches 44px
+   vertically through `.reach`. */
+.mm-addon--add {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--color-text);
+  font-weight: var(--weight-medium);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.mm-addon--add:hover:not(:disabled) {
+  text-decoration-thickness: 2px;
+}
+
+.mm-addon--add:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The tick box in a download. Native, so the keyboard, the screen reader and
+   the finger already know it. */
+.mm-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.mm-choice input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  flex-shrink: 0;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+
+.mm-choice input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.mm-choice svg {
+  flex-shrink: 0;
+  color: var(--color-text-secondary);
+}
+
+.mm-choice__size {
+  font-family: var(--font-mono);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Fit ────────────────────────────────────────────────────────────────── */
+
+.mm-fit {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.mm-fit--use {
+  font-family: var(--font-body);
+  font-weight: var(--weight-bold);
+  color: var(--color-text);
+}
+
+.mm-fit--big {
+  font-family: var(--font-body);
+  font-weight: var(--weight-medium);
+  color: var(--color-warning-fg);
+}
+
+.mm-fit svg {
+  flex-shrink: 0;
+}
+
+.mm-fit--big {
+  align-items: flex-start;
+}
+
+.mm-fit--big svg {
+  margin-top: 2px;
+}
+
+.mm-fit__hint {
+  display: block;
+  font-weight: var(--weight-regular);
+  color: var(--color-text-secondary);
+}
+
+.mm-fit--ok {
+  width: 100%;
+  max-width: 220px;
+}
+
+.mm-fit__track {
+  flex: 1 1 48px;
+  min-width: 48px;
+  height: 6px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg);
+  overflow: hidden;
+}
+
+/* Slate on paper, 5.97:1 light and 5.30:1 dark: a measure, not the accent. */
+.mm-fit__fill {
+  display: block;
+  height: 100%;
+  background: var(--color-text-tertiary);
+}
+
+.mm-fit__pct {
+  min-width: 3.5ch;
+  text-align: right;
+}
+
+/* ── What is coming down ────────────────────────────────────────────────── */
+
+.mm-xfer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.mm-xfer__part {
+  display: grid;
+  grid-template-columns: 64px minmax(80px, 1fr) minmax(0, auto);
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.mm-xfer__label {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--color-text);
+}
+
+/* On --color-bg the accent fill clears 3:1 in both schemes: #7C3AED is 5.47:1 on
+   the light paper and 3.28:1 on the dark; on the dark surface it is 2.97:1. */
+.mm-xfer__track {
+  height: 8px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg);
+  overflow: hidden;
+}
+
+.mm-xfer__fill {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+  transition: width 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* No total yet: a bar pinned at zero reads as stalled, which is a different thing. */
+.mm-xfer__fill--unknown {
+  width: 35%;
+  animation: mm-indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes mm-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(340%);
+  }
+}
+
+.mm-xfer__part[data-status="paused"] .mm-xfer__fill {
+  background: var(--color-text-tertiary);
+}
+
+.mm-xfer__bytes {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.mm-xfer__note,
+.mm-xfer__error {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+}
+
+.mm-xfer__note {
+  color: var(--color-text-secondary);
+}
+
+.mm-xfer__error {
+  align-items: flex-start;
+  color: var(--color-destructive-fg);
+}
+
+.mm-xfer__error svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.mm-xfer__acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* "Still going" is the indeterminate bar's whole job; parked, it says nothing, so it is held
+     at a visible width instead of sliding. */
+  .mm-xfer__fill--unknown {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+  .mm-xfer__fill,
+  .mm-btn,
+  .mm-btn--ask {
+    transition: none;
+  }
+  .mm-spin {
+    animation: none;
+  }
+}
