@@ -860,4 +860,85 @@ mod decode_profiles {
             .expect("memory released by the failed and the held states serves a transcription");
         assert!(after.to_lowercase().contains("country"), "{after:?}");
     }
+
+    /// The other place a full GPU fails: decoding, after the state was created. A state is
+    /// created with a self-attention cache for one decoder, and beam search grows it to
+    /// `beams + 2` decoders' worth (42 MiB for `base` with five beams) on its first decode.
+    /// whisper.cpp freed the caller's state when that failed, and whisper-rs freed it again
+    /// on drop; on 2026-10-05 the Pond took `SIGBUS` a second after
+    /// `whisper_kv_cache_init() failed for self-attention cache`. So a crash here is that bug.
+    ///
+    /// One beam decode runs first, as the Pond's earlier transcriptions have by the time this
+    /// happens in production. Then the GPU is filled with states, and each decodes with beam
+    /// search until one cannot grow its cache. Stop the Pond first, as for the test above.
+    /// CUDA builds only.
+    ///
+    /// Where a run fails depends on how much memory the fill leaves, so run it until it prints
+    /// `beam decodes fit before`. A run that aborts with `cuMemAddressReserve` in its log has
+    /// hit a different failure and says nothing about this one: each state's first decode
+    /// reserves GGML's CUDA scratch pool, and GGML aborts when that fails. On the Jetson on
+    /// 2026-10-05, three of four runs without the fix aborted there; the fourth reached the
+    /// cache, got `-7`, and took `SIGBUS` on drop, as the Pond had. With the fix, every run
+    /// that reached the cache passed.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn running_out_of_gpu_memory_while_decoding_is_an_error_not_a_crash() {
+        let Some(ctx) = model() else {
+            eprintln!("set WHISPER_TEST_MODEL to run this");
+            return;
+        };
+        let samples = jfk_samples();
+        let beam = || {
+            let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            });
+            params.set_language(Some("en"));
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+            params
+        };
+        ctx.create_state()
+            .expect("a state on an idle GPU")
+            .full(beam(), &samples)
+            .expect("a beam decode on an idle GPU");
+
+        let mut held = Vec::new();
+        while let Ok(state) = ctx.create_state() {
+            held.push(state);
+            assert!(
+                held.len() < 256,
+                "the GPU never filled; is this a CUDA build?"
+            );
+        }
+        assert!(
+            !held.is_empty(),
+            "not even one state fit, so nothing was tested"
+        );
+
+        let mut decoded = 0;
+        let error = held
+            .iter_mut()
+            .find_map(|state| match state.full(beam(), &samples) {
+                Ok(()) => {
+                    decoded += 1;
+                    None
+                }
+                Err(error) => Some(error),
+            })
+            .expect("every state grew its cache; the GPU never filled");
+        eprintln!("\n  {decoded} beam decodes fit before: {error}\n");
+        assert!(
+            matches!(error, whisper_rs::WhisperError::GenericError(-7)),
+            "the decode failed somewhere other than growing its cache: {error}"
+        );
+
+        // The failed state is dropped here with the rest; before the fix it was freed twice.
+        drop(held);
+        let after = WhisperRsInput::transcribe_samples(ctx, jfk_samples())
+            .expect("memory released by the failed and the held states serves a transcription");
+        assert!(after.to_lowercase().contains("country"), "{after:?}");
+    }
 }

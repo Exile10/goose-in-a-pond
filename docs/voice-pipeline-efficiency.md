@@ -262,6 +262,13 @@ answer 500 with the reason, and the wake-word loop moves to its next window. Unt
 was a `SIGSEGV` in Whisper's vendored GGML that took the whole Pond down
 (`vendor/whisper-rs-sys/POND-PATCH.md`).
 
+A call can also run out later, after its state exists. The accurate profile decodes with five
+beams, which grows the state's self-attention cache to seven decoders' worth (42 MiB for `base`)
+on the first decode. When that fails, the log shows `whisper_kv_cache_init() failed for
+self-attention cache` and the transcription returns `GenericError(-7)`. Until 2026-10-05 that
+was a double free of the state and a `SIGBUS` (`POND-PATCH.md`, "decoder KV cache that cannot
+grow").
+
 Whisper does not fall back to the CPU. On the Orin, CPU and GPU allocations come from the same
 memory, so a CPU retry competes for what just ran out, and a second, CPU-resident context
 would hold its weights all the time to cover a failure that clears when the LLM's turn ends.
