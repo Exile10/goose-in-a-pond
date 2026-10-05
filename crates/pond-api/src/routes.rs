@@ -6689,7 +6689,7 @@ async fn download_via_hf_cache_tracked(
         .repo(repo_id.to_string())
         .with_revision(revision.to_string());
     let fetch = repo.file(fname.to_string());
-    let fetch = match pond_core::models::domain::litert::pinned(repo_id, revision, fname) {
+    let fetch = match pond_core::models::domain::curated::file_pin(repo_id, revision, fname) {
         Some(pin) => fetch.expect_size(pin.size_bytes).expect_etag(pin.sha256),
         None => fetch,
     };

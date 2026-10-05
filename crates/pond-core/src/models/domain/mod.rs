@@ -1,4 +1,5 @@
 pub mod acceleration;
+pub mod curated;
 pub mod device_budget;
 pub mod device_profile;
 pub mod drafter;
@@ -12,5 +13,6 @@ pub mod model_capabilities;
 pub mod model_probe;
 pub mod model_record; // re-exports ModelRecord, ModelCategory, ModelRoleAssignment, BinaryRecord
 pub mod model_role;
+pub mod recommended;
 pub mod taxonomy;
 pub mod vision_encoder;

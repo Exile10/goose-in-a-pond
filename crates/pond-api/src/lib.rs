@@ -441,6 +441,47 @@ pub struct ModelStatusEntry {
     pub kind: Option<pond_core::models::domain::taxonomy::ModelKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acquire: Option<pond_core::models::domain::taxonomy::Acquisition>,
+    /// Set only for GIAP's suggestions. Shown, never imposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<RecommendedDto>,
+}
+
+/// Why GIAP suggests a model; `measured` only where it was measured on this class of machine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecommendedDto {
+    pub rank: pond_core::models::domain::recommended::Rank,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured: Option<MeasuredDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeasuredDto {
+    pub device: pond_core::models::domain::recommended::DeviceClass,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_reply_s: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_second_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_second_max: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_tokens: Option<u32>,
+    pub measured_on: String,
+}
+
+impl From<&pond_core::models::domain::recommended::Measured> for MeasuredDto {
+    fn from(m: &pond_core::models::domain::recommended::Measured) -> Self {
+        Self {
+            device: m.device,
+            summary: m.summary.to_string(),
+            first_reply_s: m.first_reply_s,
+            tokens_per_second_min: m.tokens_per_second.map(|(low, _)| low),
+            tokens_per_second_max: m.tokens_per_second.map(|(_, high)| high),
+            window_tokens: m.window_tokens,
+            measured_on: m.measured_on.to_string(),
+        }
+    }
 }
 
 /// The engine a conversation model runs on.

@@ -155,63 +155,6 @@ pub fn speculative_decoding(model: &str, execution: Execution) -> bool {
     !(execution == Execution::Cpu && model.to_ascii_lowercase().contains("e2b"))
 }
 
-/// A curated model, pinned to one upload: the download refuses any other bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LiteRtModelSpec {
-    /// File name in the repository and on disk, and the model's id.
-    pub filename: &'static str,
-    pub repo: &'static str,
-    /// Pinned commit, so a re-upload can't swap the bytes.
-    pub revision: &'static str,
-    pub size_bytes: u64,
-    /// The file's sha256, its LFS oid on Hugging Face.
-    pub sha256: &'static str,
-    /// The longest context the model card states.
-    pub context_length: u32,
-    pub description: &'static str,
-}
-
-impl LiteRtModelSpec {
-    /// The file at its pinned revision.
-    pub fn url(&self) -> String {
-        format!(
-            "https://huggingface.co/{}/resolve/{}/{}",
-            self.repo, self.revision, self.filename
-        )
-    }
-}
-
-/// The files the catalogue offers.
-pub const CURATED: &[LiteRtModelSpec] = &[
-    LiteRtModelSpec {
-        filename: "gemma-4-E2B-it.litertlm",
-        repo: "litert-community/gemma-4-E2B-it-litert-lm",
-        revision: "b3ca0d2f076785a8f4b2219ddbd2bdb99954eae1",
-        size_bytes: 2_588_147_712,
-        sha256: "181938105e0eefd105961417e8da75903eacda102c4fce9ce90f50b97139a63c",
-        context_length: 32_768,
-        description:
-            "Gemma 4 E2B Instruct for LiteRT-LM (~2.6 GB, tool calling + thinking, text only)",
-    },
-    LiteRtModelSpec {
-        filename: "gemma-4-E4B-it.litertlm",
-        repo: "litert-community/gemma-4-E4B-it-litert-lm",
-        revision: "2eee7ac325f20eb8c9ac1d0e972f7c84663062da",
-        size_bytes: 3_659_530_240,
-        sha256: "0b2a8980ce155fd97673d8e820b4d29d9c7d99b8fa6806f425d969b145bd52e0",
-        context_length: 32_768,
-        description:
-            "Gemma 4 E4B Instruct for LiteRT-LM (~3.7 GB, tool calling + thinking, text only)",
-    },
-];
-
-/// The pin for a Hugging Face file, when it is a curated model at its pinned revision.
-pub fn pinned(repo: &str, revision: &str, filename: &str) -> Option<&'static LiteRtModelSpec> {
-    CURATED
-        .iter()
-        .find(|s| s.repo == repo && s.revision == revision && s.filename == filename)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,15 +167,6 @@ mod tests {
         assert!(!is_litert_model("gemma-4-E2B-it-Q4_K_M.gguf"));
         assert!(!is_litert_model("litertlm"));
         assert!(!is_litert_model(""));
-    }
-
-    /// The GGUF canonical stem and the LiteRT id of one model never collide.
-    #[test]
-    fn no_curated_id_is_a_gguf_spelling() {
-        for spec in CURATED {
-            assert!(is_litert_model(spec.filename), "{}", spec.filename);
-            assert!(!spec.filename.ends_with(".gguf"));
-        }
     }
 
     #[test]
@@ -344,40 +278,5 @@ mod tests {
             speculative_decoding(e2b, Execution::Gpu),
             "an unknown value keeps the rule"
         );
-    }
-
-    #[test]
-    fn a_pin_matches_only_its_own_revision() {
-        let spec = &CURATED[0];
-        assert_eq!(pinned(spec.repo, spec.revision, spec.filename), Some(spec));
-        assert_eq!(pinned(spec.repo, "main", spec.filename), None);
-        assert_eq!(pinned(spec.repo, spec.revision, "other.litertlm"), None);
-        assert_eq!(
-            spec.url(),
-            format!(
-                "https://huggingface.co/{}/resolve/{}/{}",
-                spec.repo, spec.revision, spec.filename
-            )
-        );
-    }
-
-    #[test]
-    fn every_pin_is_complete() {
-        for spec in CURATED {
-            assert_eq!(
-                spec.revision.len(),
-                40,
-                "{}: revision is a commit",
-                spec.filename
-            );
-            assert_eq!(spec.sha256.len(), 64, "{}: sha256", spec.filename);
-            assert!(
-                spec.sha256.chars().all(|c| c.is_ascii_hexdigit()),
-                "{}",
-                spec.filename
-            );
-            assert!(spec.size_bytes > 0);
-            assert!(spec.context_length >= DEVICE_CONTEXT_TOKENS);
-        }
     }
 }

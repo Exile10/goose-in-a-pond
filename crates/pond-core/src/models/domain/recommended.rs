@@ -1,0 +1,164 @@
+//! GIAP's suggestions among its picks: a reason each, and numbers only where they were measured
+//! on that class of machine. Shown, never imposed: only the REST view reads this module, never
+//! seeding, startup or activation.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rank {
+    Primary,
+    Lighter,
+    Alternative,
+}
+
+/// The machine a measurement was taken on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceClass {
+    /// The 8 GB Orin Nano, or anything living within its budget.
+    Orin,
+    Desktop,
+}
+
+impl DeviceClass {
+    pub fn current() -> Self {
+        if super::device_budget::budgeted_device() {
+            Self::Orin
+        } else {
+            Self::Desktop
+        }
+    }
+}
+
+/// What one pick did on one class of machine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Measured {
+    pub device: DeviceClass,
+    /// The household's sentence for these numbers.
+    pub summary: &'static str,
+    pub first_reply_s: Option<f32>,
+    pub tokens_per_second: Option<(u32, u32)>,
+    pub window_tokens: Option<u32>,
+    /// When, as `YYYY-MM-DD`.
+    pub measured_on: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Recommendation {
+    /// The pick's `"{category}/{name}"`.
+    pub model_id: &'static str,
+    /// The role it is suggested for.
+    pub role: &'static str,
+    pub rank: Rank,
+    pub reason: &'static str,
+    pub measured: &'static [Measured],
+}
+
+impl Recommendation {
+    /// Numbers for `device`; `None` where nothing was measured there.
+    pub fn measured_on(&self, device: DeviceClass) -> Option<&'static Measured> {
+        self.measured.iter().find(|m| m.device == device)
+    }
+}
+
+/// The same three on every machine; the Orin numbers are the household's logs.
+pub const RECOMMENDED: &[Recommendation] = &[
+    Recommendation {
+        model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL",
+        role: "chat",
+        rank: Rank::Primary,
+        reason: "Best answers this pond can run",
+        measured: &[Measured {
+            device: DeviceClass::Orin,
+            summary: "First reply in about 1 s, 15-16 tokens a second, 16k window",
+            first_reply_s: Some(1.0),
+            tokens_per_second: Some((15, 16)),
+            window_tokens: Some(16_384),
+            measured_on: "2026-10-05",
+        }],
+    },
+    Recommendation {
+        model_id: "gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL",
+        role: "chat",
+        rank: Rank::Lighter,
+        reason: "Faster replies and a smaller download, with a little less depth",
+        measured: &[],
+    },
+    Recommendation {
+        model_id: "litert/gemma-4-E4B-it.litertlm",
+        role: "chat",
+        rank: Rank::Alternative,
+        reason: "Runs on Google's LiteRT-LM engine; text only",
+        measured: &[Measured {
+            device: DeviceClass::Orin,
+            summary: "12-14 tokens a second, 8k window",
+            first_reply_s: None,
+            tokens_per_second: Some((12, 14)),
+            window_tokens: Some(8_192),
+            measured_on: "2026-10-05",
+        }],
+    },
+];
+
+pub fn recommendation_for(model_id: &str) -> Option<&'static Recommendation> {
+    RECOMMENDED.iter().find(|r| r.model_id == model_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::domain::curated;
+
+    #[test]
+    fn every_recommendation_is_a_pick_with_a_rank_of_its_own() {
+        let mut ranks = Vec::new();
+        for r in RECOMMENDED {
+            assert!(
+                curated::CURATED.iter().any(|p| p.id() == r.model_id),
+                "{} is not one of GIAP's picks",
+                r.model_id
+            );
+            assert!(!ranks.contains(&r.rank), "{:?} twice", r.rank);
+            ranks.push(r.rank);
+            assert_eq!(r.role, "chat");
+            assert!(!r.reason.is_empty() && !r.reason.ends_with('.'));
+        }
+        assert_eq!(
+            recommendation_for("gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL").map(|r| r.rank),
+            Some(Rank::Primary)
+        );
+        assert_eq!(recommendation_for("gguf/llama-3.2-3b"), None);
+    }
+
+    /// A number is shown only where it was measured; nothing has been measured on a desktop.
+    #[test]
+    fn numbers_exist_only_where_they_were_measured() {
+        for r in RECOMMENDED {
+            assert!(
+                r.measured_on(DeviceClass::Desktop).is_none(),
+                "{}",
+                r.model_id
+            );
+            for m in r.measured {
+                assert_eq!(m.measured_on.len(), 10, "{}: a date", r.model_id);
+                assert!(
+                    m.first_reply_s.is_some()
+                        || m.tokens_per_second.is_some()
+                        || m.window_tokens.is_some()
+                );
+            }
+        }
+        let e2b = recommendation_for("gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL").unwrap();
+        assert!(
+            e2b.measured.is_empty(),
+            "E2B QAT has not been measured on the Orin"
+        );
+        let e4b = recommendation_for("gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL").unwrap();
+        assert_eq!(
+            e4b.measured_on(DeviceClass::Orin)
+                .and_then(|m| m.window_tokens),
+            Some(16_384)
+        );
+    }
+}

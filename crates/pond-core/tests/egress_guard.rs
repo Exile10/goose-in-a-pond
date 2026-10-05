@@ -99,8 +99,6 @@ const LOOPBACK_ONLY: &[Exempt] = &[
         non_target_urls: &[
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/",
             "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/",
-            "https://huggingface.co/Mozilla/",
-            "https://huggingface.co/{}/resolve/main/{}",
         ],
     },
 ];
