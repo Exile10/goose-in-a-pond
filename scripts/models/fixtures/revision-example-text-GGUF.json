@@ -1,0 +1,28 @@
+{
+ "id": "example/text-GGUF",
+ "sha": "2222222222222222222222222222222222222222",
+ "siblings": [
+  {
+   "rfilename": "README.md",
+   "size": 812
+  },
+  {
+   "rfilename": "text-Q4_K_M.gguf",
+   "size": 900000000,
+   "lfs": {
+    "sha256": "cd15d004ab44de4ab3cf092e80bcc39d917e4b89fcba6f99a288de42750a2771",
+    "size": 900000000,
+    "pointerSize": 134
+   }
+  },
+  {
+   "rfilename": "text-Q8_0.gguf",
+   "size": 1600000000,
+   "lfs": {
+    "sha256": "411cb0488f3849951740af7c06629194cdba475a5212bf67631c37a1cdd04637",
+    "size": 1600000000,
+    "pointerSize": 134
+   }
+  }
+ ]
+}

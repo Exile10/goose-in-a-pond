@@ -1,0 +1,24 @@
+{
+ "id": "example/gemma-4-E2B-it-GGUF",
+ "sha": "4444444444444444444444444444444444444444",
+ "siblings": [
+  {
+   "rfilename": "gemma-4-E2B-it-Q4_K_M.gguf",
+   "size": 3106738272,
+   "lfs": {
+    "sha256": "7a71e0969c0ec12af888e32045fd0fd5852d9ddfcb9a499cffa94d0d3f77d8c0",
+    "size": 3106738272,
+    "pointerSize": 134
+   }
+  },
+  {
+   "rfilename": "mmproj-gemma-4-E2B-it-f16.gguf",
+   "size": 985654080,
+   "lfs": {
+    "sha256": "6533c7860f2740a63abc9c647cb4e55f8f95c88d3ec3c1c22c9bfc10a8c19ec3",
+    "size": 985654080,
+    "pointerSize": 134
+   }
+  }
+ ]
+}
