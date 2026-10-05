@@ -2,12 +2,13 @@ package mobile
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 )
@@ -99,200 +100,321 @@ func configuredServers() []netip.AddrPort {
 	return resolvers
 }
 
-// probeQuery builds a DNS query for the root zone with a random id. The answer is
-// not used: this asks whether the server responds at all, not what it says.
-func probeQuery() []byte {
-	id := make([]byte, 2)
-	if _, err := rand.Read(id); err != nil {
-		// A predictable id is still fine for a reachability probe on the local
-		// link; failing the lookup over it would not be.
-		id[0], id[1] = 0x50, 0x4e
-	}
-	return []byte{
-		id[0], id[1],
-		0x01, 0x00, // standard query, recursion desired
-		0x00, 0x01, // one question
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00,       // root name
-		0x00, 0x02, // NS
-		0x00, 0x01, // IN
-	}
-}
-
-// udpAnswers reports whether a server actually replies over UDP.
-//
-// This cannot be done by dialling. UDP is connectionless, so net.Dial succeeds
-// against a server that will never answer -- which is why racing a UDP dial
-// against a TCP one would hand back a dead socket every time, instantly. The
-// only way to learn that UDP works is to use it.
-func udpAnswers(ctx context.Context, server netip.AddrPort) bool {
-	conn, err := (&net.Dialer{}).DialContext(ctx, "udp", server.String())
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(2 * time.Second)
-	}
-	if conn.SetDeadline(deadline) != nil {
-		return false
-	}
-	query := probeQuery()
-	if _, err := conn.Write(query); err != nil {
-		return false
-	}
-	reply := make([]byte, 512)
-	read, err := conn.Read(reply)
-	// A header and a matching id is proof enough. Anything more would be reading
-	// an answer this function has no use for.
-	return err == nil && read >= 12 && reply[0] == query[0] && reply[1] == query[1]
-}
-
-// tcpAnswers reports whether a server answers a DNS query over TCP.
-//
-// A completed connect is not that. Observed on Safaricom LTE on 2026-10-05: the
-// first resolver it reports accepts a TCP connection in about 30 ms and then never
-// answers a query on it, while answering the same query over UDP in about 170 ms.
-// Taking the connect as proof, the race handed Go that connection nearly every
-// time, because a connect beats any UDP answer, and the lookup ran out its whole
-// deadline on it. The node could not resolve its coordinator's DERP server, so
-// on cellular it took fifteen seconds or more to start, and sometimes never did.
-func tcpAnswers(ctx context.Context, server netip.AddrPort) bool {
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", server.String())
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(2 * time.Second)
-	}
-	if conn.SetDeadline(deadline) != nil {
-		return false
-	}
-	query := probeQuery()
-	framed := append([]byte{byte(len(query) >> 8), byte(len(query))}, query...)
-	if _, err := conn.Write(framed); err != nil {
-		return false
-	}
-	// The two-byte length, then at least the header carrying the same id.
-	reply := make([]byte, 14)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		return false
-	}
-	return int(reply[0])<<8|int(reply[1]) >= 12 && reply[2] == query[0] && reply[3] == query[1]
-}
-
 // dialResolver ignores the address Go derived from configuration that does not
-// exist on this platform and dials a resolver the operating system actually
-// reported. Successive calls rotate, so Go's own retry reaches a different
-// server rather than the same unreachable one.
-func dialResolver(ctx context.Context, network, _ string) (net.Conn, error) {
+// exist on this platform and hands Go a connection to every resolver the
+// operating system reported. Each query written to it goes to every server over
+// UDP and over TCP at once, and the first answer to that query is what Go reads.
+//
+// No transport and no server is chosen in advance, because none can be. Each of
+// these was observed, and each defeated a rule that suited the one before:
+//   - September 2026, a home router: its routable resolver answered nothing and
+//     its link-local one answered only over TCP.
+//   - Safaricom LTE: the first resolver accepts TCP connections and never answers
+//     on them, while answering UDP in about 170 ms.
+//   - October 2026, the same home router after a power cut: A queries are answered
+//     over UDP in about 10 ms, AAAA queries over UDP never, and AAAA over TCP only
+//     on the link-local address. A probe chose UDP for every query, so each lookup
+//     waited out its whole deadline for the AAAA answer and the node could not
+//     reach its coordinator on the home network.
+//
+// Racing every query costs a few extra packets to servers that are answering
+// anyway, on a lookup the node makes a handful of times. Go frames a query by
+// whether the connection is a net.PacketConn, so the connection is one for the
+// UDP framing it asks for first, and a stream for the TCP framing it asks for
+// when an answer comes back truncated.
+//
+// A dial here touches only memory: see SetResolvers.
+func dialResolver(_ context.Context, network, _ string) (net.Conn, error) {
 	servers := configuredServers()
 	if len(servers) == 0 {
 		diagnose("resolver: no nameserver has been installed")
 		return nil, errors.New("no resolver is configured")
 	}
-	// A plain dialer, deliberately. netns.NewDialer panics without a monitor, and
-	// obtaining the live one would mean taking the lifecycle lock that a starting
-	// node already holds. On this platform netns only applies the protect and
-	// bind-to-network hooks, and neither is registered here.
-	// Go's choice of transport is ignored, deliberately: it only retries over TCP
-	// when a UDP answer comes back truncated, never when it times out, so letting
-	// it pick means one dead transport burns the whole lookup budget.
-	//
-	// This used to mean always TCP, on the reasoning that a home router commonly
-	// answers DNS over TCP while ignoring UDP from a client it did not hand the
-	// lease to. That is true of some routers and false of others, and when it is
-	// false the node cannot resolve its coordinator at all. Observed on a home
-	// network in September 2026: the gateway answered UDP and timed out on TCP,
-	// for both the IPv4 and IPv6 resolvers it advertised, so every lookup failed
-	// while every other application on the network resolved normally.
-	//
-	// So neither transport is assumed now. Both are tried at once and whichever
-	// proves itself first is used. Which one Go then frames the query for follows
-	// from the connection it is handed: it picks by whether the conn implements
-	// net.PacketConn.
-	_ = network
-
-	// Every server at once, first one to answer wins.
-	//
-	// These used to be tried in order with three seconds each, and a carrier
-	// showed why that is not good enough: Safaricom reports two resolvers and
-	// the FIRST one never answers DNS over TCP. Every lookup spent its budget dialling
-	// a server that would never answer before reaching the one that would, so
-	// the node could not resolve its coordinator at all on cellular while
-	// working perfectly on wifi.
-	//
-	// The file already warned about this shape for UDP -- "a UDP attempt here
-	// just burns the lookup's whole budget" -- and then reintroduced it by
-	// walking a list. Racing them costs one extra connection to a server that is
-	// answering anyway, and removes a whole class of ordering luck.
-	attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	type dialed struct {
-		conn net.Conn
-		err  error
+	race := &racingResolver{servers: servers, answer: make(chan answered, 1), done: make(chan struct{})}
+	if network == "tcp" || network == "tcp4" || network == "tcp6" {
+		return &streamResolver{racingResolver: race}, nil
 	}
-	// Two attempts per server, one per transport, and each has to prove itself by
-	// being answered: a UDP dial cannot fail, and a TCP connect only shows that the
-	// port is open.
-	attempts := len(servers) * 2
-	results := make(chan dialed, attempts)
-	for _, server := range servers {
+	return &packetResolver{racingResolver: race}, nil
+}
+
+// exchangeTimeout bounds a query when Go has set no deadline on the connection.
+const exchangeTimeout = 5 * time.Second
+
+// racingResolver is the connection dialResolver returns. It holds one query at a
+// time: a new Write abandons the race for the previous one.
+type racingResolver struct {
+	servers []netip.AddrPort
+
+	mu       sync.Mutex
+	deadline time.Time
+	cancel   context.CancelFunc
+	answer   chan answered
+	closed   bool
+	done     chan struct{}
+}
+
+// answered is how a race ends: the first answer to its query, or why there was none.
+type answered struct {
+	reply []byte
+	err   error
+}
+
+// ask starts a race for query and returns at once; the outcome arrives on r.answer.
+func (r *racingResolver) ask(query []byte) error {
+	if len(query) < 12 {
+		return errors.New("a DNS query is at least a header")
+	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return net.ErrClosed
+	}
+	if r.cancel != nil {
+		r.cancel()
+	}
+	deadline := r.deadline
+	if deadline.IsZero() {
+		deadline = time.Now().Add(exchangeTimeout)
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	r.cancel = cancel
+	answer := make(chan answered, 1)
+	r.answer = answer
+	r.mu.Unlock()
+
+	query = append([]byte(nil), query...)
+	type result struct {
+		reply []byte
+		err   error
+	}
+	attempts := len(r.servers) * 2
+	results := make(chan result, attempts)
+	for _, server := range r.servers {
 		go func(server netip.AddrPort) {
-			if !tcpAnswers(attempt, server) {
-				diagnose("resolver: " + server.String() + " did not answer over tcp")
-				results <- dialed{err: errors.New("no tcp answer from " + server.String())}
-				return
-			}
-			// A fresh connection, so Go's own query is the first on it.
-			dialer := net.Dialer{}
-			conn, err := dialer.DialContext(attempt, "tcp", server.String())
-			results <- dialed{conn: conn, err: err}
+			reply, err := udpExchange(ctx, server, query)
+			results <- result{reply, err}
 		}(server)
 		go func(server netip.AddrPort) {
-			if !udpAnswers(attempt, server) {
-				diagnose("resolver: " + server.String() + " did not answer over udp")
-				results <- dialed{err: errors.New("no udp answer from " + server.String())}
-				return
-			}
-			// A fresh socket, so the probe's reply cannot be sitting in the buffer
-			// waiting to be mistaken for the answer to Go's own query.
-			dialer := net.Dialer{}
-			conn, err := dialer.DialContext(attempt, "udp", server.String())
-			results <- dialed{conn: conn, err: err}
+			reply, err := tcpExchange(ctx, server, query)
+			results <- result{reply, err}
 		}(server)
 	}
-
-	var last error
-	for range make([]struct{}, attempts) {
-		select {
-		case result := <-results:
-			if result.err == nil && result.conn != nil {
-				// Cancelling closes the losers' dials; any that already
-				// succeeded are closed by the drain below.
-				remaining := attempts - 1
-				go func() {
-					for range make([]struct{}, remaining) {
-						if late := <-results; late.conn != nil {
-							late.conn.Close()
-						}
-					}
-				}()
-				return result.conn, nil
+	go func() {
+		defer cancel()
+		var truncated []byte
+		var failures []error
+		for range attempts {
+			got := <-results
+			switch {
+			case got.err != nil:
+				failures = append(failures, got.err)
+			case got.reply[2]&0x02 != 0:
+				// A truncated UDP answer is kept only in case nothing better comes:
+				// the same server's TCP answer is the whole one.
+				if truncated == nil {
+					truncated = got.reply
+				}
+			default:
+				answer <- answered{reply: got.reply}
+				return
 			}
-			last = result.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		}
+		if truncated != nil {
+			answer <- answered{reply: truncated}
+			return
+		}
+		// Every server and transport failed. Saying so now, rather than at the
+		// deadline, lets Go move on to its next attempt at once.
+		failed := errors.Join(failures...)
+		answer <- answered{err: failed}
+		// The one line worth writing, unless the race was abandoned for a newer
+		// query or a close.
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			diagnose("resolver: no server answered over udp or tcp: " + failed.Error())
+		}
+	}()
+	return nil
+}
+
+// wait returns the answer to the current query, or an error at the deadline.
+func (r *racingResolver) wait() ([]byte, error) {
+	r.mu.Lock()
+	answer, deadline := r.answer, r.deadline
+	r.mu.Unlock()
+	var expired <-chan time.Time
+	if !deadline.IsZero() {
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		expired = timer.C
+	}
+	select {
+	case outcome := <-answer:
+		return outcome.reply, outcome.err
+	case <-expired:
+		return nil, os.ErrDeadlineExceeded
+	case <-r.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (r *racingResolver) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	if r.cancel != nil {
+		r.cancel()
+	}
+	close(r.done)
+	return nil
+}
+
+func (r *racingResolver) SetDeadline(t time.Time) error {
+	r.mu.Lock()
+	r.deadline = t
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *racingResolver) SetReadDeadline(t time.Time) error { return r.SetDeadline(t) }
+
+// SetWriteDeadline has nothing to bound: a Write only starts the race.
+func (r *racingResolver) SetWriteDeadline(time.Time) error { return nil }
+
+func (r *racingResolver) LocalAddr() net.Addr { return &net.UDPAddr{} }
+
+func (r *racingResolver) RemoteAddr() net.Addr {
+	return net.UDPAddrFromAddrPort(r.servers[0])
+}
+
+// packetResolver carries one DNS message per Write and per Read, as UDP does.
+type packetResolver struct{ *racingResolver }
+
+func (p *packetResolver) Write(query []byte) (int, error) {
+	if err := p.ask(query); err != nil {
+		return 0, err
+	}
+	return len(query), nil
+}
+
+func (p *packetResolver) Read(buffer []byte) (int, error) {
+	reply, err := p.wait()
+	if err != nil {
+		return 0, err
+	}
+	if len(reply) > len(buffer) {
+		// Too big for Go's UDP buffer: hand it the head marked truncated, and Go
+		// asks again over TCP, which comes back here as a streamResolver.
+		reply = append([]byte(nil), reply[:len(buffer)]...)
+		reply[2] |= 0x02
+	}
+	return copy(buffer, reply), nil
+}
+
+func (p *packetResolver) ReadFrom(buffer []byte) (int, net.Addr, error) {
+	read, err := p.Read(buffer)
+	return read, p.RemoteAddr(), err
+}
+
+func (p *packetResolver) WriteTo(query []byte, _ net.Addr) (int, error) { return p.Write(query) }
+
+// streamResolver carries DNS-over-TCP framing: a two-byte length before each message.
+type streamResolver struct {
+	*racingResolver
+	pending []byte
+	framed  []byte
+}
+
+func (s *streamResolver) Write(data []byte) (int, error) {
+	s.framed = append(s.framed, data...)
+	if len(s.framed) < 2 {
+		return len(data), nil
+	}
+	size := int(s.framed[0])<<8 | int(s.framed[1])
+	if len(s.framed) < 2+size {
+		return len(data), nil
+	}
+	query := s.framed[2 : 2+size]
+	s.framed = s.framed[2+size:]
+	if err := s.ask(query); err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
+
+func (s *streamResolver) Read(buffer []byte) (int, error) {
+	if len(s.pending) == 0 {
+		reply, err := s.wait()
+		if err != nil {
+			return 0, err
+		}
+		s.pending = append([]byte{byte(len(reply) >> 8), byte(len(reply))}, reply...)
+	}
+	read := copy(buffer, s.pending)
+	s.pending = s.pending[read:]
+	return read, nil
+}
+
+// udpExchange sends query to server over UDP and returns the reply carrying its id.
+func udpExchange(ctx context.Context, server netip.AddrPort, query []byte) ([]byte, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "udp", server.String())
+	if err != nil {
+		return nil, fmt.Errorf("%s udp: %w", server, err)
+	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+	if _, err := conn.Write(query); err != nil {
+		return nil, fmt.Errorf("%s udp: %w", server, err)
+	}
+	buffer := make([]byte, 1232)
+	for {
+		read, err := conn.Read(buffer)
+		if err != nil {
+			return nil, fmt.Errorf("%s udp: %w", server, err)
+		}
+		// Anything else on the socket is not the answer to this query.
+		if read >= 12 && buffer[0] == query[0] && buffer[1] == query[1] && buffer[2]&0x80 != 0 {
+			return append([]byte(nil), buffer[:read]...), nil
 		}
 	}
-	if last != nil {
-		return nil, last
+}
+
+// tcpExchange sends query to server over TCP and returns the reply carrying its id.
+// A connection that is accepted and never answered fails at the deadline, as the
+// first resolver Safaricom reports does.
+func tcpExchange(ctx context.Context, server netip.AddrPort, query []byte) ([]byte, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", server.String())
+	if err != nil {
+		return nil, fmt.Errorf("%s tcp: %w", server, err)
 	}
-	return nil, errors.New("no configured resolver could be dialled")
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+	framed := append([]byte{byte(len(query) >> 8), byte(len(query))}, query...)
+	if _, err := conn.Write(framed); err != nil {
+		return nil, fmt.Errorf("%s tcp: %w", server, err)
+	}
+	head := make([]byte, 2)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		return nil, fmt.Errorf("%s tcp: %w", server, err)
+	}
+	reply := make([]byte, int(head[0])<<8|int(head[1]))
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		return nil, fmt.Errorf("%s tcp: %w", server, err)
+	}
+	if len(reply) < 12 || reply[0] != query[0] || reply[1] != query[1] || reply[2]&0x80 == 0 {
+		return nil, fmt.Errorf("%s tcp: the reply does not answer the query", server)
+	}
+	return reply, nil
 }
 
 // configuredResolver resolves through the OS-reported servers. PreferGo is

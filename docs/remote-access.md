@@ -95,23 +95,37 @@ prefers pinned local addresses, uses mDNS to find a changed address, then tries
 the authenticated embedded address when remote access is enabled. Cellular uses
 the embedded node; local-only profiles remain disconnected away from home.
 
-The node's resolvers are dialled **concurrently**, first to answer wins. They used
-to be tried in order with a three-second budget each, and a carrier showed why
-that is not enough: Safaricom reports two resolvers for its LTE network and the
-first never answers DNS over TCP, so every lookup spent its budget on a server
-that would never answer and the node resolved nothing on cellular while working
-on Wi-Fi. Nor is the transport assumed: each server is tried over TCP and UDP at
-once, and whichever proves itself first is used. A home gateway was found that
-refuses DNS over TCP on every resolver it advertises while answering UDP, and
-there racing servers cannot help (#394). Neither transport's connection proves
-anything: UDP is connectionless, and that first Safaricom resolver accepts a TCP
-connection in about 30 ms and then never answers on it (measured 2026-10-05), so
-a TCP connect beat every UDP answer and the lookup hung on it for its whole
-deadline. Each server and transport proves itself with a real root-zone query
-whose random id comes back, and only then is a fresh connection handed to Go.
-Before that change, a cold start on cellular took fifteen seconds or more to bring
-the node up, and sometimes it never came up: netcheck and the DERP connection
-both need the coordinator's name resolved, under deadlines of about a second. Network changes and foreground
+The node's resolvers are not chosen in advance, by server or by transport: every
+query the node makes goes to every resolver the operating system reports, over UDP
+and over TCP at once, and the first answer to that query is used
+(`dialResolver`, `native/pondnet/mobile/dns.go`). Each narrower rule was defeated by
+a network that was measured:
+
+- **A home router, September 2026.** Its routable resolver answered nothing; its
+  link-local one answered only over TCP.
+- **Safaricom LTE.** The first resolver accepts a TCP connection in about 30 ms
+  and never answers on it, while answering UDP in about 170 ms. Trying servers in
+  order spent each lookup's budget on it, and taking a TCP connect as proof made
+  the lookup hang on it.
+- **The same home router after a power cut, 2026-10-05.** A queries over UDP are
+  answered in about 10 ms, but AAAA queries over UDP are never answered, from
+  either of its addresses. AAAA is answered over TCP only, on the link-local
+  address. The previous rule probed each server with one test query and used
+  whichever transport answered for every later query. UDP won, so every lookup
+  waited out its whole deadline for the AAAA answer. On the A57 the coordinator's
+  name took 10.003 s to resolve, longer than tailscale allows for a control
+  lookup, so a phone on that network could not enrol. Racing each query, the same
+  lookup on the same phone takes about 30 ms.
+
+A UDP answer counts only if it carries the query's id. A TCP answer counts only
+once it is complete and carries that id. A truncated UDP answer is used only if
+nothing better arrives. A race that every server and transport loses ends at
+once, with one event-log line naming each failure, so Go moves straight to its
+next attempt. Losers cancelled because another server answered are not reported.
+Before these changes, a cold start on cellular took fifteen seconds or more to
+bring the node up, and sometimes it never came up: netcheck and the DERP
+connection both need the coordinator's name resolved, under deadlines of about a
+second. Network changes and foreground
 resume re-evaluate the choice; background probing pauses. Recovery is coalesced,
 uses a capped backoff, and stops after six failed attempts until another trigger
 or a manual retry. NetInfo does not perform external reachability probes or

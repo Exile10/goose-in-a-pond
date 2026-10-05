@@ -5,7 +5,9 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -81,107 +83,7 @@ func TestResolversAreAbsentUntilInstalledAndSurviveAnEmptyUpdate(t *testing.T) {
 	}
 }
 
-// The carrier case, which walking the list in order could not survive.
-//
-// Safaricom reports two resolvers for its LTE network and the FIRST one refuses
-// DNS over TCP. Dialling them in sequence spent each lookup's budget on a server
-// that would never answer, so the node resolved nothing on cellular while
-// working perfectly on wifi.
-func TestADeadFirstResolverDoesNotCostTheLookup(t *testing.T) {
-	t.Cleanup(func() {
-		resolverMu.Lock()
-		resolvers = nil
-		resolverMu.Unlock()
-	})
-
-	// A closed port stands in for the resolver that refuses TCP.
-	answering, stopAnswering := tcpResponder(t, true)
-	defer stopAnswering()
-
-	dead, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadAddr := dead.Addr().(*net.TCPAddr)
-	dead.Close() // nothing is listening there now
-
-	live := answering.Addr().(*net.TCPAddr)
-	resolverMu.Lock()
-	resolvers = []netip.AddrPort{
-		netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(deadAddr.Port)),
-		netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(live.Port)),
-	}
-	resolverMu.Unlock()
-
-	started := time.Now()
-	conn, err := dialResolver(context.Background(), "udp", "")
-	if err != nil {
-		t.Fatal("the answering resolver was never reached:", err)
-	}
-	conn.Close()
-	// Sequential dialling would have waited on the dead server first. The point
-	// is not the exact number; it is that a dead server costs no wall clock.
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("a dead first resolver cost %s of the lookup", elapsed)
-	}
-}
-
-func TestEveryResolverDeadIsStillAnError(t *testing.T) {
-	t.Cleanup(func() {
-		resolverMu.Lock()
-		resolvers = nil
-		resolverMu.Unlock()
-	})
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := closed.Addr().(*net.TCPAddr)
-	closed.Close()
-
-	resolverMu.Lock()
-	resolvers = []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(addr.Port))}
-	resolverMu.Unlock()
-
-	if conn, err := dialResolver(context.Background(), "udp", ""); err == nil {
-		conn.Close()
-		t.Fatal("dialling a resolver that is not there reported success")
-	}
-}
-
-// udpResponder answers any datagram with a minimal reply carrying the query's id,
-// which is all udpAnswers checks for. It stands in for a router that serves DNS
-// over UDP.
-func udpResponder(t *testing.T) (netip.AddrPort, func()) {
-	t.Helper()
-	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal("could not listen on udp", err)
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		buffer := make([]byte, 512)
-		for {
-			read, from, err := packet.ReadFrom(buffer)
-			if err != nil {
-				return
-			}
-			if read < 2 {
-				continue
-			}
-			reply := make([]byte, 12)
-			reply[0], reply[1] = buffer[0], buffer[1]
-			reply[2] = 0x81 // response, recursion desired
-			if _, err := packet.WriteTo(reply, from); err != nil {
-				return
-			}
-		}
-	}()
-	address := netip.MustParseAddrPort(packet.LocalAddr().String())
-	return address, func() { packet.Close(); <-done }
-}
-
+// useResolvers installs servers for one test and restores the previous list after it.
 func useResolvers(t *testing.T, servers ...netip.AddrPort) {
 	t.Helper()
 	resolverMu.Lock()
@@ -195,160 +97,327 @@ func useResolvers(t *testing.T, servers ...netip.AddrPort) {
 	})
 }
 
-// The failure this guards against: a router that answers DNS over UDP and ignores
-// TCP. Dialling TCP only, the node could not resolve its coordinator at all on
-// such a network, while every other application on it resolved normally.
-func TestResolverFallsBackToUdpWhenTcpIsRefused(t *testing.T) {
-	server, stop := udpResponder(t)
-	defer stop()
-	// Nothing is listening on TCP at that port, so the TCP half of the race fails.
-	useResolvers(t, server)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	conn, err := dialResolver(ctx, "udp", "")
-	if err != nil {
-		t.Fatal("a server answering over udp was treated as unreachable", err)
-	}
-	defer conn.Close()
-	// Go frames the query by the connection's type, so a UDP win has to hand back
-	// something that is a PacketConn or the query goes out with TCP length prefixes.
-	if _, ok := conn.(net.PacketConn); !ok {
-		t.Fatal("udp winner returned a stream connection; Go would frame the query for tcp")
-	}
+// fakeDNS is a nameserver on 127.0.0.1 whose behaviour per transport is chosen by
+// the test: which query types it answers over UDP and over TCP, whether it accepts
+// TCP connections and then says nothing, and whether its UDP answers are truncated.
+type fakeDNS struct {
+	udpTypes, tcpTypes []uint16
+	silentTCP          bool
+	truncateUDP        bool
 }
 
-// The behaviour that was already there and must survive: a server that answers
-// only over TCP still resolves. This is the case the TCP-only dial was written for.
-func TestResolverStillUsesTcpWhenUdpIsSilent(t *testing.T) {
-	listener, stop := tcpResponder(t, true)
-	defer stop()
-	useResolvers(t, netip.MustParseAddrPort(listener.Addr().String()))
+const (
+	typeA    uint16 = 1
+	typeAAAA uint16 = 28
+)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	conn, err := dialResolver(ctx, "udp", "")
-	if err != nil {
-		t.Fatal("a server answering over tcp was treated as unreachable", err)
-	}
-	defer conn.Close()
-	if _, ok := conn.(net.PacketConn); ok {
-		t.Fatal("tcp-only server produced a packet connection")
-	}
-}
-
-func TestUdpProbeIsNotSatisfiedBySilence(t *testing.T) {
-	// A UDP dial cannot fail, so an unanswered server must be rejected by the
-	// exchange rather than by the dial. Without this, the race would always be
-	// won instantly by a dead socket.
+// start serves f on one port for both transports and returns that address.
+func (f fakeDNS) start(t *testing.T) netip.AddrPort {
+	t.Helper()
 	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	address := netip.MustParseAddrPort(packet.LocalAddr().String())
-	packet.Close() // nothing answers here now
-
-	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
-	defer cancel()
-	if udpAnswers(ctx, address) {
-		t.Fatal("a server that never replied was reported as answering over udp")
-	}
-}
-
-// tcpResponder accepts DNS-over-TCP connections. With answer set it replies to each
-// framed query with a minimal header carrying the query's id; without it, it
-// accepts and then says nothing, as the first resolver Safaricom reports does.
-func tcpResponder(t *testing.T, answer bool) (net.Listener, func()) {
-	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", address.String())
 	if err != nil {
-		t.Fatal("could not listen on tcp", err)
+		packet.Close()
+		t.Skip("could not take the same port for tcp:", err)
 	}
-	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		defer close(done)
+		defer wg.Done()
+		buffer := make([]byte, 1500)
+		for {
+			read, from, err := packet.ReadFrom(buffer)
+			if err != nil {
+				return
+			}
+			if reply := f.reply(buffer[:read], f.udpTypes, f.truncateUDP); reply != nil {
+				packet.WriteTo(reply, from)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
-			go func(conn net.Conn) {
-				defer conn.Close()
-				if !answer {
-					// Hold the connection open and silent until the client gives up.
-					_, _ = io.Copy(io.Discard, conn)
-					return
-				}
-				head := make([]byte, 2)
-				if _, err := io.ReadFull(conn, head); err != nil {
-					return
-				}
-				query := make([]byte, int(head[0])<<8|int(head[1]))
-				if _, err := io.ReadFull(conn, query); err != nil || len(query) < 2 {
-					return
-				}
-				reply := make([]byte, 14)
-				reply[1] = 12
-				reply[2], reply[3] = query[0], query[1]
-				reply[4] = 0x81 // response, recursion desired
-				_, _ = conn.Write(reply)
-			}(conn)
+			go f.serveTCP(conn)
 		}
 	}()
-	return listener, func() { listener.Close(); <-done }
+	t.Cleanup(func() { packet.Close(); listener.Close(); wg.Wait() })
+	return address
 }
 
-// The shape Safaricom's first resolver has: TCP connects at once and never
-// answers, UDP answers. A connect beats any UDP answer, so taking it as proof
-// handed Go a connection that hung for the whole lookup.
-func TestAResolverThatConnectsButNeverAnswersOverTcpIsNotUsedForTcp(t *testing.T) {
-	udp, stopUDP := udpResponder(t)
-	defer stopUDP()
-	// The silent TCP listener on the same port the UDP responder answers on.
-	silent, err := net.Listen("tcp", udp.String())
-	if err != nil {
-		t.Skip("could not take the same port for tcp:", err)
+func (f fakeDNS) serveTCP(conn net.Conn) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if f.silentTCP {
+		io.Copy(io.Discard, conn)
+		return
 	}
-	defer silent.Close()
-	go func() {
-		for {
-			conn, err := silent.Accept()
-			if err != nil {
-				return
-			}
-			go func() { defer conn.Close(); _, _ = io.Copy(io.Discard, conn) }()
+	for {
+		head := make([]byte, 2)
+		if _, err := io.ReadFull(conn, head); err != nil {
+			return
 		}
-	}()
-	useResolvers(t, udp)
+		query := make([]byte, int(head[0])<<8|int(head[1]))
+		if _, err := io.ReadFull(conn, query); err != nil {
+			return
+		}
+		reply := f.reply(query, f.tcpTypes, false)
+		if reply == nil {
+			continue
+		}
+		conn.Write(append([]byte{byte(len(reply) >> 8), byte(len(reply))}, reply...))
+	}
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	conn, err := dialResolver(ctx, "udp", "")
+// reply answers query when its type is in answered: one A or AAAA record for an
+// address query, an empty answer for anything else. It returns nil for a query it
+// drops, which is what the router does to AAAA over UDP.
+func (fakeDNS) reply(query []byte, answered []uint16, truncate bool) []byte {
+	if len(query) < 12 {
+		return nil
+	}
+	end := 12
+	for end < len(query) && query[end] != 0 {
+		end += int(query[end]) + 1
+	}
+	if end+5 > len(query) {
+		return nil
+	}
+	question := query[12 : end+5]
+	qtype := uint16(query[end+1])<<8 | uint16(query[end+2])
+	if !slices.Contains(answered, qtype) {
+		return nil
+	}
+	reply := []byte{query[0], query[1], 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0}
+	if truncate {
+		reply[2] |= 0x02
+		return append(reply, question...)
+	}
+	var data []byte
+	switch qtype {
+	case typeA:
+		data = []byte{192, 0, 2, 1}
+	case typeAAAA:
+		data = netip.MustParseAddr("2001:db8::1").AsSlice()
+	}
+	reply = append(reply, question...)
+	if data != nil {
+		reply[7] = 1
+		reply = append(reply, 0xc0, 0x0c, byte(qtype>>8), byte(qtype), 0, 1, 0, 0, 0, 60, 0, byte(len(data)))
+		reply = append(reply, data...)
+	}
+	return reply
+}
+
+// closedPort is an address with nothing listening on either transport.
+func closedPort(t *testing.T) netip.AddrPort {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal("the server answering over udp was not used:", err)
+		t.Fatal(err)
+	}
+	address := netip.MustParseAddrPort(listener.Addr().String())
+	listener.Close()
+	return address
+}
+
+// syncEvents records the event log from the racing goroutines.
+type syncEvents struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (s *syncEvents) Log(line string) { s.mu.Lock(); s.lines = append(s.lines, line); s.mu.Unlock() }
+
+func (s *syncEvents) all() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.lines)
+}
+
+func recordEvents(t *testing.T) *syncEvents {
+	t.Helper()
+	events := new(syncEvents)
+	SetEventLog(events)
+	t.Cleanup(func() { SetEventLog(nil) })
+	return events
+}
+
+// lookup resolves the test name through the node's resolver and reports how long
+// it took. The name is fully qualified so no search domain of the machine running
+// the test is tried.
+func lookup(t *testing.T) ([]netip.Addr, time.Duration, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	started := time.Now()
+	addresses, err := configuredResolver().LookupNetIP(ctx, "ip", "pond.example.")
+	return addresses, time.Since(started), err
+}
+
+// resolvesBoth looks the test name up and requires both records, promptly.
+func resolvesBoth(t *testing.T) {
+	t.Helper()
+	addresses, took, err := lookup(t)
+	if err != nil {
+		t.Fatalf("lookup failed after %s: %v", took, err)
+	}
+	if !slices.Contains(addresses, netip.MustParseAddr("192.0.2.1")) || !slices.Contains(addresses, netip.MustParseAddr("2001:db8::1")) {
+		t.Fatalf("got %v, want the A and the AAAA record", addresses)
+	}
+	// Each case below used to wait out a whole query timeout, five seconds at
+	// least. The point is not the exact figure but that no dead path costs one.
+	if took > 2*time.Second {
+		t.Fatalf("the lookup took %s", took)
+	}
+}
+
+// The home router after the October 2026 power cut: A over UDP is answered, AAAA
+// over UDP never is, and TCP answers both. Choosing UDP because it answered a probe
+// made every lookup wait out its deadline for the AAAA answer.
+func TestARouterThatDropsAaaaOverUdpStillResolvesAtOnce(t *testing.T) {
+	events := recordEvents(t)
+	useResolvers(t, fakeDNS{udpTypes: []uint16{typeA}, tcpTypes: []uint16{typeA, typeAAAA}}.start(t))
+	resolvesBoth(t)
+	if lines := events.all(); len(lines) != 0 {
+		t.Fatalf("a lookup that was answered wrote to the event log: %q", lines)
+	}
+}
+
+// Safaricom's first resolver: TCP connects at once and never answers; UDP answers.
+func TestAResolverThatConnectsButNeverAnswersOverTcpCostsNothing(t *testing.T) {
+	useResolvers(t, fakeDNS{udpTypes: []uint16{typeA, typeAAAA}, silentTCP: true}.start(t))
+	resolvesBoth(t)
+}
+
+// The September 2026 router: nothing over UDP, everything over TCP.
+func TestAServerAnsweringOnlyOverTcpResolves(t *testing.T) {
+	useResolvers(t, fakeDNS{tcpTypes: []uint16{typeA, typeAAAA}}.start(t))
+	resolvesBoth(t)
+}
+
+// Walking the list in order spent each lookup's budget on a dead first server.
+func TestADeadFirstResolverDoesNotCostTheLookup(t *testing.T) {
+	useResolvers(t, closedPort(t), fakeDNS{udpTypes: []uint16{typeA, typeAAAA}}.start(t))
+	resolvesBoth(t)
+}
+
+// Two servers that each answer only part of what is asked still make a whole answer.
+func TestEachQueryIsAnsweredByWhicheverServerCan(t *testing.T) {
+	useResolvers(t, fakeDNS{udpTypes: []uint16{typeA}}.start(t), fakeDNS{tcpTypes: []uint16{typeAAAA}}.start(t))
+	resolvesBoth(t)
+}
+
+func TestEveryResolverDeadIsAnErrorAndSaysSoOnce(t *testing.T) {
+	events := recordEvents(t)
+	useResolvers(t, closedPort(t))
+	if addresses, took, err := lookup(t); err == nil {
+		t.Fatalf("a lookup with no live server returned %v after %s", addresses, took)
+	}
+	lines := events.all()
+	if len(lines) == 0 {
+		t.Fatal("every server failed and nothing was written to the event log")
+	}
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "resolver: no server answered over udp or tcp: ") {
+			t.Fatalf("unexpected event: %s", line)
+		}
+	}
+}
+
+// A truncated UDP answer loses to the whole answer over TCP.
+func TestATruncatedUdpAnswerLosesToTheTcpOne(t *testing.T) {
+	useResolvers(t, fakeDNS{udpTypes: []uint16{typeA}, tcpTypes: []uint16{typeA}, truncateUDP: true}.start(t))
+	conn, err := dialResolver(context.Background(), "udp", "")
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer conn.Close()
-	if _, ok := conn.(net.PacketConn); !ok {
-		t.Fatal("a tcp connection that never answers won the race")
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	query := []byte{0xab, 0xcd, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 'p', 'o', 'n', 'd', 0, 0, 1, 0, 1}
+	if _, err := conn.Write(query); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 512)
+	read, err := conn.Read(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply[2]&0x02 != 0 || read <= len(query) {
+		t.Fatalf("the truncated answer won: % x", reply[:read])
 	}
 }
 
-func TestTcpProbeIsNotSatisfiedByAConnect(t *testing.T) {
-	listener, stop := tcpResponder(t, false)
-	defer stop()
-	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
-	defer cancel()
-	if tcpAnswers(ctx, netip.MustParseAddrPort(listener.Addr().String())) {
-		t.Fatal("a server that accepted and never answered was reported as answering over tcp")
+// Go frames a query by the connection's type: a packet for UDP, a two-byte length
+// for TCP, which it asks for after a truncated answer.
+func TestTheConnectionFramesAsGoAsksForIt(t *testing.T) {
+	useResolvers(t, fakeDNS{udpTypes: []uint16{typeA}, tcpTypes: []uint16{typeA}}.start(t))
+	packet, err := dialResolver(context.Background(), "udp", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet.Close()
+	if _, ok := packet.(net.PacketConn); !ok {
+		t.Fatal("a udp dial returned a stream; Go would frame its query for tcp")
+	}
+	stream, err := dialResolver(context.Background(), "tcp", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	if _, ok := stream.(net.PacketConn); ok {
+		t.Fatal("a tcp dial returned a packet connection")
+	}
+	stream.SetDeadline(time.Now().Add(3 * time.Second))
+	query := []byte{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, 'p', 'o', 'n', 'd', 0, 0, 1, 0, 1}
+	// Written in two pieces, as a stream may be.
+	framed := append([]byte{0, byte(len(query))}, query...)
+	if _, err := stream.Write(framed[:5]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write(framed[5:]); err != nil {
+		t.Fatal(err)
+	}
+	head := make([]byte, 2)
+	if _, err := io.ReadFull(stream, head); err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, int(head[0])<<8|int(head[1]))
+	if _, err := io.ReadFull(stream, body); err != nil {
+		t.Fatal(err)
+	}
+	if body[0] != 0x12 || body[1] != 0x34 || len(body) <= len(query) {
+		t.Fatalf("framed reply: % x", body)
 	}
 }
 
-func TestTcpProbeIsSatisfiedByAnAnswer(t *testing.T) {
-	listener, stop := tcpResponder(t, true)
-	defer stop()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if !tcpAnswers(ctx, netip.MustParseAddrPort(listener.Addr().String())) {
-		t.Fatal("a server answering over tcp was reported as silent")
+// An answer that never comes ends at the deadline Go set, not later.
+func TestAnUnansweredQueryEndsAtTheDeadline(t *testing.T) {
+	recordEvents(t)
+	useResolvers(t, fakeDNS{silentTCP: true}.start(t))
+	conn, err := dialResolver(context.Background(), "udp", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1}
+	if _, err := conn.Write(query); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if _, err := conn.Read(make([]byte, 512)); err == nil {
+		t.Fatal("silence was read as an answer")
+	}
+	if took := time.Since(started); took > time.Second {
+		t.Fatalf("the read outlived its deadline by %s", took)
 	}
 }
