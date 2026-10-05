@@ -146,7 +146,13 @@ fn model_file(data_dir: &Path, record: &ModelRecord) -> Result<TrackedFile, Refu
         .filename
         .as_deref()
         .and_then(model_layout::file_name)
-        .ok_or_else(|| refusal(StatusCode::BAD_REQUEST, "no_file", "model has no filename"))?;
+        .ok_or_else(|| {
+            refusal(
+                StatusCode::BAD_REQUEST,
+                "no_file",
+                "This model has no file name, so the pond cannot save it.",
+            )
+        })?;
     let dest = model_layout::path_for(data_dir, &record.category, filename).ok_or_else(|| {
         refusal(
             StatusCode::BAD_REQUEST,
@@ -161,7 +167,7 @@ fn model_file(data_dir: &Path, record: &ModelRecord) -> Result<TrackedFile, Refu
             refusal(
                 StatusCode::BAD_REQUEST,
                 "no_url",
-                "model has no download URL",
+                "The pond does not know where to download this model from.",
             )
         })?;
     Ok(TrackedFile {
@@ -806,6 +812,29 @@ mod tests {
         let (status, Json(body)) = plan(tmp.path(), &row, true).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "external");
+    }
+
+    /// A row that cannot be fetched says why in the household's words, with a code for the client.
+    #[test]
+    fn a_row_with_nowhere_to_fetch_it_from_says_so_plainly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut row = row_for_pick(&curated::CURATED[0]);
+        row.name = "found-on-disk".into();
+        row.id = "gguf/found-on-disk".into();
+        row.filename = Some("found-on-disk.gguf".into());
+        row.url = None;
+        let (status, Json(body)) = plan(tmp.path(), &row, true).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "no_url");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("where to download"));
+
+        row.filename = Some("..".into());
+        let (_, Json(body)) = plan(tmp.path(), &row, true).unwrap_err();
+        assert_eq!(body["code"], "no_file");
+        assert!(body["error"].as_str().unwrap().contains("no file name"));
     }
 
     #[test]
