@@ -447,8 +447,8 @@ async fn a_text_only_model_refuses_a_picture_with_409_and_saves_nothing() {
     assert_eq!(body["state"], json!({"kind": "not_declared"}));
     assert_eq!(
         body["error"],
-        "This model cannot look at pictures. To send one, choose a model marked Reads pictures on \
-         the Models page."
+        "This model cannot look at pictures. To send one, choose a model marked Pictures included \
+         on the Models page."
     );
     // The handler asked about the model the settings name, under their provider.
     assert_eq!(
