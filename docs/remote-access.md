@@ -156,6 +156,20 @@ remote access without approving anything. The revision is re-read from the
 stand-down's own answer, because standing an enrollment down gives it a new one --
 assuming otherwise cost a household its enrollment without a replacement.
 
+A phone that was removed, or whose remote access lapsed, needs no recovery
+(2026-10-05). Its enrollment is left `revoked`, and a re-paired phone keeps the
+same device id. The coordinator refuses a plain enrollment over any existing
+record, so on the Galaxy A57 a removed and re-paired phone got `409
+invalid_enrollment` and could come back only through recovery: a second
+dashboard approval after a pairing that had already needed one. Enabling remote
+access now replaces a `revoked` or `failed` enrollment at the revision the
+coordinator reports, through the same `replace` the recovery uses
+(`phone_enrollment` in `crates/pond-server/src/embedded_network.rs`). This grants
+nothing a first enrollment does not: both need a LAN peer and a valid bearer, and
+a stood-down record carries no working remote access to take over. An `active`
+enrollment held by another identity is still refused and still needs the
+approval above.
+
 Remote access lapses after thirty days without the device authenticating from the
 household LAN; see `docs/auth-network-posture.md`. The deadline is reported in the
 remote configuration and the app warns from a week out.
