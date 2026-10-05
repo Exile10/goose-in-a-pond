@@ -13,11 +13,18 @@ use super::vision_encoder::EncoderSpec;
 
 const TABLE_JSONL: &str = include_str!("../../../data/vision-pairings.jsonl");
 
+/// Publishers in the order the generator trusts them (`scripts/models/vision-sources.json`). A
+/// file name several of them share pairs with the first one's encoder, wherever it is met, so
+/// a download and the model's later use agree and encoders already installed stay in use.
+pub const PUBLISHER_PREFERENCE: &[&str] =
+    &["unsloth", "ggml-org", "bartowski", "lmstudio-community"];
+
 /// One known model family with its encoder.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct VisionPairing {
     pub model_repo: String,
-    /// Chat model files known to pair; may lag the repository until the next refresh.
+    /// Chat model files known to pair, as repository paths (a split model lists its first
+    /// shard); may lag the repository until the next refresh.
     pub model_files: Vec<String>,
     /// `general.architecture` of the chat model.
     pub architecture: String,
@@ -68,16 +75,59 @@ impl VisionPairing {
         self.model_repo.to_ascii_lowercase().contains("qat")
     }
 
+    /// Whether a file of this name is one of the model's, by base name.
     pub fn lists(&self, file_name: &str) -> bool {
-        self.model_files.iter().any(|f| f == file_name)
+        let name = base_name(file_name);
+        self.model_files.iter().any(|f| base_name(f) == name)
     }
+
+    fn publisher_rank(&self) -> usize {
+        let owner = self.model_repo.split('/').next().unwrap_or_default();
+        PUBLISHER_PREFERENCE
+            .iter()
+            .position(|p| p.eq_ignore_ascii_case(owner))
+            .unwrap_or(PUBLISHER_PREFERENCE.len())
+    }
+}
+
+fn base_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The parsed table, with each line's index in preference order and by file base name.
+struct Table {
+    lines: Vec<VisionPairing>,
+    preferred: Vec<usize>,
+    by_file: HashMap<String, Vec<usize>>,
+}
+
+fn table() -> &'static Table {
+    static TABLE: OnceLock<Table> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let lines = parse_table(TABLE_JSONL);
+        let mut preferred: Vec<usize> = (0..lines.len()).collect();
+        preferred.sort_by_key(|&i| (lines[i].publisher_rank(), i));
+        let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
+        for &i in &preferred {
+            for f in &lines[i].model_files {
+                let entry = by_file.entry(base_name(f).to_string()).or_default();
+                if !entry.contains(&i) {
+                    entry.push(i);
+                }
+            }
+        }
+        Table {
+            lines,
+            preferred,
+            by_file,
+        }
+    })
 }
 
 /// The table, parsed once. A line that does not parse is skipped here; the guard test fails
 /// the build on one.
 pub fn pairings() -> &'static [VisionPairing] {
-    static TABLE: OnceLock<Vec<VisionPairing>> = OnceLock::new();
-    TABLE.get_or_init(|| parse_table(TABLE_JSONL))
+    &table().lines
 }
 
 fn parse_table(text: &str) -> Vec<VisionPairing> {
@@ -105,15 +155,11 @@ pub struct PairingQuery<'a> {
 }
 
 /// The pairing for a chat model, biased to `None`: a false positive tells a blind model it can
-/// see. In order: the exact source, a listed file name, then the header's architecture and
-/// width with the qat flag from the name. Anything else has no pairing.
+/// see. A file listed under any line pairs, the source's own (repo, file) among them; failing
+/// that, the header's architecture and width with the qat flag from the name. Several matches
+/// go to [`PUBLISHER_PREFERENCE`], then table order. Anything else has no pairing.
 pub fn vision_pairing_for(q: &PairingQuery<'_>) -> Option<&'static VisionPairing> {
-    let table = pairings();
-    if let Some((repo, file)) = q.source {
-        if let Some(p) = table.iter().find(|p| p.model_repo == repo && p.lists(file)) {
-            return Some(p);
-        }
-    }
+    let table = table();
     let source_name = q.source.map(|(_, file)| file);
     let names: Vec<&str> = q.file_names.iter().copied().chain(source_name).collect();
     if names
@@ -122,12 +168,18 @@ pub fn vision_pairing_for(q: &PairingQuery<'_>) -> Option<&'static VisionPairing
     {
         return None;
     }
-    if let Some(p) = names.iter().find_map(|n| table.iter().find(|p| p.lists(n))) {
-        return Some(p);
+    let listed = names
+        .iter()
+        .filter_map(|n| table.by_file.get(base_name(n)))
+        .flatten()
+        .copied()
+        .min_by_key(|&i| (table.lines[i].publisher_rank(), i));
+    if let Some(i) = listed {
+        return table.lines.get(i);
     }
     let (arch, width) = q.header?;
     let qat = names.iter().any(|n| n.to_ascii_lowercase().contains("qat"));
-    table.iter().find(|p| {
+    table.preferred.iter().map(|&i| &table.lines[i]).find(|p| {
         p.architecture == arch
             && p.embedding_length == width
             && p.encoder.projection_dim == width
@@ -177,7 +229,7 @@ pub fn encoder_for_model(chat_model: &str, gguf: Option<&Path>) -> Option<Encode
     pairing_for_model(chat_model, gguf).map(VisionPairing::spec)
 }
 
-/// The encoder for a file acquired from `repo`, by rules one and two.
+/// The encoder for a file acquired from `repo`: by its name, as the file will be met on disk.
 pub fn encoder_for_source(repo: &str, file: &str) -> Option<EncoderSpec> {
     vision_pairing_for(&PairingQuery {
         source: Some((repo, file)),
@@ -358,21 +410,80 @@ mod tests {
         }
     }
 
+    /// One file name, one encoder, wherever it is met, so a download and the model's later use
+    /// agree and the encoders households already installed stay in use.
     #[test]
-    fn the_exact_source_wins_then_a_listed_file_name() {
+    fn a_shared_file_name_pairs_with_the_preferred_publishers_encoder_everywhere() {
+        let file = "gemma-4-E4B-it-Q4_K_M.gguf";
+        let listing = pairings().iter().filter(|p| p.lists(file)).count();
+        assert!(
+            listing > 1,
+            "the table should list {file} under several publishers"
+        );
+        assert_eq!(
+            encoder_for_model("gemma-4-E4B-it-Q4_K_M", None).map(|s| s.dir),
+            Some("gemma-4-e4b-it")
+        );
+        for repo in [
+            "lmstudio-community/gemma-4-E4B-it-GGUF",
+            "ggml-org/gemma-4-E4B-it-GGUF",
+            "unsloth/gemma-4-E4B-it-GGUF",
+            "someone/gemma-4-E4B-it-GGUF",
+        ] {
+            assert_eq!(
+                encoder_for_source(repo, file).map(|s| s.dir),
+                Some("gemma-4-e4b-it"),
+                "{repo}"
+            );
+        }
         let qat = encoder_for_source(
             "unsloth/gemma-4-E4B-it-qat-GGUF",
             "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
         )
         .unwrap();
         assert_eq!(qat.dir, "gemma-4-e4b-it-qat");
-        // Another publisher's copy of a listed file pairs by its name.
-        let copy = encoder_for_source("someone/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q4_K_M.gguf");
-        assert_eq!(copy.map(|s| s.dir), Some("gemma-4-e4b-it"));
-        // A repository we know, a file we don't: no guess without a header.
+        // A file nobody lists, with no header to read: no guess.
         assert!(
             encoder_for_source("unsloth/gemma-4-E4B-it-GGUF", "gemma-4-E4B-it-Q9_K.gguf").is_none()
         );
+    }
+
+    /// A split model is listed by its first shard's repository path; it matches by base name.
+    #[test]
+    fn a_listed_path_matches_by_its_base_name() {
+        let Some((pairing, path)) = pairings().iter().find_map(|p| {
+            p.model_files
+                .iter()
+                .find(|f| f.contains('/'))
+                .map(|f| (p, f))
+        }) else {
+            return;
+        };
+        assert!(
+            encoder_for_source(&pairing.model_repo, path).is_some(),
+            "{path}"
+        );
+        assert!(
+            encoder_for_source(&pairing.model_repo, base_name(path)).is_some(),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn the_publisher_preference_is_the_generators() {
+        let sources = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/models/vision-sources.json");
+        let Ok(text) = std::fs::read_to_string(&sources) else {
+            return;
+        };
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let authors: Vec<&str> = json["authors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        assert_eq!(authors, PUBLISHER_PREFERENCE, "{}", sources.display());
     }
 
     #[test]
@@ -438,9 +549,15 @@ mod tests {
         // DeepSeek-R1-Distill-Qwen-1.5B shares E2B's width and is not Gemma.
         let qwen = write("qwen-1.5b.gguf", &chat_gguf("qwen2", 1536));
         assert!(encoder_for_model("qwen-1.5b", Some(&qwen)).is_none());
-        // No qat 12B encoder is known, so a qat 12B reads text only.
+        // A qat 12B pairs with the qat 12B encoder, never the plain one.
         let qat12 = write("gemma-12b-qat.gguf", &chat_gguf("gemma4", 3840));
-        assert!(encoder_for_model("gemma-12b-qat", Some(&qat12)).is_none());
+        assert_eq!(
+            encoder_for_model("gemma-12b-qat", Some(&qat12)).map(|s| s.dir),
+            Some("gemma-4-12b-it-qat")
+        );
+        // A width no Gemma 4 has pairs with nothing.
+        let odd = write("gemma-odd.gguf", &chat_gguf("gemma4", 1234));
+        assert!(encoder_for_model("gemma-odd", Some(&odd)).is_none());
         // A companion's file never pairs, whatever its header.
         let mtp = write("mtp-gemma-4-E2B-it.gguf", &chat_gguf("gemma4", 1536));
         assert!(encoder_for_model("mtp-gemma-4-E2B-it", Some(&mtp)).is_none());
