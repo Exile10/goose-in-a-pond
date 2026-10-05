@@ -2981,8 +2981,8 @@ milestone).**
 
 - **What landed** (goose `e45f6b357`, bumped in GIAP `5830dcce`, branch
   `feat/litert-compaction-no-save`, at Jerry's call to build the step after the measurement above).
-  goose runs a compaction's summary call inside `request_context::replacing_history`, a task-local in
-  `goose-provider-types` beside the session id goose already carries to providers. The local
+  goose runs a compaction's summary call inside `request_context::replacing_history`, a task-local
+  in `goose-provider-types` beside the session id goose already carries to providers. The local
   provider reads it before it spawns and hands it to its backend, and LiteRT-LM no longer saves the
   chat it sets aside for that call when the chat's family already has a snapshot. The first
   compaction in a family with no snapshot still saves, and so do side calls that leave the history
@@ -3007,7 +3007,7 @@ milestone).**
   untouched.
 - **PAI.** Preamble, egress, secrets, guest, turn blocking: none. No `Settings` field.
 - **Verification.** `request_context` tests 2 (in scope, not in a spawned task); goose
-  `the_summary_call_reaches_the_provider_marked_as_replacing_history` (through `complete_fast` and its
-  session scope; an ordinary call is not marked) with the other 21 `context_mgmt` tests; LiteRT
+  `the_summary_call_reaches_the_provider_marked_as_replacing_history` (through `complete_fast` and
+  its session scope; an ordinary call is not marked) with the other 21 `context_mgmt` tests; LiteRT
   `a_chat_about_to_be_compacted_is_saved_only_when_its_family_has_no_snapshot` with the other 41;
   `cargo check -p pond-server -p pond-adapters-goose --all-targets`; the Orin runs above.
