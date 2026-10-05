@@ -2540,40 +2540,61 @@ not a PAI milestone).**
   was short. That message also carried about 900 empty thinking parts from the stream (41 KB of JSON
   for 510 characters), harmless to the prompt and worth trimming in the backend.
 
-**2026-10-05 — LiteRT-LM's GPU memory stays flat on the Orin: only the 128-token prefill chunk
-(GIAP wiring; not a PAI milestone).**
+**2026-10-05 — LiteRT-LM compiles only the 128-token prefill chunk on the Orin (GIAP wiring; not a
+PAI milestone).**
 
 - **What landed** (GIAP `69f5815f`, at Jerry's request to make LiteRT give GPU memory back). On the
   budgeted device the pond sets giap-main's `LITERT_PREFILL_SIGNATURES=128` (87e4a9e7) at startup,
   before any engine loads, unless the environment already sets it; an empty value asks for every
   size the model ships. It runs in `serve`, `chat` and the bare interactive chat, beside the
   compaction prompts.
-- **Why this and not a release.** The growth in the snapshot entry above was the 1024-token prefill
-  chunk: Gemma 4 ships 128- and 1024-token prefill signatures, each compiled signature keeps
-  attention scratch sized by the whole context, and the GPU layer (Dawn under the closed ML Drift)
-  pools freed memory inside the process; the earlier vision work found that only destroying the
-  Dawn device returns it. Compiling only the 128-token chunk means the memory is never taken.
-- **Measured** (the same 8-turn probe with one compaction, E4B, 8k window, one-second sampler):
+- **Why this and not a release.** The GPU growth in the snapshot entry above came mostly from the
+  1024-token prefill chunk: Gemma 4 ships 128- and 1024-token prefill signatures, each compiled
+  signature keeps attention scratch sized by the whole context, and the GPU layer (Dawn under the
+  closed ML Drift) pools freed memory inside the process; the earlier vision work found that only
+  destroying the Dawn device returns it. Compiling only the 128-token chunk means that memory is
+  never taken.
+- **Measured before the first compaction**, where the compaction prompt plays no part (E4B, 8k
+  window, one-second sampler, the same conversation script). Sampling made the third turn differ:
+  it prefilled a 1,997-token tool result with both chunk sizes, a 948-token one in the 16-turn run
+  with 128 only, and none in the 8-turn run with 128 only.
+
+  | | Both chunk sizes | 128 only (8- and 16-turn runs) |
+  |---|---|---|
+  | GPU share of RAM after the first turn | 4.77 GB | 4.07-4.09 GB |
+  | GPU share at the first compaction | 5.36 GB | 4.03-4.11 GB |
+  | Free memory before each turn | 164-250 MB | 694-812 MB |
+  | Pond swapped out by the first compaction | 757 MB | 0 |
+
+  Past the first compaction the 8-turn runs also differ in the compaction prompt, because the run
+  with both chunk sizes predates the bounded pair. With both sizes and goose's own prompt the GPU
+  share rose to 6.9 GB, 2.24 GB of the pond was swapped out and free memory fell to 41 MB. With 128
+  only and the bounded pair it peaked at 4.51 GB in its one compaction, nothing was swapped and free
+  memory stayed at or above 204 MB. E2B and E4B both ship the 128-token chunk; the backend's live
+  test passes on the Mac's GPU with only it compiled.
+- **Orin, 16 turns, the bounded pair in both runs** (release `0f5b5df3` with both chunk sizes,
+  release `69f5815f` with 128 only; the second set the switch itself: its trace shows
+  `prefill_signatures="128"` and the engine printed "compiling decode, prefill_128, verify; not
+  compiling prefill_1024"):
 
   | | Both chunk sizes | 128 only |
   |---|---|---|
-  | GPU share of RAM at the first turn | 4.77 GB | 4.07 GB |
-  | GPU share by the eighth turn | 6.6 GB | 4.14 GB (4.5 at the compaction) |
-  | Pond swapped out | up to 2.24 GB | 0 |
-  | Lowest free memory | 41 MB | 204 MB (600-800 MB most of the run) |
-  | First token after the compaction | 10-16 s | 4.1 s |
+  | Compactions (summary call) | 3 (67-98 s) | 5 (60-83 s) |
+  | Model's first token, turn after a compaction | 5.7-10.1 s | 3.6-4.3 s |
+  | Model's first token, every other turn | 2.8-4.1 s | 2.3-4.1 s |
+  | First word on a compacting turn (summary call first) | 73-108 s | 64-87 s |
+  | Output, wall time | 7,117 tokens, 952 s | 10,471 tokens, 1,254 s |
+  | Wall time per output token | 0.134 s | 0.120 s |
 
-  E2B and E4B both ship the 128-token chunk; the backend's live test passes on the Mac's GPU with
-  only it compiled.
-- **Orin, 16 turns on the shipped build** (release `69f5815f`, no manual setting: the trace shows
-  `prefill_signatures="128"` and the engine printed "compiling decode, prefill_128, verify; not
-  compiling prefill_1024"). The first token came in 2.3-4.3 s on every turn, under the 5 s gate
-  throughout. The pond never swapped (system swap stayed at the 488 MB other processes hold), free
-  memory never fell below 241 MB and stayed at 400-700 MB most of the run, and the GPU's share held
-  at 4.1-4.5 GB, peaking at each of five compactions and settling back. E4B wrote 47% more this run
-  (10,471 tokens against 7,117 in the previous 16-turn run), so it compacted five times and took
-  1,254 s against 952 s, but 0.120 s per output token against 0.134, and decoded at 13.6 tok/s
-  against 13.0. The fact from turn 1 was recalled at turn 15.
+  Memory was sampled in the second run only. Through the first three compactions free memory stayed
+  at or above 239 MB and nothing was swapped. At the fourth and fifth (turns 13 and 16) it fell to
+  148 and 125 MB, and the kernel swapped out 87 MB, then 204 MB of the pond (system swap 488 to 696
+  MB). The GPU share sat at 4.0-4.2 GB between turns, about 0.1 GB higher by the end, and peaked at
+  4.4-4.7 GB in each compaction. So the GPU share no longer grows by gigabytes, but a long run still
+  runs short of memory at its compactions. E4B wrote 47% more in the second run, hence the extra
+  compactions, and decoded at 13.6 tok/s against 13.0; both recalled the fact from turn 1 at turn
+  15. The 5 s gate holds for the model's first token on every turn but not for a turn that
+  compacts: goose runs the summary call inside the turn, and only the quiet-time job moves it out.
 - **PAI.** Preamble, egress, secrets, guest, turn blocking: none. No `Settings` field; the switch is
   an environment variable. Side effect: long prompts prefill in 128-token chunks.
 - **Verification.** pond-core LiteRT tests 12 passed, including the new rule; the adapter's
