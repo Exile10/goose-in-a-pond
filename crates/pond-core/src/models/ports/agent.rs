@@ -44,6 +44,12 @@ pub trait Agent: Send + Sync {
         Ok(None)
     }
 
+    /// Whether this session's next turn would start by compacting it, by the backend's own rule.
+    /// `false` when the backend never compacts on its own, or cannot tell.
+    async fn compacts_on_next_turn(&self, _session_id: &str) -> bool {
+        false
+    }
+
     /// Call a tool by fully-qualified name (e.g. `giap-weather__get_current_weather`).
     /// Fallback for a model that emits tool calls as text markup, not the structured protocol.
     async fn call_tool(

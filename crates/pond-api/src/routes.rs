@@ -1155,6 +1155,11 @@ async fn chat(
     let service = ChatService::new(state.agent.clone(), session_id.clone(), storage.clone())
         .with_profile_scope(resolve_turn_scope(&state, &session_id, &device).await);
 
+    // As every turn path does before the model: wait out a quiet compaction in the way.
+    if let Some(wait) = state.runs.quiet_passes().turn_arrives(&session_id) {
+        wait.until_the_pass_ends().await;
+    }
+
     let response_text = service.chat_once(req.message).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2110,6 +2115,17 @@ async fn drive_turn(
             return;
         }
     };
+
+    // ── A quiet compaction in the way ───────────────────────────────────
+    // One writing the summary this turn would otherwise start by writing is waited for; any other
+    // is stopped, which takes a moment.
+    if let Some(wait) = state.runs.quiet_passes().turn_arrives(&session_id) {
+        if wait.compacting_for_this_turn() {
+            let status = json!({"type": "status", "content": "Compacting context..."}).to_string();
+            run.push(status, false);
+        }
+        wait.until_the_pass_ends().await;
+    }
 
     // ── On-demand llamafile startup ─────────────────────────────────────
     {
@@ -10030,6 +10046,14 @@ async fn agent_chat_stream(
         if let Err(e) = chat_service.persist_user_message_with_images(&message, images.clone()).await {
             yield Ok(Event::default().data(json!({"error": format!("Failed to persist user message: {}", e)}).to_string()));
             return;
+        }
+
+        // As every turn path does before the model: wait out a quiet compaction in the way.
+        if let Some(wait) = state.runs.quiet_passes().turn_arrives(&session_id) {
+            if wait.compacting_for_this_turn() {
+                yield Ok(Event::default().data(json!({"type": "status", "content": "Compacting context..."}).to_string()));
+            }
+            wait.until_the_pass_ends().await;
         }
 
         // Shared with `/chat/stream` so both routes fold engine events into a turn identically.
