@@ -1,192 +1,318 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, /* fireEvent, */ cleanup /* , waitFor */ } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent, waitFor, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 vi.mock("../../../api/PondApiClient", () => ({
   api: {
     listModels: vi.fn(),
     getActiveRoles: vi.fn(),
+    getMemoryStatus: vi.fn(),
+    getDownloadProgress: vi.fn(),
     activateModel: vi.fn(),
-    getSettings: vi.fn(),
-    updateSettings: vi.fn(),
-    getVisionStatus: vi.fn(),
+    downloadModel: vi.fn(),
+    addPictures: vi.fn(),
+    controlModelDownload: vi.fn(),
   },
 }));
 
 import { ModelsDetail } from "./Models";
 import { api } from "../../../api/PondApiClient";
+import type { DownloadEntry, ModelEntry, ModelMemoryStatus } from "../../../api/types";
+import {
+  E4B_ORIN, e2b, e4b, entry, foundOnDisk, litertE2b, litertE4b, llamafile, NO_ROLES, ollama,
+  ORIN_MEMORY, rolesWith, voice, whisper,
+} from "../../../sections/models/fixtures";
 
-const MODELS = [
-  {
-    id: "gguf/gemma-4-E2B-it-Q4_K_M",
-    provider: "gguf",
-    name: "gemma-4-E2B-it-Q4_K_M",
-    is_active: true,
-    downloaded: true,
-    recommended_role: "chat",
-  },
-];
+const HERE = { downloaded: true };
 
-const ROLES = { chat: { provider: "gguf", model: "gemma-4-E2B-it-Q4_K_M" }, tool: null, asr: null, tts: null, embedding: null };
-
-function modelsSettings(overrides: Record<string, unknown> = {}) {
-  return { ...overrides };
+function setup(opts: {
+  models?: ModelEntry[];
+  roles?: ReturnType<typeof rolesWith>;
+  memory?: ModelMemoryStatus;
+  downloads?: DownloadEntry[];
+} = {}) {
+  vi.mocked(api.listModels).mockResolvedValue(opts.models ?? [e4b(), e2b(HERE), litertE4b()]);
+  vi.mocked(api.getActiveRoles).mockResolvedValue(opts.roles ?? NO_ROLES);
+  vi.mocked(api.getMemoryStatus).mockResolvedValue(opts.memory ?? ORIN_MEMORY);
+  vi.mocked(api.getDownloadProgress).mockResolvedValue({ downloads: opts.downloads ?? [] });
 }
 
-// Commented out with the Speed card (speculative decoding left the engine); restore with it.
-// async function renderModels() {
-//   render(<ModelsDetail go={() => {}} />);
-//   await screen.findByText("Language models");
-//   // Let the (separately-loaded) settings promise land too.
-//   await screen.findByText("Guess ahead with a helper model");
-// }
-//
-// /** The Speed row's switch — Voice.test.tsx's pattern, found via its own row
-//  *  rather than by index. */
-// function speedSwitch(): HTMLButtonElement {
-//   const label = screen.getByText("Guess ahead with a helper model");
-//   const row = label.closest(".srow");
-//   if (!row) throw new Error("speed row not found");
-//   const btn = row.querySelector("button.htoggle");
-//   if (!btn) throw new Error("speed row has no switch");
-//   return btn as HTMLButtonElement;
-// }
+function renderHub(go = vi.fn()) {
+  render(<ModelsDetail go={go} />);
+  return go;
+}
 
-afterEach(cleanup);
+/** A card of the screen, by its title. */
+async function card(title: string): Promise<HTMLElement> {
+  const head = await screen.findByText(title, { selector: ".setcard__title" });
+  return head.closest(".setcard") as HTMLElement;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.mocked(api.listModels).mockResolvedValue(MODELS as never);
-  vi.mocked(api.getActiveRoles).mockResolvedValue(ROLES as never);
   vi.mocked(api.activateModel).mockResolvedValue(undefined as never);
-  vi.mocked(api.getSettings).mockResolvedValue(modelsSettings() as never);
-  vi.mocked(api.updateSettings).mockResolvedValue({} as never);
-  vi.mocked(api.getVisionStatus).mockResolvedValue({
-    model: "", state: { kind: "unknown" }, size_bytes: null, message: null,
-  } as never);
+  vi.mocked(api.downloadModel).mockResolvedValue({ status: "download_started", message: "Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)" });
+  vi.mocked(api.controlModelDownload).mockResolvedValue({ status: "ok" });
+  setup();
 });
 
-describe("Hub Models, while speculative decoding is out of the engine", () => {
-  it("offers no guess-ahead switch and never reads settings for one", async () => {
-    render(<ModelsDetail go={() => {}} />);
-    await screen.findByText("Language models");
-    expect(screen.queryByText("Guess ahead with a helper model")).toBeNull();
-    expect(api.getSettings).not.toHaveBeenCalled();
+afterEach(cleanup);
+
+describe("Hub Models: the jobs", () => {
+  it("shows the four jobs a pond fills, in the household's words, and no fake Think or Task", async () => {
+    renderHub();
+    const tiles = await screen.findByRole("list", { name: "Which model does each job" });
+    const jobs = within(tiles).getAllByRole("listitem").map((t) => t.querySelector(".hm-tile__job")?.textContent);
+    expect(jobs).toEqual(["Conversation", "Listening", "Speaking", "Memory"]);
+    expect(screen.queryByText("Think")).toBeNull();
+    expect(screen.queryByText("Task")).toBeNull();
+  });
+
+  it("names the model holding a job and the engine that runs it", async () => {
+    setup({ roles: rolesWith({ provider: "local", model: e2b().name }) });
+    renderHub();
+    const tiles = await screen.findByRole("list", { name: "Which model does each job" });
+    await waitFor(() => expect(within(tiles).getByText("Gemma 4 E2B")).toBeTruthy());
+    expect(within(tiles).getByText("llama.cpp")).toBeTruthy();
+    expect(within(tiles).getByText(".gguf")).toBeTruthy();
+  });
+
+  it("says nothing is chosen for an unfilled job, and that memory runs on its built-in model", async () => {
+    vi.mocked(api.getActiveRoles).mockResolvedValue({ ...NO_ROLES, embedding: { provider: "fastembed", model: "" } } as never);
+    renderHub();
+    const tiles = await screen.findByRole("list", { name: "Which model does each job" });
+    await waitFor(() => expect(within(tiles).getByText("Built-in default")).toBeTruthy());
+    expect(within(tiles).getAllByText("Nothing chosen yet")).toHaveLength(3);
+  });
+
+  it("says the room for one model, the same figure the rows use", async () => {
+    renderHub();
+    expect(await screen.findByText("Everything runs on this pond. Room for one model: 5.0 GB.")).toBeTruthy();
+  });
+
+  it("says nothing of room when the machine reports no budget", async () => {
+    setup({ memory: { total_mb: 0, available_for_llm_mb: 0, loaded_model: null } });
+    renderHub();
+    expect(await screen.findByText("Everything runs on this pond.")).toBeTruthy();
   });
 });
 
-describe("Hub Models, a chat model on this device's own engine", () => {
-  // As the server answers: rows carry their category, the chat role the stored provider.
-  const LOCAL = [
-    { id: "gguf/llama-3.2-3b", provider: "gguf", name: "llama-3.2-3b", is_active: false, downloaded: true, recommended_role: "chat" },
-    { id: "litert/gemma-4-E2B-it.litertlm", provider: "litert", name: "gemma-4-E2B-it.litertlm", is_active: true, downloaded: true, recommended_role: "chat" },
-    { id: "litert/gemma-4-E4B-it.litertlm", provider: "litert", name: "gemma-4-E4B-it.litertlm", is_active: false, downloaded: false, recommended_role: "chat" },
-  ];
-
-  beforeEach(() => {
-    vi.mocked(api.listModels).mockResolvedValue(LOCAL as never);
-    vi.mocked(api.getActiveRoles).mockResolvedValue({
-      ...ROLES,
-      chat: { provider: "local", model: "gemma-4-E2B-it.litertlm" },
-    } as never);
+describe("Hub Models: what to get", () => {
+  it("offers the picks that are not here yet, with their size, and nothing else of the catalogue", async () => {
+    setup({
+      models: [e4b(), e2b(HERE), litertE4b(), litertE2b(), whisper("base.en"), whisper("small"), voice("af_heart", { downloaded: false }), ollama()],
+    });
+    renderHub();
+    const recommended = await card("Recommended for this pond");
+    const names = within(recommended).getAllByRole("article").map((a) => a.getAttribute("aria-label"));
+    expect(names).toEqual(["Gemma 4 E4B, llama.cpp", "Gemma 4 E4B, LiteRT-LM"]);
+    expect(within(recommended).getByText("4.2 GB + 945 MB for pictures")).toBeTruthy();
+    // Not the whole catalogue: no speech models, no voices, nothing the pond does not recommend.
+    expect(screen.queryByText("Whisper small (en)")).toBeNull();
+    expect(screen.queryByText("Whisper base.en (en)")).toBeNull();
+    expect(screen.queryByText("Litert")).toBeNull();
   });
 
-  it("shows the model the role holds as Loaded, though the role reads local", async () => {
-    render(<ModelsDetail go={() => {}} />);
-    await screen.findByText("Language models");
-    expect(await screen.findByText("Loaded")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Load gemma-4-E2B-it.litertlm as chat model" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Load llama-3.2-3b as chat model" })).toBeTruthy();
+  it("has no Download placeholder that can never be pressed", async () => {
+    renderHub();
+    await card("Recommended for this pond");
+    expect(screen.queryByTitle(/coming in Phase/i)).toBeNull();
+    const disabled = screen.queryAllByRole("button").filter((b) => (b as HTMLButtonElement).disabled);
+    expect(disabled).toEqual([]);
   });
 
-  it("offers no Load for a model that is not downloaded", async () => {
-    render(<ModelsDetail go={() => {}} />);
-    const missing = await screen.findByRole("button", { name: "gemma-4-E4B-it.litertlm is not downloaded" });
-    expect((missing as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.queryByRole("button", { name: "Load gemma-4-E4B-it.litertlm as chat model" })).toBeNull();
+  it("downloads with the add-on ticked, and can be unticked, saying the number each way", async () => {
+    renderHub();
+    const recommended = await card("Recommended for this pond");
+    const pick = within(recommended).getByRole("article", { name: "Gemma 4 E4B, llama.cpp" });
+    const tick = within(pick).getByRole("checkbox", { name: /Include picture support/ }) as HTMLInputElement;
+    expect(tick.checked).toBe(true);
+    fireEvent.click(tick);
+    expect(within(pick).getByText("4.2 GB")).toBeTruthy();
+    fireEvent.click(within(pick).getByRole("button", { name: "Download Gemma 4 E4B, llama.cpp" }));
+    await waitFor(() => expect(api.downloadModel).toHaveBeenCalledWith("gguf", e4b().name, { pictures: false }));
+    expect(await screen.findByText("Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)")).toBeTruthy();
+  });
+
+  it("raises one card and asks with one button while nothing converses; after that it raises the model in use", async () => {
+    renderHub();
+    const recommended = await card("Recommended for this pond");
+    expect(recommended.querySelectorAll(".mm-pick[data-raised='true']")).toHaveLength(1);
+    expect(document.querySelectorAll(".mm-btn--ask")).toHaveLength(1);
+    cleanup();
+
+    setup({ roles: rolesWith({ provider: "local", model: e2b().name }) });
+    renderHub();
+    await card("Recommended for this pond");
+    await waitFor(() => expect(document.querySelectorAll(".hm-row[data-raised='true']")).toHaveLength(1));
+    expect(document.querySelectorAll(".mm-pick[data-raised='true']")).toHaveLength(0);
+    expect(document.querySelectorAll(".mm-btn--ask")).toHaveLength(0);
+  });
+
+  it("shows a download on its own card, a bar per file and one set of controls for the model", async () => {
+    const downloads = [
+      entry({ filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", model_id: e4b().id, part: "model", total_bytes: 4_215_695_776, downloaded_bytes: 2_000_000_000 }),
+      entry({ filename: "mmproj/gemma-4-e4b-it-qat/mmproj-BF16.gguf", category: "mmproj", model_id: e4b().id, part: "pictures", total_bytes: 991_552_320, downloaded_bytes: 991_552_320, status: "done" }),
+    ];
+    setup({ downloads });
+    renderHub();
+    const recommended = await card("Recommended for this pond");
+    const pick = within(recommended).getByRole("article", { name: "Gemma 4 E4B, llama.cpp" });
+    expect(within(pick).getAllByRole("progressbar")).toHaveLength(2);
+    expect(within(pick).getByText("2.0 GB of 4.2 GB")).toBeTruthy();
+    expect(within(pick).getByText("Arrived")).toBeTruthy();
+    fireEvent.click(within(pick).getByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(api.controlModelDownload).toHaveBeenCalledWith(e4b().id, "cancel"));
+    expect(await screen.findByText("Stopped Gemma 4 E4B. Nothing was kept.")).toBeTruthy();
   });
 });
 
-// Commented out with the Speed card (speculative decoding left the engine); restore with it.
-// // The hub Toggle seeds its own state from its `on` prop once (controls.tsx),
-// // and settings arrive a render after mount — these assert what is DRAWN
-// // after the async load, not merely that a control exists. Same regression
-// // Voice.test.tsx's thinking-tone suite guards.
-// describe("Hub Models — guess ahead with a helper model", () => {
-//   it("draws ON when the key is absent", async () => {
-//     // The field defaults ON in Rust, so a settings row written before this
-//     // field existed carries no such key.
-//     vi.mocked(api.getSettings).mockResolvedValue(modelsSettings() as never);
-//     await renderModels();
-//
-//     expect(speedSwitch().getAttribute("aria-pressed")).toBe("true");
-//   });
-//
-//   it("draws OFF when the stored setting is off", async () => {
-//     vi.mocked(api.getSettings).mockResolvedValue(
-//       modelsSettings({ speculative_decoding_enabled: false }) as never,
-//     );
-//     await renderModels();
-//
-//     await waitFor(() => {
-//       expect(speedSwitch().getAttribute("aria-pressed")).toBe("false");
-//     });
-//   });
-//
-//   it("writes speculative_decoding_enabled and nothing else", async () => {
-//     vi.mocked(api.getSettings).mockResolvedValue(modelsSettings() as never);
-//     await renderModels();
-//
-//     fireEvent.click(speedSwitch());
-//
-//     await waitFor(() => {
-//       expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({
-//         speculative_decoding_enabled: false,
-//       });
-//     });
-//   });
-//
-//   it("reverts and flashes the failure when the save is refused", async () => {
-//     vi.mocked(api.getSettings).mockResolvedValue(modelsSettings() as never);
-//     vi.mocked(api.updateSettings).mockRejectedValueOnce(new Error("offline"));
-//     await renderModels();
-//
-//     fireEvent.click(speedSwitch());
-//
-//     await waitFor(() => {
-//       expect(screen.getByText(/Could not turn guessing ahead off: offline\. It is still on; try again\./)).toBeTruthy();
-//     });
-//     expect(speedSwitch().getAttribute("aria-pressed")).toBe("true");
-//   });
-//
-//   it("has an accessible name", async () => {
-//     await renderModels();
-//     expect(speedSwitch().getAttribute("aria-label")).toBe("Guess ahead with a helper model");
-//   });
-//
-//   it("does not adopt the PUT echo — the optimistic value stands even if the server answers differently", async () => {
-//     vi.mocked(api.getSettings).mockResolvedValue(modelsSettings() as never);
-//     // A stale echo naming the OLD value, as a fast second click or a lagging
-//     // response could produce.
-//     vi.mocked(api.updateSettings).mockResolvedValue({ speculative_decoding_enabled: true } as never);
-//     await renderModels();
-//
-//     fireEvent.click(speedSwitch());
-//
-//     await waitFor(() => {
-//       expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({
-//         speculative_decoding_enabled: false,
-//       });
-//     });
-//     expect(speedSwitch().getAttribute("aria-pressed")).toBe("false");
-//   });
-//
-//   it("renders no switch, and no guessed value, when settings cannot be read", async () => {
-//     vi.mocked(api.getSettings).mockRejectedValue(new Error("offline"));
-//     render(<ModelsDetail go={() => {}} />);
-//
-//     // The model list still renders — a settings failure must not blank the
-//     // whole page into the offline view (they are loaded separately).
-//     await screen.findByText("Language models");
-//     await screen.findByText("Could not read this setting. Use Refresh above to try again.");
-//     expect(document.querySelector(".srow button.htoggle")).toBeNull();
-//   });
-// });
+describe("Hub Models: what is here", () => {
+  it("groups the installed models by engine, each opened by one plain sentence", async () => {
+    setup({ models: [e2b(HERE), litertE4b(HERE), foundOnDisk(), ollama(), llamafile(), e4b()] });
+    renderHub();
+    const conversation = await card("Conversation");
+    expect(within(conversation).getByText("llama.cpp runs .gguf files and can read pictures with an add-on.")).toBeTruthy();
+    expect(within(conversation).getByText("LiteRT-LM runs .litertlm files on the GPU, text only.")).toBeTruthy();
+    expect(within(conversation).getByText("Ollama is your own Ollama server; llamafile runs a model packed into one file.")).toBeTruthy();
+    const titles = Array.from(conversation.querySelectorAll(".hm-row__title")).map((t) => t.textContent);
+    expect(titles).toEqual(["Gemma 4 E2B", "Llama-3.2-3B-Instruct-Q4_K_M", "Gemma 4 E4B", "mistral-7b-instruct", "qwen3:4b"]);
+  });
+
+  it("says why a pick is a pick, with measured numbers only where the server sent them", async () => {
+    const measured = { ...e2b().recommended!, measured: E4B_ORIN };
+    setup({ models: [e2b({ ...HERE, recommended: measured })] });
+    renderHub();
+    const conversation = await card("Conversation");
+    expect(within(conversation).getByText("Recommended")).toBeTruthy();
+    expect(within(conversation).getByText(e2b().recommended!.reason)).toBeTruthy();
+    expect(within(conversation).getByText(E4B_ORIN.summary)).toBeTruthy();
+  });
+
+  it("says In use for the model in use, once, though the role reads local", async () => {
+    setup({ models: [litertE4b(HERE), e2b(HERE)], roles: rolesWith({ provider: "local", model: litertE4b().name }) });
+    renderHub();
+    const conversation = await card("Conversation");
+    await waitFor(() => expect(within(conversation).getAllByText("In use")).toHaveLength(1));
+    const rows = Array.from(conversation.querySelectorAll(".hm-row"));
+    const inUse = rows.find((r) => r.getAttribute("data-inuse") === "true")!;
+    expect(inUse.querySelector(".hm-row__title")?.textContent).toBe("Gemma 4 E4B");
+    expect(within(inUse as HTMLElement).queryByRole("button", { name: /^Use / })).toBeNull();
+  });
+
+  it("uses a model on the person's word, and says so", async () => {
+    setup({ models: [e2b(HERE)] });
+    renderHub();
+    const conversation = await card("Conversation");
+    fireEvent.click(within(conversation).getByRole("button", { name: "Use Gemma 4 E2B, llama.cpp for conversation" }));
+    await waitFor(() => expect(api.activateModel).toHaveBeenCalledWith("gguf", e2b().name, "chat"));
+    expect(await screen.findByText("Now using Gemma 4 E2B for conversation.")).toBeTruthy();
+  });
+
+  it("says a model is too big for this pond rather than a percentage", async () => {
+    setup({
+      models: [e2b(HERE)],
+      memory: { total_mb: 7620, available_for_llm_mb: 1500, loaded_model: null, reclaimable_mb: 0 },
+    });
+    renderHub();
+    const conversation = await card("Conversation");
+    expect(within(conversation).getByText("Too big for this pond")).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/\d{3,}%/);
+  });
+
+  it("reads picture support, and adds it only when pressed", async () => {
+    vi.mocked(api.addPictures).mockResolvedValue({ status: "download_started", message: "Downloading picture support for Gemma 4 E2B (941 MB)" });
+    setup({ models: [e2b(HERE), litertE4b(HERE)] });
+    renderHub();
+    const conversation = await card("Conversation");
+    expect(within(conversation).getByText("Text only")).toBeTruthy();
+    expect(api.addPictures).not.toHaveBeenCalled();
+    fireEvent.click(within(conversation).getByRole("button", { name: "Add pictures · 941 MB" }));
+    await waitFor(() => expect(api.addPictures).toHaveBeenCalledWith("gguf", e2b().name));
+    expect(await screen.findByText("Downloading picture support for Gemma 4 E2B (941 MB)")).toBeTruthy();
+  });
+
+  it("says when nothing is on the device to talk with, and points at the picks", async () => {
+    setup({ models: [e4b(), litertE4b()] });
+    renderHub();
+    const conversation = await card("Conversation");
+    expect(within(conversation).getByText(/Nothing is on this device to talk with yet/)).toBeTruthy();
+    expect(within(conversation).getByText(/Download one of the picks above/)).toBeTruthy();
+  });
+
+  it("keeps a helper out of conversation", async () => {
+    setup({ models: [e2b(HERE), { ...e2b(HERE), id: "gguf/functiongemma", name: "functiongemma", title: "FunctionGemma 270M", kind: "helper", recommended_role: "tool", recommended: undefined }] });
+    renderHub();
+    await card("Conversation");
+    expect(screen.queryByText("FunctionGemma 270M")).toBeNull();
+  });
+});
+
+describe("Hub Models: speech", () => {
+  it("lists only the listening models that are on the device, and the voice, not 54 of them", async () => {
+    const voices = ["af_heart", "af_bella", "af_nicole"].map((n, i) => voice(n, { downloaded: i === 0 }));
+    setup({
+      models: [e2b(HERE), whisper("base.en", HERE), whisper("small"), ...voices],
+      roles: { ...NO_ROLES, tts: { provider: "tts_kokoro", model: "af_heart" } },
+    });
+    renderHub();
+    const speech = await card("Speech");
+    expect(within(speech).getByText("Whisper base.en (en)")).toBeTruthy();
+    expect(within(speech).queryByText("Whisper small (en)")).toBeNull();
+    await waitFor(() => expect(within(speech).getByText("Af_Heart")).toBeTruthy());
+    expect(within(speech).queryByText("Af_Bella")).toBeNull();
+  });
+
+  it("sends a household to Voice to choose one, and to the computer for a listening model", async () => {
+    setup({ models: [e2b(HERE)] });
+    const go = renderHub();
+    const speech = await card("Speech");
+    expect(within(speech).getByText(/No listening model is on this device yet/)).toBeTruthy();
+    fireEvent.click(within(speech).getByRole("button", { name: "Choose a voice" }));
+    expect(go).toHaveBeenCalledWith("voice");
+  });
+
+  it("uses a listening model on the person's word", async () => {
+    setup({ models: [e2b(HERE), whisper("base.en", HERE)] });
+    renderHub();
+    const speech = await card("Speech");
+    fireEvent.click(within(speech).getByRole("button", { name: /Use Whisper base.en/ }));
+    await waitFor(() => expect(api.activateModel).toHaveBeenCalledWith("whisper", "base.en", "asr"));
+  });
+});
+
+describe("Hub Models: when the pond cannot be reached", () => {
+  it("says so, and still draws the screen", async () => {
+    vi.mocked(api.listModels).mockRejectedValue(new Error("connection refused"));
+    renderHub();
+    expect(await screen.findByText(/Could not reach the server/)).toBeTruthy();
+    expect(screen.getByText("Models")).toBeTruthy();
+  });
+
+  it("goes back to Settings", async () => {
+    const go = renderHub();
+    fireEvent.click(await screen.findByRole("button", { name: "Back to Settings" }));
+    expect(go).toHaveBeenCalledWith("settings");
+  });
+});
+
+describe("Hub Models: made of tokens", () => {
+  const HERE_DIR = dirname(fileURLToPath(import.meta.url));
+  const HEX = /#[0-9a-fA-F]{3,8}\b/;
+
+  it("writes no colour of its own, so dark mode and the chosen accent reach it", () => {
+    const source = readFileSync(resolve(HERE_DIR, "Models.tsx"), "utf8");
+    expect(source.match(HEX)).toBeNull();
+
+    const css = readFileSync(resolve(HERE_DIR, "../../hub.css"), "utf8");
+    const start = css.indexOf("/* ─── Models ───");
+    const end = css.indexOf(".mrow__btn {");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = css.slice(start, end);
+    expect(block.match(HEX)).toBeNull();
+    expect(block).not.toMatch(/rgba?\(/);
+  });
+});

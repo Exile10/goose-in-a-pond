@@ -1,514 +1,307 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { Download, Check, RefreshCw, Loader2, Image } from "lucide-react";
-import { HubIco } from "../../primitives/HubIco";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Brain, Ear, MessageSquare, RefreshCw, Volume2, type LucideIcon } from "lucide-react";
 import { DetailShell } from "./DetailShell";
-// Row and Toggle are used only by the commented-out Speed card below.
-import { Card /* , Row, Toggle */ } from "./controls";
-import { api } from "../../../api/PondApiClient";
-import { voiceTitle } from "../../../voice/voiceCatalogue";
-import { useVisionStatus } from "../../../api/useVisionStatus";
-import { providerOf } from "../../../lib/modelProvider";
-import type { ModelEntry, ModelActiveRoles /* , Settings */ } from "../../../api/types";
+import { Card } from "./controls";
+import { useModels } from "../../../hooks/useModels";
+import { useModelActions } from "../../../hooks/useModelActions";
+import { AddOnLine, EngineMark, FitCell, SourceChip, TransferView } from "../../../components/models/ModelMarks";
+import { PickCard } from "../../../sections/models/PickCard";
+import { engineOf, groupByEngine } from "../../../lib/modelProvider";
+import {
+  ROLES, type RoleKey, addOnOf, askingPick, budgetReading, downloadedOnly, emptyJobText, fitReading,
+  groupByJob, holderEntry, isInUse, measuredOf, modelFacts, modelFullName, modelLabel, raisedPick,
+  recommendedPicks, roleHolder, rolesFor, sortModels, sourceChip,
+} from "../../../sections/models/modelsView";
+import type { ModelEntry } from "../../../api/types";
 
-// ─── Icon path strings for this view ─────────────────────────
-const SICN = {
-  chat:    "M21 12a8 8 0 0 1-11.5 7.2L4 21l1.8-5.4A8 8 0 1 1 21 12z",
-  spark:   "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z",
-  bolt:    "M13 2L3 14h7l-1 8 11-12h-7z",
-  ear:     "M6 8a6 6 0 0 1 12 0c0 3-1.5 4-3 5s-2 2-2 4-1 3-3 3-3-2-3-4M9 12a3 3 0 0 1 6 0",
-  speaker: "M11 5L6 9H2v6h4l5 4zM19 5a10 10 0 0 1 0 14M15.5 8.5a5 5 0 0 1 0 7",
-  cpu:     "M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM9 9h6v6H9zM9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3",
-} as const;
-
-// ─── Role tile definitions ────────────────────────────────────
-interface RoleTile {
-  role: string;
-  key: keyof ModelActiveRoles;
-  icon: string;
-  c: string;
-  bg: string;
-}
-
-const ROLE_TILES: RoleTile[] = [
-  { role: "Chat",           key: "chat",  icon: SICN.chat,    c: "#7C3AED", bg: "#EDE9FE" },
-  { role: "Think",          key: "chat",  icon: SICN.spark,   c: "#D97706", bg: "#FEF3C7" },
-  { role: "Task",           key: "chat",  icon: SICN.bolt,    c: "#16A34A", bg: "#DCFCE7" },
-  { role: "Speech-to-text", key: "asr",   icon: SICN.ear,     c: "#2563EB", bg: "#DBEAFE" },
-  { role: "Text-to-speech", key: "tts",   icon: SICN.speaker, c: "#DB2777", bg: "#FCE7F3" },
-];
-
-// ─── Mock fallback (used offline so screen still renders) ─────
-const MOCK_ROLES: ModelActiveRoles = {
-  chat:      null,
-  tool:      null,
-  asr:       null,
-  tts:       null,
-  embedding: null,
+const ROLE_ICON: Record<RoleKey, LucideIcon> = {
+  chat: MessageSquare,
+  asr: Ear,
+  tts: Volume2,
+  embedding: Brain,
 };
 
-const NON_LLM_PROVIDERS = new Set(["whisper", "tts", "tts_piper", "tts_kokoro", "tts_http", "embedding"]);
+// ─── One installed model ─────────────────────────────────────
 
-function isLlmModel(m: ModelEntry): boolean {
-  return !NON_LLM_PROVIDERS.has(m.provider) && m.category !== "embedding";
+function HubRow({
+  model, inUse, raised, actions, memory, transfer,
+}: {
+  model: ModelEntry;
+  inUse: boolean;
+  raised: boolean;
+  actions: ReturnType<typeof useModelActions>;
+  memory: ReturnType<typeof useModels>["memory"];
+  transfer: ReturnType<ReturnType<typeof useModels>["transferFor"]>;
+}) {
+  const title = modelLabel(model);
+  const full = modelFullName(model);
+  const chip = sourceChip(model);
+  const facts = modelFacts(model);
+  const addOn = addOnOf(model);
+  const measured = measuredOf(model.recommended);
+  const fit = fitReading(model, memory, { inUse });
+  const role = rolesFor(model)[0];
+
+  return (
+    <div className="hm-row" data-inuse={inUse ? "true" : undefined} data-raised={raised ? "true" : undefined}>
+      <div className="hm-row__text">
+        <span className="hm-row__name">
+          <span className="hm-row__title">{title}</span>
+          {chip && <SourceChip chip={chip} />}
+        </span>
+        {facts.length > 0 && <span className="hm-row__facts">{facts.join(" · ")}</span>}
+        {model.recommended && <span className="hm-row__why">{model.recommended.reason}</span>}
+        {measured && <span className="hm-row__facts">{measured.text}</span>}
+        {addOn.kind !== "none" && (
+          <AddOnLine
+            addOn={addOn}
+            busy={actions.busy}
+            onAdd={addOn.kind === "add" ? () => void actions.addPictures(model) : undefined}
+          />
+        )}
+      </div>
+
+      {transfer ? (
+        <div className="hm-row__xfer">
+          <TransferView
+            transfer={transfer}
+            title={full}
+            busy={actions.busy}
+            onControl={(action) => void actions.control(model, transfer, action)}
+          />
+        </div>
+      ) : (
+        <div className="hm-row__end">
+          {inUse ? (
+            <FitCell fit={fit} />
+          ) : (
+            <>
+              <FitCell fit={fit} quiet />
+              {role && (
+                <button
+                  type="button"
+                  className="mm-btn"
+                  disabled={actions.busy}
+                  onClick={() => void actions.useFor(model, role)}
+                  aria-label={`Use ${full} for ${ROLES.find((r) => r.key === role)?.label.toLowerCase()}`}
+                >
+                  Use
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
-function isAsrModel(m: ModelEntry): boolean {
-  return m.provider === "whisper" || m.category === "asr";
-}
-
-function isTtsModel(m: ModelEntry): boolean {
-  return m.provider === "tts" || m.provider === "tts_piper" || m.provider === "tts_kokoro" || m.provider === "tts_http" || m.category === "tts";
-}
-
-// ─── Skeleton row ─────────────────────────────────────────────
 function SkeletonRow() {
   return (
-    <div className="mrow" style={{ opacity: 0.5 }}>
-      <span className="mrow__icon" style={{ background: "#f1f5f9", borderRadius: 6, width: 28, height: 28 }} />
-      <div className="mrow__text" style={{ gap: 4 }}>
-        <span style={{ display: "block", height: 12, width: 160, background: "#e2e8f0", borderRadius: 4 }} />
-        <span style={{ display: "block", height: 10, width: 100, background: "#f1f5f9", borderRadius: 4 }} />
+    <div className="hm-row hm-row--skeleton" aria-hidden="true">
+      <div className="hm-row__text">
+        <span className="hm-skel hm-skel--wide" />
+        <span className="hm-skel" />
       </div>
     </div>
   );
 }
 
-// ─── Component ───────────────────────────────────────────────
+// ─── The screen ──────────────────────────────────────────────
+
 interface ModelsDetailProps {
   go: (route: string) => void;
 }
 
 export function ModelsDetail({ go }: ModelsDetailProps) {
-  const [models, setModels] = useState<ModelEntry[]>([]);
-  const [activeRoles, setActiveRoles] = useState<ModelActiveRoles>(MOCK_ROLES);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [activating, setActivating] = useState<string | null>(null);
+  const data = useModels();
+  const { models, roles, memory, loading, error, transferFor } = data;
   const [flash, setFlash] = useState<{ text: string; ok: boolean } | null>(null);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Live picture-support state, for the active chat row only; others show the static tag.
-  const { status: visionStatus } = useVisionStatus();
 
-  // Speed card state, commented out while llama.cpp lacks speculative decoding; restore together.
-  // // Settings, loaded SEPARATELY from the model list above (Voice.tsx's
-  // // guard): a settings failure must not blank the whole page into the
-  // // offline view, and a settings success must not wait on — or block — the
-  // // model scan.
-  // const [settings, setSettings] = useState<Settings | null>(null);
-  // const [settingsLoaded, setSettingsLoaded] = useState(false);
-  // const [draftAheadPending, setDraftAheadPending] = useState(false);
-
-  function showFlash(text: string, ok = true) {
+  const say = useCallback((text: string, ok = true) => {
     if (flashTimer.current) clearTimeout(flashTimer.current);
     setFlash({ text, ok });
-    flashTimer.current = setTimeout(() => setFlash(null), 3000);
-  }
-
-  const loadData = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [fetchedModels, fetchedRoles] = await Promise.all([
-        api.listModels(),
-        api.getActiveRoles(),
-      ]);
-      setModels(fetchedModels);
-      setActiveRoles(fetchedRoles);
-    } catch (e) {
-      console.warn("[ModelsDetail] API offline — using mock fallback:", e);
-      setError("Could not reach the server. Showing offline view.");
-    } finally {
-      setLoading(false);
-    }
+    flashTimer.current = setTimeout(() => setFlash(null), ok ? 4500 : 7000);
   }, []);
+  useEffect(() => () => { if (flashTimer.current) clearTimeout(flashTimer.current); }, []);
 
-  // const loadSettings = useCallback(async () => {
-  //   try {
-  //     const s = await api.getSettings();
-  //     if (s && typeof s === "object") {
-  //       setSettings(s);
-  //       setSettingsLoaded(true);
-  //     } else {
-  //       throw new Error("settings response was empty");
-  //     }
-  //   } catch (e) {
-  //     console.warn("[ModelsDetail] could not load settings:", e);
-  //     setSettingsLoaded(false);
-  //   }
-  // }, []);
+  const actions = useModelActions(data, say);
 
-  useEffect(() => {
-    loadData();
-    // loadSettings();
-    return () => {
-      if (flashTimer.current) clearTimeout(flashTimer.current);
-    };
-  }, [loadData /* , loadSettings */]);
+  const onDisk = useMemo(() => downloadedOnly(models), [models]);
+  const groups = useMemo(() => groupByJob(onDisk), [onDisk]);
+  const conversation = useMemo(
+    () => groups.find((g) => g.key === "chat")?.models ?? [],
+    [groups],
+  );
+  const listening = useMemo(() => groups.find((g) => g.key === "asr")?.models ?? [], [groups]);
+  const picks = useMemo(() => recommendedPicks(models), [models]);
+  // Picks already here are listed with the models on the device, which say why they are picks.
+  const toGet = useMemo(() => picks.filter((m) => !m.downloaded), [picks]);
+  const comingDown = useCallback((m: ModelEntry) => transferFor(m) !== null, [transferFor]);
 
-  // // Defaults ON, so an absent key (a settings row saved before this field
-  // // existed) reads as ON — `!== false`, not `?? false`.
-  // const draftAhead = settings?.speculative_decoding_enabled !== false;
-  //
-  // async function handleDraftAheadChange(on: boolean) {
-  //   if (draftAheadPending || !settings) return;
-  //   setDraftAheadPending(true);
-  //   const previous = settings.speculative_decoding_enabled;
-  //   setSettings((prev) => (prev ? { ...prev, speculative_decoding_enabled: on } : prev));
-  //   try {
-  //     // Patch only the changed key — the key SET is what marks user intent,
-  //     // and the server echo is deliberately NOT adopted below (it can be
-  //     // stale against a fast second click).
-  //     await api.updateSettings({ speculative_decoding_enabled: on });
-  //     showFlash(
-  //       on
-  //         ? "Guessing ahead is on. The model is reloading, so the next reply waits for it."
-  //         : "Guessing ahead is off. The model is reloading, so the next reply waits for it.",
-  //     );
-  //   } catch (e) {
-  //     setSettings((prev) =>
-  //       prev ? { ...prev, speculative_decoding_enabled: previous } : prev,
-  //     );
-  //     const reason = e instanceof Error ? e.message : String(e);
-  //     showFlash(
-  //       `Could not turn guessing ahead ${on ? "on" : "off"}: ${reason}. It is still ${on ? "off" : "on"}; try again.`,
-  //       false,
-  //     );
-  //   } finally {
-  //     setDraftAheadPending(false);
-  //   }
-  // }
+  const asking = askingPick(picks.filter((m) => !m.downloaded), roles, comingDown);
+  const inUseNow = conversation.find((m) => isInUse(m, roles)) ?? null;
+  const raisedInstalled = inUseNow;
+  const raisedCard = inUseNow ? null : raisedPick(toGet, roles);
 
-  async function handleActivate(provider: string, name: string, role: string) {
-    const key = `${provider}/${name}/${role}`;
-    setActivating(key);
-    try {
-      await api.activateModel(provider, name, role);
-      const freshRoles = await api.getActiveRoles();
-      setActiveRoles(freshRoles);
-      showFlash(`${name} set as ${role} model.`);
-    } catch (e) {
-      showFlash(`Failed to activate ${name}: ${String(e)}`, false);
-    } finally {
-      setActivating(null);
-    }
-  }
+  const budget = budgetReading(memory);
+  const subtitle =
+    budget.text === "—"
+      ? "Everything runs on this pond."
+      : `Everything runs on this pond. Room for one model: ${budget.text}.`;
+  const voice = holderEntry(models, roles, "tts");
 
-  // ── Derived lists ──────────────────────────────────────────
-  const llmModels = models.filter(isLlmModel);
-  const asrModels = models.filter(isAsrModel);
-  const ttsModels = models.filter(isTtsModel);
-
-  // ── Role tile model label helper ───────────────────────────
-  function roleModel(tile: RoleTile): string {
-    const assignment = activeRoles[tile.key];
-    if (!assignment || !("model" in assignment) || !assignment.model) return "—";
-    return assignment.model;
-  }
-
-  // ── Chat role active check ─────────────────────────────────
-  // The role carries the stored provider ("local" for a GGUF or LiteRT-LM model), the row its
-  // category, so both go through `providerOf`: compared as they were, no local model was Loaded.
-  function isChatActive(m: ModelEntry): boolean {
-    const a = activeRoles.chat;
-    if (!a) return false;
-    return providerOf(a.provider) === providerOf(m.provider) && a.model === m.name;
-  }
-
-  function isAsrActive(m: ModelEntry): boolean {
-    const a = activeRoles.asr;
-    if (!a) return false;
-    return a.provider === m.provider && a.model === m.name;
-  }
-
-  function isTtsActive(m: ModelEntry): boolean {
-    const a = activeRoles.tts;
-    if (!a) return false;
-    return a.provider === m.provider && a.model === m.name;
-  }
+  const rowFor = (m: ModelEntry) => (
+    <HubRow
+      key={m.id}
+      model={m}
+      inUse={isInUse(m, roles)}
+      raised={raisedInstalled?.id === m.id}
+      actions={actions}
+      memory={memory}
+      transfer={transferFor(m)}
+    />
+  );
 
   return (
     <DetailShell
       title="Models"
-      subtitle="Local language & speech models powering Goose. Everything runs on-device."
-      accent="#7C3AED"
+      subtitle={subtitle}
       onBack={() => go("settings")}
       headRight={
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <button
-            className="mrow__btn"
-            type="button"
-            onClick={() => { loadData(); /* loadSettings(); */ }}
-            aria-label="Refresh models"
-            style={{ minWidth: 32, display: "flex", alignItems: "center", justifyContent: "center" }}
-          >
-            <RefreshCw size={13} strokeWidth={2} style={{ opacity: loading ? 0.4 : 1 }} />
-          </button>
-          {/* TODO Phase 8 wave 2: open download modal — api.downloadModel(category, name) */}
-          <button className="primary-btn" type="button" disabled title="Model download browser coming in Phase 8 wave 2">
-            <Download size={15} color="#fff" strokeWidth={2.2} /> Download
-          </button>
-        </div>
+        <button
+          className="hm-iconbtn"
+          type="button"
+          onClick={() => void data.reload()}
+          aria-label="Refresh models"
+        >
+          <RefreshCw size={18} strokeWidth={2} className={loading ? "hm-dim" : undefined} aria-hidden="true" />
+        </button>
       }
     >
-      {/* Flash feedback */}
       {flash && (
-        <div
-          style={{
-            padding: "8px 12px",
-            borderRadius: 6,
-            fontSize: 13,
-            background: flash.ok ? "#f0fdf4" : "#fef2f2",
-            color: flash.ok ? "#16a34a" : "#dc2626",
-            border: `1px solid ${flash.ok ? "#bbf7d0" : "#fecaca"}`,
-          }}
-          role="status"
-          aria-live="polite"
-        >
+        <div className={flash.ok ? "hm-flash" : "hm-flash hm-flash--bad"} role="status" aria-live="polite">
           {flash.text}
         </div>
       )}
 
-      {/* Offline error banner */}
       {error && (
-        <div
-          style={{
-            padding: "8px 12px",
-            borderRadius: 6,
-            fontSize: 13,
-            background: "#fffbeb",
-            color: "#92400e",
-            border: "1px solid #fde68a",
-          }}
-        >
-          {error}
+        <div className="hm-flash hm-flash--bad" role="alert">
+          Could not reach the server: {error}
         </div>
       )}
 
-      {/* Active roles */}
-      <Card title="Active roles">
-        <div className="roles-grid">
-          {ROLE_TILES.map((r) => (
-            <div key={r.role} className="role2">
-              <span className="role2__icon" style={{ background: r.bg }}>
-                <HubIco d={r.icon} size={16} color={r.c} />
+      <div className="hm-tiles" role="list" aria-label="Which model does each job">
+        {ROLES.map((role) => {
+          const Icon = ROLE_ICON[role.key];
+          const entry = holderEntry(models, roles, role.key);
+          const name = roleHolder(roles, role.key);
+          const engine = entry ? engineOf(entry) : null;
+          const empty = emptyJobText(roles, role.key);
+          return (
+            <div key={role.key} className="hm-tile" role="listitem" data-empty={name || empty ? undefined : "true"}>
+              <span className="hm-tile__icon"><Icon size={18} aria-hidden="true" /></span>
+              <span className="hm-tile__job">{role.label}</span>
+              <span className="hm-tile__holder">
+                {loading ? (
+                  <span className="hm-skel" />
+                ) : name ? (
+                  entry ? modelLabel(entry) : name
+                ) : (
+                  empty ?? "Nothing chosen yet"
+                )}
               </span>
-              <div className="role2__text">
-                <span className="role2__role">{r.role}</span>
-                <span className="role2__model">
-                  {loading ? (
-                    <span style={{ display: "inline-block", height: 10, width: 80, background: "#e2e8f0", borderRadius: 4, verticalAlign: "middle" }} />
-                  ) : (
-                    roleModel(r)
-                  )}
-                </span>
-              </div>
+              {!loading && engine && (
+                <EngineMark engine={engine} label={engine.label} format={engine.file_format} />
+              )}
             </div>
-          ))}
-        </div>
-        {/* TODO Phase 8 wave 2: clicking a role tile navigates to the relevant model list */}
-      </Card>
+          );
+        })}
+      </div>
 
-      {/* Language models */}
-      <Card title="Language models">
-        <div className="mlist">
-          {loading ? (
-            <>
-              <SkeletonRow />
-              <SkeletonRow />
-              <SkeletonRow />
-            </>
-          ) : llmModels.length === 0 ? (
-            <p style={{ margin: 0, fontSize: 13, color: "var(--color-text-tertiary)", padding: "8px 0" }}>
-              No language models found. Download one to get started.
-            </p>
-          ) : (
-            llmModels.map((m) => {
-              const active = isChatActive(m);
-              const activateKey = `${m.provider}/${m.name}/chat`;
-              const isActivating = activating === activateKey;
-              const tags: string[] = [];
-              if (m.recommended_role === "chat" || (!m.recommended_role && isLlmModel(m))) tags.push("chat");
-              if (/gemma.?4|qwen3|qwq|deepseek.?r1/.test(m.name.toLowerCase())) tags.push("think");
-              if (m.reads_images === true) tags.push("pictures");
-              // The encoder's lifecycle only applies to the model in use.
-              const liveVision = active && visionStatus?.message ? visionStatus.message : null;
-
+      {toGet.length > 0 && (
+        <Card title="Recommended for this pond">
+          <div className="hm-picks">
+            {toGet.map((m) => {
+              const transfer = transferFor(m);
               return (
-                <div key={m.id} className={`mrow${active ? " mrow--active" : ""}`}>
-                  <span className="mrow__icon">
-                    <HubIco d={SICN.cpu} size={16} color={active ? "#7C3AED" : "var(--color-text-tertiary)"} />
-                  </span>
-                  <div className="mrow__text">
-                    <span className="mrow__name">{m.display_name ?? (m.provider === "tts_kokoro" ? voiceTitle(m.name) : m.name)}</span>
-                    <span className="mrow__file">
-                      {m.provider} / {m.name}
-                      {m.size_mb != null ? ` · ${(m.size_mb / 1024).toFixed(1)} GB` : ""}
-                      {m.ram_estimate_mb != null ? ` · ${m.ram_estimate_mb} MB RAM` : ""}
-                      {liveVision ? ` · ${liveVision}` : ""}
-                    </span>
-                  </div>
-                  <div className="mrow__tags">
-                    {tags.map((t) =>
-                      t === "pictures" ? (
-                        <span key={t} className="mtag">
-                          <Image size={11} aria-hidden="true" /> pictures
-                        </span>
-                      ) : (
-                        <span key={t} className="mtag">{t}</span>
-                      ),
-                    )}
-                  </div>
-                  {active ? (
-                    <span className="mrow__loaded">
-                      <Check size={12} color="#16A34A" strokeWidth={3} /> Loaded
-                    </span>
-                  ) : m.downloaded === false ? (
-                    // The server accepts any catalogued model, so a file not on disk would only
-                    // fail at the next turn; the classic Models page downloads it.
-                    <button
-                      className="mrow__btn"
-                      type="button"
-                      disabled
-                      aria-label={`${m.name} is not downloaded`}
-                    >
-                      Not downloaded
-                    </button>
-                  ) : (
-                    <button
-                      className="mrow__btn"
-                      type="button"
-                      disabled={isActivating}
-                      onClick={() => handleActivate(m.provider, m.name, "chat")}
-                      aria-label={`Load ${m.name} as chat model`}
-                    >
-                      {isActivating ? <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} /> : "Load"}
-                    </button>
-                  )}
-                </div>
+                <PickCard
+                  key={m.id}
+                  model={m}
+                  memory={memory}
+                  inUse={false}
+                  raised={raisedCard?.id === m.id}
+                  asking={asking?.id === m.id}
+                  transfer={transfer}
+                  withPictures={actions.withPictures(m)}
+                  busy={actions.busy}
+                  onWithPictures={(next) => actions.setWithPictures(m, next)}
+                  onUse={() => void actions.useFor(m, "chat")}
+                  onDownload={() => void actions.download(m)}
+                  onControl={(action) => transfer && void actions.control(m, transfer, action)}
+                />
               );
-            })
-          )}
-        </div>
-      </Card>
+            })}
+          </div>
+        </Card>
+      )}
 
-      {/* Speculative decoding was taken out of the llama.cpp engine on 2026-09-24 (goose
-          743649d98), so this card is commented out rather than deleted; restore it with the
-          setting.
-      Speed: the one knob this page owned. Between the language
-          models it applies to and Speech, so it reads as "how the model
-          above answers" rather than a stray setting.
-      <Card title="Speed">
-        {settingsLoaded ? (
-          <Row
-            label="Guess ahead with a helper model"
-            sub="Answers stay the same; only the speed changes. Faster on a Jetson, can be slower on a Mac. Only Gemma 4 E2B and E4B have a helper."
-            control={
-              // `key` on purpose — see Voice.tsx's thinking-tone toggle: the
-              // hub Toggle seeds its own state from `on` via useState and
-              // never re-reads the prop, and settings arrive a render after
-              // mount. Without the remount key a stored `false` draws ON.
-              <Toggle
-                key={`draft-ahead-${draftAhead}`}
-                on={draftAhead}
-                onChange={handleDraftAheadChange}
-                label="Guess ahead with a helper model"
-              />
-            }
-          />
+      <Card title="Conversation">
+        {loading ? (
+          <>
+            <SkeletonRow />
+            <SkeletonRow />
+          </>
+        ) : conversation.length === 0 ? (
+          <p className="hm-empty">
+            Nothing is on this device to talk with yet.
+            {toGet.length > 0 ? " Download one of the picks above." : ""}
+          </p>
         ) : (
-          <Row
-            label="Guess ahead with a helper model"
-            sub="Could not read this setting. Use Refresh above to try again."
-          />
+          groupByEngine(sortModels(conversation)).map((section) => (
+            <div key={section.key} className="hm-engine">
+              <div className="hm-engine__head">
+                <EngineMark engine={{ id: section.key }} label={section.label} format={section.format} />
+                <p className="hm-engine__blurb">{section.blurb}</p>
+              </div>
+              {section.models.map(rowFor)}
+            </div>
+          ))
         )}
       </Card>
-      */}
 
-      {/* Speech models */}
       <Card title="Speech">
-        <div className="mlist">
-          {loading ? (
-            <>
-              <SkeletonRow />
-              <SkeletonRow />
-            </>
-          ) : asrModels.length === 0 && ttsModels.length === 0 ? (
-            <p style={{ margin: 0, fontSize: 13, color: "var(--color-text-tertiary)", padding: "8px 0" }}>
-              No speech models found.
-            </p>
-          ) : (
-            <>
-              {asrModels.map((m) => {
-                const active = isAsrActive(m);
-                const activateKey = `${m.provider}/${m.name}/asr`;
-                const isActivating = activating === activateKey;
-                return (
-                  <div key={m.id} className={`mrow${active ? " mrow--active" : ""}`}>
-                    <span className="mrow__icon">
-                      <HubIco d={SICN.ear} size={16} color={active ? "#7C3AED" : "var(--color-text-tertiary)"} />
-                    </span>
-                    <div className="mrow__text">
-                      <span className="mrow__name">{m.display_name ?? (m.provider === "tts_kokoro" ? voiceTitle(m.name) : m.name)}</span>
-                      <span className="mrow__file">
-                        Speech-to-text · {m.provider} / {m.name}
-                      </span>
-                    </div>
-                    {active ? (
-                      <span className="mrow__loaded">
-                        <Check size={12} color="#16A34A" strokeWidth={3} /> Active
-                      </span>
-                    ) : (
-                      <button
-                        className="mrow__btn"
-                        type="button"
-                        disabled={isActivating}
-                        onClick={() => handleActivate(m.category ?? m.provider, m.name, "asr")}
-                        aria-label={`Use ${m.name} as speech-to-text model`}
-                      >
-                        {isActivating ? <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} /> : "Use"}
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-
-              {ttsModels.map((m) => {
-                const active = isTtsActive(m);
-                const activateKey = `${m.provider}/${m.name}/tts`;
-                const isActivating = activating === activateKey;
-                return (
-                  <div key={m.id} className={`mrow${active ? " mrow--active" : ""}`}>
-                    <span className="mrow__icon">
-                      <HubIco d={SICN.speaker} size={16} color={active ? "#7C3AED" : "var(--color-text-tertiary)"} />
-                    </span>
-                    <div className="mrow__text">
-                      <span className="mrow__name">{m.display_name ?? (m.provider === "tts_kokoro" ? voiceTitle(m.name) : m.name)}</span>
-                      <span className="mrow__file">
-                        Text-to-speech · {m.provider} / {m.name}
-                      </span>
-                    </div>
-                    {active ? (
-                      <span className="mrow__loaded">
-                        <Check size={12} color="#16A34A" strokeWidth={3} /> Active
-                      </span>
-                    ) : (
-                      <button
-                        className="mrow__btn"
-                        type="button"
-                        disabled={isActivating}
-                        onClick={() => handleActivate(m.category ?? m.provider, m.name, "tts")}
-                        aria-label={`Use ${m.name} as text-to-speech voice`}
-                      >
-                        {isActivating ? <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} /> : "Use"}
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-            </>
-          )}
-        </div>
+        {loading ? (
+          <SkeletonRow />
+        ) : (
+          <>
+            {listening.length === 0 ? (
+              <p className="hm-empty">
+                No listening model is on this device yet. Add one from the Models page on a computer.
+              </p>
+            ) : (
+              listening.map(rowFor)
+            )}
+            <div className="hm-row hm-voice">
+              <div className="hm-row__text">
+                <span className="hm-row__name">
+                  <span className="hm-row__title">Voice</span>
+                </span>
+                <span className="hm-row__facts">
+                  {voice ? modelLabel(voice) : "Not chosen yet"}
+                </span>
+              </div>
+              <div className="hm-row__end">
+                <button type="button" className="mm-btn" onClick={() => go("voice")}>
+                  Choose a voice
+                </button>
+              </div>
+            </div>
+          </>
+        )}
       </Card>
     </DetailShell>
   );
 }
+

@@ -71,8 +71,7 @@ export const SETTINGS: SettingsGroup[] = [
         color: "#7C3AED",
         bg: "#EDE9FE",
         label: "Models",
-        sub: "Local LLMs for chat, think, task",
-        value: "gemma-4-E4B",
+        sub: "What answers, listens, speaks and remembers",
       },
       {
         id: "prompts",
