@@ -8,8 +8,9 @@ use super::model_record::{ModelCategory, ModelRecord};
 /// The description a scanned file gets when its header names nothing; never a title.
 pub const ON_DISK_PLACEHOLDER: &str = "(detected on disk)";
 
-/// Whether a GGUF is an encoder (`mmproj-*`) or a drafter (`mtp-*`, Gemma 4 `-assistant`).
-/// Offered as a model it would land in `models/gguf`, where every scan takes it for one.
+/// Whether a GGUF is an encoder (`mmproj-*`) or a drafter (`mtp-*`, `dflash-*`, Gemma 4
+/// `-assistant`). Offered as a model it would land in `models/gguf`, where every scan takes it
+/// for one.
 pub fn is_companion_file(file_name: &str) -> bool {
     let base = file_name
         .rsplit('/')
@@ -18,12 +19,14 @@ pub fn is_companion_file(file_name: &str) -> bool {
         .to_ascii_lowercase();
     base.starts_with("mmproj")
         || base.starts_with("mtp-")
+        || base.starts_with("dflash-")
         || ((base.contains("gemma-4") || base.contains("gemma4")) && base.contains("-assistant"))
 }
 
-/// The header's own word for a companion: `clip` is an encoder, `*-assistant` a drafter.
+/// The header's own word for a companion: `clip` is an encoder, `dflash` and `*-assistant` are
+/// drafters.
 pub fn is_companion_architecture(architecture: Option<&str>) -> bool {
-    architecture.is_some_and(|a| a == "clip" || a.ends_with("-assistant"))
+    architecture.is_some_and(|a| a == "clip" || a == "dflash" || a.ends_with("-assistant"))
 }
 
 /// A GGUF architecture that is not a conversation model: a companion, speech or embeddings.
@@ -50,9 +53,11 @@ pub fn is_helper_architecture(architecture: Option<&str>) -> bool {
 
 /// Whether a model's name says it is a helper rather than something to talk to.
 pub fn is_helper_name(name: &str) -> bool {
-    if is_companion_file(name) {
-        return true;
-    }
+    is_companion_file(name) || names_a_non_chat_task(name)
+}
+
+/// Whether a name has a token for speech, embeddings or tool calling; no file-name rule.
+fn names_a_non_chat_task(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -165,7 +170,13 @@ impl ModelKind {
             return Self::Helper;
         }
         let file = record.filename.as_deref().unwrap_or_default();
-        if is_helper_name(&record.name) || is_helper_name(file) {
+        // An Ollama tag names no file: `gemma4-assistant` there is a persona, not a drafter.
+        let helper = if record.category == ModelCategory::Ollama {
+            names_a_non_chat_task
+        } else {
+            is_helper_name
+        };
+        if helper(&record.name) || helper(file) {
             return Self::Helper;
         }
         Self::Conversation
