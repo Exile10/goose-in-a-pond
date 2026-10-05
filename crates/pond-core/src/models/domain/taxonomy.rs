@@ -78,6 +78,20 @@ pub fn title(record: &ModelRecord, pick_title: Option<&str>) -> String {
     record.name.clone()
 }
 
+/// The catalogue name a file goes by: a LiteRT-LM file keeps its whole name (its extension is
+/// how it is told from a GGUF stem); every other file drops its extension.
+pub fn catalogue_name(category: &ModelCategory, filename: &str) -> String {
+    let base = filename.rsplit('/').next().unwrap_or(filename);
+    if *category == ModelCategory::Litert {
+        return base.to_string();
+    }
+    [".gguf", ".llamafile", ".exe", ".onnx", ".bin"]
+        .iter()
+        .find_map(|ext| base.strip_suffix(ext))
+        .unwrap_or(base)
+        .to_string()
+}
+
 /// Where a row came from. Derived in this order: GIAP's own list, Ollama, a download URL, disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -347,6 +361,23 @@ mod tests {
         let mut voice = row(ModelCategory::TtsKokoro, "af_heart");
         voice.description = "American female — Heart".to_string();
         assert_eq!(title(&voice, None), "American female — Heart");
+    }
+
+    #[test]
+    fn a_file_keeps_the_name_the_scan_would_give_it() {
+        assert_eq!(
+            catalogue_name(&ModelCategory::Gguf, "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"),
+            "gemma-4-E4B-it-qat-UD-Q4_K_XL"
+        );
+        assert_eq!(
+            catalogue_name(&ModelCategory::Litert, "gemma-4-E2B-it.litertlm"),
+            "gemma-4-E2B-it.litertlm"
+        );
+        assert_eq!(
+            catalogue_name(&ModelCategory::Llamafile, "a/b/llama.llamafile"),
+            "llama"
+        );
+        assert_eq!(catalogue_name(&ModelCategory::Gguf, "odd-name"), "odd-name");
     }
 
     #[test]

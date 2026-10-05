@@ -102,6 +102,7 @@ type Tracker = Arc<tokio::sync::RwLock<std::collections::HashMap<String, Downloa
 /// Everything a test may need to reach behind the router.
 struct Fixture {
     app: axum::Router,
+    state: Arc<AppState>,
     repo: Arc<dyn ModelRepository + Send + Sync>,
     settings: Arc<dyn SettingsRepository + Send + Sync>,
     tracker: Tracker,
@@ -215,7 +216,8 @@ async fn pond_with(agent: Arc<dyn pond_core::models::ports::agent::Agent>) -> Fi
     });
 
     Fixture {
-        app: build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
+        app: build_router(state.clone(), std::path::PathBuf::from("pond-desktop/dist")),
+        state,
         repo: model_repo,
         settings: settings_repo,
         tracker,
@@ -661,16 +663,9 @@ async fn a_litert_file_on_disk_is_listed_under_litert() {
 // ── The disk scan keeps `downloaded` true to the disk ─────────────────────────
 
 fn tracked(filename: &str, status: &str) -> DownloadEntry {
-    DownloadEntry {
-        filename: filename.to_string(),
-        category: "gguf".to_string(),
-        downloaded_bytes: 0,
-        total_bytes: None,
-        status: status.to_string(),
-        finished_at: None,
-        control: Arc::new(std::sync::atomic::AtomicU8::new(pond_api::DL_RUN)),
-        url: None,
-    }
+    let mut entry = DownloadEntry::starting(filename, "gguf");
+    entry.status = status.to_string();
+    entry
 }
 
 #[tokio::test]
@@ -713,5 +708,383 @@ async fn a_scan_corrects_stale_flags_but_not_a_file_mid_download() {
     assert!(
         flag("gguf/coming-down").await,
         "a file with a live download is left to the download"
+    );
+}
+
+// ── One pipeline acquires a model with its add-ons ────────────────────────────
+
+/// Polls until `check` holds; a test that never gets there fails loudly after two seconds.
+async fn eventually<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..100 {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+async fn weights_server(file: &str) -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!("/{file}")))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"GGUF weights".to_vec()))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn post_json(
+    app: &axum::Router,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(auth_req("POST", uri, body))
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+#[tokio::test]
+async fn a_text_only_model_downloads_as_one_tracked_part_and_is_marked_downloaded() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let server = weights_server("my-model.gguf").await;
+    let mut row = gguf_record("my-model");
+    row.downloaded = false;
+    row.url = Some(format!("{}/my-model.gguf", server.uri()));
+    f.repo.upsert(&row).await.unwrap();
+
+    let (status, body) = post_json(&f.app, "/api/v1/models/gguf/my-model/download", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "download_started");
+    assert_eq!(body["pictures"], "text_only");
+    assert_eq!(body["parts"][0]["part"], "model");
+    assert_eq!(body["parts"].as_array().map(Vec::len), Some(1));
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("Downloading my-model"));
+
+    let repo = f.repo.clone();
+    eventually("the row to read downloaded", || {
+        let repo = repo.clone();
+        async move {
+            repo.get_by_id("gguf/my-model")
+                .await
+                .unwrap()
+                .is_some_and(|m| m.downloaded)
+        }
+    })
+    .await;
+    assert!(f.tmp.path().join("models/gguf/my-model.gguf").exists());
+    let tracker = f.tracker.read().await;
+    let entry = tracker.get("my-model.gguf").expect("a tracker entry");
+    assert_eq!(entry.status, "done");
+    assert_eq!(entry.model_id.as_deref(), Some("gguf/my-model"));
+    assert_eq!(entry.part.as_deref(), Some("model"));
+}
+
+/// The add-on is part of the download by default; unticked, only the model comes down.
+#[tokio::test]
+async fn leaving_pictures_out_fetches_only_the_model() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let name = "gemma-4-E2B-it-Q4_K_M";
+    let server = weights_server(&format!("{name}.gguf")).await;
+    let mut row = gguf_record(name);
+    row.downloaded = false;
+    row.url = Some(format!("{}/{name}.gguf", server.uri()));
+    f.repo.upsert(&row).await.unwrap();
+
+    let (status, body) = post_json(
+        &f.app,
+        &format!("/api/v1/models/gguf/{name}/download"),
+        Some(serde_json::json!({"pictures": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let parts = body["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["part"], "model");
+    if !pond_core::models::domain::device_budget::budgeted_device() {
+        assert_eq!(body["pictures"], "left_out");
+    }
+    let tracker = f.tracker.clone();
+    eventually("the model part to finish", || {
+        let tracker = tracker.clone();
+        async move {
+            tracker
+                .read()
+                .await
+                .get(&format!("{name}.gguf"))
+                .is_some_and(|e| e.status == "done")
+        }
+    })
+    .await;
+    assert_eq!(
+        f.tracker.read().await.len(),
+        1,
+        "no picture part was registered"
+    );
+}
+
+#[tokio::test]
+async fn an_ollama_model_is_never_downloaded_by_the_pond() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let mut row = gguf_record("llama3.2:latest");
+    row.id = ModelRecord::id_for(&ModelCategory::Ollama, "llama3.2:latest");
+    row.category = ModelCategory::Ollama;
+    row.filename = None;
+    row.url = None;
+    row.downloaded = false;
+    f.repo.upsert(&row).await.unwrap();
+    let (status, body) = post_json(
+        &f.app,
+        "/api/v1/models/ollama/llama3.2:latest/download",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "external");
+}
+
+/// A file named by URL becomes an Added row under its sanitised name, and a failure says why.
+#[tokio::test]
+async fn a_url_download_becomes_an_added_row_and_a_failure_keeps_its_reason() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let (status, body) = post_json(
+        &f.app,
+        "/api/v1/models/download/url",
+        Some(serde_json::json!({
+            "url": "https://127.0.0.1:9/nowhere.gguf",
+            "category": "gguf",
+            "filename": "../../escaped.gguf",
+            "pictures": false,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["status"], "downloading");
+    assert_eq!(body["filename"], "escaped.gguf");
+
+    let row = f.repo.get_by_id("gguf/escaped").await.unwrap().unwrap();
+    assert_eq!(row.filename.as_deref(), Some("escaped.gguf"));
+    assert_eq!(row.url.as_deref(), Some("https://127.0.0.1:9/nowhere.gguf"));
+    assert!(row.is_custom && !row.downloaded);
+
+    let tracker = f.tracker.clone();
+    eventually("the transfer to fail", || {
+        let tracker = tracker.clone();
+        async move {
+            tracker
+                .read()
+                .await
+                .get("escaped.gguf")
+                .is_some_and(|e| e.status == "error" && e.error.is_some())
+        }
+    })
+    .await;
+    assert!(!f.tmp.path().join("escaped.gguf").exists());
+    assert!(!f.tmp.path().join("models/gguf/escaped.gguf.part").exists());
+}
+
+#[tokio::test]
+async fn pause_cancel_and_resume_keep_their_own_statuses() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let control =
+        |filename: &str, action: &str| serde_json::json!({"filename": filename, "action": action});
+
+    f.tracker
+        .write()
+        .await
+        .insert("live.gguf".into(), tracked("live.gguf", "downloading"));
+    let (status, body) = post_json(
+        &f.app,
+        "/api/v1/models/download/control",
+        Some(control("live.gguf", "pause")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "pausing");
+    assert_eq!(
+        f.tracker.read().await["live.gguf"]
+            .control
+            .load(std::sync::atomic::Ordering::Relaxed),
+        pond_api::DL_PAUSE
+    );
+
+    // A paused transfer has no task to see a flag: the route itself throws the partial away.
+    let partial = f.tmp.path().join("waiting.gguf.incomplete");
+    std::fs::write(&partial, b"half").unwrap();
+    let mut paused = tracked("waiting.gguf", "paused");
+    paused.partial = Some(partial.clone());
+    f.tracker
+        .write()
+        .await
+        .insert("waiting.gguf".into(), paused);
+    let (status, body) = post_json(
+        &f.app,
+        "/api/v1/models/download/control",
+        Some(control("waiting.gguf", "cancel")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "cancelled");
+    assert!(!partial.exists(), "cancel deletes the partial file");
+    assert_eq!(f.tracker.read().await["waiting.gguf"].status, "cancelled");
+
+    // Resuming needs the recorded source.
+    f.tracker.write().await.insert(
+        "sourceless.gguf".into(),
+        tracked("sourceless.gguf", "paused"),
+    );
+    let (status, _) = post_json(
+        &f.app,
+        "/api/v1/models/download/control",
+        Some(control("sourceless.gguf", "resume")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_paused_download_is_never_evicted_and_a_finished_one_is() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let long_ago = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap();
+    let mut done = tracked("old.gguf", "done");
+    done.finished_at = Some(long_ago);
+    let mut paused = tracked("paused.gguf", "paused");
+    paused.finished_at = Some(long_ago);
+    f.tracker.write().await.insert("old.gguf".into(), done);
+    f.tracker.write().await.insert("paused.gguf".into(), paused);
+
+    let resp = f
+        .app
+        .clone()
+        .oneshot(auth_req("GET", "/api/v1/models/download/progress", None))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let names: Vec<&str> = body["downloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["filename"].as_str())
+        .collect();
+    assert_eq!(names, ["paused.gguf"]);
+}
+
+/// A live add-on part reads as downloading on its model's row.
+#[tokio::test]
+async fn the_pictures_companion_reads_downloading_while_its_part_is_fetched() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let name = "gemma-4-E2B-it-Q4_K_M";
+    f.repo.upsert(&gguf_record(name)).await.unwrap();
+    let companion = |list: &serde_json::Value| {
+        list["gguf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name)
+            .map(|m| m["companions"][0].clone())
+            .unwrap()
+    };
+    let list = |app: axum::Router| async move {
+        let resp = app
+            .oneshot(auth_req("GET", "/api/v1/models", None))
+            .await
+            .unwrap();
+        body_json(resp).await
+    };
+
+    let before = companion(&list(f.app.clone()).await);
+    assert_eq!(before["kind"], "pictures");
+    assert_eq!(before["size_bytes"], 986_833_728u64);
+    if pond_core::models::domain::device_budget::budgeted_device() {
+        assert_eq!(before["state"], "not_on_this_device");
+        return;
+    }
+    assert_eq!(before["state"], "available");
+
+    let mut part = tracked("mmproj/gemma-4-e2b-it/mmproj-BF16.gguf", "downloading");
+    part.model_id = Some(format!("gguf/{name}"));
+    part.part = Some("pictures".into());
+    f.tracker.write().await.insert(part.filename.clone(), part);
+    assert_eq!(
+        companion(&list(f.app.clone()).await)["state"],
+        "downloading"
+    );
+}
+
+#[tokio::test]
+async fn the_explicit_pictures_route_refuses_a_litert_model() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    f.repo
+        .upsert(&litert_record("gemma-4-E2B-it.litertlm"))
+        .await
+        .unwrap();
+    let (status, body) = post_json(
+        &f.app,
+        "/api/v1/models/litert/gemma-4-E2B-it.litertlm/companions/pictures",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "text_only");
+}
+
+/// The boot restore brings back only an assigned model whose file is missing, and through the
+/// tracker, so the household sees it coming down.
+#[tokio::test]
+async fn the_boot_restore_fetches_an_assigned_missing_model_through_the_tracker() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let server = weights_server("assigned.gguf").await;
+    let mut assigned = gguf_record("assigned");
+    assigned.downloaded = true;
+    assigned.url = Some(format!("{}/assigned.gguf", server.uri()));
+    f.repo.upsert(&assigned).await.unwrap();
+    f.repo
+        .set_assignment("chat", "gguf/assigned")
+        .await
+        .unwrap();
+
+    let mut unassigned = gguf_record("bystander");
+    unassigned.downloaded = false;
+    unassigned.url = Some(format!("{}/bystander.gguf", server.uri()));
+    f.repo.upsert(&unassigned).await.unwrap();
+
+    let started = pond_api::model_acquisition::restore_assigned_models(f.state.clone()).await;
+    assert_eq!(started, 1);
+    assert!(f.tracker.read().await.contains_key("assigned.gguf"));
+    assert!(
+        !f.tracker.read().await.contains_key("bystander.gguf"),
+        "nothing unassigned is fetched"
+    );
+    let tracker = f.tracker.clone();
+    eventually("the restored model to arrive", || {
+        let tracker = tracker.clone();
+        async move {
+            tracker
+                .read()
+                .await
+                .get("assigned.gguf")
+                .is_some_and(|e| e.status == "done")
+        }
+    })
+    .await;
+    assert!(f.tmp.path().join("models/gguf/assigned.gguf").exists());
+
+    // Once it is there, a second restore has nothing to do.
+    assert_eq!(
+        pond_api::model_acquisition::restore_assigned_models(f.state.clone()).await,
+        0
     );
 }

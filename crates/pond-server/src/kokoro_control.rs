@@ -41,17 +41,8 @@ impl KokoroTtsControl {
                 let mut t = tracker.write().await;
                 let e = t
                     .entry(filename.clone())
-                    .or_insert_with(|| pond_api::DownloadEntry {
-                        filename: filename.clone(),
-                        category: category.clone(),
-                        downloaded_bytes: 0,
-                        total_bytes: None,
-                        status: "downloading".into(),
-                        finished_at: None,
-                        control: Default::default(),
-                        // No URL: resuming re-runs `apply`, which re-derives it.
-                        url: None,
-                    });
+                    // No URL: resuming re-runs `apply`, which re-derives it.
+                    .or_insert_with(|| pond_api::DownloadEntry::starting(&filename, &category));
                 e.downloaded_bytes = downloaded;
                 e.total_bytes = Some(total);
                 if downloaded >= total && total > 0 {

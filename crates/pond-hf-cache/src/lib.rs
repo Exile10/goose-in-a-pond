@@ -43,9 +43,12 @@ pub struct DestNotALink {
     pub path: PathBuf,
 }
 
-/// A download its progress callback stopped; the `.incomplete` file stays resumable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stopped;
+/// A download its progress callback stopped. The `.incomplete` file at `incomplete` stays
+/// resumable; deleting it is a cancel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stopped {
+    pub incomplete: PathBuf,
+}
 
 impl std::fmt::Display for Stopped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -58,6 +61,12 @@ impl std::error::Error for Stopped {}
 /// Whether `err` is a caller-requested stop rather than a transfer failure.
 pub fn is_stopped(err: &anyhow::Error) -> bool {
     err.downcast_ref::<Stopped>().is_some()
+}
+
+/// The partial file a stopped download left, to delete on a cancel.
+pub fn stopped_incomplete(err: &anyhow::Error) -> Option<&Path> {
+    err.downcast_ref::<Stopped>()
+        .map(|s| s.incomplete.as_path())
 }
 
 /// Env vars consulted (in order) for an HF access token.
@@ -632,7 +641,9 @@ impl<'a> HfFetch<'a> {
         let mut downloaded: u64 = if resumed { existing_size } else { 0 };
         if !progress(downloaded, total) {
             file.flush().await.ok();
-            return Err(anyhow!(Stopped));
+            return Err(anyhow::Error::new(Stopped {
+                incomplete: incomplete_path.clone(),
+            }));
         }
 
         loop {
@@ -661,7 +672,9 @@ impl<'a> HfFetch<'a> {
             if !progress(downloaded, total) {
                 // Keep `.incomplete`: the next call resumes from it, so a stop is a pause.
                 file.flush().await.ok();
-                return Err(anyhow!(Stopped));
+                return Err(anyhow::Error::new(Stopped {
+                    incomplete: incomplete_path.clone(),
+                }));
             }
         }
         // A failed flush (full disk) must not reach the rename, or the blob is silently short.

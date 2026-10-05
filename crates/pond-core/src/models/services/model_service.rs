@@ -14,6 +14,46 @@ use crate::models::ports::model_downloader::ModelDownloader;
 use crate::models::ports::model_repository::ModelRepository;
 use crate::models::ports::model_storage::ModelStorage;
 
+/// What a boot restore does: correct the flag of an assigned file that is on disk, and fetch an
+/// assigned model whose file is missing. Only the household's own assignments; nothing else.
+#[derive(Debug, Default)]
+pub struct RestorePlan {
+    pub mark_downloaded: Vec<String>,
+    pub fetch: Vec<ModelRecord>,
+}
+
+/// The restore for `assignments`. `present` says whether a row's file is on disk, `None` for a
+/// row with no file of its own (Ollama, HTTP voices, self-fetching embeddings).
+pub fn restore_plan(
+    assignments: &[ModelRoleAssignment],
+    records: &[ModelRecord],
+    present: impl Fn(&ModelRecord) -> Option<bool>,
+) -> RestorePlan {
+    let mut plan = RestorePlan::default();
+    let mut seen = std::collections::HashSet::new();
+    for a in assignments {
+        if !seen.insert(a.model_id.as_str()) {
+            continue;
+        }
+        let Some(record) = records.iter().find(|r| r.id == a.model_id) else {
+            continue;
+        };
+        match present(record) {
+            None => {}
+            Some(true) if !record.downloaded => plan.mark_downloaded.push(record.id.clone()),
+            Some(true) => {}
+            Some(false) => {
+                let fetchable = record.url.is_some()
+                    || crate::models::domain::curated::for_record(record).is_some();
+                if fetchable {
+                    plan.fetch.push(record.clone());
+                }
+            }
+        }
+    }
+    plan
+}
+
 pub struct ModelService {
     repo: Arc<dyn ModelRepository>,
     catalog: Arc<dyn ModelCatalogProvider>,
@@ -559,6 +599,67 @@ mod tests {
                 "should not download when file already present"
             );
         }
+    }
+
+    // ── Boot restore ──────────────────────────────────────────────────────
+
+    fn assigned(role: &str, id: &str) -> ModelRoleAssignment {
+        ModelRoleAssignment {
+            role: role.into(),
+            model_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn a_restore_fetches_only_assigned_files_that_are_missing() {
+        let missing = stub_model(
+            "gguf/gone",
+            "gone.gguf",
+            true,
+            Some("https://example.com/g"),
+        );
+        let flagless = stub_model("gguf/here", "here.gguf", false, None);
+        let sourceless = stub_model("gguf/hand", "hand.gguf", false, None);
+        let unassigned = stub_model("gguf/other", "other.gguf", false, Some("https://e/o"));
+        let mut ollama = stub_model("ollama/llama3.2", "", false, None);
+        ollama.filename = None;
+        let records = vec![
+            missing.clone(),
+            flagless.clone(),
+            sourceless,
+            unassigned,
+            ollama,
+        ];
+        let assignments = vec![
+            assigned("chat", "gguf/gone"),
+            assigned("think", "gguf/gone"),
+            assigned("task", "gguf/here"),
+            assigned("tool", "gguf/hand"),
+            assigned("embedding", "ollama/llama3.2"),
+            assigned("asr", "whisper/none"),
+        ];
+        let on_disk = |r: &ModelRecord| match r.filename.as_deref() {
+            None => None,
+            Some("here.gguf") => Some(true),
+            Some(_) => Some(false),
+        };
+        let plan = restore_plan(&assignments, &records, on_disk);
+        assert_eq!(plan.mark_downloaded, vec!["gguf/here".to_string()]);
+        assert_eq!(
+            plan.fetch.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["gguf/gone"],
+            "once each, never an unassigned row or one with no source"
+        );
+    }
+
+    #[test]
+    fn a_pick_restores_from_its_pin_even_without_a_url() {
+        let pick = crate::models::domain::curated::CURATED[0];
+        let mut row = stub_model(&pick.id(), pick.filename, true, None);
+        row.category = pick.category();
+        row.name = pick.name().to_string();
+        let plan = restore_plan(&[assigned("chat", &pick.id())], &[row], |_| Some(false));
+        assert_eq!(plan.fetch.len(), 1);
     }
 
     #[tokio::test]

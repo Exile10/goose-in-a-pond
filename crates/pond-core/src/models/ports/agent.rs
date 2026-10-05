@@ -34,8 +34,8 @@ pub trait Agent: Send + Sync {
         None
     }
 
-    /// Start background prep (e.g. the vision encoder) for a just-downloaded or activated model.
-    /// Must return at once and never fail the caller.
+    /// Register a model whose files just arrived and settle its picture add-on: verify and
+    /// attach what is on disk. Never downloads; must return at once and never fail the caller.
     fn prepare_model(&self, _model: &str) {}
 
     /// Compact this session now, on the user's instruction; returns tokens retained if reported.

@@ -3,6 +3,7 @@
 pub mod cleanup;
 pub(crate) mod image_normalize;
 pub mod middleware;
+pub mod model_acquisition;
 pub(crate) mod model_views;
 pub mod music_choice;
 pub mod musickit;
@@ -364,13 +365,14 @@ pub const DL_CANCEL: u8 = 2;
 /// State of a single in-progress (or recently completed) model download.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DownloadEntry {
+    /// The tracker key, which pause, resume and cancel name.
     pub filename: String,
     pub category: String,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
     /// "downloading" | "paused" | "done" | "error" | "cancelled"
     pub status: String,
-    /// When it reached "done" or "error"; used to evict stale entries.
+    /// When it stopped for good; done, error and cancelled entries are evicted after a while.
     #[serde(skip)]
     pub finished_at: Option<std::time::Instant>,
     /// What this download has been told to do: [`DL_RUN`], [`DL_PAUSE`] or [`DL_CANCEL`].
@@ -380,6 +382,50 @@ pub struct DownloadEntry {
     /// Source URL; re-requesting it resumes a paused download from its `.incomplete` file.
     #[serde(skip)]
     pub url: Option<String>,
+    /// The catalogue row this file belongs to, `"{category}/{name}"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Which part of that model: `"model"` or `"pictures"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
+    /// Where the file lands, so a resume needs no category of its own.
+    #[serde(skip)]
+    pub dest: Option<std::path::PathBuf>,
+    /// A paused transfer's partial file, which a cancel deletes.
+    #[serde(skip)]
+    pub partial: Option<std::path::PathBuf>,
+    /// Why it stopped, for an `error` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl DownloadEntry {
+    /// A transfer about to start.
+    pub fn starting(filename: impl Into<String>, category: impl Into<String>) -> Self {
+        Self {
+            filename: filename.into(),
+            category: category.into(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+            status: "downloading".to_string(),
+            finished_at: None,
+            control: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(DL_RUN)),
+            url: None,
+            model_id: None,
+            part: None,
+            dest: None,
+            partial: None,
+            error: None,
+        }
+    }
+
+    /// Paused entries wait for the household, so only finished ones age out.
+    pub fn expired(&self, now: std::time::Instant, after: std::time::Duration) -> bool {
+        self.status != "paused"
+            && self
+                .finished_at
+                .is_some_and(|t| now.duration_since(t) >= after)
+    }
 }
 
 /// Snapshot of one model's availability, sent over the REST API.

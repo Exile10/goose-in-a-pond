@@ -1,13 +1,15 @@
 //! Vision-encoder (mmproj) resolution: the engine enables images only for a registry entry with
 //! `mmproj_path`, which goose's featured lookup never sets for our bare stems, so we stamp it.
+//! The encoder only arrives when the household asks for it, through the pond's download pipeline;
+//! this module verifies what is on disk and attaches it, and never downloads.
 
 use crate::registry_rows::{self, GooseRegistry, RegistryRows, RowSnapshot};
 use goose::providers::local_inference::local_model_registry::LocalModelEntry;
 use pond_core::models::domain::device_budget::{self, VisionDeclaration};
 use pond_core::models::domain::litert;
 use pond_core::models::domain::vision_encoder::{
-    self as domain, EncoderInvalid, EncoderSidecar, EncoderSpec, EncoderState, FailReason, OnDisk,
-    RetryBackoff, RowChange, RowView, StampDecision,
+    self as domain, EncoderSidecar, EncoderSpec, EncoderState, FailReason, OnDisk, RetryBackoff,
+    RowChange, RowView, StampDecision,
 };
 use pond_core::shared::services::egress;
 use std::collections::{BTreeSet, HashMap};
@@ -16,45 +18,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// `1` disables encoder downloads (scratch ponds); one on disk is still validated and stamped.
-pub const PROVISIONING_OPT_OUT_ENV: &str = "POND_DISABLE_MODEL_PROVISIONING";
-
-/// Where every encoder comes from; its CDN hops classify the same, so one check covers them.
-const HF_HOST: &str = "huggingface.co";
-
-/// Max wait for the boot warm-up before downloading anyway: filling page cache under the cold
-/// GGUF load causes NvMap error 12 / silent CPU fallback on the Orin.
+/// Max wait for the boot warm-up before hashing anyway: filling page cache under the cold GGUF
+/// load causes NvMap error 12 / silent CPU fallback on the Orin.
 const WARMUP_WAIT_CAP: Duration = Duration::from_secs(10 * 60);
 
-/// Network-mode poll while waiting, so opening the mode cuts a backoff step short.
-const MODE_POLL: Duration = Duration::from_secs(5);
-
-/// Publish progress at most once per this many bytes; the callback runs once per chunk.
-const PROGRESS_STEP: u64 = 1024 * 1024;
-
 // ── Paths ───────────────────────────────────────────────────────────────────
-/// The encoder file for `spec`, as spelled on disk: the canonical path is lowercase, but an
-/// existing dir differing only in case is reused so a case-sensitive disk doesn't fetch a twin.
-pub fn encoder_file(data_dir: &Path, spec: &EncoderSpec) -> PathBuf {
-    let canonical = domain::encoder_path(data_dir, spec);
-    if std::fs::symlink_metadata(&canonical).is_ok() {
-        return canonical;
-    }
-    let root = data_dir.join("models").join("mmproj");
-    if let Ok(entries) = std::fs::read_dir(&root) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name != spec.dir && name.eq_ignore_ascii_case(spec.dir) {
-                let candidate = entry.path().join(spec.filename);
-                if std::fs::symlink_metadata(&candidate).is_ok() {
-                    return candidate;
-                }
-            }
-        }
-    }
-    canonical
-}
+pub use domain::encoder_file;
 
 /// The chat model's GGUF, symlinks resolved, so this and `apply_jetson_settings` read one file.
 pub fn chat_gguf_path(data_dir: &Path, chat_model: &str) -> PathBuf {
@@ -148,28 +117,11 @@ struct DirState {
     backoff: RetryBackoff,
 }
 
-/// The fetch path's own refusal: provisioning is opted out, so the file stays absent.
-#[derive(Debug)]
-struct FetchDisabled;
-
-impl std::fmt::Display for FetchDisabled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{PROVISIONING_OPT_OUT_ENV}=1; not downloading picture support"
-        )
-    }
-}
-
-impl std::error::Error for FetchDisabled {}
-
 /// Status map, in-flight set and backoff ladder for every encoder, shared process-wide.
 pub struct PictureSupport {
     rows: Arc<dyn RegistryRows>,
-    /// Set only by the serve process. Everything that hashes, renames or downloads checks it.
+    /// Set only by the serve process. Everything that hashes or renames checks it.
     provisioning: AtomicBool,
-    /// Whether fetching may run once provisioning is on; tests turn it off to run offline.
-    fetch_allowed: AtomicBool,
     dirs: Mutex<HashMap<&'static str, DirState>>,
     /// Held across each stamp decision and its application, so a stale "unverified" read can't
     /// clear a stamp an ensure just wrote.
@@ -193,14 +145,13 @@ impl PictureSupport {
         Self {
             rows,
             provisioning: AtomicBool::new(false),
-            fetch_allowed: AtomicBool::new(true),
             dirs: Mutex::new(HashMap::new()),
             stamp_lock: Mutex::new(()),
             warmup: Arc::new(WarmupGate::default()),
         }
     }
 
-    /// Opt this process in to hashing, quarantining and fetching. The serve process only.
+    /// Opt this process in to hashing and quarantining. The serve process only.
     pub fn enable_provisioning(&self) {
         if !self.provisioning.swap(true, Ordering::SeqCst) {
             tracing::info!(
@@ -212,17 +163,6 @@ impl PictureSupport {
 
     pub fn provisioning_enabled(&self) -> bool {
         self.provisioning.load(Ordering::SeqCst)
-    }
-
-    #[cfg(test)]
-    fn without_fetch(self) -> Self {
-        self.fetch_allowed.store(false, Ordering::SeqCst);
-        self
-    }
-
-    fn fetch_disabled(&self) -> bool {
-        !self.fetch_allowed.load(Ordering::SeqCst)
-            || std::env::var(PROVISIONING_OPT_OUT_ENV).as_deref() == Ok("1")
     }
 
     /// The warm-up gate, which the adapter's prewarm holds open while it loads.
@@ -276,7 +216,8 @@ impl PictureSupport {
     }
 
     /// Provider-build step: stamp every row naming `gguf` only if its encoder is declared and
-    /// verified (a stamp loads it eagerly), else clear. Returns the encoder if an ensure is due.
+    /// verified (a stamp loads it eagerly), else clear. Returns the encoder if it is declared and
+    /// not yet verified, for [`Self::spawn_settle`].
     pub fn settle_stamp(
         &self,
         data_dir: &Path,
@@ -342,8 +283,9 @@ impl PictureSupport {
         );
     }
 
-    /// Start a background ensure for `chat_model`'s encoder if due; no-op without a Tokio runtime.
-    pub fn spawn_ensure(self: &Arc<Self>, data_dir: &Path, chat_model: &str) {
+    /// Check `chat_model`'s add-on on disk in the background: hash an unverified file once, set a
+    /// wrong one aside, attach a good one. Never downloads; a no-op without a Tokio runtime.
+    pub fn spawn_settle(self: &Arc<Self>, data_dir: &Path, chat_model: &str) {
         if !self.provisioning_enabled() {
             return;
         }
@@ -351,6 +293,8 @@ impl PictureSupport {
             return;
         };
         if self.state_of(data_dir, &spec).is_ready() {
+            // Verified on disk: attach it now, in case it arrived after the last provider build.
+            self.stamp_declared(&spec, &encoder_file(data_dir, &spec));
             return;
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -360,11 +304,11 @@ impl PictureSupport {
         if !claimed {
             return;
         }
-        handle.spawn(self.clone().ensure(data_dir.to_path_buf(), spec));
+        handle.spawn(self.clone().settle(data_dir.to_path_buf(), spec));
     }
 
-    /// The ensure, retried on the backoff ladder; holds the in-flight claim through the waits too.
-    async fn ensure(self: Arc<Self>, data_dir: PathBuf, spec: EncoderSpec) {
+    /// One settle, holding the in-flight claim until it ends.
+    async fn settle(self: Arc<Self>, data_dir: PathBuf, spec: EncoderSpec) {
         struct Flight<'a>(&'a PictureSupport, &'static str);
         impl Drop for Flight<'_> {
             fn drop(&mut self) {
@@ -376,68 +320,44 @@ impl PictureSupport {
         if device_budget::budgeted_device() {
             self.warmup.wait().await;
         }
-        loop {
-            let mode = egress::network_mode();
-            self.with_dir(spec.dir, |d| d.backoff.on_network_mode(mode.as_str()));
-            let err = match self.ensure_once(&data_dir, &spec).await {
-                Ok(bytes) => {
-                    self.with_dir(spec.dir, |d| {
-                        d.live = None;
-                        d.backoff.on_success();
-                    });
-                    tracing::info!(
-                        target: "giap::vision",
-                        encoder = spec.dir,
-                        bytes,
-                        "picture support is ready"
-                    );
-                    return;
-                }
-                Err(e) => e,
-            };
-            if err.downcast_ref::<FetchDisabled>().is_some() {
-                self.set_live(spec.dir, None);
-                tracing::info!(target: "giap::vision", encoder = spec.dir, "{err}");
-                return;
-            }
-
-            // A network-mode refusal earns no backoff step; only a mode change alters the outcome.
-            if let Some(blocked) = blocked_state(&err) {
+        match self.settle_once(&data_dir, &spec).await {
+            Ok(Some(bytes)) => {
+                self.with_dir(spec.dir, |d| {
+                    d.live = None;
+                    d.backoff.on_success();
+                });
                 tracing::info!(
                     target: "giap::vision",
                     encoder = spec.dir,
-                    mode = mode.as_str(),
-                    "picture support is waiting: the network mode refuses its download"
+                    bytes,
+                    "picture support is ready"
                 );
-                self.set_live(spec.dir, Some(blocked));
-                wait_for_mode_change(mode).await;
-                continue;
             }
-
-            let wait = self.with_dir(spec.dir, |d| d.backoff.on_failure(mode.as_str()));
-            let retry_at = now_ms().saturating_add(wait.as_millis() as u64);
-            let state = classify(&err, retry_at);
-            tracing::warn!(
-                target: "giap::vision",
-                encoder = spec.dir,
-                error = %format!("{err:#}"),
-                state = state.kind(),
-                retry_in_s = wait.as_secs(),
-                "picture support did not finish; it tries again after the wait"
-            );
-            self.set_live(spec.dir, Some(state));
-            wait_until(retry_at, mode).await;
+            Ok(None) => self.set_live(spec.dir, None),
+            Err(e) => {
+                self.set_live(spec.dir, None);
+                tracing::warn!(
+                    target: "giap::vision",
+                    encoder = spec.dir,
+                    error = %format!("{e:#}"),
+                    "could not check the picture support on disk"
+                );
+            }
         }
     }
 
-    /// One pass: validate, repair, fetch if missing, stamp. Validation skips the egress check, so
-    /// an offline pond with a good encoder is never shown as blocked.
-    async fn ensure_once(&self, data_dir: &Path, spec: &EncoderSpec) -> anyhow::Result<u64> {
+    /// One pass: validate, repair, stamp. `Ok(None)` when nothing usable is on disk. Validation
+    /// sends nothing, so an offline pond with a good encoder is never shown as blocked.
+    async fn settle_once(
+        &self,
+        data_dir: &Path,
+        spec: &EncoderSpec,
+    ) -> anyhow::Result<Option<u64>> {
         let file = encoder_file(data_dir, spec);
         match domain::encoder_on_disk(&file, spec) {
             OnDisk::Verified { bytes } => {
                 self.stamp_declared(spec, &file);
-                return Ok(bytes);
+                Ok(Some(bytes))
             }
             OnDisk::Unverified { bytes } => {
                 self.set_live(spec.dir, Some(EncoderState::Verifying));
@@ -451,7 +371,7 @@ impl PictureSupport {
                 if sha.eq_ignore_ascii_case(spec.sha256) {
                     write_sidecar(&file, &sha)?;
                     self.stamp_declared(spec, &file);
-                    return Ok(bytes);
+                    return Ok(Some(bytes));
                 }
                 tracing::warn!(
                     target: "giap::vision",
@@ -461,6 +381,7 @@ impl PictureSupport {
                     "the encoder on disk has the right shape but not the pinned bytes"
                 );
                 self.quarantine(data_dir, &file)?;
+                Ok(None)
             }
             OnDisk::Invalid(why) => {
                 tracing::warn!(
@@ -471,96 +392,10 @@ impl PictureSupport {
                     "the file at the encoder's path is not the pinned encoder"
                 );
                 self.quarantine(data_dir, &file)?;
+                Ok(None)
             }
-            OnDisk::Missing => {}
+            OnDisk::Missing => Ok(None),
         }
-        if self.fetch_disabled() {
-            return Err(anyhow::Error::new(FetchDisabled));
-        }
-        let bytes = self.fetch(data_dir, spec, &file).await?;
-        self.stamp_declared(spec, &file);
-        Ok(bytes)
-    }
-
-    /// Download the pinned file into the HF cache, check it, and link it at `dest`.
-    async fn fetch(&self, data_dir: &Path, spec: &EncoderSpec, dest: &Path) -> anyhow::Result<u64> {
-        // Pure verdict first so a refusal never shows as "downloading"; pond-hf-cache records it.
-        let mode = egress::network_mode();
-        if let Err(reason) = egress::egress_verdict(HF_HOST, mode) {
-            return Err(anyhow::Error::new(egress::EgressDenied {
-                host: HF_HOST.to_string(),
-                mode,
-                reason,
-            }));
-        }
-
-        let cache = pond_hf_cache::HfCache::new(data_dir);
-        let client = pond_hf_cache::build_redirect_aware_client(cache.token())?;
-        let repo = cache.repo(spec.repo).with_revision(spec.revision);
-        let fetch = repo
-            .file(spec.filename)
-            .expect_size(spec.size_bytes)
-            .expect_etag(spec.sha256);
-
-        self.set_live(
-            spec.dir,
-            Some(EncoderState::Downloading {
-                done: 0,
-                total: spec.size_bytes,
-            }),
-        );
-        tracing::info!(
-            target: "giap::vision",
-            encoder = spec.dir,
-            repo = spec.repo,
-            revision = spec.revision,
-            bytes = spec.size_bytes,
-            "downloading picture support; text chat works meanwhile"
-        );
-        let mut published = 0u64;
-        let blob = fetch
-            .download_to_blob(&client, cache.token(), |done, total| {
-                let total = if total > 0 { total } else { spec.size_bytes };
-                if done < published || done - published >= PROGRESS_STEP || done >= total {
-                    published = done;
-                    self.set_live(spec.dir, Some(EncoderState::Downloading { done, total }));
-                }
-                // Per chunk, so a mode change pauses the transfer at once (`.incomplete` is kept).
-                egress::egress_verdict(HF_HOST, egress::network_mode()).is_ok()
-            })
-            .await?;
-
-        // pond-hf-cache names a pinned download by its pin; anything else is not what was asked.
-        if blob.file_name().and_then(|n| n.to_str()) != Some(spec.sha256) {
-            return Err(anyhow::Error::new(EncoderInvalid::WrongFile)
-                .context(format!("the download landed as {}", blob.display())));
-        }
-        domain::validate_encoder_header(&blob, spec).map_err(anyhow::Error::new)?;
-        self.set_live(spec.dir, Some(EncoderState::Verifying));
-        let sha = sha256_file(&blob).await?;
-        if !sha.eq_ignore_ascii_case(spec.sha256) {
-            let moved = move_aside(&blob)?;
-            tracing::warn!(
-                target: "giap::vision",
-                encoder = spec.dir,
-                found = %sha,
-                moved_to = %moved.display(),
-                "the downloaded encoder's sha256 is not the pinned one; set aside"
-            );
-            return Err(anyhow::Error::new(EncoderInvalid::WrongFile));
-        }
-
-        match pond_hf_cache::link_blob(&blob, dest).await {
-            Ok(()) => {}
-            Err(e) if e.downcast_ref::<pond_hf_cache::DestNotALink>().is_some() => {
-                // An unchecked file appeared here mid-transfer: set it aside, don't overwrite.
-                self.quarantine(data_dir, dest)?;
-                pond_hf_cache::link_blob(&blob, dest).await?;
-            }
-            Err(e) => return Err(e),
-        }
-        write_sidecar(dest, &sha)?;
-        Ok(spec.size_bytes)
     }
 
     /// Set a bad encoder aside (renamed, never deleted) and clear the rows naming it. A cache
@@ -726,59 +561,6 @@ fn clear_entry(entry: &mut LocalModelEntry) -> bool {
     entry.settings.mmproj_size_bytes = 0;
     entry.settings.vision_capable = false;
     had
-}
-
-// ── Failure classification ──────────────────────────────────────────────────
-
-/// Blocked, when this failure is the network mode's refusal (up front or mid-transfer).
-fn blocked_state(err: &anyhow::Error) -> Option<EncoderState> {
-    if let blocked @ EncoderState::Blocked { .. } = domain::classify_error(err, 0) {
-        return Some(blocked);
-    }
-    if pond_hf_cache::is_stopped(err) {
-        let mode = egress::network_mode();
-        if egress::egress_verdict(HF_HOST, mode).is_err() {
-            return Some(EncoderState::Blocked {
-                mode: mode.as_str().to_string(),
-                host: HF_HOST.to_string(),
-            });
-        }
-    }
-    None
-}
-
-/// The Failed state for a non-refusal error, by type, never message text. Transfer errors are
-/// pond-hf-cache types, unseen by pond-core; a short transfer is a dropped connection.
-fn classify(err: &anyhow::Error, retry_at_unix_ms: u64) -> EncoderState {
-    if let Some(transfer) = pond_hf_cache::transfer_error(err) {
-        let reason = match transfer {
-            pond_hf_cache::TransferError::Short { .. } => FailReason::ConnectionDropped,
-            _ => FailReason::WrongFile,
-        };
-        return EncoderState::Failed {
-            reason,
-            retry_at_unix_ms,
-        };
-    }
-    domain::classify_error(err, retry_at_unix_ms)
-}
-
-/// Sleep until `until_ms`, in steps, returning early when the network mode changes.
-async fn wait_until(until_ms: u64, mode: egress::NetworkMode) {
-    loop {
-        let now = now_ms();
-        if now >= until_ms || egress::network_mode() != mode {
-            return;
-        }
-        let step = Duration::from_millis(until_ms - now).min(MODE_POLL);
-        tokio::time::sleep(step).await;
-    }
-}
-
-async fn wait_for_mode_change(mode: egress::NetworkMode) {
-    while egress::network_mode() == mode {
-        tokio::time::sleep(MODE_POLL).await;
-    }
 }
 
 // ── Files ───────────────────────────────────────────────────────────────────
@@ -1258,7 +1040,7 @@ mod tests {
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"theirs");
     }
 
-    /// Offline repair: with fetching off, the set-aside file stays absent.
+    /// A wrong file is set aside and nothing replaces it: settling never downloads.
     #[tokio::test]
     async fn an_unverified_file_with_the_wrong_bytes_is_hashed_and_set_aside() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1276,10 +1058,12 @@ mod tests {
             ..e2b
         };
         assert_eq!(disk_state(&file, &small), EncoderState::Verifying);
-        let pictures = PictureSupport::with_rows(Arc::new(MemoryRows::default())).without_fetch();
+        let pictures = PictureSupport::with_rows(Arc::new(MemoryRows::default()));
 
-        let err = pictures.ensure_once(tmp.path(), &small).await.unwrap_err();
-        assert!(err.downcast_ref::<FetchDisabled>().is_some(), "{err:#}");
+        assert_eq!(
+            pictures.settle_once(tmp.path(), &small).await.unwrap(),
+            None
+        );
         assert!(!file.exists());
         assert!(file.with_file_name("mmproj-BF16.gguf.invalid").exists());
         assert_eq!(disk_state(&file, &small), EncoderState::Absent);
@@ -1292,9 +1076,8 @@ mod tests {
         let file = domain::encoder_path(tmp.path(), &e2b);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"not really a gguf").unwrap();
-        let pictures = PictureSupport::with_rows(Arc::new(MemoryRows::default())).without_fetch();
-        let err = pictures.ensure_once(tmp.path(), &e2b).await.unwrap_err();
-        assert!(err.downcast_ref::<FetchDisabled>().is_some(), "{err:#}");
+        let pictures = PictureSupport::with_rows(Arc::new(MemoryRows::default()));
+        assert_eq!(pictures.settle_once(tmp.path(), &e2b).await.unwrap(), None);
         assert!(file.with_file_name("mmproj-BF16.gguf.invalid").exists());
     }
 
@@ -1314,10 +1097,10 @@ mod tests {
         };
         assert_eq!(disk_state(&file, &small), EncoderState::Verifying);
 
-        let pictures = PictureSupport::with_rows(Arc::new(MemoryRows::default())).without_fetch();
+        let pictures = PictureSupport::with_rows(Arc::new(MemoryRows::default()));
         assert_eq!(
-            pictures.ensure_once(tmp.path(), &small).await.unwrap(),
-            size
+            pictures.settle_once(tmp.path(), &small).await.unwrap(),
+            Some(size)
         );
         assert_eq!(
             disk_state(&file, &small),
@@ -1358,52 +1141,12 @@ mod tests {
     }
 
     #[test]
-    fn a_short_transfer_is_a_dropped_connection_and_any_other_refusal_a_wrong_file() {
-        let short = anyhow::Error::new(pond_hf_cache::TransferError::Short {
-            received: 1,
-            total: 2,
-        });
-        assert_eq!(
-            classify(&short, 7),
-            EncoderState::Failed {
-                reason: FailReason::ConnectionDropped,
-                retry_at_unix_ms: 7
-            }
-        );
-        let etag = anyhow::Error::new(pond_hf_cache::TransferError::EtagMismatch {
-            expected: "a".into(),
-            found: vec!["b".into()],
-        })
-        .context("fetching the encoder");
-        assert_eq!(
-            classify(&etag, 7),
-            EncoderState::Failed {
-                reason: FailReason::WrongFile,
-                retry_at_unix_ms: 7
-            }
-        );
-        let denied = anyhow::Error::new(egress::EgressDenied {
-            host: "huggingface.co".into(),
-            mode: egress::NetworkMode::Offline,
-            reason: "offline",
-        });
-        assert_eq!(
-            blocked_state(&denied),
-            Some(EncoderState::Blocked {
-                mode: "offline".into(),
-                host: "huggingface.co".into()
-            })
-        );
-        assert_eq!(blocked_state(&short), None);
-    }
-
-    #[test]
     fn provisioning_is_off_until_a_process_opts_in() {
         let pictures = Arc::new(PictureSupport::with_rows(Arc::new(MemoryRows::default())));
         assert!(!pictures.provisioning_enabled());
         let tmp = tempfile::tempdir().unwrap();
         // Off: no claim is taken, so nothing could be running.
-        pictures.spawn_ensure(tmp.path(), "gemma-4-E2B-it");
+        pictures.spawn_settle(tmp.path(), "gemma-4-E2B-it-Q4_K_M");
         assert!(!pictures.with_dir("gemma-4-e2b-it", |d| d.in_flight));
         pictures.enable_provisioning();
         assert!(pictures.provisioning_enabled());

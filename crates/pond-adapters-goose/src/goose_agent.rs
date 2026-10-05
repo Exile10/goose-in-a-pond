@@ -1426,8 +1426,9 @@ impl GooseAdapter {
                     Some(ref dd) => Self::register_gguf_model(&model_name, dd),
                     None => model_name.trim_end_matches(".gguf").to_string(),
                 };
-                // Registration leaves `mmproj_path` (the engine's vision gate) None. Non-blocking
-                // (~1 GB fetch); the path is resolved per generation, so no restart is needed.
+                // Registration leaves `mmproj_path` (the engine's vision gate) None. Attaches an
+                // add-on already on disk (hashing one not yet verified, in the background) and
+                // never fetches one; the path is resolved per generation, so no restart is needed.
                 // A LiteRT-LM model reads no pictures.
                 if let Some(dd) = self.data_dir.as_ref().filter(|_| !litert) {
                     let gguf = self
@@ -1438,7 +1439,7 @@ impl GooseAdapter {
                         .settle_stamp(dd, &settings.chat_model, &gguf)
                         .is_some()
                     {
-                        self.pictures.spawn_ensure(dd, &settings.chat_model);
+                        self.pictures.spawn_settle(dd, &settings.chat_model);
                     }
                 }
                 let cfg = goose_providers::model::ModelConfig::new(&registry_key);
@@ -2191,7 +2192,7 @@ impl GooseAdapter {
 
         // API backstop: the engine would swap images for a note and the model would bluff.
         if !request.images.is_empty() {
-            use pond_core::models::domain::vision_encoder::{refusal_for, RefusalCode};
+            use pond_core::models::domain::vision_encoder::refusal_for;
             let provider = settings.chat_provider.as_str();
             let model = settings.chat_model.as_str();
             let state =
@@ -2200,12 +2201,6 @@ impl GooseAdapter {
                 .spec()
                 .copied();
             if let Some(refusal) = refusal_for(state.as_ref(), spec.as_ref(), provider) {
-                if refusal.code == RefusalCode::NotReady {
-                    // A turn is the strongest signal that the encoder is wanted.
-                    if let Some(ref dd) = self.data_dir {
-                        self.pictures.spawn_ensure(dd, model);
-                    }
-                }
                 tracing::info!(
                     target: "giap::vision",
                     provider,
@@ -3660,11 +3655,17 @@ impl AgentPort for GooseAdapter {
         Self::vision_state_for(&self.pictures, self.data_dir.as_deref(), provider, model)
     }
 
-    /// Starts the model's encoder ensure in the background; no-op outside the serve process.
+    /// Registers a model whose file just arrived and settles its add-on; never downloads.
     fn prepare_model(&self, model: &str) {
-        if let Some(ref dd) = self.data_dir {
-            self.pictures.spawn_ensure(dd, model);
+        let Some(ref dd) = self.data_dir else {
+            return;
+        };
+        if pond_core::models::domain::litert::is_litert_model(model) {
+            crate::litert_model::register(model, dd);
+            return;
         }
+        Self::register_gguf_model(model, dd);
+        self.pictures.spawn_settle(dd, model);
     }
 
     async fn chat(&self, request: AgentRequest) -> Result<AgentResponse> {

@@ -55,6 +55,29 @@ pub fn encoder_path(data_dir: &Path, spec: &EncoderSpec) -> PathBuf {
         .join(spec.filename)
 }
 
+/// The encoder file as spelled on disk: the canonical path is lowercase, but an existing dir
+/// differing only in case is reused, so a case-sensitive disk doesn't fetch a twin.
+pub fn encoder_file(data_dir: &Path, spec: &EncoderSpec) -> PathBuf {
+    let canonical = encoder_path(data_dir, spec);
+    if std::fs::symlink_metadata(&canonical).is_ok() {
+        return canonical;
+    }
+    let root = data_dir.join("models").join("mmproj");
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name != spec.dir && name.eq_ignore_ascii_case(spec.dir) {
+                let candidate = entry.path().join(spec.filename);
+                if std::fs::symlink_metadata(&candidate).is_ok() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    canonical
+}
+
 // ── Validation ──────────────────────────────────────────────────────────────
 
 /// Why an encoder file is unusable; all but [`Self::Missing`] are renamed aside, never deleted.

@@ -216,6 +216,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/models/disk-usage", get(disk_usage))
         .route("/models/{category}/{name}/download", post(download_model))
         .route("/models/{category}/{name}/activate", post(activate_model))
+        .route(
+            "/models/{category}/{name}/companions/pictures",
+            post(crate::model_acquisition::add_pictures),
+        )
         .route("/models/{category}/{name}", delete(delete_model))
         .route("/profiles", get(list_profiles))
         .route("/profiles/{id}", get(get_profile).delete(delete_profile))
@@ -4799,16 +4803,6 @@ async fn update_settings(
     if save_needs_prewarm(&current, &merged) {
         crate::spawn_prefix_prewarm(state.clone(), false);
     }
-    // Fetch a new GGUF's picture support; the port takes no provider, so Ollama tags stay out.
-    let chat_changed =
-        current.chat_model != merged.chat_model || current.chat_provider != merged.chat_provider;
-    if chat_changed
-        && ModelCategory::for_chat_model(&merged.chat_provider, &merged.chat_model)
-            == ModelCategory::Gguf
-    {
-        state.agent.prepare_model(&merged.chat_model);
-    }
-
     // f32 fields echo widened (`0.7` -> 0.699999988079071); clients must diff against the patch
     // they sent. Don't round here: that would report a value the server doesn't hold.
     Ok(Json(
@@ -5334,24 +5328,6 @@ async fn scan_filesystem_extras(
     extras_from_disk
 }
 
-/// On download completion, prepare a GGUF under its file stem, the name a scan will give it.
-fn prepare_after_download(
-    state: &Arc<AppState>,
-    category: &str,
-    filename: &str,
-) -> impl std::future::Future<Output = ()> + Send + 'static {
-    let prepare = (category == "gguf")
-        .then(|| filename.strip_suffix(".gguf"))
-        .flatten()
-        .filter(|stem| !is_companion_file(filename) && !stem.is_empty())
-        .map(|stem| (state.agent.clone(), stem.to_string()));
-    async move {
-        if let Some((agent, model)) = prepare {
-            agent.prepare_model(&model);
-        }
-    }
-}
-
 /// Where a downloaded model lands, by category; `None` for a category or name with no file.
 fn model_dest_path(
     data_dir: &std::path::Path,
@@ -5384,9 +5360,9 @@ async fn download_control(
         );
     }
 
-    let (category, url) = {
-        let t = state.download_tracker.read().await;
-        let Some(entry) = t.get(&filename) else {
+    let resume = {
+        let mut t = state.download_tracker.write().await;
+        let Some(entry) = t.get_mut(&filename) else {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("no download named {filename}")})),
@@ -5399,13 +5375,28 @@ async fn download_control(
                     .store(crate::DL_PAUSE, std::sync::atomic::Ordering::Relaxed);
                 return (StatusCode::OK, Json(json!({"status": "pausing"})));
             }
+            "cancel" if entry.status == "paused" => {
+                // No transfer is running to see the flag: throw the partial file away here.
+                if let Some(partial) = entry.partial.take() {
+                    let _ = tokio::fs::remove_file(&partial).await;
+                }
+                entry.status = "cancelled".to_string();
+                entry.finished_at = Some(std::time::Instant::now());
+                return (StatusCode::OK, Json(json!({"status": "cancelled"})));
+            }
             "cancel" => {
                 entry
                     .control
                     .store(crate::DL_CANCEL, std::sync::atomic::Ordering::Relaxed);
                 return (StatusCode::OK, Json(json!({"status": "cancelling"})));
             }
-            "resume" => (entry.category.clone(), entry.url.clone()),
+            "resume" => (
+                entry.url.clone(),
+                entry.dest.clone(),
+                entry.category.clone(),
+                entry.model_id.clone(),
+                entry.part.clone(),
+            ),
             _ => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -5414,6 +5405,7 @@ async fn download_control(
             }
         }
     };
+    let (url, dest, category, model_id, part) = resume;
 
     // A fresh transfer resumes: the HF cache finds its `.incomplete` and sends a Range header.
     let Some(url) = url else {
@@ -5428,22 +5420,34 @@ async fn download_control(
             Json(json!({"error": "data_dir not configured"})),
         );
     };
-
-    let Some(dest) = model_dest_path(&data_dir, &category, &filename) else {
+    let Some(dest) = dest.or_else(|| model_dest_path(&data_dir, &category, &filename)) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "this download has no file to resume"})),
         );
     };
+    let part = match part.as_deref() {
+        Some(crate::model_acquisition::PART_MODEL) => Some(crate::model_acquisition::PART_MODEL),
+        Some(crate::model_acquisition::PART_PICTURES) => {
+            Some(crate::model_acquisition::PART_PICTURES)
+        }
+        _ => None,
+    };
+    let file = TrackedFile {
+        url,
+        dest,
+        key: filename,
+        category,
+        model_id: model_id.clone(),
+        part,
+        size_bytes: None,
+    };
     let tracker = Arc::clone(&state.download_tracker);
     let client = state.http_client.clone();
-    let on_done = prepare_after_download(&state, &category, &filename);
+    let on_done = crate::model_acquisition::arrival(state.clone(), model_id, part);
 
     tokio::spawn(async move {
-        spawn_tracked_download(
-            url, dest, filename, category, tracker, client, data_dir, on_done,
-        )
-        .await;
+        spawn_tracked_download(file, tracker, client, data_dir, on_done).await;
     });
 
     (StatusCode::OK, Json(json!({"status": "resuming"})))
@@ -5491,6 +5495,15 @@ async fn list_models(
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
 
     let vision = crate::model_views::gguf_vision_batch(&state, &records).await;
+    let fetching_pictures: std::collections::HashSet<String> = state
+        .download_tracker
+        .read()
+        .await
+        .values()
+        .filter(|e| e.part.as_deref() == Some(crate::model_acquisition::PART_PICTURES))
+        .filter(|e| matches!(e.status.as_str(), "downloading" | "paused"))
+        .filter_map(|e| e.model_id.clone())
+        .collect();
 
     let mut whisper = vec![];
     let mut llamafile = vec![];
@@ -5506,6 +5519,11 @@ async fn list_models(
             dto.reads_images = Some(v.reads_images);
             dto.image_support_bytes = v.image_support_bytes;
             dto.companions.extend(v.companion.clone());
+        }
+        for companion in &mut dto.companions {
+            if fetching_pictures.contains(&m.id) && companion.state == "available" {
+                companion.state = "downloading".to_string();
+            }
         }
         let v = serde_json::to_value(dto).unwrap_or_default();
         match m.category {
@@ -5652,33 +5670,32 @@ async fn refresh_model_registry(
     Ok(Json(json!({"status": "refresh_started"})))
 }
 
-/// GET /api/v1/models/download/progress — also evicts entries finished over 5 min ago.
+/// GET /api/v1/models/download/progress — also evicts entries finished over 5 min ago; a
+/// paused one stays until the household resumes or cancels it.
 async fn get_download_progress(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut tracker = state.download_tracker.write().await;
     let now = std::time::Instant::now();
-    tracker.retain(|_, e| match e.finished_at {
-        Some(t) => now.duration_since(t) < std::time::Duration::from_secs(300),
-        None => true,
-    });
+    tracker.retain(|_, e| !e.expired(now, std::time::Duration::from_secs(300)));
     let entries: Vec<&DownloadEntry> = tracker.values().collect();
     Json(json!({"downloads": entries}))
 }
 
-/// POST /api/v1/models/{category}/{name}/download — trigger async model download.
+/// POST /api/v1/models/{category}/{name}/download — plan and start a model's download, with its
+/// picture add-on unless the body says `{"pictures": false}`.
 async fn download_model(
     State(state): State<Arc<AppState>>,
     Path((category, name)): Path<(String, String)>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // No body is how the desktop has always asked: the add-on is included by default.
+    let include_pictures = body
+        .ok()
+        .and_then(|Json(b)| b["pictures"].as_bool())
+        .unwrap_or(true);
     let Some(model_repo) = state.model_repo.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "registry not available"})),
-        ));
-    };
-    let Some(data_dir) = state.data_dir.clone() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "data_dir not configured"})),
         ));
     };
 
@@ -5702,8 +5719,6 @@ async fn download_model(
                 Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)})),
             )
         })?;
-    // The found record's id: a forgiving TTS lookup may resolve another category.
-    let model_id = m.id.clone();
 
     if m.downloaded {
         return Ok(Json(json!({"status": "already_downloaded", "name": name})));
@@ -5716,97 +5731,10 @@ async fn download_model(
         ));
     }
 
-    let url = m.url.clone().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "model has no download URL"})),
-        )
-    })?;
-    let filename = m.filename.clone().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "model has no filename"})),
-        )
-    })?;
-
-    // Check egress before spawning so a refusal reaches the caller, not just a failed tracker row.
-    pond_core::shared::services::egress::check_egress(&url).map_err(|denied| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": denied.to_string()})),
-        )
-    })?;
-
-    let dest = model_layout::path_for(&data_dir, &m.category, &filename).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "this model has no file to download"})),
-        )
-    })?;
-
-    let tracker = Arc::clone(&state.download_tracker);
-    let dl_client = state.http_client.clone();
-    let dl_filename = filename.clone();
-    let dl_category = category.clone();
-
-    // For TTS models, also download the companion config file (.onnx.json)
-    let cfg_url = m.config_url.clone();
-    let cfg_filename = m.config_filename.clone();
-    let cfg_client = state.http_client.clone();
-    let cfg_data_dir = data_dir.clone();
-    let dl_data_dir = data_dir.clone();
-    // Prepare on arrival, or the encoder download would wait for the first photo.
-    let prepare = (cat == ModelCategory::Gguf).then(|| (state.agent.clone(), name.clone()));
-
-    tokio::spawn(async move {
-        spawn_tracked_download(
-            url,
-            dest,
-            dl_filename,
-            dl_category,
-            tracker,
-            dl_client,
-            dl_data_dir,
-            async move {
-                // Download config file before marking as downloaded
-                let cfg_dest = cfg_filename.as_deref().and_then(|cf| {
-                    model_layout::path_for(&cfg_data_dir, &ModelCategory::TtsPiper, cf)
-                });
-                if let (Some(cu), Some(cf), Some(cfg_dest)) = (cfg_url, cfg_filename, cfg_dest) {
-                    if let Some(parent) = cfg_dest.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
-                    }
-                    // A separate hop to its own host: gate it separately from the weights.
-                    match pond_core::shared::services::egress::begin(&cu, "GET") {
-                        Err(denied) => {
-                            tracing::warn!("TTS config file {cf} not fetched: {denied}")
-                        }
-                        Ok(call) => {
-                            let sent = cfg_client.get(&cu).send().await;
-                            call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
-                            match sent {
-                                Ok(resp) if resp.status().is_success() => {
-                                    if let Ok(bytes) = resp.bytes().await {
-                                        let _ = tokio::fs::write(&cfg_dest, &bytes).await;
-                                    }
-                                }
-                                _ => tracing::warn!("Failed to download TTS config file {}", cf),
-                            }
-                        }
-                    }
-                }
-                let _ = model_repo.set_downloaded(&model_id, true).await;
-                if let Some((agent, model)) = prepare {
-                    agent.prepare_model(&model);
-                }
-            },
-        )
-        .await;
-    });
-
-    Ok(Json(
-        json!({"status": "download_started", "name": name, "category": category}),
-    ))
+    let mut started = crate::model_acquisition::acquire(&state, &m, include_pictures).await?;
+    started["name"] = json!(name);
+    started["category"] = json!(category);
+    Ok(Json(started))
 }
 
 /// DELETE /api/v1/models/{category}/{name} — deletes the file but keeps the catalog row.
@@ -6119,11 +6047,8 @@ async fn activate_model(
         rebuild_llm_provider(&state, &settings).await;
     }
 
-    // As in PUT /settings: prepare picture support and warm the prefix now, in the background.
+    // As in PUT /settings: warm the prefix now, in the background. Nothing is fetched.
     if role == "chat" {
-        if cat == ModelCategory::Gguf {
-            state.agent.prepare_model(&name);
-        }
         let now = (provider.to_string(), name.clone());
         if chat_before.as_ref() != Some(&now) {
             crate::spawn_prefix_prewarm(state.clone(), false);
@@ -6379,10 +6304,16 @@ async fn list_hf_model_files(
                         .map(|s| {
                             let filename = s["rfilename"].as_str().unwrap_or("").to_string();
                             let size_mb  = s["size"].as_u64().map(|b| b / 1_048_576);
+                            // The add-on a download of this file would bring, by the pairing table.
+                            let pictures = pond_core::models::domain::vision_pairing::encoder_for_source(
+                                &repo, &filename,
+                            )
+                            .map(|e| json!({"size_bytes": e.size_bytes, "label": e.label}));
                             json!({
                                 "filename": filename,
                                 "size_mb":  size_mb,
                                 "url": format!("https://huggingface.co/{}/resolve/main/{}", repo, filename),
+                                "pictures": pictures,
                             })
                         })
                         .collect()
@@ -6397,7 +6328,9 @@ async fn list_hf_model_files(
     }
 }
 
-/// POST /api/v1/models/download/url — download a model file by URL into the right folder.
+/// POST /api/v1/models/download/url — download a model file by URL into the right folder. The
+/// file becomes an Added row, and a file with a known pairing brings its add-on unless the body
+/// says `"pictures": false`.
 async fn download_model_from_url(
     State(state): State<Arc<AppState>>,
     body: Result<Json<Value>, JsonRejection>,
@@ -6414,6 +6347,7 @@ async fn download_model_from_url(
     let url = body["url"].as_str().unwrap_or("").to_string();
     let category = body["category"].as_str().unwrap_or("gguf").to_string();
     let filename = body["filename"].as_str().unwrap_or("").to_string();
+    let include_pictures = body["pictures"].as_bool().unwrap_or(true);
 
     if url.is_empty() || filename.is_empty() {
         return (
@@ -6442,51 +6376,98 @@ async fn download_model_from_url(
             Json(json!({"error": "data_dir not configured"})),
         );
     };
-
-    let Some(dest) = model_dest_path(&data_dir, &category, &filename) else {
+    let (Some(cat), Some(file)) = (
+        ModelCategory::from_str(&category),
+        model_layout::file_name(&filename),
+    ) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("cannot save a {category} file named {filename:?}")})),
         );
     };
+    if model_dest_path(&data_dir, &category, file).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("a {category} model has no file to download")})),
+        );
+    }
 
-    let tracker = Arc::clone(&state.download_tracker);
-    let resp_filename = filename.clone();
-    let resp_category = category.clone();
-
-    let dl_client = state.http_client.clone();
-    let dl_data_dir = data_dir.clone();
-    let on_done = prepare_after_download(&state, &category, &filename);
-    tokio::spawn(async move {
-        spawn_tracked_download(
-            url,
-            dest,
-            filename,
-            category,
-            tracker,
-            dl_client,
-            dl_data_dir,
-            on_done,
-        )
-        .await;
-    });
-
-    (
-        StatusCode::ACCEPTED,
-        Json(
-            json!({"status": "downloading", "filename": resp_filename, "category": resp_category}),
-        ),
-    )
+    let record = match crate::model_acquisition::row_for_url(&state, &url, &cat, file).await {
+        Ok(r) => r,
+        Err(refused) => return refused,
+    };
+    if record.downloaded {
+        return (
+            StatusCode::OK,
+            Json(json!({"status": "already_downloaded", "filename": file, "category": category})),
+        );
+    }
+    match crate::model_acquisition::acquire(&state, &record, include_pictures).await {
+        Ok(mut started) => {
+            started["status"] = json!("downloading");
+            started["filename"] = json!(file);
+            started["category"] = json!(category);
+            (StatusCode::ACCEPTED, Json(started))
+        }
+        Err(refused) => refused,
+    }
 }
 
-/// Tracked download to `dest`; `on_done` runs only on success. HF URLs use `pond_hf_cache`
-/// (resumable, keeps auth across HF→CDN redirects).
-async fn spawn_tracked_download<F>(
-    url: String,
-    dest: std::path::PathBuf,
-    filename: String,
-    category: String,
-    tracker: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+/// One file for the tracker to fetch.
+#[derive(Debug)]
+pub(crate) struct TrackedFile {
+    pub url: String,
+    pub dest: std::path::PathBuf,
+    /// The tracker key, which pause, resume and cancel name.
+    pub key: String,
+    pub category: String,
+    pub model_id: Option<String>,
+    pub part: Option<&'static str>,
+    /// The size it must arrive at, when known before the transfer.
+    pub size_bytes: Option<u64>,
+}
+
+type Tracker = Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>;
+
+/// Put `file` in the tracker as downloading, keeping the bytes a resumed transfer already has.
+pub(crate) async fn begin_tracking(tracker: &Tracker, file: &TrackedFile) {
+    let mut t = tracker.write().await;
+    let entry = t
+        .entry(file.key.clone())
+        .or_insert_with(|| DownloadEntry::starting(&file.key, &file.category));
+    // A transfer already registered keeps its flag, so a pause sent before it began still holds.
+    if entry.status != "downloading" {
+        entry.control = Arc::new(std::sync::atomic::AtomicU8::new(crate::DL_RUN));
+    }
+    entry.category = file.category.clone();
+    entry.status = "downloading".to_string();
+    entry.finished_at = None;
+    entry.error = None;
+    entry.partial = None;
+    entry.url = Some(file.url.clone());
+    entry.model_id = file.model_id.clone();
+    entry.part = file.part.map(str::to_string);
+    entry.dest = Some(file.dest.clone());
+    if entry.total_bytes.is_none() {
+        entry.total_bytes = file.size_bytes;
+    }
+}
+
+/// Where a non-HF transfer writes until it is whole.
+fn part_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let mut name = dest
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".part");
+    dest.with_file_name(name)
+}
+
+/// Tracked download to `file.dest`; `on_done` runs only on success. HF URLs use `pond_hf_cache`
+/// (resumable, keeps auth across HF→CDN redirects); anything else lands in `.part` first.
+pub(crate) async fn spawn_tracked_download<F>(
+    file: TrackedFile,
+    tracker: Tracker,
     client: reqwest::Client,
     data_dir: std::path::PathBuf,
     on_done: F,
@@ -6495,37 +6476,30 @@ async fn spawn_tracked_download<F>(
 {
     use tokio::io::AsyncWriteExt;
 
-    {
-        let mut t = tracker.write().await;
-        t.insert(
-            filename.clone(),
-            DownloadEntry {
-                filename: filename.clone(),
-                category: category.clone(),
-                downloaded_bytes: 0,
-                total_bytes: None,
-                status: "downloading".to_string(),
-                finished_at: None,
-                control: Arc::new(std::sync::atomic::AtomicU8::new(crate::DL_RUN)),
-                url: Some(url.clone()),
-            },
-        );
-    }
+    begin_tracking(&tracker, &file).await;
+    let TrackedFile { url, dest, key, .. } = file;
+    let control = {
+        let t = tracker.read().await;
+        t.get(&key)
+            .map(|e| Arc::clone(&e.control))
+            .unwrap_or_default()
+    };
 
     if let Some(parent) = dest.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
 
-    tracing::info!("Downloading {} from {}", filename, url);
+    tracing::info!("Downloading {} from {}", key, url);
 
     let result: Result<(), String> =
         if let Some((repo_id, revision, fname)) = pond_hf_cache::parse_hf_url(&url) {
             download_via_hf_cache_tracked(
-                &repo_id, &revision, &fname, &dest, &data_dir, &filename, &tracker,
+                &repo_id, &revision, &fname, &dest, &data_dir, &key, &tracker,
             )
             .await
         } else {
-            async {
+            let partial = part_path(&dest);
+            let fetched = async {
                 // Gated here as well as in callers: every non-HF transfer passes this point.
                 let call = pond_core::shared::services::egress::begin(&url, "GET")
                     .map_err(|denied| denied.to_string())?;
@@ -6539,37 +6513,65 @@ async fn spawn_tracked_download<F>(
                 let total = resp.content_length();
                 {
                     let mut t = tracker.write().await;
-                    if let Some(e) = t.get_mut(&filename) {
+                    if let Some(e) = t.get_mut(&key) {
                         e.total_bytes = total;
                     }
                 }
 
-                let mut file = tokio::fs::File::create(&dest)
+                let mut out = tokio::fs::File::create(&partial)
                     .await
                     .map_err(|e| e.to_string())?;
 
                 let mut downloaded: u64 = 0;
                 let mut resp = resp;
                 while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-                    file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                    out.write_all(&chunk).await.map_err(|e| e.to_string())?;
                     downloaded += chunk.len() as u64;
-                    let mut t = tracker.write().await;
-                    if let Some(e) = t.get_mut(&filename) {
-                        e.downloaded_bytes = downloaded;
+                    {
+                        let mut t = tracker.write().await;
+                        if let Some(e) = t.get_mut(&key) {
+                            e.downloaded_bytes = downloaded;
+                        }
+                    }
+                    match control.load(std::sync::atomic::Ordering::Relaxed) {
+                        crate::DL_RUN => {}
+                        crate::DL_CANCEL => return Err("cancelled".to_string()),
+                        _ => return Err("paused".to_string()),
                     }
                 }
-                file.flush().await.map_err(|e| e.to_string())?;
-                Ok(())
+                out.flush().await.map_err(|e| e.to_string())?;
+                drop(out);
+                tokio::fs::rename(&partial, &dest)
+                    .await
+                    .map_err(|e| e.to_string())
             }
-            .await
+            .await;
+            match &fetched {
+                // Without a range resume, a paused transfer restarts, so nothing is kept.
+                Err(why) if why == "paused" || why == "cancelled" => {
+                    let _ = tokio::fs::remove_file(&partial).await;
+                    let mut t = tracker.write().await;
+                    if let Some(e) = t.get_mut(&key) {
+                        e.status = why.clone();
+                        if why == "cancelled" {
+                            e.finished_at = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = tokio::fs::remove_file(&partial).await;
+                }
+                Ok(()) => {}
+            }
+            fetched
         };
 
     match result {
         Ok(()) => {
-            tracing::info!("Downloaded {} to {:?}", filename, dest);
+            tracing::info!("Downloaded {} to {:?}", key, dest);
             {
                 let mut t = tracker.write().await;
-                if let Some(e) = t.get_mut(&filename) {
+                if let Some(e) = t.get_mut(&key) {
                     e.status = "done".to_string();
                     e.finished_at = Some(std::time::Instant::now());
                 }
@@ -6577,17 +6579,25 @@ async fn spawn_tracked_download<F>(
             on_done.await;
         }
         Err(err) => {
-            tracing::error!("Download {} failed: {}", filename, err);
             let mut t = tracker.write().await;
-            if let Some(e) = t.get_mut(&filename) {
-                e.status = "error".to_string();
-                e.finished_at = Some(std::time::Instant::now());
+            let Some(e) = t.get_mut(&key) else {
+                return;
+            };
+            // A pause or a cancel already set its own status; it is not a failure.
+            if matches!(e.status.as_str(), "paused" | "cancelled") {
+                tracing::info!("Download {} {}", key, e.status);
+                return;
             }
+            tracing::error!("Download {} failed: {}", key, err);
+            e.status = "error".to_string();
+            e.error = Some(err);
+            e.finished_at = Some(std::time::Instant::now());
         }
     }
 }
 
 /// Resumable HF fetch into `hf_cache/blobs`; `dest` is symlinked to the blob to keep flat paths.
+/// A pinned file must arrive at its pinned size and hash.
 async fn download_via_hf_cache_tracked(
     repo_id: &str,
     revision: &str,
@@ -6595,7 +6605,7 @@ async fn download_via_hf_cache_tracked(
     dest: &std::path::Path,
     data_dir: &std::path::Path,
     tracker_key: &str,
-    tracker: &Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+    tracker: &Tracker,
 ) -> Result<(), String> {
     let cache = pond_hf_cache::HfCache::new(data_dir);
     let token: Option<String> = hf_token_from_env().or_else(|| cache.token().map(String::from));
@@ -6643,16 +6653,23 @@ async fn download_via_hf_cache_tracked(
     {
         Ok(p) => p,
         Err(e) if pond_hf_cache::is_stopped(&e) => {
-            // Expected. The `.incomplete` file stays for a resume; cancel is this plus a delete.
+            // A pause keeps `.incomplete` for a resume; a cancel throws it away.
             let cancelled = control.load(std::sync::atomic::Ordering::Relaxed) == crate::DL_CANCEL;
+            let partial = pond_hf_cache::stopped_incomplete(&e).map(std::path::Path::to_path_buf);
+            if cancelled {
+                if let Some(p) = &partial {
+                    let _ = tokio::fs::remove_file(p).await;
+                }
+            }
             let mut t = tracker.write().await;
             if let Some(entry) = t.get_mut(tracker_key) {
                 entry.status = if cancelled { "cancelled" } else { "paused" }.to_string();
-                entry.finished_at = Some(std::time::Instant::now());
+                entry.finished_at = cancelled.then(std::time::Instant::now);
+                entry.partial = if cancelled { None } else { partial };
             }
             return Err(if cancelled { "cancelled" } else { "paused" }.to_string());
         }
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(format!("{e:#}")),
     };
 
     if let Some(parent) = dest.parent() {
@@ -6663,6 +6680,39 @@ async fn download_via_hf_cache_tracked(
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// A Piper voice's `.onnx.json` config, fetched beside its weights; a failure only logs.
+pub(crate) async fn fetch_tts_config(state: &AppState, record: &ModelRecord) {
+    let (Some(url), Some(name), Some(data_dir)) = (
+        record.config_url.as_deref(),
+        record.config_filename.as_deref(),
+        state.data_dir.as_deref(),
+    ) else {
+        return;
+    };
+    let Some(dest) = model_layout::path_for(data_dir, &ModelCategory::TtsPiper, name) else {
+        return;
+    };
+    if let Some(parent) = dest.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    // A separate hop to its own host: gate it separately from the weights.
+    match pond_core::shared::services::egress::begin(url, "GET") {
+        Err(denied) => tracing::warn!("TTS config file {name} not fetched: {denied}"),
+        Ok(call) => {
+            let sent = state.http_client.get(url).send().await;
+            call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+            match sent {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(bytes) = resp.bytes().await {
+                        let _ = tokio::fs::write(&dest, &bytes).await;
+                    }
+                }
+                _ => tracing::warn!("Failed to download TTS config file {}", name),
+            }
+        }
+    }
 }
 
 fn hf_token_from_env() -> Option<String> {

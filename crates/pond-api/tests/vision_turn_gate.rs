@@ -171,6 +171,7 @@ struct Pond {
     sessions: Arc<SqliteSessionStorage>,
     settings: Arc<SqliteSettingsRepository>,
     models: Arc<dyn ModelRepository + Send + Sync>,
+    tracker: Arc<tokio::sync::RwLock<HashMap<String, pond_api::DownloadEntry>>>,
     tmp: tempfile::TempDir,
 }
 
@@ -194,6 +195,7 @@ async fn pond(agent: Arc<VisionAgent>, provider: &str, model: &str) -> Pond {
         .unwrap();
     let models: Arc<dyn ModelRepository + Send + Sync> =
         Arc::new(SqliteModelRepository::new(db.system.clone()));
+    let tracker = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
@@ -240,7 +242,7 @@ async fn pond(agent: Arc<VisionAgent>, provider: &str, model: &str) -> Pond {
         tool_registry: None,
         marketplace: None,
         secret_repo: None,
-        download_tracker: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        download_tracker: tracker.clone(),
         piper_http_port: None,
         model_catalog_provider: None,
         model_storage_dir: None,
@@ -296,6 +298,7 @@ async fn pond(agent: Arc<VisionAgent>, provider: &str, model: &str) -> Pond {
         sessions,
         settings,
         models,
+        tracker,
         tmp,
     }
 }
@@ -751,10 +754,10 @@ async fn the_model_list_says_which_gguf_rows_read_pictures_and_what_that_costs()
     );
 }
 
-// ── Triggers: a model that arrived or was chosen gets prepared ─────────────────
+// ── Nothing is fetched on its own: only a download the household started ───────
 
 #[tokio::test]
-async fn activating_a_chat_model_prepares_it_and_warms_once() {
+async fn activating_a_chat_model_warms_once_and_fetches_nothing() {
     let pond = pond(Arc::new(VisionAgent::default()), "local", "Llama-3.2-3B").await;
     pond.models
         .upsert(&gguf_row(E2B, true, None))
@@ -771,14 +774,17 @@ async fn activating_a_chat_model_prepares_it_and_warms_once() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(pond.agent.prepared(), vec![E2B.to_string()]);
     let agent = pond.agent.clone();
     eventually("the activation warm-up", || {
         agent.prewarms.load(Ordering::SeqCst) == 1
     })
     .await;
+    assert!(
+        pond.agent.prepared().is_empty(),
+        "choosing a model must not start its picture support"
+    );
 
-    // Re-activating the current model re-prepares it (idempotent) but doesn't warm again.
+    // Re-activating the current model doesn't warm again.
     let (status, _) = send(
         &pond,
         request(
@@ -791,8 +797,11 @@ async fn activating_a_chat_model_prepares_it_and_warms_once() {
     assert_eq!(status, StatusCode::OK);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(pond.agent.prewarms.load(Ordering::SeqCst), 1);
+    assert!(pond.agent.prepared().is_empty());
+    assert!(pond.tracker.read().await.is_empty(), "no download started");
 }
 
+/// The add-on is left out here: a test must never reach huggingface.co.
 #[tokio::test]
 async fn a_finished_gguf_download_prepares_the_model() {
     let server = wiremock::MockServer::start().await;
@@ -814,10 +823,16 @@ async fn a_finished_gguf_download_prepares_the_model() {
 
     let (status, body) = send_json(
         &pond,
-        request("POST", &format!("/api/v1/models/gguf/{E2B}/download"), None),
+        request(
+            "POST",
+            &format!("/api/v1/models/gguf/{E2B}/download"),
+            Some(json!({"pictures": false})),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pictures"], "left_out");
+    assert_eq!(body["parts"].as_array().map(Vec::len), Some(1));
     let agent = pond.agent.clone();
     eventually("prepare_model after the download", || {
         agent.prepared() == vec![E2B.to_string()]
@@ -833,9 +848,9 @@ async fn a_finished_gguf_download_prepares_the_model() {
 
 // ── PUT /settings: a new chat model ────────────────────────────────────────────
 
-/// Re-sending the same model is no change; an Ollama Gemma tag is not a local GGUF.
+/// Re-sending the same model is no change, and no save starts picture support.
 #[tokio::test]
-async fn a_new_chat_model_warms_once_and_only_a_local_one_is_prepared() {
+async fn a_new_chat_model_warms_once_and_fetches_nothing() {
     let pond = pond(Arc::new(VisionAgent::default()), "local", E2B).await;
     let put = |body: Value| request("PUT", "/api/v1/settings", Some(body));
     let agent = pond.agent.clone();
@@ -852,10 +867,7 @@ async fn a_new_chat_model_warms_once_and_only_a_local_one_is_prepared() {
         1,
         "one change, one warm-up"
     );
-    assert_eq!(
-        pond.agent.prepared(),
-        vec!["gemma-4-E4B-it-Q4_K_M".to_string()]
-    );
+    assert!(pond.agent.prepared().is_empty());
 
     let (status, _) = send(&pond, put(json!({"chat_model": "gemma-4-E4B-it-Q4_K_M"}))).await;
     assert_eq!(status, StatusCode::OK);
@@ -868,11 +880,8 @@ async fn a_new_chat_model_warms_once_and_only_a_local_one_is_prepared() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        pond.agent.prepared(),
-        vec!["gemma-4-E4B-it-Q4_K_M".to_string()],
-        "only a local model is handed to prepare_model"
-    );
+    assert!(pond.agent.prepared().is_empty());
+    assert!(pond.tracker.read().await.is_empty(), "no download started");
 }
 
 // ── DELETE: the last model of a family takes its picture support with it ───────
@@ -940,4 +949,149 @@ async fn a_gguf_on_disk_that_no_scan_has_registered_still_keeps_its_picture_supp
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(encoder.exists());
+}
+
+// ── The add-on arrives only when the household asks for it ─────────────────────
+
+/// A refusal points to the Models page and names the add-on's size; it starts no fetch.
+#[tokio::test]
+async fn a_refused_picture_names_the_add_on_and_starts_nothing() {
+    let agent = VisionAgent::with(E2B, EncoderState::Absent);
+    let pond = pond(agent, "local", E2B).await;
+
+    let (status, body) = send_json(
+        &pond,
+        request(
+            "POST",
+            "/api/v1/chat/stream",
+            Some(image_turn("refused-absent", &jpeg(), "image/jpeg")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vision_not_ready");
+    assert_eq!(
+        body["error"],
+        "Picture support for Gemma 4 E2B is a separate 941 MB download. Add it on the Models \
+         page; text chat works meanwhile."
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(pond.agent.prepared().is_empty());
+    assert!(pond.tracker.read().await.is_empty(), "no download started");
+    assert_nothing_saved(&pond, "refused-absent").await;
+}
+
+/// A sparse encoder with the real header and the pinned length, as the validator reads it.
+fn write_encoder(path: &std::path::Path, projector: &str, projection_dim: u32, size: u64) {
+    fn raw_string(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+    fn kv_str(kvs: &mut Vec<u8>, k: &str, v: &str) {
+        raw_string(kvs, k);
+        kvs.extend_from_slice(&8u32.to_le_bytes());
+        raw_string(kvs, v);
+    }
+    let mut kvs = Vec::new();
+    kv_str(&mut kvs, "general.architecture", "clip");
+    kv_str(&mut kvs, "clip.vision.projector_type", projector);
+    raw_string(&mut kvs, "clip.has_vision_encoder");
+    kvs.extend_from_slice(&7u32.to_le_bytes());
+    kvs.push(1);
+    raw_string(&mut kvs, "clip.vision.projection_dim");
+    kvs.extend_from_slice(&4u32.to_le_bytes());
+    kvs.extend_from_slice(&projection_dim.to_le_bytes());
+    let header_len = |elements: u64| {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&4u64.to_le_bytes());
+        out.extend_from_slice(&kvs);
+        raw_string(&mut out, "v.weight");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&elements.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out
+    };
+    let data_start = (header_len(0).len() as u64).div_ceil(32) * 32;
+    let header = header_len((size - data_start) / 4);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, &header).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(size)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pictures_arrive_only_through_the_explicit_route() {
+    use pond_core::models::domain::vision_encoder::{encoder_by_dir, encoder_path};
+
+    let pond = pond(Arc::new(VisionAgent::default()), "local", E2B).await;
+    let add = |name: &str| {
+        request(
+            "POST",
+            &format!("/api/v1/models/gguf/{name}/companions/pictures"),
+            None,
+        )
+    };
+
+    // A model with no add-on says so rather than guessing.
+    pond.models
+        .upsert(&gguf_row("Llama-3.2-3B", true, None))
+        .await
+        .unwrap();
+    let (status, body) = send_json(&pond, add("Llama-3.2-3B")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "text_only");
+
+    let (status, _) = send_json(&pond, add("not-a-model")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    if pond_core::models::domain::device_budget::budgeted_device() {
+        return; // the Orin carries no add-on; the route refuses with not_on_this_device
+    }
+
+    // An add-on already on disk is settled, not fetched again.
+    pond.models
+        .upsert(&gguf_row(E2B, true, None))
+        .await
+        .unwrap();
+    let spec = encoder_by_dir("gemma-4-e2b-it").unwrap();
+    write_encoder(
+        &encoder_path(pond.tmp.path(), &spec),
+        spec.projector,
+        spec.projection_dim,
+        spec.size_bytes,
+    );
+    let (status, body) = send_json(&pond, add(E2B)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "already_installed");
+    assert_eq!(body["size_bytes"], spec.size_bytes);
+    assert_eq!(pond.agent.prepared(), vec![E2B.to_string()]);
+    assert!(pond.tracker.read().await.is_empty(), "nothing to download");
+
+    // The model list reads it as installed.
+    let agent = pond.agent.clone();
+    agent.set(
+        E2B,
+        EncoderState::Ready {
+            bytes: Some(spec.size_bytes),
+        },
+    );
+    let (_, list) = send_json(&pond, request("GET", "/api/v1/models", None)).await;
+    let row = list["gguf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == E2B)
+        .cloned()
+        .unwrap();
+    assert_eq!(row["companions"][0]["kind"], "pictures");
+    assert_eq!(row["companions"][0]["state"], "installed");
+    assert_eq!(row["companions"][0]["size_bytes"], spec.size_bytes);
 }

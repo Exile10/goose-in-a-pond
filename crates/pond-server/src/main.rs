@@ -17,9 +17,7 @@ use pond_server::tls_identity;
 mod model_download;
 mod node_path;
 mod ports;
-mod reqwest_model_downloader;
 mod schedule_executors;
-mod startup;
 mod system_deps;
 mod three_stage_consolidator;
 mod tracing_setup;
@@ -1327,30 +1325,6 @@ async fn run_server(
         }
     }
     sync_assignments_to_settings(&*model_repo, &settings_repo_early).await;
-
-    // Detached so the HTTP server comes up without waiting on downloads.
-    {
-        use crate::filesystem_model_storage::FilesystemModelStorage;
-        use crate::reqwest_model_downloader::ReqwestModelDownloader;
-        use crate::startup::auto_download_assigned_models;
-
-        let dl_repo: Arc<
-            dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync,
-        > = model_repo.clone();
-        let dl_storage: Arc<
-            dyn pond_core::models::ports::model_storage::ModelStorage + Send + Sync,
-        > = Arc::new(FilesystemModelStorage::new(&data_dir));
-        let dl_downloader: Arc<
-            dyn pond_core::models::ports::model_downloader::ModelDownloader + Send + Sync,
-        > = Arc::new(ReqwestModelDownloader);
-
-        tokio::spawn(async move {
-            let n = auto_download_assigned_models(dl_repo, dl_storage, dl_downloader).await;
-            if n > 0 {
-                tracing::info!("auto_download: triggered {n} download(s) for role-assigned models");
-            }
-        });
-    }
 
     // `try_start` fetches a missing model itself through ModelService.
     let any_role_needs_llamafile = settings.chat_provider == "llamafile";
@@ -4269,10 +4243,16 @@ async fn run_server(
         inference_lane.clone(),
         last_user_activity.clone(),
     ));
-    // Picture support in the background (~1 GB, never awaited). Single-flight with the prewarm's
-    // ensure, and still runs under POND_DISABLE_PREWARM.
-    if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
-        state.agent.prepare_model(&settings.chat_model);
+    // Brings back an assigned model whose file is missing, through the tracker so it shows on
+    // the Models page; detached so the server comes up without waiting on it.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let n = pond_api::model_acquisition::restore_assigned_models(state).await;
+            if n > 0 {
+                tracing::info!("restore: started {n} download(s) for role-assigned models");
+            }
+        });
     }
 
     let companion =
