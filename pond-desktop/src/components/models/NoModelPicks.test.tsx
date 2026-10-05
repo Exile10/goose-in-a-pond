@@ -18,16 +18,16 @@ import { NoModelPicks } from "./NoModelPicks";
 import { __resetDownloadAndUseForTests } from "../../state/downloadAndUse";
 import { ApiError } from "../../api/types";
 import type { DownloadEntry, ModelEntry } from "../../api/types";
-import { E4B_ORIN, e2b, e4b, entry, litertE4b, NO_ROLES, ORIN_MEMORY } from "../../sections/models/fixtures";
+import { DESKTOP_MEMORY, E4B_ORIN, e2b, e4b, entry, litertE4b, NO_ROLES, ORIN_MEMORY } from "../../sections/models/fixtures";
 
 const MODEL_FILE = "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf";
 const downloading = (over: Partial<DownloadEntry> = {}) =>
   entry({ filename: MODEL_FILE, model_id: e4b().id, part: "model", total_bytes: 4_215_695_776, downloaded_bytes: 1_000_000_000, ...over });
 
-function setup(models: ModelEntry[] = [e4b(), e2b(), litertE4b()], downloads: DownloadEntry[] = []) {
+function setup(models: ModelEntry[] = [e4b(), e2b(), litertE4b()], downloads: DownloadEntry[] = [], memory = DESKTOP_MEMORY) {
   vi.mocked(api.listModels).mockResolvedValue(models);
   vi.mocked(api.getActiveRoles).mockResolvedValue(NO_ROLES);
-  vi.mocked(api.getMemoryStatus).mockResolvedValue(ORIN_MEMORY);
+  vi.mocked(api.getMemoryStatus).mockResolvedValue(memory);
   vi.mocked(api.getDownloadProgress).mockResolvedValue({ downloads });
 }
 
@@ -67,6 +67,40 @@ describe("no conversation model", () => {
     await act(async () => {});
     expect(api.downloadModel).not.toHaveBeenCalled();
     expect(api.activateModel).not.toHaveBeenCalled();
+  });
+
+  it("starts the add-on unticked where only the model fits, says why, and downloads without it", async () => {
+    setup([e4b(), e2b(), litertE4b()], [], ORIN_MEMORY);
+    render(<NoModelPicks />);
+    const best = await pickCard("Gemma 4 E4B, llama.cpp");
+    const tick = within(best).getByRole("checkbox", { name: /Include picture support/ }) as HTMLInputElement;
+    expect(tick.checked).toBe(false);
+    const why = within(best).getByText("Left out: with pictures it would not fit this pond. Tick to include it anyway.");
+    expect(tick.getAttribute("aria-describedby")).toBe(why.id);
+    expect(within(best).getByText("4.2 GB")).toBeTruthy();
+    expect(within(best).queryByText("Too big for this pond")).toBeNull();
+
+    fireEvent.click(within(best).getByRole("button", { name: "Download and use Gemma 4 E4B, llama.cpp" }));
+    await waitFor(() => expect(api.downloadModel).toHaveBeenCalledWith("gguf", e4b().name, { pictures: false }));
+  });
+
+  it("downloads with the add-on when it is ticked anyway", async () => {
+    setup([e4b(), e2b(), litertE4b()], [], ORIN_MEMORY);
+    render(<NoModelPicks />);
+    const best = await pickCard("Gemma 4 E4B, llama.cpp");
+    fireEvent.click(within(best).getByRole("checkbox", { name: /Include picture support/ }));
+    expect(within(best).getByText("4.2 GB + 945 MB for pictures")).toBeTruthy();
+    expect(within(best).getByText("Too big for this pond")).toBeTruthy();
+    fireEvent.click(within(best).getByRole("button", { name: "Download and use Gemma 4 E4B, llama.cpp" }));
+    await waitFor(() => expect(api.downloadModel).toHaveBeenCalledWith("gguf", e4b().name, { pictures: true }));
+  });
+
+  it("asks nothing about picture support for a model that has none to bring", async () => {
+    render(<NoModelPicks />);
+    const lite = await pickCard("Gemma 4 E4B, LiteRT-LM");
+    expect(within(lite).queryByRole("checkbox")).toBeNull();
+    fireEvent.click(within(lite).getByRole("button", { name: "Download and use Gemma 4 E4B, LiteRT-LM" }));
+    await waitFor(() => expect(api.downloadModel).toHaveBeenCalledWith("litert", litertE4b().name, undefined));
   });
 
   it("keeps its moving bars out of the thread's live region, so they are not read out each second", async () => {

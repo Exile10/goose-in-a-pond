@@ -6,13 +6,16 @@ import { api } from "../api/PondApiClient";
 import type { ModelEntry } from "../api/types";
 import type { UseModels } from "./useModels";
 import { controlResult, startedText, type ModelTransfer, type TransferAction } from "../sections/models/modelDownloads";
-import { ROLES, type RoleKey, modelLabel, offersPictures } from "../sections/models/modelsView";
+import {
+  ROLES, type RoleKey, fitsOnlyWithoutPictures, modelLabel, offersPictures,
+} from "../sections/models/modelsView";
 
 export interface ModelActions {
   /** One action runs at a time; the buttons rest while it does. */
   busy: boolean;
   setBusy: (busy: boolean) => void;
-  /** The tick box on a download, per row; ticked until the household says otherwise. */
+  /** The tick box on a download, per row: ticked until the household says otherwise, except that it
+   *  starts unticked where only the model fits this pond. */
   withPictures: (m: ModelEntry) => boolean;
   setWithPictures: (m: ModelEntry, next: boolean) => void;
   useFor: (m: ModelEntry, role: RoleKey) => Promise<void>;
@@ -26,13 +29,13 @@ const reason = (e: unknown) => (e instanceof Error ? e.message : String(e));
 export function useModelActions(
   data: Pick<
     UseModels,
-    "reloadRoles" | "reloadMemory" | "reloadModels" | "reloadDownloads" | "watchDownloads"
+    "memory" | "reloadRoles" | "reloadMemory" | "reloadModels" | "reloadDownloads" | "watchDownloads"
   >,
   say: (text: string, ok?: boolean) => void,
 ): ModelActions {
   const [busy, setBusy] = useState(false);
   const [choice, setChoice] = useState<Record<string, boolean>>({});
-  const { reloadRoles, reloadMemory, reloadModels, reloadDownloads, watchDownloads } = data;
+  const { memory, reloadRoles, reloadMemory, reloadModels, reloadDownloads, watchDownloads } = data;
 
   const attempt = useCallback(
     async (work: () => Promise<void>) => {
@@ -48,7 +51,10 @@ export function useModelActions(
     [say],
   );
 
-  const withPictures = useCallback((m: ModelEntry) => choice[m.id] ?? true, [choice]);
+  const withPictures = useCallback(
+    (m: ModelEntry) => choice[m.id] ?? !fitsOnlyWithoutPictures(m, memory),
+    [choice, memory],
+  );
   const setWithPictures = useCallback(
     (m: ModelEntry, next: boolean) => setChoice((c) => ({ ...c, [m.id]: next })),
     [],

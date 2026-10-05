@@ -28,8 +28,8 @@ import type { DownloadEntry, ModelEntry, ModelMemoryStatus } from "../api/types"
 import { ConfirmProvider } from "../components/shared";
 import { Models } from "./Models";
 import {
-  E4B_ORIN, e2b, e4b, entry, foundOnDisk, functionGemma, litertE2b, litertE4b, llamafile, NO_ROLES,
-  ollama, ORIN_MEMORY, rolesWith, whisper,
+  DESKTOP_MEMORY, E4B_ORIN, e2b, e4b, entry, foundOnDisk, functionGemma, litertE2b, litertE4b, llamafile,
+  NO_ROLES, ollama, ORIN_MEMORY, rolesWith, whisper,
 } from "./models/fixtures";
 
 const NOT_DOWNLOADED = { downloaded: false };
@@ -145,6 +145,7 @@ describe("Recommended for this pond", () => {
   });
 
   it("says the number before it is spent, and drops the add-on when it is unticked", async () => {
+    setup({ memory: DESKTOP_MEMORY });
     renderModels();
     const recommended = await band("Recommended for this pond");
     const card = within(recommended).getByRole("article", { name: "Gemma 4 E4B, llama.cpp" });
@@ -162,7 +163,8 @@ describe("Recommended for this pond", () => {
     );
   });
 
-  it("downloads with the add-on by default, and says what the pond will fetch", async () => {
+  it("downloads with the add-on by default when it fits, and says what the pond will fetch", async () => {
+    setup({ memory: DESKTOP_MEMORY });
     renderModels();
     const recommended = await band("Recommended for this pond");
     const card = within(recommended).getByRole("article", { name: "Gemma 4 E4B, llama.cpp" });
@@ -362,7 +364,7 @@ describe("fit", () => {
     expect(document.body.textContent).not.toMatch(/\d{3,}%/);
   });
 
-  it("says a model that only fits without its add-on, and how to make it fit", async () => {
+  it("starts the add-on unticked where only the model fits, says why, and lets it be ticked anyway", async () => {
     // 4020 MB of weights fit the 4800 MB left; with 945 MB of add-on they do not.
     setup({
       models: [e4b()],
@@ -370,12 +372,64 @@ describe("fit", () => {
     });
     renderModels();
     const recommended = await band("Recommended for this pond");
+    const tick = within(recommended).getByRole("checkbox", { name: /Include picture support/ }) as HTMLInputElement;
+    expect(tick.checked).toBe(false);
+    const why = within(recommended).getByText("Left out: with pictures it would not fit this pond. Tick to include it anyway.");
+    expect(tick.getAttribute("aria-describedby")).toBe(why.id);
+    // What it costs without the add-on, and that it fits.
+    expect(within(recommended).getByText("4.2 GB")).toBeTruthy();
+    expect(within(recommended).getByText("84%")).toBeTruthy();
+    expect(within(recommended).queryByText("Too big for this pond")).toBeNull();
+
+    // Ticked anyway: the number, the verdict and the way out are said, and the reason is gone.
+    fireEvent.click(tick);
+    expect(within(recommended).getByText("4.2 GB + 945 MB for pictures")).toBeTruthy();
     expect(within(recommended).getByText("Too big for this pond")).toBeTruthy();
     expect(within(recommended).getByText("It fits without picture support.")).toBeTruthy();
+    expect(within(recommended).queryByText(/^Left out:/)).toBeNull();
+    fireEvent.click(within(recommended).getByRole("button", { name: "Download Gemma 4 E4B, llama.cpp" }));
+    await waitFor(() =>
+      expect(api.downloadModel).toHaveBeenCalledWith("gguf", e4b().name, { pictures: true }),
+    );
+  });
 
-    fireEvent.click(within(recommended).getByRole("checkbox", { name: /Include picture support/ }));
-    expect(within(recommended).queryByText("Too big for this pond")).toBeNull();
-    expect(within(recommended).getByText("84%")).toBeTruthy();
+  it("downloads without the add-on, as the box says, when only the model fits", async () => {
+    setup({ models: [e4b()] });
+    renderModels();
+    const recommended = await band("Recommended for this pond");
+    fireEvent.click(within(recommended).getByRole("button", { name: "Download Gemma 4 E4B, llama.cpp" }));
+    await waitFor(() =>
+      expect(api.downloadModel).toHaveBeenCalledWith("gguf", e4b().name, { pictures: false }),
+    );
+  });
+
+  it("never drops the add-on silently: it stays ticked when it fits, when nothing fits, and when the pond cannot say", async () => {
+    for (const memory of [
+      DESKTOP_MEMORY,
+      { total_mb: 7620, available_for_llm_mb: 1030, loaded_model: null, reclaimable_mb: 0 },
+      { total_mb: 0, available_for_llm_mb: 0, loaded_model: null },
+    ]) {
+      setup({ models: [e4b()], memory });
+      const { unmount } = renderModels();
+      const recommended = await band("Recommended for this pond");
+      const tick = within(recommended).getByRole("checkbox", { name: /Include picture support/ }) as HTMLInputElement;
+      expect(tick.checked).toBe(true);
+      expect(within(recommended).queryByText(/^Left out:/)).toBeNull();
+      unmount();
+    }
+  });
+
+  it("keeps what the household chose when the room changes under it", async () => {
+    setup({ models: [e4b()] });
+    renderModels();
+    const recommended = await band("Recommended for this pond");
+    const tick = within(recommended).getByRole("checkbox", { name: /Include picture support/ }) as HTMLInputElement;
+    expect(tick.checked).toBe(false);
+    fireEvent.click(tick);
+    expect(tick.checked).toBe(true);
+    fireEvent.click(tick);
+    expect(tick.checked).toBe(false);
+    expect(within(recommended).getByText(/^Left out:/)).toBeTruthy();
   });
 
   it("counts what switching away from the model in use frees", async () => {
@@ -579,6 +633,7 @@ describe("Get more", () => {
       ],
     });
     vi.mocked(api.downloadModelFromUrl).mockResolvedValue({ status: "downloading", message: "Downloading gemma (4.2 GB) and picture support (945 MB)" });
+    setup({ memory: DESKTOP_MEMORY });
     renderModels();
     const more = await band("Get more");
     fireEvent.change(within(more).getByRole("searchbox", { name: "Search Hugging Face for a model" }), { target: { value: "gemma" } });
@@ -588,13 +643,66 @@ describe("Get more", () => {
     expect(await within(more).findByText("4.2 GB + 945 MB for pictures")).toBeTruthy();
     expect(within(more).getByText("1.0 GB")).toBeTruthy();
 
-    fireEvent.click(within(more).getByRole("checkbox", { name: /Include picture support where a file has it/ }));
+    // The add-on is the file's own choice: only a file that has one carries a box.
+    const gemma = within(more).getByRole("group", { name: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf" });
+    expect(within(within(more).getByRole("group", { name: "other.gguf" })).queryByRole("checkbox")).toBeNull();
+    const tick = within(gemma).getByRole("checkbox", { name: /Include picture support/ }) as HTMLInputElement;
+    expect(tick.checked).toBe(true);
+    fireEvent.click(tick);
     expect(within(more).getByText("4.2 GB")).toBeTruthy();
 
-    fireEvent.click(within(more).getByRole("button", { name: "Download gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf" }));
+    fireEvent.click(within(gemma).getByRole("button", { name: "Download gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf" }));
     await waitFor(() =>
       expect(api.downloadModelFromUrl).toHaveBeenCalledWith(
         expect.stringContaining("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"), "gguf", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", { pictures: false },
+      ),
+    );
+  });
+
+  it("starts a file's add-on unticked where only the file fits this pond, and says why", async () => {
+    // 4020 MB fits the 4800 MB this pond has for one model; with 945 MB of add-on it does not.
+    vi.mocked(api.searchGgufModels).mockResolvedValue({
+      models: [{ id: "unsloth/gemma-4-E4B-it-qat-GGUF", downloads: 1200, likes: 5, tags: [], url: "x" }],
+    });
+    vi.mocked(api.listHfModelFiles).mockResolvedValue({
+      files: [
+        { filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", size_mb: 4020, url: "https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF/resolve/main/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", pictures: { size_bytes: 991_552_320, label: "Gemma 4 E4B" } },
+        { filename: "small.gguf", size_mb: 1000, url: "https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF/resolve/main/small.gguf", pictures: { size_bytes: 991_552_320, label: "Gemma 4 E4B" } },
+      ],
+    });
+    vi.mocked(api.downloadModelFromUrl).mockResolvedValue({ status: "downloading", message: "Downloading gemma (4.2 GB)" });
+    renderModels();
+    const more = await band("Get more");
+    fireEvent.change(within(more).getByRole("searchbox", { name: "Search Hugging Face for a model" }), { target: { value: "gemma" } });
+    fireEvent.click(within(more).getByRole("button", { name: "Search" }));
+    fireEvent.click(await within(more).findByRole("button", { name: /unsloth\/gemma-4-E4B-it-qat-GGUF/ }));
+
+    const big = await within(more).findByRole("group", { name: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf" });
+    const bigTick = within(big).getByRole("checkbox", { name: /Include picture support/ }) as HTMLInputElement;
+    expect(bigTick.checked).toBe(false);
+    expect(within(big).getByText("Left out: with pictures it would not fit this pond. Tick to include it anyway.")).toBeTruthy();
+    expect(within(big).getByText("4.2 GB")).toBeTruthy();
+
+    // The small file fits with its add-on, so it keeps it, and says nothing is left out.
+    const small = within(more).getByRole("group", { name: "small.gguf" });
+    expect((within(small).getByRole("checkbox", { name: /Include picture support/ }) as HTMLInputElement).checked).toBe(true);
+    expect(within(small).queryByText(/^Left out:/)).toBeNull();
+    expect(within(small).getByText("1.0 GB + 945 MB for pictures")).toBeTruthy();
+
+    fireEvent.click(within(big).getByRole("button", { name: "Download gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf" }));
+    await waitFor(() =>
+      expect(api.downloadModelFromUrl).toHaveBeenCalledWith(
+        expect.stringContaining("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"), "gguf", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", { pictures: false },
+      ),
+    );
+
+    // Ticked anyway, the person's word stands.
+    fireEvent.click(bigTick);
+    expect(within(big).getByText("4.2 GB + 945 MB for pictures")).toBeTruthy();
+    fireEvent.click(within(big).getByRole("button", { name: "Download gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf" }));
+    await waitFor(() =>
+      expect(api.downloadModelFromUrl).toHaveBeenLastCalledWith(
+        expect.stringContaining("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"), "gguf", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", { pictures: true },
       ),
     );
   });

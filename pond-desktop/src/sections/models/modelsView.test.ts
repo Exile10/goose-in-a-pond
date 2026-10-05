@@ -3,12 +3,12 @@ import {
   ROLES, roleHolder, formatSize, formatBytes, fitReading, budgetReading, downloadedOnly,
   rolesFor, modelLabel, groupByJob, modelFacts, sourceChip, addOnOf,
   offersPictures, downloadSummary, recommendedPicks, measuredOf, raisedPick, askingPick,
-  isInUse, holderEntry, sortModels,
+  isInUse, holderEntry, sortModels, fitsOnlyWithoutPictures, fileFitsOnlyWithoutPictures, PICTURES_LEFT_OUT,
 } from "./modelsView";
 import type { ModelActiveRoles, ModelEntry, ModelMemoryStatus } from "../../api/types";
 import {
-  E4B_ORIN, e2b, e4b, foundOnDisk, functionGemma, litertE2b, litertE4b, llamafile, ollama,
-  rolesWith, voice, whisper,
+  DESKTOP_MEMORY, E4B_ORIN, ORIN_MEMORY, e2b, e4b, foundOnDisk, functionGemma, litertE2b, litertE4b,
+  llamafile, ollama, rolesWith, voice, whisper,
 } from "./fixtures";
 
 function model(over: Partial<ModelEntry> = {}): ModelEntry {
@@ -295,6 +295,64 @@ describe("picture support", () => {
     expect(downloadSummary(litertE4b(), true)).toBe("3.7 GB");
     expect(downloadSummary(withState("not_on_this_device"), true)).toBe("2.6 GB");
     expect(downloadSummary(withState("installed"), true)).toBe("2.6 GB");
+  });
+});
+
+describe("when the picture box starts unticked", () => {
+  it("says why in the sentence the household reads beside it", () => {
+    expect(PICTURES_LEFT_OUT).toBe("Left out: with pictures it would not fit this pond. Tick to include it anyway.");
+  });
+
+  it("is only when the model fits this pond and the model with its add-on does not", () => {
+    // 4020 MB of weights; 945 MB of add-on; 4796 MB left for one model on the Orin's reading.
+    expect(fitsOnlyWithoutPictures(e4b(), ORIN_MEMORY)).toBe(true);
+  });
+
+  it("is not when the add-on fits too: it stays in, ticked", () => {
+    expect(fitsOnlyWithoutPictures(e4b(), DESKTOP_MEMORY)).toBe(false);
+  });
+
+  it("is not when the model is too big on its own: dropping the add-on would not help", () => {
+    expect(fitsOnlyWithoutPictures(e4b(), memory({ available_for_llm_mb: 1030 }))).toBe(false);
+  });
+
+  it("is not when the pond cannot say how much room there is: nothing drops silently", () => {
+    expect(fitsOnlyWithoutPictures(e4b(), memory({ total_mb: 0, available_for_llm_mb: 0 }))).toBe(false);
+    expect(fitsOnlyWithoutPictures(e4b(), null)).toBe(false);
+  });
+
+  it("counts what switching away from the model in use returns, as the card does", () => {
+    // 5820 MB free is the Orin's; 900 MB more comes back, so the add-on fits.
+    expect(fitsOnlyWithoutPictures(e4b(), { ...ORIN_MEMORY, reclaimable_mb: 900 })).toBe(false);
+  });
+
+  it("is not for a model with no add-on to bring, or one already here", () => {
+    expect(fitsOnlyWithoutPictures(litertE4b(), ORIN_MEMORY)).toBe(false);
+    expect(fitsOnlyWithoutPictures(e4b({ downloaded: true }), ORIN_MEMORY)).toBe(false);
+    expect(fitsOnlyWithoutPictures(ollama(), ORIN_MEMORY)).toBe(false);
+  });
+
+  it("agrees with the card: whenever it is true, ticking the box reads 'Too big' and leaving it out reads a fit", () => {
+    expect(fitReading(e4b(), ORIN_MEMORY).state).toBe("fits");
+    expect(fitReading(e4b(), ORIN_MEMORY, { withPictures: true }).state).toBe("too_big");
+  });
+
+  describe("for a file Hugging Face lists", () => {
+    const addOn = { size_bytes: 991_552_320, label: "Gemma 4 E4B" };
+
+    it("is the same question, asked of the sizes the listing gives", () => {
+      expect(fileFitsOnlyWithoutPictures({ size_mb: 4020, pictures: addOn }, ORIN_MEMORY)).toBe(true);
+      expect(fileFitsOnlyWithoutPictures({ size_mb: 1000, pictures: addOn }, ORIN_MEMORY)).toBe(false);
+      expect(fileFitsOnlyWithoutPictures({ size_mb: 4020, pictures: addOn }, DESKTOP_MEMORY)).toBe(false);
+    });
+
+    it("cannot weigh a file whose size is not listed, so its add-on stays in", () => {
+      expect(fileFitsOnlyWithoutPictures({ pictures: addOn }, ORIN_MEMORY)).toBe(false);
+    });
+
+    it("has nothing to leave out when the file brings no add-on", () => {
+      expect(fileFitsOnlyWithoutPictures({ size_mb: 4020, pictures: null }, ORIN_MEMORY)).toBe(false);
+    });
   });
 });
 

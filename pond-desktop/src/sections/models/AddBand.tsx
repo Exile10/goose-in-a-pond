@@ -1,18 +1,23 @@
 import { useCallback, useState } from "react";
-import { Download, ImagePlus, Loader2, Search } from "lucide-react";
+import { Download, Loader2, Search } from "lucide-react";
 import { api } from "../../api/PondApiClient";
 import { ErrorBanner } from "../../components/shared";
-import type { HfModel, HfModelFile } from "../../api/types";
+import { PicturesChoice } from "../../components/models/ModelMarks";
+import type { HfModel, HfModelFile, ModelMemoryStatus } from "../../api/types";
 import { startedText } from "./modelDownloads";
-import { formatBytes, formatSize } from "./modelsView";
+import { fileFitsOnlyWithoutPictures, formatBytes, formatSize } from "./modelsView";
 
-/** Search Hugging Face for a model to add. A file with a known picture add-on says its size first. */
+/** Search Hugging Face for a model to add. A file with a known picture add-on says its size first,
+ *  and carries its own tick box: whether the add-on fits depends on the file. */
 export function AddBand({
   carriesPictures,
+  memory,
   onStarted,
 }: {
   /** False when this device will not carry picture support; null when nothing says. */
   carriesPictures: boolean | null;
+  /** The room this pond has for one model, to weigh a file with its add-on. */
+  memory: ModelMemoryStatus | null;
   /** A download began, or was already on its way; `message` says which, in the pond's words. */
   onStarted: (message: string) => void;
 }) {
@@ -24,7 +29,8 @@ export function AddBand({
   const [files, setFiles] = useState<Record<string, HfModelFile[]>>({});
   const [loadingFiles, setLoadingFiles] = useState<string | null>(null);
   const [starting, setStarting] = useState<string | null>(null);
-  const [withPictures, setWithPictures] = useState(true);
+  // The tick box per file, by its URL; a file the household has not touched takes its default.
+  const [choice, setChoice] = useState<Record<string, boolean>>({});
 
   const search = useCallback(async () => {
     const q = query.trim();
@@ -61,16 +67,20 @@ export function AddBand({
     }
   }
 
+  /** The add-on a download of this file would bring, where this device carries it. */
+  const addOnOf = (file: HfModelFile) => (carriesPictures === false ? null : (file.pictures ?? null));
+  /** Ticked until the household says otherwise, except where only the file fits this pond. */
+  const withPictures = (file: HfModelFile) => choice[file.url] ?? !fileFitsOnlyWithoutPictures(file, memory);
+
   async function download(file: HfModelFile) {
     setStarting(file.filename);
     try {
       // The add-on is only asked about for a file that has one on a device that carries it.
-      const asksPictures = carriesPictures !== false && !!file.pictures;
       const started = await api.downloadModelFromUrl(
         file.url,
         "gguf",
         file.filename,
-        asksPictures ? { pictures: withPictures } : undefined,
+        addOnOf(file) ? { pictures: withPictures(file) } : undefined,
       );
       onStarted(startedText(started, file.filename));
     } catch (e) {
@@ -84,12 +94,11 @@ export function AddBand({
    *  listing often leaves a file's own size out; the pond states it when the download starts. */
   function costOf(file: HfModelFile): string {
     const own = formatSize(file.size_mb) || "Size not listed";
-    const pictures = carriesPictures === false ? null : file.pictures;
-    return pictures && withPictures ? `${own} + ${formatBytes(pictures.size_bytes)} for pictures` : own;
+    const pictures = addOnOf(file);
+    return pictures && withPictures(file) ? `${own} + ${formatBytes(pictures.size_bytes)} for pictures` : own;
   }
 
   const repoFiles = openRepo ? (files[openRepo] ?? []) : [];
-  const offersPictures = carriesPictures !== false && repoFiles.some((f) => f.pictures);
 
   return (
     <section className="mdl-band" id="mdl-add">
@@ -132,26 +141,32 @@ export function AddBand({
                   {loadingFiles !== r.id && repoFiles.length === 0 && (
                     <span className="mdl-muted">No GGUF files in this repository.</span>
                   )}
-                  {offersPictures && (
-                    <label className="mm-choice">
-                      <input type="checkbox" checked={withPictures}
-                        onChange={(e) => setWithPictures(e.target.checked)} />
-                      <ImagePlus size={14} aria-hidden="true" />
-                      <span>Include picture support where a file has it</span>
-                    </label>
-                  )}
-                  {repoFiles.map((f) => (
-                    <div key={f.filename} className="mdl-file">
-                      <span className="mdl-file__name" title={f.filename}>{f.filename}</span>
-                      <span className="mdl-file__size">{costOf(f)}</span>
-                      <button type="button" className="mm-btn"
-                        onClick={() => void download(f)} disabled={starting === f.filename}
-                        aria-label={`Download ${f.filename}`}>
-                        <Download size={15} aria-hidden="true" />
-                        <span>{starting === f.filename ? "Starting…" : "Download"}</span>
-                      </button>
-                    </div>
-                  ))}
+                  {repoFiles.map((f) => {
+                    const addOn = addOnOf(f);
+                    return (
+                      <div key={f.url} className="mdl-file" role="group" aria-label={f.filename}>
+                        <span className="mdl-file__name" title={f.filename}>{f.filename}</span>
+                        <span className="mdl-file__size">{costOf(f)}</span>
+                        <button type="button" className="mm-btn"
+                          onClick={() => void download(f)} disabled={starting === f.filename}
+                          aria-label={`Download ${f.filename}`}>
+                          <Download size={15} aria-hidden="true" />
+                          <span>{starting === f.filename ? "Starting…" : "Download"}</span>
+                        </button>
+                        {addOn && (
+                          <div className="mdl-file__addon">
+                            <PicturesChoice
+                              checked={withPictures(f)}
+                              size={formatBytes(addOn.size_bytes)}
+                              onChange={(next) => setChoice((c) => ({ ...c, [f.url]: next }))}
+                              disabled={starting === f.filename}
+                              leftOut={fileFitsOnlyWithoutPictures(f, memory)}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </li>

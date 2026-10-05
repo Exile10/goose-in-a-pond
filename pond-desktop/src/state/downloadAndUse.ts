@@ -123,11 +123,12 @@ function schedule(): void {
 }
 
 /** Starts the download and promises to use the model when it arrives. Rejects, with nothing
- *  promised, when the pond refuses the download. */
+ *  promised, when the pond refuses the download. `includePictures` is left out for a model that has
+ *  no picture support to ask about. */
 export async function downloadAndUse(
   model: Pick<ModelEntry, "id" | "category" | "provider" | "name" | "downloaded">,
   title: string,
-  includePictures: boolean,
+  includePictures?: boolean,
 ): Promise<DownloadStarted | null> {
   const category = model.category ?? model.provider;
   const entry: Watched = {
@@ -144,7 +145,11 @@ export async function downloadAndUse(
     await activate(entry);
     return null;
   }
-  const started = await api.downloadModel(category, model.name, { pictures: includePictures });
+  const started = await api.downloadModel(
+    category,
+    model.name,
+    includePictures === undefined ? undefined : { pictures: includePictures },
+  );
   watched.set(entry.id, entry);
   publish();
   schedule();

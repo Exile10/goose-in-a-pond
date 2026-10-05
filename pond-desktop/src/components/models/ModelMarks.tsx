@@ -1,8 +1,10 @@
+import { useId } from "react";
 import {
   AlertTriangle, Check, Cpu, FileBox, Image, ImageOff, ImagePlus, Loader2, Microchip, Pause,
   Play, RotateCw, Server, X, type LucideIcon,
 } from "lucide-react";
 import type { ModelEngine } from "../../api/types";
+import { PICTURES_LEFT_OUT } from "../../sections/models/modelsView";
 import type { AddOn, FitReading, SourceChip as Chip } from "../../sections/models/modelsView";
 import { pausedText, type ModelTransfer, type TransferAction } from "../../sections/models/modelDownloads";
 import "../../styles/model-marks.css";
@@ -135,31 +137,45 @@ export function FitCell({ fit, quiet = false }: { fit: FitReading; quiet?: boole
   }
 }
 
-/** The tick box that keeps picture support in the download. Ticked until the household says otherwise. */
+/** The tick box that keeps picture support in the download. Ticked until the household says otherwise,
+ *  except where only the model fits this pond: then it starts unticked and says why beside it. */
 export function PicturesChoice({
   checked,
   size,
   onChange,
   disabled = false,
+  leftOut = false,
 }: {
   checked: boolean;
   /** "945 MB" */
   size: string;
   onChange: (next: boolean) => void;
   disabled?: boolean;
+  /** Only the model fits this pond, so the box is unticked and the reason is shown. */
+  leftOut?: boolean;
 }) {
+  const whyId = useId();
+  const why = leftOut && !checked;
   return (
-    <label className="mm-choice">
-      <input
-        type="checkbox"
-        checked={checked}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.checked)}
-      />
-      <ImagePlus size={14} aria-hidden="true" />
-      <span>Include picture support</span>
-      <span className="mm-choice__size">{size}</span>
-    </label>
+    <>
+      <label className="mm-choice">
+        <input
+          type="checkbox"
+          checked={checked}
+          disabled={disabled}
+          aria-describedby={why ? whyId : undefined}
+          onChange={(e) => onChange(e.target.checked)}
+        />
+        <ImagePlus size={14} aria-hidden="true" />
+        <span>Include picture support</span>
+        <span className="mm-choice__size">{size}</span>
+      </label>
+      {why && (
+        <p className="mm-choice__why" id={whyId}>
+          {PICTURES_LEFT_OUT}
+        </p>
+      )}
+    </>
   );
 }
 

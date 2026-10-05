@@ -3,7 +3,7 @@ import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { mockAllApiRoutes } from "./helpers/api-mocks";
 import { navigateTo } from "./helpers/nav";
-import { mockModels, ollamaModel, typicalModels, whisperBase, type ModelMocks } from "./helpers/model-mocks";
+import { mockModels, ollamaModel, ROOMY_MEMORY, typicalModels, whisperBase, type ModelMocks } from "./helpers/model-mocks";
 
 const NO_ROLES = {
   chat: null, tool: null, asr: null, tts: null,
@@ -37,7 +37,7 @@ async function goToModelsScreen(page: Page) {
 
 test.describe("Hub — Models sub-screen wiring", () => {
   test("shows the four jobs, the picks still to get, and what is here by engine", async ({ page }) => {
-    await setupHub(page, { roles: E2B_IN_USE });
+    await setupHub(page, { roles: E2B_IN_USE, memory: ROOMY_MEMORY });
     await goToModelsScreen(page);
 
     const tiles = page.getByRole("list", { name: "Which model does each job" }).getByRole("listitem");
@@ -57,6 +57,16 @@ test.describe("Hub — Models sub-screen wiring", () => {
     await expect(conversation).toContainText("llama.cpp runs .gguf files and can read pictures with an add-on.");
     await expect(conversation).toContainText("Ollama is your own Ollama server; llamafile runs a model packed into one file.");
     await expect(conversation.getByText("(detected on disk)")).toHaveCount(0);
+  });
+
+  test("leaves the add-on out where only the model fits, and says why beside the box", async ({ page }) => {
+    await setupHub(page, { roles: E2B_IN_USE });
+    await goToModelsScreen(page);
+    const card = page.locator(".mm-pick", { hasText: "llama.cpp" });
+    await expect(card.getByRole("checkbox", { name: /Include picture support/ })).not.toBeChecked();
+    await expect(card.locator(".mm-choice__why")).toHaveText(
+      "Left out: with pictures it would not fit this pond. Tick to include it anyway.",
+    );
   });
 
   test("does not list the whole catalogue, and has no Download button that can never be pressed", async ({ page }) => {

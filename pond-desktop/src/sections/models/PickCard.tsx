@@ -5,8 +5,8 @@ import { engineOf } from "../../lib/modelProvider";
 import "../../styles/model-pick.css";
 import type { ModelTransfer, TransferAction } from "./modelDownloads";
 import {
-  addOnOf, downloadSummary, fitReading, formatBytes, formatSize, measuredOf, modelLabel,
-  modelFullName, offersPictures, picturesOf,
+  addOnOf, downloadSummary, fitReading, fitsOnlyWithoutPictures, formatBytes, formatSize, measuredOf,
+  modelLabel, modelFullName, offersPictures, picturesOf,
 } from "./modelsView";
 
 export interface PickCardProps {
@@ -72,6 +72,7 @@ export function PickCard({
               size={formatBytes(pictures.size_bytes)}
               onChange={onWithPictures}
               disabled={busy || transfer !== null}
+              leftOut={fitsOnlyWithoutPictures(model, memory)}
             />
           ) : (
             <AddOnLine addOn={addOn} />

@@ -181,7 +181,7 @@ restate fit, labels or engine names anywhere else.
 | `<SourceChip>` | Recommended, Added, Found on disk or Ollama; nothing for the catalogue |
 | `<AddOnLine>` | Picture support: included, add, adding, checking, or text only |
 | `<FitCell>` | In use, a share of the pond's one budget, or "Too big for this pond" |
-| `<PicturesChoice>` | The ticked, untickable add-on box on a download |
+| `<PicturesChoice>` | The add-on box on a download: ticked and untickable, and unticked with its reason beside it where only the model fits this pond |
 | `<TransferView>` | A bar per part, one Pause, Resume and Stop set per model, and why a part failed |
 
 Elevation is state. One pick is raised (the model in use, else the first suggestion), and one

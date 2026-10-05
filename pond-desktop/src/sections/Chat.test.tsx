@@ -653,7 +653,7 @@ describe("Chat with no conversation model", () => {
     const extra = {
       listModels: vi.fn().mockResolvedValue([fixtures.e4b(), fixtures.e2b(), fixtures.litertE4b()]),
       getActiveRoles: vi.fn().mockResolvedValue(fixtures.NO_ROLES),
-      getMemoryStatus: vi.fn().mockResolvedValue(fixtures.ORIN_MEMORY),
+      getMemoryStatus: vi.fn().mockResolvedValue(fixtures.DESKTOP_MEMORY),
       getDownloadProgress: vi.fn().mockResolvedValue({ downloads: [] }),
       downloadModel: vi.fn().mockResolvedValue({ status: "download_started" }),
       activateModel: vi.fn().mockResolvedValue(undefined),

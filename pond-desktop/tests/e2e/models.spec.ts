@@ -4,7 +4,7 @@ import type { Page } from "@playwright/test";
 import { mockAllApiRoutes } from "./helpers/api-mocks";
 import { navigateTo } from "./helpers/nav";
 import {
-  e2bQat, e4bQat, foundGguf, litertE4b, mockModels, ollamaModel, typicalModels,
+  e2bQat, e4bQat, foundGguf, litertE4b, mockModels, ollamaModel, ROOMY_MEMORY, typicalModels,
   whisperBase,
 } from "./helpers/model-mocks";
 
@@ -122,7 +122,7 @@ test.describe("Models section", () => {
     });
 
     test("says the number before it is spent, and the add-on can be unticked", async ({ page }) => {
-      await mockModels(page, { roles: { chat: null, tool: null, asr: null, tts: null, embedding: null } });
+      await mockModels(page, { roles: { chat: null, tool: null, asr: null, tts: null, embedding: null }, memory: ROOMY_MEMORY });
       let body: unknown = "unset";
       await page.route("**/api/v1/models/gguf/*/download", (route) => {
         body = route.request().postDataJSON();
@@ -140,16 +140,44 @@ test.describe("Models section", () => {
       await expect(page.getByText("Downloading Gemma 4 E4B (4.2 GB)")).toBeVisible();
     });
 
-    test("downloads with picture support by default", async ({ page }) => {
-      await mockModels(page, { roles: { chat: null, tool: null, asr: null, tts: null, embedding: null } });
+    test("downloads with picture support by default where it fits", async ({ page }) => {
+      await mockModels(page, { roles: { chat: null, tool: null, asr: null, tts: null, embedding: null }, memory: ROOMY_MEMORY });
       let body: unknown = "unset";
       await page.route("**/api/v1/models/gguf/*/download", (route) => {
         body = route.request().postDataJSON();
         return route.fulfill({ json: { status: "download_started" } });
       });
       await goToModels(page);
-      await page.locator(".mm-pick", { hasText: "llama.cpp" }).first().getByRole("button", { name: /^Download/ }).click();
+      const card = page.locator(".mm-pick", { hasText: "llama.cpp" }).first();
+      await expect(card.getByRole("checkbox", { name: /Include picture support/ })).toBeChecked();
+      await expect(card).not.toContainText("Left out");
+      await card.getByRole("button", { name: /^Download/ }).click();
       await expect.poll(() => body).toEqual({ pictures: true });
+    });
+
+    test("leaves the add-on out where only the model fits, says why, and lets it be ticked anyway", async ({ page }) => {
+      // The Orin's room: 4.2 GB fits, and 4.2 GB with 945 MB of picture support does not.
+      await mockModels(page, { roles: { chat: null, tool: null, asr: null, tts: null, embedding: null } });
+      const bodies: unknown[] = [];
+      await page.route("**/api/v1/models/gguf/*/download", (route) => {
+        bodies.push(route.request().postDataJSON());
+        return route.fulfill({ json: { status: "download_started", message: "Downloading Gemma 4 E4B (4.2 GB)" } });
+      });
+      await goToModels(page);
+      const card = page.locator(".mm-pick", { hasText: "llama.cpp" }).first();
+      const tick = card.getByRole("checkbox", { name: /Include picture support/ });
+      await expect(tick).not.toBeChecked();
+      await expect(card.locator(".mm-choice__why")).toHaveText(
+        "Left out: with pictures it would not fit this pond. Tick to include it anyway.",
+      );
+      await expect(card).not.toContainText("Too big for this pond");
+
+      await tick.check();
+      await expect(card).toContainText("4.2 GB + 945 MB for pictures");
+      await expect(card).toContainText("Too big for this pond");
+      await expect(card.locator(".mm-choice__why")).toHaveCount(0);
+      await card.getByRole("button", { name: /^Download Gemma 4 E4B/ }).click();
+      await expect.poll(() => bodies).toEqual([{ pictures: true }]);
     });
 
     test("says a file already coming down is already on its way, and not as a failure", async ({ page }) => {
@@ -305,8 +333,8 @@ test.describe("Models section", () => {
       await expect(more.getByRole("searchbox", { name: "Search Hugging Face for a model" })).toBeVisible();
     });
 
-    test("says a Hugging Face file's add-on size before it is spent", async ({ page }) => {
-      await mockModels(page);
+    test("says a Hugging Face file's add-on size before it is spent, and lets it be left out", async ({ page }) => {
+      await mockModels(page, { memory: ROOMY_MEMORY });
       await page.route("**/api/v1/models/search/gguf?q=*", (route) =>
         route.fulfill({ json: { models: [{ id: "unsloth/gemma-4-E4B-it-qat-GGUF", downloads: 1200, likes: 5, tags: [], url: "x" }] } }),
       );
@@ -325,6 +353,37 @@ test.describe("Models section", () => {
       await expect(more).toContainText("4.2 GB + 945 MB for pictures");
       await more.getByRole("checkbox", { name: /Include picture support/ }).uncheck();
       await expect(more.locator(".mdl-file__size")).toHaveText("4.2 GB");
+    });
+
+    test("starts a Hugging Face file's add-on unticked where only the file fits this pond", async ({ page }) => {
+      await mockModels(page);
+      await page.route("**/api/v1/models/search/gguf?q=*", (route) =>
+        route.fulfill({ json: { models: [{ id: "unsloth/gemma-4-E4B-it-qat-GGUF", downloads: 1200, likes: 5, tags: [], url: "x" }] } }),
+      );
+      await page.route("**/api/v1/models/search/gguf/files?repo=*", (route) =>
+        route.fulfill({
+          json: {
+            files: [{ filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", size_mb: 4020, url: "https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF/resolve/main/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", pictures: { size_bytes: 991_552_320, label: "Gemma 4 E4B" } }],
+          },
+        }),
+      );
+      let body: unknown = "unset";
+      await page.route("**/api/v1/models/download/url", (route) => {
+        body = route.request().postDataJSON();
+        return route.fulfill({ json: { status: "download_started", message: "Downloading gemma (4.2 GB)" } });
+      });
+      await goToModels(page);
+      const more = page.locator("#mdl-get");
+      await more.getByRole("searchbox").fill("gemma");
+      await more.getByRole("button", { name: "Search" }).click();
+      await more.getByRole("button", { name: /unsloth\/gemma-4-E4B-it-qat-GGUF/ }).click();
+      await expect(more.getByRole("checkbox", { name: /Include picture support/ })).not.toBeChecked();
+      await expect(more.locator(".mm-choice__why")).toHaveText(
+        "Left out: with pictures it would not fit this pond. Tick to include it anyway.",
+      );
+      await expect(more.locator(".mdl-file__size")).toHaveText("4.2 GB");
+      await more.getByRole("button", { name: /^Download gemma-4-E4B/ }).click();
+      await expect.poll(() => body).toMatchObject({ pictures: false });
     });
   });
 

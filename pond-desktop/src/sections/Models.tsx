@@ -437,6 +437,7 @@ export function Models() {
 
         <AddBand
           carriesPictures={carriesPictures(models)}
+          memory={memory}
           onStarted={(message) => {
             say(message);
             // A file named by URL becomes a row of its own, which the transfer then sits on.

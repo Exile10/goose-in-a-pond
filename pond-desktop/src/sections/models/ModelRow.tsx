@@ -3,8 +3,8 @@ import type { ModelEntry, ModelMemoryStatus } from "../../api/types";
 import { AddOnLine, FitCell, PicturesChoice, SourceChip, TransferView } from "../../components/models/ModelMarks";
 import type { ModelTransfer, TransferAction } from "./modelDownloads";
 import {
-  type RoleKey, ROLES, addOnOf, downloadSummary, fitReading, formatBytes, formatSize, modelFacts,
-  modelFullName, modelLabel, offersPictures, picturesOf, sourceChip,
+  type RoleKey, ROLES, addOnOf, downloadSummary, fitReading, fitsOnlyWithoutPictures, formatBytes,
+  formatSize, modelFacts, modelFullName, modelLabel, offersPictures, picturesOf, sourceChip,
 } from "./modelsView";
 
 export interface ModelRowProps {
@@ -58,6 +58,7 @@ export function ModelRow({
                 size={formatBytes(pictures.size_bytes)}
                 onChange={onWithPictures}
                 disabled={busy || transfer !== null}
+                leftOut={fitsOnlyWithoutPictures(model, memory)}
               />
             ) : (
               <AddOnLine

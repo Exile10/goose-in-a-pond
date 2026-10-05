@@ -22,8 +22,8 @@ import { api } from "../../../api/PondApiClient";
 import { ApiError } from "../../../api/types";
 import type { DownloadEntry, ModelEntry, ModelMemoryStatus } from "../../../api/types";
 import {
-  E4B_ORIN, e2b, e4b, entry, foundOnDisk, litertE2b, litertE4b, llamafile, NO_ROLES, ollama,
-  ORIN_MEMORY, rolesWith, voice, whisper,
+  DESKTOP_MEMORY, E4B_ORIN, e2b, e4b, entry, foundOnDisk, litertE2b, litertE4b, llamafile, NO_ROLES,
+  ollama, ORIN_MEMORY, rolesWith, voice, whisper,
 } from "../../../sections/models/fixtures";
 
 const HERE = { downloaded: true };
@@ -104,6 +104,7 @@ describe("Hub Models: what to get", () => {
   it("offers the picks that are not here yet, with their size, and nothing else of the catalogue", async () => {
     setup({
       models: [e4b(), e2b(HERE), litertE4b(), litertE2b(), whisper("base.en"), whisper("small"), voice("af_heart", { downloaded: false }), ollama()],
+      memory: DESKTOP_MEMORY,
     });
     renderHub();
     const recommended = await card("Recommended for this pond");
@@ -124,7 +125,8 @@ describe("Hub Models: what to get", () => {
     expect(disabled).toEqual([]);
   });
 
-  it("downloads with the add-on ticked, and can be unticked, saying the number each way", async () => {
+  it("downloads with the add-on ticked where it fits, and can be unticked, saying the number each way", async () => {
+    setup({ memory: DESKTOP_MEMORY });
     renderHub();
     const recommended = await card("Recommended for this pond");
     const pick = within(recommended).getByRole("article", { name: "Gemma 4 E4B, llama.cpp" });
@@ -135,6 +137,28 @@ describe("Hub Models: what to get", () => {
     fireEvent.click(within(pick).getByRole("button", { name: "Download Gemma 4 E4B, llama.cpp" }));
     await waitFor(() => expect(api.downloadModel).toHaveBeenCalledWith("gguf", e4b().name, { pictures: false }));
     expect(await screen.findByText("Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)")).toBeTruthy();
+  });
+
+  it("starts the add-on unticked where only the model fits, says why, and lets it be ticked anyway", async () => {
+    renderHub();
+    const recommended = await card("Recommended for this pond");
+    const pick = within(recommended).getByRole("article", { name: "Gemma 4 E4B, llama.cpp" });
+    const tick = within(pick).getByRole("checkbox", { name: /Include picture support/ }) as HTMLInputElement;
+    expect(tick.checked).toBe(false);
+    const why = within(pick).getByText("Left out: with pictures it would not fit this pond. Tick to include it anyway.");
+    expect(tick.getAttribute("aria-describedby")).toBe(why.id);
+    expect(within(pick).getByText("4.2 GB")).toBeTruthy();
+    expect(within(pick).queryByText("Too big for this pond")).toBeNull();
+
+    fireEvent.click(within(pick).getByRole("button", { name: "Download Gemma 4 E4B, llama.cpp" }));
+    await waitFor(() => expect(api.downloadModel).toHaveBeenCalledWith("gguf", e4b().name, { pictures: false }));
+
+    fireEvent.click(tick);
+    expect(within(pick).getByText("4.2 GB + 945 MB for pictures")).toBeTruthy();
+    expect(within(pick).getByText("Too big for this pond")).toBeTruthy();
+    expect(within(pick).queryByText(/^Left out:/)).toBeNull();
+    fireEvent.click(within(pick).getByRole("button", { name: "Download Gemma 4 E4B, llama.cpp" }));
+    await waitFor(() => expect(api.downloadModel).toHaveBeenLastCalledWith("gguf", e4b().name, { pictures: true }));
   });
 
   it("raises one card and asks with one button while nothing converses; after that it raises the model in use", async () => {

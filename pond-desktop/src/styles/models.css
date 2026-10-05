@@ -506,6 +506,11 @@
   flex-shrink: 0;
 }
 
+/* The file's picture box sits on a line of its own under the name, size and button. */
+.mdl-file__addon {
+  flex: 1 1 100%;
+}
+
 /* ── Narrow panes ───────────────────────────────────────────────────────── */
 
 /* Four jobs read as two and two on a small panel, not three and one. */

@@ -225,6 +225,17 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Why the box starts unticked, set under its label's words. Secondary text on the card, 6.22:1 light
+   and 5.45:1 dark. */
+.mm-choice__why {
+  margin: 0 0 var(--space-2);
+  padding-inline-start: calc(18px + 14px + var(--space-2) * 2);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--color-text-secondary);
+}
+
 /* ── Fit ────────────────────────────────────────────────────────────────── */
 
 .mm-fit {

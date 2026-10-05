@@ -241,10 +241,18 @@ export function voice(name = "af_heart", over: Partial<ModelEntry> = {}): ModelE
   };
 }
 
-/** The Orin's reading with nothing loaded. */
+/** The Orin's reading with nothing loaded: 4.2 GB fits, 4.2 GB with its picture support does not. */
 export const ORIN_MEMORY: ModelMemoryStatus = {
   total_mb: 7620,
   available_for_llm_mb: 5820,
+  loaded_model: null,
+  reclaimable_mb: 0,
+};
+
+/** A desktop with room to spare: the primary pick fits with its picture support. */
+export const DESKTOP_MEMORY: ModelMemoryStatus = {
+  total_mb: 16384,
+  available_for_llm_mb: 12288,
   loaded_model: null,
   reclaimable_mb: 0,
 };

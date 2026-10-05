@@ -1,4 +1,5 @@
 import type {
+  HfModelFile,
   ModelActiveRoles,
   ModelCompanion,
   ModelEntry,
@@ -294,6 +295,44 @@ export function carriesPictures(models: Pick<ModelEntry, "companions">[]): boole
 /** Whether a download of this row can bring picture support along, for the tick box. */
 export function offersPictures(m: Pick<ModelEntry, "companions" | "downloaded">): boolean {
   return !m.downloaded && picturesOf(m)?.state === "available";
+}
+
+/** Said beside a picture box that starts unticked because only the model fits. */
+export const PICTURES_LEFT_OUT = "Left out: with pictures it would not fit this pond. Tick to include it anyway.";
+
+/** The model fits the room this pond has for one model, but not together with the picture support its
+ *  download would bring. That is the one case the box starts unticked: when the add-on fits, or the
+ *  pond cannot say, it starts ticked and nothing drops it silently. The same readings the card shows. */
+export function fitsOnlyWithoutPictures(
+  m: Pick<ModelEntry, "size_mb" | "ram_estimate_mb" | "companions" | "downloaded" | "engine" | "category" | "provider">,
+  memory: ModelMemoryStatus | null | undefined,
+): boolean {
+  if (!offersPictures(m)) return false;
+  return (
+    fitReading(m, memory).state === "fits" &&
+    fitReading(m, memory, { withPictures: true }).state === "too_big"
+  );
+}
+
+/** The same question for a file Hugging Face lists, from the sizes its listing gives. A file whose
+ *  size is not listed cannot be weighed, so its add-on stays in. */
+export function fileFitsOnlyWithoutPictures(
+  file: Pick<HfModelFile, "size_mb" | "pictures">,
+  memory: ModelMemoryStatus | null | undefined,
+): boolean {
+  if (!file.pictures || !file.size_mb || file.size_mb <= 0) return false;
+  return fitsOnlyWithoutPictures(
+    {
+      size_mb: file.size_mb,
+      category: "gguf",
+      provider: "gguf",
+      downloaded: false,
+      companions: [
+        { kind: "pictures", label: file.pictures.label, size_bytes: file.pictures.size_bytes, state: "available" },
+      ],
+    },
+    memory,
+  );
 }
 
 /** The size a person is about to spend, said before they spend it: "4.2 GB + 945 MB for pictures". */
