@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use pond_api::{build_router, AppState};
+use pond_api::{build_router, AppState, DownloadEntry};
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
 use pond_core::models::ports::model_repository::ModelRepository;
 use pond_core::shared::mocks::mock_agent::MockAgent;
@@ -93,6 +93,22 @@ async fn make_app_with_settings_repo() -> (
     Arc<dyn SettingsRepository + Send + Sync>,
     tempfile::TempDir,
 ) {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    (f.app, f.repo, f.settings, f.tmp)
+}
+
+type Tracker = Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>;
+
+/// Everything a test may need to reach behind the router.
+struct Fixture {
+    app: axum::Router,
+    repo: Arc<dyn ModelRepository + Send + Sync>,
+    settings: Arc<dyn SettingsRepository + Send + Sync>,
+    tracker: Tracker,
+    tmp: tempfile::TempDir,
+}
+
+async fn pond_with(agent: Arc<dyn pond_core::models::ports::agent::Agent>) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
 
@@ -101,10 +117,10 @@ async fn make_app_with_settings_repo() -> (
         Arc::new(SqliteModelRepository::new(db.system.clone()));
     let settings_repo: Arc<dyn SettingsRepository + Send + Sync> =
         Arc::new(MockSettingsRepository::new());
+    let tracker: Tracker = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
-
     let state = Arc::new(AppState {
         warmup: Default::default(),
         suggestion_queue: std::sync::Arc::new(
@@ -117,7 +133,7 @@ async fn make_app_with_settings_repo() -> (
         transcribe_audio: None,
         session_storage,
         http_client: reqwest::Client::new(),
-        agent: Arc::new(MockAgent::new()),
+        agent,
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
@@ -147,7 +163,7 @@ async fn make_app_with_settings_repo() -> (
         tool_registry: None,
         marketplace: None,
         secret_repo: None,
-        download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        download_tracker: tracker.clone(),
         piper_http_port: None,
         model_catalog_provider: None,
         model_storage_dir: None,
@@ -198,12 +214,13 @@ async fn make_app_with_settings_repo() -> (
         mesh_rebuild: None,
     });
 
-    (
-        build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
-        model_repo,
-        settings_repo,
+    Fixture {
+        app: build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
+        repo: model_repo,
+        settings: settings_repo,
+        tracker,
         tmp,
-    )
+    }
 }
 
 fn gguf_record(name: &str) -> ModelRecord {
@@ -639,4 +656,62 @@ async fn a_litert_file_on_disk_is_listed_under_litert() {
     assert!(litert.iter().any(|m| m["name"] == LITERT), "{list}");
     let gguf = list["gguf"].as_array().cloned().unwrap_or_default();
     assert!(gguf.iter().all(|m| m["name"] != LITERT), "{list}");
+}
+
+// ── The disk scan keeps `downloaded` true to the disk ─────────────────────────
+
+fn tracked(filename: &str, status: &str) -> DownloadEntry {
+    DownloadEntry {
+        filename: filename.to_string(),
+        category: "gguf".to_string(),
+        downloaded_bytes: 0,
+        total_bytes: None,
+        status: status.to_string(),
+        finished_at: None,
+        control: Arc::new(std::sync::atomic::AtomicU8::new(pond_api::DL_RUN)),
+        url: None,
+    }
+}
+
+#[tokio::test]
+async fn a_scan_corrects_stale_flags_but_not_a_file_mid_download() {
+    let f = pond_with(Arc::new(MockAgent::new())).await;
+    let gguf = f.tmp.path().join("models").join("gguf");
+    std::fs::create_dir_all(&gguf).unwrap();
+
+    let mut gone = gguf_record("deleted-by-hand");
+    gone.downloaded = true;
+    f.repo.upsert(&gone).await.unwrap();
+
+    let mut arrived = gguf_record("copied-by-hand");
+    arrived.downloaded = false;
+    std::fs::write(gguf.join("copied-by-hand.gguf"), b"weights").unwrap();
+    f.repo.upsert(&arrived).await.unwrap();
+
+    let mut fetching = gguf_record("coming-down");
+    fetching.downloaded = true;
+    f.repo.upsert(&fetching).await.unwrap();
+    f.tracker.write().await.insert(
+        "coming-down.gguf".into(),
+        tracked("coming-down.gguf", "downloading"),
+    );
+
+    let resp = f
+        .app
+        .clone()
+        .oneshot(auth_req("POST", "/api/v1/models/scan", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let flag = |id: &'static str| {
+        let repo = f.repo.clone();
+        async move { repo.get_by_id(id).await.unwrap().unwrap().downloaded }
+    };
+    assert!(!flag("gguf/deleted-by-hand").await, "its file is gone");
+    assert!(flag("gguf/copied-by-hand").await, "its file is there");
+    assert!(
+        flag("gguf/coming-down").await,
+        "a file with a live download is left to the download"
+    );
 }

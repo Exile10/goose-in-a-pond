@@ -205,12 +205,14 @@ pub fn encoder_pinned(repo: &str, revision: &str, filename: &str) -> Option<Enco
         .map(VisionPairing::spec)
 }
 
+type HeaderKey = (PathBuf, u64, Option<SystemTime>);
+type HeaderFacts = Option<(String, u32)>;
+
 /// `(architecture, embedding_length)` from a GGUF's header, cached per (path, length, mtime).
-fn header_facts(path: &Path) -> Option<(String, u32)> {
-    type Key = (PathBuf, u64, Option<SystemTime>);
-    static CACHE: OnceLock<Mutex<HashMap<Key, Option<(String, u32)>>>> = OnceLock::new();
+fn header_facts(path: &Path) -> HeaderFacts {
+    static CACHE: OnceLock<Mutex<HashMap<HeaderKey, HeaderFacts>>> = OnceLock::new();
     let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
-    let key: Key = (path.to_path_buf(), meta.len(), meta.modified().ok());
+    let key: HeaderKey = (path.to_path_buf(), meta.len(), meta.modified().ok());
     let cache = CACHE.get_or_init(Default::default);
     if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
         return hit;
@@ -222,7 +224,7 @@ fn header_facts(path: &Path) -> Option<(String, u32)> {
     facts
 }
 
-fn read_header_facts(path: &Path) -> Option<(String, u32)> {
+fn read_header_facts(path: &Path) -> HeaderFacts {
     use std::io::Read as _;
     let mut head = Vec::with_capacity(super::device_budget::HEAD_BYTES);
     std::fs::File::open(path)

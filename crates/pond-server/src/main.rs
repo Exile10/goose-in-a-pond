@@ -8392,14 +8392,8 @@ async fn run_models(action: ModelAction) -> Result<()> {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("Model '{id}' has no filename"))?;
 
-            let subdir = match cat {
-                ModelCategory::Whisper => "models",
-                ModelCategory::Llamafile => "models/llm",
-                ModelCategory::Gguf => "models/gguf",
-                ModelCategory::TtsPiper => "models/tts",
-                _ => "models",
-            };
-            let dest = data_dir.join(subdir).join(filename);
+            let dest = pond_core::models::domain::model_layout::path_for(&data_dir, &cat, filename)
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' has no file to download"))?;
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -8409,8 +8403,12 @@ async fn run_models(action: ModelAction) -> Result<()> {
 
             // For Piper TTS models also download the companion .onnx.json config file.
             if cat == ModelCategory::TtsPiper {
-                if let (Some(cf), Some(cu)) = (&record.config_filename, &record.config_url) {
-                    let config_dest = data_dir.join(subdir).join(cf);
+                let config_dest = record.config_filename.as_deref().and_then(|cf| {
+                    pond_core::models::domain::model_layout::path_for(&data_dir, &cat, cf)
+                });
+                if let (Some(cf), Some(cu), Some(config_dest)) =
+                    (&record.config_filename, &record.config_url, config_dest)
+                {
                     if !config_dest.exists() {
                         println!("Downloading config {} → {}", cu, config_dest.display());
                         if let Err(e) = model_download::download_file(cu, &config_dest, 0).await {
@@ -8443,15 +8441,10 @@ async fn run_models(action: ModelAction) -> Result<()> {
                 );
             }
 
-            if let Some(filename) = &record.filename {
-                let subdir = match cat {
-                    ModelCategory::Whisper => "models",
-                    ModelCategory::Llamafile => "models/llm",
-                    ModelCategory::Gguf => "models/gguf",
-                    ModelCategory::TtsPiper => "models/tts",
-                    _ => "models",
-                };
-                let path = data_dir.join(subdir).join(filename);
+            let path = record.filename.as_deref().and_then(|filename| {
+                pond_core::models::domain::model_layout::path_for(&data_dir, &cat, filename)
+            });
+            if let Some(path) = path {
                 if path.exists() {
                     std::fs::remove_file(&path)?;
                     println!("✓ Deleted {}", path.display());

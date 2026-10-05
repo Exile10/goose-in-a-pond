@@ -52,6 +52,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use pond_core::models::domain::model_layout;
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
 use pond_core::models::domain::taxonomy::{
     is_companion_file, is_helper_architecture, ON_DISK_PLACEHOLDER,
@@ -1682,9 +1683,13 @@ async fn remove_orphaned_encoder_dir(
     if in_catalogue {
         return;
     }
-    let gguf_dir = data_dir.join("models").join("gguf");
     let deleted_file = deleted.filename.as_deref();
-    if let Ok(mut entries) = tokio::fs::read_dir(&gguf_dir).await {
+    let gguf_dir = model_layout::dir_for(data_dir, &ModelCategory::Gguf);
+    let entries = match gguf_dir {
+        Some(dir) => tokio::fs::read_dir(dir).await.ok(),
+        None => None,
+    };
+    if let Some(mut entries) = entries {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
             if Some(name.as_str()) == deleted_file || is_companion_file(&name) {
@@ -5180,17 +5185,26 @@ fn whisper_facts_from_name(name: &str) -> (Option<String>, Option<String>) {
 }
 
 /// Adds model files found on disk but missing from the catalog as custom entries; returns them.
+/// Also corrects a known row whose `downloaded` disagrees with its file, unless it is mid-download.
 async fn scan_filesystem_extras(
     data_dir: &std::path::Path,
     model_repo: &Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
+    tracker: &Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
 ) -> Vec<ModelRecord> {
     let all = model_repo.list_all().await.unwrap_or_default();
     let known_filenames: std::collections::HashSet<String> =
         all.iter().filter_map(|m| m.filename.clone()).collect();
+    let in_flight: std::collections::HashSet<String> = tracker
+        .read()
+        .await
+        .values()
+        .filter(|e| matches!(e.status.as_str(), "downloading" | "paused"))
+        .map(|e| e.filename.clone())
+        .collect();
 
     let data_dir_owned = data_dir.to_path_buf();
     let known = known_filenames;
-    let extras_from_disk = tokio::task::spawn_blocking(move || {
+    let (extras_from_disk, stale) = tokio::task::spawn_blocking(move || {
         let scan_dir =
             |dir: std::path::PathBuf, category: ModelCategory, exts: &[&str]| -> Vec<ModelRecord> {
                 let mut found = vec![];
@@ -5278,44 +5292,43 @@ async fn scan_filesystem_extras(
             };
 
         let mut extras = vec![];
-        extras.extend(scan_dir(
-            data_dir_owned.join("models").join("gguf"),
-            ModelCategory::Gguf,
-            &[".gguf"],
-        ));
-        extras.extend(scan_dir(
-            pond_core::models::domain::litert::models_dir(&data_dir_owned),
-            ModelCategory::Litert,
-            &[".litertlm"],
-        ));
-        extras.extend(scan_dir(
-            data_dir_owned.join("models").join("llm"),
-            ModelCategory::Llamafile,
-            &[".llamafile", ".exe"],
-        ));
-        extras.extend(scan_dir(
-            data_dir_owned.join("models"),
-            ModelCategory::Whisper,
-            &[".bin"],
-        ));
-        extras.extend(scan_dir(
-            data_dir_owned.join("models").join("tts"),
-            ModelCategory::TtsPiper,
-            &[".onnx"],
-        ));
-        // Hand-copied voices: the catalogue lists only the English ones of the repo's 50-odd.
-        extras.extend(scan_dir(
-            data_dir_owned.join("models").join("kokoro").join("voices"),
-            ModelCategory::TtsKokoro,
-            &[".bin"],
-        ));
-        extras
+        let dirs: [(ModelCategory, &[&str]); 6] = [
+            (ModelCategory::Gguf, &[".gguf"]),
+            (ModelCategory::Litert, &[".litertlm"]),
+            (ModelCategory::Llamafile, &[".llamafile", ".exe"]),
+            (ModelCategory::Whisper, &[".bin"]),
+            (ModelCategory::TtsPiper, &[".onnx"]),
+            // Hand-copied voices: the catalogue lists only the English ones of the repo's 50-odd.
+            (ModelCategory::TtsKokoro, &[".bin"]),
+        ];
+        for (category, exts) in dirs {
+            if let Some(dir) = model_layout::dir_for(&data_dir_owned, &category) {
+                extras.extend(scan_dir(dir, category, exts));
+            }
+        }
+        // Rows whose flag the disk contradicts; a file being fetched is neither yet.
+        let stale: Vec<(String, bool)> = all
+            .iter()
+            .filter(|m| !m.filename.as_ref().is_some_and(|f| in_flight.contains(f)))
+            .filter_map(|m| {
+                let path =
+                    model_layout::path_for(&data_dir_owned, &m.category, m.filename.as_deref()?)?;
+                let present = path.exists();
+                (present != m.downloaded).then(|| (m.id.clone(), present))
+            })
+            .collect();
+        (extras, stale)
     })
     .await
     .unwrap_or_default();
 
     for m in &extras_from_disk {
         let _ = model_repo.upsert(m).await;
+    }
+    for (id, present) in &stale {
+        if model_repo.set_downloaded(id, *present).await.is_ok() {
+            tracing::info!(model = %id, downloaded = present, "corrected a stale downloaded flag");
+        }
     }
 
     extras_from_disk
@@ -5339,25 +5352,14 @@ fn prepare_after_download(
     }
 }
 
-/// Where a downloaded model lands, by category; shared so a resume finds its partial file.
+/// Where a downloaded model lands, by category; `None` for a category or name with no file.
 fn model_dest_path(
     data_dir: &std::path::Path,
     category: &str,
     filename: &str,
-) -> std::path::PathBuf {
-    match category {
-        "whisper" => data_dir.join("models").join(filename),
-        "llamafile" => data_dir.join("models").join("llm").join(filename),
-        "gguf" => data_dir.join("models").join("gguf").join(filename),
-        "litert" => pond_core::models::domain::litert::models_dir(data_dir).join(filename),
-        "tts" | "tts_piper" => data_dir.join("models").join("tts").join(filename),
-        "tts_kokoro" => data_dir
-            .join("models")
-            .join("kokoro")
-            .join("voices")
-            .join(filename),
-        _ => data_dir.join("models").join(filename),
-    }
+) -> Option<std::path::PathBuf> {
+    let category = ModelCategory::from_str(category)?;
+    model_layout::path_for(data_dir, &category, filename)
 }
 
 /// `POST /api/v1/models/download/control` — pause, resume or cancel. Filename is in the body
@@ -5427,7 +5429,12 @@ async fn download_control(
         );
     };
 
-    let dest = model_dest_path(&data_dir, &category, &filename);
+    let Some(dest) = model_dest_path(&data_dir, &category, &filename) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "this download has no file to resume"})),
+        );
+    };
     let tracker = Arc::clone(&state.download_tracker);
     let client = state.http_client.clone();
     let on_done = prepare_after_download(&state, &category, &filename);
@@ -5467,8 +5474,9 @@ async fn list_models(
         {
             let dir = data_dir.clone();
             let repo = Arc::clone(model_repo);
+            let tracker = Arc::clone(&state.download_tracker);
             tokio::spawn(async move {
-                let _ = scan_filesystem_extras(&dir, &repo).await;
+                let _ = scan_filesystem_extras(&dir, &repo, &tracker).await;
                 SCANNING.store(false, std::sync::atomic::Ordering::Release);
             });
         }
@@ -5524,7 +5532,7 @@ async fn scan_models(State(state): State<Arc<AppState>>) -> Json<Value> {
         return Json(json!({"found": 0, "entries": []}));
     };
 
-    let extras = scan_filesystem_extras(data_dir, model_repo).await;
+    let extras = scan_filesystem_extras(data_dir, model_repo, &state.download_tracker).await;
     sync_ollama_models(&state.http_client, model_repo).await;
 
     let count = extras.len();
@@ -5621,42 +5629,16 @@ async fn refresh_model_registry(
             Ok((models, _binaries)) => {
                 let count = models.len();
                 for mut m in models {
-                    m.downloaded = m
+                    m.downloaded = match m
                         .filename
-                        .as_ref()
-                        .map(|f| match m.category {
-                            pond_core::models::domain::model_record::ModelCategory::Whisper => {
-                                data_dir.join("models").join(f).exists()
-                            }
-                            pond_core::models::domain::model_record::ModelCategory::Llamafile => {
-                                data_dir.join("models").join("llm").join(f).exists()
-                            }
-                            pond_core::models::domain::model_record::ModelCategory::Gguf => {
-                                data_dir.join("models").join("gguf").join(f).exists()
-                            }
-                            pond_core::models::domain::model_record::ModelCategory::Litert => {
-                                pond_core::models::domain::litert::models_dir(&data_dir)
-                                    .join(f)
-                                    .exists()
-                            }
-                            pond_core::models::domain::model_record::ModelCategory::TtsPiper => {
-                                data_dir.join("models").join("tts").join(f).exists()
-                            }
-                            pond_core::models::domain::model_record::ModelCategory::TtsKokoro => {
-                                data_dir
-                                    .join("models")
-                                    .join("kokoro")
-                                    .join("voices")
-                                    .join(f)
-                                    .exists()
-                            }
-                            _ => false,
-                        })
-                        .unwrap_or(matches!(
-                            m.category,
-                            pond_core::models::domain::model_record::ModelCategory::TtsHttp
-                                | pond_core::models::domain::model_record::ModelCategory::Ollama
-                        ));
+                        .as_deref()
+                        .and_then(|f| model_layout::path_for(&data_dir, &m.category, f))
+                    {
+                        Some(path) => path.exists(),
+                        None => {
+                            matches!(m.category, ModelCategory::TtsHttp | ModelCategory::Ollama)
+                        }
+                    };
                     if let Err(e) = model_repo.upsert(&m).await {
                         tracing::warn!("Failed to upsert model '{}': {}", m.id, e);
                     }
@@ -5755,25 +5737,12 @@ async fn download_model(
         )
     })?;
 
-    let dest = match cat {
-        ModelCategory::Whisper => data_dir.join("models").join(&filename),
-        ModelCategory::Llamafile => data_dir.join("models").join("llm").join(&filename),
-        ModelCategory::Gguf => data_dir.join("models").join("gguf").join(&filename),
-        ModelCategory::Litert => {
-            pond_core::models::domain::litert::models_dir(&data_dir).join(&filename)
-        }
-        ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
-            data_dir.join("models").join("tts").join(&filename)
-        }
-        // Not models/tts/: the Kokoro engine loads voices from its own directory.
-        ModelCategory::TtsKokoro => data_dir
-            .join("models")
-            .join("kokoro")
-            .join("voices")
-            .join(&filename),
-        ModelCategory::Ollama => data_dir.join("models").join(&filename),
-        ModelCategory::Embedding => data_dir.join("models").join("embedding").join(&filename),
-    };
+    let dest = model_layout::path_for(&data_dir, &m.category, &filename).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "this model has no file to download"})),
+        )
+    })?;
 
     let tracker = Arc::clone(&state.download_tracker);
     let dl_client = state.http_client.clone();
@@ -5800,8 +5769,10 @@ async fn download_model(
             dl_data_dir,
             async move {
                 // Download config file before marking as downloaded
-                if let (Some(cu), Some(cf)) = (cfg_url, cfg_filename) {
-                    let cfg_dest = cfg_data_dir.join("models").join("tts").join(&cf);
+                let cfg_dest = cfg_filename.as_deref().and_then(|cf| {
+                    model_layout::path_for(&cfg_data_dir, &ModelCategory::TtsPiper, cf)
+                });
+                if let (Some(cu), Some(cf), Some(cfg_dest)) = (cfg_url, cfg_filename, cfg_dest) {
                     if let Some(parent) = cfg_dest.parent() {
                         let _ = tokio::fs::create_dir_all(parent).await;
                     }
@@ -5883,27 +5854,13 @@ async fn delete_model(
         ));
     }
 
-    if let (Some(filename), Some(data_dir)) = (&m.filename, &state.data_dir) {
-        let path = match cat {
-            ModelCategory::Whisper => data_dir.join("models").join(filename),
-            ModelCategory::Llamafile => data_dir.join("models").join("llm").join(filename),
-            ModelCategory::Gguf => data_dir.join("models").join("gguf").join(filename),
-            ModelCategory::Litert => {
-                pond_core::models::domain::litert::models_dir(data_dir).join(filename)
-            }
-            ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
-                data_dir.join("models").join("tts").join(filename)
-            }
-            // Must match `download_model`'s path, or the file survives and reappears as installed.
-            ModelCategory::TtsKokoro => data_dir
-                .join("models")
-                .join("kokoro")
-                .join("voices")
-                .join(filename),
-            ModelCategory::Ollama => data_dir.join("models").join(filename),
-            ModelCategory::Embedding => data_dir.join("models").join("embedding").join(filename),
-        };
-        if path.exists() {
+    let path = match (&m.filename, &state.data_dir) {
+        (Some(filename), Some(data_dir)) => model_layout::path_for(data_dir, &m.category, filename),
+        _ => None,
+    };
+    if let (Some(path), Some(data_dir)) = (path, &state.data_dir) {
+        // `symlink_metadata`, so a link whose cache blob is gone is removed too.
+        if tokio::fs::symlink_metadata(&path).await.is_ok() {
             tokio::fs::remove_file(&path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -5912,8 +5869,11 @@ async fn delete_model(
             })?;
         }
         // Also delete companion config file for TTS models (.onnx.json)
-        if let Some(cfg_filename) = &m.config_filename {
-            let cfg_path = data_dir.join("models").join("tts").join(cfg_filename);
+        if let Some(cfg_path) = m
+            .config_filename
+            .as_deref()
+            .and_then(|cf| model_layout::path_for(data_dir, &ModelCategory::TtsPiper, cf))
+        {
             if cfg_path.exists() {
                 let _ = tokio::fs::remove_file(&cfg_path).await;
             }
@@ -6483,7 +6443,12 @@ async fn download_model_from_url(
         );
     };
 
-    let dest = model_dest_path(&data_dir, &category, &filename);
+    let Some(dest) = model_dest_path(&data_dir, &category, &filename) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("cannot save a {category} file named {filename:?}")})),
+        );
+    };
 
     let tracker = Arc::clone(&state.download_tracker);
     let resp_filename = filename.clone();

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use pond_core::models::domain::curated;
 use pond_core::models::domain::engine::Engine;
+use pond_core::models::domain::model_layout;
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
 use pond_core::models::domain::recommended::{self, DeviceClass};
 use pond_core::models::domain::taxonomy::{self, Acquisition, ModelKind, Provenance};
@@ -78,7 +79,7 @@ pub(crate) async fn gguf_path_for(state: &AppState, model: &str) -> Option<PathB
         None => None,
     };
     let filename = recorded.unwrap_or_else(|| gguf_file_name(model));
-    Some(data_dir.join("models").join("gguf").join(filename))
+    model_layout::path_for(data_dir, &ModelCategory::Gguf, &filename)
 }
 
 /// The picture add-on `model` pairs with, reading its header only when no name is listed.
@@ -146,7 +147,7 @@ pub(crate) async fn gguf_vision_batch(
             let path = state
                 .data_dir
                 .as_ref()
-                .map(|dd| dd.join("models").join("gguf").join(file));
+                .and_then(|dd| model_layout::path_for(dd, &ModelCategory::Gguf, &file));
             (m.id.clone(), m.name.clone(), path)
         })
         .collect();
