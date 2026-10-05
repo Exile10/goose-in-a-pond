@@ -6564,9 +6564,16 @@ fn register(
     entry.model_id = file.model_id.clone();
     entry.part = file.part.map(str::to_string);
     entry.dest = Some(file.dest.clone());
+    entry.resumable = resumes(&file.url);
     if entry.total_bytes.is_none() {
         entry.total_bytes = file.size_bytes;
     }
+}
+
+/// Whether a transfer from `url` keeps what has arrived across a pause: the Hugging Face path
+/// through `pond_hf_cache` does, the `.part` path restarts.
+fn resumes(url: &str) -> bool {
+    pond_hf_cache::parse_hf_url(url).is_some()
 }
 
 /// Where a non-HF transfer writes until it is whole.
@@ -16887,6 +16894,33 @@ mod tests {
     fn model_spills_budget_headroom_matches_desktop() {
         // Mirrors the desktop's DEFAULT_HEADROOM_MB so the server warning and UI badge agree.
         assert_eq!(MEMORY_FIT_HEADROOM_MB, 1024);
+    }
+
+    /// The progress list says which pauses keep what has arrived.
+    #[tokio::test]
+    async fn only_a_hugging_face_transfer_is_resumable() {
+        let tracker: Tracker = Arc::new(tokio::sync::RwLock::new(Default::default()));
+        for (url, resumable) in [
+            ("https://huggingface.co/o/r/resolve/main/m.gguf", true),
+            ("https://example.com/m.gguf", false),
+        ] {
+            let file = TrackedFile {
+                url: url.to_string(),
+                dest: "/pond/models/gguf/m.gguf".into(),
+                key: url.to_string(),
+                category: "gguf".into(),
+                model_id: None,
+                part: None,
+                size_bytes: None,
+            };
+            begin_tracking(&tracker, &file).await;
+            let entry = tracker.read().await[url].clone();
+            assert_eq!(entry.resumable, resumable, "{url}");
+            assert_eq!(
+                serde_json::to_value(&entry).unwrap()["resumable"],
+                resumable
+            );
+        }
     }
 
     #[test]
