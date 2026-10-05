@@ -2,6 +2,7 @@ package mobile
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
@@ -93,22 +94,9 @@ func TestADeadFirstResolverDoesNotCostTheLookup(t *testing.T) {
 		resolverMu.Unlock()
 	})
 
-	// A listener that accepts is the one that answers; a closed port stands in
-	// for the resolver that refuses TCP.
-	answering, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer answering.Close()
-	go func() {
-		for {
-			conn, err := answering.Accept()
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-		}
-	}()
+	// A closed port stands in for the resolver that refuses TCP.
+	answering, stopAnswering := tcpResponder(t, true)
+	defer stopAnswering()
 
 	dead, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -233,20 +221,8 @@ func TestResolverFallsBackToUdpWhenTcpIsRefused(t *testing.T) {
 // The behaviour that was already there and must survive: a server that answers
 // only over TCP still resolves. This is the case the TCP-only dial was written for.
 func TestResolverStillUsesTcpWhenUdpIsSilent(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal("could not listen on tcp", err)
-	}
-	defer listener.Close()
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-		}
-	}()
+	listener, stop := tcpResponder(t, true)
+	defer stop()
 	useResolvers(t, netip.MustParseAddrPort(listener.Addr().String()))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -276,5 +252,103 @@ func TestUdpProbeIsNotSatisfiedBySilence(t *testing.T) {
 	defer cancel()
 	if udpAnswers(ctx, address) {
 		t.Fatal("a server that never replied was reported as answering over udp")
+	}
+}
+
+// tcpResponder accepts DNS-over-TCP connections. With answer set it replies to each
+// framed query with a minimal header carrying the query's id; without it, it
+// accepts and then says nothing, as the first resolver Safaricom reports does.
+func tcpResponder(t *testing.T, answer bool) (net.Listener, func()) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal("could not listen on tcp", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				if !answer {
+					// Hold the connection open and silent until the client gives up.
+					_, _ = io.Copy(io.Discard, conn)
+					return
+				}
+				head := make([]byte, 2)
+				if _, err := io.ReadFull(conn, head); err != nil {
+					return
+				}
+				query := make([]byte, int(head[0])<<8|int(head[1]))
+				if _, err := io.ReadFull(conn, query); err != nil || len(query) < 2 {
+					return
+				}
+				reply := make([]byte, 14)
+				reply[1] = 12
+				reply[2], reply[3] = query[0], query[1]
+				reply[4] = 0x81 // response, recursion desired
+				_, _ = conn.Write(reply)
+			}(conn)
+		}
+	}()
+	return listener, func() { listener.Close(); <-done }
+}
+
+// The shape Safaricom's first resolver has: TCP connects at once and never
+// answers, UDP answers. A connect beats any UDP answer, so taking it as proof
+// handed Go a connection that hung for the whole lookup.
+func TestAResolverThatConnectsButNeverAnswersOverTcpIsNotUsedForTcp(t *testing.T) {
+	udp, stopUDP := udpResponder(t)
+	defer stopUDP()
+	// The silent TCP listener on the same port the UDP responder answers on.
+	silent, err := net.Listen("tcp", udp.String())
+	if err != nil {
+		t.Skip("could not take the same port for tcp:", err)
+	}
+	defer silent.Close()
+	go func() {
+		for {
+			conn, err := silent.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer conn.Close(); _, _ = io.Copy(io.Discard, conn) }()
+		}
+	}()
+	useResolvers(t, udp)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := dialResolver(ctx, "udp", "")
+	if err != nil {
+		t.Fatal("the server answering over udp was not used:", err)
+	}
+	defer conn.Close()
+	if _, ok := conn.(net.PacketConn); !ok {
+		t.Fatal("a tcp connection that never answers won the race")
+	}
+}
+
+func TestTcpProbeIsNotSatisfiedByAConnect(t *testing.T) {
+	listener, stop := tcpResponder(t, false)
+	defer stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+	if tcpAnswers(ctx, netip.MustParseAddrPort(listener.Addr().String())) {
+		t.Fatal("a server that accepted and never answered was reported as answering over tcp")
+	}
+}
+
+func TestTcpProbeIsSatisfiedByAnAnswer(t *testing.T) {
+	listener, stop := tcpResponder(t, true)
+	defer stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if !tcpAnswers(ctx, netip.MustParseAddrPort(listener.Addr().String())) {
+		t.Fatal("a server answering over tcp was reported as silent")
 	}
 }

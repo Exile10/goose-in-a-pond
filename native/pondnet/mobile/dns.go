@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -98,9 +99,9 @@ func configuredServers() []netip.AddrPort {
 	return resolvers
 }
 
-// udpProbe builds a DNS query for the root zone with a random id. The answer is
+// probeQuery builds a DNS query for the root zone with a random id. The answer is
 // not used: this asks whether the server responds at all, not what it says.
-func udpProbe() []byte {
+func probeQuery() []byte {
 	id := make([]byte, 2)
 	if _, err := rand.Read(id); err != nil {
 		// A predictable id is still fine for a reachability probe on the local
@@ -137,7 +138,7 @@ func udpAnswers(ctx context.Context, server netip.AddrPort) bool {
 	if conn.SetDeadline(deadline) != nil {
 		return false
 	}
-	query := udpProbe()
+	query := probeQuery()
 	if _, err := conn.Write(query); err != nil {
 		return false
 	}
@@ -146,6 +147,41 @@ func udpAnswers(ctx context.Context, server netip.AddrPort) bool {
 	// A header and a matching id is proof enough. Anything more would be reading
 	// an answer this function has no use for.
 	return err == nil && read >= 12 && reply[0] == query[0] && reply[1] == query[1]
+}
+
+// tcpAnswers reports whether a server answers a DNS query over TCP.
+//
+// A completed connect is not that. Observed on Safaricom LTE on 2026-10-05: the
+// first resolver it reports accepts a TCP connection in about 30 ms and then never
+// answers a query on it, while answering the same query over UDP in about 170 ms.
+// Taking the connect as proof, the race handed Go that connection nearly every
+// time, because a connect beats any UDP answer, and the lookup ran out its whole
+// deadline on it. The node could not resolve its coordinator's DERP server, so
+// on cellular it took fifteen seconds or more to start, and sometimes never did.
+func tcpAnswers(ctx context.Context, server netip.AddrPort) bool {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", server.String())
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(2 * time.Second)
+	}
+	if conn.SetDeadline(deadline) != nil {
+		return false
+	}
+	query := probeQuery()
+	framed := append([]byte{byte(len(query) >> 8), byte(len(query))}, query...)
+	if _, err := conn.Write(framed); err != nil {
+		return false
+	}
+	// The two-byte length, then at least the header carrying the same id.
+	reply := make([]byte, 14)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		return false
+	}
+	return int(reply[0])<<8|int(reply[1]) >= 12 && reply[2] == query[0] && reply[3] == query[1]
 }
 
 // dialResolver ignores the address Go derived from configuration that does not
@@ -184,7 +220,7 @@ func dialResolver(ctx context.Context, network, _ string) (net.Conn, error) {
 	//
 	// These used to be tried in order with three seconds each, and a carrier
 	// showed why that is not good enough: Safaricom reports two resolvers and
-	// the FIRST one refuses DNS over TCP. Every lookup spent its budget dialling
+	// the FIRST one never answers DNS over TCP. Every lookup spent its budget dialling
 	// a server that would never answer before reaching the one that would, so
 	// the node could not resolve its coordinator at all on cellular while
 	// working perfectly on wifi.
@@ -200,17 +236,21 @@ func dialResolver(ctx context.Context, network, _ string) (net.Conn, error) {
 		conn net.Conn
 		err  error
 	}
-	// Two attempts per server: a TCP dial, which proves itself by connecting, and a
-	// UDP exchange, which has to prove itself by being answered.
+	// Two attempts per server, one per transport, and each has to prove itself by
+	// being answered: a UDP dial cannot fail, and a TCP connect only shows that the
+	// port is open.
 	attempts := len(servers) * 2
 	results := make(chan dialed, attempts)
 	for _, server := range servers {
 		go func(server netip.AddrPort) {
+			if !tcpAnswers(attempt, server) {
+				diagnose("resolver: " + server.String() + " did not answer over tcp")
+				results <- dialed{err: errors.New("no tcp answer from " + server.String())}
+				return
+			}
+			// A fresh connection, so Go's own query is the first on it.
 			dialer := net.Dialer{}
 			conn, err := dialer.DialContext(attempt, "tcp", server.String())
-			if err != nil {
-				diagnose("resolver: dialing " + server.String() + " over tcp failed: " + err.Error())
-			}
 			results <- dialed{conn: conn, err: err}
 		}(server)
 		go func(server netip.AddrPort) {

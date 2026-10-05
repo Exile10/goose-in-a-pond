@@ -98,14 +98,20 @@ the embedded node; local-only profiles remain disconnected away from home.
 The node's resolvers are dialled **concurrently**, first to answer wins. They used
 to be tried in order with a three-second budget each, and a carrier showed why
 that is not enough: Safaricom reports two resolvers for its LTE network and the
-first refuses DNS over TCP, so every lookup spent its budget on a server that
-would never answer and the node resolved nothing on cellular while working on
-Wi-Fi. Nor is the transport assumed: each server is tried over TCP and UDP at
+first never answers DNS over TCP, so every lookup spent its budget on a server
+that would never answer and the node resolved nothing on cellular while working
+on Wi-Fi. Nor is the transport assumed: each server is tried over TCP and UDP at
 once, and whichever proves itself first is used. A home gateway was found that
 refuses DNS over TCP on every resolver it advertises while answering UDP, and
-there racing servers cannot help (#394). UDP is connectionless, so a dial proves
-nothing; reachability over UDP is shown by a real root-zone query whose random
-id comes back. Network changes and foreground
+there racing servers cannot help (#394). Neither transport's connection proves
+anything: UDP is connectionless, and that first Safaricom resolver accepts a TCP
+connection in about 30 ms and then never answers on it (measured 2026-10-05), so
+a TCP connect beat every UDP answer and the lookup hung on it for its whole
+deadline. Each server and transport proves itself with a real root-zone query
+whose random id comes back, and only then is a fresh connection handed to Go.
+Before that change, a cold start on cellular took fifteen seconds or more to bring
+the node up, and sometimes it never came up: netcheck and the DERP connection
+both need the coordinator's name resolved, under deadlines of about a second. Network changes and foreground
 resume re-evaluate the choice; background probing pauses. Recovery is coalesced,
 uses a capped backoff, and stops after six failed attempts until another trigger
 or a manual retry. NetInfo does not perform external reachability probes or
