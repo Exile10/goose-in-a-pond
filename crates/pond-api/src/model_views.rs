@@ -1,12 +1,18 @@
 //! How a catalogue row is shown over REST.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use pond_core::models::domain::curated;
 use pond_core::models::domain::engine::Engine;
-use pond_core::models::domain::model_record::{ModelRecord, ModelRoleAssignment};
+use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
 use pond_core::models::domain::recommended::{self, DeviceClass};
 use pond_core::models::domain::taxonomy::{self, Acquisition, ModelKind, Provenance};
+use pond_core::models::domain::vision_encoder::{encoder_for_model, EncoderSpec, EncoderState};
+use pond_core::models::domain::vision_pairing::gguf_file_name;
+use pond_core::models::ports::agent::Agent;
 
-use crate::{MeasuredDto, ModelStatusEntry, RecommendedDto};
+use crate::{AppState, CompanionDto, MeasuredDto, ModelStatusEntry, RecommendedDto};
 
 pub(crate) fn record_to_dto(
     m: &ModelRecord,
@@ -45,6 +51,7 @@ pub(crate) fn record_to_dto(
         kind: Some(ModelKind::of(m)),
         acquire: Some(Acquisition::of(m, pick.is_some())),
         recommended: recommendation(&m.id, DeviceClass::current()),
+        companions: Vec::new(),
     }
 }
 
@@ -56,6 +63,104 @@ pub(crate) fn recommendation(model_id: &str, device: DeviceClass) -> Option<Reco
         reason: r.reason.to_string(),
         measured: r.measured_on(device).map(MeasuredDto::from),
     })
+}
+
+/// Where a llama.cpp model's file is: its row's file name, else its name as a file.
+pub(crate) async fn gguf_path_for(state: &AppState, model: &str) -> Option<PathBuf> {
+    let data_dir = state.data_dir.as_ref()?;
+    let recorded = match &state.model_repo {
+        Some(repo) => repo
+            .get_by_id(&ModelRecord::id_for(&ModelCategory::Gguf, model))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.filename),
+        None => None,
+    };
+    let filename = recorded.unwrap_or_else(|| gguf_file_name(model));
+    Some(data_dir.join("models").join("gguf").join(filename))
+}
+
+/// The picture add-on `model` pairs with, reading its header only when no name is listed.
+pub(crate) async fn chat_model_encoder(state: &AppState, model: &str) -> Option<EncoderSpec> {
+    let gguf = gguf_path_for(state, model).await;
+    let model = model.to_string();
+    tokio::task::spawn_blocking(move || encoder_for_model(&model, gguf.as_deref()))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// What one llama.cpp row says about pictures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GgufVision {
+    pub reads_images: bool,
+    pub image_support_bytes: Option<u64>,
+    pub companion: Option<CompanionDto>,
+}
+
+/// Picture facts for `model`: the agent's verdict where it gives one, else the pairing alone. A
+/// pure read: listing must never prepare or fetch.
+pub(crate) fn gguf_vision(agent: &dyn Agent, model: &str, spec: Option<EncoderSpec>) -> GgufVision {
+    let state = agent.vision_state("local", model);
+    let reads_images = match &state {
+        None | Some(EncoderState::Unknown) => spec.is_some(),
+        Some(state) => !state.is_unsupported(),
+    };
+    GgufVision {
+        reads_images,
+        image_support_bytes: spec.filter(|_| reads_images).map(|s| s.size_bytes),
+        companion: spec.map(|s| CompanionDto {
+            kind: "pictures".to_string(),
+            label: s.label.to_string(),
+            size_bytes: s.size_bytes,
+            state: companion_state(state.as_ref()).to_string(),
+        }),
+    }
+}
+
+/// The add-on's state on the wire, from picture support's own state.
+pub(crate) fn companion_state(state: Option<&EncoderState>) -> &'static str {
+    match state {
+        Some(EncoderState::Ready { .. }) => "installed",
+        Some(EncoderState::NotOnThisDevice) => "not_on_this_device",
+        Some(EncoderState::Downloading { .. } | EncoderState::Verifying) => "downloading",
+        _ => "available",
+    }
+}
+
+/// [`gguf_vision`] for every llama.cpp row, keyed by row id, in one blocking-pool batch: a row
+/// may read a header on every page visit.
+pub(crate) async fn gguf_vision_batch(
+    state: &AppState,
+    records: &[ModelRecord],
+) -> HashMap<String, GgufVision> {
+    let rows: Vec<(String, String, Option<PathBuf>)> = records
+        .iter()
+        .filter(|m| m.category == ModelCategory::Gguf)
+        .map(|m| {
+            let file = m
+                .filename
+                .clone()
+                .unwrap_or_else(|| gguf_file_name(&m.name));
+            let path = state
+                .data_dir
+                .as_ref()
+                .map(|dd| dd.join("models").join("gguf").join(file));
+            (m.id.clone(), m.name.clone(), path)
+        })
+        .collect();
+    let agent = state.agent.clone();
+    tokio::task::spawn_blocking(move || {
+        rows.into_iter()
+            .map(|(id, name, path)| {
+                let spec = encoder_for_model(&name, path.as_deref());
+                (id, gguf_vision(agent.as_ref(), &name, spec))
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -75,5 +180,92 @@ mod tests {
         assert_eq!(measured.tokens_per_second_min, Some(15));
         assert_eq!(measured.tokens_per_second_max, Some(16));
         assert!(recommendation("gguf/llama-3.2-3b", DeviceClass::Orin).is_none());
+    }
+
+    /// An agent that answers `vision_state` from a fixed table.
+    struct TableAgent(Option<EncoderState>);
+
+    #[async_trait::async_trait]
+    impl Agent for TableAgent {
+        async fn chat(
+            &self,
+            _request: pond_core::shared::domain::agent::AgentRequest,
+        ) -> anyhow::Result<pond_core::shared::domain::agent::AgentResponse> {
+            unimplemented!("not exercised")
+        }
+        async fn chat_stream(
+            &self,
+            _request: pond_core::shared::domain::agent::AgentRequest,
+        ) -> anyhow::Result<
+            futures::stream::BoxStream<
+                'static,
+                anyhow::Result<pond_core::shared::domain::agent::AgentStreamEvent>,
+            >,
+        > {
+            unimplemented!("not exercised")
+        }
+        fn vision_state(&self, provider: &str, _model: &str) -> Option<EncoderState> {
+            assert_eq!(provider, "local", "a GGUF row is asked about as `local`");
+            self.0.clone()
+        }
+    }
+
+    const E2B: &str = "gemma-4-E2B-it-Q4_K_M";
+
+    #[test]
+    fn a_gguf_row_reads_images_by_the_agents_verdict_and_by_the_pairing_without_one() {
+        let e2b = encoder_for_model(E2B, None);
+        let facts = |state| gguf_vision(&TableAgent(state), E2B, e2b);
+        let refused = facts(Some(EncoderState::NotOnThisDevice));
+        assert!(!refused.reads_images);
+        assert_eq!(refused.image_support_bytes, None);
+        assert_eq!(
+            refused.companion.map(|c| c.state),
+            Some("not_on_this_device".to_string())
+        );
+
+        let absent = facts(Some(EncoderState::Absent));
+        assert!(absent.reads_images);
+        assert_eq!(absent.image_support_bytes, Some(986_833_728));
+        let companion = absent.companion.unwrap();
+        assert_eq!(companion.kind, "pictures");
+        assert_eq!(companion.label, "Gemma 4 E2B");
+        assert_eq!(companion.state, "available");
+
+        assert!(facts(None).reads_images, "no verdict: the pairing decides");
+        let text_only = gguf_vision(
+            &TableAgent(Some(EncoderState::Unknown)),
+            "Llama-3.2-3B",
+            None,
+        );
+        assert!(!text_only.reads_images);
+        assert!(text_only.companion.is_none(), "text only lists no add-on");
+    }
+
+    #[test]
+    fn the_add_on_state_follows_picture_support() {
+        assert_eq!(
+            companion_state(Some(&EncoderState::Ready { bytes: Some(1) })),
+            "installed"
+        );
+        assert_eq!(
+            companion_state(Some(&EncoderState::Downloading { done: 1, total: 2 })),
+            "downloading"
+        );
+        assert_eq!(
+            companion_state(Some(&EncoderState::Verifying)),
+            "downloading"
+        );
+        assert_eq!(
+            companion_state(Some(&EncoderState::NotOnThisDevice)),
+            "not_on_this_device"
+        );
+        for available in [
+            None,
+            Some(EncoderState::Absent),
+            Some(EncoderState::Unknown),
+        ] {
+            assert_eq!(companion_state(available.as_ref()), "available");
+        }
     }
 }

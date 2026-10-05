@@ -1,17 +1,20 @@
-//! Which `mmproj` encoder a chat model needs, how to validate it, and what the household is told.
+//! How a chat model's `mmproj` encoder is validated and what the household is told about it.
+//! Which encoder a model needs comes from the pairing table (`vision_pairing`).
 //!
-//! Keyed by family AND qat-ness: a qat release's projector has the non-qat one's exact size and
-//! loads without error, so only each row's pinned sha256 tells the wrong one apart. Hashing is
-//! the adapter's job; this module reads headers (~85 KB) and judges the `.verified` sidecar.
+//! A qat release's projector has the non-qat one's exact size and loads without error, so only
+//! each pin's sha256 tells the wrong one apart. Hashing is the adapter's job; this module reads
+//! headers (~85 KB) and judges the `.verified` sidecar.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::gguf::{parse_gguf_layout_file, GgufInfo};
+use super::gguf::parse_gguf_layout_file;
 
-/// One pinned encoder file.
+pub use super::vision_pairing::{encoder_by_dir, encoder_for_model, encoder_for_source};
+
+/// One pinned encoder file, borrowed from the pairing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderSpec {
     /// Directory under `models/mmproj/`, lowercase (the Orin's ext4 is case-sensitive).
@@ -34,105 +37,14 @@ pub struct EncoderSpec {
     pub label: &'static str,
 }
 
-/// The chat architecture every encoder in [`ENCODER_SPECS`] pairs with.
-pub const GEMMA4_ARCH: &str = "gemma4";
-
-/// Every encoder GIAP provisions.
-pub const ENCODER_SPECS: &[EncoderSpec] = &[
-    EncoderSpec {
-        dir: "gemma-4-e2b-it",
-        repo: "unsloth/gemma-4-E2B-it-GGUF",
-        revision: "0314792d7f1f7e229411f620751375812bb9faf2",
-        filename: "mmproj-BF16.gguf",
-        size_bytes: 986_833_728,
-        sha256: "a402f10fb5780bf91d03a10cd89061139f522bee2e679b1291bbfdcd71d9547d",
-        projector: "gemma4v",
-        projection_dim: 1536,
-        label: "Gemma 4 E2B",
-    },
-    EncoderSpec {
-        dir: "gemma-4-e2b-it-qat",
-        repo: "unsloth/gemma-4-E2B-it-qat-GGUF",
-        revision: "66a399f68ddd113b06dff02fca9523e55465d11d",
-        filename: "mmproj-BF16.gguf",
-        size_bytes: 986_833_728,
-        sha256: "38b33846f56426cd650e0e574d78de125abdfcedf35c0d7f6929f6ffe26efe02",
-        projector: "gemma4v",
-        projection_dim: 1536,
-        label: "Gemma 4 E2B",
-    },
-    EncoderSpec {
-        dir: "gemma-4-e4b-it",
-        repo: "unsloth/gemma-4-E4B-it-GGUF",
-        revision: "bfc15c382204943c3a8fff0c750b94ae2364d7a3",
-        filename: "mmproj-BF16.gguf",
-        size_bytes: 991_552_320,
-        sha256: "ee01cba03fd9c71ea2ea722225d24a84f72e7197714367e550ef705ef8851bc6",
-        projector: "gemma4v",
-        projection_dim: 2560,
-        label: "Gemma 4 E4B",
-    },
-    EncoderSpec {
-        dir: "gemma-4-e4b-it-qat",
-        repo: "unsloth/gemma-4-E4B-it-qat-GGUF",
-        revision: "8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265",
-        filename: "mmproj-BF16.gguf",
-        size_bytes: 991_552_320,
-        sha256: "7c9bafa27f82d658eda805c1d82ef62bb0368e1ff75f64f77de58ad318beaaf9",
-        projector: "gemma4v",
-        projection_dim: 2560,
-        label: "Gemma 4 E4B",
-    },
-    EncoderSpec {
-        dir: "gemma-4-12b-it",
-        repo: "unsloth/gemma-4-12b-it-GGUF",
-        revision: "fc034cfff751157913579611efad8462ac1be606",
-        filename: "mmproj-BF16.gguf",
-        size_bytes: 175_115_840,
-        sha256: "2e269f906eb15169ee9ce880ea649bd6d42d4964c21f8ede10d0d0efc738bcbb",
-        projector: "gemma4uv",
-        projection_dim: 3840,
-        label: "Gemma 4 12B",
-    },
-];
-
-/// The encoder `chat_model` needs, biased to `None`: a false positive tells a blind model it
-/// can see. Matched on lowercase substrings so every spelling of one model finds its row.
-pub fn encoder_for(chat_model: &str) -> Option<EncoderSpec> {
-    // A `.litertlm` Gemma 4 carries the family's name but reads no mmproj.
-    if super::litert::is_litert_model(chat_model) {
-        return None;
+impl EncoderSpec {
+    /// The file at its pinned revision.
+    pub fn url(&self) -> String {
+        format!(
+            "https://huggingface.co/{}/resolve/{}/{}",
+            self.repo, self.revision, self.filename
+        )
     }
-    let m = chat_model.to_ascii_lowercase();
-    if !m.contains("gemma-4") && !m.contains("gemma4") {
-        return None;
-    }
-    if m.contains("mtp") || m.contains("assistant") || m.contains("mobile") {
-        return None;
-    }
-    let qat = m.contains("qat");
-    let dir = if m.contains("e2b") {
-        if qat {
-            "gemma-4-e2b-it-qat"
-        } else {
-            "gemma-4-e2b-it"
-        }
-    } else if m.contains("e4b") {
-        if qat {
-            "gemma-4-e4b-it-qat"
-        } else {
-            "gemma-4-e4b-it"
-        }
-    } else if m.contains("12b") && !m.contains("a4b") && !qat {
-        "gemma-4-12b-it"
-    } else {
-        return None;
-    };
-    encoder_by_dir(dir)
-}
-
-pub fn encoder_by_dir(dir: &str) -> Option<EncoderSpec> {
-    ENCODER_SPECS.iter().find(|s| s.dir == dir).copied()
 }
 
 pub fn encoder_path(data_dir: &Path, spec: &EncoderSpec) -> PathBuf {
@@ -141,19 +53,6 @@ pub fn encoder_path(data_dir: &Path, spec: &EncoderSpec) -> PathBuf {
         .join("mmproj")
         .join(spec.dir)
         .join(spec.filename)
-}
-
-/// Whether `spec` pairs by arch AND width; DeepSeek-R1-Distill-Qwen-1.5B shares E2B's 1536.
-pub fn pairs_with(spec: &EncoderSpec, model_arch: &str, model_embedding_length: u32) -> bool {
-    model_arch == GEMMA4_ARCH && model_embedding_length == spec.projection_dim
-}
-
-/// [`pairs_with`] over what a chat model's own header says. Unknown fields do not pair.
-pub fn pairs_with_gguf(spec: &EncoderSpec, info: &GgufInfo) -> bool {
-    match (info.architecture.as_deref(), info.embedding_length) {
-        (Some(arch), Some(width)) => pairs_with(spec, arch, width),
-        _ => false,
-    }
 }
 
 // ── Validation ──────────────────────────────────────────────────────────────
@@ -715,13 +614,13 @@ pub fn status_message_with(
         }
         EncoderState::Absent => match spec {
             Some(s) => format!(
-                "Picture support for {} needs a one-time {} MB download. It starts by itself; \
-                 text chat works meanwhile.",
+                "Picture support for {} is a separate {} MB download. Add it on the Models \
+                 page; text chat works meanwhile.",
                 s.label,
                 mb(s.size_bytes)
             ),
-            None => "Picture support needs a one-time download. It starts by itself; text chat \
-                     works meanwhile."
+            None => "Picture support is a separate download. Add it on the Models page; text \
+                     chat works meanwhile."
                 .to_string(),
         },
         EncoderState::Downloading { done, total } => {
@@ -816,193 +715,7 @@ mod tests {
     use super::*;
     use crate::models::domain::gguf::test_gguf::{GgufWriter, BF16, F32};
 
-    // ── The table ───────────────────────────────────────────────────────────
-
-    /// Every row, pinned: a change here changes which bytes every pond downloads and trusts.
-    /// (dir, repo, revision, size, sha256, projector, projection_dim, label)
-    type PinnedRow = (
-        &'static str,
-        &'static str,
-        &'static str,
-        u64,
-        &'static str,
-        &'static str,
-        u32,
-        &'static str,
-    );
-
-    #[test]
-    fn the_encoder_table_is_pinned() {
-        #[rustfmt::skip]
-        let want: [PinnedRow; 5] = [
-            ("gemma-4-e2b-it", "unsloth/gemma-4-E2B-it-GGUF",
-             "0314792d7f1f7e229411f620751375812bb9faf2", 986_833_728,
-             "a402f10fb5780bf91d03a10cd89061139f522bee2e679b1291bbfdcd71d9547d", "gemma4v", 1536, "Gemma 4 E2B"),
-            ("gemma-4-e2b-it-qat", "unsloth/gemma-4-E2B-it-qat-GGUF",
-             "66a399f68ddd113b06dff02fca9523e55465d11d", 986_833_728,
-             "38b33846f56426cd650e0e574d78de125abdfcedf35c0d7f6929f6ffe26efe02", "gemma4v", 1536, "Gemma 4 E2B"),
-            ("gemma-4-e4b-it", "unsloth/gemma-4-E4B-it-GGUF",
-             "bfc15c382204943c3a8fff0c750b94ae2364d7a3", 991_552_320,
-             "ee01cba03fd9c71ea2ea722225d24a84f72e7197714367e550ef705ef8851bc6", "gemma4v", 2560, "Gemma 4 E4B"),
-            ("gemma-4-e4b-it-qat", "unsloth/gemma-4-E4B-it-qat-GGUF",
-             "8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265", 991_552_320,
-             "7c9bafa27f82d658eda805c1d82ef62bb0368e1ff75f64f77de58ad318beaaf9", "gemma4v", 2560, "Gemma 4 E4B"),
-            ("gemma-4-12b-it", "unsloth/gemma-4-12b-it-GGUF",
-             "fc034cfff751157913579611efad8462ac1be606", 175_115_840,
-             "2e269f906eb15169ee9ce880ea649bd6d42d4964c21f8ede10d0d0efc738bcbb", "gemma4uv", 3840, "Gemma 4 12B"),
-        ];
-        assert_eq!(ENCODER_SPECS.len(), want.len());
-        for (spec, (dir, repo, rev, size, sha, proj, dim, label)) in ENCODER_SPECS.iter().zip(want)
-        {
-            assert_eq!(spec.dir, dir);
-            assert_eq!(spec.repo, repo, "{dir}");
-            assert_eq!(spec.revision, rev, "{dir}");
-            assert_eq!(spec.filename, "mmproj-BF16.gguf", "{dir}");
-            assert_eq!(spec.size_bytes, size, "{dir}");
-            assert_eq!(spec.sha256, sha, "{dir}");
-            assert_eq!(spec.projector, proj, "{dir}");
-            assert_eq!(spec.projection_dim, dim, "{dir}");
-            assert_eq!(spec.label, label, "{dir}");
-        }
-    }
-
-    #[test]
-    fn qat_and_non_qat_encoders_share_a_size_and_not_an_identity() {
-        for family in ["gemma-4-e2b-it", "gemma-4-e4b-it"] {
-            let plain = encoder_by_dir(family).unwrap();
-            let qat = encoder_by_dir(&format!("{family}-qat")).unwrap();
-            assert_eq!(plain.size_bytes, qat.size_bytes, "{family}");
-            assert_ne!(plain.sha256, qat.sha256, "{family}");
-            assert_ne!(plain.repo, qat.repo, "{family}");
-        }
-    }
-
-    #[test]
-    fn every_row_is_well_formed() {
-        let hex = |s: &str, n: usize| {
-            s.len() == n
-                && s.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        };
-        let mut dirs = std::collections::BTreeSet::new();
-        let mut shas = std::collections::BTreeSet::new();
-        for s in ENCODER_SPECS {
-            assert!(
-                hex(s.revision, 40),
-                "{}: revision must be a 40-hex commit",
-                s.dir
-            );
-            assert!(
-                hex(s.sha256, 64),
-                "{}: sha256 must be 64 lowercase hex",
-                s.dir
-            );
-            assert_eq!(
-                s.dir,
-                s.dir.to_ascii_lowercase(),
-                "{}: the Orin's filesystem is case-sensitive",
-                s.dir
-            );
-            assert!(
-                !s.label.contains(".gguf"),
-                "{}: the label is not a filename",
-                s.dir
-            );
-            assert!(dirs.insert(s.dir), "{}: duplicate dir", s.dir);
-            assert!(shas.insert(s.sha256), "{}: duplicate sha256", s.dir);
-        }
-    }
-
-    // ── Which model gets which encoder ──────────────────────────────────────
-
-    #[test]
-    fn every_model_on_both_machines_resolves_to_the_right_row() {
-        let cases: &[(&str, Option<&str>)] = &[
-            // Mac, models/gguf
-            ("gemma-4-E2B-it-Q4_K_M", Some("gemma-4-e2b-it")),
-            ("gemma-4-E2B-it-qat-UD-Q4_K_XL", Some("gemma-4-e2b-it-qat")),
-            ("gemma-4-E4B-it-Q4_K_M", Some("gemma-4-e4b-it")),
-            ("gemma-4-E4B-it-Q5_K_M", Some("gemma-4-e4b-it")),
-            ("gemma-4-E4B-it-qat-UD-Q4_K_XL", Some("gemma-4-e4b-it-qat")),
-            ("gemma-4-12b-it-IQ4_XS", Some("gemma-4-12b-it")),
-            ("Llama-3.2-3B-Instruct-Q4_K_M", None),
-            ("NVIDIA-Nemotron3-Nano-4B-Q4_K_M", None),
-            ("Nanbeige_Nanbeige4.2-3B-Q4_K_M", None),
-            ("granite-4.1-3b-Q4_K_M", None),
-            ("DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M", None),
-            ("mtp-gemma-4-E2B-it", None),
-            ("mtp-gemma-4-E4B-it.gguf", None),
-            ("gemma-4-E2B-it-assistant-F16", None),
-            ("gemma-4-E2B-it-assistant-Q8_0", None),
-            ("gemma-4-E4B-it-assistant.Q8_0", None),
-            ("old_functiongemma-270m-it-Q4_K_M", None),
-            // Registry stems
-            ("gemma-4-E2B-it", Some("gemma-4-e2b-it")),
-            ("gemma-4-E2B-it-qat", Some("gemma-4-e2b-it-qat")),
-            ("gemma-4-E4B-it-qat", Some("gemma-4-e4b-it-qat")),
-            ("gemma-4-12b-it", Some("gemma-4-12b-it")),
-            // Orin, and the colon / owner spellings its registry and catalogue use
-            ("gemma-4-E4B-it-IQ4_XS", Some("gemma-4-e4b-it")),
-            ("gemma-4-E4B-it:IQ4_XS", Some("gemma-4-e4b-it")),
-            ("unsloth/gemma-4-E4B-it-GGUF:IQ4_XS", Some("gemma-4-e4b-it")),
-            (
-                "unsloth/gemma-4-E4B-it-qat-GGUF:UD-Q4_K_XL",
-                Some("gemma-4-e4b-it-qat"),
-            ),
-            ("unsloth/gemma-4-E2B-it-GGUF:Q4_K_M", Some("gemma-4-e2b-it")),
-            ("GEMMA-4-e2b-IT", Some("gemma-4-e2b-it")),
-            // Families with no pinned row, and releases that are not these models
-            ("gemma-4-E1B-it", None),
-            ("gemma-4-12B-A4B-it", None),
-            ("unsloth/gemma-4-12B-A4B-it-GGUF:Q4_K_M", None),
-            ("gemma-4-26B-A4B-it-Q4_K_M", None),
-            ("gemma-4-27B-it", None),
-            ("gemma-4-31B-it", None),
-            ("gemma-4-E2B-it-qat-mobile", None),
-            ("gemma-4-12b-it-qat", None),
-            ("gemma-3-4b-it", None),
-            // LiteRT-LM files: the family's name, no mmproj
-            ("gemma-4-E2B-it.litertlm", None),
-            ("gemma-4-E4B-it.litertlm", None),
-            ("", None),
-        ];
-        for (name, want) in cases {
-            assert_eq!(
-                encoder_for(name).map(|s| s.dir),
-                *want,
-                "encoder_for({name:?})"
-            );
-        }
-    }
-
-    #[test]
-    fn a_qat_model_does_not_share_its_encoder() {
-        let qat = "gemma-4-E2B-it-qat-UD-Q4_K_XL";
-        let plain = "gemma-4-E2B-it-Q4_K_M";
-        assert_ne!(
-            encoder_for(qat).unwrap().dir,
-            encoder_for(plain).unwrap().dir
-        );
-    }
-
-    #[test]
-    fn pairing_needs_the_architecture_and_the_width() {
-        let e2b = encoder_by_dir("gemma-4-e2b-it").unwrap();
-        assert!(pairs_with(&e2b, "gemma4", 1536));
-        assert!(
-            !pairs_with(&e2b, "qwen2", 1536),
-            "DeepSeek-R1-Distill-Qwen-1.5B is 1536 wide and is not Gemma"
-        );
-        assert!(!pairs_with(&e2b, "gemma4", 2560), "E4B's width");
-        let e4b = encoder_by_dir("gemma-4-e4b-it-qat").unwrap();
-        let header = GgufInfo {
-            architecture: Some("gemma4".into()),
-            embedding_length: Some(2560),
-            ..Default::default()
-        };
-        assert!(pairs_with_gguf(&e4b, &header));
-        assert!(!pairs_with_gguf(&e4b, &GgufInfo::default()));
-    }
+    // ── Paths ───────────────────────────────────────────────────────────────
 
     #[test]
     fn the_encoder_lives_in_its_own_lowercase_dir() {
@@ -1645,8 +1358,8 @@ mod tests {
         let s = |st: EncoderState| status_message_with(&st, Some(&spec), &[]);
         assert_eq!(
             s(EncoderState::Absent).unwrap(),
-            "Picture support for Gemma 4 E2B needs a one-time 941 MB download. It starts by \
-             itself; text chat works meanwhile."
+            "Picture support for Gemma 4 E2B is a separate 941 MB download. Add it on the Models \
+             page; text chat works meanwhile."
         );
         assert_eq!(
             s(EncoderState::Downloading {
@@ -1837,7 +1550,8 @@ mod tests {
     #[test]
     fn no_line_names_a_file_or_leaves_ascii() {
         let mut lines = vec![NOT_DECLARED_MESSAGE.to_string(), MESH_MESSAGE.to_string()];
-        for spec in ENCODER_SPECS {
+        for pairing in crate::models::domain::vision_pairing::pairings() {
+            let spec = &pairing.spec();
             for st in [
                 EncoderState::Absent,
                 EncoderState::Verifying,

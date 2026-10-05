@@ -1533,10 +1533,12 @@ async fn prepare_turn_images(
     if let Ok(settings) = state.settings_repo.get().await {
         let reported =
             read_vision_state(state, &settings.chat_provider, &settings.chat_model).await;
+        let spec = crate::model_views::chat_model_encoder(state, &settings.chat_model).await;
         vision_refusal_response(
             reported.as_ref(),
             &settings.chat_provider,
             &settings.chat_model,
+            spec.as_ref(),
         )?;
     }
     let images = crate::image_normalize::normalize_images_for_engine(images)
@@ -1567,11 +1569,11 @@ fn vision_refusal_response(
     reported: Option<&pond_core::models::domain::vision_encoder::EncoderState>,
     provider: &str,
     model: &str,
+    spec: Option<&pond_core::models::domain::vision_encoder::EncoderSpec>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    use pond_core::models::domain::vision_encoder::{encoder_for, refusal_for};
+    use pond_core::models::domain::vision_encoder::refusal_for;
 
-    let spec = encoder_for(model);
-    let Some(refusal) = refusal_for(reported, spec.as_ref(), provider) else {
+    let Some(refusal) = refusal_for(reported, spec, provider) else {
         return Ok(());
     };
     tracing::info!(
@@ -1638,7 +1640,7 @@ fn vision_status_size(
 /// `GET /api/v1/models/vision-status` — picture support for the active chat model.
 /// Polled every 2 s, so a pure read: fetching and hashing belong to `prepare_model`.
 async fn get_vision_status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    use pond_core::models::domain::vision_encoder::{encoder_for, EncoderState};
+    use pond_core::models::domain::vision_encoder::EncoderState;
 
     // Unreadable settings name no model: unknown, which the desktop neither shows nor blocks.
     let (provider, model, reported) = match state.settings_repo.get().await {
@@ -1650,33 +1652,13 @@ async fn get_vision_status(State(state): State<Arc<AppState>>) -> Json<Value> {
         }
         Err(_) => (String::new(), String::new(), EncoderState::Unknown),
     };
-    let spec = encoder_for(&model);
+    let spec = crate::model_views::chat_model_encoder(&state, &model).await;
     Json(json!({
         "size_bytes": vision_status_size(&reported, spec.as_ref()),
         "message": vision_status_message(&provider, &reported, spec.as_ref()),
         "state": reported,
         "model": model,
     }))
-}
-
-/// A GGUF row's `(reads_images, image_support_bytes)`, from the agent's `local` verdict.
-/// Falls back to the pinned table; a pure read, as listing must never prepare or fetch.
-fn gguf_vision_facts(
-    agent: &dyn pond_core::models::ports::agent::Agent,
-    model: &str,
-) -> (bool, Option<u64>) {
-    use pond_core::models::domain::vision_encoder::{encoder_for, EncoderState};
-    let spec = encoder_for(model);
-    let reads = match agent.vision_state("local", model) {
-        None | Some(EncoderState::Unknown) => spec.is_some(),
-        Some(state) => !state.is_unsupported(),
-    };
-    let bytes = if reads {
-        spec.map(|s| s.size_bytes)
-    } else {
-        None
-    };
-    (reads, bytes)
 }
 
 /// After a GGUF delete, remove its `models/mmproj/<dir>/` if nothing else uses it.
@@ -1686,12 +1668,12 @@ async fn remove_orphaned_encoder_dir(
     deleted: &ModelRecord,
     model_repo: &Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
 ) {
-    use pond_core::models::domain::vision_encoder::encoder_for;
+    use pond_core::models::domain::vision_encoder::encoder_for_model;
 
-    let Some(spec) = encoder_for(&deleted.name) else {
+    let Some(spec) = encoder_for_model(&deleted.name, None) else {
         return;
     };
-    let same_dir = |name: &str| encoder_for(name).is_some_and(|s| s.dir == spec.dir);
+    let same_dir = |name: &str| encoder_for_model(name, None).is_some_and(|s| s.dir == spec.dir);
 
     let rows = model_repo.list_all().await.unwrap_or_default();
     let in_catalogue = rows.iter().any(|m| {
@@ -1709,7 +1691,8 @@ async fn remove_orphaned_encoder_dir(
                 continue;
             }
             if let Some(stem) = name.strip_suffix(".gguf") {
-                if same_dir(stem) {
+                let path = entry.path();
+                if encoder_for_model(stem, Some(&path)).is_some_and(|s| s.dir == spec.dir) {
                     return;
                 }
             }
@@ -5499,25 +5482,7 @@ async fn list_models(
     })?;
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
 
-    // One blocking-pool batch: the verdict may read a header per row, on every page visit.
-    let gguf_names: Vec<String> = records
-        .iter()
-        .filter(|m| m.category == ModelCategory::Gguf)
-        .map(|m| m.name.clone())
-        .collect();
-    let agent = state.agent.clone();
-    let vision_facts: std::collections::HashMap<String, (bool, Option<u64>)> =
-        tokio::task::spawn_blocking(move || {
-            gguf_names
-                .into_iter()
-                .map(|name| {
-                    let facts = gguf_vision_facts(agent.as_ref(), &name);
-                    (name, facts)
-                })
-                .collect()
-        })
-        .await
-        .unwrap_or_default();
+    let vision = crate::model_views::gguf_vision_batch(&state, &records).await;
 
     let mut whisper = vec![];
     let mut llamafile = vec![];
@@ -5529,12 +5494,10 @@ async fn list_models(
 
     for m in &records {
         let mut dto = record_to_dto(m, &assignments);
-        let facts = (m.category == ModelCategory::Gguf)
-            .then(|| vision_facts.get(&m.name))
-            .flatten();
-        if let Some((reads, bytes)) = facts {
-            dto.reads_images = Some(*reads);
-            dto.image_support_bytes = *bytes;
+        if let Some(v) = vision.get(&m.id) {
+            dto.reads_images = Some(v.reads_images);
+            dto.image_support_bytes = v.image_support_bytes;
+            dto.companions.extend(v.companion.clone());
         }
         let v = serde_json::to_value(dto).unwrap_or_default();
         match m.category {
@@ -17381,7 +17344,7 @@ mod tests {
     mod vision_gate {
         use super::*;
         use pond_core::models::domain::vision_encoder::{
-            encoder_for, EncoderState, FailReason, MESH_MESSAGE, NOT_DECLARED_MESSAGE,
+            encoder_for_model, EncoderState, FailReason, MESH_MESSAGE, NOT_DECLARED_MESSAGE,
         };
 
         const E2B: &str = "gemma-4-E2B-it-Q4_K_M";
@@ -17391,7 +17354,8 @@ mod tests {
             provider: &str,
             model: &str,
         ) -> Option<(StatusCode, Value)> {
-            vision_refusal_response(state.as_ref(), provider, model)
+            let spec = encoder_for_model(model, None);
+            vision_refusal_response(state.as_ref(), provider, model, spec.as_ref())
                 .err()
                 .map(|(status, Json(body))| (status, body))
         }
@@ -17474,12 +17438,12 @@ mod tests {
 
         #[test]
         fn the_status_line_speaks_only_where_the_server_has_something_to_say() {
-            let spec = encoder_for(E2B);
+            let spec = encoder_for_model(E2B, None);
             assert_eq!(
                 vision_status_message("local", &EncoderState::Absent, spec.as_ref()).as_deref(),
                 Some(
-                    "Picture support for Gemma 4 E2B needs a one-time 941 MB download. It starts \
-                     by itself; text chat works meanwhile."
+                    "Picture support for Gemma 4 E2B is a separate 941 MB download. Add it on the \
+                     Models page; text chat works meanwhile."
                 )
             );
             for quiet in [
@@ -17498,7 +17462,7 @@ mod tests {
 
         #[test]
         fn the_status_size_is_the_encoders_and_only_where_one_is_involved() {
-            let spec = encoder_for(E2B);
+            let spec = encoder_for_model(E2B, None);
             assert_eq!(
                 vision_status_size(&EncoderState::Absent, spec.as_ref()),
                 Some(986_833_728)
@@ -17548,56 +17512,6 @@ mod tests {
             other.assistant_name = "Heron".into();
             other.mic_enabled = !current.mic_enabled;
             assert!(!save_needs_prewarm(&current, &other));
-        }
-
-        /// An agent that answers `vision_state` from a fixed table, for `gguf_vision_facts`.
-        struct TableAgent(Option<EncoderState>);
-
-        #[async_trait::async_trait]
-        impl pond_core::models::ports::agent::Agent for TableAgent {
-            async fn chat(
-                &self,
-                _request: pond_core::shared::domain::agent::AgentRequest,
-            ) -> anyhow::Result<pond_core::shared::domain::agent::AgentResponse> {
-                unimplemented!("not exercised")
-            }
-            async fn chat_stream(
-                &self,
-                _request: pond_core::shared::domain::agent::AgentRequest,
-            ) -> anyhow::Result<
-                futures::stream::BoxStream<
-                    'static,
-                    anyhow::Result<pond_core::shared::domain::agent::AgentStreamEvent>,
-                >,
-            > {
-                unimplemented!("not exercised")
-            }
-            fn vision_state(&self, provider: &str, _model: &str) -> Option<EncoderState> {
-                assert_eq!(provider, "local", "a GGUF row is asked about as `local`");
-                self.0.clone()
-            }
-        }
-
-        #[test]
-        fn a_gguf_row_reads_images_by_the_agents_verdict_and_by_the_table_without_one() {
-            // The agent's verdict wins: on a budgeted device a Gemma may be declined.
-            assert_eq!(
-                gguf_vision_facts(&TableAgent(Some(EncoderState::NotOnThisDevice)), E2B),
-                (false, None)
-            );
-            assert_eq!(
-                gguf_vision_facts(&TableAgent(Some(EncoderState::Absent)), E2B),
-                (true, Some(986_833_728))
-            );
-            // No verdict, or unknown: pond-core's pinned table decides.
-            assert_eq!(
-                gguf_vision_facts(&TableAgent(None), E2B),
-                (true, Some(986_833_728))
-            );
-            assert_eq!(
-                gguf_vision_facts(&TableAgent(Some(EncoderState::Unknown)), "Llama-3.2-3B"),
-                (false, None)
-            );
         }
     }
 }

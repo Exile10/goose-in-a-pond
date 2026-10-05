@@ -144,11 +144,17 @@ pub fn for_record(record: &ModelRecord) -> Option<&'static CuratedModel> {
     find(&record.category, &record.name)
 }
 
-/// The size and hash a Hugging Face file must have, when it is a pick.
+/// The size and hash a Hugging Face file must have: a pick, or a paired picture add-on.
 pub fn file_pin(repo: &str, revision: &str, filename: &str) -> Option<FilePin> {
-    pinned(repo, revision, filename).map(|pick| FilePin {
-        size_bytes: pick.size_bytes,
-        sha256: pick.sha256,
+    if let Some(pick) = pinned(repo, revision, filename) {
+        return Some(FilePin {
+            size_bytes: pick.size_bytes,
+            sha256: pick.sha256,
+        });
+    }
+    super::vision_pairing::encoder_pinned(repo, revision, filename).map(|spec| FilePin {
+        size_bytes: spec.size_bytes,
+        sha256: spec.sha256,
     })
 }
 

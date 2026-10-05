@@ -2191,14 +2191,14 @@ impl GooseAdapter {
 
         // API backstop: the engine would swap images for a note and the model would bluff.
         if !request.images.is_empty() {
-            use pond_core::models::domain::vision_encoder::{
-                encoder_for, refusal_for, RefusalCode,
-            };
+            use pond_core::models::domain::vision_encoder::{refusal_for, RefusalCode};
             let provider = settings.chat_provider.as_str();
             let model = settings.chat_model.as_str();
             let state =
                 Self::vision_state_for(&self.pictures, self.data_dir.as_deref(), provider, model);
-            let spec = encoder_for(model);
+            let spec = crate::vision_encoder::declaration(self.data_dir.as_deref(), model)
+                .spec()
+                .copied();
             if let Some(refusal) = refusal_for(state.as_ref(), spec.as_ref(), provider) {
                 if refusal.code == RefusalCode::NotReady {
                     // A turn is the strongest signal that the encoder is wanted.

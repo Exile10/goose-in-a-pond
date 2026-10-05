@@ -4,6 +4,7 @@
 use crate::registry_rows::{self, GooseRegistry, RegistryRows, RowSnapshot};
 use goose::providers::local_inference::local_model_registry::LocalModelEntry;
 use pond_core::models::domain::device_budget::{self, VisionDeclaration};
+use pond_core::models::domain::litert;
 use pond_core::models::domain::vision_encoder::{
     self as domain, EncoderInvalid, EncoderSidecar, EncoderSpec, EncoderState, FailReason, OnDisk,
     RetryBackoff, RowChange, RowView, StampDecision,
@@ -65,13 +66,12 @@ pub fn chat_gguf_path(data_dir: &Path, chat_model: &str) -> PathBuf {
 // ── Declaration ─────────────────────────────────────────────────────────────
 /// Whether `chat_model` reads pictures on this device, as declared, not downloaded: it feeds
 /// the KV-cached `<vision>` prompt section, so it may change only with the model or its file.
+/// The file is read only when the pairing needs its header or the fit needs its weights.
 pub fn declaration(data_dir: Option<&Path>, chat_model: &str) -> VisionDeclaration {
-    let needs_weights = device_budget::budgeted_device()
-        && domain::encoder_for(chat_model)
-            .is_some_and(|s| device_budget::DEVICE_MEASURED_VISION.contains(&s.dir));
-    let gguf = data_dir
-        .filter(|_| needs_weights)
-        .map(|dd| chat_gguf_path(dd, chat_model));
+    if chat_model.trim().is_empty() || litert::is_litert_model(chat_model) {
+        return VisionDeclaration::NotDeclared;
+    }
+    let gguf = data_dir.map(|dd| chat_gguf_path(dd, chat_model));
     device_budget::vision_declaration(gguf.as_deref(), chat_model)
 }
 
@@ -667,22 +667,19 @@ fn views(rows: &[RowSnapshot]) -> Vec<RowView<'_>> {
         .collect()
 }
 
-/// Whether `row`'s model declares `spec` here: by id, or by file name if the id isn't a model.
+/// Whether `row`'s model declares `spec` here, by its id or by its file's own name.
 fn row_declares(row: &RowSnapshot, spec: &EncoderSpec) -> bool {
     let file_name = row
         .resolved_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    let name = if domain::encoder_for(&row.id).is_some() {
-        row.id.as_str()
-    } else {
-        file_name
-    };
-    matches!(
-        declaration_at(Some(&row.resolved_path), name),
-        VisionDeclaration::Declared(s) if s.dir == spec.dir
-    )
+    [row.id.as_str(), file_name].into_iter().any(|name| {
+        matches!(
+            declaration_at(Some(&row.resolved_path), name),
+            VisionDeclaration::Declared(s) if s.dir == spec.dir
+        )
+    })
 }
 
 fn stamp_entry(

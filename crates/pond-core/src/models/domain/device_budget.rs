@@ -12,7 +12,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use super::gguf::parse_gguf_header;
-use super::vision_encoder::{encoder_for, EncoderSpec, EncoderState};
+use super::vision_encoder::{EncoderSpec, EncoderState};
+use super::vision_pairing::encoder_for_model;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -191,11 +192,11 @@ impl VisionFit {
 pub fn vision_fit(
     budget_mb: u64,
     model_bytes: Option<u64>,
-    chat_model: &str,
+    encoder: Option<&EncoderSpec>,
     kv_kib_per_token: Option<u64>,
     encoder_compute_mb: u64,
 ) -> VisionFit {
-    let Some(spec) = encoder_for(chat_model) else {
+    let Some(spec) = encoder else {
         return VisionFit::NotDeclared;
     };
     let slope = slope(kv_kib_per_token);
@@ -222,8 +223,8 @@ pub fn vision_fit(
 }
 
 /// [`vision_fit`] for the GGUF at `gguf_path` on this device; reads only its length and head.
-pub fn vision_fit_on_device(gguf_path: &Path, chat_model: &str) -> VisionFit {
-    if encoder_for(chat_model).is_none() {
+pub fn vision_fit_on_device(gguf_path: &Path, encoder: Option<&EncoderSpec>) -> VisionFit {
+    if encoder.is_none() {
         return VisionFit::NotDeclared;
     }
     let model_bytes = std::fs::metadata(gguf_path)
@@ -234,7 +235,7 @@ pub fn vision_fit_on_device(gguf_path: &Path, chat_model: &str) -> VisionFit {
     vision_fit(
         llm_budget_mb(),
         model_bytes,
-        chat_model,
+        encoder,
         kv,
         ENCODER_COMPUTE_MB,
     )
@@ -320,12 +321,12 @@ impl VisionDeclaration {
 
 /// The declaration over its inputs; `fit` runs only for a listed encoder on a budgeted device.
 pub fn declare(
-    chat_model: &str,
+    encoder: Option<EncoderSpec>,
     budgeted: bool,
     measured: &[&str],
     fit: impl FnOnce(&EncoderSpec) -> VisionFit,
 ) -> VisionDeclaration {
-    let Some(spec) = encoder_for(chat_model) else {
+    let Some(spec) = encoder else {
         return VisionDeclaration::NotDeclared;
     };
     if !budgeted {
@@ -341,8 +342,9 @@ pub fn declare(
     }
 }
 
-/// Whether `chat_model` reads pictures here: by name off a budgeted device, else fit AND listed.
-/// Cached per file: `<vision>` sits in the KV-cached prefix, so it may change only with the file.
+/// Whether `chat_model` reads pictures here: by its pairing off a budgeted device, else fit AND
+/// listed. Cached per file: `<vision>` sits in the KV-cached prefix, so it may change only with
+/// the file.
 pub fn vision_declaration(gguf_path: Option<&Path>, chat_model: &str) -> VisionDeclaration {
     budgeted_declaration(gguf_path, chat_model, budgeted_device())
 }
@@ -353,11 +355,11 @@ fn budgeted_declaration(
     budgeted: bool,
 ) -> VisionDeclaration {
     declare(
-        chat_model,
+        encoder_for_model(chat_model, gguf_path),
         budgeted,
         DEVICE_MEASURED_VISION,
-        |_| match gguf_path {
-            Some(p) => cached_fit(p, chat_model),
+        |spec| match gguf_path {
+            Some(p) => cached_fit(p, spec),
             None => VisionFit::CostsWindow {
                 window_without: MIN_CTX,
                 window_with: MIN_CTX,
@@ -371,22 +373,22 @@ pub fn declares_vision(gguf_path: Option<&Path>, chat_model: &str) -> bool {
     vision_declaration(gguf_path, chat_model).is_declared()
 }
 
-/// [`vision_fit_on_device`], cached per (path, length, mtime, model).
-fn cached_fit(path: &Path, chat_model: &str) -> VisionFit {
-    type Key = (PathBuf, u64, Option<SystemTime>, String);
+/// [`vision_fit_on_device`], cached per (path, length, mtime, encoder).
+fn cached_fit(path: &Path, spec: &EncoderSpec) -> VisionFit {
+    type Key = (PathBuf, u64, Option<SystemTime>, &'static str);
     static CACHE: OnceLock<Mutex<HashMap<Key, VisionFit>>> = OnceLock::new();
     let meta = std::fs::metadata(path).ok();
     let key: Key = (
         path.to_path_buf(),
         meta.as_ref().map_or(0, |m| m.len()),
         meta.as_ref().and_then(|m| m.modified().ok()),
-        chat_model.to_ascii_lowercase(),
+        spec.dir,
     );
     let cache = CACHE.get_or_init(Default::default);
     if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&key).copied()) {
         return hit;
     }
-    let fit = vision_fit_on_device(path, chat_model);
+    let fit = vision_fit_on_device(path, Some(spec));
     if let Ok(mut c) = cache.lock() {
         c.insert(key, fit);
     }
@@ -440,6 +442,16 @@ pub fn device_window(gguf_path: Option<&Path>, chat_model: &str) -> DeviceWindow
 mod tests {
     use super::*;
     use crate::models::domain::gguf::test_gguf::GgufWriter;
+    use crate::models::domain::vision_encoder::encoder_by_dir;
+
+    /// The pairing a model's own file name finds, with no header to read.
+    fn enc(model: &str) -> Option<EncoderSpec> {
+        encoder_for_model(model, None)
+    }
+
+    fn by_dir(dir: &str) -> EncoderSpec {
+        encoder_by_dir(dir).unwrap_or_else(|| panic!("no pairing for {dir}"))
+    }
 
     /// The Orin's LLM budget, fixed, so these tests do not read the environment.
     const BUDGET: u64 = LLM_BUDGET_MB;
@@ -694,7 +706,7 @@ mod tests {
         ];
         for (model, bytes, kv, fits) in cases {
             for compute in 0..=900u64 {
-                let fit = vision_fit(5820, Some(bytes), model, Some(kv), compute);
+                let fit = vision_fit(5820, Some(bytes), enc(model).as_ref(), Some(kv), compute);
                 assert_eq!(
                     fit.fits(),
                     fits,
@@ -709,7 +721,7 @@ mod tests {
             vision_fit(
                 5820,
                 Some(ORIN_E4B_QAT_UD),
-                "gemma-4-E4B-it-qat",
+                Some(&by_dir("gemma-4-e4b-it-qat")),
                 Some(E4B_KV),
                 0
             ),
@@ -724,7 +736,13 @@ mod tests {
     fn a_model_already_at_the_floor_is_not_declared() {
         // Weights past budget less compute leave no KV with or without the encoder.
         for bytes in [5_500_000_000, 6_000_000_000, 9_000_000_000] {
-            let fit = vision_fit(5820, Some(bytes), "gemma-4-E2B-it", Some(E2B_KV), 0);
+            let fit = vision_fit(
+                5820,
+                Some(bytes),
+                Some(&by_dir("gemma-4-e2b-it")),
+                Some(E2B_KV),
+                0,
+            );
             assert_eq!(
                 fit,
                 VisionFit::CostsWindow {
@@ -739,20 +757,36 @@ mod tests {
     #[test]
     fn unknown_weights_are_never_a_fit() {
         for budget in [5820, 13764, 1_000_000] {
-            let fit = vision_fit(budget, None, "gemma-4-E2B-it", Some(E2B_KV), 0);
+            let fit = vision_fit(
+                budget,
+                None,
+                Some(&by_dir("gemma-4-e2b-it")),
+                Some(E2B_KV),
+                0,
+            );
             assert!(!fit.fits(), "budget {budget}: {fit:?}");
         }
-        assert!(!vision_fit_on_device(Path::new("/nowhere/at/all.gguf"), "gemma-4-E2B-it").fits());
+        assert!(!vision_fit_on_device(
+            Path::new("/nowhere/at/all.gguf"),
+            Some(&by_dir("gemma-4-e2b-it"))
+        )
+        .fits());
     }
 
     #[test]
     fn a_model_with_no_encoder_is_not_declared_before_any_arithmetic() {
         assert_eq!(
-            vision_fit(5820, Some(1), "Llama-3.2-3B-Instruct", Some(28), 0),
+            vision_fit(
+                5820,
+                Some(1),
+                enc("Llama-3.2-3B-Instruct").as_ref(),
+                Some(28),
+                0
+            ),
             VisionFit::NotDeclared
         );
         assert_eq!(
-            vision_fit_on_device(Path::new("/nowhere"), "granite-4.1-3b"),
+            vision_fit_on_device(Path::new("/nowhere"), enc("granite-4.1-3b").as_ref()),
             VisionFit::NotDeclared
         );
     }
@@ -760,16 +794,12 @@ mod tests {
     /// With the encoder charged, E4B-qat drops to the floor, so the Orin must not declare it.
     #[test]
     fn the_encoder_is_charged_its_weights_and_compute() {
-        let enc = crate::models::domain::vision_encoder::encoder_by_dir("gemma-4-e4b-it-qat")
-            .unwrap()
-            .size_bytes;
+        let e4b_qat = by_dir("gemma-4-e4b-it-qat").size_bytes;
         assert_eq!(
-            context_size_with_encoder(BUDGET, ORIN_E4B_QAT_UD, enc, Some(E4B_KV)),
+            context_size_with_encoder(BUDGET, ORIN_E4B_QAT_UD, e4b_qat, Some(E4B_KV)),
             MIN_CTX
         );
-        let e2b = crate::models::domain::vision_encoder::encoder_by_dir("gemma-4-e2b-it")
-            .unwrap()
-            .size_bytes;
+        let e2b = by_dir("gemma-4-e2b-it").size_bytes;
         assert_eq!(
             context_size_with_encoder(BUDGET, ORIN_E2B_Q4_K_M, e2b, Some(E2B_KV)),
             16384
@@ -807,15 +837,15 @@ mod tests {
             &gemma4_head(42, 2, 18),
         );
         assert_eq!(
-            vision_fit_on_device(&e2b, "gemma-4-E2B-it-Q4_K_M"),
+            vision_fit_on_device(&e2b, enc("gemma-4-E2B-it-Q4_K_M").as_ref()),
             VisionFit::Fits { window: 16384 }
         );
-        assert!(!vision_fit_on_device(&e4b, "gemma-4-E4B-it-qat-UD-Q4_K_XL").fits());
+        assert!(!vision_fit_on_device(&e4b, enc("gemma-4-E4B-it-qat-UD-Q4_K_XL").as_ref()).fits());
 
         // Through a link, as models/gguf holds them.
         let link = tmp.path().join("link.gguf");
         std::os::unix::fs::symlink(&e2b, &link).unwrap();
-        assert!(vision_fit_on_device(&link, "gemma-4-E2B-it").fits());
+        assert!(vision_fit_on_device(&link, Some(&by_dir("gemma-4-e2b-it"))).fits());
 
         // No encoder (nothing measured, nothing declared): the board's 16384.
         let w = device_window(Some(&e4b), "gemma-4-E4B-it-qat-UD-Q4_K_XL");
@@ -841,19 +871,16 @@ mod tests {
              MemAvailable reading during the boot prewarm first"
         );
         for d in DEVICE_MEASURED_VISION {
-            assert!(
-                crate::models::domain::vision_encoder::encoder_by_dir(d).is_some(),
-                "{d}"
-            );
+            assert!(encoder_by_dir(d).is_some(), "{d}");
         }
     }
 
     #[test]
-    fn off_the_budgeted_device_the_name_decides_with_no_file_io() {
+    fn off_the_budgeted_device_the_pairing_decides_with_no_file_io() {
         let never = |_: &EncoderSpec| -> VisionFit { panic!("no fit may be computed off-device") };
-        assert!(declare("gemma-4-E4B-it-qat-UD-Q4_K_XL", false, &[], never).is_declared());
+        assert!(declare(enc("gemma-4-E4B-it-qat-UD-Q4_K_XL"), false, &[], never).is_declared());
         assert_eq!(
-            declare("Llama-3.2-3B-Instruct", false, &[], never),
+            declare(enc("Llama-3.2-3B-Instruct"), false, &[], never),
             VisionDeclaration::NotDeclared
         );
     }
@@ -861,40 +888,34 @@ mod tests {
     #[test]
     fn on_the_budgeted_device_a_model_needs_the_list_and_the_fit() {
         let never = |_: &EncoderSpec| -> VisionFit { panic!("an unlisted encoder costs no I/O") };
+        let e2b = Some(by_dir("gemma-4-e2b-it"));
         assert!(matches!(
-            declare("gemma-4-E2B-it", true, &[], never),
+            declare(e2b, true, &[], never),
             VisionDeclaration::NotOnThisDevice(s) if s.dir == "gemma-4-e2b-it"
         ));
         let listed = &["gemma-4-e2b-it"];
+        assert!(declare(e2b, true, listed, |_| VisionFit::Fits { window: 16384 }).is_declared());
+        assert!(!declare(e2b, true, listed, |_| VisionFit::CostsWindow {
+            window_without: 16384,
+            window_with: 2048
+        })
+        .is_declared());
         assert!(
-            declare("gemma-4-E2B-it", true, listed, |_| VisionFit::Fits {
-                window: 16384
-            })
-            .is_declared()
-        );
-        assert!(
-            !declare("gemma-4-E2B-it", true, listed, |_| VisionFit::CostsWindow {
-                window_without: 16384,
-                window_with: 2048
-            })
-            .is_declared()
-        );
-        assert!(
-            !declare("gemma-4-E2B-it-qat", true, listed, |_| VisionFit::Fits {
-                window: 1
+            !declare(Some(by_dir("gemma-4-e2b-it-qat")), true, listed, |_| {
+                VisionFit::Fits { window: 1 }
             })
             .is_declared(),
             "the qat row is its own entry"
         );
         assert_eq!(
-            declare("granite-4.1-3b", true, listed, never),
+            declare(enc("granite-4.1-3b"), true, listed, never),
             VisionDeclaration::NotDeclared
         );
     }
 
     #[test]
     fn a_declaration_reports_its_own_state_before_any_file_is_read() {
-        let spec = crate::models::domain::vision_encoder::encoder_by_dir("gemma-4-e4b-it").unwrap();
+        let spec = by_dir("gemma-4-e4b-it");
         assert_eq!(
             VisionDeclaration::NotDeclared.undeclared_state(),
             Some(EncoderState::NotDeclared)
@@ -920,7 +941,7 @@ mod tests {
                 "{model}"
             );
         }
-        assert!(budgeted_declaration(None, "gemma-4-E2B-it", false).is_declared());
+        assert!(budgeted_declaration(None, "gemma-4-E2B-it-Q4_K_M", false).is_declared());
     }
 
     #[test]

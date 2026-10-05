@@ -444,6 +444,21 @@ pub struct ModelStatusEntry {
     /// Set only for GIAP's suggestions. Shown, never imposed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended: Option<RecommendedDto>,
+    /// Separate downloads that extend the model, such as picture support. Empty: text only.
+    #[serde(default)]
+    pub companions: Vec<CompanionDto>,
+}
+
+/// One separate download that extends a model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompanionDto {
+    /// `"pictures"`.
+    pub kind: String,
+    /// What the household reads, e.g. "Gemma 4 E4B".
+    pub label: String,
+    pub size_bytes: u64,
+    /// `installed` | `available` | `downloading` | `not_on_this_device`.
+    pub state: String,
 }
 
 /// Why GIAP suggests a model; `measured` only where it was measured on this class of machine.

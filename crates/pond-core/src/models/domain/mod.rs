@@ -15,3 +15,4 @@ pub mod model_role;
 pub mod recommended;
 pub mod taxonomy;
 pub mod vision_encoder;
+pub mod vision_pairing;
