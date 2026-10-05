@@ -3117,7 +3117,7 @@ async fn run_server(
             Some(session_storage.clone()),
             Some(model_repo.clone()),
             false, // voice_mode — server mode, not voice
-            true,  // model_provisioning — the serve process owns companion downloads
+            true,  // model_provisioning — the serve process verifies add-ons on disk
             mesh_provider.clone(),
         )
         .await
@@ -7894,7 +7894,7 @@ async fn build_goose_backend(
     // Supply it: without the catalog an Ollama model's context window is guessed from its name.
     model_repo: Option<Arc<dyn ModelRepository>>,
     voice_mode: bool,
-    // True only in serve: this process fetches and repairs companion files like the encoder.
+    // True only in serve: this process verifies add-ons on disk and sets a wrong one aside.
     model_provisioning: bool,
     // Locked so mesh enabled at runtime applies next turn; CLI callers pass a permanent `None`.
     mesh_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,

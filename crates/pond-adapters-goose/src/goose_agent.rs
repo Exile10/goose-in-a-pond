@@ -378,8 +378,8 @@ impl GooseAdapter {
         })
     }
 
-    /// Lets this process fetch and repair the vision encoder. Serve process only: short-lived
-    /// processes on the same data directory must not start downloads or rename files in use.
+    /// Lets this process verify picture add-ons on disk and set a wrong one aside. Serve process
+    /// only: short-lived processes on the same data directory must not rename files in use.
     pub fn enable_model_provisioning(self: &Arc<Self>) {
         self.pictures.enable_provisioning();
     }

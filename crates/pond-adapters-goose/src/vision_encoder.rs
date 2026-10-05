@@ -156,7 +156,7 @@ impl PictureSupport {
         if !self.provisioning.swap(true, Ordering::SeqCst) {
             tracing::info!(
                 target: "giap::vision",
-                "picture support provisioning enabled in this process"
+                "this process verifies and attaches picture add-ons on disk; it fetches none"
             );
         }
     }
