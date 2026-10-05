@@ -2861,3 +2861,56 @@ PAI milestone).**
 - **Verification.** pond-core LiteRT tests 12 passed, including the new rule; the adapter's
   `litert_model` and `compaction_prompts` tests 12 passed; clippy clean; `scripts/live-test.sh` 158
   checks passed; the live LiteRT test on the Mac with only the 128 chunk; the Orin runs above.
+
+**2026-10-05 — The 128-token prefill chunk, measured against its own control on the Orin
+(measurement; not a PAI milestone).**
+
+- **Why.** The entry above leads with the turns before the first compaction because its 8-turn run
+  with both chunk sizes predates the bounded compaction pair, so past that point it changed two
+  things at once. This is the control: the same release build (`69f5815f`), the same bounded pair,
+  the same 8-turn probe and one-second sampler, with `LITERT_PREFILL_SIGNATURES` set empty so the
+  engine compiles both chunk sizes. The pond logged `prefill_signatures=""` and left it alone.
+- **Measured** (E4B, 8k window):
+
+  | | Both chunk sizes | 128 only |
+  |---|---|---|
+  | GPU share of RAM at the first turn | 4.78 GB | 4.13 GB |
+  | GPU share at its highest | 6.80 GB | 4.51 GB |
+  | Lowest free memory | 43 MB | 204 MB |
+  | Pond swapped out, at most | 2.05 GB | 0 |
+  | Compactions (summary call) | 2 (44 s, 92 s) | 1 (85 s) |
+  | Model's first token, every turn | 2.5-7.5 s | 2.3-4.1 s |
+
+  With both sizes the GPU share was already 4.78 GB at the first turn and the pond had 92 MB in
+  swap, rose to 5.21 GB by the first compaction and to 6.3-6.5 GB after it, and never came back. So
+  the chunk accounts for the growth on its own, with the compaction prompt held fixed. The run with
+  both sizes wrote 48% more (5,641 tokens against 3,810), so it compacted twice.
+
+**2026-10-05 — What a compaction does to the Orin's memory, at 250 ms (measurement; not a PAI
+milestone).**
+
+- **Why.** In the 16-turn run on the shipped build free memory fell to 148 and 125 MB at the fourth
+  and fifth compactions and the pond began to swap. A one-second sampler put the jump at the KV
+  snapshot save. A 250 ms sampler that splits the pond's memory into anonymous, file-backed and
+  shared says otherwise (`nano-memprobe2.sh`, 12 turns, E4B, 8k, release `69f5815f`, three
+  compactions; `compaction_phases2.py`).
+- **The snapshot save costs nothing measurable.** Across its 0.7 s free memory and the GPU's share
+  moved by less than 70 MB, and the pond's anonymous memory by under 40 MB.
+- **The summary call's own conversation is the jump.** Within 4-8 s of the compaction starting,
+  the moment goose's summary call opens its conversation, the GPU's share of RAM rose by 413-466 MB
+  and held there into the summary's decode. In two of the three it drained away before the summary
+  ended; in the first it stayed until that conversation was dropped for the restore. The likeliest
+  reading, not yet tested: a second conversation's KV state (about 235 MB per bank for E4B at 8k),
+  allocated before the memory of the conversation set aside a moment earlier is released. The
+  backend deletes the held conversation before it opens the summary's, so the release would have to
+  lag behind the delete.
+- **The pond's file-backed pages rise too, and do not matter.** During the same call its resident
+  file pages went from 312-514 MB to 666-698 MB, the model file read for the summary's long prefill.
+  They are clean, so the kernel drops them first: 30 s after the restore they were at 218-359 MB.
+- **What stays behind.** About 50 MB of the GPU's share and 45 MB of anonymous memory per
+  compaction (4.05 to 4.30 GB GPU over the five compactions of the 16-turn run), consistent with
+  the swapping beginning only at the fourth.
+- **The lever.** The backend already prefills a whole prompt into the conversation it holds,
+  rewinding to what its KV cache shares (the Rematch plan), and the held conversation's snapshot is
+  saved before any side call. Running the summary, and the other side calls, in that conversation's
+  buffers instead of a new conversation's would not allocate a second KV state at all. Not built.
