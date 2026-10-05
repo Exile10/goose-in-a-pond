@@ -224,3 +224,67 @@ describe("ChatHubView — picture support", () => {
     expect(screen.queryByText(/^error:/i)).toBeNull();
   });
 });
+
+/** With none chosen the pond refuses a turn and picks nothing, so the screen offers its suggestions. */
+describe("ChatHubView — no conversation model", () => {
+  let added: string[] = [];
+
+  beforeEach(async () => {
+    const fixtures = await import("../../sections/models/fixtures");
+    const extra = {
+      listModels: vi.fn().mockResolvedValue([fixtures.e4b(), fixtures.e2b(), fixtures.litertE4b()]),
+      getActiveRoles: vi.fn().mockResolvedValue(fixtures.NO_ROLES),
+      getMemoryStatus: vi.fn().mockResolvedValue(fixtures.ORIN_MEMORY),
+      getDownloadProgress: vi.fn().mockResolvedValue({ downloads: [] }),
+      downloadModel: vi.fn().mockResolvedValue({ status: "download_started" }),
+      activateModel: vi.fn().mockResolvedValue(undefined),
+      controlModelDownload: vi.fn().mockResolvedValue({ status: "ok" }),
+    };
+    Object.assign(api, extra);
+    added = Object.keys(extra);
+  });
+
+  afterEach(() => {
+    for (const name of added) delete (api as unknown as Record<string, unknown>)[name];
+  });
+
+  it("offers the suggestions with their sizes, instead of a conversation it cannot hold", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue({ chat_provider: "", chat_model: "", show_turn_stats: false } as never);
+    render(<ChatHubView />);
+
+    expect(await screen.findByRole("heading", { name: "Pick a model to talk with" })).toBeTruthy();
+    expect(await screen.findByText("4.2 GB + 945 MB for pictures")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Download and use Gemma 4 E4B, llama.cpp" })).toBeTruthy();
+    // The sample conversation would promise what the pond cannot do.
+    expect(screen.queryByText(/Is the front door locked/)).toBeNull();
+    expect(api.downloadModel).not.toHaveBeenCalled();
+    expect(api.activateModel).not.toHaveBeenCalled();
+  });
+
+  it("keeps the sample conversation when a model is chosen", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue({ chat_provider: "local", chat_model: "gemma", show_turn_stats: false } as never);
+    render(<ChatHubView />);
+    expect(await screen.findByText(/Is the front door locked/)).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Pick a model to talk with" })).toBeNull();
+  });
+
+  it("shows the suggestions when a turn is refused for want of a model, and hands the message back", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue({ chat_provider: "local", chat_model: "gone", show_turn_stats: false } as never);
+    vi.mocked(api.chatStream).mockImplementation(() =>
+      (async function* () {
+        throw new ApiError(409, "No conversation model is chosen yet. Choose one on the Models page to start talking.", "no_model");
+      })(),
+    );
+    render(<ChatHubView />);
+    await screen.findByText(/Is the front door locked/);
+
+    fireEvent.change(screen.getByLabelText("Message input"), { target: { value: "lights on" } });
+    fireEvent.click(screen.getByLabelText("Send message"));
+
+    expect(await screen.findByRole("heading", { name: "Pick a model to talk with" })).toBeTruthy();
+    await waitFor(() => {
+      expect((screen.getByLabelText("Message input") as HTMLInputElement).value).toBe("lights on");
+    });
+    await screen.findByText(/Your message is back in the box; send it once a model is chosen\./);
+  });
+});

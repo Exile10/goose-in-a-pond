@@ -19,6 +19,9 @@ export const COMPOSER_GATE_LINE =
 
 /** Clause for a restored 409's message (design_v2.md §H); unknown codes get the fallback. */
 export function refusalClientClause(code: string | undefined): string {
+  if (code === "no_model") {
+    return " Your message is back in the box; send it once a model is chosen.";
+  }
   if (code === "vision_not_ready") {
     return " Your message and pictures are back in the box; send them when it is ready.";
   }

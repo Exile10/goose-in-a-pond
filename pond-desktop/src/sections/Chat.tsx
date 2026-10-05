@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { WarmupBanner } from "../components/WarmupBanner";
-import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, Copy, Cpu, Loader2, Paperclip, Pencil, PenSquare, PlayCircle, RefreshCw, ThumbsDown, ThumbsUp, Wand2, Wrench, X } from "lucide-react";
+import { ArrowLeft, ArrowUp, Brain, Check, Copy, Loader2, Paperclip, Pencil, PenSquare, PlayCircle, RefreshCw, ThumbsDown, ThumbsUp, Wand2, Wrench, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import {
@@ -33,13 +33,16 @@ import { Goose } from "../components/Goose";
 import { greeting, subtitle } from "../components/quips";
 import { HubIco, micEl } from "../hub/primitives/HubIco";
 import { CONTINUE_TURN_MESSAGE } from "../api/types";
-import type { ModelEntry, SessionSummary } from "../api/types";
+import type { SessionSummary } from "../api/types";
 import { TurnStatsFooter } from "../components/TurnStatsFooter";
 import { ContextPressureNote } from "../components/ContextPressureNote";
 import { SubagentTree } from "../components/SubagentTree";
 import { prepareImage, validateAttachmentSet } from "../lib/imageAttach";
 import type { PreparedImage } from "../lib/imageAttach";
 import { useSuggestedPrompts } from "../hooks/useSuggestedPrompts";
+import { useConversationModel } from "../hooks/useConversationModel";
+import { ModelSwitcher } from "../components/ModelSwitcher";
+import { NoModelPicks } from "../components/models/NoModelPicks";
 
 export function Chat() {
   const state    = useAppState();
@@ -67,9 +70,6 @@ export function Chat() {
   );
   /** Where in the pane the opened card was, so the chat grows out of it. */
   const [openOrigin, setOpenOrigin]         = useState<OpenOrigin | null>(null);
-  const [showModelSelector, setShowModelSelector] = useState(false);
-  const [availableModels, setAvailableModels]     = useState<ModelEntry[]>([]);
-  const [modelSwitching, setModelSwitching]       = useState(false);
   const [showTurnStats, setShowTurnStats]         = useState(false);
   const [attachments, setAttachments]             = useState<PreparedImage[]>([]);
   const [attachError, setAttachError]             = useState<string | null>(null);
@@ -86,14 +86,10 @@ export function Chat() {
   const lastThinkingOnRef                         = useRef<string>("auto");
   // Used only to personalise the greeting; blank is fine and handled there.
   const [userName, setUserName]                   = useState<string>("");
-  // Configured provider: the model label's fallback before any turn reports a model_name. `meshEnabled`
-  // gates injecting "mesh" into the switcher, since no `listModels()` scan can find it.
-  const [configuredProvider, setConfiguredProvider] = useState<string | null>(null);
-  const [meshEnabled, setMeshEnabled]               = useState(false);
+  const conversationModel = useConversationModel();
 
   const bottomRef        = useRef<HTMLDivElement>(null);
   const textareaRef      = useRef<HTMLTextAreaElement>(null);
-  const modelSelectorRef = useRef<HTMLDivElement>(null);
   const fileInputRef     = useRef<HTMLInputElement>(null);
 
   // The primary attach decision; `capabilities.vision` is the fallback while this is unknown.
@@ -202,6 +198,7 @@ export function Chat() {
     if (!input.trim()) setInput(draft.text);
     setAttachments(draft.attachments);
     setAttachError(draft.message + refusalClientClause(draft.code));
+    if (draft.code === "no_model") conversationModel.markNone();
     refreshVisionStatus();
     // `input` excluded: once per refusal, not per keystroke.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -223,101 +220,6 @@ export function Chat() {
     api.listSessions().then(setSessions).catch(() => {});
   }, []);
 
-  const openModelSelector = useCallback(() => {
-    setShowModelSelector(true);
-    Promise.all([api.listModels(), api.listOllamaModels()])
-      .then(([localModels, { models: ollamaModels }]) => {
-        const ollamaEntries: ModelEntry[] = (ollamaModels ?? []).map((m) => {
-          const sizeMb = m.size ? Math.round(m.size / (1024 * 1024)) : undefined;
-          return {
-            id: `ollama/${m.name}`,
-            provider: "ollama",
-            name: m.name,
-            display_name: m.name,
-            is_active: false,
-            ram_estimate_mb: sizeMb,
-            size_mb: sizeMb,
-            category: "ollama",
-            downloaded: true,
-          };
-        });
-        setAvailableModels([...localModels, ...ollamaEntries]);
-      })
-      .catch(() => {
-        api.listModels().then(setAvailableModels).catch(() => {});
-      });
-  }, []);
-
-  const chatModels = useMemo(() => {
-    const real = availableModels.filter((m) => {
-      if (m.downloaded === false) return false;
-      const cat = (m.category ?? m.provider ?? "").toLowerCase();
-      if (cat === "whisper" || cat.startsWith("tts")) return false;
-      return true;
-    });
-    // "mesh" is a peer's compute, not a downloaded file, so no scan finds it; synthesised when mesh_enabled.
-    if (!meshEnabled) return real;
-    const meshEntry: ModelEntry = {
-      id: "mesh/mesh",
-      provider: "mesh",
-      name: "mesh",
-      display_name: "Mesh (trusted peer)",
-      is_active: configuredProvider === "mesh",
-      downloaded: true,
-    };
-    return [...real, meshEntry];
-  }, [availableModels, meshEnabled, configuredProvider]);
-
-  const groupedModels = useMemo(() => {
-    const map = new Map<string, ModelEntry[]>();
-    for (const m of chatModels) {
-      const group = map.get(m.provider) ?? [];
-      group.push(m);
-      map.set(m.provider, group);
-    }
-    return Array.from(map.entries());
-  }, [chatModels]);
-
-  const handleModelSwitch = useCallback(async (provider: string, name: string) => {
-    setModelSwitching(true);
-    try {
-      // `POST /activate/…` would 400 on "mesh", which has no catalog row; set chat_provider directly.
-      if (provider === "mesh") {
-        await api.updateSettings({ chat_provider: "mesh" });
-        setConfiguredProvider("mesh");
-      } else {
-        await api.activateModel(provider, name, "chat");
-      }
-      dispatch({ type: "SET_LAST_RESPONSE_META", payload: { modelName: name, modelRole: "chat", completionTokens: 0 } });
-      // The new model may have a different encoder, or none (mesh); don't wait for the next poll.
-      refreshVisionStatus();
-    } catch (e) {
-      console.warn("Model switch failed:", e);
-    } finally {
-      setModelSwitching(false);
-      setShowModelSelector(false);
-    }
-  }, [dispatch, refreshVisionStatus]);
-
-  // Close model selector on outside click / Escape
-  useEffect(() => {
-    if (!showModelSelector) return;
-    function handleClick(e: MouseEvent) {
-      if (modelSelectorRef.current && !modelSelectorRef.current.contains(e.target as Node)) {
-        setShowModelSelector(false);
-      }
-    }
-    function handleKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setShowModelSelector(false);
-    }
-    document.addEventListener("mousedown", handleClick);
-    document.addEventListener("keydown", handleKey);
-    return () => {
-      document.removeEventListener("mousedown", handleClick);
-      document.removeEventListener("keydown", handleKey);
-    };
-  }, [showModelSelector]);
-
   useEffect(() => {
     if (!state.serverOnline) return;
     api.getSettings().then((s) => {
@@ -326,8 +228,6 @@ export function Chat() {
       const mode = s.thinking_mode ?? "auto";
       setThinkingMode(mode);
       if (mode !== "off") lastThinkingOnRef.current = mode;
-      setConfiguredProvider(s.chat_provider ?? null);
-      setMeshEnabled(s.mesh_enabled ?? false);
     }).catch(() => {});
   }, [state.serverOnline]);
 
@@ -502,8 +402,10 @@ export function Chat() {
     prevBusyRef.current = busy;
     if (busy || !wasBusy) return;
     refreshSessions();
+    // A turn the pond accepted proves a model is chosen, whatever the last read said.
+    if (conversationModel.state === "none") conversationModel.refresh();
     textareaRef.current?.focus();
-  }, [busy, refreshSessions]);
+  }, [busy, refreshSessions, conversationModel]);
 
   const copyMessageText = useCallback((text: string) => {
     void navigator.clipboard.writeText(text).catch(() => {});
@@ -616,9 +518,6 @@ export function Chat() {
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
   }
-
-  // `lastResponseMeta` exists only after a turn completes; `configuredProvider` covers the time before.
-  const modelLabel = state.lastResponseMeta?.modelName ?? configuredProvider ?? "local model";
 
   return (
     // While `view` is null, the wall's skeleton avoids a flash of new chat before the wall.
@@ -749,7 +648,7 @@ export function Chat() {
           </div>
         )}
 
-        {!loadingSession && messages.length === 0 && (
+        {!loadingSession && messages.length === 0 && conversationModel.state !== "none" && (
           <div className="chat-empty">
             <div className="chat-empty__eyebrow">New chat</div>
             <div className="chat-empty__body">
@@ -948,6 +847,12 @@ export function Chat() {
           );
         })}
 
+        {/* No conversation model: the pond picks nothing and downloads nothing on its own, so the
+            thread offers its suggestions, with sizes, and waits for a press. */}
+        {!loadingSession && conversationModel.state === "none" && (
+          <NoModelPicks />
+        )}
+
         {/* Messages typed while Goose was still answering. Shown in place, muted,
             so the queue is visible rather than a silent buffer. */}
         {queued.map((q, i) => (
@@ -1032,7 +937,7 @@ export function Chat() {
       </div>
 
       {/* Quips, below the composer — a starting point, not a header. */}
-      {!loadingSession && messages.length === 0 && (
+      {!loadingSession && messages.length === 0 && conversationModel.state !== "none" && (
         <div className="chat2__chips" role="group" aria-label="Suggestions">
           {chips.map((c, i) => (
             <button
@@ -1051,62 +956,7 @@ export function Chat() {
 
       {/* Hint bar — model selector + keyboard shortcut */}
       <div className="chat2__hint">
-        <div ref={modelSelectorRef} className="model-selector-wrap">
-          <button
-            className={`model-selector-trigger${showModelSelector ? " is-open" : ""}`}
-            onClick={() => showModelSelector ? setShowModelSelector(false) : openModelSelector()}
-            disabled={modelSwitching}
-            aria-label="Select model"
-            aria-expanded={showModelSelector}
-          >
-            <Cpu size={11} />
-            <span className="model-selector-trigger__label">
-              {modelSwitching ? "Switching…" : modelLabel}
-            </span>
-            {modelSwitching ? <Loader2 size={10} className="spin" /> : <ChevronDown size={10} />}
-          </button>
-
-          {showModelSelector && (
-            <div className="model-selector-dropdown">
-              <div className="model-selector-dropdown__header">
-                <span>Switch Model</span>
-              </div>
-              <div className="model-selector-dropdown__list">
-                {groupedModels.length === 0 && (
-                  <div className="model-selector-dropdown__empty">No models available</div>
-                )}
-                {groupedModels.map(([provider, group]) => (
-                  <div key={provider}>
-                    <div className="model-selector-dropdown__group-label">
-                      {provider.charAt(0).toUpperCase() + provider.slice(1)}
-                    </div>
-                    {group.map((m) => {
-                      const isActive = modelLabel === m.name || modelLabel === (m.display_name ?? m.name);
-                      return (
-                        <button
-                          key={m.id}
-                          className={`model-selector-dropdown__item${isActive ? " is-active" : ""}`}
-                          onClick={() => handleModelSwitch(m.provider, m.name)}
-                          disabled={modelSwitching}
-                        >
-                          <span className="model-selector-dropdown__item-name">{m.name}</span>
-                          <span className="model-selector-dropdown__item-meta">
-                            {m.size_mb
-                              ? m.size_mb >= 1024
-                                ? `${(m.size_mb / 1024).toFixed(1)} GB`
-                                : `${m.size_mb} MB`
-                              : ""}
-                            {isActive && <Check size={12} color="var(--color-accent)" />}
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
+        <ModelSwitcher onSwitched={refreshVisionStatus} />
 
         {/* Thinking. Writes `thinking_mode`, which the agent reads on the next
             turn — so this is the real setting, not a display preference. */}
