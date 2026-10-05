@@ -11,11 +11,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"tailscale.com/tailcfg"
 )
 
 type fakeBackend struct {
@@ -25,6 +28,7 @@ type fakeBackend struct {
 	calls        int
 	deleted      int
 	rules        []Rule
+	attrs        []NodeAttr
 	fail         bool
 	lostResponse bool
 	rejected     bool
@@ -72,7 +76,10 @@ func (f *fakeBackend) Delete(_ context.Context, id string) error {
 	f.nodes = kept
 	return nil
 }
-func (f *fakeBackend) Policy(_ context.Context, r []Rule) error { f.rules = r; return nil }
+func (f *fakeBackend) Policy(_ context.Context, r []Rule, a []NodeAttr) error {
+	f.rules, f.attrs = r, a
+	return nil
+}
 func fixture(t *testing.T) (*Service, ed25519.PrivateKey, *fakeBackend) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "state")
@@ -344,6 +351,49 @@ func TestPolicySeparatesHouseholdsAndOnlyPermitsCompanionPort(t *testing.T) {
 		if r.Src[0] == "100.64.0.2" && r.Dst[0] != "100.64.0.1:4443" {
 			t.Fatal(r)
 		}
+	}
+}
+
+// Only phones may start from a cached network map. A Pond that did would enforce
+// the packet filter it last saw, so a phone revoked while it was down could pass.
+func TestPolicyGrantsTheNetworkMapCacheToPhonesOnly(t *testing.T) {
+	if cacheNetworkMaps != string(tailcfg.NodeAttrCacheNetworkMaps) {
+		t.Fatalf("attribute %q is not the one the pinned tailscale reads (%q)", cacheNetworkMaps, tailcfg.NodeAttrCacheNetworkMaps)
+	}
+	s, _, b := fixture(t)
+	key := "nodekey:" + strings.Repeat("a", 64)
+	// The first household has two phones, the second a Pond and no phone at all.
+	s.Store.value.Households["household00000002"] = Household{UserID: "2", Port: 4444}
+	s.Store.value.Devices["household00000001"] = map[string]Device{
+		"pond":   {NodeID: "1", Key: key, Role: "pond", Status: "active", Address: "100.64.0.1"},
+		"phone2": {NodeID: "3", Key: key, Role: "phone", Status: "active", Address: "100.64.0.3"},
+		"phone1": {NodeID: "2", Key: key, Role: "phone", Status: "active", Address: "100.64.0.2"},
+		"gone":   {NodeID: "4", Key: key, Role: "phone", Status: "revoking", Address: "100.64.0.4"}}
+	s.Store.value.Devices["household00000002"] = map[string]Device{
+		"pond": {NodeID: "5", Key: key, Role: "pond", Status: "active", Address: "100.64.0.5"}}
+	b.nodes = []Registered{
+		{ID: "1", Key: key, UserID: "1", Addresses: []string{"100.64.0.1"}},
+		{ID: "2", Key: key, UserID: "1", Addresses: []string{"100.64.0.2"}},
+		{ID: "3", Key: key, UserID: "1", Addresses: []string{"100.64.0.3"}},
+		{ID: "4", Key: key, UserID: "1", Addresses: []string{"100.64.0.4"}},
+		{ID: "5", Key: key, UserID: "2", Addresses: []string{"100.64.0.5"}}}
+	for range 8 { // map iteration order varies; the policy must not
+		if err := s.policy(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		want := []NodeAttr{{Target: []string{"100.64.0.2", "100.64.0.3"}, Attr: []string{"cache-network-maps"}}}
+		if !reflect.DeepEqual(b.attrs, want) {
+			t.Fatalf("node attributes %+v, want %+v", b.attrs, want)
+		}
+	}
+
+	// With no verified phone anywhere, nothing is granted, and the Pond still is not.
+	delete(s.Store.value.Devices, "household00000001")
+	if err := s.policy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if b.attrs == nil || len(b.attrs) != 0 {
+		t.Fatalf("node attributes %+v, want an empty list", b.attrs)
 	}
 }
 func TestStatePersistenceAndExclusiveOwnership(t *testing.T) {
