@@ -1222,9 +1222,13 @@ export class PondApiClient {
             provider: obj.provider as string,
             model: obj.model as string,
           };
+        // A slot that reports its own provider and model (conversation) says nothing is chosen
+        // when they are empty; an assignment that outlived the setting does not say otherwise.
+        const reportsPair = typeof obj.provider === "string" && typeof obj.model === "string";
         // Memory runs on its provider's built-in model while none is named.
-        if (keepProvider && typeof obj.provider === "string" && obj.provider && !obj.model)
-          return { provider: obj.provider, model: "" };
+        if (keepProvider && reportsPair && obj.provider)
+          return { provider: obj.provider as string, model: "" };
+        if (reportsPair) return null;
         if (typeof obj.model_id === "string" && obj.model_id.includes("/")) {
           const [provider, ...rest] = obj.model_id.split("/");
           return { provider, model: rest.join("/") };

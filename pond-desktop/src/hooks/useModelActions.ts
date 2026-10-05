@@ -76,10 +76,10 @@ export function useModelActions(
           offersPictures(m) ? { pictures: withPictures(m) } : undefined,
         );
         say(started?.message ?? `Downloading ${modelLabel(m)}.`);
-        await reloadDownloads();
+        await Promise.all([reloadModels(), reloadDownloads()]);
         watchDownloads();
       }),
-    [attempt, withPictures, reloadDownloads, watchDownloads, say],
+    [attempt, withPictures, reloadModels, reloadDownloads, watchDownloads, say],
   );
 
   /** Fetches picture support for a model already here. Nothing else ever starts that fetch. */

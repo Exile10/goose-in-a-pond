@@ -19,6 +19,7 @@ vi.mock("../state/AppContext", () => ({
 
 import { api } from "../api/PondApiClient";
 import { ModelSwitcher } from "./ModelSwitcher";
+import { __resetDownloadAndUseForTests, downloadAndUse } from "../state/downloadAndUse";
 import type { ModelEntry } from "../api/types";
 import {
   e2b, e4b, foundOnDisk, functionGemma, litertE4b, llamafile, NO_ROLES, ollama, rolesWith, voice,
@@ -54,6 +55,7 @@ async function open() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  __resetDownloadAndUseForTests();
   vi.mocked(api.activateModel).mockResolvedValue(undefined as never);
   vi.mocked(api.updateSettings).mockResolvedValue({} as never);
   setup();
@@ -149,11 +151,22 @@ describe("the list", () => {
     expect(dispatch).toHaveBeenCalledWith({ type: "SET_SECTION", payload: "models" });
   });
 
-  it("closes on Escape", async () => {
+  it("closes on Escape, and hands focus back to the chip", async () => {
     const { menu } = await open();
     expect(menu).toBeTruthy();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(document.querySelector(".model-selector-dropdown")).toBeNull();
+    expect(document.activeElement).toBe(trigger());
+  });
+
+  it("names the model a household asked for from the empty thread, as soon as it is the one answering", async () => {
+    setup({ models: [e2b(HERE)], roles: NO_ROLES, settings: { chat_provider: "", chat_model: "" } });
+    render(<ModelSwitcher />);
+    await waitFor(() => expect(trigger().textContent).toBe("Choose a model"));
+
+    vi.mocked(api.getActiveRoles).mockResolvedValue(rolesWith({ provider: "local", model: e2b().name }));
+    await downloadAndUse(e2b(HERE), "Gemma 4 E2B", true);
+    await waitFor(() => expect(trigger().textContent).toBe("Gemma 4 E2B · llama.cpp"));
   });
 });
 

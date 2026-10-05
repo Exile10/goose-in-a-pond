@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronDown, Cpu, Loader2 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppDispatch } from "../state/AppContext";
+import { onUsed } from "../state/downloadAndUse";
 import type { ModelActiveRoles, ModelEngine, ModelEntry } from "../api/types";
 import { EngineMark } from "./models/ModelMarks";
 import { engineOf } from "../lib/modelProvider";
@@ -50,6 +51,7 @@ export function ModelSwitcher({ onSwitched }: { onSwitched?: () => void }) {
   const [switching, setSwitching] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   /** Each read stands alone: a model list that fails still leaves the label the roles give. A call
    *  that throws before it returns a promise reads as a failed one. */
@@ -74,6 +76,8 @@ export function ModelSwitcher({ onSwitched }: { onSwitched?: () => void }) {
 
   useEffect(() => {
     void load();
+    // A model the household asked for from the empty thread has just become the one answering.
+    return onUsed(() => void load());
   }, [load]);
 
   useEffect(() => {
@@ -82,7 +86,9 @@ export function ModelSwitcher({ onSwitched }: { onSwitched?: () => void }) {
       if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
     }
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key !== "Escape") return;
+      setOpen(false);
+      triggerRef.current?.focus();
     }
     document.addEventListener("mousedown", onClick);
     document.addEventListener("keydown", onKey);
@@ -166,6 +172,7 @@ export function ModelSwitcher({ onSwitched }: { onSwitched?: () => void }) {
   return (
     <div ref={wrapRef} className="model-selector-wrap">
       <button
+        ref={triggerRef}
         className={`model-selector-trigger reach${open ? " is-open" : ""}`}
         onClick={toggle}
         disabled={switching}

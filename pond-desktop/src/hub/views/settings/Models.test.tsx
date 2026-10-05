@@ -291,6 +291,16 @@ describe("Hub Models: when the pond cannot be reached", () => {
     expect(screen.getByText("Models")).toBeTruthy();
   });
 
+  it("says a failure as an alert, and a success as a status", async () => {
+    vi.mocked(api.activateModel).mockRejectedValueOnce(new Error("The file is not on this device"));
+    setup({ models: [e2b(HERE)] });
+    renderHub();
+    fireEvent.click(await screen.findByRole("button", { name: "Use Gemma 4 E2B, llama.cpp for conversation" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("The file is not on this device");
+    fireEvent.click(screen.getByRole("button", { name: "Use Gemma 4 E2B, llama.cpp for conversation" }));
+    expect((await screen.findByRole("status")).textContent).toBe("Now using Gemma 4 E2B for conversation.");
+  });
+
   it("goes back to Settings", async () => {
     const go = renderHub();
     fireEvent.click(await screen.findByRole("button", { name: "Back to Settings" }));

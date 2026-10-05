@@ -275,15 +275,36 @@ describe("On this device", () => {
     expect(await screen.findByText("Now using Gemma 4 E2B for conversation.")).toBeTruthy();
   });
 
-  it("says In use for the model in use, once, and offers no Use or Delete for it", async () => {
+  it("says In use for the model in use, once, and offers it no Use", async () => {
     setup({ models: [e2b(HERE), foundOnDisk()], roles: rolesWith({ provider: "local", model: e2b().name }) });
     renderModels();
     const device = await band("On this device");
     const row = within(device).getByText("Gemma 4 E2B").closest(".mdl-row") as HTMLElement;
     expect(within(row).getByText("In use")).toBeTruthy();
     expect(within(row).queryByRole("button", { name: /^Use / })).toBeNull();
-    expect((within(row).getByRole("button", { name: /Delete/ }) as HTMLButtonElement).disabled).toBe(true);
     expect(within(row).queryByText(/\d%/)).toBeNull();
+  });
+
+  it("explains, without asking first, why the model in use cannot be deleted", async () => {
+    setup({ models: [e2b(HERE), foundOnDisk()], roles: rolesWith({ provider: "local", model: e2b().name }) });
+    renderModels();
+    const device = await band("On this device");
+    const row = within(device).getByText("Gemma 4 E2B").closest(".mdl-row") as HTMLElement;
+    fireEvent.click(within(row).getByRole("button", { name: "Delete Gemma 4 E2B, llama.cpp" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("Gemma 4 E2B is doing a job right now. Give that job to another model first.");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(api.deleteModel).not.toHaveBeenCalled();
+  });
+
+  it("says what was freed when a model is deleted", async () => {
+    setup({ models: [e2b(HERE), foundOnDisk()] });
+    renderModels();
+    const device = await band("On this device");
+    fireEvent.click(within(device).getByRole("button", { name: "Delete Llama-3.2-3B-Instruct-Q4_K_M, llama.cpp" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(api.deleteModel).toHaveBeenCalledWith("gguf", "Llama-3.2-3B-Instruct-Q4_K_M"));
+    expect(await screen.findByText("Deleted Llama-3.2-3B-Instruct-Q4_K_M. 2.0 GB freed.")).toBeTruthy();
   });
 
   it("offers no Delete for a model another program manages", async () => {
@@ -302,7 +323,8 @@ describe("On this device", () => {
     fireEvent.click(within(device).getByRole("button", { name: "Delete Llama-3.2-3B-Instruct-Q4_K_M, llama.cpp" }));
     fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
     await waitFor(() => expect(api.deleteModel).toHaveBeenCalledWith("gguf", "Llama-3.2-3B-Instruct-Q4_K_M"));
-    expect(await screen.findByText(/is doing a job right now/)).toBeTruthy();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/is doing a job right now/);
   });
 });
 
@@ -537,6 +559,55 @@ describe("Get more", () => {
         expect.stringContaining("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"), "gguf", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", { pictures: false },
       ),
     );
+  });
+
+  it("says so when the listing gives a file no size, and still names its add-on's", async () => {
+    vi.mocked(api.searchGgufModels).mockResolvedValue({ models: [{ id: "ggml-org/SmolVLM-256M-Instruct-GGUF", downloads: 9, likes: 1, tags: [], url: "x" }] });
+    vi.mocked(api.listHfModelFiles).mockResolvedValue({
+      files: [{ filename: "SmolVLM-256M-Instruct-Q8_0.gguf", url: "https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/SmolVLM-256M-Instruct-Q8_0.gguf", pictures: { size_bytes: 190_031_616, label: "SmolVLM 256M" } }],
+    });
+    renderModels();
+    const more = await band("Get more");
+    fireEvent.change(within(more).getByRole("searchbox"), { target: { value: "smol" } });
+    fireEvent.click(within(more).getByRole("button", { name: "Search" }));
+    fireEvent.click(await within(more).findByRole("button", { name: /SmolVLM-256M/ }));
+    expect(await within(more).findByText("Size not listed + 181 MB for pictures")).toBeTruthy();
+  });
+
+  it("shows the download of a file named by URL on the row it becomes, as soon as it starts", async () => {
+    const smol = e2b({
+      id: "gguf/SmolVLM-256M-Instruct-Q8_0", name: "SmolVLM-256M-Instruct-Q8_0", title: "SmolVLM 256M",
+      filename: "SmolVLM-256M-Instruct-Q8_0.gguf", downloaded: false, provenance: "added", recommended: undefined,
+      size_mb: 166, quantization: "Q8_0", context_length: undefined, acquire: "download",
+      companions: [{ kind: "pictures", label: "SmolVLM 256M", size_bytes: 190_031_616, state: "downloading" }],
+    });
+    vi.mocked(api.searchGgufModels).mockResolvedValue({ models: [{ id: "ggml-org/SmolVLM-256M-Instruct-GGUF", downloads: 9, likes: 1, tags: [], url: "x" }] });
+    vi.mocked(api.listHfModelFiles).mockResolvedValue({
+      files: [{ filename: "SmolVLM-256M-Instruct-Q8_0.gguf", url: "https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/SmolVLM-256M-Instruct-Q8_0.gguf", pictures: { size_bytes: 190_031_616, label: "SmolVLM 256M" } }],
+    });
+    vi.mocked(api.downloadModelFromUrl).mockResolvedValue({
+      status: "downloading", message: "Downloading SmolVLM 256M (166 MB) and picture support (181 MB)",
+    });
+    renderModels();
+    const more = await band("Get more");
+    expect(screen.queryByText("SmolVLM 256M")).toBeNull();
+
+    // Once it starts, the pond has the row and the transfers.
+    vi.mocked(api.listModels).mockResolvedValue([e2b(HERE), smol]);
+    vi.mocked(api.getDownloadProgress).mockResolvedValue({ downloads: [
+      entry({ filename: "SmolVLM-256M-Instruct-Q8_0.gguf", model_id: smol.id, part: "model", total_bytes: 175_054_528, downloaded_bytes: 50_000_000 }),
+      entry({ filename: "mmproj/smolvlm-256m-instruct/mmproj-SmolVLM-256M-Instruct-f16.gguf", category: "mmproj", model_id: smol.id, part: "pictures", total_bytes: 190_031_616, downloaded_bytes: 60_000_000 }),
+    ] });
+    fireEvent.change(within(more).getByRole("searchbox"), { target: { value: "smol" } });
+    fireEvent.click(within(more).getByRole("button", { name: "Search" }));
+    fireEvent.click(await within(more).findByRole("button", { name: /SmolVLM-256M/ }));
+    fireEvent.click(await within(more).findByRole("button", { name: "Download SmolVLM-256M-Instruct-Q8_0.gguf" }));
+
+    expect(await screen.findByText("Downloading SmolVLM 256M (166 MB) and picture support (181 MB)")).toBeTruthy();
+    const row = (await screen.findAllByText("SmolVLM 256M")).map((el) => el.closest(".mdl-row")).find(Boolean) as HTMLElement;
+    expect(within(row).getAllByRole("progressbar")).toHaveLength(2);
+    expect(within(row).getByText("Added")).toBeTruthy();
+    expect(within(row).getByRole("button", { name: "Pause" })).toBeTruthy();
   });
 
   it("does not promise picture support on a device that will not carry it", async () => {

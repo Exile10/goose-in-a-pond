@@ -181,7 +181,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
       }
     >
       {flash && (
-        <div className={flash.ok ? "hm-flash" : "hm-flash hm-flash--bad"} role="status" aria-live="polite">
+        <div className={flash.ok ? "hm-flash" : "hm-flash hm-flash--bad"} role={flash.ok ? "status" : "alert"}>
           {flash.text}
         </div>
       )}

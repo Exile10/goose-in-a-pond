@@ -105,8 +105,7 @@ export function ModelRow({
               type="button"
               className="mm-btn mm-btn--danger"
               onClick={onDelete}
-              disabled={busy || inUse}
-              title={inUse ? "In use. Choose another model first." : undefined}
+              disabled={busy}
               aria-label={`Delete ${full}`}
             >
               <Trash2 size={15} aria-hidden="true" />

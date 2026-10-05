@@ -900,6 +900,40 @@ describe("addPictures()", () => {
   });
 });
 
+describe("getActiveRoles()", () => {
+  const roles = (over: Record<string, unknown>) =>
+    okJson({
+      chat: { provider: "local", model: "gemma-4-E2B-it-qat-UD-Q4_K_XL", model_id: "gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL" },
+      tool: { model: null },
+      asr: { model_id: null },
+      tts: { model_id: null },
+      embedding: { model_id: null, model: "", provider: "fastembed" },
+      ...over,
+    });
+
+  it("reads each slot's model, from its own fields or from its assignment", async () => {
+    fetchMock.mockResolvedValueOnce(
+      roles({ asr: { model_id: "whisper/base.en" }, tts: { model_id: "tts_kokoro/af_heart" } }),
+    );
+    const r = await client().getActiveRoles();
+    expect(r.chat).toEqual({ provider: "local", model: "gemma-4-E2B-it-qat-UD-Q4_K_XL" });
+    expect(r.asr).toEqual({ provider: "whisper", model: "base.en" });
+    expect(r.tts).toEqual({ provider: "tts_kokoro", model: "af_heart" });
+  });
+
+  it("says nothing is chosen for conversation when the setting is empty, whatever an old assignment says", async () => {
+    fetchMock.mockResolvedValueOnce(
+      roles({ chat: { provider: "", model: "", model_id: "gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL" } }),
+    );
+    expect((await client().getActiveRoles()).chat).toBeNull();
+  });
+
+  it("keeps memory's provider when it names no model, so the built-in one can be said", async () => {
+    fetchMock.mockResolvedValueOnce(roles({}));
+    expect((await client().getActiveRoles()).embedding).toEqual({ provider: "fastembed", model: "" });
+  });
+});
+
 describe("getMemoryStatus()", () => {
   it("carries what a switch would free", async () => {
     fetchMock.mockResolvedValueOnce(

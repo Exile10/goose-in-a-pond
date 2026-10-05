@@ -52,7 +52,8 @@ export function NoModelPicks() {
   }
 
   return (
-    <section className="nm" aria-labelledby="nm-title">
+    // Off: the thread is a live region, and a bar that moves every second would be read out each time.
+    <section className="nm" aria-labelledby="nm-title" aria-live="off">
       <h2 className="nm__title" id="nm-title">Pick a model to talk with</h2>
       <p className="nm__lead">
         This pond has no conversation model yet. Nothing is downloaded until you choose one.

@@ -232,7 +232,13 @@ export function Models() {
 
   // ── Actions ──
   async function remove(model: ModelEntry) {
-    const size = formatSize(model.size_mb) || "the file";
+    // Nothing to ask: the pond refuses it, so say why before a confirmation promises otherwise.
+    if (isInUse(model, roles)) {
+      say(`${modelLabel(model)} is doing a job right now. Give that job to another model first.`, false);
+      return;
+    }
+    const freed = formatSize(model.size_mb);
+    const size = freed || "the file";
     // The encoder file is shared per family, so its bytes return only if no other model uses it.
     const pictures = picturesOf(model);
     const removes =
@@ -248,7 +254,7 @@ export function Models() {
     try {
       await api.deleteModel(model.category ?? model.provider, model.name);
       await data.reload();
-      say(`Deleted ${modelLabel(model)}.`);
+      say(`Deleted ${modelLabel(model)}.${freed ? ` ${freed} freed.` : ""}`);
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         say(`${modelLabel(model)} is doing a job right now. Give that job to another model first.`, false);
@@ -307,7 +313,7 @@ export function Models() {
       </header>
 
       {flash && (
-        <p className={flash.ok ? "mdl-flash" : "mdl-flash mdl-flash--bad"} role="status">
+        <p className={flash.ok ? "mdl-flash" : "mdl-flash mdl-flash--bad"} role={flash.ok ? "status" : "alert"}>
           {flash.text}
         </p>
       )}
@@ -442,6 +448,8 @@ export function Models() {
           carriesPictures={carriesPictures(models)}
           onStarted={(message) => {
             say(message ?? "Downloading.");
+            // A file named by URL becomes a row of its own, which the transfer then sits on.
+            void data.reloadModels();
             void data.reloadDownloads();
             data.watchDownloads();
           }}

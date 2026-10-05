@@ -74,9 +74,10 @@ export function AddBand({
     }
   }
 
-  /** What a file would cost: its own size, and its add-on's where it has one and it is wanted. */
+  /** What a file would cost: its own size, and its add-on's where it has one and it is wanted. The
+   *  listing often leaves a file's own size out; the pond states it when the download starts. */
   function costOf(file: HfModelFile): string {
-    const own = formatSize(file.size_mb);
+    const own = formatSize(file.size_mb) || "Size not listed";
     const pictures = carriesPictures === false ? null : file.pictures;
     return pictures && withPictures ? `${own} + ${formatBytes(pictures.size_bytes)} for pictures` : own;
   }
@@ -126,7 +127,7 @@ export function AddBand({
                     <span className="mdl-muted">No GGUF files in this repository.</span>
                   )}
                   {offersPictures && (
-                    <label className="mm-choice reach">
+                    <label className="mm-choice">
                       <input type="checkbox" checked={withPictures}
                         onChange={(e) => setWithPictures(e.target.checked)} />
                       <ImagePlus size={14} aria-hidden="true" />

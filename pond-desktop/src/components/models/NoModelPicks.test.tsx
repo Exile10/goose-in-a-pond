@@ -68,6 +68,12 @@ describe("no conversation model", () => {
     expect(api.activateModel).not.toHaveBeenCalled();
   });
 
+  it("keeps its moving bars out of the thread's live region, so they are not read out each second", async () => {
+    render(<NoModelPicks />);
+    await pickCard("Gemma 4 E4B, llama.cpp");
+    expect(document.querySelector(".nm")?.getAttribute("aria-live")).toBe("off");
+  });
+
   it("raises one card, and asks with one button", async () => {
     render(<NoModelPicks />);
     await pickCard("Gemma 4 E4B, llama.cpp");
