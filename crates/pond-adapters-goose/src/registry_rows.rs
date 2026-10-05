@@ -1,4 +1,4 @@
-//! Reads and edits the engine registry's rows for the companion files (vision encoder, drafter).
+//! Reads and edits the engine registry's rows for the vision encoder companion file.
 //!
 //! One GGUF has several ids sharing one engine slot, so a plan covers ALL rows naming a file.
 //! The registry `Mutex` is not reentrant (`evict_model`, `resolve_model_path` take it): hold the
@@ -15,7 +15,6 @@ pub struct RowSnapshot {
     pub resolved_path: PathBuf,
     pub mmproj_path: Option<PathBuf>,
     pub mmproj_size_bytes: u64,
-    pub draft_model: Option<String>,
 }
 
 impl RowSnapshot {
@@ -25,7 +24,6 @@ impl RowSnapshot {
             resolved_path: resolve(&entry.local_path),
             mmproj_path: entry.mmproj_path.clone(),
             mmproj_size_bytes: entry.mmproj_size_bytes,
-            draft_model: entry.settings.draft_model.clone(),
         }
     }
 }

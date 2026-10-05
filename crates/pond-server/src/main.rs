@@ -1101,11 +1101,6 @@ async fn run_server(
 
     // Apply the mic privacy setting before anything can open a device.
     pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
-    // // The speculation switch, before any local adapter is built: `apply_*_settings` decides the
-    // // drafter from it each time one is, and would otherwise turn it back on.
-    // pond_core::models::domain::drafter::set_speculation_enabled(
-    //     settings.speculative_decoding_enabled,
-    // );
 
     // Serve never opens the mic (only `/transcribe`), but `WhisperRsInput::new` needs a handle.
     let (mic_handle, _mic_owner_join) = pond_audio::spawn(
@@ -1622,43 +1617,6 @@ async fn run_server(
 
     let effective_chat_provider = settings.chat_provider.clone();
     let effective_chat_model = settings.chat_model.clone();
-
-    // Speculative decoding is out of the engine: restore this if it returns.
-    // // The speculative-decoding drafter, provisioned the way the TTS engine is:
-    // // a helper model nobody asked for and nobody should have to think about.
-    // // Measured on the Orin, it takes a real turn from 31 to 49 tok/s.
-    // //
-    // // Before ANY provider is built, because both consumers read the registry
-    // // and neither re-reads it: `apply_jetson_settings` sizes the context window
-    // // against the models that will be resident and sets `draft_model` from the
-    // // registry, and it runs when the local adapter is constructed a few lines
-    // // below. Registering after that point costs a restart to converge.
-    // //
-    // // Failure is silent by design -- decode is simply not accelerated. The
-    // // notification further down is the last resort, and it is down there
-    // // because the queue to put it on does not exist yet.
-    // //
-    // // Only while the switch in Settings is on: a household that turned
-    // // speculation off asked for neither the download nor that notice.
-    // let drafter_wanted = settings.speculative_decoding_enabled
-    //     && model_download::drafter_for(&settings.chat_model).is_some();
-    // let drafter_ready = if drafter_wanted {
-    //     let present = model_download::ensure_mtp_drafter(&data_dir, &settings.chat_model)
-    //         .await
-    //         .is_some();
-    //     // The registry row is what the engine resolves a drafter by name
-    //     // through, so a downloaded file with no row is invisible.
-    //     #[cfg(feature = "goose-agent")]
-    //     if present {
-    //         pond_adapters_goose::mtp_drafter::ensure_drafter_registered(
-    //             &data_dir,
-    //             &settings.chat_model,
-    //         );
-    //     }
-    //     present
-    // } else {
-    //     false
-    // };
 
     // ── Build per-role LLM providers ────────────────────────────────────────
     // TODO(cloud-fallback): wire `cloud_fallback_enabled` (spill to cloud on local failure only).
@@ -3508,33 +3466,6 @@ async fn run_server(
         pond_infra::sqlite_notification_queue::SqliteNotificationQueue::new(db.system.clone()),
     );
 
-    // Speculative decoding is out of the engine: restore this if it returns.
-    // // Last resort: the pond goes on without the helper and nothing else would
-    // // ever say so. In the words of the switch that controls it, and with no
-    // // claim about speed: guessing ahead measured faster on the Orin and slower
-    // // on a Mac, so "replies are just slower" was only true on one of them.
-    // if drafter_wanted && !drafter_ready {
-    //     let label = pond_core::models::domain::vision_encoder::encoder_for(&settings.chat_model)
-    //         .map(|spec| spec.label)
-    //         .unwrap_or("this model");
-    //     let helper_mb = model_download::drafter_for(&settings.chat_model)
-    //         .map(|spec| spec.approx_mb)
-    //         .unwrap_or(0);
-    //     let notice = pond_core::mcp::ports::notification::Notification {
-    //         id: uuid::Uuid::new_v4().to_string(),
-    //         target: "broadcast".to_string(),
-    //         category: "info".to_string(),
-    //         title: "Guessing ahead is not running".to_string(),
-    //         body: format!(
-    //             "The {helper_mb} MB helper model for {label} could not be downloaded, so \
-    //              replies arrive without it. The pond tries again at its next start."
-    //         ),
-    //         timestamp: chrono::Utc::now().to_rfc3339(),
-    //         data: None,
-    //     };
-    //     let _ = notification_queue.enqueue(notice.clone()).await;
-    //     let _ = notification_tx.send(notice);
-    // }
     // FCM v1 when a service-account key exists (data-only wake pings, no content via Google).
     let fcm_key_path = std::env::var("POND_FCM_KEY_PATH")
         .map(std::path::PathBuf::from)
@@ -4809,11 +4740,6 @@ async fn run_chat(
 
     // Apply the microphone privacy setting before anything can open a device.
     pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
-    // // The speculation switch, before any local adapter is built: `apply_*_settings` decides the
-    // // drafter from it each time one is, and would otherwise turn it back on.
-    // pond_core::models::domain::drafter::set_speculation_enabled(
-    //     settings.speculative_decoding_enabled,
-    // );
 
     // Every capture path must use this one mic owner. 15_000 ms covers the wake-word detector's
     // ~13.4 s history with headroom (see `pond_audio::spawn`).
@@ -8720,9 +8646,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     pond_core::shared::services::egress::set_network_mode(
         pond_core::shared::services::egress::NetworkMode::parse(&settings.network_mode),
     );
-    // pond_core::models::domain::drafter::set_speculation_enabled(
-    //     settings.speculative_decoding_enabled,
-    // );
     // Used only when chat_provider = "llamafile"; other providers route themselves.
     let llamafile_url = format!("http://127.0.0.1:{}", ports::llamafile_port());
 

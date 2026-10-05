@@ -2,7 +2,6 @@ pub mod acceleration;
 pub mod curated;
 pub mod device_budget;
 pub mod device_profile;
-pub mod drafter;
 pub mod engine;
 pub mod gguf;
 pub mod image_limits;

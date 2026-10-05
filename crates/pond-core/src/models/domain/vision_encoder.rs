@@ -976,11 +976,9 @@ mod tests {
     }
 
     #[test]
-    fn a_qat_model_shares_its_drafter_but_not_its_encoder() {
-        use crate::models::domain::drafter::drafter_for;
+    fn a_qat_model_does_not_share_its_encoder() {
         let qat = "gemma-4-E2B-it-qat-UD-Q4_K_XL";
         let plain = "gemma-4-E2B-it-Q4_K_M";
-        assert_eq!(drafter_for(qat).unwrap().id, drafter_for(plain).unwrap().id);
         assert_ne!(
             encoder_for(qat).unwrap().dir,
             encoder_for(plain).unwrap().dir

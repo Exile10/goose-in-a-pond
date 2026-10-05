@@ -1754,10 +1754,8 @@ async fn remove_orphaned_encoder_dir(
 }
 
 /// Whether a save leaves the warmed prefix stale (new provider or model): one warm-up follows.
-/// The speculation switch is commented out with speculative decoding; restore it if it returns.
 fn save_needs_prewarm(current: &Settings, merged: &Settings) -> bool {
     current.chat_provider != merged.chat_provider || current.chat_model != merged.chat_model
-    // || current.speculative_decoding_enabled != merged.speculative_decoding_enabled
 }
 
 // ── One engine event, one SSE frame ───────────────────────────────────────────
@@ -4743,15 +4741,6 @@ async fn update_settings(
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
 
-    // Speculative decoding was removed from the llama.cpp engine; restore this if it returns.
-    // // The speculation switch, and it must land HERE, before either
-    // // `rebuild_llm_provider` below: the rebuild constructs the local-inference
-    // // adapter, whose device settings re-stamp `draft_model` from this gate, so a
-    // // rebuild that ran first would put back the drafter the user just turned off.
-    // // Unconditional for the mic gate's reason: a cheap idempotent write.
-    // pond_core::models::domain::drafter::set_speculation_enabled(
-    //     merged.speculative_decoding_enabled,
-    // );
     // Unconditional: it's cheap, and a skipped re-install would silently drop the restriction.
     pond_core::shared::services::egress::set_network_mode(
         pond_core::shared::services::egress::NetworkMode::parse(&merged.network_mode),
@@ -17554,9 +17543,6 @@ mod tests {
             provider.chat_provider = "local".into();
             assert!(save_needs_prewarm(&current, &provider));
 
-            // let mut switch = current.clone();
-            // switch.speculative_decoding_enabled = !current.speculative_decoding_enabled;
-            // assert!(save_needs_prewarm(&current, &switch));
             // Unrelated fields never warm.
             let mut other = current.clone();
             other.assistant_name = "Heron".into();

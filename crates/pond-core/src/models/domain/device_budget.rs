@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
-use super::drafter::drafter_for;
 use super::gguf::parse_gguf_header;
 use super::vision_encoder::{encoder_for, EncoderSpec, EncoderState};
 
@@ -53,9 +52,6 @@ pub fn llm_budget_mb() -> u64 {
 pub const KV_KIB_PER_TOKEN: u64 = 56;
 /// llama.cpp's compute buffers: measured 522 MiB at 4096-16384 and 582 at 32768, nearly flat.
 pub const COMPUTE_BUFFER_MB: u64 = 600;
-/// Drafter compute beyond its weights; no KV, as `ctx_other` shares the target's cache.
-/// 64 pads a measured 38-47 MB, which undercounts: MemAvailable counts mmap'd weights as free.
-pub const DRAFTER_COMPUTE_MB: u64 = 64;
 /// Vision encoder compute beyond its weights (read whole, not mmapped). UNMEASURED; tests pin
 /// that no shipped model's declaration flips anywhere in 0..=900.
 pub const ENCODER_COMPUTE_MB: u64 = 256;
@@ -73,17 +69,10 @@ pub const ASSUMED_LARGEST_MODEL_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 fn kv_allowance_mb(
     budget_mb: u64,
     model_bytes: u64,
-    drafter_bytes: u64,
     encoder_bytes: u64,
     encoder_compute_mb: u64,
 ) -> u64 {
     let model_mb = model_bytes / MIB;
-    // A drafter is a second set of weights, resident for the whole session.
-    let drafter_mb = if drafter_bytes > 0 {
-        drafter_bytes / MIB + DRAFTER_COMPUTE_MB
-    } else {
-        0
-    };
     // The encoder loads eagerly at every model load and cannot be reclaimed as page cache.
     let encoder_mb = if encoder_bytes > 0 {
         encoder_bytes / MIB + encoder_compute_mb
@@ -93,7 +82,6 @@ fn kv_allowance_mb(
     budget_mb
         .saturating_sub(model_mb)
         .saturating_sub(COMPUTE_BUFFER_MB)
-        .saturating_sub(drafter_mb)
         .saturating_sub(encoder_mb)
 }
 
@@ -121,34 +109,20 @@ fn window_for_tokens(tokens: u64) -> u32 {
 pub fn context_size_for_budget(
     budget_mb: u64,
     model_bytes: u64,
-    drafter_bytes: u64,
     kv_kib_per_token: Option<u64>,
 ) -> u32 {
-    context_size_with_encoder(budget_mb, model_bytes, drafter_bytes, 0, kv_kib_per_token)
+    context_size_with_encoder(budget_mb, model_bytes, 0, kv_kib_per_token)
 }
 
 /// [`context_size_for_budget`] plus a resident encoder: its weights and [`ENCODER_COMPUTE_MB`].
 pub fn context_size_with_encoder(
     budget_mb: u64,
     model_bytes: u64,
-    drafter_bytes: u64,
     encoder_bytes: u64,
     kv_kib_per_token: Option<u64>,
 ) -> u32 {
-    let kv_mb = kv_allowance_mb(
-        budget_mb,
-        model_bytes,
-        drafter_bytes,
-        encoder_bytes,
-        ENCODER_COMPUTE_MB,
-    );
+    let kv_mb = kv_allowance_mb(budget_mb, model_bytes, encoder_bytes, ENCODER_COMPUTE_MB);
     window_for_tokens(tokens_for(kv_mb, slope(kv_kib_per_token)))
-}
-
-/// Drafter charge for `chat_model`: its catalogue size whenever it has one, never the file or the
-/// speculation switch, so `n_ctx` (and with it the KV snapshot) stays put when either changes.
-pub fn drafter_budget_bytes(chat_model: &str) -> u64 {
-    drafter_for(chat_model).map_or(0, |d| d.approx_mb * MIB)
 }
 
 // ── The header slope ────────────────────────────────────────────────────────
@@ -224,20 +198,13 @@ pub fn vision_fit(
     let Some(spec) = encoder_for(chat_model) else {
         return VisionFit::NotDeclared;
     };
-    let drafter = drafter_budget_bytes(chat_model);
     let slope = slope(kv_kib_per_token);
     let weights = model_bytes.unwrap_or(ASSUMED_LARGEST_MODEL_BYTES);
 
-    let without = tokens_for(kv_allowance_mb(budget_mb, weights, drafter, 0, 0), slope);
+    let without = tokens_for(kv_allowance_mb(budget_mb, weights, 0, 0), slope);
     let window_without = window_for_tokens(without);
     let with = tokens_for(
-        kv_allowance_mb(
-            budget_mb,
-            weights,
-            drafter,
-            spec.size_bytes,
-            encoder_compute_mb,
-        ),
+        kv_allowance_mb(budget_mb, weights, spec.size_bytes, encoder_compute_mb),
         slope,
     );
     let window_with = window_for_tokens(with);
@@ -438,8 +405,6 @@ pub struct DeviceWindow {
     pub weights_known: bool,
     /// The header slope, or `None` for the fallback [`KV_KIB_PER_TOKEN`].
     pub kv_kib_per_token: Option<u64>,
-    /// See [`drafter_budget_bytes`].
-    pub drafter_bytes: u64,
     /// The encoder charged: its size when the model declares vision on the budgeted device.
     pub encoder_bytes: u64,
 }
@@ -452,7 +417,6 @@ pub fn device_window(gguf_path: Option<&Path>, chat_model: &str) -> DeviceWindow
         .filter(|m| m.is_file())
         .map(|m| m.len());
     let kv_kib_per_token = gguf_path.and_then(kv_cost_from_header);
-    let drafter_bytes = drafter_budget_bytes(chat_model);
     let encoder_bytes = match budgeted_declaration(gguf_path, chat_model, true) {
         VisionDeclaration::Declared(spec) => spec.size_bytes,
         _ => 0,
@@ -462,14 +426,12 @@ pub fn device_window(gguf_path: Option<&Path>, chat_model: &str) -> DeviceWindow
         window: context_size_with_encoder(
             llm_budget_mb(),
             model_bytes,
-            drafter_bytes,
             encoder_bytes,
             kv_kib_per_token,
         ),
         model_bytes,
         weights_known: file_len.is_some(),
         kv_kib_per_token,
-        drafter_bytes,
         encoder_bytes,
     }
 }
@@ -483,8 +445,8 @@ mod tests {
     const BUDGET: u64 = LLM_BUDGET_MB;
 
     /// The window at the Orin's constant budget.
-    fn jetson(model_bytes: u64, drafter_bytes: u64, kv: Option<u64>) -> u32 {
-        context_size_for_budget(BUDGET, model_bytes, drafter_bytes, kv)
+    fn jetson(model_bytes: u64, kv: Option<u64>) -> u32 {
+        context_size_for_budget(BUDGET, model_bytes, kv)
     }
 
     // The real files on the Orin, `ls -lL` / `stat -Lc %s`.
@@ -493,9 +455,6 @@ mod tests {
     const ORIN_E4B_QAT_UD: u64 = 4_215_695_776;
     const ORIN_E4B_IQ4_XS: u64 = 4_715_416_704;
     const E4B_Q4_K_M: u64 = 4_977_171_584;
-    /// The real drafter files.
-    const E2B_DRAFTER: u64 = 59_235_648;
-    const E4B_DRAFTER: u64 = 59_678_016;
     /// Header slopes, KiB/token.
     const E2B_KV: u64 = 18;
     const E4B_KV: u64 = 56;
@@ -518,8 +477,8 @@ mod tests {
     /// Uses the exact on-device sizes: the window is a step function of weight size.
     #[test]
     fn jetson_context_fits_each_model_in_the_budget() {
-        let e2b = jetson(ORIN_E2B_Q4_K_M, 0, None);
-        let e4b = jetson(E4B_Q4_K_M, 0, None);
+        let e2b = jetson(ORIN_E2B_Q4_K_M, None);
+        let e4b = jetson(E4B_Q4_K_M, None);
         assert_eq!(e2b, 16384, "E2B should keep the full window");
         assert_eq!(
             e4b, 8192,
@@ -535,8 +494,8 @@ mod tests {
     fn a_different_device_budget_produces_a_different_window() {
         let nano = 7620 - RESERVED_MB;
         let nx = 15564 - RESERVED_MB;
-        let on_nano = context_size_for_budget(nano, E4B_Q4_K_M, 0, None);
-        let on_nx = context_size_for_budget(nx, E4B_Q4_K_M, 0, None);
+        let on_nano = context_size_for_budget(nano, E4B_Q4_K_M, None);
+        let on_nx = context_size_for_budget(nx, E4B_Q4_K_M, None);
         assert_eq!(on_nano, 8192, "the board we actually have");
         assert!(on_nx > on_nano, "got {on_nx} against {on_nano}");
     }
@@ -545,16 +504,16 @@ mod tests {
     fn the_orin_profile_reproduces_the_devices_own_windows() {
         let budget = 7620 - (1500 + 200 + 100);
         assert_eq!(
-            context_size_for_budget(budget, ORIN_E2B_Q4_K_M, 0, None),
+            context_size_for_budget(budget, ORIN_E2B_Q4_K_M, None),
             16384
         );
-        assert_eq!(context_size_for_budget(budget, E4B_Q4_K_M, 0, None), 8192);
+        assert_eq!(context_size_for_budget(budget, E4B_Q4_K_M, None), 8192);
     }
 
     /// A budget smaller than the weights must clamp, not underflow into a huge window.
     #[test]
     fn an_impossible_budget_clamps_instead_of_wrapping() {
-        assert_eq!(context_size_for_budget(512, E4B_Q4_K_M, 0, None), 2048);
+        assert_eq!(context_size_for_budget(512, E4B_Q4_K_M, None), 2048);
     }
 
     /// Redoes the arithmetic by hand, so the test cannot share the function's mistake.
@@ -562,7 +521,7 @@ mod tests {
     fn e4b_fits_its_window_and_could_not_take_another_doubling() {
         let weights_mb = 4_640_000_000u64 / MIB;
         let free_mb = LLM_BUDGET_MB - weights_mb - 600;
-        let chosen = u64::from(jetson(4_640_000_000, 0, None));
+        let chosen = u64::from(jetson(4_640_000_000, None));
         let needed_mb = (chosen * E4B_KV) / 1024;
         assert!(
             needed_mb < free_mb,
@@ -577,15 +536,15 @@ mod tests {
 
     #[test]
     fn the_per_token_slope_is_observable_on_a_model_the_ceiling_does_not_cap() {
-        assert_eq!(jetson(4_739_563_520, 0, None), 12288);
+        assert_eq!(jetson(4_739_563_520, None), 12288);
     }
 
     /// E4B IQ4_XS affords 13,220 tokens; a power-of-two floor handed back 8,192.
     #[test]
     fn rounding_does_not_discard_context_the_budget_affords() {
-        assert_eq!(jetson(ORIN_E4B_IQ4_XS, 0, None), 12288);
+        assert_eq!(jetson(ORIN_E4B_IQ4_XS, None), 12288);
         for bytes in [4_600_000_000u64, 4_700_000_000, 4_800_000_000] {
-            let ctx = u64::from(jetson(bytes, 0, None));
+            let ctx = u64::from(jetson(bytes, None));
             let kv_mb = LLM_BUDGET_MB
                 .saturating_sub(bytes / MIB)
                 .saturating_sub(600);
@@ -610,75 +569,42 @@ mod tests {
             (E4B_Q4_K_M, E4B_KV, 8192),
             (ORIN_E4B_IQ4_XS, E4B_KV, 12288),
         ] {
-            let derived = jetson(bytes, 0, Some(kv));
+            let derived = jetson(bytes, Some(kv));
             assert_eq!(derived, want, "{bytes} at {kv}");
-            assert_eq!(derived, jetson(bytes, 0, None), "{bytes}");
+            assert_eq!(derived, jetson(bytes, None), "{bytes}");
         }
     }
 
     #[test]
     fn a_cheaper_model_is_no_longer_charged_the_widest_geometry() {
         let bytes = 4_500u64 * MIB;
-        assert!(jetson(bytes, 0, Some(28)) > jetson(bytes, 0, None));
+        assert!(jetson(bytes, Some(28)) > jetson(bytes, None));
     }
 
     #[test]
     fn a_wider_model_is_charged_for_it() {
         let bytes = 4_000_000_000u64;
-        assert!(jetson(bytes, 0, Some(168)) < jetson(bytes, 0, None));
+        assert!(jetson(bytes, Some(168)) < jetson(bytes, None));
     }
 
     #[test]
     fn a_useless_slope_falls_back_rather_than_dividing_by_zero() {
-        assert_eq!(jetson(E4B_Q4_K_M, 0, Some(0)), jetson(E4B_Q4_K_M, 0, None));
+        assert_eq!(jetson(E4B_Q4_K_M, Some(0)), jetson(E4B_Q4_K_M, None));
     }
 
     #[test]
     fn jetson_context_floors_for_an_oversized_model() {
-        assert_eq!(jetson(9_000_000_000, 0, None), 2048);
+        assert_eq!(jetson(9_000_000_000, None), 2048);
     }
 
-    #[test]
-    fn a_drafter_costs_window() {
-        let without = jetson(ORIN_E2B_Q4_K_M, 0, Some(E2B_KV));
-        let with = jetson(ORIN_E2B_Q4_K_M, E2B_DRAFTER, Some(E2B_KV));
-        assert!(with <= without);
-        assert!(with >= 8192, "got {with}");
-    }
+    // ── Encoder charges ────────────────────────────────────────────────────
 
-    /// The drafter's cost is flat in `n_ctx`, so it must not be folded into the slope.
+    /// Both picks stay at the latency clamp: the board's E4B log line reads 16384.
     #[test]
-    fn the_drafter_is_charged_once_not_per_token() {
-        let without = u64::from(context_size_for_budget(BUDGET, E4B_Q4_K_M, 0, Some(E4B_KV)));
-        let with = u64::from(context_size_for_budget(
-            BUDGET,
-            E4B_Q4_K_M,
-            E4B_DRAFTER,
-            Some(E4B_KV),
-        ));
-        let expected_loss = (57 + 64) * 1024 / 56;
-        assert!(without.saturating_sub(with) <= expected_loss + 1024);
-    }
-
-    // ── Drafter and encoder charges ────────────────────────────────────────
-
-    /// Keeps 16384 whether charged the real drafter file or its catalogue size.
-    #[test]
-    fn e4b_qat_with_its_drafter_still_gets_16384() {
-        assert_eq!(
-            jetson(ORIN_E4B_QAT_UD, E4B_DRAFTER, Some(E4B_KV)),
-            16384,
-            "the old input: the drafter file's own size"
-        );
-        assert_eq!(
-            jetson(
-                ORIN_E4B_QAT_UD,
-                drafter_budget_bytes("gemma-4-E4B-it-qat-UD-Q4_K_XL"),
-                Some(E4B_KV)
-            ),
-            16384,
-            "the new input: the catalogue size"
-        );
+    fn the_e2b_and_e4b_picks_keep_the_16384_clamp() {
+        assert_eq!(jetson(ORIN_E4B_QAT_UD, Some(E4B_KV)), 16384);
+        assert_eq!(jetson(ORIN_E2B_QAT_UD, Some(E2B_KV)), 16384);
+        assert_eq!(jetson(ORIN_E2B_Q4_K_M, Some(E2B_KV)), 16384);
     }
 
     /// A zero encoder matches `context_size_for_budget` across a sweep of sizes and slopes.
@@ -686,54 +612,12 @@ mod tests {
     fn a_zero_encoder_is_the_old_arithmetic() {
         for bytes in (0..9_000_000_000u64).step_by(97_000_000) {
             for kv in [None, Some(0), Some(18), Some(56), Some(168)] {
-                for drafter in [0, E2B_DRAFTER] {
-                    assert_eq!(
-                        context_size_with_encoder(BUDGET, bytes, drafter, 0, kv),
-                        context_size_for_budget(BUDGET, bytes, drafter, kv)
-                    );
-                }
+                assert_eq!(
+                    context_size_with_encoder(BUDGET, bytes, 0, kv),
+                    context_size_for_budget(BUDGET, bytes, kv)
+                );
             }
         }
-    }
-
-    #[test]
-    fn the_catalogue_drafter_size_lands_on_the_same_windows_as_the_file() {
-        for (model, bytes, file, kv) in [
-            (
-                "gemma-4-E2B-it-Q4_K_M",
-                ORIN_E2B_Q4_K_M,
-                E2B_DRAFTER,
-                E2B_KV,
-            ),
-            (
-                "gemma-4-E2B-it-qat-UD-Q4_K_XL",
-                ORIN_E2B_QAT_UD,
-                E2B_DRAFTER,
-                E2B_KV,
-            ),
-            (
-                "gemma-4-E4B-it-qat-UD-Q4_K_XL",
-                ORIN_E4B_QAT_UD,
-                E4B_DRAFTER,
-                E4B_KV,
-            ),
-            (
-                "gemma-4-E4B-it-IQ4_XS",
-                ORIN_E4B_IQ4_XS,
-                E4B_DRAFTER,
-                E4B_KV,
-            ),
-            ("gemma-4-E4B-it-Q4_K_M", E4B_Q4_K_M, E4B_DRAFTER, E4B_KV),
-        ] {
-            assert_eq!(
-                jetson(bytes, drafter_budget_bytes(model), Some(kv)),
-                jetson(bytes, file, Some(kv)),
-                "{model}"
-            );
-        }
-        assert_eq!(drafter_budget_bytes("gemma-4-E2B-it"), 57 * MIB);
-        assert_eq!(drafter_budget_bytes("Llama-3.2-3B-Instruct"), 0);
-        assert_eq!(drafter_budget_bytes("gemma-4-12b-it"), 0);
     }
 
     // ── The header slope ───────────────────────────────────────────────────
@@ -831,14 +715,15 @@ mod tests {
             ),
             VisionFit::CostsWindow {
                 window_without: 16384,
-                window_with: 2048
+                window_with: 4096
             }
         ));
     }
 
     #[test]
     fn a_model_already_at_the_floor_is_not_declared() {
-        for bytes in [ASSUMED_LARGEST_MODEL_BYTES, 5_300_000_000, 9_000_000_000] {
+        // Weights past budget less compute leave no KV with or without the encoder.
+        for bytes in [5_500_000_000, 6_000_000_000, 9_000_000_000] {
             let fit = vision_fit(5820, Some(bytes), "gemma-4-E2B-it", Some(E2B_KV), 0);
             assert_eq!(
                 fit,
@@ -879,14 +764,14 @@ mod tests {
             .unwrap()
             .size_bytes;
         assert_eq!(
-            context_size_with_encoder(BUDGET, ORIN_E4B_QAT_UD, 57 * MIB, enc, Some(E4B_KV)),
+            context_size_with_encoder(BUDGET, ORIN_E4B_QAT_UD, enc, Some(E4B_KV)),
             MIN_CTX
         );
         let e2b = crate::models::domain::vision_encoder::encoder_by_dir("gemma-4-e2b-it")
             .unwrap()
             .size_bytes;
         assert_eq!(
-            context_size_with_encoder(BUDGET, ORIN_E2B_Q4_K_M, 57 * MIB, e2b, Some(E2B_KV)),
+            context_size_with_encoder(BUDGET, ORIN_E2B_Q4_K_M, e2b, Some(E2B_KV)),
             16384
         );
     }
@@ -932,11 +817,10 @@ mod tests {
         std::os::unix::fs::symlink(&e2b, &link).unwrap();
         assert!(vision_fit_on_device(&link, "gemma-4-E2B-it").fits());
 
-        // Drafter charged, no encoder (nothing measured, nothing declared): the board's 16384.
+        // No encoder (nothing measured, nothing declared): the board's 16384.
         let w = device_window(Some(&e4b), "gemma-4-E4B-it-qat-UD-Q4_K_XL");
         assert_eq!(w.window, 16384);
         assert_eq!(w.kv_kib_per_token, Some(E4B_KV));
-        assert_eq!(w.drafter_bytes, 57 * MIB);
         assert_eq!(w.encoder_bytes, 0);
         assert!(w.weights_known);
 
