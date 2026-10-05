@@ -17,8 +17,23 @@ import (
 	"syscall"
 	"time"
 
+	"tailscale.com/envknob"
+
 	"github.com/Exile10/goose-in-a-pond/native/pondnet"
 )
+
+// refuseCachedNetworkMaps makes this node start from the coordinator's live
+// network map every time, never from one cached on disk.
+//
+// The Pond is the side that enforces access: its packet filter decides which
+// phones may reach it. Starting from a cached map would enforce the rules as they
+// were when the map was written, so a phone revoked while the Pond was down could
+// pass until the coordinator answered. The coordinator grants the cache to phones
+// only, and this holds even if a policy ever granted it to the Pond.
+//
+// tailscale reads the knob on every check rather than once, and with it off it
+// neither loads nor writes the cache.
+func refuseCachedNetworkMaps() { envknob.Setenv("TS_USE_CACHED_NETMAP", "false") }
 
 func main() {
 	notices := flag.Bool("third-party-notices", false, "print bundled dependency licenses and notices")
@@ -90,6 +105,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "embedded networking configuration is incomplete")
 		os.Exit(2)
 	}
+	refuseCachedNetworkMaps()
 	n, err := pondnet.Open(*state, *host, *control)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "embedded networking could not start:", err)
