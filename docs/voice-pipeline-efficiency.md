@@ -293,7 +293,7 @@ they run one at a time.
 Whisper does not fall back to the CPU. On the Orin, CPU and GPU allocations come from the same
 memory, so a CPU retry competes for what just ran out, and a second, CPU-resident context
 would hold its weights all the time to cover a failure that clears when the LLM's turn ends.
-The next utterance allocates again and normally succeeds. If failures recur, the budget is the
+The next utterance reuses the kept state and normally succeeds once the LLM's turn ends; only a state that was never prepared, or was replaced after a panic, allocates again. If failures recur, the budget is the
 cause: the LLM's context size, not Whisper, is what to shrink.
 
 ### Apple Silicon Mac (dev)
