@@ -261,10 +261,25 @@ loads nor writes a cache.
 **Rollout.** The attribute is part of the coordinator's policy, so it takes effect
 only once the enrollment service is redeployed; the service reinstalls its policy
 on start and on every enrollment change. Headscale 0.29 accepts `nodeAttrs` with
-address targets and passes this attribute through. Whether a phone on the deployed
-coordinator actually receives it is checked by the live Headscale test
-(`enrollment/headscale_live_test.go`), not by the default test run, and that has
-not yet been run against Headscale 0.29.3.
+address targets and passes this attribute through. The live Headscale test
+(`enrollment/headscale_live_test.go`) is not part of the default run.
+
+Measured on the pilot coordinator (Headscale 0.29.3) and the Galaxy A57 on
+2026-10-05, after the enrollment service was redeployed. `headscale policy get`
+showed `"nodeAttrs":[{"target":["100.64.0.2"],"attr":["cache-network-maps"]}]`,
+the phone's address and not the Pond's. Four cold starts on mobile data reached
+the Pond in 3.6 to 3.7 s, against about 9 s before the cache. The two
+launches straight after the reinstall and switching Wi-Fi off took longer than
+25 s and 30.6 s; their logs were not kept. One cold start, timed from the app process starting:
+
+| Time | Event |
+|---|---|
+| 0.32 s | `Start: loaded netmap from disk cache; 1 peers` |
+| 0.34 s | `Starting -> Running`, with no wait for control login, which used to take 3.4 s |
+| 1.41 s | relay connected |
+| 3.05 s | the app reaches the Pond |
+
+The live map replaced the cached one afterwards.
 
 ## Verification
 
