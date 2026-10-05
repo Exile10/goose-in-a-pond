@@ -110,6 +110,15 @@ struct Fixture {
 }
 
 async fn pond_with(agent: Arc<dyn pond_core::models::ports::agent::Agent>) -> Fixture {
+    pond_with_catalog(agent, None).await
+}
+
+async fn pond_with_catalog(
+    agent: Arc<dyn pond_core::models::ports::agent::Agent>,
+    catalog: Option<
+        Arc<dyn pond_core::models::ports::model_catalog_provider::ModelCatalogProvider>,
+    >,
+) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
 
@@ -166,7 +175,7 @@ async fn pond_with(agent: Arc<dyn pond_core::models::ports::agent::Agent>) -> Fi
         secret_repo: None,
         download_tracker: tracker.clone(),
         piper_http_port: None,
-        model_catalog_provider: None,
+        model_catalog_provider: catalog,
         model_storage_dir: None,
         prompt_template_repo: None,
         prompt_extra_repo: None,
@@ -1163,5 +1172,81 @@ async fn arrival_registers_through_the_agent_and_delete_forgets_the_file() {
     assert_eq!(
         agent.forgotten.lock().unwrap().as_slice(),
         [f.tmp.path().join("models/gguf/fresh.gguf")]
+    );
+}
+
+/// A refresh prunes what nobody can use and keeps whatever is downloaded or assigned.
+#[tokio::test]
+async fn a_refresh_prunes_stale_rows_and_keeps_downloaded_and_assigned_ones() {
+    let bundled = whisper_record("base");
+    let catalog = Arc::new(
+        pond_core::models::mocks::mock_model_catalog_provider::MockModelCatalogProvider::with_models(
+            vec![bundled.clone()],
+        ),
+    );
+    let f = pond_with_catalog(Arc::new(MockAgent::new()), Some(catalog)).await;
+    let gguf = f.tmp.path().join("models/gguf");
+    std::fs::create_dir_all(&gguf).unwrap();
+
+    let mut retired = gguf_record("llama-3.2-3b");
+    retired.downloaded = false;
+    let mut kept_file = gguf_record("qwen2.5-3b");
+    kept_file.downloaded = true;
+    std::fs::write(gguf.join("qwen2.5-3b.gguf"), b"weights").unwrap();
+    let mut assigned = gguf_record("gemma-2b");
+    assigned.downloaded = false;
+    let mut ghost = gguf_record("lost-by-hand");
+    ghost.is_custom = true;
+    ghost.downloaded = false;
+    ghost.url = None;
+    let mut added = gguf_record("added-by-url");
+    added.is_custom = true;
+    added.downloaded = false;
+    let mut drafter = gguf_record("mtp-gemma-4-E2B-it");
+    drafter.is_custom = true;
+    drafter.recommended_role = Some("draft".into());
+    for r in [&retired, &kept_file, &assigned, &ghost, &added, &drafter] {
+        f.repo.upsert(r).await.unwrap();
+    }
+    f.repo
+        .set_assignment("chat", "gguf/gemma-2b")
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(&f.app, "/api/v1/models/registry/refresh", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let repo = f.repo.clone();
+    eventually("the stale rows to be pruned", || {
+        let repo = repo.clone();
+        async move { repo.get_by_id("gguf/llama-3.2-3b").await.unwrap().is_none() }
+    })
+    .await;
+
+    let ids: Vec<String> = f
+        .repo
+        .list_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    for gone in [
+        "gguf/llama-3.2-3b",
+        "gguf/lost-by-hand",
+        "gguf/mtp-gemma-4-E2B-it",
+    ] {
+        assert!(!ids.iter().any(|i| i == gone), "{gone} should be pruned");
+    }
+    for kept in [
+        "gguf/qwen2.5-3b",
+        "gguf/gemma-2b",
+        "gguf/added-by-url",
+        "whisper/base",
+    ] {
+        assert!(ids.iter().any(|i| i == kept), "{kept} should be kept");
+    }
+    assert!(
+        gguf.join("qwen2.5-3b.gguf").exists(),
+        "pruning never touches a file"
     );
 }

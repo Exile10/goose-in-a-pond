@@ -8172,15 +8172,15 @@ async fn seed_model_catalog(repo: &dyn ModelRepository, data_dir: &std::path::Pa
         }
     };
 
-    let count = models.len();
-    for mut record in models {
-        record.downloaded = storage.is_present(&record);
-        if let Err(e) = repo.upsert(&record).await {
-            tracing::warn!("Failed to seed model '{}': {e}", record.name);
-        }
+    let present = move |r: &ModelRecord| storage.path_for(r).map(|p| p.exists());
+    match pond_core::models::services::model_service::apply_catalog(repo, models, &present).await {
+        Ok(applied) => tracing::info!(
+            upserted = applied.upserted,
+            pruned = applied.pruned,
+            "model catalog seeded"
+        ),
+        Err(e) => tracing::warn!("Failed to seed the model catalog: {e}"),
     }
-
-    tracing::info!("model catalog seeded ({count} records)");
 }
 
 /// Mirrors role assignments, the source of truth, into settings; unassigned roles are untouched.
@@ -8197,9 +8197,8 @@ async fn sync_assignments_to_settings(
     };
 
     for a in &assignments {
-        // model_id format: "{category}/{name}"
-        let model_name = a.model_id.split('/').nth(1).unwrap_or(&a.model_id);
-        let category = a.model_id.split('/').next().unwrap_or("");
+        // "{category}/{name}"; an Ollama name may hold a slash of its own ("dimavz/whisper-tiny").
+        let (category, model_name) = a.model_id.split_once('/').unwrap_or(("", &a.model_id));
 
         match a.role.as_str() {
             "chat" => {
@@ -9353,6 +9352,30 @@ mod tests {
         let settings = settings_repo.get().await.unwrap();
         assert_eq!(settings.chat_provider, "ollama");
         assert_eq!(settings.chat_model, "llama3.2");
+    }
+
+    /// An Ollama name can hold a slash of its own; only the first one ends the category.
+    #[tokio::test]
+    async fn sync_keeps_a_namespaced_ollama_name_whole() {
+        use pond_core::models::ports::model_repository::ModelRepository;
+        use pond_core::user_data::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+        repo.set_assignment("chat", "ollama/library/qwen3:4b")
+            .await
+            .unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        let settings = settings_repo.get().await.unwrap();
+        assert_eq!(settings.chat_provider, "ollama");
+        assert_eq!(settings.chat_model, "library/qwen3:4b");
     }
 
     #[tokio::test]

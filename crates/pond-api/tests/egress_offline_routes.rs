@@ -43,17 +43,13 @@ const UNGATED_LOOPBACK_SENDS: &[UngatedSend] = &[
         loopback_literal: "http://127.0.0.1:{}/tts",
     },
     UngatedSend {
-        function: "sync_ollama_models(",
-        loopback_literal: "http://localhost:11434/api/tags",
-    },
-    UngatedSend {
         function: "list_ollama_models(",
         loopback_literal: "http://localhost:11434/api/tags",
     },
 ];
 
 /// `.send()` sites in `routes.rs` production source; pinned so a broken detector can't pass.
-const EXPECTED_SENDS: usize = 16;
+const EXPECTED_SENDS: usize = 15;
 
 /// Remove every `#[cfg(test)]` item, line-based (rustfmt puts the closing brace at the item's
 /// indent) since `format!("{{")` fools a brace counter. There are several, with code between.

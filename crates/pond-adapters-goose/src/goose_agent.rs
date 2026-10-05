@@ -5485,6 +5485,9 @@ mod tests {
         async fn set_downloaded(&self, _id: &str, _d: bool) -> Result<()> {
             Ok(())
         }
+        async fn delete(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
         async fn list_assignments(
             &self,
         ) -> Result<Vec<pond_core::models::domain::model_record::ModelRoleAssignment>> {

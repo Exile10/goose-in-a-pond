@@ -14,6 +14,104 @@ use crate::models::ports::model_downloader::ModelDownloader;
 use crate::models::ports::model_repository::ModelRepository;
 use crate::models::ports::model_storage::ModelStorage;
 
+/// Why a seed takes a row out of the catalogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pruned {
+    /// A drafter, encoder or `draft`-role row: never something to choose.
+    Companion,
+    /// Added by hand or found on disk, then lost its file, with no source to fetch it again.
+    Ghost,
+    /// Once bundled, bundled no more, and never downloaded.
+    Retired,
+    /// An Ollama model the Ollama server no longer lists.
+    Unlisted,
+}
+
+/// What a seed does to the rows already in the catalogue.
+#[derive(Debug, Default, PartialEq)]
+pub struct PrunePlan {
+    pub delete: Vec<(String, Pruned)>,
+    /// Assigned Ollama rows the server no longer lists: kept for the assignment, unavailable.
+    pub unavailable: Vec<String>,
+}
+
+/// The rows `catalogue` (this seed's fetch) leaves stale. An assigned row is never deleted, and
+/// nothing on disk is touched: a downloaded row stays unless it is a companion, whose file the
+/// scan's companion filter keeps from coming back as a row.
+pub fn prune_plan(
+    records: &[ModelRecord],
+    catalogue: &[ModelRecord],
+    assignments: &[ModelRoleAssignment],
+) -> PrunePlan {
+    use crate::models::domain::taxonomy::is_companion_file;
+    let assigned: std::collections::HashSet<&str> =
+        assignments.iter().map(|a| a.model_id.as_str()).collect();
+    let listed: std::collections::HashSet<&str> = catalogue.iter().map(|m| m.id.as_str()).collect();
+    let mut plan = PrunePlan::default();
+    for r in records {
+        let in_listing = listed.contains(r.id.as_str());
+        if assigned.contains(r.id.as_str()) {
+            if r.category == ModelCategory::Ollama && !in_listing && r.downloaded {
+                plan.unavailable.push(r.id.clone());
+            }
+            continue;
+        }
+        let companion = is_companion_file(&r.name)
+            || r.filename.as_deref().is_some_and(is_companion_file)
+            || r.recommended_role.as_deref() == Some("draft");
+        let why = if companion {
+            Some(Pruned::Companion)
+        } else if r.category == ModelCategory::Ollama {
+            (!in_listing).then_some(Pruned::Unlisted)
+        } else if r.is_custom {
+            (!r.downloaded && r.url.is_none()).then_some(Pruned::Ghost)
+        } else {
+            (!in_listing && !r.downloaded).then_some(Pruned::Retired)
+        };
+        if let Some(why) = why {
+            plan.delete.push((r.id.clone(), why));
+        }
+    }
+    plan
+}
+
+/// What [`apply_catalog`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CatalogApplied {
+    pub upserted: usize,
+    pub pruned: usize,
+}
+
+/// Upsert a fetched catalogue and prune what it leaves stale. `present` says whether a row's
+/// file is on disk, `None` for a row with no file of its own, whose fetched flag is kept.
+pub async fn apply_catalog(
+    repo: &dyn ModelRepository,
+    models: Vec<ModelRecord>,
+    present: &(dyn Fn(&ModelRecord) -> Option<bool> + Send + Sync),
+) -> Result<CatalogApplied> {
+    let mut applied = CatalogApplied::default();
+    for mut record in models.iter().cloned() {
+        if let Some(on_disk) = present(&record) {
+            record.downloaded = on_disk;
+        }
+        repo.upsert(&record).await?;
+        applied.upserted += 1;
+    }
+    let records = repo.list_all().await?;
+    let assignments = repo.list_assignments().await?;
+    let plan = prune_plan(&records, &models, &assignments);
+    for (id, why) in &plan.delete {
+        if repo.delete(id).await? {
+            tracing::info!(model = %id, reason = ?why, "pruned a stale catalogue row");
+            applied.pruned += 1;
+        }
+    }
+    for id in &plan.unavailable {
+        repo.set_downloaded(id, false).await?;
+    }
+    Ok(applied)
+}
+
 /// What a boot restore does: correct the flag of an assigned file that is on disk, and fetch an
 /// assigned model whose file is missing. Only the household's own assignments; nothing else.
 #[derive(Debug, Default)]
@@ -78,15 +176,13 @@ impl ModelService {
 
     // ── Catalog ───────────────────────────────────────────────────────────────
 
-    /// Upsert the fetched catalog on first run; `ModelRepository::upsert` keeps `is_custom` set.
+    /// Upsert the fetched catalog and prune what it leaves stale; `upsert` keeps `is_custom` set.
     pub async fn seed_catalog(&self) -> Result<usize> {
         let (models, _binaries) = self.catalog.fetch().await?;
-        let count = models.len();
-        for mut record in models {
-            record.downloaded = self.storage.is_present(&record);
-            self.repo.upsert(&record).await?;
-        }
-        Ok(count)
+        let storage = self.storage.clone();
+        let present =
+            move |r: &ModelRecord| storage.path_for(r).is_some().then(|| storage.is_present(r));
+        Ok(apply_catalog(&*self.repo, models, &present).await?.upserted)
     }
 
     /// Re-run `seed_catalog`; safe to repeat.
@@ -103,10 +199,14 @@ impl ModelService {
     // ── Disk sync ─────────────────────────────────────────────────────────────
 
     /// Refresh `downloaded` flags from disk on every later startup; returns how many changed.
+    /// A row with no file of its own (Ollama, HTTP voices) keeps the flag its source gave it.
     pub async fn sync_disk_flags(&self) -> Result<usize> {
         let records = self.repo.list_all().await?;
         let mut changed = 0usize;
         for record in &records {
+            if self.storage.path_for(record).is_none() {
+                continue;
+            }
             let on_disk = self.storage.is_present(record);
             if on_disk != record.downloaded {
                 self.repo.set_downloaded(&record.id, on_disk).await?;
@@ -305,6 +405,9 @@ mod tests {
                 r.downloaded = downloaded;
             }
             Ok(())
+        }
+        async fn delete(&self, id: &str) -> Result<bool> {
+            Ok(self.records.lock().unwrap().remove(id).is_some())
         }
         async fn list_assignments(&self) -> Result<Vec<ModelRoleAssignment>> {
             Ok(vec![])
@@ -599,6 +702,124 @@ mod tests {
                 "should not download when file already present"
             );
         }
+    }
+
+    // ── Prune at seed ─────────────────────────────────────────────────────
+
+    fn row(id: &str, category: ModelCategory, custom: bool, downloaded: bool) -> ModelRecord {
+        let name = id.split_once('/').map_or(id, |(_, n)| n).to_string();
+        let mut r = stub_model(id, &format!("{name}.gguf"), downloaded, None);
+        r.category = category;
+        r.name = name;
+        r.is_custom = custom;
+        r
+    }
+
+    #[test]
+    fn a_seed_prunes_what_nobody_can_use_and_keeps_what_is_downloaded_or_assigned() {
+        use ModelCategory::{Gguf, Ollama, Whisper};
+        let mut drafter = row("gguf/mtp-gemma-4-E2B-it", Gguf, true, true);
+        drafter.recommended_role = Some("draft".into());
+        let assistant = row("gguf/gemma-4-E2B-it-assistant-F16", Gguf, true, false);
+        let ghost = row("gguf/lost-by-hand", Gguf, true, false);
+        let mut added = row("gguf/added-by-url", Gguf, true, false);
+        added.url = Some("https://example.com/a.gguf".into());
+        let on_disk = row("gguf/copied-in", Gguf, true, true);
+        let retired = row("gguf/llama-3.2-3b", Gguf, false, false);
+        let kept_file = row("gguf/qwen2.5-3b", Gguf, false, true);
+        let assigned = row("gguf/gemma-2b", Gguf, false, false);
+        let assigned_companion = row("gguf/mmproj-BF16", Gguf, true, true);
+        let gone_ollama = row("ollama/llama3.2", Ollama, true, true);
+        let listed_ollama = row("ollama/qwen3:4b", Ollama, false, true);
+        let assigned_ollama = row("ollama/mistral", Ollama, false, true);
+        let bundled = row("whisper/base", Whisper, false, false);
+        let records = vec![
+            drafter,
+            assistant,
+            ghost,
+            added,
+            on_disk,
+            retired,
+            kept_file,
+            assigned,
+            assigned_companion,
+            gone_ollama,
+            listed_ollama.clone(),
+            assigned_ollama,
+            bundled.clone(),
+        ];
+        let catalogue = vec![bundled, listed_ollama];
+        let assignments = vec![
+            assigned_one("chat", "gguf/gemma-2b"),
+            assigned_one("tool", "gguf/mmproj-BF16"),
+            assigned_one("think", "ollama/mistral"),
+        ];
+
+        let plan = prune_plan(&records, &catalogue, &assignments);
+        let mut deleted: Vec<(&str, Pruned)> = plan
+            .delete
+            .iter()
+            .map(|(id, why)| (id.as_str(), *why))
+            .collect();
+        deleted.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            deleted,
+            [
+                ("gguf/gemma-4-E2B-it-assistant-F16", Pruned::Companion),
+                ("gguf/llama-3.2-3b", Pruned::Retired),
+                ("gguf/lost-by-hand", Pruned::Ghost),
+                ("gguf/mtp-gemma-4-E2B-it", Pruned::Companion),
+                ("ollama/llama3.2", Pruned::Unlisted),
+            ]
+        );
+        assert_eq!(plan.unavailable, ["ollama/mistral"]);
+    }
+
+    fn assigned_one(role: &str, id: &str) -> ModelRoleAssignment {
+        ModelRoleAssignment {
+            role: role.into(),
+            model_id: id.into(),
+        }
+    }
+
+    /// The seed path itself: upsert with the disk's word, keep a file-less row's own, then prune.
+    #[tokio::test]
+    async fn applying_a_catalogue_upserts_then_prunes() {
+        use crate::models::mocks::mock_model_repository::MockModelRepository as Repo;
+        let repo = Repo::new();
+        let stale = row("gguf/llama-3.2-3b", ModelCategory::Gguf, false, false);
+        repo.upsert(&stale).await.unwrap();
+
+        let pick = row("gguf/pick", ModelCategory::Gguf, false, false);
+        let mut ollama = row("ollama/qwen3:4b", ModelCategory::Ollama, false, true);
+        ollama.filename = None;
+        let present = |r: &ModelRecord| r.filename.as_ref().map(|f| f == "pick.gguf");
+        let applied = apply_catalog(&repo, vec![pick, ollama], &present)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied,
+            CatalogApplied {
+                upserted: 2,
+                pruned: 1
+            }
+        );
+        assert!(repo.get_by_id("gguf/llama-3.2-3b").await.unwrap().is_none());
+        assert!(
+            repo.get_by_id("gguf/pick")
+                .await
+                .unwrap()
+                .unwrap()
+                .downloaded
+        );
+        assert!(
+            repo.get_by_id("ollama/qwen3:4b")
+                .await
+                .unwrap()
+                .unwrap()
+                .downloaded,
+            "a listed Ollama model is available: it has no file to check"
+        );
     }
 
     // ── Boot restore ──────────────────────────────────────────────────────

@@ -5551,7 +5551,10 @@ async fn scan_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     };
 
     let extras = scan_filesystem_extras(data_dir, model_repo, &state.download_tracker).await;
-    sync_ollama_models(&state.http_client, model_repo).await;
+    // Ollama rows come from the catalogue's one builder, applied as a seed applies it.
+    if let Some(provider) = &state.model_catalog_provider {
+        apply_fetched_catalog(provider.as_ref(), model_repo.as_ref(), data_dir).await;
+    }
 
     let count = extras.len();
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
@@ -5563,66 +5566,31 @@ async fn scan_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"found": count, "entries": entries}))
 }
 
-/// Registers only models the local Ollama daemon actually has, so `downloaded` is accurate.
-async fn sync_ollama_models(
-    client: &reqwest::Client,
-    model_repo: &Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
+/// Fetch the catalogue, upsert it with each file's presence, and prune what it leaves stale.
+async fn apply_fetched_catalog(
+    provider: &dyn pond_core::models::ports::model_catalog_provider::ModelCatalogProvider,
+    repo: &(dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync),
+    data_dir: &std::path::Path,
 ) {
-    let resp = match client
-        .get("http://localhost:11434/api/tags")
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return,
+    let models = match provider.fetch().await {
+        Ok((models, _binaries)) => models,
+        Err(e) => {
+            tracing::warn!("Registry refresh failed: {e}");
+            return;
+        }
     };
-
-    let body: Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return,
+    let data_dir = data_dir.to_path_buf();
+    let present = move |m: &ModelRecord| {
+        let path = model_layout::path_for(&data_dir, &m.category, m.filename.as_deref()?)?;
+        Some(path.exists())
     };
-
-    let Some(models) = body["models"].as_array() else {
-        return;
-    };
-
-    for m in models {
-        let Some(model_name) = m["name"].as_str() else {
-            continue;
-        };
-        let size_mb = m["size"].as_u64().unwrap_or(0) / (1024 * 1024);
-        let model_id = ModelRecord::id_for(&ModelCategory::Ollama, model_name);
-
-        let existing = model_repo.get_by_id(&model_id).await.unwrap_or(None);
-        let record = ModelRecord {
-            id: model_id,
-            category: ModelCategory::Ollama,
-            name: model_name.to_string(),
-            filename: None,
-            description: String::new(),
-            size_mb,
-            url: None,
-            hf_id: None,
-            ram_estimate_mb: None,
-            recommended_role: existing
-                .as_ref()
-                .and_then(|e| e.recommended_role.clone())
-                .or_else(|| Some("chat".to_string())),
-            context_length: existing.as_ref().and_then(|e| e.context_length),
-            quantization: None,
-            asr_language: None,
-            asr_size: None,
-            tts_engine: None,
-            tts_voice_name: None,
-            config_filename: None,
-            config_url: None,
-            tts_url: None,
-            sample_rate: None,
-            downloaded: true,
-            is_custom: existing.as_ref().map(|e| e.is_custom).unwrap_or(true),
-        };
-        let _ = model_repo.upsert(&record).await;
+    match pond_core::models::services::model_service::apply_catalog(repo, models, &present).await {
+        Ok(applied) => tracing::info!(
+            upserted = applied.upserted,
+            pruned = applied.pruned,
+            "Model registry refreshed"
+        ),
+        Err(e) => tracing::warn!("Registry refresh failed: {e}"),
     }
 }
 
@@ -5643,28 +5611,7 @@ async fn refresh_model_registry(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     tokio::spawn(async move {
-        match catalog_provider.fetch().await {
-            Ok((models, _binaries)) => {
-                let count = models.len();
-                for mut m in models {
-                    m.downloaded = match m
-                        .filename
-                        .as_deref()
-                        .and_then(|f| model_layout::path_for(&data_dir, &m.category, f))
-                    {
-                        Some(path) => path.exists(),
-                        None => {
-                            matches!(m.category, ModelCategory::TtsHttp | ModelCategory::Ollama)
-                        }
-                    };
-                    if let Err(e) = model_repo.upsert(&m).await {
-                        tracing::warn!("Failed to upsert model '{}': {}", m.id, e);
-                    }
-                }
-                tracing::info!("Model registry refreshed: {} records upserted", count);
-            }
-            Err(e) => tracing::warn!("Registry refresh failed: {}", e),
-        }
+        apply_fetched_catalog(catalog_provider.as_ref(), model_repo.as_ref(), &data_dir).await;
     });
 
     Ok(Json(json!({"status": "refresh_started"})))

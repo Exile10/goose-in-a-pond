@@ -170,6 +170,14 @@ impl ModelRepository for SqliteModelRepository {
         Ok(())
     }
 
+    async fn delete(&self, id: &str) -> Result<bool> {
+        let done = sqlx::query("DELETE FROM models WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     // ── Role assignments ──────────────────────────────────────────────────────
 
     async fn list_assignments(&self) -> Result<Vec<ModelRoleAssignment>> {
@@ -311,6 +319,17 @@ mod tests {
         assert_eq!(fetched.quantization, Some("Q4_K_M".to_string()));
         assert!(!fetched.downloaded);
         assert!(!fetched.is_custom);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_only_that_row() {
+        let (repo, _dir) = make_repo().await;
+        repo.upsert(&gguf_record("llama-3b")).await.unwrap();
+        repo.upsert(&gguf_record("gemma-2b")).await.unwrap();
+        assert!(repo.delete("gguf/llama-3b").await.unwrap());
+        assert!(!repo.delete("gguf/llama-3b").await.unwrap(), "already gone");
+        assert!(repo.get_by_id("gguf/llama-3b").await.unwrap().is_none());
+        assert!(repo.get_by_id("gguf/gemma-2b").await.unwrap().is_some());
     }
 
     #[tokio::test]
