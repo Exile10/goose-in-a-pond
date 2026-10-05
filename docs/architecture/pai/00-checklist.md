@@ -2539,3 +2539,43 @@ not a PAI milestone).**
   its own markdown (510 characters), which goose keeps as it is, so the cap did not apply, but it
   was short. That message also carried about 900 empty thinking parts from the stream (41 KB of JSON
   for 510 characters), harmless to the prompt and worth trimming in the backend.
+
+**2026-10-05 — LiteRT-LM's GPU memory stays flat on the Orin: only the 128-token prefill chunk
+(GIAP wiring; not a PAI milestone).**
+
+- **What landed** (GIAP `69f5815f`, at Jerry's request to make LiteRT give GPU memory back). On the
+  budgeted device the pond sets giap-main's `LITERT_PREFILL_SIGNATURES=128` (87e4a9e7) at startup,
+  before any engine loads, unless the environment already sets it; an empty value asks for every
+  size the model ships. It runs in `serve`, `chat` and the bare interactive chat, beside the
+  compaction prompts.
+- **Why this and not a release.** The growth in the snapshot entry above was the 1024-token prefill
+  chunk: Gemma 4 ships 128- and 1024-token prefill signatures, each compiled signature keeps
+  attention scratch sized by the whole context, and the GPU layer (Dawn under the closed ML Drift)
+  pools freed memory inside the process; the earlier vision work found that only destroying the
+  Dawn device returns it. Compiling only the 128-token chunk means the memory is never taken.
+- **Measured** (the same 8-turn probe with one compaction, E4B, 8k window, one-second sampler):
+
+  | | Both chunk sizes | 128 only |
+  |---|---|---|
+  | GPU share of RAM at the first turn | 4.77 GB | 4.07 GB |
+  | GPU share by the eighth turn | 6.6 GB | 4.14 GB (4.5 at the compaction) |
+  | Pond swapped out | up to 2.24 GB | 0 |
+  | Lowest free memory | 41 MB | 204 MB (600-800 MB most of the run) |
+  | First token after the compaction | 10-16 s | 4.1 s |
+
+  E2B and E4B both ship the 128-token chunk; the backend's live test passes on the Mac's GPU with
+  only it compiled.
+- **Orin, 16 turns on the shipped build** (release `69f5815f`, no manual setting: the trace shows
+  `prefill_signatures="128"` and the engine printed "compiling decode, prefill_128, verify; not
+  compiling prefill_1024"). The first token came in 2.3-4.3 s on every turn, under the 5 s gate
+  throughout. The pond never swapped (system swap stayed at the 488 MB other processes hold), free
+  memory never fell below 241 MB and stayed at 400-700 MB most of the run, and the GPU's share held
+  at 4.1-4.5 GB, peaking at each of five compactions and settling back. E4B wrote 47% more this run
+  (10,471 tokens against 7,117 in the previous 16-turn run), so it compacted five times and took
+  1,254 s against 952 s, but 0.120 s per output token against 0.134, and decoded at 13.6 tok/s
+  against 13.0. The fact from turn 1 was recalled at turn 15.
+- **PAI.** Preamble, egress, secrets, guest, turn blocking: none. No `Settings` field; the switch is
+  an environment variable. Side effect: long prompts prefill in 128-token chunks.
+- **Verification.** pond-core LiteRT tests 12 passed, including the new rule; the adapter's
+  `litert_model` and `compaction_prompts` tests 12 passed; clippy clean; `scripts/live-test.sh` 158
+  checks passed; the live LiteRT test on the Mac with only the 128 chunk; the Orin runs above.
