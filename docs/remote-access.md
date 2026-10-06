@@ -40,6 +40,18 @@ which is what an operator revokes a lost Pond by. A certificate the service refu
 (`device_certificate_invalid`, `device_revoked`, `device_used`) brings the invite field
 back, since an invite still admits the household.
 
+A household already registered is not asked for an invite either (2026-10-05). Until then
+the dashboard showed the field on every Pond nobody provisioned, including the Jetson,
+which registered on 2026-09-20 and could never need one again. The Pond now writes
+`embedded-network/registered.json`, private, naming the enrollment origin the household
+registered with. It writes the record when registration succeeds and when its node first
+reaches `Running`, which an enrolled Pond's node can do only after its household
+registered; that is how a household that registered before the record existed gets one.
+`GET /api/v1/remote-access/device` reports `registered` for the coordination service
+configured now, so a household moving to another service is asked again. The dashboard
+shows the field only to a Pond that is neither provisioned nor registered, or straight
+after the service refuses an admission, and otherwise says why no invite is needed.
+
 This branch prepares a locally tested pilot deployment. Public domains and hosting
 are still prerequisites for cellular use. Follow
 [the deployment guide](../deploy/remote-access/README.md) to provision a pilot
@@ -217,7 +229,10 @@ the Pond**. It is not done at request time: that route needs only a LAN peer and
 a bearer token, so revoking there would let anyone with both drop the household's
 remote access without approving anything. The revision is re-read from the
 stand-down's own answer, because standing an enrollment down gives it a new one --
-assuming otherwise cost a household its enrollment without a replacement.
+assuming otherwise cost a household its enrollment without a replacement. The
+dashboard's **Phone recovery requests** section appears only while a request is
+waiting, or when the requests cannot be read (2026-10-05); it polls every five
+seconds, so a new request shows without a reload.
 
 The review names what is being approved (2026-09-30): the phone's name from the
 device list and the first sixteen hex digits of the replacement's machine key,

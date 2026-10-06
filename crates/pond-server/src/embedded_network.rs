@@ -50,6 +50,19 @@ fn with_default_coordinator(mut config: Config) -> Config {
     config
 }
 
+/// Where the Pond records the coordination service its household is registered with.
+///
+/// An invite or a device certificate is needed only for a household's first registration, so the
+/// dashboard asks for an invite only while this names no service, or another one than configured.
+const REGISTERED_FILE: &str = "registered.json";
+
+/// The contents of [`REGISTERED_FILE`]: the enrollment origin the household registered with.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Registered {
+    enrollment: String,
+}
+
 /// Non-secret enrollment settings. No auth key can be stored in this file.
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -218,6 +231,11 @@ impl Runtime {
                 state = status.state,
                 "embedded networking state changed"
             );
+            // A Pond's node is enrolled only after its household registered, so reaching Running
+            // proves it. This is what records a household that registered before the record existed.
+            if status.state == "Running" {
+                self.record_registered();
+            }
         }
         let address = status
             .addresses
@@ -230,6 +248,68 @@ impl Runtime {
         }
         *self.status.write().unwrap_or_else(|p| p.into_inner()) = status;
         self.changed.notify_one();
+    }
+
+    /// Record that the household is registered with the configured coordination service.
+    /// Failing to record it is logged and costs only an invite field the dashboard shows again.
+    fn record_registered(&self) {
+        let enrollment = match self.config() {
+            Ok(config) => with_default_coordinator(config).enrollment_url,
+            Err(error) => {
+                tracing::warn!(%error, "could not read the configuration to record the household's registration");
+                return;
+            }
+        };
+        if self.registered_with().as_deref() == Some(enrollment.as_str()) {
+            return;
+        }
+        match revocation::write_private_json(
+            &self.directory,
+            REGISTERED_FILE,
+            &Registered {
+                enrollment: enrollment.clone(),
+            },
+        ) {
+            Ok(()) => tracing::info!(
+                target: "giap::trace",
+                kind = "household_registration_recorded",
+                %enrollment,
+                "remote access: recorded that this household is registered"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                %enrollment,
+                "remote access: could not record that this household is registered"
+            ),
+        }
+    }
+
+    /// Whether the household is registered with the coordination service now configured.
+    fn registered(&self) -> bool {
+        match self.config() {
+            Ok(config) => {
+                let enrollment = with_default_coordinator(config).enrollment_url;
+                self.registered_with().as_deref() == Some(enrollment.as_str())
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not read the configuration to report the household's registration");
+                false
+            }
+        }
+    }
+
+    /// The enrollment origin [`REGISTERED_FILE`] names, if it exists and can be read.
+    fn registered_with(&self) -> Option<String> {
+        match revocation::read_private_json::<Registered>(
+            &self.directory.join(REGISTERED_FILE),
+            4096,
+        ) {
+            Ok(registered) => registered.map(|registered| registered.enrollment),
+            Err(error) => {
+                tracing::warn!(%error, "the household registration record is unreadable");
+                None
+            }
+        }
     }
 
     /// Publish only addresses covered by the certificate installed on the listener.
@@ -1236,9 +1316,12 @@ async fn device_status(
     peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     local(peer)?;
+    let registered = runtime.registered();
     Ok(Json(match runtime.provisioned_serial() {
-        Some(serial) => serde_json::json!({ "provisioned": true, "serial": serial }),
-        None => serde_json::json!({ "provisioned": false }),
+        Some(serial) => {
+            serde_json::json!({ "provisioned": true, "serial": serial, "registered": registered })
+        }
+        None => serde_json::json!({ "provisioned": false, "registered": registered }),
     }))
 }
 
@@ -1309,6 +1392,7 @@ async fn register_pond(
             _ => refuse(StatusCode::SERVICE_UNAVAILABLE, "registration_unavailable"),
         });
     }
+    runtime.record_registered();
     runtime
         .enroll("pond000000000001", "pond", &registration)
         .await
@@ -2164,7 +2248,7 @@ mod tests {
         };
         assert_eq!(
             ask(runtime.clone()).await,
-            serde_json::json!({ "provisioned": false })
+            serde_json::json!({ "provisioned": false, "registered": false })
         );
 
         let device = runtime.directory.join("device");
@@ -2188,14 +2272,14 @@ mod tests {
         std::fs::set_permissions(&certificate, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             ask(runtime.clone()).await,
-            serde_json::json!({ "provisioned": true, "serial": serial })
+            serde_json::json!({ "provisioned": true, "serial": serial, "registered": false })
         );
 
         // A certificate others can read is not shown as a provisioning.
         std::fs::set_permissions(&certificate, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
             ask(runtime).await,
-            serde_json::json!({ "provisioned": false })
+            serde_json::json!({ "provisioned": false, "registered": false })
         );
     }
 
@@ -2293,11 +2377,91 @@ mod tests {
         );
 
         // A household already registered sends no invite at all.
+        assert!(
+            !data
+                .path()
+                .join("embedded-network")
+                .join(REGISTERED_FILE)
+                .exists(),
+            "a refusal was recorded as a registration"
+        );
         helper.answer("register", 0, r#"{"household":"h"}"#);
         let response = register("{}").await.unwrap();
         assert_ne!(response.status(), StatusCode::FORBIDDEN);
         assert!(std::fs::read_to_string(helper.dir.path().join("calls"))
             .unwrap()
             .contains(r#"register {"invite":""}"#));
+        let recorded: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(data.path().join("embedded-network").join(REGISTERED_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            recorded,
+            serde_json::json!({ "enrollment": "https://enroll.example" })
+        );
+    }
+
+    /// The dashboard asks for an invite only while the household has never registered with the
+    /// coordination service configured now. A node that reached Running proves it registered,
+    /// which is how a household that registered before the record existed gets one.
+    #[tokio::test]
+    async fn a_registered_household_is_not_asked_for_an_invite_again() {
+        use std::os::unix::fs::PermissionsExt;
+        use tower::ServiceExt;
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        let ask = |runtime: Arc<Runtime>| async move {
+            let mut request = Request::builder()
+                .uri("/api/v1/remote-access/device")
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+            let response = management(runtime).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["registered"].clone()
+        };
+        let state = |state: &str| Status {
+            state: state.into(),
+            addresses: vec![],
+            auth_url: None,
+            node_key: String::new(),
+            machine_key: String::new(),
+        };
+        assert_eq!(ask(runtime.clone()).await, false);
+
+        runtime.publish(state("Starting"));
+        assert_eq!(ask(runtime.clone()).await, false, "starting proves nothing");
+        runtime.publish(state("Running"));
+        assert_eq!(ask(runtime.clone()).await, true);
+        let record = runtime.directory.join(REGISTERED_FILE);
+        let mode = std::fs::metadata(&record).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the record is readable by others: {mode:o}"
+        );
+
+        // Another coordination service has never seen this household.
+        runtime
+            .persist(&Config {
+                enabled: true,
+                control_url: "https://elsewhere.example".into(),
+                enrollment_url: "https://enroll.elsewhere.example".into(),
+            })
+            .unwrap();
+        assert_eq!(ask(runtime.clone()).await, false);
+        runtime.publish(state("Stopped"));
+        runtime.publish(state("Running"));
+        assert_eq!(ask(runtime.clone()).await, true);
+
+        // An unreadable record is not taken as a registration.
+        std::fs::write(&record, b"not json").unwrap();
+        assert_eq!(ask(runtime).await, false);
     }
 }
