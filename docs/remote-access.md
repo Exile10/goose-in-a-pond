@@ -219,11 +219,12 @@ Enabling remote access inspects the coordinator first and returns the existing
 enrollment when the device is already **active and still holds the identity it
 enrolled with**. Pressing the button on a pond where remote access already works
 is a no-op rather than a conflict. A mismatched identity -- a phone that re-paired
-and regenerated its tailnet keys -- is a real conflict: the enrollment is refused
-with `409` and the app points at recovery. Because every re-pair takes this path,
-the Pond logs it at `INFO` as `kind="remote_access_recovery_required"`, not as a
-failure; `embedded enrollment failed` at `WARN` is kept for refusals with no
-enrollment to recover and for a coordinator that could not be reached.
+and regenerated its tailnet keys -- is a real conflict while its enrollment is still
+`active`: the enrollment is refused with `409` and the app points at recovery.
+Because every re-pair of an active phone takes this path, the Pond logs it at `INFO`
+as `kind="remote_access_recovery_required"`, not as a failure; `embedded enrollment
+failed` at `WARN` is kept for refusals with no enrollment to recover, for a refused
+replacement, and for a coordinator that could not be reached.
 
 The household key is created on the Pond the first time remote access is enabled,
 just before registration, and loaded on every later registration (2026-10-05).
@@ -260,6 +261,20 @@ A helper built before 2026-09-30 on a host with umask 002 (Ubuntu's default, the
 Jetson's included) is group-writable and is now refused, so remote access does not
 start; the log names the helper's path. Rebuild it with
 `scripts/build-network-helper.sh`, or `chmod 0755` it.
+
+A phone that was removed, or whose remote access lapsed, needs no recovery
+(2026-10-05). Its enrollment is left `revoked`, and a re-paired phone keeps the
+same device id. The coordinator refuses a plain enrollment over any existing
+record, so on the Galaxy A57 a removed and re-paired phone got `409
+invalid_enrollment` and could come back only through recovery: a second
+dashboard approval after a pairing that had already needed one. Enabling remote
+access now replaces a `revoked` or `failed` enrollment at the revision the
+coordinator reports, through the same `replace` the recovery uses
+(`phone_enrollment` in `crates/pond-server/src/embedded_network.rs`). This grants
+nothing a first enrollment does not: both need a LAN peer and a valid bearer, and
+a stood-down record carries no working remote access to take over. An `active`
+enrollment held by another identity is still refused and still needs the
+approval above.
 
 Remote access lapses after thirty days without the device authenticating from the
 household LAN; see `docs/auth-network-posture.md`. The deadline is reported in the

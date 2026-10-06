@@ -361,10 +361,13 @@ empty or absent value, or no input at all, sends no invite, so an already-regist
 household keeps working. The invite is never a command-line argument, because other
 accounts on the host can read those.
 
-This is an operator authority, not a public recovery endpoint. Replacement must
-follow fresh local pairing and explicit local review of the exact device and pending
-registration. A caller must never automatically inspect and replace after an ordinary
-enrollment failure. Active/revoking records, reused machines, stale revisions,
+This is an operator authority, not a public recovery endpoint. Replacing an `active`
+enrollment must follow fresh local pairing and explicit local review of the exact
+device and pending registration, and a caller must never replace one automatically.
+Since 2026-10-05 the Pond replaces a `revoked` or `failed` enrollment for the
+bearer's own device without review, and only from the home network, because such a
+record holds no working remote access and a first enrollment needs no review either.
+Active/revoking records, reused machines, stale revisions,
 expired approvals and replays fail closed. A newer revocation invalidates an older
 replacement approval. Retired identities remain in backups for late-registration
 cleanup, with a bound of 256 per household and no automatic deletion.
