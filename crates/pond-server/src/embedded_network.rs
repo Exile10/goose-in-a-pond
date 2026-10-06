@@ -1503,6 +1503,21 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
+    /// `management` as the dashboard reaches it, presenting the host credential on every
+    /// request, for the tests that are about something else.
+    fn management_with_credential(runtime: Arc<Runtime>) -> Router {
+        let credential = pond_api::host_guard::HostCredential::generate();
+        let presented = axum::http::HeaderValue::from_str(credential.as_str()).unwrap();
+        management(runtime, credential).layer(axum::middleware::from_fn(
+            move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+                request
+                    .headers_mut()
+                    .insert(pond_api::host_guard::CREDENTIAL_HEADER, presented.clone());
+                next.run(request)
+            },
+        ))
+    }
+
     #[tokio::test]
     async fn a_device_that_stops_coming_home_loses_its_remote_access() {
         use pond_core::security::ports::remote_access::{DevicePresence, LAN_PRESENCE_WINDOW_DAYS};
@@ -2077,7 +2092,7 @@ mod tests {
             node_key: format!("nodekey:{}", "b".repeat(64)),
             machine_key: format!("mkey:{}", "a".repeat(64)),
         });
-        let router = management(runtime);
+        let router = management_with_credential(runtime);
         let register = |body: &str| {
             let mut request = Request::builder()
                 .method("POST")
