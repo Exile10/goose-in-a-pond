@@ -13,11 +13,29 @@ JavaScript bridge. The proxy permits only configured tailnet IP/port pairs. It
 forwards TLS bytes without terminating the Pond's HTTPS connection; the native
 client still checks the public-key pin, certificate validity, and hostname.
 
+The proxy holds at most 64 sockets (`MaxConnections`), closes idle keep-alive
+connections after 30 s, and closes a connection after a 407. It refuses Tailscale's
+service addresses (`100.100.100.100`, `fd7a:115c:a1e0::53`) as targets, and
+`mobile.SetTargets` refuses the node's own tailnet addresses. On the Pond, the bridge
+(`BridgeHandler`, `ServePond`) forwards only `/api/v1/` paths in origin form, caps its
+listener at 64 sockets, closes idle connections after 60 s, and answers
+`502 {"error":"embedded_bridge_unavailable"}` when the Pond sends no response headers
+within 30 s. The coordinator client (`coordinatorClient`) ignores proxy environment
+variables and follows no redirects. `Submit` refuses a coordinator answer with unknown
+fields, trailing data, an unknown status or role, or a malformed revision; for an
+enroll or replace, one naming a different role or machine key than asked; and for a
+revoke, one that does not confirm the device as `revoked`.
+
 `Node.Dial` uses `internal/tailnetdial`, which calls the userspace TCP stack directly.
 Do not replace it with `tsnet.Server.Dial`: the general-purpose tsnet dialer can use
 system routes when a destination is absent from its peer map. A separately running
-VPN must never become an implicit fallback. The subsystem API is version-sensitive;
-every Tailscale update must pass the real Headscale isolation and relay tests.
+VPN must never become an implicit fallback. The subsystem API is version-sensitive.
+`internal/tailnetdial/dial_test.go` pins the property offline on every `go test`: two
+nodes on an in-process control server, a host listener that `TCP` must never reach,
+a canary showing `tsnet.Server.Dial` does reach it, and a peer round trip. If the
+canary fails after a Tailscale update, the fallback is gone upstream and this package
+can be re-evaluated. Every update must still pass the real Headscale isolation and
+relay tests.
 
 On the Pond, the helper serves the existing TLS identity and forwards requests over
 a private Unix socket. Only this boundary supplies the actual embedded peer address.
