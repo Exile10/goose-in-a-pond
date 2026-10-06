@@ -21,7 +21,7 @@ the upstream build behavior.
 Changes from the published crate: this note, `namespace.rs`, build-script wiring,
 a standalone Cargo workspace declaration, the upstream Unlicense text
 (restored from the whisper-rs repository because the published crate omitted it),
-and one native source change, below.
+and two native source changes, below.
 When updating Whisper, regenerate and inspect the linked symbol inventory and run
 both GPU transcription and inference in the same production process before shipping.
 
@@ -42,6 +42,30 @@ The last log line before such a crash is `ggml_gallocr_reserve_n_impl: failed to
 allocate CUDA0 buffer`; with the change it is followed by `failed to reserve graph
 buffers` and Whisper's own `failed to init ... allocator`, and the transcription
 returns an error.
+
+## Native source change: decoder KV cache that cannot grow
+
+`whisper.cpp/src/whisper.cpp`, in `whisper_full_with_state`, no longer frees the state
+when the self-attention cache cannot be recreated for more decoders, and in
+`whisper_kv_cache_init` a failed buffer allocation frees the ggml context it made.
+This is Pond's own change, not an upstream one. Drop it when upstream whisper.cpp
+stops calling `whisper_free_state` before `return -7`.
+
+A state is created with a self-attention cache for one decoder. Beam search grows it
+on the first decode to `beams + 2` decoders' worth, 42 MiB for `base` with five beams.
+When that allocation failed, whisper.cpp freed the state and returned `-7`. But the
+state belongs to the caller, and whisper-rs's `Drop` frees it again: a double free. On
+2026-10-05 the Pond took `SIGBUS` on the Jetson one second after
+`whisper_kv_cache_init() failed for self-attention cache`, while a build held most of
+the memory. The `ggml_backend_sched_alloc_splits` change above does not reach this
+path: it happens after the state, with its compute buffers, already exists. Now the
+state is left freeable and reusable. The cache is marked absent, with no buffer and a
+decoder count of zero, so another `whisper_full` on the state recreates it.
+`running_out_of_gpu_memory_while_decoding_is_an_error_not_a_crash` in
+`crates/pond-adapters-whisper` reproduces the failure on a CUDA build. Its doc comment
+says how to read a run that aborts in GGML's CUDA scratch pool instead
+(`cuMemAddressReserve` in `ggml-cuda.cu`). That is a separate failure this change does
+not touch: GGML aborts when a state's first decode cannot reserve its pool.
 
 `build.rs` declares the native sources with `rerun-if-changed` and refreshes the copy
 in `OUT_DIR` file by file. Before, the copy was made once per `OUT_DIR` and only
