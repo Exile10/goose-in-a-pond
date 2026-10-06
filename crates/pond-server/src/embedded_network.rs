@@ -1366,6 +1366,17 @@ async fn register_pond(
         node_key: current.node_key,
         machine_key: current.machine_key,
     };
+    // A fresh Pond has no household key until something creates one, and only the self-hosting
+    // panel's "Prepare household identity" did, so the hosted Enable flow reached registration
+    // without one and the helper refused it. The identity action creates the key once and
+    // otherwise loads it, so asking for it on every registration is safe.
+    if let Err(error) = runtime.authority("identity", serde_json::Value::Null).await {
+        tracing::warn!(%error, operation = "identity", "embedded enrollment failed");
+        return Err(refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registration_unavailable",
+        ));
+    }
     // Register the household first; idempotent for one already registered, which needs no
     // invite. The invite goes to the helper on stdin and is never stored here.
     if let Err(error) = runtime
@@ -1783,6 +1794,50 @@ mod tests {
             .contains_key(&network_device("phone000000000001").unwrap()));
         std::fs::write(restored.directory.join("revocations.json"), b"corrupt").unwrap();
         assert!(restored.queue("phone000000000002").await.is_err());
+    }
+
+    /// Enabling remote access on a fresh Pond failed with `registration_unavailable`: nothing on
+    /// the Enable path created the household key, and the helper refuses to register without
+    /// one ("existing household authority is required").
+    #[tokio::test]
+    async fn registering_a_fresh_pond_creates_its_household_identity_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = tempfile::tempdir().unwrap();
+        // Stands in for the helper: records each authority action, answers with an empty object.
+        let calls = data.path().join("calls");
+        let helper = data.path().join("pondnet");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\necho \"$2\" >> '{}'\ncat > /dev/null\necho '{{}}'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // No other test in this module spawns the helper, so setting it process-wide is safe.
+        std::env::set_var("POND_NETWORK_BINARY", &helper);
+
+        let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
+        runtime.status.write().unwrap().auth_url =
+            Some("https://control.example/register/pending".into());
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/remote-access/register")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+        management(runtime).oneshot(request).await.unwrap();
+
+        let recorded = std::fs::read_to_string(&calls).unwrap();
+        let actions: Vec<&str> = recorded.lines().collect();
+        assert_eq!(
+            actions.get(..2),
+            Some(&["identity", "register"][..]),
+            "registration must ensure the household identity first: {actions:?}"
+        );
     }
 
     #[tokio::test]
