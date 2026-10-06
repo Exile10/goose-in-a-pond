@@ -19,7 +19,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/remote-access/Dockerfile
-    command: ['--state', '/state', '--listen', '0.0.0.0:8081', '--headscale', 'http://headscale:8080', '--credential-file', '/run/secrets/headscale_admin']
+    # The gateway's X-Forwarded-For is believed only from the pinned network below.
+    command: ['--state', '/state', '--listen', '0.0.0.0:8081', '--headscale', 'http://headscale:8080', '--credential-file', '/run/secrets/headscale_admin', '--trusted-proxy', '172.31.250.0/28']
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -53,7 +54,11 @@ services:
     networks: [control]
     logging: {driver: json-file, options: {max-size: 10m, max-file: '3'}}
 networks:
-  control: {}
+  # Pinned so the enrollment service can tell its own gateway from any other sender.
+  control:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/28
 secrets:
   headscale_admin:
     file: ./runtime/secrets/headscale_admin

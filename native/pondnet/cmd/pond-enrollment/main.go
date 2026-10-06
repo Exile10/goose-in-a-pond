@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"github.com/Exile10/goose-in-a-pond/native/pondnet/enrollment"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -30,6 +33,7 @@ func run() error {
 	user := flag.String("user-id", "", "operator-created Headscale user ID")
 	port := flag.Uint("https-port", 4443, "household companion port")
 	health := flag.Bool("health-check", false, "check the local enrollment listener")
+	proxies := flag.String("trusted-proxy", "", "comma-separated CIDRs of the reverse proxies whose X-Forwarded-For is believed")
 	flag.Parse()
 	if *health {
 		client := http.Client{Timeout: 2 * time.Second}
@@ -64,9 +68,17 @@ func run() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	trusted, err := parsePrefixes(*proxies)
+	if err != nil {
+		return err
+	}
 	handler, err := enrollment.New(ctx, store, backend)
 	if err != nil {
 		return err
+	}
+	handler.TrustedProxies = trusted
+	if len(trusted) == 0 {
+		slog.Warn("no --trusted-proxy: behind a reverse proxy every client shares one rate-limit budget")
 	}
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -97,6 +109,21 @@ func run() error {
 		return nil
 	}
 	return err
+}
+
+func parsePrefixes(list string) ([]netip.Prefix, error) {
+	var prefixes []netip.Prefix
+	for _, entry := range strings.Split(list, ",") {
+		if entry = strings.TrimSpace(entry); entry == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --trusted-proxy %q: %w", entry, err)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
 }
 
 type configError struct{}

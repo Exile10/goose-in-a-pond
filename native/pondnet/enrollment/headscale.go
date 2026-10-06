@@ -28,7 +28,28 @@ func NewHeadscale(origin, credential string) (*Headscale, error) {
 	}
 	return &Headscale{strings.TrimSuffix(origin, "/"), strings.TrimSpace(credential), &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
+
+// MaxNodes bounds the coordinator inventory this service will read. Enrollment stops at
+// EnrollmentCapacity, below it, so the inventory never reaches the bound through this
+// service; the difference leaves room for nodes an operator adds by hand.
+const MaxNodes = 8192
+
+// EnrollmentCapacity is the most devices this service enrolls across every household.
+const EnrollmentCapacity = 4096
+
+// ErrInventoryTooLarge means the coordinator holds more nodes than MaxNodes.
+var ErrInventoryTooLarge = errors.New("coordinator inventory exceeds the supported size")
+
 func (h *Headscale) call(ctx context.Context, method, path string, body, result any) error {
+	return h.do(ctx, method, path, body, func(r io.Reader) error {
+		if result == nil {
+			return nil
+		}
+		return json.NewDecoder(io.LimitReader(r, 1<<20)).Decode(result)
+	})
+}
+
+func (h *Headscale) do(ctx context.Context, method, path string, body any, read func(io.Reader) error) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -54,10 +75,7 @@ func (h *Headscale) call(ctx context.Context, method, path string, body, result 
 		}
 		return fmt.Errorf("coordinator rejected operation: HTTP %d", response.StatusCode)
 	}
-	if result == nil {
-		return nil
-	}
-	return json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(result)
+	return read(response.Body)
 }
 
 // EnsureUser returns the numeric ID of the household's user, creating it if this
@@ -99,7 +117,8 @@ func (h *Headscale) findUser(ctx context.Context, name string) (string, error) {
 			Name string `json:"name"`
 		} `json:"users"`
 	}
-	if err := h.call(ctx, "GET", "/api/v1/user", nil, &accounts); err != nil {
+	// Filtered by the coordinator, so the answer is one user however many households exist.
+	if err := h.call(ctx, "GET", "/api/v1/user?name="+url.QueryEscape(name), nil, &accounts); err != nil {
 		return "", err
 	}
 	for _, account := range accounts.Users {
@@ -119,7 +138,10 @@ func (h *Headscale) Register(ctx context.Context, user, auth string) (Registered
 			Name string `json:"name"`
 		} `json:"users"`
 	}
-	if err := h.call(ctx, "GET", "/api/v1/user", nil, &accounts); err != nil {
+	if !numeric.MatchString(user) {
+		return Registered{}, fmt.Errorf("%w: invalid household user", ErrRegistrationRejected)
+	}
+	if err := h.call(ctx, "GET", "/api/v1/user?id="+user, nil, &accounts); err != nil {
 		return Registered{}, fmt.Errorf("%w: household lookup unavailable", ErrRegistrationRejected)
 	}
 	name := ""
@@ -172,16 +194,66 @@ type coordinatorNode struct {
 }
 
 // Inventory verifies durable permissions against the current coordinator database.
+//
+// Nodes are decoded one at a time and counted, never buffered as one document: a size cap
+// on the whole body is what let enough registered nodes stop every policy update.
 func (h *Headscale) Inventory(ctx context.Context) ([]Registered, error) {
-	var response struct {
-		Nodes []coordinatorNode `json:"nodes"`
-	}
-	if err := h.call(ctx, "GET", "/api/v1/node", nil, &response); err != nil {
+	var nodes []Registered
+	err := h.do(ctx, "GET", "/api/v1/node", nil, func(body io.Reader) error {
+		decoded, err := decodeNodes(body, MaxNodes)
+		nodes = decoded
+		return err
+	})
+	return nodes, err
+}
+
+// decodeNodes reads `{"nodes": [...]}`, refusing more than limit nodes.
+func decodeNodes(body io.Reader, limit int) ([]Registered, error) {
+	// A generous per-node allowance; the count, not this, is the real bound.
+	decoder := json.NewDecoder(io.LimitReader(body, int64(limit+1)*4096))
+	if err := expect(decoder, json.Delim('{')); err != nil {
 		return nil, err
 	}
-	nodes := make([]Registered, 0, len(response.Nodes))
-	for _, n := range response.Nodes {
-		nodes = append(nodes, Registered{ID: n.ID, Key: n.Key, UserID: n.User.ID, Addresses: n.Addresses, Tags: n.Tags, Routes: n.Routes, MachineKey: n.MachineKey})
+	nodes := []Registered{}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		if key != "nodes" {
+			var skipped json.RawMessage
+			if err := decoder.Decode(&skipped); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err := expect(decoder, json.Delim('[')); err != nil {
+			return nil, err
+		}
+		for decoder.More() {
+			if len(nodes) == limit {
+				return nil, ErrInventoryTooLarge
+			}
+			var n coordinatorNode
+			if err := decoder.Decode(&n); err != nil {
+				return nil, err
+			}
+			nodes = append(nodes, Registered{ID: n.ID, Key: n.Key, UserID: n.User.ID, Addresses: n.Addresses, Tags: n.Tags, Routes: n.Routes, MachineKey: n.MachineKey})
+		}
+		if err := expect(decoder, json.Delim(']')); err != nil {
+			return nil, err
+		}
 	}
-	return nodes, nil
+	return nodes, expect(decoder, json.Delim('}'))
+}
+
+func expect(decoder *json.Decoder, want json.Delim) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != want {
+		return fmt.Errorf("coordinator inventory: expected %v", want)
+	}
+	return nil
 }
