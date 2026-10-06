@@ -3,7 +3,7 @@
 
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, ErrorData},
+    model::{CallToolResult, ContentBlock, ErrorData},
     service::RequestContext,
     tool, tool_router, RoleServer,
 };
@@ -275,7 +275,7 @@ async fn app_id() -> Option<String> {
 }
 
 fn text_result(s: &str) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(s.to_string())])
+    CallToolResult::success(vec![ContentBlock::text(s.to_string())])
 }
 
 // ── Response rendering ─────────────────────────────────────────────────────
@@ -812,7 +812,7 @@ mod tests {
             let _ = stream.write_all(
                 format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                     ContentBlock-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .as_bytes(),
