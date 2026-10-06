@@ -88,8 +88,11 @@ type Service struct {
 	// TrustedProxies are the reverse proxies whose X-Forwarded-For names the real client.
 	// Without them every request would share the proxy's own rate-limit budget.
 	TrustedProxies []netip.Prefix
-	slots          chan struct{}
-	limiter        *rate.Limiter
+	// ProvisioningKeys sign the device certificates that admit a household without an
+	// invite. More than one lets a key be rotated; none means only invites admit.
+	ProvisioningKeys []ed25519.PublicKey
+	slots            chan struct{}
+	limiter          *rate.Limiter
 	// registrations and approvals limit each client address; households limits each
 	// signed household, so one busy household cannot spend another's budget.
 	registrations *sources

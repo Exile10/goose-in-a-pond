@@ -113,9 +113,82 @@ neither read household data nor use a Pond; it can deny or disrupt remote access
 which is why the self-hosted path stays. Registration is also rate limited per
 source address, the source table is capped, and there are at most 1000 households.
 
+An invite sent to the wrong person, or pasted somewhere it should not have been, can
+be withdrawn until it is spent:
+
+```sh
+docker compose exec enrollment /pond-enrollment --state /state --revoke-invite giap-inv1-XXXX-...
+```
+
+The admin commands need the running service's state directory (`--state /state` in
+the compose stack) or `--admin-socket`; without either they stop and say so rather
+than looking for `admin.sock` in the current directory.
+
 Deploy this service before any Pond that sends an invite. The registration is
 decoded strictly, so an older service answers `400` to a registration carrying one;
 a Pond sends none when the field is left empty.
+
+### Device certificates (2026-10-05)
+
+A Pond imaged by the operator needs no invite. Imaging gives it a device key, and the
+operator signs that key's public half, on the operator's own machine, with a
+provisioning key; the certificate goes back onto the Pond. Its first registration
+carries the certificate and a signature by the device key over the household it is
+registering, so a proof seen in transit admits no other household. The service checks
+the certificate against the provisioning keys it trusts, admits one household per
+certificate, and records the admission in the same write that creates the household.
+
+Make the provisioning key once, on the operator's machine, and keep it offline. The
+tool builds from this repository (`go build -o pond-provision ./cmd/pond-provision` in
+`native/pondnet`):
+
+```sh
+pond-provision keygen --key ~/jarida-provisioning.key
+```
+
+It prints the public half. Give the service that, and only that, by adding to the
+enrollment command in `compose.yaml`; repeat the flag to trust a second key while
+rotating:
+
+```
+--provisioning-key <base64 public key>
+```
+
+Without `--provisioning-key` the service ignores certificates and only invites admit.
+Imaging a Pond creates its device key with `pondnet --device-action create`, signs
+the printed public key with `pond-provision sign --key ... --device-public-key ...`,
+and installs the result with `pondnet --device-action install`. `scripts/giap.sh
+provision` runs those steps over SSH; it is added with the Pond-side change. The
+device key never leaves the Pond; the provisioning key never leaves the operator's
+machine.
+
+Certificate refusals are a closed set: `device_certificate_invalid` (any check failed,
+deliberately not saying which), `device_revoked`, `device_used`. A Pond whose
+certificate is refused can still be admitted with an invite: the certificate is tried
+first and the invite is the fallback.
+
+Revoke a lost or stolen Pond's certificate by its serial, which `pondnet
+--device-action install` printed when it was imaged:
+
+```sh
+docker compose exec enrollment /pond-enrollment --state /state --revoke-device <serial>
+```
+
+Revocation stops the certificate admitting a household from then on. A household it
+already admitted keeps its registration, since it holds its own key; the Pond's tailnet
+access is removed through the household's own device removal, or by the operator.
+
+A certificate has no expiry. It stops admitting only when its serial is revoked or
+once it has admitted its one household. If the provisioning key is lost or exposed,
+make a new one, drop the old one's `--provisioning-key` from the enrollment command,
+and redeploy; every unspent certificate the old key signed then stops admitting, and
+those Ponds need an invite or a certificate signed by the new key.
+
+A certificate does not separate households, any more than an invite does: the policy
+does. What it bounds is the same thing, who can consume this service's households and
+addresses, without a code a person has to carry. Deploy the service with this support
+before any provisioned Pond registers: an older service answers `400` to a
+registration carrying a certificate.
 
 Source addresses come from the gateway's `X-Forwarded-For`, believed only from
 `--trusted-proxy` (the pinned `172.31.250.0/28` compose network); without it every

@@ -20,9 +20,9 @@ import (
 )
 
 // HouseholdRegistration is a household's first contact, signed by the key it
-// registers. A new household must also present an invite from whoever runs this
-// service; a household already registered needs none, so a lost response can be
-// retried.
+// registers. A new household must also be admitted: by a device certificate from a
+// provisioning key this service trusts, or by an invite from whoever runs it. A
+// household already registered needs neither, so a lost response can be retried.
 //
 // Admission is not what keeps households apart: the policy does, granting each
 // phone its own Pond's HTTPS port and nothing else. The invite bounds who can
@@ -35,14 +35,17 @@ type HouseholdRegistration struct {
 	Expires   int64  `json:"expires"`
 	// Invite is omitted by a household already registered, and by an older Pond.
 	Invite string `json:"invite,omitempty"`
+	// Device is sent by a Pond that was provisioned with a device certificate.
+	Device *DeviceProof `json:"device,omitempty"`
 }
 
 // householdDomain separates these signatures from enrollment approvals, so a
 // signature captured from one can never be presented as the other.
 const householdDomain = "goose-household-v1\x00"
 
-// maxHouseholds bounds the households one service holds. Each needs an invite now,
-// so this is a backstop for a mistake rather than the admission control.
+// maxHouseholds bounds the households one service holds. Each needs an invite or a
+// device certificate now, so this is a backstop for a mistake rather than the
+// admission control.
 const maxHouseholds = 1000
 
 // sources rate-limits by a key: a client address, or a household.
@@ -201,8 +204,24 @@ func (s *Service) registerHousehold(w http.ResponseWriter, r *http.Request) {
 		writeHousehold(w, id)
 		return
 	}
-	digest, refusal := s.Store.admitLocked(registration.Invite, id, now)
-	if refusal != "" {
+	// A device certificate is tried first; an invite is the fallback, so a Pond whose
+	// certificate was revoked or already used can still be admitted by an operator's
+	// invite. A service trusting no provisioning key ignores certificates altogether.
+	var serial, digest, refusal string
+	if registration.Device != nil && len(s.ProvisioningKeys) > 0 {
+		serial, refusal = VerifyDeviceProof(registration.Device, s.ProvisioningKeys, registration.PublicKey, registration.Expires)
+		if refusal == "" {
+			refusal = s.Store.admitDeviceLocked(serial, id)
+		}
+		if refusal != "" {
+			slog.Warn("device certificate refused", "reason", refusal, "serial", serial)
+			serial = ""
+		}
+	}
+	if serial == "" && (registration.Invite != "" || refusal == "") {
+		digest, refusal = s.Store.admitLocked(registration.Invite, id, now)
+	}
+	if serial == "" && refusal != "" {
 		slog.Warn("household registration refused", "reason", refusal)
 		http.Error(w, `{"error":"`+refusal+`"}`, 403)
 		return
@@ -218,16 +237,17 @@ func (s *Service) registerHousehold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Spent in the same write that creates the household, so neither can happen alone.
-	invite := s.Store.value.Invites[digest]
-	spent := invite
-	spent.ConsumedBy = id
-	s.Store.value.Invites[digest] = spent
+	undo := s.Store.spendAdmissionLocked(serial, digest, id)
 	if err := s.Store.provisionLocked(id, Household{PublicKey: registration.PublicKey, UserID: user, Port: registration.Port}); err != nil {
-		s.Store.value.Invites[digest] = invite
+		undo()
 		http.Error(w, `{"error":"registration_failed"}`, 409)
 		return
 	}
-	slog.Info("household registered with an invite")
+	if serial != "" {
+		slog.Info("household registered with a device certificate", "serial", serial)
+	} else {
+		slog.Info("household registered with an invite")
+	}
 	writeHousehold(w, id)
 }
 

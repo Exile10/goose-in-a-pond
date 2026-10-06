@@ -42,6 +42,13 @@ HTTPS port; phone-to-phone, cross-household, subnet and exit-node access have no
 allow rule. Coordinator inventory drift removes permissions rather
 than silently accepting a changed device identity.
 
+A Pond the operator imaged is admitted by a device certificate instead of an invite
+(2026-10-05). It holds a device key in `embedded-network/device`, beside its
+household authority, used only to bind that certificate to its household's first
+registration. Keeping the device key out of backups lands with the Pond-side change;
+a restored Pond does not need it, because its household is already registered and
+registering again needs neither a certificate nor an invite.
+
 The enrollment service holds at most 4096 enrolled devices across every household
 (`EnrollmentCapacity`) and refuses further enrollments with `capacity`. It reads the
 coordinator inventory node by node and refuses it only past 8192 nodes (`MaxNodes`),
