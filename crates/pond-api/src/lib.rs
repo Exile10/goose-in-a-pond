@@ -2,6 +2,7 @@
 
 pub mod cleanup;
 pub(crate) mod download_failure;
+pub mod host_guard;
 pub(crate) mod image_normalize;
 pub mod middleware;
 pub mod model_acquisition;
@@ -629,15 +630,13 @@ fn build_transport_router(state: Arc<AppState>, static_dir: Option<std::path::Pa
         }))
         // CORS allows only first-party desktop origins (plus `POND_CORS_ALLOWED_ORIGINS`).
         // Native GOTG clients send no `Origin`, so they are unaffected.
-        .layer(build_cors_layer())
+        .layer(cors_layer())
         .with_state(state)
 }
 
-/// Build the CORS layer with a scoped origin allowlist (see call site).
-fn build_cors_layer() -> CorsLayer {
-    use axum::http::{header, HeaderValue, Method};
-
-    let mut origins: Vec<HeaderValue> = [
+/// First-party desktop origins, plus any in `POND_CORS_ALLOWED_ORIGINS` (comma-separated).
+pub fn allowed_origins() -> Vec<axum::http::HeaderValue> {
+    let mut origins: Vec<axum::http::HeaderValue> = [
         // Packaged desktop renderer: a custom scheme, since file:// sends `Origin: null`.
         "app://giap",
         // Vite dev server, loaded by the shell in development.
@@ -654,7 +653,14 @@ fn build_cors_layer() -> CorsLayer {
             }
         }
     }
+    origins
+}
 
+/// The CORS layer with the scoped origin allowlist, for every router the dashboard calls.
+pub fn cors_layer() -> CorsLayer {
+    use axum::http::{header, Method};
+
+    let origins = allowed_origins();
     CorsLayer::new()
         .allow_origin(origins)
         .allow_methods([
@@ -665,7 +671,11 @@ fn build_cors_layer() -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static(host_guard::CREDENTIAL_HEADER),
+        ])
 }
 
 /// True for pairing endpoints (own rate budget); segment-matched so `/handshakes` is not one.

@@ -137,7 +137,7 @@ pub fn retry_after_secs(remaining: Duration) -> u64 {
 }
 
 /// Unauthenticated-loopback escape hatch for local dev; off unless explicitly enabled.
-fn dev_allow_loopback() -> bool {
+pub fn dev_allow_loopback() -> bool {
     loopback_flag_enabled(std::env::var("POND_DEV_ALLOW_LOOPBACK").ok().as_deref())
 }
 

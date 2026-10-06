@@ -21,6 +21,46 @@ the key requires local re-pairing. WireGuard protects remote transport underneat
 HTTPS. Headscale node certificate issuance is not required. See
 [remote access](remote-access.md) for deployment and certificate recovery.
 
+### The loopback listener (2026-09-30)
+
+Binding `127.0.0.1` keeps other machines out but not other software on this one.
+Three checks close the rest (`pond-api/src/host_guard.rs`, wired outermost on the
+dashboard router in `pond-server/src/listeners.rs::compose`):
+
+- **Host.** A request whose `Host` (or HTTP/2 authority) is not `127.0.0.1`,
+  `localhost` or `[::1]` gets `421 loopback_host_required`. This defeats DNS
+  rebinding, where a page on `attacker.example` re-points its name at `127.0.0.1`
+  and then reads and writes the API as a same-origin page. Any port is accepted, so
+  `ssh -L 9000:localhost:4000` still works.
+- **Origin.** A present `Origin` must be a CORS origin (below) or `http://` on a
+  loopback name, else `403 origin_not_allowed`. This defeats cross-site `POST`s
+  that need no CORS preflight.
+- **Host credential.** Pairing codes and remote-access management
+  (`/handshake/pairing-code`, `/remote-access*`) also need
+  `X-Pond-Host-Credential`: 32 random bytes the server writes to
+  `<data>/.runtime_host_credential` (`0600`, atomically replaced) at every start,
+  before `.runtime_api_port`. A pairing code is a full device token, and the
+  management routes can re-point the Pond and every phone at another coordinator,
+  so reaching loopback is not enough: another OS account on the Pond machine cannot
+  read the file. Refusals are `403 host_credential_required`.
+
+The desktop app reads the credential over IPC (`host_credential`). A browser gets it
+from the sign-in link `pond-server dashboard` prints,
+`http://localhost:<port>/#host=<credential>`: the fragment is never sent over the
+network or logged, and the page moves it into that tab's session storage and out of
+the address bar. The link stops working at the next restart. A new link opened in a
+tab that is already running is taken too (2026-10-05): it differs only after `#`, which
+does not reload the page, so the page listens for the change, keeps the new credential
+and reloads. A tab refused for want of the current credential says so and stops polling
+for recovery requests; before, it asked every five seconds and the Pond logged a
+`host_credential_rejected` warning each time, for as long as the tab stayed open.
+`pond-server pairing`
+reads the file itself. `POND_DEV_ALLOW_LOOPBACK` admits a missing credential for
+local development; the Host and Origin checks still apply.
+
+Software running as the Pond's own OS account can read the credential; no
+application-level control protects against that, and none is claimed.
+
 Do not publish the listener on the public internet. An untrusted tailnet node
 can reach public API routes; encrypting transport does not authenticate its user.
 This branch also includes W3 authorization checks for session revocation,
@@ -195,8 +235,9 @@ from those events. The API error code is stable for client localization.
 
 The Android and iOS clients use two-phase HMAC pairing; they do not transmit the six-digit code directly:
 
-1. Operator reads the pairing code printed on server startup (or `GET
-   /api/v1/handshake/pairing-code`, loopback-only).
+1. Operator reads the pairing code printed on server startup, or from
+   `pond-server pairing` (`GET /api/v1/handshake/pairing-code`, loopback and the
+   host credential).
 2. Client `POST /handshake/init {client_id,…}` → `{challenge_id, challenge}`.
 3. Client computes `mac = HMAC-SHA256(pairing_code, transcript)` and
    `POST /handshake/verify {challenge_id, mac, channel_binding?}` →
@@ -276,7 +317,8 @@ GOTG, and desktop clients all use this shape.
 
 The blanket loopback auth bypass was **removed** (#94). By default, even
 same-host clients (including the desktop app) must present a valid token —
-the desktop auto-pairs via the loopback `pairing-code` endpoint.
+the desktop auto-pairs via the host-only `pairing-code` endpoint, so a browser tab
+must first be opened from the `pond-server dashboard` sign-in link.
 
 For local development you can opt back into the bypass with:
 
@@ -289,7 +331,9 @@ This is **off by default** and intended only for dev machines.
 ## CORS
 
 Scoped to first-party origins (`app://giap`, `http://localhost:1420`,
-`http://127.0.0.1:1420`); **not** `Any`. Add extra browser origins (e.g. a LAN
+`http://127.0.0.1:1420`); **not** `Any`. The same list feeds the loopback
+listener's Origin check, and it also covers the remote-access management routes,
+which the desktop renderer calls cross-origin. Add extra browser origins (e.g. a LAN
 dashboard) with a comma-separated:
 
 ```

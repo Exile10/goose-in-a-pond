@@ -6,7 +6,7 @@ use axum::{
     extract::{ConnectInfo, Request, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -770,8 +770,30 @@ async fn disable(
     Ok(Json(serde_json::json!({"accepted":true})))
 }
 
-/// Management is available only on the loopback listener, guarded by socket peer.
-pub fn management(runtime: Arc<Runtime>) -> Router {
+/// Refuse management without the host credential: these routes can re-point the Pond and
+/// every paired phone at another coordinator, and a bearer token proves only that its holder
+/// once had a pairing code.
+async fn host_only(
+    State(credential): State<pond_api::host_guard::HostCredential>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match pond_api::host_guard::require_credential(
+        Some(&credential),
+        request.headers(),
+        "remote_access_management",
+    ) {
+        Ok(()) => next.run(request).await,
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
+/// Management is available only on the loopback listener, guarded by socket peer and the
+/// host credential.
+pub fn management(
+    runtime: Arc<Runtime>,
+    credential: pond_api::host_guard::HostCredential,
+) -> Router {
     Router::new()
         .route(
             "/api/v1/remote-access",
@@ -787,6 +809,10 @@ pub fn management(runtime: Arc<Runtime>) -> Router {
         )
         .merge(recovery::local_routes())
         .with_state(runtime)
+        .route_layer(middleware::from_fn_with_state(credential, host_only))
+        .layer(middleware::from_fn(pond_api::middleware::log_requests))
+        // The desktop renderer calls these cross-origin, like every other dashboard route.
+        .layer(pond_api::cors_layer())
 }
 
 async fn trusted_peer(mut request: Request, next: Next) -> Result<Response, StatusCode> {
@@ -1252,12 +1278,14 @@ mod tests {
     async fn local_management_ignores_forged_forwarding_identity() {
         let data = tempfile::tempdir().unwrap();
         let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
-        let router = management(runtime);
+        let credential = pond_api::host_guard::HostCredential::generate();
+        let router = management(runtime, credential.clone());
         for ip in ["100.64.0.2:1234", "192.168.1.2:1234"] {
             let mut request = Request::builder()
                 .uri("/api/v1/remote-access")
                 .header("x-forwarded-for", "127.0.0.1")
                 .header(PEER_HEADER, "127.0.0.1:1234")
+                .header(pond_api::host_guard::CREDENTIAL_HEADER, credential.as_str())
                 .body(Body::empty())
                 .unwrap();
             request
@@ -1270,11 +1298,51 @@ mod tests {
         }
         let request = Request::builder()
             .uri("/api/v1/remote-access")
+            .header(pond_api::host_guard::CREDENTIAL_HEADER, credential.as_str())
             .body(Body::empty())
             .unwrap();
         assert_eq!(
             router.oneshot(request).await.unwrap().status(),
             StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn local_management_requires_the_host_credential() {
+        let data = tempfile::tempdir().unwrap();
+        let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
+        let credential = pond_api::host_guard::HostCredential::generate();
+        let router = management(runtime, credential.clone());
+        let request = |value: Option<&str>| {
+            let mut request = Request::builder().uri("/api/v1/remote-access");
+            if let Some(value) = value {
+                request = request.header(pond_api::host_guard::CREDENTIAL_HEADER, value);
+            }
+            let mut request = request.body(Body::empty()).unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+            request
+        };
+        let stale = pond_api::host_guard::HostCredential::generate();
+        for value in [None, Some(stale.as_str())] {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(request(value))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            router
+                .oneshot(request(Some(credential.as_str())))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
         );
     }
 

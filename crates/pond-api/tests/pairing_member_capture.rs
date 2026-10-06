@@ -138,12 +138,16 @@ async fn make_app() -> Harness {
     });
 
     let dist = std::path::PathBuf::from("pond-desktop/dist");
+    // Both carry the credential, so the remote case fails on its peer, not a missing header.
     let loopback = build_router(state.clone(), dist.clone())
+        .layer(axum::Extension(CREDENTIAL.clone()))
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_000))));
-    let remote = build_router(state, dist).layer(MockConnectInfo(SocketAddr::from((
-        [192, 168, 1, 44],
-        40_000,
-    ))));
+    let remote = build_router(state, dist)
+        .layer(axum::Extension(CREDENTIAL.clone()))
+        .layer(MockConnectInfo(SocketAddr::from((
+            [192, 168, 1, 44],
+            40_000,
+        ))));
 
     Harness {
         loopback,
@@ -154,11 +158,16 @@ async fn make_app() -> Harness {
     }
 }
 
+/// The host credential the server would have written to its data directory.
+static CREDENTIAL: std::sync::LazyLock<pond_api::host_guard::HostCredential> =
+    std::sync::LazyLock::new(pond_api::host_guard::HostCredential::generate);
+
 /// `POST /handshake/pairing-code`; `body: None` sends no body or content type, as the CLI does.
 async fn issue(router: &axum::Router, body: Option<&str>) -> (StatusCode, Value) {
     let req = Request::builder()
         .method(Method::POST)
-        .uri("/api/v1/handshake/pairing-code");
+        .uri("/api/v1/handshake/pairing-code")
+        .header(pond_api::host_guard::CREDENTIAL_HEADER, CREDENTIAL.as_str());
     let req = match body {
         Some(b) => req
             .header("Content-Type", "application/json")
@@ -183,6 +192,7 @@ async fn live_code(router: &axum::Router) -> Value {
             Request::builder()
                 .method(Method::GET)
                 .uri("/api/v1/handshake/pairing-code")
+                .header(pond_api::host_guard::CREDENTIAL_HEADER, CREDENTIAL.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )

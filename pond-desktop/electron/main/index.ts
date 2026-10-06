@@ -18,7 +18,13 @@ import { installMenu, setAboutPanel } from "./menu";
 import { createTray, setTrayStatus, destroyTray } from "./tray";
 import { registerHotkeys, unregisterHotkeys } from "./hotkeys";
 import { createHealthLoop, createTeardown } from "./lifecycle";
-import { resolveDataDir, readRuntimePort, RUNTIME_PORT_FILE } from "./dataDir";
+import {
+  resolveDataDir,
+  readRuntimePort,
+  readHostCredential,
+  RUNTIME_PORT_FILE,
+  HOST_CREDENTIAL_FILE,
+} from "./dataDir";
 import type { ShellEvent, ShellEvents } from "../../src/shell/contract";
 
 const log = {
@@ -40,22 +46,34 @@ function emit<E extends ShellEvent>(name: E, payload?: ShellEvents[E]): void {
   if (win && !win.isDestroyed()) win.webContents.send(`giap:${name}`, payload);
 }
 
+/** pond-server's data directory, not Electron's userData. */
+function serverDataDir(): string {
+  return resolveDataDir({
+    env: process.env,
+    home: homedir(),
+    platform: process.platform,
+  });
+}
+
 /** The port pond-server says it bound, and when; read from the server's data dir, not userData. */
 function readPortFile(): { port: number; mtimeMs: number } | null {
-  const file = join(
-    resolveDataDir({
-      env: process.env,
-      home: homedir(),
-      platform: process.platform,
-    }),
-    RUNTIME_PORT_FILE,
-  );
+  const file = join(serverDataDir(), RUNTIME_PORT_FILE);
   try {
     const port = readRuntimePort(readFileSync(file, "utf8"));
     if (port === null) return null;
     return { port, mtimeMs: statSync(file).mtimeMs };
   } catch {
     // Not written yet, or unreadable. The caller keeps its assumed port.
+    return null;
+  }
+}
+
+/** The credential host-only routes need; read per call because every server start rotates it. */
+function readHostCredentialFile(): string | null {
+  try {
+    return readHostCredential(readFileSync(join(serverDataDir(), HOST_CREDENTIAL_FILE), "utf8"));
+  } catch (e) {
+    log.warn(`host credential unreadable: ${String(e)}`);
     return null;
   }
 }
@@ -137,7 +155,7 @@ if (!app.requestSingleInstanceLock()) {
 
     setAboutPanel();
     installMenu({ emit });
-    registerIpc({ server, voice });
+    registerIpc({ server, voice, hostCredential: readHostCredentialFile });
 
     win = createMainWindow({
       preloadPath: join(__dirname, "../preload/index.cjs"),

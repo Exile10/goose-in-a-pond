@@ -39,6 +39,7 @@ const BASE: AppState = {
   serverStarting: false,
   serverUrl: "http://127.0.0.1:4000",
   sessionToken: null,
+  signInRequired: false,
   sessionId: null,
   needsOnboarding: false,
   voiceState: "idle",
