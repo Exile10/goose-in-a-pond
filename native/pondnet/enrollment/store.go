@@ -39,6 +39,8 @@ type state struct {
 	Devices    map[string]map[string]Device `json:"devices"`
 	Requests   map[string]int64             `json:"requests"`
 	Retired    map[string][]Device          `json:"retired,omitempty"`
+	// Invites is keyed by each invite's digest; the invites themselves are never stored.
+	Invites map[string]Invite `json:"invites,omitempty"`
 }
 
 // Store holds an exclusive process lock and atomically persists every security transition.
@@ -281,6 +283,16 @@ func validateState(v state) error {
 		}
 		if _, ok := v.Households[parts[0]]; !ok {
 			return invalid
+		}
+	}
+	for digest, invite := range v.Invites {
+		if len(digest) != 64 || strings.Trim(digest, "0123456789abcdef") != "" || invite.Expires <= 0 {
+			return invalid
+		}
+		if invite.ConsumedBy != "" {
+			if _, ok := v.Households[invite.ConsumedBy]; !ok {
+				return invalid
+			}
 		}
 	}
 	return nil

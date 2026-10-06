@@ -51,11 +51,23 @@ func registration(public ed25519.PublicKey) HouseholdRegistration {
 	}
 }
 
+// invited is a registration carrying a fresh invite from s.
+func invited(t *testing.T, s *Service, public ed25519.PublicKey) HouseholdRegistration {
+	t.Helper()
+	invite, _, err := s.Store.IssueInvite(time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := registration(public)
+	body.Invite = invite
+	return body
+}
+
 func TestAHouseholdRegistersItselfAndTheServerNamesIt(t *testing.T) {
 	service, backend := emptyService(t)
 	public, key, _ := ed25519.GenerateKey(rand.Reader)
 
-	envelope, _ := SignHousehold(registration(public), key)
+	envelope, _ := SignHousehold(invited(t, service, public), key)
 	code, id := register(service, envelope, "198.51.100.7:1234")
 	if code != 200 {
 		t.Fatalf("registration rejected: %d", code)
@@ -73,7 +85,8 @@ func TestAHouseholdRegistersItselfAndTheServerNamesIt(t *testing.T) {
 		t.Fatalf("expected one coordinator user, got %d", backend.created)
 	}
 
-	// Registering again is how a household recovers from a lost response.
+	// Registering again is how a household recovers from a lost response, and needs
+	// no second invite.
 	again, _ := SignHousehold(registration(public), key)
 	if code, second := register(service, again, "198.51.100.8:1234"); code != 200 || second != id {
 		t.Fatalf("re-registration was not idempotent: %d %q", code, second)
@@ -133,7 +146,7 @@ func TestRegistrationIsRateLimitedPerSource(t *testing.T) {
 	limited := false
 	for attempt := 0; attempt < 8; attempt++ {
 		public, key, _ := ed25519.GenerateKey(rand.Reader)
-		envelope, _ := SignHousehold(registration(public), key)
+		envelope, _ := SignHousehold(invited(t, service, public), key)
 		if code, _ := register(service, envelope, "192.0.2.50:4321"); code == 429 {
 			limited = true
 			break
@@ -144,7 +157,7 @@ func TestRegistrationIsRateLimitedPerSource(t *testing.T) {
 	}
 	// A different source is unaffected by that one's budget.
 	public, key, _ := ed25519.GenerateKey(rand.Reader)
-	envelope, _ := SignHousehold(registration(public), key)
+	envelope, _ := SignHousehold(invited(t, service, public), key)
 	if code, _ := register(service, envelope, "192.0.2.51:4321"); code != 200 {
 		t.Fatalf("an unrelated source was limited: %d", code)
 	}
