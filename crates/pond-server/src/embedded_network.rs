@@ -1476,7 +1476,7 @@ async fn register_phone(
 
     // Skip re-enrolling a phone already active with the same identity (it would raise a
     // conflict); any other answer, or none, falls through to the enrollment below.
-    match runtime.authority("inspect", payload.clone()).await {
+    let replaces_existing = match runtime.authority("inspect", payload.clone()).await {
         Ok(existing) => {
             let field = |name: &str| {
                 existing
@@ -1502,19 +1502,34 @@ async fn register_phone(
                 %device, status = %status, same_identity,
                 "remote access: an existing enrollment does not match, so enrolling again"
             );
+            true
         }
         Err(error) => {
             // Not a failure: the enrollment below is the authority.
             tracing::info!(%error, %device, "remote access: could not inspect the existing enrollment; enrolling");
+            false
         }
-    }
+    };
 
     let enrolled = runtime
         .authority("enroll", payload)
         .await
         .map_err(|error| {
             let refused = error.downcast_ref::<RefusedByCoordinator>().is_some();
-            tracing::warn!(%error, %device, refused, operation = "enroll_phone", "embedded enrollment failed");
+            if refused && replaces_existing {
+                // Expected, not a fault: the coordinator will not let a new identity take over an
+                // enrollment it already holds. The 409 offers the phone recovery, which someone
+                // approves on the home network.
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "remote_access_recovery_required",
+                    %error,
+                    %device,
+                    "remote access: the coordinator kept the existing enrollment; the phone must recover it"
+                );
+            } else {
+                tracing::warn!(%error, %device, refused, operation = "enroll_phone", "embedded enrollment failed");
+            }
             if refused {
                 StatusCode::CONFLICT
             } else {
