@@ -76,6 +76,23 @@ pub fn notification_sender(
     NOTIFICATION_SENDER.get().cloned()
 }
 
+// -- Who is speaking: per-call identity for tools that act for one member; unset → they refuse --
+static SPEAKER_AUTHORITY: OnceLock<
+    Arc<dyn pond_core::security::ports::draft_authority::DraftAuthority>,
+> = OnceLock::new();
+
+/// Install the speaker resolution. Call once per binary path, before the first turn.
+pub fn init_speaker_authority(
+    authority: Arc<dyn pond_core::security::ports::draft_authority::DraftAuthority>,
+) {
+    let _ = SPEAKER_AUTHORITY.set(authority);
+}
+
+pub fn speaker_authority(
+) -> Option<Arc<dyn pond_core::security::ports::draft_authority::DraftAuthority>> {
+    SPEAKER_AUTHORITY.get().cloned()
+}
+
 /// Generate tool params via the ToolCaller; when one is configured they replace the LLM's.
 pub async fn generate_params(
     tool_name: &str,
