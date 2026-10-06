@@ -94,6 +94,12 @@ A shared manager selects endpoints for REST and foreground SSE. On Wi-Fi it
 prefers pinned local addresses, uses mDNS to find a changed address, then tries
 the authenticated embedded address when remote access is enabled. Cellular uses
 the embedded node; local-only profiles remain disconnected away from home.
+Network changes and foreground resume re-evaluate the endpoint choice; background
+probing pauses. Recovery is coalesced, uses a capped backoff, and stops after six
+failed attempts until another trigger or a manual retry. NetInfo does not perform
+external reachability probes or collect SSIDs. On Wi-Fi, six bounded local
+rechecks also allow a connected phone to return from tailnet after a temporary LAN
+outage without waiting for a network-change event.
 
 The node's resolvers are not chosen in advance, by server or by transport: every
 query the node makes goes to every resolver the operating system reports, over UDP
@@ -101,13 +107,18 @@ and over TCP at once, and the first answer to that query is used
 (`dialResolver`, `native/pondnet/mobile/dns.go`). Each narrower rule was defeated by
 a network that was measured:
 
-- **A home router, September 2026.** Its routable resolver answered nothing; its
+- **A home router, 2026-09-20.** Its routable resolver answered nothing; its
   link-local one answered only over TCP.
+- **A home gateway, September 2026 (#394).** It refused DNS over TCP on both the
+  IPv4 and IPv6 resolvers it advertised while answering UDP. This is the opposite
+  of the 2026-09-20 measurement; both were measured, at different times, and the
+  record does not say whether it was the same router in another state. Racing
+  every query covers both.
 - **Safaricom LTE.** The first resolver accepts a TCP connection in about 30 ms
   and never answers on it, while answering UDP in about 170 ms. Trying servers in
   order spent each lookup's budget on it, and taking a TCP connect as proof made
   the lookup hang on it.
-- **The same home router after a power cut, 2026-10-05.** A queries over UDP are
+- **The 2026-09-20 home router after a power cut, 2026-10-05.** A queries over UDP are
   answered in about 10 ms, but AAAA queries over UDP are never answered, from
   either of its addresses. AAAA is answered over TCP only, on the link-local
   address. The previous rule probed each server with one test query and used
@@ -125,13 +136,7 @@ next attempt. Losers cancelled because another server answered are not reported.
 Before these changes, a cold start on cellular took fifteen seconds or more to
 bring the node up, and sometimes it never came up: netcheck and the DERP
 connection both need the coordinator's name resolved, under deadlines of about a
-second. Network changes and foreground
-resume re-evaluate the choice; background probing pauses. Recovery is coalesced,
-uses a capped backoff, and stops after six failed attempts until another trigger
-or a manual retry. NetInfo does not perform external reachability probes or
-collect SSIDs.
-On Wi-Fi, six bounded local rechecks also allow a connected phone to return from
-tailnet after a temporary LAN outage without waiting for a network-change event.
+second.
 
 Reads retry at most once after recovery. Writes and refresh-token rotations are
 never replayed after ambiguous transport failures. A failed write may have

@@ -215,13 +215,36 @@ coordinator's own logs were checked. Those logs showed the node completing the
 control handshake and holding a map poll for minutes at a time on Wi-Fi. The
 addressing collision is real and was not the fault.
 
-### A second resolver defect: a gateway that refuses TCP entirely
+### A second resolver defect: a gateway that refuses TCP entirely (superseded 2026-10-05; see below)
 
 Racing the servers fixed the carrier above. It could not fix a home network where the gateway refused DNS over **TCP** on both resolvers it advertised, IPv4 and IPv6, while answering **UDP** normally. The node resolved nothing there, and the phone logged **88 dial timeouts in a minute**, while every other app on the network resolved fine over UDP (#394).
 
 `dialResolver` discarded the transport Go asked for and always used TCP, on a documented assumption about routers that ignore UDP from clients they did not lease. That holds for some routers and not others, so neither transport is assumed now: both are tried per server, and whichever proves itself first is used. UDP is the asymmetric case. `net.Dial` over UDP cannot fail, so a raced UDP dial would win at once with a dead socket. The probe therefore sends a real query for the root zone with a random id and waits for the id to come back, and the winning connection is a fresh socket so the probe's reply cannot be mistaken for the answer to Go's own query.
 
 On the network where it failed, the dial timeouts went from 88 a minute to none and the node reached its coordinator. `TestResolverFallsBackToUdpWhenTcpIsRefused` fails against the old behaviour. `TestResolverStillUsesTcpWhenUdpIsSilent` passes both ways, so the case the TCP-only dial was written for is unchanged. `TestUdpProbeIsNotSatisfiedBySilence` pins the connectionless trap.
+
+### A third resolver defect: one answer per query type (2026-10-05)
+
+The probe design above, and the tests named there, are gone. After a power cut
+the home router answered A queries over UDP in about 10 ms, from both of its
+addresses, but never answered AAAA over UDP; it answered AAAA over TCP only, on
+its link-local address. The per-server probe chose one transport for every later
+query, UDP won, and every lookup waited out its deadline for the AAAA answer: on
+the Galaxy A57, resolving the coordinator took 10.003 s, longer than tailscale
+allows a control lookup, so the phone could not enable remote access.
+
+`dialResolver` now races each query, not a probe, across every server and both
+transports, and gives Go the first answer carrying that query's id. On the A57
+against the same router the lookup takes about 30 ms.
+`TestARouterThatDropsAaaaOverUdpStillResolvesAtOnce` and
+`TestEachQueryIsAnsweredByWhicheverServerCan` failed with an i/o timeout against
+the probe resolver and pass now.
+`TestAResolverThatConnectsButNeverAnswersOverTcpCostsNothing` (Safaricom's first
+resolver), `TestAServerAnsweringOnlyOverTcpResolves` (the router as measured on
+2026-09-20), `TestADeadFirstResolverDoesNotCostTheLookup`,
+`TestATruncatedUdpAnswerLosesToTheTcpOne` and
+`TestEveryResolverDeadIsAnErrorAndSaysSoOnce` pin the other measured shapes and
+the race's edges; all are in `native/pondnet/mobile/dns_test.go`.
 
 ### Diagnosis was blocked by discarded causes
 
