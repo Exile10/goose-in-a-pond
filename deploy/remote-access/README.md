@@ -111,6 +111,12 @@ Do not manually reassign users, nodes, addresses, tags, routes, or policies behi
 it. Cross-household traffic, phone-to-phone traffic, other Pond ports, subnet
 routing, and exit nodes have no allow rule.
 
+The policy also grants the `cache-network-maps` node attribute to every active,
+verified phone's address, never a Pond's (2026-10-05), so a phone can start from
+its last network map while the coordinator is out of reach. The service reinstalls
+its policy at start, so the grant takes effect when the service is redeployed. See
+"Cached network map on phones" in `docs/remote-access.md`.
+
 ## Backups and restoration
 
 Back up the Pond's complete private data directory using its existing backup

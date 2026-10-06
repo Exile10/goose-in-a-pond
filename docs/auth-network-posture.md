@@ -39,6 +39,11 @@ Pond's companion HTTPS port; phone-to-phone, cross-household, subnet and exit-no
 access have no allow rule. Coordinator inventory drift removes permissions rather
 than silently accepting a changed device identity.
 
+Phones may start from a cached network map; the Pond never does. Its helper sets
+`TS_USE_CACHED_NETMAP=false` before starting its node, so access is always
+enforced against the coordinator's live map (2026-10-05). A removed phone's cache
+is erased when the coordinator refuses it (`Node.ForgetNetworkMapWhenRefused`).
+
 The bundled helper terminates application TLS on the Pond and forwards into a
 private Unix socket. Only that private router accepts its peer-identity header;
 public listeners ignore caller-supplied forwarding identity. The shared auth and

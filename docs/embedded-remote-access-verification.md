@@ -237,6 +237,18 @@ dialing ... over tcp failed")` was written on every attempt and read by nobody.
 Those lines are recorded unconditionally now, through the same redaction;
 tailscale's verbose backend log stays behind a debuggable build.
 
+## Cached network map on phones (2026-10-05)
+
+Measured on the pilot coordinator (Headscale 0.29.3) and the Galaxy A57 after the
+enrollment service was redeployed: the installed policy granted
+`cache-network-maps` to the phone's address and not the Pond's, and four cold
+starts on mobile data reached the Pond in 3.6 to 3.7 s, against about 9 s before
+the cache. In one timed cold start the node loaded its map from disk at 0.32 s,
+was `Running` at 0.34 s and reached the Pond at 3.05 s. The two launches straight
+after the reinstall and switching Wi-Fi off took longer than 25 s and 30.6 s;
+their logs were not kept. Details, including the removed-phone erasure, are in
+"Cached network map on phones" in [remote access](remote-access.md).
+
 ## Remaining acceptance work
 
 - The Android API 37 emulator passes the expanded 39-assertion suite, including
