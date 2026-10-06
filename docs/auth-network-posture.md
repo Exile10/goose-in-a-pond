@@ -220,6 +220,25 @@ never enabled remote access is never swept either, and does not contact
 coordination to discover it has nothing to revoke. Sightings live in
 `presence.json` beside `revocations.json` rather than a `devices` column.
 
+Where sightings are recorded (2026-09-30). Until this date the presence port was
+attached only to the `127.0.0.1` dashboard router, so the only device that ever
+renewed was the desktop app, and no phone ever lapsed. It is now attached to the
+HTTPS companion listener, which is where phones connect from home, and to nothing
+else: the tailnet socket's router is built from the companion before presence is
+added, so a request over the tailnet cannot count as being at home even if the
+middleware's LAN check were wrong. `listener_wiring.rs` asserts all three listeners.
+Overlay VPNs that present as Ethernet (ZeroTier `zt*`/`feth*`, NetBird `wt*`,
+Hamachi `ham*`, Nebula `nebula*`) are excluded from the LAN by name, as WireGuard
+already was, and so are macOS's `gif*`/`stf*` tunnel interfaces
+(`network.rs::is_lan_interface`).
+
+Sightings are keyed by the same network-hashed id as the queue and written at most
+once an hour per device. The file is read like the other private files (no
+symlinks, `0600`, at most 256 KiB and 1024 devices). An unreadable file used to
+stop every sweep, which failed open; it is now moved aside as
+`presence.json.corrupt-<time>` and every phone in the enrollment record is treated
+as last seen when the file was last written, so each still lapses within the window.
+
 `GET /api/v1/notifications/stream?device_id=...` and
 `POST/DELETE /api/v1/devices/{id}/push-token` require the target device to match
 `Principal.device_id`, obtained by the middleware from `caller_for_token`.

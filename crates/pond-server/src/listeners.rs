@@ -45,9 +45,15 @@ pub fn compose(
             embedded.clone(),
             state,
         ));
+    // Taken before presence is added: a request over the tailnet must never count as the
+    // phone being at home. The middleware's LAN check says the same; this makes it structural.
+    #[cfg(unix)]
+    let tailnet = embedded_network::private_companion(companion.clone());
+    // Phones reach the Pond over HTTPS, so that is where a LAN sighting renews remote access.
+    #[cfg(unix)]
+    let companion = companion.layer(Extension(embedded.clone() as Arc<dyn DevicePresence>));
     #[cfg(unix)]
     let dashboard = dashboard
-        .layer(Extension(embedded.clone() as Arc<dyn DevicePresence>))
         .layer(Extension(embedded.clone() as Arc<dyn RemoteRevocation>))
         .layer(Extension(embedded.address.clone()))
         .merge(embedded_network::management(
@@ -60,12 +66,10 @@ pub fn compose(
         .layer(axum::middleware::from_fn(
             pond_api::host_guard::loopback_only,
         ));
-    #[cfg(unix)]
-    let embedded = embedded_network::private_companion(companion.clone());
     Listeners {
         dashboard,
         companion,
         #[cfg(unix)]
-        embedded,
+        embedded: tailnet,
     }
 }
