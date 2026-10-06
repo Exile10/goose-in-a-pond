@@ -12,8 +12,12 @@ bundles the same pinned Go networking module as a supervised helper. No separate
 Tailscale app, system VPN profile, or user Tailscale account is required. After
 local pairing, choose **Enable remote access** or **Keep local only**. Local-only
 profiles do not start a node or contact a coordination service. Remote operation
-uses only the explicitly configured Goose-operated Headscale and DERP endpoints;
-there is no fallback to hosted Tailscale or a separate VPN app.
+uses only the explicitly configured Goose-operated Headscale and DERP endpoints, and
+never a separate VPN app, with one exception: when system DNS cannot resolve the
+coordinator, tsnet may ask Tailscale's DERP servers to resolve its name (see
+Residual risks in [the deployment guide](../deploy/remote-access/README.md)). That
+request reveals the client's address and the coordinator's host name and carries
+no household data.
 
 This branch prepares a locally tested pilot deployment. Public domains and hosting
 are still prerequisites for cellular use. Follow

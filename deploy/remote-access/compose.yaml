@@ -3,7 +3,10 @@ services:
   headscale:
     image: ghcr.io/juanfont/headscale:0.29.3@sha256:0e7f1c6e4ce6c2a2a001103ecd3fa645a045adf30ac8a5234fe037b43000cd72
     command: serve
-    tmpfs: [/var/run/headscale]
+    # Unprivileged; the tmpfs for its local socket belongs to the same user. Existing
+    # runtime/headscale must be chowned to 65532:65532 once (README, Upgrading).
+    user: '65532:65532'
+    tmpfs: ['/var/run/headscale:uid=65532,gid=65532,mode=0700']
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -13,14 +16,18 @@ services:
       - ./runtime/headscale:/var/lib/headscale
     ports:
       - '${STUN_BIND:-127.0.0.1}:3478:3478/udp'
-    networks: [control]
+    # The gateway reaches the control plane on `edge`; only enrollment, holding the
+    # admin key, reaches it on `admin`, so that key never crosses the gateway's network.
+    networks:
+      edge: {}
+      admin: {aliases: [headscale-admin]}
     logging: {driver: json-file, options: {max-size: 10m, max-file: '3'}}
   enrollment:
     build:
       context: ../..
       dockerfile: deploy/remote-access/Dockerfile
     # The gateway's X-Forwarded-For is believed only from the pinned network below.
-    command: ['--state', '/state', '--listen', '0.0.0.0:8081', '--headscale', 'http://headscale:8080', '--credential-file', '/run/secrets/headscale_admin', '--trusted-proxy', '172.31.250.0/28']
+    command: ['--state', '/state', '--listen', '0.0.0.0:8081', '--headscale', 'http://headscale-admin:8080', '--credential-file', '/run/secrets/headscale_admin', '--trusted-proxy', '172.31.250.0/28']
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -28,7 +35,7 @@ services:
     volumes:
       - ./runtime/enrollment:/state
     secrets: [headscale_admin]
-    networks: [control]
+    networks: [enroll, admin]
     logging: {driver: json-file, options: {max-size: 10m, max-file: '3'}}
     healthcheck:
       test: [CMD, /pond-enrollment, --health-check]
@@ -41,24 +48,40 @@ services:
         condition: service_healthy
     image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
     restart: unless-stopped
+    # No root: Caddy listens on 8080/8443 inside and Docker maps the public ports. The
+    # image marks /usr/bin/caddy with cap_net_bind_service, and the kernel refuses to
+    # exec such a binary ("operation not permitted") when that capability is not in the
+    # bounding set, so it is the one capability kept. Nothing binds below 1024.
+    user: '65532:65532'
+    read_only: true
+    tmpfs: ['/tmp:uid=65532,gid=65532']
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
     environment:
       HEADSCALE_HOST: '${HEADSCALE_HOST:?Set the Headscale domain}'
       ENROLLMENT_HOST: '${ENROLLMENT_HOST:?Set the enrollment domain}'
     ports:
-      - '${HTTPS_BIND:-127.0.0.1}:443:443'
-      - '${HTTPS_BIND:-127.0.0.1}:80:80'
+      - '${HTTPS_BIND:-127.0.0.1}:443:8443'
+      - '${HTTPS_BIND:-127.0.0.1}:80:8080'
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./runtime/caddy-data:/data
       - ./runtime/caddy-config:/config
-    networks: [control]
+    networks: [edge, enroll]
     logging: {driver: json-file, options: {max-size: 10m, max-file: '3'}}
 networks:
-  # Pinned so the enrollment service can tell its own gateway from any other sender.
-  control:
+  # Public: the gateway and the Headscale control plane.
+  edge: {}
+  # Gateway to enrollment. Pinned so enrollment can tell its own gateway's
+  # X-Forwarded-For from any other sender.
+  enroll:
     ipam:
       config:
         - subnet: 172.31.250.0/28
+  # Enrollment to the Headscale admin API, and nothing else; no route out.
+  admin:
+    internal: true
 secrets:
   headscale_admin:
     file: ./runtime/secrets/headscale_admin
