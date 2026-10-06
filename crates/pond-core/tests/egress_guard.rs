@@ -36,6 +36,7 @@ const EGRESS_TRACKED: &[&str] = &[
     "crates/pond-api/src/spotify_focus.rs",
     "crates/pond-adapters-caldav/src/lib.rs",
     "crates/pond-adapters-weather/src/lib.rs",
+    "crates/pond-adapters-uber/src/lib.rs",
     "crates/pond-hf-cache/src/lib.rs",
     "crates/pond-infra/src/fcm_push_relay.rs",
     "crates/pond-mcp-server/src/http.rs",
