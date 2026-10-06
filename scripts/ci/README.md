@@ -25,3 +25,8 @@ has permission to read the dependency; the hosted fetch step establishes that.
 
 The CI pull-request event covers stacked PRs as well as main-targeted PRs so
 security dependency stacks receive the same checks before their bases merge.
+
+Security scans also run for stacked PRs and explicitly cover the Goose
+standalone lockfile and Matter lockfile, which previously fell outside the
+OSV job. The integration branch includes the separately reviewed Matter fix
+so the expanded scanner validates the complete set of remediations.
