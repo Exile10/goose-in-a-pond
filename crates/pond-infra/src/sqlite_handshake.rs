@@ -623,8 +623,9 @@ const SERVER_LABEL: &[u8] = b"goose-pair-server-v1";
 /// unbound  challenge || client_id
 /// ```
 ///
-/// The unbound shape is the original one and is kept byte-for-byte, because the
-/// desktop dashboard and any phone running an older build still compute it.
+/// The unbound shape is the original one and is kept byte-for-byte for the desktop
+/// dashboard, which pairs over loopback HTTP and has no key to bind. The route refuses
+/// it from any other peer (`channel_binding_required`), so a phone must bind.
 ///
 /// `0x00` separates the bound fields unambiguously: `client_id` and the pin are
 /// text and cannot contain a NUL, and the challenge is a fixed 32 bytes. The
