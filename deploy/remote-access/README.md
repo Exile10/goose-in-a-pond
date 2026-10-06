@@ -364,9 +364,11 @@ accounts on the host can read those.
 This is an operator authority, not a public recovery endpoint. Replacing an `active`
 enrollment must follow fresh local pairing and explicit local review of the exact
 device and pending registration, and a caller must never replace one automatically.
-Since 2026-10-05 the Pond replaces a `revoked` or `failed` enrollment for the
-bearer's own device without review, and only from the home network, because such a
-record holds no working remote access and a first enrollment needs no review either.
+Since 2026-10-05 the Pond replaces a `revoked` enrollment for the bearer's own device
+without review, and only from the home network, because such a record holds no
+working remote access and a first enrollment needs no review either. A `failed`
+enrollment still needs review: each replacement retires a record against the
+household's bounded budget, and a refused enrollment can be failed again at will.
 Active/revoking records, reused machines, stale revisions,
 expired approvals and replays fail closed. A newer revocation invalidates an older
 replacement approval. Retired identities remain in backups for late-registration

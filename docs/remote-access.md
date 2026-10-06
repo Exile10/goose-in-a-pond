@@ -268,13 +268,15 @@ same device id. The coordinator refuses a plain enrollment over any existing
 record, so on the Galaxy A57 a removed and re-paired phone got `409
 invalid_enrollment` and could come back only through recovery: a second
 dashboard approval after a pairing that had already needed one. Enabling remote
-access now replaces a `revoked` or `failed` enrollment at the revision the
-coordinator reports, through the same `replace` the recovery uses
+access now replaces a `revoked` enrollment at the revision the coordinator
+reports, through the same `replace` the recovery uses
 (`phone_enrollment` in `crates/pond-server/src/embedded_network.rs`). This grants
 nothing a first enrollment does not: both need a LAN peer and a valid bearer, and
 a stood-down record carries no working remote access to take over. An `active`
 enrollment held by another identity is still refused and still needs the
-approval above.
+approval above, and so does a `failed` one: every replacement retires the old
+record against the household's bounded retirement budget, and a refused
+enrollment can be failed again at will.
 
 Remote access lapses after thirty days without the device authenticating from the
 household LAN; see `docs/auth-network-posture.md`. The deadline is reported in the

@@ -1581,7 +1581,10 @@ enum PhoneEnrollment {
 /// pairing that already needed it. Replacing a stood-down record grants nothing a first
 /// enrollment would not: both need a LAN peer and a valid bearer, and there is no working
 /// enrollment to take over. An active one stays behind the recovery approval, because
-/// replacing it would drop remote access the household is using.
+/// replacing it would drop remote access the household is using. So does a `failed` one:
+/// a refused enrollment can be failed again at will, and every replacement retires the old
+/// record against the household's bounded retirement budget, so replacing failed records
+/// would let a loop of bad enrollments spend that budget without anyone approving it.
 fn phone_enrollment(existing: &serde_json::Value, machine_key: &str) -> PhoneEnrollment {
     let field = |name: &str| {
         existing
@@ -1591,7 +1594,7 @@ fn phone_enrollment(existing: &serde_json::Value, machine_key: &str) -> PhoneEnr
     };
     match field("status") {
         "active" if field("machineKey") == machine_key => PhoneEnrollment::AlreadyEnrolled,
-        "revoked" | "failed" if valid_device(field("revision")) => {
+        "revoked" if valid_device(field("revision")) => {
             PhoneEnrollment::Replace(field("revision").to_owned())
         }
         _ => PhoneEnrollment::Enroll,
@@ -1683,16 +1686,13 @@ mod tests {
     fn a_removed_phone_replaces_its_stood_down_enrollment() {
         let key = "mkey:aaaa";
         let revision = "rev-0123456789abcdef";
-        for status in ["revoked", "failed"] {
-            let existing = serde_json::json!({
-                "status": status, "machineKey": "mkey:old", "revision": revision
-            });
-            assert_eq!(
-                phone_enrollment(&existing, key),
-                PhoneEnrollment::Replace(revision.into()),
-                "{status}"
-            );
-        }
+        let existing = serde_json::json!({
+            "status": "revoked", "machineKey": "mkey:old", "revision": revision
+        });
+        assert_eq!(
+            phone_enrollment(&existing, key),
+            PhoneEnrollment::Replace(revision.into())
+        );
     }
 
     #[test]
@@ -1716,6 +1716,9 @@ mod tests {
         for existing in [
             serde_json::json!({}),
             serde_json::json!({"status": "pending", "revision": "rev-0123456789abcdef"}),
+            // Each replacement spends a retirement slot, and a refused enrollment can be
+            // failed again at will, so a failed record waits for the recovery approval.
+            serde_json::json!({"status": "failed", "machineKey": "mkey:old", "revision": "rev-0123456789abcdef"}),
             // A revision the helper would reject is not sent.
             serde_json::json!({"status": "revoked", "revision": "short"}),
             serde_json::json!({"status": "revoked", "revision": "has spaces in it, too many"}),
