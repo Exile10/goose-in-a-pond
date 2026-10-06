@@ -12,7 +12,19 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"golang.org/x/net/netutil"
 )
+
+// MaxConnections bounds the sockets a listener holds open, whatever they send.
+const MaxConnections = 64
+
+// serviceAddresses are Tailscale's own resolver and local API on every node. They are
+// never a Pond, and a tunnel to them would let a page query this node.
+var serviceAddresses = map[netip.Addr]bool{
+	netip.MustParseAddr("100.100.100.100"):    true,
+	netip.MustParseAddr("fd7a:115c:a1e0::53"): true,
+}
 
 // Proxy is an authenticated, allowlisted loopback CONNECT transport. TLS remains
 // between the mobile native client and the Pond, including hostname/SPKI checks.
@@ -42,8 +54,10 @@ func NewProxy(dial DialContext) (*Proxy, error) {
 		return nil, err
 	}
 	p := &Proxy{listener: listener, dial: dial, credential: base64.RawURLEncoding.EncodeToString(key), targets: map[string]bool{}, active: map[net.Conn]bool{}, limit: make(chan struct{}, 32), pending: map[uint64]context.CancelFunc{}}
-	p.server = &http.Server{Handler: p, ReadHeaderTimeout: 5 * time.Second, MaxHeaderBytes: 8192}
-	go p.server.Serve(listener)
+	// No ReadTimeout: it would cut a tunnel or an event stream mid-flight. Idle keep-alive
+	// connections that never send CONNECT are closed, and the listener is capped.
+	p.server = &http.Server{Handler: p, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
+	go p.server.Serve(netutil.LimitListener(listener, MaxConnections))
 	return p, nil
 }
 
@@ -63,6 +77,9 @@ func (p *Proxy) SetTargets(targets []string) error {
 		peer, err := PeerAddress(target)
 		if err != nil {
 			return err
+		}
+		if serviceAddresses[peer.Addr()] {
+			return errors.New("the tailnet service address is not a Pond")
 		}
 		next[peer.String()] = true
 	}
@@ -101,6 +118,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	expected := "Basic " + base64.StdEncoding.EncodeToString([]byte("pond:"+p.credential))
 	if subtle.ConstantTimeCompare([]byte(r.Header.Get("Proxy-Authorization")), []byte(expected)) != 1 {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="pond"`)
+		// Closed after the refusal, so an unauthenticated client cannot hold the socket.
+		w.Header().Set("Connection", "close")
 		http.Error(w, "proxy authorization required", http.StatusProxyAuthRequired)
 		return
 	}
@@ -151,6 +170,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer client.Close()
+	// The tunnel's lifetime is the client's and the Pond's, not the header deadline's.
+	client.SetDeadline(time.Time{})
 	p.mu.Lock()
 	if p.closed || p.generation != epoch || !p.targets[peer.String()] {
 		p.mu.Unlock()

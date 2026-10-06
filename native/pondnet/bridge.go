@@ -11,9 +11,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Exile10/goose-in-a-pond/native/pondnet/internal/privatefile"
+	"golang.org/x/net/netutil"
 )
 
 // PeerHeader is accepted only by the Pond's private Unix listener. Never trust
@@ -51,7 +53,9 @@ func LoadCertificate(path string) (*tls.Certificate, error) {
 // overwriting all peer metadata from the authenticated transport connection.
 func BridgeHandler(socket string) http.Handler {
 	target := &url.URL{Scheme: "http", Host: "pond.internal"}
-	transport := &http.Transport{MaxIdleConns: 16, IdleConnTimeout: 30 * time.Second,
+	// The Pond answers every route's headers promptly, event streams included, so a
+	// socket that has not by then is stuck rather than slow.
+	transport := &http.Transport{MaxIdleConns: 16, IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 30 * time.Second,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", socket)
 		}}
@@ -76,6 +80,12 @@ func BridgeHandler(socket string) http.Handler {
 			http.Error(w, "invalid remote peer", http.StatusForbidden)
 			return
 		}
+		// The companion API and nothing else, in origin form: no absolute-form or
+		// asterisk request targets, and no dashboard assets or development pages.
+		if !strings.HasPrefix(r.RequestURI, "/api/v1/") || !strings.HasPrefix(r.URL.Path, "/api/v1/") {
+			http.NotFound(w, r)
+			return
+		}
 		proxy.ServeHTTP(w, r)
 	})
 }
@@ -95,8 +105,10 @@ func ServePond(n *Node, port int, socket, identity string) (*http.Server, <-chan
 	}
 	config := &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"},
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return LoadCertificate(identity) }}
-	server := &http.Server{Handler: BridgeHandler(socket), ReadHeaderTimeout: 5 * time.Second, MaxHeaderBytes: 32768}
+	server := &http.Server{Handler: BridgeHandler(socket), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32768}
 	finished := make(chan error, 1)
-	go func() { finished <- server.Serve(tls.NewListener(listener, config)) }()
+	go func() {
+		finished <- server.Serve(tls.NewListener(netutil.LimitListener(listener, MaxConnections), config))
+	}()
 	return server, finished, nil
 }

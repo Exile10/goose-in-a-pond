@@ -189,8 +189,7 @@ func (a Authority) Register(ctx context.Context, origin string, port uint16) (st
 		return "", e
 	}
 	request.Header.Set("Content-Type", "application/json")
-	client := http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	response, e := client.Do(request)
+	response, e := coordinatorClient().Do(request)
 	if e != nil {
 		return "", fmt.Errorf("enrollment service unavailable: %w", e)
 	}
@@ -237,8 +236,7 @@ func (a Authority) Submit(ctx context.Context, origin string, approval enrollmen
 		return result, e
 	}
 	request.Header.Set("Content-Type", "application/json")
-	client := http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	response, e := client.Do(request)
+	response, e := coordinatorClient().Do(request)
 	if e != nil {
 		return result, fmt.Errorf("enrollment service unavailable: %w", e)
 	}
@@ -251,8 +249,50 @@ func (a Authority) Submit(ctx context.Context, origin string, approval enrollmen
 		// everybody already knew and none of the causes.
 		return result, &Refused{Status: response.StatusCode, Reason: refusal(response.Body), Action: approval.Action}
 	}
-	e = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&result)
-	return result, e
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 4096))
+	decoder.DisallowUnknownFields()
+	if e = decoder.Decode(&result); e != nil {
+		return result, e
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return result, errors.New("coordinator answered with trailing data")
+	}
+	return result, answered(approval, result)
+}
+
+// answered checks the coordinator's account of the device against what was asked, so a
+// proxy or a confused service cannot report a different device as this one's outcome.
+func answered(approval enrollment.Approval, device enrollment.Device) error {
+	known := map[string]bool{"pending": true, "active": true, "revoking": true, "revoked": true, "failed": true}
+	if !known[device.Status] || (device.Role != "pond" && device.Role != "phone") {
+		return errors.New("coordinator answered with an unknown device state")
+	}
+	if len(device.Revision) > 80 || strings.ContainsFunc(device.Revision, func(r rune) bool {
+		return !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_')
+	}) {
+		return errors.New("coordinator answered with an invalid revision")
+	}
+	switch approval.Action {
+	case "enroll", "replace":
+		if device.Role != approval.Role || device.MachineKey != approval.MachineKey {
+			return errors.New("coordinator answered for a different device")
+		}
+	case "revoke":
+		if device.Status != "revoked" {
+			return errors.New("coordinator did not confirm the revocation")
+		}
+	}
+	return nil
+}
+
+// coordinatorClient ignores proxy settings in the environment: the helper talks to the
+// coordinator directly or not at all. Redirects are not followed.
+func coordinatorClient() *http.Client {
+	return &http.Client{
+		Timeout:       20 * time.Second,
+		Transport:     &http.Transport{Proxy: nil, TLSHandshakeTimeout: 10 * time.Second, ForceAttemptHTTP2: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // refusal reads the coordinator's own account of why it said no.

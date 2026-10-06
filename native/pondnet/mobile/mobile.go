@@ -4,6 +4,7 @@ package mobile
 import (
 	"encoding/json"
 	"errors"
+	"net/netip"
 	"sync"
 
 	"github.com/Exile10/goose-in-a-pond/native/pondnet"
@@ -129,6 +130,13 @@ func SetTargets(encoded string) error {
 	var targets []string
 	if err := json.Unmarshal([]byte(encoded), &targets); err != nil {
 		return err
+	}
+	// A tunnel to this node itself would reach its own listeners, not the Pond.
+	ip4, ip6 := node.Server.TailscaleIPs()
+	for _, target := range targets {
+		if peer, err := netip.ParseAddrPort(target); err == nil && (peer.Addr() == ip4 || peer.Addr() == ip6) {
+			return errors.New("a target is this device's own tailnet address")
+		}
 	}
 	return proxy.SetTargets(targets)
 }

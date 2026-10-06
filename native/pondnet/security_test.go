@@ -31,7 +31,7 @@ func TestProxyRefusesUnauthenticatedAndUnconfiguredTargets(t *testing.T) {
 	if err = p.SetTargets([]string{"100.64.0.7:4443"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, target := range []string{"127.0.0.1:4443", "192.168.1.1:443", "1.1.1.1:443", "[::ffff:100.64.0.7]:443", "100.64.0.7:0"} {
+	for _, target := range []string{"127.0.0.1:4443", "192.168.1.1:443", "1.1.1.1:443", "[::ffff:100.64.0.7]:443", "100.64.0.7:0", "100.100.100.100:443", "[fd7a:115c:a1e0::53]:443"} {
 		if p.SetTargets([]string{target}) == nil {
 			t.Fatalf("unsafe target accepted: %s", target)
 		}
@@ -46,6 +46,9 @@ func TestProxyRefusesUnauthenticatedAndUnconfiguredTargets(t *testing.T) {
 		response.Body.Close()
 		if response.StatusCode != 407 {
 			t.Fatal(response.StatusCode)
+		}
+		if !response.Close {
+			t.Fatal("an unauthenticated client kept its connection")
 		}
 	}
 	proxyURL, _ := url.Parse("http://" + p.Address())
@@ -137,7 +140,7 @@ func TestBridgeReplacesForgedPeerHeaders(t *testing.T) {
 	go backend.Serve(listener)
 	handler := BridgeHandler(socket)
 	for _, source := range []string{"100.64.0.9:4567", "127.0.0.1:4567", "malformed"} {
-		r := httptest.NewRequest("GET", "https://pond/api/v1/health", nil)
+		r := httptest.NewRequest("GET", "/api/v1/health", nil)
 		r.RemoteAddr = source
 		r.Header.Set(PeerHeader, "127.0.0.1:1234")
 		r.Header.Set("Forwarded", "for=127.0.0.1")
@@ -150,6 +153,16 @@ func TestBridgeReplacesForgedPeerHeaders(t *testing.T) {
 		}
 		if w.Code != want {
 			t.Fatalf("%s: %d", source, w.Code)
+		}
+	}
+	// Only the companion API, and only in origin form.
+	for _, target := range []string{"/", "/assets/index.js", "/dev/test", "https://pond/api/v1/health", "/api/v1"} {
+		r := httptest.NewRequest("GET", target, nil)
+		r.RemoteAddr = "100.64.0.9:4567"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s reached the Pond: %d", target, w.Code)
 		}
 	}
 }

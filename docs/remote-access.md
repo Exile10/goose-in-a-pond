@@ -167,7 +167,9 @@ A failure reports which kind it is. The helper exits 3 when the coordinator
 refused the request and 1 when it could not be reached, so `register_phone`
 answers `409` for a decision and `503` for an outage, and the app can tell a
 household whose phone is already enrolled from one whose coordinator is
-unreachable. Every layer carries the cause it was given: the Pond captures the
+unreachable. Household registration (`pondnet --authority-action register`) also
+exits 3 on a coordinator refusal, and prints `{"refused": "<identifier>"}` on stdout.
+Every layer carries the cause it was given: the Pond captures the
 helper's stderr, the helper prints `Submit`'s error, and `Submit` carries the
 coordinator's status and its error identifier.
 
