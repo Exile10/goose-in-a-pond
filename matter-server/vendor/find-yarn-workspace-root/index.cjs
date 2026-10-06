@@ -1,3 +1,4 @@
+// Modified from Square find-yarn-workspace-root: use picomatch instead of micromatch.
 'use strict';
 
 const fs = require('fs');
