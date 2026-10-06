@@ -267,7 +267,7 @@ trusting a line number.
 | `POND_DEV_INSECURE_LAN=1` | Opens a plaintext HTTP listener for the companion API on every interface (below). | Ignored, with a WARN. |
 | `POND_DEV_INSECURE_LAN_PORT` | Port for that listener; default 4080, bound exactly, no fallback. | Ignored with it. |
 | `POND_DEV_SAME_MACHINE_MESH=1` | Mesh dials allocate a new port so two Ponds can run on one machine. | Honoured: it is not build-gated. |
-| `POND_NETWORK_BINARY` | Path of the embedded-networking helper instead of the bundled `pondnet`. | Honoured on this branch's base; the hardening work gates it to debug builds. |
+| `POND_NETWORK_BINARY` | Path of the embedded-networking helper instead of the bundled `pondnet`. | Ignored in release builds; debug builds honour it. |
 
 ### The insecure development listener
 
@@ -302,10 +302,8 @@ router rather than derived from anything the client sent. Pairing over it is
 unbound by construction (there is no TLS key to bind), logs
 `kind = "insecure_dev_pairing"`, and the `auth.device_paired` /
 `auth.pairing_verify_failed` audit event carries `transport = "insecure_dev"`.
-On this branch's base the Pond accepts unbound pairing from any LAN peer, so the
-marker records rather than permits; where the channel-binding requirement is in
-force (unbound pairing refused off loopback with `channel_binding_required`), the
-marker is the one other exemption alongside loopback, and the HTTPS listener's
+Unbound pairing is otherwise refused off loopback with `channel_binding_required`;
+the plaintext listener's marker is the one other exemption. The HTTPS listener's
 behaviour is unchanged.
 
 While it runs, `GET /api/v1/system/info` includes `"insecure_dev": true` on every

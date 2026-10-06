@@ -149,6 +149,10 @@ Returns basic system metadata for device identification.
 }
 ```
 
+`"insecure_dev": true` appears only while the debug-build plaintext development
+listener runs (`POND_DEV_INSECURE_LAN=1`); the key is absent otherwise. See
+[the security posture](auth-network-posture.md).
+
 ---
 
 ### GET /test
