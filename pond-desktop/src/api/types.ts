@@ -787,6 +787,9 @@ export interface ModelMemoryStatus {
   loaded_model: string | null;
   /** What switching away from the model in use frees; absent from an older server. */
   reclaimable_mb?: number;
+  /** The most this pond lets the models take: a desktop's memory less what it keeps for itself, or
+   *  a budgeted device's own figure. `available_for_llm_mb` is what is left of it now. */
+  budget_mb?: number;
 }
 
 export interface ModelCapabilities {
