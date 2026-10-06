@@ -16,6 +16,14 @@ TREES = ["embedded-network", "tls", "secrets"]
 FILES = ["secrets.json", "schedules.json", "schedule_runs.json"]
 # Locks are per-process artefacts; the tailscaled logs are noise.
 SKIP = (".lock", "tailscaled.log.conf", "tailscaled.log1.txt", "tailscaled.log2.txt")
+# The device key and certificate admit a household only on its first registration, and a
+# restored Pond's household is already registered, so they are not irreplaceable; leaving
+# them out keeps a copy of the device key off every backup host.
+SKIP_DIRS = {os.path.join(DATA, "embedded-network", "device")}
+
+def skipped(directory, names):
+    return [n for n in names
+            if n.endswith(SKIP) or os.path.join(directory, n) in SKIP_DIRS]
 
 def consistent_copy(src, dst):
     s = sqlite3.connect("file:%s?mode=ro" % src, uri=True)
@@ -33,8 +41,7 @@ try:
     for tree in TREES:
         src = os.path.join(DATA, tree)
         if os.path.isdir(src):
-            shutil.copytree(src, os.path.join(staged, tree),
-                            ignore=lambda d, names: [n for n in names if n.endswith(SKIP)])
+            shutil.copytree(src, os.path.join(staged, tree), ignore=skipped)
     for name in FILES:
         p = os.path.join(DATA, name)
         if os.path.exists(p):
