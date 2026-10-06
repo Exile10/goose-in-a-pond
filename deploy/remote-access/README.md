@@ -64,11 +64,6 @@ user, and stores it. Repeating the call answers with the same household, so a
 lost response costs nothing and an operator-created household answers
 identically.
 
-The household key is created on the Pond the first time remote access is enabled,
-just before registration, and loaded on every later registration. Until
-2026-10-05 only the manual path's **Prepare household identity** created it, so
-enabling remote access on a fresh Pond failed with `registration_unavailable`.
-
 Admission proves possession of a key and nothing else, because admission is not
 what separates households: the policy is, and it grants each phone its own Pond's
 HTTPS port and nothing more. Registration is rate limited per source address, the
