@@ -1132,7 +1132,11 @@ A Pond from before this route answers a GET here with **405**, because the reque
 
 ### DELETE /devices/{id}
 
+Before revoking the device's sessions, the Pond queues its tailnet revocation through the durable remote-revocation queue (`RemoteRevocation::queue`); Matter devices are skipped.
+
 **Response 204** — no body
+
+**Response 503** `{"error":"revocation_unavailable"}` — the queue could not be written. The device is left listed with its sessions intact, so the removal can be retried. See `docs/auth-network-posture.md`.
 
 ---
 

@@ -121,6 +121,9 @@ func main() {
 			// one exit code for both outcomes forced it to do.
 			var refused *pondnet.Refused
 			if errors.As(err, &refused) {
+				// The coordinator's own identifier, so the pond can act on which refusal
+				// it was: enrollment_missing means there is nothing to revoke.
+				json.NewEncoder(os.Stdout).Encode(map[string]string{"refused": refused.Reason})
 				os.Exit(3)
 			}
 			os.Exit(1)

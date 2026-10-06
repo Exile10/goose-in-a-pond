@@ -168,6 +168,28 @@ that is merely offline. Each orders itself so a failure is recoverable: the
 delete refuses rather than completing with access live, and the sign-out removes
 credentials first so a failed row removal still leaves the device without access.
 
+Removing a device also removes its remote access (2026-09-30). Before its sessions
+are revoked, `DELETE /api/v1/devices/{id}` queues the device's tailnet revocation
+through `RemoteRevocation::queue`, the same durable queue sign-out uses, and
+refuses with `503 revocation_unavailable` if that cannot be written. Previously
+only sign-out did this, so a phone removed from the dashboard kept reaching the
+Pond from outside. Matter devices never enroll and are not queued.
+
+The queue (`embedded-network/revocations.json`) backs off each entry on its own,
+from 30 seconds doubling to six hours. A coordinator that refuses one device no
+longer holds up the devices behind it; an unreachable coordinator still stops the
+tick, since it is unreachable for all of them. A read or write fault is logged as
+`remote_revocation_store_unavailable` and retried; the loop never returns, so it
+can no longer end `serve()`. A revocation for a device the coordinator never saw
+would leave a tombstone there, so the Pond keeps `enrolled.json`, the phones it
+enrolled: recorded devices are revoked outright, and on a household created after
+the record existed an unrecorded device (a desktop session, say) is not sent at
+all. A Pond that enrolled phones before the record asks the coordinator first and
+drops the entry on `enrollment_missing`. Helper calls lock one device at a time,
+so a slow coordinator no longer blocks every enrollment and sign-out, and an
+enrollment that a revocation overtook reports a conflict rather than success.
+Implementation: `pond-server/src/embedded_network/revocation.rs`.
+
 `revoke_device` carries no default on the port. Every other new method there is
 defaulted and each of those defaults narrows -- a forgotten override loses a
 capability. A default here would do the opposite: `Ok(0)` reads as "revoked
