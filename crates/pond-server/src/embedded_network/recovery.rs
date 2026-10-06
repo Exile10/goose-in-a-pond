@@ -2,6 +2,7 @@
 use super::*;
 use axum::{extract::Path as RoutePath, http::HeaderMap, Extension};
 use pond_core::security::ports::handshake::Handshake;
+use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -12,6 +13,8 @@ use std::{
 pub(super) struct Queue(RwLock<BTreeMap<String, Pending>>);
 struct Pending {
     device: String,
+    /// The name the household gave the phone, so the review is not of an opaque id.
+    device_name: Option<String>,
     bearer_hash: [u8; 32],
     payload: serde_json::Value,
     expires: Instant,
@@ -23,7 +26,24 @@ struct Pending {
 struct Review {
     id: String,
     device: String,
+    device_name: Option<String>,
+    /// The start of the replacement's machine key, which the phone shows too, so the
+    /// household can check it is approving that phone and not one that asked first.
+    key_preview: String,
     approved: bool,
+}
+
+/// `mkey:` and the first sixteen hex digits, grouped in fours for reading aloud.
+fn key_preview(machine_key: &str) -> String {
+    let hex = machine_key.strip_prefix("mkey:").unwrap_or(machine_key);
+    let groups: Vec<&str> = hex
+        .get(..16)
+        .unwrap_or(hex)
+        .as_bytes()
+        .chunks(4)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
+        .collect();
+    format!("mkey:{}", groups.join(" "))
 }
 impl Queue {
     pub(super) fn clear(&self) {
@@ -47,6 +67,7 @@ impl Queue {
         device: String,
         bearer_hash: [u8; 32],
         payload: serde_json::Value,
+        device_name: Option<String>,
         generation: u64,
     ) -> Result<String, StatusCode> {
         self.prune(generation);
@@ -60,6 +81,7 @@ impl Queue {
             id.clone(),
             Pending {
                 device,
+                device_name,
                 bearer_hash,
                 payload,
                 expires: Instant::now() + Duration::from_secs(120),
@@ -93,10 +115,17 @@ impl Queue {
     }
 }
 
+/// Who a phone request is from: its network id, the Pond's own id for it, and its bearer.
+pub(super) struct Caller {
+    pub device: String,
+    pub device_id: String,
+    pub bearer_hash: [u8; 32],
+}
+
 pub(super) async fn caller(
     headers: &HeaderMap,
     handshake: &dyn Handshake,
-) -> Result<(String, [u8; 32]), StatusCode> {
+) -> Result<Caller, StatusCode> {
     let token = pond_api::middleware::extract_bearer_token(headers)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     if !handshake
@@ -112,7 +141,11 @@ pub(super) async fn caller(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let device = network_device(&caller.device_id).map_err(|_| StatusCode::FORBIDDEN)?;
-    Ok((device, Sha256::digest(token.as_bytes()).into()))
+    Ok(Caller {
+        device,
+        device_id: caller.device_id,
+        bearer_hash: Sha256::digest(token.as_bytes()).into(),
+    })
 }
 fn failed(error: anyhow::Error) -> StatusCode {
     tracing::warn!(%error, "remote recovery operation failed");
@@ -122,11 +155,16 @@ async fn request(
     State(runtime): State<Arc<Runtime>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Extension(handshake): Extension<Arc<dyn Handshake>>,
+    Extension(registry): Extension<Arc<dyn DeviceRegistry + Send + Sync>>,
     headers: HeaderMap,
     Json(registration): Json<Registration>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     pond_api::network::require_lan(Some(ConnectInfo(peer))).map_err(|_| StatusCode::FORBIDDEN)?;
-    let (device, hash) = caller(&headers, handshake.as_ref()).await?;
+    let Caller {
+        device,
+        device_id,
+        bearer_hash: hash,
+    } = caller(&headers, handshake.as_ref()).await?;
     let lock = runtime.device_lock(&device);
     let _held = lock.lock().await;
     if runtime
@@ -163,7 +201,16 @@ async fn request(
     };
     tracing::info!(%device, %status, "remote recovery awaiting local review");
     payload["expectedRevision"] = serde_json::Value::String(revision.to_owned());
-    let id = runtime.recovery.insert(device, hash, payload, generation)?;
+    let device_name = match registry.get_device(&device_id).await {
+        Ok(found) => found.map(|d| d.name),
+        Err(error) => {
+            tracing::warn!(%error, %device, "remote recovery: could not read the device's name for review");
+            None
+        }
+    };
+    let id = runtime
+        .recovery
+        .insert(device, hash, payload, device_name, generation)?;
     tracing::info!("remote recovery awaits local review");
     Ok(Json(serde_json::json!({"id":id})))
 }
@@ -182,6 +229,8 @@ async fn review(
             .map(|(id, p)| Review {
                 id: id.clone(),
                 device: p.device.clone(),
+                device_name: p.device_name.clone(),
+                key_preview: key_preview(p.payload["machineKey"].as_str().unwrap_or_default()),
                 approved: p.approved,
             })
             .collect(),
@@ -220,7 +269,11 @@ async fn operation(
     action: &str,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     pond_api::network::require_lan(Some(ConnectInfo(peer))).map_err(|_| StatusCode::FORBIDDEN)?;
-    let (device, hash) = caller(&headers, handshake.as_ref()).await?;
+    let Caller {
+        device,
+        bearer_hash: hash,
+        ..
+    } = caller(&headers, handshake.as_ref()).await?;
     let lock = runtime.device_lock(&device);
     let _held = lock.lock().await;
     if runtime
@@ -326,7 +379,10 @@ pub(super) fn local_routes() -> Router<Arc<Runtime>> {
             axum::routing::post(approve),
         )
 }
-pub(super) fn phone_routes(handshake: Arc<dyn Handshake>) -> Router<Arc<Runtime>> {
+pub(super) fn phone_routes(
+    handshake: Arc<dyn Handshake>,
+    registry: Arc<dyn DeviceRegistry + Send + Sync>,
+) -> Router<Arc<Runtime>> {
     Router::new()
         .route(
             "/api/v1/remote-access/recovery",
@@ -337,6 +393,7 @@ pub(super) fn phone_routes(handshake: Arc<dyn Handshake>) -> Router<Arc<Runtime>
             get(poll).post(execute).delete(cancel),
         )
         .layer(Extension(handshake))
+        .layer(Extension(registry))
 }
 
 #[cfg(test)]
@@ -364,11 +421,15 @@ mod tests {
         let token = paired.session_token.unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
-        let (device, hash) = caller(&headers, handshake.as_ref()).await.unwrap();
+        let Caller {
+            device,
+            bearer_hash: hash,
+            ..
+        } = caller(&headers, handshake.as_ref()).await.unwrap();
         let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
         let id = runtime
             .recovery
-            .insert(device.clone(), hash, serde_json::Value::Null, 0)
+            .insert(device.clone(), hash, serde_json::Value::Null, None, 0)
             .unwrap();
         runtime
             .recovery
@@ -421,6 +482,7 @@ mod tests {
                 "device".into(),
                 [1; 32],
                 serde_json::json!({"expectedRevision":"first"}),
+                None,
                 1,
             )
             .unwrap();
@@ -446,7 +508,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         let expired = queue
-            .insert("device".into(), [1; 32], serde_json::Value::Null, 1)
+            .insert("device".into(), [1; 32], serde_json::Value::Null, None, 1)
             .unwrap();
         queue.0.write().unwrap().get_mut(&expired).unwrap().expires =
             Instant::now() - Duration::from_secs(1);
@@ -454,11 +516,11 @@ mod tests {
             .inspect(&expired, "device", [1; 32], 1, false)
             .is_err());
         let stale = queue
-            .insert("device".into(), [1; 32], serde_json::Value::Null, 1)
+            .insert("device".into(), [1; 32], serde_json::Value::Null, None, 1)
             .unwrap();
         assert!(queue.inspect(&stale, "device", [1; 32], 2, false).is_err());
         let revoked = queue
-            .insert("device".into(), [1; 32], serde_json::Value::Null, 2)
+            .insert("device".into(), [1; 32], serde_json::Value::Null, None, 2)
             .unwrap();
         queue.revoke("device");
         assert!(queue
@@ -469,11 +531,11 @@ mod tests {
     fn queue_is_bounded_and_a_new_request_invalidates_old_approval() {
         let queue = Queue::default();
         let old = queue
-            .insert("device".into(), [1; 32], serde_json::Value::Null, 1)
+            .insert("device".into(), [1; 32], serde_json::Value::Null, None, 1)
             .unwrap();
         queue.0.write().unwrap().get_mut(&old).unwrap().approved = true;
         let new = queue
-            .insert("device".into(), [2; 32], serde_json::Value::Null, 1)
+            .insert("device".into(), [2; 32], serde_json::Value::Null, None, 1)
             .unwrap();
         assert!(queue.inspect(&old, "device", [1; 32], 1, true).is_err());
         assert_eq!(
@@ -482,12 +544,18 @@ mod tests {
         );
         for i in 1..32 {
             queue
-                .insert(format!("device{i}"), [1; 32], serde_json::Value::Null, 1)
+                .insert(
+                    format!("device{i}"),
+                    [1; 32],
+                    serde_json::Value::Null,
+                    None,
+                    1,
+                )
                 .unwrap();
         }
         assert_eq!(
             queue
-                .insert("extra".into(), [1; 32], serde_json::Value::Null, 1)
+                .insert("extra".into(), [1; 32], serde_json::Value::Null, None, 1)
                 .unwrap_err(),
             StatusCode::TOO_MANY_REQUESTS
         );
@@ -498,7 +566,7 @@ mod tests {
         let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
         let id = runtime
             .recovery
-            .insert("device".into(), [1; 32], serde_json::Value::Null, 0)
+            .insert("device".into(), [1; 32], serde_json::Value::Null, None, 0)
             .unwrap();
         let credential = pond_api::host_guard::HostCredential::generate();
         let router = management(runtime.clone(), credential.clone());
@@ -541,5 +609,14 @@ mod tests {
                 .unwrap()["approved"],
             true
         );
+    }
+
+    #[test]
+    fn the_review_shows_a_readable_key_start() {
+        assert_eq!(
+            key_preview(&format!("mkey:0123456789abcdef{}", "0".repeat(48))),
+            "mkey:0123 4567 89ab cdef"
+        );
+        assert_eq!(key_preview(""), "mkey:");
     }
 }

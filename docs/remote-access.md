@@ -198,6 +198,25 @@ remote access without approving anything. The revision is re-read from the
 stand-down's own answer, because standing an enrollment down gives it a new one --
 assuming otherwise cost a household its enrollment without a replacement.
 
+The review names what is being approved (2026-09-30): the phone's name from the
+device list and the first sixteen hex digits of the replacement's machine key,
+which the phone shows too. It used to show only a request id and a hashed device
+id, so a household could approve whichever request arrived first without being
+able to tell it was theirs.
+
+The helper that holds the household's network identity runs with an empty
+environment apart from `HOME`, `TMPDIR`, `SSL_CERT_FILE` and `SSL_CERT_DIR`, so an
+inherited `TS_AUTHKEY` or `HTTPS_PROXY` cannot join it to another tailnet or route
+its coordinator traffic. It must be a regular file owned by the Pond's account or
+root and writable by no one else (`build-network-helper.sh` sets `0755`), and
+`POND_NETWORK_BINARY` selects another helper only in debug builds. Node and machine
+keys are checked for their exact shape before anything is signed for them.
+
+A helper built before 2026-09-30 on a host with umask 002 (Ubuntu's default, the
+Jetson's included) is group-writable and is now refused, so remote access does not
+start; the log names the helper's path. Rebuild it with
+`scripts/build-network-helper.sh`, or `chmod 0755` it.
+
 Remote access lapses after thirty days without the device authenticating from the
 household LAN; see `docs/auth-network-posture.md`. The deadline is reported in the
 remote configuration and the app warns from a week out.

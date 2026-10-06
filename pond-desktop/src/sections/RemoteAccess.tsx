@@ -3,6 +3,7 @@ import { Button, Switch } from '@heroui/react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api/PondApiClient';
 import { isSignInRequired } from '../api/hostCredential';
+import type { RecoveryRequest } from '../api/types';
 
 /** Household activation stays on the Pond's protected local dashboard. */
 export function RemoteAccess() {
@@ -11,7 +12,7 @@ export function RemoteAccess() {
   const [enrollment, setEnrollment] = useState('');
   const [identity, setIdentity] = useState<{ household: string; publicKey: string } | null>(null);
   const [state, setState] = useState('connecting');
-  const [requests, setRequests] = useState<{ id: string; device: string; approved: boolean }[]>([]);
+  const [requests, setRequests] = useState<RecoveryRequest[]>([]);
   const [reviewFailed, setReviewFailed] = useState(false);
   const [busy, setBusy] = useState(false);
   // Every call here needs the host credential; a restart rotates it out from under this tab.
@@ -149,6 +150,8 @@ export function RemoteAccess() {
       <p style={{ margin: 0 }}>{t('remote.recoveryDescription')}</p>
       {reviewFailed && <p role="alert" style={{ margin: 0 }}>{t('remote.reviewFailed')}</p>}
       {requests.map((request) => <div key={request.id} style={{ overflowWrap: 'anywhere', display: 'grid', gap: 4 }}>
+        <p style={{ margin: 0 }}>{request.deviceName ? t('remote.reviewDevice', { name: request.deviceName }) : t('remote.reviewUnnamed')}</p>
+        <p style={{ margin: 0, fontFamily: 'var(--font-mono, monospace)' }}>{t('remote.reviewKey', { key: request.keyPreview })}</p>
         <p style={{ margin: 0 }}>{t('remote.reviewCode', { id: request.id })}</p>
         <div>
           <Button variant="secondary" isDisabled={busy || request.approved} onPress={() => void approve(request.id)}>{t(request.approved ? 'remote.reviewApproved' : 'remote.reviewApprove')}</Button>
