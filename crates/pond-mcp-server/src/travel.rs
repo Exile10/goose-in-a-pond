@@ -1,7 +1,8 @@
-//! Travel MCP server: directions and ride-app links. The user opens each link and confirms in
-//! the app; nothing here books, pays or tracks.
+//! Travel MCP server: directions, ride-app links, and ride offers sent to the speaker's own phone.
+//! Nothing here books a ride: the member gets the fare and confirms on their phone.
 
 use pond_core::mcp::ports::notification::{MemberNotifier, Notification};
+use pond_core::rides::ports::RideAccounts;
 use pond_core::security::ports::draft_authority::DraftAuthority;
 use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::ports::place_lookup::{PlaceFix, PlaceLookup};
@@ -43,6 +44,15 @@ pub struct RideParams {
     pub pickup: Option<String>,
     /// uber (default) or bolt.
     pub app: Option<String>,
+    /// Catch-all for unexpected fields the model might send.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct BookRideParams {
+    pub destination: Option<String>,
     /// Catch-all for unexpected fields the model might send.
     #[serde(flatten)]
     #[schemars(skip)]
@@ -178,6 +188,8 @@ pub struct TravelMcpServer {
     /// Both set: links are also pushed to the speaker's own phones. Either unset: reply only.
     authority: Option<Arc<dyn DraftAuthority>>,
     notifier: Option<Arc<dyn MemberNotifier>>,
+    /// Which members can book; `None` means booking is not set up and `book_ride` says so.
+    ride_accounts: Option<Arc<dyn RideAccounts>>,
     #[allow(dead_code)] // accessed by rmcp's generated tool_handler code
     tool_router: ToolRouter<Self>,
 }
@@ -194,6 +206,7 @@ impl TravelMcpServer {
             places,
             authority: None,
             notifier: None,
+            ride_accounts: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -208,6 +221,11 @@ impl TravelMcpServer {
         self
     }
 
+    pub fn with_ride_accounts(mut self, accounts: Option<Arc<dyn RideAccounts>>) -> Self {
+        self.ride_accounts = accounts;
+        self
+    }
+
     #[tool(description = "\
 Directions to a place as Google Maps and Apple Maps links the user opens on \
 their phone. Omit origin for their current location. Never invent routes or times.")]
@@ -218,6 +236,18 @@ their phone. Omit origin for their current location. Never invent routes or time
     ) -> Result<CallToolResult, ErrorData> {
         crate::set_current_tool("get_directions_link");
         Ok(self.directions_result(&ctx.meta, &params.0).await)
+    }
+
+    #[tool(description = "\
+Book an Uber for the person speaking: sends the trip to their own phone, which gets \
+the fare from where they are and books only when they confirm. Never claim a ride is booked.")]
+    async fn book_ride(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        params: Parameters<BookRideParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("book_ride");
+        Ok(self.book_result(&ctx.meta, &params.0).await)
     }
 
     #[tool(description = "\
@@ -409,40 +439,133 @@ impl TravelMcpServer {
     /// line saying where it went. Only a named member is pushed to: a household or guest speaker
     /// has no phone that is theirs, and a broadcast would put one person's trip on every phone.
     async fn deliver(&self, meta: &Meta, link: PhoneLink) -> Option<String> {
-        let (Some(authority), Some(notifier)) = (&self.authority, &self.notifier) else {
+        if self.authority.is_none() || self.notifier.is_none() {
             return None;
+        }
+        let profile_id = match self.speaker(meta).await {
+            Ok(id) => id,
+            Err(why) => return Some(format!("Not sent to a phone: {why}.")),
         };
-        let Some(session) = crate::session_meta::session_from_meta(meta) else {
-            return Some("Not sent to a phone: this call carries no session.".to_string());
-        };
-        let profile_id =
-            match authority.actor_for_engine_session(&session).await {
-                Some((ProfileScope::Owner(id), _)) => id,
-                _ => return Some(
-                    "Not sent to a phone: the speaker is not identified as one household member."
-                        .to_string(),
-                ),
-            };
-        let notification = Notification {
-            id: uuid::Uuid::new_v4().to_string(),
-            target: profile_id.clone(),
-            category: "info".to_string(),
-            title: link.title,
-            body: link.body,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            data: Some(serde_json::json!({
-                "action": "open_url",
-                "kind": link.kind,
-                "url": link.url,
-                "label": link.label,
-            })),
-        };
-        let reached = notifier.notify_member(&profile_id, notification).await;
-        Some(match reached.len() {
+        let data = serde_json::json!({
+            "action": "open_url",
+            "kind": link.kind,
+            "url": link.url,
+            "label": link.label,
+        });
+        let reached = self
+            .push(&profile_id, "info", link.title, link.body, data)
+            .await;
+        Some(match reached {
             0 => "Not sent to a phone: the speaker has no paired phone of their own.".to_string(),
             1 => "Also sent to the speaker's phone.".to_string(),
             n => format!("Also sent to the speaker's {n} paired devices."),
         })
+    }
+
+    /// The household member speaking in this call, or why there is none.
+    async fn speaker(&self, meta: &Meta) -> Result<String, &'static str> {
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or("this pond cannot tell who is speaking")?;
+        let session =
+            crate::session_meta::session_from_meta(meta).ok_or("this call carries no session")?;
+        match authority.actor_for_engine_session(&session).await {
+            Some((ProfileScope::Owner(id), _)) => Ok(id),
+            _ => Err("the speaker is not identified as one household member"),
+        }
+    }
+
+    /// Send to one member's own devices; returns how many it reached, never a broadcast.
+    async fn push(
+        &self,
+        profile_id: &str,
+        category: &str,
+        title: String,
+        body: String,
+        data: serde_json::Value,
+    ) -> usize {
+        let Some(notifier) = &self.notifier else {
+            return 0;
+        };
+        let notification = Notification {
+            id: uuid::Uuid::new_v4().to_string(),
+            target: profile_id.to_string(),
+            category: category.to_string(),
+            title,
+            body,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            data: Some(data),
+        };
+        notifier.notify_member(profile_id, notification).await.len()
+    }
+
+    /// The body of `book_ride`, apart from the rmcp wrapper so tests can call it.
+    pub async fn book_result(&self, meta: &Meta, params: &BookRideParams) -> CallToolResult {
+        let fail = |text: String| CallToolResult::error(vec![Content::text(text)]);
+        let Some(accounts) = &self.ride_accounts else {
+            return fail(
+                "Booking rides is not set up on this pond, so no ride offer was sent.".into(),
+            );
+        };
+        let Some(destination) = text_param(&params.destination, &params.extra, DESTINATION_KEYS)
+        else {
+            return fail("No destination was given, so no ride offer was sent.".into());
+        };
+        let profile_id = match self.speaker(meta).await {
+            Ok(id) => id,
+            Err(why) => return fail(format!("No ride offer was sent: {why}.")),
+        };
+        match accounts.is_connected(&profile_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return fail(
+                    "This member has not connected Uber on this pond (Settings, Accounts), so no \
+                     ride offer was sent."
+                        .into(),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "travel: could not read the member's Uber connection");
+                return fail(
+                    "Could not read this member's Uber connection; no ride offer was sent.".into(),
+                );
+            }
+        }
+        let fix = match self.resolve(&destination).await {
+            Ok(fix) => fix,
+            Err(why) => {
+                return fail(format!(
+                    "No ride offer was sent: {why} for \"{destination}\"."
+                ))
+            }
+        };
+
+        let data = serde_json::json!({
+            "action": "ride_offer",
+            "provider": "uber",
+            "dropoff": {"name": fix.name, "latitude": fix.latitude, "longitude": fix.longitude},
+            "label": "Get a fare",
+        });
+        let reached = self
+            .push(
+                &profile_id,
+                "action_required",
+                format!("Ride to {}?", fix.name),
+                "Get an Uber fare from where you are. Nothing is booked until you confirm.".into(),
+                data,
+            )
+            .await;
+        if reached == 0 {
+            return fail(
+                "No ride offer was sent: the speaker has no paired phone of their own.".into(),
+            );
+        }
+        CallToolResult::success(vec![Content::text(format!(
+            "Sent a ride offer to the speaker's phone: a ride to {} (matched from \"{destination}\"). \
+             The phone gets the fare from where it is. Nothing is booked until they confirm on the phone.",
+            fix.name
+        ))])
     }
 }
 
@@ -487,8 +610,10 @@ impl ServerHandler for TravelMcpServer {
                  Tools:\n\
                  - get_directions_link: Google Maps and Apple Maps directions to a place.\n\
                  - get_ride_link: an Uber link with pickup and drop-off filled in. Bolt has no \
-                 such link.\n\n\
-                 Nothing here books, pays for or tracks a ride.",
+                 such link.\n\
+                 - book_ride: an Uber ride offer on the speaker's own phone, booked only when \
+                 they confirm there.\n\n\
+                 Nothing here books a ride without the member's confirmation on their phone.",
             )
     }
 }
@@ -503,6 +628,12 @@ struct TravelDeps {
 }
 
 static TRAVEL_DEPS: OnceLock<TravelDeps> = OnceLock::new();
+static RIDE_ACCOUNTS: OnceLock<Arc<dyn RideAccounts>> = OnceLock::new();
+
+/// Turn on `book_ride`. Call once at startup, when a ride provider is configured.
+pub fn init_ride_accounts(accounts: Arc<dyn RideAccounts>) {
+    let _ = RIDE_ACCOUNTS.set(accounts);
+}
 
 /// Install the place lookup. Call once at startup.
 pub fn init_travel_deps(places: Option<Arc<dyn PlaceLookup>>) {
@@ -519,7 +650,8 @@ pub fn spawn_travel_server(reader: DuplexStream, writer: DuplexStream) {
         return;
     };
     let server = TravelMcpServer::new(deps.places.clone())
-        .with_phone_delivery(crate::speaker_authority(), crate::member_notifier());
+        .with_phone_delivery(crate::speaker_authority(), crate::member_notifier())
+        .with_ride_accounts(RIDE_ACCOUNTS.get().cloned());
     crate::serve_builtin(TRAVEL_EXTENSION, server, reader, writer);
 }
 
@@ -885,6 +1017,166 @@ mod delivery_tests {
                 .await,
         );
         assert!(!out.contains("sent to"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod booking_tests {
+    //! `book_ride` sends an offer to the speaker's own phone and books nothing itself.
+
+    use super::*;
+    use async_trait::async_trait;
+    use pond_core::mcp::mocks::mock_member_notifier::MockMemberNotifier;
+    use pond_core::security::ports::policy::{PolicyDecision, PolicyMode};
+    use pond_core::user_data::domain::session::IdentificationSource;
+
+    struct Speaker(Option<ProfileScope>);
+
+    #[async_trait]
+    impl DraftAuthority for Speaker {
+        async fn policy_mode(&self) -> PolicyMode {
+            PolicyMode::Audit
+        }
+        async fn actor_for_engine_session(
+            &self,
+            _s: &str,
+        ) -> Option<(ProfileScope, IdentificationSource)> {
+            self.0.clone().map(|s| (s, IdentificationSource::Explicit))
+        }
+        async fn audit(&self, _s: &str, _a: &str, _d: &PolicyDecision) {}
+    }
+
+    struct Connected(&'static [&'static str]);
+
+    #[async_trait]
+    impl RideAccounts for Connected {
+        async fn is_connected(&self, profile_id: &str) -> anyhow::Result<bool> {
+            Ok(self.0.contains(&profile_id))
+        }
+    }
+
+    struct Places;
+
+    #[async_trait]
+    impl PlaceLookup for Places {
+        async fn by_name(&self, query: &str) -> anyhow::Result<PlaceFix> {
+            if query != "JKIA" {
+                anyhow::bail!("no location found for '{query}'");
+            }
+            Ok(PlaceFix {
+                name: "Jomo Kenyatta International Airport, Kenya".into(),
+                latitude: -1.319167,
+                longitude: 36.9275,
+                timezone: None,
+            })
+        }
+    }
+
+    fn meta() -> Meta {
+        let mut m = Meta::new();
+        m.0.insert(
+            crate::session_meta::SESSION_ID_META_KEY.to_string(),
+            serde_json::json!("engine-1"),
+        );
+        m
+    }
+
+    fn server(
+        speaker: Option<ProfileScope>,
+        connected: &'static [&'static str],
+        notifier: Arc<MockMemberNotifier>,
+    ) -> TravelMcpServer {
+        TravelMcpServer::new(Some(Arc::new(Places)))
+            .with_phone_delivery(Some(Arc::new(Speaker(speaker))), Some(notifier))
+            .with_ride_accounts(Some(Arc::new(Connected(connected))))
+    }
+
+    fn to(place: &str) -> BookRideParams {
+        BookRideParams {
+            destination: Some(place.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn liz() -> Option<ProfileScope> {
+        Some(ProfileScope::Owner("liz".into()))
+    }
+
+    #[tokio::test]
+    async fn the_offer_goes_to_the_speakers_phone_with_the_matched_drop_off() {
+        let notifier = Arc::new(MockMemberNotifier::new().with_devices("liz", &["liz-phone"]));
+        let result = server(liz(), &["liz"], notifier.clone())
+            .book_result(&meta(), &to("JKIA"))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{}", text(&result));
+        assert!(text(&result).contains("Nothing is booked"));
+
+        let sent = notifier.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "liz");
+        assert_eq!(sent[0].1.category, "action_required");
+        let data = sent[0].1.data.as_ref().unwrap();
+        assert_eq!(data["action"], "ride_offer");
+        assert_eq!(data["dropoff"]["latitude"], -1.319167);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_when_booking_cannot_happen() {
+        let cases: [(Option<ProfileScope>, &'static [&'static str], &str, &str); 4] = [
+            (
+                Some(ProfileScope::Guest),
+                &["liz"],
+                "JKIA",
+                "not identified",
+            ),
+            (
+                Some(ProfileScope::Household),
+                &["liz"],
+                "JKIA",
+                "not identified",
+            ),
+            (liz(), &[], "JKIA", "has not connected Uber"),
+            (liz(), &["liz"], "my aunt's place", "no place matched"),
+        ];
+        for (speaker, connected, place, says) in cases {
+            let notifier = Arc::new(MockMemberNotifier::new().with_devices("liz", &["liz-phone"]));
+            let result = server(speaker.clone(), connected, notifier.clone())
+                .book_result(&meta(), &to(place))
+                .await;
+            assert_eq!(result.is_error, Some(true), "{speaker:?} {place}");
+            assert!(text(&result).contains(says), "{}", text(&result));
+            assert!(
+                notifier.sent().is_empty(),
+                "{speaker:?} {place} was sent an offer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_member_without_a_phone_or_a_pond_without_booking_says_so() {
+        let no_phone = Arc::new(MockMemberNotifier::new());
+        let result = server(liz(), &["liz"], no_phone)
+            .book_result(&meta(), &to("JKIA"))
+            .await;
+        assert!(
+            text(&result).contains("no paired phone"),
+            "{}",
+            text(&result)
+        );
+
+        let unset = TravelMcpServer::new(Some(Arc::new(Places)))
+            .book_result(&meta(), &to("JKIA"))
+            .await;
+        assert!(text(&unset).contains("not set up"), "{}", text(&unset));
     }
 }
 
