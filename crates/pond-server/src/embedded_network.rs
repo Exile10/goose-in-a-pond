@@ -1476,47 +1476,61 @@ async fn register_phone(
 
     // Skip re-enrolling a phone already active with the same identity (it would raise a
     // conflict); any other answer, or none, falls through to the enrollment below.
-    let replaces_existing = match runtime.authority("inspect", payload.clone()).await {
+    let decided = match runtime.authority("inspect", payload.clone()).await {
         Ok(existing) => {
-            let field = |name: &str| {
-                existing
-                    .get(name)
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            let status = field("status");
-            // Machine keys are public; only whether they match is logged, as the keys are noise.
-            let same_identity = field("machineKey") == registration.machine_key;
-            if status == "active" && same_identity {
-                tracing::info!(
+            let decided = phone_enrollment(&existing, &registration.machine_key);
+            let status = existing
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            match &decided {
+                PhoneEnrollment::AlreadyEnrolled => {
+                    tracing::info!(
+                        target: "giap::trace",
+                        kind = "remote_access_already_enrolled",
+                        %device,
+                        "remote access: already enrolled with this identity and active; nothing to do"
+                    );
+                    runtime.record_enrolled(&device).map_err(store_failed)?;
+                    return Ok(Json(existing));
+                }
+                PhoneEnrollment::Replace(_) => tracing::info!(
                     target: "giap::trace",
-                    kind = "remote_access_already_enrolled",
-                    %device,
-                    "remote access: already enrolled with this identity and active; nothing to do"
-                );
-                runtime.record_enrolled(&device).map_err(store_failed)?;
-                return Ok(Json(existing));
+                    kind = "remote_access_reenrolling",
+                    %device, %status,
+                    "remote access: the phone's previous enrollment was stood down, so it is replaced"
+                ),
+                PhoneEnrollment::Enroll => tracing::info!(
+                    %device, %status,
+                    "remote access: an existing enrollment does not match, so enrolling again"
+                ),
             }
-            tracing::info!(
-                %device, status = %status, same_identity,
-                "remote access: an existing enrollment does not match, so enrolling again"
-            );
-            true
+            Some(decided)
         }
         Err(error) => {
             // Not a failure: the enrollment below is the authority.
             tracing::info!(%error, %device, "remote access: could not inspect the existing enrollment; enrolling");
-            false
+            None
         }
+    };
+    // Only a plain enrollment over a record another identity holds is expected to be refused:
+    // that refusal sends the phone to recovery. A refused replace is a fault.
+    let refusal_expected = matches!(decided, Some(PhoneEnrollment::Enroll));
+    let (operation, payload) = match decided {
+        Some(PhoneEnrollment::Replace(revision)) => {
+            let mut payload = payload;
+            payload["expectedRevision"] = serde_json::Value::String(revision);
+            ("replace", payload)
+        }
+        _ => ("enroll", payload),
     };
 
     let enrolled = runtime
-        .authority("enroll", payload)
+        .authority(operation, payload)
         .await
         .map_err(|error| {
             let refused = error.downcast_ref::<RefusedByCoordinator>().is_some();
-            if refused && replaces_existing {
+            if refused && refusal_expected {
                 // Expected, not a fault: the coordinator will not let a new identity take over an
                 // enrollment it already holds. The 409 offers the phone recovery, which someone
                 // approves on the home network.
@@ -1545,6 +1559,48 @@ async fn register_phone(
     tracing::info!(%device, "remote access: phone enrolled");
     Ok(Json(enrolled))
 }
+/// What a phone enrolling from the home network asks the coordinator for, given the
+/// enrollment the coordinator already holds for its device.
+#[derive(Debug, PartialEq)]
+enum PhoneEnrollment {
+    /// Active with this identity: nothing to do.
+    AlreadyEnrolled,
+    /// A first enrollment. Also what an active enrollment held by another identity gets,
+    /// which the coordinator refuses, sending the phone to recovery and its local approval.
+    Enroll,
+    /// A stood-down enrollment, replaced at the revision the coordinator reported.
+    Replace(String),
+}
+
+/// Decides [`PhoneEnrollment`] from the coordinator's `inspect` answer.
+///
+/// A phone removed from the household, or whose remote access lapsed, leaves a `revoked`
+/// enrollment under its device id, and a re-paired phone keeps that id. The coordinator
+/// refuses a plain enrollment over any existing record, so without this the phone could
+/// only come back through recovery, approved on the dashboard a second time after the
+/// pairing that already needed it. Replacing a stood-down record grants nothing a first
+/// enrollment would not: both need a LAN peer and a valid bearer, and there is no working
+/// enrollment to take over. An active one stays behind the recovery approval, because
+/// replacing it would drop remote access the household is using. So does a `failed` one:
+/// a refused enrollment can be failed again at will, and every replacement retires the old
+/// record against the household's bounded retirement budget, so replacing failed records
+/// would let a loop of bad enrollments spend that budget without anyone approving it.
+fn phone_enrollment(existing: &serde_json::Value, machine_key: &str) -> PhoneEnrollment {
+    let field = |name: &str| {
+        existing
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    match field("status") {
+        "active" if field("machineKey") == machine_key => PhoneEnrollment::AlreadyEnrolled,
+        "revoked" if valid_device(field("revision")) => {
+            PhoneEnrollment::Replace(field("revision").to_owned())
+        }
+        _ => PhoneEnrollment::Enroll,
+    }
+}
+
 /// Companion enrollment uses the same bearer middleware and actual-peer LAN checks.
 pub fn companion_management(runtime: Arc<Runtime>, state: Arc<pond_api::AppState>) -> Router {
     let limiter = Arc::new(pond_api::middleware::RateLimiter::new(
@@ -1625,6 +1681,57 @@ mod tests {
         assert_eq!(helper_complaint(b"   \n  "), "and said nothing");
     }
     use super::*;
+
+    #[test]
+    fn a_removed_phone_replaces_its_stood_down_enrollment() {
+        let key = "mkey:aaaa";
+        let revision = "rev-0123456789abcdef";
+        let existing = serde_json::json!({
+            "status": "revoked", "machineKey": "mkey:old", "revision": revision
+        });
+        assert_eq!(
+            phone_enrollment(&existing, key),
+            PhoneEnrollment::Replace(revision.into())
+        );
+    }
+
+    #[test]
+    fn an_active_enrollment_is_never_replaced_without_approval() {
+        let existing = serde_json::json!({
+            "status": "active", "machineKey": "mkey:other", "revision": "rev-0123456789abcdef"
+        });
+        assert_eq!(
+            phone_enrollment(&existing, "mkey:aaaa"),
+            PhoneEnrollment::Enroll
+        );
+        let same = serde_json::json!({"status": "active", "machineKey": "mkey:aaaa"});
+        assert_eq!(
+            phone_enrollment(&same, "mkey:aaaa"),
+            PhoneEnrollment::AlreadyEnrolled
+        );
+    }
+
+    #[test]
+    fn anything_else_enrolls_and_leaves_the_decision_to_the_coordinator() {
+        for existing in [
+            serde_json::json!({}),
+            serde_json::json!({"status": "pending", "revision": "rev-0123456789abcdef"}),
+            // Each replacement spends a retirement slot, and a refused enrollment can be
+            // failed again at will, so a failed record waits for the recovery approval.
+            serde_json::json!({"status": "failed", "machineKey": "mkey:old", "revision": "rev-0123456789abcdef"}),
+            // A revision the helper would reject is not sent.
+            serde_json::json!({"status": "revoked", "revision": "short"}),
+            serde_json::json!({"status": "revoked", "revision": "has spaces in it, too many"}),
+            serde_json::json!({"status": "revoked"}),
+            serde_json::json!({"status": "active"}),
+        ] {
+            assert_eq!(
+                phone_enrollment(&existing, "mkey:aaaa"),
+                PhoneEnrollment::Enroll,
+                "{existing}"
+            );
+        }
+    }
 
     #[test]
     fn enabling_without_a_coordinator_uses_the_hosted_one() {
