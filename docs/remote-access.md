@@ -43,7 +43,9 @@ coordinator policy permits an approved phone to reach only its own Pond HTTPS po
   `serve --https-port PORT` overrides its starting port. Each listener tries ten
   consecutive ports. Neither listener falls back to plaintext network access.
 - Read `<data_dir>/.runtime_api_port` and `.runtime_https_port` for actual ports.
-  `/api/v1/system/info` publishes `https_port` and `tls_spki_sha256`.
+  `/api/v1/system/info` publishes `https_port` and `tailnet_address` to anyone; the
+  pin comes with the pairing code from `/handshake/pairing-code` (host only) and
+  from mDNS.
 - mDNS `_pond._tcp.local.` publishes the HTTPS port and `scheme=https`.
   Discovery supplies candidates; it never supplies trusted keys.
 

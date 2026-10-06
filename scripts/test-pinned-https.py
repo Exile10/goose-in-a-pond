@@ -94,10 +94,17 @@ def main():
                             time.sleep(0.1)
                     else:
                         raise AssertionError(f"HTTPS did not become ready: {last_error}")
-                    assert info["https_port"] == https_port and info["tls_spki_sha256"] == pin
+                    # Anonymous callers learn where to connect and nothing about the household.
+                    assert info["https_port"] == https_port and info["protocol"] == 2
+                    assert "hostname" not in info and "tls_spki_sha256" not in info, info
                     curl(https + "/api/v1/health", certificate, pin)
-                    if info.get("lan_address"):
-                        lan = info["lan_address"]
+                    curl(http + "/api/v1/handshake/pairing-code", expect=403)
+                    host_credential = (data / ".runtime_host_credential").read_text().strip()
+                    pairing = curl(http + "/api/v1/handshake/pairing-code",
+                                   headers=["X-Pond-Host-Credential: " + host_credential])["pairing"]
+                    assert pairing["https_port"] == https_port and pairing["tls_spki_sha256"] == pin
+                    if pairing.get("lan_address"):
+                        lan = pairing["lan_address"]
                         curl(f"https://{lan}:{https_port}/api/v1/health", certificate, pin)
                         plain_lan = subprocess.run(["curl", "--silent", "--max-time", "3",
                                                     f"http://{lan}:{http_port}/api/v1/health"], capture_output=True)
@@ -105,10 +112,6 @@ def main():
                     curl(https + "/api/v1/devices", certificate, pin, expect=401)
                     for path in ["/", "/dev/test", "/dev/face", "/assets/index.js"]:
                         curl(https + path, certificate, pin, expect=404)
-                    curl(http + "/api/v1/handshake/pairing-code", expect=403)
-                    host_credential = (data / ".runtime_host_credential").read_text().strip()
-                    curl(http + "/api/v1/handshake/pairing-code",
-                         headers=["X-Pond-Host-Credential: " + host_credential])
                     curl(https + "/api/v1/handshake/init", certificate, pin,
                          data={"client_id": "scratch-phone", "client_type": "gotg", "client_version": "test"})
                     bad = subprocess.run(["curl", "--silent", "--max-time", "10", "--cacert", str(certificate),
