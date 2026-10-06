@@ -21,7 +21,7 @@ the upstream build behavior.
 Changes from the published crate: this note, `namespace.rs`, build-script wiring,
 a standalone Cargo workspace declaration, the upstream Unlicense text
 (restored from the whisper-rs repository because the published crate omitted it),
-and two native source changes, below.
+and three native source changes, below.
 When updating Whisper, regenerate and inspect the linked symbol inventory and run
 both GPU transcription and inference in the same production process before shipping.
 
@@ -73,3 +73,18 @@ in `OUT_DIR` file by file. Before, the copy was made once per `OUT_DIR` and only
 nothing and the earlier library shipped with no error. `namespace.rs` leaves the
 forced-include header alone when its content is unchanged: every native file includes
 it, so rewriting it recompiled all of them (44 minutes on the Jetson) for a one-file edit.
+
+## Native source change: a state's batch starts empty
+
+`whisper.cpp/src/whisper.cpp` gives `whisper_state::batch` an initializer, so a new
+state's batch is all null. This is Pond's own change; upstream has the same bug. Drop
+it when upstream initialises the member.
+
+`whisper_init_state` creates the state with `new whisper_state`, which leaves `batch`
+indeterminate until the batch is allocated near the end. Every earlier failure, a
+backend, `kv_self`, `kv_cross` or `kv_pad` that cannot be allocated, goes through
+`whisper_free_state`, which hands that batch to `whisper_batch_free`. So the
+out-of-memory path the graph-reservation change above turns into an error freed
+whatever the pointers happened to hold, and when the allocator returned the block a
+previous, already freed state had used, that was a double free. `whisper_batch_free`
+skips null pointers, so an empty batch makes the early free do nothing.
