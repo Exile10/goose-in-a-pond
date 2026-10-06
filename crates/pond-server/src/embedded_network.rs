@@ -2419,7 +2419,10 @@ mod tests {
             request
                 .extensions_mut()
                 .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
-            let response = management(runtime).oneshot(request).await.unwrap();
+            let response = management_with_credential(runtime)
+                .oneshot(request)
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(response.into_body(), 4096)
                 .await
