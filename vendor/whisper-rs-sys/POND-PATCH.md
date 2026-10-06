@@ -19,7 +19,33 @@ names; CPU and CUDA backends remain statically registered. Other platforms retai
 the upstream build behavior.
 
 Changes from the published crate: this note, `namespace.rs`, build-script wiring,
-a standalone Cargo workspace declaration, and the upstream Unlicense text
-(restored from the whisper-rs repository because the published crate omitted it). Native source files are unchanged.
+a standalone Cargo workspace declaration, the upstream Unlicense text
+(restored from the whisper-rs repository because the published crate omitted it),
+and one native source change, below.
 When updating Whisper, regenerate and inspect the linked symbol inventory and run
 both GPU transcription and inference in the same production process before shipping.
+
+## Native source change: graph buffer reservation failure
+
+`whisper.cpp/ggml/src/ggml-backend.cpp`, in `ggml_backend_sched_alloc_splits`, is
+upstream llama.cpp commit `911f6cdc8a` ("ggml : handle graph buffer reservation
+failure", #26070, 2026-09-18), applied unchanged. Drop it when the vendored GGML
+already contains that commit.
+
+Without it, a compute buffer that cannot be allocated crashes the process instead of
+returning an error. `ggml_gallocr_reserve_n` records the new graph layout, fails to
+allocate the buffer and leaves it `NULL`; the scheduler ignored that result, and
+`ggml_gallocr_alloc_graph` then found a matching layout, skipped reallocation and
+dereferenced the `NULL` buffer. On a Jetson this is ordinary: the LLM and Whisper share
+the GPU, and on 2026-10-04 a 90 MiB encoder buffer failed and the Pond took `SIGSEGV`.
+The last log line before such a crash is `ggml_gallocr_reserve_n_impl: failed to
+allocate CUDA0 buffer`; with the change it is followed by `failed to reserve graph
+buffers` and Whisper's own `failed to init ... allocator`, and the transcription
+returns an error.
+
+`build.rs` declares the native sources with `rerun-if-changed` and refreshes the copy
+in `OUT_DIR` file by file. Before, the copy was made once per `OUT_DIR` and only
+`wrapper.h` and `namespace.rs` were watched, so an edit to a native source compiled
+nothing and the earlier library shipped with no error. `namespace.rs` leaves the
+forced-include header alone when its content is unchanged: every native file includes
+it, so rewriting it recompiled all of them (44 minutes on the Jetson) for a one-file edit.

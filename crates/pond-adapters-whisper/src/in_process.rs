@@ -181,7 +181,8 @@ impl WhisperRsInput {
             return Ok(String::new());
         }
         let n_threads = opts.n_threads.unwrap_or_else(default_threads);
-        let audio_ctx = opts.fit_audio_ctx.then(|| audio_ctx_for(samples.len()));
+        let sample_count = samples.len();
+        let audio_ctx = opts.fit_audio_ctx.then(|| audio_ctx_for(sample_count));
 
         // Catches Rust panics from whisper-rs; a C++ failure in whisper.cpp aborts regardless.
         let result = catch_unwind(AssertUnwindSafe(move || -> Result<String> {
@@ -232,7 +233,17 @@ impl WhisperRsInput {
 
         match result {
             Ok(Ok(text)) => Ok(text),
-            Ok(Err(e)) => Err(e),
+            // Most often the GPU had no room for this call's buffers while the LLM held it.
+            // Each call allocates afresh, so the next request retries on its own.
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    kind = "whisper_transcription_failed",
+                    error = format!("{e:#}"),
+                    samples = sample_count,
+                    "whisper could not transcribe this audio"
+                );
+                Err(e)
+            }
             Err(panic) => {
                 let msg = panic_message(&panic);
                 tracing::error!("whisper-rs panic caught: {}", msg);
@@ -811,5 +822,42 @@ mod decode_profiles {
             .expect("decode");
         eprintln!("\n  quiet-room transcript: {out:?}\n");
         assert!(!out.contains('['), "annotation leaked through: {out:?}");
+    }
+
+    /// Fill the GPU with Whisper states until there is no room for another, as the LLM does
+    /// in production, and require that the failure is an error. Before the GGML change in
+    /// `vendor/whisper-rs-sys/POND-PATCH.md` it was a `SIGSEGV`, so a crash here is that bug.
+    ///
+    /// It exhausts device memory on purpose: stop the Pond first. CUDA builds only, because
+    /// on unified memory without a device limit it would fill RAM before anything failed.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn running_out_of_gpu_memory_is_an_error_not_a_crash() {
+        let Some(ctx) = model() else {
+            eprintln!("set WHISPER_TEST_MODEL to run this");
+            return;
+        };
+        let mut held = Vec::new();
+        let error = loop {
+            match ctx.create_state() {
+                Ok(state) => held.push(state),
+                Err(error) => break error,
+            }
+            assert!(
+                held.len() < 256,
+                "the GPU never filled; is this a CUDA build?"
+            );
+        };
+        eprintln!("\n  {} states fit before: {error}\n", held.len());
+        assert!(
+            !held.is_empty(),
+            "not even one state fit, so nothing was tested"
+        );
+
+        drop(held);
+        let after = WhisperRsInput::transcribe_samples(ctx, jfk_samples())
+            .expect("memory released by the failed and the held states serves a transcription");
+        assert!(after.to_lowercase().contains("country"), "{after:?}");
     }
 }

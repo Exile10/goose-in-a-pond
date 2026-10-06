@@ -561,7 +561,8 @@ fn detection_loop(
                 continue;
             }
             Err(e) => {
-                tracing::warn!("Whisper error (retrying): {}", e);
+                // The backend has logged the failure with its cause; the next window retries.
+                tracing::debug!("KWS: window not transcribed, retrying: {}", e);
                 continue;
             }
         };
