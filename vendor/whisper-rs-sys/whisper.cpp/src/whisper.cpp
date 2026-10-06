@@ -862,7 +862,7 @@ struct whisper_state {
 
     whisper_mel mel;
 
-    whisper_batch batch;
+    whisper_batch batch = {};
 
     whisper_decoder decoders[WHISPER_MAX_DECODERS];
 
@@ -1002,6 +1002,7 @@ static bool whisper_kv_cache_init(
     cache.buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!cache.buffer) {
         WHISPER_LOG_ERROR("%s: failed to allocate memory for the kv cache\n", __func__);
+        ggml_free(ctx);
         return false;
     }
 
@@ -7123,6 +7124,10 @@ int whisper_full_with_state(
                     WHISPER_LOG_DEBUG("%s: recreating KV cache: n_decoders_cur = %d\n", __func__, n_decoders_cur);
 
                     whisper_kv_cache_free(state->kv_self);
+                    // Until the cache below exists, no decoder count fits it, so a later call
+                    // on this state recreates it rather than decoding into freed memory.
+                    state->kv_self.buffer = nullptr;
+                    state->kv_self_n_dec = 0;
 
                     // overallocate to workaround KV cache fragmentation issues
                     const int factor = n_decoders_cur > 1 ? n_decoders_cur + 2 : 1;
@@ -7132,7 +7137,8 @@ int whisper_full_with_state(
                                 ctx->model.hparams.n_text_layer,
                                 GGML_PAD(ctx->model.hparams.n_text_ctx, 256)*factor)) {
                         WHISPER_LOG_ERROR("%s: whisper_kv_cache_init() failed for self-attention cache\n", __func__);
-                        whisper_free_state(state);
+                        // The state belongs to the caller, who frees it: freeing it here as
+                        // well was a double free, and a SIGBUS on the Jetson (POND-PATCH.md).
                         return -7;
                     }
 
