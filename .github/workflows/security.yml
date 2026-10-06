@@ -77,7 +77,7 @@ jobs:
 
       # Prebuilt binary — installs in seconds vs minutes for cargo install.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2.87.22
+        uses: taiki-e/install-action@v2.87.23
         with:
           tool: cargo-audit
 
