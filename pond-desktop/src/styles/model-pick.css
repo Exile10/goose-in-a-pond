@@ -1,0 +1,101 @@
+/* ─── Recommended picks ─────────────────────────────────────────────────────
+ *
+ * A pick is a card on the ink edge: it is what the screen is for. The hard offset
+ * is spent on one of them (the model in use, else the one GIAP puts first), so it
+ * means something. Shared by the classic page and the hub.
+ */
+
+.mm-picks {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--space-5);
+}
+
+.mm-pick {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-4);
+  background: var(--color-surface);
+  border: 2px solid var(--color-text);
+  border-radius: var(--radius-lg);
+}
+
+.mm-pick[data-raised="true"] { box-shadow: var(--shadow-ink); }
+
+.mm-pick__head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.mm-pick__title {
+  font-family: var(--font-heading);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  line-height: var(--leading-tight);
+  color: var(--color-text);
+  margin: 0;
+}
+
+.mm-pick__reason {
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--leading-base);
+  color: var(--color-text);
+  margin: 0;
+}
+
+/* Numbers someone measured on this kind of machine. Mono, because every part of
+   it is a figure; the date says when, and the card says nothing where nothing was
+   measured. */
+.mm-pick__measured {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--color-border-strong);
+}
+
+.mm-pick__numbers {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-base);
+  color: var(--color-text);
+}
+
+.mm-pick__caption {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+.mm-pick__foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: auto;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+.mm-pick__foot > .mm-xfer { flex: 1 1 100%; }
+
+.mm-pick__cost {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.mm-pick__size {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+

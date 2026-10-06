@@ -92,29 +92,36 @@ describe("updateSettings()", () => {
 // ── models ────────────────────────────────────────────────────────────────────
 
 describe("listModels()", () => {
-  it("flattens the grouped reply, carrying reads_images and image_support_bytes through", async () => {
+  /** A row as `GET /api/v1/models` sends it. */
+  const e2b = {
+    id: "gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL",
+    category: "gguf",
+    name: "gemma-4-E2B-it-qat-UD-Q4_K_XL",
+    title: "Gemma 4 E2B",
+    description: "Gemma 4 E2B Instruct, quantisation-aware 4-bit (~2.6 GB)",
+    active: true,
+    downloaded: true,
+    size_mb: 2498,
+    quantization: "UD-Q4_K_XL",
+    engine: { id: "llama_cpp", label: "llama.cpp", file_format: ".gguf", in_process: true },
+    provenance: "catalogue",
+    kind: "conversation",
+    acquire: "download",
+    recommended: { rank: "lighter", reason: "Faster replies and a smaller download" },
+    companions: [{ kind: "pictures", label: "Gemma 4 E2B", size_bytes: 986_833_728, state: "available" }],
+    // The server still sends these; the client no longer reads them.
+    reads_images: true,
+    image_support_bytes: 986_833_728,
+  };
+
+  it("flattens the grouped reply, carrying the engine, source, kind, picks and companions through", async () => {
     fetchMock.mockResolvedValueOnce(
       okJson({
         gguf: [
-          {
-            name: "gemma-4-E2B-it-Q4_K_M",
-            description: "Gemma 4 E2B",
-            active: true,
-            downloaded: true,
-            size_mb: 2600,
-            category: "llm",
-            reads_images: true,
-            image_support_bytes: 986_833_728,
-          },
-          {
-            name: "llama-3.2-3b",
-            description: "Llama 3.2 3B",
-            active: false,
-            downloaded: true,
-            size_mb: 1900,
-            category: "llm",
-          },
+          e2b,
+          { name: "Llama-3.2-3B", description: "(detected on disk)", downloaded: true, category: "gguf" },
         ],
+        litert: [],
         llamafile: [],
         whisper: [],
         tts: [],
@@ -123,12 +130,39 @@ describe("listModels()", () => {
       }),
     );
     const models = await client().listModels();
-    const vision = models.find((m) => m.name === "gemma-4-E2B-it-Q4_K_M");
-    expect(vision?.reads_images).toBe(true);
-    expect(vision?.image_support_bytes).toBe(986_833_728);
-    const textOnly = models.find((m) => m.name === "llama-3.2-3b");
-    expect(textOnly?.reads_images).toBeUndefined();
-    expect(textOnly?.image_support_bytes).toBeUndefined();
+    const pick = models.find((m) => m.name === e2b.name)!;
+    expect(pick.id).toBe("gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL");
+    expect(pick.title).toBe("Gemma 4 E2B");
+    expect(pick.engine).toEqual(e2b.engine);
+    expect(pick.provenance).toBe("catalogue");
+    expect(pick.kind).toBe("conversation");
+    expect(pick.acquire).toBe("download");
+    expect(pick.recommended).toEqual(e2b.recommended);
+    expect(pick.companions).toEqual(e2b.companions);
+    expect(pick.quantization).toBe("UD-Q4_K_XL");
+    expect(pick).not.toHaveProperty("reads_images");
+    expect(pick).not.toHaveProperty("image_support_bytes");
+  });
+
+  it("reads a row from an older server as text only, with no engine, title or pick", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({ gguf: [{ name: "llama-3.2-3b", description: "Llama 3.2 3B", downloaded: true }] }),
+    );
+    const [row] = await client().listModels();
+    expect(row.id).toBe("gguf/llama-3.2-3b");
+    expect(row.title).toBeUndefined();
+    expect(row.engine).toBeUndefined();
+    expect(row.recommended).toBeUndefined();
+    expect(row.companions).toEqual([]);
+  });
+
+  it("keeps the server's row id, which a download's `model_id` names", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({ tts: [{ id: "tts_kokoro/af_heart", category: "tts_kokoro", name: "af_heart" }] }),
+    );
+    const [voice] = await client().listModels();
+    expect(voice.id).toBe("tts_kokoro/af_heart");
+    expect(voice.provider).toBe("tts");
   });
 });
 
@@ -764,6 +798,173 @@ describe("downloadModelFromUrl()", () => {
       }),
     );
     expect(res.status).toBe("download_started");
+  });
+
+  it("says when the household left the add-on out, and says nothing when they did not", async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(okJson({ status: "downloading" })));
+    await client().downloadModelFromUrl("https://hf.co/f.gguf", "gguf", "f.gguf", { pictures: false });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string)).toEqual({
+      url: "https://hf.co/f.gguf", category: "gguf", filename: "f.gguf", pictures: false,
+    });
+    fetchMock.mockClear();
+    await client().downloadModelFromUrl("https://hf.co/f.gguf", "gguf", "f.gguf", {});
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string)).not.toHaveProperty("pictures");
+  });
+});
+
+describe("downloadModel()", () => {
+  const started = {
+    status: "download_started",
+    model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL",
+    parts: [
+      { part: "model", filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", size_bytes: 4_215_695_776 },
+      { part: "pictures", filename: "mmproj/gemma-4-e4b-it-qat/mmproj-BF16.gguf", size_bytes: 991_552_320 },
+    ],
+    pictures: "included",
+    message: "Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)",
+  };
+
+  it("asks with no body unless told, so the add-on comes by default", async () => {
+    fetchMock.mockResolvedValueOnce(okJson(started));
+    const res = await client().downloadModel("gguf", "gemma-4-E4B-it-qat-UD-Q4_K_XL");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL/download",
+      expect.objectContaining({ method: "POST", body: undefined }),
+    );
+    expect(res.message).toBe("Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)");
+    expect(res.parts?.map((p) => p.part)).toEqual(["model", "pictures"]);
+  });
+
+  it("leaves the add-on out when told", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ ...started, pictures: "left_out" }));
+    await client().downloadModel("gguf", "gemma-4-E4B-it-qat-UD-Q4_K_XL", { pictures: false });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string)).toEqual({ pictures: false });
+  });
+
+  it("encodes the name, which LiteRT-LM files carry an extension in", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ status: "download_started" }));
+    await client().downloadModel("litert", "gemma-4-E4B-it.litertlm");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://localhost:4000/api/v1/models/litert/gemma-4-E4B-it.litertlm/download",
+    );
+  });
+});
+
+describe("controlModelDownload()", () => {
+  it("names the model, not a file, so the pond moves every part of it", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({
+        status: "cancelled",
+        files: [
+          { filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", status: "cancelled" },
+          { filename: "mmproj/gemma-4-e4b-it-qat/mmproj-BF16.gguf", status: "cancelled" },
+        ],
+      }),
+    );
+    const res = await client().controlModelDownload("gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", "cancel");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/download/control",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", action: "cancel" }),
+      }),
+    );
+    expect(res.files).toHaveLength(2);
+  });
+
+  it("carries the pond's refusal when nothing of the model can be told to do that", async () => {
+    fetchMock.mockResolvedValueOnce(errJson(404, "gguf/x has no download that can be told to pause"));
+    await expect(client().controlModelDownload("gguf/x", "pause")).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe("addPictures()", () => {
+  it("POSTs to the model's own companions route, and returns what it will fetch", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({ status: "download_started", message: "Downloading picture support for Gemma 4 E2B (941 MB)" }),
+    );
+    const res = await client().addPictures("gguf", "gemma-4-E2B-it-qat-UD-Q4_K_XL");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:4000/api/v1/models/gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL/companions/pictures",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(res.message).toMatch(/941 MB/);
+  });
+
+  it("carries the server's refusal for a model with no add-on", async () => {
+    fetchMock.mockResolvedValueOnce(errJson(409, "Gemma 4 E4B reads text only", "text_only"));
+    await expect(client().addPictures("litert", "gemma-4-E4B-it.litertlm")).rejects.toMatchObject({
+      status: 409,
+      code: "text_only",
+    });
+  });
+});
+
+describe("getActiveRoles()", () => {
+  const roles = (over: Record<string, unknown>) =>
+    okJson({
+      chat: { provider: "local", model: "gemma-4-E2B-it-qat-UD-Q4_K_XL", model_id: "gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL" },
+      tool: { model: null },
+      asr: { model_id: null },
+      tts: { model_id: null },
+      embedding: { model_id: null, model: "", provider: "fastembed" },
+      ...over,
+    });
+
+  it("reads each slot's model, from its own fields or from its assignment", async () => {
+    fetchMock.mockResolvedValueOnce(
+      roles({ asr: { model_id: "whisper/base.en" }, tts: { model_id: "tts_kokoro/af_heart" } }),
+    );
+    const r = await client().getActiveRoles();
+    expect(r.chat).toEqual({ provider: "local", model: "gemma-4-E2B-it-qat-UD-Q4_K_XL" });
+    expect(r.asr).toEqual({ provider: "whisper", model: "base.en" });
+    expect(r.tts).toEqual({ provider: "tts_kokoro", model: "af_heart" });
+  });
+
+  it("says nothing is chosen for conversation when the setting is empty, whatever an old assignment says", async () => {
+    fetchMock.mockResolvedValueOnce(
+      roles({ chat: { provider: "", model: "", model_id: "gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL" } }),
+    );
+    expect((await client().getActiveRoles()).chat).toBeNull();
+  });
+
+  it("keeps memory's provider when it names no model, so the built-in one can be said", async () => {
+    fetchMock.mockResolvedValueOnce(roles({}));
+    expect((await client().getActiveRoles()).embedding).toEqual({ provider: "fastembed", model: "" });
+  });
+});
+
+describe("getMemoryStatus()", () => {
+  it("carries what a switch would free", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({ total_mb: 7620, available_for_llm_mb: 1000, loaded_model: null, reclaimable_mb: 2600 }),
+    );
+    expect((await client().getMemoryStatus()).reclaimable_mb).toBe(2600);
+  });
+});
+
+describe("getDownloadProgress() entries", () => {
+  it("name the model and the part they belong to, and say why one failed", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({
+        downloads: [
+          {
+            filename: "mmproj/gemma-4-e4b-it-qat/mmproj-BF16.gguf",
+            category: "mmproj",
+            downloaded_bytes: 0,
+            total_bytes: 991_552_320,
+            status: "error",
+            model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL",
+            part: "pictures",
+            error: "HTTP 503",
+          },
+        ],
+      }),
+    );
+    const [d] = (await client().getDownloadProgress()).downloads;
+    expect(d.model_id).toBe("gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL");
+    expect(d.part).toBe("pictures");
+    expect(d.error).toBe("HTTP 503");
   });
 });
 

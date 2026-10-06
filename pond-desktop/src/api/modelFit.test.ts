@@ -1,11 +1,17 @@
 import { describe, it, expect } from "vitest";
 import {
+  availableMb,
   modelFit,
   modelFitFor,
   modelResidencyMb,
+  usableBudgetMb,
   DEFAULT_HEADROOM_MB,
 } from "./modelFit";
-import type { ModelMemoryStatus } from "./types";
+import type { ModelCompanion, ModelMemoryStatus } from "./types";
+
+const PICTURES = (state: ModelCompanion["state"]): ModelCompanion[] => [
+  { kind: "pictures", label: "Gemma 4 E2B", size_bytes: 986_833_728, state },
+];
 
 describe("modelFit", () => {
   // Budget mirrors the Jetson-class E2E mock: 4096 MB available for the LLM.
@@ -76,20 +82,53 @@ describe("modelResidencyMb", () => {
     expect(modelResidencyMb({ size_mb: 0, ram_estimate_mb: 0 })).toBeNull();
   });
 
-  it("adds the encoder's resident bytes when the model reads pictures", () => {
-    // A declared-vision model keeps the encoder resident too (eager load, on
-    // the GPU, at every model load) — the fit meter must count it or a model
-    // that "fits" can still spill once its encoder lands.
-    expect(
-      modelResidencyMb({ size_mb: 2600, reads_images: true, image_support_bytes: 986_833_728 }),
-    ).toBeCloseTo(2600 + 986_833_728 / 1_048_576, 6);
+  it("counts the add-on once it is installed or on its way, because it loads on the GPU too", () => {
+    const encoderMb = 986_833_728 / 1_048_576;
+    for (const state of ["installed", "verifying", "downloading"] as const) {
+      expect(modelResidencyMb({ size_mb: 2600, companions: PICTURES(state) })).toBeCloseTo(
+        2600 + encoderMb,
+        6,
+      );
+    }
   });
 
-  it("never adds encoder bytes when reads_images is not exactly true", () => {
+  it("counts an add-on not yet fetched only where the person is including it", () => {
+    const m = { size_mb: 2600, companions: PICTURES("available") };
+    expect(modelResidencyMb(m)).toBe(2600);
+    expect(modelResidencyMb(m, { withPictures: true })).toBeCloseTo(2600 + 986_833_728 / 1_048_576, 6);
+  });
+
+  it("never counts an add-on this device will not carry", () => {
     expect(
-      modelResidencyMb({ size_mb: 2600, reads_images: false, image_support_bytes: 986_833_728 }),
+      modelResidencyMb({ size_mb: 2600, companions: PICTURES("not_on_this_device") }, { withPictures: true }),
     ).toBe(2600);
-    expect(modelResidencyMb({ size_mb: 2600, image_support_bytes: 986_833_728 })).toBe(2600);
+    expect(modelResidencyMb({ size_mb: 2600, companions: [] })).toBe(2600);
+  });
+});
+
+describe("the budget", () => {
+  const status = (over: Partial<ModelMemoryStatus> = {}): ModelMemoryStatus => ({
+    total_mb: 7620,
+    available_for_llm_mb: 2000,
+    loaded_model: null,
+    ...over,
+  });
+
+  it("is what is free plus what leaving the model in use returns", () => {
+    expect(availableMb(status())).toBe(2000);
+    expect(availableMb(status({ reclaimable_mb: 2600 }))).toBe(4600);
+  });
+
+  it("sets headroom aside, and never reads below zero", () => {
+    expect(usableBudgetMb(status({ reclaimable_mb: 2600 }))).toBe(4600 - DEFAULT_HEADROOM_MB);
+    expect(usableBudgetMb(status({ available_for_llm_mb: 500 }))).toBe(0);
+  });
+
+  it("is unknown, not zero, when the machine reports no budget", () => {
+    expect(availableMb(null)).toBeNull();
+    expect(usableBudgetMb(undefined)).toBeNull();
+    expect(usableBudgetMb(status({ total_mb: 0, available_for_llm_mb: 0 }))).toBeNull();
+    expect(usableBudgetMb(status({ available_for_llm_mb: 0 }))).toBeNull();
   });
 });
 
@@ -115,5 +154,24 @@ describe("modelFitFor", () => {
   it("returns unknown when the scheduler reports no budget (total_mb 0)", () => {
     const noop: ModelMemoryStatus = { total_mb: 0, available_for_llm_mb: 0, loaded_model: null };
     expect(modelFitFor({ size_mb: 5600 }, noop)).toBe("unknown");
+  });
+
+  it("counts what a switch frees, so the model in use never blocks its replacement", () => {
+    // The Orin with a 2.6 GB model loaded: 1000 MB free, 2600 MB returned by switching.
+    const loaded: ModelMemoryStatus = {
+      total_mb: 7620,
+      available_for_llm_mb: 1000,
+      loaded_model: null,
+      reclaimable_mb: 2600,
+    };
+    expect(modelFitFor({ size_mb: 2400 }, loaded)).toBe("fits");
+    expect(modelFitFor({ size_mb: 2400 }, { ...loaded, reclaimable_mb: 0 })).toBe("spills");
+  });
+
+  it("counts a picture add-on that will come with the download", () => {
+    const m = { size_mb: 2600, companions: PICTURES("available") };
+    const near: ModelMemoryStatus = { total_mb: 7620, available_for_llm_mb: 4000, loaded_model: null };
+    expect(modelFitFor(m, near)).toBe("fits");
+    expect(modelFitFor(m, near, DEFAULT_HEADROOM_MB, { withPictures: true })).toBe("spills");
   });
 });

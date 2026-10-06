@@ -1,0 +1,96 @@
+/* ─── No conversation model ─────────────────────────────────────────────────
+ *
+ * Where the conversation would be, when none is chosen: the pond's suggestions,
+ * with what each costs, and one explicit button. The cards are the shared picks
+ * (`model-pick.css`), so the one raised card and the one raised button are the
+ * ones the screen is asking about.
+ */
+
+.nm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: var(--space-4) var(--space-4) var(--space-6);
+}
+
+.nm__title {
+  margin: 0;
+  font-family: var(--font-heading);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+}
+
+.nm__lead,
+.nm__note {
+  margin: 0;
+  max-width: 62ch;
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--leading-base);
+  color: var(--color-text-secondary);
+}
+
+.nm__problem {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: 0;
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  color: var(--color-destructive-fg);
+}
+
+.nm__problem svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.nm .mm-picks {
+  margin-top: var(--space-2);
+}
+
+/* A short panel (the hub's 1024x600 and 800x480): each pick is a row with its question beside it, so
+   the first button is on screen without a scroll. A download in progress goes back to a card, since
+   its bars need the width. */
+@media (max-height: 640px) {
+  .nm {
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3) var(--space-4);
+  }
+
+  .nm .mm-picks {
+    grid-template-columns: 1fr;
+    gap: var(--space-3);
+  }
+
+  .nm .mm-pick:not(:has(.mm-xfer)) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: var(--space-4);
+    align-items: center;
+  }
+
+  .nm .mm-pick:not(:has(.mm-xfer)) > * {
+    grid-column: 1;
+  }
+
+  .nm .mm-pick:not(:has(.mm-xfer)) > .mm-pick__foot {
+    grid-column: 2;
+    grid-row: 1 / span 4;
+    flex-direction: column;
+    align-items: flex-end;
+    margin-top: 0;
+    padding-top: 0;
+    border-top: 0;
+  }
+
+  .nm .mm-pick:not(:has(.mm-xfer)) .mm-pick__cost {
+    align-items: flex-end;
+    text-align: right;
+  }
+}

@@ -169,6 +169,24 @@ async function handleDelete() {
 }
 ```
 
+### Model marks (`components/models/ModelMarks.tsx`, `styles/model-marks.css`)
+
+The repeated words of a Models screen. The classic page, the hub, the picks and the composer chip
+all compose them from tokens. What they say is decided in `sections/models/modelsView.ts`; do not
+restate fit, labels or engine names anywhere else.
+
+| Part | What it says |
+|---|---|
+| `<EngineMark>` | The engine's name, its file format in mono, an aria-hidden icon. No engine has a hue |
+| `<SourceChip>` | Recommended, Added, Found on disk or Ollama; nothing for the catalogue |
+| `<AddOnLine>` | Picture support: included, add, adding, checking, or text only |
+| `<FitCell>` | In use, a share of the pond's one budget, or "Too big for this pond" |
+| `<PicturesChoice>` | The add-on box on a download: ticked and untickable, and unticked with its reason beside it where only the model fits this pond |
+| `<TransferView>` | A bar per part, one Pause, Resume and Stop set per model, and why a part failed |
+
+Elevation is state. One pick is raised (the model in use, else the first suggestion), and one
+`.mm-btn--ask` is raised while no conversation model is chosen. Everything else is flat.
+
 ---
 
 ## HeroUI Components

@@ -1,415 +1,108 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import {
-  AlertTriangle, Check, Download, HardDrive, Loader2, Pause, Play,
-  RefreshCw, Search, Trash2, X,
-} from "lucide-react";
+import { AlertTriangle, HardDrive, RefreshCw } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useConfirm, ErrorBanner } from "../components/shared";
-import { ApiError } from "../api/types";
-import type {
-  DiskUsage, DownloadEntry, HfModel, HfModelFile,
-  ModelActiveRoles, ModelEntry, ModelMemoryStatus,
-} from "../api/types";
+import type { ModelEngine, ModelEntry } from "../api/types";
+import { useModels } from "../hooks/useModels";
+import { useModelActions } from "../hooks/useModelActions";
+import { EngineMark } from "../components/models/ModelMarks";
+import { ENGINE_GROUPS, engineOf, groupByEngine } from "../lib/modelProvider";
 import {
-  ROLES, type RoleKey, roleHolder, formatSize, formatBytes, downloadPercent,
-  isInFlight, fitReading, downloadedOnly, availableToDownload, rolesFor, modelLabel,
-  groupByJob, modelFacts,
+  ROLES, type RoleKey, roleHolder, emptyJobText, formatSize, formatBytes, budgetReading,
+  downloadedOnly, rolesFor, modelLabel, groupByJob, isInUse, holderEntry, recommendedPicks,
+  raisedPick, askingPick, sortModels, carriesPictures, picturesOf,
 } from "./models/modelsView";
+import { isInFlight } from "./models/modelDownloads";
+import { ModelRow } from "./models/ModelRow";
+import { PickCard } from "./models/PickCard";
+import { AddBand } from "./models/AddBand";
 import { VoicePicker } from "../hub/views/settings/VoicePicker";
 import { useVoicePreview } from "../voice/useVoicePreview";
 import { clampPace, DEFAULT_VOICE, DEFAULT_PACE, DEFAULT_QUALITY } from "../voice/voiceCatalogue";
 import "../styles/models.css";
 import "../hub/views/settings/voice-picker.css";
 
-// Fit meter: whether a model fits this device's model budget or spills to the CPU, from
-// `models/memory-status`; "unknown" rather than a guess when no budget is reported (dev machines).
-
-// ─── Roles band ────────────────────────────────────────────────────────────
+// ─── Jobs band ─────────────────────────────────────────────────────────────
 
 function RoleCard({
-  role, holder, onClear,
+  role, holder, emptyText, onChange,
 }: {
   role: (typeof ROLES)[number];
-  holder: string | null;
-  onClear: () => void;
+  holder: { title: string; engine: ModelEngine | null } | null;
+  /** What an unnamed job reads when that is not a gap, e.g. memory's built-in model. */
+  emptyText: string | null;
+  /** Null when no list below can fill the job, so there is nothing to press. */
+  onChange: (() => void) | null;
 }) {
   return (
-    <article className="mdl-role" data-empty={holder ? undefined : "true"}>
+    <article className="mdl-role" data-empty={holder || emptyText ? undefined : "true"}>
       <span className="mdl-role__job">{role.label}</span>
       <span className="mdl-role__blurb">{role.blurb}</span>
       {holder ? (
         <>
-          <span className="mdl-role__holder" title={holder}>{holder}</span>
-          <button type="button" className="mdl-role__clear" onClick={onClear}>
-            Change
-          </button>
+          <span className="mdl-role__holder" title={holder.title}>{holder.title}</span>
+          {holder.engine && (
+            <EngineMark engine={holder.engine} label={holder.engine.label} format={holder.engine.file_format} />
+          )}
         </>
+      ) : emptyText ? (
+        <span className="mdl-role__built">{emptyText}</span>
       ) : (
         <span className="mdl-role__none">
           <AlertTriangle size={14} aria-hidden="true" />
-          Nothing assigned
+          Nothing chosen yet
         </span>
+      )}
+      {onChange && (
+        <button type="button" className="mm-btn mdl-role__change" onClick={onChange}
+          aria-label={`${holder ? "Change" : "Choose"} the model for ${role.label.toLowerCase()}`}>
+          {holder ? "Change" : "Choose"}
+        </button>
       )}
     </article>
   );
 }
 
-// ─── Downloads in flight ───────────────────────────────────────────────────
+// ─── An engine's rows ──────────────────────────────────────────────────────
 
-function DownloadRow({
-  entry, busy, onControl,
-}: {
-  entry: DownloadEntry;
-  busy: boolean;
-  onControl: (action: "pause" | "resume" | "cancel") => void;
-}) {
-  const pct = downloadPercent(entry);
-  const paused = entry.status === "paused";
-
+function EngineHead({ group }: { group: (typeof ENGINE_GROUPS)[number] }) {
   return (
-    <div className="mdl-dl" data-paused={paused ? "true" : undefined}>
-      <div className="mdl-dl__head">
-        <span className="mdl-dl__name" title={entry.filename}>{entry.filename}</span>
-        <span className="mdl-dl__pct">{pct == null ? "…" : `${pct}%`}</span>
-      </div>
-
-      <div className="mdl-dl__track" role="progressbar"
-        aria-valuenow={pct ?? undefined} aria-valuemin={0} aria-valuemax={100}
-        aria-label={`${entry.filename} download progress`}>
-        {/* Indeterminate until the server reports a total — a bar pinned at
-            zero reads as stalled, which is a different thing. */}
-        <span className={pct == null ? "mdl-dl__fill mdl-dl__fill--unknown" : "mdl-dl__fill"}
-          style={pct == null ? undefined : { width: `${pct}%` }} />
-      </div>
-
-      <div className="mdl-dl__foot">
-        <span className="mdl-dl__bytes">
-          {formatBytes(entry.downloaded_bytes)}
-          {entry.total_bytes ? ` of ${formatBytes(entry.total_bytes)}` : ""}
-          {paused ? " · paused" : ""}
-        </span>
-        <div className="mdl-dl__acts">
-          <button type="button" className="mdl-btn mdl-btn--quiet"
-            onClick={() => onControl(paused ? "resume" : "pause")} disabled={busy}>
-            {paused ? <Play size={15} aria-hidden="true" /> : <Pause size={15} aria-hidden="true" />}
-            <span>{paused ? "Resume" : "Pause"}</span>
-          </button>
-          <button type="button" className="mdl-btn mdl-btn--danger"
-            onClick={() => onControl("cancel")} disabled={busy}>
-            <X size={15} aria-hidden="true" />
-            <span>Stop</span>
-          </button>
-        </div>
-      </div>
-    </div>
+    <header className="mdl-engine">
+      <EngineMark engine={{ id: group.key }} label={group.label} format={group.format} />
+      <p className="mdl-engine__blurb">{group.blurb}</p>
+    </header>
   );
 }
 
-// ─── A model already on disk ───────────────────────────────────────────────
-
-function ModelRow({
-  model, memory, activeRoles, busy, onUse, onDelete,
-}: {
-  model: ModelEntry;
-  memory: ModelMemoryStatus | null;
-  activeRoles: ModelActiveRoles | null;
-  busy: boolean;
-  onUse: (role: RoleKey) => void;
-  onDelete: () => void;
-}) {
-  const fit = fitReading(model, memory);
-  const roles = rolesFor(model);
-  const name = modelLabel(model);
-  const facts = modelFacts(model);
-  const inUse = roles.some((r) => roleHolder(activeRoles, r) === model.name);
-
-  return (
-    <div className="mdl-row" data-fit={fit.verdict} data-inuse={inUse ? "true" : undefined}>
-      <div className="mdl-row__id">
-        <div className="mdl-row__idline">
-          <span className="mdl-row__name" title={name}>{name}</span>
-          {inUse && (
-            <span className="mdl-row__inuse">
-              <Check size={13} aria-hidden="true" />
-              In use
-            </span>
-          )}
-        </div>
-        {/* What the model file said about itself. For anything discovered on
-            disk this is read from its GGUF header, which is the difference
-            between a row that is a filename and one that tells you what you
-            have. */}
-        {facts.length > 0 && (
-          <span className="mdl-row__facts">{facts.join(" · ")}</span>
-        )}
-      </div>
-
-      <span className="mdl-row__size">
-        {formatSize(model.size_mb ?? model.ram_estimate_mb) || "—"}
-      </span>
-
-      {/* The fit meter, inline. Its width is the share of what this device can
-          give one model — the bar IS the claim, not decoration beside it. */}
-      <div className="mdl-row__fit" title={fit.label}>
-        <div className="mdl-fit__track">
-          <span className="mdl-fit__fill" style={{ width: `${Math.min(100, fit.percent ?? 0)}%` }} />
-        </div>
-        <span className="mdl-row__fitpct">
-          {fit.percent == null ? "—" : `${fit.percent}%`}
-        </span>
-      </div>
-
-      <div className="mdl-row__acts">
-        {roles.map((r) => (
-          <button key={r} type="button" className="mdl-btn mdl-btn--primary"
-            onClick={() => onUse(r)} disabled={busy || inUse}>
-            {inUse ? "In use" : "Use"}
-          </button>
-        ))}
-        <button type="button" className="mdl-btn mdl-btn--danger" onClick={onDelete} disabled={busy}
-          aria-label={`Delete ${name}`}>
-          <Trash2 size={15} aria-hidden="true" />
-          <span>Delete</span>
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ─── A model the catalogue offers but this device does not have ────────────
-
-function AvailableRow({
-  model, memory, busy, onDownload,
-}: {
-  model: ModelEntry;
-  memory: ModelMemoryStatus | null;
-  busy: boolean;
-  onDownload: () => void;
-}) {
-  const fit = fitReading(model, memory);
-  const facts = modelFacts(model);
-  const name = modelLabel(model);
-
-  return (
-    <div className="mdl-row" data-fit={fit.verdict}>
-      <div className="mdl-row__id">
-        <div className="mdl-row__idline">
-          <span className="mdl-row__name" title={name}>{name}</span>
-        </div>
-        {facts.length > 0 && <span className="mdl-row__facts">{facts.join(" · ")}</span>}
-      </div>
-
-      <span className="mdl-row__size">
-        {formatSize(model.size_mb) || "—"}
-        {/* Say the number before the spend (DESIGN.md section 5): picture
-            support is a second, one-time download this model triggers on
-            its own, so it belongs beside the weights size, not discovered
-            afterward. */}
-        {model.reads_images === true && model.image_support_bytes
-          ? ` + ${formatBytes(model.image_support_bytes)} for pictures`
-          : ""}
-      </span>
-
-      {/* The fit meter earns its keep most here: this is the moment before
-          several gigabytes are spent, which is the only moment the answer can
-          still change what you do. */}
-      <div className="mdl-row__fit" title={fit.label}>
-        <div className="mdl-fit__track">
-          <span className="mdl-fit__fill" style={{ width: `${Math.min(100, fit.percent ?? 0)}%` }} />
-        </div>
-        <span className="mdl-row__fitpct">{fit.percent == null ? "—" : `${fit.percent}%`}</span>
-      </div>
-
-      <div className="mdl-row__acts">
-        <button type="button" className="mdl-btn mdl-btn--primary" onClick={onDownload}
-          disabled={busy} aria-label={`Download ${name}`}>
-          <Download size={15} aria-hidden="true" />
-          <span>Download</span>
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ─── Add from Hugging Face ─────────────────────────────────────────────────
-
-function AddBand({ onStarted }: { onStarted: () => void }) {
-  const [query, setQuery] = useState("");
-  const [searching, setSearching] = useState(false);
-  const [results, setResults] = useState<HfModel[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [openRepo, setOpenRepo] = useState<string | null>(null);
-  const [files, setFiles] = useState<Record<string, HfModelFile[]>>({});
-  const [loadingFiles, setLoadingFiles] = useState<string | null>(null);
-  const [starting, setStarting] = useState<string | null>(null);
-
-  const search = useCallback(async () => {
-    const q = query.trim();
-    if (!q) return;
-    setSearching(true); setError(null); setOpenRepo(null);
-    try { setResults((await api.searchGgufModels(q)).models ?? []); }
-    catch (e) { setError(e instanceof Error ? e.message : String(e)); setResults(null); }
-    finally { setSearching(false); }
-  }, [query]);
-
-  async function openFiles(repoId: string) {
-    if (openRepo === repoId) { setOpenRepo(null); return; }
-    setOpenRepo(repoId);
-    if (files[repoId]) return;
-    setLoadingFiles(repoId);
-    try {
-      // Await outside the updater: an async setState callback would store a promise as the list.
-      const list = (await api.listHfModelFiles(repoId)).files ?? [];
-      setFiles((f) => ({ ...f, [repoId]: list }));
-    } catch {
-      setFiles((f) => ({ ...f, [repoId]: [] }));
-    } finally {
-      setLoadingFiles(null);
-    }
-  }
-
-  async function download(file: HfModelFile) {
-    setStarting(file.filename);
-    try {
-      await api.downloadModelFromUrl(file.url, "gguf", file.filename);
-      onStarted();
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-    finally { setStarting(null); }
-  }
-
-  return (
-    <section className="mdl-band">
-      <h2 className="mdl-band__title">Add a model</h2>
-      <p className="mdl-band__sub">Search Hugging Face. Downloads land on this device and nowhere else.</p>
-
-      <form className="mdl-search" onSubmit={(e) => { e.preventDefault(); void search(); }}>
-        <Search size={16} aria-hidden="true" />
-        <input className="mdl-search__input" type="search" value={query}
-          aria-label="Search Hugging Face for a model"
-          placeholder="gemma, qwen, whisper…"
-          onChange={(e) => setQuery(e.target.value)} />
-        <button type="submit" className="mdl-btn mdl-btn--primary" disabled={searching || !query.trim()}>
-          {searching ? <Loader2 size={15} className="mdl-spin" aria-hidden="true" /> : null}
-          <span>{searching ? "Searching…" : "Search"}</span>
-        </button>
-      </form>
-
-      {error && <ErrorBanner error={error} />}
-
-      {results !== null && results.length === 0 && !searching && (
-        <p className="mdl-empty">Nothing on Hugging Face matches “{query.trim()}”.</p>
-      )}
-
-      {results !== null && results.length > 0 && (
-        <ul className="mdl-results">
-          {results.map((r) => (
-            <li key={r.id} className="mdl-result">
-              <button type="button" className="mdl-result__head"
-                onClick={() => void openFiles(r.id)} aria-expanded={openRepo === r.id}>
-                <span className="mdl-result__name">{r.id}</span>
-                <span className="mdl-result__meta">
-                  {typeof r.downloads === "number" ? `${r.downloads.toLocaleString()} downloads` : ""}
-                </span>
-              </button>
-
-              {openRepo === r.id && (
-                <div className="mdl-result__files">
-                  {loadingFiles === r.id && <span className="mdl-muted">Reading the file list…</span>}
-                  {loadingFiles !== r.id && (files[r.id]?.length ?? 0) === 0 && (
-                    <span className="mdl-muted">No GGUF files in this repository.</span>
-                  )}
-                  {files[r.id]?.map((f) => (
-                    <div key={f.filename} className="mdl-file">
-                      <span className="mdl-file__name" title={f.filename}>{f.filename}</span>
-                      <span className="mdl-file__size">{formatSize(f.size_mb)}</span>
-                      <button type="button" className="mdl-btn mdl-btn--primary"
-                        onClick={() => void download(f)} disabled={starting === f.filename}>
-                        <Download size={15} aria-hidden="true" />
-                        <span>{starting === f.filename ? "Starting…" : "Download"}</span>
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-    </section>
-  );
+/** Scrolls to a band, gently unless the person has asked for no motion. */
+function jumpTo(id: string): boolean {
+  const el = document.getElementById(id);
+  if (!el) return false;
+  const calm = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  el.scrollIntoView?.({ behavior: calm ? "auto" : "smooth", block: "start" });
+  return true;
 }
 
 // ─── The page ──────────────────────────────────────────────────────────────
 
 export function Models() {
   const confirm = useConfirm();
+  const data = useModels({ disk: true });
+  const { models, roles, memory, downloads, disk, loading, error, transferFor } = data;
 
-  const [roles, setRoles] = useState<ModelActiveRoles | null>(null);
-  const [models, setModels] = useState<ModelEntry[]>([]);
-  const [modelsLoading, setModelsLoading] = useState(true);
-  const [modelsError, setModelsError] = useState<string | null>(null);
-  const [downloads, setDownloads] = useState<DownloadEntry[]>([]);
-  const [memory, setMemory] = useState<ModelMemoryStatus | null>(null);
-  const [disk, setDisk] = useState<DiskUsage | null>(null);
-  const [busy, setBusy] = useState(false);
   const [flash, setFlash] = useState<{ text: string; ok: boolean } | null>(null);
-  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const say = useCallback((text: string, ok = true) => {
+    if (flashTimer.current) clearTimeout(flashTimer.current);
     setFlash({ text, ok });
-    setTimeout(() => setFlash(null), 3500);
+    flashTimer.current = setTimeout(() => setFlash(null), ok ? 4500 : 7000);
   }, []);
 
-  const loadRoles = useCallback(async () => {
-    try { setRoles(await api.getActiveRoles()); } catch { /* non-fatal */ }
-  }, []);
+  useEffect(() => () => { if (flashTimer.current) clearTimeout(flashTimer.current); }, []);
 
-  const loadModels = useCallback(async () => {
-    setModelsLoading(true); setModelsError(null);
-    try { setModels(await api.listModels()); }
-    catch (e) { setModelsError(e instanceof Error ? e.message : String(e)); }
-    finally { setModelsLoading(false); }
-  }, []);
-
-  const loadDownloads = useCallback(async () => {
-    try { setDownloads((await api.getDownloadProgress()).downloads ?? []); }
-    catch { /* non-fatal */ }
-  }, []);
-
-  /** Poll only while something is actually moving. */
-  const pollDownloads = useCallback(() => {
-    if (pollRef.current) return;
-    const tick = async () => {
-      pollRef.current = null;
-      const list = await api.getDownloadProgress()
-        .then((r) => r.downloads ?? [])
-        .catch(() => [] as DownloadEntry[]);
-      setDownloads(list);
-      if (list.some((d) => d.status === "downloading")) {
-        pollRef.current = setTimeout(tick, 1500);
-      } else {
-        // A transfer ended or paused: the model list and disk figure may have moved.
-        void loadModels();
-        void api.getDiskUsage().then(setDisk).catch(() => {});
-      }
-    };
-    pollRef.current = setTimeout(tick, 1500);
-  }, [loadModels]);
-
-  useEffect(() => {
-    void loadRoles();
-    void loadModels();
-    void loadDownloads();
-    api.getMemoryStatus().then(setMemory).catch(() => {});
-    api.getDiskUsage().then(setDisk).catch(() => {});
-    return () => { if (pollRef.current) clearTimeout(pollRef.current); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Resume polling across a remount while a transfer is still going.
-  useEffect(() => {
-    if (downloads.some((d) => d.status === "downloading")) pollDownloads();
-  }, [downloads, pollDownloads]);
+  const actions = useModelActions(data, say);
+  const { busy, withPictures } = actions;
 
   // ── Voice, for the Speaking group ──
   // Choosing a voice is not managing a model file, so Speaking gets a picker, not a row list.
@@ -443,9 +136,9 @@ export function Models() {
     try {
       await api.updateSettings({ voice_tts_voice: id });
       // Apply to the running engine (fetching the voice if new); otherwise it waits for a restart.
-      pollDownloads();
+      data.watchDownloads();
       await api.applyTtsSettings({ voice: id });
-      void loadModels();
+      void data.reloadModels();
       // Speak straight away: a list of names is a guess until you hear it.
       void preview.play();
     } catch {
@@ -475,8 +168,8 @@ export function Models() {
     setApplying(true);
     try {
       await api.updateSettings({ voice_tts_quality: value });
-      // Poll before the apply: the fetch happens inside it.
-      pollDownloads();
+      // Watch before the apply: the fetch happens inside it.
+      data.watchDownloads();
       // Fetches a new tier, then drops the session so the next utterance loads it.
       await api.applyTtsSettings({ quality: value });
     } catch {
@@ -486,8 +179,32 @@ export function Models() {
     }
   }
 
+  // ── What each band lists ──
   const onDisk = useMemo(() => downloadedOnly(models), [models]);
+  const conversation = useMemo(() => models.filter((m) => rolesFor(m).includes("chat")), [models]);
+  const picks = useMemo(() => recommendedPicks(models), [models]);
+  const pickIds = useMemo(() => new Set(picks.map((m) => m.id)), [picks]);
+
   const groups = useMemo(() => groupByJob(onDisk), [onDisk]);
+  const comingDown = useCallback((m: ModelEntry) => transferFor(m) !== null, [transferFor]);
+
+  /** Rows to fetch: not here, not already a pick above, and with somewhere to fetch them from. */
+  const getMoreConversation = useMemo(
+    () =>
+      sortModels(
+        conversation.filter(
+          (m) =>
+            !m.downloaded &&
+            !pickIds.has(m.id) &&
+            (comingDown(m) || (m.acquire !== "external" && m.acquire !== "unavailable")),
+        ),
+      ),
+    [conversation, pickIds, comingDown],
+  );
+  const getMoreListening = useMemo(
+    () => models.filter((m) => !m.downloaded && rolesFor(m).includes("asr")),
+    [models],
+  );
 
   // Every catalogue voice, installed or not: each is a ~522 KB style table fetched on selection.
   const allVoices = useMemo(
@@ -498,101 +215,68 @@ export function Models() {
     () => new Set(onDisk.filter((m) => (m.category ?? m.provider) === "tts_kokoro").map((m) => m.name)),
     [onDisk],
   );
-  // No voices in "Ready to download": the picker offers and fetches every one.
-  const availableGroups = useMemo(
-    () => groupByJob(availableToDownload(models)).filter((g) => g.key !== "tts"),
-    [models],
-  );
-  // "Coming down" excludes voice fetches; the picker shows those beside the voice.
-  const inFlight = useMemo(
-    () => downloads.filter(isInFlight).filter((d) => d.category !== "tts_kokoro"),
-    [downloads],
-  );
-  const voiceInFlight = useMemo(
-    () => downloads.filter(isInFlight).filter((d) => d.category === "tts_kokoro"),
-    [downloads],
-  );
 
-  // Voice/engine fetches for the picker's progress row, from the same feed as `inFlight`.
+  // Voice and engine fetches belong to the picker, which shows them beside the voice.
   const voiceTransfers = useMemo(
     () =>
-      voiceInFlight
+      downloads
+        .filter((d) => isInFlight(d) && d.category === "tts_kokoro")
         .map((d) => ({
           filename: d.filename,
           downloaded: d.downloaded_bytes ?? 0,
           total: d.total_bytes ?? null,
         })),
-    [voiceInFlight],
+    [downloads],
   );
 
-  async function useFor(model: ModelEntry, role: RoleKey) {
-    setBusy(true);
-    try {
-      // `category` (e.g. "tts_kokoro"), not `provider`: the server builds the lookup id from it,
-      // and `provider` is only the list endpoint's group key ("tts").
-      await api.activateModel(model.category ?? model.provider, model.name, role);
-      await loadRoles();
-      say(`${modelLabel(model)} now handles ${ROLES.find((r) => r.key === role)?.label.toLowerCase()}.`);
-    } catch (e) { say(e instanceof Error ? e.message : String(e), false); }
-    finally { setBusy(false); }
-  }
-
+  // ── Actions ──
   async function remove(model: ModelEntry) {
-    const size = formatSize(model.size_mb) || "the file";
+    const freed = formatSize(model.size_mb);
+    const size = freed || "the file";
     // The encoder file is shared per family, so its bytes return only if no other model uses it.
+    const pictures = picturesOf(model);
     const removes =
-      model.reads_images === true && model.image_support_bytes
-        ? `This removes ${size}, plus ${formatBytes(model.image_support_bytes)} of picture support if no other model uses it.`
+      pictures?.state === "installed"
+        ? `This removes ${size}, plus ${formatBytes(pictures.size_bytes)} of picture support if no other model uses it.`
         : `This removes ${size} from this device.`;
     const ok = await confirm(
       `Delete “${modelLabel(model)}”? ${removes}`,
       { title: "Delete model", confirmLabel: "Delete", destructive: true },
     );
     if (!ok) return;
-    setBusy(true);
+    actions.setBusy(true);
     try {
       await api.deleteModel(model.category ?? model.provider, model.name);
-      await loadModels();
-      void api.getDiskUsage().then(setDisk).catch(() => {});
-      say(`${modelLabel(model)} deleted.`);
+      await data.reload();
+      say(`Deleted ${modelLabel(model)}.${freed ? ` ${freed} freed.` : ""}`);
     } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
-        say(`${modelLabel(model)} is doing a job right now. Give that job to another model first.`, false);
-      } else {
-        say(e instanceof Error ? e.message : String(e), false);
-      }
-    } finally { setBusy(false); }
+      // The pond refuses a model in use, or one whose file another model uses, in its own words.
+      say(e instanceof Error ? e.message : String(e), false);
+    } finally { actions.setBusy(false); }
   }
 
-  /** Start a download; for TTS voices the server also fetches the companion .json. */
-  async function fetchModel(model: ModelEntry) {
-    setBusy(true);
-    try {
-      await api.downloadModel(model.category ?? model.provider, model.name);
-      // Name the picture-support size up front: it downloads on its own after the model.
-      const flash =
-        model.reads_images === true && model.image_support_bytes
-          ? `${modelLabel(model)} is downloading. Picture support (${formatBytes(model.image_support_bytes)}) follows.`
-          : `${modelLabel(model)} is downloading.`;
-      say(flash);
-      await loadDownloads();
-      pollDownloads();
-    } catch (e) { say(e instanceof Error ? e.message : String(e), false); }
-    finally { setBusy(false); }
+  function change(role: RoleKey) {
+    const label = ROLES.find((r) => r.key === role)?.label.toLowerCase();
+    if (!jumpTo(`mdl-job-${role}`)) jumpTo(role === "chat" ? "mdl-recommended" : "mdl-get");
+    say(role === "tts" ? "Pick a voice under Speaking." : `Press Use on the model you want for ${label}.`);
   }
 
-  async function control(entry: DownloadEntry, action: "pause" | "resume" | "cancel") {
-    setBusy(true);
-    try {
-      await api.controlDownload(entry.filename, action);
-      await loadDownloads();
-      if (action === "resume") pollDownloads();
-    } catch (e) { say(e instanceof Error ? e.message : String(e), false); }
-    finally { setBusy(false); }
-  }
+  const row = (m: ModelEntry) => {
+    const transfer = transferFor(m);
+    return (
+      <ModelRow key={m.id} model={m} memory={memory} inUse={isInUse(m, roles)} roles={rolesFor(m)}
+        transfer={transfer} withPictures={withPictures(m)} busy={busy}
+        onWithPictures={(next) => actions.setWithPictures(m, next)}
+        onUse={(role) => void actions.useFor(m, role)} onDelete={() => void remove(m)}
+        onDownload={() => void actions.download(m)} onAddPictures={() => void actions.addPictures(m)}
+        onControl={(action) => transfer && void actions.control(m, transfer, action)} />
+    );
+  };
 
-  const budget = memory ? formatSize(memory.available_for_llm_mb) : null;
-  const used = disk ? formatBytes(disk.total_bytes) : null;
+  const budget = budgetReading(memory);
+  const used = disk ? formatBytes(disk.total_bytes) : "—";
+  const raised = raisedPick(picks, roles);
+  const asking = askingPick(picks, roles, comingDown);
 
   return (
     <div className="mdl">
@@ -605,24 +289,14 @@ export function Models() {
         <div className="mdl-head__stats">
           <span className="mdl-stat">
             <HardDrive size={15} aria-hidden="true" />
-            <span className="mdl-stat__num">{used ?? "—"}</span>
+            <span className="mdl-stat__num">{used}</span>
             <span className="mdl-stat__of">on disk</span>
           </span>
-          <span className="mdl-stat">
-            <span className="mdl-stat__num">{budget ?? "—"}</span>
-            <span className="mdl-stat__of">for models</span>
+          <span className="mdl-stat" title={budget.label}>
+            <span className="mdl-stat__num">{budget.text}</span>
+            <span className="mdl-stat__of">for one model</span>
           </span>
-          {/* Re-reads the memory budget too, not just the lists. Left out, a
-              memory read that failed at mount — the server is often still
-              starting when this page first loads — left every fit meter stuck
-              on "unknown" with no way back short of leaving the section. */}
-          <button type="button" className="mdl-btn mdl-btn--quiet" onClick={() => {
-            void loadModels();
-            void loadRoles();
-            void loadDownloads();
-            api.getMemoryStatus().then(setMemory).catch(() => {});
-            api.getDiskUsage().then(setDisk).catch(() => {});
-          }}>
+          <button type="button" className="mm-btn mdl-head__refresh" onClick={() => void data.reload()}>
             <RefreshCw size={15} aria-hidden="true" />
             <span>Refresh</span>
           </button>
@@ -630,50 +304,69 @@ export function Models() {
       </header>
 
       {flash && (
-        <p className={flash.ok ? "mdl-flash" : "mdl-flash mdl-flash--bad"} role="status">
+        <p className={flash.ok ? "mdl-flash" : "mdl-flash mdl-flash--bad"} role={flash.ok ? "status" : "alert"}>
           {flash.text}
         </p>
       )}
 
-      <section className="mdl-band">
-        <h2 className="mdl-band__title">Jobs</h2>
+      <section className="mdl-band" aria-labelledby="mdl-jobs">
+        <h2 className="mdl-band__title" id="mdl-jobs">Jobs</h2>
         <p className="mdl-band__sub">Which model does what. This is the only part most ponds ever change.</p>
         <div className="mdl-roles">
-          {ROLES.map((role) => (
-            <RoleCard key={role.key} role={role} holder={roleHolder(roles, role.key)}
-              onClear={() => say(`Pick a model below and choose “Use for ${role.label.toLowerCase()}”.`)} />
-          ))}
+          {ROLES.map((role) => {
+            const entry = holderEntry(models, roles, role.key);
+            const name = roleHolder(roles, role.key);
+            // Something below must be able to fill the job, or there is nothing to press.
+            const canChoose =
+              role.key === "chat" ||
+              role.key === "tts" ||
+              groups.some((g) => g.key === role.key) ||
+              (role.key === "asr" && getMoreListening.length > 0);
+            return (
+              <RoleCard key={role.key} role={role}
+                holder={name ? { title: entry ? modelLabel(entry) : name, engine: entry ? engineOf(entry) : null } : null}
+                emptyText={emptyJobText(roles, role.key)}
+                onChange={canChoose ? () => change(role.key) : null} />
+            );
+          })}
         </div>
       </section>
 
-      {inFlight.length > 0 && (
-        <section className="mdl-band">
-          <h2 className="mdl-band__title">Coming down</h2>
-          <div className="mdl-dls">
-            {inFlight.map((d) => (
-              <DownloadRow key={d.filename} entry={d} busy={busy}
-                onControl={(a) => void control(d, a)} />
-            ))}
+      {picks.length > 0 && (
+        <section className="mdl-band" id="mdl-recommended" aria-labelledby="mdl-recommended-title">
+          <h2 className="mdl-band__title" id="mdl-recommended-title">Recommended for this pond</h2>
+          <p className="mdl-band__sub">
+            GIAP's picks. Nothing is downloaded or switched on until you choose it.
+          </p>
+          <div className="mm-picks">
+            {picks.map((m) => {
+              const transfer = transferFor(m);
+              return (
+                <PickCard key={m.id} model={m} memory={memory} inUse={isInUse(m, roles)}
+                  raised={raised?.id === m.id} asking={asking?.id === m.id}
+                  transfer={transfer} withPictures={withPictures(m)} busy={busy}
+                  onWithPictures={(next) => actions.setWithPictures(m, next)}
+                  onUse={() => void actions.useFor(m, "chat")} onDownload={() => void actions.download(m)}
+                  onControl={(action) => transfer && void actions.control(m, transfer, action)} />
+              );
+            })}
           </div>
         </section>
       )}
 
-      <section className="mdl-band">
-        <h2 className="mdl-band__title">On this device</h2>
-        {modelsError && <ErrorBanner error={modelsError} onRetry={() => void loadModels()} />}
-        {modelsLoading && <p className="mdl-muted">Reading the catalogue…</p>}
-        {!modelsLoading && !modelsError && onDisk.length === 0 && (
-          <p className="mdl-empty">Nothing downloaded yet. Search below to add one.</p>
+      <section className="mdl-band" id="mdl-device" aria-labelledby="mdl-device-title">
+        <h2 className="mdl-band__title" id="mdl-device-title">On this device</h2>
+        {error && <ErrorBanner error={error} onRetry={() => void data.reloadModels()} />}
+        {loading && <p className="mdl-muted">Reading the catalogue…</p>}
+        {!loading && !error && onDisk.length === 0 && (
+          <p className="mdl-empty">Nothing downloaded yet. Pick one above, or add one below.</p>
         )}
-        {/* Grouped under the job each one can do, using the same four words as
-            the Jobs band above — so "Listening" means one thing on this page
-            rather than "ASR" at the top and "Whisper" further down.
-
-            One ink card per group rather than per model: fourteen of the pond's
-            loudest treatment is a wall of purple, and the grouping is the
-            structure worth drawing. */}
+        {/* Grouped under the job each one can do, in the Jobs band's own words, so "Listening" means
+            one thing on this page. Conversation then splits by the engine that runs it: the card
+            is the group and the models are rows in it, because a card per model is a wall of
+            purple. */}
         {groups.map((g) => (
-          <section key={g.key} className="mdl-group">
+          <section key={g.key} id={`mdl-job-${g.key}`} className="mdl-group" aria-label={g.label}>
             <header className="mdl-group__head">
               <h3 className="mdl-group__title">{g.label}</h3>
               <span className="mdl-group__count">
@@ -694,54 +387,66 @@ export function Models() {
                 pace={pace}
                 onPaceChange={choosePace}
                 preview={preview}
-                loading={modelsLoading}
+                loading={loading}
                 quality={quality}
                 onQualityChange={(v) => void chooseQuality(v)}
                 availableMb={memory?.available_for_llm_mb ?? null}
               />
+            ) : g.key === "chat" ? (
+              groupByEngine(sortModels(g.models)).map((section) => (
+                <div key={section.key} className="mdl-engine-section">
+                  <EngineHead group={section} />
+                  <div className="mdl-group__rows">{section.models.map(row)}</div>
+                </div>
+              ))
             ) : (
-              <div className="mdl-group__rows">
-                {g.models.map((m) => (
-                  <ModelRow key={`${m.provider}/${m.name}`} model={m} memory={memory}
-                    activeRoles={roles} busy={busy}
-                    onUse={(role) => void useFor(m, role)} onDelete={() => void remove(m)} />
-                ))}
-              </div>
+              <div className="mdl-group__rows">{g.models.map(row)}</div>
             )}
           </section>
         ))}
       </section>
 
-      {/* The catalogue's own offerings, grouped the same way. This is where a
-          second voice or a better transcriber comes from: whisper builds and
-          piper voices ship with download URLs already attached, and the page
-          used to drop every one of them by showing only what was downloaded. */}
-      {availableGroups.length > 0 && (
-        <section className="mdl-band">
-          <h2 className="mdl-band__title">Ready to download</h2>
-          <p className="mdl-band__sub">
-            Known to this pond and not here yet. Voices are chosen above.
-          </p>
-          {availableGroups.map((g) => (
-            <section key={g.key} className="mdl-group">
-              <header className="mdl-group__head">
-                <h3 className="mdl-group__title">{g.label}</h3>
-                <span className="mdl-group__count">
-                  {g.models.length} {g.models.length === 1 ? "model" : "models"}
-                </span>
-              </header>
-              <div className="mdl-group__rows">
-                {g.models.map((m) => (
-                  <AvailableRow key={`${m.provider}/${m.name}`} model={m} memory={memory}
-                    busy={busy} onDownload={() => void fetchModel(m)} />
-                ))}
-              </div>
-            </section>
-          ))}
-        </section>
-      )}
+      <section className="mdl-band" id="mdl-get" aria-labelledby="mdl-get-title">
+        <h2 className="mdl-band__title" id="mdl-get-title">Get more</h2>
+        <p className="mdl-band__sub">Other models this pond knows about, and anything on Hugging Face.</p>
 
-      <AddBand onStarted={() => { void loadDownloads(); pollDownloads(); }} />
+        {getMoreConversation.length > 0 && (
+          <section className="mdl-group" aria-label="More conversation models">
+            <header className="mdl-group__head">
+              <h3 className="mdl-group__title">Conversation</h3>
+              <span className="mdl-group__count">{getMoreConversation.length}</span>
+            </header>
+            {groupByEngine(getMoreConversation).map((section) => (
+              <div key={section.key} className="mdl-engine-section">
+                <EngineHead group={section} />
+                <div className="mdl-group__rows">{section.models.map(row)}</div>
+              </div>
+            ))}
+          </section>
+        )}
+
+        {getMoreListening.length > 0 && (
+          <section className="mdl-group" aria-label="More listening models">
+            <header className="mdl-group__head">
+              <h3 className="mdl-group__title">Listening</h3>
+              <span className="mdl-group__count">{getMoreListening.length}</span>
+            </header>
+            <div className="mdl-group__rows">{getMoreListening.map(row)}</div>
+          </section>
+        )}
+
+        <AddBand
+          carriesPictures={carriesPictures(models)}
+          memory={memory}
+          onStarted={(message) => {
+            say(message);
+            // A file named by URL becomes a row of its own, which the transfer then sits on.
+            void data.reloadModels();
+            void data.reloadDownloads();
+            data.watchDownloads();
+          }}
+        />
+      </section>
     </div>
   );
 }

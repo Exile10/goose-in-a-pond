@@ -84,7 +84,8 @@ test.describe("Chat section — response rendering", () => {
     await textarea.fill("explain why the sky is blue");
     await textarea.press("Meta+Enter");
 
-    await expect(page.getByText(/think/i)).toBeVisible({ timeout: 10_000 });
+    // Exact: the composer's "Thinking" switch matches /think/i too, and is there before any reply.
+    await expect(page.getByText("think", { exact: true })).toBeVisible({ timeout: 10_000 });
   });
 
   test("task role badge appears on agent bubble", async ({ page }) => {

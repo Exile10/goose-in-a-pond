@@ -632,7 +632,7 @@
 /* ─── Detail shell ─── */
 .setd { padding: 24px 30px 40px; max-width: 880px; margin: 0 auto; }
 .setd__head { margin-bottom: 4px; }
-.setd__back { display: inline-flex; align-items: center; gap: 4px; border: none; background: none; color: var(--pp); font-family: inherit; font-size: 13.5px; font-weight: 700; cursor: pointer; padding: 6px 10px 6px 6px; border-radius: 9px; margin-bottom: 12px; transition: background .15s; }
+.setd__back { display: inline-flex; align-items: center; gap: 4px; border: none; background: none; color: var(--color-accent-line, var(--pp)); font-family: inherit; font-size: 13.5px; font-weight: 700; cursor: pointer; padding: 6px 10px 6px 6px; border-radius: 9px; margin-bottom: 12px; transition: background .15s; }
 .setd__back:hover { background: var(--pp-50); }
 .setd__titlerow { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
 .setd__body { display: flex; flex-direction: column; gap: 18px; margin-top: 22px; }
@@ -667,24 +667,43 @@
 .hrange input::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: var(--pp); cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,.25); }
 .hrange__val { font-size: 13px; font-weight: 700; color: var(--ink); min-width: 42px; text-align: right; }
 
-/* ─── Models ─── */
-.roles-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; padding: 6px; }
-.role2 { display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 13px; background: var(--hub-bg); }
-.role2__icon { width: 32px; height: 32px; border-radius: 9px; display: flex; align-items: center; justify-content: center; }
-.role2__text { display: flex; flex-direction: column; }
-.role2__role { font-size: 12px; font-weight: 800; color: var(--ink); display: block; }
-.role2__model { font-size: 10.5px; font-weight: 600; color: var(--mut); display: block; margin-top: 2px; word-break: break-word; }
-.mlist { display: flex; flex-direction: column; }
-.mrow { display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: 12px; }
-.mrow + .mrow { border-top: 1px solid var(--line); border-radius: 0; }
-.mrow--active { background: var(--pp-50); border-radius: 12px !important; }
-.mrow__icon { width: 36px; height: 36px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-.mrow__text { flex: 1; min-width: 0; }
-.mrow__name { font-size: 14px; font-weight: 700; color: var(--ink); display: block; }
-.mrow__file { font-size: 12px; font-weight: 600; color: var(--mut); display: block; margin-top: 1px; }
-.mrow__tags { display: flex; gap: 5px; }
-.mtag { font-size: 10.5px; font-weight: 700; color: var(--pp-600); background: var(--pp-100); padding: 3px 8px; border-radius: 999px; }
-.mrow__loaded { display: flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 700; color: #16A34A; white-space: nowrap; }
+/* ─── Models ───
+   Every colour is a token, so dark mode and the chosen accent reach this screen. The ink edge
+   and its offset are spent on the model in use, or on the pick GIAP puts first, and on the one
+   button the screen asks its question with; everything else is a hairline. Targets are 44px. */
+.hm-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+.hm-tile { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+.hm-tile[data-empty="true"] { border-style: dashed; }
+.hm-tile__icon { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; margin-bottom: 4px; border-radius: 9px; background: var(--hub-bg); color: var(--mut); }
+.hm-tile__job { font-size: 12.5px; font-weight: 700; color: var(--mut); }
+.hm-tile__holder { max-width: 100%; font-size: 15px; font-weight: 800; color: var(--ink); overflow-wrap: anywhere; }
+.hm-tile[data-empty="true"] .hm-tile__holder { font-weight: 600; color: var(--mut); }
+.hm-picks { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; padding: 8px 8px 12px; }
+.hm-engine { padding: 4px 0; }
+.hm-engine + .hm-engine { border-top: 1px solid var(--line); }
+.hm-engine__head { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px 6px; }
+.hm-engine__blurb { margin: 0; max-width: 62ch; font-size: 13px; font-weight: 600; line-height: 1.45; color: var(--mut); }
+.hm-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; min-height: 56px; padding: 10px 12px; border: 2px solid transparent; border-radius: 12px; }
+.hm-row + .hm-row:not([data-inuse="true"]) { border-top-color: var(--line); border-top-left-radius: 0; border-top-right-radius: 0; }
+.hm-row[data-inuse="true"] { margin: 4px 6px 8px 0; border-color: var(--ink); background: var(--panel); }
+.hm-row[data-raised="true"] { box-shadow: var(--shadow-ink); }
+.hm-row__text { display: flex; flex: 1 1 220px; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
+.hm-row__name { display: flex; align-items: center; gap: 8px; max-width: 100%; flex-wrap: wrap; }
+.hm-row__title { font-size: 14.5px; font-weight: 700; color: var(--ink); overflow-wrap: anywhere; }
+.hm-row__facts { font-family: var(--font-mono); font-size: 12px; color: var(--mut); }
+.hm-row__why { font-size: 12.5px; font-weight: 600; color: var(--mut); }
+.hm-row__end { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.hm-row__xfer { flex: 1 1 100%; padding-top: 4px; }
+.hm-row .mm-addon--add { min-height: var(--tap-min); }
+.hm-voice { border-top: 1px solid var(--line); }
+.hm-empty { margin: 0; padding: 10px 12px; font-size: 13.5px; font-weight: 600; color: var(--mut); }
+.hm-flash { padding: 12px 16px; border: 1px solid var(--color-accent); border-radius: 12px; background: var(--color-accent-subtle); font-size: 14px; font-weight: 600; color: var(--ink); }
+.hm-flash--bad { border-color: var(--color-destructive-fg); background: var(--color-destructive-soft); }
+.hm-iconbtn { display: inline-flex; align-items: center; justify-content: center; width: var(--tap-min); height: var(--tap-min); border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--ink); cursor: pointer; }
+.hm-iconbtn:hover { border-color: var(--ink); background: var(--color-accent-subtle); }
+.hm-dim { opacity: 0.4; }
+.hm-skel { display: block; width: 110px; height: 12px; border-radius: 4px; background: var(--line); }
+.hm-skel--wide { width: 180px; margin-bottom: 6px; }
 .mrow__btn { border: 1px solid var(--line); background: var(--panel); color: var(--pp); font-family: inherit; font-size: 12.5px; font-weight: 700; padding: 7px 14px; border-radius: 9px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .mrow__btn:hover { background: var(--pp-50); }
 
@@ -906,13 +925,15 @@ body,
   margin: 0 auto;
 }
 
+/* --color-accent-line reads 4.78:1 to 6.68:1 on the page in every accent and scheme; --pp alone was
+   3.28:1 on the dark Purple, under the 4.5:1 text needs. */
 .setd__back {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   border: none;
   background: none;
-  color: var(--pp);
+  color: var(--color-accent-line, var(--pp));
   font-family: inherit;
   font-size: 13.5px;
   font-weight: 700;
@@ -1549,15 +1570,12 @@ body,
   /* Routines: 2 col */
   .rt__grid { grid-template-columns: repeat(2, 1fr); }
 
-  /* Roles grid: 3 cols instead of 5 */
-  .roles-grid { grid-template-columns: repeat(3, 1fr); }
 
   /* Touch targets: icon rail items */
 
   /* Set row / srow: 40px minimum */
   .set-row { min-height: 40px; }
   .srow { min-height: 40px; }
-  .mrow { min-height: 44px; }
 }
 
 /* ── 3. Very short height (≤500px — 800x480 target) ──────────────────────── */

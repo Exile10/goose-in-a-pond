@@ -121,11 +121,48 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     return route.fulfill({ json: {} });
   });
 
+  // The catch-all goes first: Playwright tries the last-registered matching route first, so a
+  // specific models route registered before it is never reached.
+  await page.route("**/api/v1/models/**", (route) =>
+    route.fulfill({ json: { status: "ok" } }),
+  );
+  await page.route("**/api/v1/models", (route) =>
+    route.fulfill({
+      json: { whisper: [], llamafile: [], tts: [], gguf: [], litert: [], ollama: [], embedding: [] },
+    }),
+  );
   await page.route("**/api/v1/models/active-roles", (route) =>
-    route.fulfill({ json: { chat: { provider: "llamafile", model: "llama3.2" }, think: {}, task: {}, asr: {}, tts: {}, router_name: "llamafile" } }),
+    route.fulfill({
+      json: {
+        chat: { provider: "llamafile", model: "llama3.2" },
+        tool: { model: null },
+        asr: { model_id: null },
+        tts: { model_id: null },
+        embedding: { model_id: null, model: "", provider: "fastembed" },
+        router_name: "llamafile",
+      },
+    }),
   );
   await page.route("**/api/v1/models/memory-status", (route) =>
-    route.fulfill({ json: { total_mb: 8192, available_for_llm_mb: 4096, loaded_model: null } }),
+    route.fulfill({
+      json: { total_mb: 8192, available_for_llm_mb: 4096, loaded_model: null, reclaimable_mb: 0 },
+    }),
+  );
+  await page.route("**/api/v1/models/download/progress", (route) =>
+    route.fulfill({ json: { downloads: [] } }),
+  );
+  await page.route("**/api/v1/models/ollama", (route) =>
+    route.fulfill({ json: { models: [] } }),
+  );
+  await page.route("**/api/v1/models/disk-usage", (route) =>
+    route.fulfill({
+      json: { total_bytes: 0, by_category: {}, hf_cache_bytes: 0, incomplete_bytes: 0 },
+    }),
+  );
+  await page.route("**/api/v1/models/vision-status", (route) =>
+    route.fulfill({
+      json: { model: "", state: { kind: "unknown" }, size_bytes: null, message: null },
+    }),
   );
   // Mirrors WarmupStatus::default(); unmocked, it hits the network and fails console checks.
   await page.route("**/api/v1/warmup", (route) =>
@@ -138,24 +175,6 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
         finished_unix_ms: null,
         elapsed_ms: 0,
       },
-    }),
-  );
-  await page.route("**/api/v1/models/download/progress", (route) =>
-    route.fulfill({ json: { downloads: [] } }),
-  );
-  await page.route("**/api/v1/models/ollama", (route) =>
-    route.fulfill({ json: { models: [] } }),
-  );
-  await page.route("**/api/v1/models", (route) =>
-    route.fulfill({ json: { whisper: [], llamafile: [], tts: [], gguf: [], ollama: [], embedding: [] } }),
-  );
-  await page.route("**/api/v1/models/**", (route) =>
-    route.fulfill({ json: { status: "ok" } }),
-  );
-  // Must follow the models/** catch-all: Playwright tries the last-registered matching route first.
-  await page.route("**/api/v1/models/vision-status", (route) =>
-    route.fulfill({
-      json: { model: "", state: { kind: "unknown" }, size_bytes: null, message: null },
     }),
   );
 
