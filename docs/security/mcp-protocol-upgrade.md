@@ -10,6 +10,10 @@ The Goose fork ports the upstream RMCP 2 migration from
 `7b7b8aa58f54a7e189f681883de55bd42b633634`, keeps the GIAP patches, and adapts
 its additional LiteRT conversion path to the flattened content model.
 The parent MCP servers and Goose adapter use the same ContentBlock API.
+Custom ordinary, OAuth and PCTX HTTP clients also disable redirects explicitly;
+supplying a custom client bypasses RMCP's default redirect policy. Local HTTP
+regressions prove headers reach the configured endpoint but no request reaches
+the destination of 307/308 redirects.
 
 Four vendored PCTX compatibility patches retain code-mode instead of removing
 it. The optional feature is compiled explicitly. Provenance, retained licenses

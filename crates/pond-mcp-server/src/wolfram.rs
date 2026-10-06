@@ -812,7 +812,7 @@ mod tests {
             let _ = stream.write_all(
                 format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
-                     ContentBlock-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .as_bytes(),
