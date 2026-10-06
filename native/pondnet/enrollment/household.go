@@ -8,8 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
-	"net"
 	"net/http"
+	"net/netip"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,34 +41,79 @@ const householdDomain = "goose-household-v1\x00"
 // fill the store and the coordinator's address space.
 const maxHouseholds = 10000
 
-// sources rate-limits registration per client address, because the service-wide
-// limiter cannot tell one household's first contact from a flood.
+// sources rate-limits by a key: a client address, or a household.
 type sources struct {
 	mu      sync.Mutex
-	seen    map[string]*rate.Limiter
+	seen    map[string]*source
+	every   rate.Limit
+	burst   int
 	maximum int
 }
 
-func newSources() *sources { return &sources{seen: map[string]*rate.Limiter{}, maximum: 4096} }
+type source struct {
+	limiter *rate.Limiter
+	last    time.Time
+}
 
-func (s *sources) allow(address string) bool {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		host = address
-	}
+// idle is how long an untouched key is kept; by then its bucket has refilled anyway.
+const idle = 10 * time.Minute
+
+func newSources(every rate.Limit, burst int) *sources {
+	return &sources{seen: map[string]*source{}, every: every, burst: burst, maximum: 4096}
+}
+
+func (s *sources) allow(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Forget everything rather than grow without bound. A caller that loses its
-	// budget this way is one among thousands and will be limited again at once.
-	if len(s.seen) >= s.maximum {
-		s.seen = map[string]*rate.Limiter{}
-	}
-	limiter, ok := s.seen[host]
+	now := time.Now()
+	entry, ok := s.seen[key]
 	if !ok {
-		limiter = rate.NewLimiter(rate.Limit(1.0/60.0), 3)
-		s.seen[host] = limiter
+		if len(s.seen) >= s.maximum {
+			for other, candidate := range s.seen {
+				if now.Sub(candidate.last) > idle {
+					delete(s.seen, other)
+				}
+			}
+		}
+		// Refuse a new key rather than forget every budget: forgetting is what let a
+		// flood of addresses reset everyone's limit.
+		if len(s.seen) >= s.maximum {
+			return false
+		}
+		entry = &source{limiter: rate.NewLimiter(s.every, s.burst)}
+		s.seen[key] = entry
 	}
-	return limiter.Allow()
+	entry.last = now
+	return entry.limiter.Allow()
+}
+
+// client is the address a request came from. Behind a trusted proxy that is the last
+// X-Forwarded-For hop, the one the proxy itself saw; anything earlier is the client's
+// own claim. IPv6 clients are keyed by /64, which one subscriber typically holds whole.
+func (s *Service) client(r *http.Request) string {
+	address := remoteAddress(r.RemoteAddr)
+	if address.IsValid() && slices.ContainsFunc(s.TrustedProxies, func(p netip.Prefix) bool { return p.Contains(address) }) {
+		hops := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+		if forwarded, err := netip.ParseAddr(strings.TrimSpace(hops[len(hops)-1])); err == nil {
+			address = forwarded.Unmap()
+		}
+	}
+	if !address.IsValid() {
+		return r.RemoteAddr
+	}
+	if address.Is6() {
+		prefix, _ := address.Prefix(64)
+		return prefix.String()
+	}
+	return address.String()
+}
+
+func remoteAddress(remote string) netip.Addr {
+	if port, err := netip.ParseAddrPort(remote); err == nil {
+		return port.Addr().Unmap()
+	}
+	address, _ := netip.ParseAddr(remote)
+	return address.Unmap()
 }
 
 // HouseholdID is the household's name for itself: a digest of its public key. The
@@ -90,7 +137,7 @@ func SignHousehold(registration HouseholdRegistration, key ed25519.PrivateKey) (
 }
 
 func (s *Service) registerHousehold(w http.ResponseWriter, r *http.Request) {
-	if !s.sources.allow(r.RemoteAddr) {
+	if !s.registrations.allow(s.client(r)) {
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, `{"error":"rate_limited"}`, 429)
 		return

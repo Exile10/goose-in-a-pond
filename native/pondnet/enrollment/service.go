@@ -14,7 +14,9 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
 
@@ -83,18 +85,38 @@ type Service struct {
 	Store   *Store
 	Backend Backend
 	Now     func() time.Time
-	slots   chan struct{}
-	limiter *rate.Limiter
-	sources *sources
+	// TrustedProxies are the reverse proxies whose X-Forwarded-For names the real client.
+	// Without them every request would share the proxy's own rate-limit budget.
+	TrustedProxies []netip.Prefix
+	slots          chan struct{}
+	limiter        *rate.Limiter
+	// registrations and approvals limit each client address; households limits each
+	// signed household, so one busy household cannot spend another's budget.
+	registrations *sources
+	approvals     *sources
+	households    *sources
+	// degraded is set while the coordinator cannot be reconciled; requests still run.
+	degraded atomic.Bool
 }
 
-// New reconciles the durable allowlist before accepting enrollment requests.
+// New reconciles the durable allowlist before accepting enrollment requests. A coordinator
+// that cannot be reconciled yet leaves the service degraded rather than failing to start,
+// which would only restart it into the same failure; Reconcile retries.
 func New(ctx context.Context, s *Store, b Backend) (*Service, error) {
-	service := &Service{Store: s, Backend: b, Now: time.Now, slots: make(chan struct{}, 8), limiter: rate.NewLimiter(10, 20), sources: newSources()}
+	service := &Service{
+		Store: s, Backend: b, Now: time.Now, slots: make(chan struct{}, 8), limiter: rate.NewLimiter(10, 20),
+		registrations: newSources(rate.Limit(1.0/60.0), 3),
+		approvals:     newSources(rate.Limit(1), 10),
+		households:    newSources(rate.Limit(1.0/6.0), 10),
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failure != nil {
+		return nil, s.failure
+	}
 	if err := service.policy(ctx); err != nil {
-		return nil, err
+		service.degraded.Store(true)
+		slog.Warn("enrollment service starting degraded: the coordinator policy could not be reconciled", "error", err)
 	}
 	return service, nil
 }
@@ -121,8 +143,15 @@ func (s *Service) policy(ctx context.Context) error {
 		}
 		return false
 	}
+	// Sorted, so an unchanged store always produces a byte-identical policy.
+	households := make([]string, 0, len(s.Store.value.Devices))
+	for id := range s.Store.value.Devices {
+		households = append(households, id)
+	}
+	slices.Sort(households)
 	rules := []Rule{}
-	for id, devices := range s.Store.value.Devices {
+	for _, id := range households {
+		devices := s.Store.value.Devices[id]
 		pond := ""
 		phones := []string{}
 		for _, device := range devices {
@@ -136,10 +165,17 @@ func (s *Service) policy(ctx context.Context) error {
 			}
 		}
 		if pond != "" && len(phones) > 0 {
+			slices.Sort(phones)
 			rules = append(rules, Rule{Action: "accept", Src: phones, Dst: []string{pond + ":" + strconv.Itoa(int(s.Store.value.Households[id].Port))}})
 		}
 	}
-	return s.Backend.Policy(ctx, rules)
+	if err := s.Backend.Policy(ctx, rules); err != nil {
+		return err
+	}
+	if s.degraded.Swap(false) {
+		slog.Info("enrollment service recovered: the coordinator policy is reconciled")
+	}
+	return nil
 }
 func strict(data []byte, value any) error {
 	d := json.NewDecoder(bytes.NewReader(data))
@@ -172,6 +208,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"storage_unavailable"}`, 503)
 			return
 		}
+		// Still 200: the process is serving, and an unhealthy container would keep the
+		// gateway, and so every Pond, from reaching it at all.
+		if s.degraded.Load() {
+			io.WriteString(w, `{"ok":true,"degraded":true}`)
+			return
+		}
 		io.WriteString(w, `{"ok":true}`)
 		return
 	}
@@ -183,7 +225,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.limiter.Allow() {
+	if !s.approvals.allow(s.client(r)) || !s.limiter.Allow() {
 		w.Header().Set("Retry-After", "2")
 		http.Error(w, `{"error":"rate_limited"}`, 429)
 		return
@@ -232,9 +274,21 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unauthorized"}`, 403)
 		return
 	}
+	if !s.households.allow(approval.Household) {
+		w.Header().Set("Retry-After", "10")
+		http.Error(w, `{"error":"rate_limited"}`, 429)
+		return
+	}
 	requestID := approval.Household + ":" + approval.Nonce
 	if _, used := s.Store.value.Requests[requestID]; used {
 		http.Error(w, `{"error":"approval_used"}`, 409)
+		return
+	}
+	// Spent as soon as it is authentic, and durably, so no later refusal leaves a signed
+	// approval that can be presented again.
+	s.consume(requestID, approval.Expires, now)
+	if err := s.Store.save(); err != nil {
+		http.Error(w, `{"error":"storage_unavailable"}`, 503)
 		return
 	}
 	devices := s.Store.value.Devices[approval.Household]
@@ -249,7 +303,6 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			current.Revision = rand.Text()
 			devices[approval.Device] = current
 		}
-		s.consume(requestID, approval.Expires, now)
 		if err := s.Store.save(); err != nil {
 			http.Error(w, `{"error":"storage_unavailable"}`, 503)
 			return
@@ -312,7 +365,14 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid_action"}`, 400)
 		return
 	}
-	s.consume(requestID, approval.Expires, now)
+	if approval.Action == "enroll" && s.enrolledLocked() >= EnrollmentCapacity {
+		// Every enrolled device is a coordinator node the policy must read; past this the
+		// inventory would stop fitting and revocations everywhere would stall.
+		slog.Warn("enrollment refused: the service is at capacity", "capacity", EnrollmentCapacity)
+		w.Header().Set("Retry-After", "3600")
+		http.Error(w, `{"error":"capacity"}`, 503)
+		return
+	}
 	if approval.Action == "enroll" || replacing {
 		if replacing {
 			// Retain the old binding permanently, including after a late registration.
@@ -448,6 +508,19 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 	}
 	return s.policy(ctx)
+}
+
+// enrolledLocked counts the devices that hold, or may yet hold, a coordinator node.
+func (s *Service) enrolledLocked() int {
+	count := 0
+	for _, devices := range s.Store.value.Devices {
+		for _, device := range devices {
+			if device.Status != "revoked" && device.Status != "failed" {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func (s *Service) consume(requestID string, expiry, now int64) {
