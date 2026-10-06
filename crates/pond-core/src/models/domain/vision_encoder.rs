@@ -555,7 +555,7 @@ pub fn mb(bytes: u64) -> u64 {
 
 /// The refusal for a model with no encoder.
 pub const NOT_DECLARED_MESSAGE: &str = "This model cannot look at pictures. To send one, choose a \
-     model marked Reads pictures on the Models page.";
+     model marked Pictures included on the Models page.";
 
 /// The refusal while the chat provider is another pond: the mesh wire carries text only.
 pub const MESH_MESSAGE: &str = "Pictures cannot be sent to another pond yet. Switch back to a \
@@ -1501,8 +1501,8 @@ mod tests {
         assert_eq!(nd.code.as_str(), "vision_unsupported");
         assert_eq!(
             nd.message,
-            "This model cannot look at pictures. To send one, choose a model marked Reads \
-             pictures on the Models page."
+            "This model cannot look at pictures. To send one, choose a model marked Pictures \
+             included on the Models page."
         );
         // What the goose adapter reports under mesh.
         let mesh = r(Some(EncoderState::NotDeclared), "mesh").unwrap();

@@ -54,6 +54,7 @@ use uuid::Uuid;
 
 use pond_core::models::domain::model_layout;
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
+use pond_core::models::domain::model_role::ModelRole;
 use pond_core::models::domain::taxonomy::{
     is_companion_file, is_helper_architecture, ON_DISK_PLACEHOLDER,
 };
@@ -5116,9 +5117,10 @@ async fn get_active_roles(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
-/// GET /api/v1/models/memory-status — returns current LLM memory budget snapshot.
-/// `reclaimable_mb` is what switching away from the model in use would free, so a fit check can
-/// count it.
+/// GET /api/v1/models/memory-status — returns current LLM memory budget snapshot: the board's on
+/// a budgeted device, the machine's own elsewhere. `budget_mb` is the most the LLM slot may ever
+/// hold here; `reclaimable_mb` is what switching away from the model in use would free, so a fit
+/// check can count it.
 async fn get_memory_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let status = state
         .model_scheduler
@@ -5130,6 +5132,7 @@ async fn get_memory_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "total_mb":             status.total_mb,
         "available_for_llm_mb": status.available_for_llm_mb,
+        "budget_mb":            status.budget_mb,
         "loaded_model":         status.loaded_model,
         "reclaimable_mb":       reclaimable_mb,
     }))
@@ -5844,11 +5847,27 @@ async fn delete_model(
     let model_id = m.id.clone();
 
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
-    if let Some(a) = assignments.iter().find(|a| a.model_id == model_id) {
+    // The job a row is doing, if any; the first in the roles' own order when it has several.
+    let job_of = |id: &str| {
+        assignments
+            .iter()
+            .filter(|a| a.model_id == id)
+            .min_by_key(|a| {
+                ModelRole::ALL
+                    .iter()
+                    .position(|r| r.as_str() == a.role)
+                    .unwrap_or(ModelRole::ALL.len())
+            })
+            .map(|a| ModelRole::job_for(&a.role).to_string())
+    };
+    if let Some(job) = job_of(&model_id) {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
-                "error": format!("Model is assigned to role '{}'. Deactivate it first.", a.role)
+                "error": format!(
+                    "{} is doing a job right now ({job}). Give that job to another model first.",
+                    crate::model_views::title_of(&m)
+                )
             })),
         ));
     }
@@ -5858,19 +5877,14 @@ async fn delete_model(
     let in_use_by = rows
         .iter()
         .filter(|r| r.id != model_id && model_layout::share_a_file(r, &m))
-        .find_map(|r| {
-            assignments
-                .iter()
-                .find(|a| a.model_id == r.id)
-                .map(|a| (r.name.clone(), a.role.clone()))
-        });
-    if let Some((other, role)) = in_use_by {
+        .find_map(|r| job_of(&r.id).map(|job| (crate::model_views::title_of(r), job)));
+    if let Some((other, job)) = in_use_by {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
                 "error": format!(
-                    "'{other}' uses the same file and is assigned to role '{role}'. \
-                     Deactivate it first."
+                    "{other} uses the same file and is doing a job right now ({job}). Give that \
+                     job to another model first."
                 )
             })),
         ));
@@ -6550,9 +6564,16 @@ fn register(
     entry.model_id = file.model_id.clone();
     entry.part = file.part.map(str::to_string);
     entry.dest = Some(file.dest.clone());
+    entry.resumable = resumes(&file.url);
     if entry.total_bytes.is_none() {
         entry.total_bytes = file.size_bytes;
     }
+}
+
+/// Whether a transfer from `url` keeps what has arrived across a pause: the Hugging Face path
+/// through `pond_hf_cache` does, the `.part` path restarts.
+fn resumes(url: &str) -> bool {
+    pond_hf_cache::parse_hf_url(url).is_some()
 }
 
 /// Where a non-HF transfer writes until it is whole.
@@ -16839,6 +16860,13 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_reading_lets_the_primary_pick_fit() {
+        // Gemma 4 E4B QAT (4,020 MB) against a 32 GB desktop's own reading, then the board's.
+        assert_eq!(model_spills_budget(4_020, 22_000), Some(false));
+        assert_eq!(model_spills_budget(4_020, 1_000 + 3_000), Some(true));
+    }
+
+    #[test]
     fn model_spills_budget_spills_large_model() {
         // gemma3n:e2b real download (~5600 MB) spills a 4096 MB budget.
         assert_eq!(model_spills_budget(5600, 4096), Some(true));
@@ -16866,6 +16894,33 @@ mod tests {
     fn model_spills_budget_headroom_matches_desktop() {
         // Mirrors the desktop's DEFAULT_HEADROOM_MB so the server warning and UI badge agree.
         assert_eq!(MEMORY_FIT_HEADROOM_MB, 1024);
+    }
+
+    /// The progress list says which pauses keep what has arrived.
+    #[tokio::test]
+    async fn only_a_hugging_face_transfer_is_resumable() {
+        let tracker: Tracker = Arc::new(tokio::sync::RwLock::new(Default::default()));
+        for (url, resumable) in [
+            ("https://huggingface.co/o/r/resolve/main/m.gguf", true),
+            ("https://example.com/m.gguf", false),
+        ] {
+            let file = TrackedFile {
+                url: url.to_string(),
+                dest: "/pond/models/gguf/m.gguf".into(),
+                key: url.to_string(),
+                category: "gguf".into(),
+                model_id: None,
+                part: None,
+                size_bytes: None,
+            };
+            begin_tracking(&tracker, &file).await;
+            let entry = tracker.read().await[url].clone();
+            assert_eq!(entry.resumable, resumable, "{url}");
+            assert_eq!(
+                serde_json::to_value(&entry).unwrap()["resumable"],
+                resumable
+            );
+        }
     }
 
     #[test]

@@ -104,8 +104,9 @@ failed entry's `error` says what happened and what to do in plain words
 `{filename, action}` for one file or `{model_id, action}` for every part of a model, with
 `action` one of `pause`, `resume` or `cancel`. Pause keeps a Hugging Face transfer's partial file
 to resume from (a transfer from any other host has no range resume, so its pause discards the
-partial and a resume starts over), cancel deletes it, cancelling a model's own file cancels its
-add-on too, and a paused entry is never evicted. A
+partial and a resume starts over); each entry's `resumable` says which. Cancel deletes the
+partial, cancelling a model's own file cancels its add-on too, and a paused entry is never
+evicted. A
 row's `companions` read `downloading` while the add-on comes down, `verifying` while its hash is
 checked, then `installed`. When the model file arrives its row is marked downloaded,
 and when either part arrives the agent registers the model by the file its row names and verifies
@@ -133,8 +134,21 @@ no file is touched. An Ollama that does not answer, or answers with no models, c
 its rows: the fetch cannot tell the two apart, so the last model removed from Ollama leaves its
 row behind. Rows are told apart by exact id; `Foo` and `foo` are two rows.
 
-Deleting a model refuses when another row that is assigned names the same file (an older row
-under another id, or another spelling of the name).
+Deleting a model refuses (409) while it has a job, or while another row that names the same file
+has one (an older row under another id, or another spelling of the name). The refusal names the
+model by its title and the job in the household's words (`ModelRole::job`): Conversation,
+Listening, Speaking, Memory, Tool helper.
+
+## Memory budget
+
+`GET /models/memory-status` reports `total_mb`, `available_for_llm_mb`, `budget_mb` and
+`reclaimable_mb`. On a budgeted device (the Orin, or a `POND_DEVICE_PROFILE` emulation) they are
+the board's: its fixed total, `MemAvailable`, and the budget left after the system, speech and
+voice. Any other machine reports its own total and available memory (`sysinfo`, in the
+local-inference adapter's scheduler), with a budget of that total less a desktop reserve
+(`device_budget::host_llm_budget_mb`: a quarter of memory, at least 4 GB). Available never
+exceeds the budget, and what a switch frees is counted against that same budget, so the Models
+page's fit check and the server's spill warning read one status.
 
 ## No model chosen
 

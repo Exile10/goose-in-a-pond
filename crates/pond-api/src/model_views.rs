@@ -56,6 +56,11 @@ pub(crate) fn record_to_dto(
     }
 }
 
+/// The name the household reads for `m`.
+pub(crate) fn title_of(m: &ModelRecord) -> String {
+    taxonomy::title(m, curated::for_record(m).map(|p| p.title))
+}
+
 /// The suggestion for `model_id`, carrying numbers only measured on `device`'s class.
 pub(crate) fn recommendation(model_id: &str, device: DeviceClass) -> Option<RecommendedDto> {
     let r = recommended::recommendation_for(model_id)?;
@@ -209,7 +214,8 @@ pub(crate) async fn in_use_mb(state: &AppState) -> u64 {
 }
 
 /// [`device_budget::reclaimable_mb`](pond_core::models::domain::device_budget::reclaimable_mb)
-/// for this pond right now; zero where memory is managed by another program.
+/// for this pond right now, against the budget the status was measured with; zero where memory
+/// is managed by another program.
 pub(crate) async fn reclaimable_mb(
     state: &AppState,
     status: &pond_core::models::ports::model_scheduler::MemoryStatus,
@@ -219,7 +225,7 @@ pub(crate) async fn reclaimable_mb(
     }
     pond_core::models::domain::device_budget::reclaimable_mb(
         in_use_mb(state).await,
-        pond_core::models::domain::device_budget::llm_budget_mb(),
+        status.budget_mb,
         status.available_for_llm_mb,
     )
 }

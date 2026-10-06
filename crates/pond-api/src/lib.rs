@@ -398,6 +398,9 @@ pub struct DownloadEntry {
     /// Why it stopped, for an `error` entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether a pause keeps what has arrived: a Hugging Face transfer resumes from its
+    /// `.incomplete`, while a `.part` transfer starts again from zero.
+    pub resumable: bool,
 }
 
 impl DownloadEntry {
@@ -417,6 +420,7 @@ impl DownloadEntry {
             dest: None,
             partial: None,
             error: None,
+            resumable: false,
         }
     }
 

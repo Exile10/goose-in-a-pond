@@ -360,6 +360,10 @@ async fn delete_model_409_when_model_has_active_role() {
     let req = auth_req("DELETE", "/api/v1/models/gguf/test-model", None);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(resp).await["error"],
+        "test-model is doing a job right now (Conversation). Give that job to another model first."
+    );
 }
 
 #[tokio::test]
@@ -1704,6 +1708,23 @@ impl pond_core::models::ports::model_scheduler::ModelScheduler for LoadedSchedul
         pond_core::models::ports::model_scheduler::MemoryStatus {
             total_mb: 7620,
             available_for_llm_mb: 1000,
+            budget_mb: pond_core::models::domain::device_budget::llm_budget_mb(),
+            loaded_model: None,
+        }
+    }
+}
+
+/// A 32 GB desktop's own reading with a model loaded.
+struct DesktopScheduler;
+
+#[async_trait::async_trait]
+impl pond_core::models::ports::model_scheduler::ModelScheduler for DesktopScheduler {
+    async fn notify_wake_word(&self) {}
+    fn memory_status(&self) -> pond_core::models::ports::model_scheduler::MemoryStatus {
+        pond_core::models::ports::model_scheduler::MemoryStatus {
+            total_mb: 32_768,
+            available_for_llm_mb: 22_000,
+            budget_mb: 24_576,
             loaded_model: None,
         }
     }
@@ -1744,6 +1765,7 @@ async fn memory_status_counts_what_a_switch_would_free() {
     let body = body_json(resp).await;
     assert_eq!(body["available_for_llm_mb"], 1000);
     let budget = pond_core::models::domain::device_budget::llm_budget_mb();
+    assert_eq!(body["budget_mb"], budget);
     assert_eq!(
         body["reclaimable_mb"],
         3000u64.min(budget.saturating_sub(1000))
@@ -1761,6 +1783,44 @@ async fn memory_status_counts_what_a_switch_would_free() {
         .await
         .unwrap();
     assert_eq!(body_json(resp).await["reclaimable_mb"], 0);
+}
+
+/// A desktop's own numbers come through whole, and what a switch frees is measured against its
+/// own budget, not the board's.
+#[tokio::test]
+async fn memory_status_reports_a_desktop_by_its_own_budget() {
+    let f = pond_with_parts(
+        Arc::new(MockAgent::new()),
+        Parts {
+            scheduler: Some(Arc::new(DesktopScheduler)),
+            sqlite_settings: true,
+            ..Parts::default()
+        },
+    )
+    .await;
+    let gguf = f.tmp.path().join("models/gguf");
+    std::fs::create_dir_all(&gguf).unwrap();
+    let file = std::fs::File::create(gguf.join("in-use.gguf")).unwrap();
+    file.set_len(4000 * 1_048_576).unwrap();
+    f.repo.upsert(&gguf_record("in-use")).await.unwrap();
+    for (key, value) in [("chat_provider", "local"), ("chat_model", "in-use")] {
+        f.settings.set_key(key, value.into()).await.unwrap();
+    }
+
+    let resp = f
+        .app
+        .clone()
+        .oneshot(auth_req("GET", "/api/v1/models/memory-status", None))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["total_mb"], 32_768);
+    assert_eq!(body["budget_mb"], 24_576);
+    assert_eq!(body["available_for_llm_mb"], 22_000);
+    assert_eq!(
+        body["reclaimable_mb"], 2_576,
+        "never more than the budget is short of"
+    );
 }
 
 /// A model's download served slowly, so a second request lands while the first is in flight.
@@ -1930,9 +1990,11 @@ async fn deleting_a_row_leaves_the_file_of_an_assigned_row_that_shares_it() {
     };
     let (status, body) = del("gemma-4-E4B-it-Q4_K_M").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(
-        body["error"].as_str().unwrap().contains("gemma-4-e4b"),
-        "{body}"
+    assert_eq!(
+        body["error"],
+        "Gemma 4 E4B uses the same file and is doing a job right now (Conversation). Give that \
+         job to another model first.",
+        "the other row by the name the household reads, and its job"
     );
     assert!(gguf.join("gemma-4-E4B-it-Q4_K_M.gguf").exists());
     assert!(
