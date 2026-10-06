@@ -250,6 +250,24 @@ Notes: Run `tiny.en` on 9001, `base.en` on 9000. Pi 4 is slow — tiered models 
 ```
 Notes: Build whisper.cpp with CUDA support (`make clean && WHISPER_CUDA=1 make`). Inference drops to ~0.5s for `base.en`. Both models load simultaneously with ~120 MB VRAM.
 
+#### When the GPU has no room for a transcription
+
+In-process Whisper (`pond-adapters-whisper`, built with `pond-adapters-whisper/cuda`) keeps the
+model weights on the GPU from startup, but every transcription creates a fresh `whisper_state`
+whose KV caches and compute buffers are allocated for that call and freed after it (the one that
+failed on 2026-10-04, with `base`, was 90 MiB). The LLM shares the same 8 GB, so a call can find no room. That is
+an error, not a crash: the log shows `failed to reserve graph buffers`, Whisper's
+`failed to init ... allocator`, then `kind="whisper_transcription_failed"`; the transcribe routes
+answer 500 with the reason, and the wake-word loop moves to its next window. Until 2026-10-04 it
+was a `SIGSEGV` in Whisper's vendored GGML that took the whole Pond down
+(`vendor/whisper-rs-sys/POND-PATCH.md`).
+
+Whisper does not fall back to the CPU. On the Orin, CPU and GPU allocations come from the same
+memory, so a CPU retry competes for what just ran out, and a second, CPU-resident context
+would hold its weights all the time to cover a failure that clears when the LLM's turn ends.
+The next utterance allocates again and normally succeeds. If failures recur, the budget is the
+cause: the LLM's context size, not Whisper, is what to shrink.
+
 ### Apple Silicon Mac (dev)
 
 ```json

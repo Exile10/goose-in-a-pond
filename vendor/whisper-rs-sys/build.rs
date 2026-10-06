@@ -114,16 +114,15 @@ fn main() {
         println!("cargo:rerun-if-changed=namespace.rs");
     }
 
-    if !whisper_root.exists() {
-        std::fs::create_dir_all(&whisper_root).unwrap();
-        fs_extra::dir::copy("./whisper.cpp", &out, &Default::default()).unwrap_or_else(|e| {
-            panic!(
-                "Failed to copy whisper sources into {}: {}",
-                whisper_root.display(),
-                e
-            )
-        });
-    }
+    // The native sources carry a Pond patch (POND-PATCH.md), so a change to them must rebuild.
+    println!("cargo:rerun-if-changed=whisper.cpp");
+    sync_sources(std::path::Path::new("whisper.cpp"), &whisper_root).unwrap_or_else(|e| {
+        panic!(
+            "Failed to copy whisper sources into {}: {}",
+            whisper_root.display(),
+            e
+        )
+    });
 
     if isolated && env::var("WHISPER_DONT_GENERATE_BINDINGS").is_ok() {
         panic!("Linux GGML isolation requires generated bindings; unset WHISPER_DONT_GENERATE_BINDINGS");
@@ -401,6 +400,26 @@ fn get_cpp_link_stdlib(target: &str) -> Option<&'static str> {
     } else {
         Some("stdc++")
     }
+}
+
+/// Bring the build's copy of the native sources up to date, rewriting only files that differ.
+///
+/// The copy used to be made once per `OUT_DIR` and never refreshed, so an edited source
+/// compiled nothing and the previous library shipped. Unchanged files keep their timestamps,
+/// so CMake recompiles only what changed.
+fn sync_sources(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            sync_sources(&source, &target)?;
+        } else if std::fs::read(&target).ok() != Some(std::fs::read(&source)?) {
+            std::fs::copy(&source, &target)?;
+        }
+    }
+    Ok(())
 }
 
 fn add_link_search_path(dir: &std::path::Path) -> std::io::Result<()> {

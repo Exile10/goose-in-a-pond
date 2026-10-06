@@ -45,6 +45,11 @@ pub fn header(source: &Path, destination: &Path) -> std::io::Result<()> {
     for name in names {
         output.push_str(&format!("#define {name} pond_whisper_{name}\n"));
     }
+    // Every native file includes this header, so rewriting it unchanged would recompile all
+    // of them whenever the build script reruns.
+    if fs::read_to_string(destination).ok().as_deref() == Some(output.as_str()) {
+        return Ok(());
+    }
     fs::write(destination, output)
 }
 #[derive(Debug)]
