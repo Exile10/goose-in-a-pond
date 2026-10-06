@@ -27,6 +27,10 @@ void i18n.use(initReactI18next).init({
     invite_invalid: 'That invite was not recognised. Check it against the one you were given.',
     invite_expired: 'That invite has expired. Ask for a new one.',
     invite_used: 'That invite has already admitted another household. Ask for a new one.',
+    provisioned: 'This Pond was provisioned when it was set up, so it joins the hosted coordination service without an invite. Device serial: {{serial}}',
+    device_certificate_invalid: 'The coordination service does not recognise this Pond\'s device certificate. Ask whoever runs it for an invite and enter it below.',
+    device_revoked: 'This Pond\'s device certificate has been revoked. Ask whoever runs the coordination service for an invite and enter it below.',
+    device_used: 'This Pond\'s device certificate has already admitted another household. Ask whoever runs the coordination service for an invite and enter it below.',
   }, signIn: {
     title: 'Sign in to this Pond',
     instructions: 'This browser has not been signed in. On the Pond, run this command and open the link it prints:',

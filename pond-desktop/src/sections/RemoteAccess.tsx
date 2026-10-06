@@ -5,8 +5,10 @@ import { api } from '../api/PondApiClient';
 import { isSignInRequired } from '../api/hostCredential';
 import { ApiError, type RecoveryRequest } from '../api/types';
 
-/** The coordinator's refusals over an invite, each with its own `remote.*` message. */
-const INVITE_REFUSALS = ['invite_required', 'invite_invalid', 'invite_expired', 'invite_used'];
+/** The coordinator's refusals over an invite or a device certificate, each with its own `remote.*` message. */
+const ADMISSION_REFUSALS = ['invite_required', 'invite_invalid', 'invite_expired', 'invite_used', 'device_certificate_invalid', 'device_revoked', 'device_used'];
+/** A refused certificate falls back to an invite, so these bring the invite field back. */
+const DEVICE_REFUSALS = ['device_certificate_invalid', 'device_revoked', 'device_used'];
 
 /** Household activation stays on the Pond's protected local dashboard. */
 export function RemoteAccess() {
@@ -14,6 +16,7 @@ export function RemoteAccess() {
   const [control, setControl] = useState('');
   const [enrollment, setEnrollment] = useState('');
   const [invite, setInvite] = useState('');
+  const [device, setDevice] = useState<{ provisioned: boolean; serial?: string } | null>(null);
   const [identity, setIdentity] = useState<{ household: string; publicKey: string } | null>(null);
   const [state, setState] = useState('connecting');
   const [requests, setRequests] = useState<RecoveryRequest[]>([]);
@@ -29,6 +32,13 @@ export function RemoteAccess() {
       if (current === generation.current) setState(status.state === 'Running' ? 'enabled' : status.state === 'Stopped' ? 'local' : 'failed');
     }).catch((error: unknown) => { noteRefusal(error); if (current === generation.current) setState('failed'); });
     return () => { generation.current++; };
+  }, []);
+  useEffect(() => {
+    let active = true;
+    // Unknown is shown as not provisioned, so the invite field stays available.
+    void api.remoteDevice().then((found) => { if (active) setDevice(found); })
+      .catch(() => { if (active) setDevice(null); console.warn('[remote] device provisioning status unavailable'); });
+    return () => { active = false; };
   }, []);
   useEffect(() => {
     let active = true;
@@ -95,8 +105,8 @@ export function RemoteAccess() {
       }
     } catch (error) {
       noteRefusal(error);
-      // The coordinator names which invite refusal it was; each has its own explanation.
-      const refusal = error instanceof ApiError && INVITE_REFUSALS.includes(error.message) ? error.message : null;
+      // The coordinator names which admission refusal it was; each has its own explanation.
+      const refusal = error instanceof ApiError && ADMISSION_REFUSALS.includes(error.message) ? error.message : null;
       if (current === generation.current) setState(refusal ?? 'failed');
       console.warn('[remote] local activation operation failed');
     } finally { if (current === generation.current) setBusy(false); }
@@ -126,11 +136,13 @@ export function RemoteAccess() {
       </Switch>
     </div>
 
-    <label style={field}>
+    {device?.provisioned && !DEVICE_REFUSALS.includes(state)
+      ? <p style={{ margin: 0, overflowWrap: 'anywhere' }}>{t('remote.provisioned', { serial: device.serial ?? '' })}</p>
+      : <label style={field}>
       <span>{t('remote.invite')}</span>
       <input type="text" autoCapitalize="characters" autoComplete="off" spellCheck={false} placeholder="giap-inv1-..." value={invite} onChange={(e) => setInvite(e.target.value)} disabled={busy || on} />
       <span style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-sm)' }}>{t('remote.inviteHint')}</span>
-    </label>
+    </label>}
 
     <details>
       <summary>{t('remote.advanced')}</summary>

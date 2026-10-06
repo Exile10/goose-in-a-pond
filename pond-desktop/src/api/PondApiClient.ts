@@ -343,6 +343,8 @@ export class PondApiClient {
   approveRemoteRecovery(id: string): Promise<unknown> { return this.hostRequest('POST', `/api/v1/remote-access/recovery-requests/${encodeURIComponent(id)}`, {}); }
   /** `invite` is needed only the first time this household registers with a coordinator. */
   registerRemotePond(invite?: string): Promise<unknown> { return this.hostRequest('POST', '/api/v1/remote-access/register', invite ? { invite } : {}); }
+  /** Whether this Pond was provisioned with a device certificate, which admits it without an invite. */
+  remoteDevice(): Promise<{ provisioned: boolean; serial?: string }> { return this.hostRequest('GET', '/api/v1/remote-access/device'); }
   disableRemoteAccess(): Promise<unknown> { return this.hostRequest('DELETE', '/api/v1/remote-access'); }
 
   // ── Health ────────────────────────────────────────────────

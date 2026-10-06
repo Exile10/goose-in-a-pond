@@ -245,6 +245,43 @@ impl Runtime {
         };
     }
 
+    /// The serial of the device certificate this Pond was imaged with, or `None` when it was
+    /// never provisioned. A certificate file that is a symlink, too large, readable by others
+    /// or unreadable counts as absent and is logged, so the dashboard falls back to asking for
+    /// an invite rather than claiming a provisioning it cannot show.
+    fn provisioned_serial(&self) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Certificate {
+            payload: String,
+        }
+        #[derive(Deserialize)]
+        struct Payload {
+            serial: String,
+        }
+        let path = self.directory.join("device").join("certificate.json");
+        // Opened once and checked on the open handle, so a file swapped in after a check is
+        // never read: a symlink, a loose mode or more than 8 KiB counts as no certificate.
+        let certificate = match revocation::read_private_json::<Certificate>(&path, 8192) {
+            Ok(Some(certificate)) => certificate,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(error = %error, "device certificate unreadable; ignoring it");
+                return None;
+            }
+        };
+        use base64::Engine;
+        let serial = base64::engine::general_purpose::STANDARD
+            .decode(certificate.payload)
+            .ok()
+            .and_then(|payload| serde_json::from_slice::<Payload>(&payload).ok())
+            .map(|payload| payload.serial)
+            .filter(|serial| serial.len() == 32 && serial.bytes().all(|b| b.is_ascii_hexdigit()));
+        if serial.is_none() {
+            tracing::warn!("device certificate carries no serial; ignoring it");
+        }
+        serial
+    }
+
     async fn authority(
         &self,
         action: &str,
@@ -1070,6 +1107,7 @@ pub fn management(
             "/api/v1/remote-access/register",
             axum::routing::post(register_pond),
         )
+        .route("/api/v1/remote-access/device", get(device_status))
         .merge(recovery::local_routes())
         .with_state(runtime)
         .route_layer(middleware::from_fn_with_state(credential, host_only))
@@ -1189,6 +1227,21 @@ struct RegisterPond {
 
 /// Loosely the coordinator's invite shape; it decides validity, this only refuses what
 /// could never be one before it reaches the helper.
+/// Whether this Pond was imaged with a device certificate, and the serial it was issued
+/// under, so the dashboard can say why no invite is needed and an operator can quote the
+/// serial to revoke a lost Pond. The helper presents the certificate itself; nothing here
+/// signs or sends it.
+async fn device_status(
+    State(runtime): State<Arc<Runtime>>,
+    peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    local(peer)?;
+    Ok(Json(match runtime.provisioned_serial() {
+        Some(serial) => serde_json::json!({ "provisioned": true, "serial": serial }),
+        None => serde_json::json!({ "provisioned": false }),
+    }))
+}
+
 fn plausible_invite(invite: &str) -> bool {
     invite.len() <= 64
         && invite
@@ -1245,7 +1298,13 @@ async fn register_pond(
         tracing::warn!(%error, reason = ?reason, "household registration failed");
         return Err(match reason.as_deref() {
             Some(
-                reason @ ("invite_required" | "invite_invalid" | "invite_expired" | "invite_used"),
+                reason @ ("invite_required"
+                | "invite_invalid"
+                | "invite_expired"
+                | "invite_used"
+                | "device_certificate_invalid"
+                | "device_revoked"
+                | "device_used"),
             ) => refuse(StatusCode::FORBIDDEN, reason),
             _ => refuse(StatusCode::SERVICE_UNAVAILABLE, "registration_unavailable"),
         });
@@ -2076,6 +2135,102 @@ mod tests {
                 &registration(node_key, machine_key),
             );
             assert_eq!(payload.is_ok(), ok, "{node_key:?} {machine_key:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_learns_whether_the_pond_was_provisioned() {
+        use std::os::unix::fs::PermissionsExt;
+        use tower::ServiceExt;
+        let data = tempfile::tempdir().unwrap();
+        let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
+        let ask = |runtime: Arc<Runtime>| async move {
+            let mut request = Request::builder()
+                .uri("/api/v1/remote-access/device")
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+            let response = management(runtime).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        assert_eq!(
+            ask(runtime.clone()).await,
+            serde_json::json!({ "provisioned": false })
+        );
+
+        let device = runtime.directory.join("device");
+        std::fs::create_dir(&device).unwrap();
+        std::fs::set_permissions(&device, std::fs::Permissions::from_mode(0o700)).unwrap();
+        use base64::Engine;
+        let serial = "0f".repeat(16);
+        let payload = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "v": 1, "serial": serial, "devicePublicKey": "k", "issued": 1
+            }))
+            .unwrap(),
+        );
+        let certificate = device.join("certificate.json");
+        std::fs::write(
+            &certificate,
+            serde_json::to_vec(&serde_json::json!({ "payload": payload, "signature": "s" }))
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&certificate, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            ask(runtime.clone()).await,
+            serde_json::json!({ "provisioned": true, "serial": serial })
+        );
+
+        // A certificate others can read is not shown as a provisioning.
+        std::fs::set_permissions(&certificate, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            ask(runtime).await,
+            serde_json::json!({ "provisioned": false })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_device_certificate_is_explained_to_the_dashboard() {
+        use tower::ServiceExt;
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        runtime.publish(Status {
+            state: "NeedsLogin".into(),
+            addresses: vec![],
+            auth_url: Some("https://coord.example/register/abcdefghijklmnop".into()),
+            node_key: format!("nodekey:{}", "b".repeat(64)),
+            machine_key: format!("mkey:{}", "a".repeat(64)),
+        });
+        for reason in [
+            "device_certificate_invalid",
+            "device_revoked",
+            "device_used",
+        ] {
+            helper.answer("register", 3, &format!(r#"{{"refused":"{reason}"}}"#));
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/remote-access/register")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
+            let response = management(runtime.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{reason}");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], reason);
         }
     }
 

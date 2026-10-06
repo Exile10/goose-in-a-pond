@@ -93,6 +93,7 @@ bash scripts/giap.sh build       # web UI + pond-server, correct features for th
 bash scripts/giap.sh doctor      # health report; exits 1 on any FAIL
 bash scripts/giap.sh status      # detection banner only
 bash scripts/giap.sh node        # find, or download and verify, the Node this repo needs
+bash scripts/giap.sh provision --host HOST --key FILE  # operator: give a Pond a device certificate
 bash scripts/giap.sh --dry-run … # print every command instead of running it
 ```
 

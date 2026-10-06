@@ -26,6 +26,20 @@ registered no invite is needed again. The dashboard explains each refusal
 (`invite_required`, `invite_invalid`, `invite_expired`, `invite_used`). Operators
 issue invites as described in [the deployment guide](../deploy/remote-access/README.md).
 
+A Pond the operator imaged needs no invite (2026-10-05). `scripts/giap.sh provision`,
+run on the operator's machine, gives it a device key in `embedded-network/device` and a
+certificate signed with the operator's offline provisioning key; its first registration
+carries that certificate, bound to the household it registers, and the hosted service
+admits it. `provision-device.sh` assumes the Jetson layout by default: data in
+`~/.local/share/goose-in-a-pond` and the helper at
+`~/goose-in-a-pond/target/release/pondnet`. Pass `--data-dir` and `--pondnet` for any
+other Pond, including one on macOS. It needs `ssh` and `python3` on the operator's
+machine, and builds `pond-provision` from `native/pondnet` (which needs Go) if it is
+not on `PATH`. The dashboard then shows the device serial in place of the invite field,
+which is what an operator revokes a lost Pond by. A certificate the service refuses
+(`device_certificate_invalid`, `device_revoked`, `device_used`) brings the invite field
+back, since an invite still admits the household.
+
 This branch prepares a locally tested pilot deployment. Public domains and hosting
 are still prerequisites for cellular use. Follow
 [the deployment guide](../deploy/remote-access/README.md) to provision a pilot
@@ -245,9 +259,11 @@ can act on which refusal it was. The revocation queue drops an entry refused wit
 an optional `{"invite"?: string}` and refuses unknown fields with `422`. It answers
 `400 invite_invalid`, without running the helper, for a string that could never be an
 invite; `403` with the coordinator's reason (`invite_required`, `invite_invalid`,
-`invite_expired`, `invite_used`); `409 no_pending_registration` when the node has no
-pending registration; `503 registration_unavailable` for any other registration
-failure; and `503 enrollment_unavailable` when enrolling the Pond's own node fails.
+`invite_expired`, `invite_used`, and for a provisioned Pond
+`device_certificate_invalid`, `device_revoked`, `device_used`);
+`409 no_pending_registration` when the node has no pending registration;
+`503 registration_unavailable` for any other registration failure; and
+`503 enrollment_unavailable` when enrolling the Pond's own node fails.
 
 ### Disabling and signing out
 
@@ -412,6 +428,9 @@ the three items above, `secrets/`, `secrets.json`, the schedules, and consistent
 of `pond_system.db` and `pond_vectors.db` taken through SQLite's online backup API so
 the Pond keeps serving. It deliberately omits `models/`, `hf_cache/`, `bin/`, `lib/` and
 the logs, which are gigabytes and all refetchable; the remainder is under a megabyte.
+It also omits `embedded-network/device`: the device key admits a household only on its
+first registration, a restored Pond's household is already registered, and leaving it
+out keeps a copy of that key off every backup host.
 
 An `embedded-network/authority/` directory with no `identity.json` is refused as a lost
 key (`authority identity is missing; restore its backup`). If a crash during first setup
