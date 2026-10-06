@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
+	"tailscale.com/logtail"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/key"
 
@@ -116,11 +117,12 @@ func Open(dir, hostname, control string) (*Node, error) {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0077 != 0 {
 		return nil, errors.New("embedded identity directory must be private and not a symlink")
 	}
-	fd, err := unix.Open(filepath.Join(dir, "node.lock"), unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW, 0600)
-	fresh := err == nil
-	if errors.Is(err, os.ErrExist) {
-		fd, err = unix.Open(filepath.Join(dir, "node.lock"), unix.O_RDWR|unix.O_NOFOLLOW, 0600)
-	}
+	// A new identity may be created only until one has been written once. This used to be
+	// keyed on creating the lock file, so a crash between that and the first write left a
+	// node that refused every later start for want of an identity it never had.
+	_, err = os.Lstat(filepath.Join(dir, initializedMarker))
+	fresh := errors.Is(err, os.ErrNotExist)
+	fd, err := unix.Open(filepath.Join(dir, "node.lock"), unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +132,9 @@ func Open(dir, hostname, control string) (*Node, error) {
 		return nil, errors.New("embedded identity is already in use")
 	}
 	identity, err := openIdentityStore(dir, control, fresh)
+	if err == nil && fresh {
+		err = markInitialized(dir)
+	}
 	if err != nil {
 		lock.Close()
 		return nil, err
@@ -147,6 +152,14 @@ func Open(dir, hostname, control string) (*Node, error) {
 	// Opt out before starting any backend; discarded local logging alone does not
 	// disable Tailscale's separate remote diagnostic uploader.
 	envknob.SetNoLogsNoSupport()
+	// tsnet also keeps its own log ring on disk in the profile, unredacted, whatever Logf
+	// does. Disabling logtail drops entries before they reach it, and what earlier builds
+	// wrote there is removed.
+	logtail.Disable()
+	if err := removeBackendLogs(dir); err != nil {
+		lock.Close()
+		return nil, err
+	}
 	s := &tsnet.Server{Dir: dir, Store: identity, Hostname: hostname, ControlURL: control,
 		Logf: backendLogf, UserLogf: backendLogf}
 	if err := s.Start(); err != nil {
@@ -234,3 +247,39 @@ func PeerAddress(value string) (netip.AddrPort, error) {
 
 // DialContext is implemented by tsnet and permits controlled transport tests.
 type DialContext func(context.Context, string, string) (net.Conn, error)
+
+// initializedMarker records that this profile has held an identity; see Open.
+const initializedMarker = "initialized"
+
+func markInitialized(dir string) error {
+	f, err := os.OpenFile(filepath.Join(dir, initializedMarker), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	parent, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	return parent.Sync()
+}
+
+// removeBackendLogs deletes the on-disk log ring tsnet keeps beside the identity.
+func removeBackendLogs(dir string) error {
+	for _, name := range []string{"tailscaled.log1.txt", "tailscaled.log2.txt"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}

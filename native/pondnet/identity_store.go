@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"golang.org/x/sys/unix"
+	"github.com/Exile10/goose-in-a-pond/native/pondnet/internal/privatefile"
 	"tailscale.com/ipn"
 	"tailscale.com/types/key"
 )
@@ -31,7 +31,7 @@ type identityStore struct {
 
 func openIdentityStore(directory, control string, fresh bool) (*identityStore, error) {
 	s := &identityStore{path: filepath.Join(directory, "tailscaled.state")}
-	fd, err := unix.Open(s.path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	f, err := privatefile.Open(s.path, maxIdentityBytes)
 	if errors.Is(err, os.ErrNotExist) && fresh {
 		machine, _ := key.NewMachine().MarshalText()
 		s.values = map[ipn.StateKey][]byte{ipn.MachineKeyStateKey: machine, controlStateKey: []byte(control)}
@@ -40,15 +40,13 @@ func openIdentityStore(directory, control string, fresh bool) (*identityStore, e
 		}
 		return s, nil
 	}
+	if errors.Is(err, privatefile.ErrNotPrivate) {
+		return nil, errors.New("embedded identity file is not private or regular")
+	}
 	if err != nil {
 		return nil, errors.New("embedded identity is missing or unreadable; restore its backup")
 	}
-	f := os.NewFile(uintptr(fd), "embedded identity")
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > maxIdentityBytes {
-		return nil, errors.New("embedded identity file is not private or regular")
-	}
 	d := json.NewDecoder(io.LimitReader(f, maxIdentityBytes+1))
 	if d.Decode(&s.values) != nil || d.Decode(new(any)) != io.EOF || validateIdentity(s.values, control) != nil {
 		return nil, errors.New("embedded identity is corrupt or belongs to another coordinator; restore its backup")

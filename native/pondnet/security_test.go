@@ -174,7 +174,8 @@ func TestNodeRefusesLostOrEmptyIdentityBeforeNetworking(t *testing.T) {
 			if err := os.Chmod(directory, 0700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(directory, "node.lock"), nil, 0600); err != nil {
+			// This profile has held an identity before, so a missing one was lost.
+			if err := os.WriteFile(filepath.Join(directory, initializedMarker), nil, 0600); err != nil {
 				t.Fatal(err)
 			}
 			if contents != "missing" {
@@ -188,6 +189,34 @@ func TestNodeRefusesLostOrEmptyIdentityBeforeNetworking(t *testing.T) {
 				t.Fatal("damaged identity silently accepted")
 			}
 		})
+	}
+}
+
+func TestACrashBeforeTheFirstIdentityIsRecoverable(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "node")
+	if err := os.Mkdir(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// What a crash between taking the lock and writing the identity leaves behind.
+	if err := os.WriteFile(filepath.Join(directory, "node.lock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "tailscaled.log1.txt"), []byte("old backend log"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Open(directory, "pond-test", "https://127.0.0.1:9")
+	if err != nil {
+		t.Fatalf("an interrupted first setup could never start again: %v", err)
+	}
+	node.Close()
+	if _, err := os.Stat(filepath.Join(directory, initializedMarker)); err != nil {
+		t.Fatal("the profile was not marked as holding an identity")
+	}
+	if _, err := os.Stat(filepath.Join(directory, "tailscaled.state")); err != nil {
+		t.Fatal("no identity was written")
+	}
+	if data, err := os.ReadFile(filepath.Join(directory, "tailscaled.log1.txt")); err == nil && len(data) > 0 {
+		t.Fatal("an earlier backend log survived")
 	}
 }
 
