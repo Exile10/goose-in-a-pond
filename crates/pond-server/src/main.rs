@@ -3369,6 +3369,16 @@ async fn run_server(
             )),
         ));
 
+    // Without it every member-scoped tool refuses; decisions audit through the security policy.
+    pond_mcp_server::init_speaker_authority(Arc::new(
+        pond_core::security::services::draft_authority::RepoDraftAuthority::new(
+            settings_repo.clone(),
+            session_storage.clone(),
+            profile_repo.clone(),
+            security_policy.clone(),
+        ),
+    ));
+
     // WARN+ tracing into the SQLite log; `_file_guard` must live until run_server returns.
     let _file_guard = drain_handle.drain_into(operational_log.clone());
 
@@ -4700,6 +4710,14 @@ async fn run_chat(
         None,
         None,
     );
+    pond_mcp_server::init_speaker_authority(Arc::new(
+        pond_core::security::services::draft_authority::RepoDraftAuthority::new(
+            Arc::new(SqliteSettingsRepository::new(db.system.clone())),
+            Arc::new(SqliteSessionStorage::new(db.system.clone())),
+            Arc::new(SqliteProfileRepository::new(db.system.clone())),
+            None,
+        ),
+    ));
 
     let settings_repo_chat = SqliteSettingsRepository::new(db.system.clone());
     let settings = settings_repo_chat.get().await.unwrap_or_default();
