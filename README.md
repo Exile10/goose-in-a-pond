@@ -117,7 +117,9 @@ bash scripts/giap.sh provision --host HOST --key FILE  # operator: give a Pond a
 bash scripts/giap.sh --dry-run …    # print every command instead of running it
 ```
 
-`make install|build|doctor|deploy|test` forward to the same script.
+`make install|build|doctor` forward to the same script. `make deploy` runs
+`scripts/jetson.sh deploy` directly, without the check `giap.sh deploy` adds, and
+`make test` runs a subset of the cargo tests.
 
 Run `doctor` after any install or deploy. Nothing else catches the failures
 this project has historically shipped without any warning: a goose submodule the
@@ -224,7 +226,8 @@ bash scripts/giap.sh deploy      # wraps scripts/jetson.sh deploy with a safety 
 Two things to watch for. First, the deploy **hard-resets the device** to `origin/<branch>`.
 Second, the device's `origin` is your personal fork, so if you push only to the org remote,
 the deploy builds stale code and still reports success. `giap.sh deploy` refuses unless HEAD is
-on both. After a deploy, reach the dashboard through the SSH tunnel above. See
+on both. After a deploy the service listens on 8080, not 4000, so tunnel that port:
+`ssh -N -L 8080:127.0.0.1:8080 user@<host>`, then open `http://localhost:8080`. See
 **[scripts/jetson/README.md](./scripts/jetson/README.md)** and
 **[docs/jetson-build-and-run.txt](./docs/jetson-build-and-run.txt)**.
 
