@@ -9,8 +9,8 @@ Goose On The Go (GOTG). This document covers what the ride companies allow, what
 link. The ride app opens with the trip filled in, and the member confirms and pays there. Every
 ride is confirmed by a person in the app that charges them.
 
-Status, 2026-10-06: phase 1 is built behind `ext_travel_enabled`, which ships off. Phases 1b and 2
-are not started.
+Status, 2026-10-06: phases 1 and 1b are built behind `ext_travel_enabled`, which ships off. GOTG's
+half of 1b is built too. Phase 2 is not started. None of it has been run end to end on a phone yet.
 
 ## What the ride companies allow
 
@@ -63,26 +63,32 @@ say, which a test in `travel.rs` enforces.
 
 ### How the link reaches the phone
 
-In phase 1 the link is in the assistant's reply. In GOTG's chat it is tappable. Through a speaker
-or the desktop, it isn't useful yet: that is phase 1b.
+The link is always in the assistant's reply, which is tappable in GOTG's chat. Phase 1b also
+pushes it to the speaker's own phone.
 
-## Phase 1b: send the link to the member's phone
+## Phase 1b: send the link to the member's phone (built)
 
-The pond pushes the link to the phone of the person who asked, as a notification with a button
-that opens it. Three pieces, two of them outside `giap-travel`:
+The pond pushes the link to the phone of the person who asked, as a notification that opens it
+when tapped. That works whether they asked through a speaker, the desktop or the phone. Three
+pieces:
 
-1. **Who is speaking.** The tool needs the speaker's `ProfileScope` from the call's engine session
-   (`DraftAuthority::actor_for_engine_session`). `RepoDraftAuthority` exists in `pond-core`, but no
-   binary installs one, so `init_context_authority` has no caller and `giap-context` refuses every
-   call today. Installing it in `pond-server` is a change of its own. It also unblocks
-   `giap-context`.
-2. **Which phones are theirs.** `BroadcastNotificationSender::send_to_profile` already delivers to
-   one member's devices through `DeviceAttribution::devices_for_profile`, and never falls back to
-   a broadcast. It has no production caller yet. `pond-mcp-server` holds only the
-   `NotificationSender` port, so a small port for profile-addressed delivery is needed.
-   A speaker that resolves to `Household` or `Guest` gets the link in the reply, never a push.
-3. **GOTG opens it.** The `Notification.data` field carries an action GOTG acts on. Proposed
-   contract:
+1. **Who is speaking.** `pond-mcp-server` keeps one speaker authority
+   (`init_speaker_authority`), a `RepoDraftAuthority` installed on both binary paths. Each tool
+   call reads the engine session from its `_meta` and asks it for the speaker's `ProfileScope`.
+   Nothing had installed one since `giap-draft` was deleted, so `giap-context` refused every call;
+   restoring the install fixes that too. A wiring test in `pond-core` fails if either install goes
+   missing.
+2. **Which phones are theirs.** The `MemberNotifier` port in `pond-core`
+   (`mcp/ports/notification.rs`), implemented by `BroadcastNotificationSender` over
+   `send_to_profile` and installed with `init_member_notifier`. It delivers to the member's
+   attributed devices through `DeviceAttribution::devices_for_profile` and never falls back to a
+   broadcast.
+
+   Only a speaker who resolves to `Owner` is pushed to. `Household`, `Guest`, an unresolved
+   session and a call without one get the link in the reply only, and the reply says why. So does
+   a member with no paired phone of their own. On the voice/CLI chat path and the direct
+   dispatcher there is no member notifier, and the reply says nothing about phones.
+3. **GOTG opens it.** The `Notification.data` field carries:
 
    ```json
    {
@@ -93,16 +99,18 @@ that opens it. Three pieces, two of them outside `giap-travel`:
    }
    ```
 
-   `kind` is `ride` or `directions`. For directions the pond sends the Google Maps link on Android
-   and the Apple Maps link on iOS. GOTG shows the notification with a button labelled `label`, and
-   opens `url` with the system handler, which opens the app when it is installed. GOTG must accept
-   only `https` URLs on hosts it knows (`m.uber.com`, `www.google.com`, `maps.apple.com`).
+   `kind` is `ride` or `directions`. For directions the pond sends the Google Maps link, which
+   opens Google Maps where it is installed and the browser otherwise, on both platforms. The
+   category is `info`, so Android files it under Updates, not Security alerts.
 
-   For Bolt, GOTG can at least open the app: package `ee.mtakso.client` on Android, App Store id
-   `675033630` on iOS, with the destination shown in the notification body for the member to type.
-   This would use `"action": "open_app"`.
+   GOTG (`services/notification-link.ts`) accepts only `https` URLs on `m.uber.com`,
+   `maps.apple.com` and `www.google.com/maps`. It stores the checked link on the shade
+   notification, checks it again when the notification is tapped, and opens it with the system
+   handler. A tap that launches the app counts too.
 
-GOTG's code is in `jarida-io/goose-on-the-go`. Its half is item 3.
+**Bolt.** GOTG could at least open the Bolt app (package `ee.mtakso.client` on Android, App Store id
+`675033630` on iOS) with the destination in the notification body, as `"action": "open_app"`.
+That isn't built: the pond doesn't push anything for Bolt yet.
 
 ## Phase 2: order and track (needs partnerships)
 
