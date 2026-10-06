@@ -11340,6 +11340,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond-adapters-uber"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "pond-core",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "pond-adapters-vision"
 version = "0.1.0"
 dependencies = [
