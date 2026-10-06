@@ -146,6 +146,13 @@ cargo test -p pond-api --test chat_integration_test
 cargo test -p pond-api --test onboarding_integration_test
 ```
 
+For a test that exercises a real security boundary (pairing, the device registry,
+profiles, sessions or onboarding), enable pond-api's `test-support` feature and build the
+state with `pond_api::test_support::app_state()`. Those five run on the real SQLite
+adapters over a fresh database with every migration applied; everything else is a mock.
+Replace a field with struct update syntax before wrapping the state in `Arc`. Do not copy
+the `AppState` literal into a test file: it has about sixty fields and drifts.
+
 ---
 
 ## 4. Desktop Frontend Tests (vitest)

@@ -15,6 +15,8 @@ pub mod quiet_pass;
 pub mod routes;
 pub mod runs;
 pub mod spotify_focus;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod thought_filter;
 pub mod tool_context;
 
