@@ -75,131 +75,169 @@ pond-desktop                (Electron desktop app — React + TypeScript)
 
 ## Getting Started
 
+### 1. Prerequisites
+
+- **Rust** stable via [rustup](https://rustup.rs). `giap.sh install` fetches it if it's missing.
+- **Go ≥ 1.27**. The build compiles the bundled `pondnet` network helper (`native/pondnet`) next to `pond-server`. The installer does not install Go for you.
+- **Node** `^22.12 || ^24 || >=26` for the desktop app and the tests (`.nvmrc` says 22). **≥ 20.19** is enough to build the web UI, and an older Node can still run the server. Not sure what you have? `bash scripts/giap.sh node` checks, uses one you already have (nvm, fnm, volta, asdf), or downloads one after asking. See [Node](docs/developer/installation.md#node).
+- **Git** with submodule support (Goose is vendored as the `goose` submodule)
+- **cmake** and a C/C++ toolchain (`install.sh` installs these on Linux)
+
+### 2. Clone and install
+
 ```bash
-git clone --recursive https://github.com/your-username/goose-in-a-pond.git
+git clone --recursive https://github.com/jarida-io/goose-in-a-pond.git
 cd goose-in-a-pond
-bash scripts/giap.sh
+bash scripts/giap.sh install     # -y to skip the prompts
+bash scripts/giap.sh doctor      # confirm the result; exits 1 on any FAIL
 ```
 
-**`scripts/giap.sh` is the front door.** It is a menu-driven control script for
-install, build, service management, logs and diagnostics. It detects the host
-(Jetson / generic Linux / macOS), whether CUDA is actually usable, and the known
-bad states *before* you hit them — then offers only the actions that make sense
-on that machine.
+**`scripts/giap.sh` is the front door.** Run it with no arguments for a menu that covers
+install, build, service management, logs and diagnostics. It works out what the
+host is (Jetson, generic Linux or macOS), checks whether CUDA actually works, and
+looks for known bad states *before* you run into them. It only offers the actions
+that make sense on that machine.
+
+`install` puts guardrails in front of `scripts/install.sh`, which runs the full sequence:
+preflight, submodule, system deps, build, `pond-server setup`, model downloads,
+systemd, mDNS, verify. You can pick **Full** (the default) or **Minimal** (server + DB only, no model
+downloads). It works out the mode itself (dev, production or Jetson) and won't add a
+second systemd unit when one already exists.
+
+Other non-interactive commands:
 
 ```bash
-bash scripts/giap.sh install     # first-time install on this host (-y to skip prompts)
-bash scripts/giap.sh build       # web UI + pond-server, correct features for this host
-bash scripts/giap.sh doctor      # health report; exits 1 on any FAIL
-bash scripts/giap.sh status      # detection banner only
-bash scripts/giap.sh node        # find, or download and verify, the Node this repo needs
-bash scripts/giap.sh --dry-run … # print every command instead of running it
+bash scripts/giap.sh build          # web UI, then pond-server + pondnet with this host's features
+bash scripts/giap.sh build-ui       # web UI only
+bash scripts/giap.sh build-desktop  # Electron app (macOS only)
+bash scripts/giap.sh node           # find, or download and verify, the Node this repo needs
+bash scripts/giap.sh status         # detection banner only
+bash scripts/giap.sh logs           # today's rolling log file (not journald)
+bash scripts/giap.sh --dry-run …    # print every command instead of running it
 ```
 
-Run `doctor` after any install or deploy. It is the only thing that catches the
-failures this project has historically shipped silently: a goose submodule the
-parent commit did not move, a build without the CUDA feature that runs on the CPU
-while looking fine, a placeholder dashboard the server itself cannot detect, two
+`make install|build|doctor|deploy|test` forward to the same script.
+
+Run `doctor` after any install or deploy. Nothing else catches the failures
+this project has historically shipped without any warning: a goose submodule the
+parent commit did not move, a build without the CUDA feature that quietly runs on the CPU,
+a placeholder dashboard the server itself cannot detect, two
 service units competing for one port, and a stray `target/debug` binary that
 `--native` prefers over your release build.
 
-### Prerequisites
+### 3. Building by hand
 
-- **Rust** stable (install via [rustup](https://rustup.rs)) — `giap.sh install` will fetch it if missing
-- **Git** with submodule support
-- **Node** `^22.12 || ^24 || >=26` for the desktop app and the tests (`.nvmrc` says 22); **≥ 20.19** is enough to build the web UI, so an older Node can still run the server. Not sure what you have? `bash scripts/giap.sh node` checks, uses one you already have (nvm, fnm, volta, asdf), or downloads one after asking. See [Node](docs/developer/installation.md#node)
-- Voice models are downloaded for you by `pond-server setup`
-
-### Building by hand
-
-`giap.sh` exists so you don't have to, but the underlying commands are:
+You don't need these if you use `giap.sh`, but these are the commands it runs:
 
 ```bash
-# The genuinely fast set — no Goose, no llama-cpp-2
+# The genuinely fast set: no Goose, no llama-cpp-2
 SQLX_OFFLINE=true cargo build -p pond-core -p pond-infra -p pond-api
 
-# pond-server pulls Goose AND llama-cpp-2 through its default features,
-# so this is a 10-35 minute cold build, not a fast one
+# Build the web UI FIRST, or the server embeds a placeholder dashboard
+(cd pond-desktop && npm ci && npm run build)
+
+# pond-server pulls in Goose AND llama-cpp-2 through its default features,
+# so a cold build takes 10-35 minutes
 SQLX_OFFLINE=true cargo build -p pond-server --release
+
+# The userspace network helper, placed next to the binary
+bash scripts/build-network-helper.sh target/release
 ```
 
-Build the web UI **before** the server, or the binary embeds a placeholder
-dashboard: `cd pond-desktop && npm run build`. The server cannot warn you about
-this — `giap.sh doctor` is the only detector.
+The server can't tell you when it has embedded the placeholder dashboard. Only
+`giap.sh doctor` detects it.
 
-### Jetson Orin Nano
+### 4. First-time setup
 
-Deploy from your dev machine (the Jetson's Node is too old to build the UI, so
-the UI is built locally and synced):
+`setup` initializes the databases, seeds the model catalog and prompt templates, and downloads the
+Whisper ASR model. `install` already runs it, so you only need it after a hand build:
+
+```bash
+./target/release/pond-server setup                 # default: base (~74 MB)
+./target/release/pond-server setup --model tiny    # ~39 MB, fastest
+./target/release/pond-server setup --model small   # ~244 MB, most accurate
+
+./target/release/pond-server onboard               # name, timezone, personality, model
+```
+
+### 5. Run the server
+
+```bash
+./target/release/pond-server serve --open          # HTTP + REST API + dashboard
+./target/release/pond-server serve --port 4000 --https-port 4443 --debug
+./target/release/pond-server serve --native        # also launch the desktop app (macOS)
+```
+
+The server opens two listeners:
+
+- **HTTP** on `127.0.0.1` only (default port 4000). It serves the dashboard, the CLI and OAuth callbacks.
+- **HTTPS** on all interfaces (default 4443). The paired phone companion uses this one.
+
+Each listener tries ten consecutive ports if its first choice is taken, so always
+pass `--port` explicitly. To find the ports a server actually bound, read
+`<data_dir>/.runtime_api_port` and `.runtime_https_port`.
+
+The HTTP listener is loopback-only, so you can't reach the dashboard from another computer
+at `http://<host>:4000`. Use an SSH tunnel with the same port on both ends, so
+OAuth redirects registered against that port still land:
+
+```bash
+ssh -N -L 4000:127.0.0.1:4000 user@<host>
+```
+
+To pair a phone, use the dashboard or `pond-server pairing`. See
+**[docs/remote-access.md](./docs/remote-access.md)** for remote (away-from-home) access.
+
+### 6. Chat from the terminal
+
+```bash
+./target/release/pond-server chat                       # text mode (keyboard)
+./target/release/pond-server chat --provider ollama -M llama3.2
+./target/release/pond-server chat --provider llamafile  # llamafile on :8080
+./target/release/pond-server chat --voice               # wake word → listen → reply aloud
+```
+
+`--voice` downloads whatever it's missing on the first run. You don't need to install anything first.
+
+### 7. Run as a service (Linux)
+
+```bash
+bash scripts/giap.sh             # menu 20 installs a user systemd unit (21–24 start/stop/restart/remove)
+```
+
+This installs a **user** unit and runs `loginctl enable-linger`, so the service survives
+logout and starts at boot. `scripts/install.sh` writes a *system* unit with the
+same name. If both exist, you get two servers, each loading its own model into the same
+memory. `giap.sh` refuses to create the second one. The service logs to rolling files
+under the data directory, not to journald.
+
+### 8. Jetson Orin Nano
+
+Deploy from your dev machine. The Jetson's Node is too old to build the UI, so the UI
+is built locally and synced, and the CUDA build runs on the device (~35 min from clean):
 
 ```bash
 bash scripts/giap.sh deploy      # wraps scripts/jetson.sh deploy with a safety check
 ```
 
-Two things that bite: the deploy **hard-resets the device** to `origin/<branch>`,
-and the device's `origin` is your personal fork — pushing only to the org remote
-deploys stale code and reports success. `giap.sh deploy` refuses unless HEAD is on
-both. See **[scripts/jetson/README.md](./scripts/jetson/README.md)** and
+Two things to watch for. First, the deploy **hard-resets the device** to `origin/<branch>`.
+Second, the device's `origin` is your personal fork, so if you push only to the org remote,
+the deploy builds stale code and still reports success. `giap.sh deploy` refuses unless HEAD is
+on both. After a deploy, reach the dashboard through the SSH tunnel above. See
+**[scripts/jetson/README.md](./scripts/jetson/README.md)** and
 **[docs/jetson-build-and-run.txt](./docs/jetson-build-and-run.txt)**.
 
-### Running as a service
-
-```bash
-bash scripts/giap.sh             # menu 20 installs a user systemd unit
-```
-
-It installs a **user** unit and enables `loginctl enable-linger` so it survives
-logout and starts at boot. Note `scripts/install.sh` writes a *system* unit of the
-same name — having both means two servers, each loading its own model into the
-same memory. `giap.sh` refuses to create a second one.
-
-### 3. First-time setup
-
-Downloads the Whisper ASR model and initializes the database:
-
-```bash
-cargo run -p pond-server -- setup
-# Choose model size (default: base.en, ~141 MB)
-cargo run -p pond-server -- setup --model tiny    # 39 MB  — fastest
-cargo run -p pond-server -- setup --model small   # 244 MB — better accuracy
-```
-
-### 4. Run the server
-
-```bash
-# HTTP server + REST API + web dashboard
-cargo run -p pond-server -- serve
-
-# With options
-cargo run -p pond-server -- serve --port 4000 --open --debug
-```
-
-### 5. Chat
-
-```bash
-# Text mode (keyboard input, default)
-cargo run -p pond-server -- chat
-
-# With a local Ollama model
-cargo run -p pond-server -- chat --provider ollama
-
-# With llamafile running on port 8080
-cargo run -p pond-server -- chat --provider llamafile
-
-# Voice mode — wake word, speech detection, recognition, spoken reply.
-# Downloads whatever it needs on the first run; nothing to install first.
-cargo run -p pond-server -- chat --voice
-```
-
-### 6. Desktop app
+### 9. Desktop app (macOS)
 
 ```bash
 cd pond-desktop
 npm install
-npm run dev:electron
+npm run dev:electron             # dev: Vite + Electron, starts pond-server for you
+npm run bundle:app               # release .app (or: bash scripts/giap.sh build-desktop)
 ```
 
-The desktop app starts `pond-server` automatically and provides three modes: the GUI, the Voice orb, and the Canvas floating overlay.
+The desktop app has three modes: the GUI, the Voice orb, and the Canvas floating overlay.
+On Linux there's no desktop shell. Use the server's own dashboard instead.
 
 ---
 
