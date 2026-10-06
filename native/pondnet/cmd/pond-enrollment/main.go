@@ -3,15 +3,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"github.com/Exile10/goose-in-a-pond/native/pondnet/enrollment"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +39,9 @@ func run() error {
 	port := flag.Uint("https-port", 4443, "household companion port")
 	health := flag.Bool("health-check", false, "check the local enrollment listener")
 	proxies := flag.String("trusted-proxy", "", "comma-separated CIDRs of the reverse proxies whose X-Forwarded-For is believed")
+	issue := flag.Bool("issue-invite", false, "ask the running service for a household invite and print it")
+	expires := flag.Duration("expires", enrollment.DefaultInviteLifetime, "how long an issued invite stays usable (at most 720h)")
+	socket := flag.String("admin-socket", "", "private socket for issuing invites (default: admin.sock in the state directory)")
 	flag.Parse()
 	if *health {
 		client := http.Client{Timeout: 2 * time.Second}
@@ -46,6 +54,12 @@ func run() error {
 			return errors.New("enrollment unhealthy")
 		}
 		return nil
+	}
+	if *socket == "" {
+		*socket = filepath.Join(*directory, "admin.sock")
+	}
+	if *issue {
+		return issueInvite(*socket, *expires)
 	}
 	store, err := enrollment.Open(*directory)
 	if err != nil {
@@ -96,6 +110,13 @@ func run() error {
 			}
 		}
 	}()
+	admin, err := listenAdmin(*socket)
+	if err != nil {
+		return err
+	}
+	adminServer := &http.Server{Handler: handler.AdminHandler(), ReadHeaderTimeout: 5 * time.Second}
+	go adminServer.Serve(admin)
+	defer adminServer.Close()
 	server := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
 	go func() {
 		<-ctx.Done()
@@ -109,6 +130,54 @@ func run() error {
 		return nil
 	}
 	return err
+}
+
+// listenAdmin serves invite issuance on a Unix socket, mode 0600, so only the account
+// running the service can use it.
+func listenAdmin(path string) (net.Listener, error) {
+	// A socket path is bounded by sockaddr_un: 104 bytes on macOS, 108 on Linux.
+	if len(path) > 100 {
+		return nil, fmt.Errorf("admin socket path is too long for a Unix socket; pass a shorter --admin-socket: %s", path)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err = os.Chmod(path, 0600); err != nil {
+		listener.Close()
+		return nil, err
+	}
+	return listener, nil
+}
+
+// issueInvite asks the running service, which holds the state lock, for an invite.
+func issueInvite(socket string, lifetime time.Duration) error {
+	client := http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+		},
+	}}
+	response, err := client.Post("http://admin/v1/invite?lifetime="+url.QueryEscape(lifetime.String()), "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("no enrollment service is listening on %s: %w", socket, err)
+	}
+	defer response.Body.Close()
+	var issued struct {
+		Invite  string `json:"invite"`
+		Expires string `json:"expires"`
+		Error   string `json:"error"`
+	}
+	if err = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&issued); err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("no invite issued: %s", issued.Error)
+	}
+	fmt.Printf("%s\nexpires %s; it is shown once and admits one household\n", issued.Invite, issued.Expires)
+	return nil
 }
 
 func parsePrefixes(list string) ([]netip.Prefix, error) {

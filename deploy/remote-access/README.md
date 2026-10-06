@@ -15,7 +15,8 @@ separate application authorization milestone.
 Every image is pinned by digest. The enrollment image runs without a shell, as a
 non-root user. Headscale's HTTP administration API stays on the private Compose
 network; Caddy blocks its public paths. No API key belongs in an image, environment
-file, repository, or phone. There are no hosted Tailscale DERP or control defaults.
+file, repository, or phone. The coordinator is Headscale, run here or by the household;
+nothing depends on Tailscale's hosted control plane.
 
 ## First boot
 
@@ -57,18 +58,39 @@ only trusted operators may manage this host.
 
 ## How a household joins
 
-A household registers itself. The Pond sends its public key and companion port,
-signed with that key, to `/v1/household`; the service names the household by
-digesting the key rather than trusting what was sent, creates its coordinator
-user, and stores it. Repeating the call answers with the same household, so a
-lost response costs nothing and an operator-created household answers
-identically.
+A household registers itself with an invite from the operator (2026-09-30). The
+Pond sends its public key, companion port and invite, signed with that key, to
+`/v1/household`; the service names the household by digesting the key rather than
+trusting what was sent, spends the invite, creates its coordinator user and stores
+it, in one write. Repeating the call answers with the same household and needs no
+second invite, so a lost response costs nothing; the invite a household already
+spent also admits it again.
 
-Admission proves possession of a key and nothing else, because admission is not
-what separates households: the policy is, and it grants each phone its own Pond's
-HTTPS port and nothing more. Registration is rate limited per source address, the
-source table is capped, and the number of households is capped, because
-`--provision` used to be the only thing bounding what admission could consume.
+Issue an invite on the host running the service:
+
+```sh
+docker compose exec enrollment /pond-enrollment --state /state --issue-invite --expires 72h
+```
+
+It prints `giap-inv1-XXXX-XXXX-...` once; only its digest is stored. It lasts seven
+days by default and at most 30, admits one household, and can be typed in any case
+with or without its dashes. The household pastes it into Remote access on its Pond.
+Refusals are a closed set: `invite_required`, `invite_invalid`, `invite_expired`,
+`invite_used`. The command talks to the running service over `admin.sock` in the
+state directory, mode `0600`; `--admin-socket` moves it. Someone running their own
+service issues invites from it the same way.
+
+Admission used to prove possession of a key and nothing else, so anyone could
+register households and consume this service's users and addresses; that is what
+the invite now bounds. It is not what separates households: the policy is, and it
+grants each phone its own Pond's HTTPS port and nothing more. The operator can
+neither read household data nor use a Pond; it can deny or disrupt remote access,
+which is why the self-hosted path stays. Registration is also rate limited per
+source address, the source table is capped, and there are at most 1000 households.
+
+Deploy this service before any Pond that sends an invite. The registration is
+decoded strictly, so an older service answers `400` to a registration carrying one;
+a Pond sends none when the field is left empty.
 
 Source addresses come from the gateway's `X-Forwarded-For`, believed only from
 `--trusted-proxy` (the pinned `172.31.250.0/28` compose network); without it every
@@ -216,6 +238,11 @@ Inspection signs a single-use request for one device and returns its current
 pending `authId` and `machineKey`, optional `nodeKey`, and `expectedRevision` from
 that inspection. The helper supplies its own household, nonce and two-minute expiry;
 no administration credential is involved.
+
+`--authority-action register` reads `{"invite": "..."}` on stdin (2026-09-30). An
+empty or absent value, or no input at all, sends no invite, so an already-registered
+household keeps working. The invite is never a command-line argument, because other
+accounts on the host can read those.
 
 This is an operator authority, not a public recovery endpoint. Replacement must
 follow fresh local pairing and explicit local review of the exact device and pending

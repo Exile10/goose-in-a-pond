@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"slices"
@@ -18,28 +19,31 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// HouseholdRegistration is a household's first contact. It is signed by the key
-// it registers, which is the only thing it proves.
+// HouseholdRegistration is a household's first contact, signed by the key it
+// registers. A new household must also present an invite from whoever runs this
+// service; a household already registered needs none, so a lost response can be
+// retried.
 //
-// That is deliberate. Admission is not what keeps households apart: the policy
-// does, granting each phone its own Pond's HTTPS port and nothing else, so a
-// stranger who registers gains a tailnet address and no reach into anyone's
-// home. Requiring an operator to provision every household instead would mean
-// nobody could set up a Pond without us.
+// Admission is not what keeps households apart: the policy does, granting each
+// phone its own Pond's HTTPS port and nothing else. The invite bounds who can
+// consume this service's households and addresses. Whoever runs the service can
+// neither read household data nor use a Pond; it can deny or disrupt remote access,
+// and a household that wants to depend on nobody runs its own.
 type HouseholdRegistration struct {
 	PublicKey string `json:"publicKey"`
 	Port      uint16 `json:"port"`
 	Expires   int64  `json:"expires"`
+	// Invite is omitted by a household already registered, and by an older Pond.
+	Invite string `json:"invite,omitempty"`
 }
 
 // householdDomain separates these signatures from enrollment approvals, so a
 // signature captured from one can never be presented as the other.
 const householdDomain = "goose-household-v1\x00"
 
-// maxHouseholds bounds what open admission can consume. Provision used to be the
-// only admission control; without a ceiling a stranger could enumerate keys and
-// fill the store and the coordinator's address space.
-const maxHouseholds = 10000
+// maxHouseholds bounds the households one service holds. Each needs an invite now,
+// so this is a backstop for a mistake rather than the admission control.
+const maxHouseholds = 1000
 
 // sources rate-limits by a key: a client address, or a household.
 type sources struct {
@@ -197,6 +201,12 @@ func (s *Service) registerHousehold(w http.ResponseWriter, r *http.Request) {
 		writeHousehold(w, id)
 		return
 	}
+	digest, refusal := s.Store.admitLocked(registration.Invite, id, now)
+	if refusal != "" {
+		slog.Warn("household registration refused", "reason", refusal)
+		http.Error(w, `{"error":"`+refusal+`"}`, 403)
+		return
+	}
 	if len(s.Store.value.Households) >= maxHouseholds {
 		w.Header().Set("Retry-After", "3600")
 		http.Error(w, `{"error":"capacity"}`, 503)
@@ -207,10 +217,17 @@ func (s *Service) registerHousehold(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"coordinator_unavailable"}`, 503)
 		return
 	}
+	// Spent in the same write that creates the household, so neither can happen alone.
+	invite := s.Store.value.Invites[digest]
+	spent := invite
+	spent.ConsumedBy = id
+	s.Store.value.Invites[digest] = spent
 	if err := s.Store.provisionLocked(id, Household{PublicKey: registration.PublicKey, UserID: user, Port: registration.Port}); err != nil {
+		s.Store.value.Invites[digest] = invite
 		http.Error(w, `{"error":"registration_failed"}`, 409)
 		return
 	}
+	slog.Info("household registered with an invite")
 	writeHousehold(w, id)
 }
 

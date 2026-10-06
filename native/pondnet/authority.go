@@ -156,18 +156,20 @@ func syncDirectory(path string) error {
 	return dir.Sync()
 }
 
-// Register introduces this household to the enrollment service, so that a
-// household can be set up without an operator creating it by hand.
+// Register introduces this household to the enrollment service. A household the
+// service has not seen must present an invite from whoever runs it; one already
+// registered needs none.
 //
-// It proves possession of the household key and nothing else. That is enough,
-// because the coordinator's policy grants each phone its own Pond and nothing
-// else, so a household that is not yours gives you no reach into one that is.
-// The service names the household from the key rather than trusting what is
-// sent, so this cannot claim another household.
+// It proves possession of the household key, and the invite proves the operator
+// agreed to serve it. The coordinator's policy grants each phone its own Pond and
+// nothing else, so a household that is not yours gives you no reach into one that
+// is. The service names the household from the key rather than trusting what is
+// sent, so this cannot claim another household. Whoever runs the service can neither
+// read household data nor use a Pond; it can deny or disrupt remote access.
 //
 // It is safe to repeat: the service answers with the same household rather than
 // conflicting, which is how a lost response is recovered.
-func (a Authority) Register(ctx context.Context, origin string, port uint16) (string, error) {
+func (a Authority) Register(ctx context.Context, origin string, port uint16, invite string) (string, error) {
 	u, e := url.Parse(origin)
 	if e != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return "", errors.New("enrollment requires an HTTPS origin")
@@ -179,6 +181,7 @@ func (a Authority) Register(ctx context.Context, origin string, port uint16) (st
 		PublicKey: a.PublicKey,
 		Port:      port,
 		Expires:   time.Now().Add(2 * time.Minute).Unix(),
+		Invite:    invite,
 	}, a.key)
 	if e != nil {
 		return "", e
