@@ -2,7 +2,8 @@
 
 ## Scope and acceptance
 
-This change addresses the three open CodeQL findings and 18 Dependabot findings
+This change remediates the three open CodeQL findings and 11 dependency findings.
+It tracks all 18 Dependabot findings
 reported on `jarida-io/goose-in-a-pond` main. The starting revision is
 `b5af5a1c`, which includes the fetched fork main `3dad8d34`.
 
@@ -70,6 +71,10 @@ remain isolated on `fix/security-alert-remediation`.
 
 | Check | Result |
 | --- | --- |
+| Clean desktop install with npm 10, plus Vite and Electron builds | Passed. |
+| Core test suite | Passed, including egress inventory checks and doctests. |
+| API library tests | 279 passed. |
+| Mesh clippy, all targets | Passed. |
 | Desktop Vitest suite after dependency updates | 95 files, 1,444 tests passed. Some existing tests log connection-refused/abort messages; there were no failing tests. |
 | Desktop TypeScript checks | Passed for renderer and Electron. |
 | Desktop Vite and Electron tsup builds | Passed; Vite reports a large-chunk warning. |
