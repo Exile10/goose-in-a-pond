@@ -47,3 +47,15 @@ fn the_ingest_pipeline_is_constructed_with_a_redactor() {
          time a session loads giap-context."
     );
 }
+
+/// Without a speaker authority `scope_for` answers `Unresolved`, so every member-scoped tool
+/// refuses while looking like a working guard. Deleting giap-draft removed the last install.
+#[test]
+fn the_speaker_authority_is_installed_on_both_binary_paths() {
+    assert!(
+        MAIN.matches("init_speaker_authority(").count() >= 2,
+        "`init_speaker_authority` is not called on both the `serve` and the voice/CLI chat \
+         paths, so giap-context and giap-travel cannot tell who is speaking on the path without \
+         it and refuse or fall back on every call."
+    );
+}
