@@ -1829,7 +1829,10 @@ mod tests {
         request
             .extensions_mut()
             .insert(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()));
-        management(runtime).oneshot(request).await.unwrap();
+        management_with_credential(runtime)
+            .oneshot(request)
+            .await
+            .unwrap();
 
         let recorded = std::fs::read_to_string(&calls).unwrap();
         let actions: Vec<&str> = recorded.lines().collect();
