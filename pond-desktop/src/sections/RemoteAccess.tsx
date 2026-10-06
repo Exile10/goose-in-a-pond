@@ -16,7 +16,7 @@ export function RemoteAccess() {
   const [control, setControl] = useState('');
   const [enrollment, setEnrollment] = useState('');
   const [invite, setInvite] = useState('');
-  const [device, setDevice] = useState<{ provisioned: boolean; serial?: string } | null>(null);
+  const [device, setDevice] = useState<{ provisioned: boolean; serial?: string; registered: boolean } | null>(null);
   const [identity, setIdentity] = useState<{ household: string; publicKey: string } | null>(null);
   const [state, setState] = useState('connecting');
   const [requests, setRequests] = useState<RecoveryRequest[]>([]);
@@ -35,7 +35,7 @@ export function RemoteAccess() {
   }, []);
   useEffect(() => {
     let active = true;
-    // Unknown is shown as not provisioned, so the invite field stays available.
+    // Unknown is shown as neither provisioned nor registered, so the invite field stays available.
     void api.remoteDevice().then((found) => { if (active) setDevice(found); })
       .catch(() => { if (active) setDevice(null); console.warn('[remote] device provisioning status unavailable'); });
     return () => { active = false; };
@@ -138,6 +138,10 @@ export function RemoteAccess() {
 
     {device?.provisioned && !DEVICE_REFUSALS.includes(state)
       ? <p style={{ margin: 0, overflowWrap: 'anywhere' }}>{t('remote.provisioned', { serial: device.serial ?? '' })}</p>
+      // An invite admits a household once. One already registered needs none, unless the service
+      // has just refused it, which is what switching to another coordination service looks like.
+      : device?.registered && !ADMISSION_REFUSALS.includes(state)
+      ? <p style={{ margin: 0 }}>{t('remote.registered')}</p>
       : <label style={field}>
       <span>{t('remote.invite')}</span>
       <input type="text" autoCapitalize="characters" autoComplete="off" spellCheck={false} placeholder="giap-inv1-..." value={invite} onChange={(e) => setInvite(e.target.value)} disabled={busy || on} />
@@ -169,7 +173,10 @@ export function RemoteAccess() {
       </div>
     </details>
 
-    <div style={{ display: 'grid', gap: 6 }}>
+    {/* Only when there is something to approve, or the requests could not be read: recovery is the
+        rare path, for a phone whose identity changed while its enrollment was still active, and a
+        removed or lapsed phone now comes back without it. Polling continues, so a request appears. */}
+    {(requests.length > 0 || reviewFailed) && <div style={{ display: 'grid', gap: 6 }}>
       <h3 style={{ margin: 0 }}>{t('remote.recoveryTitle')}</h3>
       <p style={{ margin: 0 }}>{t('remote.recoveryDescription')}</p>
       {reviewFailed && <p role="alert" style={{ margin: 0 }}>{t('remote.reviewFailed')}</p>}
@@ -181,6 +188,6 @@ export function RemoteAccess() {
           <Button variant="secondary" isDisabled={busy || request.approved} onPress={() => void approve(request.id)}>{t(request.approved ? 'remote.reviewApproved' : 'remote.reviewApprove')}</Button>
         </div>
       </div>)}
-    </div>
+    </div>}
   </section>;
 }
