@@ -120,6 +120,12 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
         core: false,
     },
     ToolGroup {
+        extension: TRAVEL_EXTENSION,
+        description: "Getting somewhere: directions and a map link to a place, or a taxi or ride \
+                      with Uber or Bolt to the airport, a mall, an office or home.",
+        core: false,
+    },
+    ToolGroup {
         extension: ORCHESTRATOR_EXTENSION,
         description: "Handing a piece of work to a named specialist agent that runs on its own \
                       and reports back: research a question in depth, work through a longer task \
