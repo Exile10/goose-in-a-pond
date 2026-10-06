@@ -3,7 +3,7 @@ import { runInNewContext } from "node:vm";
 import { beforeEach, describe, expect, it } from "vitest";
 
 const html = readFileSync("../crates/pond-mcp-server/apps/weather-card.html", "utf8");
-const script = html.match(/<script>([\s\S]*?)<\/script>/)![1];
+const script = new DOMParser().parseFromString(html, "text/html").querySelector("script")!.textContent!;
 let render: (data: Record<string, unknown>) => void;
 
 beforeEach(() => {
