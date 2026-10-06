@@ -670,11 +670,62 @@ export interface UserSkill {
 }
 
 // ── Models ────────────────────────────────────────────────────
+
+/** What runs a conversation model; absent on speech, voice and embedding rows. */
+export interface ModelEngine {
+  /** `llama_cpp`, `litert_lm`, `ollama` or `llamafile`; any other id is grouped as "other". */
+  id: string;
+  label: string;
+  /** The extension it loads, e.g. `.gguf`; null for Ollama, which keeps its own store. */
+  file_format: string | null;
+  /** Its weights count against the pond's own memory budget. */
+  in_process: boolean;
+}
+
+export type ModelProvenance = "catalogue" | "added" | "on_disk" | "ollama";
+
+/** A helper (tool-call model, speech, embeddings) is never offered as conversation. */
+export type ModelKind = "conversation" | "helper";
+
+/** A download the pond runs, another program's store, or no source at all. */
+export type ModelAcquire = "download" | "external" | "unavailable";
+
+/** A separate download that extends a model. Picture support is the only kind. */
+export interface ModelCompanion {
+  kind: "pictures";
+  label: string;
+  size_bytes: number;
+  /** `verifying`: the file is on disk and its hash is not yet checked. */
+  state: "installed" | "available" | "downloading" | "verifying" | "not_on_this_device";
+}
+
+/** What a pick did on this class of machine; the server sends it only where it was measured. */
+export interface ModelMeasured {
+  device: "orin" | "desktop";
+  summary: string;
+  first_reply_s?: number;
+  tokens_per_second_min?: number;
+  tokens_per_second_max?: number;
+  window_tokens?: number;
+  /** `YYYY-MM-DD`. */
+  measured_on: string;
+}
+
+/** Why GIAP suggests a model: shown, never imposed. */
+export interface ModelRecommendation {
+  rank: "primary" | "lighter" | "alternative";
+  reason: string;
+  measured?: ModelMeasured;
+}
+
 export interface ModelEntry {
+  /** `"{category}/{name}"`, the key of the row and of its downloads (`DownloadEntry.model_id`). */
   id: string;
   provider: string;
   name: string;
   display_name?: string;
+  /** What the household reads as the name; never a placeholder. */
+  title?: string;
   is_active: boolean;
   ram_estimate_mb?: number;
   recommended_role?: string;
@@ -692,10 +743,13 @@ export interface ModelEntry {
   asr_size?: string;
   tts_engine?: string;
   config_filename?: string;
-  /** GGUF only: can read images on THIS device (encoder may not fit); absent if unclassified. */
-  reads_images?: boolean;
-  /** One-time picture-support download in bytes; present only when `reads_images` is true. */
-  image_support_bytes?: number;
+  engine?: ModelEngine;
+  provenance?: ModelProvenance;
+  kind?: ModelKind;
+  acquire?: ModelAcquire;
+  recommended?: ModelRecommendation;
+  /** Separate downloads that extend the model; none means text only. */
+  companions?: ModelCompanion[];
 }
 
 /** GET /api/v1/warmup — the boot/model-change prefix warm-up (see Agent::prewarm). */
@@ -731,6 +785,11 @@ export interface ModelMemoryStatus {
   total_mb: number;
   available_for_llm_mb: number;
   loaded_model: string | null;
+  /** What switching away from the model in use frees; absent from an older server. */
+  reclaimable_mb?: number;
+  /** The most this pond lets the models take: a desktop's memory less what it keeps for itself, or
+   *  a budgeted device's own figure. `available_for_llm_mb` is what is left of it now. */
+  budget_mb?: number;
 }
 
 export interface ModelCapabilities {
@@ -1074,16 +1133,48 @@ export interface HfModelFile {
   filename: string;
   size_mb?: number;
   url: string;
+  /** The picture add-on a download of this file brings. Null where the pairing is not known, and on
+   *  a device that carries no add-ons. */
+  pictures?: { size_bytes: number; label: string } | null;
 }
 
+/** Which file of a model a download is. */
+export type DownloadPart = "model" | "pictures";
+
 export interface DownloadEntry {
+  /** The tracker key, which pause, resume and stop name. */
   filename: string;
   category: string;
   downloaded_bytes: number;
   total_bytes: number | null;
-  /** `paused` keeps the partial file for resuming; `cancelled` deletes it. */
+  /** `paused` keeps the partial file where `resumable`; `cancelled` deletes it. */
   status: "downloading" | "paused" | "done" | "error" | "cancelled";
+  /** The row this file belongs to, `"{category}/{name}"`. */
+  model_id?: string;
+  part?: DownloadPart;
+  /** Why it stopped, on an `error` entry: a sentence for the household, shown as given. */
   error?: string;
+  /** Whether a pause keeps the partial file to resume from: true for a Hugging Face transfer, false for
+   *  any other host, whose pause discards it and whose resume starts again from the beginning. */
+  resumable?: boolean;
+}
+
+/** The server's answer to pausing, resuming or stopping a model's download: each part it moved. */
+export interface DownloadControlResult {
+  status: string;
+  files?: { filename: string; status?: string; error?: string }[];
+}
+
+/** The server's answer to a download request: what it will fetch, before anything starts. */
+export interface DownloadStarted {
+  /** `download_started`, or `already_downloading` when every file asked for was already coming down. */
+  status: string;
+  model_id?: string;
+  parts?: { part: DownloadPart; filename: string; size_bytes: number | null }[];
+  /** `text_only`, `not_on_this_device`, `installed`, `included` or `left_out`. */
+  pictures?: string;
+  /** The household's sentence, e.g. "Downloading Gemma 4 E4B (4.2 GB) and picture support (945 MB)". */
+  message?: string;
 }
 
 // ── Disk cleanup / usage ─────────────────────────────────────

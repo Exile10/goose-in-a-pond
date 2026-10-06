@@ -22,6 +22,9 @@ pub trait ModelRepository: Send + Sync {
     /// Update only the `downloaded` flag (and `updated_at`) for a model.
     async fn set_downloaded(&self, id: &str, downloaded: bool) -> Result<()>;
 
+    /// Remove a row; `false` when there was none. Never touches a file.
+    async fn delete(&self, id: &str) -> Result<bool>;
+
     // ── Role assignments ──────────────────────────────────────────────────────
 
     async fn list_assignments(&self) -> Result<Vec<ModelRoleAssignment>>;

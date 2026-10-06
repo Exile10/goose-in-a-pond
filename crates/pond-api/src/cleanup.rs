@@ -205,41 +205,32 @@ pub async fn collect_disk_usage(data_dir: &Path) -> anyhow::Result<DiskUsage> {
     let mut out = DiskUsage::default();
 
     // ── Per-category totals (symlinks resolve to target file size) ──────────
+    use pond_core::models::domain::model_layout::dir_for;
+    use pond_core::models::domain::model_record::ModelCategory;
     let models_root = data_dir.join("models");
     if fs::metadata(&models_root).await.is_ok() {
-        for cat in &[
-            "gguf",
-            "litertlm",
-            "whisper",
-            "tts",
-            "embedding",
-            "llamafile",
-            "llm",
-            "mmproj",
+        // Whisper files share `models/` with every other directory, so they are counted by name.
+        let whisper = sum_files_matching(&models_root, |n| {
+            n.starts_with("ggml-") && n.ends_with(".bin")
+        })
+        .await;
+        out.by_category.insert("whisper".to_string(), whisper);
+        for (key, category) in [
+            ("gguf", ModelCategory::Gguf),
+            ("litertlm", ModelCategory::Litert),
+            ("tts", ModelCategory::TtsPiper),
+            ("embedding", ModelCategory::Embedding),
+            ("llamafile", ModelCategory::Llamafile),
         ] {
-            // "whisper" is virtual (models/ggml-*.bin); "llm" holds llamafile binaries and
-            // "mmproj" the vision encoders (~941 MB each).
-            match *cat {
-                "whisper" => {
-                    let bytes = sum_files_matching(&models_root, |n| {
-                        n.starts_with("ggml-") && n.ends_with(".bin")
-                    })
-                    .await;
-                    out.by_category.insert("whisper".to_string(), bytes);
-                }
-                "llamafile" => {
-                    let llm_dir = models_root.join("llm");
-                    let bytes = sum_tree_bytes(&llm_dir).await;
-                    out.by_category.insert("llamafile".to_string(), bytes);
-                }
-                "llm" => {} // folded into "llamafile"
-                cat => {
-                    let dir = models_root.join(cat);
-                    let bytes = sum_tree_bytes(&dir).await;
-                    out.by_category.insert(cat.to_string(), bytes);
-                }
+            if let Some(dir) = dir_for(data_dir, &category) {
+                out.by_category
+                    .insert(key.to_string(), sum_tree_bytes(&dir).await);
             }
         }
+        // The vision encoders (~941 MB each), outside any catalogue category.
+        let mmproj = models_root.join("mmproj");
+        out.by_category
+            .insert("mmproj".to_string(), sum_tree_bytes(&mmproj).await);
     }
     out.total_bytes = out.by_category.values().sum();
 

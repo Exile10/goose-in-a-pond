@@ -43,9 +43,12 @@ pub struct DestNotALink {
     pub path: PathBuf,
 }
 
-/// A download its progress callback stopped; the `.incomplete` file stays resumable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stopped;
+/// A download its progress callback stopped. The `.incomplete` file at `incomplete` stays
+/// resumable; deleting it is a cancel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stopped {
+    pub incomplete: PathBuf,
+}
 
 impl std::fmt::Display for Stopped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -58,6 +61,12 @@ impl std::error::Error for Stopped {}
 /// Whether `err` is a caller-requested stop rather than a transfer failure.
 pub fn is_stopped(err: &anyhow::Error) -> bool {
     err.downcast_ref::<Stopped>().is_some()
+}
+
+/// The partial file a stopped download left, to delete on a cancel.
+pub fn stopped_incomplete(err: &anyhow::Error) -> Option<&Path> {
+    err.downcast_ref::<Stopped>()
+        .map(|s| s.incomplete.as_path())
 }
 
 /// Env vars consulted (in order) for an HF access token.
@@ -632,7 +641,9 @@ impl<'a> HfFetch<'a> {
         let mut downloaded: u64 = if resumed { existing_size } else { 0 };
         if !progress(downloaded, total) {
             file.flush().await.ok();
-            return Err(anyhow!(Stopped));
+            return Err(anyhow::Error::new(Stopped {
+                incomplete: incomplete_path.clone(),
+            }));
         }
 
         loop {
@@ -661,7 +672,9 @@ impl<'a> HfFetch<'a> {
             if !progress(downloaded, total) {
                 // Keep `.incomplete`: the next call resumes from it, so a stop is a pause.
                 file.flush().await.ok();
-                return Err(anyhow!(Stopped));
+                return Err(anyhow::Error::new(Stopped {
+                    incomplete: incomplete_path.clone(),
+                }));
             }
         }
         // A failed flush (full disk) must not reach the rename, or the blob is silently short.
@@ -865,6 +878,18 @@ async fn head_with_redirects(
         });
     }
     Err(anyhow!("too many redirects following HEAD {url}"))
+}
+
+/// The length `url` would download at, asked with a HEAD chain gated hop by hop and fetching
+/// nothing: the final hop's length, else the first `x-linked-size`; `None` when no hop states
+/// one. The token reaches only Hugging Face hosts, as for a download.
+pub async fn remote_length(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<Option<u64>> {
+    let head = head_with_redirects(client, url, token).await?;
+    Ok(plain_len(head.headers()).or(head.linked_size))
 }
 
 /// GET `url` following redirects like `head_with_redirects`, re-sending `Range` on every hop.
@@ -1390,6 +1415,73 @@ mod tests {
         assert_eq!(
             head.headers().get("etag").and_then(|v| v.to_str().ok()),
             Some("\"deadbeef\"")
+        );
+    }
+
+    /// The size probe is a sender like any other: a hop that leaves loopback under the allowlist
+    /// is refused at the hop, by name, and nothing is asked of that host.
+    #[tokio::test]
+    async fn a_remote_length_is_refused_at_a_hop_the_network_mode_refuses() {
+        let server = redirector("https://cdn.invalid/blob").await;
+        let _mode = ModeGuard::set(NetworkMode::Allowlist);
+
+        let client = build_redirect_aware_client(None).expect("client builds");
+        let err = remote_length(&client, &format!("{}/start", server.uri()), None)
+            .await
+            .expect_err("the second hop leaves loopback and must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("cdn.invalid") && rendered.contains("network_mode"),
+            "{rendered}"
+        );
+        assert!(
+            err.chain()
+                .any(|cause| cause.downcast_ref::<EgressDenied>().is_some()),
+            "a refusal is typed, so a caller can tell it from the network being down"
+        );
+    }
+
+    /// The size a download would arrive at, learned without a GET: HF's first-hop
+    /// `x-linked-size` when the final hop states none, else the final hop's own length.
+    #[tokio::test]
+    async fn a_remote_length_is_asked_with_a_head_and_fetches_nothing() {
+        let cdn = MockServer::start().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/blob"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"cafe\""))
+            .mount(&cdn)
+            .await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/sized"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "4321"))
+            .mount(&cdn)
+            .await;
+        Mock::given(wm_method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&cdn)
+            .await;
+        let origin = redirector(&format!("{}/blob", cdn.uri())).await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/linked"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/blob", cdn.uri()))
+                    .insert_header("x-linked-size", "1000"),
+            )
+            .mount(&origin)
+            .await;
+        let client = build_redirect_aware_client(None).expect("client builds");
+
+        let linked = remote_length(&client, &format!("{}/linked", origin.uri()), None).await;
+        assert_eq!(linked.expect("the chain answers"), Some(1000));
+        let sized = remote_length(&client, &format!("{}/sized", cdn.uri()), None).await;
+        assert_eq!(sized.expect("the host answers"), Some(4321));
+        let silent = remote_length(&client, &format!("{}/start", origin.uri()), None).await;
+        assert_eq!(
+            silent.expect("the chain answers"),
+            None,
+            "no hop states a length"
         );
     }
 

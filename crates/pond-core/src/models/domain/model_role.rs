@@ -92,6 +92,32 @@ impl ModelRole {
         matches!(self, Self::Chat)
     }
 
+    /// The job as the household reads it.
+    pub fn job(&self) -> &'static str {
+        match self {
+            Self::Chat => "Conversation",
+            Self::Think => "Thinking",
+            Self::Task => "Tasks",
+            Self::Tool => "Tool helper",
+            Self::Asr => "Listening",
+            Self::Tts => "Speaking",
+            Self::Embedding => "Memory",
+        }
+    }
+
+    /// The household's word for a stored role name, which arrives as free text: the role's job,
+    /// or the name itself when no role goes by it.
+    pub fn job_for(role: &str) -> &str {
+        Self::from_str(role).map_or(role, |r| r.job())
+    }
+
+    /// Whether a running path loads this role's model: chat, the tool-calling specialist that
+    /// `tool_model` names, speech both ways and embeddings. Think and task select nothing yet, so
+    /// nothing done on behalf of an assignment (a boot restore included) acts on theirs.
+    pub fn loads_a_model(&self) -> bool {
+        !matches!(self, Self::Think | Self::Task)
+    }
+
     /// Settings keys this role owns; a patch touching one must re-sync this role's assignment.
     pub fn settings_keys(&self) -> &'static [&'static str] {
         match self {
@@ -206,6 +232,35 @@ mod tests {
             assert!(role.settings_mirror(&ModelCategory::Gguf, "m").is_empty());
             assert!(role.settings_keys().is_empty());
         }
+    }
+
+    #[test]
+    fn every_role_has_a_job_the_household_reads() {
+        let jobs: Vec<&str> = ModelRole::ALL.iter().map(|r| r.job()).collect();
+        assert_eq!(
+            jobs,
+            [
+                "Conversation",
+                "Thinking",
+                "Tasks",
+                "Tool helper",
+                "Listening",
+                "Speaking",
+                "Memory"
+            ]
+        );
+        assert_eq!(ModelRole::job_for("embedding"), "Memory");
+        assert_eq!(ModelRole::job_for("someday"), "someday");
+    }
+
+    #[test]
+    fn every_role_loads_its_model_except_think_and_task() {
+        let loaded: Vec<&str> = ModelRole::ALL
+            .iter()
+            .filter(|r| r.loads_a_model())
+            .map(|r| r.as_str())
+            .collect();
+        assert_eq!(loaded, ["chat", "tool", "asr", "tts", "embedding"]);
     }
 
     #[test]

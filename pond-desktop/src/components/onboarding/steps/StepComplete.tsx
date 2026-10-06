@@ -24,7 +24,7 @@ export function StepComplete({ onFinish }: Props) {
       { k: "Style",      v: PROMPT_STYLES.find((p) => p.value === draft.promptStyle)?.label ?? "Balanced" },
       { k: "Assistant",  v: `${draft.assistantName} \u00b7 ${describeVoice(draft.ttsVoice).name}` },
       { k: "Wake word",  v: draft.wakeWord === "custom" ? `"${draft.wakeWordCustom}"` : `"${draft.wakeWord}"` },
-      { k: "Model",      v: "Auto (downloads on first run)" },
+      { k: "Model",      v: "You choose one after setup" },
     ],
     [draft],
   );

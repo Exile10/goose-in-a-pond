@@ -1,4 +1,4 @@
-//! Implementations are the single owner of the on-disk layout under `data_dir`.
+//! Where model files are. Implementations map through `model_layout`, the one on-disk layout.
 
 use std::path::PathBuf;
 

@@ -204,28 +204,6 @@ impl LocalInferenceLlmAdapter {
         Self::new(model_id).await
     }
 
-    // Speculation left the engine; kept commented out in case it returns.
-    // /// The drafter id to hand the engine, or `None` to decode without speculation.
-    // ///
-    // /// `None` whenever the speculation switch in Settings is off: every call site stamps the
-    // /// whole settings block, so a drafter decided here would switch speculation back on behind
-    // /// the household's back at the next adapter build.
-    // ///
-    // /// Checks the file, not just the row: a registry entry whose weights have
-    // /// been deleted would otherwise fail inside context creation on the next
-    // /// turn, which reads as the engine breaking rather than as a missing file.
-    // fn registered_drafter(model_id: &str) -> Option<String> {
-    //     use goose::providers::local_inference::local_model_registry::get_registry;
-    //     use pond_core::models::domain::drafter::{drafter_for, speculation_enabled};
-    //
-    //     if !speculation_enabled() {
-    //         return None;
-    //     }
-    //     let spec = drafter_for(model_id)?;
-    //     let registry = get_registry().lock().ok()?;
-    //     let entry = registry.get_model(spec.id)?;
-    //     entry.local_path.exists().then(|| spec.id.to_string())
-    // }
     /// Stamp device settings into the registry before llama-cpp-2 loads. A device profile sends a
     /// non-CUDA build down the Jetson path, so `device_budget::device_window` also runs off-device.
     fn apply_model_settings(model_id: &str) {
@@ -248,10 +226,10 @@ impl LocalInferenceLlmAdapter {
     /// Whether goose runs `model_id` on its LiteRT-LM backend, as the row's entry-level id says.
     fn is_litert_row(model_id: &str) -> bool {
         use goose::providers::local_inference::local_model_registry::get_registry;
-        use pond_core::models::domain::litert::BACKEND_ID;
+        use pond_core::models::domain::engine::LITERT_BACKEND_ID;
         get_registry().lock().ok().is_some_and(|reg| {
             reg.get_model(model_id)
-                .is_some_and(|e| e.backend_id.as_deref() == Some(BACKEND_ID))
+                .is_some_and(|e| e.backend_id.as_deref() == Some(LITERT_BACKEND_ID))
         })
     }
 
@@ -426,9 +404,6 @@ impl LocalInferenceLlmAdapter {
         let sizing =
             pond_core::models::domain::device_budget::device_window(gguf.as_deref(), model_id);
         let context_size = sizing.window;
-        // `device_window` still charges a drafter, keeping the Orin's windows as measured.
-        // Speculation left the engine; kept commented out in case it returns.
-        // let draft_model = Self::registered_drafter(model_id);
         tracing::info!(
             model = model_id,
             model_mb = sizing.model_bytes / (1024 * 1024),
@@ -437,9 +412,7 @@ impl LocalInferenceLlmAdapter {
                 .kv_kib_per_token
                 .map_or("fallback".to_string(), |k| k.to_string()),
             context_size,
-            drafter_mb = sizing.drafter_bytes / (1024 * 1024),
             encoder_mb = sizing.encoder_bytes / (1024 * 1024),
-            // speculation = draft_model.is_some(),
             "Jetson context sized to fit this model's KV cache in the LLM budget"
         );
 
@@ -482,18 +455,6 @@ impl LocalInferenceLlmAdapter {
             // From the model's own template; see `tool_and_thinking_for`.
             tool_calling: tools,
             enable_thinking: thinking,
-            // Speculation left the engine; kept commented out in case it returns.
-            // // Speculative decoding, when the switch in Settings is on AND this
-            // // model's drafter is registered AND its weights are still on disk.
-            // // Re-decided on every provider build
-            // // rather than configured once: `update_model_settings` below
-            // // replaces the whole block, so a `draft_model` set by hand in
-            // // registry.json is erased here anyway. Deciding it from the file
-            // // system each time is what makes that safe -- a deleted drafter
-            // // stops being referenced instead of failing the next context
-            // // creation, and a newly downloaded one is picked up without a
-            // // restart.
-            // draft_model,
             ..Default::default()
         };
 

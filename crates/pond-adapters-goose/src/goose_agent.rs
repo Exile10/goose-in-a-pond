@@ -258,17 +258,6 @@ pub struct GooseAdapter {
     group_embeddings: tokio::sync::OnceCell<Vec<(String, Vec<f32>)>>,
     /// In-process picture support: the one state every vision path shares.
     pictures: Arc<crate::vision_encoder::PictureSupport>,
-    // Speculation left the engine; kept commented out in case it returns.
-    // /// Which speculation-switch position the engine's loaded slot reflects. See
-    // /// `mtp_drafter::SpeculationLedger`; shared with the turn's stream, which reports cold
-    // /// loads back into it.
-    // speculation: Arc<Mutex<crate::mtp_drafter::SpeculationLedger>>,
-    // /// The canonical registry key the in-process provider was last built for: the id the engine
-    // /// loads under, and the one the speculation reconcile evicts.
-    // local_registry_key: Mutex<Option<String>>,
-    // /// Set by [`GooseAdapter::enable_model_provisioning`], so background work (a drafter that
-    // /// finished downloading) can run this adapter's own warm-up.
-    // self_handle: std::sync::OnceLock<std::sync::Weak<GooseAdapter>>,
 }
 
 /// Byte cap on a buffered reasoning passage (memory bound); crossing it splits, never drops.
@@ -386,17 +375,13 @@ impl GooseAdapter {
             session_permitted_groups: tokio::sync::RwLock::new(HashMap::new()),
             group_embeddings: tokio::sync::OnceCell::new(),
             pictures: Arc::new(crate::vision_encoder::PictureSupport::new()),
-            // speculation: Arc::new(Mutex::new(crate::mtp_drafter::SpeculationLedger::default())),
-            // local_registry_key: Mutex::new(None),
-            // self_handle: std::sync::OnceLock::new(),
         })
     }
 
-    /// Lets this process fetch and repair the vision encoder. Serve process only: short-lived
-    /// processes on the same data directory must not start downloads or rename files in use.
+    /// Lets this process verify picture add-ons on disk and set a wrong one aside. Serve process
+    /// only: short-lived processes on the same data directory must not rename files in use.
     pub fn enable_model_provisioning(self: &Arc<Self>) {
         self.pictures.enable_provisioning();
-        // let _ = self.self_handle.set(Arc::downgrade(self));
     }
 
     /// Makes prompt templates ask for short, TTS-friendly replies.
@@ -1428,21 +1413,24 @@ impl GooseAdapter {
             },
             // In-process; LocalInferenceProvider finds the file, and its backend, via Goose's
             // registry: llama.cpp for a .gguf, LiteRT-LM for a .litertlm.
+            // No model chosen: nothing to build, and no placeholder stands in for one.
+            "local" | "gguf" if settings.chat_model.trim().is_empty() => None,
             "local" | "gguf" => {
-                let model_name = if settings.chat_model.is_empty() {
-                    "llamafile".to_string()
-                } else {
-                    settings.chat_model.clone()
-                };
+                let model_name = settings.chat_model.clone();
                 let litert = pond_core::models::domain::litert::is_litert_model(&model_name);
                 // Canonical key, so aliases of one GGUF can't load it twice under two ids.
                 let registry_key = match self.data_dir {
                     Some(ref dd) if litert => crate::litert_model::register(&model_name, dd),
-                    Some(ref dd) => Self::register_gguf_model(&model_name, dd),
+                    Some(ref dd) => {
+                        let recorded =
+                            recorded_gguf_file(self.model_repo.as_deref(), &model_name).await;
+                        Self::register_gguf_model_from(&model_name, dd, recorded.as_deref())
+                    }
                     None => model_name.trim_end_matches(".gguf").to_string(),
                 };
-                // Registration leaves `mmproj_path` (the engine's vision gate) None. Non-blocking
-                // (~1 GB fetch); the path is resolved per generation, so no restart is needed.
+                // Registration leaves `mmproj_path` (the engine's vision gate) None. Attaches an
+                // add-on already on disk (hashing one not yet verified, in the background) and
+                // never fetches one; the path is resolved per generation, so no restart is needed.
                 // A LiteRT-LM model reads no pictures.
                 if let Some(dd) = self.data_dir.as_ref().filter(|_| !litert) {
                     let gguf = self
@@ -1453,26 +1441,9 @@ impl GooseAdapter {
                         .settle_stamp(dd, &settings.chat_model, &gguf)
                         .is_some()
                     {
-                        self.pictures.spawn_ensure(dd, &settings.chat_model);
+                        self.pictures.spawn_settle(dd, &settings.chat_model);
                     }
-                    // Speculation left the engine; kept commented out in case it returns.
-                    // // Speculative decoding's drafter, for the same reason and on
-                    // // the same terms as the encoder above: the engine resolves it
-                    // // by name through the registry, so a drafter file with no row
-                    // // is invisible. Re-checked on every provider build, so one
-                    // // that arrives later is used without a restart and one that
-                    // // has been deleted simply stops being referenced. It honours
-                    // // the switch as this turn's settings row has it.
-                    // crate::mtp_drafter::ensure_drafter_registered_with(
-                    //     dd,
-                    //     &registry_key,
-                    //     settings.speculative_decoding_enabled,
-                    // );
                 }
-                // *self
-                //     .local_registry_key
-                //     .lock()
-                //     .unwrap_or_else(|e| e.into_inner()) = Some(registry_key.clone());
                 let cfg = goose_providers::model::ModelConfig::new(&registry_key);
                 tracing::debug!(
                     "[model-switch] building LocalInferenceProvider for '{}'...",
@@ -1503,14 +1474,11 @@ impl GooseAdapter {
                 }
             }
             // llamafile uses the Ollama wire protocol over HTTP.
+            "llamafile" if settings.chat_model.trim().is_empty() => None,
             "llamafile" => {
                 std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
                 std::env::set_var("OLLAMA_TIMEOUT", "600");
-                let model_name = if settings.chat_model.is_empty() {
-                    "llamafile".to_string()
-                } else {
-                    settings.chat_model.clone()
-                };
+                let model_name = settings.chat_model.clone();
                 let cfg = goose_providers::model::ModelConfig::new(&model_name);
                 tracing::debug!(
                     "[model-switch] building llamafile OllamaProvider for '{}'...",
@@ -2126,9 +2094,14 @@ impl GooseAdapter {
         self
     }
 
-    /// Registers a `$data_dir/models/gguf/` model (bare stem or filename) with Goose.
-    /// Returns the canonical key (quant suffix collapsed); build `ModelConfig` from it.
-    fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) -> String {
+    /// Registers a `$data_dir/models/gguf/` model (bare stem or filename) with Goose, from the
+    /// file its catalogue row names when that is on disk. Returns the canonical key (quant suffix
+    /// collapsed); build `ModelConfig` from it.
+    fn register_gguf_model_from(
+        model_name: &str,
+        data_dir: &std::path::Path,
+        recorded: Option<&str>,
+    ) -> String {
         use goose::providers::local_inference::local_model_registry::{
             get_registry, LocalModelEntry, LocalModelStorage,
         };
@@ -2137,7 +2110,7 @@ impl GooseAdapter {
 
         // The file comes from the ORIGINAL name, so an explicit quant still pins its exact file.
         let stem = canonical_model_stem(model_name, &gguf_dir);
-        let filename = resolve_gguf_filename(model_name, &gguf_dir);
+        let filename = registration_file(model_name, &gguf_dir, recorded);
         let local_path = gguf_dir.join(&filename);
         if !local_path.exists() {
             tracing::warn!(
@@ -2149,10 +2122,14 @@ impl GooseAdapter {
         match get_registry().lock() {
             Ok(mut registry) => {
                 let registry: &mut goose::providers::local_inference::local_model_registry::LocalModelRegistry = &mut registry;
-                // Re-register stale rows whose file is gone too; `add_model` upserts in place.
+                // Re-register a row whose file is gone or is another file; `add_model` upserts.
                 let needs_register = registry
                     .get_model(&stem)
-                    .map(|entry| !entry.local_path.exists())
+                    .map(|entry| {
+                        !entry.local_path.exists()
+                            || crate::registry_rows::resolve(&entry.local_path)
+                                != crate::registry_rows::resolve(&local_path)
+                    })
                     .unwrap_or(true);
 
                 if needs_register {
@@ -2213,158 +2190,6 @@ impl GooseAdapter {
         Some(crate::registry_rows::resolve(&path))
     }
 
-    // Speculation left the engine; kept commented out in case it returns.
-    // /// Apply the speculation switch to the loaded model before a local turn streams.
-    // ///
-    // /// Compares (canonical key, switch as THIS turn's settings row has it, drafter on disk)
-    // /// with what the ledger says the loaded slot reflects. When they differ: register the
-    // /// drafter (it takes the registry lock itself, so before any guard), reconcile every row in
-    // /// one save, and evict the slot so the next load resolves the new rows, whether or not the
-    // /// reconcile changed a row (see `SpeculationLedger`). The registry guard is never held
-    // /// across the evict, which takes it again. Returns the epoch this turn evicted under, for
-    // /// the stream to confirm with a cold load.
-    // async fn apply_speculation_switch(
-    //     &self,
-    //     settings: &pond_core::user_data::domain::settings::Settings,
-    // ) -> Option<u64> {
-    //     use crate::mtp_drafter::{DraftTuple, LedgerStep};
-    //     use pond_core::models::domain::drafter::{drafter_for, drafter_path};
-    //
-    //     if !matches!(settings.chat_provider.as_str(), "local" | "gguf") {
-    //         return None;
-    //     }
-    //     let dd = self.data_dir.as_deref()?;
-    //     let key = self
-    //         .local_registry_key
-    //         .lock()
-    //         .unwrap_or_else(|e| e.into_inner())
-    //         .clone()?;
-    //     let enabled = settings.speculative_decoding_enabled;
-    //     let drafter = drafter_for(&settings.chat_model);
-    //     let present = drafter
-    //         .as_ref()
-    //         .is_some_and(|spec| drafter_path(dd, spec).exists());
-    //     let tuple = DraftTuple {
-    //         key: key.clone(),
-    //         enabled,
-    //         present,
-    //     };
-    //
-    //     let step = self
-    //         .speculation
-    //         .lock()
-    //         .unwrap_or_else(|e| e.into_inner())
-    //         .step(&tuple);
-    //     let epoch = match step {
-    //         LedgerStep::Nothing => return None,
-    //         LedgerStep::EvictAgain { epoch } => epoch,
-    //         LedgerStep::Reconcile => {
-    //             if let Some(source) = crate::mtp_drafter::draft_override_source() {
-    //                 static WARNED: std::sync::atomic::AtomicBool =
-    //                     std::sync::atomic::AtomicBool::new(false);
-    //                 if !WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-    //                     tracing::warn!(
-    //                         source,
-    //                         "GOOSE_LOCAL_DRAFT_MODEL is set in {source}; the engine uses it for any \
-    //                          row without a drafter, so it outranks the speculation switch in Settings"
-    //                     );
-    //                 }
-    //             }
-    //             let drafter_id =
-    //                 crate::mtp_drafter::ensure_drafter_registered_with(dd, &key, enabled);
-    //             let target = self.registry_row_path(&key).unwrap_or_else(|| {
-    //                 crate::vision_encoder::chat_gguf_path(dd, &settings.chat_model)
-    //             });
-    //             let changes = crate::mtp_drafter::reconcile_drafter(
-    //                 &crate::registry_rows::GooseRegistry,
-    //                 &target,
-    //                 drafter_id.as_deref(),
-    //                 enabled,
-    //             );
-    //             if !changes.is_empty() {
-    //                 tracing::info!(
-    //                     model = %key,
-    //                     speculative_decoding_enabled = enabled,
-    //                     drafter_present = present,
-    //                     rows = changes.len(),
-    //                     "speculation switch applied to the registry; reloading the model"
-    //                 );
-    //             }
-    //             if enabled && drafter.is_some() && !present {
-    //                 self.spawn_drafter_fetch(dd, &settings.chat_model);
-    //             }
-    //             self.speculation
-    //                 .lock()
-    //                 .unwrap_or_else(|e| e.into_inner())
-    //                 .reconciled(tuple)
-    //         }
-    //     };
-    //
-    //     let evicted = match goose::providers::local_inference::evict_model(&key).await {
-    //         Ok(evicted) => evicted,
-    //         Err(e) => {
-    //             tracing::warn!(model = %key, error = %e, "could not evict the model to apply the speculation switch; retrying next turn");
-    //             false
-    //         }
-    //     };
-    //     self.speculation
-    //         .lock()
-    //         .unwrap_or_else(|e| e.into_inner())
-    //         .evicted(epoch, evicted);
-    //     // PAI-4 P5. Only an evict that emptied a slot destroyed a prefix; on a first turn or a
-    //     // model switch nothing was loaded, and the swap has already recorded its own reason.
-    //     if evicted {
-    //         self.note_prefix_invalidated(InvalidationReason::ProviderRebuilt);
-    //     }
-    //     Some(epoch)
-    // }
-    //
-    // /// The switch turned on with the drafter not on disk: fetch it in the background (serve
-    // /// process only), then run this adapter's own warm-up, so the reconcile, evict and reload
-    // /// happen there rather than in the household's next turn.
-    // fn spawn_drafter_fetch(&self, data_dir: &std::path::Path, chat_model: &str) {
-    //     if !self.pictures.provisioning_enabled() {
-    //         return;
-    //     }
-    //     let Ok(handle) = tokio::runtime::Handle::try_current() else {
-    //         return;
-    //     };
-    //     if !self
-    //         .speculation
-    //         .lock()
-    //         .unwrap_or_else(|e| e.into_inner())
-    //         .begin_fetch()
-    //     {
-    //         return;
-    //     }
-    //     let dd = data_dir.to_path_buf();
-    //     let model = chat_model.to_string();
-    //     let ledger = self.speculation.clone();
-    //     let gate = self.pictures.warmup().clone();
-    //     let adapter = self.self_handle.get().cloned();
-    //     let voice = self.voice_mode.load(std::sync::atomic::Ordering::Relaxed);
-    //     handle.spawn(async move {
-    //         if pond_core::models::domain::device_budget::budgeted_device() {
-    //             gate.wait().await;
-    //         }
-    //         let fetched = crate::mtp_drafter::fetch_drafter(&dd, &model).await;
-    //         ledger.lock().unwrap_or_else(|e| e.into_inner()).end_fetch();
-    //         match fetched {
-    //             Ok(path) => {
-    //                 tracing::info!(path = %path.display(), "MTP drafter fetched after the switch turned on");
-    //                 if let Some(adapter) = adapter.and_then(|w| w.upgrade()) {
-    //                     let quiet: Arc<dyn Fn(WarmupPhase) + Send + Sync> = Arc::new(|_| {});
-    //                     AgentPort::prewarm(adapter.as_ref(), voice, quiet).await;
-    //                 }
-    //             }
-    //             Err(e) => tracing::warn!(
-    //                 error = %format!("{e:#}"),
-    //                 "could not fetch the MTP drafter; replies arrive without speculation"
-    //             ),
-    //         }
-    //     });
-    // }
-
     pub async fn chat_stream(
         &self,
         request: AgentRequest,
@@ -2373,23 +2198,23 @@ impl GooseAdapter {
         let session_id = request.session_id.clone();
         let model_role = request.model_role.clone();
 
+        pond_core::models::domain::conversation_model::require_conversation_model(
+            &settings.chat_provider,
+            &settings.chat_model,
+        )
+        .map_err(anyhow::Error::new)?;
+
         // API backstop: the engine would swap images for a note and the model would bluff.
         if !request.images.is_empty() {
-            use pond_core::models::domain::vision_encoder::{
-                encoder_for, refusal_for, RefusalCode,
-            };
+            use pond_core::models::domain::vision_encoder::refusal_for;
             let provider = settings.chat_provider.as_str();
             let model = settings.chat_model.as_str();
             let state =
                 Self::vision_state_for(&self.pictures, self.data_dir.as_deref(), provider, model);
-            let spec = encoder_for(model);
+            let spec = crate::vision_encoder::declaration(self.data_dir.as_deref(), model)
+                .spec()
+                .copied();
             if let Some(refusal) = refusal_for(state.as_ref(), spec.as_ref(), provider) {
-                if refusal.code == RefusalCode::NotReady {
-                    // A turn is the strongest signal that the encoder is wanted.
-                    if let Some(ref dd) = self.data_dir {
-                        self.pictures.spawn_ensure(dd, model);
-                    }
-                }
                 tracing::info!(
                     target: "giap::vision",
                     provider,
@@ -2757,12 +2582,6 @@ impl GooseAdapter {
             );
         }
 
-        // Speculation left the engine; kept commented out in case it returns.
-        // // ── 5a. The speculation switch ────────────────────────────────────────
-        // // After the provider is current (so the canonical key is known) and before
-        // // this turn streams, so the load it may trigger resolves the new rows.
-        // let draft_epoch = self.apply_speculation_switch(&settings).await;
-
         // ── 6. Extension cleanup ──────────────────────────────────────────────
         // Strip Goose default extensions that would pollute the prompt, once per session.
         {
@@ -3041,7 +2860,6 @@ impl GooseAdapter {
         };
         let image_failures_at_start = session_controls.image_failures();
         let pictures = self.pictures.clone();
-        // let speculation = self.speculation.clone();
 
         // ── 7. GooseMode from model_role ──────────────────────────────────────
         let goose_mode = GooseMode::Auto;
@@ -3594,15 +3412,6 @@ impl GooseAdapter {
                                     if let Some(load) = stats.model_load_ms {
                                         turn_stats.model_load_ms =
                                             Some(turn_stats.model_load_ms.unwrap_or(0) + load);
-                                        // // A cold load in a turn that applied the speculation
-                                        // // switch resolved the reconciled rows: the switch is
-                                        // // now what the loaded slot reflects.
-                                        // if let Some(epoch) = draft_epoch {
-                                        //     speculation
-                                        //         .lock()
-                                        //         .unwrap_or_else(|e| e.into_inner())
-                                        //         .loaded(epoch);
-                                        // }
                                     }
                                     if let Some(prefill) = stats.prefill_ms {
                                         turn_stats.prefill_ms =
@@ -3754,6 +3563,15 @@ impl AgentPort for GooseAdapter {
             return;
         }
         let settings = self.settings_repo.get().await.unwrap_or_default();
+        if !pond_core::models::domain::conversation_model::conversation_model_chosen(
+            &settings.chat_provider,
+            &settings.chat_model,
+        ) {
+            progress(WarmupPhase::Skipped {
+                reason: "no conversation model is chosen".to_string(),
+            });
+            return;
+        }
         if !matches!(settings.chat_provider.as_str(), "local" | "gguf") {
             progress(WarmupPhase::Skipped {
                 reason: format!(
@@ -3860,10 +3678,43 @@ impl AgentPort for GooseAdapter {
         Self::vision_state_for(&self.pictures, self.data_dir.as_deref(), provider, model)
     }
 
-    /// Starts the model's encoder ensure in the background; no-op outside the serve process.
+    /// Registers a model whose file just arrived, from the file its row names, then settles its
+    /// add-on; never downloads. A no-op for llama.cpp without a Tokio runtime.
     fn prepare_model(&self, model: &str) {
-        if let Some(ref dd) = self.data_dir {
-            self.pictures.spawn_ensure(dd, model);
+        let Some(ref dd) = self.data_dir else {
+            return;
+        };
+        if pond_core::models::domain::litert::is_litert_model(model) {
+            crate::litert_model::register(model, dd);
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (dd, model) = (dd.clone(), model.to_string());
+        let (repo, pictures) = (self.model_repo.clone(), self.pictures.clone());
+        handle.spawn(async move {
+            let recorded = recorded_gguf_file(repo.as_deref(), &model).await;
+            Self::register_gguf_model_from(&model, &dd, recorded.as_deref());
+            pictures.spawn_settle(&dd, &model);
+        });
+    }
+
+    async fn ensure_conversation_model(
+        &self,
+    ) -> std::result::Result<(), pond_core::models::domain::conversation_model::NoConversationModel>
+    {
+        let settings = self.settings_repo.get().await.unwrap_or_default();
+        pond_core::models::domain::conversation_model::require_conversation_model(
+            &settings.chat_provider,
+            &settings.chat_model,
+        )
+    }
+
+    fn forget_model_file(&self, path: &std::path::Path) {
+        let ids = crate::registry_rows::forget_file(&crate::registry_rows::GooseRegistry, path);
+        if !ids.is_empty() {
+            tracing::info!(file = %path.display(), rows = ?ids, "forgot the registry rows of a deleted model");
         }
     }
 
@@ -4357,6 +4208,32 @@ impl GooseAdapter {
             loaded_extensions,
         })
     }
+}
+
+/// The file the catalogue row for a llama.cpp model names, if the row has one.
+async fn recorded_gguf_file(
+    repo: Option<&dyn ModelRepository>,
+    model_name: &str,
+) -> Option<String> {
+    let id = pond_core::models::domain::model_record::ModelRecord::id_for(
+        &pond_core::models::domain::model_record::ModelCategory::Gguf,
+        model_name.trim_end_matches(".gguf"),
+    );
+    repo?.get_by_id(&id).await.ok().flatten()?.filename
+}
+
+/// The file to register for `model_name`: the one its catalogue row names when that is on
+/// disk, else [`resolve_gguf_filename`]'s guess from the name.
+fn registration_file(
+    model_name: &str,
+    gguf_dir: &std::path::Path,
+    recorded: Option<&str>,
+) -> String {
+    recorded
+        .and_then(pond_core::models::domain::model_layout::file_name)
+        .filter(|f| gguf_dir.join(f).exists())
+        .map(str::to_string)
+        .unwrap_or_else(|| resolve_gguf_filename(model_name, gguf_dir))
 }
 
 /// The `.gguf` file for a model name that may lack its quant suffix (a catalog display name).
@@ -5637,6 +5514,9 @@ mod tests {
         async fn set_downloaded(&self, _id: &str, _d: bool) -> Result<()> {
             Ok(())
         }
+        async fn delete(&self, _id: &str) -> Result<bool> {
+            Ok(false)
+        }
         async fn list_assignments(
             &self,
         ) -> Result<Vec<pond_core::models::domain::model_record::ModelRoleAssignment>> {
@@ -5985,7 +5865,7 @@ mod tests {
         let declared = !pond_core::models::domain::device_budget::budgeted_device();
         for provider in ["local", "gguf"] {
             for model in [
-                "gemma-4-E2B-it",
+                "gemma-4-E2B-it-Q4_K_M",
                 "gemma-4-E4B-it-Q4_K_M",
                 "gemma-4-E4B-it-qat-UD-Q4_K_XL",
             ] {
@@ -6753,6 +6633,75 @@ mod tests {
                 rmcp::model::Content::text(body.to_string()),
             ])),
         )
+    }
+
+    /// The row's own file wins over the name scan, which picks the first quant on disk.
+    #[test]
+    fn registration_takes_the_file_the_row_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        for f in [
+            "gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+            "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+        ] {
+            std::fs::write(tmp.path().join(f), b"gguf").unwrap();
+        }
+        assert_eq!(
+            resolve_gguf_filename("gemma-4-E4B-it-qat", tmp.path()),
+            "gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+            "the name scan alone takes whichever quant sorts first"
+        );
+        assert_eq!(
+            registration_file(
+                "gemma-4-E4B-it-qat",
+                tmp.path(),
+                Some("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
+            ),
+            "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
+        );
+        // An uncatalogued spelling the name scan cannot find is still found by its row.
+        std::fs::write(tmp.path().join("Odd.Name.v2.gguf"), b"gguf").unwrap();
+        assert_eq!(
+            registration_file("odd-name", tmp.path(), Some("Odd.Name.v2.gguf")),
+            "Odd.Name.v2.gguf"
+        );
+        // A row naming a missing file, or a path, falls back to the name.
+        assert_eq!(
+            registration_file(
+                "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+                tmp.path(),
+                Some("gone.gguf")
+            ),
+            "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
+        );
+        assert_eq!(
+            registration_file(
+                "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+                tmp.path(),
+                Some("../gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
+            ),
+            "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_recorded_file_comes_from_the_gguf_row_the_name_keys() {
+        let mut stub = StubCatalog::holding("gguf/gemma-4-e4b", None);
+        if let Some(row) = stub.record.as_mut() {
+            row.category = ModelCategory::Gguf;
+            row.filename = Some("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf".to_string());
+        }
+        let repo: Arc<dyn ModelRepository> = Arc::new(stub);
+        for name in ["gemma-4-e4b", "gemma-4-e4b.gguf"] {
+            assert_eq!(
+                recorded_gguf_file(Some(repo.as_ref()), name)
+                    .await
+                    .as_deref(),
+                Some("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"),
+                "{name}"
+            );
+        }
+        assert_eq!(recorded_gguf_file(Some(repo.as_ref()), "other").await, None);
+        assert_eq!(recorded_gguf_file(None, "gemma-4-e4b").await, None);
     }
 
     #[test]

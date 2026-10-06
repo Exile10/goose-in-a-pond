@@ -18,7 +18,9 @@ import {
   type ContextSource,
   type Device,
   type DiskUsage,
+  type DownloadControlResult,
   type DownloadEntry,
+  type DownloadStarted,
   type Extension,
   type FaceModelsResponse,
   type HandshakeResponse,
@@ -38,6 +40,7 @@ import {
   type MeshSelf,
   type ModelActiveRoles,
   type ModelEntry,
+  type ModelEngine,
   type ModelMemoryStatus,
   type OllamaModel,
   type PairingCodeResponse,
@@ -1121,7 +1124,7 @@ export class PondApiClient {
       for (const [category, items] of Object.entries(r)) {
         for (const item of items as Record<string, unknown>[]) {
           entries.push({
-            id: `${category}/${item.name as string}`,
+            id: (item.id as string | undefined) || `${category}/${item.name as string}`,
             provider: category,
             name: item.name as string,
             // Kokoro descriptions are sentences, so title from the id (af_heart -> Af_Heart).
@@ -1148,8 +1151,14 @@ export class PondApiClient {
             asr_size: item.asr_size as string | undefined,
             tts_engine: item.tts_engine as string | undefined,
             config_filename: item.config_filename as string | undefined,
-            reads_images: item.reads_images as boolean | undefined,
-            image_support_bytes: item.image_support_bytes as number | undefined,
+            title: (item.title as string | undefined) || undefined,
+            engine: (item.engine as ModelEngine | null | undefined) ?? undefined,
+            provenance: item.provenance as ModelEntry["provenance"],
+            kind: item.kind as ModelEntry["kind"],
+            acquire: item.acquire as ModelEntry["acquire"],
+            recommended:
+              (item.recommended as ModelEntry["recommended"] | null | undefined) ?? undefined,
+            companions: (item.companions as ModelEntry["companions"] | undefined) ?? [],
           });
         }
       }
@@ -1204,6 +1213,7 @@ export class PondApiClient {
     ).then((raw) => {
       function normalize(
         r: unknown,
+        keepProvider = false,
       ): { provider: string; model: string } | null {
         if (!r || typeof r !== "object") return null;
         const obj = r as Record<string, unknown>;
@@ -1212,6 +1222,13 @@ export class PondApiClient {
             provider: obj.provider as string,
             model: obj.model as string,
           };
+        // A slot that reports its own provider and model (conversation) says nothing is chosen
+        // when they are empty; an assignment that outlived the setting does not say otherwise.
+        const reportsPair = typeof obj.provider === "string" && typeof obj.model === "string";
+        // Memory runs on its provider's built-in model while none is named.
+        if (keepProvider && reportsPair && obj.provider)
+          return { provider: obj.provider as string, model: "" };
+        if (reportsPair) return null;
         if (typeof obj.model_id === "string" && obj.model_id.includes("/")) {
           const [provider, ...rest] = obj.model_id.split("/");
           return { provider, model: rest.join("/") };
@@ -1223,7 +1240,7 @@ export class PondApiClient {
         tool: raw.tool ?? null,
         asr: normalize(raw.asr),
         tts: normalize(raw.tts),
-        embedding: normalize(raw.embedding),
+        embedding: normalize(raw.embedding, true),
       } as ModelActiveRoles;
     });
   }
@@ -1664,24 +1681,37 @@ export class PondApiClient {
     );
   }
 
+  /** `pictures: false` leaves out the picture add-on a file with a known pairing would bring. */
   downloadModelFromUrl(
     url: string,
     category: string,
     filename: string,
-  ): Promise<{ status: string }> {
+    options?: { pictures?: boolean },
+  ): Promise<DownloadStarted> {
     return this.post("/api/v1/models/download/url", {
       url,
       category,
       filename,
+      ...(options?.pictures === undefined ? {} : { pictures: options.pictures }),
     });
   }
 
-  /** Pause keeps the partial file (resume re-requests with a range header); cancel deletes it. */
+  /** Pause keeps a Hugging Face transfer's partial file to resume from; another host has no range resume,
+   *  so its pause discards it. Cancel deletes it. */
   controlDownload(
     filename: string,
     action: "pause" | "resume" | "cancel",
   ): Promise<{ status: string }> {
     return this.post("/api/v1/models/download/control", { filename, action });
+  }
+
+  /** Pause, resume or stop every part of a model's download at once: stopping only its file would
+   *  leave the picture add-on coming down for a model that will never arrive. */
+  controlModelDownload(
+    modelId: string,
+    action: "pause" | "resume" | "cancel",
+  ): Promise<DownloadControlResult> {
+    return this.post("/api/v1/models/download/control", { model_id: modelId, action });
   }
 
   getDownloadProgress(): Promise<{ downloads: DownloadEntry[] }> {
@@ -1702,17 +1732,31 @@ export class PondApiClient {
     return this.get("/api/v1/models/disk-usage");
   }
 
-  // Delete model file from disk (409 ApiError if model is active in a role)
+  // Delete model file from disk (409 ApiError, in the server's words, if the model is active in a role
+  // or another row names the same file)
   deleteModel(category: string, name: string): Promise<void> {
     return this.del(
       `/api/v1/models/${encodeURIComponent(category)}/${encodeURIComponent(name)}`,
     );
   }
 
-  // Trigger async download of a catalog model by category and name
-  downloadModel(category: string, name: string): Promise<{ status: string }> {
+  /** Starts a catalog model's download; the answer says what it will fetch. Picture support is
+   *  included unless `pictures` is false. */
+  downloadModel(
+    category: string,
+    name: string,
+    options?: { pictures?: boolean },
+  ): Promise<DownloadStarted> {
     return this.post(
       `/api/v1/models/${encodeURIComponent(category)}/${encodeURIComponent(name)}/download`,
+      options?.pictures === undefined ? undefined : { pictures: options.pictures },
+    );
+  }
+
+  /** Adds picture support to a model that is already on this device. */
+  addPictures(category: string, name: string): Promise<DownloadStarted> {
+    return this.post(
+      `/api/v1/models/${encodeURIComponent(category)}/${encodeURIComponent(name)}/companions/pictures`,
     );
   }
 

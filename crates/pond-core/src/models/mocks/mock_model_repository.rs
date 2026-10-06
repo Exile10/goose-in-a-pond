@@ -76,6 +76,10 @@ impl ModelRepository for MockModelRepository {
         Ok(())
     }
 
+    async fn delete(&self, id: &str) -> Result<bool> {
+        Ok(self.models.write().await.remove(id).is_some())
+    }
+
     async fn list_assignments(&self) -> Result<Vec<ModelRoleAssignment>> {
         let map = self.assignments.read().await;
         Ok(map

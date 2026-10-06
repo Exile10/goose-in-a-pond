@@ -7,6 +7,7 @@ use goose::providers::local_inference::local_model_registry::{
     ToolCallingMode,
 };
 use pond_core::models::domain::device_budget;
+use pond_core::models::domain::engine::LITERT_BACKEND_ID;
 use pond_core::models::domain::litert::{self, EngineOptions, Overrides};
 use std::path::Path;
 
@@ -117,7 +118,7 @@ fn planned_entry(
     entry.filename = filename;
     entry.local_path = local_path.to_path_buf();
     // Entry level: a settings stamp replaces the whole `ModelSettings`, its `backend_id` too.
-    entry.backend_id = Some(litert::BACKEND_ID.to_string());
+    entry.backend_id = Some(LITERT_BACKEND_ID.to_string());
     // GIAP owns the file; goose must not delete it as managed storage.
     entry.storage = LocalModelStorage::ManualPath;
     entry.mmproj_path = None;

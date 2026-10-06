@@ -1,8 +1,11 @@
 //! REST API under `/api/v1/`; protected routes take a Bearer token from `POST /api/v1/handshake`.
 
 pub mod cleanup;
+pub(crate) mod download_failure;
 pub(crate) mod image_normalize;
 pub mod middleware;
+pub mod model_acquisition;
+pub(crate) mod model_views;
 pub mod music_choice;
 pub mod musickit;
 pub mod network;
@@ -363,13 +366,14 @@ pub const DL_CANCEL: u8 = 2;
 /// State of a single in-progress (or recently completed) model download.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DownloadEntry {
+    /// The tracker key, which pause, resume and cancel name.
     pub filename: String,
     pub category: String,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
     /// "downloading" | "paused" | "done" | "error" | "cancelled"
     pub status: String,
-    /// When it reached "done" or "error"; used to evict stale entries.
+    /// When it stopped for good; done, error and cancelled entries are evicted after a while.
     #[serde(skip)]
     pub finished_at: Option<std::time::Instant>,
     /// What this download has been told to do: [`DL_RUN`], [`DL_PAUSE`] or [`DL_CANCEL`].
@@ -379,6 +383,61 @@ pub struct DownloadEntry {
     /// Source URL; re-requesting it resumes a paused download from its `.incomplete` file.
     #[serde(skip)]
     pub url: Option<String>,
+    /// The catalogue row this file belongs to, `"{category}/{name}"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Which part of that model: `"model"` or `"pictures"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
+    /// Where the file lands, so a resume needs no category of its own.
+    #[serde(skip)]
+    pub dest: Option<std::path::PathBuf>,
+    /// A paused transfer's partial file, which a cancel deletes.
+    #[serde(skip)]
+    pub partial: Option<std::path::PathBuf>,
+    /// Why it stopped, for an `error` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Whether a pause keeps what has arrived: a Hugging Face transfer resumes from its
+    /// `.incomplete`, while a `.part` transfer starts again from zero.
+    pub resumable: bool,
+}
+
+impl DownloadEntry {
+    /// A transfer about to start.
+    pub fn starting(filename: impl Into<String>, category: impl Into<String>) -> Self {
+        Self {
+            filename: filename.into(),
+            category: category.into(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+            status: "downloading".to_string(),
+            finished_at: None,
+            control: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(DL_RUN)),
+            url: None,
+            model_id: None,
+            part: None,
+            dest: None,
+            partial: None,
+            error: None,
+            resumable: false,
+        }
+    }
+
+    /// Whether a transfer is attached to this entry. A running one holds a clone of `control` until
+    /// it ends, so an entry left at "downloading" by a task that died, or by a writer that never
+    /// held the flag (the voice downloads), is not running.
+    pub fn is_running(&self) -> bool {
+        self.status == "downloading" && std::sync::Arc::strong_count(&self.control) > 1
+    }
+
+    /// Paused entries wait for the household, so only finished ones age out.
+    pub fn expired(&self, now: std::time::Instant, after: std::time::Duration) -> bool {
+        self.status != "paused"
+            && self
+                .finished_at
+                .is_some_and(|t| now.duration_since(t) >= after)
+    }
 }
 
 /// Snapshot of one model's availability, sent over the REST API.
@@ -423,6 +482,100 @@ pub struct ModelStatusEntry {
     /// Image-support download in bytes (the encoder's pinned size); set only when `reads_images`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_support_bytes: Option<u64>,
+    /// `"{category}/{name}"`, the id activation and role assignments use.
+    #[serde(default)]
+    pub id: String,
+    /// What the household reads as the model's name; never a placeholder.
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    /// The engine that runs it; `None` for speech, voice and embedding rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<ModelEngineDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<pond_core::models::domain::taxonomy::Provenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<pond_core::models::domain::taxonomy::ModelKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquire: Option<pond_core::models::domain::taxonomy::Acquisition>,
+    /// Set only for GIAP's suggestions. Shown, never imposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<RecommendedDto>,
+    /// Separate downloads that extend the model, such as picture support. Empty: text only.
+    #[serde(default)]
+    pub companions: Vec<CompanionDto>,
+}
+
+/// One separate download that extends a model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompanionDto {
+    /// `"pictures"`.
+    pub kind: String,
+    /// What the household reads, e.g. "Gemma 4 E4B".
+    pub label: String,
+    pub size_bytes: u64,
+    /// `installed` | `available` | `downloading` | `verifying` | `not_on_this_device`.
+    pub state: String,
+}
+
+/// Why GIAP suggests a model; `measured` only where it was measured on this class of machine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecommendedDto {
+    pub rank: pond_core::models::domain::recommended::Rank,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured: Option<MeasuredDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeasuredDto {
+    pub device: pond_core::models::domain::recommended::DeviceClass,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_reply_s: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_second_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_second_max: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_tokens: Option<u32>,
+    pub measured_on: String,
+}
+
+impl From<&pond_core::models::domain::recommended::Measured> for MeasuredDto {
+    fn from(m: &pond_core::models::domain::recommended::Measured) -> Self {
+        Self {
+            device: m.device,
+            summary: m.summary.to_string(),
+            first_reply_s: m.first_reply_s,
+            tokens_per_second_min: m.tokens_per_second.map(|(low, _)| low),
+            tokens_per_second_max: m.tokens_per_second.map(|(_, high)| high),
+            window_tokens: m.window_tokens,
+            measured_on: m.measured_on.to_string(),
+        }
+    }
+}
+
+/// The engine a conversation model runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelEngineDto {
+    pub id: String,
+    pub label: String,
+    /// The file extension it loads, e.g. `.gguf`; `None` for Ollama.
+    pub file_format: Option<String>,
+    pub in_process: bool,
+}
+
+impl From<pond_core::models::domain::engine::Engine> for ModelEngineDto {
+    fn from(engine: pond_core::models::domain::engine::Engine) -> Self {
+        Self {
+            id: engine.id().to_string(),
+            label: engine.label().to_string(),
+            file_format: engine.file_format().map(str::to_string),
+            in_process: engine.in_process(),
+        }
+    }
 }
 
 /// True when the web UI is embedded in this binary (`pond-desktop/dist` existed at build).
@@ -587,6 +740,27 @@ mod rate_limit_tests {
         ] {
             assert!(!is_handshake_path(path), "{path} should not use it");
         }
+    }
+
+    /// An entry is running while a transfer holds a clone of its flag, and only then: a status
+    /// left at "downloading" by a task that died or by a writer that never held the flag is not.
+    #[test]
+    fn an_entry_is_running_only_while_a_transfer_holds_its_flag() {
+        let mut entry = DownloadEntry::starting("m.gguf", "gguf");
+        assert!(!entry.is_running(), "nothing holds the flag yet");
+
+        let transfer = std::sync::Arc::clone(&entry.control);
+        assert!(entry.is_running());
+        entry.status = "paused".to_string();
+        assert!(!entry.is_running(), "a paused transfer is not running");
+        entry.status = "downloading".to_string();
+        assert!(entry.is_running());
+
+        drop(transfer);
+        assert!(
+            !entry.is_running(),
+            "the task ended or died: nothing holds it"
+        );
     }
 
     #[tokio::test]

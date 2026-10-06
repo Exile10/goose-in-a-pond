@@ -17,7 +17,8 @@ import type {
   ZoneChoice,
 } from "../api/types";
 import { allZones, detectPlace, deviceZone } from "../lib/place";
-import { providerOf } from "../lib/modelProvider";
+import { engineOf, providerOf } from "../lib/modelProvider";
+import { modelLabel, rolesFor } from "../sections/models/modelsView";
 import { diffSettings, foldServerState } from "./state";
 import { ErrorBanner, SkeletonList } from "../components/shared";
 import {
@@ -64,14 +65,15 @@ export function summariseRetitle(r: RetitleResult): string {
 
 // ─── Options from the model registry ──────────────────────────────────────
 
-/** Registry filters per picker, by `provider` (the Models page's equivalent is `rolesFor`). */
+/** Registry filters per picker, by `provider` (the Models page's equivalent is `rolesFor`). The
+ *  chat picker offers only what can hold a conversation: a helper is never one. */
 const PROVIDERS: Record<
   Exclude<OptionSource, "llm-providers" | "time-zones">,
   (m: ModelEntry) => boolean
 > = {
   "llm-models": (m) => ["gguf", "llamafile", "ollama"].includes(m.provider),
   "chat-models": (m) =>
-    ["gguf", "litert", "llamafile", "ollama"].includes(m.provider),
+    ["gguf", "litert", "llamafile", "ollama"].includes(m.provider) && rolesFor(m).includes("chat"),
   "whisper-models": (m) => m.provider === "whisper",
   "tts-voices": (m) =>
     ["tts", "tts_piper", "tts_kokoro", "tts_http"].includes(m.provider),
@@ -88,6 +90,40 @@ interface Option {
  *  once offered, as `local`. Display only, so it is never saved as a change. */
 function shownValue(source: OptionSource, value: string): string {
   return source === "llm-providers" ? providerOf(value) : value;
+}
+
+/** "Gemma 4 E4B · llama.cpp": the model's title and the engine that runs it. Never the scan's
+ *  placeholder. Rows that still read alike are told apart by quantization, then file name. */
+function modelOptions(
+  rows: ModelEntry[],
+  valueOf: (m: ModelEntry) => string,
+  withEngine: boolean,
+): Option[] {
+  const seen = new Set<string>();
+  const unique = rows.filter((m) => {
+    const value = valueOf(m);
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
+  const base = (m: ModelEntry) => {
+    const engine = withEngine ? engineOf(m) : null;
+    return engine ? `${modelLabel(m)} · ${engine.label}` : modelLabel(m);
+  };
+  const counts = new Map<string, number>();
+  for (const m of unique) counts.set(base(m), (counts.get(base(m)) ?? 0) + 1);
+  const labelled = unique.map((m) => {
+    const label = base(m);
+    return { m, label: (counts.get(label) ?? 0) > 1 && m.quantization ? `${label} (${m.quantization})` : label };
+  });
+  const again = new Map<string, number>();
+  for (const { label } of labelled) again.set(label, (again.get(label) ?? 0) + 1);
+  return labelled
+    .map(({ m, label }) => ({
+      value: valueOf(m),
+      label: (again.get(label) ?? 0) > 1 ? `${label} (${m.filename ?? m.name})` : label,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
 }
 
 function optionsFor(
@@ -115,16 +151,13 @@ function optionsFor(
     const providers = meshEnabled ? [...seen, "mesh"] : seen;
     return providers.sort().map((p) => ({ value: p, label: p }));
   }
-  return (
+  return modelOptions(
     models
       .filter(PROVIDERS[source])
-    // Only downloaded models can serve; an absent `downloaded` means untracked, not missing.
-      .filter((m) => m.downloaded !== false)
-      .map((m) => ({
-        value: source === "tts-voices" ? (m.filename ?? m.name) : m.name,
-        label: m.display_name ?? m.name,
-      }))
-      .sort((a, b) => a.label.localeCompare(b.label))
+      // Only downloaded models can serve; an absent `downloaded` means untracked, not missing.
+      .filter((m) => m.downloaded !== false),
+    (m) => (source === "tts-voices" ? (m.filename ?? m.name) : m.name),
+    source === "chat-models" || source === "llm-models",
   );
 }
 

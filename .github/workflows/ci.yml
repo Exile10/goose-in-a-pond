@@ -350,6 +350,21 @@ jobs:
       - name: Tests
         run: bash scripts/lib/node-setup.test.sh
 
+  # The vision pairing generator (`giap.sh models pairings`) writes a file pond-core embeds, so it is
+  # tested like code and offline: recorded Hugging Face listings, GGUF headers built by the tests, and
+  # giap.sh's wiring against a fake python3. The weekly refresh itself is model-pairings.yml.
+  model-pairings:
+    name: Vision pairing generator - unit and bash tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Generator unit tests
+        run: python3 -m unittest discover -s scripts/models -p 'test_*.py' -v
+
+      - name: Bash tests
+        run: bash scripts/lib/model-pairings.test.sh
+
   frontend:
     name: Frontend — vitest / playwright
     runs-on: ubuntu-latest

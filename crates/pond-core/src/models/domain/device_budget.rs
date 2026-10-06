@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
-use super::drafter::drafter_for;
 use super::gguf::parse_gguf_header;
-use super::vision_encoder::{encoder_for, EncoderSpec, EncoderState};
+use super::vision_encoder::{EncoderSpec, EncoderState};
+use super::vision_pairing::encoder_for_model;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -46,6 +46,24 @@ pub fn llm_budget_mb() -> u64 {
     total_ram_mb().saturating_sub(RESERVED_MB)
 }
 
+// ── Desktop budget ──────────────────────────────────────────────────────────
+// Not Orin measurements: a desktop reports its own memory, and these only decide how much of it
+// the LLM slot may take.
+
+/// The least a desktop keeps from the LLM slot (MB): the system, the household's other programs
+/// and the rest of the pond.
+pub const HOST_RESERVED_MIN_MB: u64 = 4096;
+/// The share of a desktop's memory it keeps from the LLM slot (percent), when larger than the
+/// floor. A quarter is what macOS keeps back from Metal's working set on most Macs.
+pub const HOST_RESERVED_PERCENT: u64 = 25;
+
+/// The LLM slot's budget on a desktop with `total_mb` of memory: total less the larger of the
+/// floor and the share. A budgeted device uses [`llm_budget_mb`] instead.
+pub fn host_llm_budget_mb(total_mb: u64) -> u64 {
+    let reserve = (total_mb * HOST_RESERVED_PERCENT / 100).max(HOST_RESERVED_MIN_MB);
+    total_mb.saturating_sub(reserve)
+}
+
 // ── Window arithmetic ───────────────────────────────────────────────────────
 
 /// KV KiB/token of the widest shipped geometry (E4B; E2B is 18), measured on the Orin. Unpadded
@@ -53,9 +71,6 @@ pub fn llm_budget_mb() -> u64 {
 pub const KV_KIB_PER_TOKEN: u64 = 56;
 /// llama.cpp's compute buffers: measured 522 MiB at 4096-16384 and 582 at 32768, nearly flat.
 pub const COMPUTE_BUFFER_MB: u64 = 600;
-/// Drafter compute beyond its weights; no KV, as `ctx_other` shares the target's cache.
-/// 64 pads a measured 38-47 MB, which undercounts: MemAvailable counts mmap'd weights as free.
-pub const DRAFTER_COMPUTE_MB: u64 = 64;
 /// Vision encoder compute beyond its weights (read whole, not mmapped). UNMEASURED; tests pin
 /// that no shipped model's declaration flips anywhere in 0..=900.
 pub const ENCODER_COMPUTE_MB: u64 = 256;
@@ -73,17 +88,10 @@ pub const ASSUMED_LARGEST_MODEL_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 fn kv_allowance_mb(
     budget_mb: u64,
     model_bytes: u64,
-    drafter_bytes: u64,
     encoder_bytes: u64,
     encoder_compute_mb: u64,
 ) -> u64 {
     let model_mb = model_bytes / MIB;
-    // A drafter is a second set of weights, resident for the whole session.
-    let drafter_mb = if drafter_bytes > 0 {
-        drafter_bytes / MIB + DRAFTER_COMPUTE_MB
-    } else {
-        0
-    };
     // The encoder loads eagerly at every model load and cannot be reclaimed as page cache.
     let encoder_mb = if encoder_bytes > 0 {
         encoder_bytes / MIB + encoder_compute_mb
@@ -93,7 +101,6 @@ fn kv_allowance_mb(
     budget_mb
         .saturating_sub(model_mb)
         .saturating_sub(COMPUTE_BUFFER_MB)
-        .saturating_sub(drafter_mb)
         .saturating_sub(encoder_mb)
 }
 
@@ -121,34 +128,27 @@ fn window_for_tokens(tokens: u64) -> u32 {
 pub fn context_size_for_budget(
     budget_mb: u64,
     model_bytes: u64,
-    drafter_bytes: u64,
     kv_kib_per_token: Option<u64>,
 ) -> u32 {
-    context_size_with_encoder(budget_mb, model_bytes, drafter_bytes, 0, kv_kib_per_token)
+    context_size_with_encoder(budget_mb, model_bytes, 0, kv_kib_per_token)
 }
 
 /// [`context_size_for_budget`] plus a resident encoder: its weights and [`ENCODER_COMPUTE_MB`].
 pub fn context_size_with_encoder(
     budget_mb: u64,
     model_bytes: u64,
-    drafter_bytes: u64,
     encoder_bytes: u64,
     kv_kib_per_token: Option<u64>,
 ) -> u32 {
-    let kv_mb = kv_allowance_mb(
-        budget_mb,
-        model_bytes,
-        drafter_bytes,
-        encoder_bytes,
-        ENCODER_COMPUTE_MB,
-    );
+    let kv_mb = kv_allowance_mb(budget_mb, model_bytes, encoder_bytes, ENCODER_COMPUTE_MB);
     window_for_tokens(tokens_for(kv_mb, slope(kv_kib_per_token)))
 }
 
-/// Drafter charge for `chat_model`: its catalogue size whenever it has one, never the file or the
-/// speculation switch, so `n_ctx` (and with it the KV snapshot) stays put when either changes.
-pub fn drafter_budget_bytes(chat_model: &str) -> u64 {
-    drafter_for(chat_model).map_or(0, |d| d.approx_mb * MIB)
+/// MB a model switch would free: the in-use in-process model's weights (and add-on), but never
+/// more than the budget is short of right now. Where `available` is the budget itself (no live
+/// reading, as off Linux), nothing is held back from it, so nothing is reclaimable.
+pub fn reclaimable_mb(in_use_mb: u64, budget_mb: u64, available_for_llm_mb: u64) -> u64 {
+    in_use_mb.min(budget_mb.saturating_sub(available_for_llm_mb))
 }
 
 // ── The header slope ────────────────────────────────────────────────────────
@@ -217,27 +217,20 @@ impl VisionFit {
 pub fn vision_fit(
     budget_mb: u64,
     model_bytes: Option<u64>,
-    chat_model: &str,
+    encoder: Option<&EncoderSpec>,
     kv_kib_per_token: Option<u64>,
     encoder_compute_mb: u64,
 ) -> VisionFit {
-    let Some(spec) = encoder_for(chat_model) else {
+    let Some(spec) = encoder else {
         return VisionFit::NotDeclared;
     };
-    let drafter = drafter_budget_bytes(chat_model);
     let slope = slope(kv_kib_per_token);
     let weights = model_bytes.unwrap_or(ASSUMED_LARGEST_MODEL_BYTES);
 
-    let without = tokens_for(kv_allowance_mb(budget_mb, weights, drafter, 0, 0), slope);
+    let without = tokens_for(kv_allowance_mb(budget_mb, weights, 0, 0), slope);
     let window_without = window_for_tokens(without);
     let with = tokens_for(
-        kv_allowance_mb(
-            budget_mb,
-            weights,
-            drafter,
-            spec.size_bytes,
-            encoder_compute_mb,
-        ),
+        kv_allowance_mb(budget_mb, weights, spec.size_bytes, encoder_compute_mb),
         slope,
     );
     let window_with = window_for_tokens(with);
@@ -255,8 +248,8 @@ pub fn vision_fit(
 }
 
 /// [`vision_fit`] for the GGUF at `gguf_path` on this device; reads only its length and head.
-pub fn vision_fit_on_device(gguf_path: &Path, chat_model: &str) -> VisionFit {
-    if encoder_for(chat_model).is_none() {
+pub fn vision_fit_on_device(gguf_path: &Path, encoder: Option<&EncoderSpec>) -> VisionFit {
+    if encoder.is_none() {
         return VisionFit::NotDeclared;
     }
     let model_bytes = std::fs::metadata(gguf_path)
@@ -267,7 +260,7 @@ pub fn vision_fit_on_device(gguf_path: &Path, chat_model: &str) -> VisionFit {
     vision_fit(
         llm_budget_mb(),
         model_bytes,
-        chat_model,
+        encoder,
         kv,
         ENCODER_COMPUTE_MB,
     )
@@ -353,12 +346,12 @@ impl VisionDeclaration {
 
 /// The declaration over its inputs; `fit` runs only for a listed encoder on a budgeted device.
 pub fn declare(
-    chat_model: &str,
+    encoder: Option<EncoderSpec>,
     budgeted: bool,
     measured: &[&str],
     fit: impl FnOnce(&EncoderSpec) -> VisionFit,
 ) -> VisionDeclaration {
-    let Some(spec) = encoder_for(chat_model) else {
+    let Some(spec) = encoder else {
         return VisionDeclaration::NotDeclared;
     };
     if !budgeted {
@@ -374,8 +367,9 @@ pub fn declare(
     }
 }
 
-/// Whether `chat_model` reads pictures here: by name off a budgeted device, else fit AND listed.
-/// Cached per file: `<vision>` sits in the KV-cached prefix, so it may change only with the file.
+/// Whether `chat_model` reads pictures here: by its pairing off a budgeted device, else fit AND
+/// listed. Cached per file: `<vision>` sits in the KV-cached prefix, so it may change only with
+/// the file.
 pub fn vision_declaration(gguf_path: Option<&Path>, chat_model: &str) -> VisionDeclaration {
     budgeted_declaration(gguf_path, chat_model, budgeted_device())
 }
@@ -386,11 +380,11 @@ fn budgeted_declaration(
     budgeted: bool,
 ) -> VisionDeclaration {
     declare(
-        chat_model,
+        encoder_for_model(chat_model, gguf_path),
         budgeted,
         DEVICE_MEASURED_VISION,
-        |_| match gguf_path {
-            Some(p) => cached_fit(p, chat_model),
+        |spec| match gguf_path {
+            Some(p) => cached_fit(p, spec),
             None => VisionFit::CostsWindow {
                 window_without: MIN_CTX,
                 window_with: MIN_CTX,
@@ -404,22 +398,22 @@ pub fn declares_vision(gguf_path: Option<&Path>, chat_model: &str) -> bool {
     vision_declaration(gguf_path, chat_model).is_declared()
 }
 
-/// [`vision_fit_on_device`], cached per (path, length, mtime, model).
-fn cached_fit(path: &Path, chat_model: &str) -> VisionFit {
-    type Key = (PathBuf, u64, Option<SystemTime>, String);
+/// [`vision_fit_on_device`], cached per (path, length, mtime, encoder).
+fn cached_fit(path: &Path, spec: &EncoderSpec) -> VisionFit {
+    type Key = (PathBuf, u64, Option<SystemTime>, &'static str);
     static CACHE: OnceLock<Mutex<HashMap<Key, VisionFit>>> = OnceLock::new();
     let meta = std::fs::metadata(path).ok();
     let key: Key = (
         path.to_path_buf(),
         meta.as_ref().map_or(0, |m| m.len()),
         meta.as_ref().and_then(|m| m.modified().ok()),
-        chat_model.to_ascii_lowercase(),
+        spec.dir,
     );
     let cache = CACHE.get_or_init(Default::default);
     if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&key).copied()) {
         return hit;
     }
-    let fit = vision_fit_on_device(path, chat_model);
+    let fit = vision_fit_on_device(path, Some(spec));
     if let Ok(mut c) = cache.lock() {
         c.insert(key, fit);
     }
@@ -438,8 +432,6 @@ pub struct DeviceWindow {
     pub weights_known: bool,
     /// The header slope, or `None` for the fallback [`KV_KIB_PER_TOKEN`].
     pub kv_kib_per_token: Option<u64>,
-    /// See [`drafter_budget_bytes`].
-    pub drafter_bytes: u64,
     /// The encoder charged: its size when the model declares vision on the budgeted device.
     pub encoder_bytes: u64,
 }
@@ -452,7 +444,6 @@ pub fn device_window(gguf_path: Option<&Path>, chat_model: &str) -> DeviceWindow
         .filter(|m| m.is_file())
         .map(|m| m.len());
     let kv_kib_per_token = gguf_path.and_then(kv_cost_from_header);
-    let drafter_bytes = drafter_budget_bytes(chat_model);
     let encoder_bytes = match budgeted_declaration(gguf_path, chat_model, true) {
         VisionDeclaration::Declared(spec) => spec.size_bytes,
         _ => 0,
@@ -462,14 +453,12 @@ pub fn device_window(gguf_path: Option<&Path>, chat_model: &str) -> DeviceWindow
         window: context_size_with_encoder(
             llm_budget_mb(),
             model_bytes,
-            drafter_bytes,
             encoder_bytes,
             kv_kib_per_token,
         ),
         model_bytes,
         weights_known: file_len.is_some(),
         kv_kib_per_token,
-        drafter_bytes,
         encoder_bytes,
     }
 }
@@ -478,13 +467,23 @@ pub fn device_window(gguf_path: Option<&Path>, chat_model: &str) -> DeviceWindow
 mod tests {
     use super::*;
     use crate::models::domain::gguf::test_gguf::GgufWriter;
+    use crate::models::domain::vision_encoder::encoder_by_dir;
+
+    /// The pairing a model's own file name finds, with no header to read.
+    fn enc(model: &str) -> Option<EncoderSpec> {
+        encoder_for_model(model, None)
+    }
+
+    fn by_dir(dir: &str) -> EncoderSpec {
+        encoder_by_dir(dir).unwrap_or_else(|| panic!("no pairing for {dir}"))
+    }
 
     /// The Orin's LLM budget, fixed, so these tests do not read the environment.
     const BUDGET: u64 = LLM_BUDGET_MB;
 
     /// The window at the Orin's constant budget.
-    fn jetson(model_bytes: u64, drafter_bytes: u64, kv: Option<u64>) -> u32 {
-        context_size_for_budget(BUDGET, model_bytes, drafter_bytes, kv)
+    fn jetson(model_bytes: u64, kv: Option<u64>) -> u32 {
+        context_size_for_budget(BUDGET, model_bytes, kv)
     }
 
     // The real files on the Orin, `ls -lL` / `stat -Lc %s`.
@@ -493,9 +492,6 @@ mod tests {
     const ORIN_E4B_QAT_UD: u64 = 4_215_695_776;
     const ORIN_E4B_IQ4_XS: u64 = 4_715_416_704;
     const E4B_Q4_K_M: u64 = 4_977_171_584;
-    /// The real drafter files.
-    const E2B_DRAFTER: u64 = 59_235_648;
-    const E4B_DRAFTER: u64 = 59_678_016;
     /// Header slopes, KiB/token.
     const E2B_KV: u64 = 18;
     const E4B_KV: u64 = 56;
@@ -518,8 +514,8 @@ mod tests {
     /// Uses the exact on-device sizes: the window is a step function of weight size.
     #[test]
     fn jetson_context_fits_each_model_in_the_budget() {
-        let e2b = jetson(ORIN_E2B_Q4_K_M, 0, None);
-        let e4b = jetson(E4B_Q4_K_M, 0, None);
+        let e2b = jetson(ORIN_E2B_Q4_K_M, None);
+        let e4b = jetson(E4B_Q4_K_M, None);
         assert_eq!(e2b, 16384, "E2B should keep the full window");
         assert_eq!(
             e4b, 8192,
@@ -535,8 +531,8 @@ mod tests {
     fn a_different_device_budget_produces_a_different_window() {
         let nano = 7620 - RESERVED_MB;
         let nx = 15564 - RESERVED_MB;
-        let on_nano = context_size_for_budget(nano, E4B_Q4_K_M, 0, None);
-        let on_nx = context_size_for_budget(nx, E4B_Q4_K_M, 0, None);
+        let on_nano = context_size_for_budget(nano, E4B_Q4_K_M, None);
+        let on_nx = context_size_for_budget(nx, E4B_Q4_K_M, None);
         assert_eq!(on_nano, 8192, "the board we actually have");
         assert!(on_nx > on_nano, "got {on_nx} against {on_nano}");
     }
@@ -545,16 +541,16 @@ mod tests {
     fn the_orin_profile_reproduces_the_devices_own_windows() {
         let budget = 7620 - (1500 + 200 + 100);
         assert_eq!(
-            context_size_for_budget(budget, ORIN_E2B_Q4_K_M, 0, None),
+            context_size_for_budget(budget, ORIN_E2B_Q4_K_M, None),
             16384
         );
-        assert_eq!(context_size_for_budget(budget, E4B_Q4_K_M, 0, None), 8192);
+        assert_eq!(context_size_for_budget(budget, E4B_Q4_K_M, None), 8192);
     }
 
     /// A budget smaller than the weights must clamp, not underflow into a huge window.
     #[test]
     fn an_impossible_budget_clamps_instead_of_wrapping() {
-        assert_eq!(context_size_for_budget(512, E4B_Q4_K_M, 0, None), 2048);
+        assert_eq!(context_size_for_budget(512, E4B_Q4_K_M, None), 2048);
     }
 
     /// Redoes the arithmetic by hand, so the test cannot share the function's mistake.
@@ -562,7 +558,7 @@ mod tests {
     fn e4b_fits_its_window_and_could_not_take_another_doubling() {
         let weights_mb = 4_640_000_000u64 / MIB;
         let free_mb = LLM_BUDGET_MB - weights_mb - 600;
-        let chosen = u64::from(jetson(4_640_000_000, 0, None));
+        let chosen = u64::from(jetson(4_640_000_000, None));
         let needed_mb = (chosen * E4B_KV) / 1024;
         assert!(
             needed_mb < free_mb,
@@ -577,15 +573,15 @@ mod tests {
 
     #[test]
     fn the_per_token_slope_is_observable_on_a_model_the_ceiling_does_not_cap() {
-        assert_eq!(jetson(4_739_563_520, 0, None), 12288);
+        assert_eq!(jetson(4_739_563_520, None), 12288);
     }
 
     /// E4B IQ4_XS affords 13,220 tokens; a power-of-two floor handed back 8,192.
     #[test]
     fn rounding_does_not_discard_context_the_budget_affords() {
-        assert_eq!(jetson(ORIN_E4B_IQ4_XS, 0, None), 12288);
+        assert_eq!(jetson(ORIN_E4B_IQ4_XS, None), 12288);
         for bytes in [4_600_000_000u64, 4_700_000_000, 4_800_000_000] {
-            let ctx = u64::from(jetson(bytes, 0, None));
+            let ctx = u64::from(jetson(bytes, None));
             let kv_mb = LLM_BUDGET_MB
                 .saturating_sub(bytes / MIB)
                 .saturating_sub(600);
@@ -610,75 +606,62 @@ mod tests {
             (E4B_Q4_K_M, E4B_KV, 8192),
             (ORIN_E4B_IQ4_XS, E4B_KV, 12288),
         ] {
-            let derived = jetson(bytes, 0, Some(kv));
+            let derived = jetson(bytes, Some(kv));
             assert_eq!(derived, want, "{bytes} at {kv}");
-            assert_eq!(derived, jetson(bytes, 0, None), "{bytes}");
+            assert_eq!(derived, jetson(bytes, None), "{bytes}");
         }
     }
 
     #[test]
     fn a_cheaper_model_is_no_longer_charged_the_widest_geometry() {
         let bytes = 4_500u64 * MIB;
-        assert!(jetson(bytes, 0, Some(28)) > jetson(bytes, 0, None));
+        assert!(jetson(bytes, Some(28)) > jetson(bytes, None));
     }
 
     #[test]
     fn a_wider_model_is_charged_for_it() {
         let bytes = 4_000_000_000u64;
-        assert!(jetson(bytes, 0, Some(168)) < jetson(bytes, 0, None));
+        assert!(jetson(bytes, Some(168)) < jetson(bytes, None));
     }
 
     #[test]
     fn a_useless_slope_falls_back_rather_than_dividing_by_zero() {
-        assert_eq!(jetson(E4B_Q4_K_M, 0, Some(0)), jetson(E4B_Q4_K_M, 0, None));
+        assert_eq!(jetson(E4B_Q4_K_M, Some(0)), jetson(E4B_Q4_K_M, None));
+    }
+
+    #[test]
+    fn a_switch_frees_the_model_in_use_and_never_more_than_is_missing() {
+        // The Orin with E4B loaded: 1 GB free of the 5,820 MB budget, the model holds 4,020.
+        assert_eq!(reclaimable_mb(4020, BUDGET, 1000), 4020);
+        // Never past what the budget is short of.
+        assert_eq!(reclaimable_mb(4020, BUDGET, 3000), BUDGET - 3000);
+        // No live reading: available is the budget, so nothing is held back.
+        assert_eq!(reclaimable_mb(4020, BUDGET, BUDGET), 0);
+        assert_eq!(reclaimable_mb(0, BUDGET, 100), 0);
+    }
+
+    #[test]
+    fn a_desktop_keeps_a_quarter_of_its_memory_and_never_less_than_the_floor() {
+        assert_eq!(host_llm_budget_mb(65_536), 49_152);
+        assert_eq!(host_llm_budget_mb(32_768), 24_576);
+        assert_eq!(host_llm_budget_mb(16_384), 12_288);
+        assert_eq!(host_llm_budget_mb(8_192), 4_096, "the floor, not a quarter");
+        assert_eq!(host_llm_budget_mb(3_000), 0);
     }
 
     #[test]
     fn jetson_context_floors_for_an_oversized_model() {
-        assert_eq!(jetson(9_000_000_000, 0, None), 2048);
+        assert_eq!(jetson(9_000_000_000, None), 2048);
     }
 
-    #[test]
-    fn a_drafter_costs_window() {
-        let without = jetson(ORIN_E2B_Q4_K_M, 0, Some(E2B_KV));
-        let with = jetson(ORIN_E2B_Q4_K_M, E2B_DRAFTER, Some(E2B_KV));
-        assert!(with <= without);
-        assert!(with >= 8192, "got {with}");
-    }
+    // ── Encoder charges ────────────────────────────────────────────────────
 
-    /// The drafter's cost is flat in `n_ctx`, so it must not be folded into the slope.
+    /// Both picks stay at the latency clamp: the board's E4B log line reads 16384.
     #[test]
-    fn the_drafter_is_charged_once_not_per_token() {
-        let without = u64::from(context_size_for_budget(BUDGET, E4B_Q4_K_M, 0, Some(E4B_KV)));
-        let with = u64::from(context_size_for_budget(
-            BUDGET,
-            E4B_Q4_K_M,
-            E4B_DRAFTER,
-            Some(E4B_KV),
-        ));
-        let expected_loss = (57 + 64) * 1024 / 56;
-        assert!(without.saturating_sub(with) <= expected_loss + 1024);
-    }
-
-    // ── Drafter and encoder charges ────────────────────────────────────────
-
-    /// Keeps 16384 whether charged the real drafter file or its catalogue size.
-    #[test]
-    fn e4b_qat_with_its_drafter_still_gets_16384() {
-        assert_eq!(
-            jetson(ORIN_E4B_QAT_UD, E4B_DRAFTER, Some(E4B_KV)),
-            16384,
-            "the old input: the drafter file's own size"
-        );
-        assert_eq!(
-            jetson(
-                ORIN_E4B_QAT_UD,
-                drafter_budget_bytes("gemma-4-E4B-it-qat-UD-Q4_K_XL"),
-                Some(E4B_KV)
-            ),
-            16384,
-            "the new input: the catalogue size"
-        );
+    fn the_e2b_and_e4b_picks_keep_the_16384_clamp() {
+        assert_eq!(jetson(ORIN_E4B_QAT_UD, Some(E4B_KV)), 16384);
+        assert_eq!(jetson(ORIN_E2B_QAT_UD, Some(E2B_KV)), 16384);
+        assert_eq!(jetson(ORIN_E2B_Q4_K_M, Some(E2B_KV)), 16384);
     }
 
     /// A zero encoder matches `context_size_for_budget` across a sweep of sizes and slopes.
@@ -686,54 +669,12 @@ mod tests {
     fn a_zero_encoder_is_the_old_arithmetic() {
         for bytes in (0..9_000_000_000u64).step_by(97_000_000) {
             for kv in [None, Some(0), Some(18), Some(56), Some(168)] {
-                for drafter in [0, E2B_DRAFTER] {
-                    assert_eq!(
-                        context_size_with_encoder(BUDGET, bytes, drafter, 0, kv),
-                        context_size_for_budget(BUDGET, bytes, drafter, kv)
-                    );
-                }
+                assert_eq!(
+                    context_size_with_encoder(BUDGET, bytes, 0, kv),
+                    context_size_for_budget(BUDGET, bytes, kv)
+                );
             }
         }
-    }
-
-    #[test]
-    fn the_catalogue_drafter_size_lands_on_the_same_windows_as_the_file() {
-        for (model, bytes, file, kv) in [
-            (
-                "gemma-4-E2B-it-Q4_K_M",
-                ORIN_E2B_Q4_K_M,
-                E2B_DRAFTER,
-                E2B_KV,
-            ),
-            (
-                "gemma-4-E2B-it-qat-UD-Q4_K_XL",
-                ORIN_E2B_QAT_UD,
-                E2B_DRAFTER,
-                E2B_KV,
-            ),
-            (
-                "gemma-4-E4B-it-qat-UD-Q4_K_XL",
-                ORIN_E4B_QAT_UD,
-                E4B_DRAFTER,
-                E4B_KV,
-            ),
-            (
-                "gemma-4-E4B-it-IQ4_XS",
-                ORIN_E4B_IQ4_XS,
-                E4B_DRAFTER,
-                E4B_KV,
-            ),
-            ("gemma-4-E4B-it-Q4_K_M", E4B_Q4_K_M, E4B_DRAFTER, E4B_KV),
-        ] {
-            assert_eq!(
-                jetson(bytes, drafter_budget_bytes(model), Some(kv)),
-                jetson(bytes, file, Some(kv)),
-                "{model}"
-            );
-        }
-        assert_eq!(drafter_budget_bytes("gemma-4-E2B-it"), 57 * MIB);
-        assert_eq!(drafter_budget_bytes("Llama-3.2-3B-Instruct"), 0);
-        assert_eq!(drafter_budget_bytes("gemma-4-12b-it"), 0);
     }
 
     // ── The header slope ───────────────────────────────────────────────────
@@ -810,7 +751,7 @@ mod tests {
         ];
         for (model, bytes, kv, fits) in cases {
             for compute in 0..=900u64 {
-                let fit = vision_fit(5820, Some(bytes), model, Some(kv), compute);
+                let fit = vision_fit(5820, Some(bytes), enc(model).as_ref(), Some(kv), compute);
                 assert_eq!(
                     fit.fits(),
                     fits,
@@ -825,21 +766,28 @@ mod tests {
             vision_fit(
                 5820,
                 Some(ORIN_E4B_QAT_UD),
-                "gemma-4-E4B-it-qat",
+                Some(&by_dir("gemma-4-e4b-it-qat")),
                 Some(E4B_KV),
                 0
             ),
             VisionFit::CostsWindow {
                 window_without: 16384,
-                window_with: 2048
+                window_with: 4096
             }
         ));
     }
 
     #[test]
     fn a_model_already_at_the_floor_is_not_declared() {
-        for bytes in [ASSUMED_LARGEST_MODEL_BYTES, 5_300_000_000, 9_000_000_000] {
-            let fit = vision_fit(5820, Some(bytes), "gemma-4-E2B-it", Some(E2B_KV), 0);
+        // Weights past budget less compute leave no KV with or without the encoder.
+        for bytes in [5_500_000_000, 6_000_000_000, 9_000_000_000] {
+            let fit = vision_fit(
+                5820,
+                Some(bytes),
+                Some(&by_dir("gemma-4-e2b-it")),
+                Some(E2B_KV),
+                0,
+            );
             assert_eq!(
                 fit,
                 VisionFit::CostsWindow {
@@ -854,20 +802,36 @@ mod tests {
     #[test]
     fn unknown_weights_are_never_a_fit() {
         for budget in [5820, 13764, 1_000_000] {
-            let fit = vision_fit(budget, None, "gemma-4-E2B-it", Some(E2B_KV), 0);
+            let fit = vision_fit(
+                budget,
+                None,
+                Some(&by_dir("gemma-4-e2b-it")),
+                Some(E2B_KV),
+                0,
+            );
             assert!(!fit.fits(), "budget {budget}: {fit:?}");
         }
-        assert!(!vision_fit_on_device(Path::new("/nowhere/at/all.gguf"), "gemma-4-E2B-it").fits());
+        assert!(!vision_fit_on_device(
+            Path::new("/nowhere/at/all.gguf"),
+            Some(&by_dir("gemma-4-e2b-it"))
+        )
+        .fits());
     }
 
     #[test]
     fn a_model_with_no_encoder_is_not_declared_before_any_arithmetic() {
         assert_eq!(
-            vision_fit(5820, Some(1), "Llama-3.2-3B-Instruct", Some(28), 0),
+            vision_fit(
+                5820,
+                Some(1),
+                enc("Llama-3.2-3B-Instruct").as_ref(),
+                Some(28),
+                0
+            ),
             VisionFit::NotDeclared
         );
         assert_eq!(
-            vision_fit_on_device(Path::new("/nowhere"), "granite-4.1-3b"),
+            vision_fit_on_device(Path::new("/nowhere"), enc("granite-4.1-3b").as_ref()),
             VisionFit::NotDeclared
         );
     }
@@ -875,18 +839,14 @@ mod tests {
     /// With the encoder charged, E4B-qat drops to the floor, so the Orin must not declare it.
     #[test]
     fn the_encoder_is_charged_its_weights_and_compute() {
-        let enc = crate::models::domain::vision_encoder::encoder_by_dir("gemma-4-e4b-it-qat")
-            .unwrap()
-            .size_bytes;
+        let e4b_qat = by_dir("gemma-4-e4b-it-qat").size_bytes;
         assert_eq!(
-            context_size_with_encoder(BUDGET, ORIN_E4B_QAT_UD, 57 * MIB, enc, Some(E4B_KV)),
+            context_size_with_encoder(BUDGET, ORIN_E4B_QAT_UD, e4b_qat, Some(E4B_KV)),
             MIN_CTX
         );
-        let e2b = crate::models::domain::vision_encoder::encoder_by_dir("gemma-4-e2b-it")
-            .unwrap()
-            .size_bytes;
+        let e2b = by_dir("gemma-4-e2b-it").size_bytes;
         assert_eq!(
-            context_size_with_encoder(BUDGET, ORIN_E2B_Q4_K_M, 57 * MIB, e2b, Some(E2B_KV)),
+            context_size_with_encoder(BUDGET, ORIN_E2B_Q4_K_M, e2b, Some(E2B_KV)),
             16384
         );
     }
@@ -922,21 +882,20 @@ mod tests {
             &gemma4_head(42, 2, 18),
         );
         assert_eq!(
-            vision_fit_on_device(&e2b, "gemma-4-E2B-it-Q4_K_M"),
+            vision_fit_on_device(&e2b, enc("gemma-4-E2B-it-Q4_K_M").as_ref()),
             VisionFit::Fits { window: 16384 }
         );
-        assert!(!vision_fit_on_device(&e4b, "gemma-4-E4B-it-qat-UD-Q4_K_XL").fits());
+        assert!(!vision_fit_on_device(&e4b, enc("gemma-4-E4B-it-qat-UD-Q4_K_XL").as_ref()).fits());
 
         // Through a link, as models/gguf holds them.
         let link = tmp.path().join("link.gguf");
         std::os::unix::fs::symlink(&e2b, &link).unwrap();
-        assert!(vision_fit_on_device(&link, "gemma-4-E2B-it").fits());
+        assert!(vision_fit_on_device(&link, Some(&by_dir("gemma-4-e2b-it"))).fits());
 
-        // Drafter charged, no encoder (nothing measured, nothing declared): the board's 16384.
+        // No encoder (nothing measured, nothing declared): the board's 16384.
         let w = device_window(Some(&e4b), "gemma-4-E4B-it-qat-UD-Q4_K_XL");
         assert_eq!(w.window, 16384);
         assert_eq!(w.kv_kib_per_token, Some(E4B_KV));
-        assert_eq!(w.drafter_bytes, 57 * MIB);
         assert_eq!(w.encoder_bytes, 0);
         assert!(w.weights_known);
 
@@ -957,19 +916,16 @@ mod tests {
              MemAvailable reading during the boot prewarm first"
         );
         for d in DEVICE_MEASURED_VISION {
-            assert!(
-                crate::models::domain::vision_encoder::encoder_by_dir(d).is_some(),
-                "{d}"
-            );
+            assert!(encoder_by_dir(d).is_some(), "{d}");
         }
     }
 
     #[test]
-    fn off_the_budgeted_device_the_name_decides_with_no_file_io() {
+    fn off_the_budgeted_device_the_pairing_decides_with_no_file_io() {
         let never = |_: &EncoderSpec| -> VisionFit { panic!("no fit may be computed off-device") };
-        assert!(declare("gemma-4-E4B-it-qat-UD-Q4_K_XL", false, &[], never).is_declared());
+        assert!(declare(enc("gemma-4-E4B-it-qat-UD-Q4_K_XL"), false, &[], never).is_declared());
         assert_eq!(
-            declare("Llama-3.2-3B-Instruct", false, &[], never),
+            declare(enc("Llama-3.2-3B-Instruct"), false, &[], never),
             VisionDeclaration::NotDeclared
         );
     }
@@ -977,40 +933,34 @@ mod tests {
     #[test]
     fn on_the_budgeted_device_a_model_needs_the_list_and_the_fit() {
         let never = |_: &EncoderSpec| -> VisionFit { panic!("an unlisted encoder costs no I/O") };
+        let e2b = Some(by_dir("gemma-4-e2b-it"));
         assert!(matches!(
-            declare("gemma-4-E2B-it", true, &[], never),
+            declare(e2b, true, &[], never),
             VisionDeclaration::NotOnThisDevice(s) if s.dir == "gemma-4-e2b-it"
         ));
         let listed = &["gemma-4-e2b-it"];
+        assert!(declare(e2b, true, listed, |_| VisionFit::Fits { window: 16384 }).is_declared());
+        assert!(!declare(e2b, true, listed, |_| VisionFit::CostsWindow {
+            window_without: 16384,
+            window_with: 2048
+        })
+        .is_declared());
         assert!(
-            declare("gemma-4-E2B-it", true, listed, |_| VisionFit::Fits {
-                window: 16384
-            })
-            .is_declared()
-        );
-        assert!(
-            !declare("gemma-4-E2B-it", true, listed, |_| VisionFit::CostsWindow {
-                window_without: 16384,
-                window_with: 2048
-            })
-            .is_declared()
-        );
-        assert!(
-            !declare("gemma-4-E2B-it-qat", true, listed, |_| VisionFit::Fits {
-                window: 1
+            !declare(Some(by_dir("gemma-4-e2b-it-qat")), true, listed, |_| {
+                VisionFit::Fits { window: 1 }
             })
             .is_declared(),
             "the qat row is its own entry"
         );
         assert_eq!(
-            declare("granite-4.1-3b", true, listed, never),
+            declare(enc("granite-4.1-3b"), true, listed, never),
             VisionDeclaration::NotDeclared
         );
     }
 
     #[test]
     fn a_declaration_reports_its_own_state_before_any_file_is_read() {
-        let spec = crate::models::domain::vision_encoder::encoder_by_dir("gemma-4-e4b-it").unwrap();
+        let spec = by_dir("gemma-4-e4b-it");
         assert_eq!(
             VisionDeclaration::NotDeclared.undeclared_state(),
             Some(EncoderState::NotDeclared)
@@ -1036,7 +986,36 @@ mod tests {
                 "{model}"
             );
         }
-        assert!(budgeted_declaration(None, "gemma-4-E2B-it", false).is_declared());
+        assert!(budgeted_declaration(None, "gemma-4-E2B-it-Q4_K_M", false).is_declared());
+    }
+
+    /// Nothing is measured on the Orin, so no model the pairing table knows reads pictures there,
+    /// by its file name, by the name a household gives the row, or by an encoder's own `dir`.
+    #[test]
+    fn the_budgeted_policy_declares_no_model_the_table_lists() {
+        use crate::models::domain::vision_pairing::pairings;
+        assert!(DEVICE_MEASURED_VISION.is_empty());
+        let never = |_: &EncoderSpec| -> VisionFit { panic!("an unlisted encoder costs no I/O") };
+        for p in pairings() {
+            assert!(
+                matches!(
+                    declare(Some(p.spec()), true, DEVICE_MEASURED_VISION, never),
+                    VisionDeclaration::NotOnThisDevice(_)
+                ),
+                "{}",
+                p.encoder.dir
+            );
+            for file in &p.model_files {
+                let stem = file.rsplit('/').next().unwrap_or(file);
+                let stem = stem.strip_suffix(".gguf").unwrap_or(stem);
+                let declared = budgeted_declaration(None, stem, true);
+                assert!(!declared.is_declared(), "{file}");
+                assert!(
+                    matches!(declared, VisionDeclaration::NotOnThisDevice(_)),
+                    "{file}: a paired file is refused for the device, not unknown to it"
+                );
+            }
+        }
     }
 
     #[test]

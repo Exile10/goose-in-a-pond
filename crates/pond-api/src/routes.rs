@@ -52,7 +52,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use pond_core::models::domain::model_layout;
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
+use pond_core::models::domain::model_role::ModelRole;
+use pond_core::models::domain::taxonomy::{
+    is_companion_file, is_helper_architecture, ON_DISK_PLACEHOLDER,
+};
 use pond_core::user_data::domain::memory::MemoryFragment;
 use pond_core::user_data::domain::prompt_extra::PromptExtra;
 use pond_core::user_data::domain::prompt_template::PromptTemplate;
@@ -60,7 +65,8 @@ use pond_core::user_data::domain::recipe::AgentRecipe;
 use pond_core::user_data::domain::skill::UserSkill;
 
 use crate::middleware::onboarding_guard::require_onboarding_complete;
-use crate::{AppState, DownloadEntry, ModelStatusEntry};
+use crate::model_views::record_to_dto;
+use crate::{AppState, DownloadEntry};
 use pond_core::context::ports::ContextRepository;
 use pond_core::security::ports::policy::is_draft_decision_permitted;
 use pond_core::user_data::domain::draft::DraftStatus;
@@ -211,6 +217,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/models/disk-usage", get(disk_usage))
         .route("/models/{category}/{name}/download", post(download_model))
         .route("/models/{category}/{name}/activate", post(activate_model))
+        .route(
+            "/models/{category}/{name}/companions/pictures",
+            post(crate::model_acquisition::add_pictures),
+        )
         .route("/models/{category}/{name}", delete(delete_model))
         .route("/profiles", get(list_profiles))
         .route("/profiles/{id}", get(get_profile).delete(delete_profile))
@@ -1133,6 +1143,7 @@ async fn chat(
             Json(json!({"error": format!("Invalid request: {}", e)})),
         )
     })?;
+    refuse_without_a_model(&state).await?;
 
     let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let storage = &state.session_storage;
@@ -1432,6 +1443,7 @@ async fn chat_stream(
     })?;
 
     // Before the stream opens, so the client gets a real HTTP status, not an SSE error event.
+    refuse_without_a_model(&state).await?;
     image_limit_response(&req.images)?;
 
     // Picture support too, before the run permit and `spawn_run`, which saves the user message.
@@ -1514,6 +1526,18 @@ fn image_limit_response(
     }
 }
 
+/// A turn with no conversation model chosen is refused before anything is saved; nothing is
+/// picked or downloaded in its place.
+async fn refuse_without_a_model(state: &AppState) -> Result<(), (StatusCode, Json<Value>)> {
+    use pond_core::models::domain::conversation_model::NoConversationModel;
+    state.agent.ensure_conversation_model().await.map_err(|no| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error": no.to_string(), "code": NoConversationModel::CODE})),
+        )
+    })
+}
+
 // ── Picture support, before a turn is persisted ───────────────────────────────
 
 /// Pre-stream picture checks for both chat handlers, run before anything is saved.
@@ -1529,10 +1553,12 @@ async fn prepare_turn_images(
     if let Ok(settings) = state.settings_repo.get().await {
         let reported =
             read_vision_state(state, &settings.chat_provider, &settings.chat_model).await;
+        let spec = crate::model_views::chat_model_encoder(state, &settings.chat_model).await;
         vision_refusal_response(
             reported.as_ref(),
             &settings.chat_provider,
             &settings.chat_model,
+            spec.as_ref(),
         )?;
     }
     let images = crate::image_normalize::normalize_images_for_engine(images)
@@ -1563,11 +1589,11 @@ fn vision_refusal_response(
     reported: Option<&pond_core::models::domain::vision_encoder::EncoderState>,
     provider: &str,
     model: &str,
+    spec: Option<&pond_core::models::domain::vision_encoder::EncoderSpec>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    use pond_core::models::domain::vision_encoder::{encoder_for, refusal_for};
+    use pond_core::models::domain::vision_encoder::refusal_for;
 
-    let spec = encoder_for(model);
-    let Some(refusal) = refusal_for(reported, spec.as_ref(), provider) else {
+    let Some(refusal) = refusal_for(reported, spec, provider) else {
         return Ok(());
     };
     tracing::info!(
@@ -1632,9 +1658,9 @@ fn vision_status_size(
 }
 
 /// `GET /api/v1/models/vision-status` — picture support for the active chat model.
-/// Polled every 2 s, so a pure read: fetching and hashing belong to `prepare_model`.
+/// Polled every 2 s, so a pure read: hashing an add-on belongs to `prepare_model`.
 async fn get_vision_status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    use pond_core::models::domain::vision_encoder::{encoder_for, EncoderState};
+    use pond_core::models::domain::vision_encoder::EncoderState;
 
     // Unreadable settings name no model: unknown, which the desktop neither shows nor blocks.
     let (provider, model, reported) = match state.settings_repo.get().await {
@@ -1646,51 +1672,13 @@ async fn get_vision_status(State(state): State<Arc<AppState>>) -> Json<Value> {
         }
         Err(_) => (String::new(), String::new(), EncoderState::Unknown),
     };
-    let spec = encoder_for(&model);
+    let spec = crate::model_views::chat_model_encoder(&state, &model).await;
     Json(json!({
         "size_bytes": vision_status_size(&reported, spec.as_ref()),
         "message": vision_status_message(&provider, &reported, spec.as_ref()),
         "state": reported,
         "model": model,
     }))
-}
-
-/// A GGUF row's `(reads_images, image_support_bytes)`, from the agent's `local` verdict.
-/// Falls back to the pinned table; a pure read, as listing must never prepare or fetch.
-fn gguf_vision_facts(
-    agent: &dyn pond_core::models::ports::agent::Agent,
-    model: &str,
-) -> (bool, Option<u64>) {
-    use pond_core::models::domain::vision_encoder::{encoder_for, EncoderState};
-    let spec = encoder_for(model);
-    let reads = match agent.vision_state("local", model) {
-        None | Some(EncoderState::Unknown) => spec.is_some(),
-        Some(state) => !state.is_unsupported(),
-    };
-    let bytes = if reads {
-        spec.map(|s| s.size_bytes)
-    } else {
-        None
-    };
-    (reads, bytes)
-}
-
-/// Whether a GGUF is an encoder (`mmproj-*`) or drafter (`mtp-*`, Gemma 4 `-assistant`).
-/// Offered as a chat model it would land in `models/gguf`, where every scan takes it for one.
-fn is_companion_gguf(file_name: &str) -> bool {
-    let base = file_name
-        .rsplit('/')
-        .next()
-        .unwrap_or(file_name)
-        .to_ascii_lowercase();
-    base.starts_with("mmproj")
-        || base.starts_with("mtp-")
-        || ((base.contains("gemma-4") || base.contains("gemma4")) && base.contains("-assistant"))
-}
-
-/// The header's own word for a companion: `clip` is an encoder, `*-assistant` a drafter.
-fn is_companion_architecture(architecture: Option<&str>) -> bool {
-    architecture.is_some_and(|a| a == "clip" || a.ends_with("-assistant"))
 }
 
 /// After a GGUF delete, remove its `models/mmproj/<dir>/` if nothing else uses it.
@@ -1700,12 +1688,12 @@ async fn remove_orphaned_encoder_dir(
     deleted: &ModelRecord,
     model_repo: &Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
 ) {
-    use pond_core::models::domain::vision_encoder::encoder_for;
+    use pond_core::models::domain::vision_encoder::encoder_for_model;
 
-    let Some(spec) = encoder_for(&deleted.name) else {
+    let Some(spec) = encoder_for_model(&deleted.name, None) else {
         return;
     };
-    let same_dir = |name: &str| encoder_for(name).is_some_and(|s| s.dir == spec.dir);
+    let same_dir = |name: &str| encoder_for_model(name, None).is_some_and(|s| s.dir == spec.dir);
 
     let rows = model_repo.list_all().await.unwrap_or_default();
     let in_catalogue = rows.iter().any(|m| {
@@ -1714,16 +1702,21 @@ async fn remove_orphaned_encoder_dir(
     if in_catalogue {
         return;
     }
-    let gguf_dir = data_dir.join("models").join("gguf");
     let deleted_file = deleted.filename.as_deref();
-    if let Ok(mut entries) = tokio::fs::read_dir(&gguf_dir).await {
+    let gguf_dir = model_layout::dir_for(data_dir, &ModelCategory::Gguf);
+    let entries = match gguf_dir {
+        Some(dir) => tokio::fs::read_dir(dir).await.ok(),
+        None => None,
+    };
+    if let Some(mut entries) = entries {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
-            if Some(name.as_str()) == deleted_file || is_companion_gguf(&name) {
+            if Some(name.as_str()) == deleted_file || is_companion_file(&name) {
                 continue;
             }
             if let Some(stem) = name.strip_suffix(".gguf") {
-                if same_dir(stem) {
+                let path = entry.path();
+                if encoder_for_model(stem, Some(&path)).is_some_and(|s| s.dir == spec.dir) {
                     return;
                 }
             }
@@ -1768,10 +1761,8 @@ async fn remove_orphaned_encoder_dir(
 }
 
 /// Whether a save leaves the warmed prefix stale (new provider or model): one warm-up follows.
-/// The speculation switch is commented out with speculative decoding; restore it if it returns.
 fn save_needs_prewarm(current: &Settings, merged: &Settings) -> bool {
     current.chat_provider != merged.chat_provider || current.chat_model != merged.chat_model
-    // || current.speculative_decoding_enabled != merged.speculative_decoding_enabled
 }
 
 // ── One engine event, one SSE frame ───────────────────────────────────────────
@@ -4757,15 +4748,6 @@ async fn update_settings(
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
 
-    // Speculative decoding was removed from the llama.cpp engine; restore this if it returns.
-    // // The speculation switch, and it must land HERE, before either
-    // // `rebuild_llm_provider` below: the rebuild constructs the local-inference
-    // // adapter, whose device settings re-stamp `draft_model` from this gate, so a
-    // // rebuild that ran first would put back the drafter the user just turned off.
-    // // Unconditional for the mic gate's reason: a cheap idempotent write.
-    // pond_core::models::domain::drafter::set_speculation_enabled(
-    //     merged.speculative_decoding_enabled,
-    // );
     // Unconditional: it's cheap, and a skipped re-install would silently drop the restriction.
     pond_core::shared::services::egress::set_network_mode(
         pond_core::shared::services::egress::NetworkMode::parse(&merged.network_mode),
@@ -4836,16 +4818,6 @@ async fn update_settings(
     if save_needs_prewarm(&current, &merged) {
         crate::spawn_prefix_prewarm(state.clone(), false);
     }
-    // Fetch a new GGUF's picture support; the port takes no provider, so Ollama tags stay out.
-    let chat_changed =
-        current.chat_model != merged.chat_model || current.chat_provider != merged.chat_provider;
-    if chat_changed
-        && ModelCategory::for_chat_model(&merged.chat_provider, &merged.chat_model)
-            == ModelCategory::Gguf
-    {
-        state.agent.prepare_model(&merged.chat_model);
-    }
-
     // f32 fields echo widened (`0.7` -> 0.699999988079071); clients must diff against the patch
     // they sent. Don't round here: that would report a value the server doesn't hold.
     Ok(Json(
@@ -5145,18 +5117,24 @@ async fn get_active_roles(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
-/// GET /api/v1/models/memory-status — returns current LLM memory budget snapshot.
+/// GET /api/v1/models/memory-status — returns current LLM memory budget snapshot: the board's on
+/// a budgeted device, the machine's own elsewhere. `budget_mb` is the most the LLM slot may ever
+/// hold here; `reclaimable_mb` is what switching away from the model in use would free, so a fit
+/// check can count it.
 async fn get_memory_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let status = state
         .model_scheduler
         .as_ref()
         .map(|s| s.memory_status())
         .unwrap_or_default();
+    let reclaimable_mb = crate::model_views::reclaimable_mb(&state, &status).await;
 
     Json(json!({
         "total_mb":             status.total_mb,
         "available_for_llm_mb": status.available_for_llm_mb,
+        "budget_mb":            status.budget_mb,
         "loaded_model":         status.loaded_model,
+        "reclaimable_mb":       reclaimable_mb,
     }))
 }
 
@@ -5186,31 +5164,6 @@ async fn find_model_forgiving_tts(
         }
     }
     Ok(None)
-}
-
-fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelStatusEntry {
-    let active = assignments.iter().any(|a| a.model_id == m.id);
-    ModelStatusEntry {
-        category: m.category.as_str().to_string(),
-        name: m.name.clone(),
-        description: m.description.clone(),
-        size_mb: m.size_mb,
-        downloaded: m.downloaded,
-        active,
-        url: m.url.clone(),
-        hf_id: m.hf_id.clone(),
-        filename: m.filename.clone(),
-        ram_estimate_mb: m.ram_estimate_mb,
-        recommended_role: m.recommended_role.clone(),
-        context_length: m.context_length,
-        asr_language: m.asr_language.clone(),
-        asr_size: m.asr_size.clone(),
-        tts_engine: m.tts_engine.clone(),
-        config_filename: m.config_filename.clone(),
-        // `list_models` fills these for GGUF rows: the agent's verdict may read a header.
-        reads_images: None,
-        image_support_bytes: None,
-    }
 }
 
 /// Parses a GGUF header from the first MiB, which holds every useful key; `None` if not GGUF.
@@ -5247,17 +5200,26 @@ fn whisper_facts_from_name(name: &str) -> (Option<String>, Option<String>) {
 }
 
 /// Adds model files found on disk but missing from the catalog as custom entries; returns them.
+/// Also corrects a known row whose `downloaded` disagrees with its file, unless it is mid-download.
 async fn scan_filesystem_extras(
     data_dir: &std::path::Path,
     model_repo: &Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
+    tracker: &Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
 ) -> Vec<ModelRecord> {
     let all = model_repo.list_all().await.unwrap_or_default();
     let known_filenames: std::collections::HashSet<String> =
         all.iter().filter_map(|m| m.filename.clone()).collect();
+    let in_flight: std::collections::HashSet<String> = tracker
+        .read()
+        .await
+        .values()
+        .filter(|e| matches!(e.status.as_str(), "downloading" | "paused"))
+        .map(|e| e.filename.clone())
+        .collect();
 
     let data_dir_owned = data_dir.to_path_buf();
     let known = known_filenames;
-    let extras_from_disk = tokio::task::spawn_blocking(move || {
+    let (extras_from_disk, stale) = tokio::task::spawn_blocking(move || {
         let scan_dir =
             |dir: std::path::PathBuf, category: ModelCategory, exts: &[&str]| -> Vec<ModelRecord> {
                 let mut found = vec![];
@@ -5283,10 +5245,11 @@ async fn scan_filesystem_extras(
                     } else {
                         None
                     };
-                    // Skip companions; the header catches one whose name doesn't say so.
+                    // Companions and speech or embedding weights are never conversation rows;
+                    // the header catches one whose name doesn't say so.
                     if fname.ends_with(".gguf")
-                        && (is_companion_gguf(&fname)
-                            || is_companion_architecture(
+                        && (is_companion_file(&fname)
+                            || is_helper_architecture(
                                 gguf.as_ref().and_then(|g| g.architecture.as_deref()),
                             ))
                     {
@@ -5312,7 +5275,7 @@ async fn scan_filesystem_extras(
                         .as_ref()
                         .and_then(|g| g.name.clone())
                         .filter(|n| !n.trim().is_empty())
-                        .unwrap_or_else(|| "(detected on disk)".to_string());
+                        .unwrap_or_else(|| ON_DISK_PLACEHOLDER.to_string());
 
                     found.push(ModelRecord {
                         id: ModelRecord::id_for(&category, &name),
@@ -5344,38 +5307,32 @@ async fn scan_filesystem_extras(
             };
 
         let mut extras = vec![];
-        extras.extend(scan_dir(
-            data_dir_owned.join("models").join("gguf"),
-            ModelCategory::Gguf,
-            &[".gguf"],
-        ));
-        extras.extend(scan_dir(
-            pond_core::models::domain::litert::models_dir(&data_dir_owned),
-            ModelCategory::Litert,
-            &[".litertlm"],
-        ));
-        extras.extend(scan_dir(
-            data_dir_owned.join("models").join("llm"),
-            ModelCategory::Llamafile,
-            &[".llamafile", ".exe"],
-        ));
-        extras.extend(scan_dir(
-            data_dir_owned.join("models"),
-            ModelCategory::Whisper,
-            &[".bin"],
-        ));
-        extras.extend(scan_dir(
-            data_dir_owned.join("models").join("tts"),
-            ModelCategory::TtsPiper,
-            &[".onnx"],
-        ));
-        // Hand-copied voices: the catalogue lists only the English ones of the repo's 50-odd.
-        extras.extend(scan_dir(
-            data_dir_owned.join("models").join("kokoro").join("voices"),
-            ModelCategory::TtsKokoro,
-            &[".bin"],
-        ));
-        extras
+        let dirs: [(ModelCategory, &[&str]); 6] = [
+            (ModelCategory::Gguf, &[".gguf"]),
+            (ModelCategory::Litert, &[".litertlm"]),
+            (ModelCategory::Llamafile, &[".llamafile", ".exe"]),
+            (ModelCategory::Whisper, &[".bin"]),
+            (ModelCategory::TtsPiper, &[".onnx"]),
+            // Hand-copied voices: the catalogue lists only the English ones of the repo's 50-odd.
+            (ModelCategory::TtsKokoro, &[".bin"]),
+        ];
+        for (category, exts) in dirs {
+            if let Some(dir) = model_layout::dir_for(&data_dir_owned, &category) {
+                extras.extend(scan_dir(dir, category, exts));
+            }
+        }
+        // Rows whose flag the disk contradicts; a file being fetched is neither yet.
+        let stale: Vec<(String, bool)> = all
+            .iter()
+            .filter(|m| !m.filename.as_ref().is_some_and(|f| in_flight.contains(f)))
+            .filter_map(|m| {
+                let path =
+                    model_layout::path_for(&data_dir_owned, &m.category, m.filename.as_deref()?)?;
+                let present = path.exists();
+                (present != m.downloaded).then(|| (m.id.clone(), present))
+            })
+            .collect();
+        (extras, stale)
     })
     .await
     .unwrap_or_default();
@@ -5383,51 +5340,57 @@ async fn scan_filesystem_extras(
     for m in &extras_from_disk {
         let _ = model_repo.upsert(m).await;
     }
+    for (id, present) in &stale {
+        if model_repo.set_downloaded(id, *present).await.is_ok() {
+            tracing::info!(model = %id, downloaded = present, "corrected a stale downloaded flag");
+        }
+    }
 
     extras_from_disk
 }
 
-/// On download completion, prepare a GGUF under its file stem, the name a scan will give it.
-fn prepare_after_download(
-    state: &Arc<AppState>,
-    category: &str,
-    filename: &str,
-) -> impl std::future::Future<Output = ()> + Send + 'static {
-    let prepare = (category == "gguf")
-        .then(|| filename.strip_suffix(".gguf"))
-        .flatten()
-        .filter(|stem| !is_companion_gguf(filename) && !stem.is_empty())
-        .map(|stem| (state.agent.clone(), stem.to_string()));
-    async move {
-        if let Some((agent, model)) = prepare {
-            agent.prepare_model(&model);
-        }
-    }
-}
-
-/// Where a downloaded model lands, by category; shared so a resume finds its partial file.
+/// Where a downloaded model lands, by category; `None` for a category or name with no file.
 fn model_dest_path(
     data_dir: &std::path::Path,
     category: &str,
     filename: &str,
-) -> std::path::PathBuf {
-    match category {
-        "whisper" => data_dir.join("models").join(filename),
-        "llamafile" => data_dir.join("models").join("llm").join(filename),
-        "gguf" => data_dir.join("models").join("gguf").join(filename),
-        "litert" => pond_core::models::domain::litert::models_dir(data_dir).join(filename),
-        "tts" | "tts_piper" => data_dir.join("models").join("tts").join(filename),
-        "tts_kokoro" => data_dir
-            .join("models")
-            .join("kokoro")
-            .join("voices")
-            .join(filename),
-        _ => data_dir.join("models").join(filename),
+) -> Option<std::path::PathBuf> {
+    let category = ModelCategory::from_str(category)?;
+    model_layout::path_for(data_dir, &category, filename)
+}
+
+/// What a control request asks of a download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadAction {
+    Pause,
+    Resume,
+    Cancel,
+}
+
+impl DownloadAction {
+    fn parse(action: &str) -> Option<Self> {
+        match action {
+            "pause" => Some(Self::Pause),
+            "resume" => Some(Self::Resume),
+            "cancel" => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+
+    /// Whether a request for a whole model moves a part that is `status`.
+    fn moves(self, status: &str) -> bool {
+        match self {
+            Self::Pause => status == "downloading",
+            Self::Resume => matches!(status, "paused" | "error"),
+            Self::Cancel => matches!(status, "downloading" | "paused"),
+        }
     }
 }
 
-/// `POST /api/v1/models/download/control` — pause, resume or cancel. Filename is in the body
-/// (it has dots and slashes). Pause keeps the partial file for a resume; cancel deletes it.
+/// `POST /api/v1/models/download/control` — pause, resume or cancel one file (`filename`, in
+/// the body since it has dots and slashes) or every part of a model (`model_id`). Pause keeps
+/// the partial file for a resume; cancel deletes it, and cancelling a model's own file cancels
+/// its add-ons too, which are no use without it.
 async fn download_control(
     State(state): State<Arc<AppState>>,
     body: Result<Json<Value>, JsonRejection>,
@@ -5438,74 +5401,183 @@ async fn download_control(
             Json(json!({"error": "invalid request body"})),
         );
     };
-
-    let filename = body["filename"].as_str().unwrap_or_default().to_string();
-    let action = body["action"].as_str().unwrap_or_default().to_string();
-    if filename.is_empty() {
+    let Some(action) = body["action"].as_str().and_then(DownloadAction::parse) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "filename is required"})),
+            Json(json!({"error": "action must be pause, resume or cancel"})),
         );
-    }
+    };
+    let filename = body["filename"].as_str().filter(|s| !s.is_empty());
+    let model_id = body["model_id"].as_str().filter(|s| !s.is_empty());
 
-    let (category, url) = {
+    let keys: Vec<String> = {
         let t = state.download_tracker.read().await;
-        let Some(entry) = t.get(&filename) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("no download named {filename}")})),
-            );
+        // The model's own file first, then its add-ons by name.
+        let parts_of = |id: &str, except: Option<&str>, action: DownloadAction| {
+            let mut parts: Vec<(bool, String)> = t
+                .iter()
+                .filter(|(key, e)| {
+                    Some(key.as_str()) != except
+                        && e.model_id.as_deref() == Some(id)
+                        && action.moves(&e.status)
+                })
+                .map(|(key, e)| {
+                    let add_on = e.part.as_deref() != Some(crate::model_acquisition::PART_MODEL);
+                    (add_on, key.clone())
+                })
+                .collect();
+            parts.sort();
+            parts.into_iter().map(|(_, key)| key).collect::<Vec<_>>()
         };
-        match action.as_str() {
-            "pause" => {
-                entry
-                    .control
-                    .store(crate::DL_PAUSE, std::sync::atomic::Ordering::Relaxed);
-                return (StatusCode::OK, Json(json!({"status": "pausing"})));
+        match (model_id, filename) {
+            (Some(id), _) => parts_of(id, None, action),
+            (None, Some(name)) => {
+                let Some(entry) = t.get(name) else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": format!("no download named {name}")})),
+                    );
+                };
+                let mut keys = vec![name.to_string()];
+                let own_file = entry.part.as_deref() == Some(crate::model_acquisition::PART_MODEL);
+                if let (DownloadAction::Cancel, true, Some(id)) =
+                    (action, own_file, entry.model_id.as_deref())
+                {
+                    keys.extend(parts_of(id, Some(name), DownloadAction::Cancel));
+                }
+                keys
             }
-            "cancel" => {
-                entry
-                    .control
-                    .store(crate::DL_CANCEL, std::sync::atomic::Ordering::Relaxed);
-                return (StatusCode::OK, Json(json!({"status": "cancelling"})));
-            }
-            "resume" => (entry.category.clone(), entry.url.clone()),
-            _ => {
+            (None, None) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "action must be pause, resume or cancel"})),
+                    Json(json!({"error": "filename or model_id is required"})),
                 )
             }
         }
     };
+    if keys.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!(
+                "{} has no download that can be told to {}",
+                model_id.unwrap_or_default(),
+                body["action"].as_str().unwrap_or_default()
+            )})),
+        );
+    }
+
+    let mut outcomes = Vec::with_capacity(keys.len());
+    for key in &keys {
+        outcomes.push(control_one(&state, key, action).await);
+    }
+    let files: Vec<Value> = keys
+        .iter()
+        .zip(&outcomes)
+        .map(|(key, outcome)| match outcome {
+            Ok(status) => json!({"filename": key, "status": status}),
+            Err((_, Json(why))) => json!({"filename": key, "error": why["error"]}),
+        })
+        .collect();
+    // The named file answers for a file; for a model, any part that moved.
+    let lead = match model_id {
+        Some(_) => outcomes.iter().position(Result::is_ok).unwrap_or(0),
+        None => 0,
+    };
+    match outcomes.swap_remove(lead) {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(json!({"status": status, "files": files})),
+        ),
+        Err(refused) => refused,
+    }
+}
+
+/// Applies `action` to the tracker entry `key`: the status it reports, or why it cannot.
+async fn control_one(
+    state: &Arc<AppState>,
+    key: &str,
+    action: DownloadAction,
+) -> Result<&'static str, (StatusCode, Json<Value>)> {
+    let resume = {
+        let mut t = state.download_tracker.write().await;
+        let Some(entry) = t.get_mut(key) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("no download named {key}")})),
+            ));
+        };
+        match action {
+            DownloadAction::Pause => {
+                entry
+                    .control
+                    .store(crate::DL_PAUSE, std::sync::atomic::Ordering::Relaxed);
+                return Ok("pausing");
+            }
+            DownloadAction::Cancel if entry.status == "paused" => {
+                // No transfer is running to see the flag: throw the partial file away here.
+                if let Some(partial) = entry.partial.take() {
+                    let _ = tokio::fs::remove_file(&partial).await;
+                }
+                entry.status = "cancelled".to_string();
+                entry.finished_at = Some(std::time::Instant::now());
+                return Ok("cancelled");
+            }
+            DownloadAction::Cancel => {
+                entry
+                    .control
+                    .store(crate::DL_CANCEL, std::sync::atomic::Ordering::Relaxed);
+                return Ok("cancelling");
+            }
+            DownloadAction::Resume => (
+                entry.url.clone(),
+                entry.dest.clone(),
+                entry.category.clone(),
+                entry.model_id.clone(),
+                entry.part.clone(),
+            ),
+        }
+    };
+    let (url, dest, category, model_id, part) = resume;
 
     // A fresh transfer resumes: the HF cache finds its `.incomplete` and sends a Range header.
     let Some(url) = url else {
-        return (
+        return Err((
             StatusCode::CONFLICT,
             Json(json!({"error": "this download cannot be resumed — its source was not recorded"})),
-        );
+        ));
     };
     let Some(data_dir) = state.data_dir.clone() else {
-        return (
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "data_dir not configured"})),
-        );
+        ));
     };
-
-    let dest = model_dest_path(&data_dir, &category, &filename);
-    let tracker = Arc::clone(&state.download_tracker);
-    let client = state.http_client.clone();
-    let on_done = prepare_after_download(&state, &category, &filename);
-
-    tokio::spawn(async move {
-        spawn_tracked_download(
-            url, dest, filename, category, tracker, client, data_dir, on_done,
-        )
-        .await;
-    });
-
-    (StatusCode::OK, Json(json!({"status": "resuming"})))
+    let Some(dest) = dest.or_else(|| model_dest_path(&data_dir, &category, key)) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "this download has no file to resume"})),
+        ));
+    };
+    let part = match part.as_deref() {
+        Some(crate::model_acquisition::PART_MODEL) => Some(crate::model_acquisition::PART_MODEL),
+        Some(crate::model_acquisition::PART_PICTURES) => {
+            Some(crate::model_acquisition::PART_PICTURES)
+        }
+        _ => None,
+    };
+    let file = TrackedFile {
+        url,
+        dest,
+        key: key.to_string(),
+        category,
+        model_id,
+        part,
+        size_bytes: None,
+    };
+    if crate::model_acquisition::start(state, vec![file]).await == 0 {
+        return Ok("downloading");
+    }
+    Ok("resuming")
 }
 
 /// GET /api/v1/models — returns all catalog models with downloaded/active flags.
@@ -5533,8 +5605,9 @@ async fn list_models(
         {
             let dir = data_dir.clone();
             let repo = Arc::clone(model_repo);
+            let tracker = Arc::clone(&state.download_tracker);
             tokio::spawn(async move {
-                let _ = scan_filesystem_extras(&dir, &repo).await;
+                let _ = scan_filesystem_extras(&dir, &repo, &tracker).await;
                 SCANNING.store(false, std::sync::atomic::Ordering::Release);
             });
         }
@@ -5548,25 +5621,16 @@ async fn list_models(
     })?;
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
 
-    // One blocking-pool batch: the verdict may read a header per row, on every page visit.
-    let gguf_names: Vec<String> = records
-        .iter()
-        .filter(|m| m.category == ModelCategory::Gguf)
-        .map(|m| m.name.clone())
-        .collect();
-    let agent = state.agent.clone();
-    let vision_facts: std::collections::HashMap<String, (bool, Option<u64>)> =
-        tokio::task::spawn_blocking(move || {
-            gguf_names
-                .into_iter()
-                .map(|name| {
-                    let facts = gguf_vision_facts(agent.as_ref(), &name);
-                    (name, facts)
-                })
-                .collect()
-        })
+    let vision = crate::model_views::gguf_vision_batch(&state, &records).await;
+    let fetching_pictures: std::collections::HashSet<String> = state
+        .download_tracker
+        .read()
         .await
-        .unwrap_or_default();
+        .values()
+        .filter(|e| e.part.as_deref() == Some(crate::model_acquisition::PART_PICTURES))
+        .filter(|e| matches!(e.status.as_str(), "downloading" | "paused"))
+        .filter_map(|e| e.model_id.clone())
+        .collect();
 
     let mut whisper = vec![];
     let mut llamafile = vec![];
@@ -5578,12 +5642,15 @@ async fn list_models(
 
     for m in &records {
         let mut dto = record_to_dto(m, &assignments);
-        let facts = (m.category == ModelCategory::Gguf)
-            .then(|| vision_facts.get(&m.name))
-            .flatten();
-        if let Some((reads, bytes)) = facts {
-            dto.reads_images = Some(*reads);
-            dto.image_support_bytes = *bytes;
+        if let Some(v) = vision.get(&m.id) {
+            dto.reads_images = Some(v.reads_images);
+            dto.image_support_bytes = v.image_support_bytes;
+            dto.companions.extend(v.companion.clone());
+        }
+        for companion in &mut dto.companions {
+            if fetching_pictures.contains(&m.id) && companion.state == "available" {
+                companion.state = "downloading".to_string();
+            }
         }
         let v = serde_json::to_value(dto).unwrap_or_default();
         match m.category {
@@ -5610,8 +5677,11 @@ async fn scan_models(State(state): State<Arc<AppState>>) -> Json<Value> {
         return Json(json!({"found": 0, "entries": []}));
     };
 
-    let extras = scan_filesystem_extras(data_dir, model_repo).await;
-    sync_ollama_models(&state.http_client, model_repo).await;
+    let extras = scan_filesystem_extras(data_dir, model_repo, &state.download_tracker).await;
+    // Ollama rows come from the catalogue's one builder, applied as a seed applies it.
+    if let Some(provider) = &state.model_catalog_provider {
+        apply_fetched_catalog(provider.as_ref(), model_repo.as_ref(), data_dir).await;
+    }
 
     let count = extras.len();
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
@@ -5623,66 +5693,31 @@ async fn scan_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"found": count, "entries": entries}))
 }
 
-/// Registers only models the local Ollama daemon actually has, so `downloaded` is accurate.
-async fn sync_ollama_models(
-    client: &reqwest::Client,
-    model_repo: &Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
+/// Fetch the catalogue, upsert it with each file's presence, and prune what it leaves stale.
+async fn apply_fetched_catalog(
+    provider: &dyn pond_core::models::ports::model_catalog_provider::ModelCatalogProvider,
+    repo: &(dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync),
+    data_dir: &std::path::Path,
 ) {
-    let resp = match client
-        .get("http://localhost:11434/api/tags")
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return,
+    let models = match provider.fetch().await {
+        Ok((models, _binaries)) => models,
+        Err(e) => {
+            tracing::warn!("Registry refresh failed: {e}");
+            return;
+        }
     };
-
-    let body: Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return,
+    let data_dir = data_dir.to_path_buf();
+    let present = move |m: &ModelRecord| {
+        let path = model_layout::path_for(&data_dir, &m.category, m.filename.as_deref()?)?;
+        Some(path.exists())
     };
-
-    let Some(models) = body["models"].as_array() else {
-        return;
-    };
-
-    for m in models {
-        let Some(model_name) = m["name"].as_str() else {
-            continue;
-        };
-        let size_mb = m["size"].as_u64().unwrap_or(0) / (1024 * 1024);
-        let model_id = ModelRecord::id_for(&ModelCategory::Ollama, model_name);
-
-        let existing = model_repo.get_by_id(&model_id).await.unwrap_or(None);
-        let record = ModelRecord {
-            id: model_id,
-            category: ModelCategory::Ollama,
-            name: model_name.to_string(),
-            filename: None,
-            description: String::new(),
-            size_mb,
-            url: None,
-            hf_id: None,
-            ram_estimate_mb: None,
-            recommended_role: existing
-                .as_ref()
-                .and_then(|e| e.recommended_role.clone())
-                .or_else(|| Some("chat".to_string())),
-            context_length: existing.as_ref().and_then(|e| e.context_length),
-            quantization: None,
-            asr_language: None,
-            asr_size: None,
-            tts_engine: None,
-            tts_voice_name: None,
-            config_filename: None,
-            config_url: None,
-            tts_url: None,
-            sample_rate: None,
-            downloaded: true,
-            is_custom: existing.as_ref().map(|e| e.is_custom).unwrap_or(true),
-        };
-        let _ = model_repo.upsert(&record).await;
+    match pond_core::models::services::model_service::apply_catalog(repo, models, &present).await {
+        Ok(applied) => tracing::info!(
+            upserted = applied.upserted,
+            pruned = applied.pruned,
+            "Model registry refreshed"
+        ),
+        Err(e) => tracing::warn!("Registry refresh failed: {e}"),
     }
 }
 
@@ -5703,86 +5738,38 @@ async fn refresh_model_registry(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     tokio::spawn(async move {
-        match catalog_provider.fetch().await {
-            Ok((models, _binaries)) => {
-                let count = models.len();
-                for mut m in models {
-                    m.downloaded = m
-                        .filename
-                        .as_ref()
-                        .map(|f| match m.category {
-                            pond_core::models::domain::model_record::ModelCategory::Whisper => {
-                                data_dir.join("models").join(f).exists()
-                            }
-                            pond_core::models::domain::model_record::ModelCategory::Llamafile => {
-                                data_dir.join("models").join("llm").join(f).exists()
-                            }
-                            pond_core::models::domain::model_record::ModelCategory::Gguf => {
-                                data_dir.join("models").join("gguf").join(f).exists()
-                            }
-                            pond_core::models::domain::model_record::ModelCategory::Litert => {
-                                pond_core::models::domain::litert::models_dir(&data_dir)
-                                    .join(f)
-                                    .exists()
-                            }
-                            pond_core::models::domain::model_record::ModelCategory::TtsPiper => {
-                                data_dir.join("models").join("tts").join(f).exists()
-                            }
-                            pond_core::models::domain::model_record::ModelCategory::TtsKokoro => {
-                                data_dir
-                                    .join("models")
-                                    .join("kokoro")
-                                    .join("voices")
-                                    .join(f)
-                                    .exists()
-                            }
-                            _ => false,
-                        })
-                        .unwrap_or(matches!(
-                            m.category,
-                            pond_core::models::domain::model_record::ModelCategory::TtsHttp
-                                | pond_core::models::domain::model_record::ModelCategory::Ollama
-                        ));
-                    if let Err(e) = model_repo.upsert(&m).await {
-                        tracing::warn!("Failed to upsert model '{}': {}", m.id, e);
-                    }
-                }
-                tracing::info!("Model registry refreshed: {} records upserted", count);
-            }
-            Err(e) => tracing::warn!("Registry refresh failed: {}", e),
-        }
+        apply_fetched_catalog(catalog_provider.as_ref(), model_repo.as_ref(), &data_dir).await;
     });
 
     Ok(Json(json!({"status": "refresh_started"})))
 }
 
-/// GET /api/v1/models/download/progress — also evicts entries finished over 5 min ago.
+/// GET /api/v1/models/download/progress — also evicts entries finished over 5 min ago; a
+/// paused one stays until the household resumes or cancels it.
 async fn get_download_progress(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut tracker = state.download_tracker.write().await;
     let now = std::time::Instant::now();
-    tracker.retain(|_, e| match e.finished_at {
-        Some(t) => now.duration_since(t) < std::time::Duration::from_secs(300),
-        None => true,
-    });
+    tracker.retain(|_, e| !e.expired(now, std::time::Duration::from_secs(300)));
     let entries: Vec<&DownloadEntry> = tracker.values().collect();
     Json(json!({"downloads": entries}))
 }
 
-/// POST /api/v1/models/{category}/{name}/download — trigger async model download.
+/// POST /api/v1/models/{category}/{name}/download — plan and start a model's download, with its
+/// picture add-on unless the body says `{"pictures": false}`.
 async fn download_model(
     State(state): State<Arc<AppState>>,
     Path((category, name)): Path<(String, String)>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // No body is how the desktop has always asked: the add-on is included by default.
+    let include_pictures = body
+        .ok()
+        .and_then(|Json(b)| b["pictures"].as_bool())
+        .unwrap_or(true);
     let Some(model_repo) = state.model_repo.clone() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "registry not available"})),
-        ));
-    };
-    let Some(data_dir) = state.data_dir.clone() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "data_dir not configured"})),
         ));
     };
 
@@ -5806,8 +5793,6 @@ async fn download_model(
                 Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)})),
             )
         })?;
-    // The found record's id: a forgiving TTS lookup may resolve another category.
-    let model_id = m.id.clone();
 
     if m.downloaded {
         return Ok(Json(json!({"status": "already_downloaded", "name": name})));
@@ -5820,108 +5805,10 @@ async fn download_model(
         ));
     }
 
-    let url = m.url.clone().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "model has no download URL"})),
-        )
-    })?;
-    let filename = m.filename.clone().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "model has no filename"})),
-        )
-    })?;
-
-    // Check egress before spawning so a refusal reaches the caller, not just a failed tracker row.
-    pond_core::shared::services::egress::check_egress(&url).map_err(|denied| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": denied.to_string()})),
-        )
-    })?;
-
-    let dest = match cat {
-        ModelCategory::Whisper => data_dir.join("models").join(&filename),
-        ModelCategory::Llamafile => data_dir.join("models").join("llm").join(&filename),
-        ModelCategory::Gguf => data_dir.join("models").join("gguf").join(&filename),
-        ModelCategory::Litert => {
-            pond_core::models::domain::litert::models_dir(&data_dir).join(&filename)
-        }
-        ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
-            data_dir.join("models").join("tts").join(&filename)
-        }
-        // Not models/tts/: the Kokoro engine loads voices from its own directory.
-        ModelCategory::TtsKokoro => data_dir
-            .join("models")
-            .join("kokoro")
-            .join("voices")
-            .join(&filename),
-        ModelCategory::Ollama => data_dir.join("models").join(&filename),
-        ModelCategory::Embedding => data_dir.join("models").join("embedding").join(&filename),
-    };
-
-    let tracker = Arc::clone(&state.download_tracker);
-    let dl_client = state.http_client.clone();
-    let dl_filename = filename.clone();
-    let dl_category = category.clone();
-
-    // For TTS models, also download the companion config file (.onnx.json)
-    let cfg_url = m.config_url.clone();
-    let cfg_filename = m.config_filename.clone();
-    let cfg_client = state.http_client.clone();
-    let cfg_data_dir = data_dir.clone();
-    let dl_data_dir = data_dir.clone();
-    // Prepare on arrival, or the encoder download would wait for the first photo.
-    let prepare = (cat == ModelCategory::Gguf).then(|| (state.agent.clone(), name.clone()));
-
-    tokio::spawn(async move {
-        spawn_tracked_download(
-            url,
-            dest,
-            dl_filename,
-            dl_category,
-            tracker,
-            dl_client,
-            dl_data_dir,
-            async move {
-                // Download config file before marking as downloaded
-                if let (Some(cu), Some(cf)) = (cfg_url, cfg_filename) {
-                    let cfg_dest = cfg_data_dir.join("models").join("tts").join(&cf);
-                    if let Some(parent) = cfg_dest.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
-                    }
-                    // A separate hop to its own host: gate it separately from the weights.
-                    match pond_core::shared::services::egress::begin(&cu, "GET") {
-                        Err(denied) => {
-                            tracing::warn!("TTS config file {cf} not fetched: {denied}")
-                        }
-                        Ok(call) => {
-                            let sent = cfg_client.get(&cu).send().await;
-                            call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
-                            match sent {
-                                Ok(resp) if resp.status().is_success() => {
-                                    if let Ok(bytes) = resp.bytes().await {
-                                        let _ = tokio::fs::write(&cfg_dest, &bytes).await;
-                                    }
-                                }
-                                _ => tracing::warn!("Failed to download TTS config file {}", cf),
-                            }
-                        }
-                    }
-                }
-                let _ = model_repo.set_downloaded(&model_id, true).await;
-                if let Some((agent, model)) = prepare {
-                    agent.prepare_model(&model);
-                }
-            },
-        )
-        .await;
-    });
-
-    Ok(Json(
-        json!({"status": "download_started", "name": name, "category": category}),
-    ))
+    let mut started = crate::model_acquisition::acquire(&state, &m, include_pictures).await?;
+    started["name"] = json!(name);
+    started["category"] = json!(category);
+    Ok(Json(started))
 }
 
 /// DELETE /api/v1/models/{category}/{name} — deletes the file but keeps the catalog row.
@@ -5960,36 +5847,56 @@ async fn delete_model(
     let model_id = m.id.clone();
 
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
-    if let Some(a) = assignments.iter().find(|a| a.model_id == model_id) {
+    // The job a row is doing, if any; the first in the roles' own order when it has several.
+    let job_of = |id: &str| {
+        assignments
+            .iter()
+            .filter(|a| a.model_id == id)
+            .min_by_key(|a| {
+                ModelRole::ALL
+                    .iter()
+                    .position(|r| r.as_str() == a.role)
+                    .unwrap_or(ModelRole::ALL.len())
+            })
+            .map(|a| ModelRole::job_for(&a.role).to_string())
+    };
+    if let Some(job) = job_of(&model_id) {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
-                "error": format!("Model is assigned to role '{}'. Deactivate it first.", a.role)
+                "error": format!(
+                    "{} is doing a job right now ({job}). Give that job to another model first.",
+                    crate::model_views::title_of(&m)
+                )
+            })),
+        ));
+    }
+    // Another row may name the same file (an older row, or one spelled in another case): deleting
+    // it would take the file from a model in use.
+    let rows = model_repo.list_all().await.unwrap_or_default();
+    let in_use_by = rows
+        .iter()
+        .filter(|r| r.id != model_id && model_layout::share_a_file(r, &m))
+        .find_map(|r| job_of(&r.id).map(|job| (crate::model_views::title_of(r), job)));
+    if let Some((other, job)) = in_use_by {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "{other} uses the same file and is doing a job right now ({job}). Give that \
+                     job to another model first."
+                )
             })),
         ));
     }
 
-    if let (Some(filename), Some(data_dir)) = (&m.filename, &state.data_dir) {
-        let path = match cat {
-            ModelCategory::Whisper => data_dir.join("models").join(filename),
-            ModelCategory::Llamafile => data_dir.join("models").join("llm").join(filename),
-            ModelCategory::Gguf => data_dir.join("models").join("gguf").join(filename),
-            ModelCategory::Litert => {
-                pond_core::models::domain::litert::models_dir(data_dir).join(filename)
-            }
-            ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
-                data_dir.join("models").join("tts").join(filename)
-            }
-            // Must match `download_model`'s path, or the file survives and reappears as installed.
-            ModelCategory::TtsKokoro => data_dir
-                .join("models")
-                .join("kokoro")
-                .join("voices")
-                .join(filename),
-            ModelCategory::Ollama => data_dir.join("models").join(filename),
-            ModelCategory::Embedding => data_dir.join("models").join("embedding").join(filename),
-        };
-        if path.exists() {
+    let path = match (&m.filename, &state.data_dir) {
+        (Some(filename), Some(data_dir)) => model_layout::path_for(data_dir, &m.category, filename),
+        _ => None,
+    };
+    if let (Some(path), Some(data_dir)) = (path, &state.data_dir) {
+        // `symlink_metadata`, so a link whose cache blob is gone is removed too.
+        if tokio::fs::symlink_metadata(&path).await.is_ok() {
             tokio::fs::remove_file(&path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -5997,9 +5904,15 @@ async fn delete_model(
                 )
             })?;
         }
+        if matches!(m.category, ModelCategory::Gguf | ModelCategory::Litert) {
+            state.agent.forget_model_file(&path);
+        }
         // Also delete companion config file for TTS models (.onnx.json)
-        if let Some(cfg_filename) = &m.config_filename {
-            let cfg_path = data_dir.join("models").join("tts").join(cfg_filename);
+        if let Some(cfg_path) = m
+            .config_filename
+            .as_deref()
+            .and_then(|cf| model_layout::path_for(data_dir, &ModelCategory::TtsPiper, cf))
+        {
             if cfg_path.exists() {
                 let _ = tokio::fs::remove_file(&cfg_path).await;
             }
@@ -6245,11 +6158,8 @@ async fn activate_model(
         rebuild_llm_provider(&state, &settings).await;
     }
 
-    // As in PUT /settings: prepare picture support and warm the prefix now, in the background.
+    // As in PUT /settings: warm the prefix now, in the background. Nothing is fetched.
     if role == "chat" {
-        if cat == ModelCategory::Gguf {
-            state.agent.prepare_model(&name);
-        }
         let now = (provider.to_string(), name.clone());
         if chat_before.as_ref() != Some(&now) {
             crate::spawn_prefix_prewarm(state.clone(), false);
@@ -6286,15 +6196,16 @@ async fn warn_if_model_spills(state: &Arc<AppState>, record: &ModelRecord) {
     } else {
         record.ram_estimate_mb.unwrap_or(0)
     };
+    // What the switch away from the model in use frees counts, as the desktop's check counts it.
+    let available =
+        status.available_for_llm_mb + crate::model_views::reclaimable_mb(state, &status).await;
 
-    if model_spills_budget(residency_mb, status.available_for_llm_mb) == Some(true) {
-        let budget = status
-            .available_for_llm_mb
-            .saturating_sub(MEMORY_FIT_HEADROOM_MB);
+    if model_spills_budget(residency_mb, available) == Some(true) {
+        let budget = available.saturating_sub(MEMORY_FIT_HEADROOM_MB);
         tracing::warn!(
             model = %record.name,
             model_size_mb = residency_mb,
-            available_for_llm_mb = status.available_for_llm_mb,
+            available_for_llm_mb = available,
             budget_mb = budget,
             "model exceeds device LLM memory budget — it will spill to CPU and \
              run slowly. On Jetson, enable the fail-closed loader path \
@@ -6492,25 +6403,13 @@ async fn list_hf_model_files(
     match sent {
         Ok(resp) if resp.status().is_success() => {
             let meta: Value = resp.json().await.unwrap_or_default();
+            let budgeted = pond_core::models::domain::device_budget::budgeted_device();
             let files: Vec<Value> = meta["siblings"]
                 .as_array()
                 .map(|siblings| {
-                    siblings.iter()
-                        // Chat models only; companions arrive by themselves, elsewhere.
-                        .filter(|s| {
-                            s["rfilename"].as_str()
-                                .map(|n| n.ends_with(".gguf") && !is_companion_gguf(n))
-                                .unwrap_or(false)
-                        })
-                        .map(|s| {
-                            let filename = s["rfilename"].as_str().unwrap_or("").to_string();
-                            let size_mb  = s["size"].as_u64().map(|b| b / 1_048_576);
-                            json!({
-                                "filename": filename,
-                                "size_mb":  size_mb,
-                                "url": format!("https://huggingface.co/{}/resolve/main/{}", repo, filename),
-                            })
-                        })
+                    siblings
+                        .iter()
+                        .filter_map(|s| crate::model_acquisition::hf_file_entry(&repo, s, budgeted))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -6523,7 +6422,9 @@ async fn list_hf_model_files(
     }
 }
 
-/// POST /api/v1/models/download/url — download a model file by URL into the right folder.
+/// POST /api/v1/models/download/url — download a model file by URL into the right folder. The
+/// file becomes an Added row, and a file with a known pairing brings its add-on unless the body
+/// says `"pictures": false`.
 async fn download_model_from_url(
     State(state): State<Arc<AppState>>,
     body: Result<Json<Value>, JsonRejection>,
@@ -6540,6 +6441,7 @@ async fn download_model_from_url(
     let url = body["url"].as_str().unwrap_or("").to_string();
     let category = body["category"].as_str().unwrap_or("gguf").to_string();
     let filename = body["filename"].as_str().unwrap_or("").to_string();
+    let include_pictures = body["pictures"].as_bool().unwrap_or(true);
 
     if url.is_empty() || filename.is_empty() {
         return (
@@ -6568,46 +6470,127 @@ async fn download_model_from_url(
             Json(json!({"error": "data_dir not configured"})),
         );
     };
+    let (Some(cat), Some(file)) = (
+        ModelCategory::from_str(&category),
+        model_layout::file_name(&filename),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("cannot save a {category} file named {filename:?}")})),
+        );
+    };
+    if model_dest_path(&data_dir, &category, file).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("a {category} model has no file to download")})),
+        );
+    }
 
-    let dest = model_dest_path(&data_dir, &category, &filename);
-
-    let tracker = Arc::clone(&state.download_tracker);
-    let resp_filename = filename.clone();
-    let resp_category = category.clone();
-
-    let dl_client = state.http_client.clone();
-    let dl_data_dir = data_dir.clone();
-    let on_done = prepare_after_download(&state, &category, &filename);
-    tokio::spawn(async move {
-        spawn_tracked_download(
-            url,
-            dest,
-            filename,
-            category,
-            tracker,
-            dl_client,
-            dl_data_dir,
-            on_done,
-        )
-        .await;
-    });
-
-    (
-        StatusCode::ACCEPTED,
-        Json(
-            json!({"status": "downloading", "filename": resp_filename, "category": resp_category}),
-        ),
-    )
+    let record = match crate::model_acquisition::row_for_url(&state, &url, &cat, file).await {
+        Ok(r) => r,
+        Err(refused) => return refused,
+    };
+    if record.downloaded {
+        return (
+            StatusCode::OK,
+            Json(json!({"status": "already_downloaded", "filename": file, "category": category})),
+        );
+    }
+    match crate::model_acquisition::acquire(&state, &record, include_pictures).await {
+        Ok(mut started) => {
+            started["status"] = json!("downloading");
+            started["filename"] = json!(file);
+            started["category"] = json!(category);
+            (StatusCode::ACCEPTED, Json(started))
+        }
+        Err(refused) => refused,
+    }
 }
 
-/// Tracked download to `dest`; `on_done` runs only on success. HF URLs use `pond_hf_cache`
-/// (resumable, keeps auth across HF→CDN redirects).
-async fn spawn_tracked_download<F>(
-    url: String,
-    dest: std::path::PathBuf,
-    filename: String,
-    category: String,
-    tracker: Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+/// One file for the tracker to fetch.
+#[derive(Debug)]
+pub(crate) struct TrackedFile {
+    pub url: String,
+    pub dest: std::path::PathBuf,
+    /// The tracker key, which pause, resume and cancel name.
+    pub key: String,
+    pub category: String,
+    pub model_id: Option<String>,
+    pub part: Option<&'static str>,
+    /// The size it must arrive at, when known before the transfer.
+    pub size_bytes: Option<u64>,
+}
+
+type Tracker = Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>;
+
+/// Put `file` in the tracker as downloading, keeping the bytes a resumed transfer already has.
+pub(crate) async fn begin_tracking(tracker: &Tracker, file: &TrackedFile) {
+    register(&mut *tracker.write().await, file, false);
+}
+
+/// Registers `file` as downloading unless a transfer already holds its key. The flag it returns
+/// goes with the transfer and is how a later claim sees the entry is still running.
+pub(crate) async fn claim_tracking(
+    tracker: &Tracker,
+    file: &TrackedFile,
+) -> Option<Arc<std::sync::atomic::AtomicU8>> {
+    let mut t = tracker.write().await;
+    if t.get(&file.key).is_some_and(DownloadEntry::is_running) {
+        return None;
+    }
+    register(&mut t, file, true);
+    t.get(&file.key).map(|e| Arc::clone(&e.control))
+}
+
+/// `fresh_flag` drops a pause or cancel an earlier transfer was sent; otherwise a transfer that
+/// is already registered keeps its flag, so a pause sent before it began still holds.
+fn register(
+    t: &mut std::collections::HashMap<String, DownloadEntry>,
+    file: &TrackedFile,
+    fresh_flag: bool,
+) {
+    let entry = t
+        .entry(file.key.clone())
+        .or_insert_with(|| DownloadEntry::starting(&file.key, &file.category));
+    if fresh_flag || entry.status != "downloading" {
+        entry.control = Arc::new(std::sync::atomic::AtomicU8::new(crate::DL_RUN));
+    }
+    entry.category = file.category.clone();
+    entry.status = "downloading".to_string();
+    entry.finished_at = None;
+    entry.error = None;
+    entry.partial = None;
+    entry.url = Some(file.url.clone());
+    entry.model_id = file.model_id.clone();
+    entry.part = file.part.map(str::to_string);
+    entry.dest = Some(file.dest.clone());
+    entry.resumable = resumes(&file.url);
+    if entry.total_bytes.is_none() {
+        entry.total_bytes = file.size_bytes;
+    }
+}
+
+/// Whether a transfer from `url` keeps what has arrived across a pause: the Hugging Face path
+/// through `pond_hf_cache` does, the `.part` path restarts.
+fn resumes(url: &str) -> bool {
+    pond_hf_cache::parse_hf_url(url).is_some()
+}
+
+/// Where a non-HF transfer writes until it is whole.
+fn part_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let mut name = dest
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".part");
+    dest.with_file_name(name)
+}
+
+/// Tracked download to `file.dest`; `on_done` runs only on success. HF URLs use `pond_hf_cache`
+/// (resumable, keeps auth across HF→CDN redirects); anything else lands in `.part` first.
+pub(crate) async fn spawn_tracked_download<F>(
+    file: TrackedFile,
+    tracker: Tracker,
     client: reqwest::Client,
     data_dir: std::path::PathBuf,
     on_done: F,
@@ -6616,81 +6599,112 @@ async fn spawn_tracked_download<F>(
 {
     use tokio::io::AsyncWriteExt;
 
-    {
-        let mut t = tracker.write().await;
-        t.insert(
-            filename.clone(),
-            DownloadEntry {
-                filename: filename.clone(),
-                category: category.clone(),
-                downloaded_bytes: 0,
-                total_bytes: None,
-                status: "downloading".to_string(),
-                finished_at: None,
-                control: Arc::new(std::sync::atomic::AtomicU8::new(crate::DL_RUN)),
-                url: Some(url.clone()),
-            },
-        );
-    }
+    begin_tracking(&tracker, &file).await;
+    let TrackedFile { url, dest, key, .. } = file;
+    let control = {
+        let t = tracker.read().await;
+        t.get(&key)
+            .map(|e| Arc::clone(&e.control))
+            .unwrap_or_default()
+    };
 
     if let Some(parent) = dest.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
 
-    tracing::info!("Downloading {} from {}", filename, url);
+    tracing::info!("Downloading {} from {}", key, url);
 
     let result: Result<(), String> =
         if let Some((repo_id, revision, fname)) = pond_hf_cache::parse_hf_url(&url) {
             download_via_hf_cache_tracked(
-                &repo_id, &revision, &fname, &dest, &data_dir, &filename, &tracker,
+                &repo_id, &revision, &fname, &dest, &data_dir, &key, &tracker,
             )
             .await
         } else {
-            async {
+            let partial = part_path(&dest);
+            let fetched = async {
                 // Gated here as well as in callers: every non-HF transfer passes this point.
                 let call = pond_core::shared::services::egress::begin(&url, "GET")
-                    .map_err(|denied| denied.to_string())?;
+                    .map_err(|denied| crate::download_failure::plain_denied(&denied))?;
                 let sent = client.get(&url).send().await;
                 call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
-                let resp = sent.map_err(|e| e.to_string())?;
+                let resp = sent.map_err(|e| crate::download_failure::plain_request(&e))?;
                 if !resp.status().is_success() {
-                    return Err(format!("HTTP {}", resp.status()));
+                    return Err(crate::download_failure::plain_status(
+                        resp.status().as_u16(),
+                    ));
                 }
 
                 let total = resp.content_length();
                 {
                     let mut t = tracker.write().await;
-                    if let Some(e) = t.get_mut(&filename) {
+                    if let Some(e) = t.get_mut(&key) {
                         e.total_bytes = total;
                     }
                 }
 
-                let mut file = tokio::fs::File::create(&dest)
+                let mut out = tokio::fs::File::create(&partial)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| crate::download_failure::plain_io(&e))?;
 
                 let mut downloaded: u64 = 0;
                 let mut resp = resp;
-                while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-                    file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                while let Some(chunk) = resp
+                    .chunk()
+                    .await
+                    .map_err(|e| crate::download_failure::plain_request(&e))?
+                {
+                    out.write_all(&chunk)
+                        .await
+                        .map_err(|e| crate::download_failure::plain_io(&e))?;
                     downloaded += chunk.len() as u64;
-                    let mut t = tracker.write().await;
-                    if let Some(e) = t.get_mut(&filename) {
-                        e.downloaded_bytes = downloaded;
+                    {
+                        let mut t = tracker.write().await;
+                        if let Some(e) = t.get_mut(&key) {
+                            e.downloaded_bytes = downloaded;
+                        }
+                    }
+                    match control.load(std::sync::atomic::Ordering::Relaxed) {
+                        crate::DL_RUN => {}
+                        crate::DL_CANCEL => return Err("cancelled".to_string()),
+                        _ => return Err("paused".to_string()),
                     }
                 }
-                file.flush().await.map_err(|e| e.to_string())?;
-                Ok(())
+                out.flush()
+                    .await
+                    .map_err(|e| crate::download_failure::plain_io(&e))?;
+                drop(out);
+                tokio::fs::rename(&partial, &dest)
+                    .await
+                    .map_err(|e| crate::download_failure::plain_io(&e))
             }
-            .await
+            .await;
+            match &fetched {
+                // Without a range resume, a paused transfer restarts, so nothing is kept.
+                Err(why) if why == "paused" || why == "cancelled" => {
+                    let _ = tokio::fs::remove_file(&partial).await;
+                    let mut t = tracker.write().await;
+                    if let Some(e) = t.get_mut(&key) {
+                        e.status = why.clone();
+                        if why == "cancelled" {
+                            e.finished_at = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = tokio::fs::remove_file(&partial).await;
+                }
+                Ok(()) => {}
+            }
+            fetched
         };
 
     match result {
         Ok(()) => {
-            tracing::info!("Downloaded {} to {:?}", filename, dest);
+            tracing::info!("Downloaded {} to {:?}", key, dest);
             {
                 let mut t = tracker.write().await;
-                if let Some(e) = t.get_mut(&filename) {
+                if let Some(e) = t.get_mut(&key) {
                     e.status = "done".to_string();
                     e.finished_at = Some(std::time::Instant::now());
                 }
@@ -6698,17 +6712,25 @@ async fn spawn_tracked_download<F>(
             on_done.await;
         }
         Err(err) => {
-            tracing::error!("Download {} failed: {}", filename, err);
             let mut t = tracker.write().await;
-            if let Some(e) = t.get_mut(&filename) {
-                e.status = "error".to_string();
-                e.finished_at = Some(std::time::Instant::now());
+            let Some(e) = t.get_mut(&key) else {
+                return;
+            };
+            // A pause or a cancel already set its own status; it is not a failure.
+            if matches!(e.status.as_str(), "paused" | "cancelled") {
+                tracing::info!("Download {} {}", key, e.status);
+                return;
             }
+            tracing::error!("Download {} failed: {}", key, err);
+            e.status = "error".to_string();
+            e.error = Some(err);
+            e.finished_at = Some(std::time::Instant::now());
         }
     }
 }
 
 /// Resumable HF fetch into `hf_cache/blobs`; `dest` is symlinked to the blob to keep flat paths.
+/// A pinned file must arrive at its pinned size and hash.
 async fn download_via_hf_cache_tracked(
     repo_id: &str,
     revision: &str,
@@ -6716,18 +6738,18 @@ async fn download_via_hf_cache_tracked(
     dest: &std::path::Path,
     data_dir: &std::path::Path,
     tracker_key: &str,
-    tracker: &Arc<tokio::sync::RwLock<std::collections::HashMap<String, DownloadEntry>>>,
+    tracker: &Tracker,
 ) -> Result<(), String> {
     let cache = pond_hf_cache::HfCache::new(data_dir);
     let token: Option<String> = hf_token_from_env().or_else(|| cache.token().map(String::from));
-    let client =
-        pond_hf_cache::build_redirect_aware_client(token.as_deref()).map_err(|e| e.to_string())?;
+    let client = pond_hf_cache::build_redirect_aware_client(token.as_deref())
+        .map_err(|e| crate::download_failure::plain_failure(&e))?;
 
     let repo = cache
         .repo(repo_id.to_string())
         .with_revision(revision.to_string());
     let fetch = repo.file(fname.to_string());
-    let fetch = match pond_core::models::domain::litert::pinned(repo_id, revision, fname) {
+    let fetch = match pond_core::models::domain::curated::file_pin(repo_id, revision, fname) {
         Some(pin) => fetch.expect_size(pin.size_bytes).expect_etag(pin.sha256),
         None => fetch,
     };
@@ -6764,16 +6786,23 @@ async fn download_via_hf_cache_tracked(
     {
         Ok(p) => p,
         Err(e) if pond_hf_cache::is_stopped(&e) => {
-            // Expected. The `.incomplete` file stays for a resume; cancel is this plus a delete.
+            // A pause keeps `.incomplete` for a resume; a cancel throws it away.
             let cancelled = control.load(std::sync::atomic::Ordering::Relaxed) == crate::DL_CANCEL;
+            let partial = pond_hf_cache::stopped_incomplete(&e).map(std::path::Path::to_path_buf);
+            if cancelled {
+                if let Some(p) = &partial {
+                    let _ = tokio::fs::remove_file(p).await;
+                }
+            }
             let mut t = tracker.write().await;
             if let Some(entry) = t.get_mut(tracker_key) {
                 entry.status = if cancelled { "cancelled" } else { "paused" }.to_string();
-                entry.finished_at = Some(std::time::Instant::now());
+                entry.finished_at = cancelled.then(std::time::Instant::now);
+                entry.partial = if cancelled { None } else { partial };
             }
             return Err(if cancelled { "cancelled" } else { "paused" }.to_string());
         }
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(crate::download_failure::plain_failure(&e)),
     };
 
     if let Some(parent) = dest.parent() {
@@ -6782,8 +6811,77 @@ async fn download_via_hf_cache_tracked(
     let _ = tokio::fs::remove_file(dest).await;
     link_or_copy_blob(&blob_path, dest)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::download_failure::plain_failure(&e))?;
     Ok(())
+}
+
+/// A Piper voice's `.onnx.json` config, fetched beside its weights; a failure only logs.
+pub(crate) async fn fetch_tts_config(state: &AppState, record: &ModelRecord) {
+    let (Some(url), Some(name), Some(data_dir)) = (
+        record.config_url.as_deref(),
+        record.config_filename.as_deref(),
+        state.data_dir.as_deref(),
+    ) else {
+        return;
+    };
+    let Some(dest) = model_layout::path_for(data_dir, &ModelCategory::TtsPiper, name) else {
+        return;
+    };
+    if let Some(parent) = dest.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    // A separate hop to its own host: gate it separately from the weights.
+    match pond_core::shared::services::egress::begin(url, "GET") {
+        Err(denied) => tracing::warn!("TTS config file {name} not fetched: {denied}"),
+        Ok(call) => {
+            let sent = state.http_client.get(url).send().await;
+            call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+            match sent {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(bytes) = resp.bytes().await {
+                        let _ = tokio::fs::write(&dest, &bytes).await;
+                    }
+                }
+                _ => tracing::warn!("Failed to download TTS config file {}", name),
+            }
+        }
+    }
+}
+
+/// How long learning a file's size may hold up the request that names it.
+const SIZE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The size the file at `url` would download at, asked before anything is fetched (a HEAD
+/// chain, gated hop by hop); `None` when the host does not say or does not answer in time.
+pub(crate) async fn remote_size(data_dir: &std::path::Path, url: &str) -> Option<u64> {
+    remote_size_within(data_dir, url, SIZE_PROBE_TIMEOUT).await
+}
+
+pub(crate) async fn remote_size_within(
+    data_dir: &std::path::Path,
+    url: &str,
+    limit: std::time::Duration,
+) -> Option<u64> {
+    let token = pond_hf_cache::parse_hf_url(url).and_then(|_| {
+        hf_token_from_env().or_else(|| {
+            pond_hf_cache::HfCache::new(data_dir)
+                .token()
+                .map(String::from)
+        })
+    });
+    let client = pond_hf_cache::build_redirect_aware_client(token.as_deref()).ok()?;
+    let asked = pond_hf_cache::remote_length(&client, url, token.as_deref());
+    match tokio::time::timeout(limit, asked).await {
+        Ok(Ok(size)) => size,
+        Ok(Err(e)) => {
+            tracing::info!(url, error = %e, "the size could not be learned before downloading");
+            None
+        }
+        Err(_) => {
+            tracing::info!(url, "the host did not say the size in time");
+            None
+        }
+    }
 }
 
 fn hf_token_from_env() -> Option<String> {
@@ -9994,6 +10092,9 @@ async fn agent_chat_stream(
         .get("images")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+    if let Err(resp) = refuse_without_a_model(&state).await {
+        return resp.into_response();
+    }
     if let Err(resp) = image_limit_response(&images) {
         return resp.into_response();
     }
@@ -16759,6 +16860,13 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_reading_lets_the_primary_pick_fit() {
+        // Gemma 4 E4B QAT (4,020 MB) against a 32 GB desktop's own reading, then the board's.
+        assert_eq!(model_spills_budget(4_020, 22_000), Some(false));
+        assert_eq!(model_spills_budget(4_020, 1_000 + 3_000), Some(true));
+    }
+
+    #[test]
     fn model_spills_budget_spills_large_model() {
         // gemma3n:e2b real download (~5600 MB) spills a 4096 MB budget.
         assert_eq!(model_spills_budget(5600, 4096), Some(true));
@@ -16786,6 +16894,33 @@ mod tests {
     fn model_spills_budget_headroom_matches_desktop() {
         // Mirrors the desktop's DEFAULT_HEADROOM_MB so the server warning and UI badge agree.
         assert_eq!(MEMORY_FIT_HEADROOM_MB, 1024);
+    }
+
+    /// The progress list says which pauses keep what has arrived.
+    #[tokio::test]
+    async fn only_a_hugging_face_transfer_is_resumable() {
+        let tracker: Tracker = Arc::new(tokio::sync::RwLock::new(Default::default()));
+        for (url, resumable) in [
+            ("https://huggingface.co/o/r/resolve/main/m.gguf", true),
+            ("https://example.com/m.gguf", false),
+        ] {
+            let file = TrackedFile {
+                url: url.to_string(),
+                dest: "/pond/models/gguf/m.gguf".into(),
+                key: url.to_string(),
+                category: "gguf".into(),
+                model_id: None,
+                part: None,
+                size_bytes: None,
+            };
+            begin_tracking(&tracker, &file).await;
+            let entry = tracker.read().await[url].clone();
+            assert_eq!(entry.resumable, resumable, "{url}");
+            assert_eq!(
+                serde_json::to_value(&entry).unwrap()["resumable"],
+                resumable
+            );
+        }
     }
 
     #[test]
@@ -17430,7 +17565,7 @@ mod tests {
     mod vision_gate {
         use super::*;
         use pond_core::models::domain::vision_encoder::{
-            encoder_for, EncoderState, FailReason, MESH_MESSAGE, NOT_DECLARED_MESSAGE,
+            encoder_for_model, EncoderState, FailReason, MESH_MESSAGE, NOT_DECLARED_MESSAGE,
         };
 
         const E2B: &str = "gemma-4-E2B-it-Q4_K_M";
@@ -17440,7 +17575,8 @@ mod tests {
             provider: &str,
             model: &str,
         ) -> Option<(StatusCode, Value)> {
-            vision_refusal_response(state.as_ref(), provider, model)
+            let spec = encoder_for_model(model, None);
+            vision_refusal_response(state.as_ref(), provider, model, spec.as_ref())
                 .err()
                 .map(|(status, Json(body))| (status, body))
         }
@@ -17523,12 +17659,12 @@ mod tests {
 
         #[test]
         fn the_status_line_speaks_only_where_the_server_has_something_to_say() {
-            let spec = encoder_for(E2B);
+            let spec = encoder_for_model(E2B, None);
             assert_eq!(
                 vision_status_message("local", &EncoderState::Absent, spec.as_ref()).as_deref(),
                 Some(
-                    "Picture support for Gemma 4 E2B needs a one-time 941 MB download. It starts \
-                     by itself; text chat works meanwhile."
+                    "Picture support for Gemma 4 E2B is a separate 941 MB download. Add it on the \
+                     Models page; text chat works meanwhile."
                 )
             );
             for quiet in [
@@ -17547,7 +17683,7 @@ mod tests {
 
         #[test]
         fn the_status_size_is_the_encoders_and_only_where_one_is_involved() {
-            let spec = encoder_for(E2B);
+            let spec = encoder_for_model(E2B, None);
             assert_eq!(
                 vision_status_size(&EncoderState::Absent, spec.as_ref()),
                 Some(986_833_728)
@@ -17592,89 +17728,11 @@ mod tests {
             provider.chat_provider = "local".into();
             assert!(save_needs_prewarm(&current, &provider));
 
-            // let mut switch = current.clone();
-            // switch.speculative_decoding_enabled = !current.speculative_decoding_enabled;
-            // assert!(save_needs_prewarm(&current, &switch));
             // Unrelated fields never warm.
             let mut other = current.clone();
             other.assistant_name = "Heron".into();
             other.mic_enabled = !current.mic_enabled;
             assert!(!save_needs_prewarm(&current, &other));
-        }
-
-        #[test]
-        fn encoders_and_drafters_are_companions_and_chat_models_are_not() {
-            for companion in [
-                "mmproj-BF16.gguf",
-                "subdir/mmproj-F16.gguf",
-                "mtp-gemma-4-E2B-it.gguf",
-                "gemma-4-E2B-it-assistant-F16.gguf",
-                "gemma-4-E4B-it-assistant-Q8_0.gguf",
-            ] {
-                assert!(is_companion_gguf(companion), "{companion}");
-            }
-            for chat in [
-                "gemma-4-E2B-it-Q4_K_M.gguf",
-                "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
-                "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-                "Nemotron3-Nano-4B.gguf",
-            ] {
-                assert!(!is_companion_gguf(chat), "{chat}");
-            }
-            assert!(is_companion_architecture(Some("clip")));
-            assert!(is_companion_architecture(Some("gemma4-assistant")));
-            assert!(!is_companion_architecture(Some("gemma4")));
-            assert!(!is_companion_architecture(None));
-        }
-
-        /// An agent that answers `vision_state` from a fixed table, for `gguf_vision_facts`.
-        struct TableAgent(Option<EncoderState>);
-
-        #[async_trait::async_trait]
-        impl pond_core::models::ports::agent::Agent for TableAgent {
-            async fn chat(
-                &self,
-                _request: pond_core::shared::domain::agent::AgentRequest,
-            ) -> anyhow::Result<pond_core::shared::domain::agent::AgentResponse> {
-                unimplemented!("not exercised")
-            }
-            async fn chat_stream(
-                &self,
-                _request: pond_core::shared::domain::agent::AgentRequest,
-            ) -> anyhow::Result<
-                futures::stream::BoxStream<
-                    'static,
-                    anyhow::Result<pond_core::shared::domain::agent::AgentStreamEvent>,
-                >,
-            > {
-                unimplemented!("not exercised")
-            }
-            fn vision_state(&self, provider: &str, _model: &str) -> Option<EncoderState> {
-                assert_eq!(provider, "local", "a GGUF row is asked about as `local`");
-                self.0.clone()
-            }
-        }
-
-        #[test]
-        fn a_gguf_row_reads_images_by_the_agents_verdict_and_by_the_table_without_one() {
-            // The agent's verdict wins: on a budgeted device a Gemma may be declined.
-            assert_eq!(
-                gguf_vision_facts(&TableAgent(Some(EncoderState::NotOnThisDevice)), E2B),
-                (false, None)
-            );
-            assert_eq!(
-                gguf_vision_facts(&TableAgent(Some(EncoderState::Absent)), E2B),
-                (true, Some(986_833_728))
-            );
-            // No verdict, or unknown: pond-core's pinned table decides.
-            assert_eq!(
-                gguf_vision_facts(&TableAgent(None), E2B),
-                (true, Some(986_833_728))
-            );
-            assert_eq!(
-                gguf_vision_facts(&TableAgent(Some(EncoderState::Unknown)), "Llama-3.2-3B"),
-                (false, None)
-            );
         }
     }
 }

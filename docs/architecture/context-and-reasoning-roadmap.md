@@ -442,6 +442,10 @@ ever produce the engine's "[Image attached - image input is not supported...]".
     GGUF, or clears them.
   - Triggers: serve start (the active chat model), a finished model download,
     activation, and a chat-model change.
+  - **Changed 2026-10-05:** the table became the generated pairing table
+    (`crates/pond-core/data/vision-pairings.jsonl`), and none of those triggers fetches any
+    more. The encoder comes down only as part of a model's download (included by default) or
+    through `POST /models/{category}/{name}/companions/pictures`; see `docs/developer/models.md`.
   - `GET /models/vision-status`, and the chat routes refuse a picture turn that
     is not ready with 409 before anything is saved. WebP is transcoded (the
     engine's `stb_image` cannot read it).

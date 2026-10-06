@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::models::domain::model_record::{BinaryRecord, ModelCategory, ModelRecord};
+use crate::models::domain::model_record::{BinaryRecord, ModelRecord};
 use crate::models::ports::model_storage::ModelStorage;
 
 /// Mock storage with three configurable presence modes.
@@ -40,18 +40,7 @@ impl ModelStorage for MockModelStorage {
                 Some(PathBuf::from(format!("/mock/never/{filename}")))
             }
             Self::FileSystemBacked { base } => {
-                let subdir = match record.category {
-                    ModelCategory::Whisper => "models",
-                    ModelCategory::Llamafile => "models/llm",
-                    ModelCategory::Gguf => "models/gguf",
-                    ModelCategory::Litert => "models/litertlm",
-                    ModelCategory::TtsPiper => "models/tts",
-                    ModelCategory::TtsKokoro => "models/kokoro/voices",
-                    ModelCategory::Ollama | ModelCategory::TtsHttp | ModelCategory::Embedding => {
-                        return None
-                    }
-                };
-                Some(base.join(subdir).join(filename))
+                crate::models::domain::model_layout::path_for(base, &record.category, filename)
             }
         }
     }

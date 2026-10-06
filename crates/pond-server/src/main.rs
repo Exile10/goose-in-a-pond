@@ -17,9 +17,7 @@ use pond_server::tls_identity;
 mod model_download;
 mod node_path;
 mod ports;
-mod reqwest_model_downloader;
 mod schedule_executors;
-mod startup;
 mod system_deps;
 mod three_stage_consolidator;
 mod tracing_setup;
@@ -1101,11 +1099,6 @@ async fn run_server(
 
     // Apply the mic privacy setting before anything can open a device.
     pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
-    // // The speculation switch, before any local adapter is built: `apply_*_settings` decides the
-    // // drafter from it each time one is, and would otherwise turn it back on.
-    // pond_core::models::domain::drafter::set_speculation_enabled(
-    //     settings.speculative_decoding_enabled,
-    // );
 
     // Serve never opens the mic (only `/transcribe`), but `WhisperRsInput::new` needs a handle.
     let (mic_handle, _mic_owner_join) = pond_audio::spawn(
@@ -1332,30 +1325,6 @@ async fn run_server(
         }
     }
     sync_assignments_to_settings(&*model_repo, &settings_repo_early).await;
-
-    // Detached so the HTTP server comes up without waiting on downloads.
-    {
-        use crate::filesystem_model_storage::FilesystemModelStorage;
-        use crate::reqwest_model_downloader::ReqwestModelDownloader;
-        use crate::startup::auto_download_assigned_models;
-
-        let dl_repo: Arc<
-            dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync,
-        > = model_repo.clone();
-        let dl_storage: Arc<
-            dyn pond_core::models::ports::model_storage::ModelStorage + Send + Sync,
-        > = Arc::new(FilesystemModelStorage::new(&data_dir));
-        let dl_downloader: Arc<
-            dyn pond_core::models::ports::model_downloader::ModelDownloader + Send + Sync,
-        > = Arc::new(ReqwestModelDownloader);
-
-        tokio::spawn(async move {
-            let n = auto_download_assigned_models(dl_repo, dl_storage, dl_downloader).await;
-            if n > 0 {
-                tracing::info!("auto_download: triggered {n} download(s) for role-assigned models");
-            }
-        });
-    }
 
     // `try_start` fetches a missing model itself through ModelService.
     let any_role_needs_llamafile = settings.chat_provider == "llamafile";
@@ -1622,43 +1591,6 @@ async fn run_server(
 
     let effective_chat_provider = settings.chat_provider.clone();
     let effective_chat_model = settings.chat_model.clone();
-
-    // Speculative decoding is out of the engine: restore this if it returns.
-    // // The speculative-decoding drafter, provisioned the way the TTS engine is:
-    // // a helper model nobody asked for and nobody should have to think about.
-    // // Measured on the Orin, it takes a real turn from 31 to 49 tok/s.
-    // //
-    // // Before ANY provider is built, because both consumers read the registry
-    // // and neither re-reads it: `apply_jetson_settings` sizes the context window
-    // // against the models that will be resident and sets `draft_model` from the
-    // // registry, and it runs when the local adapter is constructed a few lines
-    // // below. Registering after that point costs a restart to converge.
-    // //
-    // // Failure is silent by design -- decode is simply not accelerated. The
-    // // notification further down is the last resort, and it is down there
-    // // because the queue to put it on does not exist yet.
-    // //
-    // // Only while the switch in Settings is on: a household that turned
-    // // speculation off asked for neither the download nor that notice.
-    // let drafter_wanted = settings.speculative_decoding_enabled
-    //     && model_download::drafter_for(&settings.chat_model).is_some();
-    // let drafter_ready = if drafter_wanted {
-    //     let present = model_download::ensure_mtp_drafter(&data_dir, &settings.chat_model)
-    //         .await
-    //         .is_some();
-    //     // The registry row is what the engine resolves a drafter by name
-    //     // through, so a downloaded file with no row is invisible.
-    //     #[cfg(feature = "goose-agent")]
-    //     if present {
-    //         pond_adapters_goose::mtp_drafter::ensure_drafter_registered(
-    //             &data_dir,
-    //             &settings.chat_model,
-    //         );
-    //     }
-    //     present
-    // } else {
-    //     false
-    // };
 
     // ── Build per-role LLM providers ────────────────────────────────────────
     // TODO(cloud-fallback): wire `cloud_fallback_enabled` (spill to cloud on local failure only).
@@ -3185,7 +3117,7 @@ async fn run_server(
             Some(session_storage.clone()),
             Some(model_repo.clone()),
             false, // voice_mode — server mode, not voice
-            true,  // model_provisioning — the serve process owns companion downloads
+            true,  // model_provisioning — the serve process verifies add-ons on disk
             mesh_provider.clone(),
         )
         .await
@@ -3508,33 +3440,6 @@ async fn run_server(
         pond_infra::sqlite_notification_queue::SqliteNotificationQueue::new(db.system.clone()),
     );
 
-    // Speculative decoding is out of the engine: restore this if it returns.
-    // // Last resort: the pond goes on without the helper and nothing else would
-    // // ever say so. In the words of the switch that controls it, and with no
-    // // claim about speed: guessing ahead measured faster on the Orin and slower
-    // // on a Mac, so "replies are just slower" was only true on one of them.
-    // if drafter_wanted && !drafter_ready {
-    //     let label = pond_core::models::domain::vision_encoder::encoder_for(&settings.chat_model)
-    //         .map(|spec| spec.label)
-    //         .unwrap_or("this model");
-    //     let helper_mb = model_download::drafter_for(&settings.chat_model)
-    //         .map(|spec| spec.approx_mb)
-    //         .unwrap_or(0);
-    //     let notice = pond_core::mcp::ports::notification::Notification {
-    //         id: uuid::Uuid::new_v4().to_string(),
-    //         target: "broadcast".to_string(),
-    //         category: "info".to_string(),
-    //         title: "Guessing ahead is not running".to_string(),
-    //         body: format!(
-    //             "The {helper_mb} MB helper model for {label} could not be downloaded, so \
-    //              replies arrive without it. The pond tries again at its next start."
-    //         ),
-    //         timestamp: chrono::Utc::now().to_rfc3339(),
-    //         data: None,
-    //     };
-    //     let _ = notification_queue.enqueue(notice.clone()).await;
-    //     let _ = notification_tx.send(notice);
-    // }
     // FCM v1 when a service-account key exists (data-only wake pings, no content via Google).
     let fcm_key_path = std::env::var("POND_FCM_KEY_PATH")
         .map(std::path::PathBuf::from)
@@ -4338,10 +4243,16 @@ async fn run_server(
         inference_lane.clone(),
         last_user_activity.clone(),
     ));
-    // Picture support in the background (~1 GB, never awaited). Single-flight with the prewarm's
-    // ensure, and still runs under POND_DISABLE_PREWARM.
-    if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
-        state.agent.prepare_model(&settings.chat_model);
+    // Brings back an assigned model whose file is missing, through the tracker so it shows on
+    // the Models page; detached so the server comes up without waiting on it.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let n = pond_api::model_acquisition::restore_assigned_models(state).await;
+            if n > 0 {
+                tracing::info!("restore: started {n} download(s) for role-assigned models");
+            }
+        });
     }
 
     let companion =
@@ -4809,11 +4720,6 @@ async fn run_chat(
 
     // Apply the microphone privacy setting before anything can open a device.
     pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
-    // // The speculation switch, before any local adapter is built: `apply_*_settings` decides the
-    // // drafter from it each time one is, and would otherwise turn it back on.
-    // pond_core::models::domain::drafter::set_speculation_enabled(
-    //     settings.speculative_decoding_enabled,
-    // );
 
     // Every capture path must use this one mic owner. 15_000 ms covers the wake-word detector's
     // ~13.4 s history with headroom (see `pond_audio::spawn`).
@@ -4833,6 +4739,17 @@ async fn run_chat(
 
     // Held until after `ready`, which the NDJSON contract requires to be the first line.
     let deferred_diagnostics: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+
+    // Said up front; each turn is refused the same way until a model is chosen.
+    if let Err(no) = pond_core::models::domain::conversation_model::require_conversation_model(
+        effective_provider,
+        effective_model,
+    ) {
+        out!("  Think    {no}");
+        if json_events {
+            deferred_diagnostics.borrow_mut().push(no.to_string());
+        }
+    }
 
     let effective_tts_owned: String;
     let effective_tts: &str = match tts {
@@ -5992,7 +5909,13 @@ async fn run_quiet_compaction(
                 continue;
             }
         };
-        let enabled = settings.context_monitor_enabled && settings.hybrid_compaction_enabled;
+        // With no conversation model chosen there is nothing to compact with.
+        let enabled = settings.context_monitor_enabled
+            && settings.hybrid_compaction_enabled
+            && pond_core::models::domain::conversation_model::conversation_model_chosen(
+                &settings.chat_provider,
+                &settings.chat_model,
+            );
         // Never during a turn, even by hand: the lane counts a running turn as no quiet, but a
         // hand-asked tick waives that, and this pass rewrites the history a turn is answering in.
         let turn_running = state.runs.turn_in_flight();
@@ -7971,7 +7894,7 @@ async fn build_goose_backend(
     // Supply it: without the catalog an Ollama model's context window is guessed from its name.
     model_repo: Option<Arc<dyn ModelRepository>>,
     voice_mode: bool,
-    // True only in serve: this process fetches and repairs companion files like the encoder.
+    // True only in serve: this process verifies add-ons on disk and sets a wrong one aside.
     model_provisioning: bool,
     // Locked so mesh enabled at runtime applies next turn; CLI callers pass a permanent `None`.
     mesh_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
@@ -8266,15 +8189,15 @@ async fn seed_model_catalog(repo: &dyn ModelRepository, data_dir: &std::path::Pa
         }
     };
 
-    let count = models.len();
-    for mut record in models {
-        record.downloaded = storage.is_present(&record);
-        if let Err(e) = repo.upsert(&record).await {
-            tracing::warn!("Failed to seed model '{}': {e}", record.name);
-        }
+    let present = move |r: &ModelRecord| storage.path_for(r).map(|p| p.exists());
+    match pond_core::models::services::model_service::apply_catalog(repo, models, &present).await {
+        Ok(applied) => tracing::info!(
+            upserted = applied.upserted,
+            pruned = applied.pruned,
+            "model catalog seeded"
+        ),
+        Err(e) => tracing::warn!("Failed to seed the model catalog: {e}"),
     }
-
-    tracing::info!("model catalog seeded ({count} records)");
 }
 
 /// Mirrors role assignments, the source of truth, into settings; unassigned roles are untouched.
@@ -8291,9 +8214,8 @@ async fn sync_assignments_to_settings(
     };
 
     for a in &assignments {
-        // model_id format: "{category}/{name}"
-        let model_name = a.model_id.split('/').nth(1).unwrap_or(&a.model_id);
-        let category = a.model_id.split('/').next().unwrap_or("");
+        // "{category}/{name}"; an Ollama name may hold a slash of its own ("dimavz/whisper-tiny").
+        let (category, model_name) = a.model_id.split_once('/').unwrap_or(("", &a.model_id));
 
         match a.role.as_str() {
             "chat" => {
@@ -8466,14 +8388,8 @@ async fn run_models(action: ModelAction) -> Result<()> {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("Model '{id}' has no filename"))?;
 
-            let subdir = match cat {
-                ModelCategory::Whisper => "models",
-                ModelCategory::Llamafile => "models/llm",
-                ModelCategory::Gguf => "models/gguf",
-                ModelCategory::TtsPiper => "models/tts",
-                _ => "models",
-            };
-            let dest = data_dir.join(subdir).join(filename);
+            let dest = pond_core::models::domain::model_layout::path_for(&data_dir, &cat, filename)
+                .ok_or_else(|| anyhow::anyhow!("Model '{id}' has no file to download"))?;
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -8483,8 +8399,12 @@ async fn run_models(action: ModelAction) -> Result<()> {
 
             // For Piper TTS models also download the companion .onnx.json config file.
             if cat == ModelCategory::TtsPiper {
-                if let (Some(cf), Some(cu)) = (&record.config_filename, &record.config_url) {
-                    let config_dest = data_dir.join(subdir).join(cf);
+                let config_dest = record.config_filename.as_deref().and_then(|cf| {
+                    pond_core::models::domain::model_layout::path_for(&data_dir, &cat, cf)
+                });
+                if let (Some(cf), Some(cu), Some(config_dest)) =
+                    (&record.config_filename, &record.config_url, config_dest)
+                {
                     if !config_dest.exists() {
                         println!("Downloading config {} → {}", cu, config_dest.display());
                         if let Err(e) = model_download::download_file(cu, &config_dest, 0).await {
@@ -8511,21 +8431,18 @@ async fn run_models(action: ModelAction) -> Result<()> {
 
             let assignments = repo.list_assignments().await?;
             if let Some(a) = assignments.iter().find(|a| a.model_id == id) {
+                use pond_core::models::domain::{curated, model_role::ModelRole, taxonomy};
                 anyhow::bail!(
-                    "Model is assigned to role '{}'. Deactivate it first.",
-                    a.role
+                    "{} is doing a job right now ({}). Give that job to another model first.",
+                    taxonomy::title(&record, curated::for_record(&record).map(|p| p.title)),
+                    ModelRole::job_for(&a.role)
                 );
             }
 
-            if let Some(filename) = &record.filename {
-                let subdir = match cat {
-                    ModelCategory::Whisper => "models",
-                    ModelCategory::Llamafile => "models/llm",
-                    ModelCategory::Gguf => "models/gguf",
-                    ModelCategory::TtsPiper => "models/tts",
-                    _ => "models",
-                };
-                let path = data_dir.join(subdir).join(filename);
+            let path = record.filename.as_deref().and_then(|filename| {
+                pond_core::models::domain::model_layout::path_for(&data_dir, &cat, filename)
+            });
+            if let Some(path) = path {
                 if path.exists() {
                     std::fs::remove_file(&path)?;
                     println!("✓ Deleted {}", path.display());
@@ -8720,9 +8637,6 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     pond_core::shared::services::egress::set_network_mode(
         pond_core::shared::services::egress::NetworkMode::parse(&settings.network_mode),
     );
-    // pond_core::models::domain::drafter::set_speculation_enabled(
-    //     settings.speculative_decoding_enabled,
-    // );
     // Used only when chat_provider = "llamafile"; other providers route themselves.
     let llamafile_url = format!("http://127.0.0.1:{}", ports::llamafile_port());
 
@@ -9457,6 +9371,30 @@ mod tests {
         let settings = settings_repo.get().await.unwrap();
         assert_eq!(settings.chat_provider, "ollama");
         assert_eq!(settings.chat_model, "llama3.2");
+    }
+
+    /// An Ollama name can hold a slash of its own; only the first one ends the category.
+    #[tokio::test]
+    async fn sync_keeps_a_namespaced_ollama_name_whole() {
+        use pond_core::models::ports::model_repository::ModelRepository;
+        use pond_core::user_data::ports::settings::SettingsRepository;
+        use pond_infra::db::Database;
+        use pond_infra::sqlite_model_repository::SqliteModelRepository;
+        use pond_infra::sqlite_settings::SqliteSettingsRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteModelRepository::new(db.system.clone());
+        let settings_repo = SqliteSettingsRepository::new(db.system.clone());
+        repo.set_assignment("chat", "ollama/library/qwen3:4b")
+            .await
+            .unwrap();
+
+        sync_assignments_to_settings(&repo, &settings_repo).await;
+
+        let settings = settings_repo.get().await.unwrap();
+        assert_eq!(settings.chat_provider, "ollama");
+        assert_eq!(settings.chat_model, "library/qwen3:4b");
     }
 
     #[tokio::test]

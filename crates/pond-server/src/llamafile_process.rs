@@ -30,22 +30,29 @@ pub async fn is_running(port: u16) -> bool {
 
 // ── Binary lookup ─────────────────────────────────────────────────────────────
 
-/// First `.llamafile` (`.llamafile.exe` on Windows) in `<data_dir>/models/llm/`.
-pub fn find_model(data_dir: &Path) -> Option<PathBuf> {
-    let llm_dir = data_dir.join("models").join("llm");
-    let entries = std::fs::read_dir(&llm_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let is_llamafile = name.ends_with(".llamafile") || name.ends_with(".llamafile.exe");
-        if is_llamafile {
-            return Some(path);
-        }
-    }
-    None
+/// The file of the chosen llamafile model: its catalogue row's, else its name as a file.
+async fn chosen_file(
+    data_dir: &Path,
+    model_service: &pond_core::models::services::model_service::ModelService,
+    name: &str,
+) -> Option<PathBuf> {
+    use pond_core::models::domain::model_layout::path_for;
+    use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
+    let recorded = model_service
+        .get(&ModelRecord::id_for(&ModelCategory::Llamafile, name))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.filename);
+    [
+        recorded,
+        Some(name.to_string()),
+        Some(format!("{name}.llamafile")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|f| path_for(data_dir, &ModelCategory::Llamafile, &f))
+    .find(|p| p.is_file())
 }
 
 // ── Spawn ─────────────────────────────────────────────────────────────────────
@@ -110,8 +117,8 @@ pub fn url_for(port: u16) -> String {
     format!("http://127.0.0.1:{}", port)
 }
 
-/// Check, find (downloading if needed), spawn on the first free port. Never errors: `None`
-/// if the base port already serves, or on any failure, which is printed.
+/// Spawn the chosen llamafile on the first free port; never downloads. Never errors: `None` if
+/// the base port already serves, none is chosen or on disk, or on any failure, which is printed.
 pub async fn try_start(
     data_dir: &Path,
     model_service: std::sync::Arc<pond_core::models::services::model_service::ModelService>,
@@ -132,68 +139,28 @@ pub async fn try_start(
         }
     };
 
-    // Resolve a model name (argument, chat role, then catalog) and download it if needed.
-    let preferred_model = {
-        use pond_core::models::domain::model_record::ModelCategory;
-
-        let resolved_name: Option<String> = match model_name {
-            Some(name) if !name.is_empty() => Some(name.to_string()),
-            _ => if let Ok(Some(record)) = model_service.model_for_role("chat").await {
-                if record.category == ModelCategory::Llamafile {
-                    Some(record.name.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
+    // A chosen llamafile runs. None chosen, none runs, and nothing is fetched on its behalf: an
+    // assigned model whose file is missing comes back through the boot restore.
+    let chosen: Option<String> = match model_name {
+        Some(name) if !name.trim().is_empty() => Some(name.to_string()),
+        _ => match model_service.model_for_role("chat").await {
+            Ok(Some(record))
+                if record.category
+                    == pond_core::models::domain::model_record::ModelCategory::Llamafile =>
+            {
+                Some(record.name)
             }
-            .or_else(|| None),
-        };
-
-        let resolved_name = match resolved_name {
-            Some(n) => Some(n),
-            None => {
-                match model_service
-                    .list_by_category(&ModelCategory::Llamafile)
-                    .await
-                {
-                    Ok(models) => {
-                        let downloaded = models.iter().find(|m| m.downloaded);
-                        let first = downloaded.or(models.first());
-                        first.map(|m| m.name.clone())
-                    }
-                    Err(_) => None,
-                }
-            }
-        };
-
-        if let Some(ref name) = resolved_name {
-            let model_id = format!("llamafile/{}", name);
-            match model_service.ensure_downloaded(&model_id).await {
-                Ok(path) => {
-                    println!("  ✅ Model '{}' is ready", name);
-                    Some(path)
-                }
-                Err(e) => {
-                    println!("  ⚠  Could not ensure model '{}': {}", name, e);
-                    None
-                }
-            }
-        } else {
-            println!("  ⚠  No llamafile model configured or found in catalog");
-            None
-        }
+            _ => None,
+        },
     };
-
-    let model = preferred_model
-        .filter(|p| p.exists())
-        .or_else(|| find_model(data_dir));
-
-    let model = match model {
-        Some(p) => p,
+    let Some(name) = chosen else {
+        println!("  ⏭  LLM: no llamafile model is chosen");
+        return None;
+    };
+    let model = match chosen_file(data_dir, &model_service, &name).await {
+        Some(path) => path,
         None => {
-            println!("  ⚠  No LLM model found — run `pond-server setup` to download one.");
-            println!("     Chat will fall back to mock echo until a model is available.");
+            println!("  ⚠  LLM: llamafile model '{name}' is not on disk yet");
             return None;
         }
     };
@@ -212,5 +179,95 @@ pub async fn try_start(
             println!("  ⚠  Failed to start llamafile: {}", e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
+    use pond_core::models::mocks::mock_model_catalog_provider::MockModelCatalogProvider;
+    use pond_core::models::mocks::mock_model_downloader::MockModelDownloader;
+    use pond_core::models::mocks::mock_model_repository::MockModelRepository;
+    use pond_core::models::mocks::mock_model_storage::MockModelStorage;
+    use pond_core::models::ports::model_repository::ModelRepository;
+    use pond_core::models::services::model_service::ModelService;
+    use std::sync::Arc;
+
+    fn llamafile_row(name: &str) -> ModelRecord {
+        ModelRecord {
+            id: ModelRecord::id_for(&ModelCategory::Llamafile, name),
+            category: ModelCategory::Llamafile,
+            name: name.to_string(),
+            filename: Some(format!("{name}.llamafile")),
+            description: String::new(),
+            size_mb: 1950,
+            url: Some(format!("https://example.com/{name}.llamafile")),
+            hf_id: None,
+            ram_estimate_mb: None,
+            recommended_role: Some("chat".into()),
+            context_length: None,
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: None,
+            tts_voice_name: None,
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: None,
+            downloaded: false,
+            is_custom: false,
+        }
+    }
+
+    /// No model chosen, or one not on disk: nothing starts and nothing is downloaded, whatever
+    /// the catalogue offers.
+    #[tokio::test]
+    async fn nothing_is_picked_or_fetched_for_the_household() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(MockModelRepository::new());
+        repo.upsert(&llamafile_row("gemma-2b")).await.unwrap();
+        let downloader = Arc::new(MockModelDownloader::new(true));
+        let service = Arc::new(ModelService::new(
+            repo,
+            Arc::new(MockModelCatalogProvider::default()),
+            downloader.clone(),
+            Arc::new(MockModelStorage::file_system_backed(
+                tmp.path().to_path_buf(),
+            )),
+        ));
+
+        for chosen in [None, Some(""), Some("gemma-2b")] {
+            assert!(try_start(tmp.path(), service.clone(), chosen)
+                .await
+                .is_none());
+        }
+        assert_eq!(downloader.download_count().await, 0, "nothing downloaded");
+    }
+
+    #[tokio::test]
+    async fn the_chosen_file_is_found_by_its_row_or_its_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let llm = tmp.path().join("models/llm");
+        std::fs::create_dir_all(&llm).unwrap();
+        std::fs::write(llm.join("gemma-2-2b-it.Q4_K_M.llamafile"), b"exe").unwrap();
+        let repo = Arc::new(MockModelRepository::new());
+        let mut row = llamafile_row("gemma-2b");
+        row.filename = Some("gemma-2-2b-it.Q4_K_M.llamafile".into());
+        repo.upsert(&row).await.unwrap();
+        let service = ModelService::new(
+            repo,
+            Arc::new(MockModelCatalogProvider::default()),
+            Arc::new(MockModelDownloader::new(false)),
+            Arc::new(MockModelStorage::file_system_backed(
+                tmp.path().to_path_buf(),
+            )),
+        );
+        assert_eq!(
+            chosen_file(tmp.path(), &service, "gemma-2b").await,
+            Some(llm.join("gemma-2-2b-it.Q4_K_M.llamafile"))
+        );
+        assert_eq!(chosen_file(tmp.path(), &service, "missing").await, None);
     }
 }

@@ -1998,3 +1998,11 @@
   from { opacity: 0; transform: translateY(-4px); }
   to   { opacity: 1; transform: none; }
 }
+
+/* In the hub nothing pads the pane, so the reach back through the classic shell's 32px gutter
+   pushes the chat past both edges below 1180px. Here the chat is exactly its pane. */
+.ghub__main .chat2 {
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+}

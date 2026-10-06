@@ -1,0 +1,82 @@
+# Weekly refresh of the vision pairing table, crates/pond-core/data/vision-pairings.jsonl, from Hugging
+# Face. When the generator changes the table this opens a pull request, so a new pin reaches a pond only
+# through review and a release; the pond never fetches the table itself.
+#
+# Needs the repository setting "Allow GitHub Actions to create and approve pull requests". A pull
+# request opened with GITHUB_TOKEN starts no other workflow, so its checks run once a person closes and
+# reopens it or pushes to its branch. HF_TOKEN is optional; without it the requests are anonymous.
+
+name: Model pairings
+
+on:
+  schedule:
+    # Weekly, Thursday 04:41 UTC. Odd minute, away from the top of the hour and from security.yml's slot.
+    - cron: "41 4 * * 4"
+  workflow_dispatch:
+
+# Two refreshes at once would race for the same branch.
+concurrency:
+  group: model-pairings
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    name: Regenerate and propose
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # Exits non-zero, writing nothing, when a request fails; a failed run opens no pull request.
+      - name: Regenerate the table
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python3 scripts/models/vision_pairings.py > "$RUNNER_TEMP/summary.txt"
+          cat "$RUNNER_TEMP/summary.txt"
+
+      - name: Propose the change
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          table=crates/pond-core/data/vision-pairings.jsonl
+          if [ -z "$(git status --porcelain -- "$table")" ]; then
+            echo "The table is unchanged."
+            exit 0
+          fi
+          day="$(date -u +%Y-%m-%d)"
+          branch="bot/model-pairings-$day"
+          title="chore(models): refresh the vision pairing table ($day)"
+          {
+            echo "The weekly run of \`scripts/models/vision_pairings.py\` changed \`$table\`:"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/summary.txt"
+            echo '```'
+          } > "$RUNNER_TEMP/body.md"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -- "$table"
+          git commit -q -m "$title" -m "$(cat "$RUNNER_TEMP/summary.txt")"
+          git push --force origin "$branch"
+
+          number="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh pr create --base main --head "$branch" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+            number="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')"
+          fi
+
+          # Each run starts from main, so this one carries every earlier unmerged refresh.
+          gh pr list --state open --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"bot/model-pairings-\")) | select(.headRefName != \"$branch\") | .number" |
+            while read -r old; do
+              gh pr close "$old" --delete-branch --comment "Superseded by #$number."
+            done

@@ -99,8 +99,6 @@ const LOOPBACK_ONLY: &[Exempt] = &[
         non_target_urls: &[
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/",
             "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/",
-            "https://huggingface.co/Mozilla/",
-            "https://huggingface.co/{}/resolve/main/{}",
         ],
     },
 ];
@@ -484,8 +482,8 @@ fn every_entry_point_installs_the_gate_before_it_downloads() {
         "    ensure_onnx_runtime();",
         "model_download::download_file(",
         "download_and_extract_ort(",
-        // The vision encoder, fetched at serve start.
-        "agent.prepare_model(",
+        // The boot restore of an assigned model whose file is missing.
+        "restore_assigned_models(",
     ];
 
     /// Helpers, not entry points (callers own the install); named so each exemption is audited.

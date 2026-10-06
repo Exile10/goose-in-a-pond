@@ -437,8 +437,8 @@ describe("SettingsCatalogue", () => {
       await renderPage({}, WITH_LITERT);
       fireEvent.click(screen.getByRole("button", { name: /^Extensions/ }));
       const helper = screen.getByLabelText("Tool-call helper model") as HTMLSelectElement;
-      expect(texts(helper)).toContain("qwen3-1.7b");
-      expect(texts(helper)).not.toContain("gemma-4-E2B-it.litertlm");
+      expect(texts(helper)).toContain("qwen3-1.7b · llama.cpp");
+      expect(texts(helper).join("|")).not.toMatch(/litertlm|LiteRT-LM/);
     });
 
     it("shows a provider saved as gguf as local, without counting it as a change", async () => {
@@ -446,6 +446,95 @@ describe("SettingsCatalogue", () => {
       fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
       expect((screen.getByLabelText("Provider") as HTMLSelectElement).value).toBe("local");
       expect(screen.queryByRole("button", { name: /Save \d+ change/ })).toBeNull();
+    });
+  });
+
+  describe("model pickers read Title · engine", () => {
+    const texts = (select: HTMLSelectElement) => [...select.options].map((o) => o.text);
+    const values = (select: HTMLSelectElement) => [...select.options].map((o) => o.value);
+    const row = (over: Record<string, unknown>) => ({
+      id: "x", provider: "gguf", category: "gguf", is_active: false, downloaded: true,
+      kind: "conversation", recommended_role: "chat",
+      engine: { id: "llama_cpp", label: "llama.cpp", file_format: ".gguf", in_process: true },
+      ...over,
+    });
+    const picker = async (models: unknown[], overrides: Record<string, unknown> = {}) => {
+      await renderPage(overrides, models);
+      fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
+      return screen.getByLabelText("Model") as HTMLSelectElement;
+    };
+
+    it("names a model by its title and the engine that runs it, whatever the file is called", async () => {
+      const model = await picker([
+        row({ name: "gemma-4-E4B-it-qat-UD-Q4_K_XL", title: "Gemma 4 E4B", display_name: "Gemma 4 E4B Instruct, quantisation-aware 4-bit (~4.2 GB, ...)" }),
+        row({
+          name: "gemma-4-E2B-it.litertlm", title: "Gemma 4 E2B", provider: "litert", category: "litert",
+          engine: { id: "litert_lm", label: "LiteRT-LM", file_format: ".litertlm", in_process: true },
+        }),
+        row({
+          name: "qwen3:4b", title: "qwen3:4b", provider: "ollama", category: "ollama",
+          engine: { id: "ollama", label: "Ollama", file_format: null, in_process: false },
+        }),
+      ]);
+      expect(texts(model)).toEqual(expect.arrayContaining([
+        "Gemma 4 E4B · llama.cpp", "Gemma 4 E2B · LiteRT-LM", "qwen3:4b · Ollama",
+      ]));
+      // The value stays what the server reads.
+      expect(values(model)).toEqual(expect.arrayContaining(["gemma-4-E4B-it-qat-UD-Q4_K_XL", "gemma-4-E2B-it.litertlm", "qwen3:4b"]));
+      expect(texts(model).join("|")).not.toMatch(/quantisation-aware/);
+    });
+
+    it("never shows the placeholder the disk scan writes, not even for the model in use", async () => {
+      const model = await picker(
+        [row({ name: "Llama-3.2-3B-Instruct-Q4_K_M", title: "Llama-3.2-3B-Instruct-Q4_K_M", display_name: "(detected on disk)" }),
+         row({ name: "bare-file", display_name: "(detected on disk)" })],
+        { chat_model: "bare-file" },
+      );
+      expect(texts(model).join("|")).not.toMatch(/detected on disk/);
+      expect(texts(model)).toEqual(expect.arrayContaining(["Llama-3.2-3B-Instruct-Q4_K_M · llama.cpp", "bare-file · llama.cpp"]));
+      expect(model.value).toBe("bare-file");
+      expect(screen.queryByText(/detected on disk/)).toBeNull();
+    });
+
+    it("tells two rows that read alike apart, and lists a model once", async () => {
+      const model = await picker([
+        row({ name: "gemma-a", title: "Gemma 4 E4B", quantization: "Q4_K_M" }),
+        row({ name: "gemma-b", title: "Gemma 4 E4B", quantization: "Q8_0" }),
+        row({ name: "twin-a", title: "Twin", filename: "twin-a.gguf" }),
+        row({ name: "twin-b", title: "Twin", filename: "twin-b.gguf" }),
+        row({ name: "gemma-a", title: "Gemma 4 E4B", quantization: "Q4_K_M" }),
+      ]);
+      const labels = texts(model).filter((t) => /Gemma|Twin/.test(t));
+      expect(labels).toEqual([
+        "Gemma 4 E4B · llama.cpp (Q4_K_M)",
+        "Gemma 4 E4B · llama.cpp (Q8_0)",
+        "Twin · llama.cpp (twin-a.gguf)",
+        "Twin · llama.cpp (twin-b.gguf)",
+      ]);
+      expect(new Set(labels).size).toBe(labels.length);
+      expect(values(model).filter((v) => v === "gemma-a")).toHaveLength(1);
+    });
+
+    it("offers only models that can hold a conversation, but every one to the tool-call helper", async () => {
+      const models = [
+        row({ name: "gemma-4-E2B-it-qat-UD-Q4_K_XL", title: "Gemma 4 E2B" }),
+        row({ name: "functiongemma-270m", title: "FunctionGemma 270M", kind: "helper", recommended_role: "tool" }),
+      ];
+      const model = await picker(models);
+      expect(texts(model)).toContain("Gemma 4 E2B · llama.cpp");
+      expect(texts(model).join("|")).not.toMatch(/FunctionGemma/);
+      cleanup();
+
+      await renderPage({}, models);
+      fireEvent.click(screen.getByRole("button", { name: /^Extensions/ }));
+      const helper = screen.getByLabelText("Tool-call helper model") as HTMLSelectElement;
+      expect(texts(helper)).toEqual(expect.arrayContaining(["FunctionGemma 270M · llama.cpp", "Gemma 4 E2B · llama.cpp"]));
+    });
+
+    it("still keeps a stored model the registry no longer lists", async () => {
+      const model = await picker([row({ name: "here", title: "Here" })], { chat_model: "removed-model" });
+      expect(model.value).toBe("removed-model");
+      expect(texts(model)).toContain("removed-model — not installed");
     });
   });
 

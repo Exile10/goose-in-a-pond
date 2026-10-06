@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use pond_core::models::domain::curated::{self, CuratedModel};
 use pond_core::models::domain::model_record::{BinaryRecord, ModelCategory, ModelRecord};
 use pond_core::models::ports::model_catalog_provider::ModelCatalogProvider;
 
@@ -45,7 +46,7 @@ impl ModelCatalogProvider for CompositeModelCatalogProvider {
 
 // ── Static curated catalog ────────────────────────────────────────────────────
 
-/// Curated static catalog: Whisper, Kokoro TTS, Llamafile, GGUF and embedding models.
+/// The bundled catalogue: Whisper, Kokoro voices, GIAP's picks and embedding models.
 pub struct StaticModelCatalogProvider;
 
 #[async_trait]
@@ -59,9 +60,7 @@ fn static_models() -> Vec<ModelRecord> {
     let mut out = Vec::new();
     out.extend(whisper_models());
     out.extend(kokoro_tts_voices());
-    out.extend(llamafile_models());
-    out.extend(gguf_models());
-    out.extend(litert_models());
+    out.extend(curated_models());
     out.extend(embedding_models());
     out
 }
@@ -211,408 +210,29 @@ fn kokoro_tts_voices() -> Vec<ModelRecord> {
         .collect()
 }
 
-// ── Llamafile ─────────────────────────────────────────────────────────────────
+// ── GIAP's picks ──────────────────────────────────────────────────────────────
 
-struct LlamafileEntry {
-    name: &'static str,
-    filename: &'static str,
-    mozilla_repo: &'static str,
-    size_mb: u64,
-    ram_estimate_mb: u64,
-    /// The base model's declared maximum; must match the GGUF row for the same weights.
-    context_length: u32,
-    recommended_role: &'static str,
-    description: &'static str,
+/// One row per pick, downloading the pinned revision; anything else is added from Hugging Face.
+fn curated_models() -> Vec<ModelRecord> {
+    curated::CURATED.iter().map(curated_record).collect()
 }
 
-fn llamafile_record(e: &LlamafileEntry) -> ModelRecord {
-    let url = format!(
-        "https://huggingface.co/Mozilla/{}/resolve/main/{}",
-        e.mozilla_repo, e.filename
-    );
+fn curated_record(pick: &CuratedModel) -> ModelRecord {
+    let size_mb = pick.size_mb();
     ModelRecord {
-        id: ModelRecord::id_for(&ModelCategory::Llamafile, e.name),
-        category: ModelCategory::Llamafile,
-        name: e.name.to_string(),
-        filename: Some(e.filename.to_string()),
-        description: e.description.to_string(),
-        size_mb: e.size_mb,
-        url: Some(url),
-        hf_id: None,
-        ram_estimate_mb: Some(e.ram_estimate_mb),
-        recommended_role: Some(e.recommended_role.to_string()),
-        context_length: Some(e.context_length),
-        quantization: None,
-        asr_language: None,
-        asr_size: None,
-        tts_engine: None,
-        tts_voice_name: None,
-        config_filename: None,
-        config_url: None,
-        tts_url: None,
-        sample_rate: None,
-        downloaded: false,
-        is_custom: false,
-    }
-}
-
-fn llamafile_models() -> Vec<ModelRecord> {
-    let entries = vec![
-        LlamafileEntry {
-            name: "llama-1b",
-            filename: "Llama-3.2-1B-Instruct-Q4_K_M.llamafile",
-            mozilla_repo: "Llama-3.2-1B-Instruct-llamafile",
-            size_mb: 1120,
-            ram_estimate_mb: 950,
-            context_length: 131072,
-            recommended_role: "chat",
-            description: "Llama 3.2 1B Instruct Q4_K_M (~1.1 GB, fastest)",
-        },
-        LlamafileEntry {
-            name: "gemma-2b",
-            filename: "gemma-2-2b-it.Q4_K_M.llamafile",
-            mozilla_repo: "gemma-2-2b-it-llamafile",
-            size_mb: 1950,
-            ram_estimate_mb: 1800,
-            context_length: 8192,
-            recommended_role: "chat",
-            description: "Gemma 2 2B IT Q4_K_M (~2.0 GB, smarter) — default",
-        },
-        LlamafileEntry {
-            name: "llama-3b",
-            filename: "Llama-3.2-3B-Instruct-Q4_K_M.llamafile",
-            mozilla_repo: "Llama-3.2-3B-Instruct-llamafile",
-            size_mb: 2020,
-            ram_estimate_mb: 2500,
-            context_length: 131072,
-            recommended_role: "chat",
-            description: "Llama 3.2 3B Instruct Q4_K_M (~2.0 GB, balanced)",
-        },
-        LlamafileEntry {
-            name: "phi-3.5-mini",
-            filename: "Phi-3.5-mini-instruct.Q4_K_M.llamafile",
-            mozilla_repo: "Phi-3.5-mini-instruct-llamafile",
-            size_mb: 2390,
-            ram_estimate_mb: 2600,
-            context_length: 131072,
-            recommended_role: "think",
-            description: "Phi-3.5 Mini Instruct Q4_K_M (~2.4 GB, efficient reasoning)",
-        },
-        LlamafileEntry {
-            name: "mistral-7b",
-            filename: "Mistral-7B-Instruct-v0.2.Q4_K_M.llamafile",
-            mozilla_repo: "Mistral-7B-Instruct-v0.2-llamafile",
-            size_mb: 4370,
-            ram_estimate_mb: 5200,
-            context_length: 32768,
-            recommended_role: "think",
-            description: "Mistral 7B Instruct v0.2 Q4_K_M (~4.4 GB, most capable)",
-        },
-    ];
-    entries.iter().map(llamafile_record).collect()
-}
-
-// ── GGUF ──────────────────────────────────────────────────────────────────────
-
-struct GgufEntry {
-    name: &'static str,
-    filename: &'static str,
-    /// HuggingFace repo in `owner/repo` form (without `:quant` suffix)
-    hf_repo: &'static str,
-    size_mb: u64,
-    ram_estimate_mb: u64,
-    context_length: u32,
-    quantization: &'static str,
-    recommended_role: &'static str,
-    description: &'static str,
-}
-
-fn gguf_record(e: &GgufEntry) -> ModelRecord {
-    let url = format!(
-        "https://huggingface.co/{}/resolve/main/{}",
-        e.hf_repo, e.filename
-    );
-    ModelRecord {
-        id: ModelRecord::id_for(&ModelCategory::Gguf, e.name),
-        category: ModelCategory::Gguf,
-        name: e.name.to_string(),
-        filename: Some(e.filename.to_string()),
-        description: e.description.to_string(),
-        size_mb: e.size_mb,
-        url: Some(url),
-        hf_id: Some(format!("{}:{}", e.hf_repo, e.quantization)),
-        ram_estimate_mb: Some(e.ram_estimate_mb),
-        recommended_role: Some(e.recommended_role.to_string()),
-        context_length: Some(e.context_length),
-        quantization: Some(e.quantization.to_string()),
-        asr_language: None,
-        asr_size: None,
-        tts_engine: None,
-        tts_voice_name: None,
-        config_filename: None,
-        config_url: None,
-        tts_url: None,
-        sample_rate: None,
-        downloaded: false,
-        is_custom: false,
-    }
-}
-
-fn gguf_models() -> Vec<ModelRecord> {
-    let entries = vec![
-        GgufEntry {
-            name: "llama-3.2-1b",
-            filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-            hf_repo: "bartowski/Llama-3.2-1B-Instruct-GGUF",
-            size_mb: 800,
-            ram_estimate_mb: 1500,
-            context_length: 131072,
-            quantization: "Q4_K_M",
-            recommended_role: "task",
-            description: "Llama 3.2 1B Instruct Q4_K_M (~800 MB, fastest — ideal for Jetson Nano)",
-        },
-        GgufEntry {
-            name: "llama-3.2-3b",
-            filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-            hf_repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
-            size_mb: 2000,
-            ram_estimate_mb: 3000,
-            context_length: 131072,
-            quantization: "Q4_K_M",
-            recommended_role: "chat",
-            description:
-                "Llama 3.2 3B Instruct Q4_K_M (~2 GB, balanced) — default for local inference",
-        },
-        GgufEntry {
-            name: "llama-3.1-8b",
-            filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-            hf_repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
-            size_mb: 4700,
-            ram_estimate_mb: 7000,
-            context_length: 131072,
-            quantization: "Q4_K_M",
-            recommended_role: "chat",
-            description: "Llama 3.1 8B Instruct Q4_K_M (~4.7 GB, best quality for 8 GB RAM)",
-        },
-        GgufEntry {
-            name: "qwen2.5-0.5b",
-            filename: "Qwen2.5-0.5B-Instruct-Q6_K.gguf",
-            hf_repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-            size_mb: 500,
-            ram_estimate_mb: 900,
-            context_length: 32768,
-            quantization: "Q6_K",
-            recommended_role: "task",
-            description: "Qwen2.5 0.5B Instruct Q6_K (~500 MB, ultra-low RAM)",
-        },
-        GgufEntry {
-            name: "qwen2.5-1.5b",
-            filename: "Qwen2.5-1.5B-Instruct-Q6_K.gguf",
-            hf_repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-            size_mb: 1100,
-            ram_estimate_mb: 2000,
-            context_length: 32768,
-            quantization: "Q6_K",
-            recommended_role: "task",
-            description: "Qwen2.5 1.5B Instruct Q6_K (~1.1 GB)",
-        },
-        GgufEntry {
-            name: "qwen2.5-3b",
-            filename: "Qwen2.5-3B-Instruct-Q5_K_M.gguf",
-            hf_repo: "Qwen/Qwen2.5-3B-Instruct-GGUF",
-            size_mb: 2100,
-            ram_estimate_mb: 3200,
-            context_length: 32768,
-            quantization: "Q5_K_M",
-            recommended_role: "chat",
-            description: "Qwen2.5 3B Instruct Q5_K_M (~2.1 GB)",
-        },
-        GgufEntry {
-            name: "qwen2.5-7b",
-            filename: "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
-            hf_repo: "Qwen/Qwen2.5-7B-Instruct-GGUF",
-            size_mb: 4700,
-            ram_estimate_mb: 7000,
-            context_length: 32768,
-            quantization: "Q4_K_M",
-            recommended_role: "chat",
-            description: "Qwen2.5 7B Instruct Q4_K_M (~4.7 GB, excellent instruction following)",
-        },
-        GgufEntry {
-            name: "gemma-2-2b-it",
-            filename: "gemma-2-2b-it-Q6_K.gguf",
-            hf_repo: "bartowski/gemma-2-2b-it-GGUF",
-            size_mb: 2100,
-            ram_estimate_mb: 3200,
-            context_length: 8192,
-            quantization: "Q6_K",
-            recommended_role: "chat",
-            description: "Gemma 2 2B Instruct Q6_K (~2.1 GB)",
-        },
-        GgufEntry {
-            name: "gemma-2-9b-it",
-            filename: "gemma-2-9b-it-Q4_K_M.gguf",
-            hf_repo: "bartowski/gemma-2-9b-it-GGUF",
-            size_mb: 5500,
-            ram_estimate_mb: 8000,
-            context_length: 8192,
-            quantization: "Q4_K_M",
-            recommended_role: "think",
-            description: "Gemma 2 9B Instruct Q4_K_M (~5.5 GB, strong reasoning)",
-        },
-        GgufEntry {
-            name: "phi-4-mini",
-            filename: "Phi-4-mini-instruct-Q4_K_M.gguf",
-            hf_repo: "bartowski/Phi-4-mini-instruct-GGUF",
-            size_mb: 2400,
-            ram_estimate_mb: 3800,
-            context_length: 131072,
-            quantization: "Q4_K_M",
-            recommended_role: "chat",
-            description: "Phi-4 Mini Instruct Q4_K_M (~2.4 GB, strong reasoning in small package)",
-        },
-        GgufEntry {
-            name: "mistral-7b-v0.3",
-            filename: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
-            hf_repo: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
-            size_mb: 4400,
-            ram_estimate_mb: 6500,
-            context_length: 32768,
-            quantization: "Q4_K_M",
-            recommended_role: "chat",
-            description: "Mistral 7B Instruct v0.3 Q4_K_M (~4.4 GB)",
-        },
-        GgufEntry {
-            name: "deepseek-r1-1.5b",
-            filename: "DeepSeek-R1-Distill-Qwen-1.5B-Q6_K.gguf",
-            hf_repo: "bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF",
-            size_mb: 1100,
-            ram_estimate_mb: 2000,
-            context_length: 32768,
-            quantization: "Q6_K",
-            recommended_role: "think",
-            description: "DeepSeek R1 Distill 1.5B Q6_K (~1.1 GB, reasoning specialist)",
-        },
-        GgufEntry {
-            name: "deepseek-r1-7b",
-            filename: "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
-            hf_repo: "bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF",
-            size_mb: 4700,
-            ram_estimate_mb: 7000,
-            context_length: 32768,
-            quantization: "Q4_K_M",
-            recommended_role: "think",
-            description: "DeepSeek R1 Distill 7B Q4_K_M (~4.7 GB, reasoning specialist)",
-        },
-        // ── Gemma 4 family ────────────────────────────────────────────
-        GgufEntry {
-            name: "gemma-4-E1B-it",
-            filename: "gemma-4-E1B-it-Q4_K_M.gguf",
-            hf_repo: "unsloth/gemma-4-E1B-it-GGUF",
-            size_mb: 700,
-            ram_estimate_mb: 1200,
-            context_length: 131072,
-            quantization: "Q4_K_M",
-            recommended_role: "tool",
-            description: "Gemma 4 E1B Instruct Q4_K_M (~700 MB, ultra-fast tool-call specialist)",
-        },
-        GgufEntry {
-            name: "gemma-4-E2B-it",
-            filename: "gemma-4-E2B-it-Q4_K_M.gguf",
-            hf_repo: "unsloth/gemma-4-E2B-it-GGUF",
-            size_mb: 3100,
-            ram_estimate_mb: 4500,
-            context_length: 131072,
-            quantization: "Q4_K_M",
-            recommended_role: "chat",
-            description: "Gemma 4 E2B Instruct Q4_K_M (~3.1 GB, vision + tool calling + thinking)",
-        },
-        GgufEntry {
-            name: "gemma-4-E4B-it-Q4_K_S",
-            filename: "gemma-4-E4B-it-Q4_K_S.gguf",
-            hf_repo: "google/gemma-4-E4B-it-GGUF",
-            size_mb: 2500,
-            ram_estimate_mb: 3500,
-            context_length: 131072,
-            quantization: "Q4_K_S",
-            recommended_role: "chat",
-            description: "Gemma 4 E4B Instruct Q4_K_S (~2.5 GB)",
-        },
-        GgufEntry {
-            name: "gemma-4-E4B-it",
-            filename: "gemma-4-E4B-it-Q4_K_M.gguf",
-            hf_repo: "unsloth/gemma-4-E4B-it-GGUF",
-            size_mb: 3000,
-            ram_estimate_mb: 4200,
-            context_length: 131072,
-            quantization: "Q4_K_M",
-            recommended_role: "chat",
-            description:
-                "Gemma 4 E4B Instruct Q4_K_M (~3 GB, vision + native tool calling + thinking)",
-        },
-        GgufEntry {
-            name: "gemma-4-12B-A4B-it",
-            filename: "gemma-4-12B-A4B-it-Q4_K_M.gguf",
-            hf_repo: "unsloth/gemma-4-12B-A4B-it-GGUF",
-            size_mb: 7500,
-            ram_estimate_mb: 10000,
-            context_length: 131072,
-            quantization: "Q4_K_M",
-            recommended_role: "think",
-            description: "Gemma 4 12B MoE (4B active) Q4_K_M (~7.5 GB, strong reasoning + vision)",
-        },
-        GgufEntry {
-            name: "gemma-4-26B-A4B-it",
-            filename: "gemma-4-26B-A4B-it-Q4_K_M.gguf",
-            hf_repo: "unsloth/gemma-4-26B-A4B-it-GGUF",
-            size_mb: 16000,
-            ram_estimate_mb: 20000,
-            context_length: 131072,
-            quantization: "Q4_K_M",
-            recommended_role: "think",
-            description: "Gemma 4 26B MoE (4B active) Q4_K_M (~16 GB, best MoE quality + vision)",
-        },
-        GgufEntry {
-            name: "gemma-4-27B-it",
-            filename: "gemma-4-27B-it-Q4_K_M.gguf",
-            hf_repo: "unsloth/gemma-4-27B-it-GGUF",
-            size_mb: 16500,
-            ram_estimate_mb: 21000,
-            context_length: 131072,
-            quantization: "Q4_K_M",
-            recommended_role: "think",
-            description: "Gemma 4 27B Dense Instruct Q4_K_M (~16.5 GB, highest quality + vision)",
-        },
-    ];
-    entries.iter().map(gguf_record).collect()
-}
-
-// ── LiteRT-LM ─────────────────────────────────────────────────────────────────
-
-/// The pinned `.litertlm` files; the name is the file name, which is also the registry id.
-fn litert_models() -> Vec<ModelRecord> {
-    pond_core::models::domain::litert::CURATED
-        .iter()
-        .map(litert_record)
-        .collect()
-}
-
-fn litert_record(spec: &pond_core::models::domain::litert::LiteRtModelSpec) -> ModelRecord {
-    let size_mb = spec.size_bytes / (1024 * 1024);
-    ModelRecord {
-        id: ModelRecord::id_for(&ModelCategory::Litert, spec.filename),
-        category: ModelCategory::Litert,
-        name: spec.filename.to_string(),
-        filename: Some(spec.filename.to_string()),
-        description: spec.description.to_string(),
+        id: pick.id(),
+        category: pick.category(),
+        name: pick.name().to_string(),
+        filename: Some(pick.filename.to_string()),
+        description: pick.summary.to_string(),
         size_mb,
-        url: Some(spec.url()),
-        hf_id: None,
+        url: Some(pick.url()),
+        hf_id: pick.quantization.map(|q| format!("{}:{q}", pick.repo)),
         // Weights + 25% for the run, the catalogue's own rule of thumb.
         ram_estimate_mb: Some(size_mb + size_mb / 4),
         recommended_role: Some("chat".to_string()),
-        context_length: Some(spec.context_length),
-        quantization: None,
+        context_length: Some(pick.context_length),
+        quantization: pick.quantization.map(str::to_string),
         asr_language: None,
         asr_size: None,
         tts_engine: None,
@@ -814,84 +434,65 @@ fn ollama_entry_to_record(m: &serde_json::Value) -> Option<ModelRecord> {
 mod tests {
     use super::*;
 
+    fn conversation_rows() -> Vec<ModelRecord> {
+        static_models()
+            .into_iter()
+            .filter(|m| m.category.is_llm())
+            .collect()
+    }
+
+    /// Rung 3 of the context governor reads `context_length`; every pick must declare one.
     #[test]
     fn every_chat_capable_entry_declares_a_context_window() {
-        let chat_capable: Vec<ModelRecord> = static_models()
-            .into_iter()
-            .filter(|m| {
-                matches!(
-                    m.category,
-                    ModelCategory::Gguf | ModelCategory::Litert | ModelCategory::Llamafile
-                )
-            })
-            .collect();
-
-        // A floor, so a broken filter cannot pass by matching nothing.
-        assert!(
-            chat_capable.len() >= 20,
-            "only {} chat-capable catalog entries — the filter has broken, \
-             not the catalog shrunk",
-            chat_capable.len()
+        let rows = conversation_rows();
+        assert_eq!(
+            rows.len(),
+            curated::CURATED.len(),
+            "the bundled conversation rows are exactly GIAP's picks"
         );
-
-        for m in &chat_capable {
-            let declared = m.context_length.unwrap_or(0);
+        for pick in curated::CURATED {
+            let row = rows
+                .iter()
+                .find(|m| m.id == pick.id())
+                .unwrap_or_else(|| panic!("{} has no catalogue row", pick.id()));
+            let declared = row.context_length.unwrap_or(0);
             assert!(
                 declared >= 2048,
-                "catalog entry {} declares no usable context window ({declared}); \
-                 rung 3 of the context governor reads this field",
-                m.name
+                "catalogue entry {} declares no usable context window ({declared})",
+                row.name
             );
+            assert_eq!(declared, pick.context_length, "{}", row.name);
         }
     }
 
     /// The download pins what the URL names; a `main` URL would fetch whatever is there now.
     #[test]
-    fn litert_entries_download_their_pinned_revision() {
-        let litert: Vec<ModelRecord> = static_models()
-            .into_iter()
-            .filter(|m| m.category == ModelCategory::Litert)
-            .collect();
-        assert_eq!(litert.len(), 2, "the E2B and E4B files");
-        for m in &litert {
+    fn every_pick_downloads_its_pinned_revision() {
+        for m in conversation_rows() {
             let url = m.url.as_deref().expect("a download URL");
             let (repo, revision, file) = pond_hf_cache::parse_hf_url(url).expect("an HF URL");
-            let pin = pond_core::models::domain::litert::pinned(&repo, &revision, &file)
+            let pin = curated::pinned(&repo, &revision, &file)
                 .unwrap_or_else(|| panic!("{} downloads an unpinned file: {url}", m.name));
-            assert_eq!(m.name, pin.filename, "the name is the file name");
+            assert_eq!(m.name, pin.name());
             assert_eq!(m.filename.as_deref(), Some(pin.filename));
-            assert_eq!(m.id, format!("litert/{}", pin.filename));
-            assert!(pond_core::models::domain::litert::is_litert_model(&m.name));
-            assert!(m.context_length.unwrap_or(0) >= 2048, "{}", m.name);
+            assert_eq!(m.id, pin.id());
+            assert_eq!(m.size_mb, pin.size_mb(), "{}", m.name);
+            assert_eq!(m.category, pin.category());
         }
     }
 
     #[test]
-    fn the_same_base_model_declares_the_same_window_in_both_tables() {
-        let by_base = |needle: &str| -> Vec<(String, u32)> {
-            static_models()
-                .iter()
-                .filter(|m| {
-                    matches!(m.category, ModelCategory::Gguf | ModelCategory::Llamafile)
-                        && m.filename
-                            .as_deref()
-                            .is_some_and(|f| f.to_ascii_lowercase().contains(needle))
-                })
-                .map(|m| (m.name.clone(), m.context_length.unwrap_or(0)))
-                .collect()
-        };
-
-        for needle in ["llama-3.2-1b", "llama-3.2-3b", "gemma-2-2b"] {
-            let found = by_base(needle);
-            assert!(
-                found.len() >= 2,
-                "expected {needle} in both the GGUF and llamafile tables, found {found:?}"
-            );
-            let first = found[0].1;
-            assert!(
-                found.iter().all(|(_, c)| *c == first),
-                "{needle} declares different windows across tables: {found:?}"
-            );
-        }
+    fn the_household_pick_keeps_its_name() {
+        let rows = conversation_rows();
+        let e4b = rows
+            .iter()
+            .find(|m| m.id == "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL")
+            .expect("the household's chat model is a pick");
+        assert_eq!(
+            e4b.filename.as_deref(),
+            Some("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")
+        );
+        assert_eq!(e4b.quantization.as_deref(), Some("UD-Q4_K_XL"));
+        assert!(rows.iter().all(|m| m.category != ModelCategory::Llamafile));
     }
 }

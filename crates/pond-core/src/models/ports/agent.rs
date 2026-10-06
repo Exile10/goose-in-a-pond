@@ -1,3 +1,4 @@
+use crate::models::domain::conversation_model::NoConversationModel;
 use crate::models::domain::model_capabilities::ModelCapabilities;
 use crate::models::domain::vision_encoder::EncoderState;
 use crate::models::services::context::prefix_cache::PrefixCacheState;
@@ -28,15 +29,24 @@ pub trait Agent: Send + Sync {
         ModelCapabilities::default()
     }
 
+    /// `Err` when no conversation model is chosen, so a turn is refused before anything is saved.
+    /// An agent that needs no model choice (mocks, HTTP agents) always answers `Ok`.
+    async fn ensure_conversation_model(&self) -> Result<(), NoConversationModel> {
+        Ok(())
+    }
+
     /// Picture support for `model`: a pure read (no hash, rename or fetch), safe per list row.
     /// `None` means unknown; callers then fail open to the adapter's own backstop.
     fn vision_state(&self, _provider: &str, _model: &str) -> Option<EncoderState> {
         None
     }
 
-    /// Start background prep (e.g. the vision encoder) for a just-downloaded or activated model.
-    /// Must return at once and never fail the caller.
+    /// Register a model whose files just arrived and settle its picture add-on: verify and
+    /// attach what is on disk. Never downloads; must return at once and never fail the caller.
     fn prepare_model(&self, _model: &str) {}
+
+    /// A model's file was deleted: forget every engine registration that names it.
+    fn forget_model_file(&self, _path: &std::path::Path) {}
 
     /// Compact this session now, on the user's instruction; returns tokens retained if reported.
     /// `Ok(None)`: the backend has no manual compaction; the caller must say so, not claim success.

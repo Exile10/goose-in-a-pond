@@ -5,8 +5,11 @@ use async_trait::async_trait;
 pub struct MemoryStatus {
     /// Total device RAM in MB (all uses combined).
     pub total_mb: u64,
-    /// MB currently available for LLM loading.
+    /// MB currently available for LLM loading, never more than `budget_mb`.
     pub available_for_llm_mb: u64,
+    /// The most the LLM slot may hold here: the board's budget on a budgeted device, a desktop's
+    /// total less its reserve elsewhere. Zero where memory is managed by another program.
+    pub budget_mb: u64,
     /// Name of the model currently loaded in the LLM slot, if any.
     pub loaded_model: Option<String>,
 }

@@ -1,243 +1,177 @@
-/** Models sub-screen (Settings > Models) wired to listModels and activateModel. */
+/** Models sub-screen (Settings > Models) wired to listModels and activateModel, on the real shapes. */
 import { test, expect } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import { mockAllApiRoutes } from "./helpers/api-mocks";
 import { navigateTo } from "./helpers/nav";
+import { mockModels, ollamaModel, ROOMY_MEMORY, typicalModels, whisperBase, type ModelMocks } from "./helpers/model-mocks";
 
-const MOCK_MODELS = {
-  gguf: [
-    {
-      name: "gemma-4-E4B-it-Q4_K_M",
-      description: "Gemma 4 E4B Instruct (Q4_K_M)",
-      active: false,
-      downloaded: true,
-      ram_estimate_mb: 3100,
-      recommended_role: "chat",
-      size_mb: 2560,
-      category: "llm",
-    },
-  ],
-  llamafile: [],
-  whisper: [
-    {
-      name: "base.en",
-      description: "Whisper base (English)",
-      active: false,
-      downloaded: true,
-      size_mb: 148,
-      category: "asr",
-    },
-  ],
-  tts: [
-    {
-      name: "en-lessac-medium",
-      description: "Piper en-US Lessac (medium)",
-      active: false,
-      downloaded: true,
-      size_mb: 65,
-      category: "tts",
-      tts_engine: "piper",
-    },
-  ],
-  ollama: [],
-  embedding: [],
+const NO_ROLES = {
+  chat: null, tool: null, asr: null, tts: null,
+  embedding: { model_id: null, model: "", provider: "fastembed" },
 };
 
-const INITIAL_ROLES = {
-  chat: null,
-  tool: null,
-  asr: null,
-  tts: null,
-  embedding: null,
-};
-
-const AFTER_ACTIVATE_ROLES = {
-  chat: { provider: "gguf", model: "gemma-4-E4B-it-Q4_K_M" },
-  tool: null,
-  asr: null,
-  tts: null,
-  embedding: null,
+const E2B_IN_USE = {
+  ...NO_ROLES,
+  chat: { provider: "local", model: "gemma-4-E2B-it-qat-UD-Q4_K_XL", model_id: "gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL" },
 };
 
 /** Call before navigating, so the routes are in place. */
-async function setupModelsRoutes(
-  page: Page,
-  opts: {
-    roles?: object;
-    onActivate?: () => void;
-  } = {},
-) {
-  const roles = opts.roles ?? INITIAL_ROLES;
-
-  await page.route("**/api/v1/health", (r) =>
-    r.fulfill({ json: { status: "ok", version: "test" } }),
-  );
-  await page.route("**/api/v1/handshake", (r) =>
-    r.fulfill({ json: { token: "e2e-test-token", session_id: "e2e-session" } }),
-  );
-  await page.route("**/api/v1/onboard/status", (r) =>
-    r.fulfill({ json: { onboarded: true, current_step: "Completed", steps_completed: 9, total_steps: 9 } }),
-  );
-  await page.route("**/api/v1/onboard/complete", (r) =>
-    r.fulfill({ json: { status: "completed" } }),
-  );
-  await page.route("**/api/v1/settings", (r) =>
-    r.fulfill({ json: { assistant_name: "Pond", user_name: "Jerry", chat_provider: "llamafile", chat_model: "llama3.2", agent_memory_inject: false, prompt_style: "balanced", llm_temperature: 0.7, llm_max_tokens: 1024 } }),
-  );
-  await page.route("**/api/v1/schedules", (r) => r.fulfill({ json: [] }));
-  await page.route("**/api/v1/sessions", (r) => r.fulfill({ json: { sessions: [] } }));
-  await page.route("**/api/v1/sessions/*/messages", (r) => r.fulfill({ json: { messages: [] } }));
-  await page.route("**/api/v1/devices", (r) => r.fulfill({ json: { devices: [] } }));
-  await page.route("**/api/v1/memories", (r) => r.fulfill({ json: [] }));
-  await page.route("**/api/v1/skills", (r) => r.fulfill({ json: [] }));
-  await page.route("**/api/v1/prompts", (r) => r.fulfill({ json: [] }));
-  await page.route("**/api/v1/prompts/**", (r) =>
-    r.fulfill({ json: { name: "balanced", content: "You are a helpful assistant.", is_system: true } }),
-  );
-  await page.route("**/api/v1/agent/extras", (r) => r.fulfill({ json: [] }));
-  await page.route("**/api/v1/agent/tools", (r) => r.fulfill({ json: [] }));
-  await page.route("**/api/v1/recipes", (r) => r.fulfill({ json: [] }));
-  await page.route("**/api/v1/transcribe", (r) => r.fulfill({ json: { text: "" } }));
-  await page.route("**/api/v1/chat/stream", (r) =>
-    r.fulfill({ status: 200, headers: { "Content-Type": "text/event-stream" }, body: 'data: {"done":true}\n\n' }),
-  );
-  await page.route("**/api/v1/tts", (r) => r.fulfill({ status: 503, json: { error: "off" } }));
-  await page.route("**/api/v1/profiles", (r) => r.fulfill({ json: [] }));
-  await page.route("**/api/v1/extensions", (r) => r.fulfill({ json: { extensions: [] } }));
-  await page.route("**/api/v1/extensions/**", (r) => r.fulfill({ json: { status: "ok" } }));
-  await page.route("**/api/v1/marketplace", (r) => r.fulfill({ json: { extensions: [] } }));
-  await page.route("**/api/v1/marketplace/*/install", (r) => r.fulfill({ status: 201, json: {} }));
-  await page.route("**/api/v1/secrets/**", (r) => r.fulfill({ json: { keys: [] } }));
-  await page.route("**/api/v1/logs", (r) => r.fulfill({ json: [] }));
-  await page.route("**/api/v1/usage", (r) => r.fulfill({ json: { total_tokens: 0, session_count: 0 } }));
-  await page.route("**/api/v1/oauth/**", (r) => r.fulfill({ json: {} }));
-
-  // Models-specific routes — registered last so they take LIFO priority
-  await page.route("**/api/v1/models/memory-status", (r) =>
-    r.fulfill({ json: { total_mb: 8192, available_for_llm_mb: 4096, loaded_model: null } }),
-  );
-  await page.route("**/api/v1/models/download/progress", (r) =>
-    r.fulfill({ json: { downloads: [] } }),
-  );
-  await page.route("**/api/v1/models/ollama", (r) =>
-    r.fulfill({ json: { models: [] } }),
-  );
-  await page.route("**/api/v1/models/capabilities", (r) =>
-    r.fulfill({ json: { thinking: false, vision: false, audio_input: false, context_window_tokens: 4096, structured_output: false } }),
-  );
-  // Activate endpoint — must be before the broad active-roles + models routes
-  await page.route("**/api/v1/models/*/*/activate", (r) => {
-    opts.onActivate?.();
-    return r.fulfill({ status: 204, body: "" });
-  });
-  await page.route("**/api/v1/models/scan", (r) => r.fulfill({ json: { found: 0 } }));
-
-  // Active-roles: use a mutable reference so the test can swap it
-  let rolesPayload = roles;
-  await page.route("**/api/v1/models/active-roles", (r) =>
-    r.fulfill({ json: rolesPayload }),
-  );
-  (page as Page & { _setRoles: (r: object) => void })._setRoles = (r) => { rolesPayload = r; };
-
-  await page.route("**/api/v1/models", (r) => r.fulfill({ json: MOCK_MODELS }));
-}
-
-async function goToModelsScreen(page: Page) {
+async function setupHub(page: Page, opts: ModelMocks = {}) {
+  await mockAllApiRoutes(page);
+  await mockModels(page, opts);
   await page.addInitScript(() => {
     localStorage.setItem("giap-section", "hub");
     localStorage.setItem("giap-force-hub", "1");
     localStorage.setItem("goosehub_route", "home");
   });
+}
+
+async function goToModelsScreen(page: Page) {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/");
   await page.waitForSelector(".ghub", { timeout: 10_000 });
   // Models is a "Manage" chip in the drawer and opens the Models detail screen directly.
   await navigateTo(page, "Models");
-  await page.waitForTimeout(600);
+  await expect(page.getByRole("heading", { name: "Models" })).toBeVisible({ timeout: 10_000 });
 }
 
 test.describe("Hub — Models sub-screen wiring", () => {
-  test("loads model rows and shows Load button", async ({ page }) => {
-    await setupModelsRoutes(page);
+  test("shows the four jobs, the picks still to get, and what is here by engine", async ({ page }) => {
+    await setupHub(page, { roles: E2B_IN_USE, memory: ROOMY_MEMORY });
     await goToModelsScreen(page);
 
-    await expect(page.getByText("Language models")).toBeVisible({ timeout: 5_000 });
+    const tiles = page.getByRole("list", { name: "Which model does each job" }).getByRole("listitem");
+    await expect(tiles).toHaveCount(4);
+    await expect(tiles.nth(0)).toContainText("Conversation");
+    await expect(tiles.nth(0)).toContainText("Gemma 4 E2B");
+    await expect(tiles.nth(0)).toContainText("llama.cpp");
+    await expect(page.getByText("Think", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Task", { exact: true })).toHaveCount(0);
 
-    await expect(page.getByText(/gemma-4-E4B-it-Q4_K_M/i)).toBeVisible({ timeout: 5_000 });
+    // The picks not yet here, with their size said first; the one that is here is listed below.
+    const recommended = page.locator(".setcard", { hasText: "Recommended for this pond" });
+    await expect(recommended.locator(".mm-pick")).toHaveCount(2);
+    await expect(recommended).toContainText("4.2 GB + 945 MB for pictures");
 
-    const loadBtn = page.getByRole("button", { name: /load gemma-4-E4B-it-Q4_K_M as chat model/i });
-    await expect(loadBtn).toBeVisible({ timeout: 3_000 });
+    const conversation = page.locator(".setcard", { hasText: "Conversation" }).last();
+    await expect(conversation).toContainText("llama.cpp runs .gguf files and can read pictures with an add-on.");
+    await expect(conversation).toContainText("Ollama is your own Ollama server; llamafile runs a model packed into one file.");
+    await expect(conversation.getByText("(detected on disk)")).toHaveCount(0);
   });
 
-  test("Load button calls activateModel and role refreshes", async ({ page }) => {
-    let activateCalled = false;
+  test("leaves the add-on out where only the model fits, and says why beside the box", async ({ page }) => {
+    await setupHub(page, { roles: E2B_IN_USE });
+    await goToModelsScreen(page);
+    const card = page.locator(".mm-pick", { hasText: "llama.cpp" });
+    await expect(card.getByRole("checkbox", { name: /Include picture support/ })).not.toBeChecked();
+    await expect(card.locator(".mm-choice__why")).toHaveText(
+      "Left out: with pictures it would not fit this pond. Tick to include it anyway.",
+    );
+  });
 
-    await setupModelsRoutes(page, {
-      onActivate: () => { activateCalled = true; },
+  test("does not list the whole catalogue, and has no Download button that can never be pressed", async ({ page }) => {
+    await setupHub(page, {
+      models: typicalModels({
+        whisper: [whisperBase({ downloaded: false }), whisperBase({ id: "whisper/small", name: "small", title: "Whisper small (en)", downloaded: false })],
+      }),
     });
+    await goToModelsScreen(page);
+    await expect(page.getByText("Whisper small (en)")).toHaveCount(0);
+    await expect(page.locator("[title*='coming in Phase']")).toHaveCount(0);
+    await expect(page.locator(".setd button:disabled")).toHaveCount(0);
+  });
 
-    await page.route("**/api/v1/models/*/*/activate", async (r) => {
-      activateCalled = true;
-      await r.fulfill({ status: 204, body: "" });
-      // Update mocked roles so the re-fetch sees the activated model
-      (page as Page & { _setRoles: (r: object) => void })._setRoles(AFTER_ACTIVATE_ROLES);
+  test("Use calls activateModel with the model's real category and the chat role, and says In use", async ({ page }) => {
+    await setupHub(page, { roles: NO_ROLES });
+    let activated: { url: string; body: unknown } | null = null;
+    await page.route("**/api/v1/models/*/*/activate", (route) => {
+      activated = { url: route.request().url(), body: route.request().postDataJSON() };
+      return route.fulfill({ json: { role: "chat", model_id: "gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL" } });
     });
-
     await goToModelsScreen(page);
 
-    await expect(page.getByText(/gemma-4-E4B-it-Q4_K_M/i)).toBeVisible({ timeout: 5_000 });
-
-    await page.getByRole("button", { name: /load gemma-4-E4B-it-Q4_K_M as chat model/i }).click();
-    await page.waitForTimeout(1000);
-
-    expect(activateCalled).toBe(true);
+    // After activation the pond reports the model in use, and the screen reads it again.
+    await page.route("**/api/v1/models/active-roles", (route) =>
+      route.fulfill({ json: activated ? E2B_IN_USE : NO_ROLES }),
+    );
+    await page.getByRole("button", { name: "Use Gemma 4 E2B, llama.cpp for conversation" }).click();
+    await expect.poll(() => activated?.url).toContain("/api/v1/models/gguf/gemma-4-E2B-it-qat-UD-Q4_K_XL/activate");
+    expect(activated!.body).toEqual({ role: "chat" });
+    await expect(page.getByText("Now using Gemma 4 E2B for conversation.")).toBeVisible();
+    await expect(page.locator(".hm-row[data-inuse='true']")).toContainText("Gemma 4 E2B");
+    await expect(page.locator(".hm-row[data-inuse='true']")).toContainText("In use");
   });
 
-  test("speech models are listed with Use buttons", async ({ page }) => {
-    await setupModelsRoutes(page);
+  test("an uninstalled LiteRT-LM pick is downloaded from its own card, text only, with no add-on to tick", async ({ page }) => {
+    await setupHub(page, { roles: E2B_IN_USE });
+    let body: unknown = "unset";
+    await page.route("**/api/v1/models/litert/*/download", (route) => {
+      body = route.request().postDataJSON();
+      return route.fulfill({ json: { status: "download_started", message: "Downloading Gemma 4 E4B (3.7 GB)" } });
+    });
     await goToModelsScreen(page);
-
-    await expect(page.locator(".setcard").filter({ hasText: "Speech" }).first()).toBeVisible({ timeout: 5_000 });
-
-    await expect(page.getByText("Whisper base (English)")).toBeVisible({ timeout: 3_000 });
-
-    await expect(page.getByText("Piper en-US Lessac (medium)")).toBeVisible({ timeout: 3_000 });
-
-    const useButtons = page.getByRole("button", { name: /use .+ as (speech-to-text|text-to-speech)/i });
-    await expect(useButtons.first()).toBeVisible({ timeout: 3_000 });
+    const card = page.locator(".mm-pick", { hasText: "LiteRT-LM" });
+    await expect(card.getByRole("checkbox")).toHaveCount(0);
+    await card.getByRole("button", { name: /^Download/ }).click();
+    await expect.poll(() => body).toBeNull();
+    await expect(page.getByText("Downloading Gemma 4 E4B (3.7 GB)")).toBeVisible();
   });
 
-  // Commented out while llama.cpp lacks speculative decoding; restore with the switch.
-  // test("the guess-ahead switch reads and writes speculative_decoding_enabled", async ({ page }) => {
-  //   await setupModelsRoutes(page);
-  //   // Overrides the fixed 8-key body setupModelsRoutes registers for
-  //   // /api/v1/settings -- registered AFTER it, so it wins (Playwright
-  //   // resolves the last-registered matching route first).
-  //   let putBody: unknown = null;
-  //   await page.route("**/api/v1/settings", async (r) => {
-  //     if (r.request().method() === "PUT") {
-  //       putBody = r.request().postDataJSON();
-  //       return r.fulfill({ json: putBody });
-  //     }
-  //     return r.fulfill({
-  //       json: {
-  //         assistant_name: "Pond", user_name: "Jerry", chat_provider: "llamafile", chat_model: "llama3.2",
-  //         agent_memory_inject: false, prompt_style: "balanced", llm_temperature: 0.7, llm_max_tokens: 1024,
-  //         speculative_decoding_enabled: false,
-  //       },
-  //     });
-  //   });
-  //
-  //   await goToModelsScreen(page);
-  //
-  //   const row = page.locator(".srow").filter({ hasText: "Guess ahead with a helper model" });
-  //   await expect(row).toBeVisible({ timeout: 5_000 });
-  //   const toggle = row.locator("button.htoggle");
-  //   // Drawn OFF from the mocked GET, guarding the remount-key regression: the
-  //   // hub Toggle seeds its own state once and never re-reads its prop.
-  //   await expect(toggle).toHaveAttribute("aria-pressed", "false");
-  //
-  //   await toggle.click();
-  //   await expect.poll(() => putBody).not.toBeNull();
-  //   expect(putBody).toEqual({ speculative_decoding_enabled: true });
-  // });
+  test("speech lists the listening model that is here, and sends a household to Voice for a voice", async ({ page }) => {
+    await setupHub(page, { roles: E2B_IN_USE });
+    await goToModelsScreen(page);
+    const speech = page.locator(".setcard", { hasText: "Speech" });
+    await expect(speech).toContainText("Whisper base.en (en)");
+    await expect(speech.getByRole("button", { name: /^Use Whisper base.en/ })).toBeVisible();
+    await speech.getByRole("button", { name: "Choose a voice" }).click();
+    await expect(page.getByRole("heading", { name: "Voice" })).toBeVisible();
+  });
+
+  test("lists Ollama's models as in-use candidates with no download", async ({ page }) => {
+    await setupHub(page, { models: typicalModels({ ollama: [ollamaModel()] }), roles: E2B_IN_USE });
+    await goToModelsScreen(page);
+    const row = page.locator(".hm-row", { hasText: "qwen3:4b" });
+    await expect(row.getByRole("button", { name: /Use qwen3:4b/ })).toBeVisible();
+    await expect(row.getByRole("button", { name: /Download|Delete/ })).toHaveCount(0);
+  });
+
+  test("every target on the screen is at least 44px tall", async ({ page }) => {
+    await setupHub(page, { roles: E2B_IN_USE, downloads: [
+      { filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", category: "gguf", downloaded_bytes: 1_200_000_000, total_bytes: 4_215_695_776, status: "downloading", model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "model" },
+    ] });
+    await goToModelsScreen(page);
+    await expect(page.locator(".setd .mm-btn").first()).toBeVisible();
+    const small = await page.evaluate(() =>
+      Array.from(document.querySelectorAll<HTMLElement>(".setd button, .setd label.mm-choice, .setd__back"))
+        .filter((el) => !el.matches(".setd__back"))
+        .map((el) => ({ text: (el.textContent ?? "").trim().slice(0, 30), h: Math.round(el.getBoundingClientRect().height) }))
+        // The add-on link reaches 44px through an invisible extension (`.reach`).
+        .filter((t) => t.h < 44 && !t.text.startsWith("Add pictures")),
+    );
+    expect(small, `Targets under 44px: ${JSON.stringify(small)}`).toEqual([]);
+  });
+
+  test("follows dark mode and the chosen accent, because it writes no colour of its own", async ({ page }) => {
+    await setupHub(page, { roles: E2B_IN_USE, downloads: [
+      { filename: "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", category: "gguf", downloaded_bytes: 1_200_000_000, total_bytes: 4_215_695_776, status: "downloading", model_id: "gguf/gemma-4-E4B-it-qat-UD-Q4_K_XL", part: "model" },
+    ] });
+    await page.addInitScript(() => {
+      localStorage.setItem("goosehub_theme", "Dark");
+      localStorage.setItem("goosehub_accent", "Teal");
+    });
+    await goToModelsScreen(page);
+    await expect(page.locator(".mm-xfer__fill").first()).toBeVisible();
+    const colours = await page.evaluate(() => {
+      const css = (sel: string, prop: string) => getComputedStyle(document.querySelector(sel)!).getPropertyValue(prop);
+      return {
+        tile: css(".hm-tile", "background-color"),
+        title: css(".hm-tile__holder", "color"),
+        fill: css(".mm-xfer__fill", "background-color"),
+      };
+    });
+    // Dark panel and light text; the progress is the teal accent, not the purple it used to be.
+    expect(colours.tile).toBe("rgb(30, 27, 38)");
+    expect(colours.title).toBe("rgb(243, 241, 248)");
+    expect(colours.fill).toBe("rgb(13, 148, 136)");
+  });
 });

@@ -1,8 +1,9 @@
-//! Filesystem `ModelStorage`: the single place that defines the on-disk model layout.
+//! Filesystem `ModelStorage` over pond-core's `model_layout`, the one on-disk model layout.
 
 use std::path::{Path, PathBuf};
 
-use pond_core::models::domain::model_record::{BinaryRecord, ModelCategory, ModelRecord};
+use pond_core::models::domain::model_layout;
+use pond_core::models::domain::model_record::{BinaryRecord, ModelRecord};
 use pond_core::models::ports::model_storage::ModelStorage;
 
 pub struct FilesystemModelStorage {
@@ -19,36 +20,11 @@ impl FilesystemModelStorage {
 
 impl ModelStorage for FilesystemModelStorage {
     fn path_for(&self, record: &ModelRecord) -> Option<PathBuf> {
-        let filename = record.filename.as_deref()?;
-        let path = match record.category {
-            ModelCategory::Whisper => self.data_dir.join("models").join(filename),
-            ModelCategory::Llamafile => {
-                let base = self.data_dir.join("models").join("llm").join(filename);
-                #[cfg(windows)]
-                let base = PathBuf::from(format!("{}.exe", base.display()));
-                base
-            }
-            ModelCategory::Gguf => self.data_dir.join("models").join("gguf").join(filename),
-            ModelCategory::Litert => {
-                pond_core::models::domain::litert::models_dir(&self.data_dir).join(filename)
-            }
-            ModelCategory::TtsPiper => self.data_dir.join("models").join("tts").join(filename),
-            // Voices live under the engine dir: useless without its shared weights.
-            ModelCategory::TtsKokoro => self
-                .data_dir
-                .join("models")
-                .join("kokoro")
-                .join("voices")
-                .join(filename),
-            ModelCategory::Embedding => self
-                .data_dir
-                .join("models")
-                .join("embedding")
-                .join(filename),
-            // Server-side or auto-downloaded: no local file to manage
-            ModelCategory::TtsHttp | ModelCategory::Ollama => return None,
-        };
-        Some(path)
+        model_layout::path_for(
+            &self.data_dir,
+            &record.category,
+            record.filename.as_deref()?,
+        )
     }
 
     fn binary_path(&self, record: &BinaryRecord) -> PathBuf {

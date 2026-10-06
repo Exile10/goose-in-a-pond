@@ -20,13 +20,17 @@ import type { SubagentRun } from "../../components/SubagentTree";
 import { AttachmentTray } from "../../components/AttachmentTray";
 import {
   ImageSupportStatus,
+  ATTACH_BLOCKED_COPY,
   COMPOSER_GATE_LINE,
+  NOT_DECLARED_COPY,
   refusalClientClause,
 } from "../../components/ImageSupportStatus";
 import { useVisionStatus } from "../../api/useVisionStatus";
 import { prepareImage, validateAttachmentSet } from "../../lib/imageAttach";
 import type { PreparedImage } from "../../lib/imageAttach";
 import { useSuggestedPrompts } from "../../hooks/useSuggestedPrompts";
+import { useConversationModel } from "../../hooks/useConversationModel";
+import { NoModelPicks } from "../../components/models/NoModelPicks";
 import "./chat.css";
 
 // ── Types ─────────────────────────────────────────────────────
@@ -110,6 +114,7 @@ export function ChatHubView() {
   const { messages, busy } = run;
 
   const chips = useSuggestedPrompts(state.sessionId);
+  const conversationModel = useConversationModel();
 
   // Presentation only: shown until the first real message, never stored.
   const [seed, setSeed] = useState<Row[]>(() => makeSeed(""));
@@ -152,9 +157,7 @@ export function ChatHubView() {
   const attachTitle = !gateBlocked
     ? "Attach image"
     : (visionStatus?.message ??
-        (visionKind === "not_declared"
-          ? "This model cannot look at pictures. To send one, choose a model marked Reads pictures on the Models page."
-          : "The active model cannot read images. Switch to a model marked Reads pictures on the Models page."));
+        (visionKind === "not_declared" ? NOT_DECLARED_COPY : ATTACH_BLOCKED_COPY));
 
   // A refused turn (409/413/415...) hands its draft back here, once: `takeRefusedDraft` clears
   // it, so a StrictMode re-run can't restore it twice.
@@ -165,6 +168,7 @@ export function ChatHubView() {
     if (!text.trim()) setText(draft.text);
     setAttachments(draft.attachments);
     setAttachError(draft.message + refusalClientClause(draft.code));
+    if (draft.code === "no_model") conversationModel.markNone();
     refreshVisionStatus();
     // `text` excluded: once per refusal, not per keystroke.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -262,8 +266,11 @@ export function ChatHubView() {
   useEffect(() => {
     const wasBusy = prevBusyRef.current;
     prevBusyRef.current = busy;
-    if (!busy && wasBusy) inputRef.current?.focus();
-  }, [busy]);
+    if (!busy && wasBusy) {
+      inputRef.current?.focus();
+      if (conversationModel.state === "none") conversationModel.refresh();
+    }
+  }, [busy, conversationModel]);
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -278,7 +285,9 @@ export function ChatHubView() {
 
   const canSend = (text.trim().length > 0 || attachments.length > 0) && !busy;
 
-  const rows: Row[] = messages.length > 0 ? messages.map(toRow) : seed;
+  const noModel = conversationModel.state === "none";
+  // With no model chosen the sample conversation would be a promise the pond cannot keep.
+  const rows: Row[] = messages.length > 0 ? messages.map(toRow) : noModel ? [] : seed;
 
   return (
     <div className="chat2">
@@ -367,10 +376,11 @@ export function ChatHubView() {
         {busy && rows[rows.length - 1]?.text === "" && (
           <TypingIndicator />
         )}
+        {noModel && <NoModelPicks />}
       </div>
 
-      {/* Suggestion chips */}
-      <div
+      {/* Suggestion chips: a turn without a model would be refused, so none are offered. */}
+      {!noModel && <div
         className="chat2__chips"
         role="group"
         aria-label="Quick suggestions"
@@ -386,7 +396,7 @@ export function ChatHubView() {
             {c}
           </button>
         ))}
-      </div>
+      </div>}
 
       {/* Picture support's own status, then any pending attachments. */}
       <ImageSupportStatus status={visionStatus} revealed={attachReasonShown} />

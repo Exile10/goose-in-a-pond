@@ -1,0 +1,27 @@
+{
+  "_about": {
+    "explicit": "Always scanned, and a repository here that cannot be read stops the run. GIAP's curated llama.cpp picks and the Gemma 4 E2B, E4B and 12B builds, qat and not. Each gets the plain directory name (the repository name in lower case, without -GGUF).",
+    "families": "Searched under each author, by downloads. A result is kept when its name starts with the search term, allowing only an upstream_orgs prefix before it.",
+    "authors": "Publishers whose GGUF uploads are trusted. Lines already in the table from these publishers are rescanned even when a search no longer returns them.",
+    "upstream_orgs": "Organisations a re-uploader may put before a name, as bartowski does (google_gemma-3-4b-it). Any other prefix marks a third-party fine-tune, which is left out.",
+    "search_limit": "Results taken from each family and author search."
+  },
+  "explicit": [
+    "unsloth/gemma-4-E2B-it-qat-GGUF",
+    "unsloth/gemma-4-E4B-it-qat-GGUF",
+    "unsloth/gemma-4-E2B-it-GGUF",
+    "unsloth/gemma-4-E4B-it-GGUF",
+    "unsloth/gemma-4-12b-it-GGUF",
+    "unsloth/gemma-4-12B-it-qat-GGUF"
+  ],
+  "families": [
+    {"name": "Gemma 4", "search": "gemma-4"},
+    {"name": "Gemma 3", "search": "gemma-3"},
+    {"name": "Qwen2.5-VL", "search": "Qwen2.5-VL"},
+    {"name": "Qwen3-VL", "search": "Qwen3-VL"},
+    {"name": "SmolVLM", "search": "SmolVLM"}
+  ],
+  "authors": ["unsloth", "ggml-org", "bartowski", "lmstudio-community"],
+  "upstream_orgs": ["google", "Qwen", "HuggingFaceTB"],
+  "search_limit": 20
+}
