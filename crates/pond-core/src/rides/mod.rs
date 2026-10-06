@@ -2,6 +2,7 @@
 //! confirmation, the request, and the trip's status. Provider-neutral; adapters implement
 //! [`ports::RideProvider`].
 
+pub mod booking;
 pub mod domain;
 pub mod ports;
 
