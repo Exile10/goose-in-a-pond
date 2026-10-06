@@ -523,7 +523,21 @@ async fn handshake_handler(
     >,
     body: Result<Json<HandshakeRequest>, JsonRejection>,
 ) -> Result<Json<HandshakeResponse>, (axum::http::StatusCode, Json<Value>)> {
-    crate::network::require_lan(peer.ok())?;
+    let peer = peer.ok();
+    crate::network::require_lan(peer)?;
+    // The legacy shape sends the six-digit code itself and binds nothing, so off this host
+    // it is refused; phones use the two-phase, channel-bound handshake.
+    if !peer.is_some_and(|axum::extract::ConnectInfo(p)| p.ip().is_loopback()) {
+        tracing::warn!(
+            kind = "legacy_pairing_refused",
+            peer = ?peer.map(|p| p.0.ip()),
+            "refused a legacy single-step pairing from off this host"
+        );
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(json!({"error": "legacy_pairing_host_only"})),
+        ));
+    }
     let Json(request) = body.map_err(|e| {
         (
             axum::http::StatusCode::BAD_REQUEST,
@@ -709,6 +723,27 @@ async fn handshake_verify(
     }
     let Json(request) = body.map_err(|_| bad_body())?;
     let device_name = request.device_name.clone();
+    // Without a binding the MAC covers no key, so whoever answered the phone's TLS can take
+    // its proof, recover the six digits offline, and pair in its place. Only loopback, which
+    // no one can sit between, may pair unbound; the challenge is left unspent.
+    if request.channel_binding.is_none() && !peer.ip().is_loopback() {
+        tracing::warn!(
+            kind = "unbound_pairing_refused",
+            peer = %peer.ip(),
+            "refused a pairing that does not bind the Pond's TLS key"
+        );
+        emit_pairing_outcome(
+            &state,
+            false,
+            device_name.as_deref(),
+            Some("channel_binding_required"),
+        )
+        .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "channel_binding_required"})),
+        ));
+    }
     let resp = match state.handshake.verify_handshake(request).await {
         Ok(resp) => resp,
         Err(e) => {

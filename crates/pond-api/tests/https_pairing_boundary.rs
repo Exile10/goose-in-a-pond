@@ -322,3 +322,73 @@ async fn companion_never_serves_dashboard_and_missing_peer_fails_closed() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "pairing_requires_lan");
 }
+
+/// This host's own address on an attached LAN: the one non-loopback peer the LAN check
+/// admits in-process. `None` on a host with no LAN, where the test says it was skipped.
+fn own_lan_address() -> Option<std::net::IpAddr> {
+    pond_api::network::interfaces()
+        .ok()?
+        .into_iter()
+        .filter(pond_api::network::is_lan_interface)
+        .map(|interface| interface.ip())
+        .find(|ip| {
+            ip.is_ipv4()
+                && pond_api::network::is_lan_peer(
+                    *ip,
+                    &pond_api::network::interfaces().unwrap_or_default(),
+                )
+        })
+}
+
+#[tokio::test]
+async fn a_phone_on_the_lan_must_bind_the_key_it_pinned() {
+    let Some(address) = own_lan_address() else {
+        eprintln!("SKIPPED: this host has no attached LAN, so no LAN peer can be simulated");
+        return;
+    };
+    let h = make_app().await;
+    let state_router = h.companion.clone();
+    let lan = state_router.layer(MockConnectInfo(SocketAddr::new(address, 40_000)));
+    let code = h.handshake.issue_pairing_code().await.unwrap().code;
+    let (status, challenge) = post(
+        &lan,
+        "/api/v1/handshake/init",
+        json!({"client_id":"lan-phone", "client_type":"gotg", "client_version":"test"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    use base64::Engine;
+    use hmac::Mac;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(challenge["challenge"].as_str().unwrap())
+        .unwrap();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(code.as_bytes()).unwrap();
+    mac.update(&raw);
+    mac.update(b"lan-phone");
+    let unbound: String = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let verify = json!({"challenge_id": challenge["challenge_id"], "mac": unbound});
+
+    let (status, body) = post(&lan, "/api/v1/handshake/verify", verify.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "channel_binding_required");
+
+    // The refusal spent nothing: the same challenge still completes from loopback.
+    let (status, body) = post(&h.loopback, "/api/v1/handshake/verify", verify).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], true);
+
+    let (status, body) = post(
+        &lan,
+        "/api/v1/handshake",
+        json!({"client_id":"lan-phone", "client_type":"gotg", "client_version":"test", "pairing_code": code}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "legacy_pairing_host_only");
+}
