@@ -239,6 +239,11 @@ pending `authId` and `machineKey`, optional `nodeKey`, and `expectedRevision` fr
 that inspection. The helper supplies its own household, nonce and two-minute expiry;
 no administration credential is involved.
 
+`--authority-action register` reads `{"invite": "..."}` on stdin (2026-09-30). An
+empty or absent value, or no input at all, sends no invite, so an already-registered
+household keeps working. The invite is never a command-line argument, because other
+accounts on the host can read those.
+
 This is an operator authority, not a public recovery endpoint. Replacement must
 follow fresh local pairing and explicit local review of the exact device and pending
 registration. A caller must never automatically inspect and replace after an ordinary

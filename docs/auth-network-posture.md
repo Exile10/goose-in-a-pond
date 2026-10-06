@@ -32,11 +32,14 @@ from the companion router.
 
 Remote access is explicit opt-in. Local-only companions do not contact Headscale.
 The Pond's separate persistent Ed25519 authority key signs expiring, single-use
-registration approvals. The enrollment service maps those approvals to
-operator-provisioned pilot households, supplies default-deny ACLs, and keeps
-administrative credentials private. Approved phones can reach only their own
-Pond's companion HTTPS port; phone-to-phone, cross-household, subnet and exit-node
-access have no allow rule. Coordinator inventory drift removes permissions rather
+registration approvals. The enrollment service admits a household that registers
+its own key, but only with an operator-issued, single-use invite (2026-09-30), and
+maps approvals to that household. The invite bounds who can consume the service's
+coordinator users and addresses; it does not separate households. The service
+supplies default-deny ACLs, which are what separate them, and keeps administrative
+credentials private. Approved phones can reach only their own Pond's companion
+HTTPS port; phone-to-phone, cross-household, subnet and exit-node access have no
+allow rule. Coordinator inventory drift removes permissions rather
 than silently accepting a changed device identity.
 
 The enrollment service holds at most 4096 enrolled devices across every household
