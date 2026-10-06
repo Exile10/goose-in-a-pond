@@ -238,7 +238,7 @@ test.describe("Models section", () => {
     });
 
     test("shows a refused delete in the pond's own words, and keeps the model listed", async ({ page }) => {
-      const refusal = "Gemma 4 E2B is doing a job right now (Conversation). Give that job to another model first.";
+      const refusal = "Gemma 4 E2B uses the same file and is doing a job right now (Conversation). Give that job to another model first.";
       await mockModels(page, { models: typicalModels({ gguf: [e2bQat({ downloaded: true }), foundGguf({ downloaded: true })] }) });
       await page.route("**/api/v1/models/gguf/Llama-3.2-3B-Instruct-Q4_K_M", (route) =>
         route.fulfill({ status: 409, json: { error: refusal } }),

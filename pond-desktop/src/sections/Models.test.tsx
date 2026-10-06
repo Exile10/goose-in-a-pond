@@ -335,8 +335,8 @@ describe("On this device", () => {
   });
 
   it("asks before deleting, and shows a refusal in the pond's own words", async () => {
-    // Another row names the same file: the pond keeps it, and names that model as it names any other.
-    const refusal = "Gemma 4 E2B is doing a job right now (Conversation). Give that job to another model first.";
+    // Another row names the same file: the pond keeps it, and names that model and its job.
+    const refusal = "Gemma 4 E2B uses the same file and is doing a job right now (Conversation). Give that job to another model first.";
     vi.mocked(api.deleteModel).mockRejectedValue(new ApiError(409, refusal));
     setup({ models: [e2b(HERE), foundOnDisk()] });
     renderModels();
