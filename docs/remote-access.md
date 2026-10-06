@@ -222,6 +222,11 @@ is a no-op rather than a conflict. A mismatched identity -- a phone that re-pair
 and regenerated its tailnet keys -- is a real conflict: the enrollment is refused
 with `409` and the app points at recovery.
 
+The household key is created on the Pond the first time remote access is enabled,
+just before registration, and loaded on every later registration (2026-10-05).
+Until then only the manual path's **Prepare household identity** created it, so
+enabling remote access on a fresh Pond failed with `registration_unavailable`.
+
 Recovery replaces an enrollment. The coordinator replaces one that has been stood
 down rather than a live one, so the Pond revokes the existing enrollment itself
 and then replaces it, and **only after a person has approved the replacement at
@@ -437,6 +442,13 @@ there is no cloud account recovery, and every paired device must pair again. The
 identity (`tls/identity.json`) and the WireGuard node state
 (`embedded-network/node/tailscaled.state`) must be restored *with* it, because trust is
 the combination and not any one of the three.
+
+Enabling remote access creates the household key when `embedded-network/authority/`
+does not exist at all (2026-10-05). A Pond restored without that directory therefore
+registers a new household when remote access is enabled, instead of failing. A directory
+that exists but has lost `identity.json` is still refused, never replaced. Restore the
+authority before enabling remote access, and pair every phone again only if it is truly
+lost.
 
 `scripts/pond-snapshot.py` streams a tar of exactly that state to standard output:
 the three items above, `secrets/`, `secrets.json`, the schedules, and consistent copies
