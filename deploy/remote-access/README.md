@@ -301,12 +301,11 @@ Do not deploy publicly while those lifecycle acceptance items are open.
 **A Pond or phone may ask Tailscale's servers to resolve the coordinator's name.**
 When the system resolver cannot resolve the Headscale host, tsnet's control client
 falls back to the bootstrap-DNS endpoint of DERP servers from a map compiled into
-the Tailscale module (`net/dnsfallback`, wired in `control/controlclient/direct.go`
-line 337 and `control/controlhttp/client.go` line 374 of v1.102.4). Tailscale's
-default regions are always part of that map, whatever the coordinator's own DERP
-map says, and there is no setting or build tag that turns the fallback off. What
-such a request reveals is the client's address and the coordinator's host name; it
-carries no household data and grants Tailscale nothing. It happens only when normal
-DNS has failed. We document it rather than patch the module, and have drafted a
-request for an upstream option in `docs/upstream/tailscale-dnsfallback.md`.
-
+the Tailscale module (`net/dnsfallback`, wired as `LookupIPFallback` in
+`controlclient.NewDirect` and `controlhttp.(*Dialer).resolver` of v1.102.4).
+Tailscale's default regions are always part of that map, whatever the coordinator's
+own DERP map says, and there is no setting or build tag that turns the fallback off.
+What such a request reveals is the client's address and the coordinator's host name;
+it carries no household data and grants Tailscale nothing. It happens only when
+normal DNS has failed. We document it rather than patch the module, and have drafted
+a request for an upstream option in `docs/upstream/tailscale-dnsfallback.md`.
