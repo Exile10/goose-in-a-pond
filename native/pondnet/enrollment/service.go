@@ -70,7 +70,7 @@ type Backend interface {
 	EnsureUser(context.Context, string) (string, error)
 	Register(context.Context, string, string) (Registered, error)
 	Delete(context.Context, string) error
-	Policy(context.Context, []Rule) error
+	Policy(context.Context, []Rule, []NodeAttr) error
 }
 
 // Rule permits only approved phone addresses to reach their own Pond HTTPS port.
@@ -79,6 +79,19 @@ type Rule struct {
 	Src    []string `json:"src"`
 	Dst    []string `json:"dst"`
 }
+
+// NodeAttr grants node capabilities to every node whose address is in Target.
+type NodeAttr struct {
+	Target []string `json:"target"`
+	Attr   []string `json:"attr"`
+}
+
+// cacheNetworkMaps is tailcfg.NodeAttrCacheNetworkMaps. A node granted it keeps
+// its last network map on disk and starts from it when the coordinator is out of
+// reach, instead of waiting for a live map. It is granted to phones only: a Pond
+// must always start from the coordinator's current map, so that a phone revoked
+// while the Pond was down never passes a stale packet filter on the Pond.
+const cacheNetworkMaps = "cache-network-maps"
 
 // Service serializes security transitions and bounds public work before parsing.
 type Service struct {
@@ -153,6 +166,8 @@ func (s *Service) policy(ctx context.Context) error {
 	}
 	slices.Sort(households)
 	rules := []Rule{}
+	// Every verified phone, across households, sorted so the policy is deterministic.
+	cachers := []string{}
 	for _, id := range households {
 		devices := s.Store.value.Devices[id]
 		pond := ""
@@ -167,12 +182,18 @@ func (s *Service) policy(ctx context.Context) error {
 				phones = append(phones, device.Address)
 			}
 		}
+		cachers = append(cachers, phones...)
 		if pond != "" && len(phones) > 0 {
 			slices.Sort(phones)
 			rules = append(rules, Rule{Action: "accept", Src: phones, Dst: []string{pond + ":" + strconv.Itoa(int(s.Store.value.Households[id].Port))}})
 		}
 	}
-	if err := s.Backend.Policy(ctx, rules); err != nil {
+	attrs := []NodeAttr{}
+	if len(cachers) > 0 {
+		slices.Sort(cachers)
+		attrs = append(attrs, NodeAttr{Target: cachers, Attr: []string{cacheNetworkMaps}})
+	}
+	if err := s.Backend.Policy(ctx, rules, attrs); err != nil {
 		return err
 	}
 	if s.degraded.Swap(false) {

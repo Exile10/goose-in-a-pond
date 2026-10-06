@@ -198,6 +198,26 @@ func TestHeadscaleLive(t *testing.T) {
 		t.Fatal("own household cannot connect:", e)
 	}
 	allowed.Close()
+	// The same policy grants the network-map cache to the phone and never to the Pond.
+	for index, want := range []bool{false, true} {
+		lc, err := nodes[index].LocalClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		granted := !want
+		for attempt := 0; attempt < 50 && granted != want; attempt++ {
+			if status, err := lc.StatusWithoutPeers(ctx); err == nil && status.Self != nil {
+				granted = status.Self.HasCap(tailcfg.NodeAttrCacheNetworkMaps)
+			}
+			if granted != want {
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		if granted != want {
+			t.Fatalf("node %d: cache-network-maps granted=%t, want %t", index, granted, want)
+		}
+	}
+	t.Log("the coordinator grants the network-map cache to the phone only")
 	if relay {
 		lc, err := nodes[1].LocalClient()
 		if err != nil {

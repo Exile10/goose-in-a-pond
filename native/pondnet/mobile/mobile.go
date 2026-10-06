@@ -2,6 +2,7 @@
 package mobile
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/netip"
@@ -13,6 +14,9 @@ import (
 var lock sync.Mutex
 var node *pondnet.Node
 var proxy *pondnet.Proxy
+
+// stopWatching ends the running node's ForgetNetworkMapWhenRefused.
+var stopWatching context.CancelFunc
 
 // Diagnostics receives redacted backend log lines through the binding boundary.
 // The native layer installs one only for a debuggable build; a release build
@@ -93,6 +97,9 @@ func Start(directory, hostname, control string) error {
 	}
 	node = n
 	proxy = p
+	ctx, cancel := context.WithCancel(context.Background())
+	stopWatching = cancel
+	go n.ForgetNetworkMapWhenRefused(ctx, diagnose)
 	return nil
 }
 
@@ -142,9 +149,46 @@ func SetTargets(encoded string) error {
 }
 
 // Stop invalidates tunnels and releases the node without deleting its identity.
+// The cached network map stays, so the next Start can use it.
 func Stop() {
 	lock.Lock()
 	defer lock.Unlock()
+	stopLocked()
+}
+
+// Disable is Stop for remote access being switched off or the device removed:
+// it also erases the network map the node cached in directory, its state
+// directory. The identity stays, so enabling again needs no new enrollment, but
+// the list of peers and the access rules a removed device last saw do not.
+//
+// The node is stopped whatever happens. A failure to erase is returned and
+// recorded in the event log, never dropped: a cache left behind is the one
+// thing this was meant to prevent.
+func Disable(directory string) error {
+	lock.Lock()
+	defer lock.Unlock()
+	if node != nil {
+		// While the node runs, so the backend also drops what it holds in memory.
+		// The removal below is what decides the outcome, so a refusal here is
+		// recorded rather than returned.
+		if err := node.ClearNetworkMapCache(); err != nil {
+			diagnose("the running node did not clear its cached network map; erasing it from disk instead: " + err.Error())
+		}
+	}
+	stopLocked()
+	// After the node has stopped, so no map arriving in between survives.
+	if err := pondnet.RemoveNetworkMapCache(directory); err != nil {
+		diagnose("remote access was disabled, but its cached network map was not erased: " + err.Error())
+		return err
+	}
+	return nil
+}
+
+func stopLocked() {
+	if stopWatching != nil {
+		stopWatching()
+		stopWatching = nil
+	}
 	if proxy != nil {
 		proxy.Close()
 		proxy = nil
