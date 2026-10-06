@@ -130,11 +130,12 @@ rotating:
 ```
 
 Without `--provisioning-key` the service ignores certificates and only invites admit.
-Imaging a Pond (`scripts/giap.sh provision`) creates its device key with
-`pondnet --device-action create`, signs the printed public key with
-`pond-provision sign --key ... --device-public-key ...`, and installs the result with
-`pondnet --device-action install`. The device key never leaves the Pond; the
-provisioning key never leaves the operator's machine.
+Imaging a Pond creates its device key with `pondnet --device-action create`, signs
+the printed public key with `pond-provision sign --key ... --device-public-key ...`,
+and installs the result with `pondnet --device-action install`. `scripts/giap.sh
+provision` runs those steps over SSH; it is added with the Pond-side change. The
+device key never leaves the Pond; the provisioning key never leaves the operator's
+machine.
 
 Certificate refusals are a closed set: `device_certificate_invalid` (any check failed,
 deliberately not saying which), `device_revoked`, `device_used`. A Pond whose
@@ -151,6 +152,12 @@ docker compose exec enrollment /pond-enrollment --state /state --revoke-device <
 Revocation stops the certificate admitting a household from then on. A household it
 already admitted keeps its registration, since it holds its own key; the Pond's tailnet
 access is removed through the household's own device removal, or by the operator.
+
+A certificate has no expiry. It stops admitting only when its serial is revoked or
+once it has admitted its one household. If the provisioning key is lost or exposed,
+make a new one, drop the old one's `--provisioning-key` from the enrollment command,
+and redeploy; every unspent certificate the old key signed then stops admitting, and
+those Ponds need an invite or a certificate signed by the new key.
 
 A certificate does not separate households, any more than an invite does: the policy
 does. What it bounds is the same thing, who can consume this service's households and
