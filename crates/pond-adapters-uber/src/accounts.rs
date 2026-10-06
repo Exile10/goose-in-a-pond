@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::UberAccessTokens;
+use pond_core::rides::ports::RideAccounts;
 
 /// The scopes a member grants: book and follow rides, read receipts, show which account is
 /// connected, and keep the connection without signing in again.
@@ -292,6 +293,13 @@ fn encode(s: &str) -> String {
 }
 
 #[async_trait]
+impl RideAccounts for UberAccounts {
+    async fn is_connected(&self, profile_id: &str) -> Result<bool> {
+        Ok(self.get(REFRESH_KEY, profile_id).await?.is_some())
+    }
+}
+
+#[async_trait]
 impl UberAccessTokens for UberAccounts {
     async fn access_token(&self, profile_id: &str) -> Result<String> {
         self.access_token_at(profile_id, Utc::now()).await
@@ -485,7 +493,9 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(accounts.is_connected("liz").await.unwrap());
         accounts.disconnect("liz").await.unwrap();
+        assert!(!accounts.is_connected("liz").await.unwrap());
         assert_eq!(
             accounts.connected_members().await.unwrap(),
             vec!["jerry".to_string()]

@@ -27,3 +27,9 @@ pub trait RideProvider: Send + Sync {
 
     async fn cancel(&self, profile_id: &str, request_id: &str) -> Result<()>;
 }
+
+/// Which members can book with a provider: they connected their own account on this pond.
+#[async_trait]
+pub trait RideAccounts: Send + Sync {
+    async fn is_connected(&self, profile_id: &str) -> Result<bool>;
+}
