@@ -26,8 +26,12 @@ session authorization, and rate limiting remain enforced by the Pond API.
 
 ## Identity persistence and enrollment recovery
 
-`node.lock` is both the exclusive process lock and the installation marker. Back
-up the entire private node directory, including this file and `tailscaled.state`.
+`node.lock` is the exclusive process lock. The installation marker is
+`initialized`, written after the first identity. Back up the entire private node
+directory, including `initialized` and `tailscaled.state`; `node.lock` need not be
+kept. A profile from a build before 2026-09-30 has no marker and acquires one on its
+first start, which until then treats it as new: a missing identity is created
+rather than refused.
 An existing installation with missing, empty, malformed, insecure or incomplete
 identity state fails before starting networking. Valid earlier state files retain
 their keys. The store binds an identity to its configured coordinator, writes
@@ -89,6 +93,24 @@ WireGuard isolation are tested separately in `enrollment/headscale_live_test.go`
 See [the verification ledger](../../docs/embedded-remote-access-verification.md)
 for measured results and unfinished acceptance work, and
 [the deployment guide](../../deploy/remote-access/README.md) for pilot infrastructure.
+
+### State on disk
+
+Every file holding a key or state is read through `internal/privatefile`, which
+opens with `O_NOFOLLOW|O_NONBLOCK` and checks the open descriptor: a regular file,
+`0600` or stricter, within a size bound. Checking the path first and opening it
+after would read a file swapped in between.
+
+First setup survives a crash. The node's identity may be created only while its
+profile lacks the `initialized` marker, written after the first identity; the
+household authority is built in a staging directory and renamed into place. Before
+this, a crash at the wrong moment left a profile or directory that every later
+start refused. A profile with the marker and no identity has lost it and is still
+refused: restore the backup.
+
+tsnet keeps its own log ring (`tailscaled.log1.txt`, `tailscaled.log2.txt`) in the
+profile whatever the configured logger does, unredacted. `logtail.Disable()` drops
+entries before they reach it, and the helper deletes what earlier builds wrote.
 
 ### Redistribution notices
 
