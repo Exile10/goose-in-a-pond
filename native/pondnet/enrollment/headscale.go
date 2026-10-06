@@ -172,9 +172,10 @@ func (h *Headscale) Delete(ctx context.Context, id string) error {
 	return h.call(ctx, "DELETE", "/api/v1/node/"+id, nil, nil)
 }
 
-// Policy replaces the complete allowlist; an empty list denies every connection.
-func (h *Headscale) Policy(ctx context.Context, rules []Rule) error {
-	policy, err := json.Marshal(map[string]any{"acls": rules, "ssh": []any{}, "tagOwners": map[string]any{}})
+// Policy replaces the complete allowlist and node attributes; an empty rule list
+// denies every connection, and an empty attribute list grants no capability.
+func (h *Headscale) Policy(ctx context.Context, rules []Rule, attrs []NodeAttr) error {
+	policy, err := json.Marshal(map[string]any{"acls": rules, "nodeAttrs": attrs, "ssh": []any{}, "tagOwners": map[string]any{}})
 	if err != nil {
 		return err
 	}
