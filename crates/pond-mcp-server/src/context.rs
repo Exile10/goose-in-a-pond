@@ -329,7 +329,6 @@ struct ContextDeps {
 }
 
 static CONTEXT_DEPS: OnceLock<ContextDeps> = OnceLock::new();
-static CONTEXT_AUTHORITY: OnceLock<Option<Arc<dyn DraftAuthority>>> = OnceLock::new();
 
 /// Install the repository. Call once at startup, before the first turn.
 pub fn init_context_deps(
@@ -344,11 +343,6 @@ pub fn init_context_deps(
     });
 }
 
-/// Installs the caller resolution; `None` refuses every call.
-pub fn init_context_authority(authority: Option<Arc<dyn DraftAuthority>>) {
-    let _ = CONTEXT_AUTHORITY.set(authority);
-}
-
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_context_server(reader: DuplexStream, writer: DuplexStream) {
     // Not every binary installs these deps; a panic here would take down every builtin server.
@@ -361,7 +355,7 @@ pub fn spawn_context_server(reader: DuplexStream, writer: DuplexStream) {
     let server = ContextMcpServer::new(deps.repo.clone())
         .with_embedder(deps.embedder.clone())
         .with_retrieval(deps.retrieval.clone())
-        .with_authority(CONTEXT_AUTHORITY.get().cloned().flatten());
+        .with_authority(crate::speaker_authority());
     crate::serve_builtin(CONTEXT_EXTENSION, server, reader, writer);
 }
 
