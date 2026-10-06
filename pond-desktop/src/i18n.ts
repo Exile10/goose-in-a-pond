@@ -22,6 +22,11 @@ void i18n.use(initReactI18next).init({
     local: 'Remote access is disabled.', connecting: 'Registering this Pond with the coordinator.',
     enabled: 'Remote access is enabled. Paired phones can now request enrollment on your LAN.',
     failed: 'Remote access did not complete. Check the local server logs and pilot provisioning before retrying.',
+    invite: 'Invite', inviteHint: 'Needed once, the first time this Pond joins a coordination service. Whoever runs the service gives it to you.',
+    invite_required: 'This coordination service admits new households by invite. Enter the invite you were given and try again.',
+    invite_invalid: 'That invite was not recognised. Check it against the one you were given.',
+    invite_expired: 'That invite has expired. Ask for a new one.',
+    invite_used: 'That invite has already admitted another household. Ask for a new one.',
   }, signIn: {
     title: 'Sign in to this Pond',
     instructions: 'This browser has not been signed in. On the Pond, run this command and open the link it prints:',
