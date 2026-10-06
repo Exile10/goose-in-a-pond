@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -42,6 +44,17 @@ func run() error {
 	issue := flag.Bool("issue-invite", false, "ask the running service for a household invite and print it")
 	expires := flag.Duration("expires", enrollment.DefaultInviteLifetime, "how long an issued invite stays usable (at most 720h)")
 	socket := flag.String("admin-socket", "", "private socket for issuing invites (default: admin.sock in the state directory)")
+	revokeInvite := flag.String("revoke-invite", "", "ask the running service to withdraw an unspent invite")
+	revokeDevice := flag.String("revoke-device", "", "ask the running service to stop a device certificate serial admitting a household")
+	var provisioning []ed25519.PublicKey
+	flag.Func("provisioning-key", "base64 Ed25519 public key whose device certificates admit a household; repeat to trust more than one", func(text string) error {
+		key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(text))
+		if err != nil || len(key) != ed25519.PublicKeySize {
+			return errors.New("a provisioning key is a base64 Ed25519 public key")
+		}
+		provisioning = append(provisioning, ed25519.PublicKey(key))
+		return nil
+	})
 	flag.Parse()
 	if *health {
 		// The port the service was told to listen on; a wildcard host is checked on loopback.
@@ -63,11 +76,30 @@ func run() error {
 		}
 		return nil
 	}
+	administering := *issue || *revokeInvite != "" || *revokeDevice != ""
 	if *socket == "" {
+		if *directory == "" && administering {
+			// Otherwise the socket is looked for in the current directory, and the error
+			// is a bare "no such file", which says nothing about what to pass.
+			return errors.New("pass --state with the running service's state directory (in the compose stack, --state /state), or --admin-socket")
+		}
 		*socket = filepath.Join(*directory, "admin.sock")
 	}
-	if *issue {
+	switch {
+	case *issue:
 		return issueInvite(*socket, *expires)
+	case *revokeInvite != "":
+		if err := adminRequest(*socket, "/v1/invite/revoke?invite="+url.QueryEscape(*revokeInvite), nil); err != nil {
+			return err
+		}
+		fmt.Println("invite withdrawn; it admits nobody now")
+		return nil
+	case *revokeDevice != "":
+		if err := adminRequest(*socket, "/v1/device/revoke?serial="+url.QueryEscape(*revokeDevice), nil); err != nil {
+			return err
+		}
+		fmt.Println("device certificate revoked; it admits no household from now on")
+		return nil
 	}
 	store, err := enrollment.Open(*directory)
 	if err != nil {
@@ -99,6 +131,12 @@ func run() error {
 		return err
 	}
 	handler.TrustedProxies = trusted
+	handler.ProvisioningKeys = provisioning
+	if len(provisioning) == 0 {
+		slog.Info("no --provisioning-key: only invites admit a new household")
+	} else {
+		slog.Info("device certificates admit a new household", "provisioning_keys", len(provisioning))
+	}
 	if len(trusted) == 0 {
 		slog.Warn("no --trusted-proxy: behind a reverse proxy every client shares one rate-limit budget")
 	}
@@ -163,29 +201,45 @@ func listenAdmin(path string) (net.Listener, error) {
 
 // issueInvite asks the running service, which holds the state lock, for an invite.
 func issueInvite(socket string, lifetime time.Duration) error {
+	var issued struct {
+		Invite  string `json:"invite"`
+		Expires string `json:"expires"`
+	}
+	if err := adminRequest(socket, "/v1/invite?lifetime="+url.QueryEscape(lifetime.String()), &issued); err != nil {
+		return err
+	}
+	fmt.Printf("%s\nexpires %s; it is shown once and admits one household\n", issued.Invite, issued.Expires)
+	return nil
+}
+
+// adminRequest posts to the running service's administrative socket and decodes its
+// answer into out, when out is not nil.
+func adminRequest(socket, path string, out any) error {
 	client := http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 		},
 	}}
-	response, err := client.Post("http://admin/v1/invite?lifetime="+url.QueryEscape(lifetime.String()), "application/json", nil)
+	response, err := client.Post("http://admin"+path, "application/json", nil)
 	if err != nil {
-		return fmt.Errorf("no enrollment service is listening on %s: %w", socket, err)
+		return fmt.Errorf("no enrollment service is listening on %s; pass --state with the running service's state directory (in the compose stack, --state /state), or --admin-socket: %w", socket, err)
 	}
 	defer response.Body.Close()
-	var issued struct {
-		Invite  string `json:"invite"`
-		Expires string `json:"expires"`
-		Error   string `json:"error"`
-	}
-	if err = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&issued); err != nil {
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4096))
+	if err != nil {
 		return err
 	}
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("no invite issued: %s", issued.Error)
+		var refused struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(body, &refused)
+		return fmt.Errorf("the enrollment service refused: %s", refused.Error)
 	}
-	fmt.Printf("%s\nexpires %s; it is shown once and admits one household\n", issued.Invite, issued.Expires)
-	return nil
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal(body, out)
 }
 
 func parsePrefixes(list string) ([]netip.Prefix, error) {

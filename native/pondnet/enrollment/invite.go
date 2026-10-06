@@ -173,10 +173,61 @@ func (s *Store) admitLocked(invite, id string, now int64) (string, string) {
 	return digest, ""
 }
 
-// AdminHandler issues invites. Serve it only on the private administrative socket.
+// RevokeInvite withdraws an invite nobody has spent yet, so a code sent to the wrong
+// person, or pasted somewhere it should not have been, admits nobody. One already spent
+// cannot be withdrawn: the household it admitted holds its own key.
+func (s *Store) RevokeInvite(text string) error {
+	canonical, ok := canonicalInvite(text)
+	if !ok {
+		return errors.New("that is not an invite")
+	}
+	digest := inviteDigest(canonical)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failure != nil {
+		return s.failure
+	}
+	invite, ok := s.value.Invites[digest]
+	switch {
+	case !ok:
+		return errors.New("no such invite was issued, or it has already expired")
+	case invite.ConsumedBy != "":
+		return errors.New("that invite already admitted a household and cannot be withdrawn")
+	}
+	delete(s.value.Invites, digest)
+	if err := s.save(); err != nil {
+		s.value.Invites[digest] = invite
+		return err
+	}
+	return nil
+}
+
+// AdminHandler issues and withdraws invites and revokes device certificates. Serve it
+// only on the private administrative socket.
 func (s *Service) AdminHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/invite/revoke" {
+			if err := s.Store.RevokeInvite(r.URL.Query().Get("invite")); err != nil {
+				slog.Warn("invite not withdrawn", "error", err)
+				writeAdminError(w, err)
+				return
+			}
+			slog.Info("invite withdrawn")
+			json.NewEncoder(w).Encode(map[string]bool{"revoked": true})
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/device/revoke" {
+			serial := r.URL.Query().Get("serial")
+			if err := s.Store.RevokeDevice(serial, s.Now().Unix()); err != nil {
+				slog.Warn("device certificate not revoked", "error", err)
+				writeAdminError(w, err)
+				return
+			}
+			slog.Info("device certificate revoked", "serial", serial)
+			json.NewEncoder(w).Encode(map[string]bool{"revoked": true})
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/invite" {
 			http.NotFound(w, r)
 			return
@@ -199,4 +250,11 @@ func (s *Service) AdminHandler() http.Handler {
 		slog.Info("invite issued", "expires", expires.UTC().Format(time.RFC3339))
 		json.NewEncoder(w).Encode(map[string]string{"invite": invite, "expires": expires.UTC().Format(time.RFC3339)})
 	})
+}
+
+// writeAdminError reports a refused administrative request with its reason. The socket
+// is reachable only by the operator, so the reason is shown rather than closed.
+func writeAdminError(w http.ResponseWriter, err error) {
+	w.WriteHeader(http.StatusConflict)
+	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 }
