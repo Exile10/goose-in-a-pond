@@ -6,6 +6,9 @@ import { join } from "node:path";
 /** The file pond-server writes its ACTUAL bound port to, after it binds. */
 export const RUNTIME_PORT_FILE = ".runtime_api_port";
 
+/** The 0600 file holding the credential that host-only routes require; rotated every start. */
+export const HOST_CREDENTIAL_FILE = ".runtime_host_credential";
+
 export interface DataDirEnv {
   env: NodeJS.ProcessEnv;
   home: string;
@@ -49,4 +52,11 @@ export function readRuntimePort(contents: string | null): number | null {
   const port = Number(trimmed);
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return null;
   return port;
+}
+
+/** Credential from the host credential file: 43 base64url characters, so a junk file yields null. */
+export function readHostCredential(contents: string | null): string | null {
+  if (contents === null) return null;
+  const trimmed = contents.trim();
+  return /^[A-Za-z0-9_-]{43}$/.test(trimmed) ? trimmed : null;
 }

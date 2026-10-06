@@ -8,6 +8,8 @@ import type { VoiceChildProcess } from "./voice/VoiceChildProcess";
 export interface IpcTargets {
   server: ServerProcess;
   voice: VoiceChildProcess;
+  /** Reads the server's host credential file; null when it is missing or malformed. */
+  hostCredential: () => string | null;
 }
 
 /** Register a handler, with the channel name checked against the contract. */
@@ -30,6 +32,8 @@ export function registerIpc(t: IpcTargets): void {
   });
 
   handle("stop_voice_session", () => t.voice.stop());
+
+  handle("host_credential", () => t.hostCredential());
 
   handle("open_external", async (args) => {
     const url = (args as { url?: string } | undefined)?.url;

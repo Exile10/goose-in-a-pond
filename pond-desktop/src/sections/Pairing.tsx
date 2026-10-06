@@ -5,6 +5,7 @@ import { Button, Chip } from "@heroui/react";
 import { RefreshCw, Smartphone, Wifi } from "lucide-react";
 import QRCode from "qrcode";
 import { api } from "../api/PondApiClient";
+import { isSignInRequired } from "../api/hostCredential";
 import { PageHeader } from "../components/shared";
 
 interface PairingInfo {
@@ -57,7 +58,7 @@ export function Pairing() {
       const pairUrl = `pond://pair?${params.toString()}`;
       setInfo({ code: pc.code, expiresAt: pc.expires_at ?? "", pairUrl });
     } catch (e) {
-      setError(String(e));
+      setError(isSignInRequired(e) ? i18n.t('signIn.hostOnly') : String(e));
     } finally {
       setLoading(false);
     }

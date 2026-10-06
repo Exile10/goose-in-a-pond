@@ -10,7 +10,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use pond_api::network::CompanionTransport;
 use pond_core::security::ports::handshake::{
-    Handshake, HandshakeRequest, HandshakeResponse, TokenCaller,
+    Handshake, HandshakeRequest, HandshakeResponse, PairingCode, TokenCaller,
 };
 use pond_server::listeners::{compose, Listeners};
 use serde_json::Value;
@@ -20,7 +20,8 @@ const LOOPBACK: ([u8; 4], u16) = ([127, 0, 0, 1], 40_000);
 const LAN: ([u8; 4], u16) = ([192, 168, 1, 20], 40_000);
 
 /// Accepts one bearer, so a 404 means the route is absent rather than the caller refused.
-struct PairedPhone;
+/// Pairing codes come from the real adapter.
+struct PairedPhone(std::sync::Arc<pond_infra::sqlite_handshake::SqliteHandshakeAdapter>);
 
 #[async_trait]
 impl Handshake for PairedPhone {
@@ -42,12 +43,16 @@ impl Handshake for PairedPhone {
     async fn revoke_token(&self, _: &str) -> Result<()> {
         Ok(())
     }
+    async fn issue_pairing_code_for(&self, profile: Option<&str>) -> Result<PairingCode> {
+        self.0.issue_pairing_code_for(profile).await
+    }
 }
 
 const TOKEN: &str = "wiring-test-token";
 
 struct Harness {
     listeners: Listeners,
+    credential: pond_api::host_guard::HostCredential,
     _dir: tempfile::TempDir,
 }
 
@@ -60,19 +65,31 @@ async fn harness() -> Harness {
     #[cfg(unix)]
     let (embedded, _socket) =
         pond_server::embedded_network::Runtime::new(test.dir.path(), 4000).unwrap();
+    let credential = pond_api::host_guard::HostCredential::generate();
     let listeners = compose(
         std::sync::Arc::new(pond_api::AppState {
-            handshake: std::sync::Arc::new(PairedPhone),
+            handshake: std::sync::Arc::new(PairedPhone(test.handshake)),
             ..test.state
         }),
         std::path::PathBuf::from("pond-desktop/dist"),
         transport,
+        credential.clone(),
         #[cfg(unix)]
         embedded,
     );
     Harness {
         listeners,
+        credential,
         _dir: test.dir,
+    }
+}
+
+/// What a browser or phone puts in `Host` when it reaches that listener.
+fn host_for(peer: ([u8; 4], u16)) -> &'static str {
+    if peer == LOOPBACK {
+        "127.0.0.1:4000"
+    } else {
+        "pond.local:4443"
     }
 }
 
@@ -84,6 +101,7 @@ async fn get(router: &axum::Router, peer: ([u8; 4], u16), path: &str) -> (Status
             .clone()
             .layer(axum::Extension(ConnectInfo(SocketAddr::from(peer)))),
         Request::get(path)
+            .header("Host", host_for(peer))
             .header("Authorization", format!("Bearer {TOKEN}"))
             .body(Body::empty())
             .unwrap(),
@@ -182,4 +200,68 @@ async fn the_embedded_socket_admits_only_forwarded_tailnet_peers() {
         StatusCode::NOT_FOUND,
         "management reached the tailnet"
     );
+}
+
+#[tokio::test]
+async fn the_dashboard_refuses_rebound_and_cross_site_requests() {
+    let h = harness().await;
+    let dashboard = || {
+        h.listeners
+            .dashboard
+            .clone()
+            .layer(axum::Extension(ConnectInfo(SocketAddr::from(LOOPBACK))))
+    };
+    for path in [
+        "/",
+        "/api/v1/remote-access",
+        "/api/v1/handshake/pairing-code",
+    ] {
+        let (status, body) = send(
+            dashboard(),
+            Request::get(path)
+                .header("Host", "attacker.example:4000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{path}");
+        assert_eq!(body["error"], "loopback_host_required", "{path}");
+        let (status, body) = send(
+            dashboard(),
+            Request::post(path)
+                .header("Host", "127.0.0.1:4000")
+                .header("Origin", "http://attacker.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(body["error"], "origin_not_allowed", "{path}");
+    }
+}
+
+#[tokio::test]
+async fn pairing_codes_need_the_host_credential_even_on_loopback() {
+    let h = harness().await;
+    let issue = |credential: Option<&str>| {
+        let mut request = Request::post("/api/v1/handshake/pairing-code")
+            .header("Host", "127.0.0.1:4000")
+            .header("Origin", "http://127.0.0.1:4000");
+        if let Some(credential) = credential {
+            request = request.header(pond_api::host_guard::CREDENTIAL_HEADER, credential);
+        }
+        send(
+            h.listeners
+                .dashboard
+                .clone()
+                .layer(axum::Extension(ConnectInfo(SocketAddr::from(LOOPBACK)))),
+            request.body(Body::empty()).unwrap(),
+        )
+    };
+    let (status, body) = issue(None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "host_credential_required");
+    let (status, body) = issue(Some(h.credential.as_str())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["code"].is_string(), "{body}");
 }

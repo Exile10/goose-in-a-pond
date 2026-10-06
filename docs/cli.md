@@ -90,6 +90,20 @@ RUST_LOG=pond_api=debug,sqlx=info pond-server serve
 
 ---
 
+## `dashboard`
+
+Prints a sign-in link for the web dashboard, for a browser on the Pond itself. A browser needs it to pair phones or manage remote access.
+
+```bash
+pond-server dashboard
+```
+
+No flags. It reads the running server's port from `<data_dir>/.runtime_api_port` and its host credential from `<data_dir>/.runtime_host_credential`, and prints `http://localhost:<port>/#host=<credential>`. Browsers do not send the part after `#` in any request. The server writes a new credential every time it starts, so the link stops working on a restart; run the command again for a new one. It fails if the server is not running under this account.
+
+Through an SSH tunnel (`ssh -L 9000:localhost:4000 <pond>`), change only the port in the link. Do not share the link: anyone holding it can pair devices until the server restarts. `serve --open` opens the dashboard without the credential.
+
+---
+
 ## `chat`
 
 Interactive terminal chat loop. Cycles through the `Wait → Listen → Think → Speak` state machine. Press `Ctrl-C` or send EOF to exit.

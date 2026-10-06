@@ -266,6 +266,13 @@ enum Commands {
         #[arg(long)]
         refresh: bool,
     },
+
+    /// Print a sign-in link for the web dashboard in a browser.
+    ///
+    /// A browser needs the host credential to pair phones or manage remote access. The link
+    /// carries it after `#`, which browsers never send over the network. It stops working when
+    /// the server restarts; run this again for a new one.
+    Dashboard,
 }
 
 #[derive(Subcommand)]
@@ -567,6 +574,7 @@ async fn async_main() -> Result<()> {
             reset,
         }) => run_calibrate(phrase.as_deref(), samples, whisper_url.as_deref(), reset).await,
         Some(Commands::Pairing { refresh }) => run_pairing(refresh).await,
+        Some(Commands::Dashboard) => run_dashboard(),
         None => {
             // No subcommand: interactive text chat, provider from Settings.
             let _log = tracing_setup::init_tracing(false, &data_dir);
@@ -3402,6 +3410,14 @@ async fn run_server(
         pond_server::embedded_network::Runtime::new(&data_dir, https_port)?;
     std::fs::write(data_dir.join(".runtime_https_port"), https_port.to_string())?;
 
+    // Before the port file, so a client that sees the port can always read the credential.
+    // Not best-effort: without it no one could pair or manage remote access.
+    let host_credential = pond_server::host_credential::install(&data_dir)?;
+    tracing::info!(
+        file = %pond_server::host_credential::path(&data_dir).display(),
+        "host credential rotated; `pond-server dashboard` prints a browser sign-in link"
+    );
+
     // For `pond pairing`, which needs the real port (maybe a fallback, or --port). Best-effort.
     let _ = std::fs::write(data_dir.join(".runtime_api_port"), api_port.to_string());
 
@@ -4259,6 +4275,7 @@ async fn run_server(
         state.clone(),
         static_dir,
         transport.clone(),
+        host_credential,
         #[cfg(unix)]
         embedded.clone(),
     );
@@ -4286,7 +4303,9 @@ async fn run_server(
         https_port,
         "local dashboard and HTTPS companion listeners ready"
     );
-    println!("Local dashboard: http://127.0.0.1:{api_port}");
+    println!(
+        "Local dashboard: http://127.0.0.1:{api_port} (sign-in link: `pond-server dashboard`)"
+    );
     println!("Companion API: https://{hostname}.local:{https_port}/api/v1/health");
     println!("Pond public-key fingerprint: {}", transport.tls_spki_sha256);
 
@@ -9163,18 +9182,43 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
 
 /// Shows the pairing code from the running server over loopback. Never mint locally: codes
 /// live in the server's process-local `ISSUED_CODE_CACHE`, so a CLI-minted one can't verify.
-async fn run_pairing(refresh: bool) -> Result<()> {
-    let data_dir = default_data_dir();
-
-    // The server writes its bound port here; if missing, the HTTP call reports it isn't running.
-    let port = std::fs::read_to_string(data_dir.join(".runtime_api_port"))
+/// The running server's port, from the file it writes after binding. If the file is missing,
+/// the default port; the HTTP call then reports a server that is not running.
+fn runtime_api_port(data_dir: &std::path::Path) -> u16 {
+    std::fs::read_to_string(data_dir.join(".runtime_api_port"))
         .ok()
         .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or(ports::API_SERVER);
+        .unwrap_or(ports::API_SERVER)
+}
+
+fn run_dashboard() -> Result<()> {
+    let data_dir = default_data_dir();
+    let credential = pond_server::host_credential::read(&data_dir)?;
+    let port = runtime_api_port(&data_dir);
+    println!("Open this link in a browser on this machine to sign in to the dashboard:\n");
+    println!("  http://localhost:{port}/#host={credential}\n");
+    println!(
+        "Through an SSH tunnel (ssh -L 9000:localhost:{port} <pond>), change only the port.\n\
+         Anyone with this link can pair devices until the server restarts; do not share it."
+    );
+    Ok(())
+}
+
+async fn run_pairing(refresh: bool) -> Result<()> {
+    let data_dir = default_data_dir();
+    let port = runtime_api_port(&data_dir);
+    let credential = pond_server::host_credential::read(&data_dir)?;
 
     let base = format!("http://127.0.0.1:{port}/api/v1/handshake/pairing-code");
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        pond_api::host_guard::CREDENTIAL_HEADER,
+        reqwest::header::HeaderValue::from_str(&credential)
+            .context("the host credential file is corrupt; restart the server")?,
+    );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .default_headers(headers)
         .build()?;
 
     // GET returns the current unconsumed code; POST mints a fresh one.

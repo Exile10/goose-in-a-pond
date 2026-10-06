@@ -1396,3 +1396,35 @@ describe("setBase", () => {
     vi.unstubAllGlobals();
   });
 });
+
+describe("the host credential", () => {
+  const credential = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ-_01234";
+  const sent = (path: string) =>
+    fetchMock.mock.calls
+      .filter(([url]) => String(url).includes(path))
+      .map(([, init]) => (init?.headers as Record<string, string>)["X-Pond-Host-Credential"]);
+
+  beforeEach(() => sessionStorage.setItem("giap-host-credential", credential));
+  afterEach(() => sessionStorage.clear());
+
+  it("goes only to the host-only routes", async () => {
+    fetchMock.mockImplementation(async () => okJson({ code: "123456", state: "Stopped" }));
+    const api = client();
+    await api.getPairingCode();
+    await api.remoteStatus();
+    await api.health();
+    expect(sent("/handshake/pairing-code")).toEqual([credential]);
+    expect(sent("/remote-access")).toEqual([credential]);
+    expect(sent("/health")).toEqual([undefined]);
+  });
+
+  it("surfaces the refusal by name, so the UI can explain it", async () => {
+    sessionStorage.clear();
+    fetchMock.mockResolvedValue(errJson(403, "host_credential_required"));
+    await expect(client().getPairingCode()).rejects.toMatchObject({
+      status: 403,
+      message: "host_credential_required",
+    });
+    expect(sent("/handshake/pairing-code")).toEqual([undefined]);
+  });
+});

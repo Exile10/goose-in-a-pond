@@ -8,6 +8,7 @@ import React, {
 } from "react";
 import { invoke, listen, isDesktopShell } from "../shell";
 import { api } from "../api/PondApiClient";
+import { isSignInRequired } from "../api/hostCredential";
 import { refreshHomeData } from "../hub/state/hubDataStore";
 import { setChatRunBridge, resumeActiveRun } from "./chatRunStore";
 import {
@@ -213,6 +214,7 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
       api
         .connect()
         .then(async (token) => {
+          dispatch({ type: "SET_SIGN_IN_REQUIRED", payload: false });
           if (token) {
             dispatch({ type: "SET_SESSION_TOKEN", payload: token });
           } else {
@@ -222,7 +224,14 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
           // The import-time hubDataStore fetch ran without a token and cached mock data; refetch.
           void refreshHomeData();
         })
-        .catch((err) => console.warn("Connect failed (non-fatal):", err));
+        .catch((err) => {
+          if (isSignInRequired(err)) {
+            console.warn("This tab has no host credential; showing the sign-in instructions.");
+            dispatch({ type: "SET_SIGN_IN_REQUIRED", payload: true });
+            return;
+          }
+          console.warn("Connect failed (non-fatal):", err);
+        });
     };
 
     // The sidecar bound another port; request builders read the base per call, so no reload.

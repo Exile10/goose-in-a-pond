@@ -28,7 +28,7 @@ Two properties matter more than they look, and both were violated at once in Sep
 | Lifecycle | `pond-desktop/electron/main/serverProcess.ts` | Locate, spawn, watch, replace, shut down |
 | Quit and health loop | `pond-desktop/electron/main/lifecycle.ts` | One idempotent teardown; a cancellable loop |
 | Orphan reaping | `pond-desktop/electron/main/orphan.ts` | Pidfile, liveness, identity. Shared with the voice child |
-| Data dir and port file | `pond-desktop/electron/main/dataDir.ts` | Mirrors the server's `default_data_dir` |
+| Data dir and port file | `pond-desktop/electron/main/dataDir.ts` | Mirrors the server's `default_data_dir`; also reads `.runtime_host_credential`, which the renderer gets over IPC (`host_credential`, `electron/main/ipc.ts`) and sends as `X-Pond-Host-Credential` |
 | Wiring | `pond-desktop/electron/main/index.ts` | Events, window, the real implementations of every seam |
 
 ## Lifecycle and budgets

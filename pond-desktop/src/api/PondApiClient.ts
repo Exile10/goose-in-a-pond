@@ -69,6 +69,7 @@ import {
 import { voiceTitle } from "../voice/voiceCatalogue";
 import { parseSse, type SseFrame } from "../player/sse";
 import type { PlayerReply, PlayerState } from "../player/types";
+import { hostCredential } from "./hostCredential";
 
 // All REST calls MUST go through PondApiClient; no fetch() elsewhere.
 
@@ -253,6 +254,7 @@ export class PondApiClient {
     body?: unknown,
     timeout?: number,
     _retry = false,
+    extra?: Record<string, string>,
   ): Promise<Response> {
     await this.ensureTokenFresh();
     const controller = new AbortController();
@@ -260,7 +262,7 @@ export class PondApiClient {
     try {
       const res = await fetch(`${this.base}${path}`, {
         method,
-        headers: this.headers(method),
+        headers: this.headers(method, extra),
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
@@ -268,7 +270,7 @@ export class PondApiClient {
       if (res.status === 401 && !_retry) {
         // Token rejected (e.g. rotated): re-pair once, coalesced, then retry.
         await this.reauthenticate();
-        return this.send(method, path, body, timeout, true);
+        return this.send(method, path, body, timeout, true, extra);
       }
       if (!res.ok) {
         let msg = res.statusText;
@@ -299,8 +301,9 @@ export class PondApiClient {
     path: string,
     body?: unknown,
     timeout?: number,
+    extra?: Record<string, string>,
   ): Promise<T> {
-    const res = await this.send(method, path, body, timeout);
+    const res = await this.send(method, path, body, timeout, false, extra);
     const ct = res.headers.get("content-type") ?? "";
     if (res.status === 204 || !ct.includes("json"))
       return undefined as unknown as T;
@@ -323,13 +326,22 @@ export class PondApiClient {
     return this.request<T>("DELETE", path);
   }
 
-  remoteStatus(): Promise<{ state: string; authUrl?: string }> { return this.get('/api/v1/remote-access'); }
-  prepareRemoteIdentity(): Promise<{ household: string; publicKey: string }> { return this.post('/api/v1/remote-access/identity', {}); }
-  enableRemoteAccess(config: { enabled: boolean; controlUrl: string; enrollmentUrl: string }): Promise<unknown> { return this.post('/api/v1/remote-access', config); }
-  remoteRecoveryRequests(): Promise<{ id: string; device: string; approved: boolean }[]> { return this.get('/api/v1/remote-access/recovery-requests'); }
-  approveRemoteRecovery(id: string): Promise<unknown> { return this.post(`/api/v1/remote-access/recovery-requests/${encodeURIComponent(id)}`, {}); }
-  registerRemotePond(): Promise<unknown> { return this.post('/api/v1/remote-access/register', {}); }
-  disableRemoteAccess(): Promise<unknown> { return this.del('/api/v1/remote-access'); }
+  /** Headers for routes that also need the host credential: pairing codes and remote access. */
+  private async hostHeaders(): Promise<Record<string, string>> {
+    const credential = await hostCredential();
+    return credential ? { "X-Pond-Host-Credential": credential } : {};
+  }
+  private async hostRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
+    return this.request<T>(method, path, body, undefined, await this.hostHeaders());
+  }
+
+  remoteStatus(): Promise<{ state: string; authUrl?: string }> { return this.hostRequest('GET', '/api/v1/remote-access'); }
+  prepareRemoteIdentity(): Promise<{ household: string; publicKey: string }> { return this.hostRequest('POST', '/api/v1/remote-access/identity', {}); }
+  enableRemoteAccess(config: { enabled: boolean; controlUrl: string; enrollmentUrl: string }): Promise<unknown> { return this.hostRequest('POST', '/api/v1/remote-access', config); }
+  remoteRecoveryRequests(): Promise<{ id: string; device: string; approved: boolean }[]> { return this.hostRequest('GET', '/api/v1/remote-access/recovery-requests'); }
+  approveRemoteRecovery(id: string): Promise<unknown> { return this.hostRequest('POST', `/api/v1/remote-access/recovery-requests/${encodeURIComponent(id)}`, {}); }
+  registerRemotePond(): Promise<unknown> { return this.hostRequest('POST', '/api/v1/remote-access/register', {}); }
+  disableRemoteAccess(): Promise<unknown> { return this.hostRequest('DELETE', '/api/v1/remote-access'); }
 
   // ── Health ────────────────────────────────────────────────
 
@@ -963,13 +975,24 @@ export class PondApiClient {
     method: string,
     path: string,
     body?: unknown,
+    hostOnly = false,
   ): Promise<T> {
     const res = await fetch(`${this.base}${path}`, {
       method,
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(hostOnly ? await this.hostHeaders() : {}),
+      },
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-    if (!res.ok) throw new ApiError(res.status, res.statusText);
+    if (!res.ok) {
+      // The server's `{error}` names the refusal, e.g. `host_credential_required`.
+      const error = await res
+        .json()
+        .then((b: { error?: unknown }) => (typeof b.error === "string" ? b.error : null))
+        .catch(() => null);
+      throw new ApiError(res.status, error ?? res.statusText);
+    }
     return res.json() as Promise<T>;
   }
 
@@ -1000,18 +1023,22 @@ export class PondApiClient {
       .join("");
   }
 
-  /** Auto-pairs via the loopback-only pairing-code endpoint (same machine), storing the tokens. */
+  /** Auto-pairs via the host-only pairing-code endpoint (loopback plus the host credential). */
   async pair(clientId?: string): Promise<HandshakeResponse> {
     clientId = clientId ?? this.clientId();
-    // If the startup code (10 min) lapsed, mint one; both endpoints are loopback-only.
+    // If the startup code (10 min) lapsed, mint one; both endpoints are host-only.
     let pc = await this.handshakeFetch<PairingCodeResponse>(
       "GET",
       "/api/v1/handshake/pairing-code",
+      undefined,
+      true,
     );
     if (!pc.code) {
       pc = await this.handshakeFetch<PairingCodeResponse>(
         "POST",
         "/api/v1/handshake/pairing-code",
+        undefined,
+        true,
       );
     }
     if (!pc.code) {
@@ -1096,19 +1123,23 @@ export class PondApiClient {
 
   // ── Pairing ───────────────────────────────────────────────
 
-  /** Return the current unexpired pairing code, or null if none is active. Loopback-only. */
+  /** Return the current unexpired pairing code, or null if none is active. Host-only. */
   getPairingCode(): Promise<PairingCodeResponse> {
     return this.handshakeFetch<PairingCodeResponse>(
       "GET",
       "/api/v1/handshake/pairing-code",
+      undefined,
+      true,
     );
   }
 
-  /** Issue a fresh pairing code, replacing any existing one. Loopback-only. */
+  /** Issue a fresh pairing code, replacing any existing one. Host-only. */
   issuePairingCode(): Promise<PairingCodeResponse> {
     return this.handshakeFetch<PairingCodeResponse>(
       "POST",
       "/api/v1/handshake/pairing-code",
+      undefined,
+      true,
     );
   }
 
