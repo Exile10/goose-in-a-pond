@@ -3064,3 +3064,14 @@ windows; not a PAI milestone completion).**
   tests 3,651 passed, 0 failed, 26 ignored (`model_integration_test` 38); clippy exit 0 with no new
   warning; the goose adapter's lib tests 271; pond-server's bin tests 161 and its four integration
   binaries; the four checks; `scripts/live-test.sh` on port 4979, 172 checks, 0 failed.
+- **Polish round, 2026-10-06.** A machine that is not budgeted now reports its own memory on
+  `/models/memory-status` (sysinfo, read locally; total less a desktop reserve of a quarter, at
+  least 4 GB), where it used to report the Orin's 7,620 MB; a budgeted device and an emulation keep
+  the board's arithmetic, so PAI-3's device windows are unchanged and nothing new leaves the
+  machine (PAI-2). The rest is copy and a progress field: the picture refusal names "Pictures
+  included", a delete refusal names the model and its job, and entries carry `resumable`.
+  Verification: fast-crate tests 3,684 passed, 0 failed, 26 ignored; clippy exit 0 with no new
+  warning; the local-inference adapter's lib tests 47; the goose adapter's 271; pond-server's bin
+  tests 161 and its four integration binaries; the four checks; `scripts/live-test.sh` on port
+  4979, 172 checks, 0 failed. This Mac (24 GB) reads total 24,576, budget 18,432, available about
+  16,300 MB.
