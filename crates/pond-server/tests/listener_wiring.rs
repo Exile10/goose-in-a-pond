@@ -264,4 +264,45 @@ async fn pairing_codes_need_the_host_credential_even_on_loopback() {
     let (status, body) = issue(Some(h.credential.as_str())).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["code"].is_string(), "{body}");
+    // The pairing material a phone needs travels with the code, not through /system/info.
+    assert_eq!(body["pairing"]["https_port"], 4443);
+    assert!(body["pairing"]["tls_spki_sha256"]
+        .as_str()
+        .is_some_and(|pin| pin.starts_with("sha256/")));
+    assert!(body["pairing"]["hostname"].is_string());
+}
+
+#[tokio::test]
+async fn system_info_tells_an_anonymous_caller_where_to_connect_and_nothing_more() {
+    let h = harness().await;
+    let (status, body) = send(
+        h.listeners.companion.clone(),
+        Request::get("/api/v1/system/info")
+            .header("Host", "pond.local:4443")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["https_port"], 4443);
+    assert_eq!(body["protocol"], 2);
+    for private in [
+        "hostname",
+        "lan_address",
+        "tls_spki_sha256",
+        "version",
+        "platform",
+        "arch",
+    ] {
+        assert!(
+            body.get(private).is_none(),
+            "{private} reached an anonymous caller: {body}"
+        );
+    }
+    let (status, body) = get(&h.listeners.companion, LAN, "/api/v1/system/info").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["hostname"].is_string() && body["version"].is_string(),
+        "{body}"
+    );
 }

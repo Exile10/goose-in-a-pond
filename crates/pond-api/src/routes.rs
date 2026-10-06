@@ -861,6 +861,8 @@ async fn handshake_pairing_code(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     credential: Option<axum::Extension<crate::host_guard::HostCredential>>,
+    transport: Option<axum::Extension<crate::network::CompanionTransport>>,
+    embedded: Option<axum::Extension<crate::network::EmbeddedAddress>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !peer.ip().is_loopback() {
@@ -879,14 +881,16 @@ async fn handshake_pairing_code(
         .current_pairing_code()
         .await
         .map_err(|e| handshake_error("pairing_code_lookup", e))?;
+    let pairing = pairing_material(transport, embedded);
     match code {
         Some(pc) => Ok(Json(json!({
             "code": pc.code,
             "expires_at": pc.expires_at,
             // Whose device this code will make; `null` = unattributed.
             "profile_id": pc.profile_id,
+            "pairing": pairing,
         }))),
-        None => Ok(Json(json!({"code": null}))),
+        None => Ok(Json(json!({"code": null, "pairing": pairing}))),
     }
 }
 
@@ -910,6 +914,8 @@ async fn handshake_issue_pairing_code(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     credential: Option<axum::Extension<crate::host_guard::HostCredential>>,
+    transport: Option<axum::Extension<crate::network::CompanionTransport>>,
+    embedded: Option<axum::Extension<crate::network::EmbeddedAddress>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -984,6 +990,7 @@ async fn handshake_issue_pairing_code(
         "code": pc.code,
         "expires_at": pc.expires_at,
         "profile_id": pc.profile_id,
+        "pairing": pairing_material(transport, embedded),
     })))
 }
 
@@ -3725,11 +3732,45 @@ fn tailnet_address() -> Option<String> {
     is_tailnet_v4(v4).then(|| v4.to_string())
 }
 
+/// `GET /system/info`. Public, because a phone uses it to find the HTTPS port and the
+/// tailnet address before it has paired, but only that much: the host name, addresses,
+/// version and platform are a map of the household for anything on the tailnet, so they
+/// are for callers holding a valid token. Pairing material comes with the pairing code.
 async fn system_info(
     State(state): State<Arc<AppState>>,
     transport: Option<axum::Extension<crate::network::CompanionTransport>>,
     embedded: Option<axum::Extension<crate::network::EmbeddedAddress>>,
+    headers: axum::http::HeaderMap,
 ) -> Json<Value> {
+    let authenticated = match crate::middleware::extract_bearer_token(&headers) {
+        Ok(token) => state.handshake.validate_token(&token).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "system/info: could not validate the bearer; answering as anonymous");
+            false
+        }),
+        Err(_) => false,
+    };
+    let pairing = pairing_material(transport, embedded);
+    if !authenticated {
+        return Json(json!({
+            "https_port": pairing["https_port"],
+            "tailnet_address": pairing["tailnet_address"],
+            // Pinned HTTPS pairing (v2), so a client can tell this from an older Pond.
+            "protocol": 2,
+        }));
+    }
+    let mut info = pairing;
+    info["port"] = json!(state.api_port);
+    info["version"] = json!(env!("CARGO_PKG_VERSION"));
+    info["platform"] = json!(std::env::consts::OS);
+    info["arch"] = json!(std::env::consts::ARCH);
+    Json(info)
+}
+
+/// What a phone needs to pair: every address it may try, and the key to pin.
+fn pairing_material(
+    transport: Option<axum::Extension<crate::network::CompanionTransport>>,
+    embedded: Option<axum::Extension<crate::network::EmbeddedAddress>>,
+) -> Value {
     let (https_port, tls_spki_sha256) = crate::network::transport_fields(transport);
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
@@ -3738,8 +3779,7 @@ async fn system_info(
         .strip_suffix(".local")
         .unwrap_or(&hostname)
         .to_string();
-
-    Json(json!({
+    json!({
         "hostname": hostname,
         // Null without a LAN route; for clients that can't resolve `<hostname>.local`.
         "lan_address": lan_address(),
@@ -3747,11 +3787,7 @@ async fn system_info(
         "tailnet_address": match embedded { Some(e) => e.0.0.read().ok().and_then(|v| v.clone()), None => tailnet_address() },
         "https_port": https_port,
         "tls_spki_sha256": tls_spki_sha256,
-        "port": state.api_port,
-        "version": env!("CARGO_PKG_VERSION"),
-        "platform": std::env::consts::OS,
-        "arch": std::env::consts::ARCH,
-    }))
+    })
 }
 
 async fn list_devices(

@@ -1049,6 +1049,18 @@ export interface ChallengeResponse {
 export interface PairingCodeResponse {
   code: string | null;
   expires_at?: string;
+  /** Where a phone connects and which key it pins; sent only on this host-only route. */
+  pairing: PairingMaterial;
+}
+
+export interface PairingMaterial {
+  hostname: string;
+  /** LAN IPv4 for phones that cannot resolve `<hostname>.local`; null without a LAN route. */
+  lan_address: string | null;
+  /** Tailscale IPv4, reachable from outside the house. Null unless this Pond is on a tailnet. */
+  tailnet_address: string | null;
+  https_port: number | null;
+  tls_spki_sha256: string | null;
 }
 
 // ── Model Role Assignments ────────────────────────────────────
