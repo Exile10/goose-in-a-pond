@@ -290,6 +290,12 @@ tailscale's verbose backend log stays behind a debuggable build.
   access, Matter lockfile, security advisory and frontend resolution blockers
   remain documented above.
 
+## Superseded node identities on phones (2026-10-05)
+
+On the Galaxy A57 the prune erased 33 superseded node directories, each holding a
+node's private and machine keys from an earlier pairing. See "A phone's superseded
+node identities" in [remote access](remote-access.md).
+
 ## Reproduction
 
 Run Go checks from `native/pondnet` with Go 1.27.1:
