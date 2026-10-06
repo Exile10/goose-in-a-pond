@@ -9,3 +9,13 @@
 # is AWS's own documented example key, in `a_credential_is_a_credential`.
 # Removing it would delete the coverage that stops a real token reaching a log.
 8f2721ac34f5520308130f6feadf90211ab52e7d:crates/pond-core/src/security/domain/redaction.rs:github-pat:509
+
+# A synthetic host credential in the desktop tests for the loopback host guard
+# (#432, #433): a fixed 43-character string the tests check the client sends.
+# The keyword "credential" and its entropy match generic-api-key.
+11fcf8d3324e15b5a1dc7050eb11dc42bbdffe89:pond-desktop/src/api/PondApiClient.test.ts:generic-api-key:1200
+11fcf8d3324e15b5a1dc7050eb11dc42bbdffe89:pond-desktop/src/api/hostCredential.test.ts:generic-api-key:5
+
+# A fixed key preview in the phone-recovery review test (#443): sixteen hex digits
+# the test renders and looks for, not a key.
+5d81b13eb91a9c0295d291572cc648a364653589:pond-desktop/src/sections/RemoteAccess.test.tsx:generic-api-key:60
