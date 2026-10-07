@@ -1810,9 +1810,11 @@ Partial update.
 
 A member books a ride from **their own paired phone**. The member is the one the phone's pairing
 token belongs to (`DeviceAttribution`), never a field in the request. A ride belonging to another
-member answers **404**, as if it did not exist. The pond's desktop is not a member's phone and gets
-**403**. Booking needs Uber sign-in support (see *Uber accounts*); without it every route answers
-**503**.
+member answers **404**, as if it did not exist. The pond's desktop, and a phone whose pairing names
+no member, get **403**. Booking needs travel switched on (`ext_travel_enabled`) and Uber sign-in
+support (see *Uber accounts*) when the pond starts; without them every route answers **503**. While
+travel is switched off, quote and confirm answer **503**; reading, declining and cancelling still
+work.
 
 The order is always: quote, then the member confirms. `book_ride` (the assistant's tool) only sends
 the phone a `ride_offer` notification whose `data` names the drop-off; the phone then asks for the
@@ -1841,7 +1843,11 @@ fare from where it is.
 ```
 
 `state.state` is one of `awaiting_confirmation`, `requesting`, `requested` (with `ride`: status,
-driver, vehicle, `pickup_eta_mins`), `declined`, `failed` (with `reason`).
+driver, vehicle, `pickup_eta_mins`), `outcome_unknown` (with `reason`: Uber's answer was lost and it
+may have booked the ride), `declined`, `failed` (with `reason`: Uber refused). A trip the pond took
+over at startup, rather than quoted, has `pickup`, `dropoff`, `fare` and `pickup_eta_mins` null.
+
+**422** — the drop-off is more than 150 km from the pickup; no fare is asked for.
 
 ### POST /rides/{id}/confirm
 
@@ -1849,6 +1855,7 @@ Books the ride and returns it as above, with `state.state` = `requested`.
 
 | Status | Meaning |
 |---|---|
+| 202 | Uber's answer was lost and no trip of the member's shows the ride yet: `state.state` = `outcome_unknown`, and `message` says to check the Uber app. The pond keeps checking and never sends the request again |
 | 404 | No such ride for this member |
 | 409 | Already confirmed, declined or tried; a fare is confirmed at most once |
 | 410 | The fare expired; quote again |
@@ -1856,10 +1863,12 @@ Books the ride and returns it as above, with `state.state` = `requested`.
 
 ### POST /rides/{id}/decline · POST /rides/{id}/cancel
 
-**204.** Cancel works only on a booked ride (409 otherwise); Uber may charge a cancellation fee.
+**204.** Cancel works only on a booked ride (409 otherwise; for an `outcome_unknown` ride the pond
+first looks for it among the member's trips under way); Uber may charge a cancellation fee.
 
 While a ride is under way the pond reads it every `GIAP_RIDE_POLL_SECS` (default 15, at least 5)
-and sends the member a `ride_update` notification (`data`: `ride_id`, `status`) on each change.
+and sends the member a `ride_update` notification (`data`: `ride_id`, `status`) on each change. If
+40 reads in a row fail it stops, with a last `ride_update` whose `data` has `followed: false`.
 
 ## Uber accounts
 
