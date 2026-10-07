@@ -23,7 +23,9 @@ pub const AUTHORIZE_URL: &str = "https://auth.uber.com/oauth/v2/authorize";
 
 /// Renew this long before the access token lapses, so a booking never starts with a dying token.
 const RENEW_MARGIN: chrono::Duration = chrono::Duration::minutes(10);
-const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longer than the relay waits for Uber (15 s), so the pond never gives up on an exchange the relay
+/// can still finish: Uber's code is single use, and an answer nobody waits for loses it.
+const RELAY_TIMEOUT: Duration = Duration::from_secs(25);
 /// The name relay calls are filed under in the egress log, the same as the music-token fetch.
 const EGRESS_TOOL: &str = "giap-credentials";
 
