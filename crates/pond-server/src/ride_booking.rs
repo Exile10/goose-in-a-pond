@@ -22,30 +22,40 @@ pub fn poll_interval(raw: Option<&str>) -> Duration {
         .map_or(DEFAULT_POLL, |d| d.max(MIN_POLL))
 }
 
-/// Turn ride booking on, or say why it stays off. Needs the secret store (member sign-ins) and
-/// the credentials service (Uber's client secret); without either, `book_ride` and the phone's
-/// ride routes answer that booking is not set up.
-pub fn start(
+/// Members' Uber connections, installed for `book_ride`. Needs the secret store (member sign-ins)
+/// and the credentials service (Uber's client secret); without either it stays off and says so.
+/// Every process that runs giap-travel calls this; only `serve` goes on to [`start`].
+pub fn install_accounts(
     secrets: Option<Arc<dyn SecretRepository + Send + Sync>>,
     relay_url: Option<String>,
-    notifier: Arc<dyn MemberNotifier>,
-) -> Option<Arc<RideBooking>> {
+) -> Option<Arc<UberAccounts>> {
     let (Some(secrets), Some(relay_url)) = (secrets, relay_url) else {
         tracing::info!(
             "ride booking is off: it needs the secret store and Jarida's credentials service"
         );
         return None;
     };
-    let http = reqwest::Client::new();
     let accounts = Arc::new(UberAccounts::new(
         secrets,
-        Some(SignInRelay::new(http.clone(), &relay_url)),
+        Some(SignInRelay::new(reqwest::Client::new(), &relay_url)),
     ));
-    let uber = UberRides::new(http, UberConfig::from_env(), accounts.clone());
+    pond_mcp_server::travel::init_ride_accounts(accounts.clone());
+    Some(accounts)
+}
+
+/// Turn ride booking on, or say why it stays off: the accounts as [`install_accounts`], the
+/// booking rules, the phone's ride routes and the tracker. Without them `book_ride` and the
+/// phone's ride routes answer that booking is not set up.
+pub fn start(
+    secrets: Option<Arc<dyn SecretRepository + Send + Sync>>,
+    relay_url: Option<String>,
+    notifier: Arc<dyn MemberNotifier>,
+) -> Option<Arc<RideBooking>> {
+    let accounts = install_accounts(secrets, relay_url)?;
+    let uber = UberRides::new(reqwest::Client::new(), UberConfig::from_env(), accounts);
     let booking = Arc::new(RideBooking::new(Arc::new(uber)));
 
     pond_api::rides::install(booking.clone());
-    pond_mcp_server::travel::init_ride_accounts(accounts);
 
     let interval = poll_interval(std::env::var(POLL_ENV).ok().as_deref());
     let tracked = booking.clone();

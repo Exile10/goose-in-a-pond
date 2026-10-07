@@ -193,10 +193,10 @@ pub struct TravelMcpServer {
     /// The home's country, keyed by the home it was learned for: learning it costs a lookup.
     home_country: Arc<Mutex<Option<LearnedCountry>>>,
     /// Both set: links are also pushed to the speaker's own phones. Either unset: reply only.
-    authority: Option<Arc<dyn DraftAuthority>>,
-    notifier: Option<Arc<dyn MemberNotifier>>,
-    /// Which members can book; `None` means booking is not set up and `book_ride` says so.
-    ride_accounts: Option<Arc<dyn RideAccounts>>,
+    authority: Dep<dyn DraftAuthority>,
+    notifier: Dep<dyn MemberNotifier>,
+    /// Which members can book; unset means booking is not set up and `book_ride` says so.
+    ride_accounts: Dep<dyn RideAccounts>,
     #[allow(dead_code)] // accessed by rmcp's generated tool_handler code
     tool_router: ToolRouter<Self>,
 }
@@ -213,9 +213,9 @@ impl TravelMcpServer {
             places,
             settings: None,
             home_country: Arc::new(Mutex::new(None)),
-            authority: None,
-            notifier: None,
-            ride_accounts: None,
+            authority: Dep::Fixed(None),
+            notifier: Dep::Fixed(None),
+            ride_accounts: Dep::Fixed(None),
             tool_router: Self::tool_router(),
         }
     }
@@ -234,13 +234,22 @@ impl TravelMcpServer {
         authority: Option<Arc<dyn DraftAuthority>>,
         notifier: Option<Arc<dyn MemberNotifier>>,
     ) -> Self {
-        self.authority = authority;
-        self.notifier = notifier;
+        self.authority = Dep::Fixed(authority);
+        self.notifier = Dep::Fixed(notifier);
         self
     }
 
     pub fn with_ride_accounts(mut self, accounts: Option<Arc<dyn RideAccounts>>) -> Self {
-        self.ride_accounts = accounts;
+        self.ride_accounts = Dep::Fixed(accounts);
+        self
+    }
+
+    /// Read the speaker authority, member notifier and ride accounts from the process-wide
+    /// slots on every call, so ones installed after goose spawned this server are still used.
+    fn reading_installed_deps(mut self) -> Self {
+        self.authority = Dep::Installed(crate::speaker_authority);
+        self.notifier = Dep::Installed(crate::member_notifier);
+        self.ride_accounts = Dep::Installed(installed_ride_accounts);
         self
     }
 
@@ -483,6 +492,32 @@ impl Matched {
     }
 }
 
+/// A dependency of the server: given at construction, or read from its process-wide slot each
+/// time a tool runs. Goose keeps the first server it spawns for the life of the process, and that
+/// can be before startup has installed the slots.
+enum Dep<T: ?Sized> {
+    Fixed(Option<Arc<T>>),
+    Installed(fn() -> Option<Arc<T>>),
+}
+
+impl<T: ?Sized> Dep<T> {
+    fn get(&self) -> Option<Arc<T>> {
+        match self {
+            Self::Fixed(dep) => dep.clone(),
+            Self::Installed(read) => read(),
+        }
+    }
+}
+
+impl<T: ?Sized> Clone for Dep<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Fixed(dep) => Self::Fixed(dep.clone()),
+            Self::Installed(read) => Self::Installed(*read),
+        }
+    }
+}
+
 fn describe(point: &RidePoint) -> String {
     match point {
         RidePoint::MyLocation => "the phone's current location".to_string(),
@@ -578,7 +613,7 @@ impl TravelMcpServer {
     /// line saying where it went. Only one member is ever pushed to (see [`Self::speaker`]): a
     /// broadcast would put one person's trip on every phone.
     async fn deliver(&self, meta: &Meta, link: PhoneLink) -> Option<String> {
-        let (Some(_), Some(notifier)) = (&self.authority, &self.notifier) else {
+        let (Some(_), Some(notifier)) = (self.authority.get(), self.notifier.get()) else {
             return None;
         };
         let profile_id = match self.speaker(meta).await {
@@ -627,7 +662,7 @@ impl TravelMcpServer {
         const NOT_ONE_MEMBER: &str = "the speaker is not identified as one household member";
         let authority = self
             .authority
-            .as_ref()
+            .get()
             .ok_or("this pond cannot tell who is speaking")?;
         let session =
             crate::session_meta::session_from_meta(meta).ok_or("this call carries no session")?;
@@ -643,12 +678,12 @@ impl TravelMcpServer {
     /// The body of `book_ride`, apart from the rmcp wrapper so tests can call it.
     pub async fn book_result(&self, meta: &Meta, params: &BookRideParams) -> CallToolResult {
         let fail = |text: String| CallToolResult::error(vec![Content::text(text)]);
-        let Some(accounts) = &self.ride_accounts else {
+        let Some(accounts) = self.ride_accounts.get() else {
             return fail(
                 "Booking rides is not set up on this pond, so no ride offer was sent.".into(),
             );
         };
-        let Some(notifier) = &self.notifier else {
+        let Some(notifier) = self.notifier.get() else {
             return fail("This pond cannot send to phones, so no ride offer was sent.".into());
         };
         let Some(destination) = text_param(&params.destination, &params.extra, DESTINATION_KEYS)
@@ -796,6 +831,10 @@ pub fn init_ride_accounts(accounts: Arc<dyn RideAccounts>) {
     let _ = RIDE_ACCOUNTS.set(accounts);
 }
 
+fn installed_ride_accounts() -> Option<Arc<dyn RideAccounts>> {
+    RIDE_ACCOUNTS.get().cloned()
+}
+
 /// Install the place lookup and the settings that say where home is. Call once at startup.
 pub fn init_travel_deps(
     places: Option<Arc<dyn PlaceLookup>>,
@@ -815,8 +854,7 @@ pub fn spawn_travel_server(reader: DuplexStream, writer: DuplexStream) {
     };
     let server = TravelMcpServer::new(deps.places.clone())
         .with_home(deps.settings.clone())
-        .with_phone_delivery(crate::speaker_authority(), crate::member_notifier())
-        .with_ride_accounts(RIDE_ACCOUNTS.get().cloned());
+        .reading_installed_deps();
     crate::serve_builtin(TRAVEL_EXTENSION, server, reader, writer);
 }
 
@@ -1361,6 +1399,60 @@ mod delivery_tests {
         );
         assert!(notifier.sent().is_empty());
         assert!(out.contains("carries no session"), "{out}");
+    }
+
+    /// A schedule can make goose spawn this server before startup installs these.
+    #[tokio::test]
+    async fn deps_installed_after_the_server_was_built_are_used() {
+        static NOTIFIER: OnceLock<Arc<dyn MemberNotifier>> = OnceLock::new();
+        static AUTHORITY: OnceLock<Arc<dyn DraftAuthority>> = OnceLock::new();
+        let mut server = TravelMcpServer::new(None);
+        server.notifier = Dep::Installed(|| NOTIFIER.get().cloned());
+        server.authority = Dep::Installed(|| AUTHORITY.get().cloned());
+
+        let before = text(
+            &server
+                .directions_result(&meta(), &directions_to("Kisumu"))
+                .await,
+        );
+        assert!(!before.contains("sent to"), "{before}");
+
+        let notifier = Arc::new(MockMemberNotifier::new().with_devices("liz", &["liz-phone"]));
+        assert!(NOTIFIER.set(notifier.clone()).is_ok());
+        assert!(AUTHORITY
+            .set(Arc::new(FixedSpeaker {
+                scope: Some(ProfileScope::Owner("liz".into())),
+                sole: None,
+            }))
+            .is_ok());
+        let after = text(
+            &server
+                .directions_result(&meta(), &directions_to("Kisumu"))
+                .await,
+        );
+        assert!(
+            after.contains("Also sent to the speaker's phone."),
+            "{after}"
+        );
+        assert_eq!(notifier.sent().len(), 1);
+    }
+
+    #[test]
+    fn the_spawned_server_reads_its_deps_when_a_tool_runs() {
+        let server = TravelMcpServer::new(None).reading_installed_deps();
+        assert!(matches!(server.authority, Dep::Installed(_)));
+        assert!(matches!(server.notifier, Dep::Installed(_)));
+        assert!(matches!(server.ride_accounts, Dep::Installed(_)));
+        let spawn = include_str!("travel.rs")
+            .split("pub fn spawn_travel_server")
+            .nth(1)
+            .expect("spawn_travel_server not found");
+        let body = &spawn[..spawn.find("serve_builtin").unwrap_or(spawn.len())];
+        assert!(
+            body.contains(".reading_installed_deps()"),
+            "spawn_travel_server copies its deps at spawn; a server spawned before startup \
+             installs them keeps None for the life of the process"
+        );
     }
 
     #[tokio::test]
