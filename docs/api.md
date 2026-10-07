@@ -119,6 +119,11 @@ All errors return JSON:
 | POST | /recipes | Protected | Create a recipe |
 | PUT | /recipes/{id} | Protected | Update a recipe |
 | DELETE | /recipes/{id} | Protected | Delete a recipe |
+| POST | /rides/quote | Protected, member's phone | An upfront fare from the phone's location; books nothing |
+| GET | /rides/{id} | Protected, member's phone | A quoted or booked ride |
+| POST | /rides/{id}/confirm | Protected, member's phone | Book the ride at the quoted fare |
+| POST | /rides/{id}/decline | Protected, member's phone | Turn the fare down |
+| POST | /rides/{id}/cancel | Protected, member's phone | Cancel a booked ride |
 | GET | /uber/accounts | Protected, host only | Members who have connected Uber |
 | POST | /uber/accounts/connect | Protected, host only | Start a member's Uber sign-in |
 | DELETE | /uber/accounts/{profile_id} | Protected, host only | Forget a member's Uber sign-in on this pond |
@@ -1798,6 +1803,61 @@ Partial update.
 **Response 204** — no body
 
 ---
+
+## Rides
+
+A member books a ride from **their own paired phone**. The member is the one the phone's pairing
+token belongs to (`DeviceAttribution`), never a field in the request. A ride belonging to another
+member answers **404**, as if it did not exist. The pond's desktop is not a member's phone and gets
+**403**. Booking needs Uber sign-in support (see *Uber accounts*); without it every route answers
+**503**.
+
+The order is always: quote, then the member confirms. `book_ride` (the assistant's tool) only sends
+the phone a `ride_offer` notification whose `data` names the drop-off; the phone then asks for the
+fare from where it is.
+
+### POST /rides/quote
+
+**Request**
+```json
+{
+  "pickup": { "latitude": -1.2676, "longitude": 36.8108, "name": "Home" },
+  "dropoff": { "latitude": -1.319167, "longitude": 36.9275, "name": "JKIA" }
+}
+```
+
+**Response 200**
+```json
+{
+  "id": "…", "provider": "uber",
+  "pickup": { "name": "Home", "latitude": -1.2676, "longitude": 36.8108 },
+  "dropoff": { "name": "JKIA", "latitude": -1.319167, "longitude": 36.9275 },
+  "fare": { "display": "KES 1,250", "currency_code": "KES", "expires_at": "2026-10-06T08:02:00Z" },
+  "pickup_eta_mins": 4,
+  "state": { "state": "awaiting_confirmation" }
+}
+```
+
+`state.state` is one of `awaiting_confirmation`, `requesting`, `requested` (with `ride`: status,
+driver, vehicle, `pickup_eta_mins`), `declined`, `failed` (with `reason`).
+
+### POST /rides/{id}/confirm
+
+Books the ride and returns it as above, with `state.state` = `requested`.
+
+| Status | Meaning |
+|---|---|
+| 404 | No such ride for this member |
+| 409 | Already confirmed, declined or tried; a fare is confirmed at most once |
+| 410 | The fare expired; quote again |
+| 502 | Uber refused (its reason is in `error`). The ride is not retried |
+
+### POST /rides/{id}/decline · POST /rides/{id}/cancel
+
+**204.** Cancel works only on a booked ride (409 otherwise); Uber may charge a cancellation fee.
+
+While a ride is under way the pond reads it every `GIAP_RIDE_POLL_SECS` (default 15, at least 5)
+and sends the member a `ride_update` notification (`data`: `ride_id`, `status`) on each change.
 
 ## Uber accounts
 

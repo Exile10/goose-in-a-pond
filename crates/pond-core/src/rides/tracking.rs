@@ -1,0 +1,123 @@
+//! Following booked rides: one pass reads every ride still under way and tells its member what
+//! changed. The caller decides how often to run it.
+
+use chrono::Utc;
+
+use super::booking::RideBooking;
+use crate::mcp::ports::notification::{MemberNotifier, Notification};
+
+/// One pass. Returns how many members were sent an update. A ride that cannot be read is logged
+/// and tried again on the next pass; it never stops the others.
+pub async fn track_once(booking: &RideBooking, notifier: &dyn MemberNotifier) -> usize {
+    let mut sent = 0;
+    for pending in booking.active() {
+        let (ride, announcement) = match booking.refresh(&pending.id, &pending.profile_id).await {
+            Ok(read) => read,
+            Err(e) => {
+                tracing::warn!(ride = %pending.id, error = %e, "could not read a ride's status");
+                continue;
+            }
+        };
+        let Some(message) = announcement else {
+            continue;
+        };
+        let notification = Notification {
+            id: format!("ride-{}-{:?}", pending.id, ride.status),
+            target: pending.profile_id.clone(),
+            category: "info".to_string(),
+            title: format!("Your ride to {}", pending.dropoff.name),
+            body: message,
+            timestamp: Utc::now().to_rfc3339(),
+            data: Some(serde_json::json!({
+                "action": "ride_update",
+                "ride_id": pending.id,
+                "status": ride.status,
+            })),
+        };
+        if !notifier
+            .notify_member(&pending.profile_id, notification)
+            .await
+            .is_empty()
+        {
+            sent += 1;
+        }
+    }
+    sent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::mocks::mock_member_notifier::MockMemberNotifier;
+    use crate::rides::domain::{Place, RideStatus};
+    use crate::rides::mocks::MockRideProvider;
+    use std::sync::Arc;
+
+    fn place(name: &str) -> Place {
+        Place {
+            name: name.to_string(),
+            latitude: -1.3,
+            longitude: 36.8,
+        }
+    }
+
+    async fn booked(provider: Arc<MockRideProvider>) -> (RideBooking, String) {
+        let booking = RideBooking::new(provider);
+        let now = Utc::now();
+        let pending = booking
+            .quote("liz", place("Home"), place("JKIA"), now)
+            .await
+            .unwrap();
+        booking.confirm(&pending.id, "liz", now).await.unwrap();
+        (booking, pending.id)
+    }
+
+    #[tokio::test]
+    async fn a_status_change_reaches_the_member_once() {
+        let provider = Arc::new(MockRideProvider::new());
+        let (booking, ride_id) = booked(provider.clone()).await;
+        let notifier = MockMemberNotifier::new().with_devices("liz", &["liz-phone"]);
+
+        provider.set_status(RideStatus::Accepted);
+        assert_eq!(track_once(&booking, &notifier).await, 1);
+        assert_eq!(
+            track_once(&booking, &notifier).await,
+            0,
+            "the same status was sent twice"
+        );
+
+        let sent = notifier.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "liz");
+        assert_eq!(sent[0].1.title, "Your ride to JKIA");
+        assert!(sent[0].1.body.contains("Amina"), "{}", sent[0].1.body);
+        let data = sent[0].1.data.as_ref().unwrap();
+        assert_eq!(data["action"], "ride_update");
+        assert_eq!(data["ride_id"], ride_id);
+    }
+
+    #[tokio::test]
+    async fn a_finished_ride_stops_being_followed() {
+        let provider = Arc::new(MockRideProvider::new());
+        let (booking, _) = booked(provider.clone()).await;
+        let notifier = MockMemberNotifier::new().with_devices("liz", &["liz-phone"]);
+
+        provider.set_status(RideStatus::Completed);
+        assert_eq!(track_once(&booking, &notifier).await, 1);
+        provider.set_status(RideStatus::Arriving);
+        assert_eq!(
+            track_once(&booking, &notifier).await,
+            0,
+            "a completed ride was read again"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_for_a_ride_still_being_matched() {
+        let provider = Arc::new(MockRideProvider::new());
+        let (booking, _) = booked(provider).await;
+        let notifier = MockMemberNotifier::new().with_devices("liz", &["liz-phone"]);
+        assert_eq!(track_once(&booking, &notifier).await, 0);
+        assert!(notifier.sent().is_empty());
+    }
+}

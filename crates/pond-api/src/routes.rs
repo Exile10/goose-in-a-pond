@@ -304,6 +304,11 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/oauth/refresh", post(oauth_refresh_handler))
         .route("/oauth/providers", get(oauth_providers_handler))
         .route("/oauth/status/{state}", get(oauth_status_handler))
+        .route("/rides/quote", post(crate::rides::quote))
+        .route("/rides/{id}", get(crate::rides::get))
+        .route("/rides/{id}/confirm", post(crate::rides::confirm))
+        .route("/rides/{id}/decline", post(crate::rides::decline))
+        .route("/rides/{id}/cancel", post(crate::rides::cancel))
         .route("/uber/accounts", get(crate::uber_accounts::list))
         .route(
             "/uber/accounts/connect",
