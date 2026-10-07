@@ -252,6 +252,9 @@ impl WhisperRsInput {
         let (slot, profile) = engine.slot(&opts);
         // A panic mid-decode leaves the state in an unknown condition, so it is replaced.
         let mut held = slot.lock().unwrap_or_else(|poisoned| {
+            // Forget the poisoning once the state is dropped, or every later call would land
+            // here again and rebuild the state this slot exists to keep.
+            slot.clear_poison();
             let mut held = poisoned.into_inner();
             *held = None;
             held
