@@ -43,6 +43,27 @@ allocate CUDA0 buffer`; with the change it is followed by `failed to reserve gra
 buffers` and Whisper's own `failed to init ... allocator`, and the transcription
 returns an error.
 
+## Native source change: forget a reservation that could not allocate
+
+`whisper.cpp/ggml/src/ggml-alloc.c`, in `ggml_gallocr_reserve_n_impl`, resets the recorded
+node and leaf counts when a compute buffer cannot be allocated. It is the same change, line
+for line, as the third native change in jarida-io/llama-cpp-rs-giap (`2dc017bc`, its
+`llama-cpp-sys-2/POND-PATCH.md`). Upstream llama.cpp did not have it as of 2026-10-05; drop it
+when the vendored GGML resets a failed layout itself.
+
+The reservation fix above makes the first failure an error. The next allocation of the same
+graph shape still crashed: the failed reservation had recorded a layout that places tensors in
+the buffer it could not allocate, so the allocator found a matching layout, skipped
+reallocation and wrote through NULL. While every transcription made its own state, a failed
+state was dropped and the next call started with a fresh allocator, so this was unreachable.
+Since states are kept and reused (`Engine` in `crates/pond-adapters-whisper/src/in_process.rs`),
+the next transcription after an out-of-memory one reuses that allocator.
+
+There is no Whisper-side test. The bindings here expose `ggml.h` only, not the allocator and
+scheduler APIs, and widening them changes the symbol inventory this crate renames on Linux. The
+fork's `tests/graph_reservation_failure.rs` exercises the identical code on the CPU backend: it
+died with `SIGSEGV` on the second attempt without this change, and refuses all three with it.
+
 ## Native source change: decoder KV cache that cannot grow
 
 `whisper.cpp/src/whisper.cpp`, in `whisper_full_with_state`, no longer frees the state
