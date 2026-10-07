@@ -137,15 +137,28 @@ impl SignInRelay {
     }
 }
 
+/// Why a sign-in cannot start or renew on a pond whose credentials service is turned off.
+pub const SIGN_IN_OFF: &str =
+    "Uber sign-in needs Jarida's credentials service, which is turned off on \
+                         this pond (POND_CREDENTIALS_URL)";
+
+/// A finished code exchange whose tokens are not kept yet: see [`UberAccounts::keep`].
+pub struct SignedIn {
+    tokens: TokenSet,
+    refresh_token: String,
+}
+
 /// Each member's Uber connection, stored in the pond's secret store.
 pub struct UberAccounts {
     secrets: Arc<dyn SecretRepository>,
-    relay: SignInRelay,
+    /// `None` with the credentials service turned off: no sign-in can start or renew, but the
+    /// ones kept can still be listed and forgotten.
+    relay: Option<SignInRelay>,
     renewing: tokio::sync::Mutex<()>,
 }
 
 impl UberAccounts {
-    pub fn new(secrets: Arc<dyn SecretRepository>, relay: SignInRelay) -> Self {
+    pub fn new(secrets: Arc<dyn SecretRepository>, relay: Option<SignInRelay>) -> Self {
         Self {
             secrets,
             relay,
@@ -153,38 +166,56 @@ impl UberAccounts {
         }
     }
 
-    pub fn relay(&self) -> &SignInRelay {
-        &self.relay
+    /// The credentials service, unless it is turned off on this pond.
+    pub fn relay(&self) -> Option<&SignInRelay> {
+        self.relay.as_ref()
     }
 
-    /// Finish a member's sign-in: exchange Uber's code through the relay and keep the tokens.
-    pub async fn connect(
+    fn require_relay(&self) -> Result<&SignInRelay> {
+        self.relay.as_ref().context(SIGN_IN_OFF)
+    }
+
+    /// Exchange Uber's sign-in code through the relay. Nothing is kept until [`Self::keep`], so the
+    /// caller can check in between that the member is still in the household.
+    pub async fn exchange(&self, code: &str, redirect_uri: &str) -> Result<SignedIn> {
+        let tokens = self
+            .require_relay()?
+            .exchange_code(code, redirect_uri)
+            .await?;
+        let refresh_token = tokens
+            .refresh_token
+            .clone()
+            .context("Uber gave no refresh token; was offline_access granted?")?;
+        Ok(SignedIn {
+            tokens,
+            refresh_token,
+        })
+    }
+
+    /// Keep a member's tokens from a finished sign-in.
+    pub async fn keep(
         &self,
         profile_id: &str,
-        code: &str,
-        redirect_uri: &str,
+        signed_in: SignedIn,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let tokens = self.relay.exchange_code(code, redirect_uri).await?;
-        let refresh = tokens
-            .refresh_token
-            .as_deref()
-            .context("Uber gave no refresh token; was offline_access granted?")?;
         self.store(
             profile_id,
-            &tokens.access_token,
-            refresh,
-            expiry(&tokens, now),
+            &signed_in.tokens.access_token,
+            &signed_in.refresh_token,
+            expiry(&signed_in.tokens, now),
         )
         .await
     }
 
-    /// Forget a member's Uber connection. Their Uber account itself is untouched.
-    pub async fn disconnect(&self, profile_id: &str) -> Result<()> {
+    /// Forget a member's Uber connection; true when they had one. Their Uber account itself is
+    /// untouched.
+    pub async fn disconnect(&self, profile_id: &str) -> Result<bool> {
+        let had = self.get(REFRESH_KEY, profile_id).await?.is_some();
         for prefix in [ACCESS_KEY, REFRESH_KEY, EXPIRES_KEY] {
             self.secrets.delete(&key(prefix, profile_id)).await?;
         }
-        Ok(())
+        Ok(had)
     }
 
     /// The members who have connected Uber, by profile id.
@@ -214,7 +245,12 @@ impl UberAccounts {
             .get(REFRESH_KEY, profile_id)
             .await?
             .ok_or_else(|| anyhow!("this member has not connected Uber"))?;
-        let tokens = self.relay.renew(&refresh).await?;
+        let tokens = self.require_relay()?.renew(&refresh).await?;
+        // A disconnect, or the member's removal, while the relay answered wins: never write back
+        // tokens that were forgotten in the meantime.
+        if self.get(REFRESH_KEY, profile_id).await?.as_deref() != Some(refresh.as_str()) {
+            bail!("this member's Uber connection was removed or replaced while it was renewed");
+        }
         // Uber may or may not rotate the refresh token; keep the old one when it doesn't.
         let next_refresh = tokens.refresh_token.clone().unwrap_or(refresh);
         self.store(
@@ -361,9 +397,17 @@ mod tests {
         let secrets = Arc::new(MemorySecrets::default());
         let accounts = UberAccounts::new(
             secrets.clone(),
-            SignInRelay::new(reqwest::Client::new(), &server.uri()),
+            Some(SignInRelay::new(reqwest::Client::new(), &server.uri())),
         );
         (accounts, secrets)
+    }
+
+    impl UberAccounts {
+        /// A whole sign-in, for tests that are not about the gap between exchange and keep.
+        async fn connect(&self, profile_id: &str, code: &str) -> Result<()> {
+            let signed_in = self.exchange(code, CALLBACK).await?;
+            self.keep(profile_id, signed_in, now()).await
+        }
     }
 
     async fn relay_returns(server: &MockServer, route: &str, body: serde_json::Value) {
@@ -390,10 +434,7 @@ mod tests {
             .await;
         let (accounts, secrets) = accounts(&server);
 
-        accounts
-            .connect("liz", "c-1", CALLBACK, now())
-            .await
-            .unwrap();
+        accounts.connect("liz", "c-1").await.unwrap();
         assert_eq!(
             secrets
                 .get("UBER_REFRESH_TOKEN:liz")
@@ -430,10 +471,7 @@ mod tests {
             .mount(&server)
             .await;
         let (accounts, secrets) = accounts(&server);
-        accounts
-            .connect("liz", "c-1", CALLBACK, now())
-            .await
-            .unwrap();
+        accounts.connect("liz", "c-1").await.unwrap();
 
         // 55 minutes on, inside the renewal margin.
         let later = now() + chrono::Duration::minutes(55);
@@ -470,10 +508,7 @@ mod tests {
         )
         .await;
         let (accounts, secrets) = accounts(&server);
-        accounts
-            .connect("liz", "c-1", CALLBACK, now())
-            .await
-            .unwrap();
+        accounts.connect("liz", "c-1").await.unwrap();
         assert_eq!(accounts.access_token_at("liz", now()).await.unwrap(), "a-2");
         assert_eq!(
             secrets
@@ -497,21 +532,75 @@ mod tests {
         )
         .await;
         let (accounts, _) = accounts(&server);
-        accounts.connect("liz", "c", CALLBACK, now()).await.unwrap();
-        accounts
-            .connect("jerry", "c", CALLBACK, now())
-            .await
-            .unwrap();
+        accounts.connect("liz", "c").await.unwrap();
+        accounts.connect("jerry", "c").await.unwrap();
 
         assert!(accounts.is_connected("liz").await.unwrap());
-        accounts.disconnect("liz").await.unwrap();
+        assert!(accounts.disconnect("liz").await.unwrap());
         assert!(!accounts.is_connected("liz").await.unwrap());
+        assert!(!accounts.disconnect("liz").await.unwrap(), "nothing left");
         assert_eq!(
             accounts.connected_members().await.unwrap(),
             vec!["jerry".to_string()]
         );
         assert!(accounts.access_token_at("liz", now()).await.is_err());
         assert!(accounts.access_token_at("jerry", now()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn with_the_relay_off_sign_ins_are_still_listed_and_forgotten() {
+        let secrets = Arc::new(MemorySecrets::default());
+        for prefix in [ACCESS_KEY, REFRESH_KEY, EXPIRES_KEY] {
+            secrets.set(&key(prefix, "liz"), "1").await.unwrap();
+        }
+        let accounts = UberAccounts::new(secrets.clone(), None);
+
+        assert_eq!(
+            accounts.connected_members().await.unwrap(),
+            vec!["liz".to_string()]
+        );
+        assert!(accounts.disconnect("liz").await.unwrap());
+        assert!(secrets.list_keys().await.unwrap().is_empty());
+
+        let err = accounts.exchange("c", CALLBACK).await.err().unwrap();
+        assert!(format!("{err:#}").contains("turned off"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_while_a_renewal_is_out_is_not_undone() {
+        let server = MockServer::start().await;
+        relay_returns(
+            &server,
+            "/v1/uber/token",
+            json!({
+                "access_token": "a-1", "refresh_token": "r-1", "expires_in": 60
+            }),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/uber/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({
+                        "access_token": "a-2", "refresh_token": "r-2", "expires_in": 3600
+                    }))
+                    .set_delay(std::time::Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        let (accounts, secrets) = accounts(&server);
+        accounts.connect("liz", "c-1").await.unwrap();
+        let accounts = Arc::new(accounts);
+
+        let renewing = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.access_token_at("liz", now()).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        accounts.disconnect("liz").await.unwrap();
+
+        assert!(renewing.await.unwrap().is_err());
+        assert!(secrets.list_keys().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -525,10 +614,7 @@ mod tests {
             .mount(&server)
             .await;
         let (accounts, secrets) = accounts(&server);
-        let err = accounts
-            .connect("liz", "used", CALLBACK, now())
-            .await
-            .unwrap_err();
+        let err = accounts.connect("liz", "used").await.unwrap_err();
         assert!(format!("{err:#}").contains("invalid_grant"), "{err:#}");
         assert!(secrets.list_keys().await.unwrap().is_empty());
     }
@@ -543,7 +629,7 @@ mod tests {
         )
         .await;
         let (accounts, secrets) = accounts(&server);
-        assert!(accounts.connect("liz", "c", CALLBACK, now()).await.is_err());
+        assert!(accounts.connect("liz", "c").await.is_err());
         assert!(secrets.list_keys().await.unwrap().is_empty());
     }
 

@@ -39,7 +39,7 @@ pub fn start(
     let http = reqwest::Client::new();
     let accounts = Arc::new(UberAccounts::new(
         secrets,
-        SignInRelay::new(http.clone(), &relay_url),
+        Some(SignInRelay::new(http.clone(), &relay_url)),
     ));
     let uber = UberRides::new(http, UberConfig::from_env(), accounts.clone());
     let booking = Arc::new(RideBooking::new(Arc::new(uber)));

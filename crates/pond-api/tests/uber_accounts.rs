@@ -29,7 +29,30 @@ struct Pond {
     _dir: tempfile::TempDir,
 }
 
+/// `POND_CREDENTIALS_URL` is process-global, so a test that sets it takes a turn for its whole run.
+static CREDENTIALS_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Points the pond at a credentials service, and back at none when dropped.
+struct CredentialsAt;
+
+impl CredentialsAt {
+    fn set(url: &str) -> CredentialsAt {
+        std::env::set_var("POND_CREDENTIALS_URL", url);
+        CredentialsAt
+    }
+}
+
+impl Drop for CredentialsAt {
+    fn drop(&mut self) {
+        // `off`, never unset: unset means Jarida's real service, which no test may call.
+        std::env::set_var("POND_CREDENTIALS_URL", "off");
+    }
+}
+
 async fn pond() -> Pond {
+    if std::env::var_os("POND_CREDENTIALS_URL").is_none() {
+        std::env::set_var("POND_CREDENTIALS_URL", "off");
+    }
     let pond_api::test_support::TestState { state, dir, .. } =
         pond_api::test_support::app_state().await;
     let secrets = Arc::new(
@@ -237,11 +260,12 @@ async fn the_secrets_api_cannot_reach_a_members_uber_sign_in() {
     );
 }
 
-/// The whole round trip. One test, because the credentials service address is process-wide.
+/// The whole round trip.
 #[tokio::test]
 async fn a_member_connects_uber_and_the_tokens_are_kept_for_them_alone() {
+    let _turn = CREDENTIALS_TURN.lock().await;
     let service = credentials_service().await;
-    std::env::set_var("POND_CREDENTIALS_URL", service.uri());
+    let _at = CredentialsAt::set(&service.uri());
     let p = pond().await;
 
     // 1. The desktop starts the sign-in and gets Uber's page.
@@ -351,6 +375,182 @@ async fn a_member_connects_uber_and_the_tokens_are_kept_for_them_alone() {
     .await;
     assert!(page.contains("Uber is not connected"), "{page}");
     assert_eq!(p.secrets.get(&key).await.unwrap(), None);
+}
 
-    std::env::remove_var("POND_CREDENTIALS_URL");
+fn parse(body: &str) -> Value {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+}
+
+async fn uber_keys(p: &Pond) -> Vec<String> {
+    let mut keys: Vec<String> = p
+        .secrets
+        .list_keys()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|k| k.starts_with("UBER_"))
+        .collect();
+    keys.sort();
+    keys
+}
+
+async fn start_sign_in(p: &Pond) -> String {
+    let (status, body) = call(
+        &p.loopback,
+        Method::POST,
+        "/api/v1/uber/accounts/connect",
+        Some(json!({"profile_id": p.member})),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    parse(&body)["state"].as_str().unwrap().to_string()
+}
+
+async fn delete_member(p: &Pond) -> Value {
+    let (status, body) = call(
+        &p.loopback,
+        Method::DELETE,
+        &format!("/api/v1/profiles/{}", p.member),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    parse(&body)
+}
+
+#[tokio::test]
+async fn deleting_a_member_forgets_their_uber_sign_in() {
+    let _turn = CREDENTIALS_TURN.lock().await;
+    let service = credentials_service().await;
+    let _at = CredentialsAt::set(&service.uri());
+    let p = pond().await;
+
+    let nonce = start_sign_in(&p).await;
+    let (_, page) = call(
+        &p.loopback,
+        Method::GET,
+        &format!("/api/v1/oauth/callback?code=good-code&state={nonce}"),
+        None,
+        false,
+    )
+    .await;
+    assert!(page.contains("Uber is connected"), "{page}");
+    assert_eq!(uber_keys(&p).await.len(), 3);
+
+    let deleted = delete_member(&p).await;
+    assert_eq!(deleted["deleted"]["uber_accounts"], 1, "{deleted}");
+    assert_eq!(uber_keys(&p).await, Vec::<String>::new());
+}
+
+/// The member is removed while Uber's code is still being exchanged.
+#[tokio::test]
+async fn a_sign_in_that_outlives_its_member_keeps_nothing() {
+    let _turn = CREDENTIALS_TURN.lock().await;
+    let service = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/uber/client"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"client_id": "uber-app"})))
+        .mount(&service)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/uber/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "access_token": "access-1", "refresh_token": "refresh-1", "expires_in": 3600
+                }))
+                .set_delay(std::time::Duration::from_secs(1)),
+        )
+        .mount(&service)
+        .await;
+    let _at = CredentialsAt::set(&service.uri());
+    let p = pond().await;
+
+    let nonce = start_sign_in(&p).await;
+    let returning = tokio::spawn({
+        let router = p.loopback.clone();
+        let uri = format!("/api/v1/oauth/callback?code=good-code&state={nonce}");
+        async move { call(&router, Method::GET, &uri, None, false).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    delete_member(&p).await;
+
+    let (_, page) = returning.await.unwrap();
+    assert!(page.contains("no longer in the household"), "{page}");
+    assert_eq!(uber_keys(&p).await, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn with_sign_in_turned_off_a_connection_is_still_listed_and_forgotten() {
+    let _turn = CREDENTIALS_TURN.lock().await;
+    let _at = CredentialsAt::set("off");
+    let p = pond().await;
+    for prefix in [
+        "UBER_ACCESS_TOKEN:",
+        "UBER_REFRESH_TOKEN:",
+        "UBER_TOKEN_EXPIRES_AT:",
+    ] {
+        p.secrets
+            .set(&format!("{prefix}{}", p.member), "1")
+            .await
+            .unwrap();
+    }
+
+    let (status, list) = call(
+        &p.loopback,
+        Method::GET,
+        "/api/v1/uber/accounts",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(parse(&list)["connected"], json!([p.member]));
+    let (status, body) = call(
+        &p.loopback,
+        Method::DELETE,
+        &format!("/api/v1/uber/accounts/{}", p.member),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(uber_keys(&p).await, Vec::<String>::new());
+
+    let (status, body) = call(
+        &p.loopback,
+        Method::POST,
+        "/api/v1/uber/accounts/connect",
+        Some(json!({"profile_id": p.member})),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(parse(&body)["code"], "uber_sign_in_off");
+}
+
+#[tokio::test]
+async fn the_list_names_only_people_still_in_the_household() {
+    let p = pond().await;
+    p.secrets
+        .set(&format!("UBER_REFRESH_TOKEN:{}", p.member), "r")
+        .await
+        .unwrap();
+    p.secrets
+        .set("UBER_REFRESH_TOKEN:someone-no-longer-here", "r")
+        .await
+        .unwrap();
+
+    let (status, list) = call(
+        &p.loopback,
+        Method::GET,
+        "/api/v1/uber/accounts",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(parse(&list)["connected"], json!([p.member]));
 }

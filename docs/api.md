@@ -994,14 +994,16 @@ Removes a household member and reports what went with them.
 {
   "profile_id": "8133c258-3392-4f0e-ba36-3d28a51f23a4",
   "display_name": "Liz",
-  "deleted":  { "memories": 42, "face_embeddings": 3 },
+  "deleted":  { "memories": 42, "face_embeddings": 3, "uber_accounts": 1 },
   "released": { "sessions": 7 },
   "cleared_primary_profile": false
 }
 ```
 
 `deleted` and `released` are separate on purpose. Memories and face embeddings
-are removed (`ON DELETE CASCADE`). Sessions are **released** — the conversation
+are removed (`ON DELETE CASCADE`), and so is the member's Uber sign-in
+(`uber_accounts`: 1 when they had one), forgotten before the member is deleted so
+that a failure deletes nothing. Sessions are **released** — the conversation
 survives, stripped of its attribution, because a conversation is not solely the
 speaker's. Household-scoped memories (`profile_id IS NULL`) are shared context
 and are never counted or removed.
@@ -1889,11 +1891,15 @@ install's `secrets`) answers 403 with `"code": "secret_reserved"` for such a key
 Open `auth_url` in a browser. Uber returns to `/oauth/callback`, which finishes the sign-in; follow
 it with `GET /oauth/status/{state}`.
 
-| Status | Meaning |
-|---|---|
-| 404 | No such household member |
-| 502 | The credentials service could not start an Uber sign-in |
-| 503 | No secret store, or the credentials service is turned off (`POND_CREDENTIALS_URL=off`) |
+| Status | `code` | Meaning |
+|---|---|---|
+| 404 | `not_a_member` | No such household member |
+| 502 | `uber_relay_failed` | The credentials service could not start an Uber sign-in |
+| 503 | `no_secret_store` | This pond has no secret store to keep sign-ins in |
+| 503 | `uber_sign_in_off` | The credentials service is turned off (`POND_CREDENTIALS_URL=off`) |
+
+The tokens are kept only if the member is still in the household when Uber's code has been
+exchanged; a member removed meanwhile gets nothing kept, and the sign-in is reported failed.
 
 ### GET /uber/accounts
 
@@ -1902,9 +1908,15 @@ it with `GET /oauth/status/{state}`.
 { "connected": ["p-1"] }
 ```
 
+Only members still in the household are listed. Works with the credentials service turned off.
+
 ### DELETE /uber/accounts/{profile_id}
 
-**Response 204.** Forgets the member's tokens on this pond. Their Uber account is untouched.
+**Response 204.** Forgets the member's tokens on this pond. Their Uber account is untouched. Works
+with the credentials service turned off.
+
+Every refusal on these routes is `{ "error": "...", "code": "..." }`; a 403 off this machine has
+`code` `host_only`.
 
 ## Error Codes Summary
 

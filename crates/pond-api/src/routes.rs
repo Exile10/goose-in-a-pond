@@ -7195,6 +7195,23 @@ async fn delete_profile(
         })
         .unwrap_or_default();
 
+    // Held until the member is gone, so a sign-in finishing now cannot keep tokens for nobody.
+    let _members = crate::uber_accounts::members_gate().await;
+    // The member's Uber sign-in is in the secret store, where nothing cascades. Forgetting it first
+    // means a failure aborts with nothing deleted, never a deleted member whose tokens live on.
+    let uber_accounts = crate::uber_accounts::forget_member(&state, &id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": format!(
+                        "could not forget the member's Uber sign-in, so the member was not deleted: {e}"
+                    )
+                })),
+            )
+        })?;
+
     // `primary_profile_id` is a KV row, not a foreign key, so clear it by hand before the delete.
     // Both failures abort: proceeding would leave it dangling.
     let settings = state.settings_repo.get().await.map_err(|e| {
@@ -7239,6 +7256,7 @@ async fn delete_profile(
         "deleted": {
             "memories":        memories,
             "face_embeddings": faces,
+            "uber_accounts":   uber_accounts,
         },
         "released": {
             "sessions": sessions,
