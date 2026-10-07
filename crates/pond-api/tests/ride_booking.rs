@@ -27,8 +27,9 @@ async fn pond() -> Pond {
 #[tokio::test]
 async fn a_member_gets_a_fare_confirms_and_cancels_from_their_phone() {
     let p = pond().await;
-    let phone = member_with_phone(&p, "liz").await;
-    let before = PROVIDER.requests();
+    // Counted for this member alone: the other tests here book through the same stand-in at the
+    // same time, so a count across everyone races them.
+    let (liz, phone) = member_and_phone(&p, "liz").await;
 
     let (status, quoted) = send(
         &p.lan,
@@ -42,7 +43,7 @@ async fn a_member_gets_a_fare_confirms_and_cancels_from_their_phone() {
     assert_eq!(quoted["fare"]["display"], "KES 1,250");
     assert_eq!(quoted["pickup"]["name"], "Pickup");
     assert_eq!(quoted["state"]["state"], "awaiting_confirmation");
-    assert_eq!(PROVIDER.requests(), before, "a quote booked a ride");
+    assert_eq!(PROVIDER.requests_for(&liz), 0, "a quote booked a ride");
     let id = quoted["id"].as_str().unwrap();
 
     let (status, confirmed) = send(
@@ -55,7 +56,7 @@ async fn a_member_gets_a_fare_confirms_and_cancels_from_their_phone() {
     .await;
     assert_eq!(status, StatusCode::OK, "{confirmed}");
     assert_eq!(confirmed["state"]["state"], "requested");
-    assert_eq!(PROVIDER.requests(), before + 1);
+    assert_eq!(PROVIDER.requests_for(&liz), 1);
 
     let (status, _) = send(
         &p.lan,
@@ -70,7 +71,7 @@ async fn a_member_gets_a_fare_confirms_and_cancels_from_their_phone() {
         StatusCode::CONFLICT,
         "a second confirm was accepted"
     );
-    assert_eq!(PROVIDER.requests(), before + 1);
+    assert_eq!(PROVIDER.requests_for(&liz), 1);
 
     let (status, _) = send(
         &p.lan,
