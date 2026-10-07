@@ -7,7 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use pond_core::rides::booking::{BookingError, RideBooking};
-use pond_core::rides::domain::{PendingRide, Place};
+use pond_core::rides::domain::{BookingState, PendingRide, Place};
 use pond_core::security::domain::proven_device::{DeviceRung, ProvenDevice};
 use pond_core::security::ports::policy::Principal;
 use pond_core::user_data::ports::device_attribution::DeviceAttribution;
@@ -170,20 +170,29 @@ pub async fn get(
     Ok(Json(view(&pending, booking.provider_name())))
 }
 
-/// `POST /api/v1/rides/{id}/confirm` — the member's yes; the ride is requested now.
+/// `POST /api/v1/rides/{id}/confirm` — the member's yes; the ride is requested now. 202 when the
+/// company's answer was lost: it may have booked the ride, and the pond keeps asking.
 pub async fn confirm(
     State(state): State<Arc<AppState>>,
     principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, Refusal> {
+) -> Result<(StatusCode, Json<Value>), Refusal> {
     let profile_id = member(&state, principal.as_deref()).await?;
     let booking = booking()?;
-    booking
+    let outcome = booking
         .confirm(&id, &profile_id, chrono::Utc::now())
         .await
         .map_err(booking_refusal)?;
     let pending = booking.get(&id, &profile_id).map_err(booking_refusal)?;
-    Ok(Json(view(&pending, booking.provider_name())))
+    let mut body = view(&pending, booking.provider_name());
+    if matches!(outcome, BookingState::OutcomeUnknown { .. }) {
+        body["message"] = json!(
+            "The ride company did not answer the booking and may have booked the ride: check \
+             its app. The pond keeps checking."
+        );
+        return Ok((StatusCode::ACCEPTED, Json(body)));
+    }
+    Ok((StatusCode::OK, Json(body)))
 }
 
 /// `POST /api/v1/rides/{id}/decline`

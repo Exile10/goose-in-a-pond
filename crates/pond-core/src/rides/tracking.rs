@@ -12,15 +12,20 @@ use crate::mcp::ports::notification::{MemberDelivery, MemberNotifier, Notificati
 pub async fn track_once(booking: &RideBooking, notifier: &dyn MemberNotifier) -> usize {
     let mut sent = 0;
     for pending in booking.to_follow() {
-        let under_way = matches!(
-            &pending.state,
-            BookingState::Requested { ride } if !ride.status.is_terminal()
-        );
-        if under_way {
-            if let Err(e) = booking.refresh(&pending.id, &pending.profile_id).await {
-                tracing::warn!(ride = %pending.id, error = %e, "could not read a ride's status");
-                continue;
-            }
+        let read = match &pending.state {
+            BookingState::OutcomeUnknown { .. } => booking
+                .recheck(&pending.id, &pending.profile_id)
+                .await
+                .map(|_| ()),
+            BookingState::Requested { ride } if !ride.status.is_terminal() => booking
+                .refresh(&pending.id, &pending.profile_id)
+                .await
+                .map(|_| ()),
+            _ => Ok(()),
+        };
+        if let Err(e) = read {
+            tracing::warn!(ride = %pending.id, error = %e, "could not read a ride's status");
+            continue;
         }
         let Some(news) = booking.news(&pending.id) else {
             continue;
@@ -68,7 +73,7 @@ mod tests {
     use super::*;
     use crate::mcp::mocks::mock_member_notifier::MockMemberNotifier;
     use crate::rides::domain::{Place, RideStatus};
-    use crate::rides::mocks::MockRideProvider;
+    use crate::rides::mocks::{MockRideProvider, OnCurrent, OnRequest};
     use std::sync::Arc;
 
     fn place(name: &str) -> Place {
@@ -177,6 +182,27 @@ mod tests {
         assert_eq!(track_once(&booking, &notifier).await, 0);
         assert_eq!(track_once(&booking, &notifier).await, 0);
         assert_eq!(notifier.sent().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_ride_whose_answer_was_lost_is_found_and_followed() {
+        let provider = Arc::new(MockRideProvider::new().on_request(OnRequest::LoseTheAnswer));
+        provider.set_current(OnCurrent::Unreachable);
+        let booking = RideBooking::new(provider.clone());
+        let now = Utc::now();
+        let pending = booking
+            .quote("liz", place("Home"), place("JKIA"), now)
+            .await
+            .unwrap();
+        booking.confirm(&pending.id, "liz", now).await.unwrap();
+        let notifier = MockMemberNotifier::new().with_devices("liz", &["liz-phone"]);
+
+        assert_eq!(track_once(&booking, &notifier).await, 0);
+        provider.set_current(OnCurrent::TheRide);
+        provider.set_status(RideStatus::Accepted);
+        assert_eq!(track_once(&booking, &notifier).await, 1);
+        assert!(notifier.sent()[0].1.body.contains("Amina"));
+        assert_eq!(provider.requests(), 1);
     }
 
     #[tokio::test]

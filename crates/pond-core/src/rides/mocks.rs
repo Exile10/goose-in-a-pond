@@ -7,14 +7,36 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 
-use super::domain::{Driver, FareQuote, Place, Ride, RideStatus, Vehicle};
+use super::domain::{Driver, FareQuote, Place, RequestFailure, Ride, RideStatus, Vehicle};
 use super::ports::RideProvider;
+
+/// What `request` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnRequest {
+    /// Books the ride and says so.
+    Book,
+    /// Refuses it; no ride exists.
+    Refuse,
+    /// Books the ride, but the answer never arrives.
+    LoseTheAnswer,
+}
+
+/// What `current` answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnCurrent {
+    /// The member's trip under way is the ride this mock books.
+    TheRide,
+    NoTrip,
+    /// The read fails.
+    Unreachable,
+}
 
 pub struct MockRideProvider {
     status: Mutex<RideStatus>,
     quotes: Mutex<usize>,
     requests: Mutex<usize>,
-    fail_requests: bool,
+    on_request: Mutex<OnRequest>,
+    on_current: Mutex<OnCurrent>,
 }
 
 impl Default for MockRideProvider {
@@ -29,14 +51,23 @@ impl MockRideProvider {
             status: Mutex::new(RideStatus::Processing),
             quotes: Mutex::new(0),
             requests: Mutex::new(0),
-            fail_requests: false,
+            on_request: Mutex::new(OnRequest::Book),
+            on_current: Mutex::new(OnCurrent::NoTrip),
         }
     }
 
-    /// Every `request` errors, as a provider outage would.
-    pub fn failing_requests(mut self) -> Self {
-        self.fail_requests = true;
+    /// Every `request` is refused, as Uber refusing an expired fare would be.
+    pub fn failing_requests(self) -> Self {
+        self.on_request(OnRequest::Refuse)
+    }
+
+    pub fn on_request(self, behaviour: OnRequest) -> Self {
+        *self.on_request.lock().unwrap() = behaviour;
         self
+    }
+
+    pub fn set_current(&self, answer: OnCurrent) {
+        *self.on_current.lock().unwrap() = answer;
     }
 
     pub fn set_status(&self, status: RideStatus) {
@@ -101,16 +132,29 @@ impl RideProvider for MockRideProvider {
         _pickup: &Place,
         _dropoff: &Place,
         _quote: &FareQuote,
-    ) -> Result<Ride> {
+    ) -> std::result::Result<Ride, RequestFailure> {
         *self.requests.lock().unwrap() += 1;
-        if self.fail_requests {
-            return Err(anyhow!("provider unavailable"));
+        match *self.on_request.lock().unwrap() {
+            OnRequest::Book => Ok(self.ride()),
+            OnRequest::Refuse => Err(RequestFailure::Refused(
+                "409 fare_expired: The fare has expired.".to_string(),
+            )),
+            OnRequest::LoseTheAnswer => Err(RequestFailure::Uncertain(
+                "the request timed out".to_string(),
+            )),
         }
-        Ok(self.ride())
     }
 
     async fn ride(&self, _profile_id: &str, _request_id: &str) -> Result<Ride> {
         Ok(self.ride())
+    }
+
+    async fn current(&self, _profile_id: &str) -> Result<Option<Ride>> {
+        match *self.on_current.lock().unwrap() {
+            OnCurrent::TheRide => Ok(Some(self.ride())),
+            OnCurrent::NoTrip => Ok(None),
+            OnCurrent::Unreachable => Err(anyhow!("provider unavailable")),
+        }
     }
 
     async fn cancel(&self, _profile_id: &str, _request_id: &str) -> Result<()> {

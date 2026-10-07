@@ -109,6 +109,18 @@ impl Ride {
     }
 }
 
+/// Why a ride request returned no ride.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum RequestFailure {
+    /// The provider refused it, or it was never sent: the provider holds no ride from it.
+    #[error("{0}")]
+    Refused(String),
+    /// No clear answer (a timeout, a dropped connection, a server error, a trip already under
+    /// way): the provider may hold the ride.
+    #[error("{0}")]
+    Uncertain(String),
+}
+
 /// Where a quoted ride stands in the pond. Only `AwaitingConfirmation` can be confirmed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -119,8 +131,13 @@ pub enum BookingState {
     Requested {
         ride: Ride,
     },
+    /// Sent, and the provider's answer was lost, so it may hold the ride. The member's current
+    /// trip with the provider settles it; never retried, and never reported as failed.
+    OutcomeUnknown {
+        reason: String,
+    },
     Declined,
-    /// The request failed; the provider may or may not hold a ride, so it is never retried.
+    /// The provider refused the request, so it holds no ride from it. Never retried.
     Failed {
         reason: String,
     },

@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use pond_core::rides::domain::{Driver, FareQuote, Place, Ride, RideStatus, Vehicle};
+use pond_core::rides::domain::{
+    Driver, FareQuote, Place, RequestFailure, Ride, RideStatus, Vehicle,
+};
 use pond_core::rides::ports::RideProvider;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -64,7 +66,38 @@ pub struct UberRides {
     client: reqwest::Client,
     config: UberConfig,
     tokens: Arc<dyn UberAccessTokens>,
+    timeout: Duration,
 }
+
+/// How one call to Uber went wrong. Which kind it is decides whether a ride may exist.
+#[derive(Debug)]
+enum CallError {
+    /// Never sent: the network mode refused it, or the member has no token.
+    NotSent(anyhow::Error),
+    /// Sent, and no answer came back: a timeout or a dropped connection.
+    NoAnswer(String),
+    /// Uber answered with an error status.
+    Refused {
+        status: reqwest::StatusCode,
+        /// Uber's own error code, e.g. `fare_expired`, when it sent one.
+        code: Option<String>,
+        detail: String,
+    },
+    /// Uber answered, and the body could not be read.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSent(e) => write!(f, "{e:#}"),
+            Self::NoAnswer(what) | Self::Unreadable(what) => f.write_str(what),
+            Self::Refused { detail, .. } => f.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for CallError {}
 
 impl UberRides {
     pub fn new(
@@ -76,6 +109,7 @@ impl UberRides {
             client,
             config,
             tokens,
+            timeout: REQUEST_TIMEOUT,
         }
     }
 
@@ -86,16 +120,21 @@ impl UberRides {
         method: reqwest::Method,
         path: &str,
         body: Option<Value>,
-    ) -> Result<Option<Value>> {
+    ) -> std::result::Result<Option<Value>, CallError> {
         let url = format!("{}{path}", self.config.api_base);
-        pond_core::shared::services::egress::check_egress(&url)?;
-        let token = self.tokens.access_token(profile_id).await?;
+        pond_core::shared::services::egress::check_egress(&url)
+            .map_err(|denied| CallError::NotSent(anyhow!("{denied}")))?;
+        let token = self
+            .tokens
+            .access_token(profile_id)
+            .await
+            .map_err(CallError::NotSent)?;
 
         let mut builder = self
             .client
             .request(method.clone(), &url)
             .bearer_auth(token)
-            .timeout(REQUEST_TIMEOUT);
+            .timeout(self.timeout);
         if let Some(body) = body {
             builder = builder.json(&body);
         }
@@ -107,22 +146,35 @@ impl UberRides {
             result.as_ref().ok().map(|r| r.status().as_u16()),
             start.elapsed().as_millis() as u64,
         );
-        let response = result.with_context(|| format!("Uber {method} {path} failed"))?;
+        let response = result.map_err(|e| {
+            let why = if e.is_timeout() {
+                "timed out"
+            } else {
+                "got no answer"
+            };
+            CallError::NoAnswer(format!("Uber {method} {path} {why}"))
+        })?;
 
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = response.text().await.map_err(|_| {
+            CallError::Unreadable(format!("Uber {method} {path}: the answer was cut off"))
+        })?;
         if !status.is_success() {
-            return Err(anyhow!(
-                "Uber refused {method} {path}: {}",
-                refusal(status, &text)
-            ));
+            let (code, detail) = refusal(status, &text);
+            return Err(CallError::Refused {
+                status,
+                code,
+                detail: format!("Uber refused {method} {path}: {detail}"),
+            });
         }
         if text.trim().is_empty() {
             return Ok(None);
         }
-        serde_json::from_str(&text)
-            .map(Some)
-            .with_context(|| format!("Uber {method} {path} returned something other than JSON"))
+        serde_json::from_str(&text).map(Some).map_err(|_| {
+            CallError::Unreadable(format!(
+                "Uber {method} {path} returned something other than JSON"
+            ))
+        })
     }
 
     fn trip_body(&self, pickup: &Place, dropoff: &Place) -> Value {
@@ -179,21 +231,28 @@ impl RideProvider for UberRides {
         pickup: &Place,
         dropoff: &Place,
         quote: &FareQuote,
-    ) -> Result<Ride> {
+    ) -> std::result::Result<Ride, RequestFailure> {
         let mut body = self.trip_body(pickup, dropoff);
         body["fare_id"] = json!(quote.fare_id);
         body["start_nickname"] = json!(pickup.name);
         body["end_nickname"] = json!(dropoff.name);
-        let value = self
+        let answered = self
             .call(
                 profile_id,
                 reqwest::Method::POST,
                 "/v1.2/requests",
                 Some(body),
             )
-            .await?
-            .context("Uber accepted the request but returned no ride")?;
-        parse_ride(value)
+            .await;
+        match answered {
+            // Uber took it: a ride exists even if what came back cannot be read.
+            Ok(Some(value)) => parse_ride(value)
+                .map_err(|e| RequestFailure::Uncertain(format!("Uber accepted the ride: {e:#}"))),
+            Ok(None) => Err(RequestFailure::Uncertain(
+                "Uber accepted the ride but returned no ride".to_string(),
+            )),
+            Err(e) => Err(request_failure(e)),
+        }
     }
 
     async fn ride(&self, profile_id: &str, request_id: &str) -> Result<Ride> {
@@ -205,11 +264,31 @@ impl RideProvider for UberRides {
         parse_ride(value)
     }
 
+    async fn current(&self, profile_id: &str) -> Result<Option<Ride>> {
+        match self
+            .call(
+                profile_id,
+                reqwest::Method::GET,
+                "/v1.2/requests/current",
+                None,
+            )
+            .await
+        {
+            Ok(Some(value)) => parse_ride(value).map(Some),
+            Ok(None) => Ok(None),
+            // Uber's answer for a member with no trip under way (`no_current_trip`).
+            Err(CallError::Refused { status, .. }) if status == reqwest::StatusCode::NOT_FOUND => {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn cancel(&self, profile_id: &str, request_id: &str) -> Result<()> {
         let path = format!("/v1.2/requests/{request_id}");
         self.call(profile_id, reqwest::Method::DELETE, &path, None)
-            .await
-            .map(|_| ())
+            .await?;
+        Ok(())
     }
 }
 
@@ -294,9 +373,26 @@ fn parse_status(raw: &str) -> RideStatus {
     }
 }
 
-/// Uber's own error code and message when it sent them (v1 `code`/`message`, v1.2 `errors[]`),
-/// else just the HTTP status. Never the raw body, which could carry trip details.
-fn refusal(status: reqwest::StatusCode, body: &str) -> String {
+/// Whether a failed request may still have booked a ride. Only a clear refusal, or a call never
+/// sent, rules one out: a timeout, a dropped connection or a server error leaves it open, and so
+/// does `current_trip_exists`, which says the member has a trip under way that may be this one.
+fn request_failure(error: CallError) -> RequestFailure {
+    match error {
+        CallError::NotSent(e) => RequestFailure::Refused(format!("{e:#}")),
+        CallError::Refused {
+            status,
+            ref code,
+            ref detail,
+        } if status.is_client_error() && code.as_deref() != Some("current_trip_exists") => {
+            RequestFailure::Refused(detail.clone())
+        }
+        other => RequestFailure::Uncertain(other.to_string()),
+    }
+}
+
+/// Uber's own error code, and its code and message as text (v1 `code`/`message`, v1.2
+/// `errors[]`), else just the HTTP status. Never the raw body, which could carry trip details.
+fn refusal(status: reqwest::StatusCode, body: &str) -> (Option<String>, String) {
     let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let first = parsed
         .get("errors")
@@ -307,12 +403,13 @@ fn refusal(status: reqwest::StatusCode, body: &str) -> String {
         .get("message")
         .or_else(|| first.get("title"))
         .and_then(Value::as_str);
-    match (code, message) {
+    let text = match (code, message) {
         (Some(c), Some(m)) => format!("{status} {c}: {m}"),
         (Some(c), None) => format!("{status} {c}"),
         (None, Some(m)) => format!("{status}: {m}"),
         (None, None) => status.to_string(),
-    }
+    };
+    (code.map(str::to_string), text)
 }
 
 #[cfg(test)]
@@ -494,7 +591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refusal_names_ubers_code_but_not_the_body() {
+    async fn a_clear_refusal_is_refused_and_names_ubers_code_but_not_the_body() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1.2/requests"))
@@ -508,9 +605,91 @@ mod tests {
             .request("liz", &home(), &jkia(), &quote())
             .await
             .unwrap_err();
-        let text = format!("{err:#}");
+        let RequestFailure::Refused(text) = err else {
+            panic!("a clear refusal was taken as uncertain: {err:?}");
+        };
         assert!(text.contains("fare_expired"), "{text}");
         assert!(!text.contains("secret street"), "{text}");
+    }
+
+    /// Uber may have booked each of these, so none may read as a refusal.
+    #[tokio::test]
+    async fn a_request_without_a_clear_answer_is_uncertain() {
+        let cases = [
+            ResponseTemplate::new(202)
+                .set_body_json(json!({"request_id": "req-9", "status": "processing"}))
+                .set_delay(Duration::from_millis(400)),
+            ResponseTemplate::new(500),
+            ResponseTemplate::new(503).set_body_json(json!({"code": "service_unavailable"})),
+            ResponseTemplate::new(409).set_body_json(json!({
+                "errors": [{"status": 409, "code": "current_trip_exists", "title": "trip"}]
+            })),
+            ResponseTemplate::new(202).set_body_string("not json"),
+        ];
+        for (i, response) in cases.into_iter().enumerate() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1.2/requests"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut rides = uber(&server, None);
+            rides.timeout = Duration::from_millis(100);
+            let err = rides
+                .request("liz", &home(), &jkia(), &quote())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RequestFailure::Uncertain(_)),
+                "case {i}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_never_sent_is_refused() {
+        let server = MockServer::start().await;
+        let err = uber(&server, None)
+            .request("jerry", &home(), &jkia(), &quote())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RequestFailure::Refused(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn current_reads_the_trip_under_way_or_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.2/requests/current"))
+            .and(header("authorization", "Bearer token-liz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "request_id": "req-9", "status": "accepted",
+                "pickup": {"latitude": -1.2676, "longitude": 36.8108, "eta": 3}
+            })))
+            .mount(&server)
+            .await;
+        let ride = uber(&server, None).current("liz").await.unwrap().unwrap();
+        assert_eq!(ride.request_id, "req-9");
+        assert_eq!(ride.status, RideStatus::Accepted);
+
+        let none = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.2/requests/current"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "errors": [{"status": 404, "code": "no_current_trip", "title": "none"}]
+            })))
+            .mount(&none)
+            .await;
+        assert_eq!(uber(&none, None).current("liz").await.unwrap(), None);
+
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.2/requests/current"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&down)
+            .await;
+        assert!(uber(&down, None).current("liz").await.is_err());
     }
 
     #[tokio::test]
