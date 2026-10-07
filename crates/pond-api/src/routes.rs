@@ -770,6 +770,7 @@ async fn handshake_verify(
             false,
             device_name.as_deref(),
             Some("channel_binding_required"),
+            insecure_dev,
         )
         .await;
         return Err((
