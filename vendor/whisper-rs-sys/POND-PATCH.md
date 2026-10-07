@@ -21,7 +21,7 @@ the upstream build behavior.
 Changes from the published crate: this note, `namespace.rs`, build-script wiring,
 a standalone Cargo workspace declaration, the upstream Unlicense text
 (restored from the whisper-rs repository because the published crate omitted it),
-and three native source changes, below.
+and five native source changes, below.
 When updating Whisper, regenerate and inspect the linked symbol inventory and run
 both GPU transcription and inference in the same production process before shipping.
 
@@ -109,3 +109,14 @@ out-of-memory path the graph-reservation change above turns into an error freed
 whatever the pointers happened to hold, and when the allocator returned the block a
 previous, already freed state had used, that was a double free. `whisper_batch_free`
 skips null pointers, so an empty batch makes the early free do nothing.
+
+## Native source change: a failed allocation resets the scheduler
+
+`whisper.cpp/src/whisper.cpp` calls `ggml_backend_sched_reset` before returning `false` when
+`ggml_backend_sched_alloc_graph` fails while encoding (conv, encoder, cross) or decoding. This is
+Pond's own change. `ggml_graph_compute_helper` already resets after every compute, failed or not;
+these four returns did not, so the scheduler kept the failed attempt's split assignments and tensor
+copies. With states now kept between transcriptions, the next allocation on that scheduler could
+reuse them against a different graph: a copy-layout assert or misrouted inputs when the shape
+differs (prompt versus beam step, or another wake-word clip length). Worst-case buffers are
+reserved when a state is created, so this path is rare. Drop it when upstream resets there.
