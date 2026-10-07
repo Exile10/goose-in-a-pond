@@ -22,13 +22,19 @@ pub fn poll_interval(raw: Option<&str>) -> Duration {
         .map_or(DEFAULT_POLL, |d| d.max(MIN_POLL))
 }
 
-/// Members' Uber connections, installed for `book_ride`. Needs the secret store (member sign-ins)
-/// and the credentials service (Uber's client secret); without either it stays off and says so.
-/// Every process that runs giap-travel calls this; only `serve` goes on to [`start`].
+/// Members' Uber connections, installed for `book_ride`. Off unless the household switched travel
+/// on (`ext_travel_enabled`, off by default); needs the secret store (member sign-ins) and the
+/// credentials service (Uber's client secret) too. Every process that runs giap-travel calls
+/// this; only `serve` goes on to [`start`].
 pub fn install_accounts(
+    travel_enabled: bool,
     secrets: Option<Arc<dyn SecretRepository + Send + Sync>>,
     relay_url: Option<String>,
 ) -> Option<Arc<UberAccounts>> {
+    if !travel_enabled {
+        tracing::info!("ride booking is off: travel is switched off (ext_travel_enabled)");
+        return None;
+    }
     let (Some(secrets), Some(relay_url)) = (secrets, relay_url) else {
         tracing::info!(
             "ride booking is off: it needs the secret store and Jarida's credentials service"
@@ -47,11 +53,12 @@ pub fn install_accounts(
 /// booking rules, the phone's ride routes and the tracker. Without them `book_ride` and the
 /// phone's ride routes answer that booking is not set up.
 pub fn start(
+    travel_enabled: bool,
     secrets: Option<Arc<dyn SecretRepository + Send + Sync>>,
     relay_url: Option<String>,
     notifier: Arc<dyn MemberNotifier>,
 ) -> Option<Arc<RideBooking>> {
-    let accounts = install_accounts(secrets, relay_url)?;
+    let accounts = install_accounts(travel_enabled, secrets, relay_url)?;
     let uber = UberRides::new(
         reqwest::Client::new(),
         UberConfig::from_env(),
@@ -110,10 +117,25 @@ mod tests {
         let notifier: Arc<dyn MemberNotifier> =
             Arc::new(pond_core::mcp::mocks::mock_member_notifier::MockMemberNotifier::new());
         assert!(start(
+            true,
             None,
             Some("https://credentials.example".into()),
             notifier.clone()
         )
         .is_none());
+    }
+
+    /// Everything booking needs is here; only the household's switch is off.
+    #[tokio::test]
+    async fn booking_stays_off_while_travel_is_switched_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn SecretRepository + Send + Sync> = Arc::new(
+            pond_infra::file_secret_repository::FileSecretRepository::new(dir.path()).unwrap(),
+        );
+        let notifier: Arc<dyn MemberNotifier> =
+            Arc::new(pond_core::mcp::mocks::mock_member_notifier::MockMemberNotifier::new());
+        let relay = Some("https://credentials.example".to_string());
+        assert!(start(false, Some(secrets.clone()), relay.clone(), notifier).is_none());
+        assert!(install_accounts(false, Some(secrets), relay).is_none());
     }
 }

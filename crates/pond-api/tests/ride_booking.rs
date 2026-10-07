@@ -206,3 +206,69 @@ async fn a_drop_off_far_from_the_pickup_is_never_quoted() {
         "{refused}"
     );
 }
+
+#[tokio::test]
+async fn while_travel_is_switched_off_no_fare_is_quoted_or_confirmed() {
+    let p = pond().await;
+    let phone = member_with_phone(&p, "liz6").await;
+    let (_, quoted) = send(
+        &p.lan,
+        Method::POST,
+        "/api/v1/rides/quote",
+        Some(&phone),
+        Some(trip()),
+    )
+    .await;
+    let id = quoted["id"].as_str().unwrap();
+
+    p.settings
+        .set_key("ext_travel_enabled", "false".to_string())
+        .await
+        .unwrap();
+    let (status, refused) = send(
+        &p.lan,
+        Method::POST,
+        "/api/v1/rides/quote",
+        Some(&phone),
+        Some(trip()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("switched off"),
+        "{refused}"
+    );
+    let (status, _) = send(
+        &p.lan,
+        Method::POST,
+        &format!("/api/v1/rides/{id}/confirm"),
+        Some(&phone),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    // What was already quoted stays the member's to read and decline.
+    let (status, still) = send(
+        &p.lan,
+        Method::GET,
+        &format!("/api/v1/rides/{id}"),
+        Some(&phone),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(still["state"]["state"], "awaiting_confirmation");
+    let (status, _) = send(
+        &p.lan,
+        Method::POST,
+        &format!("/api/v1/rides/{id}/decline"),
+        Some(&phone),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}

@@ -3489,7 +3489,14 @@ async fn run_server(
     pond_mcp_server::init_notification_sender(notification_sender.clone());
     // Profile-addressed, so a tool's link reaches the speaker's phones and no one else's.
     pond_mcp_server::init_member_notifier(targeted_notification_sender.clone());
+    // Read now, as the extensions were registered: an unreadable row leaves booking off.
+    let travel_enabled = settings_repo
+        .get()
+        .await
+        .map(|s| s.ext_travel_enabled)
+        .unwrap_or(false);
     pond_server::ride_booking::start(
+        travel_enabled,
         secret_repo.clone(),
         pond_api::musickit::managed_url(),
         targeted_notification_sender.clone(),
@@ -4764,6 +4771,7 @@ async fn run_chat(
     // Which members connected Uber, for book_ride. The serve process owns the store; this one
     // only reads it.
     pond_server::ride_booking::install_accounts(
+        settings.ext_travel_enabled,
         Some(Arc::new(
             pond_infra::file_secret_repository::ReadOnlySecretStore::new(&data_dir),
         )),

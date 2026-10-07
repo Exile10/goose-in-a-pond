@@ -38,6 +38,26 @@ fn booking() -> Result<&'static Arc<RideBooking>, Refusal> {
     })
 }
 
+/// Booking, for a new fare or a confirm: only while the household has travel switched on.
+/// Reading, declining and cancelling a ride already quoted or booked still work when it is off.
+async fn booking_for_new_rides(state: &AppState) -> Result<&'static Arc<RideBooking>, Refusal> {
+    let booking = booking()?;
+    match state.settings_repo.get().await {
+        Ok(settings) if settings.ext_travel_enabled => Ok(booking),
+        Ok(_) => Err(refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "travel is switched off on this pond",
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "rides: could not read whether travel is on");
+            Err(refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "could not tell whether travel is on",
+            ))
+        }
+    }
+}
+
 /// The member this request's paired phone belongs to.
 async fn member(state: &AppState, principal: Option<&Principal>) -> Result<String, Refusal> {
     let device = principal.map_or_else(ProvenDevice::none, ProvenDevice::from_principal);
@@ -150,7 +170,7 @@ pub async fn quote(
     Json(request): Json<QuoteRequest>,
 ) -> Result<Json<Value>, Refusal> {
     let profile_id = member(&state, principal.as_deref()).await?;
-    let booking = booking()?;
+    let booking = booking_for_new_rides(&state).await?;
     let pickup = place(request.pickup, "Pickup")?;
     let dropoff = place(request.dropoff, "Destination")?;
     let pending = booking
@@ -180,7 +200,7 @@ pub async fn confirm(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), Refusal> {
     let profile_id = member(&state, principal.as_deref()).await?;
-    let booking = booking()?;
+    let booking = booking_for_new_rides(&state).await?;
     let outcome = booking
         .confirm(&id, &profile_id, chrono::Utc::now())
         .await

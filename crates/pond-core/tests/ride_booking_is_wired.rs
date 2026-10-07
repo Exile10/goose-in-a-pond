@@ -40,9 +40,18 @@ fn both_entry_points_install_the_member_notifier_and_ride_accounts() {
             body.contains("init_member_notifier("),
             "{name} installs no member notifier, so giap-travel never reaches a phone there"
         );
+        let call = body.find(accounts).unwrap_or_else(|| {
+            panic!("{name} does not call {accounts}, so book_ride says booking is not set up there")
+        });
+        let first_argument = body[call + accounts.len()..]
+            .split(',')
+            .next()
+            .unwrap_or_default();
         assert!(
-            body.contains(accounts),
-            "{name} does not call {accounts}, so book_ride says booking is not set up there"
+            first_argument.contains("travel_enabled"),
+            "{name} passes `{}` as travel's switch, not the household's ext_travel_enabled; \
+             booking must stay off unless the household turned travel on",
+            first_argument.trim()
         );
     }
 }
