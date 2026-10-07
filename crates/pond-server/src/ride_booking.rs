@@ -52,14 +52,21 @@ pub fn start(
     notifier: Arc<dyn MemberNotifier>,
 ) -> Option<Arc<RideBooking>> {
     let accounts = install_accounts(secrets, relay_url)?;
-    let uber = UberRides::new(reqwest::Client::new(), UberConfig::from_env(), accounts);
+    let uber = UberRides::new(
+        reqwest::Client::new(),
+        UberConfig::from_env(),
+        accounts.clone(),
+    );
     let booking = Arc::new(RideBooking::new(Arc::new(uber)));
 
     pond_api::rides::install(booking.clone());
 
+    // Rides are kept in memory only, so the first pass takes over each connected member's trip
+    // under way: one in flight across a restart is still followed.
     let interval = poll_interval(std::env::var(POLL_ENV).ok().as_deref());
     let tracked = booking.clone();
     tokio::spawn(async move {
+        take_over_rides_under_way(&tracked, &accounts).await;
         loop {
             tokio::time::sleep(interval).await;
             pond_core::rides::tracking::track_once(&tracked, notifier.as_ref()).await;
@@ -67,6 +74,23 @@ pub fn start(
     });
     tracing::info!(poll_secs = interval.as_secs(), "ride booking is on (Uber)");
     Some(booking)
+}
+
+async fn take_over_rides_under_way(booking: &RideBooking, accounts: &UberAccounts) {
+    let members = match accounts.connected_members().await {
+        Ok(members) => members,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "rides: could not list members with Uber");
+            return;
+        }
+    };
+    for member in members {
+        match booking.take_over_current(&member, chrono::Utc::now()).await {
+            Ok(Some(ride)) => tracing::info!(ride = %ride, "rides: following a trip under way"),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "rides: could not read a member's trip under way"),
+        }
+    }
 }
 
 #[cfg(test)]

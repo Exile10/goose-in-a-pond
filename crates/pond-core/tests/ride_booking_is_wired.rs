@@ -53,6 +53,8 @@ fn startup_installs_every_piece_that_booking_needs() {
         "pond_api::rides::install(",
         "init_ride_accounts(",
         "tracking::track_once(",
+        // Rides live in memory; without this a trip under way at a restart is never followed.
+        ".take_over_current(",
     ] {
         assert!(
             STARTUP.contains(piece),

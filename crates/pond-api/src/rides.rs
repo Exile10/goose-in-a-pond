@@ -125,18 +125,20 @@ fn place(point: Point, fallback_name: &str) -> Result<Place, Refusal> {
     })
 }
 
+/// A trip found under way rather than quoted here has no pickup, drop-off or fare to show.
 fn view(pending: &PendingRide, provider: &str) -> Value {
+    let trip = pending.trip.as_ref();
     json!({
         "id": pending.id,
         "provider": provider,
-        "pickup": pending.pickup,
-        "dropoff": pending.dropoff,
-        "fare": {
-            "display": pending.quote.display,
-            "currency_code": pending.quote.currency_code,
-            "expires_at": pending.quote.expires_at,
-        },
-        "pickup_eta_mins": pending.quote.pickup_eta_mins,
+        "pickup": trip.map(|t| &t.pickup),
+        "dropoff": trip.map(|t| &t.dropoff),
+        "fare": trip.map(|t| json!({
+            "display": t.quote.display,
+            "currency_code": t.quote.currency_code,
+            "expires_at": t.quote.expires_at,
+        })),
+        "pickup_eta_mins": trip.and_then(|t| t.quote.pickup_eta_mins),
         "state": pending.state,
     })
 }

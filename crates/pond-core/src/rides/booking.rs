@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 
-use super::domain::{BookingState, PendingRide, Place, RequestFailure, Ride, RideStatus};
+use super::domain::{
+    BookingState, PendingRide, Place, QuotedTrip, RequestFailure, Ride, RideStatus,
+};
 use super::ports::RideProvider;
 use crate::user_data::services::nearby::distance_km;
 
@@ -88,9 +90,11 @@ impl RideBooking {
         let pending = PendingRide {
             id: uuid::Uuid::new_v4().to_string(),
             profile_id: profile_id.to_string(),
-            pickup,
-            dropoff,
-            quote,
+            trip: Some(QuotedTrip {
+                pickup,
+                dropoff,
+                quote,
+            }),
             created_at: now,
             state: BookingState::AwaitingConfirmation,
         };
@@ -114,28 +118,23 @@ impl RideBooking {
         now: DateTime<Utc>,
     ) -> Result<BookingState, BookingError> {
         // Claimed under the lock, so two taps on Confirm cannot both reach the provider.
-        let pending = {
+        let trip = {
             let mut rides = self.lock();
             let pending = owned(&mut rides, id, profile_id)?;
-            match &pending.state {
-                BookingState::AwaitingConfirmation => {}
-                other => return Err(BookingError::AlreadyDecided(state_word(other))),
-            }
-            if now >= pending.quote.expires_at {
+            let trip = match (&pending.state, &pending.trip) {
+                (BookingState::AwaitingConfirmation, Some(trip)) => trip.clone(),
+                (other, _) => return Err(BookingError::AlreadyDecided(state_word(other))),
+            };
+            if now >= trip.quote.expires_at {
                 return Err(BookingError::Expired);
             }
             pending.state = BookingState::Requesting;
-            pending.clone()
+            trip
         };
 
         let outcome = self
             .provider
-            .request(
-                profile_id,
-                &pending.pickup,
-                &pending.dropoff,
-                &pending.quote,
-            )
+            .request(profile_id, &trip.pickup, &trip.dropoff, &trip.quote)
             .await;
         let state = match outcome {
             Ok(ride) => BookingState::Requested { ride },
@@ -150,7 +149,7 @@ impl RideBooking {
             }
             Err(RequestFailure::Uncertain(reason)) => {
                 tracing::warn!(ride = %id, error = %reason, "a ride request got no clear answer");
-                match self.live_trip(id, profile_id).await {
+                match self.live_trip(Some(id), profile_id).await {
                     Ok(Some(ride)) => BookingState::Requested { ride },
                     Ok(None) => BookingState::OutcomeUnknown { reason },
                     Err(e) => {
@@ -172,7 +171,7 @@ impl RideBooking {
             return Ok(state);
         }
         match self
-            .live_trip(id, profile_id)
+            .live_trip(Some(id), profile_id)
             .await
             .map_err(BookingError::Provider)?
         {
@@ -185,21 +184,63 @@ impl RideBooking {
         }
     }
 
-    /// The member's trip under way, which a request without a clear answer may have made; `None`
-    /// when there is none, or it is a ride this pond already follows.
-    async fn live_trip(&self, id: &str, profile_id: &str) -> anyhow::Result<Option<Ride>> {
+    /// The member's trip under way; `None` when there is none, or a ride here other than
+    /// `except` already follows it.
+    async fn live_trip(
+        &self,
+        except: Option<&str>,
+        profile_id: &str,
+    ) -> anyhow::Result<Option<Ride>> {
         let Some(ride) = self.provider.current(profile_id).await? else {
             return Ok(None);
         };
-        if ride.status.is_terminal() {
+        if ride.status.is_terminal() || followed(&self.lock(), except, &ride.request_id) {
             return Ok(None);
         }
-        let followed_already = self.lock().iter().any(|(other, entry)| {
-            other != id
-                && matches!(&entry.ride.state, BookingState::Requested { ride: held }
-                    if held.request_id == ride.request_id)
-        });
-        Ok((!followed_already).then_some(ride))
+        Ok(Some(ride))
+    }
+
+    /// Follow the member's trip under way with the provider. Rides live only in memory, so this
+    /// is how one in flight when the pond restarted is followed again. Returns its id here, or
+    /// `None` when there is no trip under way or a ride here already follows it.
+    pub async fn take_over_current(
+        &self,
+        profile_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<String>, BookingError> {
+        let Some(ride) = self
+            .live_trip(None, profile_id)
+            .await
+            .map_err(BookingError::Provider)?
+        else {
+            return Ok(None);
+        };
+        // The same id on every restart, so a link in an earlier update still finds it.
+        let id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            format!("{}:{}", self.provider.name(), ride.request_id).as_bytes(),
+        )
+        .to_string();
+        let mut rides = self.lock();
+        if rides.contains_key(&id) || followed(&rides, None, &ride.request_id) {
+            return Ok(None);
+        }
+        // Told already, as far as anyone here knows; only what changes from now is sent.
+        let announced = Some(ride.status.clone());
+        rides.insert(
+            id.clone(),
+            Entry {
+                ride: PendingRide {
+                    id: id.clone(),
+                    profile_id: profile_id.to_string(),
+                    trip: None,
+                    created_at: now,
+                    state: BookingState::Requested { ride },
+                },
+                announced,
+            },
+        );
+        Ok(Some(id))
     }
 
     pub fn decline(&self, id: &str, profile_id: &str) -> Result<(), BookingError> {
@@ -298,6 +339,15 @@ impl RideBooking {
         // A poisoned map still holds consistent rows: every write is a single assignment.
         self.rides.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// Whether a ride here other than `except` follows the provider's `request_id`.
+fn followed(rides: &HashMap<String, Entry>, except: Option<&str>, request_id: &str) -> bool {
+    rides.iter().any(|(id, entry)| {
+        Some(id.as_str()) != except
+            && matches!(&entry.ride.state, BookingState::Requested { ride }
+                if ride.request_id == request_id)
+    })
 }
 
 fn owned<'a>(
@@ -423,7 +473,7 @@ mod tests {
     async fn an_expired_fare_cannot_be_confirmed() {
         let provider = Arc::new(MockRideProvider::new());
         let (booking, pending) = quoted(provider.clone()).await;
-        let late = pending.quote.expires_at + Duration::seconds(1);
+        let late = pending.trip.as_ref().unwrap().quote.expires_at + Duration::seconds(1);
         assert!(matches!(
             booking.confirm(&pending.id, "liz", late).await,
             Err(BookingError::Expired)
@@ -513,13 +563,68 @@ mod tests {
         provider.set_current(OnCurrent::TheRide);
         assert!(
             booking
-                .live_trip(&second.id, "liz")
+                .live_trip(Some(&second.id), "liz")
                 .await
                 .unwrap()
                 .is_none(),
             "the first ride's trip was taken as the second's"
         );
-        assert!(booking.live_trip(&first.id, "liz").await.unwrap().is_some());
+        assert!(booking
+            .live_trip(Some(&first.id), "liz")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_trip_under_way_at_startup_is_followed_once() {
+        let provider = Arc::new(MockRideProvider::new());
+        let booking = RideBooking::new(provider.clone());
+        assert_eq!(booking.take_over_current("liz", now()).await.unwrap(), None);
+
+        provider.set_current(OnCurrent::TheRide);
+        provider.set_status(RideStatus::Accepted);
+        let id = booking
+            .take_over_current("liz", now())
+            .await
+            .unwrap()
+            .expect("the trip under way is taken over");
+        assert_eq!(
+            booking.take_over_current("liz", now()).await.unwrap(),
+            None,
+            "the same trip was taken over twice"
+        );
+        let followed = booking.to_follow();
+        assert_eq!(followed.len(), 1);
+        assert_eq!(followed[0].id, id);
+        assert_eq!(followed[0].title(), "Your ride");
+        assert_eq!(
+            booking.news(&id),
+            None,
+            "a status from before the restart was announced again"
+        );
+
+        provider.set_status(RideStatus::Arriving);
+        booking.refresh(&id, "liz").await.unwrap();
+        assert!(booking.news(&id).is_some());
+        assert!(matches!(
+            booking.cancel(&id, "jerry").await,
+            Err(BookingError::NotYours)
+        ));
+        booking.cancel(&id, "liz").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_finished_trip_or_one_already_followed_is_not_taken_over() {
+        let provider = Arc::new(MockRideProvider::new());
+        let (booking, pending) = quoted(provider.clone()).await;
+        booking.confirm(&pending.id, "liz", now()).await.unwrap();
+        provider.set_current(OnCurrent::TheRide);
+        assert_eq!(booking.take_over_current("liz", now()).await.unwrap(), None);
+
+        let fresh = RideBooking::new(provider.clone());
+        provider.set_status(RideStatus::Completed);
+        assert_eq!(fresh.take_over_current("liz", now()).await.unwrap(), None);
     }
 
     #[tokio::test]

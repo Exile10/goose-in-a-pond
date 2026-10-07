@@ -38,7 +38,7 @@ pub async fn track_once(booking: &RideBooking, notifier: &dyn MemberNotifier) ->
             id: format!("ride-{}-{:?}", pending.id, news.status),
             target: pending.profile_id.clone(),
             category: "info".to_string(),
-            title: format!("Your ride to {}", pending.dropoff.name),
+            title: pending.title(),
             body: message,
             timestamp: Utc::now().to_rfc3339(),
             data: Some(serde_json::json!({
