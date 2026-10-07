@@ -3248,7 +3248,9 @@ impl GooseAdapter {
                                                         })
                                                         .collect::<Vec<_>>()
                                                         .join("\n"),
-                                                    false,
+                                                    // RMCP 2.1 reports a tool's own failures, bad
+                                                    // arguments included, as a result marked is_error.
+                                                    tool_result.is_error == Some(true),
                                                 ),
                                                 Err(e) => (format!("Error: {e}"), true),
                                             };
