@@ -26,12 +26,22 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
 /// The name relay calls are filed under in the egress log, the same as the music-token fetch.
 const EGRESS_TOOL: &str = "giap-credentials";
 
+/// Every key a member's Uber tokens are kept under starts with this. The pond's generic secrets
+/// API refuses such keys, so only the host-only Uber routes can read, change or forget them.
+pub const SECRET_KEY_PREFIX: &str = "UBER_";
+
 const ACCESS_KEY: &str = "UBER_ACCESS_TOKEN:";
 const REFRESH_KEY: &str = "UBER_REFRESH_TOKEN:";
 const EXPIRES_KEY: &str = "UBER_TOKEN_EXPIRES_AT:";
 
 fn key(prefix: &str, profile_id: &str) -> String {
     format!("{prefix}{profile_id}")
+}
+
+/// Whether `key` is one a member's Uber tokens are kept under, in any letter case.
+pub fn is_member_token_key(key: &str) -> bool {
+    key.get(..SECRET_KEY_PREFIX.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(SECRET_KEY_PREFIX))
 }
 
 /// Jarida's credentials service, which holds the Uber app's client secret.
@@ -535,6 +545,17 @@ mod tests {
         let (accounts, secrets) = accounts(&server);
         assert!(accounts.connect("liz", "c", CALLBACK, now()).await.is_err());
         assert!(secrets.list_keys().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_key_a_members_tokens_live_under_is_reserved() {
+        for prefix in [ACCESS_KEY, REFRESH_KEY, EXPIRES_KEY] {
+            assert!(is_member_token_key(&key(prefix, "liz")), "{prefix}");
+        }
+        assert!(is_member_token_key("uber_refresh_token:liz"));
+        assert!(!is_member_token_key("SPOTIFY_ACCESS_TOKEN"));
+        assert!(!is_member_token_key("UBER"));
+        assert!(!is_member_token_key(""));
     }
 
     #[test]

@@ -21,6 +21,8 @@ static CREDENTIAL: std::sync::LazyLock<pond_api::host_guard::HostCredential> =
 struct Pond {
     loopback: axum::Router,
     remote: axum::Router,
+    /// A paired phone on the companion listener: a valid bearer, no host credential.
+    phone: axum::Router,
     secrets: Arc<pond_infra::file_secret_repository::FileSecretRepository>,
     member: String,
     api_port: u16,
@@ -60,6 +62,9 @@ async fn pond() -> Pond {
     Pond {
         loopback: router([127, 0, 0, 1]),
         remote: router([192, 168, 1, 44]),
+        phone: pond_api::build_companion_router(state.clone()).layer(MockConnectInfo(
+            SocketAddr::from(([192, 168, 1, 45], 40_000)),
+        )),
         secrets,
         member,
         api_port,
@@ -153,6 +158,83 @@ async fn a_sign_in_is_only_for_a_real_member() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The generic secrets API never reaches a member's Uber sign-in, whatever bearer it is given,
+/// while ordinary keys go on working.
+#[tokio::test]
+async fn the_secrets_api_cannot_reach_a_members_uber_sign_in() {
+    let p = pond().await;
+    let key = format!("UBER_REFRESH_TOKEN:{}", p.member);
+    let lowercase = key.to_lowercase();
+    p.secrets.set(&key, "refresh-1").await.unwrap();
+
+    for router in [&p.phone, &p.loopback] {
+        for k in [&key, &lowercase] {
+            for (method, uri, body) in [
+                (Method::GET, format!("/api/v1/secrets/{k}/exists"), None),
+                (
+                    Method::PUT,
+                    format!("/api/v1/secrets/{k}"),
+                    Some(json!({"value": "stolen"})),
+                ),
+                (Method::DELETE, format!("/api/v1/secrets/{k}"), None),
+                (
+                    Method::POST,
+                    "/api/v1/extensions/music/secrets".to_string(),
+                    Some(json!({ k.as_str(): "stolen" })),
+                ),
+            ] {
+                let (status, reply) = call(router, method.clone(), &uri, body, false).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {reply}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&reply).unwrap()["code"],
+                    "secret_reserved",
+                    "{method} {uri}"
+                );
+            }
+        }
+        let (status, list) = call(router, Method::GET, "/api/v1/secrets", None, false).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert!(!list.to_uppercase().contains("UBER_"), "{list}");
+    }
+    assert_eq!(
+        p.secrets.get(&key).await.unwrap().as_deref(),
+        Some("refresh-1")
+    );
+    assert_eq!(p.secrets.get(&lowercase).await.unwrap(), None);
+
+    // An ordinary key, from the phone: stored, seen, listed and deleted.
+    let ordinary = "/api/v1/secrets/GIAP_TEST_ORDINARY_SECRET";
+    let (status, reply) = call(
+        &p.phone,
+        Method::PUT,
+        ordinary,
+        Some(json!({"value": "ordinary-value"})),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (_, exists) = call(
+        &p.phone,
+        Method::GET,
+        &format!("{ordinary}/exists"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&exists).unwrap()["exists"],
+        true
+    );
+    let (_, list) = call(&p.phone, Method::GET, "/api/v1/secrets", None, false).await;
+    assert!(list.contains("GIAP_TEST_ORDINARY_SECRET"), "{list}");
+    let (status, _) = call(&p.phone, Method::DELETE, ordinary, None, false).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        p.secrets.get("GIAP_TEST_ORDINARY_SECRET").await.unwrap(),
+        None
+    );
 }
 
 /// The whole round trip. One test, because the credentials service address is process-wide.

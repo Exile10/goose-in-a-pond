@@ -10740,6 +10740,13 @@ async fn install_marketplace_handler(
         })
         .unwrap_or_default();
 
+    if let Some(refused) = secrets
+        .keys()
+        .find_map(|key| crate::uber_accounts::refuse_reserved_secret(key))
+    {
+        return refused;
+    }
+
     if !ext.required_secrets.is_empty() {
         let mut missing = Vec::new();
         for sr in &ext.required_secrets {
@@ -10870,7 +10877,7 @@ async fn install_marketplace_handler(
 
 // ── Secret management handlers ────────────────────────────────────────────────
 
-/// `GET /api/v1/secrets` — list stored secret key names (never values).
+/// `GET /api/v1/secrets` — list stored secret key names (never values), less members' Uber keys.
 async fn list_secrets_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
     let Some(repo) = &state.secret_repo else {
@@ -10881,7 +10888,10 @@ async fn list_secrets_handler(State(state): State<Arc<AppState>>) -> axum::respo
             .into_response();
     };
     match repo.list_keys().await {
-        Ok(keys) => Json(json!({"keys": keys})).into_response(),
+        Ok(keys) => Json(json!({
+            "keys": crate::uber_accounts::without_reserved_secrets(keys)
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -10896,6 +10906,9 @@ async fn check_secret_handler(
     Path(key): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    if let Some(refused) = crate::uber_accounts::refuse_reserved_secret(&key) {
+        return refused;
+    }
     let Some(repo) = &state.secret_repo else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -10920,6 +10933,9 @@ async fn set_secret_handler(
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    if let Some(refused) = crate::uber_accounts::refuse_reserved_secret(&key) {
+        return refused;
+    }
     let Some(repo) = &state.secret_repo else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -10950,6 +10966,9 @@ async fn delete_secret_handler(
     Path(key): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    if let Some(refused) = crate::uber_accounts::refuse_reserved_secret(&key) {
+        return refused;
+    }
     let Some(repo) = &state.secret_repo else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -11156,6 +11175,13 @@ async fn set_extension_secrets_handler(
                 .into_response()
         }
     };
+
+    if let Some(refused) = secrets
+        .keys()
+        .find_map(|key| crate::uber_accounts::refuse_reserved_secret(key))
+    {
+        return refused;
+    }
 
     if let Some(reason) = ext.as_ref().and_then(|e| refused_choice(e, &secrets)) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();

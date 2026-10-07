@@ -1869,6 +1869,11 @@ Uber app's client secret; the member's tokens are kept in this pond's secret sto
 **Host only:** every route needs the request to come from this machine **and** carry the host
 credential (`X-Pond-Host-Credential`). A paired phone gets 403.
 
+The tokens are kept under secret-store keys starting with `UBER_`, and these routes are the only
+way to them: the generic secrets API (`/secrets`, `/extensions/{name}/secrets`, a marketplace
+install's `secrets`) answers 403 with `"code": "secret_reserved"` for such a key, and
+`GET /secrets` leaves them out.
+
 ### POST /uber/accounts/connect
 
 **Request**

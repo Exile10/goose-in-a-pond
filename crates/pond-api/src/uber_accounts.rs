@@ -8,7 +8,7 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Extension, Json};
-use pond_adapters_uber::accounts::{authorize_url, SignInRelay, UberAccounts};
+use pond_adapters_uber::accounts::{authorize_url, is_member_token_key, SignInRelay, UberAccounts};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -19,10 +19,36 @@ use crate::AppState;
 /// `PkceSession::provider_id` for an Uber sign-in, so the shared callback hands it here.
 pub const PROVIDER_ID: &str = "uber";
 
+/// The generic secrets API's `code` for a key it will not touch.
+pub const SECRET_RESERVED: &str = "secret_reserved";
+
 type Refusal = (StatusCode, Json<Value>);
 
 fn refuse(status: StatusCode, message: &str) -> Refusal {
     (status, Json(json!({ "error": message })))
+}
+
+/// The generic secrets API's answer for a key holding a member's Uber tokens. A bearer alone, which
+/// a paired phone has, must never read, replace or forget another member's sign-in.
+pub(crate) fn refuse_reserved_secret(key: &str) -> Option<Response> {
+    is_member_token_key(key).then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "Uber sign-ins belong to each member and are managed only on the pond \
+                          itself, under Settings, Accounts",
+                "code": SECRET_RESERVED,
+            })),
+        )
+            .into_response()
+    })
+}
+
+/// A listing of the secret store without the keys members' Uber tokens are kept under.
+pub(crate) fn without_reserved_secrets(keys: Vec<String>) -> Vec<String> {
+    keys.into_iter()
+        .filter(|key| !is_member_token_key(key))
+        .collect()
 }
 
 /// Connecting someone's Uber account is for the pond's own desktop, never a paired phone.
