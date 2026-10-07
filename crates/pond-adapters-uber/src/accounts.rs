@@ -15,9 +15,10 @@ use serde_json::json;
 use crate::UberAccessTokens;
 use pond_core::rides::ports::RideAccounts;
 
-/// The scopes a member grants: book and follow rides, read receipts, show which account is
-/// connected, and keep the connection without signing in again.
-pub const SCOPES: &[&str] = &["request", "request_receipt", "profile", "offline_access"];
+/// The scopes a member grants: book and follow rides, show which account is connected, and keep
+/// the connection without signing in again. Only what is used: a privileged scope needs Uber's
+/// approval and widens what a leaked token can do.
+pub const SCOPES: &[&str] = &["request", "profile", "offline_access"];
 pub const AUTHORIZE_URL: &str = "https://auth.uber.com/oauth/v2/authorize";
 
 /// Renew this long before the access token lapses, so a booking never starts with a dying token.
@@ -650,7 +651,7 @@ mod tests {
         assert!(url.starts_with("https://auth.uber.com/oauth/v2/authorize?client_id=client-1"));
         assert!(url.contains("&response_type=code"));
         assert!(
-            url.contains("&scope=request%20request_receipt%20profile%20offline_access"),
+            url.contains("&scope=request%20profile%20offline_access&"),
             "{url}"
         );
         assert!(url
