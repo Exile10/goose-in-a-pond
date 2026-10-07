@@ -414,21 +414,29 @@ fn parse_status(raw: &str) -> RideStatus {
 }
 
 /// Whether a failed request may still have booked a ride. Only a clear refusal, or a call never
-/// sent, rules one out: a timeout, a dropped connection or a server error leaves it open, and so
-/// does `current_trip_exists`, which says the member has a trip under way that may be this one.
+/// sent, rules one out: a timeout, a dropped connection or a server error leaves it open.
+/// `current_trip_exists` is a clear refusal too. The pond sends each request once, so the trip it
+/// names is one the member booked some other way; taking that trip as this ride would show the
+/// member a ride they did not ask the pond for, and a cancel here would end it.
 fn request_failure(error: CallError) -> RequestFailure {
     match error {
         CallError::NotSent(e) => RequestFailure::Refused(format!("{e:#}")),
-        CallError::Refused {
-            status,
-            ref code,
-            ref detail,
-        } if status.is_client_error() && code.as_deref() != Some("current_trip_exists") => {
-            RequestFailure::Refused(detail.clone())
+        CallError::Refused { code, .. } if code.as_deref() == Some(TRIP_UNDER_WAY) => {
+            RequestFailure::Refused(
+                "Uber booked nothing: this member already has a trip under way, which the Uber \
+                 app shows"
+                    .to_string(),
+            )
+        }
+        CallError::Refused { status, detail, .. } if status.is_client_error() => {
+            RequestFailure::Refused(detail)
         }
         other => RequestFailure::Uncertain(other.to_string()),
     }
 }
+
+/// Uber's refusal of a request for a member who is already on a trip.
+const TRIP_UNDER_WAY: &str = "current_trip_exists";
 
 /// Uber's own error code, and its code and message as text (v1 `code`/`message`, v1.2
 /// `errors[]`), else just the HTTP status. Never the raw body, which could carry trip details.
@@ -690,9 +698,6 @@ mod tests {
                 .set_delay(Duration::from_millis(400)),
             ResponseTemplate::new(500),
             ResponseTemplate::new(503).set_body_json(json!({"code": "service_unavailable"})),
-            ResponseTemplate::new(409).set_body_json(json!({
-                "errors": [{"status": 409, "code": "current_trip_exists", "title": "trip"}]
-            })),
             ResponseTemplate::new(202).set_body_string("not json"),
         ];
         for (i, response) in cases.into_iter().enumerate() {
@@ -714,6 +719,29 @@ mod tests {
                 "case {i}: {err:?}"
             );
         }
+    }
+
+    /// The pond never sends a request twice, so the trip Uber means is not this one: nothing was
+    /// booked, and the member's own trip must not be taken as this ride.
+    #[tokio::test]
+    async fn a_trip_already_under_way_refuses_the_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.2/requests"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "errors": [{"status": 409, "code": "current_trip_exists", "title": "trip"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let err = uber(&server, None)
+            .request("liz", &home(), &jkia(), &quote())
+            .await
+            .unwrap_err();
+        let RequestFailure::Refused(text) = err else {
+            panic!("a trip already under way read as uncertain: {err:?}");
+        };
+        assert!(text.contains("already has a trip under way"), "{text}");
     }
 
     #[tokio::test]

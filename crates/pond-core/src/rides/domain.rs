@@ -115,8 +115,8 @@ pub enum RequestFailure {
     /// The provider refused it, or it was never sent: the provider holds no ride from it.
     #[error("{0}")]
     Refused(String),
-    /// No clear answer (a timeout, a dropped connection, a server error, a trip already under
-    /// way): the provider may hold the ride.
+    /// No clear answer (a timeout, a dropped connection, a server error): the provider may hold
+    /// the ride.
     #[error("{0}")]
     Uncertain(String),
 }

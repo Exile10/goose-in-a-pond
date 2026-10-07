@@ -128,9 +128,11 @@ members' sign-ins), `pond-api/src/rides.rs` (the phone's routes), `pond-server/s
   from where it is (refused for a drop-off more than 150 km from the pickup), then confirms or
   declines it (`docs/api.md`, *Rides*). The member is whoever the phone's pairing names, and another
   member's ride reads as missing. A fare is confirmed at most once, and a request is never retried.
-- **A lost answer.** A clear refusal from Uber fails the ride. A timeout, a dropped connection, a
-  server error or `current_trip_exists` may mean Uber booked it, so the pond asks Uber for the
-  member's trip under way (`/v1.2/requests/current`) and takes it as the ride. Without one the
+- **A lost answer.** A clear refusal from Uber fails the ride, and so does `current_trip_exists`:
+  the pond sends each request once, so the trip Uber means is one the member booked some other way,
+  and it is not taken as this ride. A timeout, a dropped connection or a server error may mean Uber
+  booked it, so the pond asks Uber for the member's trip under way (`/v1.2/requests/current`) and
+  takes it as the ride. Without one the
   ride's outcome is unknown: the phone's confirm answers 202 and says to check the Uber app, and the
   tracker keeps asking.
 - **Tracking.** Every `GIAP_RIDE_POLL_SECS` (default 15, at least 5) the pond reads each ride under
