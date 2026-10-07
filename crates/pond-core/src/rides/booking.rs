@@ -15,6 +15,12 @@ use crate::user_data::services::nearby::distance_km;
 /// Farther than this, a drop-off is a place matched wrongly, not a ride anyone means to take.
 pub const MAX_RIDE_KM: f64 = 150.0;
 
+/// Reads in a row that may fail before the pond stops reading a ride and tells its member.
+pub const MAX_FAILED_READS: u32 = 40;
+
+/// How long a ride that is over is kept after it was quoted, so the phone can show how it ended.
+pub const KEEP_FINISHED: chrono::Duration = chrono::Duration::hours(24);
+
 #[derive(Debug, thiserror::Error)]
 pub enum BookingError {
     #[error("no such ride")]
@@ -45,14 +51,72 @@ struct Entry {
     /// The last status the member was told about, or that needed no telling. Trails the ride's own
     /// status until an update is delivered, so an update that failed to send is sent again.
     announced: Option<RideStatus>,
+    /// Reads in a row that failed, or found no trip for a request without a clear answer.
+    failed_reads: u32,
+    reading: Reading,
 }
 
-/// A status the member has not heard about yet.
+impl Entry {
+    fn new(ride: PendingRide, announced: Option<RideStatus>) -> Self {
+        Self {
+            ride,
+            announced,
+            failed_reads: 0,
+            reading: Reading::On,
+        }
+    }
+
+    /// Nothing more will happen to it, and its member has been told all there is.
+    fn is_over(&self, now: DateTime<Utc>) -> bool {
+        match self.reading {
+            Reading::GaveUpTold => return true,
+            Reading::GaveUp => return false,
+            Reading::On => {}
+        }
+        match &self.ride.state {
+            BookingState::Declined | BookingState::Failed { .. } => true,
+            BookingState::AwaitingConfirmation => self
+                .ride
+                .trip
+                .as_ref()
+                .is_none_or(|trip| trip.quote.expires_at <= now),
+            BookingState::Requested { ride } => {
+                ride.status.is_terminal() && self.announced.as_ref() == Some(&ride.status)
+            }
+            BookingState::Requesting | BookingState::OutcomeUnknown { .. } => false,
+        }
+    }
+}
+
+/// Whether the tracker still reads a ride.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    On,
+    /// Stopped after [`MAX_FAILED_READS`]; the member has not been told yet.
+    GaveUp,
+    GaveUpTold,
+}
+
+/// Something about a ride its member has not been told yet.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RideNews {
-    pub status: RideStatus,
-    /// What to tell them; `None` when the change is not worth a notification.
-    pub message: Option<String>,
+pub enum RideNews {
+    /// Its status changed; `message` is `None` when that is not worth a notification.
+    Status {
+        status: RideStatus,
+        message: Option<String>,
+    },
+    /// The pond stopped reading it: too many reads in a row failed.
+    LostTrack { message: String },
+}
+
+impl RideNews {
+    /// Names this news for one ride, so sending it again replaces it rather than adding a copy.
+    pub fn key(&self) -> String {
+        match self {
+            Self::Status { status, .. } => format!("{status:?}"),
+            Self::LostTrack { .. } => "lost".to_string(),
+        }
+    }
 }
 
 impl RideBooking {
@@ -98,13 +162,8 @@ impl RideBooking {
             created_at: now,
             state: BookingState::AwaitingConfirmation,
         };
-        self.lock().insert(
-            pending.id.clone(),
-            Entry {
-                ride: pending.clone(),
-                announced: None,
-            },
-        );
+        self.lock()
+            .insert(pending.id.clone(), Entry::new(pending.clone(), None));
         Ok(pending)
     }
 
@@ -229,8 +288,8 @@ impl RideBooking {
         let announced = Some(ride.status.clone());
         rides.insert(
             id.clone(),
-            Entry {
-                ride: PendingRide {
+            Entry::new(
+                PendingRide {
                     id: id.clone(),
                     profile_id: profile_id.to_string(),
                     trip: None,
@@ -238,7 +297,7 @@ impl RideBooking {
                     state: BookingState::Requested { ride },
                 },
                 announced,
-            },
+            ),
         );
         Ok(Some(id))
     }
@@ -282,38 +341,101 @@ impl RideBooking {
     pub fn to_follow(&self) -> Vec<PendingRide> {
         self.lock()
             .values()
-            .filter(|e| match &e.ride.state {
-                BookingState::Requested { ride } => {
-                    !ride.status.is_terminal() || e.announced.as_ref() != Some(&ride.status)
-                }
-                BookingState::OutcomeUnknown { .. } => true,
-                _ => false,
+            .filter(|e| match e.reading {
+                Reading::GaveUpTold => false,
+                Reading::GaveUp => true,
+                Reading::On => match &e.ride.state {
+                    BookingState::Requested { ride } => {
+                        !ride.status.is_terminal() || e.announced.as_ref() != Some(&ride.status)
+                    }
+                    BookingState::OutcomeUnknown { .. } => true,
+                    _ => false,
+                },
             })
             .map(|e| e.ride.clone())
             .collect()
     }
 
-    /// The ride's status, when its member has not been told about it yet.
+    /// Whether the tracker still reads this ride.
+    pub fn is_read(&self, id: &str) -> bool {
+        self.lock()
+            .get(id)
+            .is_some_and(|e| e.reading == Reading::On)
+    }
+
+    /// A read of the ride worked.
+    pub fn read_succeeded(&self, id: &str) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            entry.failed_reads = 0;
+        }
+    }
+
+    /// A read of the ride failed. Returns whether that was one too many: the pond stops reading
+    /// it, and its member is to be told.
+    pub fn read_failed(&self, id: &str) -> bool {
+        let mut rides = self.lock();
+        let Some(entry) = rides.get_mut(id) else {
+            return false;
+        };
+        entry.failed_reads += 1;
+        if entry.reading == Reading::On && entry.failed_reads >= MAX_FAILED_READS {
+            entry.reading = Reading::GaveUp;
+            return true;
+        }
+        false
+    }
+
+    /// What the member has not been told about this ride yet, if anything.
     pub fn news(&self, id: &str) -> Option<RideNews> {
         let rides = self.lock();
         let entry = rides.get(id)?;
+        match entry.reading {
+            Reading::GaveUpTold => return None,
+            Reading::GaveUp => {
+                let message = match &entry.ride.state {
+                    BookingState::OutcomeUnknown { .. } => {
+                        "The pond could not confirm this booking. The ride app shows whether it \
+                         was booked."
+                    }
+                    _ => {
+                        "The pond can no longer check on this ride. The ride app shows where it is."
+                    }
+                };
+                return Some(RideNews::LostTrack {
+                    message: message.to_string(),
+                });
+            }
+            Reading::On => {}
+        }
         let BookingState::Requested { ride } = &entry.ride.state else {
             return None;
         };
         if entry.announced.as_ref() == Some(&ride.status) {
             return None;
         }
-        Some(RideNews {
+        Some(RideNews::Status {
             status: ride.status.clone(),
             message: ride.announcement(entry.announced.as_ref()),
         })
     }
 
-    /// Record that the member has had the news of `status`, so it is not sent again.
-    pub fn told(&self, id: &str, status: &RideStatus) {
+    /// Record that the member has had this news, so it is not sent again.
+    pub fn told(&self, id: &str, news: &RideNews) {
         if let Some(entry) = self.lock().get_mut(id) {
-            entry.announced = Some(status.clone());
+            match news {
+                RideNews::Status { status, .. } => entry.announced = Some(status.clone()),
+                RideNews::LostTrack { .. } => entry.reading = Reading::GaveUpTold,
+            }
         }
+    }
+
+    /// Forget each ride that is over once [`KEEP_FINISHED`] has passed since it was quoted.
+    /// Returns how many were forgotten.
+    pub fn prune(&self, now: DateTime<Utc>) -> usize {
+        let mut rides = self.lock();
+        let before = rides.len();
+        rides.retain(|_, e| e.ride.created_at + KEEP_FINISHED > now || !e.is_over(now));
+        before - rides.len()
     }
 
     pub fn get(&self, id: &str, profile_id: &str) -> Result<PendingRide, BookingError> {
@@ -390,6 +512,13 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         "2026-10-06T08:00:00Z".parse().unwrap()
+    }
+
+    async fn quote_for_liz(booking: &RideBooking) -> PendingRide {
+        booking
+            .quote("liz", place("Home"), place("JKIA"), now())
+            .await
+            .unwrap()
     }
 
     async fn quoted(provider: Arc<MockRideProvider>) -> (RideBooking, PendingRide) {
@@ -636,13 +765,19 @@ mod tests {
         provider.set_status(RideStatus::Accepted);
         booking.refresh(&pending.id, "liz").await.unwrap();
         let news = booking.news(&pending.id).expect("a new status is news");
-        assert!(news.message.is_some());
+        assert!(matches!(
+            &news,
+            RideNews::Status {
+                message: Some(_),
+                ..
+            }
+        ));
         assert_eq!(
             booking.news(&pending.id),
             Some(news.clone()),
             "news the member was never told about vanished"
         );
-        booking.told(&pending.id, &news.status);
+        booking.told(&pending.id, &news);
         booking.refresh(&pending.id, "liz").await.unwrap();
         assert_eq!(
             booking.news(&pending.id),
@@ -657,11 +792,77 @@ mod tests {
             1,
             "an untold arrival was dropped"
         );
-        booking.told(&pending.id, &RideStatus::Completed);
+        let arrival = booking.news(&pending.id).unwrap();
+        booking.told(&pending.id, &arrival);
         assert!(
             booking.to_follow().is_empty(),
             "a finished ride the member was told about is still followed"
         );
+    }
+
+    #[tokio::test]
+    async fn after_too_many_failed_reads_the_ride_is_no_longer_read_and_the_member_is_told() {
+        let provider = Arc::new(MockRideProvider::new());
+        let (booking, pending) = quoted(provider.clone()).await;
+        booking.confirm(&pending.id, "liz", now()).await.unwrap();
+
+        for _ in 1..MAX_FAILED_READS {
+            assert!(!booking.read_failed(&pending.id));
+        }
+        booking.read_succeeded(&pending.id);
+        for _ in 1..MAX_FAILED_READS {
+            assert!(
+                !booking.read_failed(&pending.id),
+                "a success did not reset the count"
+            );
+        }
+        assert!(booking.read_failed(&pending.id));
+        assert!(!booking.is_read(&pending.id));
+        let news = booking.news(&pending.id).expect("the member is told");
+        assert!(matches!(news, RideNews::LostTrack { .. }));
+        booking.told(&pending.id, &news);
+        assert!(booking.to_follow().is_empty());
+        assert_eq!(booking.news(&pending.id), None);
+    }
+
+    #[tokio::test]
+    async fn only_rides_that_are_over_are_forgotten_and_only_after_a_day() {
+        let provider = Arc::new(MockRideProvider::new());
+        let booking = RideBooking::new(provider.clone());
+        let declined = quote_for_liz(&booking).await;
+        booking.decline(&declined.id, "liz").unwrap();
+        let under_way = quote_for_liz(&booking).await;
+        booking.confirm(&under_way.id, "liz", now()).await.unwrap();
+        let waiting = quote_for_liz(&booking).await;
+
+        assert_eq!(
+            booking.prune(now() + Duration::hours(1)),
+            0,
+            "pruned too soon"
+        );
+        let later = now() + KEEP_FINISHED + Duration::seconds(1);
+        // The mock's fare lasts for years, so the waiting quote is not over either.
+        assert_eq!(booking.prune(later), 1);
+        assert!(matches!(
+            booking.get(&declined.id, "liz"),
+            Err(BookingError::NotFound)
+        ));
+        assert!(
+            booking.get(&under_way.id, "liz").is_ok(),
+            "a ride under way was forgotten"
+        );
+        assert!(booking.get(&waiting.id, "liz").is_ok());
+
+        provider.set_status(RideStatus::Completed);
+        booking.refresh(&under_way.id, "liz").await.unwrap();
+        assert_eq!(
+            booking.prune(later),
+            0,
+            "an arrival nobody was told of was forgotten"
+        );
+        let arrival = booking.news(&under_way.id).unwrap();
+        booking.told(&under_way.id, &arrival);
+        assert_eq!(booking.prune(later), 1);
     }
 
     #[tokio::test]
