@@ -4,25 +4,33 @@
 use chrono::Utc;
 
 use super::booking::RideBooking;
-use crate::mcp::ports::notification::{MemberNotifier, Notification};
+use super::domain::BookingState;
+use crate::mcp::ports::notification::{MemberDelivery, MemberNotifier, Notification};
 
-/// One pass. Returns how many members were sent an update. A ride that cannot be read is logged
-/// and tried again on the next pass; it never stops the others.
+/// One pass. Returns how many members were sent an update. A ride that cannot be read, or an
+/// update that could not be sent, is tried again on the next pass; it never stops the others.
 pub async fn track_once(booking: &RideBooking, notifier: &dyn MemberNotifier) -> usize {
     let mut sent = 0;
-    for pending in booking.active() {
-        let (ride, announcement) = match booking.refresh(&pending.id, &pending.profile_id).await {
-            Ok(read) => read,
-            Err(e) => {
+    for pending in booking.to_follow() {
+        let under_way = matches!(
+            &pending.state,
+            BookingState::Requested { ride } if !ride.status.is_terminal()
+        );
+        if under_way {
+            if let Err(e) = booking.refresh(&pending.id, &pending.profile_id).await {
                 tracing::warn!(ride = %pending.id, error = %e, "could not read a ride's status");
                 continue;
             }
+        }
+        let Some(news) = booking.news(&pending.id) else {
+            continue;
         };
-        let Some(message) = announcement else {
+        let Some(message) = news.message else {
+            booking.told(&pending.id, &news.status);
             continue;
         };
         let notification = Notification {
-            id: format!("ride-{}-{:?}", pending.id, ride.status),
+            id: format!("ride-{}-{:?}", pending.id, news.status),
             target: pending.profile_id.clone(),
             category: "info".to_string(),
             title: format!("Your ride to {}", pending.dropoff.name),
@@ -31,15 +39,25 @@ pub async fn track_once(booking: &RideBooking, notifier: &dyn MemberNotifier) ->
             data: Some(serde_json::json!({
                 "action": "ride_update",
                 "ride_id": pending.id,
-                "status": ride.status,
+                "status": news.status,
             })),
         };
-        if !notifier
+        match notifier
             .notify_member(&pending.profile_id, notification)
             .await
-            .is_empty()
         {
-            sent += 1;
+            MemberDelivery::Reached(_) => {
+                booking.told(&pending.id, &news.status);
+                sent += 1;
+            }
+            // Nobody to tell: trying again would only fail the same way.
+            MemberDelivery::NoPhone => {
+                tracing::info!(ride = %pending.id, "a ride update has no phone to go to");
+                booking.told(&pending.id, &news.status);
+            }
+            MemberDelivery::Failed(why) => {
+                tracing::warn!(ride = %pending.id, error = %why, "a ride update was not sent; trying again next pass");
+            }
         }
     }
     sent
@@ -110,6 +128,55 @@ mod tests {
             0,
             "a completed ride was read again"
         );
+    }
+
+    #[tokio::test]
+    async fn an_update_that_failed_to_send_is_sent_on_the_next_pass() {
+        let provider = Arc::new(MockRideProvider::new());
+        let (booking, _) = booked(provider.clone()).await;
+        let notifier = MockMemberNotifier::new()
+            .with_devices("liz", &["liz-phone"])
+            .failing_next(1);
+
+        provider.set_status(RideStatus::Accepted);
+        assert_eq!(track_once(&booking, &notifier).await, 0);
+        assert_eq!(track_once(&booking, &notifier).await, 1);
+        let sent = notifier.sent();
+        assert_eq!(sent.len(), 2, "one failed try, one delivery");
+        assert_eq!(
+            sent[0].1.body, sent[1].1.body,
+            "the retry carries the same news"
+        );
+        assert_eq!(track_once(&booking, &notifier).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_arrival_that_failed_to_send_is_retried_without_reading_the_ride_again() {
+        let provider = Arc::new(MockRideProvider::new());
+        let (booking, _) = booked(provider.clone()).await;
+        let notifier = MockMemberNotifier::new()
+            .with_devices("liz", &["liz-phone"])
+            .failing_next(1);
+
+        provider.set_status(RideStatus::Completed);
+        assert_eq!(track_once(&booking, &notifier).await, 0);
+        // A finished ride is not read again, so this later status is never seen.
+        provider.set_status(RideStatus::Arriving);
+        assert_eq!(track_once(&booking, &notifier).await, 1);
+        assert_eq!(notifier.sent()[1].1.body, "You have arrived.");
+        assert!(booking.to_follow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_member_with_no_phone_is_not_tried_again_and_again() {
+        let provider = Arc::new(MockRideProvider::new());
+        let (booking, _) = booked(provider.clone()).await;
+        let notifier = MockMemberNotifier::new();
+
+        provider.set_status(RideStatus::Accepted);
+        assert_eq!(track_once(&booking, &notifier).await, 0);
+        assert_eq!(track_once(&booking, &notifier).await, 0);
+        assert_eq!(notifier.sent().len(), 1);
     }
 
     #[tokio::test]

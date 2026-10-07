@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 
-use super::domain::{BookingState, PendingRide, Place, Ride};
+use super::domain::{BookingState, PendingRide, Place, Ride, RideStatus};
 use super::ports::RideProvider;
 use crate::user_data::services::nearby::distance_km;
 
@@ -34,7 +34,23 @@ pub enum BookingError {
 
 pub struct RideBooking {
     provider: Arc<dyn RideProvider>,
-    rides: Mutex<HashMap<String, PendingRide>>,
+    rides: Mutex<HashMap<String, Entry>>,
+}
+
+/// A ride and what its member has been told about it.
+struct Entry {
+    ride: PendingRide,
+    /// The last status the member was told about, or that needed no telling. Trails the ride's own
+    /// status until an update is delivered, so an update that failed to send is sent again.
+    announced: Option<RideStatus>,
+}
+
+/// A status the member has not heard about yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RideNews {
+    pub status: RideStatus,
+    /// What to tell them; `None` when the change is not worth a notification.
+    pub message: Option<String>,
 }
 
 impl RideBooking {
@@ -78,7 +94,13 @@ impl RideBooking {
             created_at: now,
             state: BookingState::AwaitingConfirmation,
         };
-        self.lock().insert(pending.id.clone(), pending.clone());
+        self.lock().insert(
+            pending.id.clone(),
+            Entry {
+                ride: pending.clone(),
+                announced: None,
+            },
+        );
         Ok(pending)
     }
 
@@ -144,35 +166,54 @@ impl RideBooking {
             .map_err(BookingError::Provider)
     }
 
-    /// Read the ride from the provider. Returns it with what to tell the member, if anything
-    /// changed that is worth telling.
-    pub async fn refresh(
-        &self,
-        id: &str,
-        profile_id: &str,
-    ) -> Result<(Ride, Option<String>), BookingError> {
+    /// Read the ride from the provider and keep it.
+    pub async fn refresh(&self, id: &str, profile_id: &str) -> Result<Ride, BookingError> {
         let request_id = self.requested_id(id, profile_id)?;
-        let previous = match self.lock().get(id).map(|p| p.state.clone()) {
-            Some(BookingState::Requested { ride }) => Some(ride.status),
-            _ => None,
-        };
         let ride = self
             .provider
             .ride(profile_id, &request_id)
             .await
             .map_err(BookingError::Provider)?;
-        let announcement = ride.announcement(previous.as_ref());
         self.set_state(id, BookingState::Requested { ride: ride.clone() });
-        Ok((ride, announcement))
+        Ok(ride)
     }
 
-    /// Rides still worth reading: requested and not finished. For the tracker.
-    pub fn active(&self) -> Vec<PendingRide> {
+    /// Rides the tracker should look at: requested and still under way, or finished with news
+    /// the member has not had yet.
+    pub fn to_follow(&self) -> Vec<PendingRide> {
         self.lock()
             .values()
-            .filter(|p| matches!(&p.state, BookingState::Requested { ride } if !ride.status.is_terminal()))
-            .cloned()
+            .filter(|e| match &e.ride.state {
+                BookingState::Requested { ride } => {
+                    !ride.status.is_terminal() || e.announced.as_ref() != Some(&ride.status)
+                }
+                _ => false,
+            })
+            .map(|e| e.ride.clone())
             .collect()
+    }
+
+    /// The ride's status, when its member has not been told about it yet.
+    pub fn news(&self, id: &str) -> Option<RideNews> {
+        let rides = self.lock();
+        let entry = rides.get(id)?;
+        let BookingState::Requested { ride } = &entry.ride.state else {
+            return None;
+        };
+        if entry.announced.as_ref() == Some(&ride.status) {
+            return None;
+        }
+        Some(RideNews {
+            status: ride.status.clone(),
+            message: ride.announcement(entry.announced.as_ref()),
+        })
+    }
+
+    /// Record that the member has had the news of `status`, so it is not sent again.
+    pub fn told(&self, id: &str, status: &RideStatus) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            entry.announced = Some(status.clone());
+        }
     }
 
     pub fn get(&self, id: &str, profile_id: &str) -> Result<PendingRide, BookingError> {
@@ -189,27 +230,27 @@ impl RideBooking {
     }
 
     fn set_state(&self, id: &str, state: BookingState) {
-        if let Some(p) = self.lock().get_mut(id) {
-            p.state = state;
+        if let Some(entry) = self.lock().get_mut(id) {
+            entry.ride.state = state;
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingRide>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
         // A poisoned map still holds consistent rows: every write is a single assignment.
         self.rides.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 fn owned<'a>(
-    rides: &'a mut HashMap<String, PendingRide>,
+    rides: &'a mut HashMap<String, Entry>,
     id: &str,
     profile_id: &str,
 ) -> Result<&'a mut PendingRide, BookingError> {
-    let pending = rides.get_mut(id).ok_or(BookingError::NotFound)?;
-    if pending.profile_id != profile_id {
+    let entry = rides.get_mut(id).ok_or(BookingError::NotFound)?;
+    if entry.ride.profile_id != profile_id {
         return Err(BookingError::NotYours);
     }
-    Ok(pending)
+    Ok(&mut entry.ride)
 }
 
 fn state_word(state: &BookingState) -> &'static str {
@@ -355,22 +396,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_announces_a_change_once() {
+    async fn news_stays_until_the_member_is_told_and_then_stops() {
         let provider = Arc::new(MockRideProvider::new());
         let (booking, pending) = quoted(provider.clone()).await;
         booking.confirm(&pending.id, "liz", now()).await.unwrap();
 
         provider.set_status(RideStatus::Accepted);
-        let (_, first) = booking.refresh(&pending.id, "liz").await.unwrap();
-        assert!(first.is_some());
-        let (_, second) = booking.refresh(&pending.id, "liz").await.unwrap();
-        assert!(second.is_none(), "an unchanged status announced again");
+        booking.refresh(&pending.id, "liz").await.unwrap();
+        let news = booking.news(&pending.id).expect("a new status is news");
+        assert!(news.message.is_some());
+        assert_eq!(
+            booking.news(&pending.id),
+            Some(news.clone()),
+            "news the member was never told about vanished"
+        );
+        booking.told(&pending.id, &news.status);
+        booking.refresh(&pending.id, "liz").await.unwrap();
+        assert_eq!(
+            booking.news(&pending.id),
+            None,
+            "an unchanged status is news again"
+        );
 
         provider.set_status(RideStatus::Completed);
         booking.refresh(&pending.id, "liz").await.unwrap();
+        assert_eq!(
+            booking.to_follow().len(),
+            1,
+            "an untold arrival was dropped"
+        );
+        booking.told(&pending.id, &RideStatus::Completed);
         assert!(
-            booking.active().is_empty(),
-            "a finished ride is still tracked"
+            booking.to_follow().is_empty(),
+            "a finished ride the member was told about is still followed"
         );
     }
 

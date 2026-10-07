@@ -1,7 +1,7 @@
 //! Travel MCP server: directions, ride-app links, and ride offers sent to the speaker's own phone.
 //! Nothing here books a ride: the member gets the fare and confirms on their phone.
 
-use pond_core::mcp::ports::notification::{MemberNotifier, Notification};
+use pond_core::mcp::ports::notification::{MemberDelivery, MemberNotifier, Notification};
 use pond_core::rides::ports::RideAccounts;
 use pond_core::security::ports::draft_authority::DraftAuthority;
 use pond_core::user_data::domain::profile::ProfileScope;
@@ -536,6 +536,27 @@ struct PhoneLink {
     label: &'static str,
 }
 
+/// Send to one member's own devices, never a broadcast.
+async fn push(
+    notifier: &dyn MemberNotifier,
+    profile_id: &str,
+    category: &str,
+    title: String,
+    body: String,
+    data: serde_json::Value,
+) -> MemberDelivery {
+    let notification = Notification {
+        id: uuid::Uuid::new_v4().to_string(),
+        target: profile_id.to_string(),
+        category: category.to_string(),
+        title,
+        body,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: Some(data),
+    };
+    notifier.notify_member(profile_id, notification).await
+}
+
 impl TravelMcpServer {
     /// The body of `get_directions_link`, apart from the rmcp wrapper so tests can call it.
     pub async fn directions_result(
@@ -557,9 +578,9 @@ impl TravelMcpServer {
     /// line saying where it went. Only one member is ever pushed to (see [`Self::speaker`]): a
     /// broadcast would put one person's trip on every phone.
     async fn deliver(&self, meta: &Meta, link: PhoneLink) -> Option<String> {
-        if self.authority.is_none() || self.notifier.is_none() {
+        let (Some(_), Some(notifier)) = (&self.authority, &self.notifier) else {
             return None;
-        }
+        };
         let profile_id = match self.speaker(meta).await {
             Ok(id) => id,
             Err(why) => return Some(format!("Not sent to a phone: {why}.")),
@@ -570,13 +591,33 @@ impl TravelMcpServer {
             "url": link.url,
             "label": link.label,
         });
-        let reached = self
-            .push(&profile_id, "info", link.title, link.body, data)
-            .await;
-        Some(match reached {
-            0 => "Not sent to a phone: the speaker has no paired phone of their own.".to_string(),
-            1 => "Also sent to the speaker's phone.".to_string(),
-            n => format!("Also sent to the speaker's {n} paired devices."),
+        let delivery = push(
+            notifier.as_ref(),
+            &profile_id,
+            "info",
+            link.title,
+            link.body,
+            data,
+        )
+        .await;
+        Some(match delivery {
+            MemberDelivery::Reached(devices) if devices.len() == 1 => {
+                "Also sent to the speaker's phone.".to_string()
+            }
+            MemberDelivery::Reached(devices) => {
+                format!(
+                    "Also sent to the speaker's {} paired devices.",
+                    devices.len()
+                )
+            }
+            MemberDelivery::NoPhone => {
+                "Not sent to a phone: the speaker has no paired phone of their own.".to_string()
+            }
+            MemberDelivery::Failed(why) => {
+                tracing::warn!(error = %why, "travel: could not send the link to the speaker's phone");
+                "Not sent to a phone: sending to the speaker's phone failed on the pond."
+                    .to_string()
+            }
         })
     }
 
@@ -599,30 +640,6 @@ impl TravelMcpServer {
         }
     }
 
-    /// Send to one member's own devices; returns how many it reached, never a broadcast.
-    async fn push(
-        &self,
-        profile_id: &str,
-        category: &str,
-        title: String,
-        body: String,
-        data: serde_json::Value,
-    ) -> usize {
-        let Some(notifier) = &self.notifier else {
-            return 0;
-        };
-        let notification = Notification {
-            id: uuid::Uuid::new_v4().to_string(),
-            target: profile_id.to_string(),
-            category: category.to_string(),
-            title,
-            body,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            data: Some(data),
-        };
-        notifier.notify_member(profile_id, notification).await.len()
-    }
-
     /// The body of `book_ride`, apart from the rmcp wrapper so tests can call it.
     pub async fn book_result(&self, meta: &Meta, params: &BookRideParams) -> CallToolResult {
         let fail = |text: String| CallToolResult::error(vec![Content::text(text)]);
@@ -630,6 +647,9 @@ impl TravelMcpServer {
             return fail(
                 "Booking rides is not set up on this pond, so no ride offer was sent.".into(),
             );
+        };
+        let Some(notifier) = &self.notifier else {
+            return fail("This pond cannot send to phones, so no ride offer was sent.".into());
         };
         let Some(destination) = text_param(&params.destination, &params.extra, DESTINATION_KEYS)
         else {
@@ -672,19 +692,29 @@ impl TravelMcpServer {
             "dropoff": {"name": fix.name, "latitude": fix.latitude, "longitude": fix.longitude},
             "label": "Get a fare",
         });
-        let reached = self
-            .push(
-                &profile_id,
-                "action_required",
-                format!("Ride to {}?", fix.name),
-                "Get an Uber fare from where you are. Nothing is booked until you confirm.".into(),
-                data,
-            )
-            .await;
-        if reached == 0 {
-            return fail(
-                "No ride offer was sent: the speaker has no paired phone of their own.".into(),
-            );
+        let delivery = push(
+            notifier.as_ref(),
+            &profile_id,
+            "action_required",
+            format!("Ride to {}?", fix.name),
+            "Get an Uber fare from where you are. Nothing is booked until you confirm.".into(),
+            data,
+        )
+        .await;
+        match delivery {
+            MemberDelivery::Reached(_) => {}
+            MemberDelivery::NoPhone => {
+                return fail(
+                    "No ride offer was sent: the speaker has no paired phone of their own.".into(),
+                )
+            }
+            MemberDelivery::Failed(why) => {
+                tracing::warn!(error = %why, "travel: could not send the ride offer");
+                return fail(
+                    "No ride offer was sent: sending to the speaker's phone failed on the pond."
+                        .into(),
+                );
+            }
         }
         let mut text = format!(
             "Sent a ride offer to the speaker's phone: a ride to {} (matched from \"{destination}\"). \
@@ -1306,6 +1336,22 @@ mod delivery_tests {
     }
 
     #[tokio::test]
+    async fn a_delivery_that_failed_is_not_reported_as_no_phone() {
+        let notifier = Arc::new(
+            MockMemberNotifier::new()
+                .with_devices("liz", &["liz-phone"])
+                .failing_next(1),
+        );
+        let out = text(
+            &server(Some(ProfileScope::Owner("liz".into())), notifier)
+                .directions_result(&meta(), &directions_to("Kisumu"))
+                .await,
+        );
+        assert!(out.contains("failed on the pond"), "{out}");
+        assert!(!out.contains("no paired phone"), "{out}");
+    }
+
+    #[tokio::test]
     async fn a_call_without_a_session_is_not_pushed() {
         let notifier = Arc::new(MockMemberNotifier::new().with_devices("liz", &["liz-phone"]));
         let out = text(
@@ -1499,6 +1545,24 @@ mod booking_tests {
             .book_result(&meta(), &to("JKIA"))
             .await;
         assert!(text(&unset).contains("not set up"), "{}", text(&unset));
+    }
+
+    #[tokio::test]
+    async fn an_offer_that_failed_to_send_says_so() {
+        let notifier = Arc::new(
+            MockMemberNotifier::new()
+                .with_devices("liz", &["liz-phone"])
+                .failing_next(1),
+        );
+        let result = server(liz(), &["liz"], notifier)
+            .book_result(&meta(), &to("JKIA"))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            text(&result).contains("failed on the pond"),
+            "{}",
+            text(&result)
+        );
     }
 }
 
