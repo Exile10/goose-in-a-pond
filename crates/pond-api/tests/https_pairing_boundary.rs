@@ -423,3 +423,40 @@ async fn system_info_names_the_insecure_listener_only_while_it_runs() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_loopback_peer_on_the_plaintext_listener_is_not_the_host() {
+    use pond_api::insecure_dev::{advertise, router, InsecureDevLan};
+    let h = make_app().await;
+    let lan = Some(InsecureDevLan { port: 4080 });
+    // The middleware's refusal, as opposed to the handler's own internal-token check.
+    let refused_by_middleware = |app: axum::Router| async move {
+        let response = app
+            .oneshot(
+                Request::get("/api/v1/player/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        body["error"] == "Missing Authorization header"
+    };
+    // A host-only route: the host process gets past the middleware without a token...
+    assert!(!refused_by_middleware(from_this_machine(h.companion.clone())).await);
+    // ...but whatever reaches the plaintext door from this machine is not the host.
+    let insecure = from_this_machine(router(advertise(h.companion.clone(), lan)));
+    assert!(refused_by_middleware(insecure).await);
+}
+
+/// A loopback peer as the server records it. `MockConnectInfo` feeds only the extractor, and the
+/// auth middleware reads the extension itself, so under the mock no caller is ever the host.
+fn from_this_machine(router: axum::Router) -> axum::Router {
+    router.layer(axum::Extension(axum::extract::ConnectInfo(
+        SocketAddr::from(([127, 0, 0, 1], 40_002)),
+    )))
+}

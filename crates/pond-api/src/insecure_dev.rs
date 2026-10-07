@@ -127,9 +127,74 @@ pub fn advertise(router: Router, lan: Option<InsecureDevLan>) -> Router {
 }
 
 /// The plaintext listener's router: the companion router it is given, with every request
-/// marked [`InsecureDevTransport`]. Never pass it the dashboard router.
+/// marked [`InsecureDevTransport`] and browsers refused. Never pass it the dashboard router.
 pub fn router(companion: Router) -> Router {
-    companion.layer(Extension(InsecureDevTransport))
+    companion
+        .layer(axum::middleware::from_fn(refuse_browsers))
+        .layer(Extension(InsecureDevTransport))
+}
+
+/// This door is for the companion app's native HTTP client, which sends neither `Origin` nor
+/// `Sec-Fetch-Site`. A browser sends at least one on every cross-site request, and without this
+/// any page open on the developer's machine could drive the listener. A same-origin request
+/// sends neither, so a page that rebinds its own name to this machine is caught by its `Host`
+/// instead. A request naming no host at all cannot come from a browser and is let through.
+async fn refuse_browsers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+    let headers = request.headers();
+    if headers.contains_key(header::ORIGIN) || headers.contains_key("sec-fetch-site") {
+        tracing::warn!(
+            kind = "insecure_dev_browser_refused",
+            path = %crate::host_guard::bounded(request.uri().path()),
+            "refused a browser request on the plaintext development listener"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "browser_request_refused"})),
+        )
+            .into_response();
+    }
+    let host = request
+        .uri()
+        .authority()
+        .map(|authority| authority.host().to_owned())
+        .or_else(|| crate::host_guard::host_header(headers));
+    let names_a_host = headers.contains_key(header::HOST) || request.uri().authority().is_some();
+    if names_a_host && !host.as_deref().is_some_and(is_own_host) {
+        tracing::warn!(
+            kind = "insecure_dev_host_refused",
+            host = %crate::host_guard::bounded(host.as_deref().unwrap_or("")),
+            "refused a plaintext development request not addressed to this machine"
+        );
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            axum::Json(serde_json::json!({"error": "host_not_allowed"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// An IP literal, `localhost`, or this machine's own name with or without `.local`. None of
+/// these can be the name of a page that rebinds to this machine.
+fn is_own_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<std::net::IpAddr>().is_ok() || host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Some(name) = hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+    else {
+        return false;
+    };
+    let (name, host) = (name.to_ascii_lowercase(), host.to_ascii_lowercase());
+    let name = name.strip_suffix(".local").unwrap_or(&name);
+    !name.is_empty() && host.strip_suffix(".local").unwrap_or(&host) == name
 }
 
 /// Bind the plaintext listener on every interface, or nothing when the decision is not
@@ -184,6 +249,58 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_plaintext_router_refuses_browsers_and_rebound_names() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let app = router(Router::new().route("/ping", axum::routing::get(|| async { "pong" })));
+        let status = |headers: &[(&str, &str)]| {
+            let mut request = Request::get("/ping");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let app = app.clone();
+            let request = request.body(Body::empty()).unwrap();
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+        // What the companion app sends: an address, no Origin.
+        assert_eq!(
+            status(&[("host", "192.168.1.5:4080")]).await,
+            StatusCode::OK
+        );
+        assert_eq!(status(&[("host", "[::1]:4080")]).await, StatusCode::OK);
+        assert_eq!(status(&[]).await, StatusCode::OK);
+        let me = hostname::get().unwrap().into_string().unwrap();
+        let me = me.strip_suffix(".local").unwrap_or(&me).to_owned();
+        assert_eq!(
+            status(&[("host", &format!("{me}.local:4080"))]).await,
+            StatusCode::OK
+        );
+        // A browser, cross-site or not, and a rebound name.
+        let ip = ("host", "192.168.1.5:4080");
+        assert_eq!(
+            status(&[ip, ("origin", "http://attacker.example")]).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(&[ip, ("sec-fetch-site", "cross-site")]).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(status(&[("host", "localhost:4080")]).await, StatusCode::OK);
+        assert_eq!(
+            status(&[("host", "attacker.example:4080")]).await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        let absolute = Request::get("http://attacker.example:4080/ping")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(absolute).await.unwrap().status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
 
     #[test]
     fn a_release_binary_ignores_the_flag_whatever_its_value() {
