@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock};
 use axum::http::{Method, StatusCode};
 use pond_core::rides::booking::RideBooking;
 use pond_core::rides::mocks::MockRideProvider;
-use ride_phone::{member_with_phone, send, trip, Pond};
+use ride_phone::{member_and_phone, member_with_phone, phone_of_nobody, send, trip, Pond};
 use serde_json::json;
 
 /// One stand-in company for the whole binary: `rides::install` is process-wide.
@@ -271,4 +271,81 @@ async fn while_travel_is_switched_off_no_fare_is_quoted_or_confirmed() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// The member is whoever the phone's pairing names; a pairing that names nobody books nothing.
+#[tokio::test]
+async fn a_phone_paired_to_nobody_cannot_quote_or_confirm() {
+    let p = pond().await;
+    let liz = member_with_phone(&p, "liz7").await;
+    let (_, quoted) = send(
+        &p.lan,
+        Method::POST,
+        "/api/v1/rides/quote",
+        Some(&liz),
+        Some(trip()),
+    )
+    .await;
+    let id = quoted["id"].as_str().unwrap();
+    let stranger = phone_of_nobody(&p, "visitor").await;
+
+    let (status, refused) = send(
+        &p.lan,
+        Method::POST,
+        "/api/v1/rides/quote",
+        Some(&stranger),
+        Some(trip()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not linked to a household member"),
+        "{refused}"
+    );
+    let (status, _) = send(
+        &p.lan,
+        Method::POST,
+        &format!("/api/v1/rides/{id}/confirm"),
+        Some(&stranger),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (_, still) = send(
+        &p.lan,
+        Method::GET,
+        &format!("/api/v1/rides/{id}"),
+        Some(&liz),
+        None,
+    )
+    .await;
+    assert_eq!(still["state"]["state"], "awaiting_confirmation");
+}
+
+#[tokio::test]
+async fn two_confirms_at_once_make_one_request() {
+    let p = pond().await;
+    let (liz, phone) = member_and_phone(&p, "liz8").await;
+    let (_, quoted) = send(
+        &p.lan,
+        Method::POST,
+        "/api/v1/rides/quote",
+        Some(&phone),
+        Some(trip()),
+    )
+    .await;
+    let confirm = format!("/api/v1/rides/{}/confirm", quoted["id"].as_str().unwrap());
+
+    let ((first, _), (second, _)) = tokio::join!(
+        send(&p.lan, Method::POST, &confirm, Some(&phone), None),
+        send(&p.lan, Method::POST, &confirm, Some(&phone), None),
+    );
+    let mut statuses = [first, second];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+    assert_eq!(PROVIDER.requests_for(&liz), 1);
 }

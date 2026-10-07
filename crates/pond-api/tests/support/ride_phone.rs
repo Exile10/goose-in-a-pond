@@ -101,6 +101,11 @@ fn client_mac(code: &str, challenge_b64: &str, client_id: &str) -> String {
 
 /// A member, and a phone paired to them through a pairing code that names them.
 pub async fn member_with_phone(p: &Pond, name: &str) -> String {
+    member_and_phone(p, name).await.1
+}
+
+/// As [`member_with_phone`], with the member's profile id first.
+pub async fn member_and_phone(p: &Pond, name: &str) -> (String, String) {
     let profile_id = p
         .profiles
         .create(CreateProfileRequest {
@@ -110,17 +115,18 @@ pub async fn member_with_phone(p: &Pond, name: &str) -> String {
         .await
         .unwrap()
         .id;
-    paired_phone(
+    let phone = paired_phone(
         p,
         &format!("{name}-phone"),
         json!({"profile_id": profile_id}),
     )
-    .await
+    .await;
+    (profile_id, phone)
 }
 
 /// A phone paired through a code that names nobody: it belongs to no member.
 pub async fn phone_of_nobody(p: &Pond, name: &str) -> String {
-    paired_phone(p, &format!("{name}-phone"), json!({})).await
+    paired_phone(p, &format!("{name}-phone"), json!({"unattributed": true})).await
 }
 
 async fn paired_phone(p: &Pond, client_id: &str, code_request: Value) -> String {

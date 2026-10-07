@@ -1,6 +1,7 @@
 //! Test double for [`RideProvider`]: quotes a fixed fare, counts requests, and reports whatever
 //! status a test sets.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
@@ -34,9 +35,12 @@ pub enum OnCurrent {
 pub struct MockRideProvider {
     status: Mutex<RideStatus>,
     quotes: Mutex<usize>,
-    requests: Mutex<usize>,
+    /// Requests made, by member.
+    requests: Mutex<HashMap<String, usize>>,
     on_request: Mutex<OnRequest>,
     on_current: Mutex<OnCurrent>,
+    /// How long `request` takes, so a test can overlap two.
+    request_delay: Option<std::time::Duration>,
 }
 
 impl Default for MockRideProvider {
@@ -50,10 +54,17 @@ impl MockRideProvider {
         Self {
             status: Mutex::new(RideStatus::Processing),
             quotes: Mutex::new(0),
-            requests: Mutex::new(0),
+            requests: Mutex::new(HashMap::new()),
             on_request: Mutex::new(OnRequest::Book),
             on_current: Mutex::new(OnCurrent::NoTrip),
+            request_delay: None,
         }
+    }
+
+    /// Each `request` takes this long before it answers.
+    pub fn with_request_delay(mut self, delay: std::time::Duration) -> Self {
+        self.request_delay = Some(delay);
+        self
     }
 
     /// Every `request` is refused, as Uber refusing an expired fare would be.
@@ -81,7 +92,17 @@ impl MockRideProvider {
 
     /// How many times `request` was called.
     pub fn requests(&self) -> usize {
-        *self.requests.lock().unwrap()
+        self.requests.lock().unwrap().values().sum()
+    }
+
+    /// How many times `request` was called for this member.
+    pub fn requests_for(&self, profile_id: &str) -> usize {
+        self.requests
+            .lock()
+            .unwrap()
+            .get(profile_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn ride(&self) -> Ride {
@@ -128,12 +149,20 @@ impl RideProvider for MockRideProvider {
 
     async fn request(
         &self,
-        _profile_id: &str,
+        profile_id: &str,
         _pickup: &Place,
         _dropoff: &Place,
         _quote: &FareQuote,
     ) -> std::result::Result<Ride, RequestFailure> {
-        *self.requests.lock().unwrap() += 1;
+        *self
+            .requests
+            .lock()
+            .unwrap()
+            .entry(profile_id.to_string())
+            .or_default() += 1;
+        if let Some(delay) = self.request_delay {
+            tokio::time::sleep(delay).await;
+        }
         match *self.on_request.lock().unwrap() {
             OnRequest::Book => Ok(self.ride()),
             OnRequest::Refuse => Err(RequestFailure::Refused(

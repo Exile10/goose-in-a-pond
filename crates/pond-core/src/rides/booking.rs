@@ -577,6 +577,27 @@ mod tests {
         assert_eq!(provider.requests(), 1);
     }
 
+    /// Two taps on Confirm while the first is still with the provider.
+    #[tokio::test]
+    async fn two_confirms_at_once_make_one_request() {
+        let provider = Arc::new(
+            MockRideProvider::new().with_request_delay(std::time::Duration::from_millis(50)),
+        );
+        let (booking, pending) = quoted(provider.clone()).await;
+
+        let (first, second) = tokio::join!(
+            booking.confirm(&pending.id, "liz", now()),
+            booking.confirm(&pending.id, "liz", now()),
+        );
+        let refused = [&first, &second]
+            .iter()
+            .filter(|r| matches!(r, Err(BookingError::AlreadyDecided("being requested"))))
+            .count();
+        assert_eq!(refused, 1, "{first:?} {second:?}");
+        assert!(first.is_ok() || second.is_ok());
+        assert_eq!(provider.requests(), 1);
+    }
+
     #[tokio::test]
     async fn another_member_cannot_confirm_decline_or_cancel() {
         let provider = Arc::new(MockRideProvider::new());
