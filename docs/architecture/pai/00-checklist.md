@@ -3079,13 +3079,15 @@ windows; not a PAI milestone completion).**
 **2026-10-07 — Uber accounts, the review's fixes (PAI-2 secrets and egress; not a PAI milestone
 completion).**
 
-- **What landed** (branch `fix-uber`, on the Uber sign-in relay and the pond's Uber accounts).
+- **What landed** (corrections to #461, #462 and #463, on the Uber sign-in relay and the pond's
+  Uber accounts).
   Members' Uber tokens live in the secret store under `UBER_*:<profile_id>`, and the generic secrets
   API answered any bearer, a paired phone's included. It now refuses every `UBER_` key with 403
   `secret_reserved` (`/secrets`, `/extensions/{name}/secrets`, a marketplace install's `secrets`)
   and leaves them out of `GET /secrets`. Deleting a member forgets their tokens first and aborts if
   that fails; a sign-in checks its member again after Uber's code is exchanged, under a gate
-  `delete_profile` holds too; a renewal never writes back tokens forgotten meanwhile; listing and
+  `delete_profile` holds too; a renewal never writes back tokens forgotten meanwhile (it checks and
+  writes under a process-wide lock `disconnect` takes as well); listing and
   forgetting no longer need the relay; an unfinished sign-in expires after ten minutes; Uber's own
   `error` reaches the failure reason; the `request_receipt` scope is gone.
 - **PAI-2 (egress).** No new sender: the relay calls stay in `pond-adapters-uber/src/accounts.rs`

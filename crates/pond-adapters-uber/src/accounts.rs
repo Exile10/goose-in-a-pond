@@ -180,6 +180,12 @@ pub struct SignedIn {
     refresh_token: String,
 }
 
+/// Held across every write of a member's tokens and every forget, for the whole process: each
+/// request builds its own `UberAccounts` and ride booking keeps another, so a lock in one instance
+/// would not see the others. A renewal checks and writes under it, so a disconnect can never land
+/// between the two.
+static TOKENS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Each member's Uber connection, stored in the pond's secret store.
 pub struct UberAccounts {
     secrets: Arc<dyn SecretRepository>,
@@ -231,6 +237,7 @@ impl UberAccounts {
         signed_in: SignedIn,
         now: DateTime<Utc>,
     ) -> Result<()> {
+        let _tokens = TOKENS.lock().await;
         self.store(
             profile_id,
             &signed_in.tokens.access_token,
@@ -243,6 +250,7 @@ impl UberAccounts {
     /// Forget a member's Uber connection; true when they had one. Their Uber account itself is
     /// untouched.
     pub async fn disconnect(&self, profile_id: &str) -> Result<bool> {
+        let _tokens = TOKENS.lock().await;
         let had = self.get(REFRESH_KEY, profile_id).await?.is_some();
         for prefix in [ACCESS_KEY, REFRESH_KEY, EXPIRES_KEY] {
             self.secrets.delete(&key(prefix, profile_id)).await?;
@@ -279,7 +287,9 @@ impl UberAccounts {
             .ok_or_else(|| anyhow!("this member has not connected Uber"))?;
         let tokens = self.require_relay()?.renew(&refresh).await?;
         // A disconnect, or the member's removal, while the relay answered wins: never write back
-        // tokens that were forgotten in the meantime.
+        // tokens that were forgotten in the meantime. Checked and written under one lock, which
+        // a disconnect also takes, so none can land in between.
+        let _tokens = TOKENS.lock().await;
         if self.get(REFRESH_KEY, profile_id).await?.as_deref() != Some(refresh.as_str()) {
             bail!("this member's Uber connection was removed or replaced while it was renewed");
         }
@@ -633,6 +643,91 @@ mod tests {
 
         assert!(renewing.await.unwrap().is_err());
         assert!(secrets.list_keys().await.unwrap().is_empty());
+    }
+
+    /// Pauses the first write of an access token, armed, until told to go on.
+    #[derive(Default)]
+    struct PausingSecrets {
+        inner: MemorySecrets,
+        armed: std::sync::atomic::AtomicBool,
+        reached: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl SecretRepository for PausingSecrets {
+        async fn get(&self, key: &str) -> Result<Option<String>> {
+            self.inner.get(key).await
+        }
+        async fn set(&self, key: &str, value: &str) -> Result<()> {
+            if key.starts_with(ACCESS_KEY)
+                && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.reached.notify_one();
+                self.resume.notified().await;
+            }
+            self.inner.set(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list_keys(&self) -> Result<Vec<String>> {
+            self.inner.list_keys().await
+        }
+        async fn has(&self, key: &str) -> Result<bool> {
+            self.inner.has(key).await
+        }
+    }
+
+    /// The gap the check above cannot close alone: a disconnect after the check, while the renewed
+    /// tokens are being written. It must wait for the write and then forget all of it.
+    #[tokio::test]
+    async fn a_disconnect_cannot_land_between_a_renewals_check_and_its_write() {
+        let server = MockServer::start().await;
+        relay_returns(
+            &server,
+            "/v1/uber/token",
+            json!({ "access_token": "a-1", "refresh_token": "r-1", "expires_in": 60 }),
+        )
+        .await;
+        relay_returns(
+            &server,
+            "/v1/uber/refresh",
+            json!({ "access_token": "a-2", "refresh_token": "r-2", "expires_in": 3600 }),
+        )
+        .await;
+        let secrets = Arc::new(PausingSecrets::default());
+        let accounts = Arc::new(UberAccounts::new(
+            secrets.clone(),
+            Some(SignInRelay::new(reqwest::Client::new(), &server.uri())),
+        ));
+        accounts.connect("liz", "c-1").await.unwrap();
+
+        secrets
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let renewing = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.access_token_at("liz", now()).await }
+        });
+        secrets.reached.notified().await;
+        let disconnecting = tokio::spawn({
+            let accounts = accounts.clone();
+            async move { accounts.disconnect("liz").await }
+        });
+        // Room for the disconnect to run now, if anything let it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        secrets.resume.notify_one();
+
+        assert_eq!(renewing.await.unwrap().unwrap(), "a-2");
+        assert!(
+            disconnecting.await.unwrap().unwrap(),
+            "it forgot the renewed sign-in"
+        );
+        assert!(
+            secrets.list_keys().await.unwrap().is_empty(),
+            "nothing written back after the disconnect"
+        );
     }
 
     #[tokio::test]
