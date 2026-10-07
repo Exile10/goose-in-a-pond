@@ -31,6 +31,16 @@ pub fn install_accounts(
     secrets: Option<Arc<dyn SecretRepository + Send + Sync>>,
     relay_url: Option<String>,
 ) -> Option<Arc<UberAccounts>> {
+    let accounts = accounts(travel_enabled, secrets, relay_url)?;
+    pond_mcp_server::travel::init_ride_accounts(accounts.clone());
+    Some(accounts)
+}
+
+fn accounts(
+    travel_enabled: bool,
+    secrets: Option<Arc<dyn SecretRepository + Send + Sync>>,
+    relay_url: Option<String>,
+) -> Option<Arc<UberAccounts>> {
     if !travel_enabled {
         tracing::info!("ride booking is off: travel is switched off (ext_travel_enabled)");
         return None;
@@ -41,12 +51,10 @@ pub fn install_accounts(
         );
         return None;
     };
-    let accounts = Arc::new(UberAccounts::new(
+    Some(Arc::new(UberAccounts::new(
         secrets,
         Some(SignInRelay::new(reqwest::Client::new(), &relay_url)),
-    ));
-    pond_mcp_server::travel::init_ride_accounts(accounts.clone());
-    Some(accounts)
+    )))
 }
 
 /// Turn ride booking on, or say why it stays off: the accounts as [`install_accounts`], the
@@ -58,12 +66,16 @@ pub fn start(
     relay_url: Option<String>,
     notifier: Arc<dyn MemberNotifier>,
 ) -> Option<Arc<RideBooking>> {
-    let accounts = install_accounts(travel_enabled, secrets, relay_url)?;
-    let uber = UberRides::new(
-        reqwest::Client::new(),
-        UberConfig::from_env(),
-        accounts.clone(),
-    );
+    let accounts = accounts(travel_enabled, secrets, relay_url)?;
+    let config = match UberConfig::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "ride booking is off");
+            return None;
+        }
+    };
+    pond_mcp_server::travel::init_ride_accounts(accounts.clone());
+    let uber = UberRides::new(reqwest::Client::new(), config, accounts.clone());
     let booking = Arc::new(RideBooking::new(Arc::new(uber)));
 
     pond_api::rides::install(booking.clone());

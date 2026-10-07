@@ -5,7 +5,7 @@
 pub mod accounts;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -24,6 +24,9 @@ pub const SANDBOX_API_BASE: &str = "https://sandbox-api.uber.com";
 const API_BASE_ENV: &str = "GIAP_UBER_API_BASE";
 const PRODUCT_ID_ENV: &str = "GIAP_UBER_PRODUCT_ID";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// What Uber calls are filed under in the egress log. No chat turn makes them: they come from the
+/// phone's ride routes and the tracker, so none may be filed under the turn in flight.
+const EGRESS_TOOL: &str = "giap-rides";
 
 /// Where to reach Uber and which product to ask for.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,24 +37,62 @@ pub struct UberConfig {
 }
 
 impl UberConfig {
-    /// From `GIAP_UBER_API_BASE` (default: production) and `GIAP_UBER_PRODUCT_ID`.
-    pub fn from_env() -> Self {
+    /// From `GIAP_UBER_API_BASE` (default: production) and `GIAP_UBER_PRODUCT_ID`. A base that is
+    /// not https is refused, apart from http to this machine for tests: every call carries a
+    /// member's token.
+    pub fn from_env() -> Result<Self> {
         Self::from_values(
             std::env::var(API_BASE_ENV).ok(),
             std::env::var(PRODUCT_ID_ENV).ok(),
         )
     }
 
-    fn from_values(api_base: Option<String>, product_id: Option<String>) -> Self {
+    fn from_values(api_base: Option<String>, product_id: Option<String>) -> Result<Self> {
         let non_blank =
             |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        Self {
-            api_base: non_blank(api_base)
-                .unwrap_or_else(|| PRODUCTION_API_BASE.to_string())
-                .trim_end_matches('/')
-                .to_string(),
-            product_id: non_blank(product_id),
+        let api_base = non_blank(api_base)
+            .unwrap_or_else(|| PRODUCTION_API_BASE.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        if !https_or_loopback(&api_base) {
+            anyhow::bail!(
+                "{API_BASE_ENV} must be an https address, or http to this machine; not {api_base}"
+            );
         }
+        Ok(Self {
+            api_base,
+            product_id: non_blank(product_id),
+        })
+    }
+}
+
+fn https_or_loopback(base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base) else {
+        return false;
+    };
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    match url.scheme() {
+        "https" => !host.is_empty(),
+        "http" => {
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        _ => false,
+    }
+}
+
+fn method_name(method: &reqwest::Method) -> &'static str {
+    match *method {
+        reqwest::Method::GET => "GET",
+        reqwest::Method::POST => "POST",
+        reqwest::Method::DELETE => "DELETE",
+        _ => "OTHER",
     }
 }
 
@@ -122,13 +163,18 @@ impl UberRides {
         body: Option<Value>,
     ) -> std::result::Result<Option<Value>, CallError> {
         let url = format!("{}{path}", self.config.api_base);
-        pond_core::shared::services::egress::check_egress(&url)
-            .map_err(|denied| CallError::NotSent(anyhow!("{denied}")))?;
         let token = self
             .tokens
             .access_token(profile_id)
             .await
             .map_err(CallError::NotSent)?;
+        let call = pond_core::shared::services::egress::begin_for(
+            &url,
+            method_name(&method),
+            EGRESS_TOOL,
+            "",
+        )
+        .map_err(|denied| CallError::NotSent(anyhow!("{denied}")))?;
 
         let mut builder = self
             .client
@@ -138,14 +184,8 @@ impl UberRides {
         if let Some(body) = body {
             builder = builder.json(&body);
         }
-        let start = Instant::now();
         let result = builder.send().await;
-        pond_core::shared::services::egress::record_egress(
-            &url,
-            method.as_str(),
-            result.as_ref().ok().map(|r| r.status().as_u16()),
-            start.elapsed().as_millis() as u64,
-        );
+        call.finish(result.as_ref().ok().map(|r| r.status().as_u16()));
         let response = result.map_err(|e| {
             let why = if e.is_timeout() {
                 "timed out"
@@ -471,19 +511,48 @@ mod tests {
     #[test]
     fn config_defaults_to_production_and_ignores_blanks() {
         assert_eq!(
-            UberConfig::from_values(None, Some("  ".into())),
+            UberConfig::from_values(None, Some("  ".into())).unwrap(),
             UberConfig {
                 api_base: PRODUCTION_API_BASE.to_string(),
                 product_id: None
             }
         );
         assert_eq!(
-            UberConfig::from_values(Some(format!("{SANDBOX_API_BASE}/")), Some("uberx".into())),
+            UberConfig::from_values(Some(format!("{SANDBOX_API_BASE}/")), Some("uberx".into()))
+                .unwrap(),
             UberConfig {
                 api_base: SANDBOX_API_BASE.to_string(),
                 product_id: Some("uberx".into())
             }
         );
+    }
+
+    /// A member's token must never travel in the clear, except to this machine in a test.
+    #[test]
+    fn the_api_base_must_be_https_or_loopback() {
+        for refused in [
+            "http://sandbox-api.uber.com",
+            "http://192.168.1.10:8080",
+            "ftp://api.uber.com",
+            "api.uber.com",
+            "https://",
+        ] {
+            assert!(
+                UberConfig::from_values(Some(refused.into()), None).is_err(),
+                "{refused} was accepted"
+            );
+        }
+        for accepted in [
+            "https://sandbox-api.uber.com",
+            "http://127.0.0.1:9999",
+            "http://localhost:4000",
+            "http://[::1]:5000",
+        ] {
+            assert!(
+                UberConfig::from_values(Some(accepted.into()), None).is_ok(),
+                "{accepted} was refused"
+            );
+        }
     }
 
     #[tokio::test]

@@ -26,7 +26,8 @@ const RENEW_MARGIN: chrono::Duration = chrono::Duration::minutes(10);
 /// Longer than the relay waits for Uber (15 s), so the pond never gives up on an exchange the relay
 /// can still finish: Uber's code is single use, and an answer nobody waits for loses it.
 const RELAY_TIMEOUT: Duration = Duration::from_secs(25);
-/// The name relay calls are filed under in the egress log, the same as the music-token fetch.
+/// What relay calls are filed under in the egress log, the same as the music-token fetch. No chat
+/// turn makes them, so none may be filed under the turn in flight.
 const EGRESS_TOOL: &str = "giap-credentials";
 
 /// Every key a member's Uber tokens are kept under starts with this. The pond's generic secrets
@@ -139,7 +140,7 @@ impl SignInRelay {
         url: &str,
         method: &'static str,
     ) -> Result<reqwest::Response> {
-        let call = pond_core::shared::services::egress::begin_as(url, method, EGRESS_TOOL)
+        let call = pond_core::shared::services::egress::begin_for(url, method, EGRESS_TOOL, "")
             .map_err(|denied| anyhow!("{denied}"))?;
         let sent = builder.timeout(RELAY_TIMEOUT).send().await;
         call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
