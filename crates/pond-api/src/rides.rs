@@ -81,6 +81,7 @@ fn booking_refusal(error: BookingError) -> Refusal {
         BookingError::AlreadyDecided(_) | BookingError::NotRequested => {
             refuse(StatusCode::CONFLICT, &error.to_string())
         }
+        BookingError::TooFar(_) => refuse(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
         BookingError::Provider(e) => {
             tracing::warn!(error = %format!("{e:#}"), "rides: the ride company refused");
             refuse(StatusCode::BAD_GATEWAY, &format!("{e:#}"))

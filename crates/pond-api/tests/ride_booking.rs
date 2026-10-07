@@ -311,3 +311,25 @@ async fn only_a_phone_paired_to_a_member_can_book_and_only_on_the_map() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn a_drop_off_far_from_the_pickup_is_never_quoted() {
+    let p = pond().await;
+    let phone = member_with_phone(&p, "liz5").await;
+    let (status, refused) = send(
+        &p.lan,
+        Method::POST,
+        "/api/v1/rides/quote",
+        Some(&phone),
+        Some(json!({
+            "pickup": {"latitude": -1.2676, "longitude": 36.8108},
+            "dropoff": {"name": "Westlands", "latitude": 18.03, "longitude": -76.79},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap_or("").contains("too far"),
+        "{refused}"
+    );
+}

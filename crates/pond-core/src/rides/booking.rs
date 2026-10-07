@@ -8,6 +8,10 @@ use chrono::{DateTime, Utc};
 
 use super::domain::{BookingState, PendingRide, Place, Ride};
 use super::ports::RideProvider;
+use crate::user_data::services::nearby::distance_km;
+
+/// Farther than this, a drop-off is a place matched wrongly, not a ride anyone means to take.
+pub const MAX_RIDE_KM: f64 = 150.0;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BookingError {
@@ -22,6 +26,8 @@ pub enum BookingError {
     AlreadyDecided(&'static str),
     #[error("the ride was never requested")]
     NotRequested,
+    #[error("the drop-off is {0:.0} km from the pickup, too far for a ride booked here")]
+    TooFar(f64),
     #[error("{0}")]
     Provider(#[source] anyhow::Error),
 }
@@ -51,6 +57,13 @@ impl RideBooking {
         dropoff: Place,
         now: DateTime<Utc>,
     ) -> Result<PendingRide, BookingError> {
+        let km = distance_km(
+            (pickup.latitude, pickup.longitude),
+            (dropoff.latitude, dropoff.longitude),
+        );
+        if km > MAX_RIDE_KM {
+            return Err(BookingError::TooFar(km));
+        }
         let quote = self
             .provider
             .quote(profile_id, &pickup, &dropoff)
@@ -243,6 +256,26 @@ mod tests {
         let (_, pending) = quoted(provider.clone()).await;
         assert_eq!(pending.state, BookingState::AwaitingConfirmation);
         assert_eq!(provider.requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_drop_off_too_far_from_the_pickup_is_never_quoted() {
+        let provider = Arc::new(MockRideProvider::new());
+        let booking = RideBooking::new(provider.clone());
+        let mombasa = Place {
+            name: "Mombasa".to_string(),
+            latitude: -4.0435,
+            longitude: 39.6682,
+        };
+        assert!(matches!(
+            booking.quote("liz", place("Home"), mombasa, now()).await,
+            Err(BookingError::TooFar(km)) if km > MAX_RIDE_KM
+        ));
+        assert_eq!(
+            provider.quotes(),
+            0,
+            "a refused trip still asked for a fare"
+        );
     }
 
     #[tokio::test]

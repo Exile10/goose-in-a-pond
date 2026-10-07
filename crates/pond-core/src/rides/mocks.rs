@@ -12,6 +12,7 @@ use super::ports::RideProvider;
 
 pub struct MockRideProvider {
     status: Mutex<RideStatus>,
+    quotes: Mutex<usize>,
     requests: Mutex<usize>,
     fail_requests: bool,
 }
@@ -26,6 +27,7 @@ impl MockRideProvider {
     pub fn new() -> Self {
         Self {
             status: Mutex::new(RideStatus::Processing),
+            quotes: Mutex::new(0),
             requests: Mutex::new(0),
             fail_requests: false,
         }
@@ -39,6 +41,11 @@ impl MockRideProvider {
 
     pub fn set_status(&self, status: RideStatus) {
         *self.status.lock().unwrap() = status;
+    }
+
+    /// How many times `quote` was called.
+    pub fn quotes(&self) -> usize {
+        *self.quotes.lock().unwrap()
     }
 
     /// How many times `request` was called.
@@ -77,6 +84,7 @@ impl RideProvider for MockRideProvider {
         _pickup: &Place,
         _dropoff: &Place,
     ) -> Result<FareQuote> {
+        *self.quotes.lock().unwrap() += 1;
         Ok(FareQuote {
             fare_id: "fare-1".to_string(),
             display: "KES 1,250".to_string(),

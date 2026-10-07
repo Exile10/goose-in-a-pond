@@ -6,6 +6,9 @@ use pond_core::rides::ports::RideAccounts;
 use pond_core::security::ports::draft_authority::DraftAuthority;
 use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::ports::place_lookup::{PlaceFix, PlaceLookup};
+use pond_core::user_data::ports::settings::SettingsRepository;
+use pond_core::user_data::services::location::{self, Location};
+use pond_core::user_data::services::nearby::{self, NEAR_HOME_KM};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -18,7 +21,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use pond_core::mcp::domain::tool_group::TRAVEL_EXTENSION;
 
@@ -185,6 +188,10 @@ impl RideApp {
 #[derive(Clone)]
 pub struct TravelMcpServer {
     places: Option<Arc<dyn PlaceLookup>>,
+    /// Where home is, read per call; without it a name takes its best match anywhere.
+    settings: Option<Arc<dyn SettingsRepository + Send + Sync>>,
+    /// The home's country, keyed by the home it was learned for: learning it costs a lookup.
+    home_country: Arc<Mutex<Option<LearnedCountry>>>,
     /// Both set: links are also pushed to the speaker's own phones. Either unset: reply only.
     authority: Option<Arc<dyn DraftAuthority>>,
     notifier: Option<Arc<dyn MemberNotifier>>,
@@ -204,11 +211,22 @@ impl TravelMcpServer {
     pub fn new(places: Option<Arc<dyn PlaceLookup>>) -> Self {
         Self {
             places,
+            settings: None,
+            home_country: Arc::new(Mutex::new(None)),
             authority: None,
             notifier: None,
             ride_accounts: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Match place names near the home in these settings rather than anywhere in the world.
+    pub fn with_home(
+        mut self,
+        settings: Option<Arc<dyn SettingsRepository + Send + Sync>>,
+    ) -> Self {
+        self.settings = settings;
+        self
     }
 
     pub fn with_phone_delivery(
@@ -290,10 +308,13 @@ impl TravelMcpServer {
         let pickup_point = match &pickup {
             None => RidePoint::MyLocation,
             Some(asked) => match self.resolve(asked).await {
-                Ok(fix) => RidePoint::Place {
-                    asked: asked.clone(),
-                    fix,
-                },
+                Ok(matched) => {
+                    notes.extend(matched.note(asked));
+                    RidePoint::Place {
+                        asked: asked.clone(),
+                        fix: matched.fix,
+                    }
+                }
                 Err(why) => {
                     notes.push(format!(
                         "Pickup is the phone's current location: {why} for \"{asked}\"."
@@ -309,10 +330,13 @@ impl TravelMcpServer {
                 None
             }
             Some(asked) => match self.resolve(asked).await {
-                Ok(fix) => Some(RidePoint::Place {
-                    asked: asked.clone(),
-                    fix,
-                }),
+                Ok(matched) => {
+                    notes.extend(matched.note(asked));
+                    Some(RidePoint::Place {
+                        asked: asked.clone(),
+                        fix: matched.fix,
+                    })
+                }
                 Err(why) => {
                     notes.push(format!("The drop-off is empty: {why} for \"{asked}\"."));
                     None
@@ -349,18 +373,112 @@ impl TravelMcpServer {
         CallToolResult::success(vec![Content::text(lines.join("\n"))])
     }
 
-    async fn resolve(&self, query: &str) -> Result<PlaceFix, String> {
+    /// The place `query` names: the match nearest home within [`NEAR_HOME_KM`], or with no
+    /// home set, the best match anywhere. `Err` says why there is none.
+    async fn resolve(&self, query: &str) -> Result<Matched, String> {
         let Some(places) = &self.places else {
             return Err("this pond has no place lookup".to_string());
         };
-        places.by_name(query).await.map_err(|e| {
-            tracing::debug!(error = %e, "travel: place lookup failed");
-            // The geocoder's empty-result error; anything else (an offline refusal) is a failure.
-            if format!("{e:#}").contains("no location found") {
-                "no place matched".to_string()
-            } else {
-                "the place lookup failed".to_string()
+        let home = self.home().await;
+        let found = match &home {
+            Some(home) => {
+                let country = self.home_country(places.as_ref(), home).await;
+                nearby::near_home(
+                    places.as_ref(),
+                    query,
+                    (home.latitude, home.longitude),
+                    country.as_deref(),
+                )
+                .await
+                .map(|fix| {
+                    fix.map(|fix| Matched {
+                        fix,
+                        anywhere: false,
+                    })
+                })
             }
+            None => places.candidates(query, None, 1).await.map(|found| {
+                found.into_iter().next().map(|c| Matched {
+                    fix: c.fix,
+                    anywhere: true,
+                })
+            }),
+        };
+        match found {
+            Ok(Some(matched)) => Ok(matched),
+            Ok(None) if home.is_some() => Err(format!(
+                "no place matched within {NEAR_HOME_KM:.0} km of home"
+            )),
+            Ok(None) => Err("no place matched".to_string()),
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), "travel: place lookup failed");
+                Err("the place lookup failed".to_string())
+            }
+        }
+    }
+
+    /// Where the household is, when the pond knows its coordinates.
+    async fn home(&self) -> Option<Location> {
+        let settings = match self.settings.as_ref()?.get().await {
+            Ok(settings) => settings,
+            Err(e) => {
+                tracing::warn!(error = %e, "travel: could not read where home is");
+                return None;
+            }
+        };
+        let home = location::resolve(&settings);
+        home.has_coordinates().then_some(home)
+    }
+
+    /// The home's country, learned once per home; `None` when it cannot be told.
+    async fn home_country(&self, places: &dyn PlaceLookup, home: &Location) -> Option<String> {
+        let key = format!("{:.4},{:.4},{}", home.latitude, home.longitude, home.name);
+        if let Some(learned) = &*self.lock_home_country() {
+            if learned.home == key {
+                return learned.code.clone();
+            }
+        }
+        match nearby::home_country(places, home).await {
+            Ok(code) => {
+                *self.lock_home_country() = Some(LearnedCountry {
+                    home: key,
+                    code: code.clone(),
+                });
+                code
+            }
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), "travel: could not learn home's country");
+                None
+            }
+        }
+    }
+
+    fn lock_home_country(&self) -> std::sync::MutexGuard<'_, Option<LearnedCountry>> {
+        // A poisoned cache holds a whole value either way: every write is one assignment.
+        self.home_country.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// A home's country, and the home it was learned for.
+struct LearnedCountry {
+    home: String,
+    code: Option<String>,
+}
+
+/// A place a name was matched to.
+struct Matched {
+    fix: PlaceFix,
+    /// No home is set, so this is the best match anywhere in the world.
+    anywhere: bool,
+}
+
+impl Matched {
+    fn note(&self, asked: &str) -> Option<String> {
+        self.anywhere.then(|| {
+            format!(
+                "No home location is set on this pond, so \"{asked}\" was matched to the best \
+                 place of that name anywhere."
+            )
         })
     }
 }
@@ -532,14 +650,16 @@ impl TravelMcpServer {
                 );
             }
         }
-        let fix = match self.resolve(&destination).await {
-            Ok(fix) => fix,
+        let matched = match self.resolve(&destination).await {
+            Ok(matched) => matched,
             Err(why) => {
                 return fail(format!(
                     "No ride offer was sent: {why} for \"{destination}\"."
                 ))
             }
         };
+        let note = matched.note(&destination);
+        let fix = matched.fix;
 
         let data = serde_json::json!({
             "action": "ride_offer",
@@ -561,11 +681,16 @@ impl TravelMcpServer {
                 "No ride offer was sent: the speaker has no paired phone of their own.".into(),
             );
         }
-        CallToolResult::success(vec![Content::text(format!(
+        let mut text = format!(
             "Sent a ride offer to the speaker's phone: a ride to {} (matched from \"{destination}\"). \
              The phone gets the fare from where it is. Nothing is booked until they confirm on the phone.",
             fix.name
-        ))])
+        );
+        if let Some(note) = note {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        CallToolResult::success(vec![Content::text(text)])
     }
 }
 
@@ -625,6 +750,7 @@ use tokio::io::DuplexStream;
 
 struct TravelDeps {
     places: Option<Arc<dyn PlaceLookup>>,
+    settings: Option<Arc<dyn SettingsRepository + Send + Sync>>,
 }
 
 static TRAVEL_DEPS: OnceLock<TravelDeps> = OnceLock::new();
@@ -635,9 +761,12 @@ pub fn init_ride_accounts(accounts: Arc<dyn RideAccounts>) {
     let _ = RIDE_ACCOUNTS.set(accounts);
 }
 
-/// Install the place lookup. Call once at startup.
-pub fn init_travel_deps(places: Option<Arc<dyn PlaceLookup>>) {
-    let _ = TRAVEL_DEPS.set(TravelDeps { places });
+/// Install the place lookup and the settings that say where home is. Call once at startup.
+pub fn init_travel_deps(
+    places: Option<Arc<dyn PlaceLookup>>,
+    settings: Option<Arc<dyn SettingsRepository + Send + Sync>>,
+) {
+    let _ = TRAVEL_DEPS.set(TravelDeps { places, settings });
 }
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
@@ -650,6 +779,7 @@ pub fn spawn_travel_server(reader: DuplexStream, writer: DuplexStream) {
         return;
     };
     let server = TravelMcpServer::new(deps.places.clone())
+        .with_home(deps.settings.clone())
         .with_phone_delivery(crate::speaker_authority(), crate::member_notifier())
         .with_ride_accounts(RIDE_ACCOUNTS.get().cloned());
     crate::serve_builtin(TRAVEL_EXTENSION, server, reader, writer);
@@ -657,36 +787,116 @@ pub fn spawn_travel_server(reader: DuplexStream, writer: DuplexStream) {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
+/// Test doubles shared by the travel test modules.
 #[cfg(test)]
-mod tests {
+mod fakes {
     use super::*;
     use async_trait::async_trait;
+    use pond_core::user_data::domain::settings::Settings;
+    use pond_core::user_data::ports::place_lookup::PlaceCandidate;
 
-    struct StubPlaces;
-
-    #[async_trait]
-    impl PlaceLookup for StubPlaces {
-        async fn by_name(&self, query: &str) -> anyhow::Result<PlaceFix> {
-            match query {
-                "JKIA" => Ok(PlaceFix {
-                    name: "Jomo Kenyatta International Airport, Kenya".to_string(),
-                    latitude: -1.319167,
-                    longitude: 36.9275,
-                    timezone: None,
-                }),
-                "Westlands" => Ok(PlaceFix {
-                    name: "Westlands, Kenya".to_string(),
-                    latitude: -1.2676,
-                    longitude: 36.8108,
-                    timezone: None,
-                }),
-                _ => anyhow::bail!("no location found for '{query}'"),
-            }
+    fn candidate(name: &str, latitude: f64, longitude: f64, country: &str) -> PlaceCandidate {
+        PlaceCandidate {
+            fix: PlaceFix {
+                name: name.to_string(),
+                latitude,
+                longitude,
+                timezone: None,
+            },
+            country_code: Some(country.to_string()),
         }
     }
 
+    /// Ranks like the real geocoder: a namesake far away comes before the one near home. It
+    /// ignores the country asked for, so only picking by distance can find the near one.
+    #[derive(Default)]
+    pub struct Places {
+        asked: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl Places {
+        /// Every `(name, country_code)` searched, in order.
+        pub fn asked(&self) -> Vec<(String, Option<String>)> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl PlaceLookup for Places {
+        async fn by_name(&self, query: &str) -> anyhow::Result<PlaceFix> {
+            anyhow::bail!("travel matches names through candidates(), not by_name({query})")
+        }
+
+        async fn candidates(
+            &self,
+            query: &str,
+            country_code: Option<&str>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<PlaceCandidate>> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((query.to_string(), country_code.map(str::to_string)));
+            let all = match query {
+                "JKIA" => vec![
+                    candidate("Jkia Hill, Tanzania", -6.8, 39.2, "TZ"),
+                    candidate(
+                        "Jomo Kenyatta International Airport, Kenya",
+                        -1.319167,
+                        36.9275,
+                        "KE",
+                    ),
+                ],
+                "Westlands" => vec![
+                    candidate("Westlands, Jamaica", 18.03, -76.79, "JM"),
+                    candidate("Westlands, Kenya", -1.2676, 36.8108, "KE"),
+                ],
+                "Kisumu" => vec![candidate("Kisumu, Kenya", -0.1022, 34.7617, "KE")],
+                "Nairobi" => vec![candidate("Nairobi, Kenya", -1.2833, 36.8167, "KE")],
+                _ => Vec::new(),
+            };
+            Ok(all.into_iter().take(limit).collect())
+        }
+    }
+
+    /// Settings whose home is the given place, or unset.
+    pub struct Home(pub Option<(&'static str, f64, f64)>);
+
+    /// A pond at home in Nairobi.
+    pub fn nairobi() -> Arc<Home> {
+        Arc::new(Home(Some(("Nairobi, Kenya", -1.286, 36.817))))
+    }
+
+    #[async_trait]
+    impl SettingsRepository for Home {
+        async fn get(&self) -> anyhow::Result<Settings> {
+            let mut settings = Settings::default();
+            if let Some((name, latitude, longitude)) = self.0 {
+                settings.weather_location_name = name.to_string();
+                settings.weather_latitude = latitude;
+                settings.weather_longitude = longitude;
+            }
+            Ok(settings)
+        }
+        async fn update(&self, _: &Settings) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_key(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn set_key(&self, _: &str, _: String) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fakes::{nairobi, Home, Places};
+    use super::*;
+
     fn server() -> TravelMcpServer {
-        TravelMcpServer::new(Some(Arc::new(StubPlaces)))
+        TravelMcpServer::new(Some(Arc::new(Places::default()))).with_home(Some(nairobi()))
     }
 
     fn text(result: &CallToolResult) -> String {
@@ -815,6 +1025,67 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
         assert!(!out.contains("dropoff["), "{out}");
         assert!(out.contains("The drop-off is empty"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn the_namesake_near_home_beats_the_geocoders_first_match() {
+        let out = text(
+            &server()
+                .ride_result(&Meta::new(), &ride(Some("Westlands"), None, None))
+                .await,
+        );
+        assert!(out.contains("dropoff[latitude]=-1.267600"), "{out}");
+        assert!(out.contains("Westlands, Kenya"), "{out}");
+        assert!(!out.contains("Jamaica"), "{out}");
+        assert!(!out.contains("No home location"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_place_matching_only_far_from_home_is_no_match() {
+        let result = server()
+            .ride_result(&Meta::new(), &ride(Some("Kisumu"), None, None))
+            .await;
+        let out = text(&result);
+        assert!(!out.contains("dropoff["), "{out}");
+        assert!(
+            out.contains("no place matched within 50 km of home for \"Kisumu\""),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_home_the_best_match_anywhere_is_used_and_the_result_says_so() {
+        let out = text(
+            &TravelMcpServer::new(Some(Arc::new(Places::default())))
+                .with_home(Some(Arc::new(Home(None))))
+                .ride_result(&Meta::new(), &ride(Some("Westlands"), None, None))
+                .await,
+        );
+        assert!(out.contains("Westlands, Jamaica"), "{out}");
+        assert!(
+            out.contains("No home location is set on this pond"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_homes_country_is_learned_once_and_then_searched() {
+        let places = Arc::new(Places::default());
+        let server = TravelMcpServer::new(Some(places.clone())).with_home(Some(nairobi()));
+        server
+            .ride_result(&Meta::new(), &ride(Some("Westlands"), None, None))
+            .await;
+        server
+            .ride_result(&Meta::new(), &ride(Some("JKIA"), None, None))
+            .await;
+        assert_eq!(
+            places.asked(),
+            vec![
+                ("Nairobi".to_string(), None),
+                ("Westlands".to_string(), Some("KE".to_string())),
+                ("JKIA".to_string(), Some("KE".to_string())),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1024,6 +1295,7 @@ mod delivery_tests {
 mod booking_tests {
     //! `book_ride` sends an offer to the speaker's own phone and books nothing itself.
 
+    use super::fakes::{nairobi, Places};
     use super::*;
     use async_trait::async_trait;
     use pond_core::mcp::mocks::mock_member_notifier::MockMemberNotifier;
@@ -1055,23 +1327,6 @@ mod booking_tests {
         }
     }
 
-    struct Places;
-
-    #[async_trait]
-    impl PlaceLookup for Places {
-        async fn by_name(&self, query: &str) -> anyhow::Result<PlaceFix> {
-            if query != "JKIA" {
-                anyhow::bail!("no location found for '{query}'");
-            }
-            Ok(PlaceFix {
-                name: "Jomo Kenyatta International Airport, Kenya".into(),
-                latitude: -1.319167,
-                longitude: 36.9275,
-                timezone: None,
-            })
-        }
-    }
-
     fn meta() -> Meta {
         let mut m = Meta::new();
         m.0.insert(
@@ -1086,7 +1341,8 @@ mod booking_tests {
         connected: &'static [&'static str],
         notifier: Arc<MockMemberNotifier>,
     ) -> TravelMcpServer {
-        TravelMcpServer::new(Some(Arc::new(Places)))
+        TravelMcpServer::new(Some(Arc::new(Places::default())))
+            .with_home(Some(nairobi()))
             .with_phone_delivery(Some(Arc::new(Speaker(speaker))), Some(notifier))
             .with_ride_accounts(Some(Arc::new(Connected(connected))))
     }
@@ -1173,7 +1429,7 @@ mod booking_tests {
             text(&result)
         );
 
-        let unset = TravelMcpServer::new(Some(Arc::new(Places)))
+        let unset = TravelMcpServer::new(Some(Arc::new(Places::default())))
             .book_result(&meta(), &to("JKIA"))
             .await;
         assert!(text(&unset).contains("not set up"), "{}", text(&unset));
