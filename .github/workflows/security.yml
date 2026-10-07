@@ -140,6 +140,7 @@ jobs:
             --lockfile=pond-desktop/package-lock.json
             --lockfile=extensions/music/package-lock.json
             --lockfile=matter-server/package-lock.json
+            --lockfile=services/pondcredentials/Cargo.lock
 
   secrets:
     name: Secrets — gitleaks

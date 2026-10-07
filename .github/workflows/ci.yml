@@ -281,6 +281,13 @@ jobs:
       - name: cargo test (lightning payment rail — pond-adapters-lightning)
         run: cargo test -p pond-adapters-lightning
 
+      # rust-cache saves ~/.cargo/git after this job, and a fork's pull_request run can restore a
+      # cache written on this repository's branches. Take the private fork's source out first so
+      # no cache carries it; the next run fetches it again with the token.
+      - name: Keep the private dependency out of the cache
+        if: always()
+        run: rm -rf ~/.cargo/git/db/llama-cpp-rs-giap-* ~/.cargo/git/checkouts/llama-cpp-rs-giap-*
+
   # 2: Frontend ─────────────────────────────────────────────────────────
   # Runs Vitest unit tests and Playwright E2E tests.
   # Playwright spins up the Vite dev server itself (no pond-server process needed —
@@ -611,6 +618,13 @@ jobs:
       # for the auth phase are all the script's own doing -- see its header.
       - name: scripts/live-test.sh
         run: bash scripts/live-test.sh
+
+      # rust-cache saves ~/.cargo/git after this job, and a fork's pull_request run can restore a
+      # cache written on this repository's branches. Take the private fork's source out first so
+      # no cache carries it; the next run fetches it again with the token.
+      - name: Keep the private dependency out of the cache
+        if: always()
+        run: rm -rf ~/.cargo/git/db/llama-cpp-rs-giap-* ~/.cargo/git/checkouts/llama-cpp-rs-giap-*
 
   # Packages a real .app and checks its shape. Gated to manual dispatch and
   # tags ONLY: macOS runners bill at 10x, and nothing here changes often
