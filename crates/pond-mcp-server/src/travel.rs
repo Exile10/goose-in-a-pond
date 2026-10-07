@@ -554,8 +554,8 @@ impl TravelMcpServer {
     }
 
     /// Push `link` to the speaker's own phones. `None` when delivery isn't wired; otherwise the
-    /// line saying where it went. Only a named member is pushed to: a household or guest speaker
-    /// has no phone that is theirs, and a broadcast would put one person's trip on every phone.
+    /// line saying where it went. Only one member is ever pushed to (see [`Self::speaker`]): a
+    /// broadcast would put one person's trip on every phone.
     async fn deliver(&self, meta: &Meta, link: PhoneLink) -> Option<String> {
         if self.authority.is_none() || self.notifier.is_none() {
             return None;
@@ -580,8 +580,10 @@ impl TravelMcpServer {
         })
     }
 
-    /// The household member speaking in this call, or why there is none.
+    /// The household member speaking in this call, or why there is none. An unidentified
+    /// speaker in a one-member household can only be that member; a guest is nobody's.
     async fn speaker(&self, meta: &Meta) -> Result<String, &'static str> {
+        const NOT_ONE_MEMBER: &str = "the speaker is not identified as one household member";
         let authority = self
             .authority
             .as_ref()
@@ -590,7 +592,10 @@ impl TravelMcpServer {
             crate::session_meta::session_from_meta(meta).ok_or("this call carries no session")?;
         match authority.actor_for_engine_session(&session).await {
             Some((ProfileScope::Owner(id), _)) => Ok(id),
-            _ => Err("the speaker is not identified as one household member"),
+            Some((ProfileScope::Household, _)) => {
+                authority.sole_member().await.ok_or(NOT_ONE_MEMBER)
+            }
+            _ => Err(NOT_ONE_MEMBER),
         }
     }
 
@@ -1148,7 +1153,11 @@ mod delivery_tests {
     use pond_core::security::ports::policy::{PolicyDecision, PolicyMode};
     use pond_core::user_data::domain::session::IdentificationSource;
 
-    struct FixedSpeaker(Option<ProfileScope>);
+    /// Resolves every session to `scope`; `sole` is the household's only member, if it has one.
+    struct FixedSpeaker {
+        scope: Option<ProfileScope>,
+        sole: Option<&'static str>,
+    }
 
     #[async_trait]
     impl DraftAuthority for FixedSpeaker {
@@ -1159,9 +1168,12 @@ mod delivery_tests {
             &self,
             _engine_session_id: &str,
         ) -> Option<(ProfileScope, IdentificationSource)> {
-            self.0
+            self.scope
                 .clone()
                 .map(|scope| (scope, IdentificationSource::Explicit))
+        }
+        async fn sole_member(&self) -> Option<String> {
+            self.sole.map(str::to_string)
         }
         async fn audit(&self, _s: &str, _a: &str, _d: &PolicyDecision) {}
     }
@@ -1176,8 +1188,16 @@ mod delivery_tests {
     }
 
     fn server(speaker: Option<ProfileScope>, notifier: Arc<MockMemberNotifier>) -> TravelMcpServer {
+        in_household(speaker, None, notifier)
+    }
+
+    fn in_household(
+        scope: Option<ProfileScope>,
+        sole: Option<&'static str>,
+        notifier: Arc<MockMemberNotifier>,
+    ) -> TravelMcpServer {
         TravelMcpServer::new(None)
-            .with_phone_delivery(Some(Arc::new(FixedSpeaker(speaker))), Some(notifier))
+            .with_phone_delivery(Some(Arc::new(FixedSpeaker { scope, sole })), Some(notifier))
     }
 
     fn directions_to(place: &str) -> DirectionsParams {
@@ -1240,15 +1260,32 @@ mod delivery_tests {
     }
 
     #[tokio::test]
-    async fn household_and_guest_speakers_are_never_pushed_to() {
-        for scope in [
-            Some(ProfileScope::Household),
-            Some(ProfileScope::Guest),
-            None,
-        ] {
+    async fn a_one_member_household_is_pushed_to_its_only_member() {
+        let notifier = Arc::new(MockMemberNotifier::new().with_devices("liz", &["liz-phone"]));
+        let out = text(
+            &in_household(Some(ProfileScope::Household), Some("liz"), notifier.clone())
+                .directions_result(&meta(), &directions_to("Kisumu"))
+                .await,
+        );
+        assert!(out.contains("Also sent to the speaker's phone."), "{out}");
+        let sent = notifier.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "liz");
+    }
+
+    #[tokio::test]
+    async fn a_household_of_several_a_guest_or_nobody_is_never_pushed_to() {
+        let cases = [
+            // Several members: the household is nobody in particular.
+            (Some(ProfileScope::Household), None),
+            // A guest is nobody's, even in a one-member pond.
+            (Some(ProfileScope::Guest), Some("liz")),
+            (None, Some("liz")),
+        ];
+        for (scope, sole) in cases {
             let notifier = Arc::new(MockMemberNotifier::new().with_devices("liz", &["liz-phone"]));
             let out = text(
-                &server(scope.clone(), notifier.clone())
+                &in_household(scope.clone(), sole, notifier.clone())
                     .directions_result(&meta(), &directions_to("Kisumu"))
                     .await,
             );
@@ -1302,7 +1339,9 @@ mod booking_tests {
     use pond_core::security::ports::policy::{PolicyDecision, PolicyMode};
     use pond_core::user_data::domain::session::IdentificationSource;
 
-    struct Speaker(Option<ProfileScope>);
+    /// Resolves every session to its scope, in a household of several unless `.1` names the
+    /// only member.
+    struct Speaker(Option<ProfileScope>, Option<&'static str>);
 
     #[async_trait]
     impl DraftAuthority for Speaker {
@@ -1314,6 +1353,9 @@ mod booking_tests {
             _s: &str,
         ) -> Option<(ProfileScope, IdentificationSource)> {
             self.0.clone().map(|s| (s, IdentificationSource::Explicit))
+        }
+        async fn sole_member(&self) -> Option<String> {
+            self.1.map(str::to_string)
         }
         async fn audit(&self, _s: &str, _a: &str, _d: &PolicyDecision) {}
     }
@@ -1341,9 +1383,17 @@ mod booking_tests {
         connected: &'static [&'static str],
         notifier: Arc<MockMemberNotifier>,
     ) -> TravelMcpServer {
+        server_for(Speaker(speaker, None), connected, notifier)
+    }
+
+    fn server_for(
+        speaker: Speaker,
+        connected: &'static [&'static str],
+        notifier: Arc<MockMemberNotifier>,
+    ) -> TravelMcpServer {
         TravelMcpServer::new(Some(Arc::new(Places::default())))
             .with_home(Some(nairobi()))
-            .with_phone_delivery(Some(Arc::new(Speaker(speaker))), Some(notifier))
+            .with_phone_delivery(Some(Arc::new(speaker)), Some(notifier))
             .with_ride_accounts(Some(Arc::new(Connected(connected))))
     }
 
@@ -1383,6 +1433,22 @@ mod booking_tests {
         let data = sent[0].1.data.as_ref().unwrap();
         assert_eq!(data["action"], "ride_offer");
         assert_eq!(data["dropoff"]["latitude"], -1.319167);
+    }
+
+    #[tokio::test]
+    async fn a_one_member_household_offers_the_ride_to_its_only_member() {
+        let notifier = Arc::new(MockMemberNotifier::new().with_devices("liz", &["liz-phone"]));
+        let result = server_for(
+            Speaker(Some(ProfileScope::Household), Some("liz")),
+            &["liz"],
+            notifier.clone(),
+        )
+        .book_result(&meta(), &to("JKIA"))
+        .await;
+        assert_ne!(result.is_error, Some(true), "{}", text(&result));
+        let sent = notifier.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "liz");
     }
 
     #[tokio::test]
