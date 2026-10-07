@@ -67,6 +67,28 @@ struct RelayRefusal {
     error: Option<String>,
 }
 
+/// Why the credentials service gave no tokens. Only [`RelayError::Refused`] says anything about the
+/// member's sign-in; the other leaves a kept connection standing.
+#[derive(Debug, PartialEq)]
+pub enum RelayError {
+    /// Uber refused the code or refresh token itself, with its OAuth error code (`invalid_grant`).
+    Refused(String),
+    /// Nothing was learned about the sign-in: the service or Uber could not be reached, was busy or
+    /// failing, or answered with something unreadable. Worth trying again later.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for RelayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelayError::Refused(code) => write!(f, "Uber refused the sign-in: {code}"),
+            RelayError::Unavailable(why) => write!(f, "Uber sign-in could not finish: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for RelayError {}
+
 impl SignInRelay {
     /// `base_url` is the credentials service's address (`POND_CREDENTIALS_URL`).
     pub fn new(http: reqwest::Client, base_url: &str) -> Self {
@@ -84,10 +106,7 @@ impl SignInRelay {
         }
         let url = format!("{}/v1/uber/client", self.base_url);
         let response = self.send(self.http.get(&url), &url, "GET").await?;
-        let client: Client = response
-            .json()
-            .await
-            .context("the credentials service's Uber client ID was not readable")?;
+        let client: Client = response.json().await.map_err(|_| unreadable())?;
         Ok(client.client_id)
     }
 
@@ -109,14 +128,11 @@ impl SignInRelay {
         let response = self
             .send(self.http.post(&url).json(&body), &url, "POST")
             .await?;
-        response
-            .json()
-            .await
-            .context("the credentials service's Uber tokens were not readable")
+        Ok(response.json().await.map_err(|_| unreadable())?)
     }
 
-    /// Gated by the egress guard, filed under the credentials service, and turned into an error
-    /// that names Uber's own refusal code when there is one.
+    /// Gated by the egress guard and filed under the credentials service. A failure is a
+    /// [`RelayError`]: a refusal only when the service passes on Uber's own refusal code.
     async fn send(
         &self,
         builder: reqwest::RequestBuilder,
@@ -127,23 +143,36 @@ impl SignInRelay {
             .map_err(|denied| anyhow!("{denied}"))?;
         let sent = builder.timeout(RELAY_TIMEOUT).send().await;
         call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
-        let response = sent.map_err(|_| anyhow!("the credentials service could not be reached"))?;
+        let response = sent.map_err(|_| {
+            RelayError::Unavailable("Jarida's credentials service could not be reached".into())
+        })?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);
         }
-        let refusal: Option<RelayRefusal> = response.json().await.ok();
-        let reason = refusal
-            .and_then(|r| r.uber_error.or(r.error))
-            .unwrap_or_else(|| status.to_string());
-        bail!("Uber sign-in failed: {reason}")
+        let reply: Option<RelayRefusal> = response.json().await.ok();
+        Err(match reply {
+            Some(RelayRefusal {
+                uber_error: Some(code),
+                ..
+            }) => RelayError::Refused(code),
+            reply => RelayError::Unavailable(
+                reply
+                    .and_then(|r| r.error)
+                    .unwrap_or_else(|| format!("the credentials service answered {status}")),
+            ),
+        }
+        .into())
     }
 }
 
+fn unreadable() -> RelayError {
+    RelayError::Unavailable("the credentials service's answer was not readable".into())
+}
+
 /// Why a sign-in cannot start or renew on a pond whose credentials service is turned off.
-pub const SIGN_IN_OFF: &str =
-    "Uber sign-in needs Jarida's credentials service, which is turned off on \
-                         this pond (POND_CREDENTIALS_URL)";
+pub const SIGN_IN_OFF: &str = "Uber sign-in needs Jarida's credentials service, which is turned \
+                               off on this pond (POND_CREDENTIALS_URL)";
 
 /// A finished code exchange whose tokens are not kept yet: see [`UberAccounts::keep`].
 pub struct SignedIn {
@@ -618,8 +647,65 @@ mod tests {
             .await;
         let (accounts, secrets) = accounts(&server);
         let err = accounts.connect("liz", "used").await.unwrap_err();
-        assert!(format!("{err:#}").contains("invalid_grant"), "{err:#}");
+        assert_eq!(
+            err.downcast_ref::<RelayError>(),
+            Some(&RelayError::Refused("invalid_grant".into())),
+            "{err:#}"
+        );
         assert!(secrets.list_keys().await.unwrap().is_empty());
+    }
+
+    /// The relay's 502 says Uber did not answer, not that it turned the member down.
+    #[tokio::test]
+    async fn a_relay_that_cannot_reach_uber_is_not_a_revoked_sign_in() {
+        let server = MockServer::start().await;
+        relay_returns(
+            &server,
+            "/v1/uber/token",
+            json!({
+                "access_token": "a-1", "refresh_token": "r-1", "expires_in": 60
+            }),
+        )
+        .await;
+        let (accounts, secrets) = accounts(&server);
+        accounts.connect("liz", "c-1").await.unwrap();
+        for (status, body) in [
+            (
+                502,
+                json!({"error": "Uber is not answering right now. Try again later."}),
+            ),
+            (
+                503,
+                json!({"error": "This service does not relay Uber sign-ins."}),
+            ),
+            (429, json!({"error": "Too many requests. Try again later."})),
+        ] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/uber/refresh"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let err = accounts.access_token_at("liz", now()).await.unwrap_err();
+            assert!(
+                matches!(
+                    err.downcast_ref::<RelayError>(),
+                    Some(RelayError::Unavailable(_))
+                ),
+                "{status}: {err:#}"
+            );
+            assert!(!format!("{err:#}").contains("refused"), "{err:#}");
+            assert!(accounts.is_connected("liz").await.unwrap());
+            assert_eq!(
+                secrets
+                    .get("UBER_REFRESH_TOKEN:liz")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("r-1")
+            );
+        }
     }
 
     #[tokio::test]
