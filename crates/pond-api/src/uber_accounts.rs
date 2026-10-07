@@ -2,6 +2,7 @@
 //! through Jarida's credentials service, which holds the Uber app's client secret; the member's
 //! tokens are kept in this pond's secret store (`pond_adapters_uber::accounts`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Path, State};
@@ -171,7 +172,8 @@ pub async fn connect(
     })?;
 
     let nonce = oauth_callback::generate_state();
-    state.oauth_state.write().await.insert(
+    oauth_callback::begin_session(
+        &state.oauth_state,
         nonce.clone(),
         PkceSession {
             provider_id: PROVIDER_ID.to_string(),
@@ -181,7 +183,8 @@ pub async fn connect(
             profile_id: Some(profile_id),
             created_at: std::time::Instant::now(),
         },
-    );
+    )
+    .await;
     Ok(Json(json!({
         "auth_url": authorize_url(&client_id, &callback_uri(state.api_port), &nonce),
         "state": nonce,
@@ -256,18 +259,23 @@ pub async fn disconnect(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Uber's return to the shared OAuth callback: exchange the code through the relay and keep the
-/// member's tokens. Records the outcome for the desktop's status poll either way.
+/// Uber's return to the shared OAuth callback, with the query it came back with: exchange the code
+/// through the relay and keep the member's tokens. Records the outcome for the desktop's status
+/// poll either way.
 pub async fn finish_sign_in(
     state: &AppState,
     session: PkceSession,
-    code: &str,
+    params: &HashMap<String, String>,
     nonce: &str,
 ) -> Response {
-    let outcome = match (session.profile_id.as_deref(), code.trim()) {
-        (None, _) => Err("this sign-in was not started for a household member".to_string()),
-        (_, "") => Err("Uber did not return a sign-in code; the sign-in was cancelled".to_string()),
-        (Some(profile_id), code) => sign_in(state, profile_id, code).await,
+    let code = params.get("code").map_or("", |code| code.trim());
+    let outcome = match (session.profile_id.as_deref(), ubers_refusal(params), code) {
+        (None, _, _) => Err("this sign-in was not started for a household member".to_string()),
+        (_, Some(refusal), _) => Err(refusal),
+        (_, None, "") => {
+            Err("Uber did not return a sign-in code; the sign-in was cancelled".to_string())
+        }
+        (Some(profile_id), None, code) => sign_in(state, profile_id, code).await,
     };
 
     match outcome {
@@ -329,4 +337,23 @@ fn nothing_kept((_, Json(body)): Refusal) -> String {
             body["error"].as_str().unwrap_or("unavailable")
         ),
     }
+}
+
+/// The longest piece of Uber's own reason passed on: it arrives in the address bar.
+const REASON_CHARS: usize = 200;
+
+/// Uber's reason when it ended the sign-in itself (`error`, with `error_description` if given).
+fn ubers_refusal(params: &HashMap<String, String>) -> Option<String> {
+    let present = |name: &str| {
+        params
+            .get(name)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.chars().take(REASON_CHARS).collect::<String>())
+    };
+    let error = present("error")?;
+    Some(match present("error_description") {
+        Some(description) => format!("Uber ended the sign-in: {error} ({description})"),
+        None => format!("Uber ended the sign-in: {error}"),
+    })
 }

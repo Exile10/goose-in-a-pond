@@ -11342,19 +11342,18 @@ async fn oauth_authorize_handler(
     let (code_verifier, code_challenge) = oauth_callback::generate_pkce();
     let state_nonce = oauth_callback::generate_state();
 
-    {
-        let mut sessions = state.oauth_state.write().await;
-        sessions.insert(
-            state_nonce.clone(),
-            oauth_callback::PkceSession {
-                provider_id: provider.id.clone(),
-                code_verifier,
-                extension_id,
-                profile_id: None,
-                created_at: std::time::Instant::now(),
-            },
-        );
-    }
+    oauth_callback::begin_session(
+        &state.oauth_state,
+        state_nonce.clone(),
+        oauth_callback::PkceSession {
+            provider_id: provider.id.clone(),
+            code_verifier,
+            extension_id,
+            profile_id: None,
+            created_at: std::time::Instant::now(),
+        },
+    )
+    .await;
 
     let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
     let scopes = provider.scopes.join(" ");
@@ -11405,10 +11404,7 @@ async fn oauth_callback_handler(
     let code = params.get("code").cloned().unwrap_or_default();
     let state_nonce = params.get("state").cloned().unwrap_or_default();
 
-    let session = {
-        let mut sessions = state.oauth_state.write().await;
-        sessions.remove(&state_nonce)
-    };
+    let session = crate::oauth_callback::take_session(&state.oauth_state, &state_nonce).await;
 
     // Every terminal branch records its outcome for the UI's status poll.
     let fail = |reason: &str| {
@@ -11440,7 +11436,7 @@ async fn oauth_callback_handler(
 
     // Per-member, and its client secret lives with Jarida's credentials service.
     if session.provider_id == crate::uber_accounts::PROVIDER_ID {
-        return crate::uber_accounts::finish_sign_in(&state, session, &code, &state_nonce).await;
+        return crate::uber_accounts::finish_sign_in(&state, session, &params, &state_nonce).await;
     }
 
     let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
@@ -11588,8 +11584,22 @@ async fn oauth_status_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    if state.oauth_state.read().await.contains_key(&state_nonce) {
-        return Json(json!({"status": "pending"})).into_response();
+    if let Some(expired) = state
+        .oauth_state
+        .read()
+        .await
+        .get(&state_nonce)
+        .map(|session| session.is_expired())
+    {
+        return if expired {
+            Json(json!({
+                "status": "failed",
+                "error": crate::oauth_callback::SESSION_EXPIRED,
+            }))
+            .into_response()
+        } else {
+            Json(json!({"status": "pending"})).into_response()
+        };
     }
 
     match crate::oauth_callback::peek_outcome(&state.oauth_outcomes, &state_nonce).await {

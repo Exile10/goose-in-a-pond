@@ -1889,7 +1889,9 @@ install's `secrets`) answers 403 with `"code": "secret_reserved"` for such a key
 ```
 
 Open `auth_url` in a browser. Uber returns to `/oauth/callback`, which finishes the sign-in; follow
-it with `GET /oauth/status/{state}`.
+it with `GET /oauth/status/{state}`. A sign-in not finished within ten minutes expires (Uber's code
+lives that long): the status turns `failed` and a late return is refused. When Uber itself ends the
+sign-in, its `error` and `error_description` are the failure's reason.
 
 | Status | `code` | Meaning |
 |---|---|---|

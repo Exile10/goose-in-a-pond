@@ -26,6 +26,7 @@ struct Pond {
     secrets: Arc<pond_infra::file_secret_repository::FileSecretRepository>,
     member: String,
     api_port: u16,
+    state: Arc<pond_api::AppState>,
     _dir: tempfile::TempDir,
 }
 
@@ -91,6 +92,7 @@ async fn pond() -> Pond {
         secrets,
         member,
         api_port,
+        state,
         _dir: dir,
     }
 }
@@ -368,12 +370,33 @@ async fn a_member_connects_uber_and_the_tokens_are_kept_for_them_alone() {
     let (_, page) = call(
         &p.loopback,
         Method::GET,
-        &format!("/api/v1/oauth/callback?error=access_denied&state={nonce}"),
+        &format!(
+            "/api/v1/oauth/callback?error=access_denied\
+             &error_description=The+user+denied+the+request&state={nonce}"
+        ),
         None,
         false,
     )
     .await;
     assert!(page.contains("Uber is not connected"), "{page}");
+    assert!(
+        page.contains("access_denied") && page.contains("The user denied the request"),
+        "{page}"
+    );
+    let (_, outcome) = call(
+        &p.loopback,
+        Method::GET,
+        &format!("/api/v1/oauth/status/{nonce}"),
+        None,
+        false,
+    )
+    .await;
+    let outcome = parse(&outcome);
+    assert_eq!(outcome["status"], "failed");
+    assert!(
+        outcome["error"].as_str().unwrap().contains("access_denied"),
+        "{outcome}"
+    );
     assert_eq!(p.secrets.get(&key).await.unwrap(), None);
 }
 
@@ -553,4 +576,60 @@ async fn the_list_names_only_people_still_in_the_household() {
     .await;
     assert_eq!(status, StatusCode::OK, "{list}");
     assert_eq!(parse(&list)["connected"], json!([p.member]));
+}
+
+#[tokio::test]
+async fn a_sign_in_left_unfinished_for_ten_minutes_expires() {
+    let _turn = CREDENTIALS_TURN.lock().await;
+    let service = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/uber/client"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"client_id": "uber-app"})))
+        .mount(&service)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/uber/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "access-1", "refresh_token": "refresh-1", "expires_in": 3600
+        })))
+        .expect(0)
+        .mount(&service)
+        .await;
+    let _at = CredentialsAt::set(&service.uri());
+    let p = pond().await;
+
+    let nonce = start_sign_in(&p).await;
+    p.state
+        .oauth_state
+        .write()
+        .await
+        .get_mut(&nonce)
+        .expect("the sign-in is pending")
+        .created_at -= pond_api::oauth_callback::SESSION_TTL + std::time::Duration::from_secs(1);
+
+    let (_, outcome) = call(
+        &p.loopback,
+        Method::GET,
+        &format!("/api/v1/oauth/status/{nonce}"),
+        None,
+        false,
+    )
+    .await;
+    let outcome = parse(&outcome);
+    assert_eq!(outcome["status"], "failed", "{outcome}");
+    assert!(
+        outcome["error"].as_str().unwrap().contains("expired"),
+        "{outcome}"
+    );
+
+    let (_, page) = call(
+        &p.loopback,
+        Method::GET,
+        &format!("/api/v1/oauth/callback?code=good-code&state={nonce}"),
+        None,
+        false,
+    )
+    .await;
+    assert!(!page.contains("Uber is connected"), "{page}");
+    assert_eq!(uber_keys(&p).await, Vec::<String>::new());
 }
