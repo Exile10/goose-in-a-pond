@@ -143,6 +143,17 @@ server checks every 30 seconds and reloads rustls without changing the pin. Key
 replacement requires local re-pairing on each phone. This transport identity is
 separate from any production signing key and requires no database migration.
 
+The embedded helper serves a second certificate on the tailnet, `tls/tailnet-identity.json`
+in the same `{cert_pem, key_pem}` format and with the same key (2026-10-12). It names only
+the node's tailnet addresses and its node name, `goose-in-a-pond`, so a tailnet node no
+longer learns the host name and LAN addresses from the certificate it is shown. It is
+written at startup if missing (a failure is logged as `kind="tailnet_certificate_unavailable"`
+and does not stop the Pond, but the helper cannot start without it), renewed by the same
+30-second loop when the node's addresses change or expiry nears, and replaced, with a
+`kind="tailnet_certificate_replaced"` warning, if it is damaged or carries another key; it
+is derived from the key and holds nothing of its own. The helper re-reads it on every
+handshake, and an address is published to phones only once this certificate names it.
+
 ## Roaming and failures
 
 A shared manager selects endpoints for REST and foreground SSE. On Wi-Fi it
@@ -464,7 +475,8 @@ remaining bearer-token risks.
 The household authority is an Ed25519 private key at
 `<data_dir>/embedded-network/authority/identity.json`. Losing it means a new household:
 there is no cloud account recovery, and every paired device must pair again. The HTTPS
-identity (`tls/identity.json`) and the WireGuard node state
+identity (`tls/identity.json`; `tls/tailnet-identity.json` beside it is rebuilt from it if
+lost) and the WireGuard node state
 (`embedded-network/node/tailscaled.state`) must be restored *with* it, because trust is
 the combination and not any one of the three.
 

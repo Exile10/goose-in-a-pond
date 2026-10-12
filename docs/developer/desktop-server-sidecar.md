@@ -17,8 +17,9 @@ Two properties matter more than they look, and both were violated at once in Sep
   therefore never fails. It binds the next free port, overwrites `.runtime_api_port`, and writes
   the same SQLite database as the first.
 - **A server the shell did not start must not be inherited by accident.** `ensureRunning`
-  health-checks before it spawns, and `/api/v1/health` returns only `{status, version}` — there is
-  no pid or port in it, so the shell structurally cannot tell its own child from a stranger's
+  health-checks before it spawns, and `/api/v1/health` returns only `{status, version}` to a
+  loopback peer, and only `{status}` to a LAN or tailnet peer (2026-10-12) — there is no pid or
+  port in it, so the shell structurally cannot tell its own child from a stranger's
   server. An orphan on port 4000 is adopted, silently, by every subsequent launch.
 
 ## Components

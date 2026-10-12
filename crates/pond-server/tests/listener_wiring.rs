@@ -284,6 +284,34 @@ async fn pairing_codes_need_the_host_credential_even_on_loopback() {
     assert!(body["pairing"]["hostname"].is_string());
 }
 
+/// Only the dashboard on the host learns the software version from `/health`; a LAN or
+/// tailnet peer learns that the Pond is up and which release to aim at otherwise.
+#[tokio::test]
+async fn health_reports_the_version_only_to_the_host() {
+    let h = harness().await;
+    let (status, body) = get(&h.listeners.dashboard, LOOPBACK, "/api/v1/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["version"].is_string(), "{body}");
+
+    let (status, body) = get(&h.listeners.companion, LAN, "/api/v1/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({"status": "ok"}));
+
+    #[cfg(unix)]
+    {
+        let (status, body) = send(
+            h.listeners.embedded.clone(),
+            Request::get("/api/v1/health")
+                .header("x-pond-embedded-peer", "100.64.0.9:1234")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"status": "ok"}));
+    }
+}
+
 #[tokio::test]
 async fn system_info_tells_an_anonymous_caller_where_to_connect_and_nothing_more() {
     let h = harness().await;

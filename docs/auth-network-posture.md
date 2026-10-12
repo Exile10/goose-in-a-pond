@@ -109,7 +109,18 @@ private Unix socket. Only that private router accepts its peer-identity header;
 public listeners ignore caller-supplied forwarding identity. The shared auth and
 rate-limit middleware sees the actual embedded peer. LAN-only pairing and
 loopback-only management therefore remain enforced. Remote addresses are published
-only after the listener and certificate are ready. The helper forwards only
+only after the listener and certificate are ready.
+
+The helper presents its own certificate on the tailnet, `tls/tailnet-identity.json`
+(2026-10-12). It is signed with the same key as `tls/identity.json`, so the pin a phone
+holds is unchanged, but its SANs are only the node's tailnet addresses and its node name
+(`goose-in-a-pond`): every tailnet node can read the certificate it is shown, and it used
+to be the LAN one, which names the host and its LAN addresses. A phone away from home
+dials the tailnet IPv4 address from the QR's `ts` or `/system/info`'s
+`tailnet_address`, and checks that SAN, so that is what the address is published
+against. The LAN certificate is unchanged: LAN pairing and the phones' hostname checks
+depend on its names, and it still lists any tailnet address on this machine, since a
+system Tailscale reaches the LAN listener directly and is shown that certificate. The helper forwards only
 `/api/v1/` requests, and its coordinator client never uses a proxy from the
 environment.
 
@@ -271,7 +282,10 @@ key. Existing onboarding and OAuth-specific guards remain in place.
 returns only `https_port`, `tailnet_address` and `protocol: 2`, which is what a
 phone needs to connect; with one, the full record (host name, LAN address, public
 key pin, version, platform). Before this, every tailnet node could read the
-household's host name, addresses and software version before pairing. The pairing
+household's host name, addresses and software version before pairing. `/health`
+answers `{status, version}` to a loopback peer, which is the dashboard's welcome step,
+and only `{status}` to a LAN or tailnet peer (2026-10-12); it used to give every peer
+the version. The pairing
 material the desktop and `pond-server pairing` put in the QR now comes back with the
 code from the host-only `/handshake/pairing-code` as `pairing`. The mDNS record
 still advertises the host name, version and pin to the LAN, by design: that is how

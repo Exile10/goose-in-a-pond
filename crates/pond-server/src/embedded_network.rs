@@ -170,7 +170,7 @@ impl Runtime {
         Ok((
             Arc::new(Self {
                 directory,
-                identity: data.join("tls/identity.json"),
+                identity: crate::tls_identity::tailnet_identity_path(data),
                 socket,
                 _socket_dir: socket_dir,
                 port,
@@ -312,7 +312,8 @@ impl Runtime {
         }
     }
 
-    /// Publish only addresses covered by the certificate installed on the listener.
+    /// Publish only addresses covered by the certificate the helper serves on the tailnet,
+    /// `tls/tailnet-identity.json`, so a phone that dials the published address can verify it.
     pub fn publish_ready(&self, certificate_names: &[String]) {
         let status = self.status.read().unwrap_or_else(|p| p.into_inner());
         let address = status.addresses.iter().find(|value| {
@@ -758,7 +759,7 @@ impl Runtime {
             .arg("--state")
             .arg(self.directory.join("node"))
             .arg("--hostname")
-            .arg("goose-in-a-pond")
+            .arg(crate::tls_identity::TAILNET_HOSTNAME)
             .arg("--control")
             .arg(&config.control_url)
             .arg("--socket")
@@ -2072,9 +2073,14 @@ mod tests {
             node_key: String::new(),
             machine_key: String::new(),
         });
+        // The LAN certificate's names, or a tailnet certificate written before the address.
         runtime.publish_ready(&["pond.local".into()]);
         assert!(runtime.address.0.read().unwrap().is_none());
-        runtime.publish_ready(&["100.64.0.2".into()]);
+        runtime.publish_ready(&crate::tls_identity::tailnet_certificate_names(&[]));
+        assert!(runtime.address.0.read().unwrap().is_none());
+        runtime.publish_ready(&crate::tls_identity::tailnet_certificate_names(
+            &runtime.addresses(),
+        ));
         assert_eq!(
             runtime.address.0.read().unwrap().as_deref(),
             Some("100.64.0.2")
