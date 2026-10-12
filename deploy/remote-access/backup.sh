@@ -13,6 +13,8 @@ cd "$(dirname "$0")"
 RECIPIENTS=runtime/secrets/backup-recipients
 OUT=runtime/backups
 KEEP="${KEEP:-7}"
+# In pull mode, a run fails once no archive has been collected for this many days.
+COLLECTED_WITHIN_DAYS="${COLLECTED_WITHIN_DAYS:-3}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 ARCHIVE="$OUT/control-plane-$STAMP.tar.age"
 
@@ -22,10 +24,22 @@ ARCHIVE="$OUT/control-plane-$STAMP.tar.age"
 # that this host pushes to, or `pull`: another machine collects runtime/backups and
 # verifies what it collected (the pilot's Mac does), and this host holds no key to it.
 # Read the same file the systemd unit names, so a run by hand behaves like the nightly one.
+# unquote reads a value the way systemd's EnvironmentFile= does: surrounding whitespace,
+# a trailing carriage return and one pair of matching quotes are not part of it. Without
+# this, BACKUP_OFFSITE="pull" worked from the unit and was refused when run by hand.
+unquote() {
+  local value="${1%$'\r'}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  case "$value" in
+    \"*\"|\'*\') value="${value:1:${#value}-2}" ;;
+  esac
+  printf '%s' "$value"
+}
 if [ -z "${BACKUP_OFFSITE:-}" ] && [ -r runtime/secrets/backup.env ]; then
-  BACKUP_OFFSITE="$(sed -n 's/^BACKUP_OFFSITE=//p' runtime/secrets/backup.env | tail -1)"
+  BACKUP_OFFSITE="$(unquote "$(sed -n 's/^[[:space:]]*BACKUP_OFFSITE=//p' runtime/secrets/backup.env | tail -1)")"
 fi
-BACKUP_OFFSITE="${BACKUP_OFFSITE:-}"
+BACKUP_OFFSITE="$(unquote "${BACKUP_OFFSITE:-}")"
 case "$BACKUP_OFFSITE" in
   pull|*@*:/*) ;;
   *) echo "set BACKUP_OFFSITE=user@host:/directory, or BACKUP_OFFSITE=pull when another machine collects backups; refusing to keep backups only on this host" >&2; exit 1 ;;
@@ -92,21 +106,40 @@ chmod 600 "$ARCHIVE"
 restart
 
 if [ "$BACKUP_OFFSITE" = pull ]; then
-  # The collector verifies its copies; this host only keeps KEEP of them for it.
+  # The collector verifies each copy it takes and then writes <archive>.collected
+  # beside the archive here (README, Backups). Only a marked archive is ever pruned.
   echo "off-site copy is pulled by another machine; not pushing"
 else
-  # Copied off-host and checked there before anything local is pruned.
+  # Copied off-host and checked there before anything local is pruned. The check is
+  # rsync's own: a checksum dry run against the copy just made must find nothing to
+  # change. It needs nothing but rsync on the far side, where GNU stat may be absent.
   echo "copying off-site to $BACKUP_OFFSITE"
   rsync -a --checksum "$ARCHIVE" "$BACKUP_OFFSITE/"
-  local_size="$(stat -c %s "$ARCHIVE")"
-  remote_size="$(ssh -- "${BACKUP_OFFSITE%%:*}" stat -c %s "${BACKUP_OFFSITE#*:}/$(basename "$ARCHIVE")")"
-  [ "$remote_size" = "$local_size" ] || { echo "off-site copy is $remote_size bytes, expected $local_size; keeping every local archive" >&2; exit 1; }
-  echo "off-site copy verified ($remote_size bytes)"
+  differences="$(rsync -an --checksum --itemize-changes "$ARCHIVE" "$BACKUP_OFFSITE/")"
+  [ -z "$differences" ] || { echo "off-site copy of $(basename "$ARCHIVE") differs from the local one ($differences); keeping every local archive" >&2; exit 1; }
+  echo "off-site copy verified by checksum"
 fi
 
 ls -1t "$OUT"/control-plane-*.tar.age 2>/dev/null | tail -n +$((KEEP+1)) | while read -r old; do
-  echo "pruning $(basename "$old")"; rm -f -- "$old"
+  if [ "$BACKUP_OFFSITE" = pull ] && [ ! -e "$old.collected" ]; then
+    echo "keeping $(basename "$old"): not collected yet"
+    continue
+  fi
+  echo "pruning $(basename "$old")"; rm -f -- "$old" "$old.collected"
 done
 
 echo "wrote $ARCHIVE ($(stat -c %s "$ARCHIVE") bytes)"
 echo "retained $(ls -1 "$OUT"/control-plane-*.tar.age 2>/dev/null | wc -l) archive(s), keep=$KEEP"
+
+# A collector that has stopped would otherwise go unnoticed until a restore needs it.
+# The new archive is already written; failing here only makes the unit show failed.
+# Archives younger than the window are not overdue yet, so a fresh host passes.
+if [ "$BACKUP_OFFSITE" = pull ]; then
+  window=$((COLLECTED_WITHIN_DAYS * 1440))
+  recent="$(find "$OUT" -maxdepth 1 -name 'control-plane-*.tar.age.collected' -mmin -"$window" -print -quit)"
+  overdue="$(find "$OUT" -maxdepth 1 -name 'control-plane-*.tar.age' -mmin +"$window" -print -quit)"
+  if [ -z "$recent" ] && [ -n "$overdue" ]; then
+    echo "no archive has been collected in $COLLECTED_WITHIN_DAYS days; check the off-host collector" >&2
+    exit 1
+  fi
+fi
