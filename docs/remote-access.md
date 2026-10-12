@@ -52,6 +52,15 @@ configured now, so a household moving to another service is asked again. The das
 shows the field only to a Pond that is neither provisioned nor registered, or straight
 after the service refuses an admission, and otherwise says why no invite is needed.
 
+Any admission refusal brings the field back, on a provisioned Pond too (2026-10-12).
+Before then only a refused certificate did, so two paths dead-ended: after
+`device_used`, an invite typo answered `invite_invalid` and hid the field again, and a
+coordinator with no provisioning keys answered `invite_required` to a provisioned Pond
+that was never shown the field. The dashboard also reads the device status again after
+enabling, after disabling and after a refusal, rather than once when the page opens, so
+the field and the "already registered" note follow a registration made in the same
+visit without a reload.
+
 This branch prepares a locally tested pilot deployment. Public domains and hosting
 are still prerequisites for cellular use. Follow
 [the deployment guide](../deploy/remote-access/README.md) to provision a pilot

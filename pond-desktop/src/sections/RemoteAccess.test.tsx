@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import "../i18n";
 import { RemoteAccess } from "./RemoteAccess";
 import { api } from "../api/PondApiClient";
+import { ApiError } from "../api/types";
 
 vi.mock("../api/PondApiClient", () => ({
   api: {
@@ -78,5 +80,80 @@ describe("RemoteAccess admission", () => {
     await waitFor(() => expect(warn).toHaveBeenCalled());
     expect(screen.getByPlaceholderText("giap-inv1-...")).toBeTruthy();
     warn.mockRestore();
+  });
+
+  it("shows the phone name and key preview for the household to compare", async () => {
+    vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: false, registered: true });
+    vi.mocked(api.remoteRecoveryRequests).mockResolvedValue([
+      { id: "e5f6a7b8", device: "d", approved: false, deviceName: "Kitchen phone", keyPreview: "nodekey:4c1e" },
+    ]);
+    render(<RemoteAccess />);
+    await waitFor(() => expect(screen.getByText("Phone: Kitchen phone")).toBeTruthy());
+    expect(screen.getByText("Key begins: nodekey:4c1e")).toBeTruthy();
+  });
+});
+
+describe("RemoteAccess after the coordinator answers", () => {
+  const invite = () => screen.queryByPlaceholderText("giap-inv1-...");
+
+  beforeEach(() => {
+    // Not running yet, and the coordinator wants this Pond registered.
+    vi.mocked(api.remoteStatus).mockResolvedValue({ state: "Stopped", authUrl: "https://control.example/register" });
+    vi.mocked(api.remoteRecoveryRequests).mockResolvedValue([]);
+    vi.mocked(api.enableRemoteAccess).mockResolvedValue(undefined);
+    vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: true, serial: "0f".repeat(16), registered: false });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it("keeps the invite field when an invite typo follows a refused certificate", async () => {
+    vi.mocked(api.registerRemotePond)
+      .mockRejectedValueOnce(new ApiError(403, "device_used"))
+      .mockRejectedValueOnce(new ApiError(403, "invite_invalid"));
+    const user = userEvent.setup();
+    render(<RemoteAccess />);
+    await waitFor(() => expect(api.remoteDevice).toHaveBeenCalled());
+    expect(invite()).toBeNull();
+
+    await user.click(screen.getByRole("switch"));
+    await waitFor(() => expect(screen.getByText(/already admitted another household/)).toBeTruthy());
+    await user.type(invite()!, "giap-inv1-TYPO");
+    await user.click(screen.getByRole("switch"));
+
+    await waitFor(() => expect(screen.getByText(/invite was not recognised/)).toBeTruthy());
+    expect(api.registerRemotePond).toHaveBeenLastCalledWith("giap-inv1-TYPO");
+    expect(invite()).toBeTruthy();
+  });
+
+  it("asks a provisioned Pond for an invite when the coordinator requires one", async () => {
+    vi.mocked(api.registerRemotePond).mockRejectedValue(new ApiError(403, "invite_required"));
+    const user = userEvent.setup();
+    render(<RemoteAccess />);
+    await waitFor(() => expect(api.remoteDevice).toHaveBeenCalled());
+
+    await user.click(screen.getByRole("switch"));
+
+    await waitFor(() => expect(screen.getByText(/admits new households by invite/)).toBeTruthy());
+    expect(invite()).toBeTruthy();
+  });
+
+  it("reads the device status again after disabling", async () => {
+    vi.mocked(api.remoteStatus).mockResolvedValue({ state: "Running" });
+    vi.mocked(api.disableRemoteAccess).mockResolvedValue(undefined);
+    vi.mocked(api.remoteDevice)
+      .mockResolvedValueOnce({ provisioned: false, registered: false })
+      .mockResolvedValueOnce({ provisioned: false, registered: true });
+    const user = userEvent.setup();
+    render(<RemoteAccess />);
+    await waitFor(() => expect(screen.getByText(/Remote access is enabled/)).toBeTruthy());
+    expect(invite()).toBeTruthy();
+
+    await user.click(screen.getByRole("switch"));
+
+    await waitFor(() => expect(screen.getByText(/already registered/)).toBeTruthy());
+    expect(api.remoteDevice).toHaveBeenCalledTimes(2);
+    expect(invite()).toBeNull();
   });
 });
