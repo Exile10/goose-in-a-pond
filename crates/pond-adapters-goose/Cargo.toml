@@ -22,6 +22,7 @@ pond-adapters-weather = { path = "../pond-adapters-weather" }
 # when the speculation switch turns on with it absent, the drafter): resumable, pinned by size
 # and sha256, and gated per redirect hop, which only holds with its redirect-aware client.
 pond-hf-cache         = { path = "../pond-hf-cache" }
+pond-net              = { path = "../pond-net" }
 goose            ={ path = "../../goose/crates/goose", default-features = false, features = ["rustls-tls", "local-inference"] }
 # ModelConfig and the Provider trait moved into the extracted goose-providers
 # crate and are not re-exported as types from `goose`.

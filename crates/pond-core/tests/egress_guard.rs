@@ -452,7 +452,12 @@ fn every_reqwest_crate_owns_a_classified_sender() {
         reqwest_crates.len()
     );
 
-    let unaccounted: Vec<&String> = reqwest_crates.difference(&sender_crates).collect();
+    // Builds every crate's clients and sends nothing itself; each sender is checked where it is.
+    const CLIENT_BUILDERS: &[&str] = &["pond-net"];
+    let unaccounted: Vec<&String> = reqwest_crates
+        .difference(&sender_crates)
+        .filter(|c| !CLIENT_BUILDERS.contains(&c.as_str()))
+        .collect();
     assert!(
         unaccounted.is_empty(),
         "these crates depend on reqwest but own no file this guard sees sending:\n  {:?}\n\
@@ -611,5 +616,100 @@ fn every_entry_point_installs_the_gate_before_it_builds_an_agent() {
          run_agent_cmd); found {callers}. If one was added or removed, update \
          this number after checking the new one installs the mode first. If it \
          dropped to 0 the detector has broken, not the code."
+    );
+}
+
+// -- how names are looked up --------------------------------------------------
+
+/// Every production `reqwest` client is built by `pond-net`, so it looks names up the way
+/// `pond_net::dns` decides at startup. A client built any other way asks for IPv6 addresses even
+/// on a device with no IPv6 route, and a router that never answers that question stalls each of
+/// its lookups (15 s for the weather tool on the Orin, 2026-10-12).
+#[test]
+fn every_http_client_is_built_by_pond_net() {
+    let root = workspace_root();
+    let (files, _) = scan();
+
+    // Ways to build a client that bypass pond-net's resolver.
+    const DIRECT: &[&str] = &[
+        "reqwest::Client::new(",
+        "reqwest::Client::builder(",
+        "reqwest::ClientBuilder::new(",
+        "reqwest::blocking::",
+    ];
+
+    let mut through_pond_net = 0usize;
+    let mut direct = Vec::new();
+    for rel in &files {
+        if rel.starts_with("crates/pond-net/") {
+            continue;
+        }
+        let src = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
+        let prod = strip_line_comments(&production_source(&src));
+        through_pond_net += prod.matches("pond_net::client").count();
+        direct.extend(
+            DIRECT
+                .iter()
+                .filter(|form| prod.contains(**form))
+                .map(|form| format!("{rel}: {form}")),
+        );
+        // `use reqwest::Client;` makes a bare `Client::new()` reqwest's.
+        let imports_client = prod.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with("use reqwest::") && l.contains("Client") && !l.contains("ClientBuilder")
+        });
+        if imports_client {
+            for form in ["Client::new(", "Client::builder("] {
+                let bare = prod.match_indices(form).any(|(at, _)| {
+                    !prod[..at].ends_with(|c: char| c == ':' || c == '_' || c.is_alphanumeric())
+                });
+                if bare {
+                    direct.push(format!("{rel}: {form} (reqwest's, by its import)"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        direct.is_empty(),
+        "these build a reqwest client without pond-net, so their lookups ignore the startup \
+         decision in pond_net::dns and can stall on a router that never answers IPv6 lookups:\n  \
+         {}\nUse pond_net::client() or pond_net::client_builder() instead.",
+        direct.join("\n  ")
+    );
+    // Vacuity control: 29 when written.
+    assert!(
+        through_pond_net >= 25,
+        "only {through_pond_net} clients are built through pond_net::client* -- the scan has \
+         broken, not the code moved"
+    );
+}
+
+/// The long-running entry points decide at startup, after logging starts, so the decision is on
+/// record and the route probe never lands inside the first request.
+#[test]
+fn the_long_running_entry_points_decide_how_to_look_names_up_at_startup() {
+    let chunks = main_rs_fn_chunks();
+    let device_choices = chunks
+        .iter()
+        .find(|c| c.starts_with("apply_device_choices("))
+        .expect(
+            "`fn apply_device_choices` is gone from main.rs. It is where serve and chat make \
+             their device decisions after logging starts; if they moved, move this check too.",
+        );
+    assert!(
+        device_choices.contains("pond_net::dns::decide_at_startup("),
+        "`apply_device_choices` no longer calls pond_net::dns::decide_at_startup(), so a pond \
+         without an IPv6 route decides inside its first request and never says so in the log"
+    );
+    let async_main = chunks
+        .iter()
+        .find(|c| c.starts_with("async_main("))
+        .expect("`async fn async_main` is gone from main.rs; re-derive this check");
+    assert_eq!(
+        async_main.matches("apply_device_choices();").count(),
+        3,
+        "serve, chat (the desktop's voice child) and the bare `pond-server` chat each call \
+         apply_device_choices(); if an entry point was added or removed, check it decides too"
     );
 }

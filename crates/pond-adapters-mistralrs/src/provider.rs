@@ -56,7 +56,7 @@ impl MistralRsProvider {
     /// `base_url` is the server root, e.g. `http://127.0.0.1:9002` — no `/v1`.
     pub fn new(base_url: &str, model: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: pond_net::client(),
             base_url: base_url.trim_end_matches('/').to_string(),
             configured_model: model.to_string(),
             served_model: OnceCell::new(),

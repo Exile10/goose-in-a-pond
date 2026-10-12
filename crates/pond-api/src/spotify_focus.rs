@@ -42,7 +42,7 @@ impl SpotifyFocus {
     }
 
     fn with_api(api: &str, may_refresh: bool) -> Arc<Self> {
-        let http = reqwest::Client::builder()
+        let http = pond_net::client_builder()
             .timeout(CALL_TIMEOUT)
             .build()
             .unwrap_or_default();

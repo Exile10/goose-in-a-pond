@@ -47,7 +47,7 @@ pub async fn app_state() -> TestState {
         whisper_url: "http://127.0.0.1:9000".into(),
         transcribe_audio: None,
         session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
-        http_client: reqwest::Client::new(),
+        http_client: pond_net::client(),
         agent: Arc::new(MockAgent::new()),
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),

@@ -11,7 +11,7 @@ const VERSION_PATH: &str = "/api/version";
 
 pub async fn is_running() -> bool {
     let url = format!("http://127.0.0.1:{}{}", OLLAMA_PORT, VERSION_PATH);
-    reqwest::Client::new()
+    pond_net::client()
         .get(&url)
         .timeout(std::time::Duration::from_secs(2))
         .send()

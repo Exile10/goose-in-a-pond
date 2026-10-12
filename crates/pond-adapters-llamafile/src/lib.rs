@@ -80,7 +80,7 @@ impl LlamafileProvider {
     pub fn new(host: Option<&str>) -> Self {
         let base = host.unwrap_or(DEFAULT_HOST);
         Self {
-            client: Client::new(),
+            client: pond_net::client(),
             endpoint: format!("{}/v1/chat/completions", base),
             model: DEFAULT_MODEL.to_string(),
             max_tokens: 1024,

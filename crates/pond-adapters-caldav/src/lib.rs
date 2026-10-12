@@ -54,7 +54,7 @@ pub struct CalDavAdapter {
 
 impl CalDavAdapter {
     pub fn new(config: CalDavConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = pond_net::client_builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("could not build the CalDAV HTTP client")?;

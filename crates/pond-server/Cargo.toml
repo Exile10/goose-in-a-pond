@@ -174,6 +174,7 @@ pond-adapters-kokoro = { path = "../../crates/pond-adapters-kokoro" }
 pond-audio = { path = "../pond-audio" }
 cpal = "0.15"
 pond-mcp-server    = { path = "../pond-mcp-server" }
+pond-net           = { path = "../pond-net" }
 # Both depend on the goose submodule which creates a diamond rmcp conflict when
 # linked into the workspace build. They are built in isolation:
 #   cargo build -p pond-mcp-server

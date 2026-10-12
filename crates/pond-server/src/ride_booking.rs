@@ -53,7 +53,7 @@ fn accounts(
     };
     Some(Arc::new(UberAccounts::new(
         secrets,
-        Some(SignInRelay::new(reqwest::Client::new(), &relay_url)),
+        Some(SignInRelay::new(pond_net::client(), &relay_url)),
     )))
 }
 
@@ -75,7 +75,7 @@ pub fn start(
         }
     };
     pond_mcp_server::travel::init_ride_accounts(accounts.clone());
-    let uber = UberRides::new(reqwest::Client::new(), config, accounts.clone());
+    let uber = UberRides::new(pond_net::client(), config, accounts.clone());
     let booking = Arc::new(RideBooking::new(Arc::new(uber)));
 
     pond_api::rides::install(booking.clone());

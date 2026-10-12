@@ -20,7 +20,7 @@ impl Drop for LlamafileProcess {
 /// Returns `true` if something is already serving on `port`.
 pub async fn is_running(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{}", port);
-    reqwest::Client::new()
+    pond_net::client()
         .get(&url)
         .timeout(std::time::Duration::from_secs(2))
         .send()

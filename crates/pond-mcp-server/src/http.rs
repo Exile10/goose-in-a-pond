@@ -11,7 +11,7 @@ const USER_AGENT: &str =
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn build_http_client() -> Client {
-    Client::builder()
+    pond_net::client_builder()
         .user_agent(USER_AGENT)
         .timeout(DEFAULT_TIMEOUT)
         .pool_max_idle_per_host(4)

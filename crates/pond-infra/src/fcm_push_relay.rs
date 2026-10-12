@@ -101,7 +101,7 @@ impl FcmPushRelay {
             client = %account.client_email,
             "FCM push relay active (data-only wake pings)"
         );
-        let http = reqwest::Client::builder()
+        let http = pond_net::client_builder()
             .timeout(HTTP_TIMEOUT)
             .build()
             .context("building the FCM HTTP client")?;

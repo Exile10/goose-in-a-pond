@@ -15,6 +15,7 @@ path = "src/lib.rs"
 # every other sender. The direction is inward and there is no cycle: pond-core
 # depends only on pond-voice + serde/tokio/tracing and never reaches back here.
 pond-core = { workspace = true }
+pond-net = { workspace = true }
 anyhow = { workspace = true }
 fs2 = { workspace = true }
 reqwest = { workspace = true }

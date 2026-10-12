@@ -459,7 +459,7 @@ pub async fn download_file_reporting(
             .await;
     }
 
-    let client = reqwest::Client::builder().build()?;
+    let client = pond_net::client_builder().build()?;
     let mut req = client.get(url);
     if url.contains("huggingface.co") {
         if let Some(tok) = hugging_face_token() {
@@ -708,7 +708,7 @@ async fn fetch_buffalo_l_zip(out_dir: &Path, embed_dest: &Path, detect_dest: &Pa
         BUFFALO_L_APPROX_MB
     );
 
-    let client = reqwest::Client::builder().build()?;
+    let client = pond_net::client_builder().build()?;
     // `cfg`-gated senders still need the egress gate: the guard scans source, not the binary.
     let call = pond_core::shared::services::egress::begin(BUFFALO_L_ZIP_URL, "GET")
         .context("Failed to fetch buffalo_l.zip")?;

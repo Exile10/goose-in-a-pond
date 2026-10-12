@@ -68,7 +68,7 @@ impl OllamaProvider {
     pub fn new(host: Option<&str>, model: Option<&str>) -> Self {
         let base = host.unwrap_or(DEFAULT_HOST).trim_end_matches('/');
         Self {
-            client: Client::new(),
+            client: pond_net::client(),
             base_url: base.to_string(),
             endpoint: format!("{}/api/chat", base),
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),

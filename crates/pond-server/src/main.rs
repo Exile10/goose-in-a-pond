@@ -489,6 +489,8 @@ fn pin_goose_state_under(data_dir: &std::path::Path) {
 fn apply_device_choices() {
     pond_adapters_goose::compaction_prompts::apply_for_this_device();
     pond_adapters_goose::litert_model::apply_device_environment();
+    // Before the first tool or relay call: without an IPv6 route, look up IPv4 addresses only.
+    pond_net::dns::decide_at_startup();
 }
 
 async fn async_main() -> Result<()> {
@@ -1311,7 +1313,7 @@ async fn run_server(
             model_repo.clone(),
             Arc::new(
                 crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
-                    reqwest::Client::builder()
+                    pond_net::client_builder()
                         .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
                         .build()
                         .unwrap_or_default(),
@@ -4026,7 +4028,7 @@ async fn run_server(
         whisper_url: whisper_url.clone(),
         transcribe_audio,
         session_storage,
-        http_client: reqwest::Client::new(),
+        http_client: pond_net::client(),
         agent,
         warmup: Default::default(),
         llm_provider,
@@ -4063,7 +4065,7 @@ async fn run_server(
         piper_http_port,
         model_catalog_provider: Some(Arc::new(
             crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
-                reqwest::Client::builder()
+                pond_net::client_builder()
                     .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
                     .build()
                     .unwrap_or_default(),
@@ -4120,7 +4122,7 @@ async fn run_server(
     // OAuth refresh updates secrets only; restarting extensions would break in-flight tool calls.
     {
         let refresh_secret_repo = state.secret_repo.clone();
-        let refresh_http_client = reqwest::Client::new();
+        let refresh_http_client = pond_net::client();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(45 * 60));
             interval.tick().await; // skip the initial immediate tick
@@ -4893,7 +4895,7 @@ async fn run_chat(
             chat_model_repo.clone(),
             Arc::new(
                 crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
-                    reqwest::Client::builder()
+                    pond_net::client_builder()
                         .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
                         .build()
                         .unwrap_or_default(),
@@ -8254,7 +8256,7 @@ async fn seed_model_catalog(repo: &dyn ModelRepository, data_dir: &std::path::Pa
     use pond_core::models::ports::model_catalog_provider::ModelCatalogProvider;
     use pond_core::models::ports::model_storage::ModelStorage;
 
-    let client = reqwest::Client::builder()
+    let client = pond_net::client_builder()
         .user_agent(concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")))
         .build()
         .unwrap_or_default();
@@ -9297,7 +9299,7 @@ async fn run_pairing(refresh: bool) -> Result<()> {
         reqwest::header::HeaderValue::from_str(&credential)
             .context("the host credential file is corrupt; restart the server")?,
     );
-    let client = reqwest::Client::builder()
+    let client = pond_net::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .default_headers(headers)
         .build()?;
