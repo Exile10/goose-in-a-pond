@@ -1065,6 +1065,10 @@ impl pond_core::security::ports::remote_access::RemoteRevocation for Runtime {
 
 impl Runtime {
     /// Queue the revocation of a network-hashed device, and forget its sightings.
+    ///
+    /// The sighting goes only once the revocation is saved, or once there is nothing to revoke:
+    /// it is what makes the absence sweep queue the device again, so dropping it before a save
+    /// that then failed left a phone whose remote access never lapsed.
     fn queue_network(&self, device: &str) -> Result<()> {
         // A local-only household has never registered a node and must not contact coordination.
         if self.config()?.enrollment_url.is_empty() {
@@ -1073,16 +1077,12 @@ impl Runtime {
         let device = device.to_owned();
         self.recovery.revoke(&device);
         let _files = self.files.lock().unwrap_or_else(|p| p.into_inner());
-        let mut seen = self.presence()?;
-        if seen.remove(&device).is_some() {
-            self.save_presence(&seen)?;
-        }
         let verify = match revocation::plan(&revocation::load_enrolled(&self.directory)?, &device) {
             revocation::Plan::Revoke => false,
             revocation::Plan::VerifyThenRevoke => true,
             revocation::Plan::NothingToRevoke => {
                 tracing::debug!(%device, "no remote revocation needed: this device was never enrolled");
-                return Ok(());
+                return self.forget_sighting(&device);
             }
         };
         let mut pending = self.pending_revocations()?;
@@ -1097,6 +1097,20 @@ impl Runtime {
         entry.verify &= verify;
         self.save_revocations(&pending)?;
         tracing::info!(%device, verify, "remote network revocation queued durably");
+        self.forget_sighting(&device)
+    }
+
+    /// Drop `device`'s sighting, under the files lock, and its write throttle, so the next
+    /// request from home records a fresh sighting instead of waiting out the hour.
+    fn forget_sighting(&self, device: &str) -> Result<()> {
+        self.sightings_written
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(device);
+        let mut seen = self.presence()?;
+        if seen.remove(device).is_some() {
+            self.save_presence(&seen)?;
+        }
         Ok(())
     }
 }
@@ -1892,7 +1906,7 @@ mod tests {
 
     #[tokio::test]
     async fn revocation_is_durable_idempotent_and_local_only_does_not_enroll() {
-        use pond_core::security::ports::remote_access::RemoteRevocation;
+        use pond_core::security::ports::remote_access::{DevicePresence, RemoteRevocation};
         let data = tempfile::tempdir().unwrap();
         let (runtime, listener) = Runtime::new(data.path(), 4443).unwrap();
         runtime.queue("a").await.unwrap();
@@ -1914,8 +1928,26 @@ mod tests {
             .pending_revocations()
             .unwrap()
             .contains_key(&network_device("phone000000000001").unwrap()));
-        std::fs::write(restored.directory.join("revocations.json"), b"corrupt").unwrap();
+        let phone = network_device("phone000000000002").unwrap();
+        restored.seen_on_lan("phone000000000002").await;
+        let queue = restored.directory.join("revocations.json");
+        std::fs::write(&queue, b"corrupt").unwrap();
         assert!(restored.queue("phone000000000002").await.is_err());
+        // The sighting is what makes the sweep try again, so a failed save must keep it.
+        assert!(
+            restored.presence().unwrap().contains_key(&phone),
+            "a failed revocation forgot the sighting, so the phone would never lapse"
+        );
+
+        std::fs::remove_file(&queue).unwrap();
+        restored.queue("phone000000000002").await.unwrap();
+        assert!(!restored.presence().unwrap().contains_key(&phone));
+        // Coming home straight after is recorded, not throttled for an hour.
+        restored.seen_on_lan("phone000000000002").await;
+        assert!(
+            restored.presence().unwrap().contains_key(&phone),
+            "the phone's return home was not recorded"
+        );
     }
 
     /// Enabling remote access on a fresh Pond failed with `registration_unavailable`: nothing on
