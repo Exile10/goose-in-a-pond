@@ -159,7 +159,8 @@ enum Exposure {
     /// Public only while onboarding is incomplete. The wizard's own surface.
     UntilOnboarded,
     /// As [`Exposure::UntilOnboarded`], but still open to loopback once set up.
-    /// Only `POST /onboard/reset`, for repair; re-pairing already requires being at the host.
+    /// Only `POST /onboard/reset`, for repair; its handler then asks a caller with no token for
+    /// the host credential, the same proof re-pairing needs.
     UntilOnboardedThenHostOnly,
 }
 
@@ -199,7 +200,8 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::PUT, "/settings", Exposure::UntilOnboarded),
     // Warm-up banner during the wizard; afterwards `PondApiClient.get` sends the bearer token.
     (Method::GET, "/warmup", Exposure::UntilOnboarded),
-    // Local Piper, no user data; `playTtsSentence` and `fetch_tts_bytes` call it tokenless.
+    // Local Piper, no user data. The dashboard's voice preview and `playTtsSentence` may call it
+    // without a token; the handler then asks for the host credential.
     (Method::POST, "/tts", Exposure::HostOnly),
     // Wizard voice setup; afterwards PondApiClient.ts sends the token (verified, unlike /tts).
     (Method::POST, "/voice/tts/apply", Exposure::UntilOnboarded),
@@ -208,6 +210,7 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     // Discovery needs system info before pairing; transcription and diagnostics stay protected.
     (Method::GET, "/system/info", Exposure::Always),
     (Method::GET, "/test", Exposure::HostOnly),
+    // Speaks on the host's speaker; the handler also asks for the host credential.
     (Method::POST, "/test/speak", Exposure::HostOnly),
     // Onboarding creates/patches; GET /profiles and DELETE /profiles/{id} are deliberately absent.
     (Method::POST, "/profiles", Exposure::UntilOnboarded),
@@ -216,13 +219,13 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::GET, "/oauth/callback", Exposure::Always),
     // ...and extensions' refresh, checked against internal_extension_token in the handler.
     (Method::POST, "/oauth/refresh", Exposure::Always),
-    // The music player bridge. Extension subprocesses call the first three with the internal
-    // token, checked in the handler; the shell's main process, which holds no session, calls the
-    // last. HostOnly: every legitimate caller dials 127.0.0.1 by construction.
+    // The music player bridge. Extension subprocesses call these with the internal token,
+    // checked in the handler. HostOnly: every legitimate caller dials 127.0.0.1 by construction.
+    // `POST /player/egress-policy` is not here: its only caller, the `/player.html` page, holds
+    // a session like any other client (2026-10-12).
     (Method::POST, "/player/command", Exposure::HostOnly),
     (Method::GET, "/player/status", Exposure::HostOnly),
     (Method::POST, "/extension/egress", Exposure::HostOnly),
-    (Method::POST, "/player/egress-policy", Exposure::HostOnly),
 ];
 
 /// Segment-wise route match; `{brace}` matches exactly one non-empty segment, never more.
@@ -578,7 +581,6 @@ mod tests {
             (Method::POST, "/api/v1/player/command"),
             (Method::GET, "/api/v1/player/status"),
             (Method::POST, "/api/v1/extension/egress"),
-            (Method::POST, "/api/v1/player/egress-policy"),
         ] {
             assert!(
                 answers_without_token(&method, path, ONBOARDED, FROM_THE_HOST),
@@ -603,6 +605,8 @@ mod tests {
             (Method::GET, "/api/v1/player/command"),
             (Method::POST, "/api/v1/player/status"),
             (Method::POST, "/api/v1/player/command/x"),
+            // The player page asks with its own session; nothing on the host needs it tokenless.
+            (Method::POST, "/api/v1/player/egress-policy"),
             (Method::GET, "/api/v1/player/egress-policy"),
             (Method::POST, "/api/v1/extension/egress/x"),
             (Method::GET, "/api/v1/player/events"),
@@ -772,19 +776,19 @@ mod tests {
             "GET /warmup = UntilOnboarded".to_string(),
             "PATCH /profiles/{id} = UntilOnboarded".to_string(),
             // The music player bridge and extension egress: the handlers check the internal
-            // token (the shell's egress-policy asks nothing secret); HostOnly because no
-            // legitimate caller is off the host.
+            // token; HostOnly because no legitimate caller is off the host.
             "POST /extension/egress = HostOnly".to_string(),
             // One outbound geocoding call for a place NAME; no household data leaves. Wizard-only.
             "POST /handshake/revoke = Authenticated".to_string(),
             "POST /location/detect = UntilOnboarded".to_string(),
             "POST /onboard = UntilOnboarded".to_string(),
             "POST /onboard/complete = UntilOnboarded".to_string(),
+            // Once set up, the handler asks a caller with no token for the host credential.
             "POST /onboard/reset = UntilOnboardedThenHostOnly".to_string(),
             "POST /onboard/step/{name} = UntilOnboarded".to_string(),
             "POST /player/command = HostOnly".to_string(),
-            "POST /player/egress-policy = HostOnly".to_string(),
             "POST /profiles = UntilOnboarded".to_string(),
+            // Both handlers ask for the host credential: always for speak, without a token for tts.
             "POST /test/speak = HostOnly".to_string(),
             "POST /tts = HostOnly".to_string(),
             "POST /voice/calibrate = UntilOnboarded".to_string(),
@@ -895,8 +899,6 @@ mod tests {
         (Method::POST, "/player/command"),
         (Method::GET, "/player/status"),
         (Method::POST, "/extension/egress"),
-        // The shell's main process holds no session; loopback only, and it asks nothing secret.
-        (Method::POST, "/player/egress-policy"),
     ];
 
     #[test]

@@ -1344,11 +1344,12 @@ async fn player_status(pond: &Pond) -> Value {
     .1
 }
 
+/// The player page asks with its own session, like its other routes.
 async fn ask_policy(pond: &Pond, url: &str) -> (StatusCode, Value) {
     pond.call(
         "POST",
         "/api/v1/player/egress-policy",
-        None,
+        Some("test-token"),
         Some(json!({ "url": url, "method": "GET" })),
     )
     .await
@@ -1753,5 +1754,18 @@ async fn the_shell_asks_the_network_policy_about_the_players_requests() {
         status,
         StatusCode::UNAUTHORIZED,
         "nothing off the host may ask"
+    );
+    let (status, _) = pond
+        .call(
+            "POST",
+            "/api/v1/player/egress-policy",
+            None,
+            Some(json!({ "url": "https://js-cdn.music.apple.com/" })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "being on the host is not a session"
     );
 }

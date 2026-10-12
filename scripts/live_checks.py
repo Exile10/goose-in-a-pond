@@ -651,8 +651,9 @@ def section_music_player():
         ("no now-playing", lambda b: isinstance(b, dict) and b.get("state") is None),
     )
 
-    # The shell asks this before letting the player window reach a host, so it must follow the
-    # setting as `PUT /settings` changes it, with no restart.
+    # The player page asks this, with its session, before it loads a service's script, so it must
+    # follow the setting as `PUT /settings` changes it, with no restart. This server runs with the
+    # loopback bypass, which stands in for that session.
     apple = {"url": "https://js-cdn.music.apple.com/musickit/v3/musickit.js", "method": "GET"}
     code, body = call("PUT", "/api/v1/settings", {"network_mode": "offline"})
     if not expect("network_mode=offline is applied for the player check", code, 200, body):

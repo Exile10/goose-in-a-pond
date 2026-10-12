@@ -249,6 +249,19 @@ async fn the_dashboard_refuses_rebound_and_cross_site_requests() {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
         assert_eq!(body["error"], "origin_not_allowed", "{path}");
+        // A page on another loopback port is another origin: any account's server, or any
+        // other local listener, can serve one.
+        let (status, body) = send(
+            dashboard(),
+            Request::post(path)
+                .header("Host", "127.0.0.1:4000")
+                .header("Origin", "http://127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(body["error"], "origin_not_allowed", "{path}");
     }
 }
 
@@ -282,6 +295,68 @@ async fn pairing_codes_need_the_host_credential_even_on_loopback() {
         .as_str()
         .is_some_and(|pin| pin.starts_with("sha256/")));
     assert!(body["pairing"]["hostname"].is_string());
+}
+
+/// `POST` to `path` from a loopback peer, as the dashboard page sends it, with the host
+/// credential and a bearer when given.
+async fn post_from_the_host(
+    router: &axum::Router,
+    path: &str,
+    credential: Option<&str>,
+    bearer: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = Request::post(path)
+        .header("Host", "127.0.0.1:4000")
+        .header("Origin", "http://127.0.0.1:4000")
+        .header("Content-Type", "application/json");
+    if let Some(credential) = credential {
+        request = request.header(pond_api::host_guard::CREDENTIAL_HEADER, credential);
+    }
+    if let Some(bearer) = bearer {
+        request = request.header("Authorization", format!("Bearer {bearer}"));
+    }
+    send(
+        router
+            .clone()
+            .layer(axum::Extension(ConnectInfo(SocketAddr::from(LOOPBACK)))),
+        request.body(Body::from(r#"{"text":"hello"}"#)).unwrap(),
+    )
+    .await
+}
+
+/// Resetting onboarding reopens the wizard's writes to every LAN and tailnet peer, and speaking
+/// uses the host's speaker. Being a loopback peer proves neither is the Pond's own account.
+#[tokio::test]
+async fn onboarding_reset_and_test_speech_need_the_host_credential_on_loopback() {
+    let h = harness().await;
+    for path in ["/api/v1/onboard/reset", "/api/v1/test/speak"] {
+        let (status, body) = post_from_the_host(&h.listeners.dashboard, path, None, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(body["error"], "host_credential_required", "{path}");
+        let (status, _) = post_from_the_host(
+            &h.listeners.dashboard,
+            path,
+            Some(h.credential.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+
+        // The companion holds no credential to compare against, so a loopback peer there is
+        // refused rather than let through.
+        let (status, body) = post_from_the_host(&h.listeners.companion, path, None, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(body["error"], "host_credential_unavailable", "{path}");
+    }
+    // A paired device's token still restarts setup, even as a loopback peer of the companion.
+    let (status, _) = post_from_the_host(
+        &h.listeners.companion,
+        "/api/v1/onboard/reset",
+        None,
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]

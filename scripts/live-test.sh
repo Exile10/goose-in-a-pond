@@ -378,9 +378,20 @@ if [ "$AUTH_OK" -eq 1 ]; then
     RC=1
   fi
 
-  # The one-way-door check, end to end. curl runs on the host, which is exactly
-  # the boundary reset uses -- the same one that issues pairing codes.
+  # The one-way-door check, end to end. curl runs on the host and presents the
+  # host credential, which is exactly the boundary reset uses -- the same one
+  # that issues pairing codes. Being on the host without it is not enough: any
+  # account or local page is on the host.
   code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$AUTH_PORT/api/v1/onboard/reset")
+  if [ "$code" = "403" ]; then
+    printf '  PASS  POST   /onboard/reset         refused on the host without the credential\n'
+  else
+    printf '  FAIL  POST   /onboard/reset returned %s on the host with no credential\n' "$code"
+    RC=1
+  fi
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "X-Pond-Host-Credential: $(cat "$AUTH_DIR/.runtime_host_credential")" \
+    "http://127.0.0.1:$AUTH_PORT/api/v1/onboard/reset")
   if [ "$code" = "200" ]; then
     printf '  PASS  POST   /onboard/reset         still reachable from the host\n'
 
