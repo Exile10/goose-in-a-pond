@@ -353,9 +353,17 @@ The companion keeps one pairing at a time, so the native plugins call it on ever
 started or, with no coordinator, stopped. A forgotten pairing activates with no
 profile and keeps none. Local-only keeps its profile, so enabling again reuses the
 enrolled node. Prune never touches the running node's directory, and it refuses
-any directory whose node lock is held, whatever it believes is running. It removes
-a symbolic link rather than following it. It writes the number erased, and every
-failure, to the event log, and returns the failures to the plugin, which logs them.
+any directory whose node lock is held, whatever it believes is running. It writes
+the number erased, and every failure, to the event log, and returns the failures
+to the plugin, which logs them.
+
+It erases node directories only (2026-10-12, #491). Until then it erased every
+entry under `base` whatever its name or type, and removed a symbolic link there.
+Now an entry is erased only if its name is a valid profile name, `Lstat` finds a
+directory rather than a link or a file, and it holds `node.lock`, `initialized`
+or `tailscaled.state`, or nothing at all: an empty directory is what a start that
+failed straight after creating it leaves. Anything else, a link included, is
+left in place and not followed, and the number left is written to the event log.
 
 ### Cached network map on phones (2026-10-05)
 

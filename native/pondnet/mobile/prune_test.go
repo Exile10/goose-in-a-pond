@@ -46,7 +46,8 @@ func exists(t *testing.T, path string) bool {
 	return err == nil
 }
 
-// Every directory but the kept profile's goes, whatever is in it.
+// Every node directory but the kept profile's goes, an empty one included: that is
+// what a start that failed straight after creating it leaves.
 func TestPruneErasesEveryNodeDirectoryButTheKeptOne(t *testing.T) {
 	events := recordPruneEvents(t)
 	base := t.TempDir()
@@ -128,9 +129,9 @@ func TestPruneRefusesADirectoryWhoseNodeIsRunning(t *testing.T) {
 	}
 }
 
-// A link is removed, not followed, so nothing outside the directory is touched.
-func TestPruneRemovesALinkWithoutFollowingIt(t *testing.T) {
-	recordPruneEvents(t)
+// A link is not a node directory, even to one: it is neither removed nor followed.
+func TestPruneLeavesALinkAndItsTargetAlone(t *testing.T) {
+	events := recordPruneEvents(t)
 	base, outside := t.TempDir(), t.TempDir()
 	target := nodeDirectory(t, outside, "elsewhere")
 	if err := os.Symlink(target, filepath.Join(base, "link")); err != nil {
@@ -139,11 +140,50 @@ func TestPruneRemovesALinkWithoutFollowingIt(t *testing.T) {
 	if err := Prune(base, ""); err != nil {
 		t.Fatal(err)
 	}
-	if exists(t, filepath.Join(base, "link")) {
-		t.Fatal("the link survived")
+	if !exists(t, filepath.Join(base, "link")) {
+		t.Fatal("the link was removed")
 	}
 	if !exists(t, filepath.Join(target, "tailscaled.state")) {
 		t.Fatal("pruning followed a link out of the directory")
+	}
+	if len(events.lines) != 1 || events.lines[0] != "left 1 entries that are not node directories" {
+		t.Fatalf("event log: %q", events.lines)
+	}
+}
+
+// Only node directories are erased. A stray file, a directory a node never wrote
+// to, and a node directory not named as a profile all survive, and are counted.
+func TestPruneLeavesWhatIsNotANodeDirectory(t *testing.T) {
+	events := recordPruneEvents(t)
+	base := t.TempDir()
+	stale := nodeDirectory(t, base, "stale")
+	stray := filepath.Join(base, "stray")
+	if err := os.WriteFile(stray, []byte("not a node"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(base, "other")
+	if err := os.Mkdir(other, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "notes"), []byte("kept"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	misnamed := nodeDirectory(t, base, "not.a.profile")
+
+	if err := Prune(base, ""); err != nil {
+		t.Fatal(err)
+	}
+	if exists(t, stale) {
+		t.Fatal("a superseded node directory survived")
+	}
+	for _, kept := range []string{stray, filepath.Join(other, "notes"), filepath.Join(misnamed, "tailscaled.state")} {
+		if !exists(t, kept) {
+			t.Fatalf("%s was erased", kept)
+		}
+	}
+	want := []string{"erased 1 superseded node identities", "left 3 entries that are not node directories"}
+	if len(events.lines) != 2 || events.lines[0] != want[0] || events.lines[1] != want[1] {
+		t.Fatalf("event log: %q", events.lines)
 	}
 }
 
