@@ -137,25 +137,10 @@ test.describe("Hub — Prompts sub-screen wiring", () => {
     await expect(ta).toHaveValue(/Balanced prompt body\./);
   });
 
-  test("clicking a preset chip fetches and populates the textarea", async ({ page }) => {
-    let fetchedPromptName: string | null = null;
-
+  // The list response already carries every body, so a chip shows its own without a fetch.
+  test("clicking a preset chip populates the textarea", async ({ page }) => {
     await setupPromptsRoutes(page, {
       promptStyle: "balanced",
-    });
-
-    await page.route("**/api/v1/prompts/*", async (r) => {
-      if (r.request().method() === "GET") {
-        const url = r.request().url();
-        // Skip reset and list routes
-        if (url.includes("/reset")) { await r.continue(); return; }
-        const name = url.split("/prompts/")[1] ?? "";
-        if (!name) { await r.continue(); return; }
-        fetchedPromptName = name;
-        const found = MOCK_PROMPTS.find((p) => p.name === name) ?? MOCK_PROMPTS[0];
-        return r.fulfill({ json: found });
-      }
-      await r.continue();
     });
 
     await goToPromptsScreen(page);

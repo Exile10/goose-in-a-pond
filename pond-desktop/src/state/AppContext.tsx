@@ -14,12 +14,8 @@ import { setChatRunBridge, resumeActiveRun } from "./chatRunStore";
 import {
   reducer,
   buildInitialState,
-  nextTranscriptId,
-  nextCardId,
   type AppState,
   type AppAction,
-  type TranscriptMessage,
-  type ContextCard,
   type ScheduleToast,
 } from "./reducer";
 import type { ScheduleRunNotification } from "../api/types";

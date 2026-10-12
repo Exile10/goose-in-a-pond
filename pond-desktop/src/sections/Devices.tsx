@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Button, Separator, Switch } from "@heroui/react";
+import { Button, Separator } from "@heroui/react";
 import {
   Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio, Smartphone,
   Lightbulb, Lock, Thermometer, Fan, Blinds, RefreshCw,

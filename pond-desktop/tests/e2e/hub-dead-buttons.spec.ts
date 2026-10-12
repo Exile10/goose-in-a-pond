@@ -2,12 +2,6 @@ import { test } from "@playwright/test";
 import { mockAllApiRoutes } from "./helpers/api-mocks";
 import { navigateTo } from "./helpers/nav";
 
-interface ButtonInfo {
-  view: string;
-  text: string;
-  effect: string; // 'route-change' | 'dom-change' | 'console' | 'no-op' | 'error'
-}
-
 /** Each hub view and the drawer row reaching it; Canvas has none, so it goes by persisted route. */
 const VIEWS: Array<{ view: string; drawer: string | null }> = [
   { view: "Home",     drawer: "Home" },
@@ -63,7 +57,6 @@ test("Hub dead-button audit", async ({ page }) => {
   }
 
   const dead = inventory.filter((b) => !b.hasOnClick);
-  // eslint-disable-next-line no-console
   console.log("BUTTON_INVENTORY_TOTAL=" + inventory.length);
   console.log("DEAD_BUTTONS=" + JSON.stringify(dead, null, 0));
 });

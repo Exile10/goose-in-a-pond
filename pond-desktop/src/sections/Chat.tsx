@@ -474,11 +474,6 @@ export function Chat() {
   const greetingLine = useMemo(() => greeting(userName, quipSeed), [userName, quipSeed]);
   const subtitleLine = useMemo(() => subtitle(quipSeed), [quipSeed]);
 
-  // The server's own `status` frames ("Agent working…"), not a client-side guess.
-  const lastMsg = messages[messages.length - 1];
-  const liveStatus =
-    lastMsg?.role === "agent" && lastMsg.streaming ? lastMsg.status : undefined;
-
   // The server titles a session after its first exchange; until then it's "New Chat".
   const chatTitle =
     sessions.find((sn) => sn.id === state.sessionId)?.title?.trim() || "New Chat";

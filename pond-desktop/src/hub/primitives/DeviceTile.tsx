@@ -35,9 +35,9 @@ export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
 
   // One look for every kind; state shows via `data-active` (see hub.css) and the accent icon.
   let active = false;
-  let bg = "var(--tile-bg,#fff)";
-  let fg = "var(--tile-fg,#18181B)";
-  let sub = "var(--tile-sub,#566178)";
+  const bg = "var(--tile-bg,#fff)";
+  const fg = "var(--tile-fg,#18181B)";
+  const sub = "var(--tile-sub,#566178)";
   let iconEl: string | React.ReactNode;
   let statusText = "";
   let accentIcon = "var(--tile-icon,#CBD5E1)";

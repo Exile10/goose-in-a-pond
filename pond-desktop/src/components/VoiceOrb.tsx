@@ -134,7 +134,6 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0, pulseKey = 0 }: P
         setParticles((ps) => ps.filter((p) => p.id !== id));
       }, PARTICLE_LIFETIME_MS);
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [level, isSpeaking]);
 
   return (

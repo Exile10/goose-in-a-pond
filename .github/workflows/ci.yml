@@ -444,6 +444,12 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # eslint.config.js: rules-of-hooks, unused code and the recommended JS/TS rules fail the job
+      # as errors. Warnings are printed and do not; the deferred rules are listed in
+      # docs/CONTRIBUTING.md.
+      - name: ESLint
+        run: npm run lint
+
       - name: Vitest (unit tests)
         run: npm test
 
