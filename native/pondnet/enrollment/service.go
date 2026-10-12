@@ -130,13 +130,25 @@ func New(ctx context.Context, s *Store, b Backend) (*Service, error) {
 	if s.failure != nil {
 		return nil, s.failure
 	}
-	if err := service.policy(ctx); err != nil {
-		service.degraded.Store(true)
-		slog.Warn("enrollment service starting degraded: the coordinator policy could not be reconciled", "error", err)
-	}
+	// A failure marks the service degraded, and degrade logs it with its cause.
+	_ = service.policy(ctx)
 	return service, nil
 }
-func (s *Service) policy(ctx context.Context) error {
+
+// degrade marks the service degraded after err, logging only the transition into it,
+// so a coordinator that stays unreachable is reported once rather than every cycle.
+func (s *Service) degrade(err error) {
+	if !s.degraded.Swap(true) {
+		slog.Warn("enrollment service degraded: the coordinator could not be reconciled", "error", err)
+	}
+}
+
+func (s *Service) policy(ctx context.Context) (err error) {
+	defer func() {
+		if err != nil {
+			s.degrade(err)
+		}
+	}()
 	if s.Store.failure != nil {
 		return s.Store.failure
 	}
@@ -456,11 +468,16 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					err = s.policy(ctx)
 				}
 			} else {
+				slog.Warn("enrollment registration refused: the coordinator returned an unexpected node", "node", node.ID, "error", err)
 				failed := devices[approval.Device]
 				failed.Status = "failed"
 				devices[approval.Device] = failed
 				if saveErr := s.Store.save(); saveErr != nil {
 					err = saveErr
+				} else if deleteErr := s.deleteOwned(ctx, failed, h.UserID); deleteErr != nil {
+					// Best effort: a failed record that keeps its machine key is a tombstone,
+					// so Reconcile deletes the node if this attempt could not.
+					slog.Warn("refused registration's node left for reconciliation to delete", "error", deleteErr)
 				}
 			}
 		}
@@ -475,10 +492,16 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // Reconcile recovers a lost registration response by its approved machine key,
-// and retries revocations. It never repeats an ambiguous registration write.
-func (s *Service) Reconcile(ctx context.Context) error {
+// and retries revocations. It never repeats an ambiguous registration write. A
+// failure leaves the service degraded until a later reconciliation succeeds.
+func (s *Service) Reconcile(ctx context.Context) (err error) {
 	s.Store.mu.Lock()
 	defer s.Store.mu.Unlock()
+	defer func() {
+		if err != nil {
+			s.degrade(err)
+		}
+	}()
 	if err := s.policy(ctx); err != nil {
 		return err
 	}
@@ -508,13 +531,16 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				}
 				continue
 			}
-			if device.Status != "revoking" && !(device.Status == "revoked" && device.MachineKey != "") {
+			// A revoked or failed record that keeps its machine key is a tombstone: any node
+			// still registered under that identity, late or refused, is deleted.
+			tombstone := (device.Status == "revoked" || device.Status == "failed") && device.MachineKey != ""
+			if device.Status != "revoking" && !tombstone {
 				continue
 			}
 			if err := s.deleteOwnedFrom(ctx, device, s.Store.value.Households[household].UserID, inventory); err != nil {
 				return err
 			}
-			if device.Status == "revoked" {
+			if tombstone {
 				continue
 			}
 			device = Device{Role: device.Role, Status: "revoked", MachineKey: device.MachineKey, Revision: device.Revision}
@@ -595,11 +621,17 @@ func (s *Service) deleteOwnedFrom(ctx context.Context, device Device, user strin
 		if device.NodeID == "" && device.MachineKey != "" {
 			matched = node.MachineKey == device.MachineKey
 		}
-		if matched && node.UserID == user && (device.MachineKey == "" || node.MachineKey == device.MachineKey) {
-			if err := s.Backend.Delete(ctx, node.ID); err != nil {
-				return err
-			}
+		if !matched || (device.MachineKey != "" && node.MachineKey != device.MachineKey) {
+			continue
 		}
+		if node.UserID != user {
+			slog.Warn("coordinator node kept: it is registered to another user", "node", node.ID, "owner", node.UserID, "household_user", user)
+			continue
+		}
+		if err := s.Backend.Delete(ctx, node.ID); err != nil {
+			return err
+		}
+		slog.Info("coordinator node deleted", "node", node.ID)
 	}
 	return nil
 }

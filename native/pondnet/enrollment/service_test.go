@@ -32,6 +32,8 @@ type fakeBackend struct {
 	fail         bool
 	lostResponse bool
 	rejected     bool
+	// mutate, when set, alters each node the coordinator registers before it is stored.
+	mutate func(*Registered)
 }
 
 func (f *fakeBackend) Register(_ context.Context, user, auth string) (Registered, error) {
@@ -43,6 +45,9 @@ func (f *fakeBackend) Register(_ context.Context, user, auth string) (Registered
 		return Registered{}, errors.New("offline")
 	}
 	n := Registered{ID: "1", UserID: user, Key: "nodekey:" + strings.Repeat("a", 64), MachineKey: "mkey:" + strings.Repeat("b", 64), Addresses: []string{"100.64.0.1"}}
+	if f.mutate != nil {
+		f.mutate(&n)
+	}
 	f.nodes = append(f.nodes, n)
 	if f.lostResponse {
 		return Registered{}, errors.New("registration response lost")
@@ -321,6 +326,65 @@ func TestDefiniteRejectionCannotRecoverFromLaterInventory(t *testing.T) {
 	}
 	if s.Store.value.Devices[a.Household][a.Device].Status != "failed" || len(b.rules) != 0 {
 		t.Fatal("definite failure became an approval")
+	}
+	// The failed record is a tombstone for its machine identity.
+	if len(b.nodes) != 0 || b.deleted != 1 {
+		t.Fatalf("the later node under the failed identity survived: %d nodes, %d deleted", len(b.nodes), b.deleted)
+	}
+}
+
+// A node the coordinator registered but the service refused is deleted, right away
+// and again by Reconcile if it is still there, and its record stays failed.
+func TestARefusedRegistrationIsFailedAndItsNodeDeleted(t *testing.T) {
+	for name, mutate := range map[string]func(*Registered){
+		"tags":   func(n *Registered) { n.Tags = []string{"tag:unexpected"} },
+		"routes": func(n *Registered) { n.Routes = []string{"0.0.0.0/0"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, k, b := fixture(t)
+			b.mutate = mutate
+			a := approval()
+			if code := invoke(s, a, k); code != 503 {
+				t.Fatalf("refused registration answered %d", code)
+			}
+			if s.Store.value.Devices[a.Household][a.Device].Status != "failed" {
+				t.Fatal("refused registration not recorded as failed")
+			}
+			if len(b.nodes) != 0 || b.deleted != 1 {
+				t.Fatalf("refused node not deleted: %d nodes, %d deleted", len(b.nodes), b.deleted)
+			}
+			// As if the immediate deletion had not reached the coordinator.
+			b.nodes = append(b.nodes, Registered{ID: "1", UserID: "1", Key: a.NodeKey, MachineKey: a.MachineKey, Tags: []string{"tag:unexpected"}})
+			if err := s.Reconcile(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(b.nodes) != 0 || b.deleted != 2 || b.calls != 1 {
+				t.Fatalf("reconciliation left the refused node: %d nodes, %d deleted, %d registrations", len(b.nodes), b.deleted, b.calls)
+			}
+			if s.Store.value.Devices[a.Household][a.Device].Status != "failed" || len(b.rules) != 0 {
+				t.Fatal("the tombstone changed status or gained permission")
+			}
+		})
+	}
+}
+
+// A refused node registered to another user is never deleted, by the request or by
+// Reconcile: the machine key alone does not make it this household's.
+func TestARefusedNodeOwnedByAnotherUserIsKept(t *testing.T) {
+	s, k, b := fixture(t)
+	b.mutate = func(n *Registered) { n.UserID = "2" }
+	a := approval()
+	if code := invoke(s, a, k); code != 503 {
+		t.Fatalf("refused registration answered %d", code)
+	}
+	if err := s.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if s.Store.value.Devices[a.Household][a.Device].Status != "failed" {
+		t.Fatal("refused registration not recorded as failed")
+	}
+	if len(b.nodes) != 1 || b.deleted != 0 {
+		t.Fatalf("another user's node was deleted: %d nodes, %d deleted", len(b.nodes), b.deleted)
 	}
 }
 func TestPolicySeparatesHouseholdsAndOnlyPermitsCompanionPort(t *testing.T) {

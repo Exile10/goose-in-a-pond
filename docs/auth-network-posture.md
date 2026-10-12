@@ -93,8 +93,9 @@ The enrollment service holds at most 4096 enrolled devices across every househol
 (`EnrollmentCapacity`) and refuses further enrollments with `capacity`. It reads the
 coordinator inventory node by node and refuses it only past 8192 nodes (`MaxNodes`),
 so policy updates, and therefore revocations, keep working at capacity (2026-09-30).
-A coordinator it cannot reconcile at startup leaves it serving but degraded, which
-`/health` reports as `"degraded":true` until a reconciliation succeeds. Rate limits
+A coordinator it cannot reconcile, at startup or later, leaves it serving but
+degraded, which `/health` reports as `"degraded":true` until a reconciliation
+succeeds (later failures too since 2026-10-12). Rate limits
 key on the client address from the gateway's last `X-Forwarded-For` hop, believed
 only when the peer is inside a `--trusted-proxy` range; without that flag every
 client behind the gateway shares one budget.
