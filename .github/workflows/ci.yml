@@ -379,6 +379,40 @@ jobs:
       - name: Bash tests
         run: bash scripts/lib/model-pairings.test.sh
 
+  # Every shell script outside the goose/ submodule. Most of them run on the Jetson or a server and
+  # no test can exercise them here, so this is the only check they get. A warning fails the job; a
+  # note is printed and does not. The root .shellcheckrc makes it follow sourced files.
+  #
+  # The release binary, pinned and checksummed, not the runner's apt package: that one is older,
+  # lacks checks this one has, and so would disagree with what a developer sees locally.
+  shellcheck:
+    name: Shell scripts - shellcheck
+    runs-on: ubuntu-latest
+    env:
+      SHELLCHECK_VERSION: v0.11.0
+      SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          archive="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${archive}"
+          echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Notes (reported, never fail the job)
+        run: |
+          git ls-files -z '*.sh' ':!:goose/' | xargs -0 shellcheck --format=gcc | grep ': note:' || true
+
+      - name: Warnings and errors
+        run: |
+          shellcheck --version
+          git ls-files -z '*.sh' ':!:goose/' | xargs -0 shellcheck --severity=warning
+
   frontend:
     name: Frontend — vitest / playwright
     runs-on: ubuntu-latest
