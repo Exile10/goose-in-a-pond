@@ -4,11 +4,21 @@ import { useTranslation } from 'react-i18next';
 import { api } from '../api/PondApiClient';
 import { isSignInRequired } from '../api/hostCredential';
 import { ApiError, type RecoveryRequest } from '../api/types';
+import { isDesktopShell } from '../shell';
 
 /** The coordinator's refusals over an invite or a device certificate, each with its own `remote.*` message. */
 const ADMISSION_REFUSALS = ['invite_required', 'invite_invalid', 'invite_expired', 'invite_used', 'device_certificate_invalid', 'device_revoked', 'device_used'];
 /** A refused certificate falls back to an invite, so these bring the invite field back. */
 const DEVICE_REFUSALS = ['device_certificate_invalid', 'device_revoked', 'device_used'];
+
+/**
+ * Refused for want of the host credential, for good: a browser tab keeps the one its sign-in link
+ * gave it, but the desktop shell reads the current one for every request, so there a refusal only
+ * means the Pond restarted between the read and the request.
+ */
+function signedOut(error: unknown): boolean {
+  return isSignInRequired(error) && !isDesktopShell();
+}
 
 /** Household activation stays on the Pond's protected local dashboard. */
 export function RemoteAccess() {
@@ -24,7 +34,7 @@ export function RemoteAccess() {
   const [busy, setBusy] = useState(false);
   // Every call here needs the host credential; a restart rotates it out from under this tab.
   const [signInLost, setSignInLost] = useState(false);
-  const noteRefusal = (error: unknown) => { if (isSignInRequired(error)) setSignInLost(true); };
+  const noteRefusal = (error: unknown) => { if (signedOut(error)) setSignInLost(true); };
   const generation = useRef(0);
   useEffect(() => {
     const current = ++generation.current;
@@ -50,7 +60,7 @@ export function RemoteAccess() {
       } catch (error) {
         // Signed out: every later poll would be refused the same way, and logged by the Pond each
         // time, until a new sign-in link reloads the page. Say so once and stop.
-        if (isSignInRequired(error)) { if (active) setSignInLost(true); return; }
+        if (signedOut(error)) { if (active) setSignInLost(true); return; }
         if (active) setReviewFailed(true);
       }
       if (active) timer = setTimeout(() => void poll(), 5000);

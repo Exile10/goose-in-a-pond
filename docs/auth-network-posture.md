@@ -54,6 +54,29 @@ does not reload the page, so the page listens for the change, keeps the new cred
 and reloads. A tab refused for want of the current credential says so and stops polling
 for recovery requests; before, it asked every five seconds and the Pond logged a
 `host_credential_rejected` warning each time, for as long as the tab stayed open.
+The desktop shell does neither (2026-10-12): it reads the credential again for every
+request, so a refusal there only means the Pond restarted between the read and the
+request, and Remote access keeps polling without the sign-in message.
+
+The Jetson kiosk's Firefox renderer signs itself in the same way a browser does
+(2026-10-12). `scripts/jetson/kiosk.sh start` finds the data directory as the server
+does (`POND_DATA_DIR`, else `${XDG_DATA_HOME:-~/.local/share}/goose-in-a-pond`), waits up
+to 30 seconds for `.runtime_api_port`, `.runtime_host_credential` and an answer from
+`/api/v1/health`, and writes a `0600` page that forwards to
+`http://127.0.0.1:<port>/#host=<credential>`. The answer matters because both files
+outlive a stopped server, and only a serving one has rotated the credential. The
+credential never goes on a command line, where `/proc/<pid>/cmdline` would show it to
+every account: Firefox is given the page's `file://` path. The page goes in
+`$XDG_RUNTIME_DIR`, which is `0700`; for snap Firefox, which can read only its own
+`$XDG_RUNTIME_DIR/snap.firefox`, in that; and failing either, in a `mktemp -d` directory,
+which snap Firefox cannot read. `kiosk.sh client` prints the command `start` would hand
+weston, and writes the page. `GIAP_KIOSK_URL` still opens exactly the URL given, with no
+sign-in, and `GIAP_KIOSK_PORT` still overrides the port. The kiosk's user unit is
+`PartOf=goose-in-a-pond.service`, so a server restart, which rotates the credential,
+restarts the kiosk too; that reaches only a user unit of that name, and `kiosk.sh install`
+says so when the Pond runs as a system unit. The Electron renderer needs none of this: it
+reads the credential over IPC.
+
 `pond-server pairing`
 reads the file itself. `POND_DEV_ALLOW_LOOPBACK` admits a missing credential for
 local development; the Host and Origin checks still apply.

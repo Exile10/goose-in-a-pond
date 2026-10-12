@@ -38,15 +38,21 @@
 #   bash scripts/jetson/kiosk.sh probe        # read-only readiness report
 #   bash scripts/jetson/kiosk.sh enable-drm   # load nvidia-drm (needs sudo)
 #   bash scripts/jetson/kiosk.sh start        # run the kiosk in the foreground
+#   bash scripts/jetson/kiosk.sh client       # print the renderer command `start` runs
 #   bash scripts/jetson/kiosk.sh measure      # memory cost, before vs after
 #   bash scripts/jetson/kiosk.sh install      # user systemd unit, starts at login
 #   bash scripts/jetson/kiosk.sh default-ui   # boot straight into the dashboard
 #   bash scripts/jetson/kiosk.sh stop
+#
+# GIAP_KIOSK_URL and GIAP_KIOSK_PORT are explicit overrides. Without them the
+# kiosk follows the files pond-server writes to its data directory at every
+# start: the port it bound, and the host credential that signs Firefox in.
 # -----------------------------------------------------------------------------
 set -uo pipefail
 
-PORT="${GIAP_KIOSK_PORT:-8080}"
-URL="${GIAP_KIOSK_URL:-http://127.0.0.1:${PORT}}"
+# default_data_dir() in crates/pond-server/src/main.rs, as on Linux; mirrored by
+# pond-desktop/electron/main/dataDir.ts.
+DATA_DIR="${POND_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/goose-in-a-pond}"
 WESTON_NV="/usr/lib/aarch64-linux-gnu/nvidia/weston-13.0"
 WESTON_STD="/usr/lib/aarch64-linux-gnu/weston"
 RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -65,6 +71,12 @@ avail_mb()   { free -m | awk '/^Mem:/ {print $7}'; }
 nvmap_mb()   { awk '/NvMapMemUsed/ {print int($2/1024)}' /proc/meminfo 2>/dev/null; }
 
 weston_dir() { [ -d "$WESTON_NV" ] && echo "$WESTON_NV" || echo "$WESTON_STD"; }
+
+# The port pond-server bound, or GIAP_KIOSK_PORT; nothing if neither is a number.
+server_port() {
+  local port="${GIAP_KIOSK_PORT:-$(cat "$DATA_DIR/.runtime_api_port" 2>/dev/null)}"
+  [[ "$port" =~ ^[0-9]+$ ]] && echo "$port"
+}
 
 renderer() {
   # What can actually draw the dashboard. Electron is preferred: it is the same
@@ -219,27 +231,99 @@ cmd_start() {
 
   head1 "Starting the kiosk"
   info "compositor: weston ($(weston_dir)) drm-backend + ${shell_mod}"
-  info "target:     ${URL}"
   export XDG_RUNTIME_DIR="$RUNTIME"
   mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null
   chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null
+  local client
+  client="$(kiosk_client_cmd)" || return 1
+  info "client:     ${client}"
 
   weston \
     --backend=drm-backend.so \
     --shell="${shell_mod}" \
     --modules="" \
     --idle-time=0 \
-    -- "$(kiosk_client_cmd)"
+    -- "$client"
+}
+
+# The port, once pond-server answers on it: 30s at most. The runtime files
+# outlive a stopped server, so their existing proves nothing; the server rotates
+# the credential before it starts serving, so an answer means the credential
+# file is the current one.
+wait_for_server() {
+  if ! command -v curl >/dev/null 2>&1; then
+    bad "curl is needed to tell a running pond-server from a stale port file" >&2
+    return 1
+  fi
+  local port deadline=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    port="$(server_port)"
+    if [ -n "$port" ] && [ -s "$DATA_DIR/.runtime_host_credential" ] \
+       && curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:${port}/api/v1/health" 2>/dev/null; then
+      echo "$port"
+      return 0
+    fi
+    sleep 1
+  done
+  bad "pond-server did not answer within 30s (data dir: $DATA_DIR)" >&2
+  return 1
+}
+
+# A directory only this user can read, for Firefox's sign-in page. Snap Firefox
+# can read only its own corner of the runtime directory. Failing a 0700
+# directory of ours, a fresh one from mktemp -d, which snap Firefox cannot see.
+page_dir() {
+  local dir="$RUNTIME"
+  if [ -x /snap/bin/firefox ]; then
+    dir="$RUNTIME/snap.firefox"
+    mkdir -p -m 700 "$dir" 2>/dev/null
+  fi
+  if [ -n "$(find "$dir" -maxdepth 0 -user "$(id -u)" -perm 700 2>/dev/null)" ]; then
+    echo "$dir"
+  else
+    warn "$dir is not a 0700 directory of this user's; using a private temporary one" >&2
+    mktemp -d
+  fi
+}
+
+# What Firefox opens: GIAP_KIOSK_URL as given, or else a 0600 page that forwards
+# to the dashboard with its sign-in fragment, so a restart does not leave the
+# panel on the sign-in card. The credential goes in that page and never on a
+# command line, since /proc/<pid>/cmdline is world-readable; printf and [[ ]]
+# are builtins, so no process sees it in its arguments either.
+firefox_target() {
+  if [ -n "${GIAP_KIOSK_URL:-}" ]; then
+    echo "$GIAP_KIOSK_URL"
+    return 0
+  fi
+  local port credential dir tmp page
+  port="$(wait_for_server)" || return 1
+  credential="$(tr -d '[:space:]' < "$DATA_DIR/.runtime_host_credential")"
+  if ! [[ "$credential" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+    bad "$DATA_DIR/.runtime_host_credential does not hold a host credential" >&2
+    return 1
+  fi
+  dir="$(page_dir)" || return 1
+  # mktemp creates it 0600; the rename replaces a planted symlink rather than following it.
+  tmp="$(mktemp "$dir/giap-kiosk.XXXXXX")" || return 1
+  printf '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=http://127.0.0.1:%s/#host=%s">\n' \
+    "$port" "$credential" > "$tmp"
+  page="$dir/giap-kiosk.html"
+  mv -f "$tmp" "$page" || return 1
+  echo "file://$page"
 }
 
 kiosk_client_cmd() {
   case "$(renderer)" in
     electron)
       # The same app, told to attach to the running server rather than spawn one.
-      echo "env GIAP_SERVER_PORT=${PORT} ${REPO_ROOT:-$HOME/goose-in-a-pond}/pond-desktop/node_modules/.bin/electron ${REPO_ROOT:-$HOME/goose-in-a-pond}/pond-desktop --ozone-platform=wayland --enable-features=UseOzonePlatform --touch-events=enabled"
+      # It reads the host credential itself, over IPC.
+      echo "env GIAP_SERVER_PORT=$(server_port || echo 8080) ${REPO_ROOT:-$HOME/goose-in-a-pond}/pond-desktop/node_modules/.bin/electron ${REPO_ROOT:-$HOME/goose-in-a-pond}/pond-desktop --ozone-platform=wayland --enable-features=UseOzonePlatform --touch-events=enabled"
       ;;
     firefox)
-      echo "firefox --kiosk ${URL}"
+      local target
+      target="$(firefox_target)" || return 1
+      echo "firefox --kiosk ${target}"
       ;;
     *)
       echo "weston-terminal"
@@ -272,6 +356,8 @@ cmd_install() {
 Description=GIAP kiosk panel (weston fullscreen, no desktop)
 After=goose-in-a-pond.service
 Wants=goose-in-a-pond.service
+# A server restart rotates the host credential Firefox signed in with.
+PartOf=goose-in-a-pond.service
 
 [Service]
 Type=simple
@@ -285,6 +371,11 @@ WantedBy=default.target
 UNIT
   systemctl --user daemon-reload
   ok "wrote $unit"
+  # PartOf= in a user unit reaches only a user unit of that name.
+  if ! systemctl --user cat goose-in-a-pond.service >/dev/null 2>&1; then
+    warn "goose-in-a-pond.service is not a user unit here, so a server restart will not"
+    info "restart the kiosk; afterwards run: systemctl --user restart giap-kiosk"
+  fi
   info "enable with: systemctl --user enable --now giap-kiosk"
   info "and:         loginctl enable-linger $(id -un)   # so it survives logout"
 }
@@ -361,9 +452,10 @@ case "${1:-probe}" in
   enable-drm) cmd_enable_drm ;;
   measure)    cmd_measure ;;
   start)      cmd_start ;;
+  client)     kiosk_client_cmd ;;
   stop)       cmd_stop ;;
   status)     cmd_status ;;
   install)    cmd_install ;;
   default-ui) cmd_default_ui ;;
-  *) echo "usage: $0 {probe|enable-drm|measure|start|stop|status|install|default-ui}" >&2; exit 2 ;;
+  *) echo "usage: $0 {probe|enable-drm|measure|start|client|stop|status|install|default-ui}" >&2; exit 2 ;;
 esac

@@ -1,7 +1,10 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import "../i18n";
 import { ApiError } from "../api/types";
+
+const shell = vi.hoisted(() => ({ desktop: false }));
+vi.mock("../shell", () => ({ isDesktopShell: () => shell.desktop }));
 
 vi.mock("../api/PondApiClient", () => ({
   api: {
@@ -17,6 +20,9 @@ import { api } from "../api/PondApiClient";
 import { RemoteAccess } from "./RemoteAccess";
 
 describe("RemoteAccess once this tab is signed out", () => {
+  beforeEach(() => {
+    shell.desktop = false;
+  });
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
@@ -42,5 +48,17 @@ describe("RemoteAccess once this tab is signed out", () => {
     await waitFor(() => expect(api.remoteRecoveryRequests).toHaveBeenCalled());
     await vi.advanceTimersByTimeAsync(11_000);
     expect(vi.mocked(api.remoteRecoveryRequests).mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("keeps asking in the desktop shell, which reads a fresh credential for every request", async () => {
+    shell.desktop = true;
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.mocked(api.remoteStatus).mockRejectedValue(new ApiError(403, "host_credential_required"));
+    vi.mocked(api.remoteRecoveryRequests).mockRejectedValue(new ApiError(403, "host_credential_required"));
+    render(<RemoteAccess />);
+    await waitFor(() => expect(api.remoteRecoveryRequests).toHaveBeenCalled());
+    await vi.advanceTimersByTimeAsync(11_000);
+    expect(vi.mocked(api.remoteRecoveryRequests).mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(screen.queryByText(/no longer signed in/)).toBeNull();
   });
 });
