@@ -321,6 +321,48 @@ session and refresh credentials are revoked together. Corrupt identity files cau
 visible failure. Restore the private identity backup rather than deleting it to
 create an unrelated household.
 
+### The enrollment record and the revocation queue (2026-10-12)
+
+`embedded-network/enrolled.json` lists the phones this Pond enrolled, so a removal
+revokes a listed phone without asking the coordinator first, and skips a device a
+complete record does not list (a revocation of a device that never enrolled leaves
+a tombstone on the coordinator). `revocations.json` is the durable queue the
+30-second retry loop sends.
+
+- **A phone is recorded before the helper is asked to enroll it**, in
+  `register_phone` and in an approved recovery. The enrollment call can take up to
+  25 seconds; a removal, a logout or an absence sweep in that window used to find
+  no record, queue nothing, and leave the enrollment the coordinator then
+  completed with nothing to revoke it, and so did a crash before the record was
+  written. Now the removal queues an unchecked revocation and the phone is answered
+  `409`. A coordinator refusal (helper exit 3) is definite, so a device recorded
+  for that call alone is forgotten again, unless the coordinator's `inspect`
+  reported an enrollment of its own for the device. A timeout or an unreachable
+  coordinator (exit 1) keeps the record: an unchecked revocation of an enrollment
+  that never happened is the safe way to be wrong.
+- **An unreadable `enrolled.json`** (corrupt, or left `0644` by a restore) is moved
+  aside as `enrolled.json.corrupt-<unix time>`, logged as
+  `kind="enrollment_record_replaced"`, and read as an incomplete record, so
+  removals check with the coordinator before revoking. It used to make `DELETE
+  /devices`, logout and enrollment answer `503` until someone repaired the file.
+  `revocations.json` is still refused when unreadable: dropping queued revocations
+  would be the unsafe failure.
+- **No household authority means nothing to revoke.** With an enrollment origin
+  configured but no `embedded-network/authority/identity.json`, the helper exits 1
+  for every coordinator call, so queued entries backed off to six hours forever
+  and held up the entries behind them in each tick. A removal now queues nothing
+  and a queued entry is dropped, both logged as
+  `kind="remote_revocation_without_authority"`; a removal warns when the record
+  still lists phones, because they keep their remote access until the authority is
+  restored from its backup.
+
+**Drain the revocation queue before downgrading.** Since 2026-09-30 (#434)
+`revocations.json` holds an entry per device with its own backoff, which a binary
+from before then cannot parse, so it would fail every removal and every retry. An
+empty queue is written as `[]`, the form older binaries read, so once
+`<data_dir>/embedded-network/revocations.json` reads `[]` (or does not exist) the
+downgrade is safe. Keep the coordinator reachable until it drains.
+
 ### A phone's superseded node identities (2026-10-05)
 
 A phone runs each pairing's node in its own directory, named after the pairing's

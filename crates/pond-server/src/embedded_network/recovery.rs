@@ -301,6 +301,10 @@ async fn operation(
         if !runtime.config().map_err(failed)?.enabled {
             return Err(StatusCode::CONFLICT);
         }
+        // Recorded before any coordinator call, as `register_phone` does: the coordinator holds
+        // an enrollment for this device whatever becomes of the calls below, so a removal while
+        // they are in flight, or after a crash, must revoke it.
+        runtime.record_enrolled(&device).map_err(failed)?;
         // The coordinator replaces only a stood-down enrollment, so an active one is revoked first.
         let live = runtime
             .authority(
@@ -343,7 +347,6 @@ async fn operation(
             .authority("replace", payload)
             .await
             .map_err(failed)?;
-        runtime.record_enrolled(&device).map_err(failed)?;
         runtime
             .ensure_not_revoked_meanwhile(&device)
             .map_err(|error| {
