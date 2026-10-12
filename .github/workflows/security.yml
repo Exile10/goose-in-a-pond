@@ -58,10 +58,16 @@ jobs:
       #
       # This new module has its own blocking gate. Existing Rust advisory
       # deferrals must not suppress findings in shipped networking dependencies.
+      #
+      # --no-call-analysis=go: the action runs its own bundled Go with
+      # GOTOOLCHAIN=local, so whenever go.mod moves ahead of that Go its call
+      # analysis cannot load packages and the scanner exits 127 with zero
+      # findings. Reachability is the govulncheck step above, on the go.mod
+      # toolchain; this step's job is membership, which needs no Go at all.
       - name: Embedded networking dependencies
         uses: google/osv-scanner-action/osv-scanner-action@v2.6.0
         with:
-          scan-args: --config=osv-scanner.toml --lockfile=native/pondnet/go.mod
+          scan-args: --config=osv-scanner.toml --no-call-analysis=go --lockfile=native/pondnet/go.mod
 
   rust-audit:
     name: Rust — cargo audit (RustSec)
