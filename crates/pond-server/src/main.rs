@@ -504,7 +504,7 @@ async fn async_main() -> Result<()> {
         pond_adapters_local_inference::CUDA_ENABLED,
     );
 
-    match cli.command {
+    let result = match cli.command {
         Some(Commands::Setup { model }) => run_setup(&model).await,
         Some(Commands::Serve {
             static_dir,
@@ -583,7 +583,11 @@ async fn async_main() -> Result<()> {
             apply_device_choices();
             run_chat(None, None, false, None, true, Some("none"), None, false).await
         }
-    }
+    };
+    // Before the process exits, while nothing else is tearing down: a model still loaded at exit
+    // crashes LiteRT-LM's exit-time destructors (see `release_local_models`).
+    pond_adapters_goose::release_local_models(std::time::Duration::from_secs(20)).await;
+    result
 }
 
 async fn run_setup(model: &str) -> Result<()> {
@@ -4440,6 +4444,10 @@ async fn run_server(
     if let Some(matter) = &matter_runtime {
         matter.shutdown().await;
     }
+
+    // While logging still runs, so the release is on record. `async_main` repeats it for the
+    // other entry points; a second call finds nothing loaded.
+    pond_adapters_goose::release_local_models(std::time::Duration::from_secs(20)).await;
 
     serve_result
 }
