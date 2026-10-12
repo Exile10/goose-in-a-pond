@@ -159,9 +159,40 @@ cargo clippy     # lint (fix all warnings before submitting)
 For the desktop app:
 ```bash
 cd pond-desktop
-npx tsc --noEmit   # TypeScript type check
+npm run typecheck  # TypeScript, for the renderer and the Electron main process
+npm run lint       # ESLint (eslint.config.js)
 npm test           # vitest unit tests
 ```
+
+For shell scripts (`brew install shellcheck` or your distribution's package; CI uses 0.11.0):
+```bash
+git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning
+```
+
+### Lint checks in CI
+
+As of 2026-10-12, `.github/workflows/ci.yml` runs two linters besides `cargo clippy`:
+
+- **`shellcheck` job.** It covers every tracked `*.sh` file, with no list to maintain, so a new
+  script is checked as soon as it is committed. The root `.shellcheckrc` makes shellcheck follow
+  `source`d files from the sourcing script's directory. A warning or an error fails the job, and
+  notes are printed without failing it. CI downloads the pinned 0.11.0 release and checks its
+  sha256, rather than using the runner's older apt package. For a real false positive, put
+  `# shellcheck disable=SCxxxx  # reason` on the line above it. Do not add a file-wide disable.
+- **`frontend` job, `npm run lint` step.** It runs ESLint over `pond-desktop`: `src/`, `electron/`,
+  `tests/` and the tooling files at the package root. Generated output (`dist/`,
+  `dist-electron/`, `release/`, the Playwright reports) is ignored. Errors fail the job: the
+  recommended JavaScript and typescript-eslint rules, and `react-hooks/rules-of-hooks`. Unused code
+  is an error: remove it rather than renaming it with a `_` prefix. The one exception is a
+  parameter that an interface requires and one implementation does not read, which is named `_x`. Warnings are printed and do not
+  fail it. Rules deferred on 2026-10-12, with their hit counts on that date:
+  - `react-refresh/only-export-components` is a warning (62 hits in 32 files). It costs a full
+    reload under Vite's Fast Refresh, not a defect.
+  - `react-hooks/exhaustive-deps` is a warning (5 hits).
+  - The React Compiler rules in `eslint-plugin-react-hooks` 7's recommended set are not enabled
+    (69 hits, 56 of them `set-state-in-effect`).
+  - `require-yield` is off in `src/**/*.test.*` only, for mock streams that throw before their
+    first frame.
 
 ### Comments
 
@@ -221,6 +252,7 @@ Before opening a PR:
 - [ ] Tests pass: `cargo test -p pond-core -p pond-api`
 - [ ] No clippy warnings: `cargo clippy`
 - [ ] Code formatted: `cargo fmt`
+- [ ] Linters clean: `npm run lint` in `pond-desktop`, and `shellcheck` on any script you touched
 - [ ] Comments follow [the comment rules](#comments)
 - [ ] New ports have a mock and tests in `pond-core`
 - [ ] `pond-core` has no new external dependencies
