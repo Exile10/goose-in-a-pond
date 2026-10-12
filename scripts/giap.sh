@@ -16,7 +16,7 @@
 #   bash scripts/giap.sh litert import DIR  # take in a package built on another host (the Jetson)
 #   bash scripts/giap.sh models pairings         # regenerate the vision pairing table from Hugging Face
 #   bash scripts/giap.sh models pairings --check # only compare it (exit 1 if the committed table is stale)
-#   bash scripts/giap.sh provision --host HOST --key FILE  # give a Pond a device certificate (operator)
+#   bash scripts/giap.sh provision --host HOST --key FILE  # give a Pond a device certificate (operator; must come first)
 #   bash scripts/giap.sh --dry-run …  # print every command instead of running it
 #
 # It auto-detects the host (Jetson / Linux / macOS), whether CUDA is usable, and
@@ -1379,6 +1379,7 @@ while [ $# -gt 0 ]; do
     --major)   [ $# -ge 2 ] || { bad "--major needs a value"; exit 2; }; NODE_MAJOR="$2"; shift 2 ;;
     -h|--help|help) usage; exit 0 ;;
     -*)        bad "unknown option: $1"; usage; exit 2 ;;
+    provision) bad "provision takes only its own options and must come first: bash scripts/giap.sh provision --host HOST --key FILE"; exit 2 ;;
     *) if [ -z "$CMD" ]; then CMD="$1"
        elif [ -z "$CMD_SUB" ]; then CMD_SUB="$1"
        elif [ -z "$CMD_ARG" ]; then CMD_ARG="$1"

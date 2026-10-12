@@ -326,9 +326,10 @@ impl Runtime {
     }
 
     /// The serial of the device certificate this Pond was imaged with, or `None` when it was
-    /// never provisioned. A certificate file that is a symlink, too large, readable by others
-    /// or unreadable counts as absent and is logged, so the dashboard falls back to asking for
-    /// an invite rather than claiming a provisioning it cannot show.
+    /// never provisioned. Mirrors the helper's `LoadDevice`: the `device` directory must be
+    /// private and hold a usable key beside the certificate. Anything else counts as absent and
+    /// is logged, so the dashboard asks for an invite rather than claiming a provisioning the
+    /// helper cannot present.
     fn provisioned_serial(&self) -> Option<String> {
         #[derive(Deserialize)]
         struct Certificate {
@@ -338,7 +339,41 @@ impl Runtime {
         struct Payload {
             serial: String,
         }
-        let path = self.directory.join("device").join("certificate.json");
+        #[derive(Deserialize)]
+        struct Key {
+            seed: String,
+        }
+        use base64::Engine;
+        let device = self.directory.join("device");
+        match std::fs::symlink_metadata(&device) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::warn!(error = %error, "device directory unreadable; ignoring it");
+                return None;
+            }
+            Ok(metadata) if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 => {
+                tracing::warn!("device directory is not private; ignoring it");
+                return None;
+            }
+            Ok(_) => {}
+        }
+        let key = match revocation::read_private_json::<Key>(&device.join("key.json"), 8192) {
+            Ok(key) => key,
+            Err(error) => {
+                tracing::warn!(error = %error, "device key unreadable; ignoring the certificate");
+                return None;
+            }
+        };
+        let usable = key.is_some_and(|key| {
+            base64::engine::general_purpose::STANDARD
+                .decode(key.seed)
+                .is_ok_and(|seed| seed.len() == 32)
+        });
+        if !usable {
+            tracing::warn!("device key missing or invalid; ignoring the certificate");
+            return None;
+        }
+        let path = device.join("certificate.json");
         // Opened once and checked on the open handle, so a file swapped in after a check is
         // never read: a symlink, a loose mode or more than 8 KiB counts as no certificate.
         let certificate = match revocation::read_private_json::<Certificate>(&path, 8192) {
@@ -349,7 +384,6 @@ impl Runtime {
                 return None;
             }
         };
-        use base64::Engine;
         let serial = base64::engine::general_purpose::STANDARD
             .decode(certificate.payload)
             .ok()
@@ -2450,17 +2484,35 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&certificate, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let not_provisioned = serde_json::json!({ "provisioned": false, "registered": false });
+        // The helper cannot present a certificate without its key.
+        assert_eq!(ask(runtime.clone()).await, not_provisioned);
+        let key = device.join("key.json");
+        std::fs::write(&key, r#"{"seed":"not base64"}"#).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(ask(runtime.clone()).await, not_provisioned);
+        std::fs::write(
+            &key,
+            serde_json::to_vec(&serde_json::json!({
+                "seed": base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             ask(runtime.clone()).await,
             serde_json::json!({ "provisioned": true, "serial": serial, "registered": false })
         );
 
-        // A certificate others can read is not shown as a provisioning.
+        // A key, certificate or directory others can read is not shown as a provisioning.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(ask(runtime.clone()).await, not_provisioned);
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&certificate, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(
-            ask(runtime).await,
-            serde_json::json!({ "provisioned": false, "registered": false })
-        );
+        assert_eq!(ask(runtime.clone()).await, not_provisioned);
+        std::fs::set_permissions(&certificate, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&device, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(ask(runtime).await, not_provisioned);
     }
 
     #[tokio::test]
