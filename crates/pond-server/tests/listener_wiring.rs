@@ -75,12 +75,16 @@ async fn harness_with(insecure: Option<pond_api::insecure_dev::InsecureDevLan>) 
     let credential = pond_api::host_guard::HostCredential::generate();
     #[cfg(unix)]
     let presence = embedded.clone();
+    // Serves `/` when only the build.rs placeholder is embedded, as on a fresh checkout.
+    let web = test.dir.path().join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    std::fs::write(web.join("index.html"), "<!doctype html>").unwrap();
     let listeners = compose(
         std::sync::Arc::new(pond_api::AppState {
             handshake: std::sync::Arc::new(PairedPhone(test.handshake)),
             ..test.state
         }),
-        std::path::PathBuf::from("pond-desktop/dist"),
+        web,
         transport,
         credential.clone(),
         insecure,
