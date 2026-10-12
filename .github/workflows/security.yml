@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v7
 
       # The scanner action bundles its own Go, and it was older than the
-      # toolchain native/pondnet/go.mod asks for (1.27.1). Its reachability
+      # toolchain native/pondnet/go.mod asks for. Its reachability
       # analysis could not load the standard library, said so in a line nobody
       # reads -- "Failed to run code analysis (govulncheck) ... loading
       # packages" -- and fell back to matching the module graph. A blocking gate
@@ -50,7 +50,7 @@ jobs:
       # when a vulnerable module appears anywhere in the requirement graph.
       - name: govulncheck (reachable vulnerabilities)
         working-directory: native/pondnet
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       # Membership, kept alongside: this catches a vulnerable dependency that
       # reachability analysis cannot see, such as one reached only through

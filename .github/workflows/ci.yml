@@ -61,7 +61,7 @@ jobs:
       - name: Vet
         run: go vet -mod=readonly ./...
       - name: Vulnerability reachability
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
       - name: Production commands
         run: go build -mod=readonly ./cmd/...
       - name: Jetson helper cross-compilation
@@ -94,8 +94,14 @@ jobs:
   # Formatting, lints and the fast test suite. Excludes crates that pull the Goose submodule or
   # native system libs (pond-adapters-goose, pond-adapters-local-inference,
   # pond-adapters-face-onnx, pond-server) to keep compile time reasonable.
+  #
+  # A pull request from a fork gets no repository secrets, so CARGO_GITHUB_TOKEN is empty there
+  # and the private llama-cpp-rs-giap fetch cannot succeed. Failing on a cause the author cannot
+  # fix was most of this job's red, so a fork PR skips it and `rust-fork-notice` says why. Pushes
+  # and same-repository PRs still run it, and still fail loudly when the secret is missing.
   rust:
     name: Rust — fmt / clippy / test
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -292,6 +298,17 @@ jobs:
   # Runs Vitest unit tests and Playwright E2E tests.
   # Playwright spins up the Vite dev server itself (no pond-server process needed —
   # all API calls are intercepted by page.route() mocks in the test files).
+  rust-fork-notice:
+    name: Rust — skipped on a fork PR
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain the skip
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          echo "::warning title=Rust not verified on this PR::$HEAD_REPO is a fork, and fork PRs get no CARGO_GITHUB_TOKEN, so the private jarida-io/llama-cpp-rs-giap dependency cannot be fetched. Push the branch to jarida-io/goose-in-a-pond to run the Rust checks before merging. See scripts/ci/README.md."
+
   matter-server:
     name: Matter controller — tsc / vitest
     runs-on: ubuntu-latest

@@ -1,9 +1,9 @@
 module github.com/Exile10/goose-in-a-pond/native/pondnet
 
-go 1.27.1
+go 1.27.2
 
 require (
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sys v0.48.0
 	golang.org/x/time v0.15.0
 	tailscale.com v1.102.4
