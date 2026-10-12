@@ -170,6 +170,20 @@ test_a_new_build_is_staged_then_started_detached() {
   contains "$(cat "$W/rsync.log")" ".cache/giap-deploy/" && contains "$(cat "$W/remote.log")" "setsid -f bash run-build.sh"
 }
 
+test_a_short_device_stops_the_pond_for_the_build_only_when_it_restarts_it() {
+  world; JETSON_ADDR=192.168.1.11; JETSON_NAME=nano.local; JETSON_ALIAS=nano
+  jetson_ssh() { printf '%s\n' "$*" >>"$W/remote.log"; case "$*" in *MemAvailable*) cat "$W/free" ;; esac; }
+  echo 380 >"$W/free"
+  out="$(jetson_make_room_for_build 1)" || return 1
+  contains "$out" "stopping the pond" && contains "$(cat "$W/remote.log")" "systemctl --user stop" || return 1
+  : >"$W/remote.log"
+  out="$(jetson_make_room_for_build 0 2>&1)" || return 1
+  contains "$out" "may run out of memory" && lacks "$(cat "$W/remote.log")" "systemctl" || return 1
+  echo 6000 >"$W/free"; : >"$W/remote.log"
+  out="$(jetson_make_room_for_build 1)" || return 1
+  contains "$out" "enough to build" && lacks "$(cat "$W/remote.log")" "systemctl"
+}
+
 for fn in $(declare -F | awk '{print $3}' | grep '^test_'); do
   t "${fn#test_}" "$fn"
 done

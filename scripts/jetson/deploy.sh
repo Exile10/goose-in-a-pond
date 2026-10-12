@@ -97,6 +97,7 @@ echo "==> [3/5] Building web UI locally and syncing dist"
 jetson_rsync "${REPO_ROOT}/pond-desktop/dist/" "${REMOTE_REPO}/pond-desktop/dist/"
 
 echo "==> [4/5] Release build on the Jetson (CUDA sm_87) — this is the slow step"
+jetson_make_room_for_build "${RESTART}"
 # CMAKE_CUDA_ARCHITECTURES=87 makes ggml emit a real sm_87 cubin; without it the
 # build ships compute_80 PTX that the driver JIT-compiles at first model load.
 # whisper/cuda moves ASR decode onto the GPU (research R7: ~20s of audio in

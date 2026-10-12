@@ -207,3 +207,21 @@ jetson_follow() {
     sleep "$JETSON_POLL_SECONDS"
   done
 }
+
+# Make room for the build: its final link needs a few GB, and with a model loaded the board has a
+# few hundred MB, so the kernel kills the link or the pond. Decided from what is free right now;
+# below JETSON_BUILD_MIN_MB the pond is stopped, when the deploy is going to restart it anyway.
+: "${JETSON_BUILD_MIN_MB:=3000}"
+jetson_make_room_for_build() {
+  local will_restart="$1" free_mb
+  free_mb="$(jetson_ssh "awk '/^MemAvailable:/ { print int(\$2 / 1024) }' /proc/meminfo")" || free_mb=""
+  case "$free_mb" in '' | *[!0-9]*) echo "    (could not read the device's free memory; building as it is)"; return 0 ;; esac
+  if [ "$free_mb" -ge "$JETSON_BUILD_MIN_MB" ]; then
+    echo "    ${free_mb} MB free on the device: enough to build beside the running pond"
+  elif [ "$will_restart" = 1 ]; then
+    echo "    ${free_mb} MB free on the device: stopping the pond for the build (step 5 starts it again)"
+    jetson_ssh "systemctl --user stop goose-in-a-pond.service" || true
+  else
+    echo "    WARNING: only ${free_mb} MB free and --no-restart leaves the pond running; the link may run out of memory" >&2
+  fi
+}
