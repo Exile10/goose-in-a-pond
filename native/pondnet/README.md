@@ -21,10 +21,12 @@ service addresses (`100.100.100.100`, `fd7a:115c:a1e0::53`) as targets, and
 listener at 64 sockets, closes idle connections after 60 s, and answers
 `502 {"error":"embedded_bridge_unavailable"}` when the Pond sends no response headers
 within 30 s. The coordinator client (`coordinatorClient`) ignores proxy environment
-variables and follows no redirects. `Submit` refuses a coordinator answer with unknown
-fields, trailing data, an unknown status or role, or a malformed revision; for an
-enroll or replace, one naming a different role or machine key than asked; and for a
-revoke, one that does not confirm the device as `revoked`.
+variables and follows no redirects. `Submit` refuses a coordinator answer over 4 KB,
+with trailing data, an unknown status or role, or a malformed revision; for an enroll
+or replace, one naming a different role or machine key than asked; and for a revoke,
+one that does not confirm the device as `revoked`. It ignores fields it does not know
+(2026-10-12), so the service can add one without breaking Ponds already in homes; the
+checks above are what stop a proxy or a confused service describing another device.
 
 `Node.Dial` uses `internal/tailnetdial`, which calls the userspace TCP stack directly.
 Do not replace it with `tsnet.Server.Dial`: the general-purpose tsnet dialer can use

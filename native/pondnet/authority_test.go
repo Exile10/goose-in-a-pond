@@ -136,6 +136,32 @@ func TestCoordinatorAnswersMustDescribeTheDeviceAsked(t *testing.T) {
 	}
 }
 
+func TestAnAnswerMayCarryFieldsThisHelperDoesNotKnow(t *testing.T) {
+	machine := "mkey:" + strings.Repeat("a", 64)
+	enroll := enrollment.Approval{Action: "enroll", Role: "phone", MachineKey: machine}
+	answer := func(fields string) string {
+		return `{"role":"phone","status":"pending","machineKey":"` + machine + `","revision":"ABCDEFGHIJKLMNOPQRSTUVWXYZ"` + fields + `}`
+	}
+	device, err := decodeAnswer(strings.NewReader(answer(`,"addedLater":{"anything":1}`)), enroll)
+	if err != nil {
+		t.Fatalf("an answer with a field added later was refused: %v", err)
+	}
+	if device.MachineKey != machine || device.Status != "pending" {
+		t.Fatalf("decoded %+v", device)
+	}
+	for name, body := range map[string]string{
+		"trailing data":  answer(``) + `{}`,
+		"unknown status": strings.Replace(answer(`,"addedLater":1`), `"pending"`, `"granted"`, 1),
+		"other role":     strings.Replace(answer(`,"addedLater":1`), `"phone"`, `"pond"`, 1),
+		"other device":   strings.Replace(answer(`,"addedLater":1`), machine, "mkey:"+strings.Repeat("b", 64), 1),
+		"oversized":      answer(`,"addedLater":"` + strings.Repeat("x", 4096) + `"`),
+	} {
+		if _, err := decodeAnswer(strings.NewReader(body), enroll); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
 func TestTheCoordinatorClientIgnoresProxySettings(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
 	transport, ok := coordinatorClient().Transport.(*http.Transport)

@@ -128,6 +128,12 @@ Deploy this service before any Pond that sends an invite. The registration is
 decoded strictly, so an older service answers `400` to a registration carrying one;
 a Pond sends none when the field is left empty.
 
+A Pond's helper ignores fields it does not know in the service's answer to an approval
+(2026-10-12). Helpers before that refuse such an answer outright, so do not add a field
+to that answer until the Ponds this service admits run a helper from 2026-10-12 or
+later. The answer's status set is closed either way: a new status still needs every
+Pond updated first.
+
 ### Device certificates (2026-10-05)
 
 A Pond imaged by the operator needs no invite. Imaging gives it a device key, and the
