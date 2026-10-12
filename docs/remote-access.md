@@ -440,6 +440,14 @@ profile switch or a service stop does not throw it away. The companion app's
 Android and iOS plugins call `Disable` when remote access is switched off or the
 pairing is forgotten (goose-on-the-go `feature/phone-netmap-cache`, 2026-10-05).
 
+`Disable` erases the running node's cache wherever that node ran (2026-10-12,
+#491). Until then it erased only the directory it was given and never compared
+it with the running node's, so a caller that passed another profile's directory
+stopped the node and left its map on disk. It now records the running node's
+directory before stopping it and, when the two differ, erases the cache in both,
+writes the mismatch to the event log, and returns every failure joined
+(`cacheDirectories`, `native/pondnet/mobile/mobile.go`).
+
 **Kill switch.** `TS_USE_CACHED_NETMAP=false` in a node's environment turns the
 cache off. tailscale reads the knob on every check, and with it off it neither
 loads nor writes a cache.
