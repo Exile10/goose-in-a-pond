@@ -301,6 +301,14 @@ async fn pond_is_onboarded(state: &crate::AppState) -> bool {
     }
 }
 
+/// A sign-in callback's query carries the provider's one-time code and state, so it is not logged.
+fn loggable_query(uri: &axum::http::Uri) -> &str {
+    if uri.path().ends_with("/oauth/callback") {
+        return "<redacted>";
+    }
+    uri.query().unwrap_or("")
+}
+
 /// Request/response logging at debug level (visible under `pond-server serve --debug`).
 pub async fn log_requests(req: Request, next: Next) -> Response {
     let method = req.method().clone();
@@ -310,7 +318,7 @@ pub async fn log_requests(req: Request, next: Next) -> Response {
     tracing::debug!(
         method = %method,
         path   = %uri.path(),
-        query  = %uri.query().unwrap_or(""),
+        query  = %loggable_query(&uri),
         "--> incoming request"
     );
 
@@ -431,6 +439,16 @@ pub async fn auth_middleware(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sign_in_callbacks_code_is_not_logged() {
+        let callback: axum::http::Uri = "/api/v1/oauth/callback?code=secret-code&state=s"
+            .parse()
+            .unwrap();
+        assert_eq!(super::loggable_query(&callback), "<redacted>");
+        let other: axum::http::Uri = "/api/v1/chat?limit=5".parse().unwrap();
+        assert_eq!(super::loggable_query(&other), "limit=5");
+    }
+
     use super::*;
 
     #[test]
