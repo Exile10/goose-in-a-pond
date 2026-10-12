@@ -318,7 +318,7 @@ pub(crate) fn should_send_auth_on_redirect(host: &str) -> bool {
 pub fn build_redirect_aware_client(_token: Option<&str>) -> Result<reqwest::Client> {
     use reqwest::redirect::Policy;
 
-    reqwest::Client::builder()
+    pond_net::client_builder()
         .redirect(Policy::none())
         .build()
         .map_err(|e| anyhow!("failed to build redirect-aware client: {e}"))

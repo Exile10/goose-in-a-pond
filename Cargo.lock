@@ -11207,6 +11207,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "pond-core",
+ "pond-net",
  "quick-xml",
  "reqwest 0.13.3",
  "tokio",
@@ -11245,6 +11246,7 @@ dependencies = [
  "pond-core",
  "pond-hf-cache",
  "pond-mcp-server",
+ "pond-net",
  "reqwest 0.13.3",
  "rmcp",
  "serde",
@@ -11317,6 +11319,7 @@ dependencies = [
  "async-trait",
  "futures",
  "pond-core",
+ "pond-net",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
@@ -11417,6 +11420,7 @@ dependencies = [
  "chrono",
  "futures",
  "pond-core",
+ "pond-net",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
@@ -11434,6 +11438,7 @@ dependencies = [
  "async-trait",
  "futures",
  "pond-core",
+ "pond-net",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
@@ -11509,6 +11514,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "pond-core",
+ "pond-net",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
@@ -11544,6 +11550,7 @@ dependencies = [
  "chrono",
  "futures",
  "pond-core",
+ "pond-net",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
@@ -11584,6 +11591,7 @@ dependencies = [
  "pond-core",
  "pond-hf-cache",
  "pond-infra",
+ "pond-net",
  "rand 0.8.6",
  "reqwest 0.13.3",
  "serde",
@@ -11665,6 +11673,7 @@ dependencies = [
  "anyhow",
  "fs2",
  "pond-core",
+ "pond-net",
  "reqwest 0.13.3",
  "tempfile",
  "thiserror 1.0.69",
@@ -11708,6 +11717,7 @@ dependencies = [
  "jsonwebtoken",
  "once_cell",
  "pond-core",
+ "pond-net",
  "rand 0.8.6",
  "regex",
  "reqwest 0.13.3",
@@ -11758,6 +11768,7 @@ dependencies = [
  "once_cell",
  "pond-adapters-weather",
  "pond-core",
+ "pond-net",
  "reqwest 0.13.3",
  "rmcp",
  "schemars 1.2.1",
@@ -11781,6 +11792,16 @@ dependencies = [
  "rand 0.10.1",
  "rand_core 0.6.4",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pond-net"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "reqwest 0.13.3",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -11834,6 +11855,7 @@ dependencies = [
  "pond-infra-scheduler",
  "pond-mcp-server",
  "pond-mesh-protocol",
+ "pond-net",
  "pond-voice",
  "predicates",
  "qrcode",

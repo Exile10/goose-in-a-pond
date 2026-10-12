@@ -3104,3 +3104,28 @@ completion).**
   and `cargo clippy --locked --all-targets` in `services/pondcredentials` (32 service tests); `cargo
   clippy --locked -p pond-api -p pond-adapters-uber --all-targets` with nothing in the changed code;
   `cargo check --locked -p pond-server --all-targets`; `cargo fmt --check` in both workspaces.
+
+**2026-10-12 — Name lookups without an IPv6 route ask for IPv4 only (PAI-2 egress; not a PAI
+milestone completion).**
+
+- **What landed.** On the Orin every lookup of `api.open-meteo.com` and `credentials.jarida.io`
+  took 15 s: the home router never answers the IPv6 (AAAA) question for a name that has no IPv6
+  address, and a lookup waits for both answers. The weather tool allows 10 s in all, so it failed
+  every time. The new leaf crate `pond-net` builds every HTTP client (29 production clients in 12
+  crates). Its resolver asks the system resolver for IPv4 addresses only when the device has no
+  route to the IPv6 internet, which serve and chat decide at startup in `apply_device_choices`
+  and log as `kind="dns_family"`. With an IPv6 route, lookups are reqwest's default.
+- **PAI-2 (egress).** No new sender and no new destination: the same system resolver answers
+  (`/etc/hosts`, `.local` names, the household's DNS server), the route probe is a UDP `connect`
+  that sends nothing, and no lookup moves to a public resolver. `egress_guard` gained
+  `every_http_client_is_built_by_pond_net` and
+  `the_long_running_entry_points_decide_how_to_look_names_up_at_startup`;
+  `every_reqwest_crate_owns_a_classified_sender` names `pond-net` as a client builder that sends
+  nothing itself.
+- **Other invariants.** Preamble, guest, turn blocking: none. No `Settings` field, no migration.
+- **Not done.** Goose's own clients (the extension malware check against osv.dev, remote MCP
+  transports) are built inside the fork and still look up both families.
+- **Verification** (Mac, at merge). `cargo test -p pond-net` 7/7; `egress_guard` 9/9, including
+  a mutation check that a reintroduced `reqwest::Client::new()` fails the new guard. Jerry asked
+  for the merge and deploy before the full Mac suite finished; its result is recorded with the
+  deploy.

@@ -24,7 +24,7 @@ impl OllamaInferenceProvider {
     /// `base_url` e.g. `"http://localhost:11434"`; `model` e.g. `"gemma4:latest"`.
     pub fn new(base_url: &str, model: &str) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: pond_net::client(),
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
         }

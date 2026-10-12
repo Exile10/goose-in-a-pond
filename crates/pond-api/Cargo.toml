@@ -21,6 +21,7 @@ pond-adapters-caldav = { workspace = true }
 pond-core = { workspace = true }
 pond-hf-cache = { workspace = true }
 pond-infra = { workspace = true }
+pond-net = { workspace = true }
 pond-adapters-llamafile = { workspace = true }
 pond-adapters-ollama = { path = "../pond-adapters-ollama" }
 pond-adapters-local-inference = { workspace = true, optional = true }

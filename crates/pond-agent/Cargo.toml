@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 pond-core = { path = "../pond-core" }
+pond-net = { path = "../pond-net" }
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }

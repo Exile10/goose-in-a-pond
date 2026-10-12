@@ -42,7 +42,7 @@ impl AgentScheduleExecutor {
         Self {
             agent,
             session_storage,
-            http_client: reqwest::Client::new(),
+            http_client: pond_net::client(),
             device_control,
             semaphore: Semaphore::new(max_concurrent.max(1) as usize),
             voice_output,

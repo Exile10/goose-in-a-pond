@@ -1,0 +1,21 @@
+[package]
+name = "pond-net"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "pond_net"
+path = "src/lib.rs"
+
+[dependencies]
+# Every pond HTTP client is built here, so each one resolves names the way `dns` decides. A leaf:
+# no pond crate, so anything that sends can depend on it without a cycle.
+libc = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

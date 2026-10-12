@@ -204,7 +204,7 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
 
         if matches!(request.kind.as_str(), "http" | "streamable_http") {
             if let Some(uri) = &request.uri {
-                let client = reqwest::Client::builder()
+                let client = pond_net::client_builder()
                     .timeout(std::time::Duration::from_secs(5))
                     .build()
                     .unwrap_or_default();

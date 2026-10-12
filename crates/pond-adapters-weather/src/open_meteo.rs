@@ -85,7 +85,7 @@ pub struct OpenMeteoWeatherAdapter {
 impl OpenMeteoWeatherAdapter {
     /// Create with real Open-Meteo endpoints.
     pub fn new(latitude: f64, longitude: f64, location_name: impl Into<String>) -> Self {
-        let client = reqwest::Client::new();
+        let client = pond_net::client();
         Self {
             geocoder: Geocoder::new(client.clone()),
             client,
@@ -107,7 +107,7 @@ impl OpenMeteoWeatherAdapter {
         weather_base_url: impl Into<String>,
         geocoding_base_url: impl Into<String>,
     ) -> Self {
-        let client = reqwest::Client::new();
+        let client = pond_net::client();
         let geo_url = geocoding_base_url.into();
         Self {
             geocoder: Geocoder::with_base_url(client.clone(), &geo_url),
