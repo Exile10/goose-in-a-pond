@@ -3,10 +3,15 @@
 //! token) here, this adds the secret, and Uber's tokens go straight back. Nothing is stored or
 //! logged: the member's tokens live only on their own pond.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+use crate::{Client, RateLimiter};
+
+/// The one key the relay's shared budget is counted under.
+const EVERY_POND: Client = Client::V4([0; 4]);
 
 /// Uber's documented token endpoint.
 pub const DEFAULT_TOKEN_URL: &str = "https://auth.uber.com/oauth/v2/token";
@@ -14,6 +19,10 @@ pub const DEFAULT_TOKEN_URL: &str = "https://auth.uber.com/oauth/v2/token";
 /// Shorter than a pond waits for this service (25 s), so an exchange finished here always reaches a
 /// pond that is still waiting: Uber's code is single use.
 const UBER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Every exchange spends Jarida's client secret on a call to Uber, so the per-pond limit alone
+/// would let many addresses together get Jarida's app throttled for every pond.
+const DEFAULT_CALLS_PER_MINUTE: u32 = 600;
 
 /// The only return address a pond's sign-in uses: its own loopback OAuth callback. Refusing
 /// anything else keeps the relay from exchanging codes issued to some other site.
@@ -25,6 +34,7 @@ pub struct UberConfig {
     pub client_id: String,
     pub client_secret: String,
     pub token_url: String,
+    pub calls_per_minute: u32,
 }
 
 impl UberConfig {
@@ -51,10 +61,19 @@ impl UberConfig {
         if client_secret.is_empty() {
             return Err("UBER_CLIENT_SECRET_FILE is empty.".into());
         }
+        let calls_per_minute = match value("UBER_CALLS_PER_MINUTE") {
+            None => DEFAULT_CALLS_PER_MINUTE,
+            Some(v) => v
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or("UBER_CALLS_PER_MINUTE must be a whole number of at least 1.")?,
+        };
         Ok(Some(UberConfig {
             client_id,
             client_secret,
             token_url: value("UBER_TOKEN_URL").unwrap_or_else(|| DEFAULT_TOKEN_URL.to_string()),
+            calls_per_minute,
         }))
     }
 }
@@ -62,6 +81,7 @@ impl UberConfig {
 pub struct UberRelay {
     config: UberConfig,
     http: reqwest::Client,
+    budget: RateLimiter,
 }
 
 /// How a relayed exchange ended, ready to become a response.
@@ -92,13 +112,16 @@ pub struct Refresh {
 
 impl UberRelay {
     pub fn new(config: &UberConfig) -> Result<UberRelay, String> {
+        // A redirect would carry the form, client secret included, to wherever it points.
         let http = reqwest::Client::builder()
             .timeout(UBER_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
         Ok(UberRelay {
             config: config.clone(),
             http,
+            budget: RateLimiter::new(config.calls_per_minute, Duration::from_secs(60), 1),
         })
     }
 
@@ -134,6 +157,10 @@ impl UberRelay {
     }
 
     async fn post(&self, grant: &[(&str, &str)]) -> Relayed {
+        if self.budget.check(&EVERY_POND, Instant::now()).is_err() {
+            tracing::warn!("the relay's budget of calls to Uber is spent for this minute");
+            return Relayed::Unavailable;
+        }
         let mut form = vec![
             ("client_id", self.config.client_id.as_str()),
             ("client_secret", self.config.client_secret.as_str()),
