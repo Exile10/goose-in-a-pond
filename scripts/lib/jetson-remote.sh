@@ -217,7 +217,7 @@ jetson_make_room_for_build() {
   free_mb="$(jetson_ssh "awk '/^MemAvailable:/ { print int(\$2 / 1024) }' /proc/meminfo")" || free_mb=""
   case "$free_mb" in '' | *[!0-9]*) echo "    (could not read the device's free memory; building as it is)"; return 0 ;; esac
   if [ "$free_mb" -ge "$JETSON_BUILD_MIN_MB" ]; then
-    echo "    ${free_mb} MB free on the device: enough to build beside the running pond"
+    echo "    ${free_mb} MB free on the device: enough to build without stopping anything"
   elif [ "$will_restart" = 1 ]; then
     echo "    ${free_mb} MB free on the device: stopping the pond for the build (step 5 starts it again)"
     jetson_ssh "systemctl --user stop goose-in-a-pond.service" || true
