@@ -160,8 +160,8 @@ pub fn egress_verdict(host: &str, mode: NetworkMode) -> Result<(), &'static str>
 pub fn check_egress(url: &str) -> Result<(), EgressDenied> {
     let mode = network_mode();
     let host = extract_host(url);
-    egress_verdict(host, mode)
-        .map_err(|reason| refuse(host, mode, reason, &current_tool(), &current_session_id()))
+    egress_verdict(&host, mode)
+        .map_err(|reason| refuse(&host, mode, reason, &current_tool(), &current_session_id()))
 }
 
 /// As [`check_egress`], attributed to the given tool and session instead of the globals, for
@@ -169,7 +169,7 @@ pub fn check_egress(url: &str) -> Result<(), EgressDenied> {
 pub fn check_egress_for(url: &str, tool: &str, session_id: &str) -> Result<(), EgressDenied> {
     let mode = network_mode();
     let host = extract_host(url);
-    egress_verdict(host, mode).map_err(|reason| refuse(host, mode, reason, tool, session_id))
+    egress_verdict(&host, mode).map_err(|reason| refuse(&host, mode, reason, tool, session_id))
 }
 
 fn refuse(
@@ -352,7 +352,7 @@ pub fn record_egress_for(
 ) {
     let host = extract_host(url);
     append_event(egress_event(
-        host, tool, session_id, method, status, latency_ms,
+        &host, tool, session_id, method, status, latency_ms,
     ));
 }
 
@@ -422,19 +422,23 @@ pub fn classify_host(host: &str) -> PrivacySensitivity {
 
 fn is_loopback(host: &str) -> bool {
     host == "localhost"
-        || host == "::1"
-        || host == "127.0.0.1"
-        || host.starts_with("127.")
         || host.ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Extract the bare host from a URL (no scheme, port, or path).
-pub fn extract_host(url: &str) -> &str {
-    url.find("://")
-        .map(|i| &url[i + 3..])
-        .and_then(|s| s.split('/').next())
-        .and_then(|h| h.split(':').next())
-        .unwrap_or("unknown")
+/// The bare host a URL connects to (no scheme, userinfo, port, or path), as reqwest reads it.
+pub fn extract_host(url: &str) -> String {
+    match url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host().map(|h| h.to_owned()))
+    {
+        Some(url::Host::Domain(domain)) => domain,
+        Some(url::Host::Ipv4(ip)) => ip.to_string(),
+        Some(url::Host::Ipv6(ip)) => ip.to_string(),
+        None => "unknown".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -510,20 +514,50 @@ mod tests {
         let host = extract_host("not a url");
         assert_eq!(host, "unknown");
         assert!(
-            egress_verdict(host, NetworkMode::Allowlist).is_err(),
+            egress_verdict(&host, NetworkMode::Allowlist).is_err(),
             "an unparseable host must not be permitted under allowlist"
         );
         assert!(
-            egress_verdict(host, NetworkMode::Offline).is_err(),
+            egress_verdict(&host, NetworkMode::Offline).is_err(),
             "an unparseable host must not be permitted under offline"
         );
+    }
 
-        // Known limitation: bracketed IPv6 yields host "[", so it is refused (fails closed).
-        let v6 = extract_host("http://[::1]:8080/health");
-        assert!(
-            egress_verdict(v6, NetworkMode::Offline).is_err(),
-            "bracketed IPv6 loopback is not recognised today; it must fail CLOSED"
-        );
+    #[test]
+    fn the_gate_judges_the_host_a_request_really_goes_to() {
+        for url in [
+            "https://en.wikipedia.org:x@attacker.example/leak",
+            "https://en.wikipedia.org@attacker.example/leak",
+            "https://attacker.example?.wikipedia.org",
+            "https://attacker.example#.wikipedia.org",
+            "https://attacker.example\\.wikipedia.org",
+        ] {
+            assert!(
+                egress_verdict(&extract_host(url), NetworkMode::Allowlist).is_err(),
+                "{url} goes to attacker.example, so allowlist must refuse it"
+            );
+        }
+        for url in [
+            "http://localhost:1@attacker.example/",
+            "http://127.0.0.1@attacker.example/",
+            "http://127.attacker.example/",
+        ] {
+            assert!(
+                egress_verdict(&extract_host(url), NetworkMode::Offline).is_err(),
+                "{url} is not loopback, so offline must refuse it"
+            );
+        }
+        for url in [
+            "http://127.0.0.1:8080/health",
+            "http://127.1:8080/health",
+            "http://[::1]:8080/health",
+            "http://LOCALHOST:11434/api",
+        ] {
+            assert!(
+                egress_verdict(&extract_host(url), NetworkMode::Offline).is_ok(),
+                "{url} is loopback, so offline must allow it"
+            );
+        }
     }
 
     #[test]
