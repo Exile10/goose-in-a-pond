@@ -40,6 +40,9 @@ ZEROS=0000000000000000000000000000000000000000000000000000000000000000
 eq()       { [ "$1" = "$2" ] || { printf 'expected [%s] got [%s]\n' "$2" "$1"; return 1; }; }
 contains() { case "$1" in *"$2"*) return 0 ;; *) printf 'expected to contain [%s] in [%s]\n' "$2" "$1"; return 1 ;; esac; }
 lacks()    { case "$1" in *"$2"*) printf 'expected NOT to contain [%s] in [%s]\n' "$2" "$1"; return 1 ;; *) return 0 ;; esac; }
+# names <dir>: the entries of <dir>, dot files included, one per line -- what `ls -A` lists, but
+# from a glob, so a file name reaches grep intact.
+names()    { local f; for f in "$1"/* "$1"/.[!.]* "$1"/..?*; do { [ -e "$f" ] || [ -L "$f" ]; } && printf '%s\n' "${f##*/}"; done; }
 skip()     { echo "$*"; exit "$SKIP"; }
 not_here() { echo "$*"; exit "$NOT_HERE"; }
 
@@ -438,7 +441,7 @@ t_install_swaps_the_whole_directory() {
   world; mkdir -p "$W/dest" "$W/stage"; printf 'old\n' > "$W/dest/old-only"; printf 'new\n' > "$W/stage/new-only"
   _litert_install "$W/stage" "$W/dest" || return 1
   [ -f "$W/dest/new-only" ] && [ ! -e "$W/dest/old-only" ] && [ ! -e "$W/stage" ] || return 1
-  eq "$(ls -A "$W" | grep -c '^dest\.old')" 0 || return 1
+  eq "$(names "$W" | grep -c '^dest\.old')" 0 || return 1
   _litert_install "$W/no-such-stage" "$W/dest" 2>/dev/null && return 1
   [ -f "$W/dest/new-only" ] || { echo "a failed swap lost the installed package"; return 1; }
 }
@@ -528,7 +531,7 @@ t_build_macos_end_to_end() {
   contains "$(tools_log)" "bazelisk build -c opt --config=macos_arm64 --define=litert_runtime_link_mode=dynamic --curses=no --color=no //c:litert-lm (in $W/LiteRT-LM)" || return 1
   contains "$(logged)" "ok: LiteRT-LM C API $LITERT_CAPI_VERSION for macos-arm64: 16 files verified in $dest" || return 1
   contains "$(logged)" "finds it through the record" || return 1
-  eq "$(ls -A "$GIAP_LITERT_HOME" | grep -c '^\.stage')" 0 || return 1
+  eq "$(names "$GIAP_LITERT_HOME" | grep -c '^\.stage')" 0 || return 1
   case "$(ls -ld "$dest")" in drwxr-xr-x*) ;; *) echo "package directory mode: $(ls -ld "$dest")"; return 1 ;; esac
 }
 t_build_passes_distdir_and_jobs_to_bazel() {
@@ -545,7 +548,7 @@ t_build_failure_installs_nothing() {
   litert_build macos-arm64 && return 1
   contains "$(logged)" "bad: the macos-arm64 build did not finish; nothing was installed" || return 1
   [ ! -e "$(litert_package_dir macos-arm64)" ] && [ ! -e "$(litert_record_file macos-arm64)" ] || return 1
-  eq "$(ls -A "$GIAP_LITERT_HOME" | grep -c '^\.stage')" 0
+  eq "$(names "$GIAP_LITERT_HOME" | grep -c '^\.stage')" 0
 }
 t_build_refuses_a_package_that_fails_verification() {
   world; fakes; stubs; fake_host Darwin arm64; own_src_at_pin macos-arm64; mk_built_fixtures
@@ -661,7 +664,7 @@ t_import_takes_in_a_package_built_elsewhere() {
   eq "$(litert_recorded_dir linux-arm64)" "$dest" && litert_verify "$dest" || { echo "$LITERT_VERIFY_PROBLEMS"; return 1; }
   cmp -s "$PKG/MANIFEST.sha256" "$dest/MANIFEST.sha256" || return 1
   contains "$(logged)" "files imported into $dest" || return 1
-  eq "$(ls -A "$GIAP_LITERT_HOME" | grep -c '^\.stage')" 0
+  eq "$(names "$GIAP_LITERT_HOME" | grep -c '^\.stage')" 0
 }
 t_import_refuses_another_pin_or_a_broken_package() {
   world; stubs; mk_pkg linux-arm64

@@ -97,11 +97,16 @@ run_test() {
     local parsed
     parsed=$(echo "$raw" | parse_events)
 
-    local tools=$(echo "$parsed" | grep '^TOOLS:' | cut -d: -f2-)
-    local tool_inputs=$(echo "$parsed" | grep '^TOOL_INPUTS:' | cut -d: -f2-)
-    local results_full=$(echo "$parsed" | grep '^RESULTS_FULL:' | cut -d: -f2-)
-    local text=$(echo "$parsed" | grep '^TEXT:' | cut -d: -f2-)
-    local errors=$(echo "$parsed" | grep '^ERRORS:' | cut -d: -f2-)
+    local tools
+    tools=$(echo "$parsed" | grep '^TOOLS:' | cut -d: -f2-) || true
+    local tool_inputs
+    tool_inputs=$(echo "$parsed" | grep '^TOOL_INPUTS:' | cut -d: -f2-) || true
+    local results_full
+    results_full=$(echo "$parsed" | grep '^RESULTS_FULL:' | cut -d: -f2-) || true
+    local text
+    text=$(echo "$parsed" | grep '^TEXT:' | cut -d: -f2-) || true
+    local errors
+    errors=$(echo "$parsed" | grep '^ERRORS:' | cut -d: -f2-) || true
 
     # Extract ToolCaller activity for THIS test from server log
     if [ -n "$SERVER_LOG" ] && [ -f "$SERVER_LOG" ]; then

@@ -23,6 +23,9 @@ t() {
 eq()       { [ "$1" = "$2" ] || { printf 'expected [%s] got [%s]\n' "$2" "$1"; return 1; }; }
 contains() { case "$1" in *"$2"*) return 0 ;; *) printf 'expected to contain [%s] in [%s]\n' "$2" "$1"; return 1 ;; esac; }
 lacks()    { case "$1" in *"$2"*) printf 'expected NOT to contain [%s] in [%s]\n' "$2" "$1"; return 1 ;; *) return 0 ;; esac; }
+# names <dir>: the entries of <dir>, dot files included, one per line -- what `ls -A` lists, but
+# from a glob, so a file name reaches grep intact.
+names()    { local f; for f in "$1"/* "$1"/.[!.]* "$1"/..?*; do { [ -e "$f" ] || [ -L "$f" ]; } && printf '%s\n' "${f##*/}"; done; }
 
 # A directory of symlinks to the real tools the code needs, and nothing else: no node on it. gzip
 # because GNU tar runs it for `-z`, where macOS's tar decompresses by itself.
@@ -214,7 +217,7 @@ t_download_installs_verified_node() {
   eq "$bin" "$GIAP_NODE_HOME/v22.99.0/bin" || return 1
   eq "$("$bin/node" --version)" v22.99.0 || return 1
   eq "$("$GIAP_NODE_HOME/current/bin/node" --version)" v22.99.0 || { echo "current does not point at it"; return 1; }
-  [ -z "$(ls -A "$GIAP_NODE_HOME" | grep '^\.tmp')" ] || { echo "scratch left behind"; return 1; }
+  [ -z "$(names "$GIAP_NODE_HOME" | grep '^\.tmp')" ] || { echo "scratch left behind"; return 1; }
 }
 t_download_is_idempotent() {
   world; fixture 22 22.99.0 linux-x64
@@ -231,7 +234,7 @@ t_download_refuses_a_bad_checksum() {
   contains "$out" "CHECKSUM MISMATCH" || return 1
   contains "$out" "Nothing was installed" || return 1
   [ ! -e "$GIAP_NODE_HOME/v22.99.0" ] || { echo "a node that failed its checksum was installed"; return 1; }
-  [ -z "$(ls -A "$GIAP_NODE_HOME" 2>/dev/null | grep -v '^current$')" ] || { echo "left something behind: $(ls -A "$GIAP_NODE_HOME")"; return 1; }
+  [ -z "$(names "$GIAP_NODE_HOME" | grep -v '^current$')" ] || { echo "left something behind: $(ls -A "$GIAP_NODE_HOME")"; return 1; }
 }
 t_download_failure_leaves_nothing() {
   world; fixture 22 22.99.0 linux-x64

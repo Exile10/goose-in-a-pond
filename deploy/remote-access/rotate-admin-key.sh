@@ -41,7 +41,8 @@ chmod 400 "$SECRET"
 echo "recreating enrollment so it reads the new key"
 docker compose up -d --force-recreate enrollment >/dev/null 2>&1
 
-for i in $(seq 1 30); do
+state=unknown
+for _ in $(seq 1 30); do
   state="$(docker inspect -f '{{.State.Health.Status}}' goose-remote-access-enrollment-1 2>/dev/null || echo unknown)"
   [ "$state" = healthy ] && break
   sleep 2

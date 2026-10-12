@@ -14,7 +14,7 @@ build_desktop() {
     return
   fi
 
-  cd "${REPO_DIR}/pond-desktop"
+  cd "${REPO_DIR}/pond-desktop" || return
 
   log "Running npm install..."
   if npm install 2>&1 | tail -5; then
@@ -22,13 +22,14 @@ build_desktop() {
   else
     warn "npm install had issues"
     S_DESKTOP="failed"
-    cd "$REPO_DIR"
+    cd "$REPO_DIR" || return
     return
   fi
 
   # Nothing else to install: Electron and electron-builder are npm
   # devDependencies, so `npm install` above is the whole toolchain.
 
+  # shellcheck disable=SC2034  # read by print_summary in install-common.sh
   S_DESKTOP="ok"
-  cd "$REPO_DIR"
+  cd "$REPO_DIR" || return
 }

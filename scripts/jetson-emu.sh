@@ -40,7 +40,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
 PROFILE="orin-nano-8gb"
 DATA_DIR=""
@@ -154,8 +154,11 @@ cmd_run() {
     run_cmd=(cargo run -p pond-server --features local-inference -- serve)
   fi
 
+  local -a emu=() kv
+  while IFS= read -r kv; do emu+=("$kv"); done < <(emu_env)
+
   say "Running: ${run_cmd[*]}"
-  env $(emu_env | tr '\n' ' ') \
+  env "${emu[@]}" \
       POND_DATA_DIR="$DATA_DIR" \
       POND_DEV_ALLOW_LOOPBACK=1 \
       RUST_LOG="${RUST_LOG:-info}" \
@@ -173,8 +176,10 @@ cmd_test() {
   # it does not consult the profile, which is true by construction.
   local -a filter=()
   [ ${#CMD_ARGS[@]} -gt 0 ] && filter=("${CMD_ARGS[@]}")
+  local -a emu=() kv
+  while IFS= read -r kv; do emu+=("$kv"); done < <(emu_env)
 
-  env $(emu_env | tr '\n' ' ') \
+  env "${emu[@]}" \
     cargo test -p pond-core -p pond-adapters-local-inference "${filter[@]:-}"
 }
 

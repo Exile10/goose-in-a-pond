@@ -99,6 +99,7 @@ setup_mdns() {
     success "avahi-daemon running -- broadcasting ${current_host}.local"
     S_MDNS="ok"
   else
+    # shellcheck disable=SC2034  # read by print_summary in install-common.sh
     S_MDNS="skipped"
   fi
 
@@ -189,6 +190,7 @@ EOF
     S_SYSTEMD="ok"
   else
     warn "Service did not start cleanly -- check: journalctl -u ${SERVICE_NAME} -n 50"
+    # shellcheck disable=SC2034  # read by install.sh and print_summary in install-common.sh
     S_SYSTEMD="failed"
   fi
 }

@@ -59,6 +59,7 @@ detect_os() {
     *)       error "Unsupported OS: $(uname -s)"; exit 1 ;;
   esac
 
+  # shellcheck disable=SC2034  # ARCH is read by install.sh
   case "$(uname -m)" in
     x86_64|amd64)   ARCH="x86_64" ;;
     arm64|aarch64)   ARCH="aarch64" ;;
@@ -78,6 +79,7 @@ detect_os() {
   if command -v nvcc &>/dev/null; then
     HAS_CUDA=true
   elif [ -x /usr/local/cuda/bin/nvcc ]; then
+    # shellcheck disable=SC2034  # read by install.sh and install-build.sh
     HAS_CUDA=true
   fi
 }
@@ -112,6 +114,7 @@ resolve_data_dir() {
 # ── Argument parsing ─────────────────────────────────────────────────────────
 parse_args() {
   while [ $# -gt 0 ]; do
+    # shellcheck disable=SC2034  # the options are read by install.sh and the install-*.sh libs
     case "$1" in
       --production)    MODE="production"; shift ;;
       --jetson)        MODE="jetson"; shift ;;
