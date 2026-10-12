@@ -62,7 +62,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     ARCHS="$(lipo -archs "${SIDECAR}" 2>/dev/null || echo "")"
     case " ${ARCHS} " in
       *" ${HOST_ARCH} "*) ;;
-      "") echo "  note: could not read the sidecar's architectures; skipping that check" ;;
+      "  ") echo "  note: could not read the sidecar's architectures; skipping that check" ;;
       *) fail "sidecar is built for [${ARCHS}] but this host is ${HOST_ARCH}." ;;
     esac
   fi
