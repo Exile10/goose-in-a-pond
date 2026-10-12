@@ -188,6 +188,23 @@ once it is complete and carries that id. A truncated UDP answer is used only if
 nothing better arrives. A race that every server and transport loses ends at
 once, with one event-log line naming each failure, so Go moves straight to its
 next attempt. Losers cancelled because another server answered are not reported.
+
+A reply that says nothing about the name is held back the same way (2026-10-12,
+#491). Until then the first reply carrying the id won whatever its RCODE, so one
+server answering SERVFAIL fast failed a lookup that a slower server was about to
+answer. FORMERR, SERVFAIL, NOTIMP and REFUSED are held back, and so is a lame
+reply: NOERROR with no answer and no additional record from a server that
+claims neither authority nor recursion, the test Go's own resolver applies
+before it tries the next server (`errLameReferral` in `net/dnsclient_unix.go`).
+A usable answer from any server still wins. Otherwise the race ends, once every
+server has replied or failed, on the truncated answer if there is one, else on
+the first held-back reply, passed to Go unchanged so it reports the server's
+failure rather than a timeout, with one event-log line naming the RCODE.
+NXDOMAIN and NOERROR, with or without records, are answers and end the race as
+they arrive (`unusableReply`, `native/pondnet/mobile/dns.go`). A held-back reply
+waits for every other attempt, so when no usable answer comes and some server
+accepts TCP without ever answering on it, as Safaricom's first resolver does,
+the lookup lasts until its deadline instead of ending on the held-back reply.
 Before these changes, a cold start on cellular took fifteen seconds or more to
 bring the node up, and sometimes it never came up: netcheck and the DERP
 connection both need the coordinator's name resolved, under deadlines of about a
