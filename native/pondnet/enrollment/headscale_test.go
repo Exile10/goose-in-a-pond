@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestHeadscaleDistinguishesRejectedAndAmbiguousRegistration(t *testing.T) {
@@ -88,5 +91,61 @@ func TestHeadscalePolicyCarriesNodeAttributes(t *testing.T) {
 	}
 	if want = `{"acls":null,"nodeAttrs":[],"ssh":[],"tagOwners":{}}`; sent != want {
 		t.Fatalf("policy\n got %s\nwant %s", sent, want)
+	}
+}
+
+// The coordinator client bounds only the wait for response headers. An inventory
+// streamed for longer than that is still read, bounded by the caller's deadline; the
+// timeouts are scaled down so the test is quick.
+func TestASlowlyStreamedInventoryIsBoundedByTheCallersDeadline(t *testing.T) {
+	const count = 40
+	var stall atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if stall.Load() {
+			time.Sleep(500 * time.Millisecond)
+		}
+		flusher := w.(http.Flusher)
+		io.WriteString(w, `{"nodes":[`)
+		flusher.Flush()
+		for i := range count {
+			if i > 0 {
+				io.WriteString(w, ",")
+			}
+			fmt.Fprintf(w, `{"id":"%d","nodeKey":"nodekey:x","user":{"id":"1"}}`, i+1)
+			flusher.Flush()
+			time.Sleep(10 * time.Millisecond)
+		}
+		io.WriteString(w, `]}`)
+	}))
+	defer server.Close()
+	backend, err := NewHeadscale(server.URL, "fixture-credential")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.client.Timeout != 0 {
+		t.Fatal("a client-wide timeout still covers reading the body")
+	}
+	backend.client.Transport.(*http.Transport).ResponseHeaderTimeout = 100 * time.Millisecond
+
+	// The body takes about four times the header timeout to arrive.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	nodes, err := backend.Inventory(ctx)
+	if err != nil || len(nodes) != count {
+		t.Fatalf("read %d of %d nodes: %v", len(nodes), count, err)
+	}
+
+	// The caller's deadline still bounds the body.
+	short, stop := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer stop()
+	if _, err := backend.Inventory(short); err == nil {
+		t.Fatal("a body outlasting the deadline was read")
+	}
+
+	// And headers that do not come in time are given up on, whatever the deadline.
+	stall.Store(true)
+	started := time.Now()
+	if _, err := backend.Inventory(ctx); err == nil || time.Since(started) > 400*time.Millisecond {
+		t.Fatalf("stalled headers were waited on for %v: %v", time.Since(started), err)
 	}
 }

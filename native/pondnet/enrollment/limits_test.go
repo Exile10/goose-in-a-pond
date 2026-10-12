@@ -133,22 +133,56 @@ func TestClientAddressTrustsOnlyTheConfiguredProxy(t *testing.T) {
 	}
 }
 
-func TestAFullLimiterRefusesNewKeysInsteadOfForgettingEveryone(t *testing.T) {
+// A full table admits a new key only by forgetting one whose limit holds nobody back:
+// idle, or refilled. A spent budget is never forgotten, however many keys arrive.
+func TestAFullLimiterEvictsOnlyBudgetsItCanForget(t *testing.T) {
 	limits := newSources(rate.Limit(1.0/60.0), 1)
 	limits.maximum = 2
 	if !limits.allow("a") || limits.allow("a") {
 		t.Fatal("the first key's budget is wrong")
 	}
-	limits.allow("b")
+	if !limits.allow("b") {
+		t.Fatal("the second key was refused")
+	}
 	if limits.allow("c") {
-		t.Fatal("a new key was admitted to a full table")
+		t.Fatal("a new key was admitted to a table of spent budgets")
 	}
 	if limits.allow("a") {
 		t.Fatal("a flood reset an exhausted budget")
 	}
+
+	// A refused request does not refresh the key, so a flood cannot keep it current.
+	earlier := time.Now().Add(-time.Minute)
+	limits.seen["a"].last = earlier
+	if limits.allow("a") {
+		t.Fatal("an exhausted budget allowed a request")
+	}
+	if !limits.seen["a"].last.Equal(earlier) {
+		t.Fatal("a refused request refreshed the key")
+	}
+
+	// An idle key goes, even with its bucket still spent; the busy one stays.
 	limits.seen["b"].last = time.Now().Add(-2 * idle)
 	if !limits.allow("c") {
 		t.Fatal("an idle key was not evicted to make room")
+	}
+	if _, kept := limits.seen["b"]; kept {
+		t.Fatal("the idle key was kept")
+	}
+	if _, kept := limits.seen["a"]; !kept {
+		t.Fatal("a spent budget was evicted")
+	}
+
+	// A key whose bucket has refilled goes too, however recently it was used.
+	limits.seen["c"].limiter = rate.NewLimiter(limits.every, limits.burst)
+	if !limits.allow("d") {
+		t.Fatal("a refilled key was not evicted to make room")
+	}
+	if _, kept := limits.seen["c"]; kept {
+		t.Fatal("the refilled key was kept")
+	}
+	if _, kept := limits.seen["a"]; !kept || limits.allow("e") {
+		t.Fatal("a spent budget was evicted for a new key")
 	}
 }
 
@@ -215,7 +249,7 @@ func TestPolicyIsTheSameForTheSameStore(t *testing.T) {
 		if err := s.policy(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		got := fmt.Sprint(backend.rules)
+		got := fmt.Sprint(backend.rules, backend.attrs)
 		if first == "" {
 			first = got
 		} else if got != first {
@@ -224,5 +258,37 @@ func TestPolicyIsTheSameForTheSameStore(t *testing.T) {
 	}
 	if len(backend.rules) != 5 {
 		t.Fatalf("expected one rule per household, got %d", len(backend.rules))
+	}
+}
+
+// The inventory is indexed by node ID, and the first node with an ID decides, as a
+// scan would: a later duplicate neither grants nor withdraws permission.
+func TestPolicyMatchesTheFirstNodeWithAnID(t *testing.T) {
+	for _, order := range []string{"verified_first", "impostor_first"} {
+		t.Run(order, func(t *testing.T) {
+			s, _, backend := fixture(t)
+			s.Store.mu.Lock()
+			defer s.Store.mu.Unlock()
+			id := "household00000001"
+			key := "nodekey:" + strings.Repeat("a", 64)
+			pond := Registered{ID: "1", Key: key, UserID: "1", Addresses: []string{"100.64.0.1"}}
+			phone := Registered{ID: "2", Key: key, UserID: "1", Addresses: []string{"100.64.0.2"}}
+			impostor := Registered{ID: "2", Key: "nodekey:" + strings.Repeat("c", 64), UserID: "1", Addresses: []string{"100.64.0.2"}}
+			s.Store.value.Devices[id] = map[string]Device{
+				"pond":  {NodeID: pond.ID, Key: key, Role: "pond", Status: "active", Address: "100.64.0.1"},
+				"phone": {NodeID: phone.ID, Key: key, Role: "phone", Status: "active", Address: "100.64.0.2"}}
+			backend.nodes = []Registered{pond, phone, impostor}
+			want := 1
+			if order == "impostor_first" {
+				backend.nodes = []Registered{pond, impostor, phone}
+				want = 0
+			}
+			if err := s.policy(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(backend.rules) != want {
+				t.Fatalf("%d rules, want %d: %v", len(backend.rules), want, backend.rules)
+			}
+		})
 	}
 }

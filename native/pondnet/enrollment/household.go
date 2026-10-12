@@ -55,14 +55,18 @@ type sources struct {
 	every   rate.Limit
 	burst   int
 	maximum int
+	// refusing is set while a full table refuses new keys, so that is logged once.
+	refusing bool
 }
 
 type source struct {
 	limiter *rate.Limiter
-	last    time.Time
+	// last is the key's last allowed request; a refused one does not refresh it.
+	last time.Time
 }
 
-// idle is how long an untouched key is kept; by then its bucket has refilled anyway.
+// idle is how long a key with no allowed request is kept; by then its bucket has
+// refilled anyway.
 const idle = 10 * time.Minute
 
 func newSources(every rate.Limit, burst int) *sources {
@@ -76,22 +80,43 @@ func (s *sources) allow(key string) bool {
 	entry, ok := s.seen[key]
 	if !ok {
 		if len(s.seen) >= s.maximum {
-			for other, candidate := range s.seen {
-				if now.Sub(candidate.last) > idle {
-					delete(s.seen, other)
-				}
-			}
+			s.evict(now)
 		}
-		// Refuse a new key rather than forget every budget: forgetting is what let a
-		// flood of addresses reset everyone's limit.
+		// Refuse a new key rather than forget a budget that is still limiting someone:
+		// forgetting is what let a flood of addresses reset everyone's limit.
 		if len(s.seen) >= s.maximum {
+			if !s.refusing {
+				s.refusing = true
+				slog.Warn("rate-limit table full: refusing new sources until a budget refills", "sources", len(s.seen))
+			}
 			return false
+		}
+		if s.refusing {
+			s.refusing = false
+			slog.Info("rate-limit table admitting new sources again", "sources", len(s.seen))
 		}
 		entry = &source{limiter: rate.NewLimiter(s.every, s.burst)}
 		s.seen[key] = entry
 	}
+	if !entry.limiter.AllowN(now, 1) {
+		return false
+	}
 	entry.last = now
-	return entry.limiter.Allow()
+	return true
+}
+
+// evict forgets only the keys whose limit no longer holds anyone back: those with no
+// allowed request for longer than idle, and those whose bucket has refilled to its
+// burst. A new key starts with a full bucket, so forgetting either loses nothing. A key
+// that is still rate limited is never evicted, however long ago it was first seen:
+// evicting the least recently used instead would let anyone with enough addresses
+// push a victim's spent budget out of the table and so reset it.
+func (s *sources) evict(now time.Time) {
+	for key, entry := range s.seen {
+		if now.Sub(entry.last) > idle || entry.limiter.TokensAt(now) >= float64(s.burst) {
+			delete(s.seen, key)
+		}
+	}
 }
 
 // client is the address a request came from. Behind a trusted proxy that is the last

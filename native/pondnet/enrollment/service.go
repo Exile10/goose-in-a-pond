@@ -144,20 +144,17 @@ func (s *Service) policy(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	matches := func(device Device, household Household) bool {
-		for _, node := range inventory {
-			if node.ID != device.NodeID {
-				continue
-			}
-			address := false
-			for _, ip := range node.Addresses {
-				if ip == device.Address {
-					address = true
-				}
-			}
-			return node.Key == device.Key && (device.MachineKey == "" || node.MachineKey == device.MachineKey) && node.UserID == household.UserID && address && len(node.Tags) == 0 && len(node.Routes) == 0
+	// Indexed once, so matching runs under the store lock in devices plus nodes rather
+	// than their product. The first node with a given ID wins, as a scan would find it.
+	byID := make(map[string]Registered, len(inventory))
+	for _, node := range inventory {
+		if _, seen := byID[node.ID]; !seen {
+			byID[node.ID] = node
 		}
-		return false
+	}
+	matches := func(device Device, household Household) bool {
+		node, found := byID[device.NodeID]
+		return found && node.Key == device.Key && (device.MachineKey == "" || node.MachineKey == device.MachineKey) && node.UserID == household.UserID && slices.Contains(node.Addresses, device.Address) && len(node.Tags) == 0 && len(node.Routes) == 0
 	}
 	// Sorted, so an unchanged store always produces a byte-identical policy.
 	households := make([]string, 0, len(s.Store.value.Devices))
@@ -486,15 +483,24 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Indexed once by machine key, so pairing devices with nodes under the store lock
+	// is linear rather than devices times nodes. Each list keeps inventory order.
+	byMachine := map[string][]Registered{}
+	for _, node := range inventory {
+		byMachine[node.MachineKey] = append(byMachine[node.MachineKey], node)
+	}
+	// owned narrows the inventory to the nodes deleteOwnedFrom can match: a device
+	// bound to a machine key matches only nodes carrying it.
+	owned := func(device Device) []Registered {
+		if device.MachineKey == "" {
+			return inventory
+		}
+		return byMachine[device.MachineKey]
+	}
 	for household, devices := range s.Store.value.Devices {
 		for id, device := range devices {
 			if device.Status == "pending" && device.MachineKey != "" {
-				var matches []Registered
-				for _, node := range inventory {
-					if node.MachineKey == device.MachineKey {
-						matches = append(matches, node)
-					}
-				}
+				matches := byMachine[device.MachineKey]
 				if len(matches) == 1 {
 					active, err := s.validateRegistered(matches[0], device, s.Store.value.Households[household].UserID)
 					if err != nil {
@@ -511,7 +517,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if device.Status != "revoking" && !(device.Status == "revoked" && device.MachineKey != "") {
 				continue
 			}
-			if err := s.deleteOwnedFrom(ctx, device, s.Store.value.Households[household].UserID, inventory); err != nil {
+			if err := s.deleteOwnedFrom(ctx, device, s.Store.value.Households[household].UserID, owned(device)); err != nil {
 				return err
 			}
 			if device.Status == "revoked" {
@@ -526,7 +532,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	}
 	for household, retired := range s.Store.value.Retired {
 		for _, device := range retired {
-			if err := s.deleteOwnedFrom(ctx, device, s.Store.value.Households[household].UserID, inventory); err != nil {
+			if err := s.deleteOwnedFrom(ctx, device, s.Store.value.Households[household].UserID, owned(device)); err != nil {
 				return err
 			}
 		}

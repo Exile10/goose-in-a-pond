@@ -194,15 +194,24 @@ Source addresses come from the gateway's `X-Forwarded-For`, believed only from
 `--trusted-proxy` (the pinned `172.31.250.0/28` compose network); without it every
 client would share the gateway's budget. Only the last hop counts, IPv6 clients are
 grouped by /64, and a full table refuses new sources instead of forgetting every
-budget. Approvals are limited per source and, after the signature is checked, per
-household.
+budget. Since 2026-10-12 a full table first forgets the sources whose limit holds
+nobody back, those with no allowed request for ten minutes or whose budget has
+refilled, and a refused request no longer counts as activity. A source that is still
+rate limited is never forgotten: evicting the least recently used would let anyone
+with enough addresses reset a victim's budget. Approvals are limited per source and,
+after the signature is checked, per household.
 
 The service enrolls at most 4096 devices across every household and refuses more
 with `503 capacity`. Each enrolled device is a coordinator node the policy must
 read, so this is what keeps the inventory readable; it is streamed node by node and
 refused past 8192 nodes, leaving room for nodes added by hand. Before this, enough
 registered nodes pushed the inventory past a 1 MiB read limit, after which every
-policy update failed and revocations stopped taking effect.
+policy update failed and revocations stopped taking effect. A full inventory runs to
+about 33 MB, so the coordinator client's 10-second timeout bounds only the wait for
+response headers, and each operation's own deadline bounds reading the body: 15
+seconds for a request, 60 for startup and for each reconciliation, which reads the
+inventory up to three times (2026-10-12). Matching devices to nodes is indexed by
+node ID and machine key rather than comparing every pair while the store is locked.
 
 The manual path below remains for an operator-created household and for anyone
 running their own coordination service.
