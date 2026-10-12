@@ -183,18 +183,21 @@ impl RideBooking {
     }
 
     /// Keep this ride as it now stands, or forget it when it is gone. A store that fails is
-    /// logged and does not fail the member's action: the ride still works in memory.
+    /// logged and does not fail the member's action, except the save before a ride is requested.
     async fn persist(&self, id: &str) {
+        if let Err(e) = self.try_persist(id).await {
+            tracing::warn!(ride = %id, error = %format!("{e:#}"), "could not keep a ride");
+        }
+    }
+
+    async fn try_persist(&self, id: &str) -> anyhow::Result<()> {
         let Some(store) = &self.store else {
-            return;
+            return Ok(());
         };
         let saved = self.lock().get(id).map(Entry::saved);
-        let result = match &saved {
+        match &saved {
             Some(saved) => store.save(saved).await,
             None => store.remove(id).await,
-        };
-        if let Err(e) = result {
-            tracing::warn!(ride = %id, error = %format!("{e:#}"), "could not keep a ride");
         }
     }
 
@@ -263,7 +266,14 @@ impl RideBooking {
             trip
         };
         // Kept before the provider is asked: after a crash this ride must read as possibly booked.
-        self.persist(id).await;
+        // Unlike other saves this one must succeed, or a restart could offer the quote again.
+        if let Err(e) = self.try_persist(id).await {
+            tracing::warn!(ride = %id, error = %format!("{e:#}"), "could not keep a ride before requesting it");
+            self.set_state(id, BookingState::AwaitingConfirmation);
+            return Err(BookingError::Provider(anyhow::anyhow!(
+                "the pond could not save this ride, so it was not booked; try again"
+            )));
+        }
 
         let outcome = self
             .provider
@@ -1176,14 +1186,35 @@ mod store_tests {
     }
 
     #[tokio::test]
-    async fn a_store_that_fails_does_not_fail_the_member() {
+    async fn a_store_that_fails_does_not_fail_a_quote() {
         let provider = Arc::new(MockRideProvider::new());
         let store = Arc::new(MemoryRideStore::new());
         store.fail_writes(true);
         let b = booking(&provider, &store);
         let pending = quoted(&b).await;
+        assert!(matches!(pending.state, BookingState::AwaitingConfirmation));
+        assert!(store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_ride_that_cannot_be_kept_is_not_requested_and_cannot_be_confirmed_again_after_a_restart(
+    ) {
+        let provider = Arc::new(MockRideProvider::new());
+        let store = Arc::new(MemoryRideStore::new());
+        let b = booking(&provider, &store);
+        let pending = quoted(&b).await;
+        store.fail_writes(true);
+
+        assert!(b.confirm(&pending.id, "liz", Utc::now()).await.is_err());
+        assert_eq!(provider.requests(), 0);
+        assert!(matches!(
+            b.get(&pending.id, "liz").unwrap().state,
+            BookingState::AwaitingConfirmation
+        ));
+
+        store.fail_writes(false);
         let state = b.confirm(&pending.id, "liz", Utc::now()).await.unwrap();
         assert!(matches!(state, BookingState::Requested { .. }));
-        assert!(store.is_empty());
+        assert_eq!(provider.requests(), 1);
     }
 }
