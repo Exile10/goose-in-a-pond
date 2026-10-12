@@ -283,6 +283,19 @@ approval above, and so does a `failed` one: every replacement retires the old
 record against the household's bounded retirement budget, and a refused
 enrollment can be failed again at will.
 
+A lapsed or removed phone that was **not** re-paired still holds the machine key its
+stood-down record keeps (2026-10-12). The coordinator keeps that key as a tombstone,
+so a late registration under it can still be deleted, and refuses any `replace` or
+`enroll` that presents it (`identity_already_enrolled`), whether the record is
+`revoked` or `failed`. Recovery refuses it too, as there is nothing to replace. So
+enabling remote access sends the coordinator nothing for such a phone and answers
+`409 {"error":"stale_identity"}`, logged at `INFO` as
+`kind="remote_access_stale_identity"`; the app answers by making fresh node keys and
+enabling again, which replaces the record through the `replace` above (goose-on-the-go
+holds that change). Once it lands, each return of a lapsed phone moves its old record
+into the household's retired records, of which there are at most 256 shared by all its
+phones.
+
 Remote access lapses after thirty days without the device authenticating from the
 household LAN; see `docs/auth-network-posture.md`. The deadline is reported in the
 remote configuration and the app warns from a week out.
