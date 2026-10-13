@@ -448,8 +448,10 @@ impl LocalInferenceLlmAdapter {
             // q8_0 KV: ~half of f16's memory, quality-neutral on this board; q4_0 is 6.4x noisier.
             type_k: Some("q8_0".to_string()),
             type_v: Some("q8_0".to_string()),
-            // Compute buffer 522 -> 129 MiB versus the 512 default, at no measurable speed cost.
-            n_ubatch: Some(128),
+            // Prefill on the Orin (llama-bench, E4B/E2B QAT, depth 0 and 4,096): 256 is 1-6% faster
+            // than 128 and 512 is slower than both. The compute buffer no longer scales with it:
+            // the engine reserves logits for one output, not for every ubatch token.
+            n_ubatch: Some(256),
             // On unified memory mlock makes every GPU access page-fault.
             use_mlock: false,
             // From the model's own template; see `tool_and_thinking_for`.
@@ -914,14 +916,14 @@ mod tests {
             flash_attention: Some(true),
             type_k: Some("q8_0".to_string()),
             type_v: Some("q8_0".to_string()),
-            n_ubatch: Some(128),
+            n_ubatch: Some(256),
             use_mlock: false,
             tool_calling: ToolCallingMode::ForceNative,
             enable_thinking: true,
             ..Default::default()
         };
 
-        assert_eq!(settings.n_ubatch, Some(128));
+        assert_eq!(settings.n_ubatch, Some(256));
         assert_eq!(settings.type_k.as_deref(), Some("q8_0"));
         assert_eq!(settings.type_v.as_deref(), Some("q8_0"));
         // llama.cpp refuses a quantised V cache without flash attention.
