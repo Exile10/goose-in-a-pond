@@ -445,7 +445,31 @@ fn main() -> Result<()> {
         .worker_threads(workers)
         .enable_all()
         .build()?;
-    runtime.block_on(async_main())
+    let result = runtime.block_on(async_main());
+    shut_down(runtime, SHUTDOWN_GRACE);
+    result
+}
+
+/// How long exit waits for blocking work that is still running once the server has returned.
+///
+/// Dropping a Tokio runtime waits for every `spawn_blocking` thread to finish, with no bound.
+/// Model loads that ONNX Runtime can hang on (the embedding provider, Silero, Kokoro) are run
+/// that way under a timeout: the caller stops waiting, the thread does not, and before this an
+/// interrupted Pond never exited. Bounded work, such as a SQLite write, finishes well inside it.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Drops `runtime`, waiting at most `grace` for its blocking threads, and says so when one was
+/// still running: process exit then ends it.
+fn shut_down(runtime: tokio::runtime::Runtime, grace: std::time::Duration) {
+    let started = std::time::Instant::now();
+    runtime.shutdown_timeout(grace);
+    if started.elapsed() >= grace {
+        tracing::warn!(
+            kind = "shutdown_abandoned_blocking_work",
+            grace_secs = grace.as_secs(),
+            "shutdown left blocking work still running after the grace period; the process exits without it"
+        );
+    }
 }
 
 /// Sets `GOOSE_PATH_ROOT` so Goose's engine state lives under the pond data dir, not a shared
@@ -9382,6 +9406,40 @@ async fn run_pairing(refresh: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A blocking thread that never finishes must not keep the process from exiting.
+    #[test]
+    fn shutdown_does_not_wait_for_a_stuck_blocking_thread() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let held = release.clone();
+        runtime.block_on(async move {
+            // The shape of an abandoned model load: the caller times out, the thread runs on.
+            let stuck = tokio::task::spawn_blocking(move || {
+                while !held.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            });
+            let waited = tokio::time::timeout(std::time::Duration::from_millis(50), stuck).await;
+            assert!(
+                waited.is_err(),
+                "the stand-in for a hung load finished on its own"
+            );
+        });
+        let started = std::time::Instant::now();
+        super::shut_down(runtime, std::time::Duration::from_millis(200));
+        let took = started.elapsed();
+        release.store(true, Ordering::Relaxed);
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "shutdown waited {took:?} for a blocking thread that never finishes"
+        );
+    }
+
     /// The generator's tests prove `one_owners_candidates`; this proves the pass calls it.
     #[test]
     fn the_composing_pass_gives_the_model_one_owners_notes() {
