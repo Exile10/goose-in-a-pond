@@ -63,6 +63,24 @@ func TestADeviceKeyIsMadeOnceAndNeedsItsOwnCertificate(t *testing.T) {
 	}
 }
 
+func TestADeviceKeyIsStagedAndAnEarlierCrashIsCleared(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.Mkdir(filepath.Join(parent, "device.new-crashed"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateDevice(filepath.Join(parent, "device")); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "device" {
+		t.Fatalf("staging was left behind: %v %v", entries, err)
+	}
+	info, err := os.Stat(filepath.Join(parent, "device"))
+	if err != nil || info.Mode().Perm() != 0700 {
+		t.Fatalf("the device directory is not private: %v %v", info.Mode(), err)
+	}
+}
+
 func TestADeviceFileOthersCanReadIsRefused(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "device")
 	public, err := CreateDevice(directory)
