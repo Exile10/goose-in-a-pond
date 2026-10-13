@@ -445,17 +445,20 @@ t_install_swaps_the_whole_directory() {
 
 # ── the desktop app ──────────────────────────────────────────────────────────
 
-t_stage_desktop_copies_libraries_and_license() {
+t_stage_desktop_copies_the_metal_libraries_and_license() {
   world; mk_pkg macos-arm64 || return 1
   litert_stage_desktop "$W/res/litert-lm"; eq "$?" 3 || { echo "nothing recorded should be 3"; return 1; }
   litert_record macos-arm64 "$PKG"
   mkdir -p "$W/res/litert-lm"; printf 'stale\n' > "$W/res/litert-lm/libOld.dylib"
   litert_stage_desktop "$W/res/litert-lm" || { echo "$LITERT_VERIFY_PROBLEMS"; return 1; }
   eq "$(cd "$W/res/litert-lm" && ls | LC_ALL=C sort | tr '\n' ' ')" \
-    "LICENSE MANIFEST.sha256 libGemmaModelConstraintProvider.dylib libLiteRt.dylib libLiteRtMetalAccelerator.dylib libLiteRtTopKMetalSampler.dylib libLiteRtTopKWebGpuSampler.dylib libLiteRtWebGpuAccelerator.dylib liblitert-lm.dylib libwebgpu_dawn.dylib " || return 1
+    "LICENSE MANIFEST.sha256 libGemmaModelConstraintProvider.dylib libLiteRt.dylib libLiteRtMetalAccelerator.dylib libLiteRtTopKMetalSampler.dylib liblitert-lm.dylib " || return 1
   eq "$(sed -n 1p "$W/res/litert-lm/MANIFEST.sha256")" "$(sed -n 1p "$PKG/MANIFEST.sha256")" || return 1
-  litert_verify "$W/res/litert-lm" || { echo "staged copy: $LITERT_VERIFY_PROBLEMS"; return 1; }
-  eq "$LITERT_VERIFY_FILES" 9
+  litert_verify "$W/res/litert-lm" "$LITERT_DESKTOP_REQUIRED_LIBS" || { echo "staged copy: $LITERT_VERIFY_PROBLEMS"; return 1; }
+  eq "$LITERT_VERIFY_FILES" 6 || return 1
+  # A package must still carry WebGPU: the Orin runs on it, and so does a Mac running a package.
+  litert_verify "$W/res/litert-lm" && { echo "a copy without WebGPU passed as a package"; return 1; }
+  contains "$LITERT_VERIFY_PROBLEMS" "the package has no libLiteRtWebGpuAccelerator.dylib"
 }
 t_stage_desktop_refuses_a_bad_package() {
   world; mk_pkg macos-arm64 || return 1; litert_record macos-arm64 "$PKG"
@@ -469,7 +472,12 @@ t_desktop_config_names_every_shipped_library() {
   world
   y="$REPO/pond-desktop/electron-builder.yml"
   contains "$(cat "$y")" 'from: "resources/litert-lm"' || return 1
-  for n in liblitert-lm $MAC_PREBUILTS; do contains "$(cat "$y")" "Contents/Resources/litert-lm/$n.dylib" || return 1; done
+  for n in liblitert-lm $MAC_PREBUILTS; do
+    case " $LITERT_DESKTOP_LEAVES_OUT " in
+      *" $n "*) lacks "$(cat "$y")" "Contents/Resources/litert-lm/$n.dylib" || return 1 ;;
+      *) contains "$(cat "$y")" "Contents/Resources/litert-lm/$n.dylib" || return 1 ;;
+    esac
+  done
 }
 
 # ── the source checkout ──────────────────────────────────────────────────────

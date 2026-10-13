@@ -100,9 +100,8 @@ mac:
     - "Contents/Resources/litert-lm/liblitert-lm.dylib"
     - "Contents/Resources/litert-lm/libLiteRt.dylib"
     - "Contents/Resources/litert-lm/libGemmaModelConstraintProvider.dylib"
-    - "Contents/Resources/litert-lm/libLiteRtWebGpuAccelerator.dylib"
-    - "Contents/Resources/litert-lm/libLiteRtTopKWebGpuSampler.dylib"
-    - "Contents/Resources/litert-lm/libwebgpu_dawn.dylib"
+    # Metal only: LiteRT loads WebGPU before Metal on a Mac, so the app carries
+    # no WebGPU accelerator (LITERT_DESKTOP_LEAVES_OUT, scripts/lib/litert-setup.sh).
     - "Contents/Resources/litert-lm/libLiteRtMetalAccelerator.dylib"
     - "Contents/Resources/litert-lm/libLiteRtTopKMetalSampler.dylib"
 

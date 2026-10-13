@@ -11,6 +11,18 @@ const LIB_DIR_ENV: &str = "GOOSE_LITERT_LIB_DIR";
 const BUNDLE_SUBDIR: &str = "litert-lm";
 /// Overrides `~/.giap/litert-lm`, as it does for `scripts/lib/litert-setup.sh`.
 const HOME_ENV: &str = "GIAP_LITERT_HOME";
+/// `metal` runs a package this finds on a Mac on LiteRT's Metal accelerator, as the desktop app
+/// does; otherwise it runs on WebGPU, as the Orin does. See [`metal_view`].
+const ACCELERATOR_ENV: &str = "GIAP_LITERT_ACCELERATOR";
+/// What a package needs only to run on WebGPU: the accelerator, its sampler, and Dawn, which only
+/// those two load. `LITERT_DESKTOP_LEAVES_OUT` in `scripts/lib/litert-setup.sh` names the same.
+const WEBGPU_ONLY: &[&str] = &[
+    "libLiteRtWebGpuAccelerator.dylib",
+    "libLiteRtTopKWebGpuSampler.dylib",
+    "libwebgpu_dawn.dylib",
+];
+/// Appended to a package directory's name to name its [`metal_view`].
+const METAL_VIEW_SUFFIX: &str = ".metal";
 
 #[cfg(target_os = "macos")]
 const LIB_FILE: &str = "liblitert-lm.dylib";
@@ -24,6 +36,10 @@ const LIB_FILE: &str = "liblitert-lm.so";
 /// left to the backend, which finds it there; otherwise the variable is set to the newest
 /// package under `<data_dir>/lib/litert-lm/` (a device), then to the one
 /// `~/.giap/litert-lm/.path-<platform>` records (a development Mac). Nothing found leaves it unset.
+///
+/// On a Mac the app carries only the Metal accelerator, so it runs on Metal. A package this finds
+/// carries both and runs on WebGPU, the Orin's accelerator, so tests on a Mac reflect the Orin;
+/// `GIAP_LITERT_ACCELERATOR=metal` runs it on Metal instead.
 pub fn ensure_library_dir(data_dir: &Path) {
     if let Some(dir) = std::env::var_os(LIB_DIR_ENV).filter(|d| !d.is_empty()) {
         tracing::info!(
@@ -41,6 +57,11 @@ pub fn ensure_library_dir(data_dir: &Path) {
             "LiteRT-LM library beside the executable; left to the litert backend"
         ),
         Choice::Found(dir, from) => {
+            let dir = if wants_metal() {
+                metal_view(&dir).unwrap_or(dir)
+            } else {
+                dir
+            };
             tracing::info!(dir = %dir.display(), from, "LiteRT-LM library directory");
             std::env::set_var(LIB_DIR_ENV, &dir);
         }
@@ -48,6 +69,79 @@ pub fn ensure_library_dir(data_dir: &Path) {
             "no LiteRT-LM library beside the executable, in the data directory or recorded; \
              the litert backend falls back to its own search"
         ),
+    }
+}
+
+/// `GIAP_LITERT_ACCELERATOR=metal`, on a Mac.
+fn wants_metal() -> bool {
+    cfg!(target_os = "macos")
+        && std::env::var(ACCELERATOR_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("metal"))
+}
+
+/// A sibling of the package `dir`, `<dir>.metal`, holding hard links to its files except
+/// [`WEBGPU_ONLY`]: the file set the desktop app carries. `None` when the package has no WebGPU
+/// accelerator or the view cannot be made, and the package is used as it is.
+///
+/// LiteRT-LM never names a runtime library directory, so LiteRT opens its GPU accelerator by bare
+/// file name and the loader finds it beside libLiteRt; on macOS it tries WebGPU before Metal and
+/// keeps the first (`gpu_registry.cc`), so a package carrying both runs WebGPU over Metal. On an
+/// M4 with E2B, Metal measured warm turns at 129-142 ms to the first token against 155-192, a
+/// 128-token prefill chunk 84-92 ms against 111-143, and decode about 13% faster. Hard links, not
+/// symbolic ones: the loader resolves a symbolic link to the package and finds WebGPU there again.
+fn metal_view(dir: &Path) -> Option<PathBuf> {
+    if !WEBGPU_ONLY.iter().any(|f| dir.join(f).is_file()) {
+        return None;
+    }
+    let mut name = dir.file_name()?.to_os_string();
+    name.push(METAL_VIEW_SUFFIX);
+    let view = dir.with_file_name(name);
+    let make = || -> std::io::Result<()> {
+        std::fs::create_dir_all(&view)?;
+        let mut wanted = std::collections::HashSet::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let file = entry.file_name();
+            if !entry.file_type()?.is_file() || WEBGPU_ONLY.iter().any(|f| file == *f) {
+                continue;
+            }
+            let link = view.join(&file);
+            if !same_file(&entry.path(), &link) {
+                let _ = std::fs::remove_file(&link);
+                std::fs::hard_link(entry.path(), &link)?;
+            }
+            wanted.insert(file);
+        }
+        for entry in std::fs::read_dir(&view)? {
+            let entry = entry?;
+            if !wanted.contains(&entry.file_name()) {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    };
+    match make() {
+        Ok(()) => Some(view),
+        Err(error) => {
+            tracing::warn!(%error, view = %view.display(), "could not prepare the Metal view of the LiteRT-LM package; it runs on WebGPU");
+            None
+        }
+    }
+}
+
+/// Whether `a` and `b` are the same file (one inode), so an existing link is current.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
     }
 }
 
@@ -83,10 +177,18 @@ fn find_library_dir(data_dir: &Path, record: Option<&Path>) -> Option<(PathBuf, 
         .map(|(dir, from)| (std::fs::canonicalize(&dir).unwrap_or(dir), from))
 }
 
-/// The subdirectory of `root` whose library was modified last; ties go to the later name.
+/// The subdirectory of `root` whose library was modified last; ties go to the later name. A
+/// [`metal_view`] is no package: its links share the package's time and its name sorts later.
 fn newest_package(root: &Path) -> Option<PathBuf> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(root).ok()?.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(METAL_VIEW_SUFFIX)
+        {
+            continue;
+        }
         let dir = entry.path();
         let Ok(meta) = std::fs::metadata(dir.join(LIB_FILE)) else {
             continue;
@@ -221,6 +323,74 @@ mod tests {
             choose(Some(&empty), &tmp.path().join("no-pond"), None),
             Choice::Nothing
         );
+    }
+
+    #[test]
+    fn the_metal_view_leaves_out_webgpu_and_follows_the_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("macos-arm64");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for f in [
+            "liblitert-lm.dylib",
+            "libLiteRt.dylib",
+            "libLiteRtMetalAccelerator.dylib",
+            "libLiteRtWebGpuAccelerator.dylib",
+            "libLiteRtTopKWebGpuSampler.dylib",
+            "libwebgpu_dawn.dylib",
+        ] {
+            std::fs::write(pkg.join(f), f).unwrap();
+        }
+        let view = metal_view(&pkg).expect("a package with WebGPU gets a view");
+        assert_eq!(view, tmp.path().join("macos-arm64.metal"));
+        let mut names: Vec<_> = std::fs::read_dir(&view)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "libLiteRt.dylib",
+                "libLiteRtMetalAccelerator.dylib",
+                "liblitert-lm.dylib"
+            ]
+        );
+        assert!(same_file(
+            &pkg.join("libLiteRt.dylib"),
+            &view.join("libLiteRt.dylib")
+        ));
+
+        // A rebuilt package (new files, one gone) is followed, not served stale.
+        std::fs::remove_file(pkg.join("libLiteRt.dylib")).unwrap();
+        std::fs::write(pkg.join("libLiteRt.dylib"), "rebuilt").unwrap();
+        std::fs::remove_file(pkg.join("libLiteRtMetalAccelerator.dylib")).unwrap();
+        metal_view(&pkg).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(view.join("libLiteRt.dylib")).unwrap(),
+            "rebuilt"
+        );
+        assert!(!view.join("libLiteRtMetalAccelerator.dylib").exists());
+    }
+
+    /// A run asking for Metal must not leave every later run on Metal.
+    #[test]
+    fn a_metal_view_is_never_taken_for_the_newest_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("lib").join("litert-lm");
+        let pkg = package(&root, "1.0.0-aaaaaaaa", 60);
+        std::fs::write(pkg.join("libLiteRtWebGpuAccelerator.dylib"), "webgpu").unwrap();
+        let view = metal_view(&pkg).unwrap();
+        assert!(view.join(LIB_FILE).is_file());
+        assert_eq!(newest_package(&root), Some(pkg));
+    }
+
+    #[test]
+    fn a_package_without_webgpu_is_used_as_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("macos-arm64");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("liblitert-lm.dylib"), "lib").unwrap();
+        assert_eq!(metal_view(&pkg), None);
     }
 
     #[test]

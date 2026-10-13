@@ -41,6 +41,13 @@ LITERT_HEADERS="api_export.h engine.h conversation.h model_info.h error_reporter
 # In every package. liblitert-lm links the next two; the GPU path on both platforms (WebGPU/Dawn,
 # over Metal on a Mac and Vulkan on the Orin) needs the other three. The macOS prebuilts add Metal ones.
 LITERT_REQUIRED_LIBS="liblitert-lm libLiteRt libGemmaModelConstraintProvider libLiteRtWebGpuAccelerator libLiteRtTopKWebGpuSampler libwebgpu_dawn"
+# The desktop app runs on Metal. LiteRT's loader tries the WebGPU accelerator before Metal's on a
+# Mac and keeps the first it finds, so the app leaves out WebGPU and Dawn, which only WebGPU loads.
+# On an M4 with E2B, Metal measured warm turns at 129-142 ms to the first token against 155-192, and
+# decode about 13% faster. A package keeps both: a pond run from it on a Mac runs on WebGPU, as the
+# Orin does, unless GIAP_LITERT_ACCELERATOR=metal (crates/pond-server/src/litert_runtime.rs).
+LITERT_DESKTOP_LEAVES_OUT="libLiteRtWebGpuAccelerator libLiteRtTopKWebGpuSampler libwebgpu_dawn"
+LITERT_DESKTOP_REQUIRED_LIBS="liblitert-lm libLiteRt libGemmaModelConstraintProvider libLiteRtMetalAccelerator libLiteRtTopKMetalSampler"
 
 # linux-arm64 builds in this image on any Docker host that runs linux/arm64: glibc 2.35, as on JetPack 6.
 LITERT_LINUX_IMAGE="ubuntu:22.04"
@@ -275,7 +282,9 @@ _litert_install() { # <stage> <dest>
 _litert_problem() { LITERT_VERIFY_PROBLEMS="${LITERT_VERIFY_PROBLEMS}${LITERT_VERIFY_PROBLEMS:+$_LITERT_NL}$*"; }
 _litert_note()    { LITERT_VERIFY_NOTES="${LITERT_VERIFY_NOTES}${LITERT_VERIFY_NOTES:+$_LITERT_NL}$*"; }
 
-# litert_verify <dir>: is this a package as litert_package made it, unchanged since?
+# litert_verify <dir> [libs]: is this a package as litert_package made it, unchanged since? [libs]
+# are the libraries it must carry: LITERT_REQUIRED_LIBS unless given, LITERT_DESKTOP_REQUIRED_LIBS
+# for the desktop app's copy.
 #
 # Sets LITERT_VERIFY_PROBLEMS and LITERT_VERIFY_NOTES (one per line; a note is a check this host
 # could not make), LITERT_VERIFY_FILES (how many files matched), and LITERT_VERIFY_HEADER,
@@ -285,7 +294,7 @@ _litert_note()    { LITERT_VERIFY_NOTES="${LITERT_VERIFY_NOTES}${LITERT_VERIFY_N
 # The manifest comes first and must account for every file. Only a package whose hashes hold is
 # inspected further, and only then is its library loaded: nothing that failed a hash is executed.
 litert_verify() {
-  local dir="$1" m line hash path got n=0 listed f lib ext
+  local dir="$1" required="${2:-$LITERT_REQUIRED_LIBS}" m line hash path got n=0 listed f lib ext
   LITERT_VERIFY_PROBLEMS=""; LITERT_VERIFY_NOTES=""; LITERT_VERIFY_FILES=0
   LITERT_VERIFY_HEADER=""; LITERT_VERIFY_PLATFORM=""; LITERT_VERIFY_COMMIT=""
   if [ ! -d "$dir" ]; then _litert_problem "no such directory: $dir"; return 1; fi
@@ -334,7 +343,7 @@ EOF
 $(cd "$dir" && find . \( -type f -o -type l \) 2>/dev/null | LC_ALL=C sort)
 EOF
 
-  for lib in $LITERT_REQUIRED_LIBS; do
+  for lib in $required; do
     case "$listed$_LITERT_NL" in
       *"$_LITERT_NL./$lib.$ext$_LITERT_NL"*) ;;
       *) _litert_problem "the package has no $lib.$ext" ;;
@@ -512,18 +521,21 @@ litert_state() {
 
 # ── the desktop app ──────────────────────────────────────────────────────────
 
-# litert_stage_desktop <dest>: put the recorded macos-arm64 package's libraries and LICENSE in
-# <dest> (replaced), with a manifest of exactly those files under the package's own first line.
-# Returns 0 when staged, 3 when no package is recorded, 1 when the recorded one is missing or fails
-# verification (LITERT_VERIFY_PROBLEMS says why).
+# litert_stage_desktop <dest>: put the recorded macos-arm64 package's libraries, except those
+# LITERT_DESKTOP_LEAVES_OUT names, and LICENSE in <dest> (replaced), with a manifest of exactly
+# those files under the package's own first line. Returns 0 when staged, 3 when no package is
+# recorded, 1 when the recorded one is missing or fails verification (LITERT_VERIFY_PROBLEMS says
+# why).
 litert_stage_desktop() {
-  local dest="$1" dir f
+  local dest="$1" dir f name
   dir="$(litert_recorded_dir macos-arm64)"
   [ -n "$dir" ] || return 3
   litert_verify "$dir" || return 1
   rm -rf "$dest"
   mkdir -p "$dest" || return 1
   for f in "$dir"/*.dylib "$dir/LICENSE"; do
+    name="${f##*/}"
+    case " $LITERT_DESKTOP_LEAVES_OUT " in *" ${name%.dylib} "*) continue ;; esac
     cp "$f" "$dest/" || return 1
   done
   litert_write_manifest "$dest" "$LITERT_VERIFY_HEADER"
