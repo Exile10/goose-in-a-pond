@@ -3153,6 +3153,28 @@ async fn run_server(
         (Arc::new(MockAgent::new()), None)
     };
 
+    // Audits as `Auth` events. A separate Arc from `event_log`, so it needs its own chokepoint-2
+    // redactor: these rows carry a `token:<client_id>` label and a remote address.
+    let security_policy: Option<Arc<dyn pond_core::security::ports::policy::SecurityPolicy>> =
+        Some(Arc::new(
+            pond_infra::sqlite_security_policy::SqliteSecurityPolicy::new(Arc::new(
+                pond_core::security::services::redacting_event_log::RedactingEventLog::new(
+                    Arc::new(SqliteEventLog::new(db.logs.clone())),
+                    redactor.clone(),
+                ),
+            )),
+        ));
+
+    // Before the executor fill, which can start a turn; without it member-scoped tools refuse.
+    pond_mcp_server::init_speaker_authority(Arc::new(
+        pond_core::security::services::draft_authority::RepoDraftAuthority::new(
+            settings_repo.clone(),
+            session_storage.clone(),
+            profile_repo.clone(),
+            security_policy.clone(),
+        ),
+    ));
+
     // ── Fill the deferred schedule executor now that the agent exists ─────────
     {
         let real_executor = Arc::new(AgentScheduleExecutor::new(
@@ -3358,28 +3380,6 @@ async fn run_server(
     let operational_log: Option<
         Arc<dyn pond_core::security::ports::event_log::OperationalLogRepository>,
     > = Some(Arc::new(SqliteOperationalLog::new(db.logs.clone())));
-
-    // Audits as `Auth` events. A separate Arc from `event_log`, so it needs its own chokepoint-2
-    // redactor: these rows carry a `token:<client_id>` label and a remote address.
-    let security_policy: Option<Arc<dyn pond_core::security::ports::policy::SecurityPolicy>> =
-        Some(Arc::new(
-            pond_infra::sqlite_security_policy::SqliteSecurityPolicy::new(Arc::new(
-                pond_core::security::services::redacting_event_log::RedactingEventLog::new(
-                    Arc::new(SqliteEventLog::new(db.logs.clone())),
-                    redactor.clone(),
-                ),
-            )),
-        ));
-
-    // Without it every member-scoped tool refuses; decisions audit through the security policy.
-    pond_mcp_server::init_speaker_authority(Arc::new(
-        pond_core::security::services::draft_authority::RepoDraftAuthority::new(
-            settings_repo.clone(),
-            session_storage.clone(),
-            profile_repo.clone(),
-            security_policy.clone(),
-        ),
-    ));
 
     // WARN+ tracing into the SQLite log; `_file_guard` must live until run_server returns.
     let _file_guard = drain_handle.drain_into(operational_log.clone());
@@ -8721,6 +8721,18 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     pond_core::shared::services::egress::set_network_mode(
         pond_core::shared::services::egress::NetworkMode::parse(&settings.network_mode),
     );
+    // The backend records engine sessions here; the authority reads them to find the speaker.
+    let session_storage: Arc<dyn SessionStorage> =
+        Arc::new(SqliteSessionStorage::new(db.system.clone()));
+    // giap-context and giap-travel need it to tell who is speaking, or they refuse every call.
+    pond_mcp_server::init_speaker_authority(Arc::new(
+        pond_core::security::services::draft_authority::RepoDraftAuthority::new(
+            settings_repo.clone(),
+            session_storage.clone(),
+            Arc::new(SqliteProfileRepository::new(db.system.clone())),
+            None,
+        ),
+    ));
     // Used only when chat_provider = "llamafile"; other providers route themselves.
     let llamafile_url = format!("http://127.0.0.1:{}", ports::llamafile_port());
 
@@ -8763,7 +8775,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 template_repo,
                 extras_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
-                None, // session_storage — not needed for goose backend
+                Some(session_storage.clone()),
                 Some(cli_model_repo.clone()),
                 false,
                 false,                                    // model_provisioning — serve only
@@ -8806,7 +8818,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 template_repo,
                 extras_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
-                None, // session_storage — not needed for goose backend
+                Some(session_storage.clone()),
                 Some(cli_model_repo.clone()),
                 false,
                 false,                                    // model_provisioning — serve only
