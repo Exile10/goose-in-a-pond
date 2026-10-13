@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
-import { SettingsCatalogueView, summariseRetitle, parseText } from "./SettingsCatalogue";
+import { SettingsCatalogueView } from "./SettingsCatalogue";
+import { summariseRetitle, parseText } from "./catalogueView";
 import { api } from "../api/PondApiClient";
 
 // ── Mocks ─────────────────────────────────────────────────────

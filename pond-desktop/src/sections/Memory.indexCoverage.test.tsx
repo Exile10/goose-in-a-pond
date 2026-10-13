@@ -1,11 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, fireEvent, within } from "@testing-library/react";
-import {
-  IndexCoveragePanel,
-  coverageState,
-  coverageNote,
-  formatCoverage,
-} from "./Memory";
+import { IndexCoveragePanel } from "./Memory";
+import { coverageState, coverageNote, formatCoverage } from "./indexCoverage";
 import { ConfirmProvider } from "../components/shared";
 import { api } from "../api/PondApiClient";
 import type { ContextCorpusCoverage, ContextIndexHealth } from "../api/types";

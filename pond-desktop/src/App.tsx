@@ -1,6 +1,6 @@
 import { InkProvider } from "@jarida/ink/react";
 
-import { useAppState, useAppDispatch } from "./state/AppContext";
+import { useAppState, useAppDispatch } from "./state/useAppContext";
 import { GuiMode } from "./modes/GuiMode";
 import { VoiceMode } from "./modes/voice";
 import { OnboardingWizard } from "./components/onboarding";

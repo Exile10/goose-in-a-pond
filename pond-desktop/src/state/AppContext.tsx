@@ -1,6 +1,4 @@
-import React, {
-  createContext,
-  useContext,
+import {
   useReducer,
   useEffect,
   useRef,
@@ -11,20 +9,16 @@ import { api } from "../api/PondApiClient";
 import { isSignInRequired } from "../api/hostCredential";
 import { refreshHomeData } from "../hub/state/hubDataStore";
 import { setChatRunBridge, resumeActiveRun } from "./chatRunStore";
+import { DispatchCtx, StateCtx } from "./useAppContext";
 import {
   reducer,
   buildInitialState,
-  type AppState,
-  type AppAction,
   type ScheduleToast,
 } from "./reducer";
 import type { ScheduleRunNotification } from "../api/types";
 
 /** Survives one dropped beat inside the registry's 5-minute online window; stays clear of the per-IP budget. */
 const SELF_HEARTBEAT_MS = 120_000;
-
-const StateCtx = createContext<AppState | null>(null);
-const DispatchCtx = createContext<React.Dispatch<AppAction> | null>(null);
 
 export function AppContextProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, undefined, buildInitialState);
@@ -320,18 +314,4 @@ function inferRecipe(name: string): string | null {
   if (/weekly.*report|week.*summ/.test(lower)) return "weekly-report";
   if (/compact|consolidat|memory.*clean/.test(lower)) return "compact-memory";
   return null;
-}
-
-export function useAppState(): AppState {
-  const ctx = useContext(StateCtx);
-  if (!ctx)
-    throw new Error("useAppState must be used within AppContextProvider");
-  return ctx;
-}
-
-export function useAppDispatch(): React.Dispatch<AppAction> {
-  const ctx = useContext(DispatchCtx);
-  if (!ctx)
-    throw new Error("useAppDispatch must be used within AppContextProvider");
-  return ctx;
 }

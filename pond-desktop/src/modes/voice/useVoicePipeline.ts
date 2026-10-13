@@ -1,7 +1,7 @@
 // Voice-mode orchestration for the browser path; the desktop shell uses useVoiceSession.
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useAppState, useAppDispatch } from "../../state/AppContext";
+import { useAppState, useAppDispatch } from "../../state/useAppContext";
 import { nextTranscriptId } from "../../state/reducer";
 import { api } from "../../api/PondApiClient";
 import { resolveVoiceDecision } from "../../voiceSummon";

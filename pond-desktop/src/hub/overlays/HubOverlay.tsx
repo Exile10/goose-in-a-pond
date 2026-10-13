@@ -1,9 +1,8 @@
 import { useEffect, useState } from "react";
-import { HubIco, lockEl, unlockEl, micEl } from "../primitives/HubIco";
-import { HP_PATHS } from "../primitives/icons";
+import { HubIco } from "../primitives/HubIco";
+import { HP_PATHS, SUBTYPE_ICON, lockEl, unlockEl, micEl } from "../primitives/icons";
 import { HubModal as Modal } from "../primitives/HubModal";
 import { CameraFeed } from "../primitives/CameraFeed";
-import { SUBTYPE_ICON } from "../primitives/DeviceTile";
 import { type DeviceData, type DeviceKind } from "../data/mockHome";
 import { useHomeData } from "../state/hubDataStore";
 import { useDeviceState, hubControlDevice } from "../state/hubStore";

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { ToastContainer } from "../components/Toast";
-import { useAppState, useAppDispatch } from "../state/AppContext";
+import { useAppState, useAppDispatch } from "../state/useAppContext";
 import type { GuiSection } from "../desktopState";
 import { Hub } from "../hub/Hub";
 import { HubDrawer, type DrawerNav } from "../hub/HubDrawer";

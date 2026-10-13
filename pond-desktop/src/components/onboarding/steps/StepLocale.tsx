@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { MapPin, CloudSun } from "lucide-react";
-import { useOnboarding } from "../OnboardingContext";
+import { useOnboarding } from "../onboarding.context";
 import { FormLabel } from "../primitives/FormLabel";
 import { ToggleRow } from "../primitives/ToggleRow";
 import { Lead } from "../primitives/StepShell";

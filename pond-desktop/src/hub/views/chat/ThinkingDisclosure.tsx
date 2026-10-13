@@ -2,7 +2,7 @@ import { useState } from "react";
 import { ChevronRight } from "lucide-react";
 
 /** "a moment" / "8 seconds" / "1m 04s" — never a bare millisecond count. */
-export function formatThinkingTime(ms: number | undefined): string {
+function formatThinkingTime(ms: number | undefined): string {
   if (ms === undefined || ms < 0) return "a moment";
   const seconds = Math.round(ms / 1000);
   if (seconds < 1) return "a moment";

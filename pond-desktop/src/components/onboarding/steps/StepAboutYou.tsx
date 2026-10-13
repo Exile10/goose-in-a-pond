@@ -1,7 +1,7 @@
 // Step 1, About You (Basics + Accessibility); userName is required.
 
 import { MessageCircle, Turtle, Contrast, CircleSlash } from "lucide-react";
-import { useOnboarding } from "../OnboardingContext";
+import { useOnboarding } from "../onboarding.context";
 import { FormLabel } from "../primitives/FormLabel";
 import { Lead } from "../primitives/StepShell";
 import { AVATARS } from "../onboarding.constants";

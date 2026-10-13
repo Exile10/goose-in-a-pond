@@ -8,7 +8,7 @@ import { VoiceStream } from "./VoiceStream";
 import { api } from "../../api/PondApiClient";
 import { TranscriptFeed } from "../../components/TranscriptFeed";
 import { VoiceSwitcher } from "../../components/VoiceSwitcher";
-import { useAppState, useAppDispatch } from "../../state/AppContext";
+import { useAppState, useAppDispatch } from "../../state/useAppContext";
 import { useVoicePipeline } from "./useVoicePipeline";
 import { useVoiceSession } from "./useVoiceSession";
 import { isDesktopShell } from "../../shell";

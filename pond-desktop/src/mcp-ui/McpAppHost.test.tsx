@@ -72,3 +72,30 @@ describe("McpAppHost postMessage targeting", () => {
     }
   });
 });
+
+/** The app is told before its frame goes, so it can save state; after removal there is no window. */
+describe("McpAppHost teardown", () => {
+  it("sends ui/resource-teardown to an initialised app when the host unmounts", () => {
+    const { container, unmount } = render(<McpAppHost html="<p>x</p>" toolName="t" />);
+    const frameWindow = (container.querySelector("iframe") as HTMLIFrameElement).contentWindow;
+    expect(frameWindow, "jsdom gave the frame no contentWindow to spy on").not.toBeNull();
+
+    const methods: unknown[] = [];
+    const spy = vi
+      .spyOn(frameWindow!, "postMessage")
+      .mockImplementation(((msg: { method?: string }) => {
+        methods.push(msg.method);
+      }) as typeof window.postMessage);
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { jsonrpc: "2.0", id: 1, method: "ui/initialize" },
+        source: frameWindow,
+      } as MessageEventInit),
+    );
+    unmount();
+    spy.mockRestore();
+
+    expect(methods).toContain("ui/resource-teardown");
+  });
+});

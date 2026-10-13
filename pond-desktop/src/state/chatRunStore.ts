@@ -11,8 +11,7 @@ import type {
   LastResponseMeta,
 } from "./reducer";
 import { filterThinking } from "../lib/thinkFilter";
-import { applySubagentProgress } from "../components/SubagentTree";
-import type { SubagentRun } from "../components/SubagentTree";
+import { applySubagentProgress, type SubagentRun } from "../components/subagentRuns";
 import { ApiError } from "../api/types";
 import type {
   ChatEvent,

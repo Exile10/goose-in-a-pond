@@ -1,4 +1,4 @@
-import { useAppDispatch } from "../state/AppContext";
+import { useAppDispatch } from "../state/useAppContext";
 import { NotificationsView } from "../hub/views/Notifications";
 import type { GuiSection } from "../desktopState";
 import type { ScheduleRunNotification } from "../api/types";

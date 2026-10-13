@@ -1,7 +1,6 @@
 // ESLint for the dashboard (src/), the Electron shell (electron/) and the Playwright suites
-// (tests/). `npm run lint` runs it and the frontend CI job fails on any error. Warnings are
-// reported but do not fail the job: they are the rules whose existing hits are not defects and
-// are left to be cleaned up file by file. docs/CONTRIBUTING.md lists them.
+// (tests/). `npm run lint` runs it and the frontend CI job fails on any error. Every enabled rule
+// is an error; docs/CONTRIBUTING.md lists the ones that are off.
 import js from '@eslint/js'
 import { defineConfig, globalIgnores } from 'eslint/config'
 import reactHooks from 'eslint-plugin-react-hooks'
@@ -44,12 +43,11 @@ export default defineConfig([
       // Only the two classic hook rules. The React Compiler rules that the plugin's recommended set
       // adds would report 69 existing hits (56 of them set-state-in-effect); not enabled yet.
       'react-hooks/rules-of-hooks': 'error',
-      'react-hooks/exhaustive-deps': 'warn',
+      'react-hooks/exhaustive-deps': 'error',
       // Fast Refresh falls back to a full reload for a file that exports a component next to a
-      // hook, context or helper. That costs a dev reload, not a defect. The 62 existing hits are
-      // spread over 32 files, mostly MCP cards and hub primitives that export helpers beside the
-      // component, and each would have to be split into two modules.
-      'react-refresh/only-export-components': ['warn', { allowConstantExport: true, allowCompoundComponents: true }],
+      // hook, context or helper, or that has no exports at all. Helpers, hooks and contexts live in
+      // a sibling module instead (`useConfirm.ts` beside ConfirmDialog.tsx).
+      'react-refresh/only-export-components': ['error', { allowConstantExport: true, allowCompoundComponents: true }],
     },
   },
 

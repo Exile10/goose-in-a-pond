@@ -41,7 +41,7 @@ function relativeTime(dateStr?: string): string {
   return `${diffDay}d ago`;
 }
 
-function MemoryCard({ data, variant }: McpCardProps) {
+export function MemoryCard({ data, variant }: McpCardProps) {
   const isCompact = variant === "compact";
   const memories = (data.memories ?? []) as MemoryFragment[];
   const saved = data.saved as boolean | undefined;

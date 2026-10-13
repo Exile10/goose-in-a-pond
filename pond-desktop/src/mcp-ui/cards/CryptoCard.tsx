@@ -55,7 +55,7 @@ function normalizeCoins(data: Record<string, unknown>): CoinData[] {
   return [];
 }
 
-function CryptoCard({ data, variant }: McpCardProps) {
+export function CryptoCard({ data, variant }: McpCardProps) {
   const coins = normalizeCoins(data);
   const isCompact = variant === "compact";
   const visibleCoins = coins.slice(0, isCompact ? 2 : coins.length);

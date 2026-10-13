@@ -106,7 +106,7 @@ const NAME_MAP: Record<string, string> = {
   control: "Playback Control",
 };
 
-export function friendlyToolName(raw: string): string {
+function friendlyToolName(raw: string): string {
   // Strip namespace prefix: "giap-knowledge__get_wikipedia_article" → "get_wikipedia_article"
   const bare = raw.includes("__") ? raw.split("__").pop()! : raw;
   if (NAME_MAP[bare]) return NAME_MAP[bare];

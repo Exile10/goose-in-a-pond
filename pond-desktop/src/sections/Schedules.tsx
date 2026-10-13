@@ -3,7 +3,7 @@ import { Button, Separator } from "@heroui/react";
 import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock, List, Calendar, Repeat } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useConfirm, SkeletonList } from "../components/shared";
-import { useAppState, useAppDispatch } from "../state/AppContext";
+import { useAppState, useAppDispatch } from "../state/useAppContext";
 import type { Schedule, ScheduleRun, ChatEvent } from "../api/types";
 import { ApiError } from "../api/types";
 import { ScheduleCalendar } from "./ScheduleCalendar";

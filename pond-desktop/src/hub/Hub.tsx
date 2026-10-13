@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { ComponentType } from "react";
 import { HubDrawer, type DrawerNav } from "./HubDrawer";
 import { ShellBar } from "./ShellBar";
-import { useAppState, useAppDispatch } from "../state/AppContext";
+import { useAppState, useAppDispatch } from "../state/useAppContext";
 import type { GuiSection } from "../desktopState";
 import type { ScheduleRunNotification } from "../api/types";
 import { HomeView } from "./views/Home";

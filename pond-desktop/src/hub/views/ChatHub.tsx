@@ -2,13 +2,13 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { WarmupBanner } from "../../components/WarmupBanner";
 import { Paperclip } from "lucide-react";
 import { api } from "../../api/PondApiClient";
-import { useAppState, useAppDispatch } from "../../state/AppContext";
+import { useAppState, useAppDispatch } from "../../state/useAppContext";
 import { useChatRun, sendTurn, takeRefusedDraft } from "../../state/chatRunStore";
 import type { Message } from "../../state/chatRunStore";
 import { CONTINUE_TURN_MESSAGE } from "../../api/types";
 import type { ContextWarning, TurnStats } from "../../api/types";
-import { HubIco, micEl } from "../primitives/HubIco";
-import { HP_PATHS } from "../primitives/icons";
+import { HubIco } from "../primitives/HubIco";
+import { HP_PATHS, micEl } from "../primitives/icons";
 import { GooseAvatar } from "./chat/GooseAvatar";
 import { TypingIndicator } from "./chat/TypingIndicator";
 import { ResultCard } from "./chat/ResultCard";
@@ -16,15 +16,15 @@ import type { CardKind } from "./chat/ResultCard";
 import { TurnStatsFooter } from "../../components/TurnStatsFooter";
 import { ContextPressureNote } from "../../components/ContextPressureNote";
 import { SubagentTree } from "../../components/SubagentTree";
-import type { SubagentRun } from "../../components/SubagentTree";
+import type { SubagentRun } from "../../components/subagentRuns";
 import { AttachmentTray } from "../../components/AttachmentTray";
+import { ImageSupportStatus } from "../../components/ImageSupportStatus";
 import {
-  ImageSupportStatus,
   ATTACH_BLOCKED_COPY,
   COMPOSER_GATE_LINE,
   NOT_DECLARED_COPY,
   refusalClientClause,
-} from "../../components/ImageSupportStatus";
+} from "../../components/imageSupportCopy";
 import { useVisionStatus } from "../../api/useVisionStatus";
 import { prepareImage, validateAttachmentSet } from "../../lib/imageAttach";
 import type { PreparedImage } from "../../lib/imageAttach";

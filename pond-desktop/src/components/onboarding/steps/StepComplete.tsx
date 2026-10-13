@@ -3,7 +3,7 @@
 import { useMemo, Fragment } from "react";
 import { motion } from "framer-motion";
 import { CloudSun, Brain, Home, CalendarDays } from "lucide-react";
-import { useOnboarding } from "../OnboardingContext";
+import { useOnboarding } from "../onboarding.context";
 import { ToggleRow } from "../primitives/ToggleRow";
 import { PROMPT_STYLES } from "../onboarding.constants";
 import { describeVoice } from "../../../voice/voiceCatalogue";

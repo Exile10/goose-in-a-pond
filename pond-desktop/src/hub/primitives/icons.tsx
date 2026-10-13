@@ -1,5 +1,5 @@
 // ─── HP Icon Dictionary ────────────────────────────────────────
-// SVG `d` path strings unless noted; multi-element icons are components in HubIco.tsx.
+// SVG `d` path strings, then the multi-element icons as elements; HubIco.tsx draws either.
 
 export const HP_PATHS = {
   bulb:        "M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2V17h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2z",
@@ -37,7 +37,7 @@ export const HP_PATHS = {
   list:        "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
   bell:        "M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0",
   goose:       "M15.5 7.5a3.5 3.5 0 0 0-7 0c0 1 .3 1.7.8 2.5L4 16c-.6 1 .2 2.3 1.4 2.3H15a4 4 0 0 0 4-4c0-2.2-1.5-3.5-3.5-3.5M16 7h.01",
-  mic:         "rect:9,2,6,12,3 path:M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8", // compound — use HubIco's micEl
+  mic:         "rect:9,2,6,12,3 path:M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8", // compound — use micEl below
   // Home header icons
   chat:        "M21 12a8 8 0 0 1-11.5 7.2L4 21l1.8-5.4A8 8 0 1 1 21 12z",
   keyboard:    "M4 6h16a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1zM7 10h.01M11 10h.01M15 10h.01M17 10h.01M7 13h.01M17 13h.01M9 13h6",
@@ -66,3 +66,79 @@ export const HP_PATHS = {
 } as const;
 
 export type HpIconKey = keyof typeof HP_PATHS;
+
+/** Icons for non-smart-home devices, keyed by the Devices section's register types. */
+export const SUBTYPE_ICON: Record<string, string> = {
+  host: HP_PATHS.cpu,
+  sensor: HP_PATHS.pulse,
+  gotg: HP_PATHS.phone,
+  smart_speaker: HP_PATHS.speaker,
+  pond: HP_PATHS.goose,
+  edge: HP_PATHS.chip,
+};
+
+// ─── Compound SVG elements (multi-path icons from the HP dictionary) ──────────
+
+export const lockEl = (
+  <>
+    <rect x="5" y="11" width="14" height="10" rx="2" />
+    <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+  </>
+);
+
+export const unlockEl = (
+  <>
+    <rect x="5" y="11" width="14" height="10" rx="2" />
+    <path d="M8 11V7a4 4 0 0 1 7.5-2" />
+  </>
+);
+
+export const sunEl = (
+  <>
+    <circle cx="12" cy="12" r="4" />
+    <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+  </>
+);
+
+export const cameraEl = (
+  <>
+    <path d="M2 8a2 2 0 0 1 2-2h2l1.5-2h5L14 6h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2z" transform="translate(1 0)" />
+    <circle cx="11" cy="13" r="3.5" />
+  </>
+);
+
+export const micEl = (
+  <>
+    <rect x="9" y="2" width="6" height="12" rx="3" />
+    <path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8" />
+  </>
+);
+
+export const pauseEl = (
+  <>
+    <rect x="6" y="4" width="4" height="16" rx="1" />
+    <rect x="14" y="4" width="4" height="16" rx="1" />
+  </>
+);
+
+export const dotsEl = (
+  <>
+    <circle cx="5" cy="12" r="1.6" />
+    <circle cx="12" cy="12" r="1.6" />
+    <circle cx="19" cy="12" r="1.6" />
+  </>
+);
+
+export const filmEl = (
+  <>
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <path d="M7 3v18M17 3v18M3 8h4M17 8h4M3 16h4M17 16h4M3 12h18" />
+  </>
+);
+
+export const focusEl = (
+  <>
+    <circle cx="12" cy="12" r="3" />
+    <circle cx="12" cy="12" r="8" />
+  </>
+);

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { api } from "../../../api/PondApiClient";
-import { powerStateOf } from "../../../sections/Devices";
+import { powerStateOf } from "../../../sections/devicePower";
 import type { DeviceData } from "../../data/mockHome";
 import { HubIco } from "../../primitives/HubIco";
 import { HP_PATHS } from "../../primitives/icons";
@@ -95,13 +95,16 @@ export function HomeControlsCard({ limit, onManageDevices }: HomeControlsCardPro
   );
   const visible = useMemo(() => known.slice(0, room), [known, room]);
 
-  const canPower = (id: string): boolean =>
-    wire.status === "ready" ? (wire.byId[id]?.includes("power") ?? false) : false;
+  const canPower = useCallback(
+    (id: string): boolean =>
+      wire.status === "ready" ? (wire.byId[id]?.includes("power") ?? false) : false,
+    [wire],
+  );
 
   // Serialised so the read effect re-runs on changed ids, not on each new-but-equal array.
   const powerKey = useMemo(
     () => JSON.stringify(visible.filter((d) => canPower(d.id)).map((d) => d.id)),
-    [visible, wire],
+    [visible, canPower],
   );
 
   useEffect(() => {

@@ -5,7 +5,7 @@ import { api } from "../api/PondApiClient";
 import { __resetChatRunForTests, setChatRunBridge } from "../state/chatRunStore";
 import { ApiError } from "../api/types";
 import type { ChatEvent, VisionStatus } from "../api/types";
-import { ATTACH_BLOCKED_COPY, NOT_DECLARED_COPY } from "../components/ImageSupportStatus";
+import { ATTACH_BLOCKED_COPY, NOT_DECLARED_COPY } from "../components/imageSupportCopy";
 import { prepareImage } from "../lib/imageAttach";
 import type { PreparedImage } from "../lib/imageAttach";
 
@@ -46,7 +46,7 @@ vi.mock("../api/PondApiClient", () => ({
 // `vi.hoisted`: mock factories are lifted above the imports, where a plain `let` would be in its TDZ.
 const appState = vi.hoisted(() => ({ sessionId: null as string | null }));
 
-vi.mock("../state/AppContext", () => ({
+vi.mock("../state/useAppContext", () => ({
   useAppState: () => ({
     serverOnline: true,
     sessionToken: "test-token",
@@ -260,7 +260,7 @@ describe("Chat section", () => {
 
   it("dispatches SET_SESSION_ID from done event", async () => {
     const dispatch = vi.fn();
-    vi.doMock("../state/AppContext", () => ({
+    vi.doMock("../state/useAppContext", () => ({
       useAppState: () => ({ serverOnline: true, sessionToken: "tok", sessionId: null }),
       useAppDispatch: () => dispatch,
     }));
@@ -388,7 +388,7 @@ describe("Chat history — persisted reasoning (PAI-5 P6)", () => {
         getSessionAttachment: vi.fn(),
       },
     }));
-    vi.doMock("../state/AppContext", () => ({
+    vi.doMock("../state/useAppContext", () => ({
       useAppState: () => ({
         serverOnline: true,
         sessionToken: "tok",

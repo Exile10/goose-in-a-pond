@@ -1,6 +1,6 @@
 import React from "react";
-import { HubIco, lockEl, unlockEl, dotsEl } from "./HubIco";
-import { HP_PATHS } from "./icons";
+import { HubIco } from "./HubIco";
+import { HP_PATHS, SUBTYPE_ICON, lockEl, unlockEl, dotsEl } from "./icons";
 import { useDeviceState } from "../state/hubStore";
 import type { DeviceData } from "../data/mockHome";
 
@@ -8,16 +8,6 @@ interface DeviceTileProps {
   device: DeviceData;
   size?: "md" | "lg";
 }
-
-/** Icons for non-smart-home devices, keyed by the Devices section's register types. */
-export const SUBTYPE_ICON: Record<string, string> = {
-  host: HP_PATHS.cpu,
-  sensor: HP_PATHS.pulse,
-  gotg: HP_PATHS.phone,
-  smart_speaker: HP_PATHS.speaker,
-  pond: HP_PATHS.goose,
-  edge: HP_PATHS.chip,
-};
 
 const SUBTYPE_LABEL: Record<string, string> = {
   host: "Host / PC",

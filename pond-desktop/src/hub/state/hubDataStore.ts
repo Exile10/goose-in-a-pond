@@ -24,8 +24,7 @@ import {
   type WeatherStatus,
 } from "../data/mockHome";
 import { type RoutineDetail } from "../data/routines";
-import { sunEl, filmEl, focusEl } from "../primitives/HubIco";
-import { HP_PATHS } from "../primitives/icons";
+import { HP_PATHS, sunEl, filmEl, focusEl } from "../primitives/icons";
 
 // Reactive store of real PondApiClient data in the HomeData shape; mock data while the API is offline.
 

@@ -181,16 +181,18 @@ As of 2026-10-12, `.github/workflows/ci.yml` runs two linters besides `cargo cli
   `# shellcheck disable=SCxxxx  # reason` on the line above it. Do not add a file-wide disable.
 - **`frontend` job, `npm run lint` step.** It runs ESLint over `pond-desktop`: `src/`, `electron/`,
   `tests/` and the tooling files at the package root. Generated output (`dist/`,
-  `dist-electron/`, `release/`, the Playwright reports) is ignored. Errors fail the job: the
-  recommended JavaScript and typescript-eslint rules, and `react-hooks/rules-of-hooks`. Unused code
-  is an error: remove it rather than renaming it with a `_` prefix. The one exception is a
-  parameter that an interface requires and one implementation does not read, which is named `_x`. Warnings are printed and do not
-  fail it. Rules deferred on 2026-10-12, with their hit counts on that date:
-  - `react-refresh/only-export-components` is a warning (62 hits in 32 files). It costs a full
-    reload under Vite's Fast Refresh, not a defect.
-  - `react-hooks/exhaustive-deps` is a warning (5 hits).
-  - The React Compiler rules in `eslint-plugin-react-hooks` 7's recommended set are not enabled
-    (69 hits, 56 of them `set-state-in-effect`).
+  `dist-electron/`, `release/`, the Playwright reports) is ignored. Every enabled rule is an error
+  and fails the job: the recommended JavaScript and typescript-eslint rules,
+  `react-hooks/rules-of-hooks`, `react-hooks/exhaustive-deps` and
+  `react-refresh/only-export-components`. Unused code is an error: remove it rather than renaming
+  it with a `_` prefix. The one exception is a parameter that an interface requires and one
+  implementation does not read, which is named `_x`.
+  - `react-refresh/only-export-components` keeps Vite's Fast Refresh working: a module that
+    exports a component exports nothing else. Put a helper, hook or context in a sibling `.ts`
+    module (`useConfirm.ts` beside `ConfirmDialog.tsx`, `chatHistoryView.ts` beside
+    `ChatHistory.tsx`), and give a self-registering MCP card module an export, its component.
+  - Not enabled, as of 2026-10-13: the React Compiler rules in `eslint-plugin-react-hooks` 7's
+    recommended set (69 hits on 2026-10-12, 56 of them `set-state-in-effect`).
   - `require-yield` is off in `src/**/*.test.*` only, for mock streams that throw before their
     first frame.
 

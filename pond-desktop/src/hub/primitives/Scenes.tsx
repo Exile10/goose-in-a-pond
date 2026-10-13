@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { HubIco, sunEl, pauseEl, filmEl, focusEl } from "./HubIco";
-import { HP_PATHS } from "./icons";
+import { HubIco } from "./HubIco";
+import { HP_PATHS, sunEl, pauseEl, filmEl, focusEl } from "./icons";
 import { useHomeData } from "../state/hubDataStore";
 
 type SceneLayout = "row" | "col" | "grid";

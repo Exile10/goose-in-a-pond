@@ -1,7 +1,7 @@
 // Step 4, Wake Word. Calibration lives in Settings → Voice so setup never waits on mic permission.
 
 import { Mic, Settings2 } from "lucide-react";
-import { useOnboarding } from "../OnboardingContext";
+import { useOnboarding } from "../onboarding.context";
 import { RadioCard } from "../primitives/RadioCard";
 import { FormLabel } from "../primitives/FormLabel";
 import { Lead } from "../primitives/StepShell";

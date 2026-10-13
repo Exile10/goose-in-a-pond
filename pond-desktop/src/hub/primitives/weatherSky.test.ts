@@ -2,7 +2,7 @@
 // is derived as the smallest flat value that does, and is recomputed here.
 
 import { describe, expect, it } from "vitest";
-import { skyConditionFor } from "./WeatherWidget";
+import { skyConditionFor } from "./weatherSky";
 
 /** Relative luminance, WCAG 2.1. */
 function luminance([r, g, b]: number[]): number {

@@ -8,7 +8,7 @@ interface WorldClockEntry {
   offset: string;
 }
 
-function TimeCard({ data, variant }: McpCardProps) {
+export function TimeCard({ data, variant }: McpCardProps) {
   const isCompact = variant === "compact";
   const time = data.time as string | undefined;
   const date = data.date as string | undefined;

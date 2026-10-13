@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useCallback, useState, useEffect } from "react";
 import { Button, Separator } from "@heroui/react";
 import {
   Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio, Smartphone,
@@ -10,6 +10,7 @@ import {
 import { api } from "../api/PondApiClient";
 import { ApiError, type Device, type MatterStatus } from "../api/types";
 import { refreshHomeData } from "../hub/state/hubDataStore";
+import { powerStateOf } from "./devicePower";
 
 /** The server's own message, without the `ApiError:` prefix `String(e)` adds. */
 function errorText(e: unknown): string {
@@ -85,17 +86,6 @@ function canPower(d: Device): boolean {
   return d.capabilities?.includes("power") ?? false;
 }
 
-/** On/off from `get_device_state`'s text; `undefined`, not `false`, when it did not say.
- *  Format: `state_line` in `crates/pond-mcp-server/src/device_control.rs` (a test pins it). */
-export function powerStateOf(content: string): boolean | undefined {
-  const line = content.split("\n").find((l) => /^\s*power:/.test(l));
-  if (line === undefined) return undefined;
-  const value = line.slice(line.indexOf(":") + 1).trim().toLowerCase();
-  if (value === "on") return true;
-  if (value === "off") return false;
-  return undefined;
-}
-
 export function Devices() {
   const [devices, setDevices]     = useState<Device[]>([]);
   const [loading, setLoading]     = useState(true);
@@ -127,19 +117,8 @@ export function Devices() {
   const [editSubmitting, setEditSubmitting] = useState(false);
   const [editError, setEditError]       = useState<string | null>(null);
 
-  function load() {
-    setLoading(true);
-    api.listDevices()
-      .then((list) => {
-        setDevices(list);
-        void loadPowerStates(list);
-      })
-      .catch((e) => setError(errorText(e)))
-      .finally(() => setLoading(false));
-  }
-
   /** Ask each switchable device its power state; a failed read leaves it absent, not "off". */
-  async function loadPowerStates(list: Device[]) {
+  const loadPowerStates = useCallback(async (list: Device[]) => {
     const switchable = list.filter(canPower);
     if (switchable.length === 0) return;
     const readings = await Promise.all(
@@ -161,7 +140,18 @@ export function Devices() {
         readings.filter((r): r is readonly [string, boolean] => r[1] !== undefined),
       ),
     );
-  }
+  }, []);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api.listDevices()
+      .then((list) => {
+        setDevices(list);
+        void loadPowerStates(list);
+      })
+      .catch((e) => setError(errorText(e)))
+      .finally(() => setLoading(false));
+  }, [loadPowerStates]);
 
   /** The Matter runtime's live state: what it is doing, not what was saved. */
   function loadMatter() {
@@ -173,7 +163,7 @@ export function Devices() {
       .catch((e) => { setMatterError(errorText(e)); return null; });
   }
 
-  useEffect(() => { load(); void loadMatter(); }, []);
+  useEffect(() => { load(); void loadMatter(); }, [load]);
 
   // The settings save does not wait for the controller to start, so poll while connecting.
   useEffect(() => {

@@ -22,7 +22,7 @@ function Ico({ d, size = 16, color = "currentColor" }: { d: string; size?: numbe
 
 const COLORS = ["#7C3AED", "#0072F5", "#16A34A", "#F59E0B", "#EF4444", "#0EA5E9"];
 
-function CalendarCard({ data, variant }: McpCardProps) {
+export function CalendarCard({ data, variant }: McpCardProps) {
   const date = String(data.date ?? "Today");
   const events = (data.events ?? []) as CalendarEvent[];
   const nextIn = data.next_in as string | undefined;

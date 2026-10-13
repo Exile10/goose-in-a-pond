@@ -1,27 +1,7 @@
-import { createContext, useContext, useState, useCallback, useRef, useId, type ReactNode } from "react";
+import { useState, useCallback, useRef, useId, type ReactNode } from "react";
 import { AlertTriangle } from "lucide-react";
 import { useDialogFocusTrap } from "./useDialogFocusTrap";
-
-// ── Types ────────────────────────────────────────────────────────
-
-interface ConfirmOptions {
-  title?: string;
-  confirmLabel?: string;
-  cancelLabel?: string;
-  destructive?: boolean;
-}
-
-type ConfirmFn = (message: string, options?: ConfirmOptions) => Promise<boolean>;
-
-// ── Context ──────────────────────────────────────────────────────
-
-const ConfirmContext = createContext<ConfirmFn | null>(null);
-
-export function useConfirm(): ConfirmFn {
-  const fn = useContext(ConfirmContext);
-  if (!fn) throw new Error("useConfirm must be used within ConfirmProvider");
-  return fn;
-}
+import { ConfirmContext, type ConfirmFn, type ConfirmOptions } from "./useConfirm";
 
 // ── Provider ─────────────────────────────────────────────────────
 

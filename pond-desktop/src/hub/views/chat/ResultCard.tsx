@@ -1,6 +1,7 @@
 import { WeatherWidget } from "../../primitives/WeatherWidget";
 import { DeviceTile } from "../../primitives/DeviceTile";
-import { HubIco, filmEl } from "../../primitives/HubIco";
+import { HubIco } from "../../primitives/HubIco";
+import { filmEl } from "../../primitives/icons";
 import { useHomeData } from "../../state/hubDataStore";
 
 export type CardKind = "weather" | "lock" | "movie";
