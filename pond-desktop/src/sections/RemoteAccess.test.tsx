@@ -63,6 +63,16 @@ describe("RemoteAccess admission", () => {
     await waitFor(() => expect(screen.getByText("Phone recovery requests")).toBeTruthy());
   });
 
+  it("explains an approved recovery the coordinator refused for retired records", async () => {
+    vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: false, registered: true });
+    vi.mocked(api.remoteRecoveryRequests).mockResolvedValue([
+      { id: "a1b2c3d4", device: "d", approved: true, deviceName: "A57", keyPreview: "mkey:0123", refused: "retired_capacity" },
+    ]);
+    render(<RemoteAccess />);
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/replaced as many phones/));
+    expect(screen.queryByRole("button", { name: /recovery|Approved/ })).toBeNull();
+  });
+
   it("says so when recovery requests cannot be read", async () => {
     vi.mocked(api.remoteDevice).mockResolvedValue({ provisioned: false, registered: true });
     vi.mocked(api.remoteRecoveryRequests).mockRejectedValue(new Error("unavailable"));

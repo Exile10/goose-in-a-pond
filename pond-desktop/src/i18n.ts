@@ -11,6 +11,7 @@ void i18n.use(initReactI18next).init({
     reviewKey: 'Key begins: {{key}}',
     reviewCode: 'Request: {{id}}', reviewApprove: 'Approve this phone recovery', reviewApproved: 'Approved; waiting for phone',
     reviewFailed: 'Recovery requests could not be loaded or approved. Check the local connection and retry.',
+    retired_capacity: 'Approved, but the coordination service refused it: this household has replaced as many phones as it can keep track of for now. Each replaced phone is forgotten a day after it last appeared, so try this recovery again tomorrow.',
     description: 'Reach this Pond from outside your home. Until you turn this on, your Pond contacts no coordination service at all.',
     identity: 'Prepare household identity', household: 'Household identifier', publicKey: 'Enrollment public key',
     provision: 'Give this public identity to your operator. Keep the private identity and its backup on your Pond.',

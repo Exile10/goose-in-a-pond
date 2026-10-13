@@ -283,6 +283,20 @@ approval above, and so does a `failed` one: every replacement retires the old
 record against the household's bounded retirement budget, and a refused
 enrollment can be failed again at will.
 
+That budget refills on its own since 2026-10-13. The coordinator drops a retired
+record once its old machine key has stayed off the coordinator for 24 hours, so
+it binds only a household that replaces 256 phones within about a day. If one
+does, the coordinator refuses with `retired_capacity` instead of the
+`replacement_conflict` a stale approval gets. The Pond answers the phone `503
+{"error":"retired_capacity"}` (`PhoneRefusal` in
+`crates/pond-server/src/embedded_network.rs`): a `409` would send it to recovery,
+which meets the same bound. An approved recovery refused this way stays on the
+dashboard's **Phone recovery requests** for ten minutes, marked with the reason
+in place of its approve button, because the household that approved it would
+otherwise see the request vanish with no outcome. A Pond older than this answers
+`409` or `503` exactly as it did for `replacement_conflict`. The expiry rules
+and why an expired key may enroll again are in `deploy/remote-access/README.md`.
+
 Remote access lapses after thirty days without the device authenticating from the
 household LAN; see `docs/auth-network-posture.md`. The deadline is reported in the
 remote configuration and the app warns from a week out.

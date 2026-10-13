@@ -1247,6 +1247,57 @@ enum Sent {
 
 impl std::error::Error for RefusedByCoordinator {}
 
+/// The coordinator's refusal of a replacement because the household's retired records are
+/// at their bound. It passes on its own as old identities stay off the coordinator and their
+/// records expire, so neither recovery nor a retry right away can help.
+const RETIRED_CAPACITY: &str = "retired_capacity";
+
+/// Whether `error` is the coordinator refusing with [`RETIRED_CAPACITY`].
+fn retired_capacity(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RefusedByCoordinator>()
+        .is_some_and(|refused| refused.reason.as_deref() == Some(RETIRED_CAPACITY))
+}
+
+/// How a phone's enrollment request is refused: a status, and for a refusal the phone should
+/// be able to tell apart, its reason as `{"error": reason}`.
+#[derive(Debug, PartialEq)]
+struct PhoneRefusal {
+    status: StatusCode,
+    reason: Option<&'static str>,
+}
+
+impl PhoneRefusal {
+    /// [`RETIRED_CAPACITY`], as 503: the household can do nothing about it now, and a 409
+    /// would send a phone that reads only the status to recovery, which meets the same bound.
+    fn retired_capacity() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            reason: Some(RETIRED_CAPACITY),
+        }
+    }
+}
+
+impl From<StatusCode> for PhoneRefusal {
+    fn from(status: StatusCode) -> Self {
+        Self {
+            status,
+            reason: None,
+        }
+    }
+}
+
+impl IntoResponse for PhoneRefusal {
+    fn into_response(self) -> Response {
+        match self.reason {
+            Some(reason) => {
+                (self.status, Json(serde_json::json!({ "error": reason }))).into_response()
+            }
+            None => self.status.into_response(),
+        }
+    }
+}
+
 /// The helper's stderr, fit to log: bounded, one line, and with `/register/` URLs redacted
 /// (a bearer capability to join the household's tailnet).
 fn helper_complaint(stderr: &[u8]) -> String {
@@ -1451,7 +1502,7 @@ async fn register_phone(
     >,
     headers: axum::http::HeaderMap,
     Json(registration): Json<Registration>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, PhoneRefusal> {
     pond_api::network::require_lan(Some(ConnectInfo(peer))).map_err(|_| StatusCode::FORBIDDEN)?;
     let device = recovery::caller(&headers, handshake.as_ref()).await?.device;
     let lock = runtime.device_lock(&device);
@@ -1465,7 +1516,7 @@ async fn register_phone(
         .map_err(store_failed)?
         .contains_key(&device)
     {
-        return Err(StatusCode::CONFLICT);
+        return Err(StatusCode::CONFLICT.into());
     }
     let payload = runtime
         .registration_payload(&device, "phone", &registration)
@@ -1529,6 +1580,14 @@ async fn register_phone(
         .authority(operation, payload)
         .await
         .map_err(|error| {
+            if retired_capacity(&error) {
+                tracing::warn!(
+                    %error,
+                    %device,
+                    "remote access: the coordinator holds as many retired enrollments as it allows for this household, so the phone cannot be replaced until older ones expire"
+                );
+                return PhoneRefusal::retired_capacity();
+            }
             let refused = error.downcast_ref::<RefusedByCoordinator>().is_some();
             if refused && refusal_expected {
                 // Expected, not a fault: the coordinator will not let a new identity take over an
@@ -1545,16 +1604,16 @@ async fn register_phone(
                 tracing::warn!(%error, %device, refused, operation = "enroll_phone", "embedded enrollment failed");
             }
             if refused {
-                StatusCode::CONFLICT
+                StatusCode::CONFLICT.into()
             } else {
-                StatusCode::SERVICE_UNAVAILABLE
+                StatusCode::SERVICE_UNAVAILABLE.into()
             }
         })?;
     // Recorded even if a revocation raced in: the queued revocation then goes out unchecked.
     runtime.record_enrolled(&device).map_err(store_failed)?;
     if let Err(error) = runtime.ensure_not_revoked_meanwhile(&device) {
         tracing::warn!(%error, %device, "embedded enrollment superseded by a revocation");
-        return Err(StatusCode::CONFLICT);
+        return Err(StatusCode::CONFLICT.into());
     }
     tracing::info!(%device, "remote access: phone enrolled");
     Ok(Json(enrolled))
@@ -2082,13 +2141,14 @@ mod tests {
     }
 
     /// A stand-in helper: records each call, and answers an action from `<action>.out` and
-    /// `<action>.code` beside it (exit 0 with `{}` when neither exists).
-    struct FakeHelper {
+    /// `<action>.code` beside it (exit 0 with `{}` when neither exists). Shared with the
+    /// recovery tests.
+    pub(super) struct FakeHelper {
         dir: tempfile::TempDir,
     }
 
     impl FakeHelper {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let script = dir.path().join("pondnet");
             std::fs::write(
@@ -2106,7 +2166,7 @@ mod tests {
             Self { dir }
         }
 
-        fn answer(&self, action: &str, code: i32, stdout: &str) {
+        pub(super) fn answer(&self, action: &str, code: i32, stdout: &str) {
             std::fs::write(
                 self.dir.path().join(format!("{action}.code")),
                 code.to_string(),
@@ -2115,7 +2175,7 @@ mod tests {
             std::fs::write(self.dir.path().join(format!("{action}.out")), stdout).unwrap();
         }
 
-        fn calls(&self) -> Vec<String> {
+        pub(super) fn calls(&self) -> Vec<String> {
             std::fs::read_to_string(self.dir.path().join("calls"))
                 .unwrap_or_default()
                 .lines()
@@ -2123,7 +2183,7 @@ mod tests {
                 .collect()
         }
 
-        fn runtime(&self, data: &Path) -> Arc<Runtime> {
+        pub(super) fn runtime(&self, data: &Path) -> Arc<Runtime> {
             let (runtime, _listener) =
                 Runtime::with_helper(data, 4443, self.dir.path().join("pondnet")).unwrap();
             runtime

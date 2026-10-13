@@ -395,7 +395,11 @@ node does hold is still refused as `identity_already_registered`.
 A household that still reaches the bound, through 256 replacements within about a
 day, is refused with `409 retired_capacity` rather than the `replacement_conflict` a
 stale or invalid approval gets, and the service logs it. It clears as records
-expire. An older Pond treats the new reason like any other refusal, as before.
+expire. An older Pond treats the new reason like any other refusal, as before. A
+current Pond answers the phone `503 {"error":"retired_capacity"}`, a status the app
+already shows as a failure rather than pointing it at recovery, which would meet the
+same bound, and an approved recovery refused this way stays on the dashboard's
+review for ten minutes with the reason explained.
 
 Current pilot limitations: the service protocol and helper are implemented and tested
 against real Headscale, but the phone-to-local-dashboard recovery flow is unfinished.
