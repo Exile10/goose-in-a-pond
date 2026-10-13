@@ -144,6 +144,37 @@ fn looks_like_leaked_scaffold(text: &str) -> bool {
 const EMPTY_TURN_STEER: &str = "(Your previous attempt produced only internal reasoning and no reply. \
 Do not reason further — either call the tool you already decided on, or write the answer directly.)";
 
+/// The final reply's request: the answer from what the turn already has, not the question again.
+/// Asked with reasoning off, so "do not reason" is the engine's setting as well as the words.
+const FINAL_REPLY_PROMPT: &str = "(You have not replied yet. Write your reply to the request \
+above now, from what you already have, without reasoning first. If part of it could not be done, \
+or you have no tool for it, say so plainly instead of guessing.)";
+
+/// The one final reply a turn may ask for when an attempt reasoned but wrote no reply.
+///
+/// A small model with reasoning on can spend a whole round, or the round after a tool call, in
+/// reasoning and end without text; goose drops that round as empty. A tool call already counts as
+/// visible output, so the empty-turn re-engagement never ran and the turn ended with no reply
+/// (gemma-4-E2B, the "Daily Brief", 2026-10-13). The final reply asks for the answer once, with
+/// reasoning off for that call.
+#[derive(Debug, Default)]
+struct FinalReply {
+    asked: bool,
+}
+
+impl FinalReply {
+    /// Whether the attempt that just ended is followed by the final reply, claiming it if so.
+    /// At most once a turn; never after an attempt that wrote text, nor after one that did not
+    /// reason: an attempt with no output at all is the empty-turn re-engagement's.
+    fn due(&mut self, wrote_text: bool, reasoned: bool) -> bool {
+        if self.asked || wrote_text || !reasoned {
+            return false;
+        }
+        self.asked = true;
+        true
+    }
+}
+
 /// Shown once the re-engagement budget is spent, in place of silence.
 const EMPTY_TURN_EXHAUSTED_MESSAGE: &str =
     "I could not produce a response to that, even after retrying. \
@@ -207,7 +238,9 @@ pub struct GooseAdapter {
     /// Sessions configured with the `last_provider_key` pair; cleared on provider/model change.
     provider_configured_sessions: Mutex<HashSet<String>>,
     /// Last `enable_thinking` stamped; separate so a change re-stamps without a provider rebuild.
-    last_thinking_param: Mutex<Option<bool>>,
+    /// Shared with the turn stream, whose final reply lifts the flag for one call (`None` while
+    /// lifted, so a stream dropped mid-reply leaves the next turn to re-stamp).
+    last_thinking_param: Arc<Mutex<Option<bool>>>,
     /// Exported env-knob signature, so `set_var` runs only when a knob changes.
     last_env_signature: Mutex<String>,
     /// Budget-path token counter, built lazily; `None` = construction failed, use chars/4.
@@ -347,7 +380,7 @@ impl GooseAdapter {
             last_provider_key: Mutex::new(String::new()),
             current_provider: Mutex::new(None),
             provider_configured_sessions: Mutex::new(HashSet::new()),
-            last_thinking_param: Mutex::new(None),
+            last_thinking_param: Arc::new(Mutex::new(None)),
             last_env_signature: Mutex::new(String::new()),
             token_counter: tokio::sync::OnceCell::new(),
             last_window: Mutex::new(None),
@@ -2929,6 +2962,22 @@ impl GooseAdapter {
         // An owned counter for the 'static stream closure.
         let reasoning_counter = self.token_counter_handle().await;
 
+        // The engine as this turn configured it, and the same with reasoning off, for the final
+        // reply (`FinalReply`). Only engines that read `enable_thinking`, and only if it is on.
+        let reasoning_off_engine = self
+            .current_provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .filter(|_| {
+                thinking_enabled && matches!(settings.chat_provider.as_str(), "local" | "gguf")
+            })
+            .map(|(provider, on)| {
+                let off = Self::with_thinking_param(&settings.chat_provider, on.clone(), false);
+                (provider, on, off)
+            });
+        let thinking_param = self.last_thinking_param.clone();
+
         // Cancelled when the stream drops (e.g. voice interrupt); Goose checks it each turn.
         let cancel_token = CancellationToken::new();
         let cancel_guard = cancel_token.clone().drop_guard();
@@ -3019,7 +3068,11 @@ impl GooseAdapter {
                 let mut attempt: usize = 0;
                 // One passage in flight; every attempt flushes it, so none crosses a re-engagement.
                 let mut reasoning = ReasoningCoalescer::default();
+                let mut final_reply = FinalReply::default();
+                // Set when the next attempt is the final reply rather than the question again.
+                let mut final_reply_next = false;
                 'attempts: loop {
+                    let final_attempt = std::mem::take(&mut final_reply_next);
                     let attempt_text = if attempt == 0 {
                         turn_text.clone()
                     } else {
@@ -3047,6 +3100,35 @@ impl GooseAdapter {
                     let mut produced_visible = false;
                     // Errored, not quiet: re-engaging an error only repeats it.
                     let mut stream_failed = false;
+                    // What this attempt adds, so the final reply can tell reasoning from a reply.
+                    let chars_before = total_output_chars;
+                    let reasoning_before = turn_stats.reasoning_tokens.unwrap_or(0);
+                    // The final reply asks for the answer, not the question again. The check is
+                    // off (its round would only be hidden), and reasoning is off for this call.
+                    let mut reasoning_lifted = false;
+                    let attempt_msg = if final_attempt {
+                        agent_clone.set_session_goal(&turn_goose_sid, None).await;
+                        if let Some((provider, _, off)) = &reasoning_off_engine {
+                            // `None` until restored: a stream dropped mid-reply leaves the next
+                            // turn to re-stamp, rather than inherit reasoning off unannounced.
+                            *thinking_param.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            match agent_clone
+                                .update_provider(provider.clone(), off.clone(), &turn_goose_sid)
+                                .await
+                            {
+                                Ok(()) => reasoning_lifted = true,
+                                Err(e) => tracing::warn!(
+                                    session_id = %session_id,
+                                    error = %e,
+                                    "could not turn reasoning off for the final reply; asking \
+                                     for it with reasoning on",
+                                ),
+                            }
+                        }
+                        Message::user().with_text(FINAL_REPLY_PROMPT)
+                    } else {
+                        attempt_msg
+                    };
                 let mut goose_stream = match agent_clone.reply(attempt_msg, attempt_cfg, Some(cancel_token.clone())).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -3451,6 +3533,37 @@ impl GooseAdapter {
                     if let Some(content) = reasoning.flush() {
                         yield Ok(AgentStreamEvent::Thinking { content });
                     }
+                    // Reasoning back on before anything else runs, this turn's or the next. A turn
+                    // that re-stamped the flag meanwhile (the record is no longer `None`) wins.
+                    if reasoning_lifted {
+                        let restamped = thinking_param
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some();
+                        if restamped {
+                            tracing::info!(
+                                session_id = %session_id,
+                                "the thinking flag was re-stamped during the final reply; \
+                                 keeping that setting",
+                            );
+                        } else if let Some((provider, on, _)) = &reasoning_off_engine {
+                            match agent_clone
+                                .update_provider(provider.clone(), on.clone(), &turn_goose_sid)
+                                .await
+                            {
+                                Ok(()) => {
+                                    *thinking_param.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(thinking_enabled);
+                                }
+                                Err(e) => tracing::warn!(
+                                    session_id = %session_id,
+                                    error = %e,
+                                    "could not turn reasoning back on after the final reply; \
+                                     the next turn re-stamps it",
+                                ),
+                            }
+                        }
+                    }
                     // An errored attempt is never retried: the user already has the error.
                     if stream_failed {
                         break 'attempts;
@@ -3459,13 +3572,43 @@ impl GooseAdapter {
                     if guard_tripped {
                         break 'attempts;
                     }
+                    // Before the `produced_visible` break: a tool call sets it, and the attempt
+                    // that called a tool and then only reasoned is the one this exists for.
+                    let wrote_text = total_output_chars > chars_before;
+                    let reasoned = turn_stats.reasoning_tokens.unwrap_or(0) > reasoning_before;
+                    if final_attempt {
+                        tracing::info!(
+                            target: "giap::trace",
+                            kind = "final_reply_result",
+                            session_id = %session_id,
+                            wrote_text,
+                            called_tools = produced_visible && !wrote_text,
+                            reasoning_off = reasoning_lifted,
+                        );
+                    } else if !request.warmup && final_reply.due(wrote_text, reasoned) {
+                        tracing::info!(
+                            target: "giap::trace",
+                            kind = "final_reply_asked",
+                            session_id = %session_id,
+                            goose_sid = %turn_goose_sid,
+                            called_tools = produced_visible,
+                            reasoning_tokens =
+                                turn_stats.reasoning_tokens.unwrap_or(0) - reasoning_before,
+                            reasoning_off = reasoning_off_engine.is_some(),
+                            "an attempt reasoned but wrote no reply; asking once for the reply",
+                        );
+                        final_reply_next = true;
+                        continue 'attempts;
+                    }
                     if produced_visible {
                         break 'attempts;
                     }
-                    if attempt >= MAX_EMPTY_TURN_REENGAGEMENTS {
+                    // The final reply is the last attempt: one that wrote nothing is not re-asked.
+                    if final_attempt || attempt >= MAX_EMPTY_TURN_REENGAGEMENTS {
                         tracing::warn!(
                             session_id = %session_id,
                             attempts = attempt + 1,
+                            final_reply = final_attempt,
                             "empty turn: re-engagement budget spent",
                         );
                         total_output_chars += EMPTY_TURN_EXHAUSTED_MESSAGE.len();
@@ -6572,6 +6715,141 @@ mod tests {
             "the original ask must survive"
         );
         assert!(!EMPTY_TURN_STEER.trim().is_empty());
+    }
+
+    // ── the final reply, asked with reasoning off ─────────────────────────
+
+    /// What one scripted attempt leaves for the final-reply decision, read the way the stream
+    /// reads it: text that reached the person, and reasoning the model decoded.
+    fn attempt_outcome(messages: &[Message]) -> (bool, bool) {
+        let assistant = || {
+            messages
+                .iter()
+                .filter(|m| m.role == rmcp::model::Role::Assistant)
+        };
+        let wrote_text = assistant().any(|m| !m.as_concat_text().trim().is_empty());
+        let reasoned = assistant().any(|m| !GooseAdapter::reasoning_blocks(m).is_empty());
+        (wrote_text, reasoned)
+    }
+
+    /// 2026-10-13 on the Jetson, gemma-4-E2B with reasoning on, the "Daily Brief": reasoning and
+    /// the weather call, then two rounds of reasoning alone, which goose dropped. No text at all,
+    /// and the tool call kept the empty-turn re-engagement from running.
+    #[test]
+    fn a_tool_call_then_reasoning_only_gets_the_final_reply() {
+        let attempt = vec![
+            Message::assistant()
+                .with_thinking("weather first, then calendar and news", "")
+                .with_tool_request(
+                    "call-1",
+                    Ok(rmcp::model::CallToolRequestParams::new(
+                        "giap-weather__get_current_weather".to_string(),
+                    )),
+                ),
+            tool_response_message("call-1", "Clear sky | 19.2 C"),
+            Message::assistant().with_thinking("now the calendar, which needs a group", ""),
+            Message::assistant().with_thinking("still deciding", ""),
+        ];
+        let (wrote_text, reasoned) = attempt_outcome(&attempt);
+        assert!(!wrote_text && reasoned);
+
+        let mut final_reply = FinalReply::default();
+        assert!(
+            final_reply.due(wrote_text, reasoned),
+            "an attempt that reasoned and wrote nothing ends the turn with no reply unless the \
+             final reply is asked for"
+        );
+
+        // The final reply writes the answer; nothing more is asked.
+        let reply = vec![Message::assistant().with_text(
+            "It is clear and 19.2 C in Nairobi. I have no calendar or news source to read.",
+        )];
+        let (wrote_text, reasoned) = attempt_outcome(&reply);
+        assert!(wrote_text);
+        assert!(!final_reply.due(wrote_text, reasoned));
+    }
+
+    /// The final reply is one call, not a loop: a model that reasons through it too is not asked
+    /// again, and the turn ends with the exhausted message instead.
+    #[test]
+    fn the_final_reply_is_asked_at_most_once_a_turn() {
+        let mut final_reply = FinalReply::default();
+        assert!(final_reply.due(false, true));
+        for _ in 0..3 {
+            assert!(
+                !final_reply.due(false, true),
+                "the final reply was asked for twice in one turn"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attempt_that_wrote_text_or_never_reasoned_gets_no_final_reply() {
+        // A reply was written: there is nothing to ask for.
+        assert!(!FinalReply::default().due(true, true));
+        assert!(!FinalReply::default().due(true, false));
+        // Nothing at all: the empty-turn re-engagement's case, which re-asks the question.
+        assert!(!FinalReply::default().due(false, false));
+    }
+
+    /// Placement in the attempt loop. Before the guard break, a stopped turn would be re-asked;
+    /// after the `produced_visible` break, an attempt with a tool call would never be.
+    #[test]
+    fn the_final_reply_is_decided_between_the_guard_and_the_visible_breaks() {
+        let lines = stream_body_code();
+        let position = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("the stream no longer contains `{needle}`"))
+        };
+        let guard = position("if guard_tripped {");
+        let decided = position("final_reply.due(");
+        let visible = position("if produced_visible {");
+        assert!(
+            guard < decided && decided < visible,
+            "the final reply is decided at line {decided}; it belongs after the guard break \
+             (line {guard}) and before the `produced_visible` break (line {visible})",
+        );
+    }
+
+    /// Reasoning off must not outlive the final reply: lifted before the call, restored after the
+    /// engine loop, and marked unknown in between so a dropped stream leaves the next turn to
+    /// re-stamp it.
+    #[test]
+    fn reasoning_is_lifted_only_for_the_final_reply_and_restored_after_it() {
+        let lines = stream_body_code();
+        let position = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("the stream no longer contains `{needle}`"))
+        };
+        let final_branch = position("let attempt_msg = if final_attempt {");
+        let unknown = position("thinking_param.lock().unwrap_or_else(|e| e.into_inner()) = None");
+        let lifted = position("reasoning_lifted = true");
+        let reply = position("agent_clone.reply(attempt_msg");
+        let engine_end = position("'engine: loop {");
+        let restored = position("if reasoning_lifted {");
+        let failed = position("if stream_failed {");
+        assert!(
+            final_branch < unknown && unknown < lifted && lifted < reply,
+            "reasoning is lifted outside the final-reply branch, or after the call it is for",
+        );
+        assert!(
+            engine_end < restored && restored < failed,
+            "reasoning is restored at line {restored}; it belongs after the engine loop and \
+             before the first exit from the attempt (line {failed}), or an errored final reply \
+             leaves reasoning off",
+        );
+
+        // The final reply is not the question again, so the completeness check stays off.
+        let window = lines[final_branch..lifted].join("\n");
+        assert!(
+            window.contains("set_session_goal(&turn_goose_sid, None)"),
+            "the final reply arms the completeness check, whose round goose hides. Window:\n\
+             {window}"
+        );
     }
 
     /// Matched verbatim, so upstream rewording would silently disable recovery.

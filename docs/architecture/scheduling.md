@@ -134,3 +134,43 @@ The Schedules section (`pond-desktop/src/sections/Schedules.tsx`) provides:
 - Schedule cards with enable/disable toggle, run-now button, delete
 - Expandable run history per card with status badges (completed/failed/running)
 - Live SSE notifications when scheduled tasks complete
+
+## Turns that reason but never reply (2026-10-14)
+
+A scheduled prompt has no one watching it, so a turn that ends without text fails the run. On
+2026-10-13 at 22:54 Nairobi time, "Run now" on the household's "Daily Brief" ("Give me a morning
+briefing: weather, calendar, and top news.") failed this way on gemma-4-E2B with reasoning on
+(`Re-stamped engine thinking flag ... enable_thinking=true` in the log). The engine session shows
+the sequence: one round of reasoning (804 output tokens) ending in the weather call, a round of
+reasoning alone (213 tokens), then goose's completeness check and a 15-token round with nothing in
+it. Goose drops a round with no text and no tool call as empty (`empty_response` in the fork's
+`agent.rs`), so nothing after the tool result was stored at all. The same run with Thinking set to
+Off replied.
+
+GIAP's empty-turn re-engagement did not run because it only covers attempts with no visible output,
+and a tool call is visible output. The adapter now asks for a **final reply** instead
+(`FinalReply` in `crates/pond-adapters-goose/src/goose_agent.rs`): when an attempt reasoned but
+wrote no text, it sends one more message asking for the reply from what the turn already has, and
+to name what it could not do rather than guess. For that one call the completeness check is off
+and, on the `local`/`gguf` engines, `enable_thinking` is lifted to `false`, then restored before
+the attempt is judged. It happens at most once a turn; a final reply that also writes nothing ends
+the turn with the exhausted-retries message instead of re-asking. The user's Thinking setting is
+not changed. It is logged as `kind="final_reply_asked"` and `kind="final_reply_result"`. While
+reasoning is lifted, the adapter's record of the stamped flag is cleared, so a stream dropped
+mid-reply leaves the next turn to re-stamp it.
+
+What the "Daily Brief" can actually fetch, as of 2026-10-14:
+
+- **Weather**: yes, `giap-weather`.
+- **Calendar**: only through `giap-context`, and only when a member has connected a CalDAV
+  account (`account_sync.rs` mirrors events into `context_items`). The Jetson has no context
+  source connected, and `giap-context`'s group description in `tool_group.rs` does not mention
+  calendars, so relevant-tool selection never offers it for a calendar question. `giap-schedule`
+  is the pond's own schedules, not a calendar.
+- **News**: no tool exists. `discovery.rs :: search_web` is deliberately unregistered, and
+  `giap-knowledge` is reference lookup, not news.
+
+The thinking-off run that did reply called only `get_current_time` and `get_current_weather`, yet
+said the calendar "is currently empty as no events have been scheduled". That was never checked:
+no calendar tool ran, and none could have. Until a calendar is connected and a news source exists,
+the briefing prompt should ask only for what the pond can fetch.
