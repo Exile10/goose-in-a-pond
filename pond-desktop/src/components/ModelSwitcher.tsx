@@ -8,12 +8,13 @@ import { EngineMark } from "./models/ModelMarks";
 import { engineOf } from "../lib/modelProvider";
 import {
   formatSize, holderEntry, isInUse, modelFacts, modelFullName, modelLabel, roleHolder, rolesFor,
-  sortModels,
+  sortModels, unavailableNote,
 } from "../sections/models/modelsView";
 
 // The composer's model chip: which model is answering, and a way to change it. It names the
 // model and the engine that runs it, lists only models that can hold a conversation, groups them
-// by engine, and says so when a switch fails.
+// by engine, and says so when a switch fails. A model this pond cannot run stays listed, disabled,
+// with the reason, so the household learns what is missing rather than meeting it mid-chat.
 
 const MESH_LABEL = "Mesh (trusted peer)";
 
@@ -220,19 +221,20 @@ export function ModelSwitcher({ onSwitched }: { onSwitched?: () => void }) {
                 {rows.map((m) => {
                   const active = !onMesh && isInUse(m, roles);
                   const facts = [formatSize(m.size_mb), ...modelFacts(m).slice(0, 1)].filter(Boolean);
+                  const unavailable = unavailableNote(m);
                   return (
                     <button
                       key={m.id}
                       type="button"
                       className={`model-selector-dropdown__item${active ? " is-active" : ""}`}
                       onClick={() => void choose(m)}
-                      disabled={switching}
+                      disabled={switching || unavailable !== null}
                       aria-current={active ? "true" : undefined}
-                      aria-label={`${modelFullName(m)}${active ? ", in use" : ""}`}
+                      aria-label={`${modelFullName(m)}${active ? ", in use" : ""}${unavailable ? `, ${unavailable}` : ""}`}
                     >
                       <span className="model-selector-dropdown__item-name">{modelLabel(m)}</span>
                       <span className="model-selector-dropdown__item-meta">
-                        {facts.join(" · ")}
+                        {unavailable ?? facts.join(" · ")}
                         {active && <Check size={13} aria-hidden="true" />}
                       </span>
                     </button>

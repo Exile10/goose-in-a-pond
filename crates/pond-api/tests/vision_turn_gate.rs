@@ -234,6 +234,9 @@ async fn pond(agent: Arc<VisionAgent>, provider: &str, model: &str) -> Pond {
         model_repo: Some(models.clone()),
         data_dir: Some(tmp.path().to_path_buf()),
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: true,
+        },
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,

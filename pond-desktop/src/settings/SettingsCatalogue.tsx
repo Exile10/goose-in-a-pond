@@ -73,7 +73,9 @@ const PROVIDERS: Record<
 > = {
   "llm-models": (m) => ["gguf", "llamafile", "ollama"].includes(m.provider),
   "chat-models": (m) =>
-    ["gguf", "litert", "llamafile", "ollama"].includes(m.provider) && rolesFor(m).includes("chat"),
+    ["gguf", "litert", "llamafile", "ollama"].includes(m.provider) &&
+    rolesFor(m).includes("chat") &&
+    m.available !== false,
   "whisper-models": (m) => m.provider === "whisper",
   "tts-voices": (m) =>
     ["tts", "tts_piper", "tts_kokoro", "tts_http"].includes(m.provider),

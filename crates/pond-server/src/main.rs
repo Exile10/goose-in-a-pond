@@ -1077,8 +1077,9 @@ async fn run_server(
     // After `set_network_mode` (it may download ~100 MB from github.com) and before any
     // ONNX-dependent init (face recognition, embeddings).
     ensure_onnx_runtime();
-    // Before any provider is built: goose reads it when it first loads a `.litertlm` model.
-    litert_runtime::ensure_library_dir(&data_dir);
+    // Before any provider is built: goose reads it when it first loads a `.litertlm` model. What
+    // it finds decides whether the catalogue offers LiteRT-LM models at all.
+    let litert_library = litert_runtime::ensure_library_dir(&data_dir);
 
     // The stored setting wins unless the CLI flag names a backend other than the "goose" default.
     let agent_backend = if agent_backend == "goose" && !settings.agent_backend.is_empty() {
@@ -4052,6 +4053,9 @@ async fn run_server(
         model_repo: Some(model_repo),
         data_dir: Some(data_dir.clone()),
         skip_onboarding: false,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library,
+        },
         scheduler,
         model_scheduler,
         mcp_memory,

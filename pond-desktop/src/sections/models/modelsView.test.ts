@@ -4,6 +4,7 @@ import {
   rolesFor, modelLabel, groupByJob, modelFacts, sourceChip, addOnOf,
   offersPictures, downloadSummary, recommendedPicks, measuredOf, raisedPick, askingPick,
   isInUse, holderEntry, sortModels, fitsOnlyWithoutPictures, fileFitsOnlyWithoutPictures, PICTURES_LEFT_OUT,
+  unavailableNote,
 } from "./modelsView";
 import type { ModelActiveRoles, ModelEntry, ModelMemoryStatus } from "../../api/types";
 import {
@@ -448,4 +449,15 @@ describe("sorting and grouping", () => {
     expect(groupByJob([])).toEqual([]);
   });
 
+});
+
+describe("a model this pond cannot run", () => {
+  it("says what the missing engine needs, and nothing for a model that runs", () => {
+    expect(unavailableNote(litertE4b({ available: false, unavailable_reason: "litert_library_missing" })))
+      .toBe("Needs the LiteRT-LM library: run giap.sh litert build");
+    expect(unavailableNote(litertE4b({ available: false }))).toBe("This pond cannot run this model");
+    expect(unavailableNote(litertE4b({ available: true }))).toBeNull();
+    // A pond older than the field lists every model as one it can run.
+    expect(unavailableNote(e4b())).toBeNull();
+  });
 });

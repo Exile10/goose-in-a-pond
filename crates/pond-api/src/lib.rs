@@ -150,6 +150,9 @@ pub struct AppState {
     pub data_dir: Option<std::path::PathBuf>,
     /// Skip onboarding check in middleware. Set to `true` in tests.
     pub skip_onboarding: bool,
+    /// Which conversation engines this process can run, decided at startup. The catalogue marks
+    /// a model whose engine is missing unavailable, and its download and activation are refused.
+    pub engine_availability: pond_core::models::domain::engine::EngineAvailability,
     /// Cron-based task scheduler. `None` until `pond-infra-scheduler` is wired in.
     pub scheduler: Option<Arc<dyn SchedulerPort>>,
     /// Memory-aware model scheduler. `None` when all roles use external providers.
@@ -511,6 +514,18 @@ pub struct ModelStatusEntry {
     /// Separate downloads that extend the model, such as picture support. Empty: text only.
     #[serde(default)]
     pub companions: Vec<CompanionDto>,
+    /// Whether this pond can run the model at all: false when the engine it needs is missing, so
+    /// downloading or choosing it would only fail later.
+    #[serde(default = "runs_here")]
+    pub available: bool,
+    /// Why `available` is false, e.g. `litert_library_missing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<pond_core::models::domain::engine::EngineUnavailable>,
+}
+
+/// A row that says nothing about availability was listed by a pond that could run it.
+fn runs_here() -> bool {
+    true
 }
 
 /// One separate download that extends a model.

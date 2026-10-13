@@ -10,7 +10,7 @@ import { engineOf, groupByEngine } from "../../../lib/modelProvider";
 import {
   ROLES, type RoleKey, addOnOf, askingPick, budgetReading, downloadedOnly, emptyJobText, fitReading,
   groupByJob, holderEntry, isInUse, measuredOf, modelFacts, modelFullName, modelLabel, raisedPick,
-  recommendedPicks, roleHolder, rolesFor, sortModels, sourceChip,
+  recommendedPicks, roleHolder, rolesFor, sortModels, sourceChip, unavailableNote,
 } from "../../../sections/models/modelsView";
 import type { ModelEntry } from "../../../api/types";
 
@@ -41,6 +41,7 @@ function HubRow({
   const measured = measuredOf(model.recommended);
   const fit = fitReading(model, memory, { inUse });
   const role = rolesFor(model)[0];
+  const unavailable = unavailableNote(model);
 
   return (
     <div className="hm-row" data-inuse={inUse ? "true" : undefined} data-raised={raised ? "true" : undefined}>
@@ -77,7 +78,8 @@ function HubRow({
           ) : (
             <>
               <FitCell fit={fit} quiet />
-              {role && (
+              {unavailable && <span className="hm-row__note">{unavailable}</span>}
+              {role && !unavailable && (
                 <button
                   type="button"
                   className="mm-btn"

@@ -6,7 +6,7 @@ import "../../styles/model-pick.css";
 import type { ModelTransfer, TransferAction } from "./modelDownloads";
 import {
   addOnOf, downloadSummary, fitReading, fitsOnlyWithoutPictures, formatBytes, formatSize, measuredOf,
-  modelLabel, modelFullName, offersPictures, picturesOf,
+  modelLabel, modelFullName, offersPictures, picturesOf, unavailableNote,
 } from "./modelsView";
 
 export interface PickCardProps {
@@ -42,6 +42,7 @@ export function PickCard({
   const pictures = picturesOf(model);
   const onDevice = model.downloaded === true;
   const fit = fitReading(model, memory, { inUse, withPictures: choice && withPictures });
+  const unavailable = unavailableNote(model);
 
   return (
     <article
@@ -93,7 +94,9 @@ export function PickCard({
               </span>
               <FitCell fit={fit} />
             </div>
-            {inUse ? null : onDevice ? (
+            {inUse ? null : unavailable ? (
+              <span className="mm-pick__note">{unavailable}</span>
+            ) : onDevice ? (
               <button
                 type="button"
                 className={asking ? "mm-btn mm-btn--ask" : "mm-btn"}

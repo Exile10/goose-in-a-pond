@@ -5,6 +5,7 @@ import type { ModelTransfer, TransferAction } from "./modelDownloads";
 import {
   type RoleKey, ROLES, addOnOf, downloadSummary, fitReading, fitsOnlyWithoutPictures, formatBytes,
   formatSize, modelFacts, modelFullName, modelLabel, offersPictures, picturesOf, sourceChip,
+  unavailableNote,
 } from "./modelsView";
 
 export interface ModelRowProps {
@@ -39,7 +40,9 @@ export function ModelRow({
   const choice = offersPictures(model);
   const fit = fitReading(model, memory, { inUse, withPictures: choice && withPictures });
   const pictures = picturesOf(model);
-  const canDownload = !onDevice && model.acquire !== "external" && model.acquire !== "unavailable";
+  const unavailable = unavailableNote(model);
+  const canDownload =
+    !onDevice && model.acquire !== "external" && model.acquire !== "unavailable" && !unavailable;
   const managedElsewhere = model.acquire === "external";
 
   return (
@@ -89,6 +92,7 @@ export function ModelRow({
         <div className="mdl-row__acts">
           {onDevice &&
             !inUse &&
+            !unavailable &&
             roles.map((role) => (
               <button
                 key={role}
@@ -125,8 +129,12 @@ export function ModelRow({
               <span>Download</span>
             </button>
           )}
-          {!onDevice && !canDownload && !managedElsewhere && (
-            <span className="mdl-row__note">No source to download from</span>
+          {unavailable ? (
+            <span className="mdl-row__note">{unavailable}</span>
+          ) : (
+            !onDevice &&
+            !canDownload &&
+            !managedElsewhere && <span className="mdl-row__note">No source to download from</span>
           )}
         </div>
       )}

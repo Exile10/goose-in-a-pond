@@ -230,6 +230,9 @@ async fn make_app_with_provider(
         model_repo: None,
         data_dir: None,
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: true,
+        },
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,
@@ -577,6 +580,9 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         model_repo: None,
         data_dir: None,
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: true,
+        },
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,
@@ -698,6 +704,9 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         model_repo: None,
         data_dir: None,
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: true,
+        },
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,

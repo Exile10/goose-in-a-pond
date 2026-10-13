@@ -1,5 +1,6 @@
-//! Points goose's LiteRT-LM backend at an installed library before any provider is built. It only
-//! ever sets `GOOSE_LITERT_LIB_DIR`, only when that is unset, and downloads nothing.
+//! Points goose's LiteRT-LM backend at an installed library before any provider is built, and says
+//! whether the backend will find one at all. It only ever sets `GOOSE_LITERT_LIB_DIR`, only when
+//! that is unset, and downloads nothing.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +12,10 @@ const LIB_DIR_ENV: &str = "GOOSE_LITERT_LIB_DIR";
 const BUNDLE_SUBDIR: &str = "litert-lm";
 /// Overrides `~/.giap/litert-lm`, as it does for `scripts/lib/litert-setup.sh`.
 const HOME_ENV: &str = "GIAP_LITERT_HOME";
+/// goose's state root, which `pin_goose_state_under` sets before this module runs.
+const GOOSE_ROOT_ENV: &str = "GOOSE_PATH_ROOT";
+/// Under goose's state root: the data directory's `litert-lm/lib`, the backend's last place to look.
+const GOOSE_DATA_SUBDIR: &str = "data/litert-lm/lib";
 
 #[cfg(target_os = "macos")]
 const LIB_FILE: &str = "liblitert-lm.dylib";
@@ -24,31 +29,86 @@ const LIB_FILE: &str = "liblitert-lm.so";
 /// left to the backend, which finds it there; otherwise the variable is set to the newest
 /// package under `<data_dir>/lib/litert-lm/` (a device), then to the one
 /// `~/.giap/litert-lm/.path-<platform>` records (a development Mac). Nothing found leaves it unset.
-pub fn ensure_library_dir(data_dir: &Path) {
-    if let Some(dir) = std::env::var_os(LIB_DIR_ENV).filter(|d| !d.is_empty()) {
+///
+/// Returns whether the backend will find a library in any of the places it searches, which decides
+/// whether the catalogue offers LiteRT-LM models at all.
+pub fn ensure_library_dir(data_dir: &Path) -> bool {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    if let Some(dir) = env_dir(LIB_DIR_ENV) {
         tracing::info!(
-            dir = %Path::new(&dir).display(),
+            dir = %dir.display(),
             "LiteRT-LM library directory from {LIB_DIR_ENV}"
         );
-        return;
-    }
-    let bundled = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(BUNDLE_SUBDIR)));
-    match choose(bundled.as_deref(), data_dir, record_file().as_deref()) {
-        Choice::Bundled(dir) => tracing::info!(
-            dir = %dir.display(),
-            "LiteRT-LM library beside the executable; left to the litert backend"
-        ),
-        Choice::Found(dir, from) => {
-            tracing::info!(dir = %dir.display(), from, "LiteRT-LM library directory");
-            std::env::set_var(LIB_DIR_ENV, &dir);
+    } else {
+        let bundled = exe_dir.as_deref().map(|dir| dir.join(BUNDLE_SUBDIR));
+        match choose(bundled.as_deref(), data_dir, record_file().as_deref()) {
+            Choice::Bundled(dir) => tracing::info!(
+                dir = %dir.display(),
+                "LiteRT-LM library beside the executable; left to the litert backend"
+            ),
+            Choice::Found(dir, from) => {
+                tracing::info!(dir = %dir.display(), from, "LiteRT-LM library directory");
+                std::env::set_var(LIB_DIR_ENV, &dir);
+            }
+            Choice::Nothing => tracing::info!(
+                "no LiteRT-LM library beside the executable, in the data directory or recorded; \
+                 the litert backend falls back to its own search"
+            ),
         }
-        Choice::Nothing => tracing::info!(
-            "no LiteRT-LM library beside the executable, in the data directory or recorded; \
-             the litert backend falls back to its own search"
-        ),
     }
+    let goose_root = env_dir(GOOSE_ROOT_ENV).filter(|root| root.is_absolute());
+    let searched = backend_search_dirs(
+        env_dir(LIB_DIR_ENV).as_deref(),
+        exe_dir.as_deref(),
+        goose_root.as_deref(),
+    );
+    let found = library_in(&searched);
+    if !found {
+        let searched = searched
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(
+            searched,
+            "no LiteRT-LM library where the litert backend looks; LiteRT-LM models are listed as \
+             unavailable until one is installed (`giap.sh litert build`) and the pond restarts"
+        );
+    }
+    found
+}
+
+/// A non-empty directory variable.
+fn env_dir(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The directories goose's `litert` backend searches, in its order (`library_dirs` in
+/// `goose-local-inference/src/litert/ffi.rs`): `GOOSE_LITERT_LIB_DIR`, `litert-lm/` beside the
+/// executable, the executable's own directory, then goose's data directory. That last one is known
+/// here only under an absolute `GOOSE_PATH_ROOT`; without one goose uses its own app directory,
+/// which pond-server never installs into.
+fn backend_search_dirs(
+    lib_dir: Option<&Path>,
+    exe_dir: Option<&Path>,
+    goose_root: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = lib_dir.map(Path::to_path_buf).into_iter().collect();
+    if let Some(exe_dir) = exe_dir {
+        dirs.push(exe_dir.join(BUNDLE_SUBDIR));
+        dirs.push(exe_dir.to_path_buf());
+    }
+    dirs.extend(goose_root.map(|root| root.join(GOOSE_DATA_SUBDIR)));
+    dirs
+}
+
+/// Whether any of `dirs` holds the library, as the backend's own search decides it.
+fn library_in(dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| dir.join(LIB_FILE).is_file())
 }
 
 /// Where the library is, by who should point the backend at it.
@@ -241,5 +301,46 @@ mod tests {
 
         assert_eq!(find_library_dir(tmp.path(), Some(&record)), None);
         assert_eq!(find_library_dir(tmp.path(), None), None);
+    }
+
+    #[test]
+    fn the_backend_search_follows_goose_order() {
+        let dirs = backend_search_dirs(
+            Some(Path::new("/lib-dir")),
+            Some(Path::new("/app")),
+            Some(Path::new("/pond/engine")),
+        );
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/lib-dir"),
+                PathBuf::from("/app/litert-lm"),
+                PathBuf::from("/app"),
+                PathBuf::from("/pond/engine/data/litert-lm/lib"),
+            ]
+        );
+        assert!(backend_search_dirs(None, None, None).is_empty());
+    }
+
+    /// The catalogue's availability rests on this: a library in any searched place counts, and an
+    /// empty search, as on a Jetson nothing was installed on, does not.
+    #[test]
+    fn the_library_counts_wherever_the_backend_would_find_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("target").join("release");
+        let goose_root = tmp.path().join("engine");
+        let named = tmp.path().join("named-but-empty");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&named).unwrap();
+
+        let searched = backend_search_dirs(Some(&named), Some(&exe_dir), Some(&goose_root));
+        assert!(!library_in(&searched), "nothing installed anywhere");
+
+        package(&goose_root.join("data").join("litert-lm"), "lib", 10);
+        assert!(library_in(&searched), "goose's data directory");
+        assert!(
+            !library_in(&backend_search_dirs(Some(&named), Some(&exe_dir), None)),
+            "goose's data directory is unknown without its root"
+        );
     }
 }
