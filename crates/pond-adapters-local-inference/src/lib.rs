@@ -494,29 +494,29 @@ impl LocalInferenceLlmAdapter {
         model_id: &str,
         settings: &goose::providers::local_inference::local_model_registry::ModelSettings,
     ) -> Vec<String> {
+        use goose::providers::local_inference::local_model_registry::ModelSettings;
         let target = registry
             .get_model(model_id)
             .map(|e| Self::resolved(&e.local_path));
-        let rows: Vec<(String, u64, bool)> = match &target {
+        // Kept per row: the picture add-on's size and the speculative drafter, which other
+        // code attaches and this stamp never sets.
+        let rows: Vec<(String, ModelSettings)> = match &target {
             Some(path) => registry
                 .list_models()
                 .iter()
                 .filter(|e| Self::resolved(&e.local_path) == *path)
-                .map(|e| {
-                    (
-                        e.id.clone(),
-                        e.settings.mmproj_size_bytes,
-                        e.settings.vision_capable,
-                    )
-                })
+                .map(|e| (e.id.clone(), e.settings.clone()))
                 .collect(),
-            None => vec![(model_id.to_string(), 0, false)],
+            None => vec![(model_id.to_string(), ModelSettings::default())],
         };
         let mut applied = Vec::new();
-        for (id, mmproj_size_bytes, vision_capable) in rows {
+        for (id, kept) in rows {
             let mut row_settings = settings.clone();
-            row_settings.mmproj_size_bytes = mmproj_size_bytes;
-            row_settings.vision_capable = vision_capable;
+            row_settings.mmproj_size_bytes = kept.mmproj_size_bytes;
+            row_settings.vision_capable = kept.vision_capable;
+            row_settings.draft_model = kept.draft_model;
+            row_settings.draft_n_max = kept.draft_n_max;
+            row_settings.draft_p_min = kept.draft_p_min;
             match registry.update_model_settings(&id, row_settings) {
                 Ok(()) => applied.push(id),
                 Err(e) => tracing::debug!(
