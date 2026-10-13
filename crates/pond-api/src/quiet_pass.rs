@@ -18,6 +18,8 @@ use tokio::sync::watch;
 pub struct QuietPasses {
     running: Mutex<Option<Running>>,
     next_id: AtomicU64,
+    /// The conversation of the latest turn, which the household is taken to be in.
+    in_use: Mutex<Option<String>>,
 }
 
 struct Running {
@@ -68,6 +70,7 @@ impl QuietPasses {
     /// pass stands in its way. `Some`: wait on it before going on. A pass the turn would have to
     /// repeat runs to its end; any other is told to stop, and ends within one of its polls.
     pub fn turn_arrives(&self, session_id: &str) -> Option<PassWait> {
+        *self.in_use.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
         let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let pass = running.as_ref()?;
         if !(pass.its_turn_waits && pass.session_id == session_id) {
@@ -80,6 +83,16 @@ impl QuietPasses {
             _waiting: Waiting(pass.waiting.clone()),
             ended: pass.ended.clone(),
         })
+    }
+
+    /// The conversation of the latest turn, if any turn arrived since the pond started. A pass
+    /// for any other conversation sets this one aside in the model, so its next turn pays to get
+    /// it back.
+    pub fn conversation_in_use(&self) -> Option<String> {
+        self.in_use
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -155,6 +168,21 @@ mod tests {
     async fn no_pass_means_no_wait() {
         let passes = QuietPasses::default();
         assert!(passes.turn_arrives("s1").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_latest_turn_names_the_conversation_in_use() {
+        let passes = QuietPasses::default();
+        assert_eq!(passes.conversation_in_use(), None);
+        let _ = passes.turn_arrives("s1");
+        let pass = passes.begin("s2", true);
+        let _ = passes.turn_arrives("s3");
+        assert_eq!(
+            passes.conversation_in_use().as_deref(),
+            Some("s3"),
+            "a turn counts whether or not a pass is running"
+        );
+        drop(pass);
     }
 
     #[tokio::test]
