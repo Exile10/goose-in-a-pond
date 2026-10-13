@@ -3156,4 +3156,62 @@ latency; not a PAI milestone).**
   A's pass ran with B's chat in the model: B was saved (5,303 tokens), A compacted, B's next turn
   restored its own conversation. Unit tests: pond-core 26, pond-api quiet_pass 7, goose
   request_context 3, session_context 7, LiteRT 41.
-- **Not yet verified on the Orin.**
+- **Verified on the Orin** (round-1 build `b3baed67`, LiteRT E4B, 8k window, the same driver
+  against a scratch pond with the household's downloads hard-linked in). Before: four of B's five
+  turns stopped a pass for A and restored a snapshot, and B's first tokens took 1.6, 3.5, 1.7, 6.1
+  and 8.1 s. After: no pass started during B's turns. Two restores remained, both expected: B's
+  first turn stopped A's own pass, begun while A was still the conversation in use, and B's third
+  compacted B itself after two long replies filled its window. Those long replies make B's turn
+  times incomparable with the run before.
+
+**2026-10-13 — Each turn sends only the context that is news, and the in-process engine holds
+less memory (inference latency; not a PAI milestone).**
+
+- **What landed.**
+  - **The turn envelope.** Each turn's user message carried a 379-token `<system-context>` block
+    (Gemma 4 tokenizer). On the live path it stays in the history, so the window grew by it every
+    turn, and 295 of the tokens repeated what the conversation already held. Two changes:
+    - The turn-budget note (86 tokens) is a standing rule, so it moved to the session's appendix
+      and is prefilled once with the system prompt.
+    - A memory that an earlier turn of the conversation still shows is not shown again
+      (`context::memory_block`). Over ten days on the Orin, 186 of 335 injected lines (56%) were
+      such repeats.
+    - The answer contract stays per turn, last in the envelope, by Jerry's choice.
+  - **llama.cpp, in process (goose `8fb6988c2`, `2d942ec47`, `8e2c61ca3`):**
+    - the model is mapped, where on an iGPU the default load copied E4B's per-layer embeddings and
+      token table into 1,872 MiB of pinned host memory;
+    - a context reserves one row of logits, not one per ubatch token;
+    - contexts keep the windowed sliding-window cache and resume a deep rewind from a window
+      checkpoint;
+    - the Orin moved to f16 KV and ubatches of 256;
+    - a cache protects itself from a small prompt only when a chat filled it.
+- **PAI-3 / PAI-8.** Same memory selection and budget; the model sees the same memories, some of
+  them on an earlier turn of the conversation. When a compaction drops that turn, its memories count
+  as unseen again. The budget note adds 86 tokens to the preamble once, and takes the same 86 out of
+  every turn's working set. Guests still get no memories: the scope check precedes all of it.
+- **Invariants.** KV prefix: the appendix text is the same on every turn, and turn 1's prompt is
+  the same length as before (below). No profile path, egress, `Settings` field or
+  migration. Nothing new blocks a turn.
+- **Verified on the Mac** (scratch pond, LiteRT E2B, Orin profile, 8k window, six saved memories,
+  six turns about them; `scratchpad/envelope/drive_env.py`). Turn 1's prompt was 4,094 tokens in
+  both builds. Each later user message added 325-330 tokens before and 144-149 after. All five
+  memories in budget rode in every turn's envelope before; after, they rode in turn 1 only, and
+  later answers still used them (the dog's 06:30 walk, the sister in Nakuru, metric units). Windowed
+  KV: the live engine test `a_resume_behind_the_window_answers_like_a_full_prefill` diverged at
+  token 1,602 and resumed from a checkpoint at 1,536 with the same top five tokens as a full
+  prefill. goose-local-inference: 191 unit tests pass; the three context-cap failures predate this.
+- **Measured on the Orin, outside the pond.** E4B KV at 16K: 476 MiB with the full-size window
+  (q8_0) and 152 MiB windowed. `llama-cli` decoded 8% faster at 4.4K context with the window.
+  `llama-bench` decoded 4-8% faster with f16 KV than q8_0 on E4B and 3-11% on E2B at depth, and
+  ubatches of 256 prefilled 1-6% faster than 128 (512 was slower than both).
+- **Verified on the Orin, in the pond** (round-1 build, llama.cpp E4B, the driver above). The
+  mapped model and the one row of logits raised the minimum of available memory from 466 to
+  2,323 MB, and the median from 594 to 2,999 MB.
+- **Found on the Orin and fixed.** In that same run, B's first tokens took 7.1-10.9 s until B
+  outgrew half the cache, against 0.3-0.8 s before. A pass for A was stopped mid-summary, leaving
+  the summary prompt in llama.cpp's cache. The rule that protects a large cache from a small prompt
+  kept it, because B's prompts were under half of the 13.2K tokens cached, so every B turn ran in a
+  throwaway context with a full prefill. Fixed in goose `2d942ec47`, verified by a unit test and the
+  live engine tests on the Mac.
+- **Not yet verified on the Orin, in the pond:** the envelope, the windowed cache, f16 KV,
+  ubatches of 256, and the fix above.
