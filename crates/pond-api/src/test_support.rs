@@ -19,6 +19,9 @@ use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 
 use crate::AppState;
 
+/// The TLS key pin of the Pond [`app_state`] builds, as `tls_identity::pin()` spells one.
+pub const TEST_SPKI_PIN: &str = "sha256/TnkUsN+AaLec3BDTh/KUwSokXTmCq2+4rlfBnmJxPkE=";
+
 /// An [`AppState`] over a fresh database in its own temporary data directory.
 pub struct TestState {
     /// Not yet shared, so a test can replace fields before wrapping it.
@@ -36,7 +39,10 @@ pub async fn app_state() -> TestState {
     let pool = db.system.clone();
     let db = Arc::new(db);
     let profiles = Arc::new(SqliteProfileRepository::new(pool.clone()));
-    let handshake = Arc::new(SqliteHandshakeAdapter::new(pool.clone(), None));
+    let handshake = Arc::new(SqliteHandshakeAdapter::new(
+        pool.clone(),
+        Some(TEST_SPKI_PIN.to_string()),
+    ));
     let state = AppState {
         warmup: Default::default(),
         db,
@@ -136,4 +142,100 @@ pub async fn app_state() -> TestState {
         handshake,
         dir,
     }
+}
+
+/// Pair `client_id` through `router` as a phone does: CPace on `/handshake/pake/{init,verify}`
+/// with `code`, under the key pin `pin`. Returns the status and body of the last step reached;
+/// an accepted pair has already had its `server_proof` checked, as the app checks it.
+pub async fn pair_phone(
+    router: &axum::Router,
+    code: &str,
+    client_id: &str,
+    pin: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use pond_infra::pairing_cpace::{channel_identifier, session_id, Responder};
+
+    let nonce = [0x5au8; 32];
+    let (status, challenge) = post_json(
+        router,
+        "/api/v1/handshake/pake/init",
+        serde_json::json!({
+            "client_id": client_id, "client_type": "gotg", "client_version": "test",
+            "channel_binding": pin, "client_nonce": B64.encode(nonce),
+        }),
+    )
+    .await;
+    if status != axum::http::StatusCode::OK {
+        return (status, challenge);
+    }
+    let field = |name: &str| {
+        B64.decode(
+            challenge[name]
+                .as_str()
+                .expect("the challenge carries this field"),
+        )
+        .expect("standard base64")
+    };
+    let phone = Responder::respond(
+        code.as_bytes(),
+        &channel_identifier(pin, client_id),
+        &session_id(&field("challenge"), &nonce),
+        &field("share"),
+    )
+    .expect("the Pond's share is a valid group element");
+    let confirm: String = phone
+        .confirmation()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let (status, body) = post_json(
+        router,
+        "/api/v1/handshake/pake/verify",
+        serde_json::json!({
+            "challenge_id": challenge["challenge_id"], "device_name": client_id,
+            "share": B64.encode(phone.share()), "confirm": confirm,
+        }),
+    )
+    .await;
+    if body["accepted"] == true {
+        let proof = body["server_proof"]
+            .as_str()
+            .expect("an accepted pair carries a proof");
+        let proof: Vec<u8> = (0..proof.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&proof[i..i + 2], 16).expect("hex"))
+            .collect();
+        assert!(
+            phone.verify_server(&proof),
+            "the Pond's server_proof did not verify"
+        );
+    }
+    (status, body)
+}
+
+async fn post_json(
+    router: &axum::Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower::ServiceExt as _;
+    let response = router
+        .clone()
+        .oneshot(
+            axum::http::Request::post(path)
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("a valid request"),
+        )
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+        .await
+        .expect("a readable body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }

@@ -284,78 +284,83 @@ from those events. The API error code is stable for client localization.
 
 ## Pairing (how a client gets a token)
 
-The Android and iOS clients use two-phase HMAC pairing; they do not transmit the six-digit code directly:
+### Phones pair with CPace (2026-10-13)
+
+Phones prove they hold the six-digit code with CPace (`draft-irtf-cfrg-cpace-21`, suite
+`CPACE-RISTR255-SHA512`, #508). The exact messages, labels and refusal codes are in
+[the API reference](api.md#phone-pairing-post-handshakepakeinit-and-handshakepakeverify-2026-10-13);
+the code is `pond-infra/src/pairing_cpace.rs` (the math) and `sqlite_handshake.rs` (the state).
 
 1. Operator reads the pairing code printed on server startup, or from
    `pond-server pairing` (`GET /api/v1/handshake/pairing-code`, loopback and the
-   host credential).
-2. Client `POST /handshake/init {client_id,…}` → `{challenge_id, challenge}`.
-3. Client computes `mac = HMAC-SHA256(pairing_code, transcript)` and
-   `POST /handshake/verify {challenge_id, mac, channel_binding?}` →
-   `{session_token, refresh_token, expires_at, server_proof?}`.
+   host credential), and shows it to the phone, usually with the QR.
+2. Phone `POST /handshake/pake/init {client_id, …, channel_binding, client_nonce}`. The Pond
+   commits to the newest active code and answers with its public share `Ya`.
+3. Phone `POST /handshake/pake/verify {challenge_id, share: Yb, confirm: T_client}`. The Pond
+   checks the tag, consumes the code, mints tokens and only then answers with its own tag as
+   `server_proof`, which the phone checks before it keeps the tokens.
 
-### Channel binding (2026-09-21)
+**What CPace gives.** Before, the phone sent `HMAC(code, transcript)`. Whoever terminated the
+phone's TLS, which an mDNS-supplied pin makes possible, held that MAC and could try all
+10^6 codes against it offline in about a second, then pair with the real Pond. Under CPace
+nothing in a run can be tested against a code offline: an attacker who runs the protocol
+learns only whether its one guess was right. Every guess costs a live `verify` against this
+Pond, and the Pond limits those (below). Shares and tags reveal nothing about the code to a
+passive observer either.
 
-A client that reached the Pond over pinned TLS names the key it pinned to in
-`channel_binding` and folds it into the transcript. The Pond recomputes with its
-**own** pin, so the two agree only when the client is talking to this Pond
-directly:
+**Channel binding and the pin still matter.** The channel identifier carries the Pond's TLS key
+pin, and the Pond always uses its own. A phone that pinned an interceptor's key derives a
+different generator, so relaying its run to the real Pond fails confirmation
+(`invalid_confirmation`), and answering it directly fails without the code. The phone also names
+its pin in `init` (`channel_binding`); a mismatch is refused there with
+`403 channel_binding_mismatch`, but that check is only an early, clear failure, since an
+interceptor could rewrite it. What CPace does not do is authenticate the Pond's key: tokens
+still travel over TLS to whoever holds the pinned key, so the pin has to be right. A wrong pin
+now ends pairing in a visible failure instead of an offline-crackable MAC, which makes the
+mDNS `pin` TXT record (`mdns_advertiser.rs`) safe to offer, but the QR, which carries the pin
+from the Pond itself, remains the authentic source.
 
-```text
-bound     HMAC(code, "goose-pair-client-v1"\0 ‖ challenge ‖ \0 ‖ client_id ‖ \0 ‖ spki)
-unbound   HMAC(code, challenge ‖ client_id)
-```
+**Per-code failure budget (reverses the earlier "no lockout" decision).** Each code allows
+`PAKE_FAILURE_BUDGET` = 10 confirmation attempts. An attempt is reserved before its tag is
+checked, so concurrent verifies cannot check more than ten; the attempt that spends the budget
+answers `code_retired` and the code stops working, along with every run already committed to it.
+That caps an attacker at 10 guesses in 10^6 per code whatever addresses it holds, which the
+per-IP limits alone did not (see rate limiting). The cost is the one the old decision avoided:
+anyone on the wifi can burn the code on screen by guessing. That is visible, as `code_retired`
+on the phone and the debounced "Failed pairing attempt" alert, and the operator issues a new code
+in one click. Failed attempts against a code are counted in memory, like the code's plaintext,
+so a restart forgets both.
 
-and the Pond answers with `server_proof` over the same transcript under
-`goose-pair-server-v1`, which only something holding the pairing code can
-produce. A client that sent a binding and got no proof back must treat the pair
-as failed.
+**Issuing a code retires every older one** (`issue_pairing_code_for`), so the code on screen is
+the only code that works, and CPace can commit to it.
 
-What this buys: the pin no longer has to reach the phone by a trustworthy route,
-which is what lets `_pond._tcp.local.` publish it in a `pin` TXT record for the
-app to fill in (`mdns_advertiser.rs`) instead of somebody transcribing 51
-characters of base64. Someone who intercepts the connection and serves their own
-certificate gets a client that MACs over *their* key: relaying that fails the
-recomputation (`channel_binding_mismatch`); stripping the binding and relaying
-leaves a MAC over a transcript the Pond no longer computes (`invalid_mac`); and
-answering the client directly fails the server proof. A wrong pin therefore ends
-pairing in a visible failure rather than a successful pair with the wrong Pond.
+**One attempt per run.** A run (`challenge_id`) is removed before anything is checked, so a
+failed verify cannot be retried on it. Runs live 60 s, are held in memory only (the Pond's scalar
+never reaches disk and is zeroized when the run ends), and at most 256 may wait at once
+(`pairing_busy`), which bounds memory rather than guessing.
 
-The binding is required from every peer except loopback (2026-09-30). The desktop
-dashboard pairs over loopback HTTP, where there is no certificate and nothing in
-the middle, so it may send the unbound transcript; any other peer that omits
-`channel_binding` gets `403 channel_binding_required`, recorded as a failed pairing,
-without the challenge being consumed. Before this, a phone on the LAN could still
-pair unbound, and an interceptor that stripped the binding from a client willing to
-send either shape got a proof it could brute-force offline. Computing *either*
-transcript needs the pairing code. A binding is rejected outright, before the
-challenge is consumed, when it is not this Pond's pin — including when the Pond
-has no TLS identity to compare against, so the field can never be advisory. The
-five `sqlite_handshake.rs` tests under `// ---- Channel binding` hold each of
-those down.
+### The dashboard pairs over loopback HMAC
 
-The legacy single-shot `POST /handshake` carries the code in the request body and
-so has no MAC to bind. It is refused from any peer but loopback with
-`403 legacy_pairing_host_only`; only local scripts use it.
+The desktop dashboard reads the plaintext code from the host-only `/handshake/pairing-code` and
+pairs with the original exchange: `POST /handshake/init` → challenge, then
+`POST /handshake/verify {challenge_id, mac}` with `mac = HMAC-SHA256(code, challenge ‖
+client_id)`. A PAKE would protect a secret the dashboard was just handed, and loopback has no
+middle. These two routes, and the legacy single-step `POST /handshake`, which carries the code in
+the body, are this host's alone: any other peer, and any peer on the plaintext development
+listener, gets `403 pairing_requires_cpace` (`legacy_pairing_host_only` for the single step).
+They have no failure budget; the verify limiter below applies to loopback too.
 
-Legacy handshake, initialization, and verification require loopback or a peer
-within an active directly attached LAN interface's netmask. Tunnel interfaces,
-point-to-point links, and tailnet allocations are excluded. Missing connection
-metadata or failed interface classification is denied. Forwarding headers are
-ignored. The rejection is HTTP 403 with `pairing_requires_lan`, including remote
-completion of a challenge initialized locally. Refresh is still remotely usable.
-See `pond-api/src/network.rs` and the handshake handlers in `routes.rs`.
+### Who may pair
 
-Codes are single-use and expire in 10 min; a challenge expires in 60 s. The adapter hashes codes and tokens for validation; consult `sqlite_handshake.rs` for the storage contract.
+Every pairing route requires loopback or a peer within an active directly attached LAN
+interface's netmask. Tunnel interfaces, point-to-point links, and tailnet allocations are
+excluded. Missing connection metadata or failed interface classification is denied. Forwarding
+headers are ignored. The rejection is HTTP 403 with `pairing_requires_lan`, including remote
+completion of a run started locally. Refresh is still remotely usable. See
+`pond-api/src/network.rs` and the handshake handlers in `routes.rs`.
 
-**There is no failed-attempt lockout, and its absence is deliberate.** A bad MAC
-burns the *challenge*, not the code: `verify_handshake` consumes the challenge
-before it checks the MAC (`sqlite_handshake.rs:355-371`) and returns
-`invalid_mac` with the pairing code untouched (`:414-419`), which is consumed
-only on success (`:435-439`). The `pairing_codes` table has no attempt counter,
-and `bad_mac_attempts_do_not_lock_out_pairing_code` (`:955`) asserts a
-legitimate pairing still succeeds after ten bad guesses. Pairing is now limited to direct LAN peers. A lockout would still hand
-any guest on the wifi a denial of service against the operator's own pairing.
+Codes are single-use and expire in 10 min; a run or challenge expires in 60 s. The adapter
+hashes codes and tokens for validation; consult `sqlite_handshake.rs` for the storage contract.
 
 ### Token contract
 
@@ -409,10 +414,11 @@ What it exposes: everything on the listener is plaintext and unpinned. Anyone on
 the network can read every request and response, bearer and refresh tokens
 included; can replay those tokens against the HTTPS listener, where they are just
 as valid; can impersonate the Pond to the phone and the phone to the Pond; and can
-recover the six-digit pairing code offline from a single captured pairing, because
-an unbound MAC over plaintext is a dictionary of a million entries. Use it on a
+take the session it hands out, since the tokens cross in plaintext. Use it on a
 network you control, with a Pond holding no household data you mind losing, and
-re-pair over HTTPS before trusting the device again.
+re-pair over HTTPS before trusting the device again. CPace (2026-10-13) removes the offline
+recovery of the code from a captured pairing, but not the rest: the tokens it mints still cross
+in plaintext.
 
 What it serves: the companion router, with the same bearer-auth, rate-limit and
 LAN-peer pairing guards as the HTTPS listener and the remote-revocation hook, so a
@@ -422,13 +428,11 @@ dashboard or its management routes, never the remote-access enrollment routes
 mDNS does not advertise it; the developer types its address into the app.
 
 Each request on it carries the `InsecureDevTransport` extension, inserted by the
-router rather than derived from anything the client sent. Pairing over it is
-unbound by construction (there is no TLS key to bind), logs
+router rather than derived from anything the client sent. Phones pair over it with CPace,
+like everywhere else, under the pin this listener's `/system/info` reports; the dashboard's HMAC
+routes refuse every peer here with `pairing_requires_cpace`. A pairing over it logs
 `kind = "insecure_dev_pairing"`, and the `auth.device_paired` /
 `auth.pairing_verify_failed` audit event carries `transport = "insecure_dev"`.
-Unbound pairing is otherwise refused off loopback with `channel_binding_required`;
-the plaintext listener's marker is the one other exemption. The HTTPS listener's
-behaviour is unchanged.
 
 While it runs, `GET /api/v1/system/info` includes `"insecure_dev": true` on every
 listener (anonymous or authenticated); the key is absent otherwise. The process
@@ -468,7 +472,7 @@ is selected into its own bucket and never touches the general allowance
 |---|---|---|---|
 | General | 600 / 60 s per IP | everything except `/api/v1/handshake*` (`lib.rs:536-539`) | exempt |
 | Pairing | 30 / 60 s per IP | every `/api/v1/handshake*` route (`lib.rs:544-547`) | exempt |
-| Verify | 10 / 60 s per IP | `/handshake/verify` only (`routes.rs:590-595`) | **not exempt** |
+| Verify | 10 / 60 s per IP | `/handshake/pake/verify` and `/handshake/verify` (`verify_limiter`) | **not exempt** |
 
 Pairing was split out in `a2c86a93` because a chatty client spending the shared
 allowance would lock a device out of `/handshake` — the recovery path. The verify
@@ -477,23 +481,20 @@ loopback too: the endpoint is security-sensitive regardless of origin.
 
 The 429 does not have one shape. General and pairing go through
 `AuthError::RateLimitExceeded` and set a `Retry-After` **header**
-(`middleware/mod.rs:49-53`); verify is built in the handler and puts the same
-figure in a `retry_after_secs` **JSON body field** with no header
-(`routes.rs:681-688`). A pairing client has to read both, and since verify is
+(`middleware/mod.rs`); verify is built in the handler (`check_verify_limit`) and puts the
+same figure in a `retry_after_secs` **JSON body field** with no header, under
+`"error": "pairing_busy"` (2026-10-13). A pairing client has to read both, and since verify is
 the tighter bucket it is the 429 such a client will actually see. Making the
 two uniform is a behaviour change and belongs in its own PR.
 
-Brute force is bounded by that verify limiter plus one-challenge-per-attempt, not
-by a lockout. The bound is **per source IP**, like the table above: the limiter
-keys on the TCP peer address (`routes.rs:676-678`), so every distinct address
-gets its own bucket. At 10 attempts / 60 s against a code that lives 10 minutes,
-one address is worth roughly 100 guesses out of 1,000,000 — about 0.01% of the
-key space — and each guess burns its own challenge, so attempts cannot be
-pipelined. An attacker holding N addresses gets 100N. That matters for the threat
-model named above: a wifi guest cannot spoof a source address through a TCP
-handshake, but can hold several without effort — a second DHCP lease, a static
-address in the subnet, or IPv6 privacy addresses, which rotate on their own. On a
-typical /24 the worst case is nearer 2.5% of the key space than 0.01%.
+Before CPace (2026-10-13), brute force was bounded only per source IP: at 10 attempts / 60 s
+against a code that lives 10 minutes, one address was worth roughly 100 guesses out of
+1,000,000, and an attacker holding N addresses got 100N. A wifi guest cannot spoof a source
+address through a TCP handshake, but can hold several without effort (a second DHCP lease, a
+static address in the subnet, or IPv6 privacy addresses, which rotate on their own), so on a
+typical /24 the worst case was nearer 2.5% of the key space. The per-code failure budget now
+bounds it absolutely: 10 guesses per code, about 0.001% of the key space, however many addresses
+are used. The per-IP buckets stay, to keep one source from burning codes or flooding runs.
 
 ## Residual risks and deferred authorization work
 

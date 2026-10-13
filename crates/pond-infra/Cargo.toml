@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+# The phone side of CPace pairing (`pairing_cpace::Responder`), for tests that pair like a phone.
+cpace-client = []
+
 [dependencies]
 pond-core = { workspace = true }
 pond-net = { workspace = true }
@@ -26,6 +30,10 @@ sha2 = "0.10"
 hmac = { workspace = true }
 rand = "0.8"
 base64 = { workspace = true }
+# Phone pairing (#508): CPace over ristretto255 (`pairing_cpace.rs`). 4.1 is already in the
+# lock through `snow` and `ed25519-dalek`, and shares `sha2` and `digest` 0.10 with this crate.
+curve25519-dalek = "4.1"
+zeroize = "1"
 # Phase F2: image attachments are stored as files under the OS data dir; the
 # adapter resolves that dir itself (POND_DATA_DIR override first) rather than
 # having it threaded down from pond-server, mirroring model_download.rs.

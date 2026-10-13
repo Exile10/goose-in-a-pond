@@ -1,20 +1,24 @@
 //! Driven port: device pairing and session tokens.
-//! Two-phase pairing proves the client holds the single-use pairing code without sending it.
 //!
-//! # Channel binding
+//! # Phones pair with CPace (2026-10-13)
 //!
-//! A client on pinned TLS folds the pinned key into the MAC ([`VerifyRequest::channel_binding`]);
-//! the server recomputes with its own key, so the two agree only on a direct connection:
+//! A phone proves it holds the single-use pairing code with CPace (`draft-irtf-cfrg-cpace-21`,
+//! suite `CPACE-RISTR255-SHA512`), in two round trips with the Pond as initiator:
 //!
 //! ```text
-//! bound   mac = HMAC(code, "goose-pair-client-v1\0" || challenge || \0 || client_id || \0 || spki)
-//! unbound mac = HMAC(code, challenge || client_id)
+//! init    phone -> {client_id, client_type, client_version, channel_binding, client_nonce}
+//!         pond  -> {challenge_id, challenge, expires_at, suite, share: Ya}
+//! verify  phone -> {challenge_id, device_name?, share: Yb, confirm: T_client}
+//!         pond  -> HandshakeResponse with server_proof: T_server
 //! ```
 //!
-//! The server proves itself with [`HandshakeResponse::server_proof`] over the same transcript
-//! under `goose-pair-server-v1`, so a wrong pin fails pairing visibly instead of pairing with the
-//! wrong pond. Binding is optional only for the loopback dashboard; it can't be downgraded in
-//! transit, since both forms need the pairing code.
+//! The code is the password, and the channel identifier carries the Pond's TLS key pin, so a
+//! phone that pinned an interceptor's key derives a different generator and fails. Nothing on
+//! the wire can be tested against a code offline; each guess is one live `verify`.
+//!
+//! The desktop dashboard pairs over loopback with the code it was just handed, using the
+//! original `HMAC-SHA256(code, challenge || client_id)` exchange ([`VerifyRequest`]). The routes
+//! refuse that exchange from any peer but loopback.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -47,13 +51,13 @@ pub struct HandshakeResponse {
     pub server_version: String,
     pub capabilities: Vec<String>,
     pub rejection_reason: Option<String>,
-    /// Hex HMAC-SHA256 proving this server holds the pairing code and the pinned certificate.
-    /// Present iff [`VerifyRequest::channel_binding`] was sent; if it is missing, fail the pair.
+    /// The Pond's CPace confirmation tag `T_server`, lowercase hex (64 bytes). Present on an
+    /// accepted [`PakeVerifyRequest`] only; a phone that cannot verify it must discard the tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_proof: Option<String>,
 }
 
-/// Phase 1 request: the client asks for a challenge.
+/// Phase 1 of loopback pairing: the dashboard asks for a challenge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitRequest {
     pub client_id: String,
@@ -61,7 +65,7 @@ pub struct InitRequest {
     pub client_version: String,
 }
 
-/// Phase 1 response: the challenge the client must MAC.
+/// Phase 1 response of loopback pairing: the challenge the dashboard must MAC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChallengeResponse {
     pub challenge_id: String,
@@ -71,19 +75,81 @@ pub struct ChallengeResponse {
     pub expires_at: String,
 }
 
-/// Phase 2 request: the client proves possession of the pairing code.
+/// Phase 2 of loopback pairing: `mac = HMAC-SHA256(code, challenge || client_id)`, hex.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyRequest {
     pub challenge_id: String,
-    /// Hex-encoded MAC over the transcript named by `channel_binding`.
+    /// Hex-encoded MAC over `challenge || client_id`.
     pub mac: String,
     /// Optional friendly device name to record in the devices table.
     #[serde(default)]
     pub device_name: Option<String>,
-    /// The `sha256/<base64>` key pin the client's TLS is pinned to; must equal this server's pin.
-    /// `None` (loopback dashboard, no channel to bind) selects the unbound MAC.
+}
+
+/// CPace phase 1: a phone asks the Pond to commit to the current pairing code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PakeInitRequest {
+    pub client_id: String,
+    pub client_type: String,
+    pub client_version: String,
+    /// The `sha256/<base64>` key pin the phone's TLS is pinned to. A diagnostic only: the
+    /// Pond always runs CPace under its own pin, so a wrong pin fails either way, but naming it
+    /// here fails early and clearly with `channel_binding_mismatch`.
+    pub channel_binding: String,
+    /// 32 random bytes from the phone, standard base64: the second half of the session id.
+    pub client_nonce: String,
+}
+
+/// CPace phase 1 response: the Pond's half of the session id and its public share.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PakeChallenge {
+    pub challenge_id: String,
+    /// 32 random bytes, standard base64: the first half of the session id.
+    pub challenge: String,
+    /// RFC3339 expiry of the challenge.
+    pub expires_at: String,
+    /// Always `CPACE-RISTR255-SHA512`.
+    pub suite: String,
+    /// `Ya`, the 32-byte ristretto255 encoding, standard base64.
+    pub share: String,
+}
+
+/// Why the Pond would not start a CPace run. Each maps to one stable error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PakeRefusal {
+    /// The phone named a key pin that is not this Pond's, or this Pond has none.
+    ChannelBindingMismatch,
+    /// No unexpired, unconsumed pairing code to commit to.
+    NoActivePairingCode,
+    /// `client_nonce` is not 32 bytes of standard base64.
+    InvalidClientNonce,
+    /// Too many runs are waiting for their `verify`; try again shortly.
+    Busy,
+}
+
+impl PakeRefusal {
+    /// The stable code clients branch on.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ChannelBindingMismatch => "channel_binding_mismatch",
+            Self::NoActivePairingCode => "no_active_pairing_code",
+            Self::InvalidClientNonce => "invalid_client_nonce",
+            Self::Busy => "pairing_busy",
+        }
+    }
+}
+
+/// CPace phase 2: the phone's share and its confirmation tag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PakeVerifyRequest {
+    pub challenge_id: String,
+    /// `Yb`, the 32-byte ristretto255 encoding, standard base64.
+    pub share: String,
+    /// `T_client`, the 64-byte HMAC-SHA-512 tag, lowercase hex.
+    pub confirm: String,
+    /// Optional friendly device name to record in the devices table.
     #[serde(default)]
-    pub channel_binding: Option<String>,
+    pub device_name: Option<String>,
 }
 
 /// Exchange a refresh token for a fresh session+refresh pair.
@@ -144,17 +210,35 @@ pub trait Handshake: Send + Sync {
     /// Revoke a session token (disconnect a client).
     async fn revoke_token(&self, token: &str) -> Result<()>;
 
-    /// Phase 1: issue a challenge bound to a `client_id`.
+    /// Loopback phase 1: issue a challenge bound to a `client_id`.
     async fn init_handshake(&self, _request: InitRequest) -> Result<ChallengeResponse> {
         Err(anyhow::anyhow!(
             "two-phase handshake not supported by this adapter"
         ))
     }
 
-    /// Phase 2: verify the client's MAC and mint tokens.
+    /// Loopback phase 2: verify the dashboard's MAC and mint tokens.
     async fn verify_handshake(&self, _request: VerifyRequest) -> Result<HandshakeResponse> {
         Err(anyhow::anyhow!(
             "two-phase handshake not supported by this adapter"
+        ))
+    }
+
+    /// CPace phase 1: commit to the newest active pairing code and answer with `Ya`.
+    async fn init_pake(
+        &self,
+        _request: PakeInitRequest,
+    ) -> Result<std::result::Result<PakeChallenge, PakeRefusal>> {
+        Err(anyhow::anyhow!(
+            "CPace pairing not supported by this adapter"
+        ))
+    }
+
+    /// CPace phase 2: check `Yb` and `T_client`, then consume the code and mint tokens. A
+    /// refusal is `accepted: false` with a `rejection_reason`, never an `Err`.
+    async fn verify_pake(&self, _request: PakeVerifyRequest) -> Result<HandshakeResponse> {
+        Err(anyhow::anyhow!(
+            "CPace pairing not supported by this adapter"
         ))
     }
 
@@ -165,6 +249,7 @@ pub trait Handshake: Send + Sync {
 
     /// Issue a single-use pairing code bound to a member; returns the only plaintext copy.
     /// Bound on the host, never by the pairing client: the paired-device rung outranks all proofs.
+    /// Issuing retires every older active code, so the code on screen is the only one that works.
     async fn issue_pairing_code_for(&self, _profile_id: Option<&str>) -> Result<PairingCode> {
         Err(anyhow::anyhow!(
             "pairing-code issuance not supported by this adapter"

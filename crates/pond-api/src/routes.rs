@@ -27,8 +27,8 @@ use pond_core::prompts::{builtin_template_content, ProfileContext};
 use pond_core::security::domain::event::{EventCategory, EventQuery, PrivacySensitivity};
 use pond_core::security::domain::proven_device::{DeviceRung, ProvenDevice};
 use pond_core::security::ports::handshake::{
-    ChallengeResponse, HandshakeRequest, HandshakeResponse, InitRequest, RefreshRequest,
-    VerifyRequest,
+    ChallengeResponse, HandshakeRequest, HandshakeResponse, InitRequest, PakeChallenge,
+    PakeInitRequest, PakeRefusal, PakeVerifyRequest, RefreshRequest, VerifyRequest,
 };
 use pond_core::shared::ports::event_bus::BusEvent;
 use pond_core::shared::services::chat::ChatService;
@@ -87,7 +87,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let public_routes = Router::new()
         .route("/health", get(health))
         .route("/handshake", post(handshake_handler))
-        // Two-phase pairing: init → verify; `pairing-code` is loopback-only.
+        // Phones pair with CPace: init → verify. The HMAC pair below is the loopback
+        // dashboard's; `pairing-code` is loopback-only.
+        .route("/handshake/pake/init", post(handshake_pake_init))
+        .route("/handshake/pake/verify", post(handshake_pake_verify))
         .route("/handshake/init", post(handshake_init))
         .route("/handshake/verify", post(handshake_verify))
         .route("/handshake/refresh", post(handshake_refresh))
@@ -540,7 +543,7 @@ async fn handshake_handler(
     let peer = peer.ok();
     crate::network::require_lan(peer)?;
     // The legacy shape sends the six-digit code itself and binds nothing, so off this host
-    // it is refused; phones use the two-phase, channel-bound handshake.
+    // it is refused; phones pair with CPace.
     if !peer.is_some_and(|axum::extract::ConnectInfo(p)| p.ip().is_loopback()) {
         tracing::warn!(
             kind = "legacy_pairing_refused",
@@ -592,16 +595,42 @@ fn bad_body() -> (StatusCode, Json<Value>) {
     )
 }
 
-/// Phase 1 of pairing: client requests a challenge (public).
+/// The dashboard's HMAC pairing is for this host only: its MAC binds no channel, and one
+/// captured MAC gives up the six digits offline. A loopback peer on the plaintext development
+/// listener is not this host's dashboard either. Everyone else pairs with CPace.
+fn require_loopback_dashboard(
+    peer: std::net::SocketAddr,
+    insecure_dev: bool,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if peer.ip().is_loopback() && !insecure_dev {
+        return Ok(());
+    }
+    tracing::warn!(
+        kind = "hmac_pairing_refused",
+        peer = %peer.ip(),
+        insecure_dev,
+        "refused the loopback HMAC pairing from a phone; phones pair with CPace"
+    );
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": "pairing_requires_cpace"})),
+    ))
+}
+
+/// Phase 1 of the dashboard's loopback pairing: request a challenge.
 async fn handshake_init(
     State(state): State<Arc<AppState>>,
     peer: Result<
         axum::extract::ConnectInfo<std::net::SocketAddr>,
         axum::extract::rejection::ExtensionRejection,
     >,
+    insecure: Option<axum::Extension<crate::insecure_dev::InsecureDevTransport>>,
     body: Result<Json<InitRequest>, JsonRejection>,
 ) -> Result<Json<ChallengeResponse>, (StatusCode, Json<Value>)> {
-    crate::network::require_lan(peer.ok())?;
+    let peer = peer.ok();
+    crate::network::require_lan(peer)?;
+    let peer = peer.expect("LAN guard requires a connection address").0;
+    require_loopback_dashboard(peer, insecure.is_some())?;
     let Json(request) = body.map_err(|_| bad_body())?;
     let resp = state
         .handshake
@@ -611,7 +640,7 @@ async fn handshake_init(
     Ok(Json(resp))
 }
 
-/// Stricter per-IP limiter for the brute-forceable `/handshake/verify`; a client pairs once.
+/// Stricter per-IP limiter shared by both verify routes; a client pairs once.
 fn verify_limiter() -> &'static crate::middleware::RateLimiter {
     static VERIFY_LIMITER: std::sync::OnceLock<crate::middleware::RateLimiter> =
         std::sync::OnceLock::new();
@@ -623,12 +652,14 @@ fn verify_limiter() -> &'static crate::middleware::RateLimiter {
 /// `reason` is a closed set of rejection codes, safe to log: none carries the code or MAC.
 /// `insecure_dev` marks an attempt that arrived on the plaintext development listener, so the
 /// audit trail says which devices were paired where anyone on the network could watch.
+/// `method` is `cpace` (phones) or `loopback_hmac` (the dashboard).
 async fn emit_pairing_outcome(
     state: &AppState,
     paired: bool,
     device_name: Option<&str>,
     reason: Option<&str>,
     insecure_dev: bool,
+    method: &'static str,
 ) {
     use pond_core::security::domain::event::{Event, EventCategory, PrivacySensitivity};
 
@@ -641,19 +672,22 @@ async fn emit_pairing_outcome(
     if paired {
         tracing::info!(
             device = device_name.unwrap_or("unnamed"),
+            method,
             "pairing accepted"
         );
     } else {
         tracing::warn!(
             device = device_name.unwrap_or("unnamed"),
             reason = reason.unwrap_or("unspecified"),
+            method,
             "pairing rejected"
         );
     }
 
     if let Some(event_log) = state.event_log.as_ref() {
-        let mut event =
-            Event::new(EventCategory::Auth, action).sensitivity(PrivacySensitivity::Sensitive);
+        let mut event = Event::new(EventCategory::Auth, action)
+            .sensitivity(PrivacySensitivity::Sensitive)
+            .attr("method", method);
         if let Some(name) = device_name {
             event = event.attr("device_name", name);
         }
@@ -715,7 +749,27 @@ async fn emit_pairing_outcome(
     }
 }
 
-/// Phase 2 of pairing: client proves the pairing code via MAC (public).
+/// The per-IP verify limiter, as the 429 both verify routes answer with. The code is
+/// `pairing_busy`, the same one a CPace init answers when too many runs are waiting.
+async fn check_verify_limit(peer: std::net::SocketAddr) -> Result<(), (StatusCode, Json<Value>)> {
+    // Per source IP, loopback included.
+    if let Err(remaining) = verify_limiter()
+        .check_rate_limit_detailed(&peer.ip().to_string())
+        .await
+    {
+        let retry_after = crate::middleware::retry_after_secs(remaining);
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": PakeRefusal::Busy.code(),
+                "retry_after_secs": retry_after,
+            })),
+        ));
+    }
+    Ok(())
+}
+
+/// Phase 2 of the dashboard's loopback pairing: prove the code via MAC.
 async fn handshake_verify(
     State(state): State<Arc<AppState>>,
     peer: Result<
@@ -727,56 +781,21 @@ async fn handshake_verify(
 ) -> Result<Json<HandshakeResponse>, (StatusCode, Json<Value>)> {
     let peer = peer.ok();
     crate::network::require_lan(peer)?;
-    let insecure_dev = insecure.is_some();
     let peer = peer.expect("LAN guard requires a connection address").0;
-    // Per source IP, loopback included.
-    if let Err(remaining) = verify_limiter()
-        .check_rate_limit_detailed(&peer.ip().to_string())
-        .await
-    {
-        let retry_after = crate::middleware::retry_after_secs(remaining);
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
-                "error": "too many handshake attempts; slow down",
-                "retry_after_secs": retry_after,
-            })),
-        ));
-    }
+    check_verify_limit(peer).await?;
     let Json(request) = body.map_err(|_| bad_body())?;
     let device_name = request.device_name.clone();
-    // Plaintext has no TLS key to bind, so this listener pairs unbound by construction, and
-    // the six digits can be recovered offline from what crosses the wire. Say so every time.
-    if insecure_dev {
-        tracing::warn!(
-            kind = "insecure_dev_pairing",
-            peer = %peer.ip(),
-            bound = request.channel_binding.is_some(),
-            "pairing over the plaintext development listener; anyone on this network can take it over"
-        );
-    }
-    // Without a binding the MAC covers no key, so whoever answered the phone's TLS can take
-    // its proof, recover the six digits offline, and pair in its place. Only loopback, which
-    // no one can sit between, may pair unbound; the challenge is left unspent. The plaintext
-    // development listener is the one other exemption: it has no TLS key to bind.
-    if request.channel_binding.is_none() && !peer.ip().is_loopback() && !insecure_dev {
-        tracing::warn!(
-            kind = "unbound_pairing_refused",
-            peer = %peer.ip(),
-            "refused a pairing that does not bind the Pond's TLS key"
-        );
+    if let Err(refusal) = require_loopback_dashboard(peer, insecure.is_some()) {
         emit_pairing_outcome(
             &state,
             false,
             device_name.as_deref(),
-            Some("channel_binding_required"),
-            insecure_dev,
+            Some("pairing_requires_cpace"),
+            insecure.is_some(),
+            "loopback_hmac",
         )
         .await;
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "channel_binding_required"})),
-        ));
+        return Err(refusal);
     }
     let resp = match state.handshake.verify_handshake(request).await {
         Ok(resp) => resp,
@@ -786,7 +805,8 @@ async fn handshake_verify(
                 false,
                 device_name.as_deref(),
                 Some("internal_error"),
-                insecure_dev,
+                false,
+                "loopback_hmac",
             )
             .await;
             return Err(handshake_error("verify", e));
@@ -797,10 +817,110 @@ async fn handshake_verify(
         resp.accepted,
         device_name.as_deref(),
         resp.rejection_reason.as_deref(),
-        insecure_dev,
+        false,
+        "loopback_hmac",
     )
     .await;
     Ok(Json(resp))
+}
+
+/// CPace phase 1 (public, direct LAN peers): commit to the current pairing code and answer
+/// with the Pond's share. See `pond_core::security::ports::handshake`.
+async fn handshake_pake_init(
+    State(state): State<Arc<AppState>>,
+    peer: Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        axum::extract::rejection::ExtensionRejection,
+    >,
+    insecure: Option<axum::Extension<crate::insecure_dev::InsecureDevTransport>>,
+    body: Result<Json<PakeInitRequest>, JsonRejection>,
+) -> Result<Json<PakeChallenge>, (StatusCode, Json<Value>)> {
+    crate::network::require_lan(peer.ok())?;
+    let Json(request) = body.map_err(|_| bad_body())?;
+    let refusal = match state.handshake.init_pake(request).await {
+        Ok(Ok(challenge)) => return Ok(Json(challenge)),
+        Ok(Err(refusal)) => refusal,
+        Err(e) => return Err(handshake_error("pake_init", e)),
+    };
+    let status = match refusal {
+        PakeRefusal::ChannelBindingMismatch => {
+            // A phone at the wrong Pond, or an interceptor relaying one: record it.
+            emit_pairing_outcome(
+                &state,
+                false,
+                None,
+                Some(refusal.code()),
+                insecure.is_some(),
+                "cpace",
+            )
+            .await;
+            StatusCode::FORBIDDEN
+        }
+        PakeRefusal::NoActivePairingCode => StatusCode::CONFLICT,
+        PakeRefusal::InvalidClientNonce => StatusCode::BAD_REQUEST,
+        PakeRefusal::Busy => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    Err((status, Json(json!({"error": refusal.code()}))))
+}
+
+/// CPace phase 2 (public, direct LAN peers): check the phone's share and confirmation, then
+/// mint tokens and answer with the Pond's confirmation as `server_proof`. A refusal is a 200
+/// with `accepted: false`, and its code is in both `rejection_reason` and `error`, so a client
+/// can read every pairing refusal, from either route, from `error`.
+async fn handshake_pake_verify(
+    State(state): State<Arc<AppState>>,
+    peer: Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        axum::extract::rejection::ExtensionRejection,
+    >,
+    insecure: Option<axum::Extension<crate::insecure_dev::InsecureDevTransport>>,
+    body: Result<Json<PakeVerifyRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let peer = peer.ok();
+    crate::network::require_lan(peer)?;
+    let insecure_dev = insecure.is_some();
+    let peer = peer.expect("LAN guard requires a connection address").0;
+    check_verify_limit(peer).await?;
+    let Json(request) = body.map_err(|_| bad_body())?;
+    let device_name = request.device_name.clone();
+    // CPace keeps the code from being recovered offline even here, but over plaintext anyone
+    // on the network can take the tokens once they are issued. Say so every time.
+    if insecure_dev {
+        tracing::warn!(
+            kind = "insecure_dev_pairing",
+            peer = %peer.ip(),
+            "pairing over the plaintext development listener; anyone on this network can take it over"
+        );
+    }
+    let resp = match state.handshake.verify_pake(request).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            emit_pairing_outcome(
+                &state,
+                false,
+                device_name.as_deref(),
+                Some("internal_error"),
+                insecure_dev,
+                "cpace",
+            )
+            .await;
+            return Err(handshake_error("pake_verify", e));
+        }
+    };
+    emit_pairing_outcome(
+        &state,
+        resp.accepted,
+        device_name.as_deref(),
+        resp.rejection_reason.as_deref(),
+        insecure_dev,
+        "cpace",
+    )
+    .await;
+    let mut body = serde_json::to_value(&resp).map_err(|e| handshake_error("pake_verify", e))?;
+    if let Some(reason) = resp.rejection_reason.as_deref().filter(|_| !resp.accepted) {
+        body["error"] = json!(reason);
+    }
+    Ok(Json(body))
 }
 
 /// Exchange a refresh token for a fresh session+refresh pair (public).
@@ -3791,8 +3911,9 @@ async fn system_info(
         let mut info = json!({
             "https_port": pairing["https_port"],
             "tailnet_address": pairing["tailnet_address"],
-            // Pinned HTTPS pairing (v2), so a client can tell this from an older Pond.
-            "protocol": 2,
+            // CPace pairing over pinned HTTPS (v3); a client built for another version fails
+            // clearly instead of pairing with an exchange the Pond no longer speaks.
+            "protocol": 3,
         });
         // Present only while the plaintext development listener runs, so its absence is the
         // norm. The pin goes with it: it is public over mDNS, and binds nothing over plaintext.

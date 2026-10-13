@@ -12,7 +12,7 @@ build = "build.rs"
 # Enable in-process GGUF inference routing (mirrors pond-server's local-inference feature).
 local-inference = ["dep:pond-adapters-local-inference"]
 # `test_support::app_state()` for integration tests here and in pond-server.
-test-support = ["dep:tempfile", "pond-core/test-mocks"]
+test-support = ["dep:tempfile", "pond-core/test-mocks", "pond-infra/cpace-client"]
 
 [dependencies]
 libc = "0.2"

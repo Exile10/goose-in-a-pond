@@ -189,7 +189,6 @@ async fn pair(h: &Harness, id: &str) -> HandshakeResponse {
     let result = h
         .handshake
         .verify_handshake(VerifyRequest {
-            channel_binding: None,
             challenge_id: init.challenge_id,
             mac,
             device_name: Some(id.into()),

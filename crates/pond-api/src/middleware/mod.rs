@@ -169,6 +169,8 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::GET, "/health", Exposure::Always),
     // Pairing precedes any token; the pairing-code routes are loopback-gated in their handlers.
     (Method::POST, "/handshake", Exposure::Always),
+    (Method::POST, "/handshake/pake/init", Exposure::Always),
+    (Method::POST, "/handshake/pake/verify", Exposure::Always),
     (Method::POST, "/handshake/init", Exposure::Always),
     (Method::POST, "/handshake/verify", Exposure::Always),
     (Method::POST, "/handshake/refresh", Exposure::Always),
@@ -559,6 +561,8 @@ mod tests {
         for (method, path) in [
             (Method::GET, "/api/v1/health"),
             (Method::POST, "/api/v1/handshake"),
+            (Method::POST, "/api/v1/handshake/pake/init"),
+            (Method::POST, "/api/v1/handshake/pake/verify"),
             (Method::POST, "/api/v1/handshake/init"),
             (Method::POST, "/api/v1/handshake/verify"),
             (Method::POST, "/api/v1/handshake/refresh"),
