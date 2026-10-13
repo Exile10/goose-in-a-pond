@@ -208,7 +208,8 @@ impl CronSchedulerAdapter {
                 } else if let Some(at) = record.fire_at {
                     self.add_one_shot_to_scheduler(&record.id, at, kind).await?
                 } else {
-                    self.add_job_to_scheduler(&record.id, &record.cron, kind)
+                    // Unraced: the scheduler starts only after rehydration.
+                    self.add_job_to_scheduler(&record.id, &record.cron, &record.timezone, kind)
                         .await?
                 }
             };
@@ -236,35 +237,37 @@ impl CronSchedulerAdapter {
 
     // ── Internal job management ───────────────────────────────────────────────
 
+    /// Registers a recurring task: a one-shot at its next local occurrence, re-armed each fire.
+    /// Callers hold the `tasks` lock across this and the `job_id` write, so a fire that races
+    /// the registration waits for the entry instead of finding none.
     async fn add_job_to_scheduler(
         &self,
         task_id: &str,
         cron: &str,
+        timezone: &str,
         kind: TaskKind,
     ) -> Result<uuid::Uuid> {
-        let executor = self.executor.clone();
-        let tasks = self.tasks.clone();
-        let run_history = self.run_history.clone();
-        let result_tx = self.result_tx.clone();
-        let persist = self.persist.clone();
-        let id = task_id.to_string();
-
-        let job = Job::new_async(cron, move |_uuid, _lock| {
-            let ctx = TaskRunContext {
-                executor: executor.clone(),
-                tasks: tasks.clone(),
-                run_history: run_history.clone(),
-                result_tx: result_tx.clone(),
-                persist: persist.clone(),
-                id: id.clone(),
-                kind: kind.clone(),
-            };
-            Box::pin(async move { ctx.run().await })
-        })
-        .map_err(|e| anyhow::anyhow!("invalid cron expression '{cron}': {e}"))?;
-
-        let job_id = self.scheduler.add(job).await?;
-        Ok(job_id)
+        if timezone.parse::<chrono_tz::Tz>().is_err() {
+            tracing::warn!(
+                task = %task_id,
+                timezone,
+                "unrecognised IANA timezone; the schedule runs on UTC, as its next_run shows"
+            );
+        }
+        RecurringJob {
+            scheduler: self.scheduler.clone(),
+            executor: self.executor.clone(),
+            tasks: self.tasks.clone(),
+            run_history: self.run_history.clone(),
+            result_tx: self.result_tx.clone(),
+            persist: self.persist.clone(),
+            id: task_id.to_string(),
+            cron: cron.to_string(),
+            timezone: timezone.to_string(),
+            kind,
+        }
+        .arm(Utc::now())
+        .await
     }
 
     /// Registers a task that fires once at `at`, then removes itself. A past `at` fires now:
@@ -358,12 +361,30 @@ impl CronSchedulerAdapter {
 
 /// Next fire time of `cron_expr` in IANA `timezone` (UTC if unparseable); `None` if invalid.
 fn compute_next_run(cron_expr: &str, timezone: &str) -> Option<chrono::DateTime<Utc>> {
-    // croner 3 accepts 5- and 6-field cron by default. Keep croner on `tokio-cron-scheduler`'s
-    // major: that copy decides when jobs fire, this one what `next_run` promises.
-    let cron: croner::Cron = cron_expr.parse().ok()?;
+    next_occurrence(cron_expr, timezone, Utc::now())
+}
+
+/// First occurrence of `cron_expr` strictly after `after`, read as wall-clock time in IANA
+/// `timezone` (UTC if unparseable); `None` if the expression is invalid or never recurs.
+///
+/// Both when a task fires ([`RecurringJob`]) and the `next_run` the UI shows come from here, so
+/// the two cannot disagree. chrono-tz resolves each occurrence with the offset in force on that
+/// date, so a schedule keeps its local time across a DST change.
+fn next_occurrence(
+    cron_expr: &str,
+    timezone: &str,
+    after: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    // Parsed as `tokio-cron-scheduler` parsed it while it fired cron jobs itself: seconds
+    // required, and day-of-month AND day-of-week. Stored expressions keep their meaning.
+    let cron = croner::parser::CronParser::builder()
+        .seconds(croner::parser::Seconds::Required)
+        .dom_and_dow(true)
+        .build()
+        .parse(cron_expr)
+        .ok()?;
     let tz: chrono_tz::Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
-    let now = Utc::now().with_timezone(&tz);
-    match cron.find_next_occurrence(&now, false) {
+    match cron.find_next_occurrence(&after.with_timezone(&tz), false) {
         Ok(dt) => Some(dt.with_timezone(&Utc)),
         Err(e) => {
             tracing::debug!(
@@ -373,6 +394,106 @@ fn compute_next_run(cron_expr: &str, timezone: &str) -> Option<chrono::DateTime<
             );
             None
         }
+    }
+}
+
+/// One recurring task, kept as a chain of one-shot jobs, each armed for its next local occurrence.
+///
+/// `Job::new_async` reads a cron expression in UTC, so a daily 08:00 Africa/Nairobi schedule fired
+/// at 08:00 UTC (11:00 in Nairobi) while its card promised 08:00. `Job::new_async_tz` would fix the
+/// zone but freezes its UTC offset when the job is built, so a zone with DST would fire an hour
+/// off after every change until a restart. Each occurrence here is resolved afresh by
+/// [`next_occurrence`].
+#[derive(Clone)]
+struct RecurringJob {
+    scheduler: JobScheduler,
+    executor: Arc<dyn ScheduleExecutor>,
+    tasks: Arc<Mutex<HashMap<String, TaskEntry>>>,
+    run_history: Arc<JsonRunHistory>,
+    result_tx: Option<
+        tokio::sync::broadcast::Sender<pond_core::user_data::domain::schedule::ScheduleResultEvent>,
+    >,
+    persist: Arc<SnapshotWriter>,
+    id: String,
+    cron: String,
+    timezone: String,
+    kind: TaskKind,
+}
+
+impl RecurringJob {
+    /// Registers a one-shot at the first occurrence after `after`; an error if there is none.
+    /// Takes no lock on `tasks`, so a caller may hold it.
+    fn arm(
+        self,
+        after: chrono::DateTime<Utc>,
+    ) -> futures::future::BoxFuture<'static, Result<uuid::Uuid>> {
+        Box::pin(async move {
+            let at = next_occurrence(&self.cron, &self.timezone, after).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid cron expression '{}': it has no next occurrence",
+                    self.cron
+                )
+            })?;
+            let delay = (at - Utc::now())
+                .to_std()
+                .unwrap_or(std::time::Duration::ZERO);
+            let scheduler = self.scheduler.clone();
+            let job = Job::new_one_shot_async(delay, move |fired, _lock| {
+                let this = self.clone();
+                Box::pin(async move { this.fire(fired, at).await })
+            })
+            .map_err(|e| anyhow::anyhow!("could not schedule an occurrence at {at}: {e}"))?;
+            Ok(scheduler.add(job).await?)
+        })
+    }
+
+    /// Runs the occurrence due at `at`, arming the next one first so a run that overruns the
+    /// interval or dies mid-way does not end the chain.
+    async fn fire(self, fired: uuid::Uuid, at: chrono::DateTime<Utc>) {
+        // The one-shot timer counts whole seconds and can wake just before `at`.
+        if let Ok(early) = (at - Utc::now()).to_std() {
+            tokio::time::sleep(early).await;
+        }
+        {
+            let mut guard = self.tasks.lock().await;
+            // A pause, delete or reshape swaps the task's job id; a superseded job stays quiet.
+            if guard.get(&self.id).map(|e| e.job_id) != Some(fired) {
+                tracing::debug!(task = %self.id, job = %fired, "superseded occurrence; not running");
+                return;
+            }
+            match self.clone().arm(at).await {
+                Ok(next) => {
+                    if let Some(entry) = guard.get_mut(&self.id) {
+                        entry.job_id = next;
+                    }
+                }
+                Err(e) => tracing::error!(
+                    task = %self.id,
+                    cron = %self.cron,
+                    timezone = %self.timezone,
+                    error = %e,
+                    "could not arm the next occurrence; this schedule stops firing until it is \
+                     edited or the pond restarts"
+                ),
+            }
+        }
+        tracing::info!(
+            task = %self.id,
+            timezone = %self.timezone,
+            due = %at,
+            "recurring schedule fired"
+        );
+        TaskRunContext {
+            executor: self.executor,
+            tasks: self.tasks,
+            run_history: self.run_history,
+            result_tx: self.result_tx,
+            persist: self.persist,
+            id: self.id,
+            kind: self.kind,
+        }
+        .run()
+        .await;
     }
 }
 
@@ -567,6 +688,8 @@ impl SchedulerPort for CronSchedulerAdapter {
             fire_at,
         };
 
+        // Held from registration to insert, so an occurrence due at once finds its entry.
+        let mut guard = self.tasks.lock().await;
         // Event rules get no job (the rules engine fires them via `run_now`); nil id means no job.
         let job_id = if req.kind.is_event_triggered() {
             uuid::Uuid::nil()
@@ -574,7 +697,7 @@ impl SchedulerPort for CronSchedulerAdapter {
             self.add_one_shot_to_scheduler(&req.id, at, req.kind.clone())
                 .await?
         } else {
-            self.add_job_to_scheduler(&req.id, &cron, req.kind.clone())
+            self.add_job_to_scheduler(&req.id, &cron, &req.timezone, req.kind.clone())
                 .await?
         };
 
@@ -599,18 +722,16 @@ impl SchedulerPort for CronSchedulerAdapter {
             created_at: record.created_at.unwrap(),
         };
 
-        {
-            let mut guard = self.tasks.lock().await;
-            guard.insert(
-                req.id,
-                TaskEntry {
-                    persisted: record,
-                    job_id,
-                    currently_running: false,
-                    last_run: None,
-                },
-            );
-        }
+        guard.insert(
+            req.id,
+            TaskEntry {
+                persisted: record,
+                job_id,
+                currently_running: false,
+                last_run: None,
+            },
+        );
+        drop(guard);
 
         self.save().await?;
         Ok(schedule)
@@ -663,31 +784,35 @@ impl SchedulerPort for CronSchedulerAdapter {
     }
 
     async fn resume_task(&self, id: &str) -> Result<()> {
-        let (cron, kind) = {
-            let guard = self.tasks.lock().await;
+        // Held from registration to the `job_id` write, so an occurrence due at once finds it.
+        let mut guard = self.tasks.lock().await;
+        let (cron, timezone, kind) = {
             let entry = guard
                 .get(id)
                 .ok_or_else(|| anyhow::anyhow!("task '{id}' not found"))?;
             if !entry.persisted.paused {
                 return Ok(());
             }
-            (entry.persisted.cron.clone(), Self::resolve_kind(entry))
+            (
+                entry.persisted.cron.clone(),
+                entry.persisted.timezone.clone(),
+                Self::resolve_kind(entry),
+            )
         };
 
         // Event rules have no job to re-register; the rules engine checks `paused` itself.
         let job_id = if kind.is_event_triggered() {
             uuid::Uuid::nil()
         } else {
-            self.add_job_to_scheduler(id, &cron, kind).await?
+            self.add_job_to_scheduler(id, &cron, &timezone, kind)
+                .await?
         };
 
-        {
-            let mut guard = self.tasks.lock().await;
-            if let Some(entry) = guard.get_mut(id) {
-                entry.persisted.paused = false;
-                entry.job_id = job_id;
-            }
+        if let Some(entry) = guard.get_mut(id) {
+            entry.persisted.paused = false;
+            entry.job_id = job_id;
         }
+        drop(guard);
 
         self.save().await?;
         Ok(())
@@ -787,10 +912,12 @@ impl SchedulerPort for CronSchedulerAdapter {
 
         // `fire_at` (given, or derived via `once`) makes a one-shot with the `"@once"` cron;
         // a real `cron` alone makes it recurring again and clears `fire_at`.
-        let shape_changed = req.cron.is_some() || req.fire_at.is_some() || req.once;
+        // A new zone moves every occurrence, so it re-registers the job as a new cron does.
+        let shape_changed =
+            req.cron.is_some() || req.fire_at.is_some() || req.once || req.timezone.is_some();
 
         // Read current state and apply non-shape changes first.
-        let (old_job_id, new_cron, new_fire_at, new_kind, was_paused) = {
+        let (old_job_id, new_cron, new_fire_at, new_kind, new_timezone, was_paused) = {
             let mut guard = self.tasks.lock().await;
             let entry = guard
                 .get_mut(id)
@@ -827,27 +954,32 @@ impl SchedulerPort for CronSchedulerAdapter {
                 (entry.persisted.cron.clone(), entry.persisted.fire_at)
             };
             let kind = Self::resolve_kind(entry);
-            (old_job_id, cron, fire_at, kind, paused)
+            let timezone = entry.persisted.timezone.clone();
+            (old_job_id, cron, fire_at, kind, timezone, paused)
         };
 
-        // Create the new job first, so a bad cron leaves the old job running.
-        if shape_changed && !was_paused {
+        // Event rules have no job to replace: the rules engine fires them through `run_now`.
+        if shape_changed && !was_paused && !new_kind.is_event_triggered() {
+            // Create the new job first, so a bad cron leaves the old job running; hold the lock
+            // to the `job_id` write, so an occurrence due at once finds it.
+            let mut guard = self.tasks.lock().await;
             let new_job_id = if let Some(at) = new_fire_at {
                 self.add_one_shot_to_scheduler(id, at, new_kind).await?
             } else {
-                self.add_job_to_scheduler(id, &new_cron, new_kind).await?
+                self.add_job_to_scheduler(id, &new_cron, &new_timezone, new_kind)
+                    .await?
             };
-            if old_job_id != uuid::Uuid::nil() {
-                let _ = self.scheduler.remove(&old_job_id).await;
-            }
-            let mut guard = self.tasks.lock().await;
             if let Some(entry) = guard.get_mut(id) {
                 entry.persisted.cron = new_cron;
                 entry.persisted.fire_at = new_fire_at;
                 entry.job_id = new_job_id;
             }
-        } else if shape_changed && was_paused {
-            // Schedule is paused — just update the stored shape (no active job to replace).
+            drop(guard);
+            if old_job_id != uuid::Uuid::nil() {
+                let _ = self.scheduler.remove(&old_job_id).await;
+            }
+        } else if shape_changed {
+            // Paused, or an event rule: just update the stored shape (no active job to replace).
             let mut guard = self.tasks.lock().await;
             if let Some(entry) = guard.get_mut(id) {
                 entry.persisted.cron = new_cron;
@@ -1141,6 +1273,167 @@ mod tests {
         let next = super::compute_next_run("0 0 14 * * *", "Not/A/Zone")
             .expect("an unparseable timezone must not make an otherwise-valid cron unparseable");
         assert_eq!(next.format("%H:%M").to_string(), "14:00", "{next}");
+    }
+
+    fn utc(s: &str) -> chrono::DateTime<Utc> {
+        s.parse().expect("test instant")
+    }
+
+    /// 2026-10-12: "Daily Brief", 08:00 Africa/Nairobi, fired at 08:00 UTC, 11:00 in Nairobi.
+    #[test]
+    fn a_0800_nairobi_schedule_next_fires_at_0500_utc() {
+        let next = next_occurrence("0 0 8 * * *", "Africa/Nairobi", utc("2026-10-12T00:00:00Z"));
+        assert_eq!(next, Some(utc("2026-10-12T05:00:00Z")));
+        // Strictly after: the occurrence that just fired is never armed again.
+        let following =
+            next_occurrence("0 0 8 * * *", "Africa/Nairobi", utc("2026-10-12T05:00:00Z"));
+        assert_eq!(following, Some(utc("2026-10-13T05:00:00Z")));
+    }
+
+    /// Europe/London goes to BST on 2026-03-29: 08:00 local is 08:00 UTC the day before and
+    /// 07:00 UTC from that day on. A frozen offset would keep firing at 08:00 UTC.
+    #[test]
+    fn a_schedule_keeps_its_local_time_across_a_dst_change() {
+        let cron = "0 0 8 * * *";
+        let before = next_occurrence(cron, "Europe/London", utc("2026-03-27T12:00:00Z"));
+        assert_eq!(before, Some(utc("2026-03-28T08:00:00Z")));
+        let after = next_occurrence(cron, "Europe/London", utc("2026-03-28T08:00:00Z"));
+        assert_eq!(after, Some(utc("2026-03-29T07:00:00Z")));
+    }
+
+    /// The expression means what it meant while tokio-cron-scheduler fired it: day-of-month AND
+    /// day-of-week, and the seconds field required.
+    #[test]
+    fn stored_expressions_keep_the_meaning_they_fired_with() {
+        // The first Monday that is also the 1st, after 2026-10-12, is 2027-02-01.
+        let next = next_occurrence("0 0 8 1 * Mon", "UTC", utc("2026-10-12T00:00:00Z"));
+        assert_eq!(next, Some(utc("2027-02-01T08:00:00Z")));
+        assert_eq!(
+            next_occurrence("0 8 * * *", "UTC", utc("2026-10-12T00:00:00Z")),
+            None,
+            "a 5-field expression was refused at creation and must stay refused"
+        );
+    }
+
+    /// When the registered job is due, not just what `next_run` displays.
+    async fn registered_tick(sched: &CronSchedulerAdapter, id: &str) -> chrono::DateTime<Utc> {
+        let job_id = sched.tasks.lock().await[id].job_id;
+        let mut scheduler = sched.scheduler.clone();
+        scheduler
+            .next_tick_for_job(job_id)
+            .await
+            .expect("job lookup")
+            .expect("a recurring task has a pending occurrence")
+    }
+
+    /// The tick is the job's due time; the one-shot timer counts whole seconds, so it may lead
+    /// the occurrence by under two seconds, and `fire` waits out the remainder.
+    fn assert_due_at(tick: chrono::DateTime<Utc>, occurrence: chrono::DateTime<Utc>) {
+        let lead = occurrence - tick;
+        assert!(
+            lead >= chrono::Duration::zero() && lead < chrono::Duration::seconds(2),
+            "registered for {tick}, but the occurrence is {occurrence}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_registered_job_is_due_at_the_schedules_local_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+        let mut req = create_req("brief", "0 0 8 * * *");
+        req.timezone = "Africa/Nairobi".to_string();
+        let created = sched.create_task(req).await.unwrap();
+
+        let occurrence = created.next_run.expect("an active schedule has a next run");
+        assert_eq!(occurrence.format("%H:%M:%S").to_string(), "05:00:00");
+        assert_due_at(registered_tick(&sched, "brief").await, occurrence);
+    }
+
+    #[tokio::test]
+    async fn changing_only_the_timezone_moves_the_registered_job() {
+        use pond_core::user_data::ports::scheduler::UpdateScheduleRequest;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+        sched
+            .create_task(create_req("tz", "0 0 8 * * *"))
+            .await
+            .unwrap();
+
+        let updated = sched
+            .update_task(
+                "tz",
+                UpdateScheduleRequest {
+                    label: None,
+                    cron: None,
+                    timezone: Some("Africa/Nairobi".to_string()),
+                    kind: None,
+                    fire_at: None,
+                    once: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let occurrence = updated.next_run.expect("still active");
+        assert_eq!(occurrence.format("%H:%M:%S").to_string(), "05:00:00");
+        assert_due_at(registered_tick(&sched, "tz").await, occurrence);
+    }
+
+    /// Each fire arms the next occurrence; a chain that stops after one run is a dead schedule.
+    #[tokio::test]
+    async fn a_recurring_schedule_keeps_firing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicU32::new(0));
+        let exec: Arc<dyn ScheduleExecutor> = Arc::new(CountingExecutor(counter.clone()));
+        let sched = CronSchedulerAdapter::new(
+            tmp.path().join("schedules.json"),
+            tmp.path().join("schedule_runs.json"),
+            exec,
+        )
+        .await
+        .unwrap();
+        sched
+            .create_task(create_req("every-second", "* * * * * *"))
+            .await
+            .unwrap();
+
+        let fired_twice = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while counter.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(
+            fired_twice.is_ok(),
+            "fired {} time(s) in 10 s",
+            counter.load(Ordering::SeqCst)
+        );
+    }
+
+    /// A paused task's pending occurrence is removed, and one already firing does not re-arm.
+    #[tokio::test]
+    async fn a_paused_schedule_stops_firing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicU32::new(0));
+        let exec: Arc<dyn ScheduleExecutor> = Arc::new(CountingExecutor(counter.clone()));
+        let sched = CronSchedulerAdapter::new(
+            tmp.path().join("schedules.json"),
+            tmp.path().join("schedule_runs.json"),
+            exec,
+        )
+        .await
+        .unwrap();
+        sched
+            .create_task(create_req("stop", "* * * * * *"))
+            .await
+            .unwrap();
+        sched.pause_task("stop").await.unwrap();
+        // Let a fire that was already under way finish.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let settled = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), settled);
     }
 
     #[tokio::test]
