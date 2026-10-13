@@ -336,8 +336,15 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	replacing := approval.Action == "replace"
 	if replacing {
-		if !present || current.Role != "phone" || approval.Role != "phone" || current.Revision == "" || approval.ExpectedRevision != current.Revision || (current.Status != "revoked" && current.Status != "failed" && current.Status != "pending") || len(s.Store.value.Retired[approval.Household]) >= 256 {
+		if !present || current.Role != "phone" || approval.Role != "phone" || current.Revision == "" || approval.ExpectedRevision != current.Revision || (current.Status != "revoked" && current.Status != "failed" && current.Status != "pending") {
 			http.Error(w, `{"error":"replacement_conflict"}`, 409)
+			return
+		}
+		// Its own reason, because unlike a conflict it is about the household rather than
+		// this approval, and it passes: expireRetired frees records as identities leave.
+		if len(s.Store.value.Retired[approval.Household]) >= retiredCapacity {
+			slog.Warn("replacement refused: the household's retired records are at capacity", "household", approval.Household, "capacity", retiredCapacity)
+			http.Error(w, `{"error":"retired_capacity"}`, 409)
 			return
 		}
 	}
@@ -399,7 +406,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if approval.Action == "enroll" || replacing {
 		if replacing {
-			// Retain the old binding permanently, including after a late registration.
+			// Retain the old binding until its identity has stayed off the coordinator for
+			// retiredGrace, so a late registration under it is still deleted; see expireRetired.
 			current.Status = "revoked"
 			s.Store.value.Retired[approval.Household] = append(s.Store.value.Retired[approval.Household], current)
 		}
@@ -530,6 +538,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+	if err := s.expireRetired(inventory); err != nil {
+		return err
 	}
 	return s.policy(ctx)
 }

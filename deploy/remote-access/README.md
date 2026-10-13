@@ -371,8 +371,31 @@ enrollment still needs review: each replacement retires a record against the
 household's bounded budget, and a refused enrollment can be failed again at will.
 Active/revoking records, reused machines, stale revisions,
 expired approvals and replays fail closed. A newer revocation invalidates an older
-replacement approval. Retired identities remain in backups for late-registration
-cleanup, with a bound of 256 per household and no automatic deletion.
+replacement approval.
+
+A replacement retires the old record so a late registration under its machine key
+can still be deleted. Retired records are bounded at 256 per household and, since
+2026-10-13, expire: every reconciliation (each 30 seconds) compares them with the
+coordinator inventory it read before deleting anything, and a record is dropped once
+reads at least 24 hours apart have all found no node holding its identity under the
+household's user. The first such read stamps `absentSince` on the record; any read
+that finds a node clears it, and that node is deleted as before. A node deleted in a
+pass therefore still counts as present in that pass, and a registration still in
+flight shows up well inside the 24 hours. Older state files load unchanged, their
+records simply unstamped. Before this a record was kept for good, so 256
+replacements, each recovery and since 2026-10-05 each lapsed phone coming back,
+left a household unable to replace any phone without an operator editing the store.
+
+Once a record expires its machine key is no longer refused as `identity_retired`.
+That is deliberate, and no list of expired keys is kept: the key belongs to an old
+phone, no node holds it, and enrolling it again still needs a fresh approval signed
+by the household's own Pond for that exact key, the same as any new phone. A key a
+node does hold is still refused as `identity_already_registered`.
+
+A household that still reaches the bound, through 256 replacements within about a
+day, is refused with `409 retired_capacity` rather than the `replacement_conflict` a
+stale or invalid approval gets, and the service logs it. It clears as records
+expire. An older Pond treats the new reason like any other refusal, as before.
 
 Current pilot limitations: the service protocol and helper are implemented and tested
 against real Headscale, but the phone-to-local-dashboard recovery flow is unfinished.
