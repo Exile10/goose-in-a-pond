@@ -3129,3 +3129,31 @@ milestone completion).**
   a mutation check that a reintroduced `reqwest::Client::new()` fails the new guard. Jerry asked
   for the merge and deploy before the full Mac suite finished; its result is recorded with the
   deploy.
+
+**2026-10-13 — A quiet pass for one conversation no longer evicts the one in use (inference
+latency; not a PAI milestone).**
+
+- **What the Orin showed.** LiteRT turns in the household took 7, 9, 12 and 14 s to the first
+  token over four turns of one chat (llama.cpp turns take about 1 s). Five seconds after every turn
+  the quiet pass started summarising an OLDER conversation at 82% of its window, because that one
+  would compact at its next turn. The summary call is marked as replacing history, so LiteRT
+  skipped saving the conversation in use ("the family's snapshot already holds what the next turn
+  can reuse"; the family is system prompt plus tools, shared by every chat). The next turn
+  stopped the pass, restored an older 5,089-token snapshot and re-prefilled the rest; the pass,
+  never finished, started again after the following turn.
+- **What landed.** GIAP: `QuietPasses::conversation_in_use` (the latest turn's) and
+  `inference_lane::compaction_quiet`: 5 s (its turn compacts) and 30 s quiets only for the
+  conversation in use, 120 s for any other, doubled per pass someone stopped, at most 16x. goose
+  (`b903b2e58`): `request_context::for_session`, scoped by goose's `with_session_id`, reaches the
+  local provider; the retained LiteRT conversation records its session, and the save is skipped
+  only when the summary is for that session.
+- **Invariants.** Preamble, guest, turn blocking: none changed. No `Settings` field, no migration.
+  A conversation in use still gets its 5 s pass, and its turn still waits for it.
+- **Verified on the Mac** (scratch pond, LiteRT E2B, Orin profile, 8k window, conversation A just
+  past 80%, then conversation B with 8 s pauses; `scratchpad/loop/drive.py`). Before: a pass for A
+  after every B turn, LiteRT "Did not save" B, B restored A's snapshot, B's first token 336, 768,
+  1,069, 1,361, 1,816 ms. After: no pass during B, no restore, 329-367 ms. After 150 s of quiet
+  A's pass ran with B's chat in the model: B was saved (5,303 tokens), A compacted, B's next turn
+  restored its own conversation. Unit tests: pond-core 26, pond-api quiet_pass 7, goose
+  request_context 3, session_context 7, LiteRT 41.
+- **Not yet verified on the Orin.**
