@@ -10,7 +10,8 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use pond_api::network::CompanionTransport;
 use pond_core::security::ports::handshake::{
-    Handshake, HandshakeRequest, HandshakeResponse, PairingCode, TokenCaller,
+    Handshake, HandshakeRequest, HandshakeResponse, PairingCode, PakeChallenge, PakeInitRequest,
+    PakeRefusal, PakeVerifyRequest, TokenCaller,
 };
 use pond_server::listeners::{compose, Listeners};
 use serde_json::Value;
@@ -20,7 +21,7 @@ const LOOPBACK: ([u8; 4], u16) = ([127, 0, 0, 1], 40_000);
 const LAN: ([u8; 4], u16) = ([192, 168, 1, 20], 40_000);
 
 /// Accepts one bearer, so a 404 means the route is absent rather than the caller refused.
-/// Pairing codes come from the real adapter.
+/// Pairing codes and CPace pairing come from the real adapter.
 struct PairedPhone(std::sync::Arc<pond_infra::sqlite_handshake::SqliteHandshakeAdapter>);
 
 #[async_trait]
@@ -46,6 +47,15 @@ impl Handshake for PairedPhone {
     async fn issue_pairing_code_for(&self, profile: Option<&str>) -> Result<PairingCode> {
         self.0.issue_pairing_code_for(profile).await
     }
+    async fn init_pake(
+        &self,
+        request: PakeInitRequest,
+    ) -> Result<std::result::Result<PakeChallenge, PakeRefusal>> {
+        self.0.init_pake(request).await
+    }
+    async fn verify_pake(&self, request: PakeVerifyRequest) -> Result<HandshakeResponse> {
+        self.0.verify_pake(request).await
+    }
 }
 
 const TOKEN: &str = "wiring-test-token";
@@ -67,7 +77,8 @@ async fn harness_with(insecure: Option<pond_api::insecure_dev::InsecureDevLan>) 
     let test = pond_api::test_support::app_state().await;
     let transport = CompanionTransport {
         https_port: 4443,
-        tls_spki_sha256: "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+        // The adapter's pin, as `serve()` hands both the same one.
+        tls_spki_sha256: pond_api::test_support::TEST_SPKI_PIN.into(),
     };
     #[cfg(unix)]
     let (embedded, _socket) =
@@ -404,7 +415,7 @@ async fn system_info_tells_an_anonymous_caller_where_to_connect_and_nothing_more
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["https_port"], 4443);
-    assert_eq!(body["protocol"], 2);
+    assert_eq!(body["protocol"], 3);
     for private in [
         "hostname",
         "lan_address",
@@ -492,4 +503,52 @@ async fn the_plaintext_listener_never_enrolls_or_renews_remote_access() {
     );
     let (plaintext, _) = get(&h.listeners.insecure, LOOPBACK, path).await;
     assert_eq!(plaintext, StatusCode::NOT_FOUND);
+}
+
+/// Expo Go pairs over the plaintext listener with CPace, under the pin that listener's
+/// `/system/info` reports, exactly as the app does in development.
+#[tokio::test]
+async fn a_phone_pairs_with_cpace_over_the_plaintext_listener() {
+    let h = harness_with(Some(pond_api::insecure_dev::InsecureDevLan { port: 4080 })).await;
+    let (status, info) = send(
+        h.listeners.insecure.clone(),
+        Request::get("/api/v1/system/info")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info["protocol"], 3);
+    assert_eq!(info["insecure_dev"], true);
+    let pin = info["tls_spki_sha256"]
+        .as_str()
+        .expect("the pin is reported here");
+
+    let (status, issued) = send(
+        h.listeners
+            .dashboard
+            .clone()
+            .layer(axum::Extension(ConnectInfo(SocketAddr::from(LOOPBACK)))),
+        Request::post("/api/v1/handshake/pairing-code")
+            .header("Host", "127.0.0.1:4000")
+            .header("Origin", "http://127.0.0.1:4000")
+            .header(
+                pond_api::host_guard::CREDENTIAL_HEADER,
+                h.credential.as_str(),
+            )
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{issued}");
+    let code = issued["code"].as_str().unwrap();
+
+    let phone = h
+        .listeners
+        .insecure
+        .clone()
+        .layer(axum::Extension(ConnectInfo(SocketAddr::from(LOOPBACK))));
+    let (status, body) = pond_api::test_support::pair_phone(&phone, code, "expo-go", pin).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], true, "{body}");
 }

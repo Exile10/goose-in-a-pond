@@ -11711,6 +11711,7 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "chrono",
+ "curve25519-dalek 4.1.3",
  "dirs",
  "fastembed",
  "hmac 0.12.1",
@@ -11734,6 +11735,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
