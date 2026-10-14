@@ -48,9 +48,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ── Source shared functions ──────────────────────────────────────────────────
-for lib in common deps build models systemd desktop; do
-  source "${SCRIPT_DIR}/lib/install-${lib}.sh"
-done
+# One line per library rather than a loop, so shellcheck can follow each one
+# and see the variables they share with this script.
+source "${SCRIPT_DIR}/lib/install-common.sh"
+source "${SCRIPT_DIR}/lib/install-deps.sh"
+source "${SCRIPT_DIR}/lib/install-build.sh"
+source "${SCRIPT_DIR}/lib/install-models.sh"
+source "${SCRIPT_DIR}/lib/install-systemd.sh"
+source "${SCRIPT_DIR}/lib/install-desktop.sh"
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 MODE=""

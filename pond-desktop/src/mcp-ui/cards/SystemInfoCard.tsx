@@ -17,7 +17,7 @@ function metricIcon(type: MetricEntry["icon"]) {
   }
 }
 
-function SystemInfoCard({ data, variant }: McpCardProps) {
+export function SystemInfoCard({ data, variant }: McpCardProps) {
   const isCompact = variant === "compact";
   const platform = data.platform as string | undefined;
   const arch = data.arch as string | undefined;

@@ -8,7 +8,7 @@ import { api } from "../../api/PondApiClient";
 import { ApiError } from "../../api/types";
 import type { VisionStatus } from "../../api/types";
 import { __resetChatRunForTests, openSession } from "../../state/chatRunStore";
-import { ATTACH_BLOCKED_COPY, NOT_DECLARED_COPY } from "../../components/ImageSupportStatus";
+import { ATTACH_BLOCKED_COPY, NOT_DECLARED_COPY } from "../../components/imageSupportCopy";
 import { prepareImage } from "../../lib/imageAttach";
 import type { PreparedImage } from "../../lib/imageAttach";
 
@@ -40,7 +40,7 @@ vi.mock("../../api/PondApiClient", () => ({
   },
 }));
 
-vi.mock("../../state/AppContext", () => ({
+vi.mock("../../state/useAppContext", () => ({
   useAppState: () => ({ serverOnline: true, sessionId: "sess-hub" }),
   useAppDispatch: () => vi.fn(),
 }));

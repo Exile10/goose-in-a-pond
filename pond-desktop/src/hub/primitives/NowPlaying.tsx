@@ -1,6 +1,5 @@
 import { HubIco } from "./HubIco";
-import { HP_PATHS } from "./icons";
-import { pauseEl } from "./HubIco";
+import { HP_PATHS, pauseEl } from "./icons";
 import { useHomeData, controlNowPlaying, refreshNowPlaying } from "../state/hubDataStore";
 import { api } from "../../api/PondApiClient";
 import { invoke, isDesktopShell } from "../../shell";

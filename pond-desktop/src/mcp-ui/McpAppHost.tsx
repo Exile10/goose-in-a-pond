@@ -3,7 +3,7 @@
  * Spec: https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx
  */
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import { X } from "lucide-react";
 
 // ── Types ──────────────────────────────────────────────────────
@@ -231,11 +231,13 @@ export function McpAppHost({
     return () => window.removeEventListener("message", handleMessage);
   }, [handleMessage]);
 
-  // Send teardown on unmount
-  useEffect(() => {
+  // Send teardown on unmount. A layout effect, because its cleanup runs while the frame is still in
+  // the document; a passive cleanup runs after React has removed it, when the frame's window is gone.
+  useLayoutEffect(() => {
+    const frame = iframeRef.current;
     return () => {
       if (initializedRef.current) {
-        iframeRef.current?.contentWindow?.postMessage(
+        frame?.contentWindow?.postMessage(
           { jsonrpc: "2.0", method: "ui/resource-teardown", params: { reason: "unmount" } },
           APP_FRAME_ORIGIN,
         );

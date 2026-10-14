@@ -19,7 +19,7 @@ vi.mock("../api/PondApiClient", () => ({
 
 // ── Mock AppContext (Schedules uses useAppState) ───────────────────────────────
 
-vi.mock("../state/AppContext", () => ({
+vi.mock("../state/useAppContext", () => ({
   useAppState: () => ({ serverOnline: true, sessionToken: "test-token" }),
   useAppDispatch: () => vi.fn(),
 }));

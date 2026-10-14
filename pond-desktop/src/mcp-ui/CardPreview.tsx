@@ -1,5 +1,5 @@
 /** Standalone page (/#preview) rendering every MCP card from its registration's mockData; no backend. */
-import { getAllRegistrations, type McpCardProps } from "./registry";
+import { getAllRegistrations } from "./registry";
 
 // Trigger card registrations
 import "./cards/WeatherCard";

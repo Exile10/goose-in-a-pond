@@ -70,9 +70,9 @@ NODE_METHOD=auto; NODE_MAJOR=""; CHECK_ONLY=false; NODE_DEPS=false
 if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
   C_RST="$(tput sgr0)"; C_B="$(tput bold)"; C_DIM="$(tput dim)"
   C_RED="$(tput setaf 1)"; C_GRN="$(tput setaf 2)"; C_YLW="$(tput setaf 3)"
-  C_BLU="$(tput setaf 4)"; C_CYN="$(tput setaf 6)"
+  C_CYN="$(tput setaf 6)"
 else
-  C_RST=""; C_B=""; C_DIM=""; C_RED=""; C_GRN=""; C_YLW=""; C_BLU=""; C_CYN=""
+  C_RST=""; C_B=""; C_DIM=""; C_RED=""; C_GRN=""; C_YLW=""; C_CYN=""
 fi
 
 say()  { printf '%s\n' "$*"; }
@@ -128,7 +128,7 @@ D_SVC_SCOPE=""; D_SVC_ACTIVE=""; D_SVC_ENABLED=""; D_LINGER=""; D_SVC_SYS_STATE=
 D_DATA_DIR=""; D_PORT=""; D_HEALTH=""; D_PROCS=0
 D_RAM_TOTAL=""; D_RAM_AVAIL=""; D_DISK_FREE=""; D_TGT_DBG=""; D_TGT_REL=""
 D_PWR=""; D_OC=""; D_DISPLAY=""; D_SUDO=""
-D_ENGINE=""; D_SETTINGS=""
+D_ENGINE=""
 D_LITERT_MAC=""; D_LITERT_MAC_TAG=""; D_LITERT_MAC_DIR=""; D_LITERT_LNX=""; D_LITERT_LNX_TAG=""; D_LITERT_LNX_DIR=""
 D_LITERT_DEV=""; D_LITERT_DEV_TAG=""; D_LITERT_DEV_DIR=""
 

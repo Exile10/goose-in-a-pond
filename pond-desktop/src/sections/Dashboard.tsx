@@ -1,7 +1,7 @@
 // Home's classic-surface routing; the screen is `hub/views/DashboardGrid`. Still `Dashboard` on the
 // `dashboard` section id: it's persisted as `giap-section`, so renaming it strands anyone reopening there.
 
-import { useAppState, useAppDispatch } from "../state/AppContext";
+import { useAppState, useAppDispatch } from "../state/useAppContext";
 import { DashboardGrid } from "../hub/views/DashboardGrid";
 import { sendTurn } from "../state/chatRunStore";
 

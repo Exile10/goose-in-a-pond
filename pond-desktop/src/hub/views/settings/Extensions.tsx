@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Plus, RefreshCw, Loader2, Download, Check, X, Store, AlertCircle } from "lucide-react";
+import { Plus, RefreshCw, Loader2, Download, Check, X, AlertCircle } from "lucide-react";
 import { HubIco } from "../../primitives/HubIco";
 import { DetailShell } from "./DetailShell";
 import { Card, Segment } from "./controls";

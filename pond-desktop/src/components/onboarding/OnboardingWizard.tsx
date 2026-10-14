@@ -5,7 +5,8 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Logo } from "../Logo";
 import { api } from "../../api/PondApiClient";
 
-import { OnboardingProvider, useOnboarding } from "./OnboardingContext";
+import { OnboardingProvider } from "./OnboardingContext";
+import { useOnboarding } from "./onboarding.context";
 import { STEPS, beStepToFeIndex } from "./onboarding.constants";
 import { useOnboardingPersist } from "./hooks/useOnboardingPersist";
 import { StepHeader, Actions, ErrorBanner } from "./primitives/StepShell";

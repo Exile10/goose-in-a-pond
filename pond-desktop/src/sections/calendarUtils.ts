@@ -56,9 +56,9 @@ export function cronToSlots(schedule: Schedule, colorIndex: number): ScheduleSlo
     hourField !== "*" &&
     domField === "*";
 
-  let hour = 0;
-  let minute = 0;
-  let daysOfWeek: number[] = [];
+  let hour: number;
+  let minute: number;
+  let daysOfWeek: number[];
   let frequency: ScheduleSlot["frequency"];
 
   if (isHourly) {

@@ -228,16 +228,6 @@ test.describe("Hub — Account sub-screen wiring", () => {
     await expect(signOutBtn).toBeVisible({ timeout: 5_000 });
 
     // Sign-out reloads the page; the check is only that no error flash appears.
-    let reloadFired = false;
-    await page.exposeFunction("__onReload", () => { reloadFired = true; });
-    await page.addInitScript(() => {
-      const origReload = window.location.reload.bind(window.location);
-      window.location.reload = () => {
-        (window as unknown as Record<string, () => void>).__onReload?.();
-        origReload();
-      };
-    });
-
     await signOutBtn.click();
 
     const errorFlash = page.locator('[role="status"]').filter({ hasText: /failed/i });

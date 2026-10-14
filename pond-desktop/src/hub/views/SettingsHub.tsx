@@ -2,7 +2,7 @@ import { HubIco } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
 import { SETTINGS } from "../data/settingsConfig";
 import type { SettingsRowId } from "../data/settingsConfig";
-import { useAppDispatch } from "../../state/AppContext";
+import { useAppDispatch } from "../../state/useAppContext";
 
 // ─── Chevron right ────────────────────────────────────────────
 const CHEVR = HP_PATHS.chevR;

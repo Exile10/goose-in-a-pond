@@ -1,0 +1,7 @@
+# shellcheck configuration for every script in this repository (CI runs it over
+# `git ls-files '*.sh'`, minus the goose/ submodule, at --severity=warning).
+#
+# Follow `source`d files, and resolve their paths relative to the script that
+# sources them, so a variable set in one file and read in another is seen.
+external-sources=true
+source-path=SCRIPTDIR

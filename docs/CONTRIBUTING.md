@@ -159,9 +159,42 @@ cargo clippy     # lint (fix all warnings before submitting)
 For the desktop app:
 ```bash
 cd pond-desktop
-npx tsc --noEmit   # TypeScript type check
+npm run typecheck  # TypeScript, for the renderer and the Electron main process
+npm run lint       # ESLint (eslint.config.js)
 npm test           # vitest unit tests
 ```
+
+For shell scripts (`brew install shellcheck` or your distribution's package; CI uses 0.11.0):
+```bash
+git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning
+```
+
+### Lint checks in CI
+
+As of 2026-10-12, `.github/workflows/ci.yml` runs two linters besides `cargo clippy`:
+
+- **`shellcheck` job.** It covers every tracked `*.sh` file, with no list to maintain, so a new
+  script is checked as soon as it is committed. The root `.shellcheckrc` makes shellcheck follow
+  `source`d files from the sourcing script's directory. A warning or an error fails the job, and
+  notes are printed without failing it. CI downloads the pinned 0.11.0 release and checks its
+  sha256, rather than using the runner's older apt package. For a real false positive, put
+  `# shellcheck disable=SCxxxx  # reason` on the line above it. Do not add a file-wide disable.
+- **`frontend` job, `npm run lint` step.** It runs ESLint over `pond-desktop`: `src/`, `electron/`,
+  `tests/` and the tooling files at the package root. Generated output (`dist/`,
+  `dist-electron/`, `release/`, the Playwright reports) is ignored. Every enabled rule is an error
+  and fails the job: the recommended JavaScript and typescript-eslint rules,
+  `react-hooks/rules-of-hooks`, `react-hooks/exhaustive-deps` and
+  `react-refresh/only-export-components`. Unused code is an error: remove it rather than renaming
+  it with a `_` prefix. The one exception is a parameter that an interface requires and one
+  implementation does not read, which is named `_x`.
+  - `react-refresh/only-export-components` keeps Vite's Fast Refresh working: a module that
+    exports a component exports nothing else. Put a helper, hook or context in a sibling `.ts`
+    module (`useConfirm.ts` beside `ConfirmDialog.tsx`, `chatHistoryView.ts` beside
+    `ChatHistory.tsx`), and give a self-registering MCP card module an export, its component.
+  - Not enabled, as of 2026-10-13: the React Compiler rules in `eslint-plugin-react-hooks` 7's
+    recommended set (69 hits on 2026-10-12, 56 of them `set-state-in-effect`).
+  - `require-yield` is off in `src/**/*.test.*` only, for mock streams that throw before their
+    first frame.
 
 ### Comments
 
@@ -221,6 +254,7 @@ Before opening a PR:
 - [ ] Tests pass: `cargo test -p pond-core -p pond-api`
 - [ ] No clippy warnings: `cargo clippy`
 - [ ] Code formatted: `cargo fmt`
+- [ ] Linters clean: `npm run lint` in `pond-desktop`, and `shellcheck` on any script you touched
 - [ ] Comments follow [the comment rules](#comments)
 - [ ] New ports have a mock and tests in `pond-core`
 - [ ] `pond-core` has no new external dependencies

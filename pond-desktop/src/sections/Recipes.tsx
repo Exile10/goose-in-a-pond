@@ -3,7 +3,7 @@ import { Card, CardContent, Button, Input, Switch } from "@heroui/react";
 import { Plus, Trash2, BookOpen, Check, Pencil, Play, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { PageHeader, useConfirm } from "../components/shared";
-import type { AgentRecipe, RecipeParameter, RecipeExtensionSpec } from "../api/types";
+import type { AgentRecipe, RecipeParameter } from "../api/types";
 
 // ── Extension vocabulary ──────────────────────────────────────────────────
 // Names `recipe_extension_to_tool_group` (crates/pond-api/src/routes.rs) knows; others round-trip via YAML.

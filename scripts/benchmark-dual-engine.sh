@@ -6,7 +6,6 @@ HOST="http://127.0.0.1:4000"
 BINARY="target/debug/pond-server"
 RESULTS="scripts/benchmark-results.txt"
 TIMEOUT=180
-OUT=""
 
 ts() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
@@ -14,7 +13,7 @@ start_server() {
     pkill -f "pond-server.*serve" 2>/dev/null; sleep 2
     rm -f ~/Library/Application\ Support/goose-in-a-pond/cache/*.session.bin
     $BINARY serve --agent "$1" 2>/dev/null &
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         curl -s --max-time 2 "$HOST/api/v1/health" | grep -q "ok" && return 0
         sleep 2
     done
@@ -25,14 +24,18 @@ stop_server() { pkill -f "pond-server.*serve" 2>/dev/null; sleep 1; }
 
 bench() {
     local msg="$1" session="$2" tmp="/tmp/bench_$$.txt"
-    local start=$(ts)
+    local start
+    start=$(ts)
     curl -s --max-time "$TIMEOUT" -X POST "$HOST/api/v1/chat/stream" \
         -H "Content-Type: application/json" \
         -d "{\"message\": \"$msg\", \"session_id\": \"$session\"}" > "$tmp" 2>/dev/null
-    local end=$(ts)
+    local end
+    end=$(ts)
     local ms=$((end - start))
-    local tools=$(grep -c '"type":"tool_call"' "$tmp" 2>/dev/null || echo "0")
-    local tool_names=$(grep '"type":"tool_call"' "$tmp" | sed 's/^data: //' | python3 -c "
+    local tools
+    tools=$(grep -c '"type":"tool_call"' "$tmp" 2>/dev/null || echo "0")
+    local tool_names
+    tool_names=$(grep '"type":"tool_call"' "$tmp" | sed 's/^data: //' | python3 -c "
 import sys,json
 t=[]
 for l in sys.stdin:
@@ -40,26 +43,34 @@ for l in sys.stdin:
     except: pass
 print(','.join(t) if t else '-')
 " 2>/dev/null)
-    local text=$(grep '"type":"text"' "$tmp" | sed 's/^data: //' | python3 -c "
+    local text
+    text=$(grep '"type":"text"' "$tmp" | sed 's/^data: //' | python3 -c "
 import sys,json
 for l in sys.stdin:
     try: print(json.loads(l).get('content',''),end='')
     except: pass
 " 2>/dev/null)
-    local done=$(grep -c '"done":true' "$tmp" 2>/dev/null || echo "0")
+    local finished
+    finished=$(grep -c '"done":true' "$tmp" 2>/dev/null || echo "0")
     rm -f "$tmp"
-    echo "${ms}|${tools}|${tool_names}|${done}|${text:0:100}"
+    echo "${ms}|${tools}|${tool_names}|${finished}|${text:0:100}"
 }
 
 run_test() {
     local backend="$1" name="$2" msg="$3" session="$4" expect_tool="$5" expect_text="$6"
     echo "  [$backend] $name" >&2
-    local result=$(bench "$msg" "$session")
-    local ms=$(echo "$result" | cut -d'|' -f1)
-    local tools=$(echo "$result" | cut -d'|' -f2)
-    local tnames=$(echo "$result" | cut -d'|' -f3)
-    local done=$(echo "$result" | cut -d'|' -f4)
-    local text=$(echo "$result" | cut -d'|' -f5-)
+    local result
+    result=$(bench "$msg" "$session")
+    local ms
+    ms=$(echo "$result" | cut -d'|' -f1)
+    local tools
+    tools=$(echo "$result" | cut -d'|' -f2)
+    local tnames
+    tnames=$(echo "$result" | cut -d'|' -f3)
+    local finished
+    finished=$(echo "$result" | cut -d'|' -f4)
+    local text
+    text=$(echo "$result" | cut -d'|' -f5-)
 
     local correct="PASS"
     if [ "$expect_tool" = "none" ] && [ "$tools" -gt 0 ] 2>/dev/null; then correct="WARN"; fi
@@ -67,7 +78,7 @@ run_test() {
     if ! echo "$text" | grep -qiE "$expect_text" 2>/dev/null; then
         if [ "$correct" = "PASS" ]; then correct="WEAK"; fi
     fi
-    if [ "${done:-0}" -eq 0 ] 2>/dev/null; then correct="FAIL"; fi
+    if [ "${finished:-0}" -eq 0 ] 2>/dev/null; then correct="FAIL"; fi
 
     echo "${ms}|${correct}|${tnames}|${text:0:80}"
 }
@@ -98,16 +109,23 @@ run_all() {
     echo "═══ $backend Backend ═══" >&2
     start_server "$backend" || { echo "FAIL: server didn't start" >&2; return 1; }
 
-    local session_base="${backend}-$(date +%s)"
+    local session_base
+    session_base="${backend}-$(date +%s)"
     for test_def in "${TESTS[@]}"; do
-        local name=$(echo "$test_def" | cut -d'|' -f1)
-        local msg=$(echo "$test_def" | cut -d'|' -f2)
-        local sid_suffix=$(echo "$test_def" | cut -d'|' -f3)
-        local expect_tool=$(echo "$test_def" | cut -d'|' -f4)
-        local expect_text=$(echo "$test_def" | cut -d'|' -f5-)
+        local name
+        name=$(echo "$test_def" | cut -d'|' -f1)
+        local msg
+        msg=$(echo "$test_def" | cut -d'|' -f2)
+        local sid_suffix
+        sid_suffix=$(echo "$test_def" | cut -d'|' -f3)
+        local expect_tool
+        expect_tool=$(echo "$test_def" | cut -d'|' -f4)
+        local expect_text
+        expect_text=$(echo "$test_def" | cut -d'|' -f5-)
 
         local session="${session_base}-${sid_suffix}"
-        local result=$(run_test "$backend" "$name" "$msg" "$session" "$expect_tool" "$expect_text")
+        local result
+        result=$(run_test "$backend" "$name" "$msg" "$session" "$expect_tool" "$expect_text")
         echo "${backend}|${name}|${result}"
     done
 

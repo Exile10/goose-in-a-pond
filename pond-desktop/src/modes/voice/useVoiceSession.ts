@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useCallback, useState } from "react";
 import { invoke, listen } from "../../shell";
-import { useAppDispatch, useAppState } from "../../state/AppContext";
+import { useAppDispatch, useAppState } from "../../state/useAppContext";
 import { nextTranscriptId, nextCardId } from "../../state/reducer";
 
 // ── Contract state-string mapping ───────────────────────────────────────────

@@ -27,7 +27,7 @@ function trafficColor(t: string): string {
   return "var(--color-warning-fg)"; // moderate / default
 }
 
-function MapCard({ data, variant }: McpCardProps) {
+export function MapCard({ data, variant }: McpCardProps) {
   const origin = String(data.origin ?? data.from ?? "Your location");
   const destination = String(data.destination ?? data.to ?? "Destination");
   const routes = (data.routes ?? []) as RouteOption[];

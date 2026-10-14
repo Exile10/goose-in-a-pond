@@ -1241,6 +1241,7 @@ describe("re-authentication after a rejected token", () => {
     });
 
     const api = client();
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- draining the stream is the point; the events are not read
     for await (const _ of api.chatStream("hi", undefined, "stale")) {
       /* drain */
     }

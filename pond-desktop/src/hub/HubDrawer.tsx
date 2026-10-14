@@ -3,8 +3,8 @@
 
 import { useEffect, useState } from "react";
 import { Logo } from "../components/Logo";
-import { HubIco, micEl } from "./primitives/HubIco";
-import { HP_PATHS } from "./primitives/icons";
+import { HubIco } from "./primitives/HubIco";
+import { HP_PATHS, micEl } from "./primitives/icons";
 import { useHomeData, useRoutines } from "./state/hubDataStore";
 import type { GuiSection } from "../desktopState";
 import "./hubDrawer.css";

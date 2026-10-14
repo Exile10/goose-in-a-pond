@@ -1,4 +1,5 @@
-import { HubIco, cameraEl } from "./HubIco";
+import { HubIco } from "./HubIco";
+import { cameraEl } from "./icons";
 import type { CameraData } from "../data/mockHome";
 
 interface CameraFeedProps {

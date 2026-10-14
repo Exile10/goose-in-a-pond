@@ -1,7 +1,7 @@
 // Voice-mode orchestration for the browser path; the desktop shell uses useVoiceSession.
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useAppState, useAppDispatch } from "../../state/AppContext";
+import { useAppState, useAppDispatch } from "../../state/useAppContext";
 import { nextTranscriptId } from "../../state/reducer";
 import { api } from "../../api/PondApiClient";
 import { resolveVoiceDecision } from "../../voiceSummon";
@@ -196,7 +196,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
     });
 
     return () => { backend.stopWakeListener(); };
-  }, [wakeWord, dispatch]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [wakeWord, dispatch]);
 
   // ── Conversational turn-taking ─────────────────────────
   // After a reply, auto-record the next turn. "thinking" -> "idle" counts too: that is a barge-in
@@ -247,7 +247,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
     if (curr === "thinking" || curr === "speaking") {
       if (noSpeechTimerRef.current) { clearTimeout(noSpeechTimerRef.current); noSpeechTimerRef.current = null; }
     }
-  }, [state.voiceState, wakeWord, dispatch]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [state.voiceState, wakeWord, dispatch]);
 
   // ── Hotkey activation ──────────────────────────────────
 

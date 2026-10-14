@@ -60,7 +60,6 @@ test("Settings sub-screen dead-button audit", async ({ page }) => {
   }
 
   const dead = inventory.filter((b) => !b.hasOnClick);
-  // eslint-disable-next-line no-console
   console.log("SUB_INVENTORY=" + inventory.length);
   console.log("SUB_DEAD=" + JSON.stringify(dead, null, 0));
 });

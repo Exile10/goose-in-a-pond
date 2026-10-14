@@ -9,7 +9,7 @@ const appState = {
   scheduleRuns: [] as ScheduleRunNotification[],
 };
 
-vi.mock("../../state/AppContext", () => ({
+vi.mock("../../state/useAppContext", () => ({
   useAppState: () => appState,
 }));
 

@@ -3,8 +3,8 @@
 // can't drift. Search reaches devices kept off Home; the layout lives in `state/dashboardLayout.ts`.
 import { Fragment, useState, type ReactElement, type ReactNode } from "react";
 import { InkButton, InkSegmented, InkSheet, InkStack, InkText } from "@jarida/ink/react";
-import { HubIco, micEl } from "../primitives/HubIco";
-import { HP_PATHS } from "../primitives/icons";
+import { HubIco } from "../primitives/HubIco";
+import { HP_PATHS, micEl } from "../primitives/icons";
 import { SuggestionQueue } from "../primitives/SuggestionQueue";
 import { WeatherWidget } from "../primitives/WeatherWidget";
 import { HomeStatusBar } from "./HomeStatusBar";

@@ -72,6 +72,7 @@ say "2. headless: stop the display stack"
 note "default target: $(systemctl get-default)   gdm3: $(systemctl is-active gdm3)"
 if [ "$(systemctl is-active gdm3)" = active ]; then
   if [ -x "$SKILLS/jetson-memory-audit/scripts/audit.sh" ]; then
+    # shellcheck disable=SC2024  # written as the invoking user, into their own results directory
     sudo bash "$SKILLS/jetson-memory-audit/scripts/audit.sh" > "$OUT/audit-before-headless.json" 2>/dev/null \
       && note "baseline audit -> $OUT/audit-before-headless.json"
   fi
@@ -90,6 +91,7 @@ if [ "$(systemctl is-active gdm3)" = active ]; then
     fi
     if [ -x "$SKILLS/jetson-memory-audit/scripts/drop_caches.sh" ]; then
       sudo bash "$SKILLS/jetson-memory-audit/scripts/drop_caches.sh" | sed 's/^/     /'
+      # shellcheck disable=SC2024  # written as the invoking user, into their own results directory
       sudo bash "$SKILLS/jetson-memory-audit/scripts/audit.sh" > "$OUT/audit-after-headless.json" 2>/dev/null
       python3 - "$OUT/audit-before-headless.json" "$OUT/audit-after-headless.json" <<'PY' 2>/dev/null || true
 import json, sys
@@ -147,6 +149,7 @@ say "4. root-only baseline snapshot"
 } | sudo tee "$OUT/root-state.txt" >/dev/null
 note "-> $OUT/root-state.txt"
 if [ -x "$SKILLS/jetson-diagnostic/scripts/snapshot.sh" ]; then
+  # shellcheck disable=SC2024  # written as the invoking user, into their own results directory
   sudo bash "$SKILLS/jetson-diagnostic/scripts/snapshot.sh" --tegra-secs 5 > "$OUT/snapshot.json" 2>/dev/null \
     && note "-> $OUT/snapshot.json" || note "snapshot.sh failed (non-fatal)"
 fi

@@ -1,4 +1,6 @@
-// Side-effect imports register the built-in cards; add a new card's import here.
+// Side-effect imports register the built-in cards; add a new card's import here. Each card module
+// also exports its component, which is what lets Fast Refresh patch an edited card in place
+// instead of reloading the page: a module with no exports is never a refresh boundary.
 
 import "./cards/WeatherCard";
 import "./cards/CalendarCard";

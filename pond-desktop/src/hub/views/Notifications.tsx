@@ -1,6 +1,6 @@
 import { useState, useCallback, useMemo } from "react";
 import { Bell, Calendar, Shield, Camera, Sparkles, BatteryLow } from "lucide-react";
-import { useAppState } from "../../state/AppContext";
+import { useAppState } from "../../state/useAppContext";
 import type { ScheduleRunNotification } from "../../api/types";
 import {
   CATEGORY_COLOR,

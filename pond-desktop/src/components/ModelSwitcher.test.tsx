@@ -12,7 +12,7 @@ vi.mock("../api/PondApiClient", () => ({
 }));
 
 const dispatch = vi.hoisted(() => vi.fn());
-vi.mock("../state/AppContext", () => ({
+vi.mock("../state/useAppContext", () => ({
   useAppState: () => ({}),
   useAppDispatch: () => dispatch,
 }));

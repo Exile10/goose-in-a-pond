@@ -6,7 +6,7 @@ interface SearchResult {
   snippet: string;
 }
 
-function KnowledgeCard({ data, variant }: McpCardProps) {
+export function KnowledgeCard({ data, variant }: McpCardProps) {
   const isCompact = variant === "compact";
   const title = data.title as string | undefined;
   const summary = data.summary as string | undefined;

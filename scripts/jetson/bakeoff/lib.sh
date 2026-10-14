@@ -13,7 +13,9 @@
 
 BAKEOFF_SCHEMA=1
 SKILLS_ROOT="${JETSON_SKILLS_ROOT:-$HOME/.agents/skills}"
+# shellcheck disable=SC2034  # read by the run-c*.sh scripts that source this file
 RESULTS_ROOT="${BAKEOFF_RESULTS:-$HOME/bakeoff-results/$(date +%F)}"
+# shellcheck disable=SC2034  # read by run-c1, run-c2 and capture-payload
 DATA_DIR_DEFAULT="$HOME/.local/share/goose-in-a-pond"
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -112,7 +114,6 @@ oc3_count() { cat /sys/devices/platform/soctherm-oc-event/hwmon/hwmon*/oc3_event
 tegra_start() { # tegra_start <logfile>
   tegrastats --stop >/dev/null 2>&1 || true
   tegrastats --interval 500 --logfile "$1" >/dev/null 2>&1 &
-  BAKEOFF_TEGRA_LOG="$1"
 }
 tegra_stop() { tegrastats --stop >/dev/null 2>&1 || true; }
 tegra_summary() { # tegra_summary <logfile> -> JSON
@@ -290,8 +291,8 @@ stamp_power_env() {
   else
     export BAKEOFF_CLOCKS="dynamic(gov=$gov,gpu=${cur}/${max}MHz)"
   fi
-  export BAKEOFF_PM_NAME="$(nvpmodel_name)"
-  export BAKEOFF_GOV="$(cpu_governor)"
-  export BAKEOFF_GPU_MAX="$(gpu_max_mhz)"
+  BAKEOFF_PM_NAME="$(nvpmodel_name)"; export BAKEOFF_PM_NAME
+  BAKEOFF_GOV="$(cpu_governor)"; export BAKEOFF_GOV
+  BAKEOFF_GPU_MAX="$(gpu_max_mhz)"; export BAKEOFF_GPU_MAX
   export BAKEOFF_SCHEMA
 }

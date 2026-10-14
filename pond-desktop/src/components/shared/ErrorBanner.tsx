@@ -1,7 +1,7 @@
 import { AlertTriangle, RefreshCw } from "lucide-react";
 
 /** Maps a raw error string to a short user-facing message, falling back to a generic one. */
-export function friendlyMessage(raw: string): string {
+function friendlyMessage(raw: string): string {
   const s = raw.toLowerCase();
   if (s.includes("network") || s.includes("fetch") || s.includes("failed to fetch"))
     return "Could not reach the server. Check that it is running and try again.";

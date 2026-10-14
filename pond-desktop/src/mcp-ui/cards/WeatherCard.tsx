@@ -351,7 +351,7 @@ function shortDay(dateStr: string): string {
 
 // ── Component ───────────────────────────────────────────────────────────────
 
-function WeatherCard({ data, variant }: McpCardProps) {
+export function WeatherCard({ data, variant }: McpCardProps) {
   const hasData = data.temperature != null || data.temp != null;
   const location = String(data.location ?? data.city ?? data.location_name ?? "");
   const temp = data.temperature ?? data.temp;

@@ -1,18 +1,10 @@
-// Onboarding wizard context: the draft and a patch helper for every step.
+// Onboarding wizard provider: holds the draft every step reads and patches.
 
-import React, { createContext, useContext, useState, useCallback, useEffect } from "react";
+import React, { useState, useCallback, useEffect } from "react";
 import type { OnboardingDraft } from "./onboarding.types";
 import { DEFAULT_DRAFT } from "./onboarding.constants";
+import { OnboardingContext } from "./onboarding.context";
 import { api } from "../../api/PondApiClient";
-
-interface OnboardingContextValue {
-  draft: OnboardingDraft;
-  patch: (p: Partial<OnboardingDraft>) => void;
-  /** True while loading saved settings to pre-populate the draft. */
-  loading: boolean;
-}
-
-const Ctx = createContext<OnboardingContextValue | null>(null);
 
 export function OnboardingProvider({ children }: { children: React.ReactNode }) {
   const [draft, setDraft] = useState<OnboardingDraft>(DEFAULT_DRAFT);
@@ -62,14 +54,8 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
   }, [patch]);
 
   return (
-    <Ctx.Provider value={{ draft, patch, loading }}>
+    <OnboardingContext.Provider value={{ draft, patch, loading }}>
       {children}
-    </Ctx.Provider>
+    </OnboardingContext.Provider>
   );
-}
-
-export function useOnboarding(): OnboardingContextValue {
-  const ctx = useContext(Ctx);
-  if (!ctx) throw new Error("useOnboarding must be used within OnboardingProvider");
-  return ctx;
 }

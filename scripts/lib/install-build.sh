@@ -8,7 +8,7 @@
 init_submodules() {
   step "2" "Goose submodule"
 
-  cd "$REPO_DIR"
+  cd "$REPO_DIR" || return
   if [ -f "goose/Cargo.toml" ]; then
     success "Goose submodule already present"
     S_SUBMODULE="ok"
@@ -24,6 +24,7 @@ init_submodules() {
       fi
     else
       error "Submodule init failed -- check git remote access"
+      # shellcheck disable=SC2034  # read by print_summary in install-common.sh
       S_SUBMODULE="failed"
     fi
   fi
@@ -42,7 +43,7 @@ build_server() {
 
   step "4" "$step_label"
 
-  cd "$REPO_DIR"
+  cd "$REPO_DIR" || return
 
   # Determine build profile
   local release_flag=""

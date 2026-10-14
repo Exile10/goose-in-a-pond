@@ -3,7 +3,7 @@ import { DetailShell } from "./DetailShell";
 import { Card, Row } from "./controls";
 import { HubIco } from "../../primitives/HubIco";
 import { api } from "../../../api/PondApiClient";
-import { useAppDispatch } from "../../../state/AppContext";
+import { useAppDispatch } from "../../../state/useAppContext";
 import type { Settings } from "../../../api/types";
 import type { Device } from "../../../api/types";
 

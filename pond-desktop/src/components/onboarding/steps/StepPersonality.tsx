@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { Scale, Zap, Wrench, Sun } from "lucide-react";
-import { useOnboarding } from "../OnboardingContext";
+import { useOnboarding } from "../onboarding.context";
 import { RadioCard } from "../primitives/RadioCard";
 import { FormLabel } from "../primitives/FormLabel";
 import { Lead } from "../primitives/StepShell";
