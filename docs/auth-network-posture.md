@@ -60,7 +60,8 @@ dashboard router in `pond-server/src/listeners.rs::compose`):
 
 The desktop app reads the credential over IPC (`host_credential`). A browser gets it
 from the sign-in link `pond-server dashboard` prints,
-`http://localhost:<port>/#host=<credential>`: the fragment is never sent over the
+`http://127.0.0.1:<port>/#host=<credential>` (not `localhost`, which a browser may try as
+`[::1]` first, where another account could be listening): the fragment is never sent over the
 network or logged, and the page moves it into that tab's session storage and out of
 the address bar. The link stops working at the next restart. A new link opened in a
 tab that is already running is taken too (2026-10-05): it differs only after `#`, which

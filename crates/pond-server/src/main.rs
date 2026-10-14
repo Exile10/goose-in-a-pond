@@ -4369,7 +4369,7 @@ async fn run_server(
     }
 
     if open || (debug && has_display()) {
-        let url = format!("http://localhost:{}", api_port);
+        let url = format!("http://127.0.0.1:{}", api_port);
         if webbrowser::open(&url).is_err() {
             tracing::warn!("Could not open browser — no display available or xdg-open missing");
         }
@@ -9377,9 +9377,10 @@ fn run_dashboard() -> Result<()> {
     let credential = pond_server::host_credential::read(&data_dir)?;
     let port = runtime_api_port(&data_dir);
     println!("Open this link in a browser on this machine to sign in to the dashboard:\n");
-    println!("  http://localhost:{port}/#host={credential}\n");
+    // Not `localhost`: a browser may try [::1] first, where another account could be listening.
+    println!("  http://127.0.0.1:{port}/#host={credential}\n");
     println!(
-        "Through an SSH tunnel (ssh -L 9000:localhost:{port} <pond>), change only the port.\n\
+        "Through an SSH tunnel (ssh -L 9000:127.0.0.1:{port} <pond>), change only the port.\n\
          Anyone with this link can pair devices until the server restarts; do not share it."
     );
     Ok(())

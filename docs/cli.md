@@ -98,7 +98,7 @@ Prints a sign-in link for the web dashboard, for a browser on the Pond itself. A
 pond-server dashboard
 ```
 
-No flags. It reads the running server's port from `<data_dir>/.runtime_api_port` and its host credential from `<data_dir>/.runtime_host_credential`, and prints `http://localhost:<port>/#host=<credential>`. Browsers do not send the part after `#` in any request. The server writes a new credential every time it starts, so the link stops working on a restart; run the command again for a new one. It fails if the server is not running under this account.
+No flags. It reads the running server's port from `<data_dir>/.runtime_api_port` and its host credential from `<data_dir>/.runtime_host_credential`, and prints `http://127.0.0.1:<port>/#host=<credential>` (not `localhost`, which a browser may try as `[::1]` first, where another account could be listening). Browsers do not send the part after `#` in any request. The server writes a new credential every time it starts, so the link stops working on a restart; run the command again for a new one. It fails if the server is not running under this account.
 
 Through an SSH tunnel (`ssh -L 9000:localhost:4000 <pond>`), change only the port in the link. Do not share the link: anyone holding it can pair devices until the server restarts. `serve --open` opens the dashboard without the credential.
 
