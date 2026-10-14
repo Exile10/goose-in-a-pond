@@ -55,7 +55,7 @@ Segment-based memory with importance scoring, exponential decay, automatic extra
 
 | Tier | Decay Rate | Behavior |
 |------|-----------|----------|
-| Permanent | 0.00 | Never decays, never pruned |
+| Permanent | 0.00 | Never decays; never pruned by cleanup or consolidation |
 | Long | 0.01 | Retained for weeks/months |
 | Short | 0.10 | Expires within days |
 
@@ -276,7 +276,10 @@ unconditional: a `Correction` memory is never pruned, a merge involving one is
 forced to `segment=Correction`, `corrects` metadata propagates to the merged
 fragment (and, on a split, to the first `Correction`-segment entry), and a
 replacement that fails to insert aborts before its sources are marked
-superseded. Every lifecycle change is written to `memory_events`, and each run
+superseded. The `Permanent` tier gets the same protection, so a kept memory
+stays kept: it is never pruned, a merge with a kept source is kept, and every
+piece split from one is kept. These guards change only which rows stay active;
+nothing on the prompt path reads `tier`. Every lifecycle change is written to `memory_events`, and each run
 is recorded in `consolidation_runs` tagged with the mode that produced it.
 
 **Batch cap**: `select_batch` bounds each run at
