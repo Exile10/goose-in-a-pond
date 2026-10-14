@@ -117,7 +117,7 @@ export class PondApiClient {
   private cachedClientId: string | null = null;
   private clientId(): string {
     if (this.cachedClientId) return this.cachedClientId;
-    let id: string | null = null;
+    let id: string | null;
     try {
       id = localStorage.getItem(PondApiClient.LS_CLIENT_ID);
       if (!id) {

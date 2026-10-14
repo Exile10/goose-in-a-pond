@@ -1,12 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import {
-  BackgroundJobs,
-  describeElapsed,
-  describeHistory,
-  describeLastRun,
-  describeWait,
-} from "./BackgroundJobs";
+import { BackgroundJobs } from "./BackgroundJobs";
+import { describeElapsed, describeHistory, describeLastRun, describeWait } from "./backgroundJobsView";
 import { api } from "../api/PondApiClient";
 import type { LaneJobStatus, LaneStatus } from "../api/types";
 

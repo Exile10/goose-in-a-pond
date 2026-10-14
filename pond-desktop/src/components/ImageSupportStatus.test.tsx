@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { render, screen, cleanup } from "@testing-library/react";
-import { ATTACH_BLOCKED_COPY, ImageSupportStatus, NOT_DECLARED_COPY } from "./ImageSupportStatus";
+import { ImageSupportStatus } from "./ImageSupportStatus";
+import { ATTACH_BLOCKED_COPY, NOT_DECLARED_COPY } from "./imageSupportCopy";
 import type { VisionStatus } from "../api/types";
 
 afterEach(cleanup);

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import { Devices } from "./Devices";
+import { powerStateOf } from "./devicePower";
 import { api } from "../api/PondApiClient";
 import type { Device } from "../api/types";
 
@@ -204,9 +205,7 @@ describe("Devices section — power button", () => {
 });
 
 describe("power state parsing", () => {
-  it("reads the line shape `state_line` writes, and nothing else", async () => {
-    const { powerStateOf } = await import("./Devices");
-
+  it("reads the line shape `state_line` writes, and nothing else", () => {
     expect(powerStateOf("matter-2 is:\n    power: on\n    brightness: 50%")).toBe(true);
     expect(powerStateOf("matter-2 is:\n    power: off")).toBe(false);
     // No report is not "off": guessing `false` would label every unreachable device "Turn on".

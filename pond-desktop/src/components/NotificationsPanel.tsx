@@ -10,7 +10,7 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
-import { useAppState, useAppDispatch } from "../state/AppContext";
+import { useAppState, useAppDispatch } from "../state/useAppContext";
 import { api } from "../api/PondApiClient";
 import type { ScheduleRunNotification } from "../api/types";
 

@@ -34,7 +34,7 @@ function sensorIconPath(label: string): string {
   return "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"; // shield
 }
 
-function SmartHomeCard({ data, variant }: McpCardProps) {
+export function SmartHomeCard({ data, variant }: McpCardProps) {
   const initialRooms = (data.rooms ?? []) as RoomData[];
   const sensors = (data.sensors ?? []) as SensorData[];
   const isCompact = variant === "compact";

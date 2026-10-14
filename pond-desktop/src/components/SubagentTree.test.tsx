@@ -3,8 +3,8 @@ import { render, cleanup } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SubagentTree, applySubagentProgress } from "./SubagentTree";
-import type { SubagentRun } from "./SubagentTree";
+import { SubagentTree } from "./SubagentTree";
+import { applySubagentProgress, type SubagentRun } from "./subagentRuns";
 import type { ChatEvent, SubagentStatus } from "../api/types";
 
 afterEach(cleanup);

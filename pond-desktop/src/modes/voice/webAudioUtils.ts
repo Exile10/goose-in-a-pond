@@ -538,7 +538,7 @@ const ORPHAN_SENTINELS = /<eos>|<\|eos\|>|<end_of_turn>/gi;
 
 /** Strips thought and tool-call blocks and orphan sentinels from a token stream; returns [visible, inBlock]. */
 export function filterThinkingFull(token: string, inBlock: boolean): [string, boolean] {
-  let text = token.replace(ORPHAN_SENTINELS, "");
+  const text = token.replace(ORPHAN_SENTINELS, "");
   let inside = inBlock;
   let result = "";
   let i = 0;

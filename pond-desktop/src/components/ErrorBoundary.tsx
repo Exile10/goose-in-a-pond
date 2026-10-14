@@ -19,7 +19,6 @@ export class ErrorBoundary extends React.Component<Props, State> {
 
   componentDidCatch(err: Error, info: React.ErrorInfo) {
     // Logged so DevTools shows the stack the friendly screen hides.
-    // eslint-disable-next-line no-console
     console.error("[ErrorBoundary] React render failed:", err, info?.componentStack);
   }
 

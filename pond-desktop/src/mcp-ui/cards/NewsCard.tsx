@@ -54,7 +54,7 @@ function HeadlineIcon() {
   );
 }
 
-function NewsCard({ data, variant }: McpCardProps) {
+export function NewsCard({ data, variant }: McpCardProps) {
   const items = (data.items ?? data.headlines ?? []) as NewsItem[];
   const isCompact = variant === "compact";
   const visibleItems = items.slice(0, isCompact ? 2 : 6);

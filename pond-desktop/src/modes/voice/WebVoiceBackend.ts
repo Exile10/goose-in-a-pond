@@ -273,7 +273,7 @@ export class WebVoiceBackend implements VoiceBackend {
       if (n && !norm.includes(n)) norm.push(n);
     }
     navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS)
-      .then((s) => this.runWakeLoop(s, norm, word))
+      .then((s) => this.runWakeLoop(s, norm))
       .catch((err) => {
         console.warn("Wake listener mic failed:", err);
         this.onError?.("Mic access required for wake word detection.");
@@ -512,7 +512,7 @@ export class WebVoiceBackend implements VoiceBackend {
   // Private -- wake word listener
   // ════════════════════════════════════════════════════════════════
 
-  private runWakeLoop(stream: MediaStream, normalised: string[], rawWord: string): void {
+  private runWakeLoop(stream: MediaStream, normalised: string[]): void {
     if (!this.wakeActive) { stream.getTracks().forEach((t) => t.stop()); return; }
 
     this.wakeStream = stream;

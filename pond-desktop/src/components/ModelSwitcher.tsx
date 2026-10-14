@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronDown, Cpu, Loader2 } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { useAppDispatch } from "../state/AppContext";
+import { useAppDispatch } from "../state/useAppContext";
 import { onUsed } from "../state/downloadAndUse";
 import type { ModelActiveRoles, ModelEngine, ModelEntry } from "../api/types";
 import { EngineMark } from "./models/ModelMarks";

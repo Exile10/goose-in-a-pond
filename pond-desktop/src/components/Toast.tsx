@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { CalendarClock, Sparkles, CheckCircle2, XCircle, X } from "lucide-react";
-import { useAppState, useAppDispatch } from "../state/AppContext";
+import { useAppState, useAppDispatch } from "../state/useAppContext";
 import type { ScheduleToast } from "../state/reducer";
 
 function ToastCard({ toast, onViewNotifications }: { toast: ScheduleToast; onViewNotifications: () => void }) {

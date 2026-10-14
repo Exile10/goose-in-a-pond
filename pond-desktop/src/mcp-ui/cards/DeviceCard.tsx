@@ -17,7 +17,7 @@ function deviceTypeIcon(type?: string) {
   return <Monitor size={14} />;
 }
 
-function DeviceCard({ data, variant }: McpCardProps) {
+export function DeviceCard({ data, variant }: McpCardProps) {
   const isCompact = variant === "compact";
   const devices = (data.devices ?? []) as Device[];
 

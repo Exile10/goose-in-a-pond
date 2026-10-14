@@ -2,8 +2,8 @@
 // `MusicControlAction` has no volume. The bar moves only on the 10s poll, never interpolated.
 
 import type { ReactElement } from "react";
-import { HubIco, pauseEl } from "../../primitives/HubIco";
-import { HP_PATHS } from "../../primitives/icons";
+import { HubIco } from "../../primitives/HubIco";
+import { HP_PATHS, pauseEl } from "../../primitives/icons";
 import type { NowPlayingData } from "../../data/mockHome";
 import { controlNowPlaying, refreshNowPlaying, useHomeData } from "../../state/hubDataStore";
 import "./media-card.css";

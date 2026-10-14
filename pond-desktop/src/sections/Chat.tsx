@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { WarmupBanner } from "../components/WarmupBanner";
 import { ArrowLeft, ArrowUp, Brain, Check, Copy, Loader2, Paperclip, Pencil, PenSquare, PlayCircle, RefreshCw, ThumbsDown, ThumbsUp, Wand2, Wrench, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { useAppState, useAppDispatch } from "../state/AppContext";
+import { useAppState, useAppDispatch } from "../state/useAppContext";
 import {
   useChatRun,
   getChatRun,
@@ -22,18 +22,19 @@ import { ChatHistory, type OpenOrigin } from "./ChatHistory";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
 import { ThinkingDisclosure } from "../hub/views/chat/ThinkingDisclosure";
 import { AttachmentTray } from "../components/AttachmentTray";
+import { ImageSupportStatus } from "../components/ImageSupportStatus";
 import {
-  ImageSupportStatus,
   ATTACH_BLOCKED_COPY,
   COMPOSER_GATE_LINE,
   NOT_DECLARED_COPY,
   refusalClientClause,
-} from "../components/ImageSupportStatus";
+} from "../components/imageSupportCopy";
 import { useVisionStatus } from "../api/useVisionStatus";
 import { TypingIndicator } from "../hub/views/chat/TypingIndicator";
 import { Goose } from "../components/Goose";
 import { greeting, subtitle } from "../components/quips";
-import { HubIco, micEl } from "../hub/primitives/HubIco";
+import { HubIco } from "../hub/primitives/HubIco";
+import { micEl } from "../hub/primitives/icons";
 import { CONTINUE_TURN_MESSAGE } from "../api/types";
 import type { SessionSummary } from "../api/types";
 import { TurnStatsFooter } from "../components/TurnStatsFooter";
@@ -473,11 +474,6 @@ export function Chat() {
   const [quipSeed, setQuipSeed] = useState(() => Date.now());
   const greetingLine = useMemo(() => greeting(userName, quipSeed), [userName, quipSeed]);
   const subtitleLine = useMemo(() => subtitle(quipSeed), [quipSeed]);
-
-  // The server's own `status` frames ("Agent working…"), not a client-side guess.
-  const lastMsg = messages[messages.length - 1];
-  const liveStatus =
-    lastMsg?.role === "agent" && lastMsg.streaming ? lastMsg.status : undefined;
 
   // The server titles a session after its first exchange; until then it's "New Chat".
   const chatTitle =

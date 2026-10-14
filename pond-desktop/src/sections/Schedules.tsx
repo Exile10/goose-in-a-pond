@@ -2,8 +2,8 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { Button, Separator } from "@heroui/react";
 import { Plus, Trash2, Play, Pencil, CalendarClock, ChevronDown, ChevronUp, Clock, List, Calendar, Repeat } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import { PageHeader, useConfirm, SkeletonList } from "../components/shared";
-import { useAppState, useAppDispatch } from "../state/AppContext";
+import { useConfirm, SkeletonList } from "../components/shared";
+import { useAppState, useAppDispatch } from "../state/useAppContext";
 import type { Schedule, ScheduleRun, ChatEvent } from "../api/types";
 import { ApiError } from "../api/types";
 import { ScheduleCalendar } from "./ScheduleCalendar";
@@ -127,7 +127,7 @@ function parseCronToConfig(cron: string): { repeat: RepeatPattern; config: Sched
   const parts = cron.trim().split(/\s+/);
   if (parts.length !== 6) return { repeat: "custom", config: { ...cfg, customCron: cron } };
 
-  const [_sec, min, hour, dom, _month, dow] = parts;
+  const [, min, hour, dom, , dow] = parts;
 
   // Hourly: "0 M */N * * *"
   if (hour.startsWith("*/") && dom === "*" && dow === "*") {
@@ -307,10 +307,8 @@ export function Schedules() {
   // New schedule form
   const [showForm, setShowForm]       = useState(false);
   const [name, setName]               = useState("");
-  const [cron, setCron]               = useState("");
   const [prompt, setPrompt]           = useState("");
   const [timezone, setTimezone]       = useState("UTC");
-  const [freqKey, setFreqKey]         = useState("Custom");   // kept for compat
   const [recipeKey, setRecipeKey]     = useState("Custom");
   const [submitting, setSubmitting]   = useState(false);
 
@@ -354,7 +352,6 @@ export function Schedules() {
       // Refresh schedule list when a run completes to update last_run
       load();
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [latestScheduleResult]);
 
   function flashMsg(msg: string, isError = false) {
@@ -368,11 +365,6 @@ export function Schedules() {
   }
 
   const pickerCron = useMemo(() => buildCron(repeat, schedCfg), [repeat, schedCfg]);
-
-  // Mirror the picker into the legacy `cron` state the API calls read.
-  useEffect(() => {
-    setCron(pickerCron);
-  }, [pickerCron]);
 
   function updateCfg(patch: Partial<ScheduleConfig>) {
     setSchedCfg((prev) => ({ ...prev, ...patch }));
@@ -403,10 +395,8 @@ export function Schedules() {
         once: repeat === "once",
       });
       setName("");
-      setCron("");
       setPrompt("");
       setTimezone("UTC");
-      setFreqKey("Custom");
       setRecipeKey("Custom");
       setRepeat("daily");
       setSchedCfg(defaultConfig());

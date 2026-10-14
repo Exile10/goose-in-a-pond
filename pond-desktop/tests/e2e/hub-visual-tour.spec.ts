@@ -94,7 +94,6 @@ test("Hub visual tour — light theme", async ({ page }) => {
       results.push({ label, ok: false, note: String(e).slice(0, 200) });
     }
   }
-  // eslint-disable-next-line no-console
   console.log("TOUR_RESULTS=" + JSON.stringify(results));
 
   const errs: string[] = [];
@@ -213,7 +212,6 @@ test("Hub interaction smoke — tile toggle + routine run + bell shortcut", asyn
   await firstTile.click();
   await page.waitForTimeout(150);
   const afterStatus = await firstTile.innerText().catch(() => "n/a");
-  // eslint-disable-next-line no-console
   console.log(`TILE_TOGGLE: before="${beforeStatus}" after="${afterStatus}"`);
   await page.screenshot({ path: "/tmp/hub-tour/interact_tile_after.png" });
 

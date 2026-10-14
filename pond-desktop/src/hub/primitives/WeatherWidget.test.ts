@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { dayPhaseFor } from "./WeatherWidget";
+import { dayPhaseFor } from "./weatherSky";
 
 describe("dayPhaseFor", () => {
   const sunrise = "06:30";

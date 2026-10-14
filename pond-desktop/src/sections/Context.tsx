@@ -8,7 +8,7 @@ import { api } from "../api/PondApiClient";
 import type { ContextIndexHealth, MemoryFragment } from "../api/types";
 import { ConnectionsPanel } from "../connections/ConnectionsPanel";
 import { UberAccountsPanel } from "../connections/UberAccountsPanel";
-import { useAppState } from "../state/AppContext";
+import { useAppState } from "../state/useAppContext";
 import { Collected } from "./context/Collected";
 import { Lineage } from "./context/Lineage";
 import "../styles/context.css";

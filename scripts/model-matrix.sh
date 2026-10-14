@@ -43,7 +43,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
 DO_BUILD=1
 MODELS=""
@@ -86,8 +86,7 @@ fi
 SKIP_RE='assistant|old_functiongemma'
 
 if [ -z "$MODELS" ]; then
-  MODELS="$(ls -1 "$REAL_MODELS/gguf"/*.gguf 2>/dev/null \
-    | xargs -n1 basename | sed 's/\.gguf$//' \
+  MODELS="$(for f in "$REAL_MODELS/gguf"/*.gguf; do [ -e "$f" ] && basename "$f" .gguf; done \
     | grep -Ev "$SKIP_RE" | paste -sd, -)"
 fi
 

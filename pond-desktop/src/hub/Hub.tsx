@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { ComponentType } from "react";
 import { HubDrawer, type DrawerNav } from "./HubDrawer";
 import { ShellBar } from "./ShellBar";
-import { useAppState, useAppDispatch } from "../state/AppContext";
+import { useAppState, useAppDispatch } from "../state/useAppContext";
 import type { GuiSection } from "../desktopState";
 import type { ScheduleRunNotification } from "../api/types";
 import { HomeView } from "./views/Home";
@@ -28,11 +28,8 @@ import { AccountDetail } from "./views/settings/Account";
 import { HubOverlay } from "./overlays/HubOverlay";
 import type { SettingsRowId } from "./data/settingsConfig";
 
-// ─── Route types ──────────────────────────────────────────────
+// ─── The drawer speaks GuiSection; the hub speaks its own routes ──
 // "notifications" is not in the IconRail list; the rail-foot and Home bells open it.
-type HubRoute = "home" | "chat" | "canvas" | "routines" | "settings" | "notifications";
-
-// ─── The drawer speaks GuiSection; the hub speaks HubRoute ────
 // Deliberately partial: a section with no hub screen falls through to the classic shell.
 const HUB_ROUTE_FOR: Partial<Record<GuiSection, string>> = {
   dashboard:     "home",
@@ -79,7 +76,7 @@ const SETTINGS_VIEWS: Record<SettingsRowId, DetailComponent> = {
   connections:   ConnectionsDetail,
   notifications: NotificationsDetail,
   // AppearanceView doesn't accept a go prop — wrap it so the prop is silently dropped
-  appearance:    (_props: { go: (r: string) => void }) => <AppearanceView />,
+  appearance:    () => <AppearanceView />,
   account:       AccountDetail,
 };
 

@@ -1,7 +1,7 @@
 // Hub Home: the screen is `DashboardGrid` (shared with `sections/Dashboard.tsx`);
 // only routing and the way into voice mode are per-surface.
 
-import { useAppState, useAppDispatch } from "../../state/AppContext";
+import { useAppState, useAppDispatch } from "../../state/useAppContext";
 import type { GuiSection } from "../../desktopState";
 import { DashboardGrid } from "./DashboardGrid";
 import { sendTurn } from "../../state/chatRunStore";

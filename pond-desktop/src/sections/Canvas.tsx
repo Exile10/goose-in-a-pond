@@ -4,14 +4,14 @@ import {
   Layers, Mic, RefreshCw, Zap,
   ChevronLeft, ChevronRight, Grid3X3, Rows3,
 } from "lucide-react";
-import { useAppState, useAppDispatch } from "../state/AppContext";
+import { useAppState, useAppDispatch } from "../state/useAppContext";
 import { api } from "../api/PondApiClient";
 import { nextCardId } from "../state/reducer";
 import type { ChatEvent } from "../api/types";
 import { ScheduleDebriefCard } from "../components/ScheduleDebriefCard";
 import { GooseAvatar } from "../hub/views/chat/GooseAvatar";
-import { HubIco, micEl } from "../hub/primitives/HubIco";
-import { HP_PATHS } from "../hub/primitives/icons";
+import { HubIco } from "../hub/primitives/HubIco";
+import { HP_PATHS, micEl } from "../hub/primitives/icons";
 import "../hub/views/chat.css";
 import { CardChrome }    from "../hub/views/canvas/CardChrome";
 import { WeatherCard }   from "../hub/views/canvas/WeatherCard";

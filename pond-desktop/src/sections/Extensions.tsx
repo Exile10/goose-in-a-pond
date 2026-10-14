@@ -28,7 +28,7 @@ import {
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { followSignIn, openExternal } from "../api/followSignIn";
-import { useAppState } from "../state/AppContext";
+import { useAppState } from "../state/useAppContext";
 import { useConfirm, ErrorBanner } from "../components/shared";
 import { PlayerSignIn } from "./PlayerSignIn";
 import { splitAdvanced } from "./signInView";

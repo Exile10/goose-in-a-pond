@@ -6,7 +6,7 @@ import { describe, expect, it, beforeEach, vi } from "vitest";
 
 const dispatch = vi.fn();
 
-vi.mock("../state/AppContext", () => ({
+vi.mock("../state/useAppContext", () => ({
   useAppState: () => ({ sessionId: "s1", unreadRunCount: 0, serverOnline: true, scheduleRuns: [] }),
   useAppDispatch: () => dispatch,
 }));

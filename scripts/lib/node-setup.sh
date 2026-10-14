@@ -19,6 +19,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 NODE_RANGE_TEXT='^22.12.0 || ^24.0.0 || >=26.0.0'
+# shellcheck disable=SC2034  # read by giap.sh, which sources this file
 NODE_UI_RANGE_TEXT='^20.19.0 || >=22.12.0'
 
 # Where downloaded Node versions live, and the file that remembers the one to use. Overridable so a
@@ -46,7 +47,7 @@ _nv_patch() {
 
 # Negative, zero or positive, like a comparator.
 _nv_cmp() {
-  local a b i x y
+  local i x y
   for i in major minor patch; do
     x="$(_nv_$i "$1")"; y="$(_nv_$i "$2")"
     if [ "$x" -ne "$y" ]; then printf '%s' "$((x - y))"; return 0; fi

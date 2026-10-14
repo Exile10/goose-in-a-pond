@@ -1,24 +1,19 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Play, RefreshCw, Loader2, RotateCcw, Square, AlertCircle } from "lucide-react";
+import { RefreshCw, Loader2, RotateCcw } from "lucide-react";
 import { DetailShell } from "./DetailShell";
-import { Card, Row, Toggle, Slider } from "./controls";
+import { Card, Row, Toggle } from "./controls";
 import { api } from "../../../api/PondApiClient";
 import type { Settings, ModelEntry } from "../../../api/types";
 import { useVoicePreview } from "../../../voice/useVoicePreview";
 import { VoicePicker } from "./VoicePicker";
 import "./voice-picker.css";
 import {
-  groupVoices,
-  describeVoice,
-  paceLabel,
   clampPace,
   describeQuality,
   VOICE_QUALITY_TIERS,
   DEFAULT_VOICE,
   DEFAULT_PACE,
   DEFAULT_QUALITY,
-  MIN_PACE,
-  MAX_PACE,
 } from "../../../voice/voiceCatalogue";
 
 // ─── Icon path strings ───────────────────────────────────────
@@ -51,10 +46,6 @@ const MOCK_VOICE_SETTINGS: Partial<Settings> = {
   voice_tts_speed: DEFAULT_PACE,
   voice_tts_quality: DEFAULT_QUALITY,
 };
-
-/** Slider works in whole percent; the setting is a multiplier the engine takes. */
-const paceToPct = (pace: number) => Math.round(clampPace(pace) * 100);
-const pctToPace = (pct: number) => clampPace(pct / 100);
 
 interface VoiceDetailProps {
   go: (route: string) => void;
@@ -245,11 +236,6 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
 
   // Always offer the saved voice, or the select renders blank and reassigns it on the next change.
   const offeredVoices = voiceIds.includes(currentVoice) ? voiceIds : [currentVoice, ...voiceIds];
-  const voiceGroups = groupVoices(offeredVoices);
-  const voiceInfo = describeVoice(currentVoice);
-  const voiceLabel = voiceInfo.language
-    ? `${voiceInfo.name} — ${voiceInfo.language}`
-    : voiceInfo.name;
   const qualityTier = describeQuality(currentQuality);
 
   return (

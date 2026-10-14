@@ -42,7 +42,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
 DATA_DIR="${TMPDIR:-/tmp}/pai-bench-$$"
 DO_BUILD=1
@@ -140,7 +140,7 @@ if [ -z "$MODEL" ]; then
   # LC_ALL=C so the sort is byte order rather than locale collation. Without it
   # the "first" file differs between machines and even between shells, which is
   # how two runs on one laptop benchmarked two different models an hour apart.
-  MODEL="$(ls "$REAL_MODELS/gguf" 2>/dev/null \
+  MODEL="$(for f in "$REAL_MODELS/gguf"/*; do [ -e "$f" ] && printf '%s\n' "${f##*/}"; done \
     | grep -iE '\.gguf$' \
     | grep -iE 'Q[45689]_' \
     | grep -viE 'mmproj|asr|embed|nemotron|whisper|mtp|draft|assistant' \

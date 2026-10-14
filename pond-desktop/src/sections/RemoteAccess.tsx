@@ -31,7 +31,9 @@ export function RemoteAccess() {
     void api.remoteStatus().then((status) => {
       if (current === generation.current) setState(status.state === 'Running' ? 'enabled' : status.state === 'Stopped' ? 'local' : 'failed');
     }).catch((error: unknown) => { noteRefusal(error); if (current === generation.current) setState('failed'); });
-    return () => { generation.current++; };
+    // Unmounting supersedes whatever is in flight, the activation poll in `run` included. Written
+    // as an assignment: a ref whose `current` is never assigned is taken for a React-managed node.
+    return () => { generation.current += 1; };
   }, []);
   useEffect(() => {
     let active = true;

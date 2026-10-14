@@ -31,7 +31,7 @@ function formatRunTime(dateStr: string): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function ScheduleListCard({ data, variant }: McpCardProps) {
+export function ScheduleListCard({ data, variant }: McpCardProps) {
   const isCompact = variant === "compact";
   const schedules = (data.schedules ?? []) as Schedule[];
   const runs = (data.runs ?? []) as ScheduleRun[];

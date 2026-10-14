@@ -7,13 +7,6 @@ import { Card, Row } from "./controls";
 import { api } from "../../../api/PondApiClient";
 import type { Device } from "../../../api/types";
 
-// ─── Icon path strings for this view ─────────────────────────
-const SICN = {
-  device: "M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM9 9h6v6H9zM9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3",
-  sensor: "M22 12h-4l-3 9L9 3l-3 9H2",
-  host:   "M20 17a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H9.5a2 2 0 0 0-2 1.57L5 14.5A2 2 0 0 0 7 17M16 17H7M12 17v4M8 21h8",
-} as const;
-
 // ─── Room → icon key mapping ───────────────────────────────────
 function roomIconKey(name: string): keyof typeof HP_PATHS | null {
   const n = name.toLowerCase();
@@ -48,13 +41,6 @@ function groupByRoom(devices: Device[]): Map<string, Device[]> {
     map.set(room, list);
   }
   return map;
-}
-
-// ─── Device icon path helper ───────────────────────────────────
-function deviceIconPath(kind: string | undefined): string {
-  if (kind === "sensor") return SICN.sensor;
-  if (kind === "host")   return SICN.host;
-  return SICN.device;
 }
 
 // ─── Device sub-label ─────────────────────────────────────────

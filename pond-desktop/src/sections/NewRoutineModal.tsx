@@ -7,7 +7,7 @@ import { useDialogFocusTrap } from "../components/shared";
 
 // ── Colour / icon templates ───────────────────────────────────────────────────
 
-export interface RoutineTemplate {
+interface RoutineTemplate {
   id: string;
   label: string;
   color: string;
@@ -15,7 +15,7 @@ export interface RoutineTemplate {
   iconPath: string;
 }
 
-export const ROUTINE_TEMPLATES: RoutineTemplate[] = [
+const ROUTINE_TEMPLATES: RoutineTemplate[] = [
   { id: "morning",  label: "Morning",    color: "#F59E0B", bg: "linear-gradient(150deg,#FCD34D,#F59E0B)", iconPath: "M12 3v2M12 19v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M3 12H1M23 12h-2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42M12 7a5 5 0 1 0 0 10A5 5 0 0 0 12 7z" },
   { id: "night",    label: "Night",      color: "#6366F1", bg: "linear-gradient(150deg,#818CF8,#4F46E5)", iconPath: "M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" },
   { id: "movie",    label: "Movie",      color: "#7C3AED", bg: "linear-gradient(150deg,#A78BFA,#7C3AED)", iconPath: "M15 10l4.55-2.73A1 1 0 0 1 21 8.2v7.6a1 1 0 0 1-1.45.94L15 14M3 8a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" },

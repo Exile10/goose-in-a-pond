@@ -46,7 +46,7 @@ export function useDialogFocusTrap<T extends HTMLElement>(
       window.removeEventListener("keydown", onKeyDown);
       previouslyFocused.current?.focus();
     };
-  }, [active, onClose]);
+  }, [active, onClose, initialFocusRef]);
 
   return dialogRef;
 }

@@ -1,6 +1,6 @@
 // Connected accounts in the settings hub: the sections UI's panel, so there is one credential form.
 import { DetailShell } from "./DetailShell";
-import { useAppState } from "../../../state/AppContext";
+import { useAppState } from "../../../state/useAppContext";
 import { ConnectionsPanel } from "../../../connections/ConnectionsPanel";
 import { UberAccountsPanel } from "../../../connections/UberAccountsPanel";
 

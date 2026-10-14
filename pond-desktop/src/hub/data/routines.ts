@@ -1,8 +1,7 @@
 // ─── Routines Data ─────────────────────────────────────────────
 // On-demand scenes that run on tap; not time-triggered schedules.
 
-import { sunEl, filmEl, focusEl } from "../primitives/HubIco";
-import { HP_PATHS } from "../primitives/icons";
+import { HP_PATHS, sunEl, filmEl, focusEl } from "../primitives/icons";
 import type React from "react";
 
 export type RoutineId = "morning" | "night" | "movie" | "away" | "focus";

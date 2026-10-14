@@ -72,6 +72,7 @@ _install_deps_linux() {
     fi
   else
     warn "No supported package manager (apt/dnf/pacman) -- install build deps manually"
+    # shellcheck disable=SC2034  # read by print_summary in install-common.sh
     S_DEPS="partial"
   fi
 

@@ -1,12 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, within } from "@testing-library/react";
-import {
-  ChatHistory,
-  cardWeight,
-  relativeWhen,
-  messageCountLabel,
-  matchesQuery,
-} from "./ChatHistory";
+import { ChatHistory } from "./ChatHistory";
+import { cardWeight, relativeWhen, messageCountLabel, matchesQuery } from "./chatHistoryView";
 import type { SessionSummary } from "../api/types";
 
 afterEach(cleanup);

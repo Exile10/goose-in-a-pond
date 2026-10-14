@@ -22,7 +22,7 @@ set -uo pipefail
 set +m   # no job-control chatter when we kill background servers
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
 DATA_DIR="${POND_DATA_DIR:-${TMPDIR:-/tmp}/pond-live-$$}"
 PORT="${POND_LIVE_PORT:-4000}"

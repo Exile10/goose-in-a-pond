@@ -14,7 +14,7 @@
 run_pond_setup() {
   step "5" "Server setup (databases, Whisper ASR, Piper TTS, ONNX)"
 
-  cd "$REPO_DIR"
+  cd "$REPO_DIR" || return
 
   local binary="${REPO_DIR}/target/release/pond-server"
   if [ "$MODE" = "dev" ]; then
@@ -68,6 +68,7 @@ run_pond_setup() {
   elif [ "$NO_MODELS" = true ]; then
     S_WHISPER="skipped"
   else
+    # shellcheck disable=SC2034  # read by print_summary in install-common.sh
     S_WHISPER="failed"
   fi
 
@@ -78,6 +79,7 @@ run_pond_setup() {
   elif [ "$NO_MODELS" = true ]; then
     S_PIPER="skipped"
   else
+    # shellcheck disable=SC2034  # read by install.sh and print_summary in install-common.sh
     S_PIPER="failed"
   fi
 }
@@ -222,6 +224,7 @@ _download_llm_llamafile() {
     S_LLM="ok (llamafile)"
   else
     warn "Llamafile download failed"
+    # shellcheck disable=SC2034  # read by print_summary in install-common.sh
     S_LLM="failed"
   fi
 }

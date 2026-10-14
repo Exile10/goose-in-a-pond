@@ -1,6 +1,6 @@
 import React from "react";
 import { HubIco } from "../../primitives/HubIco";
-import { dotsEl } from "../../primitives/HubIco";
+import { dotsEl } from "../../primitives/icons";
 
 interface CardChromeProps {
   /** MCP server app name, e.g. "giap-weather" */

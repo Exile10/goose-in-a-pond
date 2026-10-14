@@ -6,7 +6,6 @@ import { api } from "../../../api/PondApiClient";
 import type { LogEntry } from "../../../api/types";
 
 // ─── Types ────────────────────────────────────────────────────
-type LogLevel = "INFO" | "WARN" | "ERROR";
 type LogFilter = "All" | "Info" | "Warn" | "Error";
 
 const FILTERS: LogFilter[] = ["All", "Info", "Warn", "Error"];

@@ -25,13 +25,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$HERE/lib.sh"
 
-REPO_DIR="$HOME/TensorRT-Edge-LLM"; PAYLOADS=""; PORT=8002; STAGE=all
+REPO_DIR="$HOME/TensorRT-Edge-LLM"; PAYLOADS=""; PORT=8002
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)     REPO_DIR="$2"; shift 2 ;;
     --payloads) PAYLOADS="$2"; shift 2 ;;
     --port)     PORT="$2"; shift 2 ;;
-    --stage)    STAGE="$2"; shift 2 ;;
+    # Accepted so the re-run hint below still parses; every stage runs regardless.
+    --stage)    shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac
 done

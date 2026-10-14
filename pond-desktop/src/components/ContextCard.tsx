@@ -48,21 +48,6 @@ function ToolContent({ toolName, data, renderHint }: { toolName: string; data: R
   return <GenericContent data={safe} />;
 }
 
-function WeatherContent({ data }: { data: Record<string, unknown> }) {
-  const temp = data?.temperature ?? data?.temp;
-  const desc = data?.description ?? data?.condition ?? data?.weather;
-  const location = data?.location ?? data?.city;
-  return (
-    <div style={styles.weatherRow}>
-      <span style={styles.weatherTemp}>{temp !== undefined ? `${temp}°` : "—"}</span>
-      <div>
-        {desc != null && <p style={styles.value}>{String(desc)}</p>}
-        {location != null && <p style={styles.hint}>{String(location)}</p>}
-      </div>
-    </div>
-  );
-}
-
 function DevicesContent({ data }: { data: Record<string, unknown> }) {
   const devices = Array.isArray(data?.devices) ? data.devices : Array.isArray(data) ? data : [];
   if (devices.length === 0) return <p style={styles.hint}>No devices found.</p>;
@@ -147,18 +132,6 @@ const styles: Record<string, React.CSSProperties> = {
   },
   body: {
     padding: "8px 10px",
-  },
-  weatherRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: "10px",
-  },
-  weatherTemp: {
-    fontFamily: "var(--font-display)",
-    fontWeight: 700,
-    fontSize: "var(--text-xl)",
-    color: "var(--color-text)",
-    lineHeight: "1",
   },
   list: {
     listStyle: "none",

@@ -62,7 +62,7 @@ const _dispatch = vi.fn((action: { type: string; payload?: unknown }) => {
 // The chat view's session, which startSession hands to the child to continue.
 let _appSessionId: string | null = null;
 
-vi.mock("../../state/AppContext", () => ({
+vi.mock("../../state/useAppContext", () => ({
   useAppDispatch: () => _dispatch,
   useAppState: () => ({
     serverOnline: true,
