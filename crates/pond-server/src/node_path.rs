@@ -95,12 +95,12 @@ fn major_minor(version: &str) -> Option<(u32, u32)> {
     Some((major, parts.next().and_then(digits).unwrap_or(0)))
 }
 
-/// The range `giap.sh node` records a Node for, `^22.12.0 || ^24.0.0 || >=26.0.0` (Electron 44 and
+/// The range `giap.sh node` records a Node for, `^22.13.0 || ^24.0.0 || >=26.0.0` (ESLint 10 and
 /// vitest; the odd-numbered 23 and 25 are out). It is `node_version_ok` in
 /// scripts/lib/node-setup.sh, and a test runs both.
 fn inside_range(version: &str) -> bool {
     match major_minor(version) {
-        Some((22, minor)) => minor >= 12,
+        Some((22, minor)) => minor >= 13,
         Some((major, _)) => major == 24 || major >= 26,
         None => false,
     }
@@ -582,12 +582,12 @@ mod tests {
 
     /// The script's own lists (`t_range_inside`, `t_range_outside` in node-setup.test.sh).
     const INSIDE: &[&str] = &[
-        "v22.12.0", "22.12.0", "v22.13.1", "v22.99.9", "v24.0.0", "v24.11.0", "v26.0.0",
+        "v22.13.0", "22.13.0", "v22.13.1", "v22.99.9", "v24.0.0", "v24.11.0", "v26.0.0",
         "v26.10.0", "v27.1.0", "v30.0.0",
     ];
     const OUTSIDE: &[&str] = &[
-        "v20.19.0", "v21.0.0", "v22.11.9", "v22.0.0", "v23.5.0", "v25.8.2", "v18.0.0", "",
-        "garbage", "v", "22", "v12.22.9",
+        "v20.19.0", "v21.0.0", "v22.11.9", "v22.12.0", "v22.12.9", "v22.0.0", "v23.5.0", "v25.8.2",
+        "v18.0.0", "", "garbage", "v", "22", "v12.22.9",
     ];
 
     #[test]

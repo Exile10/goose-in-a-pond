@@ -6,11 +6,11 @@
 # scripts/giap.sh (`giap.sh node`, and the UI build, install and doctor).
 #
 # The ranges below are not preferences. They are what the dependencies declare, read off the
-# installed packages. The repo's range is the strictest of them: Electron 44 wants >= 22.12, and
-# vitest wants "^22.12.0 || ^24.0.0 || >=26.0.0", which is what rules out the odd-numbered 23 and 25.
-# The Matter controller is nearly inside it: matter.js 0.17 wants `>=20.19.0 <22.0.0 || >=22.13.0`
-# (crates/pond-adapters-matter/src/server_setup.rs), so 22.12.x satisfies the range above and not the
-# controller. node_version_matter_ok carries that hole.
+# installed packages. The repo's range is the strictest of them: ESLint 10 wants
+# "^20.19.0 || ^22.13.0 || >=24", and vitest wants "^22.12.0 || ^24.0.0 || >=26.0.0", which is what
+# rules out the odd-numbered 23 and 25. Inside it, the Matter controller runs too: matter.js 0.17 wants
+# `>=20.19.0 <22.0.0 || >=22.13.0` (crates/pond-adapters-matter/src/server_setup.rs). Outside it, a
+# Node that only builds the UI may still miss matter.js's hole, which node_version_matter_ok carries.
 #
 # Building the web UI needs less: Vite wants "^20.19.0 || >=22.12.0". A server with only that (the
 # Jetson) can still build the UI, so it is a separate question, node_version_ui_ok.
@@ -18,7 +18,7 @@
 # Written for bash 3.2, the only bash on a stock macOS: no `declare -A`, no `mapfile`, no `${x,,}`.
 # ─────────────────────────────────────────────────────────────────────────────
 
-NODE_RANGE_TEXT='^22.12.0 || ^24.0.0 || >=26.0.0'
+NODE_RANGE_TEXT='^22.13.0 || ^24.0.0 || >=26.0.0'
 # shellcheck disable=SC2034  # read by giap.sh, which sources this file
 NODE_UI_RANGE_TEXT='^20.19.0 || >=22.12.0'
 
@@ -60,7 +60,7 @@ node_version_ok() {
   local maj min
   maj="$(_nv_major "$1")" || return 1
   min="$(_nv_minor "$1")"
-  if [ "$maj" -eq 22 ] && [ "$min" -ge 12 ]; then return 0; fi
+  if [ "$maj" -eq 22 ] && [ "$min" -ge 13 ]; then return 0; fi
   if [ "$maj" -eq 24 ]; then return 0; fi
   [ "$maj" -ge 26 ]
 }
@@ -109,12 +109,12 @@ node_why_not() {
   if [ "$maj" -lt 20 ]; then
     printf 'it is older than anything this repo runs on'
   elif [ "$maj" -lt 22 ]; then
-    printf 'Electron 44 needs Node 22.12 or newer'
+    printf 'the desktop app and its tools need Node 22.13 or newer'
   elif [ "$maj" -eq 22 ]; then
-    printf '22.%s is older than 22.12, the floor for Electron 44 and Vite 7' "$min"
+    printf '22.%s is older than 22.13, the floor for ESLint 10 and the Matter controller' "$min"
   else
     # 23 and 25: current releases that never become long-term support.
-    printf 'Node %s is an odd-numbered release, which the test runner (vitest) does not support: it wants 22.12+ in the 22 line, any 24, or 26 and up' "$maj"
+    printf 'Node %s is an odd-numbered release, which the test runner (vitest) does not support: the repo wants 22.13+ in the 22 line, any 24, or 26 and up' "$maj"
   fi
 }
 
@@ -226,7 +226,6 @@ node_report() {
   cur="$(node --version 2>/dev/null)" || cur=""
   if [ -n "$cur" ] && node_version_ok "$cur"; then
     ok "node $cur is inside $NODE_RANGE_TEXT"
-    node_version_matter_ok "$cur" || warn "but it cannot run the Matter controller: $(node_why_not_matter "$cur")"
     return 0
   fi
   if [ -n "$cur" ]; then warn "node $cur on PATH is outside $NODE_RANGE_TEXT: $(node_why_not "$cur")"
@@ -390,7 +389,6 @@ node_ensure() {
   cur="$(node --version 2>/dev/null)" || cur=""
   if [ "$method" = auto ] && [ -n "$cur" ] && node_version_ok "$cur"; then
     ok "node $cur is inside $NODE_RANGE_TEXT"
-    node_version_matter_ok "$cur" || warn "but it cannot run the Matter controller: $(node_why_not_matter "$cur")"
     return 0
   fi
   if [ -n "$cur" ]; then

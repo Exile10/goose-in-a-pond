@@ -629,13 +629,11 @@ doctor() {
   # 8b. node capability for the Matter controller — a higher, MINOR-level floor.
   # Only worth warning about when Matter is something this Pond might use; the
   # failure is otherwise invisible until someone flips the toggle months later.
-  # Inside the repo's range and still refused is 22.12.x, which giap.sh node keeps, so it has to be
-  # upgraded; anything else giap.sh node replaces, and the pond takes the replacement at its next start.
+  # Every Node inside the repo's range can; giap.sh node replaces any other, and the pond takes the
+  # replacement at its next start.
   if [ "$D_NODE_MATTER_OK" = true ]; then ok "node $D_NODE can run the Matter controller"
   else
-    if [ "$D_NODE_REPO_OK" = true ]; then local matter_fix="upgrade it to 22.13 or newer"
-    else local matter_fix="bash scripts/giap.sh node fixes it, once the pond is restarted"; fi
-    warn "node ${D_NODE:-absent} cannot run the Matter controller: $(node_why_not_matter "${D_NODE:-none}") — Matter will report it and stay off; $matter_fix"
+    warn "node ${D_NODE:-absent} cannot run the Matter controller: $(node_why_not_matter "${D_NODE:-none}") — Matter will report it and stay off; bash scripts/giap.sh node fixes it, once the pond is restarted"
     DOC_WARN=$((DOC_WARN+1)); fi
 
   # 9. desktop app
