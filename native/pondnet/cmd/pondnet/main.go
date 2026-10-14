@@ -81,9 +81,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, "invalid registration input")
 				os.Exit(2)
 			}
-			// A device directory that exists but cannot be read stops here rather than
-			// registering without the certificate the Pond was imaged with.
-			device, err := pondnet.LoadDevice(pondnet.DeviceDirectory(*state))
+			device, err := registrationDevice(pondnet.DeviceDirectory(*state), input.Invite, os.Stderr)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "device certificate unavailable:", err)
 				os.Exit(1)
@@ -182,6 +180,18 @@ func main() {
 		case <-ticker.C:
 		}
 	}
+}
+
+// registrationDevice is the device certificate to register with. One that exists but cannot
+// be loaded stops registration without an invite, rather than registering without the
+// certificate the Pond was imaged with; with an invite, the invite admits the household.
+func registrationDevice(directory, invite string, warnings io.Writer) (*pondnet.Device, error) {
+	device, err := pondnet.LoadDevice(directory)
+	if err != nil && invite != "" {
+		fmt.Fprintln(warnings, "device certificate unavailable, registering with the invite:", err)
+		return nil, nil
+	}
+	return device, err
 }
 
 // runDeviceAction provisions a Pond while it is imaged: create prints the new device key's

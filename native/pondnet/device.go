@@ -40,27 +40,54 @@ func DeviceDirectory(authority string) string {
 
 // CreateDevice makes this Pond's device key and returns its public half for the operator
 // to sign. It runs once, when the Pond is imaged: an existing key is never replaced,
-// because a certificate already issued for it would stop working.
+// because a certificate already issued for it would stop working. The key is written in a
+// staging directory and renamed into place, so a crash leaves no key or a whole one.
 func CreateDevice(directory string) (string, error) {
 	if !filepath.IsAbs(directory) {
 		return "", errors.New("device directory must be absolute")
 	}
-	if err := os.Mkdir(directory, 0700); err != nil {
-		if os.IsExist(err) {
-			return "", errors.New("this Pond already has a device key; it is never replaced")
+	exists := errors.New("this Pond already has a device key; it is never replaced")
+	if _, err := os.Lstat(directory); err == nil {
+		return "", exists
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	parent, base := filepath.Dir(directory), filepath.Base(directory)
+	// Earlier attempts that crashed before their rename.
+	if stale, err := filepath.Glob(filepath.Join(parent, base+".new-*")); err == nil {
+		for _, leftover := range stale {
+			os.RemoveAll(leftover)
 		}
+	}
+	staging, err := os.MkdirTemp(parent, base+".new-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(staging)
+	if err = os.Chmod(staging, 0700); err != nil {
 		return "", err
 	}
 	seed := make([]byte, ed25519.SeedSize)
-	if _, err := rand.Read(seed); err != nil {
+	if _, err = rand.Read(seed); err != nil {
 		return "", err
 	}
 	data, _ := json.Marshal(struct {
 		Seed string `json:"seed"`
 	}{base64.StdEncoding.EncodeToString(seed)})
-	if err := writePrivate(directory, deviceKeyFile, data); err != nil {
-		// Leave nothing behind, or every later attempt would refuse an empty directory.
-		os.Remove(directory)
+	if err = writeSynced(filepath.Join(staging, deviceKeyFile), data); err != nil {
+		return "", err
+	}
+	if err = syncDirectory(staging); err != nil {
+		return "", err
+	}
+	// rename(2) replaces an empty directory, so the existence check above is what refuses one.
+	if err = os.Rename(staging, directory); err != nil {
+		if _, statErr := os.Lstat(directory); statErr == nil {
+			return "", exists
+		}
+		return "", err
+	}
+	if err = syncDirectory(parent); err != nil {
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)), nil
