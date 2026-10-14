@@ -265,10 +265,19 @@ func (a Authority) Submit(ctx context.Context, origin string, approval enrollmen
 		// everybody already knew and none of the causes.
 		return result, &Refused{Status: response.StatusCode, Reason: refusal(response.Body), Action: approval.Action}
 	}
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 4096))
-	decoder.DisallowUnknownFields()
-	if e = decoder.Decode(&result); e != nil {
-		return result, e
+	return decodeAnswer(response.Body, approval)
+}
+
+// decodeAnswer reads the coordinator's account of a device and checks it against what
+// was asked. Fields this helper does not know are ignored, so the service can add one
+// without breaking Ponds already in homes; what protects the answer is its size bound,
+// the refusal of trailing data, and answered(), which checks the status, role, revision
+// and machine key against the request.
+func decodeAnswer(body io.Reader, approval enrollment.Approval) (enrollment.Device, error) {
+	var result enrollment.Device
+	decoder := json.NewDecoder(io.LimitReader(body, 4096))
+	if err := decoder.Decode(&result); err != nil {
+		return result, err
 	}
 	if decoder.Decode(new(any)) != io.EOF {
 		return result, errors.New("coordinator answered with trailing data")
