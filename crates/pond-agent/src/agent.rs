@@ -205,6 +205,8 @@ impl PondAgent {
         if !partition.dynamic_suffix.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(&partition.dynamic_suffix);
+            prompt.push('\n');
+            prompt.push_str(prompt_builder::TEMPORAL_RULE);
         }
 
         if let Some(ref repo) = self.extras_repo {

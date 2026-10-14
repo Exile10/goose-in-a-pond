@@ -1,14 +1,11 @@
 //! Restates the answer rule last in the turn message; stated once ~6k tokens up, it decays.
 //! Keep the rules in the system prefix too: subagents never see `<system-context>`.
 
-/// Answer-shape note for `<system-context>`, after [`super::turn_budget::turn_budget_note`].
-/// Its example must stay in a domain the pond has no tool for: small models copy it verbatim.
+/// Answer-shape note, last in `<system-context>`. The rule alone: its worked example (about 30
+/// tokens) went on 2026-10-14 so a short turn fits one 128-token LiteRT prefill chunk, and an
+/// example is also what a small model copies (see the domain test below).
 pub fn answer_contract() -> String {
-    format!(
-        "<answer-contract>\n{ANSWER_RULE} Shape: \"The parcel arrives on Thursday, \
-         and someone needs to sign for it.\" — the answer, nothing about looking it \
-         up.\n</answer-contract>"
-    )
+    format!("<answer-contract>\n{ANSWER_RULE}\n</answer-contract>")
 }
 
 /// The bare rule, shared with `orchestrator.rs :: subagent_envelope` so the two can't drift.
@@ -29,26 +26,21 @@ mod tests {
         assert_eq!(note.matches("</answer-contract>").count(), 1);
     }
 
-    /// Rule and example must agree: on a conflict the example wins.
     #[test]
-    fn it_states_the_rule_and_shows_it() {
+    fn it_states_the_rule_with_no_example_to_copy() {
         let note = answer_contract();
-        let lower = note.to_lowercase();
         assert!(
-            lower.contains("not the route"),
+            note.to_lowercase().contains("not the route"),
             "the rule itself is missing: {note}"
         );
         assert!(
-            note.contains('"'),
-            "no worked example -- on a 2B model the demonstration is what carries \
-             format compliance, not the sentence: {note}"
-        );
-        assert!(
-            lower.contains("nothing about looking it up"),
-            "the example does not say what it is an example OF: {note}"
+            !note.contains('"'),
+            "a quoted example is back. It costs a short turn a second LiteRT prefill chunk, \
+             and small models copy examples: {note}"
         );
     }
 
+    /// Should an example return: one in a domain the pond serves gets copied as a fake reading.
     #[test]
     fn the_example_cannot_be_mistaken_for_a_real_result() {
         let note = answer_contract().to_lowercase();
@@ -83,21 +75,6 @@ mod tests {
         );
     }
 
-    /// The example is what carries format compliance on a small model.
-    #[test]
-    fn it_is_still_a_worked_example_and_not_just_a_rule() {
-        let note = answer_contract();
-        let quoted: Vec<&str> = note.split('"').collect();
-        assert!(
-            quoted.len() >= 3 && quoted[1].split_whitespace().count() >= 5,
-            "the demonstration must remain a real sentence, not a stub: {note}"
-        );
-        assert!(
-            quoted[1].ends_with('.'),
-            "the example should model a complete declarative answer: {note}"
-        );
-    }
-
     /// "Be terse" alone teaches dropping the failed part, the one part the user can't reconstruct.
     #[test]
     fn a_shortfall_is_still_reportable() {
@@ -113,10 +90,10 @@ mod tests {
     fn it_stays_small_enough_to_repeat_every_turn() {
         let chars = answer_contract().chars().count();
         assert!(
-            chars <= 320,
+            chars <= 160,
             "the answer contract is {chars} chars (~{} tokens), re-prefilled on \
-             every turn. Past ~320 it stops being a restatement and becomes a \
-             second copy of the rules, which belongs in the cached prefix.",
+             every turn. A short turn's whole envelope has to fit one 128-token LiteRT \
+             prefill chunk; the rules themselves belong in the cached prefix.",
             chars / 4
         );
     }

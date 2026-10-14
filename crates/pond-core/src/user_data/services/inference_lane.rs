@@ -195,9 +195,66 @@ fn most_informative(a: SkipReason, b: SkipReason) -> SkipReason {
     }
 }
 
+/// Quiet before a compaction pass for the conversation the household is in, when that
+/// conversation's next turn would start by compacting it anyway: enough for the end of an answer
+/// (its last sentences sent to speech) to clear the model first. That turn waits for the pass
+/// rather than stopping it.
+pub const COMPACTION_QUIET_FOR_ITS_TURN: Duration = Duration::from_secs(5);
+/// Quiet before a pass that only gets ahead of the conversation the household is in, so a pause
+/// in a conversation is not mistaken for its end.
+pub const COMPACTION_QUIET: Duration = Duration::from_secs(30);
+/// Quiet before a pass for any other conversation. Its summary call sets aside the conversation
+/// being talked in, whose next turn then pays to get it back, and that next turn stops the pass
+/// anyway. On a Jetson Orin on 2026-10-13 such a pass started 5 s after every turn of the current
+/// conversation, was stopped by the next one, and cost each of them 6-13 s more to the first
+/// token. Two minutes is longer than the pauses between turns there (14-19 s, at most 108 s).
+pub const COMPACTION_QUIET_FOR_ANOTHER: Duration = Duration::from_secs(120);
+/// A pass stopped because someone came back needs twice the quiet next time, doubling at most
+/// this many times, so a conversation that keeps being interrupted stops costing the one in use.
+pub const COMPACTION_QUIET_MAX_DOUBLINGS: u32 = 4;
+
+/// How long the household must be quiet before a compaction pass for one conversation starts.
+/// `in_use`: it is the conversation of the latest turn. `its_turn_compacts`: goose would compact
+/// it at the start of its next turn. `times_stopped`: passes for it stopped since it last
+/// compacted.
+pub fn compaction_quiet(in_use: bool, its_turn_compacts: bool, times_stopped: u32) -> Duration {
+    let base = match (in_use, its_turn_compacts) {
+        (true, true) => COMPACTION_QUIET_FOR_ITS_TURN,
+        (true, false) => COMPACTION_QUIET,
+        (false, _) => COMPACTION_QUIET_FOR_ANOTHER,
+    };
+    base * (1u32 << times_stopped.min(COMPACTION_QUIET_MAX_DOUBLINGS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_conversation_in_use_is_compacted_after_a_short_quiet() {
+        assert_eq!(compaction_quiet(true, true, 0), Duration::from_secs(5));
+        assert_eq!(compaction_quiet(true, false, 0), Duration::from_secs(30));
+        assert_eq!(
+            compaction_quiet(false, true, 0),
+            Duration::from_secs(120),
+            "another conversation waits out the pauses between turns, even one that would \
+             compact on its next turn"
+        );
+        assert_eq!(compaction_quiet(false, false, 0), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn a_stopped_pass_waits_longer_each_time_up_to_a_cap() {
+        assert_eq!(compaction_quiet(false, true, 1), Duration::from_secs(240));
+        assert_eq!(compaction_quiet(false, true, 2), Duration::from_secs(480));
+        assert_eq!(compaction_quiet(false, true, 4), Duration::from_secs(1920));
+        assert_eq!(
+            compaction_quiet(false, true, 40),
+            Duration::from_secs(1920),
+            "the doubling stops, and never overflows"
+        );
+        assert_eq!(compaction_quiet(true, true, 1), Duration::from_secs(10));
+    }
 
     #[test]
     fn an_asleep_job_does_not_take_a_tick_from_the_job_that_is_asking() {
