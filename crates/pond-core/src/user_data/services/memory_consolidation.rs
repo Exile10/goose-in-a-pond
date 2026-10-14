@@ -1,5 +1,5 @@
 //! Memory consolidation. [`select_batch`] keeps a run inside a 3B model's context, and
-//! [`apply_actions`] is the only write path, so both modes share its correction guards.
+//! [`apply_actions`] is the only write path, so both modes share its correction and kept guards.
 
 use crate::user_data::domain::memory::{
     MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment,
@@ -97,7 +97,7 @@ pub struct ApplyOutcome {
     pub pruned: usize,
     pub split: usize,
     pub recategorized: usize,
-    /// Actions refused by a correction-safety guard.
+    /// Actions refused by a correction or kept-memory guard.
     pub blocked: usize,
 }
 
@@ -108,8 +108,8 @@ impl ApplyOutcome {
     }
 }
 
-/// Apply accepted consolidation actions. Pass the batch the model saw: the correction guards
-/// look sources up there, and ids outside it apply unguarded.
+/// Apply accepted consolidation actions. Pass the batch the model saw: the correction and kept
+/// guards look sources up there, and ids outside it apply unguarded.
 pub async fn apply_actions(
     repo: &dyn MemoryRepository,
     batch: &[MemoryFragment],
@@ -146,13 +146,19 @@ pub async fn apply_actions(
                     .filter_map(|m| m.corrects.clone())
                     .next();
 
+                // A kept source makes the merge kept too, or merging would undo the keep.
+                let any_kept = source_ids
+                    .iter()
+                    .filter_map(|id| memory_map.get(id.as_str()))
+                    .any(|m| m.is_kept());
+
                 if any_correction {
                     tracing::info!(
                         "[consolidation] merge includes correction source — forcing segment=Correction"
                     );
                 }
 
-                let new_frag = MemoryFragment::from_extraction(
+                let mut new_frag = MemoryFragment::from_extraction(
                     uuid::Uuid::new_v4().to_string(),
                     None,
                     merged_content,
@@ -160,6 +166,9 @@ pub async fn apply_actions(
                     importance,
                     corrects,
                 );
+                if any_kept {
+                    new_frag.keep();
+                }
                 let new_id = new_frag.id.clone();
                 // Bail if the replacement fails to write; its sources must not be superseded.
                 repo.add(new_frag).await?;
@@ -177,8 +186,10 @@ pub async fn apply_actions(
             }
             ConsolidationAction::Prune { id } => {
                 if let Some(mem) = memory_map.get(id.as_str()) {
-                    if mem.is_correction() {
-                        tracing::warn!("[consolidation] blocked prune of correction memory {id}");
+                    if mem.is_correction() || mem.is_kept() {
+                        tracing::warn!(
+                            "[consolidation] blocked prune of correction or kept memory {id}"
+                        );
                         outcome.blocked += 1;
                         continue;
                     }
@@ -211,9 +222,10 @@ pub async fn apply_actions(
                 new_memories,
             } => {
                 // Carry `corrects` to the first Correction entry so the fix survives the split.
-                let source_corrects = memory_map
-                    .get(source_id.as_str())
-                    .and_then(|m| m.corrects.clone());
+                let source = memory_map.get(source_id.as_str());
+                let source_corrects = source.and_then(|m| m.corrects.clone());
+                // Every piece of a kept memory stays kept.
+                let source_kept = source.is_some_and(|m| m.is_kept());
 
                 let mut first_new_id = String::new();
                 let mut corrects_assigned = false;
@@ -229,7 +241,7 @@ pub async fn apply_actions(
                         None
                     };
 
-                    let new_frag = MemoryFragment::from_extraction(
+                    let mut new_frag = MemoryFragment::from_extraction(
                         uuid::Uuid::new_v4().to_string(),
                         None,
                         entry.content.clone(),
@@ -237,6 +249,9 @@ pub async fn apply_actions(
                         entry.importance,
                         entry_corrects,
                     );
+                    if source_kept {
+                        new_frag.keep();
+                    }
                     let nid = new_frag.id.clone();
                     if first_new_id.is_empty() {
                         first_new_id = nid.clone();
@@ -465,6 +480,133 @@ mod tests {
         // A stored 0 must not mean "consolidate nothing forever".
         let selection = select_batch(memories, 0);
         assert_eq!(selection.batch.len(), MIN_MEMORIES_TO_CONSOLIDATE);
+    }
+
+    // ── apply_actions kept-memory safety ───────────────────────────────────
+
+    fn kept(id: &str) -> MemoryFragment {
+        let mut f = frag(id, MemorySegment::Preference, 5);
+        f.keep();
+        f
+    }
+
+    #[tokio::test]
+    async fn prune_of_a_kept_memory_is_blocked() {
+        let repo = MockMemoryRepository::new();
+        let batch = vec![kept("p1")];
+
+        let outcome = apply_actions(
+            &repo,
+            &batch,
+            vec![ConsolidationAction::Prune {
+                id: "p1".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.pruned, 0);
+        assert_eq!(outcome.blocked, 1);
+        assert!(repo.lifecycle_updates().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_with_a_kept_source_stays_kept() {
+        let repo = MockMemoryRepository::new();
+        let batch = vec![kept("p1"), frag("k1", MemorySegment::Knowledge, 6)];
+
+        apply_actions(
+            &repo,
+            &batch,
+            vec![ConsolidationAction::Merge {
+                source_ids: vec!["p1".to_string(), "k1".to_string()],
+                merged_content: "likes warm light in the evening".to_string(),
+                segment: MemorySegment::Preference,
+                importance: 0.7,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
+        let created = stored
+            .iter()
+            .find(|m| m.content == "likes warm light in the evening")
+            .unwrap();
+        assert!(created.is_kept(), "merging must not undo a keep");
+        assert_eq!(created.decay_rate, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn merge_without_a_kept_source_takes_the_segment_tier() {
+        let repo = MockMemoryRepository::new();
+        let batch = vec![
+            frag("k1", MemorySegment::Knowledge, 5),
+            frag("k2", MemorySegment::Knowledge, 6),
+        ];
+
+        apply_actions(
+            &repo,
+            &batch,
+            vec![ConsolidationAction::Merge {
+                source_ids: vec!["k1".to_string(), "k2".to_string()],
+                merged_content: "works from home on Fridays".to_string(),
+                segment: MemorySegment::Routine,
+                importance: 0.65,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
+        let created = stored
+            .iter()
+            .find(|m| m.content == "works from home on Fridays")
+            .unwrap();
+        assert!(!created.is_kept());
+    }
+
+    #[tokio::test]
+    async fn split_of_a_kept_memory_keeps_every_piece() {
+        let repo = MockMemoryRepository::new();
+        let batch = vec![kept("p1")];
+
+        apply_actions(
+            &repo,
+            &batch,
+            vec![ConsolidationAction::Split {
+                source_id: "p1".to_string(),
+                new_memories: vec![
+                    SplitEntry {
+                        content: "likes jazz".to_string(),
+                        segment: MemorySegment::Preference,
+                        importance: 0.7,
+                    },
+                    SplitEntry {
+                        content: "plays piano".to_string(),
+                        segment: MemorySegment::Knowledge,
+                        importance: 0.5,
+                    },
+                ],
+            }],
+        )
+        .await
+        .unwrap();
+
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
+        for content in ["likes jazz", "plays piano"] {
+            let piece = stored.iter().find(|m| m.content == content).unwrap();
+            assert!(piece.is_kept(), "{content} must stay kept");
+        }
     }
 
     // ── apply_actions correction safety ─────────────────────────────────────
