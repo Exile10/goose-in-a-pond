@@ -287,17 +287,22 @@ async fn run(state: Arc<AppState>, file: TrackedFile) {
 }
 
 /// What happens when one part has arrived: the model part marks its row downloaded (with its
-/// real size), and any part hands an in-process model to the agent to settle.
+/// real size), and any part hands an in-process model to the agent to settle. Fails when the
+/// store cannot read or mark the row; a row that is gone has nothing to mark.
 pub(crate) async fn arrival(
     state: Arc<AppState>,
     model_id: Option<String>,
     part: Option<&'static str>,
-) {
+) -> Result<(), String> {
     let (Some(model_id), Some(repo)) = (model_id, state.model_repo.clone()) else {
-        return;
+        return Ok(());
     };
-    let Ok(Some(mut record)) = repo.get_by_id(&model_id).await else {
-        return;
+    let Some(mut record) = repo
+        .get_by_id(&model_id)
+        .await
+        .map_err(|e| crate::download_failure::plain_unrecorded(&e))?
+    else {
+        return Ok(());
     };
     if part == Some(PART_MODEL) {
         crate::routes::fetch_tts_config(&state, &record).await;
@@ -311,11 +316,14 @@ pub(crate) async fn arrival(
             record.size_mb = mb;
             let _ = repo.upsert(&record).await;
         }
-        let _ = repo.set_downloaded(&model_id, true).await;
+        repo.set_downloaded(&model_id, true)
+            .await
+            .map_err(|e| crate::download_failure::plain_unrecorded(&e))?;
     }
     if matches!(record.category, ModelCategory::Gguf | ModelCategory::Litert) {
         state.agent.prepare_model(&record.name);
     }
+    Ok(())
 }
 
 /// What a download of one model will fetch, decided before anything starts.

@@ -6736,8 +6736,9 @@ fn part_path(dest: &std::path::Path) -> std::path::PathBuf {
     dest.with_file_name(name)
 }
 
-/// Tracked download to `file.dest`; `on_done` runs only on success. HF URLs use `pond_hf_cache`
-/// (resumable, keeps auth across HF→CDN redirects); anything else lands in `.part` first.
+/// Tracked download to `file.dest`; `on_done` runs only on success, and an error it returns ends
+/// the entry in error. HF URLs use `pond_hf_cache` (resumable, keeps auth across HF→CDN
+/// redirects); anything else lands in `.part` first.
 pub(crate) async fn spawn_tracked_download<F>(
     file: TrackedFile,
     tracker: Tracker,
@@ -6745,7 +6746,7 @@ pub(crate) async fn spawn_tracked_download<F>(
     data_dir: std::path::PathBuf,
     on_done: F,
 ) where
-    F: std::future::Future<Output = ()> + Send,
+    F: std::future::Future<Output = Result<(), String>> + Send,
 {
     use tokio::io::AsyncWriteExt;
 
@@ -6849,17 +6850,21 @@ pub(crate) async fn spawn_tracked_download<F>(
             fetched
         };
 
-    match result {
+    let result = match result {
         Ok(()) => {
             tracing::info!("Downloaded {} to {:?}", key, dest);
-            {
-                let mut t = tracker.write().await;
-                if let Some(e) = t.get_mut(&key) {
-                    e.status = "done".to_string();
-                    e.finished_at = Some(std::time::Instant::now());
-                }
+            // Recorded before the entry says done: whoever sees done must find the row downloaded.
+            on_done.await
+        }
+        failed => failed,
+    };
+    match result {
+        Ok(()) => {
+            let mut t = tracker.write().await;
+            if let Some(e) = t.get_mut(&key) {
+                e.status = "done".to_string();
+                e.finished_at = Some(std::time::Instant::now());
             }
-            on_done.await;
         }
         Err(err) => {
             let mut t = tracker.write().await;
@@ -17131,6 +17136,55 @@ mod tests {
                 resumable
             );
         }
+    }
+
+    /// A transfer says done only once `on_done` has recorded the file, and error when it could
+    /// not, so a reader that sees done never finds the row still waiting.
+    #[tokio::test]
+    async fn a_download_is_done_only_once_it_is_recorded() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"GGUF".to_vec()))
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let finish = |key: &'static str, recorded: Result<(), String>| {
+            let tracker: Tracker = Arc::new(tokio::sync::RwLock::new(Default::default()));
+            let file = TrackedFile {
+                url: format!("{}/{key}", server.uri()),
+                dest: tmp.path().join(key),
+                key: key.to_string(),
+                category: "gguf".into(),
+                model_id: None,
+                part: None,
+                size_bytes: None,
+            };
+            let seen = Arc::clone(&tracker);
+            let on_done = async move {
+                assert_eq!(seen.read().await[key].status, "downloading");
+                recorded
+            };
+            let data_dir = tmp.path().to_path_buf();
+            async move {
+                let client = reqwest::Client::new();
+                spawn_tracked_download(file, Arc::clone(&tracker), client, data_dir, on_done).await;
+                let entry = tracker.read().await[key].clone();
+                entry
+            }
+        };
+
+        let done = finish("kept.gguf", Ok(())).await;
+        assert_eq!((done.status.as_str(), done.error), ("done", None));
+        assert!(done.finished_at.is_some());
+
+        let failed = finish("lost.gguf", Err("could not record it".into())).await;
+        assert_eq!(failed.status, "error");
+        assert_eq!(failed.error.as_deref(), Some("could not record it"));
+        assert!(failed.finished_at.is_some(), "an error entry ages out");
+        assert!(
+            tmp.path().join("lost.gguf").exists(),
+            "the transfer itself finished"
+        );
     }
 
     #[test]
