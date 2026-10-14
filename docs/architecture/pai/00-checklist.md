@@ -3213,8 +3213,40 @@ less memory (inference latency; not a PAI milestone).**
   kept it, because B's prompts were under half of the 13.2K tokens cached, so every B turn ran in a
   throwaway context with a full prefill. Fixed in goose `2d942ec47`, verified by a unit test and the
   live engine tests on the Mac.
-- **Not yet verified on the Orin, in the pond:** the envelope, the windowed cache, f16 KV,
-  ubatches of 256, and the fix above.
+- **Verified on the Orin, in the pond, 2026-10-14** (round-2 build `4e4bf103`, which also carries
+  the next entry's trims and speculative decoding; E4B; a scratch pond with the household's downloads
+  hard-linked in; twelve turns about six saved memories with the goal check off, as on the nano).
+  - llama.cpp without the drafter: decode 16.2 -> 17.8 tok/s (median); the lowest available memory
+    rose from 2,872 to 3,458 MB.
+  - The fix above: round 1's driver again, B's first tokens 0.33-0.63 s (7.1-10.9 s in round 1).
+  - First tokens and the envelope: see the next entry, whose trims ran in the same build.
+
+**2026-10-14 — A short turn fits one LiteRT prefill chunk (inference latency; not a PAI
+milestone).**
+
+- **What landed.** LiteRT prefills on the GPU in whole 128-token chunks, and after the entry above a
+  short turn still carried about 146 tokens: two chunks. The standing "answer time/date questions
+  directly ... no tools needed" became `prompt_builder::TEMPORAL_RULE`. The live path states it once,
+  in the session appendix beside the turn budget; the mistral.rs and quarantined pond-agent paths
+  keep it next to their suffix. The answer contract keeps its rule and drops its worked example
+  (about 30 tokens), by Jerry's choice on 2026-10-14.
+- **Invariants.** KV prefix: the appendix text is the same every turn. No `Settings` field,
+  migration, egress or profile path. The contract stays per turn and last in the envelope.
+- **Verified on the Mac** (LiteRT E2B, three runs per build of twelve turns, goal check off). Each
+  new message added 143-150 tokens before and 103-110 after. The median first token went from 514-522
+  to 266-267 ms, and prefill from 324-456 to 160-211 ms. Every answer was right, with no narration.
+  One of nine date/time questions called `get_current_time` after the change (none before), and was
+  answered correctly at about 0.9 s instead of 0.3 s.
+- **Verified on the Orin, in the pond, 2026-10-14** (same scratch pond and twelve turns, round-1 build
+  `b3baed67` against round-2 build `4e4bf103`, which carries the entry above as well).
+  - LiteRT: each new message added 326-331 tokens before and 103-110 after (one chunk instead of
+    three). First tokens went from 2.13-2.84 s to 0.85-0.95 s. Decode was unchanged at about 13 tok/s.
+    The lowest available memory rose from 242 to 623 MB; the run before compacted at its tenth turn,
+    and the run after did not need to.
+  - llama.cpp: first tokens went from 0.84-1.01 s to 0.41-0.50 s.
+- **Watch.** One round-2 reply out of 53 came wrapped in `<answer>...</answer>`, against none of 34
+  before. That is too few to tell from chance. It is the failure the dropped example was guarding
+  against: a small model copying the shape of the `<answer-contract>` tag.
 
 **2026-10-13 — Speculative decoding returns on CUDA builds (inference latency; not a PAI
 milestone).**
@@ -3235,5 +3267,8 @@ milestone).**
   its drafter on Metal. Speculation produced the same token ids as plain decoding at draft depths
   1, 4, 8 and 12, keeping 33-84% of drafts. On that 35-token answer it ran 1.36-1.89x, which is
   not the live-turn number.
-- **Not yet verified on the Orin:** memory with the drafter attached at 16K, decode in the pond,
-  and how many drafts household turns keep.
+- **Verified on the Orin, in the pond, 2026-10-14** (round-2 build `4e4bf103`, E4B QAT with
+  `mtp-gemma-4-E4B-it` attached, the twelve turns of the entries above). Decode was 31.8 tok/s
+  median (10.8-48.5), against 17.8 without the drafter in the same build and 16.2 in round 1. At
+  16K, the lowest available memory was 3,185 MB with the drafter and 3,458 MB without. How many
+  drafts a turn keeps is not logged.
