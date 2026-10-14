@@ -164,6 +164,17 @@ impl MemoryFragment {
         self.segment.as_ref() == Some(&MemorySegment::Correction) || self.corrects.is_some()
     }
 
+    /// True for the permanent tier, which decay never archives and consolidation never prunes.
+    pub fn is_kept(&self) -> bool {
+        self.tier.as_ref() == Some(&MemoryTier::Permanent)
+    }
+
+    /// Move to the permanent tier, with the decay rate that tier implies.
+    pub fn keep(&mut self) {
+        self.tier = Some(MemoryTier::Permanent);
+        self.decay_rate = Some(MemoryTier::Permanent.default_decay_rate());
+    }
+
     /// Pass `corrects` for `Correction` segments so consolidation cannot revert the fix.
     pub fn from_extraction(
         id: String,
@@ -1485,6 +1496,24 @@ mod tests {
         );
         assert_eq!(frag.segment, Some(MemorySegment::Preference));
         assert!(frag.is_correction());
+    }
+
+    #[test]
+    fn keep_moves_to_the_permanent_tier_and_stops_decay() {
+        let mut frag = MemoryFragment::from_extraction(
+            "r1".to_string(),
+            None,
+            "Orders sushi on Fridays".to_string(),
+            MemorySegment::Routine,
+            0.65,
+            None,
+        );
+        assert!(!frag.is_kept());
+
+        frag.keep();
+
+        assert!(frag.is_kept());
+        assert_eq!(frag.decay_rate, Some(0.0));
     }
 
     #[test]
