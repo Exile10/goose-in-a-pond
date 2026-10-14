@@ -48,10 +48,11 @@ const PROTOCOL_VERSION = "2026-01-26";
 const EXTENSION_ID = "io.modelcontextprotocol/ui";
 
 /**
- * targetOrigin for messages into the frame: its sandbox makes it opaque, serialising as "null".
+ * targetOrigin for messages into the frame. Its sandbox makes the origin opaque, and `postMessage`
+ * parses any target but "*" as a URL, which "null" is not, so "*" is the only one it accepts.
  * Inbound, `event.origin` is "null" for every such frame, so `handleMessage` checks window identity.
  */
-const APP_FRAME_ORIGIN = "null";
+const FRAME_TARGET_ORIGIN = "*";
 
 // ── Component ──────────────────────────────────────────────────
 
@@ -75,21 +76,21 @@ export function McpAppHost({
   const sendResponse = useCallback((id: number | string, result: unknown) => {
     iframeRef.current?.contentWindow?.postMessage(
       { jsonrpc: "2.0", id, result },
-      APP_FRAME_ORIGIN,
+      FRAME_TARGET_ORIGIN,
     );
   }, []);
 
   const sendError = useCallback((id: number | string, code: number, message: string) => {
     iframeRef.current?.contentWindow?.postMessage(
       { jsonrpc: "2.0", id, error: { code, message } },
-      APP_FRAME_ORIGIN,
+      FRAME_TARGET_ORIGIN,
     );
   }, []);
 
   const sendNotification = useCallback((method: string, params?: unknown) => {
     iframeRef.current?.contentWindow?.postMessage(
       { jsonrpc: "2.0", method, params },
-      APP_FRAME_ORIGIN,
+      FRAME_TARGET_ORIGIN,
     );
   }, []);
 
@@ -239,7 +240,7 @@ export function McpAppHost({
       if (initializedRef.current) {
         frame?.contentWindow?.postMessage(
           { jsonrpc: "2.0", method: "ui/resource-teardown", params: { reason: "unmount" } },
-          APP_FRAME_ORIGIN,
+          FRAME_TARGET_ORIGIN,
         );
       }
     };
