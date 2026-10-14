@@ -140,6 +140,95 @@ fn looks_like_leaked_scaffold(text: &str) -> bool {
     SCAFFOLD_TAGS.iter().any(|tag| trimmed.contains(tag))
 }
 
+/// The model's reply to goose's completeness check, read back from the engine's history.
+///
+/// Goose appends the check as an invisible user message and hides the model's prose reply to
+/// it (`answers_the_completeness_check` in the fork's `agent.rs`), so the reply is never glued
+/// onto an answer already shown. Goose cannot see whether one was: when every earlier round was
+/// a tool call or reasoning alone, the hidden reply is the turn's only answer, and dropping it
+/// left the person with nothing. It stays in goose's history marked not user-visible, so it is
+/// read back from there. Only messages after the last nudge for `goal` count, which keeps a reply
+/// to an earlier turn's check from resurfacing; the caller also requires that this attempt
+/// armed the check and showed no text of its own.
+fn hidden_completeness_reply(messages: &[Message], goal: &str) -> Option<String> {
+    let nudge = goose::agents::goal_nudge(goal);
+    let after_nudge = messages.iter().rposition(|m| {
+        m.role == rmcp::model::Role::User && !m.is_user_visible() && m.as_concat_text() == nudge
+    })? + 1;
+    messages[after_nudge..]
+        .iter()
+        .filter(|m| m.role == rmcp::model::Role::Assistant && !m.is_user_visible())
+        .map(Message::as_concat_text)
+        .filter(|text| !text.trim().is_empty())
+        .last()
+}
+
+/// Drains one turn's stream into the reply a non-streaming caller (a schedule) receives.
+///
+/// The reply is the turn's text and nothing else: reasoning is not an answer, and tool calls are
+/// recorded in `metadata["tool_calls"]`. A turn whose model wrote no text is an error that says
+/// so, naming the tools it did call, and is logged as `kind="turn_without_reply"` — a run that
+/// only fetched the weather must not read as the engine having failed.
+async fn collect_reply(
+    session_id: &str,
+    mut stream: futures::stream::BoxStream<'static, Result<AgentStreamEvent>>,
+) -> Result<AgentResponse> {
+    let mut full_text = String::new();
+    let mut tool_call_ids = Vec::new();
+    let mut tool_names: Vec<String> = Vec::new();
+
+    while let Some(event_result) = stream.next().await {
+        match event_result? {
+            AgentStreamEvent::Text { content } => {
+                full_text.push_str(&content);
+            }
+            AgentStreamEvent::ToolCall { id, tool, .. } => {
+                tool_call_ids.push(id);
+                if !tool_names.contains(&tool) {
+                    tool_names.push(tool);
+                }
+            }
+            AgentStreamEvent::Error { content } => {
+                return Err(anyhow!(content));
+            }
+            _ => {}
+        }
+    }
+
+    if full_text.trim().is_empty() {
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "turn_without_reply",
+            session_id = %session_id,
+            tool_calls = tool_call_ids.len(),
+            tools = %tool_names.join(","),
+            "the turn ended without any reply text",
+        );
+        return Err(if tool_call_ids.is_empty() {
+            anyhow!("The model finished without writing a reply.")
+        } else {
+            anyhow!(
+                "The model made {} tool call(s) ({}) but finished without writing a reply.",
+                tool_call_ids.len(),
+                tool_names.join(", ")
+            )
+        });
+    }
+
+    let mut metadata = HashMap::new();
+    if !tool_call_ids.is_empty() {
+        metadata.insert(
+            "tool_calls".to_string(),
+            serde_json::to_string(&tool_call_ids).unwrap_or_default(),
+        );
+    }
+
+    Ok(AgentResponse {
+        text: full_text,
+        metadata,
+    })
+}
+
 /// Appended when re-engaging after an empty turn: an unchanged prompt gets the same reply.
 const EMPTY_TURN_STEER: &str = "(Your previous attempt produced only internal reasoning and no reply. \
 Do not reason further — either call the tool you already decided on, or write the answer directly.)";
@@ -2970,6 +3059,12 @@ impl GooseAdapter {
         let turn_goose_sid = goose_sid.clone();
 
         let agent_clone = self.agent.clone();
+        // Reads back a completeness reply goose hid when the turn has no other answer.
+        let engine_sessions = self.session_manager.clone();
+        // The goal that arms goose's completeness check: the RAW request, as `turn_text` carries
+        // household memories. `None` turns the check off for this turn.
+        let completeness_goal =
+            (settings.goal_check_enabled && !request.warmup).then(|| request.message.clone());
         let last_prompt_tokens_map = self.last_prompt_tokens_handle();
         // Live handle for the tool-call guard inside the 'static stream closure.
         let guard_controls = session_controls.clone();
@@ -3109,15 +3204,14 @@ impl GooseAdapter {
                     };
                     let attempt_msg =
                         attach_images(Message::user().with_text(&attempt_text), &turn_images);
-                    // Arms Goose's completeness check. Session-keyed (streams run concurrently),
-                    // and the RAW request: `turn_text` carries household memories.
+                    // Arms Goose's completeness check; session-keyed, as streams run concurrently.
                     agent_clone
-                        .set_session_goal(
-                            &turn_goose_sid,
-                            (settings.goal_check_enabled && !request.warmup)
-                                .then(|| request.message.clone()),
-                        )
+                        .set_session_goal(&turn_goose_sid, completeness_goal.clone())
                         .await;
+                    // Whether goose ran its completeness check in this attempt, and whether any
+                    // text reached the stream: together they say if a hidden reply is the answer.
+                    let mut completeness_checked = false;
+                    let mut emitted_text = false;
                     let attempt_cfg = goose::agents::types::SessionConfig {
                         id: turn_goose_sid.clone(),
                         schedule_id: None,
@@ -3309,6 +3403,7 @@ impl GooseAdapter {
                                             if n.msg.starts_with(GOOSE_GOAL_NOTIFICATION_PREFIX) =>
                                         {
                                             // Re-armed check; genuine multi-tool turns emit none.
+                                            completeness_checked = true;
                                             goal_rechecks += 1;
                                             if goal_rechecks > MAX_GOAL_RECHECKS_PER_TURN {
                                                 tracing::warn!(
@@ -3440,6 +3535,7 @@ impl GooseAdapter {
                                     // as a structured event so a client can offer Continue.
                                     let hit_turn_limit = raw_text.trim() == GOOSE_MAX_TURNS_MESSAGE;
                                     produced_visible = true;
+                                    emitted_text = true;
                                     total_output_chars += raw_text.len();
                                     yield Ok(AgentStreamEvent::Text { content: raw_text });
                                     if hit_turn_limit {
@@ -3600,6 +3696,54 @@ impl GooseAdapter {
                     // An errored attempt is never retried: the user already has the error.
                     if stream_failed {
                         break 'attempts;
+                    }
+                    // Goose hid its completeness check's reply; with no other text this attempt,
+                    // that reply is the answer, so it is read back from the engine and shown.
+                    if let (true, false, Some(goal)) =
+                        (completeness_checked, emitted_text, completeness_goal.as_deref())
+                    {
+                        match engine_sessions.get_session(&turn_goose_sid, true).await {
+                            Ok(session) => {
+                                let messages = session
+                                    .conversation
+                                    .map(|c| c.messages().clone())
+                                    .unwrap_or_default();
+                                match hidden_completeness_reply(&messages, goal) {
+                                    Some(reply) if looks_like_leaked_scaffold(&reply) => {
+                                        tracing::warn!(
+                                            session_id = %session_id,
+                                            leaked = %reply,
+                                            "the completeness check's hidden reply echoes \
+                                             internal scaffolding; not showing it",
+                                        );
+                                    }
+                                    Some(reply) => {
+                                        tracing::info!(
+                                            target: "giap::trace",
+                                            kind = "completeness_reply_shown",
+                                            session_id = %session_id,
+                                            goose_sid = %turn_goose_sid,
+                                            chars = reply.len(),
+                                            "the only answer this turn was the reply to goose's \
+                                             completeness check, which goose hides; showing it",
+                                        );
+                                        produced_visible = true;
+                                        total_output_chars += reply.len();
+                                        yield Ok(AgentStreamEvent::Text { content: reply });
+                                    }
+                                    None => {}
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    goose_sid = %turn_goose_sid,
+                                    error = %e,
+                                    "could not read the engine session for a hidden completeness \
+                                     reply; the turn ends without one",
+                                );
+                            }
+                        }
                     }
                     // A guard-stopped turn is never re-engaged (don't rely on `produced_visible`).
                     if guard_tripped {
@@ -3896,42 +4040,9 @@ impl AgentPort for GooseAdapter {
     }
 
     async fn chat(&self, request: AgentRequest) -> Result<AgentResponse> {
-        let mut stream: futures::stream::BoxStream<'static, Result<AgentStreamEvent>> =
-            self.chat_stream(request).await?;
-        let mut full_text = String::new();
-        let mut tool_call_ids = Vec::new();
-
-        while let Some(event_result) = stream.next().await {
-            match event_result? {
-                AgentStreamEvent::Text { content } => {
-                    full_text.push_str(&content);
-                }
-                AgentStreamEvent::ToolCall { id, .. } => {
-                    tool_call_ids.push(id);
-                }
-                AgentStreamEvent::Error { content } => {
-                    return Err(anyhow!(content));
-                }
-                _ => {}
-            }
-        }
-
-        if full_text.is_empty() {
-            return Err(anyhow!("Received empty response from Goose agent"));
-        }
-
-        let mut metadata = HashMap::new();
-        if !tool_call_ids.is_empty() {
-            metadata.insert(
-                "tool_calls".to_string(),
-                serde_json::to_string(&tool_call_ids).unwrap_or_default(),
-            );
-        }
-
-        Ok(AgentResponse {
-            text: full_text,
-            metadata,
-        })
+        let session_id = request.session_id.clone();
+        let stream = self.chat_stream(request).await?;
+        collect_reply(&session_id, stream).await
     }
 
     /// Compacts through goose's own compaction; failures are errors, never `Ok(None)`.
@@ -5534,7 +5645,17 @@ mod tests {
             );
 
         // A window, not the anchor line: the call spans several lines.
-        let window = lines[armed..(armed + 10).min(lines.len())].join("\n");
+        let armed_with = lines[armed..(armed + 3).min(lines.len())].join("\n");
+        assert!(
+            armed_with.contains("completeness_goal"),
+            "the goal is no longer armed from `completeness_goal`, the one value the hidden-reply \
+             read-back also matches against. Window:\n{armed_with}"
+        );
+        let defined = lines
+            .iter()
+            .position(|l| l.contains("let completeness_goal ="))
+            .expect("`completeness_goal` is no longer defined; this guard checks what it holds");
+        let window = lines[defined..(defined + 3).min(lines.len())].join("\n");
 
         assert!(
             window.contains("request.message"),
@@ -5580,6 +5701,197 @@ mod tests {
             armed < reply,
             "the goal is armed at line {armed}, after the reply at line {reply} that reads it.",
         );
+    }
+
+    // ── the completeness check's hidden reply ─────────────────────────────
+
+    const BRIEF: &str = "Give me a morning briefing: weather, calendar, and top news.";
+
+    fn hidden(msg: Message) -> Message {
+        msg.with_visibility(false, true)
+    }
+
+    fn weather_call(id: &str) -> Message {
+        Message::assistant()
+            .with_thinking("weather first", "")
+            .with_tool_request(
+                id,
+                Ok(rmcp::model::CallToolRequestParams::new(
+                    "giap-weather__get_current_weather".to_string(),
+                )),
+            )
+    }
+
+    /// 2026-10-12 on the Jetson, gemma-4-E2B: tool rounds, a reasoning-only round goose dropped,
+    /// then the turn's only prose as the reply to the check, which goose stored hidden.
+    #[test]
+    fn the_hidden_reply_is_the_answer_when_the_turn_wrote_nothing_else() {
+        let answer = "The weather in Nairobi is mainly clear at 23.6 C.";
+        let history = vec![
+            Message::user().with_text(format!("<user-message>\n{BRIEF}\n</user-message>")),
+            weather_call("call-1"),
+            tool_response_message("call-1", "Mainly clear | 23.6 C"),
+            hidden(Message::user().with_text(goose::agents::goal_nudge(BRIEF))),
+            hidden(Message::assistant().with_text(answer)),
+        ];
+        assert_eq!(
+            hidden_completeness_reply(&history, BRIEF).as_deref(),
+            Some(answer)
+        );
+
+        // As read back: goose's session store serialises and sanitises every message.
+        let stored: Vec<Message> =
+            serde_json::from_value(serde_json::to_value(&history).unwrap()).unwrap();
+        assert_eq!(
+            hidden_completeness_reply(&stored, BRIEF).as_deref(),
+            Some(answer),
+            "the nudge no longer matches after a round trip through goose's session store",
+        );
+    }
+
+    /// Same question two days running: yesterday's hidden reply must not answer today's turn.
+    #[test]
+    fn an_earlier_turns_hidden_reply_is_never_resurfaced() {
+        let history = vec![
+            Message::user().with_text(BRIEF),
+            hidden(Message::user().with_text(goose::agents::goal_nudge(BRIEF))),
+            hidden(Message::assistant().with_text("Yesterday's briefing.")),
+            Message::user().with_text(BRIEF),
+            weather_call("call-2"),
+            tool_response_message("call-2", "Light drizzle"),
+            hidden(Message::user().with_text(goose::agents::goal_nudge(BRIEF))),
+        ];
+        assert_eq!(hidden_completeness_reply(&history, BRIEF), None);
+    }
+
+    /// Visible text after the check was already streamed; reasoning is not an answer.
+    #[test]
+    fn only_hidden_prose_after_the_check_counts() {
+        let nudge = hidden(Message::user().with_text(goose::agents::goal_nudge(BRIEF)));
+        let shown = vec![
+            nudge.clone(),
+            Message::assistant().with_text("Already shown."),
+        ];
+        assert_eq!(hidden_completeness_reply(&shown, BRIEF), None);
+
+        let reasoning_only = vec![
+            nudge,
+            hidden(Message::assistant().with_thinking("still thinking", "")),
+        ];
+        assert_eq!(hidden_completeness_reply(&reasoning_only, BRIEF), None);
+    }
+
+    /// A nudge for another request is another turn's check.
+    #[test]
+    fn a_check_for_another_goal_is_not_this_turns() {
+        let history = vec![
+            hidden(Message::user().with_text(goose::agents::goal_nudge("Turn on the lights."))),
+            hidden(Message::assistant().with_text("The lights are on.")),
+        ];
+        assert_eq!(hidden_completeness_reply(&history, BRIEF), None);
+    }
+
+    /// After an error the user already has it; before the re-engagement break, a recovered reply
+    /// counts as visible and is not answered over by a steered retry.
+    #[test]
+    fn the_hidden_reply_is_read_back_between_the_error_and_re_engagement_checks() {
+        let lines = stream_body_code();
+        let read_back = lines
+            .iter()
+            .position(|l| l.contains("hidden_completeness_reply(&messages"))
+            .expect("the stream no longer reads back the completeness check's hidden reply");
+        let failed = lines
+            .iter()
+            .position(|l| l.contains("if stream_failed {"))
+            .expect("the stream no longer checks `stream_failed`");
+        let re_engage = lines
+            .iter()
+            .position(|l| l.contains("if produced_visible {"))
+            .expect("the stream no longer breaks on `produced_visible`");
+        assert!(
+            failed < read_back && read_back < re_engage,
+            "the read-back is at line {read_back}; it belongs after the `stream_failed` break \
+             (line {failed}) and before the `produced_visible` break (line {re_engage})",
+        );
+    }
+
+    fn events(
+        events: Vec<AgentStreamEvent>,
+    ) -> futures::stream::BoxStream<'static, Result<AgentStreamEvent>> {
+        futures::stream::iter(events.into_iter().map(Ok)).boxed()
+    }
+
+    fn tool_call(id: &str, tool: &str) -> AgentStreamEvent {
+        AgentStreamEvent::ToolCall {
+            id: id.to_string(),
+            tool: tool.to_string(),
+            input: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_the_turns_text_with_its_tool_calls_alongside() {
+        let reply = collect_reply(
+            "sched-test",
+            events(vec![
+                tool_call("call-1", "giap-weather__get_current_weather"),
+                AgentStreamEvent::Thinking {
+                    content: "summarise it".to_string(),
+                },
+                AgentStreamEvent::Text {
+                    content: "Mainly clear, 23.6 C.".to_string(),
+                },
+            ]),
+        )
+        .await
+        .expect("a turn with text is a reply");
+        assert_eq!(reply.text, "Mainly clear, 23.6 C.");
+        assert_eq!(reply.metadata["tool_calls"], "[\"call-1\"]");
+    }
+
+    /// The old "Received empty response from Goose agent" read as an engine fault.
+    #[tokio::test]
+    async fn a_turn_with_tool_calls_and_no_text_says_so() {
+        let err = collect_reply(
+            "sched-test",
+            events(vec![
+                tool_call("call-1", "giap-weather__get_current_weather"),
+                tool_call("call-2", "giap-toolkit__enable_tool_group"),
+                AgentStreamEvent::Thinking {
+                    content: "reasoning is not a reply".to_string(),
+                },
+            ]),
+        )
+        .await
+        .expect_err("a turn without text has no reply");
+        let msg = err.to_string();
+        assert!(msg.contains("2 tool call(s)"), "{msg}");
+        assert!(msg.contains("giap-weather__get_current_weather"), "{msg}");
+        assert!(msg.contains("without writing a reply"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_nothing_at_all_says_so_without_inventing_tools() {
+        let err = collect_reply("sched-test", events(vec![]))
+            .await
+            .expect_err("an empty turn has no reply");
+        assert_eq!(
+            err.to_string(),
+            "The model finished without writing a reply."
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_event_is_the_error() {
+        let err = collect_reply(
+            "sched-test",
+            events(vec![AgentStreamEvent::Error {
+                content: "the provider went away".to_string(),
+            }]),
+        )
+        .await
+        .expect_err("an errored turn is an error");
+        assert_eq!(err.to_string(), "the provider went away");
     }
 
     // ── context window precedence ─────────────────────────────────────────
