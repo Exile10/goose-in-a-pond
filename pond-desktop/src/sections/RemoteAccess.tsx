@@ -186,9 +186,11 @@ export function RemoteAccess() {
         <p style={{ margin: 0 }}>{request.deviceName ? t('remote.reviewDevice', { name: request.deviceName }) : t('remote.reviewUnnamed')}</p>
         <p style={{ margin: 0, fontFamily: 'var(--font-mono, monospace)' }}>{t('remote.reviewKey', { key: request.keyPreview })}</p>
         <p style={{ margin: 0 }}>{t('remote.reviewCode', { id: request.id })}</p>
-        <div>
-          <Button variant="secondary" isDisabled={busy || request.approved} onPress={() => void approve(request.id)}>{t(request.approved ? 'remote.reviewApproved' : 'remote.reviewApprove')}</Button>
-        </div>
+        {request.refused
+          ? <p role="alert" style={{ margin: 0 }}>{t(`remote.${request.refused}`)}</p>
+          : <div>
+            <Button variant="secondary" isDisabled={busy || request.approved} onPress={() => void approve(request.id)}>{t(request.approved ? 'remote.reviewApproved' : 'remote.reviewApprove')}</Button>
+          </div>}
       </div>)}
     </div>}
   </section>;

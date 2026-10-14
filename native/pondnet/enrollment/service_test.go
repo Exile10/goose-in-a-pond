@@ -515,3 +515,158 @@ func TestCoordinatorIdentityDriftRemovesPermission(t *testing.T) {
 		t.Fatal("reassigned node inherited permission", err, b.rules)
 	}
 }
+
+// refusalOf is invoke for a request expected to be refused, returning the reason too.
+func refusalOf(t *testing.T, s *Service, a Approval, key ed25519.PrivateKey) (int, string) {
+	t.Helper()
+	env, _ := Sign(a, key)
+	data, _ := json.Marshal(env)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("POST", "/v1/approval", bytes.NewReader(data)))
+	var answer struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &answer); err != nil {
+		t.Fatalf("HTTP %d with an unreadable answer: %v", w.Code, err)
+	}
+	return w.Code, answer.Error
+}
+
+// retiredAfterReplacement replaces the fixture phone, retiring its old record, and puts
+// the service on a clock the test moves.
+func retiredAfterReplacement(t *testing.T) (*Service, ed25519.PrivateKey, *fakeBackend, Approval, *time.Time) {
+	t.Helper()
+	s, key, backend, a := replacementFixture(t, "revoked")
+	if code := invoke(s, a, key); code != 200 {
+		t.Fatalf("replacement HTTP %d", code)
+	}
+	if retired := s.Store.value.Retired[a.Household]; len(retired) != 1 || retired[0].AbsentSince != 0 {
+		t.Fatalf("replacement did not retire one unchecked record: %+v", retired)
+	}
+	clock := time.Now()
+	s.Now = func() time.Time { return clock }
+	return s, key, backend, a, &clock
+}
+
+func reconciled(t *testing.T, s *Service) []Device {
+	t.Helper()
+	if err := s.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return s.Store.value.Retired["household00000001"]
+}
+
+func TestRetiredRecordExpiresOnceItsIdentityStaysAbsent(t *testing.T) {
+	s, key, backend, a, clock := retiredAfterReplacement(t)
+	old := s.Store.value.Retired[a.Household][0].MachineKey
+	// However long ago the replacement was, one read is one sighting, not a grace period.
+	*clock = clock.Add(2 * retiredGrace)
+	retired := reconciled(t, s)
+	if len(retired) != 1 || retired[0].AbsentSince != clock.Unix() {
+		t.Fatalf("a record seen absent once was not kept with the sighting: %+v", retired)
+	}
+	*clock = clock.Add(retiredGrace - time.Second)
+	if retired = reconciled(t, s); len(retired) != 1 {
+		t.Fatal("a record expired before its grace period ended")
+	}
+	*clock = clock.Add(time.Second)
+	if retired = reconciled(t, s); len(retired) != 0 {
+		t.Fatalf("a record absent for its whole grace period was kept: %+v", retired)
+	}
+	dir := s.Store.directory
+	s.Store.Close()
+	restored, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if _, ok := restored.value.Retired[a.Household]; ok {
+		t.Fatal("the expiry was not persisted")
+	}
+	// The expired key may enroll again, with the household's own approval for it.
+	service, err := New(context.Background(), restored, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Now = s.Now
+	a.Action, a.Device, a.Nonce, a.MachineKey, a.ExpectedRevision = "enroll", "anotherdevice0001", "expiredreuse00001", old, ""
+	a.Expires = clock.Add(time.Minute).Unix()
+	// Reaching registration is passing every identity check; the fake coordinator then
+	// registers a different machine, which is not what this test is about.
+	registered := backend.calls
+	if code, reason := refusalOf(t, service, a, key); backend.calls != registered+1 {
+		t.Fatalf("an expired identity was refused its new approval: HTTP %d %s", code, reason)
+	}
+}
+
+func TestRetiredRecordIsKeptWhileItsIdentityIsHeld(t *testing.T) {
+	s, _, backend, a, clock := retiredAfterReplacement(t)
+	old := s.Store.value.Retired[a.Household][0].MachineKey
+	reconciled(t, s)
+	// A late registration under the old identity, after a grace period already ran out.
+	*clock = clock.Add(retiredGrace + time.Hour)
+	backend.nodes = append(backend.nodes, Registered{ID: "9", UserID: "1", MachineKey: old, Key: "nodekey:" + strings.Repeat("9", 64), Addresses: []string{"100.64.0.9"}})
+	retired := reconciled(t, s)
+	if len(retired) != 1 || retired[0].AbsentSince != 0 {
+		t.Fatalf("a record whose identity a node holds was not kept and reset: %+v", retired)
+	}
+	for _, node := range backend.nodes {
+		if node.MachineKey == old {
+			t.Fatal("the late registration was not deleted")
+		}
+	}
+	// The node it deleted counts as present in that pass; absence starts at the next read.
+	if retired = reconciled(t, s); len(retired) != 1 || retired[0].AbsentSince != clock.Unix() {
+		t.Fatalf("the next read did not start a fresh grace period: %+v", retired)
+	}
+}
+
+func TestReplacementAtTheRetiredCapacityIsRefusedWithItsOwnReason(t *testing.T) {
+	s, key, backend, a := replacementFixture(t, "revoked")
+	s.Store.value.Retired[a.Household] = make([]Device, retiredCapacity)
+	if code, reason := refusalOf(t, s, a, key); code != 409 || reason != "retired_capacity" || backend.calls != 0 {
+		t.Fatalf("HTTP %d %q with %d registrations", code, reason, backend.calls)
+	}
+	// A stale approval is still a conflict: the capacity is reported only for one that
+	// would otherwise have been carried out.
+	a.Nonce, a.ExpectedRevision = "staleatcapacity01", "staleversion00001"
+	if code, reason := refusalOf(t, s, a, key); code != 409 || reason != "replacement_conflict" {
+		t.Fatalf("HTTP %d %q", code, reason)
+	}
+}
+
+func TestStateFromBeforeRetiredExpiryStillLoads(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	key := base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))
+	old := `{"households":{"household00000001":{"publicKey":"` + key + `","userId":"1","port":4443}},` +
+		`"devices":{"household00000001":{"device0000000001":{"machineKey":"mkey:` + strings.Repeat("b", 64) + `","nodeId":"","address":"","role":"phone","status":"pending","revision":"newrevision000001"}}},` +
+		`"requests":{},` +
+		`"retired":{"household00000001":[{"machineKey":"mkey:` + strings.Repeat("e", 64) + `","nodeId":"","address":"","role":"phone","status":"revoked","revision":"oldrevision000001"}]}}`
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("a state file written before retired expiry did not load: %v", err)
+	}
+	defer s.Close()
+	retired := s.value.Retired["household00000001"]
+	if len(retired) != 1 || retired[0].AbsentSince != 0 {
+		t.Fatalf("the retired record did not load as unchecked: %+v", retired)
+	}
+	// The sighting belongs to retired records alone, and is never negative.
+	retired[0].AbsentSince = -1
+	if validateState(s.value) == nil {
+		t.Fatal("a negative sighting was accepted")
+	}
+	retired[0].AbsentSince = 0
+	live := s.value.Devices["household00000001"]["device0000000001"]
+	live.AbsentSince = 1
+	s.value.Devices["household00000001"]["device0000000001"] = live
+	if validateState(s.value) == nil {
+		t.Fatal("a live device carrying a sighting was accepted")
+	}
+}

@@ -1346,6 +1346,83 @@ fn kept_existing_enrollment(error: &anyhow::Error) -> bool {
         .is_some_and(|refused| refused.reason.as_deref() == Some("invalid_enrollment"))
 }
 
+/// Whether the coordinator refused before writing anything for the call, so nothing was enrolled.
+/// `storage_unavailable` can come from the write itself and `enrollment_incomplete` after it, and
+/// an answer without a reason may be a gateway's, so none of those count.
+fn refused_before_writing(error: &anyhow::Error) -> bool {
+    const BEFORE_ANY_WRITE: &[&str] = &[
+        "approval_used",
+        "busy",
+        "capacity",
+        "coordinator_unavailable",
+        "identity_already_enrolled",
+        "identity_already_registered",
+        "identity_retired",
+        "invalid_enrollment",
+        "invalid_request",
+        "pond_registration_required",
+        "rate_limited",
+        "replacement_conflict",
+        "retired_capacity",
+        "unauthorized",
+    ];
+    error
+        .downcast_ref::<RefusedByCoordinator>()
+        .and_then(|refused| refused.reason.as_deref())
+        .is_some_and(|reason| BEFORE_ANY_WRITE.contains(&reason))
+}
+
+/// The coordinator's refusal of a replacement because the household's retired records are
+/// at their bound. It passes on its own as old identities stay off the coordinator and their
+/// records expire, so neither recovery nor a retry right away can help.
+const RETIRED_CAPACITY: &str = "retired_capacity";
+
+/// Whether `error` is the coordinator refusing with [`RETIRED_CAPACITY`].
+fn retired_capacity(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RefusedByCoordinator>()
+        .is_some_and(|refused| refused.reason.as_deref() == Some(RETIRED_CAPACITY))
+}
+
+/// How a phone's enrollment request is refused: a status, and for a refusal the phone should
+/// be able to tell apart, its reason as `{"error": reason}`.
+#[derive(Debug, PartialEq)]
+struct PhoneRefusal {
+    status: StatusCode,
+    reason: Option<&'static str>,
+}
+
+impl PhoneRefusal {
+    /// [`RETIRED_CAPACITY`], as 503: the household can do nothing about it now, and a 409
+    /// would send a phone that reads only the status to recovery, which meets the same bound.
+    fn retired_capacity() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            reason: Some(RETIRED_CAPACITY),
+        }
+    }
+}
+
+impl From<StatusCode> for PhoneRefusal {
+    fn from(status: StatusCode) -> Self {
+        Self {
+            status,
+            reason: None,
+        }
+    }
+}
+
+impl IntoResponse for PhoneRefusal {
+    fn into_response(self) -> Response {
+        match self.reason {
+            Some(reason) => {
+                (self.status, Json(serde_json::json!({ "error": reason }))).into_response()
+            }
+            None => self.status.into_response(),
+        }
+    }
+}
+
 /// The helper's stderr, fit to log: bounded, one line, and with `/register/` URLs redacted
 /// (a bearer capability to join the household's tailnet).
 fn helper_complaint(stderr: &[u8]) -> String {
@@ -1660,6 +1737,14 @@ async fn register_phone(
     let enrolled = match runtime.authority(operation, payload).await {
         Ok(enrolled) => enrolled,
         Err(error) => {
+            if retired_capacity(&error) {
+                tracing::warn!(
+                    %error,
+                    %device,
+                    "remote access: the coordinator holds as many retired enrollments as it allows for this household, so the phone cannot be replaced until older ones expire"
+                );
+                return Err(PhoneRefusal::retired_capacity().into_response());
+            }
             let refused = kept_existing_enrollment(&error);
             if refused && refusal_expected {
                 // Expected, not a fault: the coordinator will not let a new identity take over an
@@ -1675,10 +1760,10 @@ async fn register_phone(
             } else {
                 tracing::warn!(%error, %device, refused, operation = "enroll_phone", "embedded enrollment failed");
             }
-            // A refusal is definite: nothing was enrolled, so a device recorded for this call
-            // alone is forgotten. A timeout or a fault may have enrolled it, so its record stays
-            // and a later removal revokes it unchecked, which is the safe way to be wrong.
-            if refused && inserted && !coordinator_holds_one {
+            // Refused before the coordinator wrote anything, so nothing was enrolled: a device
+            // recorded for this call alone is forgotten. Anything else may have enrolled it, so its
+            // record stays and a later removal revokes it unchecked, the safe way to be wrong.
+            if refused_before_writing(&error) && inserted && !coordinator_holds_one {
                 match runtime.forget_enrolled(&device) {
                     Ok(()) => tracing::info!(
                         target: "giap::trace",
@@ -2313,13 +2398,14 @@ mod tests {
 
     /// A stand-in helper: records each call, and answers an action from `<action>.out` and
     /// `<action>.code` beside it (exit 0 with `{}` when neither exists). While `<action>.hold`
-    /// exists, a call to that action is recorded and then held open.
-    struct FakeHelper {
+    /// exists, a call to that action is recorded and then held open. Shared with the recovery
+    /// tests.
+    pub(super) struct FakeHelper {
         dir: tempfile::TempDir,
     }
 
     impl FakeHelper {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let script = dir.path().join("pondnet");
             std::fs::write(
@@ -2338,7 +2424,7 @@ mod tests {
             Self { dir }
         }
 
-        fn answer(&self, action: &str, code: i32, stdout: &str) {
+        pub(super) fn answer(&self, action: &str, code: i32, stdout: &str) {
             std::fs::write(
                 self.dir.path().join(format!("{action}.code")),
                 code.to_string(),
@@ -2356,7 +2442,7 @@ mod tests {
             std::fs::remove_file(self.dir.path().join(format!("{action}.hold"))).unwrap();
         }
 
-        fn calls(&self) -> Vec<String> {
+        pub(super) fn calls(&self) -> Vec<String> {
             std::fs::read_to_string(self.dir.path().join("calls"))
                 .unwrap_or_default()
                 .lines()
@@ -2364,7 +2450,7 @@ mod tests {
                 .collect()
         }
 
-        fn runtime(&self, data: &Path) -> Arc<Runtime> {
+        pub(super) fn runtime(&self, data: &Path) -> Arc<Runtime> {
             let (runtime, _listener) =
                 Runtime::with_helper(data, 4443, self.dir.path().join("pondnet")).unwrap();
             runtime
@@ -2661,13 +2747,14 @@ mod tests {
         );
         assert!(recorded(&runtime), "an ambiguous enrollment was forgotten");
 
-        // A refusal of a device recorded before this call does not forget it.
+        // A refusal of a device recorded before this call does not forget it. Only
+        // `invalid_enrollment` sends the phone to recovery; any other refusal is a 503.
         helper.answer("enroll", 3, r#"{"refused":"identity_already_enrolled"}"#);
         assert_eq!(
             enroll_phone(&runtime, &handshake, &headers)
                 .await
                 .unwrap_err(),
-            StatusCode::CONFLICT
+            StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(recorded(&runtime), "an earlier record was forgotten");
 
@@ -2677,11 +2764,27 @@ mod tests {
             enroll_phone(&runtime, &handshake, &headers)
                 .await
                 .unwrap_err(),
-            StatusCode::CONFLICT
+            StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(!recorded(&runtime), "a refused enrollment stayed recorded");
 
-        // ...unless the coordinator reported an enrollment of its own for the device.
+        // A refusal that can follow the coordinator's own write may have enrolled it.
+        enrolled(&runtime, true, &[]);
+        helper.answer("enroll", 3, r#"{"refused":"enrollment_incomplete"}"#);
+        assert_eq!(
+            enroll_phone(&runtime, &handshake, &headers)
+                .await
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            recorded(&runtime),
+            "an enrollment the coordinator may have written was forgotten"
+        );
+
+        // A refusal is not forgotten when the coordinator reported an enrollment of its own.
+        enrolled(&runtime, true, &[]);
+        helper.answer("enroll", 3, r#"{"refused":"invalid_enrollment"}"#);
         helper.answer(
             "inspect",
             0,

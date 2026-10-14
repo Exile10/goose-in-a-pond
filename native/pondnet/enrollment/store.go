@@ -33,6 +33,10 @@ type Device struct {
 	Status     string `json:"status"`
 	// Revision changes on every explicit enrollment or revocation, preventing stale replacement.
 	Revision string `json:"revision,omitempty"`
+	// AbsentSince is kept on a retired record only: when, in Unix seconds, a
+	// reconciliation first found no coordinator node holding its identity. It is zero
+	// until then, and again whenever one is found. See expireRetired.
+	AbsentSince int64 `json:"absentSince,omitempty"`
 }
 type state struct {
 	Households map[string]Household         `json:"households"`
@@ -211,7 +215,7 @@ func validateState(v state) error {
 		}
 		ponds := 0
 		for deviceID, d := range devices {
-			if d.Revision != "" && !identifier.MatchString(d.Revision) {
+			if (d.Revision != "" && !identifier.MatchString(d.Revision)) || d.AbsentSince != 0 {
 				return invalid
 			}
 			if d.MachineKey != "" {
@@ -248,11 +252,11 @@ func validateState(v state) error {
 		}
 	}
 	for household, retired := range v.Retired {
-		if _, ok := v.Households[household]; !ok || len(retired) > 256 {
+		if _, ok := v.Households[household]; !ok || len(retired) > retiredCapacity {
 			return invalid
 		}
 		for _, d := range retired {
-			if d.Role != "phone" || d.Status != "revoked" || (d.Revision != "" && !identifier.MatchString(d.Revision)) {
+			if d.Role != "phone" || d.Status != "revoked" || (d.Revision != "" && !identifier.MatchString(d.Revision)) || d.AbsentSince < 0 {
 				return invalid
 			}
 			if d.MachineKey != "" {
