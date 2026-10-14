@@ -147,8 +147,9 @@ fn looks_like_leaked_scaffold(text: &str) -> bool {
 /// onto an answer already shown. Goose cannot see whether one was: when every earlier round was
 /// a tool call or reasoning alone, the hidden reply is the turn's only answer, and dropping it
 /// left the person with nothing. It stays in goose's history marked not user-visible, so it is
-/// read back from there. Only messages after the last nudge for `goal` count, which keeps a reply
-/// to an earlier turn's check from resurfacing; the caller also requires that this attempt
+/// read back from there. Only messages between the last nudge for `goal` and the next user-role
+/// message count: that keeps a reply to an earlier turn's check from resurfacing, and a note
+/// compaction appends from being read as the answer. The caller also requires that this attempt
 /// armed the check and showed no text of its own.
 fn hidden_completeness_reply(messages: &[Message], goal: &str) -> Option<String> {
     let nudge = goose::agents::goal_nudge(goal);
@@ -157,6 +158,7 @@ fn hidden_completeness_reply(messages: &[Message], goal: &str) -> Option<String>
     })? + 1;
     messages[after_nudge..]
         .iter()
+        .take_while(|m| m.role != rmcp::model::Role::User)
         .filter(|m| m.role == rmcp::model::Role::Assistant && !m.is_user_visible())
         .map(Message::as_concat_text)
         .filter(|text| !text.trim().is_empty())
@@ -5779,6 +5781,21 @@ mod tests {
             hidden(Message::assistant().with_thinking("still thinking", "")),
         ];
         assert_eq!(hidden_completeness_reply(&reasoning_only, BRIEF), None);
+    }
+
+    /// A compaction after the check leaves a summary and its own hidden note; the note is not the
+    /// answer.
+    #[test]
+    fn a_compaction_note_after_the_check_is_not_the_answer() {
+        let history =
+            vec![
+                hidden(Message::user().with_text(goose::agents::goal_nudge(BRIEF))),
+                Message::user().with_text("Summary of the conversation so far."),
+                hidden(Message::assistant().with_text(
+                    "Your context was compacted. The previous message contains a summary.",
+                )),
+            ];
+        assert_eq!(hidden_completeness_reply(&history, BRIEF), None);
     }
 
     /// A nudge for another request is another turn's check.
