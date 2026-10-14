@@ -4,10 +4,8 @@
 # jetson-remote.test.sh. Bash 3.2 compatible (macOS).
 #
 # The Mac reaches the device through an ssh alias (`nano`) whose HostName is a `.local` name, and
-# mDNS on the home network drops out now and then. On 2026-10-12 it stopped resolving in the middle
-# of a 50-minute build: the session running the build died, and the restart that should have
-# followed could not find the device, which stayed down. Later the same name resolved only to an
-# IPv6 link-local address. So:
+# mDNS on the home network drops out now and then, sometimes mid-build, and the name can resolve to
+# an IPv6 link-local address only. So:
 #   - The address is decided once, at the start. While the name works, the device is asked for
 #     its own IPv4 address; when it does not, the address that worked last time is used. Every
 #     later call in the run goes to that one address.
@@ -17,6 +15,8 @@
 #   - The build runs detached on the device and this side follows its log, reconnecting as
 #     needed, until it records an exit code. A deploy started while a build is still running
 #     follows that build instead of starting a second one.
+#   - A pond stopped to make room for the build is marked on the device, so whichever deploy ends
+#     the build, failed or not, can start it again.
 
 JETSON_ALIAS=""   # the ssh alias the device is known by (`nano`)
 JETSON_NAME=""    # its configured HostName, whose host key the device must present
@@ -133,9 +133,15 @@ jetson_pin() {
 # If a command with the same label is already running there (a deploy that lost its connection),
 # follow that one instead: never two builds at once, and never a script rewritten under a running
 # bash.
+# Prints "running" while a detached task with this label holds its lock on the device, else "idle".
+jetson_task_state() {
+  local dir="$JETSON_REMOTE_DIR"
+  jetson_ssh "mkdir -p ~/$dir && cd ~/$dir && if flock -n $1.lock true; then echo idle; else echo running; fi"
+}
+
 jetson_run_detached() {
   local label="$1" command="$2" dir="$JETSON_REMOTE_DIR" staged state
-  state="$(jetson_ssh "mkdir -p ~/$dir && cd ~/$dir && if flock -n $label.lock true; then echo idle; else echo running; fi")" || return
+  state="$(jetson_task_state "$label")" || return
   if [ "$state" = running ]; then
     echo "    a ${label} started by an earlier deploy is still running on the device; following it"
   else
@@ -212,6 +218,8 @@ jetson_follow() {
 # few hundred MB, so the kernel kills the link or the pond. Decided from what is free right now;
 # below JETSON_BUILD_MIN_MB the pond is stopped, when the deploy is going to restart it anyway.
 : "${JETSON_BUILD_MIN_MB:=3000}"
+# Present on the device while the pond is stopped for a build and nothing has started it since.
+JETSON_POND_STOPPED_MARK="pond-stopped-for-build"
 jetson_make_room_for_build() {
   local will_restart="$1" free_mb
   free_mb="$(jetson_ssh "awk '/^MemAvailable:/ { print int(\$2 / 1024) }' /proc/meminfo")" || free_mb=""
@@ -220,8 +228,37 @@ jetson_make_room_for_build() {
     echo "    ${free_mb} MB free on the device: enough to build without stopping anything"
   elif [ "$will_restart" = 1 ]; then
     echo "    ${free_mb} MB free on the device: stopping the pond for the build (step 5 starts it again)"
-    jetson_ssh "systemctl --user stop goose-in-a-pond.service" || true
+    jetson_ssh "mkdir -p ~/$JETSON_REMOTE_DIR && touch ~/$JETSON_REMOTE_DIR/$JETSON_POND_STOPPED_MARK \
+      && systemctl --user stop goose-in-a-pond.service" || true
   else
     echo "    WARNING: only ${free_mb} MB free and --no-restart leaves the pond running; the link may run out of memory" >&2
   fi
+}
+
+# Set once the deploy starts the pond itself or was told to leave it alone; jetson_restore_pond skips.
+JETSON_POND_SETTLED=0
+
+# EXIT trap of a deploy that ends before starting the pond. A pond some deploy stopped for a build
+# is started again once no build holds the lock; while one does, the next deploy follows it and
+# starts the pond after it.
+jetson_restore_pond() {
+  local dir="$JETSON_REMOTE_DIR" out
+  [ "$JETSON_POND_SETTLED" = 1 ] && return 0
+  [ -n "$JETSON_ADDR" ] || return 0
+  out="$(jetson_ssh "cd ~/$dir 2>/dev/null && [ -f $JETSON_POND_STOPPED_MARK ] || exit 0
+    if flock -n build.lock true; then
+      systemctl --user start goose-in-a-pond.service && rm -f $JETSON_POND_STOPPED_MARK && echo started
+    else
+      echo building
+    fi")" || out="unreachable"
+  case "$out" in
+    *started*) echo "==> Started the pond again: it was stopped for a build that did not finish" >&2 ;;
+    *building*)
+      echo "    The pond stays stopped while the build runs on ${JETSON_NAME}." >&2
+      echo "    Run the deploy again: it follows that build and starts the pond after it." >&2 ;;
+    unreachable)
+      echo "WARNING: the pond may still be stopped for the build. Start it with:" >&2
+      echo "  ssh ${JETSON_ALIAS} systemctl --user start goose-in-a-pond.service" >&2 ;;
+  esac
+  return 0
 }

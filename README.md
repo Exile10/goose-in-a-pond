@@ -79,7 +79,7 @@ pond-desktop                (Electron desktop app — React + TypeScript)
 
 - **Rust** stable via [rustup](https://rustup.rs). `giap.sh install` fetches it if it's missing.
 - **Go ≥ 1.27**. The build compiles the bundled `pondnet` network helper (`native/pondnet`) next to `pond-server`. The installer does not install Go for you.
-- **Node** `^22.12 || ^24 || >=26` for the desktop app and the tests (`.nvmrc` says 22). **≥ 20.19** is enough to build the web UI, and an older Node can still run the server. Not sure what you have? `bash scripts/giap.sh node` checks, uses one you already have (nvm, fnm, volta, asdf), or downloads one after asking. See [Node](docs/developer/installation.md#node).
+- **Node** `^22.13 || ^24 || >=26` for the desktop app and the tests (`.nvmrc` says 22). **≥ 20.19** is enough to build the web UI, and an older Node can still run the server. Not sure what you have? `bash scripts/giap.sh node` checks, uses one you already have (nvm, fnm, volta, asdf), or downloads one after asking. See [Node](docs/developer/installation.md#node).
 - **Git** with submodule support (Goose is vendored as the `goose` submodule)
 - **cmake** and a C/C++ toolchain (`install.sh` installs these on Linux)
 

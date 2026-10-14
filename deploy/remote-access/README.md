@@ -364,7 +364,10 @@ In `pull` mode this host prunes only what it can see was collected. The contract
 
 The collector lives on the operator's machine, outside this repository. Add this
 after its pull, with `HOST` and `REMOTE` set to the SSH destination and this host's
-`runtime/backups` path, and `LOCAL` to the directory it pulled into:
+`runtime/backups` path, and `LOCAL` to the directory it pulled into. The check
+compares modification times and permissions as well as content, so the pull must
+keep them: pull with `rsync -a`. A copy taken with `scp` or a plain `rsync` differs in
+its times, is never marked, and `backup.sh` fails once `COLLECTED_WITHIN_DAYS` pass.
 
 ```sh
 for copy in "$LOCAL"/control-plane-*.tar.age; do

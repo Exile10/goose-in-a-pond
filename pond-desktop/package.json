@@ -8,7 +8,7 @@
   "main": "dist-electron/main/index.cjs",
   "type": "module",
   "engines": {
-    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
+    "node": "^22.13.0 || ^24.0.0 || >=26.0.0"
   },
   "scripts": {
     "dev": "concurrently --kill-others-on-fail -n vite,server -c cyan,green \"vite\" \"npm run dev:server\"",

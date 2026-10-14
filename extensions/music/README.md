@@ -120,5 +120,5 @@ echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | npx tsx src/
 
 ## Requirements
 
-- Node.js 22.12+ (see the repo's `.nvmrc`; `bash scripts/giap.sh node` sets it up)
+- Node.js 22.13+ (see the repo's `.nvmrc`; `bash scripts/giap.sh node` sets it up)
 - macOS, and see [Apple Music](#apple-music)
