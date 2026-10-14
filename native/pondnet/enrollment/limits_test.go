@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -152,45 +153,109 @@ func TestAFullLimiterRefusesNewKeysInsteadOfForgettingEveryone(t *testing.T) {
 	}
 }
 
+// healthOf answers the service's /health body, failing the test on anything but 200.
+func healthOf(t *testing.T, s *Service) string {
+	t.Helper()
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest("GET", "/health", nil))
+	if w.Code != 200 {
+		t.Fatalf("health %d", w.Code)
+	}
+	return w.Body.String()
+}
+
 func TestAnUnreachableCoordinatorLeavesTheServiceDegradedNotDown(t *testing.T) {
 	store, err := Open(t.TempDir() + "/state")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	backend := &unreachable{}
+	backend := &unreachable{failure: errors.New("coordinator unavailable")}
 	s, err := New(context.Background(), store, backend)
 	if err != nil {
 		t.Fatalf("startup failed instead of degrading: %v", err)
 	}
-	health := func() string {
-		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest("GET", "/health", nil))
-		if w.Code != 200 {
-			t.Fatalf("health %d", w.Code)
-		}
-		return w.Body.String()
-	}
-	if !strings.Contains(health(), `"degraded":true`) {
+	if !strings.Contains(healthOf(t, s), `"degraded":true`) {
 		t.Fatal("degraded state not reported")
 	}
-	backend.up = true
+	backend.failure = nil
 	if err := s.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(health(), "degraded") {
+	if strings.Contains(healthOf(t, s), "degraded") {
 		t.Fatal("still degraded after reconciling")
+	}
+	// A coordinator lost after a healthy start degrades the service just the same.
+	for _, failure := range []error{errors.New("coordinator unavailable"), ErrInventoryTooLarge} {
+		backend.failure = failure
+		if err := s.Reconcile(context.Background()); !errors.Is(err, failure) {
+			t.Fatalf("reconciliation hid %v: %v", failure, err)
+		}
+		if !strings.Contains(healthOf(t, s), `"degraded":true`) {
+			t.Fatalf("%v not reported as degraded", failure)
+		}
+		backend.failure = nil
+		if err := s.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(healthOf(t, s), "degraded") {
+			t.Fatalf("still degraded after recovering from %v", failure)
+		}
+	}
+}
+
+// A coordinator that stops accepting the admin key, as after a botched rotation,
+// must show on /health rather than leave it reporting ok.
+func TestARefusedCoordinatorCredentialDegradesTheService(t *testing.T) {
+	var refused atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if refused.Load() {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/api/v1/node":
+			io.WriteString(w, `{"nodes":[]}`)
+		case r.Method == "PUT" && r.URL.Path == "/api/v1/policy":
+			io.WriteString(w, `{}`)
+		default:
+			t.Errorf("unexpected coordinator request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	backend, err := NewHeadscale(server.URL, "fixture-credential")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(t.TempDir() + "/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	s, err := New(context.Background(), store, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(healthOf(t, s), "degraded") {
+		t.Fatal("degraded at a healthy start")
+	}
+	refused.Store(true)
+	if err := s.Reconcile(context.Background()); err == nil || !strings.Contains(err.Error(), "HTTP 401") {
+		t.Fatalf("a refused credential was not surfaced: %v", err)
+	}
+	if !strings.Contains(healthOf(t, s), `"degraded":true`) {
+		t.Fatal("a refused credential left /health reporting ok")
 	}
 }
 
 type unreachable struct {
 	fakeBackend
-	up bool
+	failure error
 }
 
 func (u *unreachable) Inventory(ctx context.Context) ([]Registered, error) {
-	if !u.up {
-		return nil, errors.New("coordinator unavailable")
+	if u.failure != nil {
+		return nil, u.failure
 	}
 	return u.fakeBackend.Inventory(ctx)
 }

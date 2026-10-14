@@ -149,8 +149,8 @@ func run() error {
 				return
 			case <-ticker.C:
 				job, stop := context.WithTimeout(ctx, 15*time.Second)
-				if handler.Reconcile(job) != nil {
-					slog.Warn("network enrollment reconciliation deferred")
+				if err := handler.Reconcile(job); err != nil {
+					slog.Warn("network enrollment reconciliation deferred", "error", err)
 				}
 				stop()
 			}
