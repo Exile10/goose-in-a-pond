@@ -49,13 +49,39 @@ fn the_ingest_pipeline_is_constructed_with_a_redactor() {
 }
 
 /// Without a speaker authority `scope_for` answers `Unresolved`, so every member-scoped tool
-/// refuses while looking like a working guard. Deleting giap-draft removed the last install.
+/// refuses while looking like a working guard.
 #[test]
-fn the_speaker_authority_is_installed_on_both_binary_paths() {
+fn the_speaker_authority_is_installed_on_every_binary_path() {
+    for entry in [
+        "async fn run_server(",
+        "async fn run_chat(",
+        "async fn run_agent_cmd(",
+    ] {
+        let start = MAIN
+            .find(entry)
+            .unwrap_or_else(|| panic!("no `{entry}` in main.rs"));
+        let body = &MAIN[start..];
+        let end = body[1..].find("\nasync fn ").map_or(body.len(), |i| i + 1);
+        assert!(
+            body[..end].contains("init_speaker_authority("),
+            "`{entry}` does not call `init_speaker_authority`, so giap-context and giap-travel \
+             cannot tell who is speaking on that path and refuse or fall back on every call."
+        );
+    }
+}
+
+/// Once the executor is filled, the already-running scheduler can start a turn on its next tick.
+#[test]
+fn the_speaker_authority_is_installed_before_schedules_can_run() {
+    let install = MAIN
+        .find("init_speaker_authority(")
+        .expect("no `init_speaker_authority` in main.rs");
+    let fill = MAIN
+        .find("deferred_executor\n            .init(")
+        .expect("no `deferred_executor.init` in main.rs");
     assert!(
-        MAIN.matches("init_speaker_authority(").count() >= 2,
-        "`init_speaker_authority` is not called on both the `serve` and the voice/CLI chat \
-         paths, so giap-context and giap-travel cannot tell who is speaking on the path without \
-         it and refuse or fall back on every call."
+        install < fill,
+        "`serve` fills the schedule executor before installing the speaker authority, so a \
+         schedule's turn can run with member-scoped tools refusing every call."
     );
 }
