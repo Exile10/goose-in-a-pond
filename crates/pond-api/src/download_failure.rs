@@ -46,7 +46,7 @@ pub(crate) fn plain_request(err: &reqwest::Error) -> String {
 }
 
 /// Any failure of a transfer through the Hugging Face cache, by the type behind it.
-pub(crate) fn plain_failure(err: &anyhow::Error) -> String {
+pub fn plain_failure(err: &anyhow::Error) -> String {
     use pond_hf_cache::TransferError as T;
     let raw = format!("{err:#}");
     tracing::warn!(error = %raw, "a download failed");
