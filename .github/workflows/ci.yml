@@ -21,13 +21,15 @@ on:
     # prove that markdown still parses.
     paths-ignore: *docs-only
 
-# One run per branch. Without this every push started a fresh full matrix and
-# left the previous one running to completion against a commit nobody would
-# merge; a burst of three pushes billed three complete builds to answer a
-# question only the last one asked.
+# A PR keeps cancel-in-progress: a second push makes the first run's answer about a tree nobody
+# will merge. A push to main does not. Merges land in bursts every 15 to 30 minutes and a full
+# run takes about an hour, so cancelling meant every main run since 2026-10-01 was cancelled
+# before it finished (102 cancelled, 0 passed). Without cancellation the group still holds one
+# running and one pending run, and a newer push replaces the pending one, so main is tested at
+# most twice per burst and each finished run reports on a real main commit.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every job only reads the repository; caches and artifacts use the runtime token, not this one.
 permissions:
