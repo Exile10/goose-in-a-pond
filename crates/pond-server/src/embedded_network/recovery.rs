@@ -730,7 +730,7 @@ mod tests {
     const STOOD_DOWN: &str = r#"{"status":"revoked","role":"phone","machineKey":"mkey:old","revision":"rev-0123456789abcdef"}"#;
     const AT_CAPACITY: &str = r#"{"refused":"retired_capacity"}"#;
 
-    async fn error_of(refusal: PhoneRefusal) -> (StatusCode, serde_json::Value) {
+    async fn error_of(refusal: impl IntoResponse) -> (StatusCode, serde_json::Value) {
         let response = refusal.into_response();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 4096)
