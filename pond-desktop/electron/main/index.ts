@@ -7,6 +7,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { registerAppScheme, serveRendererFrom } from "./protocol";
 import { createMainWindow, distRoot } from "./window";
+import { appOrigins, guardNavigation } from "./navigation";
 import {
   ServerProcess,
   recoveryBackoffSeconds,
@@ -141,11 +142,17 @@ const teardown = createTeardown({
 // Must happen before the app is ready.
 registerAppScheme();
 
+/** The pages that may call the shell, and the only ones a window may show. */
+const allowedOrigins = appOrigins(process.env["GIAP_DEV_SERVER"]);
+
 // One instance: a second launch surfaces this window instead of fighting for port and mic.
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", showWindow);
+
+  // Every web contents, so a window or view added later is kept on the app's pages too.
+  app.on("web-contents-created", (_event, contents) => guardNavigation(contents, allowedOrigins));
 
   void app.whenReady().then(async () => {
     serveRendererFrom(distRoot(app.getAppPath()));
@@ -155,7 +162,7 @@ if (!app.requestSingleInstanceLock()) {
 
     setAboutPanel();
     installMenu({ emit });
-    registerIpc({ server, voice, hostCredential: readHostCredentialFile });
+    registerIpc({ server, voice, hostCredential: readHostCredentialFile }, allowedOrigins);
 
     win = createMainWindow({
       preloadPath: join(__dirname, "../preload/index.cjs"),
