@@ -1,14 +1,17 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Switch } from '@heroui/react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api/PondApiClient';
 import { isSignInRequired } from '../api/hostCredential';
 import { ApiError, type RecoveryRequest } from '../api/types';
 
-/** The coordinator's refusals over an invite or a device certificate, each with its own `remote.*` message. */
+/**
+ * The coordinator's refusals over an invite or a device certificate, each with its own `remote.*`
+ * message. Every one of them brings the invite field back: a refused certificate falls back to an
+ * invite, a refused invite needs correcting, and a coordinator with no provisioning keys asks a
+ * provisioned Pond for an invite all the same.
+ */
 const ADMISSION_REFUSALS = ['invite_required', 'invite_invalid', 'invite_expired', 'invite_used', 'device_certificate_invalid', 'device_revoked', 'device_used'];
-/** A refused certificate falls back to an invite, so these bring the invite field back. */
-const DEVICE_REFUSALS = ['device_certificate_invalid', 'device_revoked', 'device_used'];
 
 /** Household activation stays on the Pond's protected local dashboard. */
 export function RemoteAccess() {
@@ -35,13 +38,20 @@ export function RemoteAccess() {
     // as an assignment: a ref whose `current` is never assigned is taken for a React-managed node.
     return () => { generation.current += 1; };
   }, []);
-  useEffect(() => {
-    let active = true;
+  // The device status changes under this page: enabling registers the household, and a coordinator
+  // can refuse what it admitted before. It is read again after every enable or disable, refused or
+  // not, and only the latest read is kept.
+  const deviceGeneration = useRef(0);
+  const refreshDevice = useCallback(() => {
+    const current = ++deviceGeneration.current;
     // Unknown is shown as neither provisioned nor registered, so the invite field stays available.
-    void api.remoteDevice().then((found) => { if (active) setDevice(found); })
-      .catch(() => { if (active) setDevice(null); console.warn('[remote] device provisioning status unavailable'); });
-    return () => { active = false; };
+    void api.remoteDevice().then((found) => { if (current === deviceGeneration.current) setDevice(found); })
+      .catch(() => { if (current === deviceGeneration.current) setDevice(null); console.warn('[remote] device provisioning status unavailable'); });
   }, []);
+  useEffect(() => {
+    refreshDevice();
+    return () => { deviceGeneration.current += 1; };
+  }, [refreshDevice]);
   useEffect(() => {
     let active = true;
     let timer: ReturnType<typeof setTimeout>;
@@ -111,7 +121,12 @@ export function RemoteAccess() {
       const refusal = error instanceof ApiError && ADMISSION_REFUSALS.includes(error.message) ? error.message : null;
       if (current === generation.current) setState(refusal ?? 'failed');
       console.warn('[remote] local activation operation failed');
-    } finally { if (current === generation.current) setBusy(false); }
+    } finally {
+      if (current === generation.current) {
+        setBusy(false);
+        if (operation !== 'identity') refreshDevice();
+      }
+    }
   };
   const on = state === 'enabled';
   const settling = state === 'connecting' || state === 'provision';
@@ -138,7 +153,7 @@ export function RemoteAccess() {
       </Switch>
     </div>
 
-    {device?.provisioned && !DEVICE_REFUSALS.includes(state)
+    {device?.provisioned && !ADMISSION_REFUSALS.includes(state)
       ? <p style={{ margin: 0, overflowWrap: 'anywhere' }}>{t('remote.provisioned', { serial: device.serial ?? '' })}</p>
       // An invite admits a household once. One already registered needs none, unless the service
       // has just refused it, which is what switching to another coordination service looks like.
