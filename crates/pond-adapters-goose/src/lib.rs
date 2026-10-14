@@ -12,6 +12,7 @@ pub mod orchestrator;
 pub mod provider_adapter;
 pub mod provider_shim;
 pub mod registry_rows;
+pub mod shutdown;
 pub mod token_counter;
 pub mod vision_encoder;
 
@@ -20,3 +21,4 @@ pub use giap_registration::{register_giap_extensions, registered_extensions};
 pub use goose_agent::GooseAdapter;
 pub use orchestrator::{GooseChildRunner, GooseOrchestrator};
 pub use provider_adapter::GooseProviderAdapter;
+pub use shutdown::release_local_models;

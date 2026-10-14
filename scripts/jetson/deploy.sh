@@ -6,8 +6,12 @@
 #   bash scripts/jetson.sh deploy                # deploy origin/main
 #   bash scripts/jetson.sh deploy --branch mybr  # deploy another pushed branch
 #   bash scripts/jetson.sh deploy --no-restart   # build and install, but leave the service as it is
-#   JETSON_HOST=nano-ip bash scripts/jetson.sh deploy   # alternate ssh host
+#   JETSON_HOST=other bash scripts/jetson.sh deploy     # another ssh alias or address
 #   JETSON_DATA_DIR=path …   # the pond's data dir on the device, if not ~/.local/share/goose-in-a-pond
+#
+# The device is found once, before step 1, and every later call goes to that address
+# (scripts/lib/jetson-remote.sh): by name while the name resolves, else at the address that worked
+# last time, with the name's host key checked either way. No flag is needed when mDNS drops out.
 #
 # What it does:
 #   1. Dev machine -> Jetson: the LiteRT-LM library that `giap.sh litert build
@@ -21,7 +25,9 @@
 #      does not have) and rsync pond-desktop/dist to the Jetson — pond-server
 #      embeds it at compile time (crates/pond-api/build.rs).
 #   4. Jetson: release build with CUDA (sm_87; .cargo/config.toml's
-#      target-cpu=native is correct for an on-device build).
+#      target-cpu=native is correct for an on-device build). It runs detached there, so a lost
+#      connection cannot kill it; this side follows its log and reconnects. Run the deploy again
+#      after a drop and it follows the build still running instead of starting another.
 #   5. Jetson: restart the user-level systemd service and health-check the API.
 #      --no-restart skips this, so a stopped or disabled service stays that way.
 #
@@ -47,6 +53,11 @@ done
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REMOTE_REPO="goose-in-a-pond"
 
+# shellcheck source=../lib/jetson-remote.sh
+source "${REPO_ROOT}/scripts/lib/jetson-remote.sh"
+echo "==> Finding ${HOST}"
+jetson_pin "$HOST"
+
 # First, so a package that fails its checks stops the deploy before the device changes.
 # shellcheck source=../lib/litert-setup.sh
 source "${REPO_ROOT}/scripts/lib/litert-setup.sh"
@@ -62,10 +73,10 @@ elif ! litert_verify "${LITERT_DIR}"; then
   echo "  Rebuild it: bash scripts/giap.sh litert build linux-arm64" >&2
   exit 1
 else
-  ssh "$HOST" "mkdir -p '${REMOTE_LITERT}'"
-  rsync -az --delete "${LITERT_DIR}/" "${HOST}:${REMOTE_LITERT}/"
+  jetson_ssh "mkdir -p '${REMOTE_LITERT}'"
+  jetson_rsync "${LITERT_DIR}/" "${REMOTE_LITERT}/"
   # The manifest's first line describes the build; every other line is a sha256sum line.
-  ssh "$HOST" "cd '${REMOTE_LITERT}' \
+  jetson_ssh "cd '${REMOTE_LITERT}' \
     && tail -n +2 MANIFEST.sha256 | sha256sum -c --quiet --strict - \
     && missing=\$(for f in *.so; do ldd \"./\$f\" | grep 'not found' || true; done) \
     && if [ -n \"\$missing\" ]; then echo \"unresolved on the device: \$missing\" >&2; exit 1; fi"
@@ -73,7 +84,7 @@ else
 fi
 
 echo "==> [2/5] Updating Jetson checkout to origin/${BRANCH}"
-ssh "$HOST" "cd ~/${REMOTE_REPO} \
+jetson_ssh "cd ~/${REMOTE_REPO} \
   && git fetch origin \
   && git checkout -q ${BRANCH} \
   && git reset --hard -q origin/${BRANCH} \
@@ -83,14 +94,15 @@ ssh "$HOST" "cd ~/${REMOTE_REPO} \
 
 echo "==> [3/5] Building web UI locally and syncing dist"
 ( cd "${REPO_ROOT}/pond-desktop" && npm run build )
-rsync -az --delete "${REPO_ROOT}/pond-desktop/dist/" "${HOST}:${REMOTE_REPO}/pond-desktop/dist/"
+jetson_rsync "${REPO_ROOT}/pond-desktop/dist/" "${REMOTE_REPO}/pond-desktop/dist/"
 
 echo "==> [4/5] Release build on the Jetson (CUDA sm_87) — this is the slow step"
+jetson_make_room_for_build "${RESTART}"
 # CMAKE_CUDA_ARCHITECTURES=87 makes ggml emit a real sm_87 cubin; without it the
 # build ships compute_80 PTX that the driver JIT-compiles at first model load.
 # whisper/cuda moves ASR decode onto the GPU (research R7: ~20s of audio in
 # ~1-2.6s instead of a multi-second all-6-core CPU burst).
-ssh "$HOST" "cd ~/${REMOTE_REPO} \
+jetson_run_detached build "cd ~/${REMOTE_REPO} \
   && PATH=\$HOME/.cargo/bin:/usr/local/cuda/bin:\$PATH SQLX_OFFLINE=true \
      CMAKE_CUDA_ARCHITECTURES=87 CUDA_COMPUTE_CAP=87 \
      cargo build -p pond-server \
@@ -108,7 +120,7 @@ echo "==> [5/5] Restarting service + health check"
 # context, loads the GGUF embedder and pre-warms the KV prefix before it binds,
 # which is tens of seconds on this board -- a fixed `sleep 4` reported HTTP 000
 # and a failed deploy for a service that was starting perfectly normally.
-ssh "$HOST" "systemctl --user restart goose-in-a-pond.service || exit 1
+jetson_ssh "systemctl --user restart goose-in-a-pond.service || exit 1
   for i in \$(seq 1 60); do
     code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8080/api/v1/health 2>/dev/null)
     if [ \"\$code\" = 200 ]; then echo \"API: HTTP 200 after \${i}0s\"; exit 0; fi
@@ -121,3 +133,6 @@ ssh "$HOST" "systemctl --user restart goose-in-a-pond.service || exit 1
 # The HTTP listener is loopback-only; phones use pinned HTTPS (normally 4443). Same port both
 # ends of the tunnel, so OAuth redirects registered against it still land.
 echo "Deployed. Dashboard: ssh -N -L 8080:127.0.0.1:8080 $HOST, then http://localhost:8080"
+if [ "${JETSON_ADDR}" != "${JETSON_NAME}" ]; then
+  echo "  (if ${JETSON_NAME} does not resolve: ssh -N -L 8080:127.0.0.1:8080 -o HostName=${JETSON_ADDR} $HOST)"
+fi
