@@ -8,6 +8,7 @@ pub mod litert_model;
 pub mod logging;
 pub mod mesh_provider;
 pub mod model_traits;
+pub mod mtp_drafter;
 pub mod orchestrator;
 pub mod provider_adapter;
 pub mod provider_shim;

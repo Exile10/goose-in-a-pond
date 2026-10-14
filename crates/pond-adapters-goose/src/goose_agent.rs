@@ -1566,6 +1566,12 @@ impl GooseAdapter {
                     {
                         self.pictures.spawn_settle(dd, &settings.chat_model);
                     }
+                    // Speculative decoding on the Orin, with a drafter already on disk; the
+                    // engine attaches it on CUDA builds only. Re-checked on every provider build,
+                    // so one added or deleted later is picked up or dropped without a restart.
+                    if pond_core::models::domain::device_budget::budgeted_device() {
+                        crate::mtp_drafter::attach_drafter(dd, &registry_key);
+                    }
                 }
                 let cfg = goose_providers::model::ModelConfig::new(&registry_key);
                 tracing::debug!(
