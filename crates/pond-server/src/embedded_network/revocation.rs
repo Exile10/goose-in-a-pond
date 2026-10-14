@@ -84,6 +84,15 @@ pub(super) fn load_queue(directory: &Path, now: DateTime<Utc>) -> Result<Queue> 
     Ok(queue)
 }
 
+/// Write the queue. An empty one is written as the empty set a binary from before per-entry
+/// backoff reads, so a Pond whose queue has drained can be downgraded.
+pub(super) fn save_queue(directory: &Path, queue: &Queue) -> Result<()> {
+    if queue.is_empty() {
+        return write_private_json(directory, QUEUE_FILE, &BTreeSet::<String>::new());
+    }
+    write_private_json(directory, QUEUE_FILE, queue)
+}
+
 /// Entries whose next attempt has come, soonest first, then oldest first.
 pub(super) fn due(queue: &Queue, now: DateTime<Utc>) -> Vec<(String, Pending)> {
     let mut due: Vec<_> = queue
@@ -106,15 +115,47 @@ pub(super) struct Enrolled {
     pub devices: BTreeSet<String>,
 }
 
-pub(super) fn load_enrolled(directory: &Path) -> Result<Enrolled> {
-    let record =
-        read_private_json::<Enrolled>(&directory.join(ENROLLED_FILE), 65536)?.unwrap_or_default();
-    ensure!(
-        record.devices.len() <= MAX_DEVICES
-            && record.devices.iter().all(|id| super::valid_device(id)),
-        "invalid enrollment record"
-    );
-    Ok(record)
+/// The enrollment record. One that cannot be read or does not validate (corrupt, or left `0644`
+/// by a restore) is moved aside as `enrolled.json.corrupt-<unix time>` and read as an incomplete
+/// record: refusing it would answer every removal, logout and enrollment 503 until someone
+/// repaired the file, and an incomplete record only makes removals check before they revoke.
+pub(super) fn load_enrolled(directory: &Path) -> Enrolled {
+    let path = directory.join(ENROLLED_FILE);
+    let reason = match read_private_json::<Enrolled>(&path, 65536) {
+        Ok(record) => {
+            let record = record.unwrap_or_default();
+            if record.devices.len() <= MAX_DEVICES
+                && record.devices.iter().all(|id| super::valid_device(id))
+            {
+                return record;
+            }
+            "invalid enrollment record".to_owned()
+        }
+        Err(error) => format!("{error:#}"),
+    };
+    let aside = directory.join(format!(
+        "{ENROLLED_FILE}.corrupt-{}",
+        Utc::now().timestamp()
+    ));
+    match std::fs::rename(&path, &aside) {
+        Ok(()) => tracing::warn!(
+            target: "giap::trace",
+            kind = "enrollment_record_replaced",
+            %reason,
+            aside = %aside.display(),
+            "the enrollment record was unreadable; it was moved aside and removals now check \
+             with the coordinator before revoking"
+        ),
+        Err(error) => tracing::warn!(
+            target: "giap::trace",
+            kind = "enrollment_record_replaced",
+            %reason,
+            rename_error = %error,
+            "the enrollment record was unreadable and could not be moved aside; removals now \
+             check with the coordinator before revoking"
+        ),
+    }
+    Enrolled::default()
 }
 
 /// How a revocation should be sent, given what this Pond knows it enrolled.
@@ -234,6 +275,20 @@ mod tests {
         assert_eq!(queue[PHONE], Pending::new(false, at(5)));
         write_private_json(dir.path(), QUEUE_FILE, &queue).unwrap();
         assert_eq!(load_queue(dir.path(), at(9)).unwrap(), queue);
+    }
+
+    #[test]
+    fn an_empty_queue_is_written_as_an_older_binary_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        save_queue(dir.path(), &Queue::new()).unwrap();
+        let written = std::fs::read(dir.path().join(QUEUE_FILE)).unwrap();
+        assert_eq!(written, b"[]");
+        assert!(serde_json::from_slice::<BTreeSet<String>>(&written).is_ok());
+        assert!(load_queue(dir.path(), at(0)).unwrap().is_empty());
+
+        let queue = Queue::from([(PHONE.to_owned(), Pending::new(true, at(0)))]);
+        save_queue(dir.path(), &queue).unwrap();
+        assert_eq!(load_queue(dir.path(), at(1)).unwrap(), queue);
     }
 
     #[test]
