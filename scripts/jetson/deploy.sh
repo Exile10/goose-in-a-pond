@@ -27,7 +27,9 @@
 #   4. Jetson: release build with CUDA (sm_87; .cargo/config.toml's
 #      target-cpu=native is correct for an on-device build). It runs detached there, so a lost
 #      connection cannot kill it; this side follows its log and reconnects. Run the deploy again
-#      after a drop and it follows the build still running instead of starting another.
+#      after a drop and it follows the build still running, skipping steps 1-3 so nothing changes
+#      under it. Below 3 GB free the pond is stopped for the build; a deploy that ends before
+#      step 5 starts it again, unless the build is still running.
 #   5. Jetson: restart the user-level systemd service and health-check the API.
 #      --no-restart skips this, so a stopped or disabled service stays that way.
 #
@@ -57,59 +59,67 @@ REMOTE_REPO="goose-in-a-pond"
 source "${REPO_ROOT}/scripts/lib/jetson-remote.sh"
 echo "==> Finding ${HOST}"
 jetson_pin "$HOST"
+trap jetson_restore_pond EXIT
 
-# First, so a package that fails its checks stops the deploy before the device changes.
-# shellcheck source=../lib/litert-setup.sh
-source "${REPO_ROOT}/scripts/lib/litert-setup.sh"
-REMOTE_LITERT="${JETSON_DATA_DIR:-.local/share/goose-in-a-pond}/$(litert_device_subdir)"
-LITERT_DIR="$(litert_recorded_dir linux-arm64)"
-echo "==> [1/5] LiteRT-LM library -> ${HOST}:${REMOTE_LITERT}"
-if [ -z "${LITERT_DIR}" ]; then
-  echo "    WARNING: no linux-arm64 LiteRT-LM package is recorded here, so none is copied and"
-  echo "    .litertlm models will not load on the device. Build one: bash scripts/giap.sh litert build linux-arm64"
-elif ! litert_verify "${LITERT_DIR}"; then
-  echo "ERROR: the recorded LiteRT-LM package (${LITERT_DIR}) fails verification:" >&2
-  printf '%s\n' "${LITERT_VERIFY_PROBLEMS}" | sed 's/^/  /' >&2
-  echo "  Rebuild it: bash scripts/giap.sh litert build linux-arm64" >&2
-  exit 1
+# Follow a build an earlier deploy left running, and leave its checkout, library and web UI alone.
+if [ "$(jetson_task_state build)" = running ]; then
+  echo "==> [1-4/5] A build started by an earlier deploy is still running on ${HOST}; following it"
+  jetson_follow build
 else
-  jetson_ssh "mkdir -p '${REMOTE_LITERT}'"
-  jetson_rsync "${LITERT_DIR}/" "${REMOTE_LITERT}/"
-  # The manifest's first line describes the build; every other line is a sha256sum line.
-  jetson_ssh "cd '${REMOTE_LITERT}' \
-    && tail -n +2 MANIFEST.sha256 | sha256sum -c --quiet --strict - \
-    && missing=\$(for f in *.so; do ldd \"./\$f\" | grep 'not found' || true; done) \
-    && if [ -n \"\$missing\" ]; then echo \"unresolved on the device: \$missing\" >&2; exit 1; fi"
-  echo "    ${LITERT_VERIFY_FILES} files copied; sha256sum -c and ldd pass on the device"
+  # First, so a package that fails its checks stops the deploy before the device changes.
+  # shellcheck source=../lib/litert-setup.sh
+  source "${REPO_ROOT}/scripts/lib/litert-setup.sh"
+  REMOTE_LITERT="${JETSON_DATA_DIR:-.local/share/goose-in-a-pond}/$(litert_device_subdir)"
+  LITERT_DIR="$(litert_recorded_dir linux-arm64)"
+  echo "==> [1/5] LiteRT-LM library -> ${HOST}:${REMOTE_LITERT}"
+  if [ -z "${LITERT_DIR}" ]; then
+    echo "    WARNING: no linux-arm64 LiteRT-LM package is recorded here, so none is copied and"
+    echo "    .litertlm models will not load on the device. Build one: bash scripts/giap.sh litert build linux-arm64"
+  elif ! litert_verify "${LITERT_DIR}"; then
+    echo "ERROR: the recorded LiteRT-LM package (${LITERT_DIR}) fails verification:" >&2
+    printf '%s\n' "${LITERT_VERIFY_PROBLEMS}" | sed 's/^/  /' >&2
+    echo "  Rebuild it: bash scripts/giap.sh litert build linux-arm64" >&2
+    exit 1
+  else
+    jetson_ssh "mkdir -p '${REMOTE_LITERT}'"
+    jetson_rsync "${LITERT_DIR}/" "${REMOTE_LITERT}/"
+    # The manifest's first line describes the build; every other line is a sha256sum line.
+    jetson_ssh "cd '${REMOTE_LITERT}' \
+      && tail -n +2 MANIFEST.sha256 | sha256sum -c --quiet --strict - \
+      && missing=\$(for f in *.so; do ldd \"./\$f\" | grep 'not found' || true; done) \
+      && if [ -n \"\$missing\" ]; then echo \"unresolved on the device: \$missing\" >&2; exit 1; fi"
+    echo "    ${LITERT_VERIFY_FILES} files copied; sha256sum -c and ldd pass on the device"
+  fi
+
+  echo "==> [2/5] Updating Jetson checkout to origin/${BRANCH}"
+  jetson_ssh "cd ~/${REMOTE_REPO} \
+    && git fetch origin \
+    && git checkout -q ${BRANCH} \
+    && git reset --hard -q origin/${BRANCH} \
+    && git submodule sync -q --recursive \
+    && git submodule update --init --recursive \
+    && git log --oneline -1"
+
+  echo "==> [3/5] Building web UI locally and syncing dist"
+  ( cd "${REPO_ROOT}/pond-desktop" && npm run build )
+  jetson_rsync "${REPO_ROOT}/pond-desktop/dist/" "${REMOTE_REPO}/pond-desktop/dist/"
+
+  echo "==> [4/5] Release build on the Jetson (CUDA sm_87) — this is the slow step"
+  jetson_make_room_for_build "${RESTART}"
+  # CMAKE_CUDA_ARCHITECTURES=87 makes ggml emit a real sm_87 cubin; without it the
+  # build ships compute_80 PTX that the driver JIT-compiles at first model load.
+  # whisper/cuda moves ASR decode onto the GPU (research R7: ~20s of audio in
+  # ~1-2.6s instead of a multi-second all-6-core CPU burst).
+  jetson_run_detached build "cd ~/${REMOTE_REPO} \
+    && PATH=\$HOME/.cargo/bin:/usr/local/cuda/bin:\$PATH SQLX_OFFLINE=true \
+       CMAKE_CUDA_ARCHITECTURES=87 CUDA_COMPUTE_CAP=87 \
+       cargo build -p pond-server \
+         --features pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda \
+         --release"
 fi
 
-echo "==> [2/5] Updating Jetson checkout to origin/${BRANCH}"
-jetson_ssh "cd ~/${REMOTE_REPO} \
-  && git fetch origin \
-  && git checkout -q ${BRANCH} \
-  && git reset --hard -q origin/${BRANCH} \
-  && git submodule sync -q --recursive \
-  && git submodule update --init --recursive \
-  && git log --oneline -1"
-
-echo "==> [3/5] Building web UI locally and syncing dist"
-( cd "${REPO_ROOT}/pond-desktop" && npm run build )
-jetson_rsync "${REPO_ROOT}/pond-desktop/dist/" "${REMOTE_REPO}/pond-desktop/dist/"
-
-echo "==> [4/5] Release build on the Jetson (CUDA sm_87) — this is the slow step"
-jetson_make_room_for_build "${RESTART}"
-# CMAKE_CUDA_ARCHITECTURES=87 makes ggml emit a real sm_87 cubin; without it the
-# build ships compute_80 PTX that the driver JIT-compiles at first model load.
-# whisper/cuda moves ASR decode onto the GPU (research R7: ~20s of audio in
-# ~1-2.6s instead of a multi-second all-6-core CPU burst).
-jetson_run_detached build "cd ~/${REMOTE_REPO} \
-  && PATH=\$HOME/.cargo/bin:/usr/local/cuda/bin:\$PATH SQLX_OFFLINE=true \
-     CMAKE_CUDA_ARCHITECTURES=87 CUDA_COMPUTE_CAP=87 \
-     cargo build -p pond-server \
-       --features pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda \
-       --release"
-
 if [ "${RESTART}" -eq 0 ]; then
+  JETSON_POND_SETTLED=1
   echo "==> [5/5] Service left as it is (--no-restart)"
   echo "    Start it with: ssh ${HOST} systemctl --user start goose-in-a-pond.service"
   exit 0
@@ -120,7 +130,9 @@ echo "==> [5/5] Restarting service + health check"
 # context, loads the GGUF embedder and pre-warms the KV prefix before it binds,
 # which is tens of seconds on this board -- a fixed `sleep 4` reported HTTP 000
 # and a failed deploy for a service that was starting perfectly normally.
+JETSON_POND_SETTLED=1
 jetson_ssh "systemctl --user restart goose-in-a-pond.service || exit 1
+  rm -f ~/${JETSON_REMOTE_DIR}/${JETSON_POND_STOPPED_MARK}
   for i in \$(seq 1 60); do
     code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8080/api/v1/health 2>/dev/null)
     if [ \"\$code\" = 200 ]; then echo \"API: HTTP 200 after \${i}0s\"; exit 0; fi

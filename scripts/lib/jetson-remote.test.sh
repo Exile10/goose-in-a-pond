@@ -184,6 +184,58 @@ test_a_short_device_stops_the_pond_for_the_build_only_when_it_restarts_it() {
   contains "$out" "enough to build" && lacks "$(cat "$W/remote.log")" "systemctl"
 }
 
+# The device side of the pond's stop and restart, run here: a fake systemctl logs its calls, and a
+# fake flock finds build.lock held while $W/build-running exists.
+device_shell() {
+  JETSON_ADDR=192.168.1.11; JETSON_NAME=nano.local; JETSON_ALIAS=nano
+  printf '#!/bin/sh\necho "systemctl $*" >>"$W/systemctl.log"\n' >"$W/bin/systemctl"
+  printf '#!/bin/sh\n[ -f "$W/build-running" ] && exit 1\nshift 2\n"$@"\n' >"$W/bin/flock"
+  chmod +x "$W/bin/systemctl" "$W/bin/flock"
+  : >"$W/systemctl.log"
+  jetson_ssh() { case "$*" in *MemAvailable*) echo 380 ;; *) bash -c "$*" ;; esac; }
+}
+MARK=".cache/giap-deploy/pond-stopped-for-build"
+
+test_a_deploy_that_ends_early_starts_the_pond_it_stopped() {
+  world; device_shell
+  jetson_make_room_for_build 1 >/dev/null || return 1
+  [ -f "$HOME/$MARK" ] && contains "$(cat "$W/systemctl.log")" "--user stop" || return 1
+  out="$(jetson_restore_pond 2>&1)" || return 1
+  contains "$out" "Started the pond again" \
+    && contains "$(cat "$W/systemctl.log")" "--user start goose-in-a-pond.service" && [ ! -f "$HOME/$MARK" ]
+}
+
+test_the_pond_stays_stopped_while_the_build_runs() {
+  world; device_shell
+  mkdir -p "$HOME/.cache/giap-deploy"; touch "$HOME/$MARK" "$W/build-running"
+  out="$(jetson_restore_pond 2>&1)" || return 1
+  contains "$out" "Run the deploy again" && lacks "$(cat "$W/systemctl.log")" "start" && [ -f "$HOME/$MARK" ]
+}
+
+test_a_pond_no_deploy_stopped_or_one_already_started_is_left_alone() {
+  world; device_shell
+  out="$(jetson_restore_pond 2>&1)" || return 1
+  eq "$out" "" && eq "$(cat "$W/systemctl.log")" "" || return 1
+  mkdir -p "$HOME/.cache/giap-deploy"; touch "$HOME/$MARK"
+  JETSON_POND_SETTLED=1
+  out="$(jetson_restore_pond 2>&1)" || return 1
+  eq "$out" "" && eq "$(cat "$W/systemctl.log")" "" && [ -f "$HOME/$MARK" ]
+}
+
+test_an_unreachable_device_gets_the_command_to_start_the_pond() {
+  world; device_shell
+  jetson_ssh() { return 255; }
+  out="$(jetson_restore_pond 2>&1)" || return 1
+  contains "$out" "ssh nano systemctl --user start goose-in-a-pond.service"
+}
+
+test_the_restore_does_nothing_before_the_device_is_found() {
+  world; device_shell; JETSON_ADDR=""
+  jetson_ssh() { echo "called" >>"$W/remote.log"; }
+  jetson_restore_pond || return 1
+  [ ! -f "$W/remote.log" ]
+}
+
 for fn in $(declare -F | awk '{print $3}' | grep '^test_'); do
   t "${fn#test_}" "$fn"
 done
