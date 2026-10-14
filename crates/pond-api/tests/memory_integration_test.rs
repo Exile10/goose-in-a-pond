@@ -209,6 +209,16 @@ fn auth_post(uri: &str, body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+fn auth_put(uri: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("Authorization", "Bearer test-token")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
 fn auth_delete(uri: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
@@ -633,6 +643,129 @@ async fn api_delete_memory_removes_from_db() {
         .await
         .unwrap();
     assert!(remaining.is_empty());
+}
+
+async fn add_routine(repo: &SqliteMemoryRepository, id: &str) {
+    repo.add(MemoryFragment::from_extraction(
+        id.into(),
+        None,
+        "Orders sushi on Fridays".into(),
+        MemorySegment::Routine,
+        0.65,
+        None,
+    ))
+    .await
+    .unwrap();
+}
+
+async fn only_memory(repo: &SqliteMemoryRepository) -> MemoryFragment {
+    let mut all = repo
+        .search_recent(&ProfileScope::Household, 10)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 1);
+    all.remove(0)
+}
+
+#[tokio::test]
+async fn api_update_memory_keeps_it_without_touching_the_text() {
+    let (app, repo, _tmp) = make_app_with_real_memory().await;
+    add_routine(&repo, "put-1").await;
+
+    let resp = app
+        .clone()
+        .oneshot(auth_put(
+            "/api/v1/memories/put-1",
+            serde_json::json!({ "tier": "permanent" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let kept = only_memory(&repo).await;
+    assert_eq!(kept.tier, Some(MemoryTier::Permanent));
+    assert_eq!(kept.decay_rate, Some(0.0));
+    assert_eq!(kept.content, "Orders sushi on Fridays");
+}
+
+#[tokio::test]
+async fn api_update_memory_rewords_and_retiers_together() {
+    let (app, repo, _tmp) = make_app_with_real_memory().await;
+    add_routine(&repo, "put-2").await;
+
+    let resp = app
+        .clone()
+        .oneshot(auth_put(
+            "/api/v1/memories/put-2",
+            serde_json::json!({ "content": "  Orders Thai on Fridays ", "tier": "short" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let updated = only_memory(&repo).await;
+    assert_eq!(updated.content, "Orders Thai on Fridays");
+    assert_eq!(updated.tier, Some(MemoryTier::Short));
+}
+
+#[tokio::test]
+async fn api_update_memory_rewording_alone_leaves_the_tier() {
+    let (app, repo, _tmp) = make_app_with_real_memory().await;
+    add_routine(&repo, "put-3").await;
+
+    let resp = app
+        .clone()
+        .oneshot(auth_put(
+            "/api/v1/memories/put-3",
+            serde_json::json!({ "content": "Orders Thai on Fridays" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let updated = only_memory(&repo).await;
+    assert_eq!(updated.content, "Orders Thai on Fridays");
+    assert_eq!(updated.tier, Some(MemoryTier::Long));
+}
+
+#[tokio::test]
+async fn api_update_memory_refuses_an_empty_or_blank_change() {
+    let (app, repo, _tmp) = make_app_with_real_memory().await;
+    add_routine(&repo, "put-4").await;
+
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({ "content": "   " }),
+        serde_json::json!({ "content": "", "tier": "permanent" }),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(auth_put("/api/v1/memories/put-4", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    let untouched = only_memory(&repo).await;
+    assert_eq!(untouched.content, "Orders sushi on Fridays");
+    assert_eq!(untouched.tier, Some(MemoryTier::Long));
+}
+
+#[tokio::test]
+async fn api_update_memory_refuses_an_unknown_tier() {
+    let (app, repo, _tmp) = make_app_with_real_memory().await;
+    add_routine(&repo, "put-5").await;
+
+    let resp = app
+        .clone()
+        .oneshot(auth_put(
+            "/api/v1/memories/put-5",
+            serde_json::json!({ "tier": "forever" }),
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_client_error(), "got {}", resp.status());
+    assert_eq!(only_memory(&repo).await.tier, Some(MemoryTier::Long));
 }
 
 // ── Token Usage Summary API Test ─────────────────────────────────────────────
