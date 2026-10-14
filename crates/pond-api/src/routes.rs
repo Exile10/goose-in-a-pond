@@ -535,9 +535,9 @@ async fn serve_from_disk(static_dir: &std::path::Path, rel: &str) -> Response<ax
 // ───────────────────────── Handlers ─────────────────────────────────
 
 /// Liveness, for anyone. The software version goes only to a loopback peer, the dashboard
-/// on the host: an anonymous LAN or tailnet peer learns which release to aim at otherwise
-/// (2026-10-12). The plaintext development listener is never the host's own, even from
-/// loopback, as in the auth middleware.
+/// on the host: an anonymous LAN or tailnet peer would otherwise learn which release to aim
+/// at. The plaintext development listener is never the host's own, even from loopback, as in
+/// the auth middleware.
 async fn health(
     peer: Result<
         axum::extract::ConnectInfo<std::net::SocketAddr>,

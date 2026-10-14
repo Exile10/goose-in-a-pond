@@ -4,8 +4,8 @@
 //! listeners and names the host and its LAN addresses, which LAN pairing and the phones'
 //! hostname checks need. `tls/tailnet-identity.json` is what the embedded helper serves on
 //! the tailnet, and names only the node's tailnet addresses and node name: every tailnet node
-//! can read a certificate it is shown, and it used to learn the host name and LAN addresses
-//! from the first one (2026-10-12). Both carry the same public key, so the pin is unchanged.
+//! can read a certificate it is shown, so it must not learn the host name or LAN addresses
+//! from it. Both carry the same public key, so the pin is unchanged.
 
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -169,10 +169,20 @@ impl TlsIdentity {
     /// is replaced, since it is derived from the key and holds nothing of its own. True when
     /// it was written.
     pub fn renew_tailnet_if_needed(&self, names: &[String]) -> Result<bool> {
+        self.write_tailnet(names, false)
+    }
+
+    /// Write the tailnet certificate only when it is missing or cannot be trusted as this key's,
+    /// so a usable one keeps the addresses it names until the renewal loop knows the current ones.
+    pub fn ensure_tailnet(&self, names: &[String]) -> Result<bool> {
+        self.write_tailnet(names, true)
+    }
+
+    fn write_tailnet(&self, names: &[String], only_if_unusable: bool) -> Result<bool> {
         let path = self.dir.join(TAILNET_IDENTITY_FILE);
         let replaced = match self.read_tailnet(&path) {
             Ok(Some(material)) => {
-                if !needs_renewal(&material.cert_pem, names)? {
+                if only_if_unusable || !needs_renewal(&material.cert_pem, names)? {
                     return Ok(false);
                 }
                 None
@@ -473,6 +483,38 @@ mod tests {
         assert!(identity.renew_tailnet_if_needed(&names).unwrap());
         let restored: Material = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(restored.key_pem, identity.material.key_pem);
+    }
+
+    /// At startup the tailnet addresses are not known yet; a usable certificate must keep the
+    /// ones it names, or a phone dialing the tailnet address fails its check until the loop runs.
+    #[test]
+    fn a_restart_keeps_the_tailnet_certificates_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = TlsIdentity::load(dir.path(), &["pond.local".to_string()]).unwrap();
+        let path = tailnet_identity_path(dir.path());
+        let at_startup = tailnet_certificate_names(&[]);
+
+        assert!(
+            identity.ensure_tailnet(&at_startup).unwrap(),
+            "missing: written"
+        );
+        let with_address = tailnet_certificate_names(&["100.64.0.7".into()]);
+        assert!(identity.renew_tailnet_if_needed(&with_address).unwrap());
+
+        assert!(!identity.ensure_tailnet(&at_startup).unwrap());
+        let kept: Material = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(san_names(&kept.cert_pem).unwrap(), with_address);
+
+        fs::write(&path, b"{}").unwrap();
+        assert!(
+            identity.ensure_tailnet(&at_startup).unwrap(),
+            "unusable: replaced"
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(
+            identity.ensure_tailnet(&at_startup).unwrap(),
+            "removed: written"
+        );
     }
 
     #[test]
