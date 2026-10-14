@@ -2,7 +2,7 @@
 
 use crate::user_data::domain::memory::{
     MemoryEdge, MemoryEvent, MemoryEventKind, MemoryFragment, MemoryGraph, MemoryLifecycle,
-    MemorySegment,
+    MemorySegment, MemoryTier,
 };
 use crate::user_data::domain::profile::ProfileScope;
 use anyhow::Result;
@@ -80,6 +80,11 @@ pub trait MemoryRepository: Send + Sync {
     /// Clears the embedding, which would still score for the old words; the sweep re-embeds it.
     async fn update_content(&self, _id: &str, _content: &str) -> Result<()> {
         anyhow::bail!("this store cannot edit a memory's text")
+    }
+
+    /// Move a memory to another tier, resetting its decay rate to that tier's default.
+    async fn update_tier(&self, _id: &str, _tier: MemoryTier) -> Result<()> {
+        anyhow::bail!("this store cannot change a memory's tier")
     }
 
     /// Update the lifecycle status of a memory.
