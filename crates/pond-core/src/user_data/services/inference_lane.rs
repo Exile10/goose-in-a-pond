@@ -205,7 +205,7 @@ pub const COMPACTION_QUIET_FOR_ITS_TURN: Duration = Duration::from_secs(5);
 pub const COMPACTION_QUIET: Duration = Duration::from_secs(30);
 /// Quiet before a pass for any other conversation. Its summary call sets aside the conversation
 /// being talked in, whose next turn then pays to get it back, and that next turn stops the pass
-/// anyway. On a Jetson Orin on 2026-10-13 such a pass started 5 s after every turn of the current
+/// anyway. Measured on a Jetson Orin, such a pass started 5 s after every turn of the current
 /// conversation, was stopped by the next one, and cost each of them 6-13 s more to the first
 /// token. Two minutes is longer than the pauses between turns there (14-19 s, at most 108 s).
 pub const COMPACTION_QUIET_FOR_ANOTHER: Duration = Duration::from_secs(120);

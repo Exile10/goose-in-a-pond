@@ -245,9 +245,8 @@ or you have no tool for it, say so plainly instead of guessing.)";
 ///
 /// A small model with reasoning on can spend a whole round, or the round after a tool call, in
 /// reasoning and end without text; goose drops that round as empty. A tool call already counts as
-/// visible output, so the empty-turn re-engagement never ran and the turn ended with no reply
-/// (gemma-4-E2B, the "Daily Brief", 2026-10-13). The final reply asks for the answer once, with
-/// reasoning off for that call.
+/// visible output, so the empty-turn re-engagement would not run and the turn would end with no
+/// reply. The final reply asks for the answer once, with reasoning off for that call.
 #[derive(Debug, Default)]
 struct FinalReply {
     asked: bool,
@@ -7132,9 +7131,9 @@ mod tests {
         (wrote_text, reasoned)
     }
 
-    /// 2026-10-13 on the Jetson, gemma-4-E2B with reasoning on, the "Daily Brief": reasoning and
-    /// the weather call, then two rounds of reasoning alone, which goose dropped. No text at all,
-    /// and the tool call kept the empty-turn re-engagement from running.
+    /// A small model with reasoning on: reasoning and the weather call, then two rounds of
+    /// reasoning alone, which goose drops. No text at all, and the tool call keeps the empty-turn
+    /// re-engagement from running.
     #[test]
     fn a_tool_call_then_reasoning_only_gets_the_final_reply() {
         let attempt = vec![
