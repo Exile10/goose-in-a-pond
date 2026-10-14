@@ -30,6 +30,7 @@ Two properties matter more than they look, and both were violated at once in Sep
 | Quit and health loop | `pond-desktop/electron/main/lifecycle.ts` | One idempotent teardown; a cancellable loop |
 | Orphan reaping | `pond-desktop/electron/main/orphan.ts` | Pidfile, liveness, identity. Shared with the voice child |
 | Data dir and port file | `pond-desktop/electron/main/dataDir.ts` | Mirrors the server's `default_data_dir`; also reads `.runtime_host_credential`, which the renderer gets over IPC (`host_credential`, `electron/main/ipc.ts`) and sends as `X-Pond-Host-Credential` |
+| IPC sender and navigation | `pond-desktop/electron/main/navigation.ts` | The app's origins; `ipc.ts` refuses any other sender, and no window leaves them (2026-10-12, see `docs/auth-network-posture.md`) |
 | Wiring | `pond-desktop/electron/main/index.ts` | Events, window, the real implementations of every seam |
 
 ## Lifecycle and budgets

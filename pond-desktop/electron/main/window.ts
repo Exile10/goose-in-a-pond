@@ -1,6 +1,6 @@
 // The one main window; Canvas is a renderer section, not a second window.
 
-import { BrowserWindow, screen, shell } from "electron";
+import { BrowserWindow, screen } from "electron";
 import { join } from "node:path";
 import { rendererEntryUrl } from "./protocol";
 import {
@@ -87,12 +87,7 @@ export function createMainWindow(opts: CreateWindowOptions): BrowserWindow {
   // Show only once the first paint is ready, so there is no white flash.
   win.once("ready-to-show", () => win.show());
 
-  // target=_blank and window.open go to the real browser, never an in-app window.
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
-    return { action: "deny" };
-  });
-
+  // Navigation and new windows are guarded for every web contents; see guardNavigation.
   void win.loadURL(opts.devServerUrl ?? rendererEntryUrl());
 
   // Save on "moved"/"resized" (settled), not on every frame of a drag.

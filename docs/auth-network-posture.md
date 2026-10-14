@@ -75,6 +75,18 @@ local development; the Host and Origin checks still apply.
 Software running as the Pond's own OS account can read the credential; no
 application-level control protects against that, and none is claimed.
 
+The desktop shell answers IPC only from its own page (2026-10-12). Before then any page
+its main window ended up showing could call `host_credential`, since `ipc.ts` ignored
+the sender. Every `giap:` command is now refused, without running its handler, unless
+the call comes from the main frame and that frame is on `app://giap`, or on the Vite dev
+server's origin when `GIAP_DEV_SERVER` names one. The window cannot get to another page
+either: `electron/main/navigation.ts` cancels a main-frame navigation or server redirect
+to any other origin, for every web contents the app creates, and hands an http(s)
+destination to the system browser. Any other scheme, and any `window.open` that is not
+http(s), is dropped with a warning rather than given to the OS to launch. The origin is
+compared as `scheme://host[:port]`, not `URL.origin`, which is the opaque `null` for
+`app://`.
+
 Do not publish the listener on the public internet. An untrusted tailnet node
 can reach public API routes; encrypting transport does not authenticate its user.
 This branch also includes W3 authorization checks for session revocation,
