@@ -382,7 +382,11 @@ household's user. The first such read stamps `absentSince` on the record; any re
 that finds a node clears it, and that node is deleted as before. A node deleted in a
 pass therefore still counts as present in that pass, and a registration still in
 flight shows up well inside the 24 hours. Older state files load unchanged, their
-records simply unstamped. Before this a record was kept for good, so 256
+records simply unstamped. The reverse does not hold: an older `pond-enrollment`
+refuses a state file that holds `absentSince`, as it refuses any unknown field, and
+restarts in a loop, and the first stamp lands within about 30 seconds of the upgrade.
+Back up `/state` before deploying this version; rolling back needs that backup, or
+`absentSince` removed from the state file. Before this a record was kept for good, so 256
 replacements, each recovery and since 2026-10-05 each lapsed phone coming back,
 left a household unable to replace any phone without an operator editing the store.
 
