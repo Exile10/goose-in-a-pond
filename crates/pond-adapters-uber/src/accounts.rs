@@ -55,7 +55,8 @@ pub struct SignInRelay {
 }
 
 /// What Uber returns for a sign-in or a renewal, as the relay passes it on.
-#[derive(Debug, Deserialize)]
+/// No `Debug`: it holds the member's tokens.
+#[derive(Deserialize)]
 struct TokenSet {
     access_token: String,
     refresh_token: Option<String>,
