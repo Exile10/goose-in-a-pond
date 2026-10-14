@@ -38,6 +38,11 @@ void i18n.use(initReactI18next).init({
     instructions: 'This browser has not been signed in. On the Pond, run this command and open the link it prints:',
     restart: 'The link stops working when the Pond restarts. Run the command again for a new one.',
     hostOnly: 'This browser is no longer signed in to the Pond, probably because it restarted. Run `pond-server dashboard` on the Pond and open the new link.',
+  }, models: {
+    unavailable: {
+      litert_library_missing: 'Needs the LiteRT-LM library: run giap.sh litert build',
+      other: 'This pond cannot run this model',
+    },
   }, pairing: {
     unavailable: 'HTTPS pairing is unavailable. Check the Pond server logs.',
     fingerprint: 'Public-key fingerprint', address: 'HTTPS address',

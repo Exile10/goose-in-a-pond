@@ -92,6 +92,13 @@
   min-width: 0;
 }
 
+/* In place of the button, for a model this pond cannot run. */
+.mm-pick__note {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
 .mm-pick__size {
   font-family: var(--font-mono);
   font-size: var(--text-sm);

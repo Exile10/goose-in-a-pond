@@ -8,6 +8,7 @@ import type {
 } from "../../api/types";
 import { DEFAULT_HEADROOM_MB, modelResidencyMb, usableBudgetMb } from "../../api/modelFit";
 import { engineOf, providerOf } from "../../lib/modelProvider";
+import i18n from "../../i18n";
 
 // Pure arithmetic and wording behind the Models surfaces, kept out of the components so it tests
 // without a browser. The classic page, the hub screen and the no-model panel all read it.
@@ -453,4 +454,15 @@ export function groupByJob(models: ModelEntry[]): JobGroup[] {
     label: role.label,
     models: models.filter((m) => rolesFor(m).includes(role.key)),
   })).filter((g) => g.models.length > 0);
+}
+
+/** Why this pond cannot run `m`, in the household's words; null when it can. The pond refuses to
+ *  download or use such a model, so every surface shows this instead of those buttons. */
+export function unavailableNote(
+  m: Pick<ModelEntry, "available" | "unavailable_reason">,
+): string | null {
+  if (m.available !== false) return null;
+  return i18n.t(`models.unavailable.${m.unavailable_reason ?? "other"}`, {
+    defaultValue: i18n.t("models.unavailable.other"),
+  });
 }

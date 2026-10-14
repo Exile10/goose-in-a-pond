@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use pond_core::models::domain::curated;
-use pond_core::models::domain::engine::Engine;
+use pond_core::models::domain::engine::{Engine, EngineAvailability};
 use pond_core::models::domain::model_layout;
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
 use pond_core::models::domain::recommended::{self, DeviceClass};
@@ -15,12 +15,15 @@ use pond_core::models::ports::agent::Agent;
 
 use crate::{AppState, CompanionDto, MeasuredDto, ModelStatusEntry, RecommendedDto};
 
+/// `m` as the catalogue shows it; `engines` decides whether this pond can run it.
 pub(crate) fn record_to_dto(
     m: &ModelRecord,
     assignments: &[ModelRoleAssignment],
+    engines: EngineAvailability,
 ) -> ModelStatusEntry {
     let active = assignments.iter().any(|a| a.model_id == m.id);
     let pick = curated::for_record(m);
+    let unavailable = engines.unavailable_for(&m.category);
     ModelStatusEntry {
         category: m.category.as_str().to_string(),
         name: m.name.clone(),
@@ -53,6 +56,8 @@ pub(crate) fn record_to_dto(
         acquire: Some(Acquisition::of(m, pick.is_some())),
         recommended: recommendation(&m.id, DeviceClass::current()),
         companions: Vec::new(),
+        available: unavailable.is_none(),
+        unavailable_reason: unavailable,
     }
 }
 
