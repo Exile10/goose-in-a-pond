@@ -50,7 +50,7 @@ export function RemoteAccess() {
   }, []);
   useEffect(() => {
     refreshDevice();
-    return () => { deviceGeneration.current++; };
+    return () => { deviceGeneration.current += 1; };
   }, [refreshDevice]);
   useEffect(() => {
     let active = true;
