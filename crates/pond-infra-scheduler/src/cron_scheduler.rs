@@ -209,8 +209,24 @@ impl CronSchedulerAdapter {
                     self.add_one_shot_to_scheduler(&record.id, at, kind).await?
                 } else {
                     // Unraced: the scheduler starts only after rehydration.
-                    self.add_job_to_scheduler(&record.id, &record.cron, &record.timezone, kind)
-                        .await?
+                    match self
+                        .add_job_to_scheduler(&record.id, &record.cron, &record.timezone, kind)
+                        .await
+                    {
+                        Ok(job) => job,
+                        // One schedule that can never fire again must not take every other
+                        // schedule and rule down with it; it stays listed for editing.
+                        Err(e) => {
+                            tracing::error!(
+                                task = %record.id,
+                                cron = %record.cron,
+                                timezone = %record.timezone,
+                                error = %e,
+                                "a stored schedule could not be armed; it is kept but does not fire"
+                            );
+                            uuid::Uuid::nil()
+                        }
+                    }
                 }
             };
 
@@ -461,7 +477,9 @@ impl RecurringJob {
                 tracing::debug!(task = %self.id, job = %fired, "superseded occurrence; not running");
                 return;
             }
-            match self.clone().arm(at).await {
+            // After now, not after `at`: occurrences missed while the machine slept or the
+            // clock jumped are one late fire, not a burst of them.
+            match self.clone().arm(at.max(Utc::now())).await {
                 Ok(next) => {
                     if let Some(entry) = guard.get_mut(&self.id) {
                         entry.job_id = next;
@@ -1558,6 +1576,41 @@ mod tests {
         let task = tasks.iter().find(|t| t.id == "cadence2").unwrap();
         assert_eq!(task.cron, "0 0 9 * * *");
         assert!(task.fire_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_schedule_with_no_next_occurrence_does_not_take_the_others_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let sched = make_scheduler(tmp.path()).await;
+            for id in ["daily", "april31"] {
+                sched
+                    .create_task(create_req(id, "0 0 9 * * *"))
+                    .await
+                    .unwrap();
+            }
+        }
+        // April has no 31st, so this expression never fires again.
+        let path = tmp.path().join("schedules.json");
+        let mut records: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for record in &mut records {
+            if record["id"] == "april31" {
+                record["cron"] = serde_json::Value::from("0 0 9 31 4 *");
+            }
+        }
+        std::fs::write(&path, serde_json::to_string(&records).unwrap()).unwrap();
+
+        let restarted = make_scheduler(tmp.path()).await;
+        let ids: Vec<String> = restarted
+            .list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        assert!(ids.iter().any(|id| id == "daily"), "{ids:?}");
+        assert!(ids.iter().any(|id| id == "april31"), "{ids:?}");
     }
 
     #[tokio::test]
