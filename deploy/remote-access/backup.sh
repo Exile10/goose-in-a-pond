@@ -25,8 +25,7 @@ ARCHIVE="$OUT/control-plane-$STAMP.tar.age"
 # verifies what it collected (the pilot's Mac does), and this host holds no key to it.
 # Read the same file the systemd unit names, so a run by hand behaves like the nightly one.
 # unquote reads a value the way systemd's EnvironmentFile= does: surrounding whitespace,
-# a trailing carriage return and one pair of matching quotes are not part of it. Without
-# this, BACKUP_OFFSITE="pull" worked from the unit and was refused when run by hand.
+# a trailing carriage return and one pair of matching quotes are not part of it.
 unquote() {
   local value="${1%$'\r'}"
   value="${value#"${value%%[![:space:]]*}"}"
