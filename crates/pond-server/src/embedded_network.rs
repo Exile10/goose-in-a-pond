@@ -2582,6 +2582,7 @@ mod tests {
             }),
         )
         .await
+        .map_err(|refused| refused.status())
     }
 
     /// A removal while the helper is still enrolling the phone used to find no record, queue
