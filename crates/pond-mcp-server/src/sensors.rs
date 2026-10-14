@@ -177,7 +177,7 @@ mod reading_words {
     }
 }
 
-/// How long ago, in the coarsest true unit; a model relays a bare timestamp as current.
+/// Marked failed, so the prompt's rule against repeating a failed call applies.
 fn store_unreadable(what: &str) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(crate::format::format_dead_end(
         what,
@@ -187,6 +187,7 @@ fn store_unreadable(what: &str) -> CallToolResult {
     ))])
 }
 
+/// How long ago, in the coarsest true unit; a model relays a bare timestamp as current.
 fn describe_age(elapsed: chrono::Duration) -> String {
     let seconds = elapsed.num_seconds().max(0);
     match seconds {
