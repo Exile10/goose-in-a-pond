@@ -1056,6 +1056,11 @@ export interface RecoveryRequest {
   /** The start of the replacement's machine key, which the phone also shows. */
   keyPreview: string;
   approved: boolean;
+  /**
+   * Set once the household approved this recovery and the coordinator still refused it:
+   * the coordinator's reason, e.g. `retired_capacity`, each with its own `remote.*` message.
+   */
+  refused?: string;
 }
 
 /** Response from the loopback-only GET /api/v1/handshake/pairing-code. */
