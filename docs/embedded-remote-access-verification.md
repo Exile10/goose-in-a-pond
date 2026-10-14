@@ -286,7 +286,10 @@ their logs were not kept. Details, including the removed-phone erasure, are in
   Combined GPU inference/transcription and clean shutdown pass with cached public
   embedding assets. Fresh/populated HTTPS checks pass. An uncached embedding
   download can outlive startup timeout and block runtime shutdown; this existing
-  background-download issue remains separate. The validated production binary
+  background-download issue remains separate. (Resolved 2026-10-13: the runtime is
+  now dropped with a 10 s bound, `SHUTDOWN_GRACE` in `pond-server`'s `main`, so a
+  model load still running on a blocking thread no longer keeps the process from
+  exiting; it is logged as `shutdown_abandoned_blocking_work`.) The validated production binary
   and helper are now installed with a private rollback backup.
 - Out-of-band coordinator inventory drift has unit coverage; additional real
   coordinator mutation cases remain unmeasured.
