@@ -239,6 +239,13 @@ stop every sweep, which failed open; it is now moved aside as
 `presence.json.corrupt-<time>` and every phone in the enrollment record is treated
 as last seen when the file was last written, so each still lapses within the window.
 
+A device's sighting is removed only once its revocation is saved, or once there is
+nothing to revoke (2026-10-12). The sighting is what makes the next sweep queue the
+device again, and it used to be removed first, so a revocation whose save failed
+(a full disk, an unreadable `revocations.json`) left a phone that never lapsed.
+Removing it also clears that device's hourly write throttle, so a phone that comes
+home straight after is recorded at once.
+
 `GET /api/v1/notifications/stream?device_id=...` and
 `POST/DELETE /api/v1/devices/{id}/push-token` require the target device to match
 `Principal.device_id`, obtained by the middleware from `caller_for_token`.
