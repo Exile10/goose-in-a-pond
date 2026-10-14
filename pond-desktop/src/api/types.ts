@@ -720,6 +720,9 @@ export interface ModelRecommendation {
   measured?: ModelMeasured;
 }
 
+/** Why a pond cannot run a model's engine. */
+export type ModelUnavailableReason = "litert_library_missing";
+
 export interface ModelEntry {
   /** `"{category}/{name}"`, the key of the row and of its downloads (`DownloadEntry.model_id`). */
   id: string;
@@ -752,6 +755,10 @@ export interface ModelEntry {
   recommended?: ModelRecommendation;
   /** Separate downloads that extend the model; none means text only. */
   companions?: ModelCompanion[];
+  /** False when this pond cannot run the model's engine; the pond refuses to fetch or use it. */
+  available?: boolean;
+  /** Why `available` is false. */
+  unavailable_reason?: ModelUnavailableReason;
 }
 
 /** GET /api/v1/warmup — the boot/model-change prefix warm-up (see Agent::prewarm). */

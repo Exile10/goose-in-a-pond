@@ -136,6 +136,17 @@ With none of them the backend falls back to its own search.
 With nothing recorded, staging and deploy warn and carry on: the app or the device then runs without
 the litert backend. A recorded package that fails verification stops them.
 
+### With no library at all (2026-10-13)
+
+After deciding, pond-server checks the places goose's backend searches (`GOOSE_LITERT_LIB_DIR`,
+`litert-lm/` beside the executable, the executable's directory, `<data dir>/engine/data/litert-lm/lib`)
+and, when none holds the library, logs a `WARN` naming them. The catalogue then lists every
+LiteRT-LM model as unavailable (`litert_library_missing`), the dashboard disables it with "Needs the
+LiteRT-LM library: run giap.sh litert build", and the pond refuses to download or switch to one with a
+409 ([models.md](models.md#an-engine-this-pond-cannot-run-2026-10-13)). Before this, a Jetson nothing
+was deployed to offered the model, accepted the switch, and failed every turn with `liblitert-lm.so
+not found`. Install the package, then restart the pond: the check runs once, at startup.
+
 ## When Bazel stalls on downloads
 
 From some networks `storage.googleapis.com` resolves to front ends that serve Bazel at 5-30 KB/s and

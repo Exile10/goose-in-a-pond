@@ -124,6 +124,8 @@ struct Parts {
     scheduler: Scheduler,
     /// The real settings store, for a test that reads `chat_provider` back through `get`.
     sqlite_settings: bool,
+    /// A pond that started without a LiteRT-LM library.
+    litert_library_missing: bool,
 }
 
 async fn pond_with_catalog(
@@ -148,6 +150,7 @@ async fn pond_with_parts(
         catalog,
         scheduler,
         sqlite_settings,
+        litert_library_missing,
     } = parts;
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
@@ -200,6 +203,9 @@ async fn pond_with_parts(
         model_repo: Some(model_repo.clone()),
         data_dir: Some(tmp.path().to_path_buf()),
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: !litert_library_missing,
+        },
         scheduler: None,
         model_scheduler: scheduler,
         mcp_memory: None,
@@ -633,6 +639,98 @@ async fn activate_litert_model_sets_local_provider_in_settings() {
     assert_eq!(model.as_deref(), Some(LITERT));
     let assignment = repo.get_assignment("chat").await.unwrap().unwrap();
     assert_eq!(assignment.model_id, format!("litert/{LITERT}"));
+}
+
+/// Without the library a LiteRT-LM model is listed as unavailable, with the reason, and the pond
+/// refuses to switch to it or fetch it rather than failing on the first turn.
+#[tokio::test]
+async fn without_the_litert_library_its_models_are_unavailable_and_refused() {
+    let f = pond_with_parts(
+        Arc::new(MockAgent::new()),
+        Parts {
+            litert_library_missing: true,
+            ..Parts::default()
+        },
+    )
+    .await;
+    f.repo.upsert(&litert_record(LITERT)).await.unwrap();
+    f.repo.upsert(&gguf_record("gemma-4-E2B")).await.unwrap();
+    let not_here = ModelRecord {
+        downloaded: false,
+        ..litert_record("gemma-4-E4B-it.litertlm")
+    };
+    f.repo.upsert(&not_here).await.unwrap();
+
+    let list = f
+        .app
+        .clone()
+        .oneshot(auth_req("GET", "/api/v1/models", None))
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list = body_json(list).await;
+    let litert = list["litert"].as_array().unwrap();
+    assert_eq!(litert.len(), 2, "{list}");
+    for row in litert {
+        assert_eq!(row["available"], false, "{row}");
+        assert_eq!(row["unavailable_reason"], "litert_library_missing", "{row}");
+    }
+    assert_eq!(list["gguf"][0]["available"], true, "{list}");
+    assert!(
+        list["gguf"][0].get("unavailable_reason").is_none(),
+        "{list}"
+    );
+
+    let switch = f
+        .app
+        .clone()
+        .oneshot(auth_req(
+            "POST",
+            &format!("/api/v1/models/litert/{LITERT}/activate"),
+            Some(serde_json::json!({ "role": "chat" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(switch.status(), StatusCode::CONFLICT);
+    let switch = body_json(switch).await;
+    assert_eq!(switch["reason"], "litert_library_missing", "{switch}");
+    assert!(
+        switch["error"]
+            .as_str()
+            .unwrap()
+            .contains("giap.sh litert build"),
+        "{switch}"
+    );
+    assert!(
+        f.repo.get_assignment("chat").await.unwrap().is_none(),
+        "a refused switch assigns nothing"
+    );
+    assert_eq!(f.settings.get_key("chat_model").await.unwrap(), None);
+
+    let fetch = f
+        .app
+        .clone()
+        .oneshot(auth_req(
+            "POST",
+            "/api/v1/models/litert/gemma-4-E4B-it.litertlm/download",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(fetch.status(), StatusCode::CONFLICT);
+    assert!(f.tracker.read().await.is_empty(), "nothing was fetched");
+
+    // A model whose engine is here still switches.
+    let gguf = f
+        .app
+        .oneshot(auth_req(
+            "POST",
+            "/api/v1/models/gguf/gemma-4-E2B/activate",
+            Some(serde_json::json!({ "role": "chat" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(gguf.status(), StatusCode::OK);
 }
 
 /// A chat model saved through settings must keep pointing at the litert row, not a gguf one.

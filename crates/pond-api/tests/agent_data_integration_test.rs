@@ -170,6 +170,9 @@ async fn make_app_full(
         model_repo: None,
         data_dir: Some(tmp.path().to_path_buf()),
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: true,
+        },
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,
@@ -459,6 +462,9 @@ async fn prompt_template_delete_system_returns_403() {
         model_repo: None,
         data_dir: None,
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: true,
+        },
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,
@@ -975,6 +981,9 @@ async fn returns_501_when_repos_not_configured() {
         model_repo: None,
         data_dir: None,
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: true,
+        },
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,

@@ -20,6 +20,30 @@ Every conversation row names the engine that runs it, derived from its category
 `Engine::backend_id` is the goose registry's id (`litert` for LiteRT-LM, none for llama.cpp);
 goose keeps its own copy private.
 
+### An engine this pond cannot run (2026-10-13)
+
+LiteRT-LM is the one engine that needs a library the pond does not build itself (see
+[litert-lm.md](litert-lm.md)). At startup `litert_runtime::ensure_library_dir` in
+`crates/pond-server/src/litert_runtime.rs` checks every place goose's `litert` backend searches and
+returns whether one holds the library; `serve` puts the answer in
+`AppState::engine_availability` (`EngineAvailability` in `engine.rs`), logging a `WARN` with the
+searched paths when there is none. Without it:
+
+- `GET /api/v1/models` lists each `litert` row with `"available": false` and
+  `"unavailable_reason": "litert_library_missing"`. Every other row carries `"available": true`; a
+  client that predates the field reads its absence as available.
+- `POST /models/{category}/{name}/activate` and `POST /models/{category}/{name}/download` answer
+  `409 {"error": ..., "reason": "litert_library_missing"}` and change nothing, instead of accepting
+  a model that fails on its first turn or fetching gigabytes nothing here can run.
+- The dashboard keeps such a model listed but disabled, with "Needs the LiteRT-LM library: run
+  giap.sh litert build" (`unavailableNote` in `sections/models/modelsView.ts`, the string in
+  `src/i18n.ts`) in the chat's model switcher, the Models rows and pick cards; the settings chat
+  picker leaves it out.
+
+The decision is made once, so installing the library takes a pond restart. `PUT /api/v1/settings`
+with a LiteRT-LM `chat_model` is not refused: the dashboard no longer offers one there, and a
+whole-settings save must not fail because of a model chosen before the library went missing.
+
 ## Sources, purpose, acquisition
 
 `crates/pond-core/src/models/domain/taxonomy.rs`, all derived from the row:

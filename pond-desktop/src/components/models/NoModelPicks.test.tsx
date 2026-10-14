@@ -69,6 +69,16 @@ describe("no conversation model", () => {
     expect(api.activateModel).not.toHaveBeenCalled();
   });
 
+  it("offers no download of a pick this pond cannot run, and says what it needs", async () => {
+    setup([e4b(), e2b(), litertE4b({ available: false, unavailable_reason: "litert_library_missing" })]);
+    render(<NoModelPicks />);
+    const lite = await pickCard("Gemma 4 E4B, LiteRT-LM");
+    expect(within(lite).getByText("Needs the LiteRT-LM library: run giap.sh litert build")).toBeTruthy();
+    expect(within(lite).queryByRole("button")).toBeNull();
+    const best = await pickCard("Gemma 4 E4B, llama.cpp");
+    expect(within(best).getByRole("button", { name: "Download and use Gemma 4 E4B, llama.cpp" })).toBeTruthy();
+  });
+
   it("starts the add-on unticked where only the model fits, says why, and downloads without it", async () => {
     setup([e4b(), e2b(), litertE4b()], [], ORIN_MEMORY);
     render(<NoModelPicks />);

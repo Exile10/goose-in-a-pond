@@ -88,6 +88,9 @@ async fn make_app_with_mesh_provider_and_capabilities(
         model_repo: None,
         data_dir: Some(tmp.path().to_path_buf()),
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: true,
+        },
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,
@@ -204,6 +207,9 @@ async fn make_app_with_settlement_deps() -> (
         model_repo: None,
         data_dir: Some(tmp.path().to_path_buf()),
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: true,
+        },
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,

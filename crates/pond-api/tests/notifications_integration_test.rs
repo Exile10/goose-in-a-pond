@@ -104,6 +104,9 @@ async fn make_app() -> Harness {
         model_repo: None,
         data_dir: Some(tmp.path().to_path_buf()),
         skip_onboarding: true,
+        engine_availability: pond_core::models::domain::engine::EngineAvailability {
+            litert_library: true,
+        },
         scheduler: None,
         model_scheduler: None,
         mcp_memory: None,

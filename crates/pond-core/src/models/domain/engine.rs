@@ -95,6 +95,50 @@ impl Engine {
     }
 }
 
+/// Why this pond cannot run an engine, as the wire names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineUnavailable {
+    /// LiteRT-LM's C API library is in none of the places goose's `litert` backend searches, so
+    /// every `.litertlm` model would fail on its first turn.
+    #[serde(rename = "litert_library_missing")]
+    LiteRtLibraryMissing,
+}
+
+impl EngineUnavailable {
+    /// The serialised reason.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::LiteRtLibraryMissing => "litert_library_missing",
+        }
+    }
+}
+
+/// Which engines this pond's process can run, decided once at startup by the server, which is
+/// the only layer that can look for the libraries an engine loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineAvailability {
+    /// Whether a LiteRT-LM library is where goose's `litert` backend will look for it.
+    pub litert_library: bool,
+}
+
+impl EngineAvailability {
+    /// Why `engine` cannot run here; `None` when it can.
+    pub fn unavailable(self, engine: Engine) -> Option<EngineUnavailable> {
+        match engine {
+            Engine::LiteRtLm if !self.litert_library => {
+                Some(EngineUnavailable::LiteRtLibraryMissing)
+            }
+            Engine::LiteRtLm | Engine::LlamaCpp | Engine::Ollama | Engine::Llamafile => None,
+        }
+    }
+
+    /// Why a model of `category` cannot run here; `None` for one that can, or that no
+    /// conversation engine runs.
+    pub fn unavailable_for(self, category: &ModelCategory) -> Option<EngineUnavailable> {
+        Engine::for_category(category).and_then(|engine| self.unavailable(engine))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +185,43 @@ mod tests {
     fn only_litert_names_a_goose_backend() {
         assert_eq!(Engine::LiteRtLm.backend_id(), Some("litert"));
         assert_eq!(Engine::LlamaCpp.backend_id(), None);
+    }
+
+    #[test]
+    fn without_the_litert_library_only_litert_models_are_unavailable() {
+        let missing = EngineAvailability {
+            litert_library: false,
+        };
+        assert_eq!(
+            missing.unavailable(Engine::LiteRtLm),
+            Some(EngineUnavailable::LiteRtLibraryMissing)
+        );
+        assert_eq!(
+            missing.unavailable_for(&ModelCategory::Litert),
+            Some(EngineUnavailable::LiteRtLibraryMissing)
+        );
+        for engine in [Engine::LlamaCpp, Engine::Ollama, Engine::Llamafile] {
+            assert_eq!(missing.unavailable(engine), None, "{}", engine.id());
+        }
+        assert_eq!(missing.unavailable_for(&ModelCategory::Whisper), None);
+    }
+
+    #[test]
+    fn with_the_litert_library_every_engine_is_available() {
+        let present = EngineAvailability {
+            litert_library: true,
+        };
+        for engine in Engine::ALL {
+            assert_eq!(present.unavailable(engine), None, "{}", engine.id());
+        }
+    }
+
+    #[test]
+    fn the_serialised_reason_is_the_id() {
+        let reason = EngineUnavailable::LiteRtLibraryMissing;
+        assert_eq!(
+            serde_json::to_value(reason).unwrap(),
+            serde_json::json!(reason.id())
+        );
     }
 }

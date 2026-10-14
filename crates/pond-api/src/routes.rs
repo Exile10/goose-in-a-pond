@@ -52,6 +52,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use pond_core::models::domain::engine::EngineUnavailable;
 use pond_core::models::domain::model_layout;
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord, ModelRoleAssignment};
 use pond_core::models::domain::model_role::ModelRole;
@@ -5875,7 +5876,7 @@ async fn list_models(
     let mut embedding = vec![];
 
     for m in &records {
-        let mut dto = record_to_dto(m, &assignments);
+        let mut dto = record_to_dto(m, &assignments, state.engine_availability);
         if let Some(v) = vision.get(&m.id) {
             dto.reads_images = Some(v.reads_images);
             dto.image_support_bytes = v.image_support_bytes;
@@ -5921,7 +5922,10 @@ async fn scan_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
     let entries: Vec<Value> = extras
         .iter()
-        .map(|m| serde_json::to_value(record_to_dto(m, &assignments)).unwrap_or_default())
+        .map(|m| {
+            serde_json::to_value(record_to_dto(m, &assignments, state.engine_availability))
+                .unwrap_or_default()
+        })
         .collect();
 
     Json(json!({"found": count, "entries": entries}))
@@ -6031,6 +6035,8 @@ async fn download_model(
     if m.downloaded {
         return Ok(Json(json!({"status": "already_downloaded", "name": name})));
     }
+    // Gigabytes for a model nothing here can run.
+    refuse_unavailable_engine(&state, &m, "download")?;
 
     // fastembed downloads embedding models itself on first use.
     if cat == ModelCategory::Embedding {
@@ -6250,6 +6256,34 @@ async fn disk_usage(
     })))
 }
 
+/// 409 for a model whose engine this pond cannot run, with the reason the catalogue lists it under.
+fn refuse_unavailable_engine(
+    state: &AppState,
+    model: &ModelRecord,
+    action: &'static str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let Some(reason) = state.engine_availability.unavailable_for(&model.category) else {
+        return Ok(());
+    };
+    tracing::warn!(
+        model = %model.id,
+        action,
+        reason = reason.id(),
+        "refused a model this pond cannot run"
+    );
+    let error = match reason {
+        EngineUnavailable::LiteRtLibraryMissing => format!(
+            "This pond has no LiteRT-LM library, so it cannot run {}. Build one with \
+             `giap.sh litert build`, install it, and restart the pond.",
+            model.name
+        ),
+    };
+    Err((
+        StatusCode::CONFLICT,
+        Json(json!({"error": error, "reason": reason.id()})),
+    ))
+}
+
 /// POST /api/v1/models/{category}/{name}/activate — assign to a role; mirrored into settings.
 async fn activate_model(
     State(state): State<Arc<AppState>>,
@@ -6312,6 +6346,8 @@ async fn activate_model(
                 Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)})),
             )
         })?;
+    // Accepted, it would only fail on the first turn.
+    refuse_unavailable_engine(&state, &record, "activate")?;
     // The found record's id: a forgiving TTS lookup may resolve another category.
     let model_id = record.id.clone();
 
