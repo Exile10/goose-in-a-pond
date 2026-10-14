@@ -18,10 +18,12 @@ such changes before testing them on a trusted repository branch. This workflow
 continues to use `pull_request`, never `pull_request_target`.
 
 On a fork PR the Rust job is therefore skipped rather than run to a certain
-failure, and `Rust — skipped on a fork PR` posts a warning on the run saying the
-Rust code is unverified. A skipped job is not a pass: before merging a fork PR
-that touches Rust, push its branch to `jarida-io/goose-in-a-pond` so the job runs
-with the secret. Pushes and same-repository PRs always run the job, and it fails
+failure. GitHub reports a skipped job as a success, so `Rust — skipped on a fork
+PR` fails in its place whenever the PR changes Rust (a `.rs` file, a Cargo
+manifest or lock, `crates/`, `vendor/`, `.cargo/`, `Cross.toml` or the goose
+submodule), and passes otherwise. Make both checks required together. To merge a
+fork PR that touches Rust, push its branch to `jarida-io/goose-in-a-pond` so the
+job runs with the secret. Pushes and same-repository PRs always run the job, and it fails
 loudly there when the secret is missing. Claude Code Review skips fork PRs for
 the same reason, since they get no OIDC token either. Comment `@claude review`
 to request a review instead.

@@ -96,8 +96,9 @@ jobs:
   #
   # A pull request from a fork gets no repository secrets, so CARGO_GITHUB_TOKEN is empty there
   # and the private llama-cpp-rs-giap fetch cannot succeed. Failing on a cause the author cannot
-  # fix was most of this job's red, so a fork PR skips it and `rust-fork-notice` says why. Pushes
-  # and same-repository PRs still run it, and still fail loudly when the secret is missing.
+  # fix was most of this job's red, so a fork PR skips it. A skipped job reports success, so
+  # `rust-fork-notice` fails in its place when the PR changes Rust; require both checks together.
+  # Pushes and same-repository PRs still run it, and still fail loudly when the secret is missing.
   rust:
     name: Rust — fmt / clippy / test
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -303,12 +304,25 @@ jobs:
     name: Rust — skipped on a fork PR
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     steps:
-      - name: Explain the skip
+      - name: Fail when the PR changes Rust
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
-          echo "::warning title=Rust not verified on this PR::$HEAD_REPO is a fork, and fork PRs get no CARGO_GITHUB_TOKEN, so the private jarida-io/llama-cpp-rs-giap dependency cannot be fetched. Push the branch to jarida-io/goose-in-a-pond to run the Rust checks before merging. See scripts/ci/README.md."
+          files="$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename')"
+          rust="$(printf '%s\n' "$files" | grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$|^(crates|vendor|\.cargo)/|^goose$|^Cross\.toml$' || true)"
+          if [ -z "$rust" ]; then
+            echo "This PR changes no Rust, so the skipped Rust job leaves nothing unverified."
+            exit 0
+          fi
+          printf 'Rust in this PR:\n%s\n' "$rust"
+          echo "::error title=Rust not verified on this PR::$HEAD_REPO is a fork, and fork PRs get no CARGO_GITHUB_TOKEN, so the private jarida-io/llama-cpp-rs-giap dependency cannot be fetched. Push the branch to jarida-io/goose-in-a-pond to run the Rust checks before merging. See scripts/ci/README.md."
+          exit 1
 
   matter-server:
     name: Matter controller — tsc / vitest
