@@ -2024,6 +2024,27 @@ impl GooseAdapter {
         kept
     }
 
+    /// The text of every user message the conversation already holds, as the model was sent it.
+    async fn earlier_user_texts(&self, goose_sid: &str) -> Vec<String> {
+        let Ok(session) = self.session_manager.get_session(goose_sid, true).await else {
+            return Vec::new();
+        };
+        let Some(conversation) = session.conversation else {
+            return Vec::new();
+        };
+        Self::visible_user_texts(conversation.messages())
+    }
+
+    /// Only the user messages the model still sees: compaction keeps the originals it summarised,
+    /// hidden from the agent, and what they carried must count as not shown.
+    fn visible_user_texts(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter(|m| m.role == rmcp::model::Role::User && m.is_agent_visible())
+            .map(|m| m.as_concat_text())
+            .collect()
+    }
+
     /// Caps history images that keep pixels; the pending turn's image isn't in history yet.
     /// Writes nothing when within the cap: `replace_conversation` rewrites every row to eMMC.
     async fn cap_history_images(&self, goose_sid: &str) {
@@ -2554,25 +2575,25 @@ impl GooseAdapter {
             }
 
             if !budgeted.is_empty() {
-                let block = budgeted
+                use pond_core::models::services::context::memory_block;
+                let rendered: Vec<String> = budgeted
                     .iter()
                     .map(|m| {
                         let seg = m
                             .segment
                             .as_ref()
-                            .map(|s| format!("{:?}", s).to_lowercase())
-                            .unwrap_or_default();
-                        if seg.is_empty() {
-                            format!("- {}", m.content)
-                        } else {
-                            format!("- [{}] {}", seg, m.content)
-                        }
+                            .map(|s| format!("{:?}", s).to_lowercase());
+                        memory_block::line(seg.as_deref(), &m.content)
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                    .collect();
+                // An earlier turn's envelope stays in the history, so what it showed is still in
+                // front of the model; only the rest is news.
+                let earlier = self.earlier_user_texts(&goose_sid).await;
+                let fresh = memory_block::not_yet_shown(&rendered, &earlier);
 
                 tracing::debug!(
-                    fragments_injected = budgeted.len(),
+                    fragments_injected = fresh.len(),
+                    fragments_already_shown = rendered.len() - fresh.len(),
                     fragments_available = memory_candidates.len(),
                     tokens_used,
                     token_budget,
@@ -2581,7 +2602,11 @@ impl GooseAdapter {
                     effective_ctx,
                 );
 
-                memory_block_for_user_msg = block;
+                memory_block_for_user_msg = fresh
+                    .iter()
+                    .map(|line| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
 
                 // Feeds decay tracking; spawned to keep sequential DB writes off the hot path.
                 let ids: Vec<String> = budgeted.iter().map(|m| m.id.clone()).collect();
@@ -2792,6 +2817,15 @@ impl GooseAdapter {
             allowed_tools
         };
 
+        // A standing rule, not news: in the appendix it is prefilled once per session instead of on
+        // every turn (86 tokens a turn while it rode the envelope). The shim strips Goose's
+        // <turn-context>, so this note is the model's only turn budget.
+        let max_turns = settings.effective_max_turns(is_voice);
+        shim_appendix.push(pond_core::models::services::turn_budget::turn_budget_note(
+            (!settings.turns_are_uncapped(is_voice)).then_some(max_turns),
+        ));
+        // Standing too: the CURRENT CONTEXT line is news each turn, the rule for reading it is not.
+        shim_appendix.push(pond_core::models::services::prompt_builder::TEMPORAL_RULE.to_string());
         // Appendix, not envelope: it only changes with the tools block, so it's prefilled once.
         if !dormant_groups_note.is_empty() {
             shim_appendix.push(dormant_groups_note.clone());
@@ -2902,12 +2936,6 @@ impl GooseAdapter {
 
         // ── 8. Run the agentic loop ───────────────────────────────────────────
         // Everything per-turn rides the user message so the system+tools prefix stays byte-stable.
-        // The shim strips Goose's <turn-context>, so this note is the model's only turn budget.
-        let max_turns = settings.effective_max_turns(is_voice);
-        let turn_budget_block = pond_core::models::services::turn_budget::turn_budget_note(
-            (!settings.turns_are_uncapped(is_voice)).then_some(max_turns),
-        );
-
         let user_text = {
             let mut msg = String::with_capacity(512 + request.message.len());
             // `<user-message>` must come FIRST: stripping the trailing envelope from past turns
@@ -2915,7 +2943,7 @@ impl GooseAdapter {
             msg.push_str("<user-message>\n");
             msg.push_str(&request.message);
             msg.push_str("\n</user-message>\n");
-            // Always emitted, since the budget note is unconditional.
+            // Always emitted, since the answer contract is unconditional.
             msg.push_str("<system-context>\n");
             if !dynamic_suffix_for_user_msg.is_empty() {
                 msg.push_str(&dynamic_suffix_for_user_msg);
@@ -2926,8 +2954,6 @@ impl GooseAdapter {
                 msg.push_str(&memory_block_for_user_msg);
                 msg.push_str("\n</memories>\n");
             }
-            msg.push_str(&turn_budget_block);
-            msg.push('\n');
             // Last, nearest where the model writes: restates the part of the prefix that decays.
             msg.push_str(&pond_core::models::services::answer_contract::answer_contract());
             msg.push('\n');
@@ -4720,6 +4746,21 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_compacted_turn_does_not_count_as_already_shown() {
+        let messages = vec![
+            Message::user()
+                .with_text("before compaction")
+                .with_visibility(true, false),
+            Message::assistant().with_text("summary"),
+            Message::user().with_text("after compaction"),
+        ];
+        assert_eq!(
+            GooseAdapter::visible_user_texts(&messages),
+            ["after compaction"]
+        );
+    }
+
     // ── thinking section stability ────────────────────────────────────────
 
     /// Turns 1 and 2 must agree in "auto", or every session re-prefills on its second turn.
@@ -5121,18 +5162,35 @@ mod tests {
              turn keeps a copy. Envelope:\n{inside}"
         );
 
-        // After the budget note, so the reply's shape is the last thing before the request.
-        let budget_at = inside
-            .find("turn_budget_block")
-            .expect("the turn-budget note left the envelope");
+        // The last thing in the envelope, so the reply's shape is nearest where it is written.
         let contract_at = inside
             .find("answer_contract()")
             .expect("checked immediately above");
         assert!(
-            contract_at > budget_at,
-            "the answer contract is emitted before the turn budget. It is the closest \
-             instruction to where the answer gets written, which is the only reason it \
-             is restated here at all."
+            !inside[contract_at..].contains("push_str(&"),
+            "something is emitted after the answer contract. It is the closest instruction to \
+             where the answer gets written, which is the only reason it is restated per turn. \
+             Envelope:\n{inside}"
+        );
+
+        // A standing rule rides the cached appendix: in the envelope every turn re-prefilled it
+        // (86 tokens) and the history kept a copy of it per turn.
+        assert!(
+            !inside.contains("turn_budget"),
+            "the turn-budget note is back in the <system-context> envelope. Envelope:\n{inside}"
+        );
+        let code = lines.join("\n");
+        assert!(
+            code.contains(
+                "shim_appendix.push(pond_core::models::services::turn_budget::turn_budget_note("
+            ),
+            "the turn-budget note no longer goes into the session's appendix"
+        );
+        assert!(
+            code.contains(
+                "shim_appendix.push(pond_core::models::services::prompt_builder::TEMPORAL_RULE"
+            ),
+            "the date/time rule no longer goes into the session's appendix"
         );
     }
 

@@ -445,11 +445,18 @@ impl LocalInferenceLlmAdapter {
             n_threads: Some(4),
             // Halves KV memory on Ampere, and llama.cpp requires it for a quantised `type_v`.
             flash_attention: Some(true),
-            // q8_0 KV: ~half of f16's memory, quality-neutral on this board; q4_0 is 6.4x noisier.
-            type_k: Some("q8_0".to_string()),
-            type_v: Some("q8_0".to_string()),
-            // Compute buffer 522 -> 129 MiB versus the 512 default, at no measurable speed cost.
-            n_ubatch: Some(128),
+            // f16 KV. With the windowed cache only 4 of E4B's 24 KV layers grow with the context,
+            // so f16 costs 286 MiB at 16K against q8_0's 152 (and the full-size cache's 476), and
+            // decodes faster at depth: quantised KV sends flash attention down a kernel that
+            // re-reads K/V per query head. llama-bench on the Orin, E4B QAT, depth 0/4096/8192:
+            // f16 19.5/18.4/18.1 tok/s, q8_0 18.7/17.4/16.7; E2B f16 38.1/38.1/37.0, q8_0
+            // 36.9/35.1/33.3.
+            type_k: Some("f16".to_string()),
+            type_v: Some("f16".to_string()),
+            // Prefill on the Orin (llama-bench, E4B/E2B QAT, depth 0 and 4,096): 256 is 1-6% faster
+            // than 128 and 512 is slower than both. The compute buffer no longer scales with it:
+            // the engine reserves logits for one output, not for every ubatch token.
+            n_ubatch: Some(256),
             // On unified memory mlock makes every GPU access page-fault.
             use_mlock: false,
             // From the model's own template; see `tool_and_thinking_for`.
@@ -912,18 +919,18 @@ mod tests {
             n_batch: Some(512),
             n_threads: Some(4),
             flash_attention: Some(true),
-            type_k: Some("q8_0".to_string()),
-            type_v: Some("q8_0".to_string()),
-            n_ubatch: Some(128),
+            type_k: Some("f16".to_string()),
+            type_v: Some("f16".to_string()),
+            n_ubatch: Some(256),
             use_mlock: false,
             tool_calling: ToolCallingMode::ForceNative,
             enable_thinking: true,
             ..Default::default()
         };
 
-        assert_eq!(settings.n_ubatch, Some(128));
-        assert_eq!(settings.type_k.as_deref(), Some("q8_0"));
-        assert_eq!(settings.type_v.as_deref(), Some("q8_0"));
+        assert_eq!(settings.n_ubatch, Some(256));
+        assert_eq!(settings.type_k.as_deref(), Some("f16"));
+        assert_eq!(settings.type_v.as_deref(), Some("f16"));
         // llama.cpp refuses a quantised V cache without flash attention.
         assert_eq!(settings.flash_attention, Some(true));
     }

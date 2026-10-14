@@ -5,7 +5,7 @@
 pub fn turn_budget_note(max_steps: Option<u32>) -> String {
     let body = match max_steps {
         // Guards against the model stopping early to ask permission to continue.
-        None => "Your reasoning budget for this request is unbounded. Take as many \
+        None => "Your reasoning budget for each request is unbounded. Take as many \
                  tool-calling steps as the task genuinely needs and do not stop \
                  early to ask whether you should keep going — finish the task, \
                  then answer."
@@ -13,7 +13,7 @@ pub fn turn_budget_note(max_steps: Option<u32>) -> String {
         // A CEILING, not a target: pacing language here licenses partial answers in every
         // default install (`agent_max_turns` = 50). A partial answer must say it is partial.
         Some(steps) => format!(
-            "You may take up to {steps} tool-calling steps for this request. Use as \
+            "You may take up to {steps} tool-calling steps for each request. Use as \
              many as the task genuinely needs — do not stop early, and do not ask \
              whether you should keep going. If you actually reach the limit, answer \
              with what you have AND say plainly which parts you could not complete. \
@@ -86,7 +86,7 @@ mod tests {
         );
     }
 
-    /// The adapter concatenates it into `<system-context>` beside `<memories>`.
+    /// The adapter puts it in the session's cached system appendix, beside other standing notes.
     #[test]
     fn note_is_a_single_well_formed_element() {
         for note in [turn_budget_note(None), turn_budget_note(Some(8))] {

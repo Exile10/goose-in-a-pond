@@ -6016,23 +6016,21 @@ async fn compose_suggestions(
 /// compacting it anyway (goose's own rule, asked of the agent) starts after 5 s, and that turn
 /// waits for it rather than stopping it: stopping it would throw the summary away for the turn to
 /// write it again from the start. Only a turn for another conversation stops it.
+///
+/// Both short quiets belong to the conversation the household is in (the latest turn's). A pass
+/// for any other conversation sets that one aside in the model, so it waits two minutes, and
+/// twice as long again each time someone coming back stops it (`compaction_quiet`).
 async fn run_quiet_compaction(
     state: Arc<AppState>,
     lane: Arc<crate::inference_lane_runner::InferenceLane>,
     last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
 ) {
     use pond_core::user_data::services::consolidation_schedule as sched;
-    use pond_core::user_data::services::inference_lane::LaneJob;
+    use pond_core::user_data::services::inference_lane::{self, LaneJob};
     use std::time::Duration;
 
     /// How often the monitor is asked.
     const POLL_SECS: u64 = 5;
-    /// Quiet before a pass that is only getting ahead, so a pause in a conversation is not
-    /// mistaken for its end.
-    const QUIET_SECS: u64 = 30;
-    /// Quiet before a pass the next turn would otherwise repeat: enough for the end of an answer
-    /// (its last sentences sent to speech) to clear the model first.
-    const QUIET_SECS_FOR_ITS_TURN: u64 = 5;
     /// A turn in flight that has not announced itself to the pass (every turn path does) stops
     /// even a pass its turn would wait for, once it has had this long to announce itself.
     const UNANNOUNCED_TURN_GRACE: Duration = Duration::from_secs(2);
@@ -6041,6 +6039,9 @@ async fn run_quiet_compaction(
     let started_at = std::time::Instant::now();
     let started_at_utc = chrono::Utc::now();
     let wake = lane.claim(LaneJob::Compaction);
+    // Passes stopped by someone coming back, per conversation, since it last compacted.
+    let mut times_stopped: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
 
     loop {
         let tick =
@@ -6080,14 +6081,28 @@ async fn run_quiet_compaction(
         let in_process_at = *last_user_activity.read().await;
         let now = chrono::Utc::now();
         let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
-        let quiet = if its_turn_compacts.contains(&true) {
-            QUIET_SECS_FOR_ITS_TURN
-        } else {
-            QUIET_SECS
-        };
+        let in_use = state.runs.quiet_passes().conversation_in_use();
+        let quiet_for: Vec<Duration> = due
+            .iter()
+            .zip(&its_turn_compacts)
+            .map(|(session_id, &compacts)| {
+                inference_lane::compaction_quiet(
+                    in_use.as_deref() == Some(session_id.as_str()),
+                    compacts,
+                    times_stopped.get(session_id).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        // The lane takes one quiet per job: the shortest, so the first pass due starts on time.
+        let quiet = quiet_for
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(inference_lane::COMPACTION_QUIET);
+        let waived = tick.waives();
         let cadence = crate::inference_lane_runner::Cadence::new(
             Duration::from_secs(POLL_SECS),
-            Duration::from_secs(quiet),
+            quiet,
             false,
         );
         // One `acquire` per tick, "nothing due" as `enabled: false`, as the reviewer does.
@@ -6096,7 +6111,7 @@ async fn run_quiet_compaction(
                 LaneJob::Compaction,
                 enabled && !due.is_empty() && !turn_running,
                 cadence,
-                tick.waives(),
+                waived,
                 sched::saw_activity_since_start(
                     started_at,
                     in_process_at,
@@ -6110,7 +6125,13 @@ async fn run_quiet_compaction(
             continue;
         };
 
-        for (session_id, its_turn_waits) in due.into_iter().zip(its_turn_compacts) {
+        for ((session_id, its_turn_waits), needs) in
+            due.into_iter().zip(its_turn_compacts).zip(quiet_for)
+        {
+            // A hand-asked tick runs every pass due; a scheduled one, those whose quiet has come.
+            if !waived && idle_for < needs {
+                continue;
+            }
             let started = std::time::Instant::now();
             let pass = state.runs.quiet_passes().begin(&session_id, its_turn_waits);
             // A returning user wins, unless the turn they start is one this pass is doing the
@@ -6173,13 +6194,15 @@ async fn run_quiet_compaction(
                     }
                     false
                 }
-                // No cooldown: the conversation is still due, and the next quiet tries again.
+                // No cooldown: the conversation is still due, and a longer quiet tries again.
                 () = someone_back => {
                     tracing::info!(
                         target: "giap::trace",
                         kind = "quiet_compaction_cancelled",
                         session_id = %session_id,
                         its_turn_waits,
+                        in_use = in_use.as_deref() == Some(session_id.as_str()),
+                        quiet_needed_s = needs.as_secs(),
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "someone came back during a quiet compaction; the turn compacts itself \
                          if it needs to"
@@ -6190,8 +6213,10 @@ async fn run_quiet_compaction(
             // Ends the pass, releasing any turn waiting on it, once the compaction is over.
             drop(pass);
             if stopped {
+                *times_stopped.entry(session_id).or_default() += 1;
                 break;
             }
+            times_stopped.remove(&session_id);
         }
 
         // Dropping the guard records the run and frees the slot on every path out.

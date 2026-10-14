@@ -5,6 +5,7 @@ pub mod context_budget;
 pub mod context_governor;
 pub mod context_monitor;
 pub mod image_history;
+pub mod memory_block;
 pub mod model_class;
 pub mod prefix_cache;
 pub mod token_counting;
