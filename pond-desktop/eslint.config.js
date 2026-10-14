@@ -40,8 +40,8 @@ export default defineConfig([
     plugins: { 'react-hooks': reactHooks },
     extends: [reactRefresh.configs.vite],
     rules: {
-      // Only the two classic hook rules. The React Compiler rules that the plugin's recommended set
-      // adds would report 69 existing hits (56 of them set-state-in-effect); not enabled yet.
+      // Only the two classic hook rules. The plugin's recommended set adds React Compiler rules,
+      // set-state-in-effect chief among them, that much of the existing code breaks.
       'react-hooks/rules-of-hooks': 'error',
       'react-hooks/exhaustive-deps': 'error',
       // Fast Refresh falls back to a full reload for a file that exports a component next to a
