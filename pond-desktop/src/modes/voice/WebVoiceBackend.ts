@@ -353,9 +353,10 @@ export class WebVoiceBackend implements VoiceBackend {
   private async playTtsSentence(text: string, signal: AbortSignal): Promise<void> {
     if (this.cancelled || signal.aborted || isTtsInterrupted()) return;
     try {
+      // Sent without a token, so the server asks for the host credential instead.
       const res = await fetch(`${this.serverUrl}/api/v1/tts`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(await api.hostHeaders()) },
         body: JSON.stringify({ text }),
         signal,
       });

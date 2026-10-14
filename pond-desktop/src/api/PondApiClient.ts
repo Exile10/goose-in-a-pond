@@ -327,8 +327,11 @@ export class PondApiClient {
     return this.request<T>("DELETE", path);
   }
 
-  /** Headers for routes that also need the host credential: pairing codes and remote access. */
-  private async hostHeaders(): Promise<Record<string, string>> {
+  /**
+   * Headers for routes that also need the host credential: pairing codes, remote access,
+   * onboarding reset, and speech synthesis by a caller without a token.
+   */
+  async hostHeaders(): Promise<Record<string, string>> {
     const credential = await hostCredential();
     return credential ? { "X-Pond-Host-Credential": credential } : {};
   }
@@ -408,15 +411,17 @@ export class PondApiClient {
     steps_completed: number;
     total_steps: number;
   }> {
-    return this.post("/api/v1/onboard/reset");
+    // Once set up, a reset from the host needs the host credential (or a token the server checks).
+    return this.hostRequest("POST", "/api/v1/onboard/reset");
   }
 
   /** WAV bytes for `text`; throws {@link ApiError} (e.g. 503) when no TTS backend runs. */
   async synthesizeSpeech(text: string): Promise<ArrayBuffer> {
     await this.ensureTokenFresh();
+    // The wizard previews voices before any token exists; then only the credential admits it.
     const res = await fetch(`${this.base}/api/v1/tts`, {
       method: "POST",
-      headers: this.headers("POST"),
+      headers: this.headers("POST", await this.hostHeaders()),
       body: JSON.stringify({ text }),
     });
     if (!res.ok) {

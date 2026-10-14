@@ -224,10 +224,16 @@ async fn app_with_repo(
         mesh_rebuild: None,
     });
     (
-        build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
+        // As the dashboard listener wires it, so host recovery can present the credential.
+        build_router(state, std::path::PathBuf::from("pond-desktop/dist"))
+            .layer(axum::Extension(CREDENTIAL.clone())),
         tmp,
     )
 }
+
+/// The host credential the server would have written to its data directory.
+static CREDENTIAL: std::sync::LazyLock<pond_api::host_guard::HostCredential> =
+    std::sync::LazyLock::new(pond_api::host_guard::HostCredential::generate);
 
 // ─────────────────────────────────────────────────────────────────
 // Public routes — must always be accessible
@@ -370,18 +376,39 @@ async fn put_settings_no_token(app: &axum::Router, body: &'static str) -> Status
 
 /// Anonymous `POST /onboard/reset` from a peer, as `into_make_service_with_connect_info` supplies.
 async fn reset_no_token(app: &axum::Router, peer: SocketAddr) -> StatusCode {
-    app.clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/onboard/reset")
-                .extension(ConnectInfo(peer))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    reset(app, peer, None, None).await.0
+}
+
+/// `POST /onboard/reset` from a peer, with a bearer and the host credential when given.
+async fn reset(
+    app: &axum::Router,
+    peer: SocketAddr,
+    bearer: Option<&str>,
+    credential: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/onboard/reset")
+        .extension(ConnectInfo(peer));
+    if let Some(bearer) = bearer {
+        request = request.header("Authorization", format!("Bearer {bearer}"));
+    }
+    if let Some(credential) = credential {
+        request = request.header(pond_api::host_guard::CREDENTIAL_HEADER, credential);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
         .await
-        .unwrap()
-        .status()
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 const AT_THE_POND: SocketAddr = SocketAddr::new(
@@ -425,9 +452,11 @@ async fn reset_then_recover_is_not_a_one_way_door() {
         StatusCode::UNAUTHORIZED
     );
 
-    // 2. Reset from loopback, no token: the trust boundary pairing already uses.
+    // 2. Reset from loopback with the host credential, no token: the boundary pairing uses.
     assert_eq!(
-        reset_no_token(&app, AT_THE_POND).await,
+        reset(&app, AT_THE_POND, None, Some(CREDENTIAL.as_str()))
+            .await
+            .0,
         StatusCode::OK,
         "reset must stay reachable from the host, or a pond misconfigured badly \
          enough to lose every token can only be fixed by reflashing it"
@@ -504,6 +533,36 @@ async fn reset_from_the_lan_without_a_token_is_refused_once_onboarded() {
     );
 }
 
+/// Another OS account, or a page on another local port, reaches loopback too. Without the
+/// credential only the Pond's own account can read, it could re-arm the wizard and open its
+/// writes to every LAN and tailnet peer.
+#[tokio::test]
+async fn reset_from_the_host_needs_the_host_credential_once_onboarded() {
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
+    let stale = pond_api::host_guard::HostCredential::generate();
+    for presented in [None, Some(stale.as_str())] {
+        let (status, body) = reset(&app, AT_THE_POND, None, presented).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{presented:?}");
+        assert_eq!(body["error"], "host_credential_required");
+    }
+    // A bearer the server cannot verify is no substitute.
+    let (status, _) = reset(&app, AT_THE_POND, Some("not-a-token"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        put_settings_no_token(&app, FULL_SETUP).await,
+        StatusCode::UNAUTHORIZED,
+        "a refused reset reopened the wizard"
+    );
+}
+
+/// The wizard's own "Start over" runs before any token or credential exists.
+#[tokio::test]
+async fn reset_stays_open_while_the_wizard_runs() {
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Basics)).await;
+    assert_eq!(reset_no_token(&app, ON_THE_LAN).await, StatusCode::OK);
+    assert_eq!(reset_no_token(&app, AT_THE_POND).await, StatusCode::OK);
+}
+
 /// The shipped "Start over" (`handleRestartOnboarding`) resets while its token is still set.
 #[tokio::test]
 async fn the_dashboard_can_still_restart_setup_with_its_token() {
@@ -521,6 +580,11 @@ async fn the_dashboard_can_still_restart_setup_with_its_token() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+
+    // From the host the middleware skips the token, so the handler checks it itself.
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
+    let (status, _) = reset(&app, AT_THE_POND, Some("test-token"), None).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 // ─────────────────────────────────────────────────────────────────

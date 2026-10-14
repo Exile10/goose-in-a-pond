@@ -615,7 +615,8 @@ pub struct PolicyRequest {
 }
 
 /// `POST /api/v1/player/egress-policy` -- the player page asks, before it loads a service's script,
-/// whether the network setting allows it. Loopback only, and untokened.
+/// whether the network setting allows it. It needs the page's bearer token, like the page's other
+/// routes: a tokenless loopback caller could be any page or process on the host.
 pub async fn player_egress_handler(body: Result<Json<PolicyRequest>, JsonRejection>) -> Response {
     let request = match body {
         Ok(Json(r)) if r.url.contains("://") => r,

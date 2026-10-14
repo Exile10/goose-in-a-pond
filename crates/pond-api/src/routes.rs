@@ -111,14 +111,14 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Public: the wizard sets location before any device pairs (see PUBLIC_ROUTES).
         .route("/time/zones", get(list_time_zones))
         .route("/location/detect", post(detect_location))
-        // Voice preview before pairing; the allowlist exempts only real loopback peers.
+        // Voice preview before pairing; a loopback peer without a token needs the host credential.
         .route("/tts", post(tts_synthesise))
         .route("/voice/tts/apply", post(apply_tts_settings))
         // Wake-word phrase calibration (public — used during onboarding WakeWord step)
         .route("/voice/calibrate", post(calibrate_wake_word))
         .route("/voice/calibrate", delete(reset_wake_word_calibration))
         .route("/system/info", get(system_info))
-        // Local diagnostics; network peers must authenticate.
+        // Local diagnostics; network peers must authenticate, and speaking needs the credential.
         .route("/test", get(test_services))
         .route("/test/speak", post(test_speak))
         // Profile create/patch are public so onboarding steps can write before completion
@@ -1189,10 +1189,65 @@ async fn onboarding_step(
     Ok(Json(onboarding_status_json(Some(target))))
 }
 
-/// Resets onboarding to `Welcome` and re-arms the onboarding guard (public).
+/// Admit a caller that holds a valid bearer token, or else the host credential.
+///
+/// The auth middleware lets some routes through from a loopback peer without reading any token,
+/// but a loopback peer is any process or OS account on the machine, and any page in its browser
+/// that gets past the Origin check. Those callers prove nothing, so a route that writes or
+/// spends anything asks them for the credential only the Pond's own account can read. A paired
+/// device's token is checked here even when the middleware skipped it, so a phone that reaches
+/// the Pond as a loopback peer (an emulator, a USB tunnel) keeps working.
+async fn bearer_or_host_credential(
+    state: &AppState,
+    principal: Option<&pond_core::security::ports::policy::Principal>,
+    credential: Option<&crate::host_guard::HostCredential>,
+    headers: &axum::http::HeaderMap,
+    operation: &'static str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    use pond_core::security::ports::policy::PrincipalKind;
+    if principal.is_some_and(|p| matches!(p.kind, PrincipalKind::Token(_))) {
+        return Ok(());
+    }
+    if let Ok(token) = crate::middleware::extract_bearer_token(headers) {
+        match state.handshake.validate_token(&token).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                operation,
+                kind = "bearer_check_failed",
+                "could not check a bearer token; asking for the host credential instead"
+            ),
+        }
+    }
+    crate::host_guard::require_credential(credential, headers, operation)
+}
+
+/// Resets onboarding to `Welcome` and re-arms the onboarding guard. Open while the wizard runs;
+/// once the Pond is set up, a caller the middleware admitted only for being on the host must
+/// hold a token or the host credential, because a reset reopens the wizard's writes
+/// (`PUT /settings`, `POST /profiles`, `/onboard/*`) to every LAN and tailnet peer.
 async fn reset_onboarding(
     State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    credential: Option<axum::Extension<crate::host_guard::HostCredential>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::security::ports::policy::PrincipalKind;
+    // The middleware attaches a loopback principal to this route only once the Pond is set up.
+    if principal
+        .as_ref()
+        .is_some_and(|axum::Extension(p)| p.kind == PrincipalKind::Loopback)
+    {
+        bearer_or_host_credential(
+            &state,
+            principal.as_ref().map(|axum::Extension(p)| p),
+            credential.as_ref().map(|axum::Extension(c)| c),
+            &headers,
+            "onboarding_reset",
+        )
+        .await?;
+    }
     let service = OnboardingService::new(state.onboarding_repo.clone());
 
     service.reset().await.map_err(|e| {
@@ -1413,10 +1468,23 @@ fn wav_duration(wav: &[u8]) -> Option<std::time::Duration> {
 }
 
 /// Synthesises WAV: in-process `AppState.tts` first, else the legacy Piper HTTP server.
+/// A caller without a token needs the host credential: synthesis spends the host's compute and
+/// pauses whatever it is playing.
 async fn tts_synthesise(
     State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    credential: Option<axum::Extension<crate::host_guard::HostCredential>>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<TtsRequest>, JsonRejection>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    bearer_or_host_credential(
+        &state,
+        principal.as_ref().map(|axum::Extension(p)| p),
+        credential.as_ref().map(|axum::Extension(c)| c),
+        &headers,
+        "tts",
+    )
+    .await?;
     let Json(req) = body.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -8430,7 +8498,7 @@ code{background:#21262d;padding:1px 5px;border-radius:3px;font-size:0.8rem}
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem">
       <h2>TTS</h2>
     </div>
-    <p class="note">Plays audio on the <strong>server device</strong> speaker via <code>/api/v1/test/speak</code>. Piper TTS is the active backend.</p>
+    <p class="note">Plays audio on the <strong>server device</strong> speaker via <code>/api/v1/test/speak</code>. Piper TTS is the active backend. It needs the host credential, so this page can call it only on a server started with <code>POND_DEV_ALLOW_LOOPBACK=1</code>.</p>
 
     <div style="margin-bottom:0.5rem">
       <textarea id="tts-text">Hello! I am Goose, your local AI assistant.</textarea>
@@ -9242,11 +9310,20 @@ async fn goose_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     }
 }
 
-/// `POST /api/v1/test/speak` — speaks `{ "text" }` on the server device's own speaker.
+/// `POST /api/v1/test/speak` — speaks `{ "text" }` on the server device's own speaker. Needs
+/// the host credential, as a token does not: it is a diagnostic for whoever is at the host.
+/// `POND_DEV_ALLOW_LOOPBACK` admits a request without one in development.
 async fn test_speak(
     State(state): State<Arc<AppState>>,
+    credential: Option<axum::Extension<crate::host_guard::HostCredential>>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    crate::host_guard::require_credential(
+        credential.as_ref().map(|axum::Extension(c)| c),
+        &headers,
+        "test_speak",
+    )?;
     let text = match body {
         Ok(Json(v)) => v
             .get("text")
@@ -9256,7 +9333,7 @@ async fn test_speak(
         Err(_) => "Hello from Goose In A Pond!".to_string(),
     };
 
-    match &state.tts {
+    Ok(match &state.tts {
         Some(tts) => {
             let t0 = std::time::Instant::now();
             match tts.speak(&text).await {
@@ -9277,7 +9354,7 @@ async fn test_speak(
             "text": text,
             "message": "No TTS engine configured. Start server with --tts piper after running setup.",
         })),
-    }
+    })
 }
 
 /// GETs `url` for status and latency; gated since `whisper_url` is user-set (loopback passes).

@@ -6,6 +6,9 @@
 //! rebinding) and then read and write this API as a same-origin page; any page can also send
 //! a body-less cross-site `POST`. The first carries the attacker's name in `Host`, the second
 //! the attacker's origin in `Origin`, and neither can forge a loopback value for them.
+//! A page on another loopback port is not first party either: it may be another account's
+//! server, or anything else listening on this machine, so `Origin` must name the very host and
+//! port the request was sent to (2026-10-12).
 //!
 //! A pairing code is a full device token, so minting one needs more than reaching loopback:
 //! the caller must also present the [`HostCredential`], which the server writes to a `0600`
@@ -14,7 +17,7 @@
 
 use axum::{
     extract::Request,
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, uri::Authority, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -93,15 +96,19 @@ const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 
 /// Refuse a request whose `Host` is not a loopback name, or whose `Origin` is not first party.
 pub async fn loopback_only(request: Request, next: Next) -> Response {
-    let host = request
+    let authority = request
         .uri()
         .authority()
-        .map(|authority| authority.host().to_owned())
-        .or_else(|| host_header(request.headers()));
-    if !host.as_deref().is_some_and(is_loopback_host) {
+        .cloned()
+        .or_else(|| host_authority(request.headers()));
+    let host = authority.as_ref().map(|authority| authority.host());
+    let Some(authority) = authority
+        .as_ref()
+        .filter(|authority| is_loopback_host(authority.host()))
+    else {
         tracing::warn!(
             kind = "loopback_host_rejected",
-            host = %bounded(host.as_deref().unwrap_or("")),
+            host = %bounded(host.unwrap_or("")),
             path = %request.uri().path(),
             "refused a dashboard request not addressed to a loopback name"
         );
@@ -110,9 +117,9 @@ pub async fn loopback_only(request: Request, next: Next) -> Response {
             Json(json!({"error": "loopback_host_required"})),
         )
             .into_response();
-    }
+    };
     if let Some(origin) = request.headers().get(header::ORIGIN) {
-        if !is_first_party_origin(origin) {
+        if !is_first_party_origin(origin, authority) {
             tracing::warn!(
                 kind = "cross_origin_rejected",
                 origin = %bounded(origin.to_str().unwrap_or("<not text>")),
@@ -130,9 +137,12 @@ pub async fn loopback_only(request: Request, next: Next) -> Response {
 }
 
 pub(crate) fn host_header(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(header::HOST)?.to_str().ok()?;
-    let authority: axum::http::uri::Authority = value.parse().ok()?;
-    Some(authority.host().to_owned())
+    host_authority(headers).map(|authority| authority.host().to_owned())
+}
+
+/// The `Host` header as an authority: the host and the port the client sent the request to.
+fn host_authority(headers: &HeaderMap) -> Option<Authority> {
+    headers.get(header::HOST)?.to_str().ok()?.parse().ok()
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -141,8 +151,9 @@ fn is_loopback_host(host: &str) -> bool {
         .any(|allowed| host.eq_ignore_ascii_case(allowed))
 }
 
-/// A page served by this dashboard (any loopback port), or one of the CORS origins.
-fn is_first_party_origin(origin: &HeaderValue) -> bool {
+/// One of the CORS origins, or a page served by this very listener: an `http://` origin on a
+/// loopback name whose host and port are the ones the request was sent to.
+fn is_first_party_origin(origin: &HeaderValue, host: &Authority) -> bool {
     if crate::allowed_origins()
         .iter()
         .any(|allowed| allowed == origin)
@@ -158,8 +169,17 @@ fn is_first_party_origin(origin: &HeaderValue) -> bool {
     else {
         return false;
     };
-    rest.parse::<axum::http::uri::Authority>()
-        .is_ok_and(|authority| authority.as_str() == rest && is_loopback_host(authority.host()))
+    rest.parse::<Authority>().is_ok_and(|authority| {
+        authority.as_str() == rest
+            && is_loopback_host(authority.host())
+            && same_authority(&authority, host)
+    })
+}
+
+/// Host compared without case, port defaulting to 80 on both sides: the dashboard is plain HTTP.
+fn same_authority(origin: &Authority, host: &Authority) -> bool {
+    origin.host().eq_ignore_ascii_case(host.host())
+        && origin.port_u16().unwrap_or(80) == host.port_u16().unwrap_or(80)
 }
 
 /// Attacker-supplied text goes to the log, so keep it short.
@@ -244,31 +264,45 @@ mod tests {
 
     #[tokio::test]
     async fn only_first_party_pages_may_send_requests() {
-        for origin in [
-            "http://127.0.0.1:4000",
-            "http://localhost:9000",
-            "http://[::1]:4000",
-            "app://giap",
-            "http://localhost:1420",
+        for (host, origin) in [
+            ("127.0.0.1:4000", "http://127.0.0.1:4000"),
+            ("LOCALHOST:9000", "http://localhost:9000"),
+            ("[::1]:4000", "http://[::1]:4000"),
+            // No port on either side is port 80 on both.
+            ("127.0.0.1", "http://127.0.0.1"),
+            ("127.0.0.1:80", "http://127.0.0.1"),
+            // An SSH tunnel's page talks to the tunnel's own port.
+            ("localhost:9000", "http://localhost:9000"),
+            // The packaged shell and the Vite dev server, from the CORS allowlist.
+            ("127.0.0.1:4000", "app://giap"),
+            ("127.0.0.1:4000", "http://localhost:1420"),
         ] {
             assert_eq!(
-                status(Some("127.0.0.1:4000"), Some(origin)).await,
+                status(Some(host), Some(origin)).await,
                 StatusCode::OK,
-                "{origin}"
+                "{origin} to {host}"
             );
         }
-        for origin in [
-            "http://attacker.example",
-            "https://127.0.0.1:4000",
-            "http://localhost.attacker.example",
-            "http://127.0.0.1:4000/path",
-            "http://user@localhost:4000",
-            "null",
+        for (host, origin) in [
+            ("127.0.0.1:4000", "http://attacker.example"),
+            ("127.0.0.1:4000", "https://127.0.0.1:4000"),
+            ("127.0.0.1:4000", "http://localhost.attacker.example"),
+            ("127.0.0.1:4000", "http://127.0.0.1:4000/path"),
+            ("localhost:4000", "http://user@localhost:4000"),
+            ("127.0.0.1:4000", "null"),
+            // A page on another loopback port: another account's server, or any local listener.
+            ("127.0.0.1:4000", "http://127.0.0.1:8080"),
+            ("127.0.0.1:4000", "http://localhost:9000"),
+            // The same port under another loopback name is another origin.
+            ("127.0.0.1:4000", "http://localhost:4000"),
+            ("127.0.0.1:4000", "http://[::1]:4000"),
+            ("127.0.0.1:4000", "http://127.0.0.1"),
+            ("127.0.0.1", "http://127.0.0.1:4000"),
         ] {
             assert_eq!(
-                status(Some("127.0.0.1:4000"), Some(origin)).await,
+                status(Some(host), Some(origin)).await,
                 StatusCode::FORBIDDEN,
-                "{origin}"
+                "{origin} to {host}"
             );
         }
     }
