@@ -3,8 +3,10 @@ import { Button, Switch } from '@heroui/react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api/PondApiClient';
 import { isSignInRequired } from '../api/hostCredential';
+import { refusalCounter, type Refusal, type SignInRefusalKey } from '../api/signInRefusal';
 import { ApiError, type RecoveryRequest } from '../api/types';
-import { isDesktopShell } from '../shell';
+
+const POLL_MS = 5000;
 
 /**
  * The coordinator's refusals over an invite or a device certificate, each with its own `remote.*`
@@ -13,15 +15,6 @@ import { isDesktopShell } from '../shell';
  * provisioned Pond for an invite all the same.
  */
 const ADMISSION_REFUSALS = ['invite_required', 'invite_invalid', 'invite_expired', 'invite_used', 'device_certificate_invalid', 'device_revoked', 'device_used'];
-
-/**
- * Refused for want of the host credential, for good: a browser tab keeps the one its sign-in link
- * gave it, but the desktop shell reads the current one for every request, so there a refusal only
- * means the Pond restarted between the read and the request.
- */
-function signedOut(error: unknown): boolean {
-  return isSignInRequired(error) && !isDesktopShell();
-}
 
 /** Household activation stays on the Pond's protected local dashboard. */
 export function RemoteAccess() {
@@ -35,9 +28,15 @@ export function RemoteAccess() {
   const [requests, setRequests] = useState<RecoveryRequest[]>([]);
   const [reviewFailed, setReviewFailed] = useState(false);
   const [busy, setBusy] = useState(false);
-  // Every call here needs the host credential; a restart rotates it out from under this tab.
-  const [signInLost, setSignInLost] = useState(false);
-  const noteRefusal = (error: unknown) => { if (signedOut(error)) setSignInLost(true); };
+  // Every call here needs the host credential; a restart rotates it out from under a browser tab.
+  const [signInNote, setSignInNote] = useState<SignInRefusalKey | null>(null);
+  const [refusals] = useState(refusalCounter);
+  const noteRefusal = useCallback((error: unknown): Refusal | null => {
+    if (!isSignInRequired(error)) return null;
+    const refusal = refusals.refused();
+    if (refusal.notice) setSignInNote(refusal.key);
+    return refusal;
+  }, [refusals]);
   const generation = useRef(0);
   useEffect(() => {
     const current = ++generation.current;
@@ -47,7 +46,7 @@ export function RemoteAccess() {
     // Unmounting supersedes whatever is in flight, the activation poll in `run` included. Written
     // as an assignment: a ref whose `current` is never assigned is taken for a React-managed node.
     return () => { generation.current += 1; };
-  }, []);
+  }, [noteRefusal]);
   // The device status changes under this page: enabling registers the household, and a coordinator
   // can refuse what it admitted before. It is read again after every enable or disable, refused or
   // not, and only the latest read is kept.
@@ -66,20 +65,24 @@ export function RemoteAccess() {
     let active = true;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
+      let wait = POLL_MS;
       try {
         const pending = await api.remoteRecoveryRequests();
-        if (active) { setRequests(pending); setReviewFailed(false); }
+        refusals.clear();
+        if (active) { setRequests(pending); setReviewFailed(false); setSignInNote(null); }
       } catch (error) {
-        // Signed out: every later poll would be refused the same way, and logged by the Pond each
-        // time, until a new sign-in link reloads the page. Say so once and stop.
-        if (signedOut(error)) { if (active) setSignInLost(true); return; }
+        // A signed-out browser is refused by every later poll, and the Pond logs each, until a new
+        // sign-in link reloads the page: say so once and stop. The shell keeps asking, ever less often.
+        const refusal = noteRefusal(error);
+        if (refusal && refusal.retryAfterMs === null) return;
+        wait = refusal?.retryAfterMs ?? POLL_MS;
         if (active) setReviewFailed(true);
       }
-      if (active) timer = setTimeout(() => void poll(), 5000);
+      if (active) timer = setTimeout(() => void poll(), wait);
     };
     void poll();
     return () => { active = false; clearTimeout(timer); };
-  }, []);
+  }, [refusals, noteRefusal]);
   const approve = async (id: string) => {
     setBusy(true);
     try {
@@ -145,7 +148,7 @@ export function RemoteAccess() {
     <div style={{ display: 'grid', gap: 6 }}>
       <h2 id="remote-access-title" style={{ margin: 0 }}>{t('remote.title')}</h2>
       <p style={{ margin: 0 }}>{t('remote.description')}</p>
-      {signInLost && <p role="alert" style={{ margin: 0 }}>{t('signIn.hostOnly')}</p>}
+      {signInNote && <p role="alert" style={{ margin: 0 }}>{t(signInNote)}</p>}
     </div>
 
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: 'var(--space-3) var(--space-4)', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-md)' }}>

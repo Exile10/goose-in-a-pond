@@ -216,7 +216,7 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
         })
         .catch((err) => {
           if (isSignInRequired(err)) {
-            console.warn("This tab has no host credential; showing the sign-in instructions.");
+            console.warn("The Pond refused the host credential; showing the sign-in notice.");
             dispatch({ type: "SET_SIGN_IN_REQUIRED", payload: true });
             return;
           }
