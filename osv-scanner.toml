@@ -59,6 +59,11 @@ id = "RUSTSEC-2026-0192"
 ignoreUntil = 2027-03-31
 reason = "ttf-parser is unmaintained. Transitive via font rendering, no fixed version exists. Named in security.yml's own comment as one of the two advisories this tree cannot clear."
 
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0449"
+ignoreUntil = 2027-03-31
+reason = "unsafe-libyaml is unmaintained (archived 2024-03-25; 0.2.11 is the last release). No fixed version exists. Arrives through serde_yaml 0.9 (itself deprecated), which pond-core, pond-api and goose use directly, so moving off it is ours to do: the advisory names saphyr / serde-saphyr as safe-Rust replacements."
+
 # ── A real vulnerability with no upstream fix ────────────────────────────────
 
 [[IgnoredVulns]]
