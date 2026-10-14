@@ -1247,6 +1247,14 @@ enum Sent {
 
 impl std::error::Error for RefusedByCoordinator {}
 
+/// Whether the coordinator refused an enrollment because it holds one for another identity.
+/// A 429 or 503 also exits 3, so the reason is what tells the two apart.
+fn kept_existing_enrollment(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RefusedByCoordinator>()
+        .is_some_and(|refused| refused.reason.as_deref() == Some("invalid_enrollment"))
+}
+
 /// The helper's stderr, fit to log: bounded, one line, and with `/register/` URLs redacted
 /// (a bearer capability to join the household's tailnet).
 fn helper_complaint(stderr: &[u8]) -> String {
@@ -1529,7 +1537,7 @@ async fn register_phone(
         .authority(operation, payload)
         .await
         .map_err(|error| {
-            let refused = error.downcast_ref::<RefusedByCoordinator>().is_some();
+            let refused = kept_existing_enrollment(&error);
             if refused && refusal_expected {
                 // Expected, not a fault: the coordinator will not let a new identity take over an
                 // enrollment it already holds. The 409 offers the phone recovery, which someone
@@ -2242,6 +2250,27 @@ mod tests {
             .collect();
         assert_eq!(attempts.iter().filter(|a| **a == 2).count(), 1);
         assert_eq!(attempts.iter().filter(|a| **a == 1).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_an_invalid_enrollment_counts_as_the_coordinator_keeping_one() {
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let runtime = helper.runtime(data.path());
+        for (code, stdout, kept) in [
+            (3, r#"{"refused":"invalid_enrollment"}"#, true),
+            (3, r#"{"refused":"rate_limited"}"#, false),
+            (3, r#"{"refused":"with no explanation"}"#, false),
+            (3, "", false),
+            (1, "", false),
+        ] {
+            helper.answer("enroll", code, stdout);
+            let error = runtime
+                .authority("enroll", serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(kept_existing_enrollment(&error), kept, "{code} {stdout}");
+        }
     }
 
     #[tokio::test]
