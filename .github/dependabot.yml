@@ -43,6 +43,19 @@ updates:
       npm-minor-patch:
         update-types: [minor, patch]
 
+  # The embedded Tailscale node. golang.org/x/net and tailscale.com are its network surface, and
+  # govulncheck in CI and security.yml blocks on reachable advisories, so a fix should arrive as a
+  # PR rather than as a red gate.
+  - package-ecosystem: gomod
+    directory: /native/pondnet
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      gomod-minor-patch:
+        update-types: [minor, patch]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

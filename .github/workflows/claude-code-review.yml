@@ -27,7 +27,12 @@ jobs:
     # Drafts are not ready to be read. `ready_for_review` above is what starts
     # the review, so a PR opened as a draft is reviewed once, when it is
     # promoted, instead of once now and again then.
-    if: github.event.pull_request.draft == false
+    #
+    # A fork PR gets neither repository secrets nor an OIDC token, so the action
+    # stops at "Could not fetch an OIDC token" and the check goes red for a
+    # reason the author cannot fix. Skip forks; a maintainer can still ask for a
+    # review with `@claude review`, which runs in this repository's context.
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
 
     runs-on: ubuntu-latest
     timeout-minutes: 20
