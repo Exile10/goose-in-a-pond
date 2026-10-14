@@ -1,4 +1,11 @@
 //! Persistent TLS identity. Certificates rotate; the QR-pinned public key does not.
+//!
+//! The key signs two certificates. `tls/identity.json` is served on the LAN and loopback
+//! listeners and names the host and its LAN addresses, which LAN pairing and the phones'
+//! hostname checks need. `tls/tailnet-identity.json` is what the embedded helper serves on
+//! the tailnet, and names only the node's tailnet addresses and node name: every tailnet node
+//! can read a certificate it is shown, and it used to learn the host name and LAN addresses
+//! from the first one (2026-10-12). Both carry the same public key, so the pin is unchanged.
 
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -14,6 +21,17 @@ use std::{
     path::{Path, PathBuf},
 };
 use time::{Duration, OffsetDateTime};
+
+const IDENTITY_FILE: &str = "identity.json";
+const TAILNET_IDENTITY_FILE: &str = "tailnet-identity.json";
+
+/// The node name the embedded helper registers on the tailnet, which its certificate names.
+pub const TAILNET_HOSTNAME: &str = "goose-in-a-pond";
+
+/// Where the tailnet certificate is kept, for the helper's `--identity`.
+pub fn tailnet_identity_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("tls").join(TAILNET_IDENTITY_FILE)
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,7 +86,7 @@ impl TlsIdentity {
         let lock = options.open(dir.join("identity.lock"))?;
         lock.try_lock_exclusive()
             .context("TLS identity is already in use by another server")?;
-        let path = dir.join("identity.json");
+        let path = dir.join(IDENTITY_FILE);
         let material = if fs::symlink_metadata(&path).is_ok() {
             ensure!(
                 !fs::symlink_metadata(&path)?.file_type().is_symlink(),
@@ -99,7 +117,7 @@ impl TlsIdentity {
                 cert_pem: certificate(&key, names)?,
                 key_pem: key.serialize_pem(),
             };
-            persist(&dir, &material)?;
+            persist(&dir, IDENTITY_FILE, &material)?;
             tracing::info!("created persistent TLS identity");
             material
         };
@@ -108,33 +126,9 @@ impl TlsIdentity {
             material,
             _lock: lock,
         };
-        identity.validate()?;
+        validate(&identity.material)?;
         identity.renew_if_needed(names)?;
         Ok(identity)
-    }
-
-    fn validate(&self) -> Result<()> {
-        let key = KeyPair::from_pem(&self.material.key_pem).context("invalid TLS private key")?;
-        ensure!(
-            key.is_compatible(&PKCS_ECDSA_P256_SHA256),
-            "TLS key must be ECDSA P-256"
-        );
-        let (_, pem) = x509_parser::pem::parse_x509_pem(self.material.cert_pem.as_bytes())
-            .map_err(|_| anyhow::anyhow!("invalid TLS certificate PEM"))?;
-        let cert = pem
-            .parse_x509()
-            .map_err(|_| anyhow::anyhow!("invalid TLS certificate"))?;
-        ensure!(
-            cert.public_key().raw == key.subject_public_key_info(),
-            "TLS key and certificate do not match"
-        );
-        cert.verify_signature(None)
-            .context("TLS certificate signature is invalid")?;
-        ensure!(
-            cert.validity().not_before.timestamp() <= OffsetDateTime::now_utc().unix_timestamp(),
-            "TLS certificate is not yet valid; check the clock"
-        );
-        Ok(())
     }
 
     /// Stable public-key pin, not a hash of the renewable certificate.
@@ -156,34 +150,7 @@ impl TlsIdentity {
 
     /// Renew when an address changes or expiry is less than thirty days away.
     pub fn renew_if_needed(&mut self, names: &[String]) -> Result<bool> {
-        let (_, pem) = x509_parser::pem::parse_x509_pem(self.material.cert_pem.as_bytes())
-            .map_err(|_| anyhow::anyhow!("invalid TLS certificate PEM"))?;
-        let cert = pem
-            .parse_x509()
-            .map_err(|_| anyhow::anyhow!("invalid TLS certificate"))?;
-        let mut actual = Vec::new();
-        if let Some(san) = cert.subject_alternative_name()? {
-            for name in &san.value.general_names {
-                use x509_parser::extensions::GeneralName;
-                match name {
-                    GeneralName::DNSName(name) => actual.push(name.to_string()),
-                    GeneralName::IPAddress(bytes) if bytes.len() == 4 => actual
-                        .push(std::net::Ipv4Addr::from(<[u8; 4]>::try_from(*bytes)?).to_string()),
-                    GeneralName::IPAddress(bytes) if bytes.len() == 16 => actual
-                        .push(std::net::Ipv6Addr::from(<[u8; 16]>::try_from(*bytes)?).to_string()),
-                    _ => {}
-                }
-            }
-        }
-        actual.sort();
-        actual.dedup();
-        let mut expected = names.to_vec();
-        expected.sort();
-        expected.dedup();
-        let renew = actual != expected
-            || cert.validity().not_after.timestamp()
-                <= (OffsetDateTime::now_utc() + Duration::days(30)).unix_timestamp();
-        if !renew {
+        if !needs_renewal(&self.material.cert_pem, names)? {
             return Ok(false);
         }
         let key = KeyPair::from_pem(&self.material.key_pem)?;
@@ -191,11 +158,146 @@ impl TlsIdentity {
             key_pem: self.material.key_pem.clone(),
             cert_pem: certificate(&key, names)?,
         };
-        persist(&self.dir, &next)?;
+        persist(&self.dir, IDENTITY_FILE, &next)?;
         self.material = next;
         tracing::info!("renewed TLS certificate with the existing public key");
         Ok(true)
     }
+
+    /// Write the tailnet certificate when it is missing, names other than `names`, is within
+    /// thirty days of expiry, or cannot be trusted as this key's: anything else in the file
+    /// is replaced, since it is derived from the key and holds nothing of its own. True when
+    /// it was written.
+    pub fn renew_tailnet_if_needed(&self, names: &[String]) -> Result<bool> {
+        let path = self.dir.join(TAILNET_IDENTITY_FILE);
+        let replaced = match self.read_tailnet(&path) {
+            Ok(Some(material)) => {
+                if !needs_renewal(&material.cert_pem, names)? {
+                    return Ok(false);
+                }
+                None
+            }
+            Ok(None) => None,
+            Err(error) => Some(format!("{error:#}")),
+        };
+        let key = KeyPair::from_pem(&self.material.key_pem)?;
+        let next = Material {
+            key_pem: self.material.key_pem.clone(),
+            cert_pem: certificate(&key, names)?,
+        };
+        persist(&self.dir, TAILNET_IDENTITY_FILE, &next)?;
+        match replaced {
+            Some(reason) => tracing::warn!(
+                target: "giap::trace",
+                kind = "tailnet_certificate_replaced",
+                %reason,
+                "the tailnet certificate was unusable; wrote a new one with the existing public key"
+            ),
+            None => tracing::info!(
+                target: "giap::trace",
+                kind = "tailnet_certificate_renewed",
+                names = ?names,
+                "renewed the tailnet certificate with the existing public key"
+            ),
+        }
+        Ok(true)
+    }
+
+    /// The tailnet certificate on disk, `None` when there is none. One that is a symlink,
+    /// readable by others, malformed, or not signed with this identity's key is an error.
+    fn read_tailnet(&self, path: &Path) -> Result<Option<Material>> {
+        let metadata = match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            other => other?,
+        };
+        ensure!(
+            metadata.is_file(),
+            "the tailnet certificate is not a regular file"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            ensure!(
+                metadata.permissions().mode() & 0o077 == 0,
+                "the tailnet certificate is readable by others"
+            );
+        }
+        let material: Material = serde_json::from_slice(&fs::read(path)?)?;
+        ensure!(
+            material.key_pem == self.material.key_pem,
+            "the tailnet certificate carries another key"
+        );
+        validate(&material)?;
+        Ok(Some(material))
+    }
+}
+
+/// The key is ECDSA P-256 and signed the certificate, which is already valid.
+fn validate(material: &Material) -> Result<()> {
+    let key = KeyPair::from_pem(&material.key_pem).context("invalid TLS private key")?;
+    ensure!(
+        key.is_compatible(&PKCS_ECDSA_P256_SHA256),
+        "TLS key must be ECDSA P-256"
+    );
+    let (_, pem) = x509_parser::pem::parse_x509_pem(material.cert_pem.as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid TLS certificate PEM"))?;
+    let cert = pem
+        .parse_x509()
+        .map_err(|_| anyhow::anyhow!("invalid TLS certificate"))?;
+    ensure!(
+        cert.public_key().raw == key.subject_public_key_info(),
+        "TLS key and certificate do not match"
+    );
+    cert.verify_signature(None)
+        .context("TLS certificate signature is invalid")?;
+    ensure!(
+        cert.validity().not_before.timestamp() <= OffsetDateTime::now_utc().unix_timestamp(),
+        "TLS certificate is not yet valid; check the clock"
+    );
+    Ok(())
+}
+
+/// The DNS names and IP addresses a certificate's SANs cover, sorted and deduplicated.
+fn san_names(cert_pem: &str) -> Result<Vec<String>> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid TLS certificate PEM"))?;
+    let cert = pem
+        .parse_x509()
+        .map_err(|_| anyhow::anyhow!("invalid TLS certificate"))?;
+    let mut actual = Vec::new();
+    if let Some(san) = cert.subject_alternative_name()? {
+        for name in &san.value.general_names {
+            use x509_parser::extensions::GeneralName;
+            match name {
+                GeneralName::DNSName(name) => actual.push(name.to_string()),
+                GeneralName::IPAddress(bytes) if bytes.len() == 4 => {
+                    actual.push(std::net::Ipv4Addr::from(<[u8; 4]>::try_from(*bytes)?).to_string())
+                }
+                GeneralName::IPAddress(bytes) if bytes.len() == 16 => {
+                    actual.push(std::net::Ipv6Addr::from(<[u8; 16]>::try_from(*bytes)?).to_string())
+                }
+                _ => {}
+            }
+        }
+    }
+    actual.sort();
+    actual.dedup();
+    Ok(actual)
+}
+
+/// Whether a certificate names other than exactly `names`, or expires within thirty days.
+fn needs_renewal(cert_pem: &str, names: &[String]) -> Result<bool> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid TLS certificate PEM"))?;
+    let cert = pem
+        .parse_x509()
+        .map_err(|_| anyhow::anyhow!("invalid TLS certificate"))?;
+    let mut expected = names.to_vec();
+    expected.sort();
+    expected.dedup();
+    Ok(san_names(cert_pem)? != expected
+        || cert.validity().not_after.timestamp()
+            <= (OffsetDateTime::now_utc() + Duration::days(30)).unix_timestamp())
 }
 
 fn certificate(key: &KeyPair, names: &[String]) -> Result<String> {
@@ -207,7 +309,7 @@ fn certificate(key: &KeyPair, names: &[String]) -> Result<String> {
     Ok(params.self_signed(key)?.pem())
 }
 
-fn persist(dir: &Path, material: &Material) -> Result<()> {
+fn persist(dir: &Path, name: &str, material: &Material) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     #[cfg(unix)]
     {
@@ -217,7 +319,7 @@ fn persist(dir: &Path, material: &Material) -> Result<()> {
     }
     file.write_all(&serde_json::to_vec(material)?)?;
     file.as_file().sync_all()?;
-    file.persist(dir.join("identity.json"))?;
+    file.persist(dir.join(name))?;
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
     Ok(())
@@ -242,6 +344,16 @@ pub fn certificate_names(hostname: &str) -> Result<Vec<String>> {
     names.sort();
     names.dedup();
     Ok(names)
+}
+
+/// What the tailnet certificate names: the embedded node's tailnet addresses and its node name,
+/// and nothing about the LAN. A phone away from home dials the tailnet IPv4 address.
+pub fn tailnet_certificate_names(addresses: &[String]) -> Vec<String> {
+    let mut names = vec![TAILNET_HOSTNAME.to_string()];
+    names.extend(addresses.iter().cloned());
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Encode the same v2 QR contract in startup output and the standalone CLI.
@@ -299,6 +411,70 @@ mod tests {
             pin
         );
     }
+    /// Every tailnet node can read the certificate the helper shows it, so it must carry the
+    /// same key the phones pinned and nothing about the LAN.
+    #[test]
+    fn the_tailnet_certificate_shares_the_key_and_names_only_the_tailnet() {
+        let dir = tempfile::tempdir().unwrap();
+        let lan = vec![
+            "pond".to_string(),
+            "pond.local".into(),
+            "192.168.1.20".into(),
+            "100.64.0.7".into(),
+        ];
+        let identity = TlsIdentity::load(dir.path(), &lan).unwrap();
+        let names = tailnet_certificate_names(&["100.64.0.7".into()]);
+        assert_eq!(names, ["100.64.0.7", TAILNET_HOSTNAME]);
+        assert!(identity.renew_tailnet_if_needed(&names).unwrap());
+        assert!(
+            !identity.renew_tailnet_if_needed(&names).unwrap(),
+            "an unchanged certificate was rewritten"
+        );
+
+        let path = tailnet_identity_path(dir.path());
+        let tailnet: Material = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        validate(&tailnet).unwrap();
+        let spki = |pem: &str| {
+            let (_, pem) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap();
+            pem.parse_x509().unwrap().public_key().raw.to_vec()
+        };
+        assert_eq!(
+            spki(&tailnet.cert_pem),
+            spki(&identity.material.cert_pem),
+            "the tailnet certificate does not match the pin"
+        );
+        assert_eq!(san_names(&tailnet.cert_pem).unwrap(), names);
+        let mut sorted = lan.clone();
+        sorted.sort();
+        assert_eq!(
+            san_names(&identity.material.cert_pem).unwrap(),
+            sorted,
+            "the LAN certificate changed"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{mode:o}");
+        }
+
+        // A new address renews it; a damaged or foreign file is replaced, not trusted.
+        assert!(identity
+            .renew_tailnet_if_needed(&tailnet_certificate_names(&["100.64.0.8".into()]))
+            .unwrap());
+        fs::write(&path, b"{}").unwrap();
+        assert!(identity.renew_tailnet_if_needed(&names).unwrap());
+        let other = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let foreign = Material {
+            cert_pem: certificate(&other, &names).unwrap(),
+            key_pem: other.serialize_pem(),
+        };
+        persist(&identity.dir, TAILNET_IDENTITY_FILE, &foreign).unwrap();
+        assert!(identity.renew_tailnet_if_needed(&names).unwrap());
+        let restored: Material = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.key_pem, identity.material.key_pem);
+    }
+
     #[test]
     fn corruption_is_not_a_new_identity() {
         let dir = tempfile::tempdir().unwrap();
@@ -332,7 +508,7 @@ mod tests {
         params.not_before = OffsetDateTime::now_utc() - Duration::days(400);
         params.not_after = OffsetDateTime::now_utc() - Duration::days(1);
         identity.material.cert_pem = params.self_signed(&key).unwrap().pem();
-        persist(&identity.dir, &identity.material).unwrap();
+        persist(&identity.dir, IDENTITY_FILE, &identity.material).unwrap();
         drop(identity);
         let identity = TlsIdentity::load(dir.path(), &names).unwrap();
         assert_eq!(identity.pin().unwrap(), pin);
@@ -349,7 +525,7 @@ mod tests {
         identity.material.key_pem = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .unwrap()
             .serialize_pem();
-        persist(&identity.dir, &identity.material).unwrap();
+        persist(&identity.dir, IDENTITY_FILE, &identity.material).unwrap();
         drop(identity);
         assert!(TlsIdentity::load(dir.path(), &names).is_err());
     }
