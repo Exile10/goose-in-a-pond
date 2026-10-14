@@ -1433,13 +1433,17 @@ fn plausible_invite(invite: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b' ')
 }
 
+/// A refusal the client can act on: `status` with `{"error": error}`.
+fn refusal(status: StatusCode, error: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({ "error": error })))
+}
+
 async fn register_pond(
     State(runtime): State<Arc<Runtime>>,
     peer: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
     body: Option<Json<RegisterPond>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let refuse =
-        |status: StatusCode, error: &str| (status, Json(serde_json::json!({ "error": error })));
+    let refuse = refusal;
     local(peer).map_err(|status| refuse(status, "host_only"))?;
     let invite = body
         .map(|Json(body)| body.invite)
@@ -1549,27 +1553,31 @@ async fn register_phone(
     >,
     headers: axum::http::HeaderMap,
     Json(registration): Json<Registration>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    pond_api::network::require_lan(Some(ConnectInfo(peer))).map_err(|_| StatusCode::FORBIDDEN)?;
-    let device = recovery::caller(&headers, handshake.as_ref()).await?.device;
+) -> Result<Json<serde_json::Value>, Response> {
+    pond_api::network::require_lan(Some(ConnectInfo(peer)))
+        .map_err(|_| StatusCode::FORBIDDEN.into_response())?;
+    let device = recovery::caller(&headers, handshake.as_ref())
+        .await
+        .map_err(IntoResponse::into_response)?
+        .device;
     let lock = runtime.device_lock(&device);
     let _held = lock.lock().await;
     let store_failed = |error: anyhow::Error| {
         tracing::warn!(%error, %device, operation = "enrollment_store", "embedded enrollment failed");
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
     };
     if runtime
         .pending_revocations()
         .map_err(store_failed)?
         .contains_key(&device)
     {
-        return Err(StatusCode::CONFLICT);
+        return Err(StatusCode::CONFLICT.into_response());
     }
     let payload = runtime
         .registration_payload(&device, "phone", &registration)
         .map_err(|error| {
             tracing::warn!(%error, %device, operation = "registration_payload", "embedded enrollment failed");
-            StatusCode::CONFLICT
+            StatusCode::CONFLICT.into_response()
         })?;
     // Recorded before the helper is asked: a removal, a logout or a sweep while the enrollment is
     // in flight (up to 25 s), or a crash before it returns, must find this device and revoke it.
@@ -1596,9 +1604,23 @@ async fn register_phone(
                     );
                     if let Err(error) = runtime.ensure_not_revoked_meanwhile(&device) {
                         tracing::warn!(%error, %device, "embedded enrollment superseded by a revocation");
-                        return Err(StatusCode::CONFLICT);
+                        return Err(StatusCode::CONFLICT.into_response());
                     }
                     return Ok(Json(existing));
+                }
+                PhoneEnrollment::StaleIdentity => {
+                    // Expected, not a fault: a lapsed or removed phone that was not re-paired
+                    // still holds the key its stood-down record keeps as a tombstone, and the
+                    // coordinator refuses both a replace and an enroll for that key. The app
+                    // answers by making fresh node keys and enabling again.
+                    tracing::info!(
+                        target: "giap::trace",
+                        kind = "remote_access_stale_identity",
+                        %device, %status,
+                        "remote access: the phone still holds the identity of its stood-down \
+                         enrollment; it needs fresh node keys"
+                    );
+                    return Err(refusal(StatusCode::CONFLICT, "stale_identity").into_response());
                 }
                 PhoneEnrollment::Replace(_) => tracing::info!(
                     target: "giap::trace",
@@ -1672,9 +1694,9 @@ async fn register_phone(
                 }
             }
             return Err(if refused {
-                StatusCode::CONFLICT
+                StatusCode::CONFLICT.into_response()
             } else {
-                StatusCode::SERVICE_UNAVAILABLE
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
             });
         }
     };
@@ -1682,7 +1704,7 @@ async fn register_phone(
     // must not be told it is enrolled when that revocation is about to undo it.
     if let Err(error) = runtime.ensure_not_revoked_meanwhile(&device) {
         tracing::warn!(%error, %device, "embedded enrollment superseded by a revocation");
-        return Err(StatusCode::CONFLICT);
+        return Err(StatusCode::CONFLICT.into_response());
     }
     tracing::info!(%device, "remote access: phone enrolled");
     Ok(Json(enrolled))
@@ -1698,6 +1720,11 @@ enum PhoneEnrollment {
     Enroll,
     /// A stood-down enrollment, replaced at the revision the coordinator reported.
     Replace(String),
+    /// A stood-down (`revoked` or `failed`) enrollment that still holds the phone's current
+    /// machine key. The coordinator keeps that key as a tombstone and refuses a `replace` or an
+    /// `enroll` that presents it (`identity_already_enrolled`), so nothing is sent: the phone
+    /// must make fresh node keys first.
+    StaleIdentity,
 }
 
 /// Decides [`PhoneEnrollment`] from the coordinator's `inspect` answer.
@@ -1713,6 +1740,10 @@ enum PhoneEnrollment {
 /// a refused enrollment can be failed again at will, and every replacement retires the old
 /// record against the household's bounded retirement budget, so replacing failed records
 /// would let a loop of bad enrollments spend that budget without anyone approving it.
+///
+/// A stood-down record that still holds the phone's current machine key is a phone that
+/// lapsed or was removed and was not re-paired (2026-10-12). The coordinator refuses any
+/// `replace` or `enroll` presenting that key, so it is [`PhoneEnrollment::StaleIdentity`].
 fn phone_enrollment(existing: &serde_json::Value, machine_key: &str) -> PhoneEnrollment {
     let field = |name: &str| {
         existing
@@ -1720,8 +1751,10 @@ fn phone_enrollment(existing: &serde_json::Value, machine_key: &str) -> PhoneEnr
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
     };
+    let same_identity = !machine_key.is_empty() && field("machineKey") == machine_key;
     match field("status") {
         "active" if field("machineKey") == machine_key => PhoneEnrollment::AlreadyEnrolled,
+        "revoked" | "failed" if same_identity => PhoneEnrollment::StaleIdentity,
         "revoked" if valid_device(field("revision")) => {
             PhoneEnrollment::Replace(field("revision").to_owned())
         }
@@ -1819,6 +1852,49 @@ mod tests {
         });
         assert_eq!(
             phone_enrollment(&existing, key),
+            PhoneEnrollment::Replace(revision.into())
+        );
+    }
+
+    /// The coordinator keeps a stood-down record's machine key as a tombstone and refuses any
+    /// replace or enroll presenting it, `failed` as much as `revoked`.
+    #[test]
+    fn a_stood_down_record_holding_the_same_key_is_a_stale_identity() {
+        let key = format!("mkey:{}", "a".repeat(64));
+        let revision = "rev-0123456789abcdef";
+        for status in ["revoked", "failed"] {
+            let existing = serde_json::json!({
+                "status": status, "machineKey": key, "revision": revision
+            });
+            assert_eq!(
+                phone_enrollment(&existing, &key),
+                PhoneEnrollment::StaleIdentity,
+                "{status}"
+            );
+        }
+        // A fresh key replaces a revoked record, and a failed one still waits for recovery.
+        let other = format!("mkey:{}", "b".repeat(64));
+        let revoked = serde_json::json!({
+            "status": "revoked", "machineKey": key, "revision": revision
+        });
+        assert_eq!(
+            phone_enrollment(&revoked, &other),
+            PhoneEnrollment::Replace(revision.into())
+        );
+        let failed = serde_json::json!({
+            "status": "failed", "machineKey": key, "revision": revision
+        });
+        assert_eq!(phone_enrollment(&failed, &other), PhoneEnrollment::Enroll);
+        // An active one with the same key is the phone already enrolled.
+        let active = serde_json::json!({"status": "active", "machineKey": key});
+        assert_eq!(
+            phone_enrollment(&active, &key),
+            PhoneEnrollment::AlreadyEnrolled
+        );
+        // A record that names no key is never mistaken for the phone's.
+        let keyless = serde_json::json!({"status": "revoked", "revision": revision});
+        assert_eq!(
+            phone_enrollment(&keyless, ""),
             PhoneEnrollment::Replace(revision.into())
         );
     }
@@ -2506,6 +2582,7 @@ mod tests {
             }),
         )
         .await
+        .map_err(|refused| refused.status())
     }
 
     /// A removal while the helper is still enrolling the phone used to find no record, queue
@@ -3010,6 +3087,70 @@ mod tests {
         assert_eq!(
             recorded,
             serde_json::json!({ "enrollment": "https://enroll.example" })
+        );
+    }
+
+    /// A phone whose remote access lapsed and that was not re-paired asks with the key its
+    /// revoked record still holds. #446 tested only the decision; this drives the route.
+    #[tokio::test]
+    async fn a_lapsed_phone_with_its_old_keys_is_told_to_make_new_ones() {
+        use pond_core::security::ports::handshake::{Handshake, HandshakeRequest};
+        use pond_infra::{db::Database, sqlite_handshake::SqliteHandshakeAdapter};
+        let helper = FakeHelper::new();
+        let data = tempfile::tempdir().unwrap();
+        let db = Database::init(data.path()).await.unwrap();
+        let handshake = Arc::new(SqliteHandshakeAdapter::new(db.system.clone(), None));
+        let code = handshake.issue_pairing_code().await.unwrap();
+        let paired = handshake
+            .handshake(HandshakeRequest {
+                client_id: "phone000000000001".into(),
+                client_type: "gotg".into(),
+                client_version: "test".into(),
+                pairing_code: Some(code.code),
+            })
+            .await
+            .unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", paired.session_token.unwrap())
+                .parse()
+                .unwrap(),
+        );
+        let runtime = helper.runtime(data.path());
+        let machine_key = format!("mkey:{}", "a".repeat(64));
+        helper.answer(
+            "inspect",
+            0,
+            &serde_json::json!({
+                "status": "revoked", "machineKey": machine_key, "revision": "rev-0123456789abcdef"
+            })
+            .to_string(),
+        );
+
+        let refused = register_phone(
+            State(runtime),
+            ConnectInfo("127.0.0.1:5555".parse().unwrap()),
+            axum::Extension(handshake as Arc<dyn Handshake>),
+            headers,
+            Json(Registration {
+                auth_url: "https://coord.example/register/abcdefghijklmnop".into(),
+                node_key: format!("nodekey:{}", "b".repeat(64)),
+                machine_key,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(refused.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, serde_json::json!({"error": "stale_identity"}));
+        assert_eq!(
+            helper.calls(),
+            ["inspect"],
+            "a replace or enroll the coordinator refuses was sent anyway"
         );
     }
 
