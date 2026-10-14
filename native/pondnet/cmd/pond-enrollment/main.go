@@ -24,6 +24,13 @@ import (
 	"time"
 )
 
+// reconcileTimeout bounds one reconciliation. It reads the coordinator inventory up
+// to three times, each up to MaxNodes nodes or about 33 MB, and the client's own
+// timeout covers only the wait for response headers, so this deadline is what bounds
+// reading those bodies. Requests wait for the store while a reconciliation holds it,
+// which is why this is no longer than a slow link needs.
+const reconcileTimeout = 60 * time.Second
+
 func main() {
 	if err := run(); err != nil {
 		slog.Error("enrollment service failed", "error", err)
@@ -126,7 +133,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	handler, err := enrollment.New(ctx, store, backend)
+	// The coordinator client bounds only the wait for response headers, so the first
+	// reconciliation needs a deadline of its own, the same as every later one.
+	starting, started := context.WithTimeout(ctx, reconcileTimeout)
+	handler, err := enrollment.New(starting, store, backend)
+	started()
 	if err != nil {
 		return err
 	}
@@ -148,7 +159,7 @@ func run() error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				job, stop := context.WithTimeout(ctx, 15*time.Second)
+				job, stop := context.WithTimeout(ctx, reconcileTimeout)
 				if err := handler.Reconcile(job); err != nil {
 					slog.Warn("network enrollment reconciliation deferred", "error", err)
 				}

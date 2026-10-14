@@ -20,13 +20,22 @@ type Headscale struct {
 	client     *http.Client
 }
 
-// NewHeadscale accepts only an explicit service origin and refuses redirects.
+// responseHeaderTimeout bounds the wait for a coordinator's response headers. It is
+// not a deadline for the whole call: the inventory body can run to about 33 MB, and
+// reading it is bounded by the caller's context deadline instead.
+const responseHeaderTimeout = 10 * time.Second
+
+// NewHeadscale accepts only an explicit service origin and refuses redirects. Every
+// call must carry a context with a deadline, which is what bounds reading a body.
 func NewHeadscale(origin, credential string) (*Headscale, error) {
 	u, err := url.Parse(origin)
 	if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || (u.Scheme != "https" && u.Scheme != "http") || strings.TrimSpace(credential) == "" {
 		return nil, errors.New("invalid private Headscale endpoint")
 	}
-	return &Headscale{strings.TrimSuffix(origin, "/"), strings.TrimSpace(credential), &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return &Headscale{strings.TrimSuffix(origin, "/"), strings.TrimSpace(credential), client}, nil
 }
 
 // MaxNodes bounds the coordinator inventory this service will read. Enrollment stops at
