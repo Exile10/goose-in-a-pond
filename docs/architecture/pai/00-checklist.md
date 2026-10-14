@@ -3237,3 +3237,24 @@ milestone).**
   not the live-turn number.
 - **Not yet verified on the Orin:** memory with the drafter attached at 16K, decode in the pond,
   and how many drafts household turns keep.
+
+**2026-10-14 — A completeness check's prose stops at its first token on llama.cpp (inference
+latency; not a PAI milestone).**
+
+- **What landed.** goose `e4052740d`. The agent makes the check round's provider call as
+  `request_context::tool_calls_only`, and the llama.cpp native-tools path ends that generation at
+  its first visible text before any tool call. The round's prose was always hidden and dropped; now
+  it is not decoded either. LiteRT-LM and the emulated-tools path finish the round as before.
+- **Invariants.** Nothing new blocks a turn. The check still runs, and a round that calls a tool
+  first is untouched. KV prefix: the stopped round's decoded tokens stay in the retained cache, as
+  after a stop string. No `Settings` field, no migration. `goal_check_enabled` keeps its default
+  (on); the nano runs with it off.
+- **Verified on the Mac** (scratch pond, E4B QAT on llama.cpp, goal check on,
+  `scratchpad/envelope/drive_ab.py`). Eight multi-step turns (timers, a reminder, the world clock, a
+  memory, a calculation) took 97.8 s before and 60.3 s after: the hidden round had been restating
+  results in 4-158 tokens, and now stops after one. On twelve plain turns the hidden round was 1-17
+  tokens, so there was no measurable change. No check round called a tool in those 20 turns, with
+  or without the stop, so none was lost. Tests: `test_only_the_completeness_check_is_tool_calls_only`
+  (fails without the agent change), the native-tools helper, goose's eight goal tests, and
+  goose-local-inference's 192 (the three context-cap failures predate this).
+- **Not verified on the Orin.** The household runs with the goal check off.
