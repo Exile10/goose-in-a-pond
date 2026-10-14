@@ -1,7 +1,7 @@
 //! REST API under `/api/v1/`; protected routes take a Bearer token from `POST /api/v1/handshake`.
 
 pub mod cleanup;
-pub(crate) mod download_failure;
+pub mod download_failure;
 pub mod host_guard;
 pub(crate) mod image_normalize;
 pub mod insecure_dev;

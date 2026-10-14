@@ -19,6 +19,14 @@ const PIPER_GITHUB_BASE: &str = "https://github.com/rhasspy/piper/releases/downl
 /// Byte-progress sink, called as `(filename, downloaded, total)`.
 pub type DlProgress = std::sync::Arc<dyn Fn(&str, u64, u64) + Send + Sync>;
 
+/// The `filename` a download to `dest` reports its progress under.
+fn progress_name(dest: &Path) -> String {
+    dest.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
 // ── Kokoro engine ─────────────────────────────────────────────────────────────
 
 const KOKORO_REPO_BASE: &str =
@@ -50,41 +58,44 @@ fn voices_to_fetch(configured: &str) -> Vec<String> {
     wanted
 }
 
+/// One file a Kokoro fetch tried: the name its progress was reported under, where it was to
+/// land, and how the download ended.
+#[derive(Debug)]
+pub struct FileFetch {
+    pub name: String,
+    pub dest: PathBuf,
+    pub result: Result<()>,
+}
+
 /// Best-effort fetch of the Kokoro tokenizer, weights and voices (the catalogue has only
 /// voices); `quality` picks the `.onnx`. Any failure leaves Piper as the engine.
 pub async fn ensure_kokoro_engine(data_dir: &Path, quality: &str, voice: &str) {
-    ensure_kokoro_engine_reporting(data_dir, quality, voice, None).await
+    ensure_kokoro_engine_reporting(data_dir, quality, voice, None).await;
 }
 
-/// `ensure_kokoro_engine`, reporting byte progress for whatever it fetches.
+/// `ensure_kokoro_engine`, reporting byte progress, and each file it tried with how it ended.
 pub async fn ensure_kokoro_engine_reporting(
     data_dir: &Path,
     quality: &str,
     voice: &str,
     report: Option<DlProgress>,
-) {
+) -> Vec<FileFetch> {
     // Status to stderr only: under `--json-events` stdout carries NDJSON and nothing else.
     let dir = kokoro_dir(data_dir);
     let voices = dir.join("voices");
     if let Err(e) = std::fs::create_dir_all(&voices) {
         tracing::warn!("could not create {}: {e}", voices.display());
-        return;
+        return Vec::new();
     }
 
+    let mut tried = Vec::new();
     // Tokenizer: 3 KB, and the one file whose absence stops the engine dead.
     let tokenizer = dir.join("tokenizer.json");
     if !tokenizer.exists() {
         eprintln!("  📥 Kokoro tokenizer...");
-        if let Err(e) = download_file_reporting(
-            &format!("{KOKORO_REPO_BASE}tokenizer.json"),
-            &tokenizer,
-            1,
-            report.clone(),
-        )
-        .await
-        {
-            tracing::warn!("Kokoro tokenizer download failed: {e}");
-            return;
+        let url = format!("{KOKORO_REPO_BASE}tokenizer.json");
+        if !fetch_kokoro_file(&mut tried, &url, tokenizer, 1, &report, "tokenizer").await {
+            return tried;
         }
     }
 
@@ -93,16 +104,9 @@ pub async fn ensure_kokoro_engine_reporting(
     if !weights.exists() {
         let mb = pond_adapters_kokoro::model_size_mb(quality);
         eprintln!("  📥 Kokoro voice engine ({quality}, ~{mb} MB) — one time...");
-        if let Err(e) = download_file_reporting(
-            &format!("{KOKORO_REPO_BASE}onnx/{filename}"),
-            &weights,
-            mb,
-            report.clone(),
-        )
-        .await
-        {
-            tracing::warn!("Kokoro weights download failed: {e}");
-            return;
+        let url = format!("{KOKORO_REPO_BASE}onnx/{filename}");
+        if !fetch_kokoro_file(&mut tried, &url, weights, mb, &report, "weights").await {
+            return tried;
         }
     }
 
@@ -114,17 +118,33 @@ pub async fn ensure_kokoro_engine_reporting(
             continue;
         }
         eprintln!("  📥 Kokoro voice \"{name}\"...");
-        if let Err(e) = download_file_reporting(
-            &format!("{KOKORO_REPO_BASE}voices/{name}.bin"),
-            &voice_file,
-            1,
-            report.clone(),
-        )
-        .await
-        {
-            tracing::warn!("Kokoro voice {name} download failed: {e}");
-        }
+        let url = format!("{KOKORO_REPO_BASE}voices/{name}.bin");
+        let what = format!("voice {name}");
+        fetch_kokoro_file(&mut tried, &url, voice_file, 1, &report, &what).await;
     }
+    tried
+}
+
+/// Fetch one Kokoro file and add it to `tried`; whether it arrived.
+async fn fetch_kokoro_file(
+    tried: &mut Vec<FileFetch>,
+    url: &str,
+    dest: PathBuf,
+    approx_size_mb: u64,
+    report: &Option<DlProgress>,
+    what: &str,
+) -> bool {
+    let result = download_file_reporting(url, &dest, approx_size_mb, report.clone()).await;
+    if let Err(e) = &result {
+        tracing::warn!("Kokoro {what} download failed: {e}");
+    }
+    let arrived = result.is_ok();
+    tried.push(FileFetch {
+        name: progress_name(&dest),
+        dest,
+        result,
+    });
+    arrived
 }
 
 // ── Silero VAD ────────────────────────────────────────────────────────────────
@@ -365,11 +385,7 @@ async fn download_via_hf_cache(
 
     let approx_total = approx_size_mb * 1_048_576;
     let mut last_printed = 0u64;
-    let reported_name = dest
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let reported_name = progress_name(dest);
     let progress = |downloaded: u64, total: u64| {
         let effective_total = if total == 0 {
             approx_total.max(1)
@@ -959,21 +975,31 @@ mod tests {
     // Only `download_file` is tested here; `ensure_espeak_ng_data` (brew-dependent early
     // returns) and `fetch_buffalo_l_zip` (`face-onnx` only) are gated in source, untested.
 
-    /// Restores the mode on drop. `network_mode` is process-global; `Offline` is safe only
+    static MODE_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores the mode on drop, before its turn is released. `network_mode` is
+    /// process-global, so tests that set it take turns; `Offline` is safe for the rest only
     /// because it still permits loopback, which is all sibling tests send to.
-    struct ModeGuard(pond_core::shared::services::egress::NetworkMode);
+    pub(super) struct ModeGuard {
+        previous: pond_core::shared::services::egress::NetworkMode,
+        _turn: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl ModeGuard {
-        fn set(mode: pond_core::shared::services::egress::NetworkMode) -> Self {
+        pub(super) fn set(mode: pond_core::shared::services::egress::NetworkMode) -> Self {
+            let turn = MODE_TURN.lock().unwrap_or_else(|e| e.into_inner());
             let previous = pond_core::shared::services::egress::network_mode();
             pond_core::shared::services::egress::set_network_mode(mode);
-            Self(previous)
+            Self {
+                previous,
+                _turn: turn,
+            }
         }
     }
 
     impl Drop for ModeGuard {
         fn drop(&mut self) {
-            pond_core::shared::services::egress::set_network_mode(self.0);
+            pond_core::shared::services::egress::set_network_mode(self.previous);
         }
     }
 
@@ -1077,5 +1103,39 @@ mod kokoro_engine_tests {
     fn a_traversal_attempt_is_refused_and_leaves_the_default() {
         let v = voices_to_fetch("../../etc/passwd");
         assert_eq!(v, vec![DEFAULT.to_string()]);
+    }
+
+    /// A missing tokenizer or engine stops the rest; a voice that fails does not.
+    #[tokio::test]
+    async fn every_file_a_fetch_tried_comes_back_with_how_it_ended() {
+        // Offline refuses huggingface.co at the first HEAD: each fetch fails, nothing leaves.
+        let _mode =
+            super::tests::ModeGuard::set(pond_core::shared::services::egress::NetworkMode::Offline);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = kokoro_dir(tmp.path());
+        let weights = pond_adapters_kokoro::model_filename("q8");
+        let names =
+            |tried: &[FileFetch]| -> Vec<String> { tried.iter().map(|f| f.name.clone()).collect() };
+
+        let tried = ensure_kokoro_engine_reporting(tmp.path(), "q8", "bm_george", None).await;
+        assert_eq!(names(&tried), ["tokenizer.json"]);
+
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        let tried = ensure_kokoro_engine_reporting(tmp.path(), "q8", "bm_george", None).await;
+        assert_eq!(names(&tried), [weights]);
+
+        std::fs::write(dir.join(weights), "").unwrap();
+        let tried = ensure_kokoro_engine_reporting(tmp.path(), "q8", "bm_george", None).await;
+        assert_eq!(
+            names(&tried),
+            [format!("{DEFAULT}.bin"), "bm_george.bin".to_string()]
+        );
+
+        for f in &tried {
+            assert_eq!(f.dest, dir.join("voices").join(&f.name));
+            let err = f.result.as_ref().expect_err("offline must refuse it");
+            let said = pond_api::download_failure::plain_failure(err);
+            assert!(said.contains("network setting"), "{}: {said}", f.name);
+        }
     }
 }
