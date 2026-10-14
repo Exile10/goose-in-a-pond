@@ -372,17 +372,43 @@ async fn expensive_diagnostics_require_auth_but_local_voice_still_works() {
             StatusCode::OK
         );
     }
-    assert_ne!(
+    // Local voice without a token needs the host credential: a loopback peer is any account or
+    // page on the host. A gate passed answers 503 here, since no TTS backend runs in this test.
+    let credential = pond_api::host_guard::HostCredential::generate();
+    let loopback = h
+        .loopback
+        .clone()
+        .layer(axum::Extension(credential.clone()));
+    let speak = |credential: Option<&str>| {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/tts")
+            .header("Content-Type", "application/json");
+        if let Some(credential) = credential {
+            request = request.header(pond_api::host_guard::CREDENTIAL_HEADER, credential);
+        }
+        loopback
+            .clone()
+            .oneshot(request.body(Body::from(r#"{"text":"hello"}"#)).unwrap())
+    };
+    assert_eq!(speak(None).await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        speak(Some(credential.as_str())).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // A paired phone's token still admits it, from the host as from anywhere.
+    let phone = pair(&h, "phone000000000001").await;
+    assert_eq!(
         send(
             &h.loopback,
             Method::POST,
             "/api/v1/tts",
-            None,
+            phone.session_token.as_deref(),
             json!({"text":"hello"})
         )
         .await
         .status(),
-        StatusCode::UNAUTHORIZED
+        StatusCode::SERVICE_UNAVAILABLE
     );
 }
 

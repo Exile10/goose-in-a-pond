@@ -206,7 +206,7 @@ export class WebVoiceBackend implements VoiceBackend {
           ? "Goodbye! I'll be here whenever you need me."
           : "Until next time. Just say my name when you need me.";
         this.onStateChange?.("speaking");
-        await this.playTtsSentence(msg, ac.signal);
+        await this.playTtsSentence(msg, ac.signal, opts.authToken);
         this.onDismissed?.(dm.isExit);
         this.onStateChange?.("idle");
         return;
@@ -217,7 +217,7 @@ export class WebVoiceBackend implements VoiceBackend {
 
       // Concurrent quip + thinking tone while the LLM streams
       let quipDone = false;
-      void this.playTtsSentence(getQuip(), ac.signal).catch(() => {}).then(() => { quipDone = true; });
+      void this.playTtsSentence(getQuip(), ac.signal, opts.authToken).catch(() => {}).then(() => { quipDone = true; });
       // `!== false`: absent means settings haven't loaded, which should sound normal, not mute.
       const stopThink = opts.thinkingTone !== false ? playThinkingTone() : null;
       this.stopThinkingFn = stopThink;
@@ -350,12 +350,16 @@ export class WebVoiceBackend implements VoiceBackend {
     return (!t || isWhisperArtifact(t)) ? null : t;
   }
 
-  private async playTtsSentence(text: string, signal: AbortSignal): Promise<void> {
+  private async playTtsSentence(text: string, signal: AbortSignal, authToken?: string): Promise<void> {
     if (this.cancelled || signal.aborted || isTtsInterrupted()) return;
     try {
+      // The token admits it; without one the server asks for the host credential, which a
+      // restart rotates under a page that keeps its token.
+      const headers: Record<string, string> = { "Content-Type": "application/json", ...(await api.hostHeaders()) };
+      if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
       const res = await fetch(`${this.serverUrl}/api/v1/tts`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ text }),
         signal,
       });
@@ -428,7 +432,7 @@ export class WebVoiceBackend implements VoiceBackend {
       }
       playing = true;
       const cleaned = normalizeForSpeech(stripMarkdown(ttsQ.shift()!));
-      if (cleaned.trim()) await this.playTtsSentence(cleaned, controller.signal);
+      if (cleaned.trim()) await this.playTtsSentence(cleaned, controller.signal, opts.authToken);
       return playNext();
     };
 

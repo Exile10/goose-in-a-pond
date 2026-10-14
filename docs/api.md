@@ -45,14 +45,14 @@ All errors return JSON:
 | GET | /onboard/status | Public | Onboarding progress |
 | GET | /system/info | Public | Connection bootstrap; full record only with a valid bearer |
 | GET | /test | Public | Probe all backend services |
-| POST | /test/speak | Public | Play text on server speakers |
+| POST | /test/speak | Loopback + host credential | Play text on server speakers |
 | GET | /dev/goose | Public | Goose agent + MCP tool status |
 | POST | /transcribe | Public | Proxy audio to Whisper ASR |
 | GET | /settings | Protected | Get all settings |
 | PUT | /settings | Public | Update settings (partial) |
 | POST | /chat | Protected | Single-turn agent conversation |
 | POST | /chat/stream | Protected | Streaming agent conversation (SSE) |
-| POST | /tts | Protected | Synthesise speech (returns WAV) |
+| POST | /tts | Token, or loopback + host credential | Synthesise speech (returns WAV) |
 | GET | /sessions | Protected | List conversation sessions |
 | PATCH | /sessions/{id} | Protected | Rename session |
 | GET | /sessions/{id}/messages | Protected | Get session messages |
@@ -202,6 +202,9 @@ Probes all backend services in parallel and reports latency. Intended for the di
 ### POST /test/speak
 
 Speaks a text string on the server device using the configured TTS engine. Intended for voice pipeline testing.
+Needs `X-Pond-Host-Credential` from every caller (2026-10-12): `403 host_credential_required`
+without it, `503 host_credential_unavailable` on the companion listener, which holds none.
+`POND_DEV_ALLOW_LOOPBACK` admits a request without it in development.
 
 **Request** *(optional body)*
 ```json
@@ -308,6 +311,19 @@ Marks onboarding as complete. After this call, all protected routes become acces
 ```json
 { "status": "completed" }
 ```
+
+---
+
+### POST /onboard/reset
+
+Returns onboarding to `Welcome` and reopens the wizard's routes. Open to anyone while the
+wizard runs. Once the Pond is set up it needs a valid bearer token, or a loopback peer
+presenting `X-Pond-Host-Credential` (2026-10-12): a reset reopens `PUT /settings`,
+`POST /profiles` and `/onboard/*` to every LAN and tailnet peer. A LAN caller without a
+token gets `401`; a loopback caller with neither gets `403 host_credential_required`, or
+`503 host_credential_unavailable` on the companion listener.
+
+**Response 200** — the status body below, at `Welcome`.
 
 ---
 
@@ -481,6 +497,10 @@ Streaming variant of `/chat` using Server-Sent Events. The response body is a st
 ### POST /tts
 
 Synthesises speech on the server and returns a WAV audio file. Priority: Piper HTTP → 503.
+A valid bearer token admits the caller. A loopback caller without one needs
+`X-Pond-Host-Credential` (2026-10-12), so the dashboard sends it with every speech
+request; without it the answer is `403 host_credential_required`, or `503
+host_credential_unavailable` on the companion listener.
 
 **Request**
 ```json

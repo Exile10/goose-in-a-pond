@@ -32,12 +32,26 @@ dashboard router in `pond-server/src/listeners.rs::compose`):
   rebinding, where a page on `attacker.example` re-points its name at `127.0.0.1`
   and then reads and writes the API as a same-origin page. Any port is accepted, so
   `ssh -L 9000:localhost:4000` still works.
-- **Origin.** A present `Origin` must be a CORS origin (below) or `http://` on a
-  loopback name, else `403 origin_not_allowed`. This defeats cross-site `POST`s
-  that need no CORS preflight.
+- **Origin.** A present `Origin` must be a CORS origin (below), or `http://` with
+  exactly the host and port the request was sent to (host compared without case,
+  port 80 when absent), else `403 origin_not_allowed`. This defeats cross-site
+  `POST`s that need no CORS preflight. Until 2026-10-12 any loopback port was
+  accepted, so a page served by another account's server, or by anything else
+  listening on this machine, counted as the dashboard.
 - **Host credential.** Pairing codes and remote-access management
   (`/handshake/pairing-code`, `/remote-access*`) also need
-  `X-Pond-Host-Credential`: 32 random bytes the server writes to
+  `X-Pond-Host-Credential`, and so do the writes the auth middleware lets through
+  from a loopback peer without a token (2026-10-12): `POST /onboard/reset` once the
+  Pond is set up, `POST /tts`, and `POST /test/speak` (the last one even with a
+  token). A reset re-arms the wizard, which reopens `PUT /settings`,
+  `POST /profiles` and `/onboard/*` to every LAN and tailnet peer, so another
+  account, or a page on another local port, could otherwise take a set-up Pond
+  back to the wizard. A valid bearer token still admits a reset or `/tts`: the
+  handler checks it itself, because the middleware skips the token on a route a
+  loopback peer may call without one. The wizard's own reset, before the Pond is
+  set up, stays open. On the companion listener, which holds no credential, these
+  answer a tokenless loopback peer `503 host_credential_unavailable`. The
+  credential is 32 random bytes the server writes to
   `<data>/.runtime_host_credential` (`0600`, atomically replaced) at every start,
   before `.runtime_api_port`. A pairing code is a full device token, and the
   management routes can re-point the Pond and every phone at another coordinator,
@@ -281,7 +295,11 @@ removal alone is not a server revocation guarantee.
 Transcription (`POST /transcribe`) and agent status (`GET /dev/goose`) require
 authentication and completed onboarding. `/tts`, `/test`, `/test/speak`, and
 non-API dashboard/development pages allow anonymous **loopback** callers only;
-remote callers need a valid token. This preserves local desktop/CLI speech.
+remote callers need a valid token. A loopback caller without a token also needs
+the host credential for `/tts`, and every caller does for `/test/speak`
+(2026-10-12), so the dashboard sends it with speech requests. `POST
+/player/egress-policy` needs the player page's session like its other routes; it
+used to be tokenless on loopback for a shell caller that no longer exists.
 Health, onboarding status and `/system/info` remain public for connection and
 pairing bootstrap; discovery information must never establish trust in a new TLS
 key. Existing onboarding and OAuth-specific guards remain in place.

@@ -1419,6 +1419,15 @@ describe("the host credential", () => {
     expect(sent("/health")).toEqual([undefined]);
   });
 
+  it("goes with an onboarding reset and with speech synthesis", async () => {
+    fetchMock.mockImplementation(async () => okJson({ onboarded: false, current_step: "Welcome" }));
+    const api = client();
+    await api.resetOnboarding();
+    await api.synthesizeSpeech("hello");
+    expect(sent("/onboard/reset")).toEqual([credential]);
+    expect(sent("/api/v1/tts")).toEqual([credential]);
+  });
+
   it("surfaces the refusal by name, so the UI can explain it", async () => {
     sessionStorage.clear();
     fetchMock.mockResolvedValue(errJson(403, "host_credential_required"));
