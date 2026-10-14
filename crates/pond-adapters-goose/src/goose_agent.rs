@@ -2786,6 +2786,8 @@ impl GooseAdapter {
         shim_appendix.push(pond_core::models::services::turn_budget::turn_budget_note(
             (!settings.turns_are_uncapped(is_voice)).then_some(max_turns),
         ));
+        // Standing too: the CURRENT CONTEXT line is news each turn, the rule for reading it is not.
+        shim_appendix.push(pond_core::models::services::prompt_builder::TEMPORAL_RULE.to_string());
         // Appendix, not envelope: it only changes with the tools block, so it's prefilled once.
         if !dormant_groups_note.is_empty() {
             shim_appendix.push(dormant_groups_note.clone());
@@ -5013,6 +5015,12 @@ mod tests {
                 "shim_appendix.push(pond_core::models::services::turn_budget::turn_budget_note("
             ),
             "the turn-budget note no longer goes into the session's appendix"
+        );
+        assert!(
+            code.contains(
+                "shim_appendix.push(pond_core::models::services::prompt_builder::TEMPORAL_RULE"
+            ),
+            "the date/time rule no longer goes into the session's appendix"
         );
     }
 

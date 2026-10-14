@@ -26,6 +26,12 @@ fn hash_string(s: &str) -> u64 {
     hasher.finish()
 }
 
+/// The standing rule for the date and time the suffix carries. The suffix leaves it out: on the
+/// live path the suffix rides every turn's user message and stays in the history, so a rule there
+/// is re-sent on every turn. Each caller states it once, beside its other standing rules.
+pub const TEMPORAL_RULE: &str = "Each turn's CURRENT CONTEXT line gives the date and time: answer \
+                                 time/date questions directly from it — no tools needed.";
+
 /// Build the partitioned prompt; date and time go to the suffix only.
 pub fn build_prompt_partition(
     settings: &Settings,
@@ -72,7 +78,6 @@ pub fn build_prompt_partition(
             temporal.push_str(&state.current_time);
             temporal.push('.');
         }
-        temporal.push_str(" Answer time/date questions directly from this — no tools needed.");
         dynamic_parts.push(temporal);
     }
 
@@ -170,6 +175,26 @@ mod tests {
         assert!(
             !partition.static_prefix.contains("14:32"),
             "Static prefix must not contain the current time"
+        );
+    }
+
+    /// The suffix is news; the rule for reading it is not, so it rides elsewhere.
+    #[test]
+    fn the_suffix_carries_the_date_and_time_but_not_the_rule_for_them() {
+        let partition = build_prompt_partition(
+            &Settings::default(),
+            None,
+            &default_state(),
+            PROMPT_BALANCED,
+        );
+        assert!(partition
+            .dynamic_suffix
+            .contains("CURRENT CONTEXT: Today is"));
+        assert!(!partition.dynamic_suffix.contains("no tools needed"));
+        assert!(!partition.static_prefix.contains(TEMPORAL_RULE));
+        assert!(
+            TEMPORAL_RULE.contains("CURRENT CONTEXT"),
+            "the rule must name the line the suffix writes"
         );
     }
 
