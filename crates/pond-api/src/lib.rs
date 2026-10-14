@@ -748,6 +748,8 @@ mod rate_limit_tests {
             "/api/v1/handshake",
             "/api/v1/handshake/init",
             "/api/v1/handshake/verify",
+            "/api/v1/handshake/pake/init",
+            "/api/v1/handshake/pake/verify",
             "/api/v1/handshake/refresh",
             "/api/v1/handshake/revoke",
             "/api/v1/handshake/pairing-code",

@@ -40,6 +40,10 @@ All errors return JSON:
 |--------|------|------|---------|
 | GET | /health | Public | Service health check |
 | POST | /handshake | Loopback only (legacy) | GIAP ↔ GOTG authentication handshake |
+| POST | /handshake/pake/init | Public, direct LAN peers | Phone pairing (CPace), phase 1 |
+| POST | /handshake/pake/verify | Public, direct LAN peers | Phone pairing (CPace), phase 2 |
+| POST | /handshake/init | Loopback only | Dashboard pairing (HMAC), phase 1 |
+| POST | /handshake/verify | Loopback only | Dashboard pairing (HMAC), phase 2 |
 | POST | /onboard | Public | Start first-run onboarding flow |
 | POST | /onboard/complete | Public | Mark onboarding finished |
 | GET | /onboard/status | Public | Onboarding progress |
@@ -152,11 +156,13 @@ Public, so a phone can find the Pond before pairing, but it answers by authentic
 {
   "https_port": 4443,
   "tailnet_address": "100.64.0.7",
-  "protocol": 2
+  "protocol": 3
 }
 ```
 
-`protocol: 2` (pinned HTTPS pairing) appears only in this anonymous answer.
+`protocol: 3` (CPace pairing over pinned HTTPS, 2026-10-13) appears only in this anonymous
+answer. A client built for another version should stop and say the Pond or the app needs an
+update; version 2's HMAC pairing is no longer served to phones.
 
 **Response 200**, with a valid bearer:
 ```json
@@ -251,9 +257,9 @@ Reports Goose agent status and loaded MCP tools. Useful for verifying the GIAP b
 
 Exchanges a session token between a GOTG mobile client and GIAP. Returns connection details.
 
-Legacy single-step pairing. It carries the code in the body and binds nothing, so it is refused from any peer but loopback: a tailnet or unclassifiable peer gets `403 {"error":"pairing_requires_lan"}`, and any other non-loopback peer `403 {"error":"legacy_pairing_host_only"}` (`handshake_handler`). Phones use `/handshake/init` and `/handshake/verify`, and must send `channel_binding`.
+Legacy single-step pairing. It carries the code in the body and binds nothing, so it is refused from any peer but loopback: a tailnet or unclassifiable peer gets `403 {"error":"pairing_requires_lan"}`, and any other non-loopback peer `403 {"error":"legacy_pairing_host_only"}` (`handshake_handler`). Phones pair with CPace on `/handshake/pake/init` and `/handshake/pake/verify`, below.
 
-> **Status**: Token validation is real. `SqliteHandshakeAdapter::validate_token` (`crates/pond-infra/src/sqlite_handshake.rs`) looks the token up by SHA-256 hash and accepts it only when it is unrevoked and unexpired, touching `last_seen_at` on success. Tokens are hashed at rest, and pairing is a two-phase HMAC challenge.
+> **Status**: Token validation is real. `SqliteHandshakeAdapter::validate_token` (`crates/pond-infra/src/sqlite_handshake.rs`) looks the token up by SHA-256 hash and accepts it only when it is unrevoked and unexpired, touching `last_seen_at` on success. Tokens are hashed at rest. Phones pair with CPace; the loopback dashboard with a two-phase HMAC challenge.
 
 **Request**
 ```json
@@ -279,6 +285,108 @@ Legacy single-step pairing. It carries the code in the body and binds nothing, s
 | 400 | Invalid request body |
 | 403 | `legacy_pairing_host_only` or `pairing_requires_lan`: the caller is not on this host |
 | 500 | Handshake handler error |
+
+---
+
+### Phone pairing: POST /handshake/pake/init and /handshake/pake/verify (2026-10-13)
+
+Phones pair with CPace (`draft-irtf-cfrg-cpace-21`, suite `CPACE-RISTR255-SHA512`). The Pond
+is initiator A and the phone responder B. Both routes take direct LAN peers and loopback only
+(a tailnet or unclassifiable peer gets `403 pairing_requires_lan`), sit in the pairing rate
+bucket, and are served on the HTTPS listener, the loopback listener and, in debug builds with
+`POND_DEV_INSECURE_LAN=1`, the plaintext development listener. The cryptography, labels and
+encodings are in `crates/pond-infra/src/pairing_cpace.rs`; one complete run with every
+intermediate value is `crates/pond-infra/tests/fixtures/cpace-vectors.json`.
+
+| Value | Definition |
+|-------|------------|
+| PRS | the six-digit code as six ASCII bytes, leading zeros kept |
+| CI | `lv_cat("goose-pair-cpace-v1", spki_pin, client_id)`; `spki_pin` is the ASCII `sha256/<base64>` pin. The Pond always uses its own pin |
+| sid | `challenge (32 bytes) ‖ client_nonce (32 bytes)` |
+| ADa, ADb | empty |
+| g | RFC 9496 element derivation of `SHA-512(generator_string(DSI, PRS, CI, sid, 128))` |
+| ISK | `SHA-512(lv_cat("CPaceRistretto255_ISK", sid, K) ‖ lv_cat(Ya, ADa) ‖ lv_cat(Yb, ADb))` |
+| mac_key | `SHA-512("CPaceMac" ‖ sid ‖ ISK)` |
+| T_client | `HMAC-SHA-512(mac_key, lv_cat("goose-pair-cpace-client-v1", Ya, ADa, Yb, ADb))` |
+| T_server | `HMAC-SHA-512(mac_key, lv_cat("goose-pair-cpace-server-v1", Ya, ADa, Yb, ADb))` |
+
+`lv_cat` prefixes each field with its LEB128 length. Shares are 32-byte ristretto255
+encodings in standard base64; tags are 64 bytes in lowercase hex.
+
+**`POST /handshake/pake/init`**
+```json
+{
+  "client_id": "install-abcdef",
+  "client_type": "gotg",
+  "client_version": "1.0.0",
+  "channel_binding": "sha256/TnkUsN+AaLec3BDTh/KUwSokXTmCq2+4rlfBnmJxPkE=",
+  "client_nonce": "<32 random bytes, base64>"
+}
+```
+
+`channel_binding` is the pin the phone pinned, and on the plaintext development listener the
+pin that listener's `/system/info` reports. It is checked only so a phone at the wrong Pond fails
+early: the run itself always uses the Pond's own pin.
+
+**Response 200**: the Pond has committed to the newest active pairing code.
+```json
+{
+  "challenge_id": "…",
+  "challenge": "<32 bytes, base64>",
+  "expires_at": "2026-10-13T09:01:00Z",
+  "suite": "CPACE-RISTR255-SHA512",
+  "share": "<Ya, base64>"
+}
+```
+
+**`POST /handshake/pake/verify`**
+```json
+{
+  "challenge_id": "…",
+  "device_name": "Liz's phone",
+  "share": "<Yb, base64>",
+  "confirm": "<T_client, hex>"
+}
+```
+
+**Response 200**, accepted: the token fields of `HandshakeResponse` plus `"server_proof"`, which
+is `T_server` in hex. The phone must check it and discard the tokens if it does not verify.
+**Response 200**, refused: `"accepted": false`, with the same code in both `rejection_reason`
+and `error`, and no `server_proof`.
+
+Every refusal from either route carries a stable code in `error`, which a client should read
+whatever the status:
+
+| Route | Status | `error` | Meaning |
+|-------|--------|---------|---------|
+| init | 403 | `pairing_requires_lan` | Not a direct LAN or loopback peer |
+| init | 403 | `channel_binding_mismatch` | The phone pinned a key that is not this Pond's |
+| init | 409 | `no_active_pairing_code` | No live code; show a new one |
+| init | 400 | `invalid_client_nonce` | `client_nonce` is not 32 bytes of base64 |
+| init | 503 | `pairing_busy` | Too many runs are waiting for their verify; retry shortly |
+| verify | 429 | `pairing_busy` | The per-IP verify limit (10 a minute); `retry_after_secs` says when |
+| verify | 200 | `invalid_confirmation` | `T_client` is wrong, which means a wrong code (or a wrong pin) |
+| verify | 200 | `invalid_share` | `Yb` did not decode, or the shared point was the identity |
+| verify | 200 | `code_retired` | The code this run used was consumed, replaced, expired, or spent its 10 failed attempts; show a new code |
+| verify | 200 | `unknown_challenge` | No such run, or it was already used (each run gets one attempt) |
+| verify | 200 | `challenge_expired` | The run is older than 60 s |
+
+The pairing rate bucket (30 a minute per IP, loopback exempt) answers `429` with
+`{"error": "Rate limit exceeded"}` and a `Retry-After` header before either handler runs, so a
+client should treat any 429 as `pairing_busy`.
+
+Each code allows 10 confirmation attempts in all; the one that spends the budget answers
+`code_retired`, and the code stops working. Issuing a new code retires every older one.
+
+### Dashboard pairing: POST /handshake/init and /handshake/verify
+
+The desktop dashboard pairs over loopback with the code it reads from the host-only
+`/handshake/pairing-code`: `init` returns `{challenge_id, challenge, expires_at}` and `verify`
+takes `{challenge_id, mac, device_name?}` with `mac = HMAC-SHA256(code, challenge ‖ client_id)`
+in hex. Any peer but loopback on the dashboard or HTTPS listener, and every peer on the plaintext
+development listener, gets `403 {"error": "pairing_requires_cpace"}` (a tailnet peer still gets
+`pairing_requires_lan` first). A refused verify is a 200 with `accepted: false` and a
+`rejection_reason`.
 
 ---
 

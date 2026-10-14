@@ -1,0 +1,92 @@
+{
+  "description": "One fixed CPace pairing run between a Pond (initiator A) and a phone (responder B). Byte strings are lowercase hex; `wire` shows them as the routes carry them. K_mac is the draft's mac_key (section 10.4). Regenerate with CPACE_VECTORS_WRITE=1 cargo test -p pond-infra exchange_vectors.",
+  "inputs": {
+    "ADa": "",
+    "ADb": "",
+    "PRS": "343832393135",
+    "challenge": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "client_id": "install-abcdef",
+    "client_nonce": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "code": "482915",
+    "spki_pin": "sha256/TnkUsN+AaLec3BDTh/KUwSokXTmCq2+4rlfBnmJxPkE=",
+    "ya": "da3d23700a9e5699258aef94dc060dfda5ebb61f02a5ea77fad53f4ff0976d08",
+    "yb": "d2316b454718c35362d83d69df6320f38578ed5984651435e2949762d900b80d"
+  },
+  "labels": {
+    "DSI": "435061636552697374726574746f323535",
+    "DSI_ISK": "435061636552697374726574746f3235355f49534b",
+    "channel": "goose-pair-cpace-v1",
+    "client_tag": "goose-pair-cpace-client-v1",
+    "mac_key_prefix": "CPaceMac",
+    "server_tag": "goose-pair-cpace-server-v1"
+  },
+  "negative": [
+    {
+      "T_client": "93bf148749292778b7279b14767354126757ecac2d8df0325cf53334767414408ea8ec503b32fc134218103605a46cf7d3608c1cc9b9e807838378a99cb40e57",
+      "Yb": "ee0cf76f9080115dadccd995c1636617caeb76e99f18581c9db7b35463a59739",
+      "name": "wrong_code",
+      "phone_code": "000000",
+      "pond_result": "invalid_confirmation"
+    },
+    {
+      "CI": "13676f6f73652d706169722d63706163652d7631337368613235362f414141414141414141414141414141414141414141414141414141414141414141414141414141414141413d0e696e7374616c6c2d616263646566",
+      "T_client": "54e83474d8f409349747655c9f327035b3da0a05a00c3743bc2b73f4b9894d772f958d84e58dfae1b9e4d88c2a12a81108f1069c85b20c562539c4f4acbba7d4",
+      "Yb": "5c188cc0bf4786b0b676dd3fce764f8e0a8b37ad447b0104fb9929a2f7ecf078",
+      "name": "wrong_pin",
+      "phone_spki_pin": "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "pond_result": "invalid_confirmation"
+    },
+    {
+      "Yb": "0000000000000000000000000000000000000000000000000000000000000000",
+      "name": "identity_share",
+      "pond_result": "invalid_share"
+    },
+    {
+      "Yb": "2b3c6b8c4f3800e7aef6864025b4ed79bd599117e427c41bd47d93d654b4a51c",
+      "name": "non_canonical_share",
+      "pond_result": "invalid_share"
+    },
+    {
+      "T_server": "8861c25dcd0f503f058fdeac76283e472405ccb4b1baa408c177dcc02f4498e2263dae96d5dcf9b944ecebcc49de7887186ae5efb2c668328b2bf3e302b3dcee",
+      "name": "tampered_server_tag",
+      "phone_result": "invalid_server_proof"
+    }
+  ],
+  "outputs": {
+    "CI": "13676f6f73652d706169722d63706163652d7631337368613235362f546e6b55734e2b41614c656333424454682f4b5577536f6b58546d4371322b34726c66426e6d4a78506b453d0e696e7374616c6c2d616263646566",
+    "ISK": "d02a4ca8bd85644cae9dbaab6cdbae27070200e4deb17350577f68cfda59b8ae1064a4e5c70525fd382a34efcfab1a965c63132ce183ce6de69f7abe3dd3529f",
+    "K": "648fdb17e0809ced8046914ce070f63f29120d6c91cd96787bad8e1e7b34552c",
+    "K_mac": "705bbb1b5ddb7759029591d135d07d42e39615ecac7f6ca695b8b7d9d180bbb0a229f6115765c5471c41137b6d36a33d125f1231951e486ef72b4bd101361cd0",
+    "T_client": "dab23d7616ad4dc555f28ad1edd25144c8898ec55d6b6730e2a009c8cb1b547c8a9937fceac2b92f38d4c18034018d976a6f0243784e636239e2f1e70c6366d2",
+    "T_server": "8961c25dcd0f503f058fdeac76283e472405ccb4b1baa408c177dcc02f4498e2263dae96d5dcf9b944ecebcc49de7887186ae5efb2c668328b2bf3e302b3dcee",
+    "Ya": "9892264cbe55cf40be1aec09869ec1fadc8c64c7a64cdce66d0593f1df29f146",
+    "Yb": "6252e766a36b8568ed662104c17eb1b42b69067c6a17de49459d75124cbf5379",
+    "g": "98ac5525c3279d2dd0171d9f1e4665fd6494b24e4dd987e88db4e58a62df2228",
+    "generator_string": "11435061636552697374726574746f32353506343832393135660000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005713676f6f73652d706169722d63706163652d7631337368613235362f546e6b55734e2b41614c656333424454682f4b5577536f6b58546d4371322b34726c66426e6d4a78506b453d0e696e7374616c6c2d61626364656640000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "sid": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+  },
+  "spec": "draft-irtf-cfrg-cpace-21",
+  "suite": "CPACE-RISTR255-SHA512",
+  "wire": {
+    "init_request": {
+      "channel_binding": "sha256/TnkUsN+AaLec3BDTh/KUwSokXTmCq2+4rlfBnmJxPkE=",
+      "client_id": "install-abcdef",
+      "client_nonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+      "client_type": "gotg",
+      "client_version": "1.0.0"
+    },
+    "init_response": {
+      "challenge": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "share": "mJImTL5Vz0C+GuwJhp7B+tyMZMemTNzmbQWT8d8p8UY=",
+      "suite": "CPACE-RISTR255-SHA512"
+    },
+    "verify_request": {
+      "confirm": "dab23d7616ad4dc555f28ad1edd25144c8898ec55d6b6730e2a009c8cb1b547c8a9937fceac2b92f38d4c18034018d976a6f0243784e636239e2f1e70c6366d2",
+      "share": "YlLnZqNrhWjtZiEEwX6xtCtpBnxqF95JRZ11Eky/U3k="
+    },
+    "verify_response": {
+      "accepted": true,
+      "server_proof": "8961c25dcd0f503f058fdeac76283e472405ccb4b1baa408c177dcc02f4498e2263dae96d5dcf9b944ecebcc49de7887186ae5efb2c668328b2bf3e302b3dcee"
+    }
+  }
+}

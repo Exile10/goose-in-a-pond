@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import time
 
+import pond_cpace
+
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("POND_TEST_BINARY", ROOT / "target/debug/pond-server"))
 
@@ -67,6 +69,7 @@ def stop(process):
 
 
 def main():
+    pond_cpace.check_vectors()
     with tempfile.TemporaryDirectory(prefix="pond-pinned-https-") as scratch:
         data = Path(scratch)
         previous_pin = None
@@ -95,7 +98,7 @@ def main():
                     else:
                         raise AssertionError(f"HTTPS did not become ready: {last_error}")
                     # Anonymous callers learn where to connect and nothing about the household.
-                    assert info["https_port"] == https_port and info["protocol"] == 2
+                    assert info["https_port"] == https_port and info["protocol"] == 3
                     assert "hostname" not in info and "tls_spki_sha256" not in info, info
                     curl(https + "/api/v1/health", certificate, pin)
                     curl(http + "/api/v1/handshake/pairing-code", expect=403)
@@ -112,8 +115,16 @@ def main():
                     curl(https + "/api/v1/devices", certificate, pin, expect=401)
                     for path in ["/", "/dev/test", "/dev/face", "/assets/index.js"]:
                         curl(https + path, certificate, pin, expect=404)
-                    curl(https + "/api/v1/handshake/init", certificate, pin,
-                         data={"client_id": "scratch-phone", "client_type": "gotg", "client_version": "test"})
+                    # A phone pairs over pinned HTTPS with CPace, under the pin it pinned.
+                    issued = curl(http + "/api/v1/handshake/pairing-code", data={},
+                                  headers=["X-Pond-Host-Credential: " + host_credential])
+
+                    def over_https(method, path, body=None, expected=200):
+                        assert method == "POST"
+                        return curl(https + "/api/v1" + path, certificate, pin, expect=expected, data=body)
+
+                    paired = pond_cpace.pair(over_https, issued["code"], pin, f"scratch-phone-{iteration}")
+                    assert paired["accepted"] is True and paired["session_token"], "CPace pairing failed"
                     bad = subprocess.run(["curl", "--silent", "--max-time", "10", "--cacert", str(certificate),
                                           "--pinnedpubkey", "sha256//" + base64.b64encode(bytes(32)).decode(),
                                           https + "/api/v1/health"], capture_output=True)
@@ -121,7 +132,7 @@ def main():
                     # A plain HTTP request to the network listener must not return an API response.
                     plain = subprocess.run(["curl", "--silent", "--max-time", "3", f"http://127.0.0.1:{https_port}/api/v1/health"], capture_output=True)
                     assert plain.returncode != 0
-                    print(f"PASS {'populated restart' if iteration else 'fresh data'}: pinned HTTPS, auth, local compatibility, no network assets, wrong pin and plaintext rejected", flush=True)
+                    print(f"PASS {'populated restart' if iteration else 'fresh data'}: pinned HTTPS, CPace pairing, auth, no network assets, wrong pin and plaintext rejected", flush=True)
                 finally:
                     stop(process)
         print("PASS clean shutdown of both listeners and persistent SPKI identity", flush=True)

@@ -53,6 +53,7 @@ async fn make_app() -> Harness {
     }
 }
 
+use pond_api::test_support::{pair_phone, TEST_SPKI_PIN};
 use pond_core::security::ports::handshake::{Handshake, HandshakeRequest};
 use serde_json::json;
 
@@ -97,6 +98,15 @@ async fn tailnet_cannot_pair_even_with_forged_local_headers() {
             "/api/v1/handshake/verify",
             json!({"challenge_id":"none", "mac":"00"}),
         ),
+        (
+            "/api/v1/handshake/pake/init",
+            json!({"client_id":"remote", "client_type":"gotg", "client_version":"test",
+                   "channel_binding": TEST_SPKI_PIN, "client_nonce": "AAAA"}),
+        ),
+        (
+            "/api/v1/handshake/pake/verify",
+            json!({"challenge_id":"none", "share":"AAAA", "confirm":"00"}),
+        ),
     ] {
         let (status, body) = post(&h.remote, path, body).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -122,6 +132,27 @@ async fn a_locally_started_challenge_cannot_be_completed_remotely() {
         json!({
             "challenge_id": challenge["challenge_id"], "mac":"00"
         }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "pairing_requires_lan");
+
+    // The same for a CPace run: started on loopback, it cannot be finished over the tailnet.
+    h.handshake.issue_pairing_code().await.unwrap();
+    let (status, challenge) = post(
+        &h.loopback,
+        "/api/v1/handshake/pake/init",
+        json!({"client_id":"phone", "client_type":"gotg", "client_version":"test",
+               "channel_binding": TEST_SPKI_PIN,
+               "client_nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{challenge}");
+    let (status, body) = post(
+        &h.remote,
+        "/api/v1/handshake/pake/verify",
+        json!({"challenge_id": challenge["challenge_id"], "share": challenge["share"],
+               "confirm": "00"}),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -222,6 +253,9 @@ async fn companion_never_serves_dashboard_and_missing_peer_fails_closed() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "pairing_requires_lan");
+    let (status, body) = pair_phone(&h.companion, "123456", "phone", TEST_SPKI_PIN).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "pairing_requires_lan");
 }
 
 /// This host's own address on an attached LAN: the one non-loopback peer the LAN check
@@ -241,45 +275,34 @@ fn own_lan_address() -> Option<std::net::IpAddr> {
         })
 }
 
+/// A phone on the LAN pairs with CPace, and only with CPace: the dashboard's HMAC exchange and
+/// the legacy single step are this host's alone.
 #[tokio::test]
-async fn a_phone_on_the_lan_must_bind_the_key_it_pinned() {
+async fn a_phone_on_the_lan_pairs_only_with_cpace() {
     let Some(address) = own_lan_address() else {
         eprintln!("SKIPPED: this host has no attached LAN, so no LAN peer can be simulated");
         return;
     };
     let h = make_app().await;
-    let state_router = h.companion.clone();
-    let lan = state_router.layer(MockConnectInfo(SocketAddr::new(address, 40_000)));
+    let lan = h
+        .companion
+        .clone()
+        .layer(MockConnectInfo(SocketAddr::new(address, 40_000)));
     let code = h.handshake.issue_pairing_code().await.unwrap().code;
-    let (status, challenge) = post(
-        &lan,
-        "/api/v1/handshake/init",
-        json!({"client_id":"lan-phone", "client_type":"gotg", "client_version":"test"}),
-    )
-    .await;
+
+    let init = json!({"client_id":"lan-phone", "client_type":"gotg", "client_version":"test"});
+    let (status, body) = post(&lan, "/api/v1/handshake/init", init.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "pairing_requires_cpace");
+
+    // A loopback challenge completed from the LAN is refused without being spent.
+    let (status, challenge) = post(&h.loopback, "/api/v1/handshake/init", init).await;
     assert_eq!(status, StatusCode::OK);
-
-    use base64::Engine;
-    use hmac::Mac;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(challenge["challenge"].as_str().unwrap())
-        .unwrap();
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(code.as_bytes()).unwrap();
-    mac.update(&raw);
-    mac.update(b"lan-phone");
-    let unbound: String = mac
-        .finalize()
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let verify = json!({"challenge_id": challenge["challenge_id"], "mac": unbound});
-
+    let mac = unbound_mac(&code, challenge["challenge"].as_str().unwrap(), "lan-phone");
+    let verify = json!({"challenge_id": challenge["challenge_id"], "mac": mac});
     let (status, body) = post(&lan, "/api/v1/handshake/verify", verify.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["error"], "channel_binding_required");
-
-    // The refusal spent nothing: the same challenge still completes from loopback.
+    assert_eq!(body["error"], "pairing_requires_cpace");
     let (status, body) = post(&h.loopback, "/api/v1/handshake/verify", verify).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["accepted"], true);
@@ -292,6 +315,17 @@ async fn a_phone_on_the_lan_must_bind_the_key_it_pinned() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "legacy_pairing_host_only");
+
+    // A phone that pinned some other key is turned away before any run starts...
+    let code = h.handshake.issue_pairing_code().await.unwrap().code;
+    let other = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let (status, body) = pair_phone(&lan, &code, "lan-phone", other).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "channel_binding_mismatch");
+    // ...and one that pinned this Pond's pairs.
+    let (status, body) = pair_phone(&lan, &code, "lan-phone", TEST_SPKI_PIN).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], true, "{body}");
 }
 
 /// A phone on the companion router as a loopback peer, so the LAN guard passes on any host.
@@ -317,32 +351,50 @@ fn unbound_mac(code: &str, challenge_b64: &str, client_id: &str) -> String {
         .collect()
 }
 
-/// Pair unbound through `router` and return the `transport` attribute of the audit event.
-async fn pair_unbound(h: &Harness, router: &axum::Router, client_id: &str) -> Option<String> {
+/// Every refusal names its code in `error`, which is what the app reads: a wrong code is
+/// `invalid_confirmation` until the code's ten attempts are spent, then `code_retired`.
+#[tokio::test]
+async fn cpace_refusals_carry_their_code_and_the_budget_retires_the_code() {
+    let h = make_app().await;
+    // Its own loopback address, so these ten verifies spend nobody else's per-IP allowance.
+    let phone = h
+        .companion
+        .clone()
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 7], 40_003))));
     let code = h.handshake.issue_pairing_code().await.unwrap().code;
-    let (status, challenge) = post(
-        router,
-        "/api/v1/handshake/init",
-        json!({"client_id": client_id, "client_type": "gotg", "client_version": "test"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{challenge}");
-    let mac = unbound_mac(&code, challenge["challenge"].as_str().unwrap(), client_id);
-    let (status, body) = post(
-        router,
-        "/api/v1/handshake/verify",
-        json!({
-            "challenge_id": challenge["challenge_id"], "mac": mac,
-            "device_name": client_id, "channel_binding": null
-        }),
-    )
-    .await;
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+
+    for attempt in 1..=10 {
+        let (status, body) = pair_phone(&phone, wrong, "guesser", TEST_SPKI_PIN).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a refusal is a 200 carrying a reason: {body}"
+        );
+        assert_eq!(body["accepted"], false);
+        let expected = if attempt < 10 {
+            "invalid_confirmation"
+        } else {
+            "code_retired"
+        };
+        assert_eq!(body["error"], expected, "attempt {attempt}: {body}");
+        assert_eq!(body["rejection_reason"], expected);
+        assert!(
+            body["server_proof"].is_null(),
+            "a refusal must not carry a proof"
+        );
+    }
+    let (status, body) = pair_phone(&phone, &code, "guesser", TEST_SPKI_PIN).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "no_active_pairing_code");
+}
+
+/// Pair with CPace through `router` and return the audit event's `transport` attribute.
+async fn pair_and_audit(h: &Harness, router: &axum::Router, client_id: &str) -> Option<String> {
+    let code = h.handshake.issue_pairing_code().await.unwrap().code;
+    let (status, body) = pair_phone(router, &code, client_id, TEST_SPKI_PIN).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["accepted"], true, "{body}");
-    assert!(
-        body["server_proof"].is_null(),
-        "an unbound pair has nothing to prove over"
-    );
 
     use pond_core::security::domain::event::{AttributeValue, EventCategory, EventQuery};
     use pond_core::security::ports::event_log::EventLog;
@@ -361,6 +413,10 @@ async fn pair_unbound(h: &Harness, router: &axum::Router, client_id: &str) -> Op
                 && e.attributes.get("device_name") == Some(&AttributeValue::Text(client_id.into()))
         })
         .expect("the pairing is audited");
+    assert_eq!(
+        event.attributes.get("method"),
+        Some(&AttributeValue::Text("cpace".into()))
+    );
     match event.attributes.get("transport") {
         Some(AttributeValue::Text(transport)) => Some(transport.clone()),
         None => None,
@@ -368,10 +424,10 @@ async fn pair_unbound(h: &Harness, router: &axum::Router, client_id: &str) -> Op
     }
 }
 
-/// The plaintext development listener pairs unbound, because there is no TLS key to bind, and
-/// the audit trail records that it did. The HTTPS listener's pairing is unchanged by the flag.
+/// Phones pair with CPace on the plaintext development listener too, and the audit trail
+/// records that they did it there. The dashboard's HMAC exchange is not served to them.
 #[tokio::test]
-async fn unbound_pairing_on_the_insecure_listener_is_audited_as_plaintext() {
+async fn pairing_on_the_insecure_listener_is_cpace_and_audited_as_plaintext() {
     use pond_api::insecure_dev::{advertise, router, InsecureDevLan};
     let h = make_app().await;
     let lan = Some(InsecureDevLan { port: 4080 });
@@ -379,10 +435,19 @@ async fn unbound_pairing_on_the_insecure_listener_is_audited_as_plaintext() {
     let insecure = on_loopback(router(advertise(h.companion.clone(), lan)));
 
     assert_eq!(
-        pair_unbound(&h, &insecure, "expo-go").await.as_deref(),
+        pair_and_audit(&h, &insecure, "expo-go").await.as_deref(),
         Some("insecure_dev")
     );
-    assert_eq!(pair_unbound(&h, &https, "release-phone").await, None);
+    assert_eq!(pair_and_audit(&h, &https, "release-phone").await, None);
+
+    let (status, body) = post(
+        &insecure,
+        "/api/v1/handshake/init",
+        json!({"client_id":"expo-go", "client_type":"gotg", "client_version":"test"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "pairing_requires_cpace");
 }
 
 async fn system_info(router: &axum::Router, bearer: Option<&str>) -> Value {
@@ -415,6 +480,11 @@ async fn system_info_names_the_insecure_listener_only_while_it_runs() {
     let https = on_loopback(advertise(h.companion.clone(), lan));
     let insecure = on_loopback(router(advertise(h.companion.clone(), lan)));
 
+    assert_eq!(
+        system_info(&off, None).await["protocol"],
+        3,
+        "anonymous callers learn which pairing protocol this Pond speaks"
+    );
     for bearer in [None, Some(token.as_str())] {
         let info = system_info(&off, bearer).await;
         assert!(info.get("insecure_dev").is_none(), "{info}");

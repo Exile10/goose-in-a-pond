@@ -72,7 +72,6 @@ async fn pair(pond: &Pond, code: &str, client_id: &str) -> String {
     let response = pond
         .handshake
         .verify_handshake(VerifyRequest {
-            channel_binding: None,
             challenge_id: init.challenge_id,
             mac: client_mac(code, &init.challenge, client_id),
             device_name: Some(format!("{client_id} phone")),

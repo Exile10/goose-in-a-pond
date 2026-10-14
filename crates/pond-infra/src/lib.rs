@@ -6,6 +6,7 @@ pub mod file_secret_repository;
 pub mod logging_device_control;
 pub mod mock_handshake;
 pub mod onboarding;
+pub mod pairing_cpace;
 pub mod pruning;
 pub(crate) mod push_token_log;
 pub mod rule_redactor;

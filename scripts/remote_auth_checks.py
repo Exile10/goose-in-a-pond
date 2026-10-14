@@ -1,7 +1,9 @@
 """W3 checks for the scratch, onboarded, no-bypass server in live-test.sh.
 
 The launcher proves process/port ownership before calling this script. Credentials
-are generated through real two-phase pairing and never printed or passed to curl.
+are generated through real pairing and never printed or passed to curl: a phone pairs
+with CPace (`pond_cpace.py`, checked against the vectors first) and the dashboard with
+its loopback HMAC exchange.
 """
 import base64
 import hashlib
@@ -10,6 +12,8 @@ import http.client
 import json
 import os
 from pathlib import Path
+
+import pond_cpace
 
 
 def run():
@@ -35,9 +39,15 @@ def run():
 
     host_only = {"X-Pond-Host-Credential": host_credential}
 
-    def pair(client):
+    def pair_phone(client):
+        issued = call("POST", "/handshake/pairing-code", extra=host_only)
+        result = pond_cpace.pair(call, issued["code"], issued["pairing"]["tls_spki_sha256"], client)
+        assert result["accepted"] is True, result
+        return result
+
+    def pair_dashboard(client):
         code = call("POST", "/handshake/pairing-code", extra=host_only)["code"]
-        challenge = call("POST", "/handshake/init", {"client_id": client, "client_type": "gotg", "client_version": "w3-live"})
+        challenge = call("POST", "/handshake/init", {"client_id": client, "client_type": "desktop", "client_version": "w3-live"})
         mac = hmac.new(code.encode(), base64.b64decode(challenge["challenge"]) + client.encode(), hashlib.sha256).hexdigest()
         result = call("POST", "/handshake/verify", {"challenge_id": challenge["challenge_id"], "mac": mac, "device_name": client})
         assert result["accepted"] is True
@@ -53,7 +63,23 @@ def run():
     call("GET", "/remote-access", extra=host_only)
     print("PASS  host-only routes need the host credential, a loopback Host and a first-party Origin")
 
-    a, b = pair("w3-live-a"), pair("w3-live-b")
+    pond_cpace.check_vectors()
+    issued = call("POST", "/handshake/pairing-code", extra=host_only)
+    pin = issued["pairing"]["tls_spki_sha256"]
+    wrong = "000000" if issued["code"] != "000000" else "000001"
+    refused = pond_cpace.pair(call, wrong, pin, "w3-live-typo")
+    assert refused["accepted"] is False and refused["error"] == "invalid_confirmation", refused
+    assert "server_proof" not in refused, refused
+    other_pin = "sha256/" + base64.b64encode(bytes(32)).decode()
+    mismatch = call("POST", "/handshake/pake/init", {
+        "client_id": "w3-live-mitm", "client_type": "gotg", "client_version": "w3-live",
+        "channel_binding": other_pin, "client_nonce": base64.b64encode(bytes(32)).decode(),
+    }, expected=403)
+    assert mismatch["error"] == "channel_binding_mismatch", mismatch
+    print("PASS  CPace: vectors hold, a wrong code and a foreign pin are refused by name")
+
+    a, b = pair_phone("w3-live-a"), pair_dashboard("w3-live-b")
+    print("PASS  a phone pairs with CPace and checks the Pond's proof; the dashboard pairs over loopback HMAC")
     for method, path in [("POST", "/transcribe"), ("GET", "/dev/goose"), ("POST", "/handshake/revoke")]:
         call(method, path, {}, expected=401)
     call("GET", "/notifications/stream?device_id=w3-live-b", token=a["session_token"], expected=403)
