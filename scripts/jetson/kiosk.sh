@@ -276,7 +276,7 @@ page_dir() {
   local dir="$RUNTIME"
   if [ -x /snap/bin/firefox ]; then
     dir="$RUNTIME/snap.firefox"
-    mkdir -p -m 700 "$dir" 2>/dev/null
+    [ -d "$dir" ] || mkdir -m 700 "$dir" 2>/dev/null
   fi
   if [ -n "$(find "$dir" -maxdepth 0 -user "$(id -u)" -perm 700 2>/dev/null)" ]; then
     echo "$dir"

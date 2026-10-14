@@ -47,6 +47,7 @@ LITERT_REQUIRED_LIBS="liblitert-lm libLiteRt libGemmaModelConstraintProvider lib
 # decode about 13% faster. A package keeps both: a pond run from it on a Mac runs on WebGPU, as the
 # Orin does, unless GIAP_LITERT_ACCELERATOR=metal (crates/pond-server/src/litert_runtime.rs).
 LITERT_DESKTOP_LEAVES_OUT="libLiteRtWebGpuAccelerator libLiteRtTopKWebGpuSampler libwebgpu_dawn"
+# shellcheck disable=SC2034  # read by the scripts that source this file
 LITERT_DESKTOP_REQUIRED_LIBS="liblitert-lm libLiteRt libGemmaModelConstraintProvider libLiteRtMetalAccelerator libLiteRtTopKMetalSampler"
 
 # linux-arm64 builds in this image on any Docker host that runs linux/arm64: glibc 2.35, as on JetPack 6.
