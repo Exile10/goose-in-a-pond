@@ -333,15 +333,25 @@ and the Pond answers with `server_proof` over the same transcript under
 produce. A client that sent a binding and got no proof back must treat the pair
 as failed.
 
-What this buys: the pin no longer has to reach the phone by a trustworthy route,
-which is what lets `_pond._tcp.local.` publish it in a `pin` TXT record for the
-app to fill in (`mdns_advertiser.rs`) instead of somebody transcribing 51
-characters of base64. Someone who intercepts the connection and serves their own
-certificate gets a client that MACs over *their* key: relaying that fails the
-recomputation (`channel_binding_mismatch`); stripping the binding and relaying
-leaves a MAC over a transcript the Pond no longer computes (`invalid_mac`); and
-answering the client directly fails the server proof. A wrong pin therefore ends
-pairing in a visible failure rather than a successful pair with the wrong Pond.
+What this buys: an interceptor cannot simply relay a pairing. Someone who
+intercepts the connection and serves their own certificate gets a client that MACs
+over *their* key: relaying that fails the recomputation (`channel_binding_mismatch`);
+stripping the binding and relaying leaves a MAC over a transcript the Pond no longer
+computes (`invalid_mac`); and answering the client directly fails the server proof.
+
+What it does not buy (corrected 2026-10-12, #483): the pin still has to reach the
+phone by a route the user can trust. The MAC is keyed by a six-digit code, so whoever
+terminated the phone's TLS holds a MAC over their own key and can try all 10^6 codes
+offline in about a second. With the code recovered, they can pair with the real Pond
+over its real key, in the phone's place. A pin from the QR code or typed from the
+Pond's own screen is out of band, so this needs a pin that came off the network. The
+only one is the pin `_pond._tcp.local.` publishes in its `pin` TXT record
+(`mdns_advertiser.rs`), and the defence for it is the user's confirmation against the
+Pond's screen before the app trusts it. Today that is a single "It matches" tap,
+which can be made without looking; goose-on-the-go#97 replaces it with picking the
+real fingerprint out of three, one of which only the Pond's screen identifies. A PAKE
+(CPace or SPAKE2) would reduce the attacker to one online guess; that needs a new
+handshake version on both sides and is tracked as later hardening in #508, not done here.
 
 The binding is required from every peer except loopback (2026-09-30). The desktop
 dashboard pairs over loopback HTTP, where there is no certificate and nothing in
