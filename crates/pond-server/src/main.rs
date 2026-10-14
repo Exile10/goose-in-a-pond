@@ -3413,6 +3413,19 @@ async fn run_server(
         &data_dir,
         &tls_identity::certificate_names(&tls_hostname)?,
     )?;
+    // The helper serves this one on the tailnet and refuses to start without it. Not fatal:
+    // the renewal loop below retries it, and only remote access waits on it.
+    #[cfg(unix)]
+    if let Err(error) =
+        tls_identity.renew_tailnet_if_needed(&tls_identity::tailnet_certificate_names(&[]))
+    {
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "tailnet_certificate_unavailable",
+            error = %format!("{error:#}"),
+            "could not write the tailnet certificate; remote access cannot start until it is"
+        );
+    }
     let pairing_pin = tls_identity.pin()?;
     let transport = pond_api::network::CompanionTransport {
         https_port,
@@ -4371,19 +4384,27 @@ async fn run_server(
                     let (cert, key) = tls_identity.pem();
                     tls_config.reload_from_pem(cert, key).await?;
                 }
-                Ok::<_, anyhow::Error>(names)
+                // The helper re-reads its certificate on every handshake, so writing it is enough.
+                #[cfg(unix)]
+                {
+                    let tailnet = tls_identity::tailnet_certificate_names(&embedded.addresses());
+                    tls_identity.renew_tailnet_if_needed(&tailnet)?;
+                    Ok::<_, anyhow::Error>(tailnet)
+                }
+                #[cfg(not(unix))]
+                Ok::<_, anyhow::Error>(())
             }
             .await;
             match renewed {
-                Ok(names) => {
+                Ok(tailnet) => {
                     if last_failure.take().is_some() {
                         tracing::info!("TLS certificate renewal recovered");
                     }
                     // Only a certificate that covers the new addresses may announce them.
                     #[cfg(unix)]
-                    embedded.publish_ready(&names);
+                    embedded.publish_ready(&tailnet);
                     #[cfg(not(unix))]
-                    let _ = names;
+                    let () = tailnet;
                 }
                 Err(error) => {
                     let error = format!("{error:#}");

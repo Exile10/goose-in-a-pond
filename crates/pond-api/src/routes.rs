@@ -523,8 +523,24 @@ async fn serve_from_disk(static_dir: &std::path::Path, rel: &str) -> Response<ax
 
 // ───────────────────────── Handlers ─────────────────────────────────
 
-async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+/// Liveness, for anyone. The software version goes only to a loopback peer, the dashboard
+/// on the host: an anonymous LAN or tailnet peer learns which release to aim at otherwise
+/// (2026-10-12). The plaintext development listener is never the host's own, even from
+/// loopback, as in the auth middleware.
+async fn health(
+    peer: Result<
+        axum::extract::ConnectInfo<std::net::SocketAddr>,
+        axum::extract::rejection::ExtensionRejection,
+    >,
+    insecure: Option<axum::Extension<crate::insecure_dev::InsecureDevTransport>>,
+) -> Json<Value> {
+    let on_the_host = insecure.is_none()
+        && peer.is_ok_and(|axum::extract::ConnectInfo(peer)| peer.ip().is_loopback());
+    if on_the_host {
+        Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+    } else {
+        Json(json!({ "status": "ok" }))
+    }
 }
 
 /// Handshake endpoint to get authentication token (public).
