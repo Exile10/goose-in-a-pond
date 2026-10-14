@@ -86,7 +86,9 @@ every account: Firefox is given the page's `file://` path. The page goes in
 `$XDG_RUNTIME_DIR/snap.firefox`, in that; and failing either, in a `mktemp -d` directory,
 which snap Firefox cannot read. `kiosk.sh client` prints the command `start` would hand
 weston, and writes the page. `GIAP_KIOSK_URL` still opens exactly the URL given, with no
-sign-in, and `GIAP_KIOSK_PORT` still overrides the port. The kiosk's user unit is
+sign-in, and `GIAP_KIOSK_PORT` still overrides the port. When no page can be written (no
+answer within the 30 seconds, or a credential it cannot read), the kiosk warns and opens the
+plain dashboard, whose sign-in card still works, rather than failing and restarting dark. The kiosk's user unit is
 `PartOf=goose-in-a-pond.service`, so a server restart, which rotates the credential,
 restarts the kiosk too; that reaches only a user unit of that name, and `kiosk.sh install`
 says so when the Pond runs as a system unit. The Electron renderer needs none of this: it
