@@ -14,14 +14,27 @@ tests are `scripts/lib/litert-setup.test.sh`.
 |---|---|
 | `liblitert-lm.{dylib,so}` | The C API (`//c:litert-lm`), built from the pinned commit |
 | `libLiteRt`, `libGemmaModelConstraintProvider` | Linked by the C API; the constraint provider is needed even on CPU |
-| `libLiteRtWebGpuAccelerator`, `libwebgpu_dawn`, `libLiteRtTopKWebGpuSampler` | The GPU path: WebGPU/Dawn over Metal on a Mac, over Vulkan on the Orin |
-| `libLiteRtMetalAccelerator`, `libLiteRtTopKMetalSampler` | macOS only |
+| `libLiteRtWebGpuAccelerator`, `libwebgpu_dawn`, `libLiteRtTopKWebGpuSampler` | The GPU path: WebGPU/Dawn over Vulkan on the Orin, over Metal on a Mac. Not in the desktop app |
+| `libLiteRtMetalAccelerator`, `libLiteRtTopKMetalSampler` | macOS only: the desktop app's GPU path |
 | `include/*.h` | The public C headers (not shipped in the app) |
 | `LICENSE` | LiteRT-LM's Apache-2.0 licence |
 | `MANIFEST.sha256` | Line 1 describes the build; then `sha256  ./path` for every other file |
 
 Everything except `liblitert-lm` is LiteRT's own prebuilt binary from `prebuilt/<platform>/` at the
-same commit. The library statically contains its own Rust std, allocator, abseil and protobuf, which
+same commit.
+
+### Metal or WebGPU on a Mac
+
+LiteRT opens its GPU accelerator by file name from the directory `libLiteRt` is in, and on macOS it
+tries WebGPU before Metal and keeps the first it finds. A macOS package carries both, so it runs on
+WebGPU. On an M4 with E2B, Metal measured warm turns at 129-142 ms to the first token against
+155-192 and decode about 13% faster; the live tool-call test passes on both.
+
+| Runs | Accelerator | Why |
+|---|---|---|
+| The desktop app | Metal | Staging leaves out the WebGPU accelerator, its sampler and Dawn (`LITERT_DESKTOP_LEAVES_OUT`); the app is 41 MB smaller for it |
+| A pond run from the source checkout | WebGPU | The Orin's accelerator, so tests on a Mac reflect the Orin |
+| The same, with `GIAP_LITERT_ACCELERATOR=metal` | Metal | pond-server points the backend at `<package>.metal/`: hard links to the package's files except WebGPU's, as the app carries them | The library statically contains its own Rust std, allocator, abseil and protobuf, which
 is why it stays behind `RTLD_LOCAL`. Their third-party notices are not collected into the package yet.
 
 ## The pin
@@ -55,9 +68,9 @@ To move it:
    `bash scripts/lib/litert-setup.test.sh`.
 3. Build both platforms. Packages live under `<capi>-<commit8>/`, so the old one stays until you
    delete it.
-4. If the prebuilt set changed, `LITERT_REQUIRED_LIBS` and `mac.binaries` in
-   `pond-desktop/electron-builder.yml` follow it; `scripts/verify-sidecar.sh` names a dylib that is
-   staged but not listed.
+4. If the prebuilt set changed, `LITERT_REQUIRED_LIBS`, `LITERT_DESKTOP_REQUIRED_LIBS`,
+   `LITERT_DESKTOP_LEAVES_OUT` and `mac.binaries` in `pond-desktop/electron-builder.yml` follow it;
+   `scripts/verify-sidecar.sh` names a dylib that is staged but not listed.
 
 ## Building
 
@@ -121,7 +134,7 @@ can. A package that fails its hashes is never loaded.
 
 | Target | Location | How |
 |---|---|---|
-| Desktop app | `Contents/Resources/litert-lm/`, beside `pond-server` | `npm run stage:server` copies the recorded macos-arm64 dylibs and LICENSE to `pond-desktop/resources/litert-lm/`; `scripts/verify-sidecar.sh` checks and loads them; electron-builder ships them |
+| Desktop app | `Contents/Resources/litert-lm/`, beside `pond-server` | `npm run stage:server` copies the recorded macos-arm64 dylibs, except WebGPU's, and LICENSE to `pond-desktop/resources/litert-lm/`; `scripts/verify-sidecar.sh` checks and loads them and refuses a WebGPU accelerator; electron-builder ships them |
 | Jetson | `~/.local/share/goose-in-a-pond/lib/litert-lm/1.0.0-a5dd27b5/` | `bash scripts/jetson.sh deploy` copies the recorded linux-arm64 package and runs `sha256sum -c` and `ldd` there; `JETSON_DATA_DIR` if the pond's data dir is elsewhere |
 | A pond run from `target/` | the recorded package directory | found through `~/.giap/litert-lm/.path-<platform>` |
 
@@ -130,8 +143,9 @@ At startup pond-server decides which library the backend loads and logs the deci
 library in `litert-lm/` beside the executable, the app bundle's, is left for the backend to find
 there, so an app always loads the copy it was built and verified with. Otherwise pond-server sets
 `GOOSE_LITERT_LIB_DIR` to the newest package under `<data dir>/lib/litert-lm/` (the Jetson), then to
-the recorded one (`~/.giap/litert-lm/.path-<platform>`, under `GIAP_LITERT_HOME` when that is set).
-With none of them the backend falls back to its own search.
+the recorded one (`~/.giap/litert-lm/.path-<platform>`, under `GIAP_LITERT_HOME` when that is set),
+or to that package's Metal view when `GIAP_LITERT_ACCELERATOR=metal` on a Mac. With none of them the
+backend falls back to its own search.
 
 With nothing recorded, staging and deploy warn and carry on: the app or the device then runs without
 the litert backend. A recorded package that fails verification stops them.
