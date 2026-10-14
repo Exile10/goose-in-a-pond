@@ -310,7 +310,7 @@ node identities" in [remote access](remote-access.md).
 
 ## Reproduction
 
-Run Go checks from `native/pondnet` with Go 1.27.2:
+Run Go checks from `native/pondnet` with the Go version `go.mod` declares (1.27.2 at the time of writing):
 
 ```
 go test -race ./...
