@@ -235,7 +235,13 @@ access. Clients cannot supply the administrative user or ACL. An ambiguous
 registration remains pending and is never replayed. Reconciliation recovers only
 an exact, unique match for the approved machine identity in the correct household.
 It cannot claim a preexisting unmanaged node or undo a definite registration
-rejection. Those failed transitions require explicit local recovery.
+rejection. Those failed transitions require explicit local recovery. A `failed`
+record keeps its machine key as a tombstone, like a revoked one (2026-10-12): when
+the coordinator registered a node the service then refused, for its tags, routes or
+owner, the node is deleted straight away and again by every reconciliation until it
+is gone. It used to stay registered, uncounted against the enrollment capacity.
+Deletion still requires the household's own coordinator user, so a node registered
+to another user is kept and logged.
 Revocation wins over pending recovery and retains the machine identity as a
 tombstone, including when registration appears after the first revocation attempt.
 Do not erase the enrollment database to retry.
@@ -307,10 +313,14 @@ it could parse.
 
 Enrollment exposes `/health`, limits request bodies to 8 KiB, concurrent operations
 to eight, and public requests to 10/s with a burst of 20. A coordinator that cannot
-be reconciled at startup leaves the service running but degraded, reported as
+be reconciled leaves the service running but degraded, reported as
 `"degraded":true` on `/health` (still 200, so the gateway keeps serving) and in the
 log, until a reconciliation succeeds; it used to exit and restart into the same
-failure. A signed approval is spent as soon as its signature checks out, even if it
+failure. Since 2026-10-12 that holds after startup too: a failed reconciliation
+(every 30 seconds) or policy update marks the service degraded, so a later outage,
+an admin key the coordinator refuses, or an inventory past `MaxNodes` shows on
+`/health` instead of leaving it at `ok`. The transition is logged once with its
+cause, and each deferred reconciliation logs its error. A signed approval is spent as soon as its signature checks out, even if it
 is then refused. Logs name transitions and
 failures, never signatures, auth IDs, QR payloads, or credentials. Container logs
 rotate at 10 MiB with three files. Alerts, off-host metrics, disk thresholds, and
