@@ -264,6 +264,8 @@ record keeps its machine key as a tombstone, like a revoked one (2026-10-12): wh
 the coordinator registered a node the service then refused, for its tags, routes or
 owner, the node is deleted straight away and again by every reconciliation until it
 is gone. It used to stay registered, uncounted against the enrollment capacity.
+A returned node under another machine key matches no tombstone, so the request
+deletes it itself, unless a record already holds that node or key.
 Deletion still requires the household's own coordinator user, so a node registered
 to another user is kept and logged.
 Revocation wins over pending recovery and retains the machine identity as a

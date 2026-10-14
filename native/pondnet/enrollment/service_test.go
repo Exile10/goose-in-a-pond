@@ -339,6 +339,8 @@ func TestARefusedRegistrationIsFailedAndItsNodeDeleted(t *testing.T) {
 	for name, mutate := range map[string]func(*Registered){
 		"tags":   func(n *Registered) { n.Tags = []string{"tag:unexpected"} },
 		"routes": func(n *Registered) { n.Routes = []string{"0.0.0.0/0"} },
+		// Under another machine key, no tombstone matches it: only the request deletes it.
+		"machine key": func(n *Registered) { n.MachineKey = "mkey:" + strings.Repeat("c", 64) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, k, b := fixture(t)
@@ -365,6 +367,25 @@ func TestARefusedRegistrationIsFailedAndItsNodeDeleted(t *testing.T) {
 				t.Fatal("the tombstone changed status or gained permission")
 			}
 		})
+	}
+}
+
+// A refused registration whose returned node a record already holds leaves that node alone.
+func TestARefusedNodeThatARecordHoldsIsKept(t *testing.T) {
+	s, k, b := fixture(t)
+	held := "mkey:" + strings.Repeat("c", 64)
+	a := approval()
+	s.Store.value.Devices[a.Household] = map[string]Device{"device0000000002": {NodeID: "1", Key: a.NodeKey, MachineKey: held, Role: "phone", Status: "active", Address: "100.64.0.1"}}
+	b.nodes = []Registered{{ID: "1", UserID: "1", Key: a.NodeKey, MachineKey: held, Addresses: []string{"100.64.0.1"}}}
+	b.mutate = func(n *Registered) { n.MachineKey = held }
+	if code := invoke(s, a, k); code != 503 {
+		t.Fatalf("refused registration answered %d", code)
+	}
+	if s.Store.value.Devices[a.Household][a.Device].Status != "failed" {
+		t.Fatal("refused registration not recorded as failed")
+	}
+	if b.deleted != 0 {
+		t.Fatalf("a node a record holds was deleted: %d deleted", b.deleted)
 	}
 }
 
