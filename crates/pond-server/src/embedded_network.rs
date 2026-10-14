@@ -705,14 +705,18 @@ impl Runtime {
 
     async fn send_revocation(&self, device: &str, verify: bool) -> Sent {
         if !self.has_authority() {
-            // Without the signing key the helper exits 1 every time, which would back this entry
-            // off to six hours forever and hold up the entries behind it in each tick.
+            // Without the signing key the helper exits 1 every time. A phone the record lists stays
+            // queued, backing off, and goes out once the key is restored. An entry that needs a
+            // check first cannot get one either, so it is dropped rather than retried forever.
+            if !verify {
+                return Sent::Unavailable("this Pond has no household authority".into());
+            }
             tracing::warn!(
                 target: "giap::trace",
                 kind = "remote_revocation_without_authority",
                 %device,
-                "queued remote revocation dropped: this Pond has no household authority, so it \
-                 cannot reach the coordinator for any device"
+                "queued remote revocation dropped: this Pond has no household authority to check \
+                 whether the device was ever enrolled"
             );
             return Sent::NeverEnrolled;
         }
@@ -1132,26 +1136,24 @@ impl Runtime {
         self.recovery.revoke(&device);
         let _files = self.files.lock().unwrap_or_else(|p| p.into_inner());
         let record = revocation::load_enrolled(&self.directory);
+        let plan = revocation::plan(&record, &device);
         if !self.has_authority() {
-            // The helper cannot sign a revocation without the household key, so a queued entry
-            // would only fail forever. Phones the record lists keep whatever they were enrolled
-            // with until the authority is restored from its backup.
-            if record.devices.is_empty() {
-                tracing::debug!(%device, "no remote revocation needed: this Pond has no household authority");
-            } else {
-                tracing::warn!(
-                    target: "giap::trace",
-                    kind = "remote_revocation_without_authority",
-                    %device,
-                    enrolled = record.devices.len(),
-                    "remote revocation not queued: the household authority is missing although \
-                     phones are recorded as enrolled; restore authority/identity.json from its \
-                     backup to revoke them"
-                );
+            // The helper cannot sign anything without the household key. A phone the record lists
+            // is queued all the same and goes out once the key is restored from its backup; one it
+            // does not list would need a check with the coordinator, so nothing is queued.
+            if !matches!(plan, revocation::Plan::Revoke) {
+                tracing::debug!(%device, "no remote revocation queued: this Pond has no household authority to check with");
+                return self.forget_sighting(&device);
             }
-            return self.forget_sighting(&device);
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "remote_revocation_without_authority",
+                %device,
+                "remote revocation queued while the household authority is missing; it goes out \
+                 once authority/identity.json is restored from its backup"
+            );
         }
-        let verify = match revocation::plan(&record, &device) {
+        let verify = match plan {
             revocation::Plan::Revoke => false,
             revocation::Plan::VerifyThenRevoke => true,
             revocation::Plan::NothingToRevoke => {
@@ -2658,7 +2660,7 @@ mod tests {
     /// Without the household key the helper exits 1 for every device, so a queued entry would
     /// back off to six hours forever and hold up the entries behind it.
     #[tokio::test]
-    async fn without_a_household_authority_there_is_nothing_to_revoke() {
+    async fn without_a_household_authority_a_listed_phone_waits_for_it() {
         use pond_core::security::ports::remote_access::RemoteRevocation;
         let helper = FakeHelper::new();
         let data = tempfile::tempdir().unwrap();
@@ -2668,10 +2670,24 @@ mod tests {
         runtime.queue("phone000000000001").await.unwrap();
         std::fs::remove_file(runtime.directory.join("authority").join("identity.json")).unwrap();
 
+        // Not on the record, and nothing to check it with: nothing is queued.
         runtime.queue("phone000000000002").await.unwrap();
         assert_eq!(runtime.pending_revocations().unwrap().len(), 1);
+        // On the record: it stays queued until the key is back, rather than being dropped.
         runtime.reconcile_due().await.unwrap();
-        assert!(runtime.pending_revocations().unwrap().is_empty());
+        let pending = runtime.pending_revocations().unwrap();
+        let listed = network_device("phone000000000001").unwrap();
+        assert_eq!(
+            pending.get(&listed).map(|entry| entry.attempts),
+            Some(1),
+            "a listed phone's revocation was dropped"
+        );
+        assert!(
+            revocation::load_enrolled(&runtime.directory)
+                .devices
+                .contains(&listed),
+            "a listed phone was forgotten"
+        );
         assert!(
             helper.calls().is_empty(),
             "the helper was asked without an authority"

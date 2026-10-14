@@ -347,14 +347,13 @@ a tombstone on the coordinator). `revocations.json` is the durable queue the
   /devices`, logout and enrollment answer `503` until someone repaired the file.
   `revocations.json` is still refused when unreadable: dropping queued revocations
   would be the unsafe failure.
-- **No household authority means nothing to revoke.** With an enrollment origin
+- **No household authority means nothing can be checked.** With an enrollment origin
   configured but no `embedded-network/authority/identity.json`, the helper exits 1
-  for every coordinator call, so queued entries backed off to six hours forever
-  and held up the entries behind them in each tick. A removal now queues nothing
-  and a queued entry is dropped, both logged as
-  `kind="remote_revocation_without_authority"`; a removal warns when the record
-  still lists phones, because they keep their remote access until the authority is
-  restored from its backup.
+  for every coordinator call. A removal of a phone the record lists is still queued:
+  its entry backs off until the authority is restored from its backup, and then goes
+  out. A removal that would need a check with the coordinator first queues nothing,
+  and such an entry already queued is dropped, since nothing can check it. Both are
+  logged as `kind="remote_revocation_without_authority"`.
 
 **Drain the revocation queue before downgrading.** Since 2026-09-30 (#434)
 `revocations.json` holds an entry per device with its own backoff, which a binary
