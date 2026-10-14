@@ -336,6 +336,8 @@ impl Default for KeywordDetectorConfig {
 /// Sliding-window wake-word detector; returns the command audio so no second recording is needed.
 pub struct WhisperKeywordDetector {
     backend: Arc<dyn WhisperBackend>,
+    /// The configured wake phrase, normalized; always among `triggers`.
+    wake_word: String,
     /// All normalized trigger variants. A transcript matching *any* of these fires detection.
     triggers: Vec<String>,
     prompt: String,
@@ -355,9 +357,11 @@ impl WhisperKeywordDetector {
     ) -> Self {
         let raw = trigger.into();
         let prompt = format!("say \"{}\"", raw);
+        let wake_word = normalize_transcript(&raw);
         Self {
             backend,
-            triggers: vec![normalize_transcript(&raw)],
+            triggers: vec![wake_word.clone()],
+            wake_word,
             prompt,
             config: KeywordDetectorConfig::default(),
             audio_level_sink: None,
@@ -371,27 +375,20 @@ impl WhisperKeywordDetector {
         self
     }
 
-    /// Trigger on onboarding's calibrated variants; empty keeps `new()`'s trigger.
+    /// Also trigger on calibrated mishearings. The wake word itself always stays a trigger, and
+    /// a stored variant is reduced to the phrase as heard: older calibrations stored whole
+    /// sentences, which fired only when that exact sentence was said again.
     pub fn with_transcriptions(mut self, variants: Vec<String>) -> Self {
-        if !variants.is_empty() {
-            self.triggers = variants
-                .iter()
-                .map(|v| normalize_transcript(v))
-                .filter(|v| !v.is_empty())
-                .collect();
-            // Fallback: if all variants normalized to empty, keep the existing trigger.
-            if self.triggers.is_empty() {
-                self.triggers = vec![normalize_transcript(&self.prompt)];
+        let mut triggers = vec![self.wake_word.clone()];
+        let heard = variants
+            .iter()
+            .filter_map(|v| pond_voice::text::extract_wake_variant(v, &self.wake_word, None));
+        for t in heard.chain(builtin_fuzzy_variants(&self.wake_word)) {
+            if !triggers.contains(&t) {
+                triggers.push(t);
             }
         }
-        // Always add the built-in mishearings of the primary trigger.
-        let primary = self.triggers.first().cloned().unwrap_or_default();
-        let builtins = builtin_fuzzy_variants(&primary);
-        for variant in builtins {
-            if !self.triggers.contains(&variant) {
-                self.triggers.push(variant);
-            }
-        }
+        self.triggers = triggers;
         self
     }
 
@@ -784,6 +781,42 @@ mod tests {
                 "{t:?} is not in normalized form"
             );
             assert!(!t.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_calibrated_sentence_triggers_on_the_phrase_not_the_whole_sentence() {
+        let d = WhisperKeywordDetector::new(Arc::new(DeafBackend), "goose", test_mic())
+            .with_transcriptions(vec![
+                "ok goose what time is it".into(),
+                "hey gus good morning".into(),
+            ]);
+        let t = d.triggers();
+        assert!(
+            !t.iter().any(|x| x.split(' ').count() > 2),
+            "no sentence survives: {t:?}"
+        );
+        assert!(
+            t.iter().any(|x| x == "gus"),
+            "the mishearing is kept: {t:?}"
+        );
+    }
+
+    #[test]
+    fn the_wake_word_stays_a_trigger_whatever_calibration_stored() {
+        for variants in [
+            vec![],
+            vec!["gus".to_string()],
+            vec!["!!!".to_string(), "".to_string()],
+        ] {
+            let d = WhisperKeywordDetector::new(Arc::new(DeafBackend), "Hey Goose", test_mic())
+                .with_transcriptions(variants.clone());
+            assert_eq!(d.triggers()[0], "hey goose", "{variants:?}");
+            assert!(
+                !d.triggers().iter().any(|t| t.starts_with("say")),
+                "{:?}",
+                d.triggers()
+            );
         }
     }
 

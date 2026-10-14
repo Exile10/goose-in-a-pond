@@ -1,6 +1,7 @@
 // Browser VoiceBackend on Web Audio and pond-server HTTP; a plain class, no React.
 
 import { api } from "../../api/PondApiClient";
+import { containsTrigger, normalizeTranscript } from "./wakePhrase";
 import type {
   VoiceBackend, VoiceState, PipelineOpts, ResponseMeta, ToolCallData,
 } from "./VoiceBackend";
@@ -267,9 +268,9 @@ export class WebVoiceBackend implements VoiceBackend {
     this._wakeNorm = [word.toLowerCase().trim(), ...variants.map((v) => v.toLowerCase().trim()).filter(Boolean)];
     this.stopWakeInternal();
     this.wakeActive = true;
-    const norm = [word.toLowerCase().trim()];
+    const norm = [normalizeTranscript(word)];
     for (const v of variants) {
-      const n = v.toLowerCase().trim();
+      const n = normalizeTranscript(v);
       if (n && !norm.includes(n)) norm.push(n);
     }
     navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS)
@@ -572,7 +573,8 @@ export class WebVoiceBackend implements VoiceBackend {
       try {
         const transcript = await this.transcribe(encodeWav(ds, 16000));
         if (!transcript || !this.wakeActive) { this.wakeDetecting = false; return; }
-        if (!normalised.some((w) => transcript.toLowerCase().includes(w))) { this.wakeDetecting = false; return; }
+        const heard = normalizeTranscript(transcript);
+        if (!normalised.some((w) => containsTrigger(heard, w))) { this.wakeDetecting = false; return; }
 
         // Barge-in: cancel running pipeline, leave wakeDetecting=false so listener re-arms.
         if (this.pipelineActive) { this.wakeDetecting = false; this.cancelPipeline(); this.onWakeInterrupt?.(); return; }

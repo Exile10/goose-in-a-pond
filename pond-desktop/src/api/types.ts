@@ -1026,6 +1026,10 @@ export interface TranscribeResponse {
 export interface CalibrateResponse {
   transcript:    string;
   normalized:    string;
+  /** The wake phrase as heard in this take; `null` when the take did not contain it. */
+  heard:         string | null;
+  /** Whether `heard` was new and became a trigger. */
+  new_variant:   boolean;
   all_variants:  string[];
   sample_count:  number;
   target_count:  number;

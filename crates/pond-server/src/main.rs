@@ -7154,21 +7154,15 @@ async fn run_calibrate(
             }
         };
 
-        let normalized: String = text
-            .chars()
-            .map(|c| if c.is_alphabetic() { c } else { ' ' })
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase();
-
         println!(" heard: \"{}\"", text);
 
-        if normalized.is_empty() {
-            println!("  (normalized to empty — skipping)");
+        // Store the phrase as heard, never whatever else the take caught.
+        let Some(normalized) =
+            pond_voice::text::extract_wake_variant(&text, &phrase, Some(&phrase))
+        else {
+            println!("  (that did not sound like \"{phrase}\" — try again)");
             continue;
-        }
+        };
 
         if settings
             .voice_wake_word_transcriptions

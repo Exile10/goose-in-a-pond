@@ -1,6 +1,8 @@
 // ─── Settings validation ───────────────────────────────────────────────────
-// The server rejects only `network_mode`, `reasoning_effort`, `agent_backend` and `matter_ws_url`;
-// other bad values are stored and silently defaulted. Reject only what is surely wrong.
+// The server refuses what breaks its own rules (`settings_validation.rs`), but a refusal arrives
+// only after Save; these catch the surely-wrong values while the person is still typing.
+
+import { wakePhraseError } from "../modes/voice/wakePhrase";
 
 /** `null` means valid. A string is the message shown under the control. */
 export type Validator = (value: unknown) => string | null;
@@ -125,3 +127,6 @@ export const ianaTimezone: Validator = (value) => {
     return `“${s}” is not a time zone this device knows.`;
   }
 };
+
+/** A wake phrase the detector can match: the same rule as the server's `Check::WakePhrase`. */
+export const wakePhrase: Validator = (value) => wakePhraseError(String(value ?? ""));
