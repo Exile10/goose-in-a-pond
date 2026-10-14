@@ -19,8 +19,9 @@
 #   5. the dist it was built against is the dist about to be shipped
 #   6. the LiteRT-LM library in resources/litert-lm, when one is staged, is the
 #      package its manifest describes: arm64 Mach-O, dependencies resolved
-#      inside that directory or by macOS, validly signed, and loadable; and
-#      every dylib in it is named under mac.binaries
+#      inside that directory or by macOS, validly signed, and loadable; with
+#      the Metal accelerator and not WebGPU's, which LiteRT would load first;
+#      and every dylib in it is named under mac.binaries
 #
 # Usage:
 #   bash scripts/verify-sidecar.sh
@@ -93,10 +94,14 @@ LITERT_SUMMARY="no LiteRT-LM library"
 if [ -d "${LITERT_STAGED}" ]; then
   # shellcheck source=lib/litert-setup.sh
   source "${SCRIPT_DIR}/lib/litert-setup.sh"
-  if ! litert_verify "${LITERT_STAGED}"; then
+  if ! litert_verify "${LITERT_STAGED}" "${LITERT_DESKTOP_REQUIRED_LIBS}"; then
     fail "the staged LiteRT-LM library fails verification:
 ${LITERT_VERIFY_PROBLEMS}"
   fi
+  for LIB in ${LITERT_DESKTOP_LEAVES_OUT}; do
+    [ ! -e "${LITERT_STAGED}/${LIB}.dylib" ] || fail "${LIB}.dylib is staged. LiteRT loads WebGPU
+  before Metal on a Mac, so the app would run on the slower accelerator."
+  done
   for LIB in "${LITERT_STAGED}"/*.dylib; do
     grep -qF "Contents/Resources/litert-lm/${LIB##*/}" "${DESKTOP_DIR}/electron-builder.yml" \
       || fail "${LIB##*/} is staged but not named under mac.binaries in electron-builder.yml."
