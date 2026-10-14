@@ -12843,24 +12843,37 @@ async fn save_memory(
 
 #[derive(Deserialize)]
 struct UpdateMemoryRequest {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tier: Option<pond_core::user_data::domain::memory::MemoryTier>,
 }
 
-/// `PUT /api/v1/memories/{id}` -- reword in place, keeping id, age, usage and vector.
+/// `PUT /api/v1/memories/{id}` -- reword and/or re-tier in place, keeping id, age and usage.
+/// A field left out is left as it is; a body with neither is refused.
 async fn update_memory(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<UpdateMemoryRequest>,
 ) -> impl axum::response::IntoResponse {
-    let content = body.content.trim();
-    if content.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "a memory cannot be blank -- delete it instead"})),
-        )
-            .into_response();
+    let bad_request =
+        |error: &str| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response();
+    let content = body.content.as_deref().map(str::trim);
+    if content.is_none() && body.tier.is_none() {
+        return bad_request("nothing to change -- send content, tier or both");
     }
-    match state.memory_repo.update_content(&id, content).await {
+    if content == Some("") {
+        return bad_request("a memory cannot be blank -- delete it instead");
+    }
+
+    let mut result = Ok(());
+    if let Some(content) = content {
+        result = state.memory_repo.update_content(&id, content).await;
+    }
+    if let (Ok(()), Some(tier)) = (&result, body.tier) {
+        result = state.memory_repo.update_tier(&id, tier).await;
+    }
+    match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

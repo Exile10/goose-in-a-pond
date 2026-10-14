@@ -114,6 +114,7 @@ All errors return JSON:
 | GET | /agent/tools | Protected | List available MCP tools |
 | GET | /memories | Protected | List memory fragments |
 | POST | /memories | Protected | Save a memory fragment |
+| PUT | /memories/{id} | Protected | Reword a memory, change its tier, or both |
 | DELETE | /memories/{id} | Protected | Delete a memory fragment |
 | GET | /skills | Protected | List user skills |
 | POST | /skills | Protected | Create a skill |
@@ -1807,6 +1808,24 @@ Returns the 50 most recent memory fragments.
 `source` defaults to `"api"`. Other values: `"chat"` | `"sensor_summary"`
 
 **Response 201** — no body
+
+---
+
+### PUT /memories/{id}
+
+**Request** — send `content`, `tier`, or both. A field left out is left as it is.
+```json
+{
+  "content": "User prefers temperatures in Celsius.",
+  "tier": "permanent"
+}
+```
+
+`tier` is `"short"` | `"long"` | `"permanent"`, and the decay rate is reset to that tier's
+default. `"permanent"` keeps a memory forever: decay never archives it and consolidation never
+prunes it. Rewording clears the memory's embedding, which is rebuilt on the next sweep.
+
+**Response 204** — no body. **400** when the body changes nothing or `content` is blank.
 
 ---
 
