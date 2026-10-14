@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import "../i18n";
 import { ApiError } from "../api/types";
 
@@ -36,7 +36,7 @@ describe("RemoteAccess once this tab is signed out", () => {
     render(<RemoteAccess />);
     await waitFor(() => expect(screen.getByText(/no longer signed in/)).toBeTruthy());
     await vi.advanceTimersByTimeAsync(30_000);
-    // Polled every five seconds before; each refusal was logged by the Pond.
+    // Asking again would only be refused again, and the Pond logs each refusal.
     expect(api.remoteRecoveryRequests).toHaveBeenCalledTimes(1);
   });
 
@@ -49,16 +49,81 @@ describe("RemoteAccess once this tab is signed out", () => {
     await vi.advanceTimersByTimeAsync(11_000);
     expect(vi.mocked(api.remoteRecoveryRequests).mock.calls.length).toBeGreaterThanOrEqual(3);
   });
+});
 
-  it("keeps asking in the desktop shell, which reads a fresh credential for every request", async () => {
+describe("RemoteAccess in the desktop shell, which reads a fresh credential for every request", () => {
+  const refused = () => new ApiError(403, "host_credential_required");
+  const mismatch = /does not match the Pond/;
+  // Inside `act`, so React has rendered what the timers' callbacks set before the next assertion.
+  const tick = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms));
+
+  beforeEach(() => {
     shell.desktop = true;
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    vi.mocked(api.remoteStatus).mockRejectedValue(new ApiError(403, "host_credential_required"));
-    vi.mocked(api.remoteRecoveryRequests).mockRejectedValue(new ApiError(403, "host_credential_required"));
+    vi.useFakeTimers();
+    vi.mocked(api.remoteStatus).mockResolvedValue({ state: "Running" });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it("asks again at the usual pace and keeps quiet for the first refusals", async () => {
+    vi.mocked(api.remoteRecoveryRequests).mockRejectedValue(refused());
     render(<RemoteAccess />);
-    await waitFor(() => expect(api.remoteRecoveryRequests).toHaveBeenCalled());
-    await vi.advanceTimersByTimeAsync(11_000);
-    expect(vi.mocked(api.remoteRecoveryRequests).mock.calls.length).toBeGreaterThanOrEqual(3);
+    await tick(0);
+    expect(api.remoteRecoveryRequests).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(mismatch)).toBeNull();
+
+    await tick(5_000);
+    expect(api.remoteRecoveryRequests).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(mismatch)).toBeNull();
     expect(screen.queryByText(/no longer signed in/)).toBeNull();
+  });
+
+  it("says its credential does not match once it keeps being refused", async () => {
+    vi.mocked(api.remoteRecoveryRequests).mockRejectedValue(refused());
+    render(<RemoteAccess />);
+    await tick(10_000);
+    expect(screen.getByText(mismatch)).toBeTruthy();
+    expect(screen.queryByText(/pond-server dashboard/)).toBeNull();
+  });
+
+  it("asks less and less often while it stays refused, up to a minute", async () => {
+    const asked: number[] = [];
+    vi.mocked(api.remoteRecoveryRequests).mockImplementation(async () => {
+      asked.push(Date.now());
+      throw refused();
+    });
+    render(<RemoteAccess />);
+    await tick(400_000);
+    const gaps = asked.slice(1).map((at, i) => at - asked[i]!);
+    expect(gaps.slice(0, 8)).toEqual([5_000, 5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000]);
+  });
+
+  it("clears the note and goes back to the usual pace once the Pond admits it", async () => {
+    vi.mocked(api.remoteRecoveryRequests)
+      .mockRejectedValueOnce(refused())
+      .mockRejectedValueOnce(refused())
+      .mockRejectedValueOnce(refused())
+      .mockResolvedValue([]);
+    render(<RemoteAccess />);
+    await tick(10_000);
+    expect(screen.getByText(mismatch)).toBeTruthy();
+
+    // The next ask is 10 s on, and it is admitted.
+    await tick(10_000);
+    expect(screen.queryByText(mismatch)).toBeNull();
+    const asked = vi.mocked(api.remoteRecoveryRequests).mock.calls.length;
+    await tick(5_000);
+    expect(vi.mocked(api.remoteRecoveryRequests).mock.calls.length).toBe(asked + 1);
+  });
+
+  it("keeps asking at the same pace after any other failure", async () => {
+    vi.mocked(api.remoteRecoveryRequests).mockRejectedValue(new Error("unreachable"));
+    render(<RemoteAccess />);
+    await tick(25_000);
+    expect(vi.mocked(api.remoteRecoveryRequests).mock.calls.length).toBe(6);
+    expect(screen.queryByText(mismatch)).toBeNull();
   });
 });

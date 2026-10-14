@@ -39,23 +39,35 @@ describe("McpAppHost sandbox", () => {
   });
 });
 
-/** An opaque origin serialises as "null"; `"*"` would deliver to whatever origin the frame has later. */
+/**
+ * `postMessage` parses a targetOrigin other than "*" or "/" as a URL. The sandboxed frame's opaque
+ * origin, "null", is not one: Chromium throws SyntaxError and the handshake never arrives.
+ */
 describe("McpAppHost postMessage targeting", () => {
-  it("addresses the app frame as the null origin", () => {
+  /** Drives `ui/initialize` the way a real app does; returns what reached the frame and what the browser refused. */
+  function handshake() {
     const { container } = render(<McpAppHost html="<p>x</p>" toolName="t" />);
-    const el = container.querySelector("iframe") as HTMLIFrameElement;
-    const frameWindow = el.contentWindow;
-    expect(frameWindow, "jsdom gave the frame no contentWindow to spy on").not.toBeNull();
+    const frameWindow = (container.querySelector("iframe") as HTMLIFrameElement).contentWindow;
+    expect(frameWindow, "the test DOM gave the frame no contentWindow to spy on").not.toBeNull();
 
-    const posted: string[] = [];
+    const delivered: Array<{ origin: string; msg: { id?: number; result?: unknown } }> = [];
+    const refused: string[] = [];
     // Spy on the frame's window: the component never posts to the host's.
     const spy = vi
       .spyOn(frameWindow!, "postMessage")
-      .mockImplementation(((_msg: unknown, origin: string) => {
-        posted.push(origin);
+      .mockImplementation(((msg: { id?: number; result?: unknown }, origin: string) => {
+        // The browser's rule for a target origin, which happy-dom does not apply.
+        if (origin !== "*" && origin !== "/") {
+          try {
+            new URL(origin);
+          } catch {
+            refused.push(origin);
+            return;
+          }
+        }
+        delivered.push({ origin, msg });
       }) as typeof window.postMessage);
 
-    // Drive the handshake the way a real app does.
     window.dispatchEvent(
       new MessageEvent("message", {
         data: { jsonrpc: "2.0", id: 1, method: "ui/initialize" },
@@ -64,11 +76,21 @@ describe("McpAppHost postMessage targeting", () => {
     );
 
     spy.mockRestore();
+    return { delivered, refused };
+  }
 
+  it("answers ui/initialize to a target origin the browser accepts", () => {
+    const { delivered, refused } = handshake();
+    expect(refused, "the browser refuses these target origins").toEqual([]);
+    expect(delivered.find((d) => d.msg.id === 1)?.msg.result, "the ui/initialize reply never reached the frame").toBeDefined();
+  });
+
+  it("addresses every message into the frame to \"*\", the only target an opaque origin has", () => {
+    const { delivered } = handshake();
     // Asserted first, or a handshake that never arrived would let the loop below pass vacuously.
-    expect(posted.length, "the ui/initialize handshake produced no reply").toBeGreaterThan(0);
-    for (const origin of posted) {
-      expect(origin).toBe("null");
+    expect(delivered.length, "the ui/initialize handshake produced no reply").toBeGreaterThan(0);
+    for (const { origin } of delivered) {
+      expect(origin).toBe("*");
     }
   });
 });

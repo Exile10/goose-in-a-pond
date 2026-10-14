@@ -1,19 +1,31 @@
-// Shown when a browser tab has no host credential: it can neither sign in nor pair phones
-// until it is opened from the link `pond-server dashboard` prints on the Pond.
+// Shown when the Pond refuses the host credential. A browser tab has none until it is opened from
+// the link `pond-server dashboard` prints; the desktop shell reads its own, so it has no link to open.
 
 import { KeyRound } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { signInRefusalKey } from "../api/signInRefusal";
+import { isDesktopShell } from "../shell";
 
 export function SignInRequired() {
   const { t } = useTranslation();
+  const inShell = isDesktopShell();
   return (
     <div style={styles.root} role="alert">
       <div style={styles.card}>
         <KeyRound size={40} aria-hidden />
-        <h1 style={styles.title}>{t("signIn.title")}</h1>
-        <p style={styles.text}>{t("signIn.instructions")}</p>
-        <code style={styles.code}>pond-server dashboard</code>
-        <p style={styles.text}>{t("signIn.restart")}</p>
+        {inShell ? (
+          <>
+            <h1 style={styles.title}>{t("signIn.shellTitle")}</h1>
+            <p style={styles.text}>{t(signInRefusalKey(inShell))}</p>
+          </>
+        ) : (
+          <>
+            <h1 style={styles.title}>{t("signIn.title")}</h1>
+            <p style={styles.text}>{t("signIn.instructions")}</p>
+            <code style={styles.code}>pond-server dashboard</code>
+            <p style={styles.text}>{t("signIn.restart")}</p>
+          </>
+        )}
       </div>
     </div>
   );

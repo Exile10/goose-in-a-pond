@@ -7,7 +7,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { registerAppScheme, serveRendererFrom } from "./protocol";
 import { createMainWindow, distRoot } from "./window";
-import { appOrigins, guardNavigation } from "./navigation";
+import { appOrigins, devServerFromEnv, guardNavigation } from "./navigation";
 import {
   ServerProcess,
   recoveryBackoffSeconds,
@@ -142,8 +142,10 @@ const teardown = createTeardown({
 // Must happen before the app is ready.
 registerAppScheme();
 
+const devServerUrl = devServerFromEnv(process.env["GIAP_DEV_SERVER"]);
+
 /** The pages that may call the shell, and the only ones a window may show. */
-const allowedOrigins = appOrigins(process.env["GIAP_DEV_SERVER"]);
+const allowedOrigins = appOrigins(devServerUrl);
 
 // One instance: a second launch surfaces this window instead of fighting for port and mic.
 if (!app.requestSingleInstanceLock()) {
@@ -168,7 +170,7 @@ if (!app.requestSingleInstanceLock()) {
       preloadPath: join(__dirname, "../preload/index.cjs"),
       serverUrl: server.url,
       userDataDir: app.getPath("userData"),
-      devServerUrl: process.env["GIAP_DEV_SERVER"],
+      devServerUrl,
       onCloseRequested: (w) => {
         if (quitting) {
           w.destroy();

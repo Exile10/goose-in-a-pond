@@ -38,6 +38,8 @@ void i18n.use(initReactI18next).init({
     instructions: 'This browser has not been signed in. On the Pond, run this command and open the link it prints:',
     restart: 'The link stops working when the Pond restarts. Run the command again for a new one.',
     hostOnly: 'This browser is no longer signed in to the Pond, probably because it restarted. Run `pond-server dashboard` on the Pond and open the new link.',
+    shellTitle: 'This app is not signed in to the Pond',
+    shellMismatch: 'This app\'s sign-in does not match the Pond it is talking to. Restart the app, and if that does not help, check that it is pointed at the Pond you meant to use.',
   }, models: {
     unavailable: {
       litert_library_missing: 'Needs the LiteRT-LM library: run giap.sh litert build',
