@@ -79,6 +79,24 @@ re-registers it. An unrecognised timezone runs on UTC, with a warning at registr
 6. `ScheduleResultEvent` broadcast via `tokio::sync::broadcast` channel
 7. Task marked as not-running, `last_run` updated
 
+### What an `AgentPrompt` run records (2026-10-13)
+
+`agent.chat()` drains the same stream as interactive chat (`GooseAdapter::chat_stream`) and keeps
+only its `Text` events: reasoning is not an answer, and tool calls go into the response metadata.
+Each run gets its own engine session: the GIAP id is `sched-{id}-{unix_ts}`, and goose names the
+session it mints for it after that id (`branch="created"` in the log). The `session_resumed`
+prefix-cache invalidation that follows is logged for every new engine session, not a sign of reuse.
+
+Goose hides the model's prose reply to its completeness check (row (b) of "the completeness check
+must not reach the user" in `docs/goose-patch-management.md`). When a turn's earlier rounds were
+all tool calls or reasoning alone, that hidden reply is the only answer the turn has. The
+household's "Daily Brief" failed every morning in the week to 2026-10-12 with "Received empty
+response from Goose agent" for this reason, on gemma-4-E2B: the weather call, a reasoning-only
+round goose dropped, then the briefing as the hidden reply. The adapter now reads that reply back
+from goose's session history when an attempt armed the check and streamed no text of its own, and
+shows it (`kind="completeness_reply_shown"`). A turn that still has no text (tool calls only, as on
+2026-10-10) fails with an error naming the tools it called, logged as `kind="turn_without_reply"`.
+
 ## Deferred Executor Pattern
 
 The scheduler needs `Arc<dyn Agent>` but is created before the agent (circular dependency). Solution:
