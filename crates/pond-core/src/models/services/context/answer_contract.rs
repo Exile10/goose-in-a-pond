@@ -1,8 +1,8 @@
 //! Restates the answer rule last in the turn message; stated once ~6k tokens up, it decays.
 //! Keep the rules in the system prefix too: subagents never see `<system-context>`.
 
-/// Answer-shape note, last in `<system-context>`. The rule alone: its worked example (about 30
-/// tokens) went on 2026-10-14 so a short turn fits one 128-token LiteRT prefill chunk, and an
+/// Answer-shape note, last in `<system-context>`. The rule alone, with no worked example: one costs
+/// about 30 tokens, which pushes a short turn past one 128-token LiteRT prefill chunk, and an
 /// example is also what a small model copies (see the domain test below).
 pub fn answer_contract() -> String {
     format!("<answer-contract>\n{ANSWER_RULE}\n</answer-contract>")

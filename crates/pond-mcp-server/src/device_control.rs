@@ -139,7 +139,7 @@ impl DeviceControlMcpServer {
     }
 }
 
-/// One `render_state` line; pond-desktop's `powerStateOf` (`Devices.tsx`) parses it.
+/// One `render_state` line; pond-desktop's `powerStateOf` (`devicePower.ts`) parses it.
 fn state_line(name: &str, value: &str) -> String {
     format!("\n    {name}: {value}")
 }
@@ -770,7 +770,7 @@ mod tests {
 
     #[test]
     fn a_state_line_is_the_shape_the_desktop_parses() {
-        // Parsed by `powerStateOf` in pond-desktop's `Devices.tsx`: change both together.
+        // Parsed by `powerStateOf` in pond-desktop's `devicePower.ts`: change both together.
         assert_eq!(state_line("power", "on"), "\n    power: on");
 
         let rendered = render_state(&DeviceState {

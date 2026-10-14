@@ -1017,6 +1017,34 @@ mod tests {
     }
 }
 
+/// Forget, straight from `store`, each kept ride quoted more than [`KEEP_FINISHED`] ago, for a pond
+/// whose booking is off: nothing follows those rides, and their pickup and drop-off places must not
+/// stay on disk for good. Returns how many were forgotten and how many are left.
+pub async fn forget_old_kept_rides(store: &dyn RideStore, now: DateTime<Utc>) -> (usize, usize) {
+    let kept = match store.load().await {
+        Ok(kept) => kept,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "could not read the kept rides");
+            return (0, 0);
+        }
+    };
+    let (mut forgotten, mut left) = (0, 0);
+    for saved in kept {
+        if saved.ride.created_at + KEEP_FINISHED > now {
+            left += 1;
+            continue;
+        }
+        match store.remove(&saved.ride.id).await {
+            Ok(()) => forgotten += 1,
+            Err(e) => {
+                left += 1;
+                tracing::warn!(ride = %saved.ride.id, error = %format!("{e:#}"), "could not forget a kept ride");
+            }
+        }
+    }
+    (forgotten, left)
+}
+
 #[cfg(test)]
 mod store_tests {
     //! Rides kept across a restart: a fresh `RideBooking` over the same store stands in for one.
@@ -1046,6 +1074,24 @@ mod store_tests {
         )
         .await
         .unwrap()
+    }
+
+    /// With booking off, nothing follows the kept rides: each goes once a day has passed.
+    #[tokio::test]
+    async fn kept_rides_are_forgotten_after_a_day_while_booking_is_off() {
+        let provider = Arc::new(MockRideProvider::new());
+        let store = Arc::new(MemoryRideStore::new());
+        quoted(&booking(&provider, &store)).await;
+        quoted(&booking(&provider, &store)).await;
+        assert_eq!(store.len(), 2);
+
+        assert_eq!(
+            forget_old_kept_rides(store.as_ref(), Utc::now()).await,
+            (0, 2)
+        );
+        let later = Utc::now() + KEEP_FINISHED + chrono::Duration::seconds(1);
+        assert_eq!(forget_old_kept_rides(store.as_ref(), later).await, (2, 0));
+        assert!(store.is_empty());
     }
 
     #[tokio::test]

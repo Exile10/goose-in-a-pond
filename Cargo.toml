@@ -270,7 +270,8 @@ strip = false
 # measured 2.8x decode win needs the latter. This is 0.1.156 with the OAI surface from
 # 0.1.146 re-applied. See docs/developer/jetson-mtp-in-process-scope.md. Its llama.cpp also
 # carries four allocation-failure fixes, listed in the fork's llama-cpp-sys-2/POND-PATCH.md, and
-# the context params gain `with_n_outputs_max` (c1317d4), which the in-process engine sets to 1.
+# the context params gain `with_n_outputs_max` (c1317d4), which the in-process engine sets to the
+# most logits one batch asks for: 1, or the drafts plus one with a drafter attached.
 [patch.crates-io]
 pctx_code_mode = { path = "goose/vendor/pctx_code_mode" }
 pctx_config = { path = "goose/vendor/pctx_config" }

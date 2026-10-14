@@ -694,12 +694,11 @@ async fn without_the_litert_library_its_models_are_unavailable_and_refused() {
     assert_eq!(switch.status(), StatusCode::CONFLICT);
     let switch = body_json(switch).await;
     assert_eq!(switch["reason"], "litert_library_missing", "{switch}");
+    let said = switch["error"].as_str().unwrap();
+    assert!(said.contains("no LiteRT-LM library"), "{switch}");
     assert!(
-        switch["error"]
-            .as_str()
-            .unwrap()
-            .contains("giap.sh litert build"),
-        "{switch}"
+        !said.contains("giap.sh"),
+        "a shell command in household text: {switch}"
     );
     assert!(
         f.repo.get_assignment("chat").await.unwrap().is_none(),
@@ -719,6 +718,34 @@ async fn without_the_litert_library_its_models_are_unavailable_and_refused() {
         .unwrap();
     assert_eq!(fetch.status(), StatusCode::CONFLICT);
     assert!(f.tracker.read().await.is_empty(), "nothing was fetched");
+
+    // Nor from a URL, and no row is left behind for it.
+    let by_url = f
+        .app
+        .clone()
+        .oneshot(auth_req(
+            "POST",
+            "/api/v1/models/download/url",
+            Some(serde_json::json!({
+                "url": "https://huggingface.co/a/b/resolve/main/gemma-4-E2B-it.litertlm",
+                "category": "litert",
+                "filename": "gemma-4-E2B-it.litertlm",
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(by_url.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(by_url).await["reason"], "litert_library_missing");
+    assert!(f.tracker.read().await.is_empty(), "nothing was fetched");
+    let listed = body_json(
+        f.app
+            .clone()
+            .oneshot(auth_req("GET", "/api/v1/models", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(listed["litert"].as_array().unwrap().len(), 2, "{listed}");
 
     // A model whose engine is here still switches.
     let gguf = f

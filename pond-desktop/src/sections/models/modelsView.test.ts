@@ -454,7 +454,7 @@ describe("sorting and grouping", () => {
 describe("a model this pond cannot run", () => {
   it("says what the missing engine needs, and nothing for a model that runs", () => {
     expect(unavailableNote(litertE4b({ available: false, unavailable_reason: "litert_library_missing" })))
-      .toBe("Needs the LiteRT-LM library: run giap.sh litert build");
+      .toBe("Needs the LiteRT-LM library, which this Pond does not have yet");
     expect(unavailableNote(litertE4b({ available: false }))).toBe("This pond cannot run this model");
     expect(unavailableNote(litertE4b({ available: true }))).toBeNull();
     // A pond older than the field lists every model as one it can run.

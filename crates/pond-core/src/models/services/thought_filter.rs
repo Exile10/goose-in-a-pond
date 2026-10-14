@@ -11,6 +11,10 @@ pub const PAIRED_TAGS: &[(&str, &str)] = &[
     ("<thought>", "</thought>"),
 ];
 
+/// The tags some models wrap a whole reply in; not markup anyone should hear or read.
+pub const ANSWER_OPEN: &str = "<answer>";
+pub const ANSWER_CLOSE: &str = "</answer>";
+
 /// Sentinels dropped wherever they appear; shared like [`PAIRED_TAGS`].
 pub const STANDALONE_SENTINELS: &[&str] = &[
     "<eos>",
@@ -19,7 +23,23 @@ pub const STANDALONE_SENTINELS: &[&str] = &[
     "</think>",
     "</thinking>",
     "</thought>",
+    ANSWER_OPEN,
+    ANSWER_CLOSE,
 ];
+
+/// Whether `s` holds either answer tag, so a filter can count the replies that came wrapped.
+pub fn has_answer_tag(s: &str) -> bool {
+    s.contains(ANSWER_OPEN) || s.contains(ANSWER_CLOSE)
+}
+
+/// The reply inside an `<answer>` wrapper, for text that is not streamed; `None` when unwrapped.
+pub fn unwrap_answer(text: &str) -> Option<&str> {
+    let inner = text
+        .trim()
+        .strip_prefix(ANSWER_OPEN)?
+        .strip_suffix(ANSWER_CLOSE)?;
+    (!inner.contains(ANSWER_OPEN) && !inner.contains(ANSWER_CLOSE)).then(|| inner.trim())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
@@ -258,6 +278,21 @@ mod tests {
     #[test]
     fn the_longer_spelling_survives_chunk_boundaries() {
         assert_eq!(run(&["<think", "ing>hmm</think", "ing>Done."]), "Done.");
+    }
+
+    #[test]
+    fn a_reply_wrapped_in_answer_tags_is_read_without_them() {
+        assert_eq!(
+            run(&["<answer>It is 21 degrees.</answer>"]),
+            "It is 21 degrees."
+        );
+        assert_eq!(run(&["<ans", "wer>Hi.</an", "swer>"]), "Hi.");
+        assert_eq!(unwrap_answer(" <answer> Hi. </answer>\n"), Some("Hi."));
+        assert_eq!(unwrap_answer("Hi."), None);
+        assert_eq!(
+            unwrap_answer("<answer>a</answer> and <answer>b</answer>"),
+            None
+        );
     }
     // ── Holdback behaviour ─────────────────────────────────────────────────
     // A fixed-size holdback would make text trail generation and freeze mid-word on slowdowns.

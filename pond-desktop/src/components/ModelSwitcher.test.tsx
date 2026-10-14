@@ -190,10 +190,10 @@ describe("switching", () => {
     setup({ models: [e2b(HERE), litertE4b({ ...HERE, ...missing })] });
     const { menu } = await open();
     const item = within(menu).getByRole("button", {
-      name: "Gemma 4 E4B, LiteRT-LM, Needs the LiteRT-LM library: run giap.sh litert build",
+      name: "Gemma 4 E4B, LiteRT-LM, Needs the LiteRT-LM library, which this Pond does not have yet",
     });
     expect(item).toHaveProperty("disabled", true);
-    expect(item.textContent).toContain("Needs the LiteRT-LM library: run giap.sh litert build");
+    expect(item.textContent).toContain("Needs the LiteRT-LM library, which this Pond does not have yet");
     fireEvent.click(item);
     expect(api.activateModel).not.toHaveBeenCalled();
     // A model it can run is still offered beside it.

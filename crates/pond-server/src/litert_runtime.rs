@@ -92,13 +92,37 @@ pub fn ensure_library_dir(data_dir: &Path) -> bool {
             .map(|dir| dir.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        tracing::warn!(
-            searched,
-            "no LiteRT-LM library where the litert backend looks; LiteRT-LM models are listed as \
-             unavailable until one is installed (`giap.sh litert build`) and the pond restarts"
-        );
+        // A warning only for a pond that has LiteRT-LM models to run; most never miss the library.
+        if has_litert_models(data_dir) {
+            tracing::warn!(
+                searched,
+                "no LiteRT-LM library where the litert backend looks, so this pond's LiteRT-LM \
+                 models cannot run until one is installed (`giap.sh litert build`) and the pond \
+                 restarts"
+            );
+        } else {
+            tracing::info!(
+                searched,
+                "no LiteRT-LM library where the litert backend looks; LiteRT-LM models are listed \
+                 as unavailable until one is installed (`giap.sh litert build`) and the pond \
+                 restarts"
+            );
+        }
     }
     found
+}
+
+/// Whether a `.litertlm` model has been downloaded into this pond.
+fn has_litert_models(data_dir: &Path) -> bool {
+    std::fs::read_dir(pond_core::models::domain::litert::models_dir(data_dir))
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                pond_core::models::domain::litert::is_litert_model(
+                    &entry.file_name().to_string_lossy(),
+                )
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// A non-empty directory variable.
