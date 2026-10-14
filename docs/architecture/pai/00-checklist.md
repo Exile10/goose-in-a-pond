@@ -3247,3 +3247,28 @@ milestone).**
 - **Watch.** One round-2 reply out of 53 came wrapped in `<answer>...</answer>`, against none of 34
   before. That is too few to tell from chance. It is the failure the dropped example was guarding
   against: a small model copying the shape of the `<answer-contract>` tag.
+
+**2026-10-13 — Speculative decoding returns on CUDA builds (inference latency; not a PAI
+milestone).**
+
+- **What landed.** goose `2a190e66b` puts the MTP drafter path back into the llama.cpp backend,
+  and only a CUDA build loads a drafter. A context with a drafter reserves logits for the drafts
+  plus one (5 by default), not a whole ubatch. On the budgeted device, GIAP attaches the chat
+  model's drafter whenever a provider is built, if its weights are already in `models/gguf`. The
+  household's Orin has both Gemma 4 drafters, from 2026-09-08. Nothing is fetched, and the pointer
+  is dropped when the file goes. The Jetson settings stamp now keeps the drafter fields.
+- **Why CUDA only.** In process on the Orin, MTP measured 2.1-2.3x decode before its removal on
+  2026-09-24. On live Metal turns it measured 0.64-0.94x. Its drafter context then cost about
+  680 MiB, most of it the logits reservation the engine no longer makes.
+- **Invariants.** KV prefix: the drafter's cache follows the target's through the preamble
+  snapshot and window checkpoints. No profile path, egress, `Settings` field or migration. Nothing
+  new blocks a turn.
+- **Verified on the Mac.** `greedy_output_is_identical_with_and_without_speculation`, E4B QAT with
+  its drafter on Metal. Speculation produced the same token ids as plain decoding at draft depths
+  1, 4, 8 and 12, keeping 33-84% of drafts. On that 35-token answer it ran 1.36-1.89x, which is
+  not the live-turn number.
+- **Verified on the Orin, in the pond, 2026-10-14** (round-2 build `4e4bf103`, E4B QAT with
+  `mtp-gemma-4-E4B-it` attached, the twelve turns of the entries above). Decode was 31.8 tok/s
+  median (10.8-48.5), against 17.8 without the drafter in the same build and 16.2 in round 1. At
+  16K, the lowest available memory was 3,185 MB with the drafter and 3,458 MB without. How many
+  drafts a turn keeps is not logged.
