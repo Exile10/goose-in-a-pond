@@ -2032,10 +2032,15 @@ impl GooseAdapter {
         let Some(conversation) = session.conversation else {
             return Vec::new();
         };
-        conversation
-            .messages()
+        Self::visible_user_texts(conversation.messages())
+    }
+
+    /// Only the user messages the model still sees: compaction keeps the originals it summarised,
+    /// hidden from the agent, and what they carried must count as not shown.
+    fn visible_user_texts(messages: &[Message]) -> Vec<String> {
+        messages
             .iter()
-            .filter(|m| m.role == rmcp::model::Role::User)
+            .filter(|m| m.role == rmcp::model::Role::User && m.is_agent_visible())
             .map(|m| m.as_concat_text())
             .collect()
     }
@@ -4740,6 +4745,21 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compacted_turn_does_not_count_as_already_shown() {
+        let messages = vec![
+            Message::user()
+                .with_text("before compaction")
+                .with_visibility(true, false),
+            Message::assistant().with_text("summary"),
+            Message::user().with_text("after compaction"),
+        ];
+        assert_eq!(
+            GooseAdapter::visible_user_texts(&messages),
+            ["after compaction"]
+        );
+    }
 
     // ── thinking section stability ────────────────────────────────────────
 
