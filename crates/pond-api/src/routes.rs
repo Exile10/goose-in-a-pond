@@ -6390,22 +6390,36 @@ fn refuse_unavailable_engine(
     model: &ModelRecord,
     action: &'static str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    let Some(reason) = state.engine_availability.unavailable_for(&model.category) else {
+    refuse_unavailable_category(state, &model.category, &model.name, action)
+}
+
+/// As [`refuse_unavailable_engine`], for a model known only by its category and name. The
+/// household reads the error; the command that fixes it goes to the log.
+fn refuse_unavailable_category(
+    state: &AppState,
+    category: &ModelCategory,
+    name: &str,
+    action: &'static str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let Some(reason) = state.engine_availability.unavailable_for(category) else {
         return Ok(());
     };
-    tracing::warn!(
-        model = %model.id,
-        action,
-        reason = reason.id(),
-        "refused a model this pond cannot run"
-    );
-    let error = match reason {
-        EngineUnavailable::LiteRtLibraryMissing => format!(
-            "This pond has no LiteRT-LM library, so it cannot run {}. Build one with \
-             `giap.sh litert build`, install it, and restart the pond.",
-            model.name
+    let (error, fix) = match reason {
+        EngineUnavailable::LiteRtLibraryMissing => (
+            format!(
+                "This pond has no LiteRT-LM library, so it cannot run {name}. Whoever set up the \
+                 pond can add it; until then, choose a GGUF model."
+            ),
+            "build one with `giap.sh litert build`, install it, and restart the pond",
         ),
     };
+    tracing::warn!(
+        model = %name,
+        action,
+        reason = reason.id(),
+        fix,
+        "refused a model this pond cannot run"
+    );
     Err((
         StatusCode::CONFLICT,
         Json(json!({"error": error, "reason": reason.id()})),
@@ -6882,6 +6896,10 @@ async fn download_model_from_url(
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("a {category} model has no file to download")})),
         );
+    }
+    // Before a row exists: a model this pond cannot run is neither listed nor fetched.
+    if let Err(refused) = refuse_unavailable_category(&state, &cat, file, "download") {
+        return refused;
     }
 
     let record = match crate::model_acquisition::row_for_url(&state, &url, &cat, file).await {

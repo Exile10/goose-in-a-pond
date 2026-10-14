@@ -40,7 +40,7 @@ void i18n.use(initReactI18next).init({
     hostOnly: 'This browser is no longer signed in to the Pond, probably because it restarted. Run `pond-server dashboard` on the Pond and open the new link.',
   }, models: {
     unavailable: {
-      litert_library_missing: 'Needs the LiteRT-LM library: run giap.sh litert build',
+      litert_library_missing: 'Needs the LiteRT-LM library, which this Pond does not have yet',
       other: 'This pond cannot run this model',
     },
   }, pairing: {
