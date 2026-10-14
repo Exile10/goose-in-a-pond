@@ -430,6 +430,8 @@ fn main() -> Result<()> {
     // Both rustls backends are on (`aws_lc_rs` from the root Cargo.toml, `ring` via reqwest), so
     // rustls panics wherever it infers one; pin it. `Err` means one is already installed: fine.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // The network mode judges a request's first URL where it is sent; this judges each redirect.
+    pond_net::set_redirect_gate(pond_core::shared::services::egress::redirect_verdict);
 
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
