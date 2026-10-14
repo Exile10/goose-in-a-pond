@@ -9,7 +9,8 @@ Requires=docker.service
 Type=oneshot
 WorkingDirectory=/opt/goose-remote-access/deploy/remote-access
 # BACKUP_OFFSITE=user@host:/directory or BACKUP_OFFSITE=pull, required; the unit
-# fails without it.
+# fails without it. With pull it also fails once nothing has been collected for
+# COLLECTED_WITHIN_DAYS (default 3), after writing that night's archive.
 EnvironmentFile=/opt/goose-remote-access/deploy/remote-access/runtime/secrets/backup.env
 ExecStart=/opt/goose-remote-access/deploy/remote-access/backup.sh
 # The stack is briefly stopped; do not let a hung run hold it down.

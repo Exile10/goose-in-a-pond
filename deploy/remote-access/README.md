@@ -18,10 +18,17 @@ read-only root, no capabilities and `no-new-privileges`. Caddy listens on 8080 a
 capability, `NET_BIND_SERVICE`, only because its image marks the binary with it and
 the kernel refuses to start such a binary without it. Three networks separate the traffic (2026-09-30): `edge` carries the
 gateway and the Headscale control plane, `enroll` the gateway and the enrollment
-service, and the internal `admin` network the enrollment service and Headscale's
-administration API alone, so the admin key never crosses the gateway's network.
-Caddy also blocks the administration paths publicly, and both sites send HSTS. No
-API key belongs in an image, environment file, repository, or phone. The
+service, and the internal `admin` network the enrollment service and Headscale
+alone. What the split keeps off `edge` is the admin key, not the admin API
+(corrected 2026-10-12): Headscale serves its control plane and its administration
+API on one listener, `:8080`, attached to both `edge` and `admin`, so anything on
+`edge`, the gateway included, can reach `/api/v1` there. Only enrollment holds the
+key, and it talks to Headscale over `admin`, as `headscale-admin`, so the key never
+crosses the gateway's network. Publicly, Caddy answers `404` for `/api/*`,
+`/metrics`, `/debug/*`, `/swagger*` and `/web*` on the Headscale host before
+anything is proxied; Headscale's metrics and gRPC listeners are bound to its own
+loopback. Both sites send HSTS. No API key belongs in an image, environment file,
+repository, or phone. The
 coordinator is Headscale, run here or by the household; nothing depends on
 Tailscale's hosted control plane, with one exception under Residual risks.
 
@@ -39,8 +46,8 @@ docker compose up -d
 ```
 
 Then check that the gateway renews certificates, `/health` answers on the
-enrollment host, a paired phone still connects, and `./rotate-admin-key.sh` and
-`./backup.sh` complete. Deploy this service before any Pond that sends a household
+enrollment host, a paired phone still connects, and `sudo ./rotate-admin-key.sh` and
+`sudo ./backup.sh` complete. Deploy this service before any Pond that sends a household
 invite.
 
 ## First boot
@@ -69,11 +76,13 @@ These names are public configuration, not credentials.
 4. Start the gateway with `docker compose up -d gateway`. It requires healthy
    enrollment at startup. Check HTTPS health and confirm that `/api/v1/user` on
    the public Headscale hostname returns 404.
-5. Rotate the administration key before expiry with `./rotate-admin-key.sh [90d]`.
-   The key is read once at startup, so the order is load-bearing: mint, install,
-   recreate enrollment, confirm it reports healthy, and only then expire the
-   previous key. Reversing the last two locks the service out of the coordinator.
-   The script restores the previous key if enrollment does not come back.
+5. Rotate the administration key before expiry with
+   `sudo ./rotate-admin-key.sh [90d]`; it needs root to read and replace the secret,
+   which belongs to UID 65532. The key is read once at startup, so the order is
+   load-bearing: mint, install, recreate enrollment, confirm it reconciles with the
+   coordinator, and only then expire the previous key. Reversing the last two locks
+   the service out of the coordinator. Any failure before that restores the previous
+   key and expires the new one.
 
 The Compose port bindings default to loopback. Setting `HTTPS_BIND=0.0.0.0` and
 `STUN_BIND=0.0.0.0` is an explicit public-deployment step and is outside this
@@ -282,19 +291,25 @@ including any SQLite WAL/SHM files. An independent copy of only enrollment or on
 Headscale can restore inconsistent authorization mappings. Keep the backup key
 outside this host; never store plaintext archives in Git.
 
-Backups must leave this host, and `./backup.sh` refuses to run until
+Backups must leave this host, and `sudo ./backup.sh` refuses to run until
 `BACKUP_OFFSITE` says how (the reference unit reads it from
-`runtime/secrets/backup.env`). Set it to `user@host:/directory` and each archive is
-copied there with rsync over SSH and its size checked there before anything local
-is pruned. Set it to `pull` when another machine collects `runtime/backups` and
-verifies what it collected, as the pilot's Mac does; this host then holds no
+`runtime/secrets/backup.env`). It needs root to read volumes owned by UID 65532. A
+run by hand reads the value as systemd does, without surrounding whitespace, a
+trailing carriage return, or one pair of matching quotes (2026-10-12); it used to
+keep the quotes and refuse `BACKUP_OFFSITE="pull"`. Set it to `user@host:/directory`
+and each archive is copied there with rsync over SSH and checked there before
+anything local is pruned: a second, checksumming rsync dry run must find nothing to
+change. That needs only rsync on the far side; the size check it replaced (2026-10-12)
+ran GNU `stat` there. Set it to `pull` when another machine collects `runtime/backups`
+and verifies what it collected, as the pilot's Mac does; this host then holds no
 credential to anywhere.
 
 `./backup.sh` performs exactly this sequence and is driven by the reference units in
 `systemd/`, whose paths assume a deployment at `/opt/goose-remote-access`: it stops gateway, enrollment and Headscale in order, checks
 both stores while nothing is writing, encrypts a single archive to an age recipient
 whose private key is deliberately absent from this host, restarts in reverse order
-through an EXIT trap, and prunes to `KEEP` archives. It refuses to run at all rather
+through an EXIT trap, and prunes to `KEEP` archives, in `pull` mode only those
+collected. It refuses to run at all rather
 than write an unencrypted archive. Expect roughly fifteen seconds of downtime per
 run; a connected Pond reconnects afterwards with its machine identity retained.
 
@@ -313,10 +328,54 @@ reconnection after full infrastructure restoration: retained machine identity,
 authenticated REST, and incremental SSE work with the restored state. These local
 fixtures do not establish public cellular availability.
 
-Key rotation (`./rotate-admin-key.sh`) expires exactly the key enrollment was
+Key rotation (`sudo ./rotate-admin-key.sh`) expires exactly the key enrollment was
 using, named by its own prefix, and only after Headscale lists the new one and
 enrollment is healthy on it. It used to scrape the key table and expire every key
-it could parse.
+it could parse. Since 2026-10-12 it writes only the key line of `apikeys create`
+into the secret, and fails when there is none. Docker's health check passes on any
+`200`, and a service whose key the coordinator refuses still answers `200` with
+`"degraded":true`, so the script then reads enrollment's own `/health` body for up
+to a minute, from inside the gateway with its busybox `wget` (the enrollment image
+has no shell), and treats `"degraded":true` as failure. Until that passes, every
+failure, an interruption included, restores the previous key, recreates enrollment
+on it and expires the new key. The gateway must be running.
+
+### What a pull-mode collector must do (2026-10-12)
+
+In `pull` mode this host prunes only what it can see was collected. The contract:
+
+- After the collector has copied `control-plane-<stamp>.tar.age` and verified its
+  copy, it writes an empty `control-plane-<stamp>.tar.age.collected` beside the
+  archive in `runtime/backups` on this host, as the account it reads the archives
+  with. It never writes a marker for a copy it did not verify.
+- `backup.sh` keeps the newest `KEEP` archives regardless, and of the older ones
+  deletes only those with a marker, together with the marker. An archive with no
+  marker is kept however old it is.
+- If no marker is younger than `COLLECTED_WITHIN_DAYS` (default 3) while some archive
+  is older than that, the run still writes its archive and then exits non-zero, so
+  `goose-backup.service` shows failed. A new host passes until its first archive is
+  that old.
+
+The collector lives on the operator's machine, outside this repository. Add this
+after its pull, with `HOST` and `REMOTE` set to the SSH destination and this host's
+`runtime/backups` path, and `LOCAL` to the directory it pulled into:
+
+```sh
+for copy in "$LOCAL"/control-plane-*.tar.age; do
+  name="$(basename "$copy")"
+  # Verified: a checksumming dry run of this host's archive against the copy changes
+  # nothing, and the rsync itself succeeded (an archive pruned meanwhile fails it).
+  if changes="$(rsync -an --checksum --itemize-changes "$HOST:$REMOTE/$name" "$LOCAL/")" \
+     && [ -z "$changes" ]; then
+    ssh "$HOST" touch -- "$REMOTE/$name.collected"
+  else
+    echo "not marking $name: the copy is not verified" >&2
+  fi
+done
+```
+
+Where the collector also holds the age identity, decrypting each copy to
+`tar -t` before marking it is the stronger check.
 
 ## Health, logs, and remaining verification
 
