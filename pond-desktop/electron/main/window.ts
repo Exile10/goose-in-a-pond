@@ -43,7 +43,7 @@ export interface CreateWindowOptions {
   serverUrl: string;
   /** Where to remember the window's position between runs. */
   userDataDir: string;
-  /** Dev-only Vite server (HMR); pond-server's CORS allowlist must keep http://localhost:1420. */
+  /** Dev-only Vite server (HMR); pond-server allows its origin through GIAP_DEV_SERVER. */
   devServerUrl?: string | undefined;
   /** Called when the user closes the window, so the caller can hide-to-tray. */
   onCloseRequested(win: BrowserWindow): void;

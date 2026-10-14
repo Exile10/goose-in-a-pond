@@ -516,8 +516,8 @@ and `serve` prints the address beside the others.
 
 ## CORS
 
-Scoped to first-party origins (`app://giap`, `http://localhost:1420`,
-`http://127.0.0.1:1420`); **not** `Any`. The same list feeds the loopback
+Scoped to first-party origins (`app://giap`, and the Vite dev server described below);
+**not** `Any`. The same list feeds the loopback
 listener's Origin check, and it also covers the remote-access management routes,
 which the desktop renderer calls cross-origin. Add extra browser origins (e.g. a LAN
 dashboard) with a comma-separated:
@@ -530,9 +530,12 @@ POND_CORS_ALLOWED_ORIGINS=https://dashboard.lan,https://…
 from a privileged custom scheme rather than from `file://`, and the reason is
 this list: a `file://` page sends `Origin: null`, which cannot be
 allow-listed in any meaningful way and would have forced the allowlist open to
-`Any` — undoing the scoping this section exists to describe. The two `:1420`
-entries are the Vite dev server, which the desktop shell loads instead of the
-packaged bundle during development.
+`Any` — undoing the scoping this section exists to describe. The Vite dev server,
+which the desktop shell loads instead of the packaged bundle during development, is
+`http://localhost:1420` and `http://127.0.0.1:1420` in a debug build only, plus in any
+build the origin `GIAP_DEV_SERVER` names (`npm run dev:electron` sets it, and the server
+the shell spawns inherits it). A release build trusts no other page on port 1420: on a
+shared machine it could be any account's.
 
 Native mobile clients (GOTG) don't send a browser `Origin` header, so CORS does
 not apply to them.

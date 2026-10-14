@@ -654,21 +654,40 @@ fn build_transport_router(state: Arc<AppState>, static_dir: Option<std::path::Pa
 
 /// First-party desktop origins, plus any in `POND_CORS_ALLOWED_ORIGINS` (comma-separated).
 pub fn allowed_origins() -> Vec<axum::http::HeaderValue> {
-    let mut origins: Vec<axum::http::HeaderValue> = [
-        // Packaged desktop renderer: a custom scheme, since file:// sends `Origin: null`.
-        "app://giap",
-        // Vite dev server, loaded by the shell in development.
-        "http://localhost:1420",
-        "http://127.0.0.1:1420",
-    ]
-    .iter()
-    .filter_map(|o| o.parse().ok())
-    .collect();
+    // Packaged desktop renderer: a custom scheme, since file:// sends `Origin: null`.
+    let mut origins: Vec<axum::http::HeaderValue> = std::iter::once("app://giap".to_string())
+        .chain(dev_server_origins(
+            std::env::var("GIAP_DEV_SERVER").ok().as_deref(),
+        ))
+        .filter_map(|o| o.parse().ok())
+        .collect();
     if let Ok(extra) = std::env::var("POND_CORS_ALLOWED_ORIGINS") {
         for o in extra.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
             if let Ok(v) = o.parse() {
                 origins.push(v);
             }
+        }
+    }
+    origins
+}
+
+/// The Vite dev server the shell loads in development: port 1420 on both loopback names in a debug
+/// build, and in any build the origin `GIAP_DEV_SERVER` names (`dev:electron` sets it, and the
+/// server the shell spawns inherits it). A release build trusts no other page on port 1420, which
+/// may be any account's.
+fn dev_server_origins(named: Option<&str>) -> Vec<String> {
+    let mut origins = Vec::new();
+    if cfg!(debug_assertions) {
+        origins.push("http://localhost:1420".to_string());
+        origins.push("http://127.0.0.1:1420".to_string());
+    }
+    let named = named
+        .and_then(|value| reqwest::Url::parse(value.trim()).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.origin().ascii_serialization());
+    if let Some(origin) = named {
+        if !origins.contains(&origin) {
+            origins.push(origin);
         }
     }
     origins
@@ -755,6 +774,31 @@ mod rate_limit_tests {
             "/api/v1/handshake/pairing-code",
         ] {
             assert!(is_handshake_path(path), "{path} should use it");
+        }
+    }
+
+    #[test]
+    fn a_dev_server_origin_comes_from_the_debug_build_or_from_giap_dev_server() {
+        let defaults = dev_server_origins(None);
+        assert_eq!(
+            defaults.contains(&"http://localhost:1420".to_string()),
+            cfg!(debug_assertions)
+        );
+        let named = dev_server_origins(Some(" http://localhost:5173/src/main.tsx "));
+        assert!(
+            named.contains(&"http://localhost:5173".to_string()),
+            "{named:?}"
+        );
+        let again = dev_server_origins(Some("http://localhost:1420"));
+        assert_eq!(
+            again
+                .iter()
+                .filter(|o| *o == "http://localhost:1420")
+                .count(),
+            1
+        );
+        for value in ["not a url", "ftp://localhost:1420", "", "app://giap"] {
+            assert_eq!(dev_server_origins(Some(value)), defaults, "{value}");
         }
     }
 

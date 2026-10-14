@@ -273,7 +273,7 @@ mod tests {
             ("127.0.0.1:80", "http://127.0.0.1"),
             // An SSH tunnel's page talks to the tunnel's own port.
             ("localhost:9000", "http://localhost:9000"),
-            // The packaged shell and the Vite dev server, from the CORS allowlist.
+            // The packaged shell and, in a debug build, the Vite dev server: the CORS allowlist.
             ("127.0.0.1:4000", "app://giap"),
             ("127.0.0.1:4000", "http://localhost:1420"),
         ] {
