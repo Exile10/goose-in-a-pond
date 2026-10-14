@@ -2,7 +2,9 @@
 //! tokens: llamafile and ollama stream natively, bypassing `strip_thinking_tokens`.
 
 /// Owned by `pond-core` and shared by both streaming filters; never keep a local copy.
-use pond_core::models::services::thought_filter::{PAIRED_TAGS, STANDALONE_SENTINELS};
+use pond_core::models::services::thought_filter::{
+    has_answer_tag, PAIRED_TAGS, STANDALONE_SENTINELS,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
@@ -24,6 +26,8 @@ pub struct ThoughtFilter {
     capture_thinking: bool,
     /// Thinking blocks captured since the last `take_thinking`.
     captured_thinking: Vec<String>,
+    /// The reply carried an `<answer>` tag, dropped as a sentinel; logged once, at the flush.
+    answer_tagged: bool,
 }
 
 impl Default for ThoughtFilter {
@@ -36,6 +40,7 @@ impl Default for ThoughtFilter {
             captured_tool_calls: Vec::new(),
             capture_thinking: false,
             captured_thinking: Vec::new(),
+            answer_tagged: false,
         }
     }
 }
@@ -64,6 +69,7 @@ impl ThoughtFilter {
                         .min_by_key(|&(i, _, _)| i);
 
                     if let Some((i, open, close)) = earliest_pair {
+                        self.answer_tagged |= has_answer_tag(&self.buf[..i]);
                         out.push_str(&strip_standalones(&self.buf[..i]));
                         self.buf.drain(..i + open.len());
                         self.inside_open_tag = Some(open);
@@ -72,6 +78,7 @@ impl ThoughtFilter {
                     } else {
                         // Hold back only a tail that could still become a marker; usually none.
                         let safe = safe_emit_len(&self.buf, &NORMAL_MARKERS);
+                        self.answer_tagged |= has_answer_tag(&self.buf[..safe]);
                         out.push_str(&strip_standalones(&self.buf[..safe]));
                         self.buf.drain(..safe);
                         break;
@@ -119,6 +126,17 @@ impl ThoughtFilter {
     /// Stream-end flush: emits buffered text, but drops an unclosed block's body.
     pub fn flush(&mut self) -> String {
         let pending = std::mem::take(&mut self.buf);
+        if matches!(self.state, State::Normal) {
+            self.answer_tagged |= has_answer_tag(&pending);
+        }
+        if std::mem::take(&mut self.answer_tagged) {
+            // Counted by kind: how often a model wraps its reply despite the answer rule.
+            tracing::info!(
+                target: "giap::trace",
+                kind = "answer_tag_stripped",
+                "the reply carried <answer> tags; they were dropped"
+            );
+        }
         match self.state {
             State::Normal => strip_standalones(&pending),
             State::InsideBlock(close) => {
