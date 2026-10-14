@@ -9,6 +9,14 @@ export function appOrigins(devServerUrl: string | undefined): string[] {
   return devServerUrl ? [APP_ORIGIN, originOf(devServerUrl)] : [APP_ORIGIN];
 }
 
+/** The configured dev server, or undefined, with a warning, when the value is not an http(s) URL. */
+export function devServerFromEnv(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (isWebUrl(value)) return value;
+  console.warn(`[giap] ignoring GIAP_DEV_SERVER, which is not an http(s) URL: ${value.slice(0, 64)}`);
+  return undefined;
+}
+
 /**
  * `scheme://host[:port]`. Not `URL.origin`, which is the opaque "null" for a non-special
  * scheme such as app://, so it could never match APP_ORIGIN. For http(s) the two agree.

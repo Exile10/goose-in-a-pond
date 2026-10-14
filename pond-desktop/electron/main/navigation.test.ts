@@ -4,7 +4,7 @@ import type { WebContents } from "electron";
 const { openExternal } = vi.hoisted(() => ({ openExternal: vi.fn(async () => undefined) }));
 vi.mock("electron", () => ({ shell: { openExternal } }));
 
-import { appOrigins, guardNavigation, isAppUrl, isWebUrl } from "./navigation";
+import { appOrigins, devServerFromEnv, guardNavigation, isAppUrl, isWebUrl } from "./navigation";
 import { APP_ORIGIN } from "./protocol";
 
 describe("isAppUrl", () => {
@@ -28,6 +28,36 @@ describe("isAppUrl", () => {
     expect(isAppUrl("http://localhost:1421/", dev)).toBe(false);
     expect(isAppUrl("https://localhost:1420/", dev)).toBe(false);
     expect(isAppUrl("app://giap/index.html", dev)).toBe(true);
+  });
+});
+
+describe("devServerFromEnv", () => {
+  it("passes an http(s) dev server through, and says nothing when none is set", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect(devServerFromEnv("http://localhost:1420")).toBe("http://localhost:1420");
+    expect(devServerFromEnv("https://dev.localhost:1420/")).toBe("https://dev.localhost:1420/");
+    expect(devServerFromEnv(undefined)).toBeUndefined();
+    expect(devServerFromEnv("")).toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("warns about a malformed value and ignores it instead of throwing at startup", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // `localhost:1420` parses as a URL with the scheme `localhost:`; `file:` would allow any local page.
+    for (const value of ["not a url", "localhost:1420", "file:///", "javascript:alert(1)", "http://"]) {
+      warn.mockClear();
+      expect(() => devServerFromEnv(value), value).not.toThrow();
+      expect(devServerFromEnv(value), value).toBeUndefined();
+      expect(warn, value).toHaveBeenCalledWith(expect.stringContaining("GIAP_DEV_SERVER"));
+    }
+    warn.mockRestore();
+  });
+
+  it("leaves the app with its normal origins when the value is ignored", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect(appOrigins(devServerFromEnv("not a url"))).toEqual([APP_ORIGIN]);
+    warn.mockRestore();
   });
 });
 
