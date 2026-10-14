@@ -339,15 +339,19 @@ Known gaps (tracked in `docs/architecture/context-and-reasoning-roadmap.md`):
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/memories` | List recent memories (up to 50) |
-| POST | `/api/v1/memories` | Save with content, source, tags |
-| PUT | `/api/v1/memories/{id}` | Reword, change tier, or both; absent fields are kept |
+| POST | `/api/v1/memories` | Save with content, source, tags; embedded at write |
+| PUT | `/api/v1/memories/{id}` | Reword, change tier, or both; absent fields are kept, and new words' vector replaces the old |
 | DELETE | `/api/v1/memories/{id}` | Delete by ID |
+
+Both writes embed with the same provider and index the extraction path uses. A row stored without a
+vector (the embedder failed, or the redactor dropped a vector of a credential) is embedded later by
+the boot backfill or by the index maintenance sweep, which runs in household quiet.
 
 ## Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `agent_memory_inject` | false | Inject memories into system prompt each turn |
+| `agent_memory_inject` | true | Inject the most relevant memories into each turn's user message |
 | `agent_memory_limit` | 5 | Max memories to inject |
 | `memory_extraction_enabled` | false | Enable background extraction |
 | `memory_cleanup_enabled` | false | Enable periodic decay cleanup |

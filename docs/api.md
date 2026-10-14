@@ -2121,25 +2121,24 @@ Lists all MCP tools currently available to the Goose agent across all loaded ext
 
 ## Memories
 
-Memory fragments are stored in `pond_system.db`. When `settings.agent_memory_inject = true`, recent fragments are injected into the system prompt on every turn.
+Memory fragments are stored in `pond_system.db`, and their vectors are mirrored into `pond_vectors.db`. When `settings.agent_memory_inject = true`, each turn injects the fragments that rank highest on a blend of similarity to the message, importance and recency. They ride the turn's user message, not the system prompt.
 
 ### GET /memories
 
-Returns the 50 most recent memory fragments.
+Returns the 50 most recent memory fragments, newest first, as a bare array. Vectors are never
+serialised.
 
 **Response 200**
 ```json
-{
-  "memories": [
-    {
-      "id": "uuid",
-      "content": "User prefers temperatures in Celsius.",
-      "source": "api",
-      "tags": ["preferences"],
-      "created_at": "2026-04-09 08:00:00"
-    }
-  ]
-}
+[
+  {
+    "id": "uuid",
+    "content": "User prefers temperatures in Celsius.",
+    "source": "api",
+    "tags": ["preferences"],
+    "created_at": "2026-04-09T08:00:00Z"
+  }
+]
 ```
 
 ---
@@ -2157,7 +2156,15 @@ Returns the 50 most recent memory fragments.
 
 `source` defaults to `"api"`. Other values: `"chat"` | `"sensor_summary"`
 
-**Response 201** — no body
+Optional: `segment`, `importance` (0.0-1.0) and `tier`; importance and tier default from the
+segment.
+
+The memory is embedded before it is stored, with the pond's embedding provider, so semantic recall
+finds it from the next turn. If embedding fails, or no provider is configured, it is stored without
+a vector and the index maintenance sweep embeds it later. A memory whose text held a credential is
+stored redacted and without a vector; the sweep embeds the redacted text.
+
+**Response 201** — the fragment as built from the request (the stored text is the redacted one)
 
 ---
 
@@ -2171,9 +2178,13 @@ Returns the 50 most recent memory fragments.
 }
 ```
 
+Rewords and/or re-tiers a memory in place, keeping its id, age and usage. New `content` is embedded
+and replaces the old vector, in the memory row and in the personal-context index, under the same
+rules as `POST`. A change of `tier` alone leaves the vector as it is.
+
 `tier` is `"short"` | `"long"` | `"permanent"`, and the decay rate is reset to that tier's
 default. `"permanent"` keeps a memory forever: decay never archives it and consolidation never
-prunes it. Rewording clears the memory's embedding, which is rebuilt on the next sweep.
+prunes it.
 
 **Response 204** — no body. **400** when the body changes nothing or `content` is blank.
 
