@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/netip"
+	"path/filepath"
 	"sync"
 
 	"github.com/Exile10/goose-in-a-pond/native/pondnet"
@@ -161,13 +162,20 @@ func Stop() {
 // directory. The identity stays, so enabling again needs no new enrollment, but
 // the list of peers and the access rules a removed device last saw do not.
 //
+// When a node is running in a directory other than directory, its cache is
+// erased too, and the mismatch is written to the event log: the node being
+// stopped is the one whose map must not survive, whatever directory the caller
+// believed it ran in.
+//
 // The node is stopped whatever happens. A failure to erase is returned and
 // recorded in the event log, never dropped: a cache left behind is the one
 // thing this was meant to prevent.
 func Disable(directory string) error {
 	lock.Lock()
 	defer lock.Unlock()
+	running := ""
 	if node != nil {
+		running = filepath.Clean(node.Server.Dir)
 		// While the node runs, so the backend also drops what it holds in memory.
 		// The removal below is what decides the outcome, so a refusal here is
 		// recorded rather than returned.
@@ -176,12 +184,33 @@ func Disable(directory string) error {
 		}
 	}
 	stopLocked()
+	directories := cacheDirectories(directory, running)
+	if len(directories) > 1 {
+		diagnose("remote access was disabled for a directory other than the running node's; erasing the cached network map in both")
+	}
 	// After the node has stopped, so no map arriving in between survives.
-	if err := pondnet.RemoveNetworkMapCache(directory); err != nil {
+	var failures []error
+	for _, dir := range directories {
+		if err := pondnet.RemoveNetworkMapCache(dir); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if err := errors.Join(failures...); err != nil {
 		diagnose("remote access was disabled, but its cached network map was not erased: " + err.Error())
 		return err
 	}
 	return nil
+}
+
+// cacheDirectories returns the state directories whose cached network map
+// Disable erases: requested and, when a node was running in another directory,
+// running as well. running is empty when no node was running.
+func cacheDirectories(requested, running string) []string {
+	requested = filepath.Clean(requested)
+	if running == "" || running == requested {
+		return []string{requested}
+	}
+	return []string{requested, running}
 }
 
 func stopLocked() {

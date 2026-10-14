@@ -103,7 +103,8 @@ func configuredServers() []netip.AddrPort {
 // dialResolver ignores the address Go derived from configuration that does not
 // exist on this platform and hands Go a connection to every resolver the
 // operating system reported. Each query written to it goes to every server over
-// UDP and over TCP at once, and the first answer to that query is what Go reads.
+// UDP and over TCP at once, and the first usable answer to that query is what Go
+// reads; see unusableReply.
 //
 // No transport and no server is chosen in advance, because none can be. Each of
 // these was observed, and each defeated a rule that suited the one before:
@@ -153,7 +154,8 @@ type racingResolver struct {
 	done     chan struct{}
 }
 
-// answered is how a race ends: the first answer to its query, or why there was none.
+// answered is how a race ends: the first usable answer to its query, a truncated
+// or unusable one if no usable one came, or why there was none.
 type answered struct {
 	reply []byte
 	err   error
@@ -201,26 +203,46 @@ func (r *racingResolver) ask(query []byte) error {
 	}
 	go func() {
 		defer cancel()
-		var truncated []byte
+		var truncated, fallback []byte
+		var fallbackReason string
 		var failures []error
 		for range attempts {
 			got := <-results
-			switch {
-			case got.err != nil:
+			if got.err != nil {
 				failures = append(failures, got.err)
-			case got.reply[2]&0x02 != 0:
+				continue
+			}
+			if got.reply[2]&0x02 != 0 {
 				// A truncated UDP answer is kept only in case nothing better comes:
 				// the same server's TCP answer is the whole one.
 				if truncated == nil {
 					truncated = got.reply
 				}
-			default:
-				answer <- answered{reply: got.reply}
-				return
+				continue
 			}
+			if reason := unusableReply(got.reply); reason != "" {
+				// A server that failed or does not recurse is kept, like a truncated
+				// answer, only in case nothing better comes: another server may
+				// answer the same query properly a moment later.
+				if fallback == nil {
+					fallback, fallbackReason = got.reply, reason
+				}
+				continue
+			}
+			answer <- answered{reply: got.reply}
+			return
 		}
 		if truncated != nil {
 			answer <- answered{reply: truncated}
+			return
+		}
+		if fallback != nil {
+			// Handed to Go as it came, so Go sees the RCODE and reports it as the
+			// server's failure rather than as a timeout.
+			answer <- answered{reply: fallback}
+			if !errors.Is(ctx.Err(), context.Canceled) {
+				diagnose("resolver: no server answered usably over udp or tcp; the first reply was " + fallbackReason)
+			}
 			return
 		}
 		// Every server and transport failed. Saying so now, rather than at the
@@ -234,6 +256,40 @@ func (r *racingResolver) ask(query []byte) error {
 		}
 	}()
 	return nil
+}
+
+// unusableReply says why reply, a complete answer to the query, is not one a race
+// should end on, or returns "" when it is. NXDOMAIN and NOERROR are answers: the
+// name does not exist, or exists with or without records of the asked type.
+//
+// FORMERR, SERVFAIL, NOTIMP and REFUSED say nothing about the name, only that this
+// server did not answer it. A lame reply is NOERROR with no answer and no
+// additional record from a server that claims neither authority nor recursion: a
+// referral elsewhere, which a stub resolver cannot follow. That test mirrors
+// errLameReferral in Go's checkHeader (net/dnsclient_unix.go), which skips such a
+// reply to try the next server as libresolv does (golang.org/issue/15434). With no
+// additional record there is no OPT record either, so the header's four-bit RCODE
+// is the whole of it, as Go's extractExtendedRCode would find.
+func unusableReply(reply []byte) string {
+	switch reply[3] & 0x0f {
+	case 1:
+		return "FORMERR"
+	case 2:
+		return "SERVFAIL"
+	case 4:
+		return "NOTIMP"
+	case 5:
+		return "REFUSED"
+	case 0:
+		authoritative := reply[2]&0x04 != 0
+		recursive := reply[3]&0x80 != 0
+		answers := reply[6]|reply[7] != 0
+		additional := reply[10]|reply[11] != 0
+		if !authoritative && !recursive && !answers && !additional {
+			return "a lame referral"
+		}
+	}
+	return ""
 }
 
 // wait returns the answer to the current query, or an error at the deadline.

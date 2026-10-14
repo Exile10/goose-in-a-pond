@@ -208,6 +208,23 @@ once it is complete and carries that id. A truncated UDP answer is used only if
 nothing better arrives. A race that every server and transport loses ends at
 once, with one event-log line naming each failure, so Go moves straight to its
 next attempt. Losers cancelled because another server answered are not reported.
+
+A reply that says nothing about the name is held back the same way (2026-10-12,
+#491). Until then the first reply carrying the id won whatever its RCODE, so one
+server answering SERVFAIL fast failed a lookup that a slower server was about to
+answer. FORMERR, SERVFAIL, NOTIMP and REFUSED are held back, and so is a lame
+reply: NOERROR with no answer and no additional record from a server that
+claims neither authority nor recursion, the test Go's own resolver applies
+before it tries the next server (`errLameReferral` in `net/dnsclient_unix.go`).
+A usable answer from any server still wins. Otherwise the race ends, once every
+server has replied or failed, on the truncated answer if there is one, else on
+the first held-back reply, passed to Go unchanged so it reports the server's
+failure rather than a timeout, with one event-log line naming the RCODE.
+NXDOMAIN and NOERROR, with or without records, are answers and end the race as
+they arrive (`unusableReply`, `native/pondnet/mobile/dns.go`). A held-back reply
+waits for every other attempt, so when no usable answer comes and some server
+accepts TCP without ever answering on it, as Safaricom's first resolver does,
+the lookup lasts until its deadline instead of ending on the held-back reply.
 Before these changes, a cold start on cellular took fifteen seconds or more to
 bring the node up, and sometimes it never came up: netcheck and the DERP
 connection both need the coordinator's name resolved, under deadlines of about a
@@ -424,9 +441,17 @@ The companion keeps one pairing at a time, so the native plugins call it on ever
 started or, with no coordinator, stopped. A forgotten pairing activates with no
 profile and keeps none. Local-only keeps its profile, so enabling again reuses the
 enrolled node. Prune never touches the running node's directory, and it refuses
-any directory whose node lock is held, whatever it believes is running. It removes
-a symbolic link rather than following it. It writes the number erased, and every
-failure, to the event log, and returns the failures to the plugin, which logs them.
+any directory whose node lock is held, whatever it believes is running. It writes
+the number erased, and every failure, to the event log, and returns the failures
+to the plugin, which logs them.
+
+It erases node directories only (2026-10-12, #491). Until then it erased every
+entry under `base` whatever its name or type, and removed a symbolic link there.
+Now an entry is erased only if its name is a valid profile name, `Lstat` finds a
+directory rather than a link or a file, and it holds `node.lock`, `initialized`
+or `tailscaled.state`, or nothing at all: an empty directory is what a start that
+failed straight after creating it leaves. Anything else, a link included, is
+left in place and not followed, and the number left is written to the event log.
 
 ### Cached network map on phones (2026-10-05)
 
@@ -502,6 +527,14 @@ enabling again needs no new enrollment. `mobile.Stop` still keeps the cache, so 
 profile switch or a service stop does not throw it away. The companion app's
 Android and iOS plugins call `Disable` when remote access is switched off or the
 pairing is forgotten (goose-on-the-go `feature/phone-netmap-cache`, 2026-10-05).
+
+`Disable` erases the running node's cache wherever that node ran (2026-10-12,
+#491). Until then it erased only the directory it was given and never compared
+it with the running node's, so a caller that passed another profile's directory
+stopped the node and left its map on disk. It now records the running node's
+directory before stopping it and, when the two differ, erases the cache in both,
+writes the mismatch to the event log, and returns every failure joined
+(`cacheDirectories`, `native/pondnet/mobile/mobile.go`).
 
 **Kill switch.** `TS_USE_CACHED_NETMAP=false` in a node's environment turns the
 cache off. tailscale reads the knob on every check, and with it off it neither
