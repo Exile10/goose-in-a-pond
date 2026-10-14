@@ -3,6 +3,7 @@ package mobile
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -46,5 +47,26 @@ func TestDisableErasesTheCachedNetworkMap(t *testing.T) {
 	}
 	if len(events.lines) != 1 || !strings.Contains(events.lines[0], "cached network map was not erased") {
 		t.Fatalf("the failure to erase was not recorded: %q", events.lines)
+	}
+}
+
+// Disable erases the cache in the directory it is given and, when a node was
+// running somewhere else, in that node's directory too.
+func TestDisableErasesTheRunningNodesCacheWhereverItRan(t *testing.T) {
+	for _, c := range []struct {
+		name               string
+		requested, running string
+		want               []string
+	}{
+		{"no node running", "/data/pond-network/a", "", []string{"/data/pond-network/a"}},
+		{"the same directory", "/data/pond-network/a/", "/data/pond-network/a", []string{"/data/pond-network/a"}},
+		{"another directory", "/data/pond-network/a", "/data/pond-network/b", []string{"/data/pond-network/a", "/data/pond-network/b"}},
+		// An unusable request still erases the running node's cache; the
+		// request's own failure is reported by the removal.
+		{"an unusable request", "relative", "/data/pond-network/b", []string{"relative", "/data/pond-network/b"}},
+	} {
+		if got := cacheDirectories(c.requested, c.running); !slices.Equal(got, c.want) {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
 	}
 }

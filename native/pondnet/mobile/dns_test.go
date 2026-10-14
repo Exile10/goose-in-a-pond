@@ -2,6 +2,7 @@ package mobile
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -100,10 +101,15 @@ func useResolvers(t *testing.T, servers ...netip.AddrPort) {
 // fakeDNS is a nameserver on 127.0.0.1 whose behaviour per transport is chosen by
 // the test: which query types it answers over UDP and over TCP, whether it accepts
 // TCP connections and then says nothing, and whether its UDP answers are truncated.
+// It can also answer with an error RCODE, answer as a lame server that neither
+// recurses nor is authoritative, and wait before every answer.
 type fakeDNS struct {
 	udpTypes, tcpTypes []uint16
 	silentTCP          bool
 	truncateUDP        bool
+	rcode              byte
+	lame               bool
+	delay              time.Duration
 }
 
 const (
@@ -135,7 +141,11 @@ func (f fakeDNS) start(t *testing.T) netip.AddrPort {
 				return
 			}
 			if reply := f.reply(buffer[:read], f.udpTypes, f.truncateUDP); reply != nil {
-				packet.WriteTo(reply, from)
+				wg.Add(1)
+				time.AfterFunc(f.delay, func() {
+					defer wg.Done()
+					packet.WriteTo(reply, from)
+				})
 			}
 		}
 	}()
@@ -173,14 +183,16 @@ func (f fakeDNS) serveTCP(conn net.Conn) {
 		if reply == nil {
 			continue
 		}
+		time.Sleep(f.delay)
 		conn.Write(append([]byte{byte(len(reply) >> 8), byte(len(reply))}, reply...))
 	}
 }
 
 // reply answers query when its type is in answered: one A or AAAA record for an
-// address query, an empty answer for anything else. It returns nil for a query it
-// drops, which is what the router does to AAAA over UDP.
-func (fakeDNS) reply(query []byte, answered []uint16, truncate bool) []byte {
+// address query, an empty answer for anything else, or no record at all with the
+// server's error RCODE or as a lame server. It returns nil for a query it drops,
+// which is what the router does to AAAA over UDP.
+func (f fakeDNS) reply(query []byte, answered []uint16, truncate bool) []byte {
 	if len(query) < 12 {
 		return nil
 	}
@@ -196,7 +208,15 @@ func (fakeDNS) reply(query []byte, answered []uint16, truncate bool) []byte {
 	if !slices.Contains(answered, qtype) {
 		return nil
 	}
-	reply := []byte{query[0], query[1], 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0}
+	reply := []byte{query[0], query[1], 0x81, 0x80 | f.rcode, 0, 1, 0, 0, 0, 0, 0, 0}
+	if f.lame {
+		// Recursion desired is echoed; recursion available and authority are not.
+		reply[3] = 0
+		return append(reply, question...)
+	}
+	if f.rcode != 0 {
+		return append(reply, question...)
+	}
 	if truncate {
 		reply[2] |= 0x02
 		return append(reply, question...)
@@ -419,5 +439,108 @@ func TestAnUnansweredQueryEndsAtTheDeadline(t *testing.T) {
 	}
 	if took := time.Since(started); took > time.Second {
 		t.Fatalf("the read outlived its deadline by %s", took)
+	}
+}
+
+// header builds a reply header with the given flag bytes and section counts.
+func header(flags, codes byte, answers, additional byte) []byte {
+	return []byte{0, 1, flags, codes, 0, 1, 0, answers, 0, 0, 0, additional}
+}
+
+func TestOnlyUsableRepliesEndARace(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		reply []byte
+		want  string
+	}{
+		{"an answer", header(0x81, 0x80, 1, 0), ""},
+		{"NXDOMAIN", header(0x81, 0x83, 0, 0), ""},
+		{"NOERROR with no record of the type", header(0x81, 0x80, 0, 0), ""},
+		{"an authoritative empty answer", header(0x85, 0x00, 0, 0), ""},
+		// Go does not call a reply with an additional record lame either.
+		{"an empty answer carrying an OPT record", header(0x81, 0x00, 0, 1), ""},
+		{"FORMERR", header(0x81, 0x81, 0, 0), "FORMERR"},
+		{"SERVFAIL", header(0x81, 0x82, 0, 0), "SERVFAIL"},
+		{"NOTIMP", header(0x81, 0x84, 0, 0), "NOTIMP"},
+		{"REFUSED", header(0x81, 0x85, 0, 0), "REFUSED"},
+		{"a lame referral", header(0x81, 0x00, 0, 0), "a lame referral"},
+	} {
+		if got := unusableReply(c.reply); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// slowGood is a server that answers everything properly, a little after the
+// server under test has already replied.
+func slowGood(t *testing.T) netip.AddrPort {
+	t.Helper()
+	both := []uint16{typeA, typeAAAA}
+	return fakeDNS{udpTypes: both, tcpTypes: both, delay: 200 * time.Millisecond}.start(t)
+}
+
+// The first reply used to win whatever it said, so one failing server failed the
+// lookup even when another was about to answer it.
+func TestAFastFailingServerDoesNotHideASlowerGoodOne(t *testing.T) {
+	both := []uint16{typeA, typeAAAA}
+	for _, c := range []struct {
+		name   string
+		server fakeDNS
+	}{
+		{"SERVFAIL", fakeDNS{udpTypes: both, tcpTypes: both, rcode: 2}},
+		{"REFUSED", fakeDNS{udpTypes: both, tcpTypes: both, rcode: 5}},
+		{"lame", fakeDNS{udpTypes: both, tcpTypes: both, lame: true}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			events := recordEvents(t)
+			useResolvers(t, c.server.start(t), slowGood(t))
+			resolvesBoth(t)
+			if lines := events.all(); len(lines) != 0 {
+				t.Fatalf("a lookup that was answered wrote to the event log: %q", lines)
+			}
+		})
+	}
+}
+
+// Holding a failure back in case something better comes must not mean waiting for
+// the deadline once every server has said all it will.
+func TestEveryServerFailingEndsTheLookupAtOnceAndSaysSo(t *testing.T) {
+	events := recordEvents(t)
+	both := []uint16{typeA, typeAAAA}
+	failing := fakeDNS{udpTypes: both, tcpTypes: both, rcode: 2}
+	useResolvers(t, failing.start(t), failing.start(t))
+	addresses, took, err := lookup(t)
+	if err == nil {
+		t.Fatalf("every server failed and the lookup returned %v", addresses)
+	}
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) || dnsErr.IsTimeout || dnsErr.IsNotFound {
+		t.Fatalf("got %v; Go should have seen SERVFAIL, not a timeout or a missing name", err)
+	}
+	if took > 2*time.Second {
+		t.Fatalf("the lookup took %s", took)
+	}
+	lines := events.all()
+	if len(lines) == 0 {
+		t.Fatal("every server failed and nothing was written to the event log")
+	}
+	for _, line := range lines {
+		if line != "resolver: no server answered usably over udp or tcp; the first reply was SERVFAIL" {
+			t.Fatalf("unexpected event: %s", line)
+		}
+	}
+}
+
+// NXDOMAIN is an answer, not a failure: the first one still ends the race.
+func TestAFastNxdomainIsTheAnswer(t *testing.T) {
+	both := []uint16{typeA, typeAAAA}
+	useResolvers(t, fakeDNS{udpTypes: both, tcpTypes: both, rcode: 3}.start(t), slowGood(t))
+	addresses, took, err := lookup(t)
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+		t.Fatalf("got %v, %v; want the name reported as not found", addresses, err)
+	}
+	if took > 2*time.Second {
+		t.Fatalf("the lookup took %s", took)
 	}
 }
