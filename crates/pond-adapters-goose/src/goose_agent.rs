@@ -170,7 +170,9 @@ fn hidden_completeness_reply(messages: &[Message], goal: &str) -> Option<String>
 /// The reply is the turn's text and nothing else: reasoning is not an answer, and tool calls are
 /// recorded in `metadata["tool_calls"]`. A turn whose model wrote no text is an error that says
 /// so, naming the tools it did call, and is logged as `kind="turn_without_reply"` — a run that
-/// only fetched the weather must not read as the engine having failed.
+/// only fetched the weather must not read as the engine having failed. So is a turn that ended on
+/// [`EMPTY_TURN_EXHAUSTED_MESSAGE`]: the apology for no reply is not one, and a schedule must not
+/// speak it or record the run as done. A reply wrapped in `<answer>` tags comes without them.
 async fn collect_reply(
     session_id: &str,
     mut stream: futures::stream::BoxStream<'static, Result<AgentStreamEvent>>,
@@ -197,10 +199,12 @@ async fn collect_reply(
         }
     }
 
-    if full_text.trim().is_empty() {
+    let exhausted = full_text.trim() == EMPTY_TURN_EXHAUSTED_MESSAGE;
+    if full_text.trim().is_empty() || exhausted {
         tracing::warn!(
             target: "giap::trace",
             kind = "turn_without_reply",
+            exhausted,
             session_id = %session_id,
             tool_calls = tool_call_ids.len(),
             tools = %tool_names.join(","),
@@ -225,10 +229,19 @@ async fn collect_reply(
         );
     }
 
-    Ok(AgentResponse {
-        text: full_text,
-        metadata,
-    })
+    let text = match pond_core::models::services::thought_filter::unwrap_answer(&full_text) {
+        Some(inner) => {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "answer_tag_stripped",
+                session_id = %session_id,
+                "the reply carried <answer> tags; they were dropped"
+            );
+            inner.to_string()
+        }
+        None => full_text,
+    };
+    Ok(AgentResponse { text, metadata })
 }
 
 /// Appended when re-engaging after an empty turn: an unchanged prompt gets the same reply.
@@ -5901,6 +5914,39 @@ mod tests {
             err.to_string(),
             "The model finished without writing a reply."
         );
+    }
+
+    /// The apology a turn ends on when re-engagement found no reply is not a reply: a schedule
+    /// would speak it and record the run as completed.
+    #[tokio::test]
+    async fn a_turn_that_ended_on_the_no_reply_apology_has_no_reply() {
+        let err = collect_reply(
+            "sched-test",
+            events(vec![AgentStreamEvent::Text {
+                content: EMPTY_TURN_EXHAUSTED_MESSAGE.to_string(),
+            }]),
+        )
+        .await
+        .expect_err("the apology is not a reply");
+        assert!(err.to_string().contains("without writing a reply"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_wrapped_in_answer_tags_comes_without_them() {
+        let reply = collect_reply(
+            "sched-test",
+            events(vec![
+                AgentStreamEvent::Text {
+                    content: "<answer>Mainly clear, ".to_string(),
+                },
+                AgentStreamEvent::Text {
+                    content: "23.6 C.</answer>".to_string(),
+                },
+            ]),
+        )
+        .await
+        .expect("a wrapped reply is still a reply");
+        assert_eq!(reply.text, "Mainly clear, 23.6 C.");
     }
 
     #[tokio::test]
