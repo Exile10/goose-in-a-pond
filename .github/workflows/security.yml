@@ -15,12 +15,9 @@ on:
     - cron: "17 6 * * 1"
   workflow_dispatch:
 
-# A PR keeps cancel-in-progress: a second push makes the first run's answer about a tree nobody
-# will merge. A push to main does not. Merges land in bursts every 15 to 30 minutes and a full
-# run takes about an hour, so cancelling meant every main run since 2026-10-01 was cancelled
-# before it finished (102 cancelled, 0 passed). Without cancellation the group still holds one
-# running and one pending run, and a newer push replaces the pending one, so main is tested at
-# most twice per burst and each finished run reports on a real main commit.
+# A PR cancels a superseded run: nobody will merge the tree it tested. Main does not, because
+# merges land faster than a full run finishes and cancelling there would leave no main commit
+# verified. A newer push to main replaces the pending run, never the running one.
 concurrency:
   group: security-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
