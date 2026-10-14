@@ -65,4 +65,14 @@ func TestSigningRefusesWhatIsNotADeviceKey(t *testing.T) {
 	if err := run([]string{"public", "--key", key}, &bytes.Buffer{}); err == nil {
 		t.Fatal("a provisioning key readable by others was used")
 	}
+	if err := os.Chmod(key, 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link.key")
+	if err := os.Symlink(key, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"public", "--key", link}, &bytes.Buffer{}); err == nil {
+		t.Fatal("a provisioning key was read through a symlink")
+	}
 }

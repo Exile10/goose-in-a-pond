@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Exile10/goose-in-a-pond/native/pondnet/enrollment"
+	"github.com/Exile10/goose-in-a-pond/native/pondnet/internal/privatefile"
 )
 
 func main() {
@@ -103,15 +104,18 @@ func keygen(path string) (string, error) {
 	return base64.StdEncoding.EncodeToString(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)), nil
 }
 
+const maxKeyFile = 8192
+
 func load(path string) (ed25519.PrivateKey, error) {
-	info, err := os.Lstat(path)
+	file, err := privatefile.Open(path, maxKeyFile)
+	if errors.Is(err, privatefile.ErrNotPrivate) {
+		return nil, fmt.Errorf("%s must be a small regular file only this account can read", path)
+	}
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return nil, fmt.Errorf("%s must be a regular file only this account can read", path)
-	}
-	data, err := os.ReadFile(path)
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxKeyFile+1))
 	if err != nil {
 		return nil, err
 	}

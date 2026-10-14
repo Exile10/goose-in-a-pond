@@ -20,8 +20,8 @@ const controlStateKey ipn.StateKey = "_pond-control"
 const maxIdentityBytes = 4 << 20
 
 // identityStore keeps the upstream state-file format, but never treats a lost or
-// empty existing identity as a new installation. node.lock is the creation marker
-// and must be backed up with tailscaled.state. The caller holds its process lock.
+// empty existing identity as a new installation. The initialized marker records that one
+// was written and must be backed up with tailscaled.state. The caller holds node.lock.
 type identityStore struct {
 	mu      sync.Mutex
 	path    string
