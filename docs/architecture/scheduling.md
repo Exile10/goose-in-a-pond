@@ -67,6 +67,13 @@ parsed as `tokio-cron-scheduler` parsed it (six fields, seconds required; day-of
 day-of-week), so stored schedules keep their meaning. Changing only a schedule's timezone
 re-registers it. An unrecognised timezone runs on UTC, with a warning at registration.
 
+Occurrences are wall-clock times, so the clock changes show. When clocks go back, the repeated
+hour runs once, not twice: an hourly `0 30 * * * *` runs at the first 01:30 and then at 02:30.
+When they go forward, a time inside the skipped hour runs when the clocks land (02:00 for a
+01:30 schedule in London) and on its own time again the next day. A schedule that
+speaks judges quiet hours in the household's `timezone` setting, the zone schedules default to,
+not in the machine's.
+
 ## Execution Flow
 
 1. The task's one-shot job fires at its next local occurrence and arms the one after it

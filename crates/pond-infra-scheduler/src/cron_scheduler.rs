@@ -415,8 +415,8 @@ fn next_occurrence(
 
 /// One recurring task, kept as a chain of one-shot jobs, each armed for its next local occurrence.
 ///
-/// `Job::new_async` reads a cron expression in UTC, so a daily 08:00 Africa/Nairobi schedule fired
-/// at 08:00 UTC (11:00 in Nairobi) while its card promised 08:00. `Job::new_async_tz` would fix the
+/// `Job::new_async` reads a cron expression in UTC, so a daily 08:00 Africa/Nairobi schedule would
+/// fire at 08:00 UTC (11:00 in Nairobi) while its card promised 08:00. `Job::new_async_tz` fixes the
 /// zone but freezes its UTC offset when the job is built, so a zone with DST would fire an hour
 /// off after every change until a restart. Each occurrence here is resolved afresh by
 /// [`next_occurrence`].
@@ -1297,7 +1297,7 @@ mod tests {
         s.parse().expect("test instant")
     }
 
-    /// 2026-10-12: "Daily Brief", 08:00 Africa/Nairobi, fired at 08:00 UTC, 11:00 in Nairobi.
+    /// 08:00 Africa/Nairobi is 05:00 UTC, not 08:00 UTC (11:00 in Nairobi).
     #[test]
     fn a_0800_nairobi_schedule_next_fires_at_0500_utc() {
         let next = next_occurrence("0 0 8 * * *", "Africa/Nairobi", utc("2026-10-12T00:00:00Z"));
@@ -1306,6 +1306,29 @@ mod tests {
         let following =
             next_occurrence("0 0 8 * * *", "Africa/Nairobi", utc("2026-10-12T05:00:00Z"));
         assert_eq!(following, Some(utc("2026-10-13T05:00:00Z")));
+    }
+
+    /// Europe/London leaves BST on 2026-10-25, when 01:00-02:00 happens twice (00:00 and 01:00
+    /// UTC). An hourly schedule runs once in it, not twice: the next occurrence after the first
+    /// 01:30 is 02:30. Accepted; docs/architecture/scheduling.md says so.
+    #[test]
+    fn an_hourly_schedule_runs_once_in_the_hour_the_clocks_repeat() {
+        let cron = "0 30 * * * *";
+        let first = next_occurrence(cron, "Europe/London", utc("2026-10-25T00:00:00Z"));
+        assert_eq!(first, Some(utc("2026-10-25T00:30:00Z")), "01:30 BST");
+        let next = next_occurrence(cron, "Europe/London", utc("2026-10-25T00:30:00Z"));
+        assert_eq!(next, Some(utc("2026-10-25T02:30:00Z")), "02:30 GMT");
+    }
+
+    /// Europe/London goes to BST on 2026-03-29, skipping 01:00-02:00: a time inside it runs when
+    /// the clocks land, at 02:00 BST, and on its own time again the day after.
+    #[test]
+    fn a_time_in_the_skipped_hour_runs_when_the_clocks_land() {
+        let cron = "0 30 1 * * *";
+        let next = next_occurrence(cron, "Europe/London", utc("2026-03-28T02:00:00Z"));
+        assert_eq!(next, Some(utc("2026-03-29T01:00:00Z")), "02:00 BST");
+        let after = next_occurrence(cron, "Europe/London", utc("2026-03-29T01:00:00Z"));
+        assert_eq!(after, Some(utc("2026-03-30T00:30:00Z")), "01:30 BST");
     }
 
     /// Europe/London goes to BST on 2026-03-29: 08:00 local is 08:00 UTC the day before and

@@ -76,6 +76,23 @@ impl LocalTimeOfDay {
     pub fn minutes(self) -> u16 {
         self.0
     }
+
+    /// The time of day at `at` in the IANA zone `zone`, or in this machine's zone when `zone`
+    /// names none.
+    pub fn in_zone(zone: &str, at: chrono::DateTime<chrono::Utc>) -> Self {
+        use chrono::Timelike;
+        let (hour, minute) = match zone.trim().parse::<chrono_tz::Tz>() {
+            Ok(tz) => {
+                let local = at.with_timezone(&tz);
+                (local.hour(), local.minute())
+            }
+            Err(_) => {
+                let local = at.with_timezone(&chrono::Local);
+                (local.hour(), local.minute())
+            }
+        };
+        Self((hour * 60 + minute) as u16)
+    }
 }
 
 /// Why the pond stayed quiet; every variant is a refusal.
@@ -3269,6 +3286,28 @@ mod tests {
     // ── Speaking first ────────────────────────────────────────────────────
 
     use crate::user_data::domain::settings::Settings;
+
+    #[test]
+    fn the_time_of_day_is_read_in_the_zone_named() {
+        let at: chrono::DateTime<chrono::Utc> = "2026-10-14T20:30:00Z".parse().unwrap();
+        assert_eq!(
+            LocalTimeOfDay::in_zone("Africa/Nairobi", at),
+            at_time(23, 30)
+        );
+        assert_eq!(LocalTimeOfDay::in_zone(" UTC ", at), at_time(20, 30));
+        let here = at.with_timezone(&chrono::Local);
+        assert_eq!(
+            LocalTimeOfDay::in_zone("not a zone", at),
+            at_time(
+                chrono::Timelike::hour(&here),
+                chrono::Timelike::minute(&here)
+            )
+        );
+    }
+
+    fn at_time(hour: u32, minute: u32) -> LocalTimeOfDay {
+        LocalTimeOfDay::new(hour, minute).unwrap()
+    }
 
     fn at(hour: u32, minute: u32) -> LocalTimeOfDay {
         LocalTimeOfDay::new(hour, minute).expect("a real clock face")

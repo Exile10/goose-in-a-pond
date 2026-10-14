@@ -51,17 +51,22 @@ impl AgentScheduleExecutor {
     }
 
     /// Checks quiet hours and `unprompted_speech_enabled` only; not `speak_unprompted`'s
-    /// presence gate, as schedules have no owner. Member-level gating is a known gap.
+    /// presence gate, as schedules have no owner. Member-level gating is a known gap. Quiet hours
+    /// are the household's, so they are read in its time zone, the one schedules fire in unless
+    /// they name another, not in the machine's, which on a headless pond is often UTC.
     fn speakable_now(settings: &pond_core::user_data::domain::settings::Settings) -> bool {
         if !settings.unprompted_speech_enabled {
             return false;
         }
-        let now = chrono::Local::now();
+        let now = pond_core::shared::services::chat::LocalTimeOfDay::in_zone(
+            &settings.timezone,
+            chrono::Utc::now(),
+        );
         !quiet_hours_cover_now(
             &settings.quiet_hours_start,
             &settings.quiet_hours_end,
-            chrono::Timelike::hour(&now),
-            chrono::Timelike::minute(&now),
+            u32::from(now.minutes() / 60),
+            u32::from(now.minutes() % 60),
         )
     }
 
