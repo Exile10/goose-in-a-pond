@@ -239,7 +239,7 @@ impl SqliteHandshakeAdapter {
         self.pake.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// End these codes now (by hash): expired in the table, plaintext and budget forgotten.
+    /// End these codes now (by hash): expired in the table, plaintext forgotten, budget spent.
     async fn retire_codes(&self, code_hashes: &[String]) -> Result<()> {
         let now = Self::now().to_rfc3339();
         for hash in code_hashes {
@@ -259,7 +259,9 @@ impl SqliteHandshakeAdapter {
         }
         let mut state = self.pake_state();
         for hash in code_hashes {
-            state.attempts.remove(hash);
+            // Spent rather than forgotten: a verify already past its liveness check must not
+            // find a fresh budget for a code that has just been retired.
+            state.attempts.insert(hash.clone(), PAKE_FAILURE_BUDGET);
         }
         Ok(())
     }
@@ -279,7 +281,7 @@ impl SqliteHandshakeAdapter {
     }
 
     /// Consume the code, register the device and mint tokens, once a proof has verified.
-    /// `None` when another pairing consumed the code first. Only the code attributes the
+    /// `None` when the code was consumed by another pairing, retired or expired first. Only the code attributes the
     /// device; nothing the client sent is consulted (see `issue_pairing_code_for`).
     async fn complete_pairing(
         &self,
@@ -298,10 +300,12 @@ impl SqliteHandshakeAdapter {
                 .flatten();
 
         let consumed = sqlx::query(
-            "UPDATE pairing_codes SET consumed_at = ? WHERE code_hash = ? AND consumed_at IS NULL",
+            "UPDATE pairing_codes SET consumed_at = ?
+             WHERE code_hash = ? AND consumed_at IS NULL AND expires_at > ?",
         )
         .bind(&at)
         .bind(code_hash)
+        .bind(&at)
         .execute(&self.pool)
         .await?;
         ISSUED_CODE_CACHE.write().await.remove(code_hash);
@@ -310,7 +314,7 @@ impl SqliteHandshakeAdapter {
             tracing::warn!(
                 client_id = %client_id,
                 method,
-                "pairing refused: the proof verified but another pairing consumed the code first"
+                "pairing refused: the proof verified, but the code was consumed, retired or expired first"
             );
             return Ok(None);
         }
@@ -586,6 +590,12 @@ impl Handshake for SqliteHandshakeAdapter {
         &self,
         request: PakeInitRequest,
     ) -> Result<std::result::Result<PakeChallenge, PakeRefusal>> {
+        // Before any refusal can return: otherwise runs committed to a code that has gone stay
+        // in memory until the next run starts.
+        let started = Self::now();
+        self.pake_state()
+            .pending
+            .retain(|_, run| run.expires_at > started);
         // The run is under this Pond's own pin whatever the phone claims; the claim only lets a
         // phone at the wrong Pond fail here, clearly, instead of at confirmation.
         let Some(pin) = self.spki_pin.as_deref() else {
@@ -913,6 +923,25 @@ mod tests {
     const OURS: &str = "sha256/TnkUsN+AaLec3BDTh/KUwSokXTmCq2+4rlfBnmJxPkE=";
     /// Somebody else's, for an interceptor to serve.
     const THEIRS: &str = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    /// A code a newer one retired can never complete a pairing, even for a verify that checked it
+    /// while it was live, and its budget reads spent.
+    #[tokio::test]
+    async fn a_retired_code_cannot_complete_a_pairing() {
+        let hs = fresh().await;
+        let old = hs.issue_pairing_code().await.unwrap();
+        let _newer = hs.issue_pairing_code().await.unwrap();
+        let old_hash = SqliteHandshakeAdapter::sha256_hex(old.code.as_bytes());
+        assert_eq!(
+            hs.pake_state().attempts.get(&old_hash),
+            Some(&PAKE_FAILURE_BUDGET)
+        );
+        assert!(hs
+            .complete_pairing(&old_hash, "phone-1", "gotg", None, "test")
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     /// A fresh Pond with a TLS identity, `OURS`.
     async fn fresh() -> SqliteHandshakeAdapter {

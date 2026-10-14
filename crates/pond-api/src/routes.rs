@@ -90,8 +90,15 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/handshake", post(handshake_handler))
         // Phones pair with CPace: init → verify. The HMAC pair below is the loopback
         // dashboard's; `pairing-code` is loopback-only.
-        .route("/handshake/pake/init", post(handshake_pake_init))
-        .route("/handshake/pake/verify", post(handshake_pake_verify))
+        // Each run waits in memory for its verify, so neither body may be large.
+        .route(
+            "/handshake/pake/init",
+            post(handshake_pake_init).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/handshake/pake/verify",
+            post(handshake_pake_verify).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
         .route("/handshake/init", post(handshake_init))
         .route("/handshake/verify", post(handshake_verify))
         .route("/handshake/refresh", post(handshake_refresh))
