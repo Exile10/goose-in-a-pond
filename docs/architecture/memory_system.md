@@ -340,6 +340,7 @@ Known gaps (tracked in `docs/architecture/context-and-reasoning-roadmap.md`):
 |--------|------|-------------|
 | GET | `/api/v1/memories` | List recent memories (up to 50) |
 | POST | `/api/v1/memories` | Save with content, source, tags |
+| PUT | `/api/v1/memories/{id}` | Reword, change tier, or both; absent fields are kept |
 | DELETE | `/api/v1/memories/{id}` | Delete by ID |
 
 ## Settings
