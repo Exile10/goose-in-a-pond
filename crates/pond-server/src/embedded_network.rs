@@ -1838,7 +1838,7 @@ enum PhoneEnrollment {
 /// would let a loop of bad enrollments spend that budget without anyone approving it.
 ///
 /// A stood-down record that still holds the phone's current machine key is a phone that
-/// lapsed or was removed and was not re-paired (2026-10-12). The coordinator refuses any
+/// lapsed or was removed and was not re-paired. The coordinator refuses any
 /// `replace` or `enroll` presenting that key, so it is [`PhoneEnrollment::StaleIdentity`].
 fn phone_enrollment(existing: &serde_json::Value, machine_key: &str) -> PhoneEnrollment {
     let field = |name: &str| {
@@ -2728,8 +2728,8 @@ mod tests {
         .map_err(|refused| refused.status())
     }
 
-    /// A removal while the helper is still enrolling the phone used to find no record, queue
-    /// nothing, and leave the enrollment the coordinator then completed with nothing to revoke it.
+    /// A removal while the helper is still enrolling the phone must find the record and queue the
+    /// revocation, or the enrollment the coordinator then completes has nothing to revoke it.
     #[tokio::test]
     async fn a_removal_while_an_enrollment_is_in_flight_revokes_it() {
         use pond_core::security::ports::remote_access::RemoteRevocation;
@@ -2853,8 +2853,8 @@ mod tests {
         );
     }
 
-    /// A corrupt record, or one a restore left readable by others, used to answer every removal,
-    /// logout and enrollment 503 until someone repaired it by hand.
+    /// A corrupt record, or one a restore left readable by others, is set aside rather than
+    /// answering every removal, logout and enrollment 503 until someone repairs it by hand.
     #[tokio::test]
     async fn an_unreadable_enrollment_record_is_set_aside_and_removals_check_first() {
         use pond_core::security::ports::remote_access::RemoteRevocation;
@@ -3251,7 +3251,7 @@ mod tests {
     }
 
     /// A phone whose remote access lapsed and that was not re-paired asks with the key its
-    /// revoked record still holds. #446 tested only the decision; this drives the route.
+    /// revoked record still holds. This drives the route, not only the decision.
     #[tokio::test]
     async fn a_lapsed_phone_with_its_old_keys_is_told_to_make_new_ones() {
         use pond_core::security::ports::handshake::{Handshake, HandshakeRequest};
