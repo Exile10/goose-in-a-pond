@@ -866,3 +866,56 @@ async fn uber_requests_share_the_rate_limit() {
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
+
+/// Many addresses together still cannot make the relay call Uber more than its budget allows.
+#[tokio::test]
+async fn uber_calls_have_one_budget_across_every_pond() {
+    let (url, seen) = fake_uber().await;
+    let (pem, public) = key();
+    let mut pairs = base();
+    pairs.extend_from_slice(&[
+        ("UBER_CLIENT_ID", "uber-client"),
+        ("UBER_CLIENT_SECRET_FILE", "/run/secrets/uber"),
+        ("UBER_TOKEN_URL", url.as_str()),
+        ("UBER_CALLS_PER_MINUTE", "1"),
+    ]);
+    let cfg = Config::from_env(env(&pairs), move |path| {
+        Ok(if path == "/run/secrets/uber" {
+            "uber-secret\n".to_string()
+        } else {
+            pem.clone()
+        })
+    })
+    .unwrap();
+    let state = Arc::new(AppState::new(&cfg).unwrap());
+    let svc = Service {
+        app: router(state.clone()),
+        state,
+        public,
+    };
+
+    let refresh = serde_json::json!({"refresh_token": "good-refresh"});
+    let (first, _, _) = send_json(&svc, "/v1/uber/refresh", refresh.clone()).await;
+    let (second, _, _) = send_json(&svc, "/v1/uber/refresh", refresh).await;
+    assert_eq!(first, StatusCode::OK);
+    assert_eq!(second, StatusCode::BAD_GATEWAY);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn an_uber_budget_of_nothing_is_refused_at_startup() {
+    let (pem, _) = key();
+    for bad in ["0", "many"] {
+        let mut pairs = base();
+        pairs.extend_from_slice(&[
+            ("UBER_CLIENT_ID", "uber-client"),
+            ("UBER_CLIENT_SECRET_FILE", "/run/secrets/uber"),
+            ("UBER_CALLS_PER_MINUTE", bad),
+        ]);
+        let pem = pem.clone();
+        let err = Config::from_env(env(&pairs), move |_| Ok(pem.clone()))
+            .err()
+            .unwrap_or_else(|| panic!("{bad} was accepted"));
+        assert!(err.contains("UBER_CALLS_PER_MINUTE"), "{err}");
+    }
+}

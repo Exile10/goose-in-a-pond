@@ -6,6 +6,7 @@ services:
     environment:
       UBER_CLIENT_ID: '${UBER_CLIENT_ID:?Set the Uber app client ID}'
       UBER_CLIENT_SECRET_FILE: /run/secrets/uber_client_secret
+      UBER_CALLS_PER_MINUTE: '${UBER_CALLS_PER_MINUTE:-600}'
     secrets: [apple_key, uber_client_secret]
 secrets:
   uber_client_secret:
