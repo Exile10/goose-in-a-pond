@@ -82,6 +82,12 @@ pub fn plain_failure(err: &anyhow::Error) -> String {
     status_in(&raw).map_or_else(|| UNKNOWN.to_string(), plain_status)
 }
 
+/// The file arrived, but the store could not mark its model downloaded.
+pub(crate) fn plain_unrecorded(err: &anyhow::Error) -> String {
+    tracing::warn!(error = %format!("{err:#}"), "a download arrived but could not be recorded");
+    "The file arrived, but the pond could not record it. Try again.".to_string()
+}
+
 fn io_reason(err: &std::io::Error) -> String {
     use std::io::ErrorKind;
     if err.kind() == ErrorKind::StorageFull || err.raw_os_error() == Some(28) {
@@ -248,6 +254,15 @@ mod tests {
             "a success is no failure"
         );
         assert_eq!(status_in("nothing here"), None);
+    }
+
+    #[test]
+    fn a_file_the_store_could_not_record_says_so_plainly() {
+        let said = plain_unrecorded(&anyhow::anyhow!(
+            "error returned from database: (code: 5) database is locked"
+        ));
+        assert!(said.contains("could not record"), "{said}");
+        assert!(is_plain(&said), "{said}");
     }
 
     #[test]
