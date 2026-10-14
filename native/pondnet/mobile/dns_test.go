@@ -479,8 +479,7 @@ func slowGood(t *testing.T) netip.AddrPort {
 	return fakeDNS{udpTypes: both, tcpTypes: both, delay: 200 * time.Millisecond}.start(t)
 }
 
-// The first reply used to win whatever it said, so one failing server failed the
-// lookup even when another was about to answer it.
+// A failing reply from one server must not end the lookup while another can still answer it.
 func TestAFastFailingServerDoesNotHideASlowerGoodOne(t *testing.T) {
 	both := []uint16{typeA, typeAAAA}
 	for _, c := range []struct {
