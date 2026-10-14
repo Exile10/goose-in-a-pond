@@ -11,7 +11,7 @@ use crate::security::domain::redaction::RedactionLevel;
 use crate::security::ports::redactor::Redactor;
 use crate::user_data::domain::memory::{
     MemoryEdge, MemoryEvent, MemoryEventKind, MemoryFragment, MemoryGraph, MemoryLifecycle,
-    MemorySegment,
+    MemorySegment, MemoryTier,
 };
 use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::ports::memory_repository::MemoryRepository;
@@ -193,6 +193,10 @@ impl MemoryRepository for RedactingMemoryRepository {
         importance: f32,
     ) -> Result<()> {
         self.inner.update_segment(id, segment, importance).await
+    }
+
+    async fn update_tier(&self, id: &str, tier: MemoryTier) -> Result<()> {
+        self.inner.update_tier(id, tier).await
     }
 
     async fn log_consolidation_run(

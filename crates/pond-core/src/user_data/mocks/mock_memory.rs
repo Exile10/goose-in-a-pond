@@ -2,7 +2,8 @@
 
 use crate::models::ports::embedding::EmbeddingProvider;
 use crate::user_data::domain::memory::{
-    cosine_similarity, MemoryEvent, MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment,
+    cosine_similarity, MemoryEvent, MemoryEventKind, MemoryFragment, MemoryLifecycle,
+    MemorySegment, MemoryTier,
 };
 use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::ports::memory_repository::MemoryRepository;
@@ -230,6 +231,15 @@ impl MemoryRepository for MockMemoryRepository {
         if let Some(f) = fragments.iter_mut().find(|f| f.id == id) {
             f.segment = Some(segment);
             f.importance = Some(importance);
+        }
+        Ok(())
+    }
+
+    async fn update_tier(&self, id: &str, tier: MemoryTier) -> Result<()> {
+        let mut fragments = self.fragments.write().await;
+        if let Some(f) = fragments.iter_mut().find(|f| f.id == id) {
+            f.decay_rate = Some(tier.default_decay_rate());
+            f.tier = Some(tier);
         }
         Ok(())
     }
