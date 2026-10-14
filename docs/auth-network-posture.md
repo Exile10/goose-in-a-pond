@@ -60,7 +60,8 @@ dashboard router in `pond-server/src/listeners.rs::compose`):
 
 The desktop app reads the credential over IPC (`host_credential`). A browser gets it
 from the sign-in link `pond-server dashboard` prints,
-`http://localhost:<port>/#host=<credential>`: the fragment is never sent over the
+`http://127.0.0.1:<port>/#host=<credential>` (not `localhost`, which a browser may try as
+`[::1]` first, where another account could be listening): the fragment is never sent over the
 network or logged, and the page moves it into that tab's session storage and out of
 the address bar. The link stops working at the next restart. A new link opened in a
 tab that is already running is taken too (2026-10-05): it differs only after `#`, which
@@ -85,7 +86,9 @@ every account: Firefox is given the page's `file://` path. The page goes in
 `$XDG_RUNTIME_DIR/snap.firefox`, in that; and failing either, in a `mktemp -d` directory,
 which snap Firefox cannot read. `kiosk.sh client` prints the command `start` would hand
 weston, and writes the page. `GIAP_KIOSK_URL` still opens exactly the URL given, with no
-sign-in, and `GIAP_KIOSK_PORT` still overrides the port. The kiosk's user unit is
+sign-in, and `GIAP_KIOSK_PORT` still overrides the port. When no page can be written (no
+answer within the 30 seconds, or a credential it cannot read), the kiosk warns and opens the
+plain dashboard, whose sign-in card still works, rather than failing and restarting dark. The kiosk's user unit is
 `PartOf=goose-in-a-pond.service`, so a server restart, which rotates the credential,
 restarts the kiosk too; that reaches only a user unit of that name, and `kiosk.sh install`
 says so when the Pond runs as a system unit. The Electron renderer needs none of this: it
@@ -516,8 +519,8 @@ and `serve` prints the address beside the others.
 
 ## CORS
 
-Scoped to first-party origins (`app://giap`, `http://localhost:1420`,
-`http://127.0.0.1:1420`); **not** `Any`. The same list feeds the loopback
+Scoped to first-party origins (`app://giap`, and the Vite dev server described below);
+**not** `Any`. The same list feeds the loopback
 listener's Origin check, and it also covers the remote-access management routes,
 which the desktop renderer calls cross-origin. Add extra browser origins (e.g. a LAN
 dashboard) with a comma-separated:
@@ -530,9 +533,12 @@ POND_CORS_ALLOWED_ORIGINS=https://dashboard.lan,https://…
 from a privileged custom scheme rather than from `file://`, and the reason is
 this list: a `file://` page sends `Origin: null`, which cannot be
 allow-listed in any meaningful way and would have forced the allowlist open to
-`Any` — undoing the scoping this section exists to describe. The two `:1420`
-entries are the Vite dev server, which the desktop shell loads instead of the
-packaged bundle during development.
+`Any` — undoing the scoping this section exists to describe. The Vite dev server,
+which the desktop shell loads instead of the packaged bundle during development, is
+`http://localhost:1420` and `http://127.0.0.1:1420` in a debug build only, plus in any
+build the origin `GIAP_DEV_SERVER` names (`npm run dev:electron` sets it, and the server
+the shell spawns inherits it). A release build trusts no other page on port 1420: on a
+shared machine it could be any account's.
 
 Native mobile clients (GOTG) don't send a browser `Origin` header, so CORS does
 not apply to them.

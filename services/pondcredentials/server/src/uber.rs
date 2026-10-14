@@ -3,6 +3,7 @@
 //! token) here, this adds the secret, and Uber's tokens go straight back. Nothing is stored or
 //! logged: the member's tokens live only on their own pond.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -12,6 +13,8 @@ use crate::{Client, RateLimiter};
 
 /// The one key the relay's shared budget is counted under.
 const EVERY_POND: Client = Client::V4([0; 4]);
+
+const BUDGET_WINDOW: Duration = Duration::from_secs(60);
 
 /// Uber's documented token endpoint.
 pub const DEFAULT_TOKEN_URL: &str = "https://auth.uber.com/oauth/v2/token";
@@ -23,6 +26,10 @@ const UBER_TIMEOUT: Duration = Duration::from_secs(15);
 /// Every exchange spends Jarida's client secret on a call to Uber, so the per-pond limit alone
 /// would let many addresses together get Jarida's app throttled for every pond.
 const DEFAULT_CALLS_PER_MINUTE: u32 = 600;
+
+/// The share of that budget only refreshes may use. A code exchange needs nothing but a made-up
+/// code, so a flood of them must not also stop every pond renewing the sign-ins it already has.
+const REFRESH_RESERVE_DIVISOR: u32 = 4;
 
 /// The only return address a pond's sign-in uses: its own loopback OAuth callback. Refusing
 /// anything else keeps the relay from exchanging codes issued to some other site.
@@ -81,7 +88,12 @@ impl UberConfig {
 pub struct UberRelay {
     config: UberConfig,
     http: reqwest::Client,
+    /// Every call to Uber.
     budget: RateLimiter,
+    /// Code exchanges alone, which stop short of `budget` by the refresh reserve.
+    exchange_budget: RateLimiter,
+    /// When a spent budget was last logged, so a flood is reported once a minute, not per call.
+    last_spent_log: Mutex<Option<Instant>>,
 }
 
 /// How a relayed exchange ended, ready to become a response.
@@ -118,10 +130,13 @@ impl UberRelay {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
+        let reserve = config.calls_per_minute / REFRESH_RESERVE_DIVISOR;
         Ok(UberRelay {
             config: config.clone(),
             http,
-            budget: RateLimiter::new(config.calls_per_minute, Duration::from_secs(60), 1),
+            budget: RateLimiter::new(config.calls_per_minute, BUDGET_WINDOW, 1),
+            exchange_budget: RateLimiter::new(config.calls_per_minute - reserve, BUDGET_WINDOW, 1),
+            last_spent_log: Mutex::new(None),
         })
     }
 
@@ -136,6 +151,14 @@ impl UberRelay {
         }
         if !is_pond_callback(&request.redirect_uri) {
             return Relayed::BadRequest("redirect_uri is not a pond's sign-in callback");
+        }
+        if self
+            .exchange_budget
+            .check(&EVERY_POND, Instant::now())
+            .is_err()
+        {
+            self.log_spent("code exchanges");
+            return Relayed::Unavailable;
         }
         self.post(&[
             ("grant_type", "authorization_code"),
@@ -156,9 +179,23 @@ impl UberRelay {
         .await
     }
 
+    /// Warn that a budget is spent, at most once a window.
+    fn log_spent(&self, what: &str) {
+        let now = Instant::now();
+        let mut last = self.last_spent_log.lock().unwrap();
+        if last.is_some_and(|at| now.duration_since(at) < BUDGET_WINDOW) {
+            return;
+        }
+        *last = Some(now);
+        tracing::warn!(
+            "the relay's budget of calls to Uber for {what} is spent for this minute; \
+             refusing them until it frees up"
+        );
+    }
+
     async fn post(&self, grant: &[(&str, &str)]) -> Relayed {
         if self.budget.check(&EVERY_POND, Instant::now()).is_err() {
-            tracing::warn!("the relay's budget of calls to Uber is spent for this minute");
+            self.log_spent("every request");
             return Relayed::Unavailable;
         }
         let mut form = vec![

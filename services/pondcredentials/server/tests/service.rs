@@ -600,6 +600,10 @@ async fn fake_uber() -> (String, Arc<std::sync::Mutex<Vec<HashMap<String, String
 }
 
 fn uber_service(token_url: &str) -> Service {
+    uber_service_with(token_url, &[])
+}
+
+fn uber_service_with(token_url: &str, extra: &[(&'static str, &'static str)]) -> Service {
     let (pem, public) = key();
     let mut pairs = base();
     pairs.extend_from_slice(&[
@@ -607,6 +611,7 @@ fn uber_service(token_url: &str) -> Service {
         ("UBER_CLIENT_SECRET_FILE", "/run/secrets/uber"),
         ("UBER_TOKEN_URL", token_url),
     ]);
+    pairs.extend_from_slice(extra);
     let cfg = Config::from_env(env(&pairs), move |path| {
         Ok(if path == "/run/secrets/uber" {
             "uber-secret\n".to_string()
@@ -900,6 +905,63 @@ async fn uber_calls_have_one_budget_across_every_pond() {
     assert_eq!(first, StatusCode::OK);
     assert_eq!(second, StatusCode::BAD_GATEWAY);
     assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// A quarter of the budget is kept for refreshes: code exchanges, which need nothing but a made-up
+/// code, cannot spend it, so a flood of them leaves every pond able to renew its sign-in.
+#[tokio::test]
+async fn a_flood_of_code_exchanges_leaves_room_for_refreshes() {
+    let (url, seen) = fake_uber().await;
+    let svc = uber_service_with(&url, &[("UBER_CALLS_PER_MINUTE", "4")]);
+    let exchange = serde_json::json!({"code": "junk", "redirect_uri": CALLBACK});
+    let mut answers = Vec::new();
+    for _ in 0..4 {
+        answers.push(send_json(&svc, "/v1/uber/token", exchange.clone()).await.0);
+    }
+    assert_eq!(
+        answers,
+        [
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_GATEWAY
+        ]
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        3,
+        "the fourth exchange reached Uber"
+    );
+
+    let refresh = serde_json::json!({"refresh_token": "good-refresh"});
+    let (renewed, _, _) = send_json(&svc, "/v1/uber/refresh", refresh.clone()).await;
+    assert_eq!(renewed, StatusCode::OK);
+    let (over, _, _) = send_json(&svc, "/v1/uber/refresh", refresh).await;
+    assert_eq!(over, StatusCode::BAD_GATEWAY, "past the whole budget");
+    assert_eq!(seen.lock().unwrap().len(), 4);
+}
+
+/// A redirect from the token endpoint would carry the form, client secret included, to wherever
+/// it points; the relay answers 502 and never follows it.
+#[tokio::test]
+async fn a_redirect_from_uber_is_never_followed() {
+    let (elsewhere, seen) = fake_uber().await;
+    let app = axum::Router::new().route(
+        "/oauth/v2/token",
+        axum::routing::post(move || {
+            let elsewhere = elsewhere.clone();
+            async move { axum::response::Redirect::temporary(&elsewhere) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/oauth/v2/token", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let svc = uber_service(&url);
+    let refresh = serde_json::json!({"refresh_token": "good-refresh"});
+    let (status, _, _) = send_json(&svc, "/v1/uber/refresh", refresh).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(seen.lock().unwrap().is_empty(), "the redirect was followed");
 }
 
 #[test]

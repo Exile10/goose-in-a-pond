@@ -8,7 +8,7 @@
 //! the attacker's origin in `Origin`, and neither can forge a loopback value for them.
 //! A page on another loopback port is not first party either: it may be another account's
 //! server, or anything else listening on this machine, so `Origin` must name the very host and
-//! port the request was sent to (2026-10-12).
+//! port the request was sent to.
 //!
 //! A pairing code is a full device token, so minting one needs more than reaching loopback:
 //! the caller must also present the [`HostCredential`], which the server writes to a `0600`
@@ -61,9 +61,10 @@ pub fn require_credential(
     operation: &'static str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let Some(expected) = expected else {
-        tracing::error!(
+        tracing::warn!(
             operation,
-            "no host credential is wired into this listener; refusing"
+            kind = "host_credential_unavailable",
+            "this listener holds no host credential; refusing"
         );
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -273,7 +274,7 @@ mod tests {
             ("127.0.0.1:80", "http://127.0.0.1"),
             // An SSH tunnel's page talks to the tunnel's own port.
             ("localhost:9000", "http://localhost:9000"),
-            // The packaged shell and the Vite dev server, from the CORS allowlist.
+            // The packaged shell and, in a debug build, the Vite dev server: the CORS allowlist.
             ("127.0.0.1:4000", "app://giap"),
             ("127.0.0.1:4000", "http://localhost:1420"),
         ] {

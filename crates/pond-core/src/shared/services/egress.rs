@@ -164,6 +164,12 @@ pub fn check_egress(url: &str) -> Result<(), EgressDenied> {
         .map_err(|reason| refuse(&host, mode, reason, &current_tool(), &current_session_id()))
 }
 
+/// [`check_egress`] for a redirect hop, in the shape `pond_net::set_redirect_gate` takes: a
+/// refusal is the [`EgressDenied`], so callers can still find it in the error's sources.
+pub fn redirect_verdict(url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    check_egress(url).map_err(|denied| Box::new(denied) as _)
+}
+
 /// As [`check_egress`], attributed to the given tool and session instead of the globals, for
 /// callers (extensions) whose request is not the built-in tool in flight.
 pub fn check_egress_for(url: &str, tool: &str, session_id: &str) -> Result<(), EgressDenied> {

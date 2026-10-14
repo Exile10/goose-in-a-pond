@@ -479,7 +479,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				devices[approval.Device] = failed
 				if saveErr := s.Store.save(); saveErr != nil {
 					err = saveErr
-				} else if deleteErr := s.deleteOwned(ctx, failed, h.UserID); deleteErr != nil {
+				} else if deleteErr := s.deleteRefused(ctx, node, failed, h.UserID); deleteErr != nil {
 					// Best effort: a failed record that keeps its machine key is a tombstone,
 					// so Reconcile deletes the node if this attempt could not.
 					slog.Warn("refused registration's node left for reconciliation to delete", "error", deleteErr)
@@ -619,6 +619,36 @@ func (s *Service) validateRegistered(node Registered, pending Device, user strin
 		}
 	}
 	return Device{Key: node.Key, MachineKey: node.MachineKey, NodeID: node.ID, Address: address, Role: pending.Role, Status: "active", Revision: pending.Revision}, nil
+}
+
+// deleteRefused deletes what a refused registration left on the coordinator: any node under
+// the approved machine key, and the node it returned when that is this household's user's and
+// no record holds it. A returned node under another machine key matches no tombstone, so
+// without this it would count toward MaxNodes indefinitely.
+func (s *Service) deleteRefused(ctx context.Context, node Registered, failed Device, user string) error {
+	if err := s.deleteOwned(ctx, failed, user); err != nil {
+		return err
+	}
+	if node.ID == "" || node.UserID != user || s.recorded(node) {
+		return nil
+	}
+	if err := s.Backend.Delete(ctx, node.ID); err != nil {
+		return err
+	}
+	slog.Info("coordinator node deleted: a refused registration returned it", "node", node.ID)
+	return nil
+}
+
+// recorded reports whether any device record names this node or its machine key.
+func (s *Service) recorded(node Registered) bool {
+	for _, devices := range s.Store.value.Devices {
+		for _, device := range devices {
+			if (device.NodeID != "" && device.NodeID == node.ID) || (device.MachineKey != "" && device.MachineKey == node.MachineKey) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // A restored stale node ID must never delete a replacement belonging to another identity.

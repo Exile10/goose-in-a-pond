@@ -8,8 +8,8 @@ use goose::providers::local_inference::{evict_model, loaded_model_ids};
 ///
 /// goose keeps its model runtime in a process-wide static that is never dropped, so a loaded model
 /// is still alive at exit. LiteRT-LM's own exit-time destructors then destroy its GPU accelerator
-/// while the engine's threads still use it, and the pond died with SIGSEGV on every stop (Orin,
-/// 2026-10-12). Evicting first deletes each engine in order, the same path a model switch takes.
+/// while the engine's threads still use it, so the pond would die with SIGSEGV on every stop.
+/// Evicting first deletes each engine in order, the same path a model switch takes.
 /// Bounded by `within`: a model still busy then is left to the exit as before, rather than holding
 /// the stop up.
 pub async fn release_local_models(within: Duration) {

@@ -141,9 +141,14 @@ All errors return JSON:
 
 Health check. Always returns 200 even before onboarding.
 
-**Response 200**
+**Response 200**, to a loopback peer on the host (the dashboard, the desktop app):
 ```json
 { "status": "ok", "version": "0.1.0" }
+```
+
+**Response 200**, to anyone else, and on the plaintext development listener even from loopback:
+```json
+{ "status": "ok" }
 ```
 
 ---

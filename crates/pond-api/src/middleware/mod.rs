@@ -224,7 +224,7 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     // The music player bridge. Extension subprocesses call these with the internal token,
     // checked in the handler. HostOnly: every legitimate caller dials 127.0.0.1 by construction.
     // `POST /player/egress-policy` is not here: its only caller, the `/player.html` page, holds
-    // a session like any other client (2026-10-12).
+    // a session like any other client.
     (Method::POST, "/player/command", Exposure::HostOnly),
     (Method::GET, "/player/status", Exposure::HostOnly),
     (Method::POST, "/extension/egress", Exposure::HostOnly),

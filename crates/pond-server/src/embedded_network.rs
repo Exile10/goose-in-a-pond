@@ -1036,6 +1036,18 @@ impl Runtime {
         }
         let cutoff = Utc::now() - chrono::Duration::days(LAN_PRESENCE_WINDOW_DAYS);
         for device in self.absent_since(cutoff).await? {
+            // Also forgets the sighting, or every sweep would re-queue this revocation. A device
+            // that cannot be queued keeps it, is retried next sweep, and holds back no other.
+            if let Err(error) = self.queue_network(&device) {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "remote_access_lapse_not_queued",
+                    %device,
+                    error = %format!("{error:#}"),
+                    "could not queue the revocation of a device away too long; retrying"
+                );
+                continue;
+            }
             tracing::warn!(
                 target: "giap::trace",
                 kind = "remote_access_lapsed",
@@ -1045,8 +1057,6 @@ impl Runtime {
                  the window, so its remote access is being revoked. Local pairing is untouched, \
                  and bringing it home restores it."
             );
-            // Also forgets the sighting, or every sweep would re-queue this revocation.
-            self.queue_network(&device)?;
         }
         Ok(())
     }
@@ -1828,7 +1838,7 @@ enum PhoneEnrollment {
 /// would let a loop of bad enrollments spend that budget without anyone approving it.
 ///
 /// A stood-down record that still holds the phone's current machine key is a phone that
-/// lapsed or was removed and was not re-paired (2026-10-12). The coordinator refuses any
+/// lapsed or was removed and was not re-paired. The coordinator refuses any
 /// `replace` or `enroll` presenting that key, so it is [`PhoneEnrollment::StaleIdentity`].
 fn phone_enrollment(existing: &serde_json::Value, machine_key: &str) -> PhoneEnrollment {
     let field = |name: &str| {
@@ -2124,6 +2134,47 @@ mod tests {
         assert!(!runtime.presence().unwrap().contains_key(&key));
         runtime.sweep_absent_devices().await.unwrap();
         assert_eq!(runtime.pending_revocations().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_device_that_cannot_be_queued_holds_back_no_other() {
+        use pond_core::security::ports::remote_access::LAN_PRESENCE_WINDOW_DAYS;
+        let data = tempfile::tempdir().unwrap();
+        let (runtime, _listener) = Runtime::new(data.path(), 4443).unwrap();
+        give_authority(&runtime);
+        runtime
+            .persist(&Config {
+                enabled: true,
+                control_url: "https://coord.example".into(),
+                enrollment_url: "https://enroll.example".into(),
+            })
+            .unwrap();
+        // A full queue refuses a device it does not hold and still takes one it does. The
+        // presence record is ordered, so the refused device comes first.
+        let (refused, queued) = ("a".repeat(64), "b".repeat(64));
+        let mut pending: revocation::Queue = (0..revocation::MAX_DEVICES - 1)
+            .map(|n| {
+                (
+                    format!("{n:064}"),
+                    revocation::Pending::new(false, Utc::now()),
+                )
+            })
+            .collect();
+        pending.insert(queued.clone(), revocation::Pending::new(false, Utc::now()));
+        runtime.save_revocations(&pending).unwrap();
+        let stale =
+            (Utc::now() - chrono::Duration::days(LAN_PRESENCE_WINDOW_DAYS + 1)).to_rfc3339();
+        runtime
+            .save_presence(&BTreeMap::from([
+                (refused.clone(), stale.clone()),
+                (queued.clone(), stale),
+            ]))
+            .unwrap();
+
+        runtime.sweep_absent_devices().await.unwrap();
+        let seen = runtime.presence().unwrap();
+        assert!(seen.contains_key(&refused), "kept for the next sweep");
+        assert!(!seen.contains_key(&queued), "handled after the refusal");
     }
 
     #[tokio::test]
@@ -2677,8 +2728,8 @@ mod tests {
         .map_err(|refused| refused.status())
     }
 
-    /// A removal while the helper is still enrolling the phone used to find no record, queue
-    /// nothing, and leave the enrollment the coordinator then completed with nothing to revoke it.
+    /// A removal while the helper is still enrolling the phone must find the record and queue the
+    /// revocation, or the enrollment the coordinator then completes has nothing to revoke it.
     #[tokio::test]
     async fn a_removal_while_an_enrollment_is_in_flight_revokes_it() {
         use pond_core::security::ports::remote_access::RemoteRevocation;
@@ -2802,8 +2853,8 @@ mod tests {
         );
     }
 
-    /// A corrupt record, or one a restore left readable by others, used to answer every removal,
-    /// logout and enrollment 503 until someone repaired it by hand.
+    /// A corrupt record, or one a restore left readable by others, is set aside rather than
+    /// answering every removal, logout and enrollment 503 until someone repairs it by hand.
     #[tokio::test]
     async fn an_unreadable_enrollment_record_is_set_aside_and_removals_check_first() {
         use pond_core::security::ports::remote_access::RemoteRevocation;
@@ -3200,7 +3251,7 @@ mod tests {
     }
 
     /// A phone whose remote access lapsed and that was not re-paired asks with the key its
-    /// revoked record still holds. #446 tested only the decision; this drives the route.
+    /// revoked record still holds. This drives the route, not only the decision.
     #[tokio::test]
     async fn a_lapsed_phone_with_its_old_keys_is_told_to_make_new_ones() {
         use pond_core::security::ports::handshake::{Handshake, HandshakeRequest};

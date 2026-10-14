@@ -430,6 +430,8 @@ fn main() -> Result<()> {
     // Both rustls backends are on (`aws_lc_rs` from the root Cargo.toml, `ring` via reqwest), so
     // rustls panics wherever it infers one; pin it. `Err` means one is already installed: fine.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // The network mode judges a request's first URL where it is sent; this judges each redirect.
+    pond_net::set_redirect_gate(pond_core::shared::services::egress::redirect_verdict);
 
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -3442,12 +3444,11 @@ async fn run_server(
         &data_dir,
         &tls_identity::certificate_names(&tls_hostname)?,
     )?;
-    // The helper serves this one on the tailnet and refuses to start without it. Not fatal:
-    // the renewal loop below retries it, and only remote access waits on it.
+    // The helper serves this one on the tailnet and refuses to start without it. Only a missing
+    // or unusable one is written here: the tailnet addresses are not known yet, and the renewal
+    // loop below adds them. Not fatal, since the loop retries and only remote access waits on it.
     #[cfg(unix)]
-    if let Err(error) =
-        tls_identity.renew_tailnet_if_needed(&tls_identity::tailnet_certificate_names(&[]))
-    {
+    if let Err(error) = tls_identity.ensure_tailnet(&tls_identity::tailnet_certificate_names(&[])) {
         tracing::warn!(
             target: "giap::trace",
             kind = "tailnet_certificate_unavailable",
@@ -4369,7 +4370,7 @@ async fn run_server(
     }
 
     if open || (debug && has_display()) {
-        let url = format!("http://localhost:{}", api_port);
+        let url = format!("http://127.0.0.1:{}", api_port);
         if webbrowser::open(&url).is_err() {
             tracing::warn!("Could not open browser — no display available or xdg-open missing");
         }
@@ -4414,33 +4415,41 @@ async fn run_server(
                     names
                 }
             });
-            let renewed = async {
+            let lan = async {
                 let names = names?;
                 if tls_identity.renew_if_needed(&names)? {
                     let (cert, key) = tls_identity.pem();
                     tls_config.reload_from_pem(cert, key).await?;
                 }
-                // The helper re-reads its certificate on every handshake, so writing it is enough.
-                #[cfg(unix)]
-                {
-                    let tailnet = tls_identity::tailnet_certificate_names(&embedded.addresses());
-                    tls_identity.renew_tailnet_if_needed(&tailnet)?;
-                    Ok::<_, anyhow::Error>(tailnet)
-                }
-                #[cfg(not(unix))]
                 Ok::<_, anyhow::Error>(())
             }
             .await;
+            // Apart from the LAN one, so a failure there cannot leave the tailnet one stale. The
+            // helper re-reads its certificate on every handshake, so writing it is enough.
+            #[cfg(unix)]
+            let renewed = {
+                let names = tls_identity::tailnet_certificate_names(&embedded.addresses());
+                let tailnet = tls_identity.renew_tailnet_if_needed(&names);
+                // Only a certificate that covers the new addresses may announce them.
+                if tailnet.is_ok() {
+                    embedded.publish_ready(&names);
+                }
+                match (lan, tailnet) {
+                    (Ok(()), Ok(_)) => Ok(()),
+                    (Err(error), Ok(_)) => Err(error),
+                    (Ok(()), Err(error)) => Err(error.context("tailnet certificate")),
+                    (Err(error), Err(tailnet)) => {
+                        Err(error.context(format!("and the tailnet certificate: {tailnet:#}")))
+                    }
+                }
+            };
+            #[cfg(not(unix))]
+            let renewed = lan;
             match renewed {
-                Ok(tailnet) => {
+                Ok(()) => {
                     if last_failure.take().is_some() {
                         tracing::info!("TLS certificate renewal recovered");
                     }
-                    // Only a certificate that covers the new addresses may announce them.
-                    #[cfg(unix)]
-                    embedded.publish_ready(&tailnet);
-                    #[cfg(not(unix))]
-                    let () = tailnet;
                 }
                 Err(error) => {
                     let error = format!("{error:#}");
@@ -9377,9 +9386,10 @@ fn run_dashboard() -> Result<()> {
     let credential = pond_server::host_credential::read(&data_dir)?;
     let port = runtime_api_port(&data_dir);
     println!("Open this link in a browser on this machine to sign in to the dashboard:\n");
-    println!("  http://localhost:{port}/#host={credential}\n");
+    // Not `localhost`: a browser may try [::1] first, where another account could be listening.
+    println!("  http://127.0.0.1:{port}/#host={credential}\n");
     println!(
-        "Through an SSH tunnel (ssh -L 9000:localhost:{port} <pond>), change only the port.\n\
+        "Through an SSH tunnel (ssh -L 9000:127.0.0.1:{port} <pond>), change only the port.\n\
          Anyone with this link can pair devices until the server restarts; do not share it."
     );
     Ok(())

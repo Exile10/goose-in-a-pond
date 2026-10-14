@@ -589,6 +589,9 @@ fn verdict(url: &str, method: Option<&str>, tool: &str) -> Value {
 
 /// `POST /api/v1/extension/egress` -- asks, before an extension's own outbound call, whether the
 /// network mode allows it, and records it in the egress log attributed to `giap-<extension>`.
+/// The host is read by the WHATWG URL standard, as Node's `fetch` reads it. A caller whose HTTP
+/// library parses otherwise (curl or Python read `http://localhost\@attacker.example/` as
+/// attacker.example) would be told about a host it does not then reach.
 pub async fn extension_egress_handler(
     headers: HeaderMap,
     body: Result<Json<EgressRequest>, JsonRejection>,
