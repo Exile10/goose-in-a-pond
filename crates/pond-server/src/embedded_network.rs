@@ -1346,6 +1346,32 @@ fn kept_existing_enrollment(error: &anyhow::Error) -> bool {
         .is_some_and(|refused| refused.reason.as_deref() == Some("invalid_enrollment"))
 }
 
+/// Whether the coordinator refused before writing anything for the call, so nothing was enrolled.
+/// `storage_unavailable` can come from the write itself and `enrollment_incomplete` after it, and
+/// an answer without a reason may be a gateway's, so none of those count.
+fn refused_before_writing(error: &anyhow::Error) -> bool {
+    const BEFORE_ANY_WRITE: &[&str] = &[
+        "approval_used",
+        "busy",
+        "capacity",
+        "coordinator_unavailable",
+        "identity_already_enrolled",
+        "identity_already_registered",
+        "identity_retired",
+        "invalid_enrollment",
+        "invalid_request",
+        "pond_registration_required",
+        "rate_limited",
+        "replacement_conflict",
+        "retired_capacity",
+        "unauthorized",
+    ];
+    error
+        .downcast_ref::<RefusedByCoordinator>()
+        .and_then(|refused| refused.reason.as_deref())
+        .is_some_and(|reason| BEFORE_ANY_WRITE.contains(&reason))
+}
+
 /// The coordinator's refusal of a replacement because the household's retired records are
 /// at their bound. It passes on its own as old identities stay off the coordinator and their
 /// records expire, so neither recovery nor a retry right away can help.
@@ -1734,10 +1760,10 @@ async fn register_phone(
             } else {
                 tracing::warn!(%error, %device, refused, operation = "enroll_phone", "embedded enrollment failed");
             }
-            // A refusal is definite: nothing was enrolled, so a device recorded for this call
-            // alone is forgotten. A timeout or a fault may have enrolled it, so its record stays
-            // and a later removal revokes it unchecked, which is the safe way to be wrong.
-            if refused && inserted && !coordinator_holds_one {
+            // Refused before the coordinator wrote anything, so nothing was enrolled: a device
+            // recorded for this call alone is forgotten. Anything else may have enrolled it, so its
+            // record stays and a later removal revokes it unchecked, the safe way to be wrong.
+            if refused_before_writing(&error) && inserted && !coordinator_holds_one {
                 match runtime.forget_enrolled(&device) {
                     Ok(()) => tracing::info!(
                         target: "giap::trace",
@@ -2721,13 +2747,14 @@ mod tests {
         );
         assert!(recorded(&runtime), "an ambiguous enrollment was forgotten");
 
-        // A refusal of a device recorded before this call does not forget it.
+        // A refusal of a device recorded before this call does not forget it. Only
+        // `invalid_enrollment` sends the phone to recovery; any other refusal is a 503.
         helper.answer("enroll", 3, r#"{"refused":"identity_already_enrolled"}"#);
         assert_eq!(
             enroll_phone(&runtime, &handshake, &headers)
                 .await
                 .unwrap_err(),
-            StatusCode::CONFLICT
+            StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(recorded(&runtime), "an earlier record was forgotten");
 
@@ -2737,11 +2764,27 @@ mod tests {
             enroll_phone(&runtime, &handshake, &headers)
                 .await
                 .unwrap_err(),
-            StatusCode::CONFLICT
+            StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(!recorded(&runtime), "a refused enrollment stayed recorded");
 
-        // ...unless the coordinator reported an enrollment of its own for the device.
+        // A refusal that can follow the coordinator's own write may have enrolled it.
+        enrolled(&runtime, true, &[]);
+        helper.answer("enroll", 3, r#"{"refused":"enrollment_incomplete"}"#);
+        assert_eq!(
+            enroll_phone(&runtime, &handshake, &headers)
+                .await
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            recorded(&runtime),
+            "an enrollment the coordinator may have written was forgotten"
+        );
+
+        // A refusal is not forgotten when the coordinator reported an enrollment of its own.
+        enrolled(&runtime, true, &[]);
+        helper.answer("enroll", 3, r#"{"refused":"invalid_enrollment"}"#);
         helper.answer(
             "inspect",
             0,
