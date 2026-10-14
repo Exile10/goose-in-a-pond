@@ -2972,8 +2972,11 @@ impl GooseAdapter {
             .filter(|_| {
                 thinking_enabled && matches!(settings.chat_provider.as_str(), "local" | "gguf")
             })
-            .map(|(provider, on)| {
-                let off = Self::with_thinking_param(&settings.chat_provider, on.clone(), false);
+            .map(|(provider, cached)| {
+                // Both stamped here: another turn may have re-stamped the shared config since
+                // this one set it up.
+                let on = Self::with_thinking_param(&settings.chat_provider, cached.clone(), true);
+                let off = Self::with_thinking_param(&settings.chat_provider, cached, false);
                 (provider, on, off)
             });
         let thinking_param = self.last_thinking_param.clone();
@@ -3106,12 +3109,14 @@ impl GooseAdapter {
                     // The final reply asks for the answer, not the question again. The check is
                     // off (its round would only be hidden), and reasoning is off for this call.
                     let mut reasoning_lifted = false;
+                    let mut thinking_before_lift = None;
                     let attempt_msg = if final_attempt {
                         agent_clone.set_session_goal(&turn_goose_sid, None).await;
                         if let Some((provider, _, off)) = &reasoning_off_engine {
                             // `None` until restored: a stream dropped mid-reply leaves the next
                             // turn to re-stamp, rather than inherit reasoning off unannounced.
-                            *thinking_param.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            thinking_before_lift =
+                                thinking_param.lock().unwrap_or_else(|e| e.into_inner()).take();
                             match agent_clone
                                 .update_provider(provider.clone(), off.clone(), &turn_goose_sid)
                                 .await
@@ -3551,9 +3556,11 @@ impl GooseAdapter {
                                 .update_provider(provider.clone(), on.clone(), &turn_goose_sid)
                                 .await
                             {
+                                // The record describes the shared config, which this reply left
+                                // as it found it, so it gets back what it held before the lift.
                                 Ok(()) => {
                                     *thinking_param.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        Some(thinking_enabled);
+                                        thinking_before_lift;
                                 }
                                 Err(e) => tracing::warn!(
                                     session_id = %session_id,
@@ -6826,7 +6833,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("the stream no longer contains `{needle}`"))
         };
         let final_branch = position("let attempt_msg = if final_attempt {");
-        let unknown = position("thinking_param.lock().unwrap_or_else(|e| e.into_inner()) = None");
+        let unknown = position("thinking_param.lock().unwrap_or_else(|e| e.into_inner()).take()");
         let lifted = position("reasoning_lifted = true");
         let reply = position("agent_clone.reply(attempt_msg");
         let engine_end = position("'engine: loop {");
