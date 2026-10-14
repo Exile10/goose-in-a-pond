@@ -7,7 +7,7 @@ use std::time::Duration;
 use pond_adapters_uber::accounts::{SignInRelay, UberAccounts};
 use pond_adapters_uber::{UberConfig, UberRides};
 use pond_core::mcp::ports::notification::MemberNotifier;
-use pond_core::rides::booking::RideBooking;
+use pond_core::rides::booking::{forget_old_kept_rides, RideBooking, KEEP_FINISHED};
 use pond_core::rides::ports::RideStore;
 use pond_core::security::ports::secret::SecretRepository;
 
@@ -69,11 +69,15 @@ pub async fn start(
     notifier: Arc<dyn MemberNotifier>,
     store: Option<Arc<dyn RideStore>>,
 ) -> Option<Arc<RideBooking>> {
-    let accounts = accounts(travel_enabled, secrets, relay_url)?;
+    let Some(accounts) = accounts(travel_enabled, secrets, relay_url) else {
+        forget_rides_while_off(store);
+        return None;
+    };
     let config = match UberConfig::from_env() {
         Ok(config) => config,
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "ride booking is off");
+            forget_rides_while_off(store);
             return None;
         }
     };
@@ -107,6 +111,31 @@ pub async fn start(
     });
     tracing::info!(poll_secs = interval.as_secs(), "ride booking is on (Uber)");
     Some(booking)
+}
+
+/// Booking is off, so nothing follows the rides kept from when it was on: forget those past a day
+/// now, and the rest once they are, rather than keep their pickup and drop-off places for good.
+fn forget_rides_while_off(store: Option<Arc<dyn RideStore>>) {
+    let Some(store) = store else {
+        return;
+    };
+    tokio::spawn(async move {
+        let (forgotten, left) = forget_old_kept_rides(store.as_ref(), chrono::Utc::now()).await;
+        if forgotten > 0 {
+            tracing::info!(
+                rides = forgotten,
+                "rides: booking is off; forgot rides kept past a day"
+            );
+        }
+        if left > 0 {
+            tokio::time::sleep(KEEP_FINISHED.to_std().unwrap_or_default()).await;
+            let (forgotten, _) = forget_old_kept_rides(store.as_ref(), chrono::Utc::now()).await;
+            tracing::info!(
+                rides = forgotten,
+                "rides: booking is off; forgot rides kept past a day"
+            );
+        }
+    });
 }
 
 async fn take_over_rides_under_way(booking: &RideBooking, accounts: &UberAccounts) {
