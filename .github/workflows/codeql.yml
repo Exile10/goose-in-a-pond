@@ -11,9 +11,12 @@ on:
     - cron: "41 4 * * 1"
   workflow_dispatch:
 
+# A PR cancels a superseded run: nobody will merge the tree it tested. Main does not, because
+# merges land faster than a full run finishes and cancelling there would leave no main commit
+# verified. A newer push to main replaces the pending run, never the running one.
 concurrency:
   group: codeql-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

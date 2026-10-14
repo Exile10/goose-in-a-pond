@@ -21,13 +21,12 @@ on:
     # prove that markdown still parses.
     paths-ignore: *docs-only
 
-# One run per branch. Without this every push started a fresh full matrix and
-# left the previous one running to completion against a commit nobody would
-# merge; a burst of three pushes billed three complete builds to answer a
-# question only the last one asked.
+# A PR cancels a superseded run: nobody will merge the tree it tested. Main does not, because
+# merges land faster than a full run finishes and cancelling there would leave no main commit
+# verified. A newer push to main replaces the pending run, never the running one.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every job only reads the repository; caches and artifacts use the runtime token, not this one.
 permissions:
