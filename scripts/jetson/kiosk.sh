@@ -286,16 +286,27 @@ page_dir() {
   fi
 }
 
-# What Firefox opens: GIAP_KIOSK_URL as given, or else a 0600 page that forwards
-# to the dashboard with its sign-in fragment, so a restart does not leave the
-# panel on the sign-in card. The credential goes in that page and never on a
-# command line, since /proc/<pid>/cmdline is world-readable; printf and [[ ]]
-# are builtins, so no process sees it in its arguments either.
+# What Firefox opens: GIAP_KIOSK_URL as given, or else a signed-in page. Failing
+# that, the plain dashboard, which shows the sign-in card: a lit panel beats a
+# kiosk that fails and restarts dark.
 firefox_target() {
   if [ -n "${GIAP_KIOSK_URL:-}" ]; then
     echo "$GIAP_KIOSK_URL"
     return 0
   fi
+  if signed_in_page; then return 0; fi
+  local port
+  port="$(server_port)"
+  warn "could not sign the panel in; opening the dashboard's sign-in card instead" >&2
+  echo "http://127.0.0.1:${port:-8080}/"
+}
+
+# A 0600 page that forwards to the dashboard with its sign-in fragment, so a
+# restart does not leave the panel on the sign-in card. The credential goes in
+# that page and never on a command line, since /proc/<pid>/cmdline is
+# world-readable; printf and [[ ]] are builtins, so no process sees it in its
+# arguments either.
+signed_in_page() {
   local port credential dir tmp page
   port="$(wait_for_server)" || return 1
   credential="$(tr -d '[:space:]' < "$DATA_DIR/.runtime_host_credential")"
@@ -309,7 +320,7 @@ firefox_target() {
   printf '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=http://127.0.0.1:%s/#host=%s">\n' \
     "$port" "$credential" > "$tmp"
   page="$dir/giap-kiosk.html"
-  mv -f "$tmp" "$page" || return 1
+  mv -f "$tmp" "$page" || { rm -f "$tmp"; return 1; }
   echo "file://$page"
 }
 
