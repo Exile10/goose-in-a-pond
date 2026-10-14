@@ -16,12 +16,13 @@ hs() { docker compose exec -T headscale headscale "$@" < /dev/null; }
 # coordinator refuses still answers 200, with "degraded":true.
 enrollment_health() { docker compose exec -T gateway wget -q -T 5 -O- http://enrollment:8081/health < /dev/null 2>/dev/null; }
 # A minted key on a line of its own; anything else Headscale prints is not the key.
-KEY_LINE='^hskey-api-[A-Za-z0-9_]{12}-[A-Za-z0-9_-]+$'
+KEY_LINE='^hskey-api-[A-Za-z0-9_-]{12}-[A-Za-z0-9_-]+$'
 
 # The key being replaced is the one enrollment holds, named by its own prefix
 # (hskey-api-<prefix>-<secret>), not guessed from a table: scraping `apikeys list`
 # expired every key it could parse, including ones other tools rely on.
-# Headscale lists a key as `hskey-api-<12-character prefix>-***`; the prefix may hold `_`.
+# Headscale lists a key as `hskey-api-<12-character prefix>-***`; the prefix is base64url, so it
+# may hold `_` and `-`.
 key_prefix() { sed -n 's/^hskey-api-\(.\{12\}\)-.*/\1/p' "$1" | head -1; }
 # The ID of the one key Headscale lists under this prefix, or nothing.
 key_id() {
@@ -47,6 +48,8 @@ installed=0
 confirmed=0
 finish() {
   status=$?
+  # A second interrupt must not stop the restore halfway.
+  trap '' HUP INT TERM
   rm -f "$SECRET.raw" "$SECRET.new"
   if [ "$confirmed" = 1 ] || [ -z "$new_prefix" ]; then
     exit "$status"
@@ -54,8 +57,12 @@ finish() {
   [ "$status" != 0 ] || status=1
   if [ "$installed" = 1 ]; then
     echo "restoring the previous key ($old_prefix) and recreating enrollment" >&2
-    { mv "$SECRET.prev" "$SECRET" && chown 65532:65532 "$SECRET" && chmod 400 "$SECRET"; } \
-      || echo "could not restore $SECRET from $SECRET.prev; restore it by hand" >&2
+    # Without the previous key back in place, recreating enrollment or expiring the new key
+    # could lock enrollment out, so both keys stay live for a person to settle.
+    if ! { mv "$SECRET.prev" "$SECRET" && chown 65532:65532 "$SECRET" && chmod 400 "$SECRET"; }; then
+      echo "could not restore $SECRET from $SECRET.prev; both keys are still live: restore it by hand, recreate enrollment, then expire $new_prefix${new_id:+ (id $new_id)}" >&2
+      exit "$status"
+    fi
     docker compose up -d --force-recreate enrollment >/dev/null 2>&1 \
       || echo "could not recreate enrollment; run docker compose up -d --force-recreate enrollment" >&2
   fi
