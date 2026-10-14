@@ -497,6 +497,16 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(())
     }
 
+    async fn update_tier(&self, id: &str, tier: MemoryTier) -> Result<()> {
+        sqlx::query("UPDATE memory_fragments SET tier = ?, decay_rate = ? WHERE id = ?")
+            .bind(tier_to_str(&tier))
+            .bind(tier.default_decay_rate() as f64)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn update_lifecycle(&self, id: &str, lifecycle: MemoryLifecycle) -> Result<()> {
         sqlx::query("UPDATE memory_fragments SET lifecycle = ? WHERE id = ?")
             .bind(lifecycle_to_str(&lifecycle))
@@ -1003,6 +1013,43 @@ mod tests {
         assert!((results[0].importance.unwrap() - 0.75).abs() < 0.01);
         assert_eq!(results[0].tier, Some(MemoryTier::Long));
         assert_eq!(results[0].lifecycle, Some(MemoryLifecycle::Active));
+    }
+
+    #[tokio::test]
+    async fn update_tier_changes_tier_and_decay_and_nothing_else() {
+        let (repo, _tmp) = make_repo().await;
+        let frag = MemoryFragment::from_extraction(
+            "tier1".to_string(),
+            None,
+            "Orders sushi on Fridays".to_string(),
+            MemorySegment::Routine,
+            0.65,
+            None,
+        );
+        repo.add(frag).await.unwrap();
+
+        repo.update_tier("tier1", MemoryTier::Permanent)
+            .await
+            .unwrap();
+        let kept = &repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(kept.tier, Some(MemoryTier::Permanent));
+        assert_eq!(kept.decay_rate, Some(0.0));
+        assert_eq!(kept.content, "Orders sushi on Fridays");
+        assert_eq!(kept.segment, Some(MemorySegment::Routine));
+
+        repo.update_tier("tier1", MemoryTier::Long).await.unwrap();
+        let unkept = &repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap()[0];
+        assert_eq!(unkept.tier, Some(MemoryTier::Long));
+        assert_eq!(
+            unkept.decay_rate,
+            Some(MemoryTier::Long.default_decay_rate())
+        );
     }
 
     #[tokio::test]
