@@ -177,6 +177,16 @@ mod reading_words {
     }
 }
 
+/// Marked failed, so the prompt's rule against repeating a failed call applies.
+fn store_unreadable(what: &str) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(crate::format::format_dead_end(
+        what,
+        "The sensor store could not be read. Every sensor tool uses \
+         the same store, so no other tool will help — tell the user \
+         the sensor data is unavailable right now.",
+    ))])
+}
+
 /// How long ago, in the coarsest true unit; a model relays a bare timestamp as current.
 fn describe_age(elapsed: chrono::Duration) -> String {
     let seconds = elapsed.num_seconds().max(0);
@@ -345,14 +355,7 @@ impl SensorsMcpServer {
             )])),
             Err(e) => {
                 tracing::warn!(error = %e, device_id, sensor_type, "sensors: get_latest failed");
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    crate::format::format_dead_end(
-                        "a sensor reading",
-                        "The sensor store could not be read. Every sensor tool uses \
-                         the same store, so no other tool will help — tell the user \
-                         the sensor data is unavailable right now.",
-                    ),
-                )]))
+                Ok(store_unreadable("a sensor reading"))
             }
         }
     }
@@ -396,14 +399,7 @@ impl SensorsMcpServer {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, device_id, sensor_type, "sensors: get_history failed");
-                return Ok(CallToolResult::success(vec![ContentBlock::text(
-                    crate::format::format_dead_end(
-                        "sensor history",
-                        "The sensor store could not be read. Every sensor tool uses \
-                         the same store, so no other tool will help — tell the user \
-                         the sensor data is unavailable right now.",
-                    ),
-                )]));
+                return Ok(store_unreadable("sensor history"));
             }
         };
 
@@ -508,14 +504,7 @@ impl SensorsMcpServer {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "sensors: list_sensors failed");
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    crate::format::format_dead_end(
-                        "the sensor list",
-                        "The sensor store could not be read. Every sensor tool uses \
-                         the same store, so no other tool will help — tell the user \
-                         the sensor data is unavailable right now.",
-                    ),
-                )]))
+                Ok(store_unreadable("the sensor list"))
             }
         }
     }
@@ -1082,6 +1071,80 @@ mod tests {
         });
         let text = text_of(server.get_sensor_history(make_ctx(), params).await.unwrap());
         assert!(text.contains("22.00"), "expected avg 22.00 in: {text}");
+    }
+
+    struct UnreadableStorage;
+
+    #[async_trait]
+    impl SensorStorage for UnreadableStorage {
+        async fn record(&self, _: SensorReading) -> Result<()> {
+            anyhow::bail!("store unreadable")
+        }
+        async fn get_latest(&self, _: &str, _: &str) -> Result<Option<SensorReading>> {
+            anyhow::bail!("store unreadable")
+        }
+        async fn get_recent(&self, _: &str, _: usize) -> Result<Vec<SensorReading>> {
+            anyhow::bail!("store unreadable")
+        }
+        async fn get_history(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<DateTime<Utc>>,
+            _: Option<DateTime<Utc>>,
+        ) -> Result<Vec<SensorReading>> {
+            anyhow::bail!("store unreadable")
+        }
+        async fn list_sensors(&self) -> Result<Vec<(String, String)>> {
+            anyhow::bail!("store unreadable")
+        }
+    }
+
+    // The prompt's anti-repeat rule applies only to results marked is_error.
+    #[tokio::test]
+    async fn an_unreadable_store_is_a_failed_tool_result() {
+        let server = SensorsMcpServer::new(
+            Arc::new(UnreadableStorage),
+            empty_registry(),
+            no_live_control(),
+        );
+        let reading = server
+            .get_sensor_reading(
+                make_ctx(),
+                Parameters(GetSensorReadingParams {
+                    device_id: Some("bedroom".to_string()),
+                    sensor_type: Some("temperature".to_string()),
+                    extra: Default::default(),
+                }),
+            )
+            .await
+            .unwrap();
+        let history = server
+            .get_sensor_history(
+                make_ctx(),
+                Parameters(GetSensorHistoryParams {
+                    device_id: Some("bedroom".to_string()),
+                    sensor_type: Some("temperature".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let list = server
+            .list_sensors(make_ctx(), Parameters(ListSensorsParams::default()))
+            .await
+            .unwrap();
+        for (tool, result) in [
+            ("get_sensor_reading", reading),
+            ("get_sensor_history", history),
+            ("list_sensors", list),
+        ] {
+            assert_eq!(result.is_error, Some(true), "{tool} reported success");
+            assert!(
+                text_of(result).contains("sensor store could not be read"),
+                "{tool} lost its explanation"
+            );
+        }
     }
 
     #[test]
