@@ -122,10 +122,10 @@ bytes = "1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-# Must track the croner that `tokio-cron-scheduler` resolves: both parse the same stored
-# expression, this one for the `next_run` the UI shows and the scheduler's for when the job
-# fires. A MAJOR apart, an expression the two read differently displays one time and fires at
-# another.
+# Decides both when a recurring schedule fires and the `next_run` the UI shows
+# (`pond-infra-scheduler::next_occurrence`); `tokio-cron-scheduler` only runs the one-shot each
+# occurrence is armed as. A major bump can change what a stored expression means, so check the
+# parser settings there against the new release.
 croner = "3.0"
 clap = { version = "4", features = ["derive"] }
 dirs = { version = "6", default-features = false }

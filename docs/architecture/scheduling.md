@@ -50,9 +50,26 @@ Examples:
 - `0 30 * * * *` — every hour at :30
 - `0 0 9 * * 1` — every Monday at 9:00 AM
 
+## Timezones (2026-10-13)
+
+A schedule's cron is wall-clock time in its IANA `timezone`. Until 2026-10-13 only the displayed
+`next_run` honoured it: the job was registered with `Job::new_async`, which reads the expression in
+UTC, so the household's "Daily Brief" (`0 0 8 * * *`, Africa/Nairobi) promised 08:00 and ran at
+11:00 Nairobi time every day. `Job::new_async_tz` would not have been enough: it freezes the zone's
+UTC offset when the job is built, so a zone with DST would fire an hour off after each change.
+
+A recurring task is now a chain of one-shot jobs (`RecurringJob` in
+`pond-infra-scheduler/src/cron_scheduler.rs`). Each occurrence is resolved by `next_occurrence`,
+with chrono-tz applying the offset in force on that date, and the same function computes
+`next_run`, so the fire time and the card cannot disagree. A fire arms the next occurrence before
+it runs, so a run that overruns the interval or fails does not end the chain. The expression is
+parsed as `tokio-cron-scheduler` parsed it (six fields, seconds required; day-of-month AND
+day-of-week), so stored schedules keep their meaning. Changing only a schedule's timezone
+re-registers it. An unrecognised timezone runs on UTC, with a warning at registration.
+
 ## Execution Flow
 
-1. `tokio-cron-scheduler` fires the job at the scheduled time
+1. The task's one-shot job fires at its next local occurrence and arms the one after it
 2. Job closure marks the task as `currently_running`
 3. `JsonRunHistory::record_start()` creates a run record
 4. `ScheduleExecutor::execute()` dispatches based on `TaskKind`:
