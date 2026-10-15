@@ -135,6 +135,47 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     },
 ];
 
+/// Prefixed name of the web search tool.
+pub const SEARCH_WEB_TOOL: &str = "giap-knowledge__search_web";
+
+/// Secret-store key holding the household's Brave Search API key.
+pub const BRAVE_SEARCH_API_KEY: &str = "BRAVE_SEARCH_API_KEY";
+
+/// A tool offered only while a secret is stored. Its server always lists it, so no tool cache
+/// goes stale; each turn's allow-set drops it while the secret is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolRequirement {
+    /// Prefixed tool name.
+    pub tool: &'static str,
+    /// Secret-store key that must hold a non-empty value.
+    pub secret: &'static str,
+}
+
+/// Every tool that needs a secret before a turn may offer it.
+pub const TOOL_REQUIREMENTS: &[ToolRequirement] = &[ToolRequirement {
+    tool: SEARCH_WEB_TOOL,
+    secret: BRAVE_SEARCH_API_KEY,
+}];
+
+/// The secret `tool_name` needs before a turn may offer it, if any.
+pub fn required_secret(tool_name: &str) -> Option<&'static str> {
+    TOOL_REQUIREMENTS
+        .iter()
+        .find(|r| r.tool == tool_name)
+        .map(|r| r.secret)
+}
+
+/// The tools in `tools` whose required secret `is_stored` says is absent, in input order.
+pub fn tools_missing_secrets<'a>(
+    tools: impl IntoIterator<Item = &'a str>,
+    is_stored: impl Fn(&str) -> bool,
+) -> Vec<&'a str> {
+    tools
+        .into_iter()
+        .filter(|tool| required_secret(tool).is_some_and(|secret| !is_stored(secret)))
+        .collect()
+}
+
 /// Sort key putting core tools first, then by name, so turns share the longest prompt prefix.
 pub fn prefix_sort_key(tool_name: &str) -> (u8, &str) {
     // A user-added server ranks non-core: nothing guarantees it is there next turn.
@@ -270,6 +311,49 @@ mod tests {
     #[test]
     fn only_catalog_extensions_are_recognised() {
         assert!(!is_catalog_extension("some-user-mcp-server"));
+    }
+}
+
+#[cfg(test)]
+mod requirement_tests {
+    use super::*;
+
+    #[test]
+    fn search_web_needs_the_brave_key_and_nothing_else_needs_one() {
+        assert_eq!(
+            required_secret("giap-knowledge__search_web"),
+            Some("BRAVE_SEARCH_API_KEY")
+        );
+        assert_eq!(required_secret("giap-knowledge__compute_answer"), None);
+        assert_eq!(required_secret("search_web"), None, "names are prefixed");
+    }
+
+    #[test]
+    fn a_tool_is_withheld_exactly_while_its_secret_is_absent() {
+        let tools = [
+            "giap-memory__recall_memories",
+            SEARCH_WEB_TOOL,
+            "giap-knowledge__get_wikipedia_article",
+        ];
+        assert_eq!(
+            tools_missing_secrets(tools, |_| false),
+            vec![SEARCH_WEB_TOOL]
+        );
+        assert!(tools_missing_secrets(tools, |s| s == BRAVE_SEARCH_API_KEY).is_empty());
+    }
+
+    /// A requirement on a tool outside the catalog would never meet the allow-set it guards.
+    #[test]
+    fn every_requirement_names_a_catalog_tool() {
+        for r in TOOL_REQUIREMENTS {
+            let group = group_of_tool(r.tool).expect("a prefixed tool name");
+            assert!(
+                is_catalog_extension(group),
+                "{} is not a catalog tool",
+                r.tool
+            );
+            assert!(!r.secret.is_empty());
+        }
     }
 }
 
