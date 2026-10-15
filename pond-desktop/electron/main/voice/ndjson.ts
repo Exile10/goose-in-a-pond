@@ -1,5 +1,5 @@
-// Classifies the voice child's NDJSON stdout and its end reason. Pure and Electron-free on
-// purpose, so it can be tested exhaustively.
+// Classifies the voice child's NDJSON stdout and its end reason, and encodes the commands written
+// to its stdin. Pure and Electron-free on purpose, so it can be tested exhaustively.
 
 import type { ShellEvent, ShellEvents } from "../../../src/shell/contract";
 
@@ -131,6 +131,14 @@ export function classifyEnd(
     reason: FAILED_TO_START,
     detail: joined.trim() === "" ? null : joined,
   };
+}
+
+/** A command the child reads from stdin; its parser is `voice_control.rs` in pond-core. */
+export type VoiceChildCommand = "interrupt" | "stop";
+
+/** One stdin line for `command`, newline included: the child reads newline-delimited JSON. */
+export function encodeCommand(command: VoiceChildCommand): string {
+  return `${JSON.stringify({ cmd: command })}\n`;
 }
 
 /** `resume` unless blank (the renderer also spells "no session" as ""), else a fresh id. */

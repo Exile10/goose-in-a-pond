@@ -237,6 +237,38 @@ describe("useVoiceSession — start/stop lifecycle", () => {
     expect(stateActions.some((a) => a.payload === "idle")).toBe(true);
   });
 
+  it("interruptTurn invokes interrupt_voice_turn and leaves the state to the child", async () => {
+    const useVoiceSession = await getHook();
+    _invoke = vi.fn()
+      .mockResolvedValueOnce("sess-1") // start_voice_session
+      .mockResolvedValueOnce(undefined); // interrupt_voice_turn
+
+    const { result } = renderHook(() => useVoiceSession(), { wrapper });
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await result.current.startSession(); });
+    act(() => { emitShellEvent("voice-ready", { session_id: "sess-1" }); });
+
+    clearDispatched();
+    await act(async () => { await result.current.interruptTurn(); });
+
+    expect(_invoke).toHaveBeenLastCalledWith("interrupt_voice_turn");
+    expect(_invoke).not.toHaveBeenCalledWith("stop_voice_session");
+    expect(result.current.sessionActive).toBe(true);
+    expect(dispatchedOfType("SET_VOICE_STATE")).toHaveLength(0);
+  });
+
+  it("interruptTurn swallows a rejected invoke", async () => {
+    const useVoiceSession = await getHook();
+    _invoke = vi.fn().mockRejectedValue(new Error("no shell"));
+
+    const { result } = renderHook(() => useVoiceSession(), { wrapper });
+    await act(async () => { await Promise.resolve(); });
+
+    clearDispatched();
+    await act(async () => { await result.current.interruptTurn(); });
+    expect(dispatchedOfType("SET_VOICE_ERROR")).toHaveLength(0);
+  });
+
   it("startSession handles invoke rejection by dispatching a persistent error", async () => {
     const useVoiceSession = await getHook();
     _invoke = vi.fn().mockRejectedValue(new Error("spawn failed"));
@@ -515,6 +547,24 @@ describe("useVoiceSession — voice-session-ended handling", () => {
 
     expect(result.current.sessionActive).toBe(false);
     expect(result.current.connecting).toBe(false);
+    expect(dispatchedOfType("SET_VOICE_ERROR").filter((a) => a.payload !== null)).toHaveLength(0);
+    expect(dispatchedOfType("SET_VOICE_STATE").some((a) => a.payload === "idle")).toBe(true);
+  });
+
+  it("voice-session-ended with reason stopped transitions to idle without error", async () => {
+    const useVoiceSession = await getHook();
+    _invoke = vi.fn().mockResolvedValue("s1");
+
+    const { result } = renderHook(() => useVoiceSession(), { wrapper });
+    await act(async () => { await Promise.resolve(); });
+
+    act(() => { emitShellEvent("voice-ready", { session_id: "s1" }); });
+    clearDispatched();
+    act(() => {
+      emitShellEvent("voice-session-ended", { code: 0, reason: "stopped", session_id: "s1" });
+    });
+
+    expect(result.current.sessionActive).toBe(false);
     expect(dispatchedOfType("SET_VOICE_ERROR").filter((a) => a.payload !== null)).toHaveLength(0);
     expect(dispatchedOfType("SET_VOICE_STATE").some((a) => a.payload === "idle")).toBe(true);
   });

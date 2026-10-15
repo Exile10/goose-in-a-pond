@@ -9,8 +9,10 @@ import type { ShellEvent, ShellEvents } from "../../../src/shell/contract";
 import {
   classifyLine,
   classifyEnd,
+  encodeCommand,
   sessionToJoin,
   STDERR_TAIL_LINES,
+  type VoiceChildCommand,
 } from "./ndjson";
 import {
   writePidfile,
@@ -21,7 +23,7 @@ import {
   VOICE_CHILD,
 } from "../orphan";
 
-/** How long to wait after closing stdin before escalating to a kill. */
+/** How long to wait after `stop` and stdin close before escalating to a kill. */
 export const GRACEFUL_STOP_MS = 3_000;
 
 /** How often to check whether the child went away during that grace period. */
@@ -155,6 +157,11 @@ export class VoiceChildProcess {
         )(child.pid);
       }
 
+      // A write to a child that already died fails as EPIPE here; unhandled, it would crash main.
+      child.stdin?.on("error", (e: Error) => {
+        this.log.debug(`voice child stdin closed under a write: ${e.message}`);
+      });
+
       child.once("error", (e: Error) => {
         // Spawn failed: no stdout will ever close, so drive the end path directly.
         this.log.warn(`voice child failed to spawn: ${e.message}`);
@@ -272,15 +279,35 @@ export class VoiceChildProcess {
     });
   }
 
+  /** False when stdin is already closed. A write the pipe then refuses surfaces on its `error`. */
+  private send(session: Session, command: VoiceChildCommand): boolean {
+    const stdin = session.child.stdin;
+    if (!stdin || stdin.destroyed || stdin.writableEnded) return false;
+    stdin.write(encodeCommand(command));
+    return true;
+  }
+
   /**
-   * Closes stdin (the clean-exit signal), waits out the grace period, then kills. The shipped
-   * voice child never reads stdin, so this always escalates; that is a child defect.
+   * Asks the child to stop speaking and end its turn. Not serialised: it changes no lifecycle
+   * state, and during a start or stop there is no turn to end.
+   */
+  interrupt(): void {
+    const session = this.session;
+    if (!session || !this.send(session, "interrupt")) {
+      this.log.debug("no voice turn to interrupt");
+    }
+  }
+
+  /**
+   * Sends `stop` and closes stdin, then waits out the grace period. The kill after it is for a
+   * child that is stuck, or a sidecar staged before the child read stdin.
    */
   stop(): Promise<void> {
     return this.serialise(async () => {
       const session = this.session;
       if (!session) return;
 
+      this.send(session, "stop");
       session.child.stdin?.end();
 
       const deadline =
@@ -288,7 +315,7 @@ export class VoiceChildProcess {
       const poll = this.deps.pollMs ?? GRACEFUL_POLL_MS;
       while (Date.now() < deadline) {
         if (this.session !== session) {
-          this.log.info("voice child exited cleanly after stdin close");
+          this.log.info("voice child exited cleanly after stop");
           return;
         }
         await new Promise((r) => setTimeout(r, poll));
