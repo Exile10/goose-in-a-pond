@@ -316,6 +316,31 @@ def e7(server, cases, log):
     return rows
 
 
+# The giap-knowledge group line a minimal-mode prompt shows, once its blurb names the web.
+BW_KNOWLEDGE_LINE = "- giap-knowledge: Looking things up, working things out and searching the web"
+
+
+def e8(server, cases, log):
+    """Minimal mode with web questions: does the group line have to mention the web for the
+    model to load giap-knowledge through the hatch? M0 is today's line, MW names the web."""
+    base = load_payload("minimal")
+    system = base["messages"][0]["content"]
+    assert "- giap-knowledge: " in system
+    web = json.load(open(os.path.join(HERE, "cases-web.json")))["cases"]
+    keep = web + [c for c in cases if c["id"][0] in "rno"]
+    family = {"giap-toolkit__enable_tool_group": set()}
+    mw = re.sub(r"- giap-knowledge: [^\n]*", BW_KNOWLEDGE_LINE, system)
+    arms = [("M0", base["tools"], family, None), ("MW", base["tools"], family, mw)]
+    rows = run_calls(server, base, arms, keep, log)
+    for r in rows:
+        r["arm_label"] = r["arm"]
+        r["arm"] = {"M0": "M0", "MW": "M1"}[r["arm"]]  # M1 so regrade_minimal grades the hatch
+    rows = regrade_minimal(rows)
+    for r in rows:
+        r["arm"] = r.pop("arm_label")
+    return rows
+
+
 def e4(server, cases, log):
     """Compute affordance only: compute, none, other cases; does a name or a rule get the call?"""
     base = load_payload("all")
@@ -367,7 +392,7 @@ def regrade_minimal(rows):
             continue
         r["arg_ok"] = None
         loaded_k = any("knowledge" in g for g in groups)
-        if r["expect"] in ("read", "compute"):
+        if r["expect"] in ("read", "compute", "web"):
             r["verdict"] = "ok" if loaded_k else ("listed" if listed else ("other_tool" if r["calls"] else "no_call"))
         elif r["expect"] == "none":
             r["verdict"] = "ok" if not r["calls"] else "false_call"
@@ -476,7 +501,7 @@ def readback(server, system, template, tools, arm, schema, renderer, case):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--exp", choices=["e1", "e2", "e3", "e4", "e5", "e6", "e7"], required=True)
+    ap.add_argument("--exp", choices=["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8"], required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--url", default="http://127.0.0.1:8095")
     ap.add_argument("--out", default=os.path.join(HERE, "results"))
@@ -489,7 +514,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     server = Server(a.url)
     log = lambda s: print(s, flush=True)  # noqa: E731
-    rows = {"e1": e1, "e2": e2, "e3": e3, "e4": e4, "e5": e5, "e6": e6, "e7": e7}[a.exp](server, cases, log)
+    rows = {"e1": e1, "e2": e2, "e3": e3, "e4": e4, "e5": e5, "e6": e6, "e7": e7, "e8": e8}[a.exp](server, cases, log)
     path = os.path.join(a.out, "%s-%s.json" % (a.exp, a.model))
     json.dump({"model": a.model, "exp": a.exp, "rows": rows}, open(path, "w"), ensure_ascii=False, indent=1)
     print("wrote", path)

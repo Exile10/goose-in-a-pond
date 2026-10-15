@@ -686,6 +686,24 @@ forced. Each snippet looks like a real hit but lacks the answer; the page text h
 | E2B | 0 / 6 | 4 / 2 | 0 / 6 | **6 / 0** |
 | E4B | 0 / 6 | 4 / 2 | 0 / 6 | **6 / 0** |
 
+**E8, finding it under `minimal`.** The household's own mode lists dormant groups by the text
+before the first colon of each description. For giap-knowledge that is "General reference
+knowledge and factual lookup", which says nothing about the web. The description now begins
+"Looking things up, working things out and searching the web".
+
+| `minimal`, knowledge loaded | web, old line | web, new line | encyclopedia, old | encyclopedia, new | false calls / stolen |
+|---|---:|---:|---:|---:|---:|
+| E2B | 7/12 | **12/12** | 0/17 | 0/17 | 0 / 0 |
+| E4B | 10/12 | **12/12** | 7/17 | **13/17** | 0 / 0 |
+
+**The same description under `relevant`** (`kt/selection.py`). This replicates
+`select_groups` with the production MiniLM: core groups, any group scoring at least 0.28, and
+the top non-core scorer as a rescue. It reproduces the live capture's choice of `giap-schedule`
+for "Who was Wangari Maathai?". The reason shows in the scores: every group scores between
+−0.1 and 0.15 against these questions, so the rescue decides. The new description takes
+encyclopedia questions from 5/17 to 10/17 and web questions from 2/12 to 5/12. Better, still
+unreliable, and more evidence for decision D1.
+
 Reading the pages is the whole difference between a web search that answers and one that does
 not. Neither model invented an answer in any arm: given results without the answer, both said
 so. The caveat is the size of the evidence. Six synthetic cases, written by the same hand

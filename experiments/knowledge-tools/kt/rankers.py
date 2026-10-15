@@ -32,6 +32,9 @@ def stem(t):
             if suf in ("ies", "ied"):
                 t += "y"
             break
+    # So "close" meets "closing" ("clos"); four letters or fewer keep their e ("time").
+    if len(t) > 4 and t.endswith("e"):
+        t = t[:-1]
     return t[:5]
 
 
@@ -44,7 +47,7 @@ ANSWER_TYPES = [
      re.compile(r"(ksh|kes|usd|\$|£|€|shillings?)\s?\d|\d[\d,]*(\.\d+)?\s?(ksh|shillings?|percent|%)|\d+\.\d{2}\b", re.I)),
     (re.compile(r"\b(when|date|year|day)\b", re.I),
      re.compile(r"\b(1[89]|20)\d{2}\b|\b\d{1,2} (january|february|march|april|may|june|july|august|september|october|november|december)\b", re.I)),
-    (re.compile(r"\b(how many|how far|percent|rate)\b", re.I), re.compile(r"\d")),
+    (re.compile(r"\b(how many|how far|how long|percent|rate|distance|length)\b", re.I), re.compile(r"\d")),
 ]
 
 
