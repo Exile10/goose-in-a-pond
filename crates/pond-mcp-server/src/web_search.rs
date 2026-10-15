@@ -65,6 +65,14 @@ const RESULT_BUDGET: usize = 1_800;
 /// Passages quoted from one source, so one site cannot fill the answer.
 const MAX_PASSAGES_PER_SOURCE: usize = 2;
 
+/// At most this many pages read, a source may give [`WIDE_PASSAGES_PER_SOURCE`] passages within
+/// [`WIDE_RESULT_BUDGET`]: fewer sources, more of each.
+const WIDE_WHEN_READ_AT_MOST: usize = 2;
+const WIDE_PASSAGES_PER_SOURCE: usize = 4;
+
+/// The model's copy when few pages were read: about 600 tokens.
+const WIDE_RESULT_BUDGET: usize = 2_400;
+
 /// One passage, in bytes, before it is placed.
 const MAX_PASSAGE_BYTES: usize = 600;
 
@@ -808,16 +816,18 @@ pub fn result_from(
     CallToolResult::success(vec![ContentBlock::text(copy), card_block(question, hits)])
 }
 
-/// The plain-text answer for the model, within [`RESULT_BUDGET`]; `None` if nothing quotable.
+/// The plain-text answer for the model, within [`selection_limits`]; `None` if nothing quotable.
 fn model_copy(question: &str, hits: &[WebHit], pages: &[Option<Vec<String>>]) -> Option<String> {
     // A source whose page was read speaks with its page; only an unread one with Brave's text.
     let mut texts: Vec<String> = Vec::new();
     let mut source_of: Vec<usize> = Vec::new();
+    let mut read = 0usize;
     for (i, hit) in hits.iter().enumerate() {
         let page = pages
             .get(i)
             .and_then(Option::as_ref)
             .filter(|b| !b.is_empty());
+        read += usize::from(page.is_some());
         let candidates: Vec<&String> = match page {
             Some(blocks) => blocks.iter().collect(),
             None => std::iter::once(&hit.description)
@@ -844,6 +854,7 @@ fn model_copy(question: &str, hits: &[WebHit], pages: &[Option<Vec<String>>]) ->
         ranked.iter().map(|r| r.index).collect()
     };
 
+    let (per_source_cap, budget) = selection_limits(read);
     let header = format!("Web results for: {}", echo(question));
     let mut used = header.len();
     let mut chosen: Vec<(usize, String)> = Vec::new();
@@ -851,7 +862,7 @@ fn model_copy(question: &str, hits: &[WebHit], pages: &[Option<Vec<String>>]) ->
     for index in order {
         let source = source_of[index];
         let quoted = per_source.get(&source).copied().unwrap_or(0);
-        if quoted >= MAX_PASSAGES_PER_SOURCE {
+        if quoted >= per_source_cap {
             continue;
         }
         let passage = passages::clip(&texts[index], MAX_PASSAGE_BYTES);
@@ -859,7 +870,7 @@ fn model_copy(question: &str, hits: &[WebHit], pages: &[Option<Vec<String>>]) ->
         if quoted == 0 {
             cost += source_line(&hits[source]).len() + 1;
         }
-        if used + cost > RESULT_BUDGET {
+        if used + cost > budget {
             continue;
         }
         used += cost;
@@ -885,6 +896,16 @@ fn model_copy(question: &str, hits: &[WebHit], pages: &[Option<Vec<String>>]) ->
         out.push_str(&passage);
     }
     Some(out)
+}
+
+/// Passages per source and the copy's byte budget, given how many pages were read: with few
+/// read pages, a page's third and fourth passages are worth more than nothing.
+fn selection_limits(pages_read: usize) -> (usize, usize) {
+    if pages_read <= WIDE_WHEN_READ_AT_MOST {
+        (WIDE_PASSAGES_PER_SOURCE, WIDE_RESULT_BUDGET)
+    } else {
+        (MAX_PASSAGES_PER_SOURCE, RESULT_BUDGET)
+    }
 }
 
 /// `Title (domain[, age])`.
@@ -1497,6 +1518,54 @@ mod tests {
         }
     }
 
+    /// Six matching blocks per page; `Passage <n>:` marks each so they can be counted.
+    fn matching_pages(sources: usize) -> (Vec<WebHit>, Vec<Option<Vec<String>>>) {
+        let hits = (0..sources)
+            .map(|i| {
+                hit(
+                    &format!("Source {i}"),
+                    &format!("https://s{i}.example/"),
+                    "",
+                )
+            })
+            .collect();
+        let pages = (0..sources)
+            .map(|i| {
+                Some(
+                    (0..6)
+                        .map(|j| {
+                            format!(
+                                "Passage {}: Junction Mall opening hours, part {j}.",
+                                i * 10 + j
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        (hits, pages)
+    }
+
+    #[test]
+    fn with_two_pages_read_a_source_may_give_four_passages() {
+        let (hits, pages) = matching_pages(1);
+        let copy = model_copy("Junction Mall opening hours", &hits, &pages).unwrap();
+        assert_eq!(copy.matches("Passage ").count(), 4, "{copy}");
+        assert!(copy.len() <= WIDE_RESULT_BUDGET);
+
+        let (hits, pages) = matching_pages(2);
+        let copy = model_copy("Junction Mall opening hours", &hits, &pages).unwrap();
+        assert_eq!(copy.matches("Passage ").count(), 8, "{copy}");
+    }
+
+    #[test]
+    fn with_three_pages_read_each_source_gives_two() {
+        let (hits, pages) = matching_pages(3);
+        let copy = model_copy("Junction Mall opening hours", &hits, &pages).unwrap();
+        assert_eq!(copy.matches("Passage ").count(), 6, "{copy}");
+        assert!(copy.len() <= RESULT_BUDGET);
+    }
+
     #[test]
     fn nothing_quotable_is_a_miss_that_offers_the_encyclopedia() {
         let hits = vec![hit("", "https://empty.example/", "")];
@@ -1849,7 +1918,7 @@ mod tests {
             "the capped page: {copy}"
         );
         assert!(!copy.contains("BRAVE TEXT FOR THE BIG PAGE"), "{copy}");
-        assert!(copy.len() <= RESULT_BUDGET);
+        assert!(copy.len() <= selection_limits(2).1);
         assert_eq!(result.content.len(), 2, "the card rides along");
     }
 
@@ -1913,6 +1982,9 @@ mod tests {
         quoted: Option<&'static str>,
         /// A substring of the answer, looked for case-insensitively in the copy.
         answer: &'static str,
+        /// Whether the shipped selection puts `answer` in the copy, as measured on the frozen
+        /// blocks by `kt/copies.py`; a miss on such a page fails the live test.
+        answered: bool,
         /// Text that must not reach the copy: navigation, footer, citation apparatus.
         absent: &'static [&'static str],
     }
@@ -1931,6 +2003,7 @@ mod tests {
             url: "https://en.wikipedia.org/wiki/Mombasa%E2%80%93Nairobi_Standard_Gauge_Railway",
             quoted: Some("completed in 2017, was built as the first phase"),
             answer: "km",
+            answered: false,
             absent: &["Retrieved", "↑", "Railway Gazette", "BBC News"],
         },
         LivePage {
@@ -1940,6 +2013,7 @@ mod tests {
             url: "https://www.parliament.go.ke/the-national-assembly",
             quoted: None,
             answer: "Two hundred and ninety",
+            answered: true,
             absent: &["Copyright", "All rights reserved"],
         },
         LivePage {
@@ -1949,6 +2023,7 @@ mod tests {
             url: "https://www.bbc.co.uk/news/world-africa-40092600",
             quoted: None,
             answer: "3.2bn",
+            answered: false,
             absent: &["Skip to content", "Accessibility Help", "Most read", "BBC Verify"],
         },
         LivePage {
@@ -1958,6 +2033,7 @@ mod tests {
             url: "https://www.gov.uk/foreign-travel-advice/kenya/entry-requirements",
             quoted: None,
             answer: "electronic travel authorisation",
+            answered: false,
             absent: &[
                 "Births, death, marriages and care",
                 "Cookies on GOV.UK",
@@ -1971,6 +2047,7 @@ mod tests {
             url: "https://www.kws.go.ke/nairobi-national-park",
             quoted: None,
             answer: "6:00 PM",
+            answered: true,
             absent: &[],
         },
         LivePage {
@@ -1980,6 +2057,7 @@ mod tests {
             url: "https://www.kenyatronics.com/view-product/apple-iphone-17-pro-max-256gb",
             quoted: None,
             answer: "161,9",
+            answered: true,
             absent: &[],
         },
         LivePage {
@@ -1989,6 +2067,7 @@ mod tests {
             url: "https://www.standardmedia.co.ke/business/article/2001301441/madaraka-express-clocks-2-million-passengers",
             quoted: None,
             answer: "million",
+            answered: true,
             absent: &["Download App", "Popular this week"],
         },
         LivePage {
@@ -1998,6 +2077,7 @@ mod tests {
             url: "https://immigration.go.ke/type-and-fees/",
             quoted: None,
             answer: "7,550",
+            answered: true,
             absent: &[],
         },
         LivePage {
@@ -2007,6 +2087,7 @@ mod tests {
             url: "https://immigration.go.ke/faqs/",
             quoted: None,
             answer: "Fourteen days",
+            answered: true,
             absent: &[],
         },
         LivePage {
@@ -2016,15 +2097,37 @@ mod tests {
             url: "https://en.wikipedia.org/wiki/Jomo_Kenyatta_International_Airport",
             quoted: None,
             answer: "1,624",
+            answered: false,
             absent: &["Retrieved", "↑"],
         },
     ];
 
+    /// The copy `model_copy` makes from each frozen fixture, written as JSON to COPIES_TO, so
+    /// the offline port in `kt/copies.py` can be checked against this code:
+    /// `FIXTURES=<dir> COPIES_TO=<file> cargo test -p pond-mcp-server fixture_copies -- --ignored`.
+    #[test]
+    #[ignore]
+    fn fixture_copies() {
+        let dir = std::path::PathBuf::from(std::env::var("FIXTURES").expect("set FIXTURES"));
+        let mut copies = serde_json::Map::new();
+        for page in LIVE_PAGES {
+            let path = dir.join(format!("{}.json", page.slug));
+            let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let blocks: Vec<String> = serde_json::from_value(fixture["blocks"].clone()).unwrap();
+            let hits = vec![hit(page.title, page.url, "")];
+            let copy = model_copy(page.question, &hits, &[Some(blocks)]).unwrap_or_default();
+            copies.insert(page.slug.to_string(), Value::String(copy));
+        }
+        let out = std::env::var("COPIES_TO").expect("set COPIES_TO");
+        std::fs::write(out, serde_json::to_string_pretty(&copies).unwrap()).unwrap();
+    }
+
     /// Freeze each live page's extracted blocks as a JSON fixture, so selection can be compared
-    /// offline: `FREEZE_TO=<dir> cargo test -p pond-mcp-server freeze_live_pages -- --ignored`.
+    /// offline: `FREEZE_TO=<dir> cargo test -p pond-mcp-server freeze_pages -- --ignored`.
     #[tokio::test]
     #[ignore]
-    async fn freeze_live_pages() {
+    async fn freeze_pages_for_offline_ranking() {
         let dir = std::path::PathBuf::from(std::env::var("FREEZE_TO").expect("set FREEZE_TO"));
         let fetched = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let client = page_client().expect("page client builds");
@@ -2063,8 +2166,9 @@ mod tests {
     /// nothing: the hits stand in for what a search would have returned.
     ///
     /// It asserts extraction: every page is read, every quoted passage is the page's own text,
-    /// and no furniture or citation reaches the copy. Whether the ranker's two passages hold the
-    /// answer is printed per page; `REQUIRE_ANSWERS=1` turns a miss into a failure.
+    /// and no furniture or citation reaches the copy. It asserts the answer for every page whose
+    /// frozen blocks the shipped selection answers; for the rest a miss is printed, and
+    /// `REQUIRE_ANSWERS=1` turns it into a failure.
     #[tokio::test]
     #[ignore]
     async fn live_pages_are_read_extracted_and_ranked() {
@@ -2083,6 +2187,7 @@ mod tests {
 
         let mut failures = Vec::new();
         let mut misses = Vec::new();
+        let mut answered = 0;
         for page in LIVE_PAGES {
             let hits = vec![hit(page.title, page.url, "BRAVE DESCRIPTION STAND-IN.")];
             let bodies = fetch_pages(client, &hits).await;
@@ -2102,7 +2207,7 @@ mod tests {
             let copy = model_copy(page.question, &hits, &pages).expect("something quotable");
             eprintln!("{copy}");
 
-            assert!(copy.len() <= RESULT_BUDGET, "{} bytes", copy.len());
+            assert!(copy.len() <= selection_limits(1).1, "{} bytes", copy.len());
             assert!(
                 !copy.contains("://"),
                 "the model's copy carries no URL: {copy}"
@@ -2136,15 +2241,18 @@ mod tests {
                 page.answer
             );
             if !found {
-                misses.push(format!("{}: no {:?} in the copy", page.url, page.answer));
+                let miss = format!("{}: no {:?} in the copy", page.url, page.answer);
+                if page.answered {
+                    failures.push(miss);
+                } else {
+                    misses.push(miss);
+                }
+            } else {
+                answered += 1;
             }
         }
+        eprintln!("\nanswers in the copy: {answered} of {}", LIVE_PAGES.len());
         assert!(failures.is_empty(), "{failures:#?}");
-        eprintln!(
-            "\nanswers in the copy: {} of {}",
-            LIVE_PAGES.len() - misses.len(),
-            LIVE_PAGES.len()
-        );
         if std::env::var("REQUIRE_ANSWERS").is_ok() {
             assert!(misses.is_empty(), "{misses:#?}");
         }
