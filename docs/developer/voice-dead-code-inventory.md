@@ -91,9 +91,7 @@ against `model_download.rs` alone, which is the proof.
   `cargo check -p pond-server --features legacy-subprocess --all-targets`
   exits 0 today. Deleting it is a choice, not a cleanup of something broken.
 
-**Stale docs to update in the same commit:** `docs/voice-pipeline-efficiency.md`
-(185, 202, 220, 235, 248 — presents `voice_kws_whisper_url` as a live tuning
-knob), `docs/wake-word-calibration.md:319`, `docs/developer/model_architecture.md:356`
+**Stale docs to update in the same commit:** `docs/developer/model_architecture.md:356`
 (names `whisper_process::try_start()` as the live ASR path), `HOWTOAI.md:172`
 (port table incl. `PIPER_TTS = 8282`).
 

@@ -1,5 +1,17 @@
 # Voice Mode — Architecture & Developer Guide
 
+> **Partly retired.** Written for the Tauri shell, which Electron replaced. The
+> [Tauri Events Contract](#tauri-events-contract) and the
+> [Known Limitations](#known-limitations-future-work) table describe that shell and no longer
+> apply. In the desktop app, voice runs in a persistent `pond-server chat --voice --json-events`
+> child (`pond-desktop/electron/main/voice/VoiceChildProcess.ts`, driven by
+> `modes/voice/useVoiceSession.ts`). The child owns the microphone and speaker and does the wake
+> word, end-of-speech detection and interruption itself; see
+> [Voice mode](../../../docs/developer/voice-mode.md). The browser path
+> (`modes/voice/useVoicePipeline.ts`) keeps the older record-and-send flow. `AudioWaves`,
+> `TranscriptFeed` and the countdown ring still exist; check them against the source before
+> relying on the details here.
+
 Voice Mode is the primary interaction paradigm for Goose In A Pond. It provides a
 local-first, always-on voice assistant experience: speak to Pond, see a live transcript,
 and watch tool results surface inline as the agent works.
@@ -114,8 +126,9 @@ The component uses:
 
 ## Auto-Stop Recording
 
-`VoiceMode.tsx` reads `voice_recording_duration_secs` from `api.getSettings()` on mount
-(default: 30s). When recording starts, a `setTimeout` is set; if the user doesn't
+Browser path only. `useVoicePipeline.ts` reads `voice_recording_duration_secs` from
+`api.getSettings()` on mount (settings default 3 s; 30 s until the settings arrive). The desktop
+child never reads it: it ends a recording on silence. When recording starts, a `setTimeout` is set; if the user doesn't
 manually stop, `stopAndSend()` is called automatically.
 
 A countdown ring (`CountdownRing` SVG component in `VoiceMode.tsx`) is shown in the
