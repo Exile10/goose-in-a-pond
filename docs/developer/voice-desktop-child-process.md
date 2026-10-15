@@ -29,11 +29,12 @@ fetches, double event dispatch into the reducer, no-op `abort_recording`).
 | CLI flags | `crates/pond-server/src/main.rs` | `--json-events` (pure NDJSON on stdout, diagnostics to stderr), `--session-id` (replaces the hardcoded `default-session`) |
 | Event source | `crates/pond-core/src/shared/services/chat.rs` | `ChatService` builder takes `.with_event_sink(...)`; `run_loop` / `stream_response_inner` emit state, transcript, token, tool, and turn-complete events |
 | Event types | `crates/pond-core/src/shared/domain/agent.rs` | `WorkflowEvent` serde-serializes to the NDJSON contract (`tag = "event"`, snake_case) |
-| Process manager | `pond-desktop/electron/main/voice/VoiceChildProcess.ts` | Spawn with held-open piped stdin, a readline reader on stdout, orphan cleanup, kill on app exit |
-| Line classification | `pond-desktop/electron/main/voice/ndjson.ts` | Pure: one line in, one event or exit notice out. Where the 30-odd golden tests live |
+| Stdin commands | `crates/pond-core/src/shared/services/voice_control.rs` | Parses the shell's stdin lines (`parse_stdin_line`), holds the latched stop and the interrupt edge (`VoiceControl`), and carries typed turns when no speech model loaded (`TypedLineInput`). `run_chat` reads stdin on a plain thread with `pump_stdin` |
+| Process manager | `pond-desktop/electron/main/voice/VoiceChildProcess.ts` | Spawn with held-open piped stdin, a readline reader on stdout, `interrupt` and `stop` written to stdin, orphan cleanup, kill on app exit |
+| Line classification | `pond-desktop/electron/main/voice/ndjson.ts` | Pure: one line in, one event or exit notice out; `encodeCommand` for the other direction. Where the 30-odd golden tests live |
 | Orphan reaping | `pond-desktop/electron/main/orphan.ts` | Pidfile + liveness + identity, for a child that outlived a hard kill of the shell. Shared with the pond-server sidecar, which is why it is parameterised over a `ChildKind`: both children are a `pond-server`, so the voice predicate requires the `chat` subcommand and the sidecar's requires `serve`, and neither can reap the other |
-| IPC | `pond-desktop/electron/main/ipc.ts` | `start_voice_session` (returns the session uuid), `stop_voice_session` (stdin EOF, then kill after 3s) |
-| Frontend | `pond-desktop/src/modes/voice/useVoiceSession.ts` | Single owner of all `voice-*` events; `VoiceMode.tsx` picks the child-process path when `isDesktopShell()` and the unchanged `WebVoiceBackend` pipeline in a plain browser |
+| IPC | `pond-desktop/electron/main/ipc.ts` | `start_voice_session` (returns the session uuid), `stop_voice_session` (`stop`, stdin EOF, then kill after 3s), `interrupt_voice_turn` (`interrupt`) |
+| Frontend | `pond-desktop/src/modes/voice/useVoiceSession.ts` | Single owner of all `voice-*` events; `VoiceMode.tsx` picks the child-process path when `isDesktopShell()` and the unchanged `WebVoiceBackend` pipeline in a plain browser. The Interrupt button shows only while the state is `speaking` |
 
 ## NDJSON contract (child stdout, one JSON object per line)
 
@@ -46,7 +47,7 @@ fetches, double event dispatch into the reducer, no-op `abort_recording`).
 {"event":"tool_result","tool":"giap__x","id":"...","content":"..."}
 {"event":"turn_complete","session_id":"<uuid>"}
 {"event":"error","message":"..."}
-{"event":"exit","reason":"stdin_eof"}       // stdin_eof | dismissed | error
+{"event":"exit","reason":"stopped"}         // stopped | stdin_eof | dismissed | error | microphone_unavailable | already_running
 ```
 
 The shell maps these 1:1 to IPC events (`voice-ready`, `voice-state`,
@@ -59,26 +60,65 @@ In `--json-events` mode stdout must contain zero non-JSON bytes; any new
 `println!` reachable from `run_chat` must go through the `out!` macro (or
 stderr). The spawn-binary contract test enforces this.
 
+## Stdin commands (shell to child, one JSON object per line)
+
+```json
+{"cmd":"interrupt"}
+{"cmd":"stop"}
+```
+
+Only under `--json-events`; the terminal `chat` command keeps Ctrl-C.
+
+- `interrupt` ends the turn in flight the way a wake word does: speech stops,
+  the agent stream is aborted, nothing is persisted and no `turn_complete` is
+  sent. The child then waits for the wake word (`state: wait`). An interrupt
+  that arrives between turns is dropped, not saved for the next one.
+- `stop` ends the session from any state: a turn in flight is abandoned like
+  an interrupt, a wake-word wait or a recording is cancelled and releases the
+  mic, and the child emits `exit: stopped` and exits 0. A turn that has
+  already finished is persisted first, and a stop that lands during a persist
+  or a farewell waits for it.
+- EOF on stdin is a stop too, reported as `exit: stdin_eof`. When the shell
+  sends `stop` and then closes stdin, the first reason wins.
+- A line that starts with `{` but is not a known command is logged and
+  ignored. Extra fields on a known command are ignored.
+- With no speech model, stdin also carries typed turns: any line that does not
+  start with `{` is a turn, and EOF ends input after the queued turns run
+  (the contract test relies on this). `stop` still stops at once.
+
+The reader is a plain thread, not `spawn_blocking`: a stdin read cannot be
+cancelled, and the runtime's shutdown waits on blocking tasks. The whisper
+capture is cancelled the same way the wake-word wait already was, by a flag
+set when its future is dropped, so a stop during a recording does not leave a
+thread holding the mic.
+
 ## Stopping and interruption
 
-- Stop = close the child's stdin (the shell does this in `stop_voice_session`);
-  the child exits cleanly with `exit: stdin_eof`. Kill is the 3-second fallback.
+- Stop: `stop_voice_session` writes `{"cmd":"stop"}`, closes stdin, and waits
+  up to 3 s for the child to exit before killing it. The kill is for a stuck
+  child or a sidecar staged before the child read stdin; a current child exits
+  well inside the grace period (`json_events_contract_test` asserts it).
+- Interrupt: the desktop voice screen shows Interrupt while the state is
+  `speaking`. It invokes `interrupt_voice_turn`, which writes
+  `{"cmd":"interrupt"}` and never ends the session.
 - Barge-in and wake-word interruption happen inside the child, where they
   already work. The shell's `AudioKillSwitch` cannot reach the child's audio.
 - The `InstantActivation` race that broke stdin / `--no-wake-word` mode is
   fixed: `StreamingWakeWordDetector::supports_interruption()` gates the
-  `run_loop` interrupt race (`InstantActivation` returns false).
+  wake-word branch of the `run_loop` turn race (`InstantActivation` returns
+  false). The shell's commands race every turn either way.
 
 ## Tests
 
 | Layer | Command |
 |-------|---------|
-| Event serialization goldens, run_loop race/persistence regressions | `cargo test -p pond-core` |
+| Event serialization goldens, run_loop race/persistence regressions, stdin command parser, interrupt and stop in every state | `cargo test -p pond-core` |
+| Whisper capture cancellation | `cargo test -p pond-adapters-whisper` |
 | Pipeline integration (stdin mode completes turns) | `SQLX_OFFLINE=true cargo test -p pond-server --test pipeline_integration_test` |
-| Spawn-binary NDJSON contract | `SQLX_OFFLINE=true cargo test -p pond-server --test json_events_contract_test` |
-| Shell NDJSON parser goldens, orphan reaping, the child driver's races | `cd pond-desktop && npx vitest run --project main` |
+| Spawn-binary NDJSON contract, `stop` exits 0 inside the shell's grace, commands are never typed turns | `SQLX_OFFLINE=true cargo test -p pond-server --test json_events_contract_test` |
+| Shell NDJSON parser goldens, command encoding, orphan reaping, the child driver's races, stop without SIGKILL | `cd pond-desktop && npx vitest run --project main` |
 | Hook single-dispatch regression + state mapping | `cd pond-desktop && npm test` |
-| Orb/transcript E2E with a stubbed bridge | `cd pond-desktop && npx playwright test tests/e2e/voice-session-child.spec.ts` |
+| Orb/transcript/Interrupt E2E with a stubbed bridge | `cd pond-desktop && npx playwright test tests/e2e/voice-session-child.spec.ts` |
 
 ## Live-hardware runbook (not covered by automation)
 
@@ -89,12 +129,16 @@ macOS:
    and `voice-ready` arrives (orb leaves the connecting state).
 3. Speak the wake word; confirm ping, live transcript, spoken reply, and the
    turn appearing in the chat sidebar under the voice session id.
-4. Barge in mid-reply; TTS must stop within ~1s.
+4. Barge in mid-reply; TTS must stop within ~1s. Then press Interrupt
+   mid-reply: speech stops at once, the orb returns to the wake word, and the
+   cut-off turn is not in the chat history.
 5. While in a voice session, confirm the shell wake listener is suspended
    (no transcribe requests in serve logs) and `record_with_vad` is refused.
-6. Leave voice mode; confirm the child exits (no `pond-server chat` process
-   left) and the wake listener resumes. Also `kill -9` the shell and confirm
-   no orphaned child survives the next app start.
+6. Press Stop session, then leave voice mode; confirm the child exits within
+   a second with `voice child exited cleanly after stop` in the shell log (not
+   `killing`), no `pond-server chat` process is left, the mic indicator goes
+   out, and the wake listener resumes. Also `kill -9` the shell and confirm no
+   orphaned child survives the next app start.
 7. Run a UI text chat during a voice turn; check both logs for SQLITE_BUSY.
 
 Jetson (nano@nano.local):
@@ -116,9 +160,6 @@ resolves it through `process.resourcesPath`, and `scripts/verify-sidecar.sh`
 refuses to package without a real one. `POND_SERVER_BIN` survives as a
 deliberate override for dev and tests.
 
-One defect worth knowing while reading `stop_voice_session`: closing stdin is
-the documented clean-exit signal, but in the shipped configuration the child
-never reads stdin — voice mode wires `WhisperRsInput`, which does not — so the
-grace period always expires and the stop escalates to a kill. That is a defect
-in the child rather than the shell, and fixing it (a stdin-EOF watcher racing
-the run loop) would also make the pidfile orphan reaper deletable.
+The pidfile orphan reaper stays although a child now exits on stdin EOF, which
+a hard kill of the shell produces: a sidecar staged before that change still
+needs it.
