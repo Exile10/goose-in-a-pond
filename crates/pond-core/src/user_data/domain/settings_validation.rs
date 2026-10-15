@@ -34,6 +34,10 @@ pub enum Check {
         schemes: &'static [&'static str],
         example: &'static str,
     },
+    /// A wake phrase: one to four words of letters (apostrophes and hyphens allowed, so names
+    /// and Swahili words work), canonicalised to single spaces. Anything else would be
+    /// silently dropped by the detector's normalisation and never match.
+    WakePhrase,
     /// A finite number within range.
     Number {
         min: f64,
@@ -180,6 +184,12 @@ pub const FIELD_RULES: &[FieldRule] = &[
         check: real(-180.0, 180.0, "degrees"),
         blank_ok: false,
     },
+    // ── Free text with a shape ─────────────────────────────────────────────
+    FieldRule {
+        key: "voice_wake_word",
+        check: Check::WakePhrase,
+        blank_ok: false,
+    },
     // ── Bounded numbers ────────────────────────────────────────────────────
     FieldRule {
         key: "agent_max_turns",
@@ -278,6 +288,27 @@ pub fn check_field(key: &str, value: &Value) -> Result<Option<Value>, FieldError
                 "{key} must be a 24-hour time like 22:00; got {raw:?}."
             ))),
         },
+        Check::WakePhrase => {
+            let words: Vec<&str> = trimmed.split_whitespace().collect();
+            if !trimmed
+                .chars()
+                .all(|c| c.is_alphabetic() || c.is_whitespace() || c == '\'' || c == '-')
+            {
+                Err(fail(format!(
+                    "a wake phrase uses only letters, spaces, apostrophes and hyphens; got {raw:?}."
+                )))
+            } else if words.len() > 4 || trimmed.chars().count() > 40 {
+                Err(fail(format!(
+                    "a wake phrase is one to four words, at most 40 letters; got {raw:?}."
+                )))
+            } else if trimmed.chars().filter(|c| c.is_alphabetic()).count() < 2 {
+                Err(fail(format!(
+                    "a wake phrase needs a word to say; got {raw:?}."
+                )))
+            } else {
+                Ok(canonical(raw, &words.join(" ")))
+            }
+        }
         Check::Url { schemes, example } => {
             if schemes.iter().any(|s| trimmed.starts_with(s)) && has_host(trimmed, schemes) {
                 Ok(canonical(raw, trimmed))
@@ -553,6 +584,38 @@ mod tests {
         assert_eq!(check_raw_key("agent_max_turns", "50").unwrap(), "50");
         assert!(check_raw_key("agent_max_turns", "0").is_err());
         assert_eq!(check_raw_key("user_name", "Jerry").unwrap(), "Jerry");
+    }
+
+    /// The detector keeps letters only, so "goose!!" or "hey 2" would store fine and never fire.
+    #[test]
+    fn a_wake_phrase_must_be_sayable_words() {
+        assert!(check_field("voice_wake_word", &s("Hey Goose"))
+            .unwrap()
+            .is_none());
+        assert!(check_field("voice_wake_word", &s("habari jarida"))
+            .unwrap()
+            .is_none());
+        assert!(check_field("voice_wake_word", &s("o'malley"))
+            .unwrap()
+            .is_none());
+        for bad in ["goose!!", "hey 2", "one two three four five", "", "x", "?"] {
+            assert!(
+                check_field("voice_wake_word", &s(bad)).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wake_phrase_is_stored_with_single_spaces() {
+        assert_eq!(
+            check_field("voice_wake_word", &s("  hey   goose ")).unwrap(),
+            Some(s("hey goose"))
+        );
+        assert_eq!(
+            check_raw_key("voice_wake_word", "ok  goose").unwrap(),
+            "ok goose"
+        );
     }
 
     #[test]

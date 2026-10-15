@@ -6,7 +6,7 @@
 import type { Settings } from "../api/types";
 import {
   all, atLeast, hhmm, ianaTimezone, integer, latitude, longitude, oneOf,
-  optional, range, retentionMap, speechCategories, url, type Validator,
+  optional, range, retentionMap, speechCategories, url, wakePhrase, type Validator,
 } from "./validation";
 
 /** Does anything read this setting once it is saved? */
@@ -159,7 +159,7 @@ export const CATALOGUE: CatalogueCategory[] = [
       {
         name: "Wake word",
         entries: [
-          { key: "voice_wake_word", label: "Wake word", description: "The phrase that wakes the pond. Capitalisation does not matter.", control: { kind: "text", placeholder: "goose" }, consumer: "live" },
+          { key: "voice_wake_word", label: "Wake word", description: "The phrase that wakes the pond. Capitalisation does not matter.", control: { kind: "text", placeholder: "goose" }, consumer: "live", validate: wakePhrase },
           { key: "voice_wake_word_transcriptions", label: "Learned pronunciations", description: "Alternative spellings learned while training the wake word, so it still answers.", control: { kind: "text", placeholder: "Not calibrated" }, consumer: "live" },
         ],
       },

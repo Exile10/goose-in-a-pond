@@ -19,6 +19,7 @@ import { StepWakeWord } from "./steps/StepWakeWord";
 import { StepComplete } from "./steps/StepComplete";
 
 import "./onboarding.css";
+import { wakePhraseError } from "../../modes/voice/wakePhrase";
 
 // ── Side Rail ────────────────────────────────────────────────
 
@@ -107,7 +108,7 @@ function WizardInner({ onComplete }: { onComplete: () => void }) {
     switch (currentStep.id) {
       case "about-you": return !!draft.userName.trim();
       case "personality": return !!draft.assistantName.trim();
-      case "wake-word": return draft.wakeWord !== "custom" || !!draft.wakeWordCustom.trim();
+      case "wake-word": return draft.wakeWord !== "custom" || wakePhraseError(draft.wakeWordCustom) === null;
       default: return true;
     }
   })();

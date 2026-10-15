@@ -1330,6 +1330,133 @@ pub fn strip_leading_wake_word(transcript: &str, triggers: &[String]) -> String 
         .to_string()
 }
 
+/// The sentences the calibration screen asks for, each containing `phrase`.
+///
+/// Must produce the same list as `buildCalibrationPrompts` in
+/// `pond-desktop/src/modes/voice/wakePhrase.ts`.
+pub fn calibration_prompts(phrase: &str) -> Vec<String> {
+    let p = phrase.trim();
+    vec![
+        p.to_string(),
+        format!("Hey {p}, good morning"),
+        format!("OK {p}, what time is it"),
+        format!("{p}, tell me a joke"),
+        format!("Thank you {p}"),
+    ]
+}
+
+/// Character edit distance (Levenshtein).
+fn char_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != cb)).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
+/// How unalike two words are, in [0, 1]: edit distance over the longer length.
+fn word_cost(a: &str, b: &str) -> f32 {
+    let longest = a.chars().count().max(b.chars().count()).max(1);
+    char_distance(a, b) as f32 / longest as f32
+}
+
+/// A heard phrase further than this from the real one is something else, not a mishearing
+/// ("gus" for "goose" is 0.6 and kept; "bruce" is 0.8 and dropped).
+const MAX_VARIANT_COST: f32 = 0.67;
+
+/// The words of `transcript` that stand where `phrase` stands in `prompt`, and the cost of
+/// the word alignment that put them there. All three must be normalized.
+fn align_phrase(transcript: &str, prompt: &str, phrase: &str) -> Option<(String, f32)> {
+    let t: Vec<&str> = transcript.split_whitespace().collect();
+    let p: Vec<&str> = prompt.split_whitespace().collect();
+    let (ps, pe) = find_trigger_words(prompt, phrase)?;
+    let (m, k) = (t.len(), p.len());
+    // cost[i][j]: aligning t[..i] with p[..j]; substitution costs word_cost, a gap costs 1.
+    let mut cost = vec![vec![0f32; k + 1]; m + 1];
+    for (i, row) in cost.iter_mut().enumerate() {
+        row[0] = i as f32;
+    }
+    for j in 0..=k {
+        cost[0][j] = j as f32;
+    }
+    for i in 1..=m {
+        for j in 1..=k {
+            cost[i][j] = (cost[i - 1][j - 1] + word_cost(t[i - 1], p[j - 1]))
+                .min(cost[i - 1][j] + 1.0)
+                .min(cost[i][j - 1] + 1.0);
+        }
+    }
+    // Walk back, noting which transcript words were paired with a word of the phrase.
+    let mut in_span = vec![false; m];
+    let (mut i, mut j) = (m, k);
+    while i > 0 && j > 0 {
+        if (cost[i][j] - (cost[i - 1][j - 1] + word_cost(t[i - 1], p[j - 1]))).abs() < 1e-6 {
+            in_span[i - 1] = (ps..pe).contains(&(j - 1));
+            i -= 1;
+            j -= 1;
+        } else if (cost[i][j] - (cost[i - 1][j] + 1.0)).abs() < 1e-6 {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    let first = in_span.iter().position(|&b| b)?;
+    let last = in_span.iter().rposition(|&b| b)?;
+    // Unpaired words between two paired ones belong to the phrase too ("goo se").
+    Some((t[first..=last].join(" "), cost[m][k]))
+}
+
+/// The wake phrase as heard in one calibration take: the transcript words standing where the
+/// phrase stands in the sentence that was read out. Without `prompt`, every calibration
+/// sentence is tried and the best-aligned one wins. `None` when the take does not contain the
+/// phrase or anything like it, so a sentence is never stored as a trigger.
+pub fn extract_wake_variant(
+    transcript: &str,
+    phrase: &str,
+    prompt: Option<&str>,
+) -> Option<String> {
+    let t = normalize_transcript(transcript);
+    let ph = normalize_transcript(phrase);
+    if t.is_empty() || ph.is_empty() {
+        return None;
+    }
+    let prompts: Vec<String> = match prompt {
+        Some(p) => vec![normalize_transcript(p)],
+        None => calibration_prompts(&ph)
+            .iter()
+            .map(|p| normalize_transcript(p))
+            .collect(),
+    };
+    let (heard, _) = prompts
+        .iter()
+        .filter_map(|p| align_phrase(&t, p, &ph))
+        .min_by(|a, b| a.1.total_cmp(&b.1))?;
+    // Equal-cost alignments can pull a neighbouring word in ("hey" twice in "Hey hey goose");
+    // drop edge words while that brings the span closer to the phrase.
+    let mut words: Vec<&str> = heard.split(' ').collect();
+    while words.len() > 1 {
+        let now = word_cost(&words.join(" "), &ph);
+        let head = word_cost(&words[1..].join(" "), &ph);
+        let tail = word_cost(&words[..words.len() - 1].join(" "), &ph);
+        if head < now && head <= tail {
+            words.remove(0);
+        } else if tail < now {
+            words.pop();
+        } else {
+            break;
+        }
+    }
+    let heard = words.join(" ");
+    (word_cost(&heard, &ph) <= MAX_VARIANT_COST).then_some(heard)
+}
+
 #[cfg(test)]
 mod wake_word_tests {
     use super::*;
@@ -1484,6 +1611,90 @@ mod wake_word_tests {
         assert_eq!(
             strip_leading_wake_word("mongoose facts please", &t),
             "mongoose facts please"
+        );
+    }
+
+    #[test]
+    fn calibration_keeps_the_phrase_not_the_sentence() {
+        let p = Some("OK goose, what time is it");
+        assert_eq!(
+            extract_wake_variant("OK goose, what time is it?", "goose", p).as_deref(),
+            Some("goose")
+        );
+        assert_eq!(
+            extract_wake_variant("Okay, goes. What time is it?", "goose", p).as_deref(),
+            Some("goes")
+        );
+        assert_eq!(
+            extract_wake_variant("OK, what time is it?", "goose", p),
+            None
+        );
+    }
+
+    #[test]
+    fn a_mishearing_beside_a_lookalike_word_is_found_by_position() {
+        // "good" spells closer to "goose" than "gus" does; alignment goes by place, not spelling.
+        let v = extract_wake_variant(
+            "Hey gus, good morning.",
+            "goose",
+            Some("Hey goose, good morning"),
+        );
+        assert_eq!(v.as_deref(), Some("gus"));
+    }
+
+    #[test]
+    fn without_the_prompt_every_calibration_sentence_is_tried() {
+        assert_eq!(
+            extract_wake_variant("hey gus good morning", "goose", None).as_deref(),
+            Some("gus")
+        );
+        assert_eq!(
+            extract_wake_variant("thank you goose", "goose", None).as_deref(),
+            Some("goose")
+        );
+        // An old calibration that stored a whole sentence reduces to the phrase.
+        assert_eq!(
+            extract_wake_variant("ok goose what time is it", "goose", None).as_deref(),
+            Some("goose")
+        );
+    }
+
+    #[test]
+    fn multi_word_phrases_and_merged_words_survive() {
+        let p = Some("Hey hey goose, good morning");
+        assert_eq!(
+            extract_wake_variant("Hey, hey goose. Good morning.", "hey goose", p).as_deref(),
+            Some("hey goose")
+        );
+        assert_eq!(
+            extract_wake_variant("Heygoose.", "hey goose", Some("hey goose")).as_deref(),
+            Some("heygoose")
+        );
+        let p = Some("Hey hey goose, good morning");
+        assert_eq!(
+            extract_wake_variant("Hey heygoose, good morning.", "hey goose", p).as_deref(),
+            Some("heygoose")
+        );
+    }
+
+    #[test]
+    fn something_unrelated_is_not_a_variant() {
+        assert_eq!(extract_wake_variant("bruce", "goose", Some("goose")), None);
+        assert_eq!(extract_wake_variant("", "goose", None), None);
+    }
+
+    #[test]
+    fn calibration_prompts_match_the_desktop_list() {
+        // The same literals are asserted in pond-desktop/src/modes/voice/wakePhrase.test.ts.
+        assert_eq!(
+            calibration_prompts("goose"),
+            [
+                "goose",
+                "Hey goose, good morning",
+                "OK goose, what time is it",
+                "goose, tell me a joke",
+                "Thank you goose"
+            ]
         );
     }
 }

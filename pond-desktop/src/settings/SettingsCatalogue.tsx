@@ -35,6 +35,7 @@ import {
 import { AppearanceView } from "../hub/views/settings/Appearance";
 import { WakeWordCalibration } from "../components/WakeWordCalibration";
 import "../styles/settings-catalogue.css";
+import { wakePhraseWarning } from "../modes/voice/wakePhrase";
 
 // ─── Marks ────────────────────────────────────────────────────────────────
 // The signature of this page: every control says whether anything reads it.
@@ -709,17 +710,25 @@ export function SettingsCatalogueView({
       const phrase = String(
         (settings as Record<string, unknown>).voice_wake_word ?? "",
       ).trim();
+      const warning = wakePhraseWarning(phrase);
       return (
-        <button
-          type="button"
-          className="scat__detect reach"
-          onClick={() => setCalibrating(true)}
-          disabled={!phrase}
-          title={phrase ? undefined : "Type a wake phrase first"}
-        >
-          <Wand2 size={12} aria-hidden="true" />
-          Train
-        </button>
+        <>
+          <button
+            type="button"
+            className="scat__detect reach"
+            onClick={() => setCalibrating(true)}
+            disabled={!phrase}
+            title={phrase ? undefined : "Type a wake phrase first"}
+          >
+            <Wand2 size={12} aria-hidden="true" />
+            Train
+          </button>
+          {warning && (
+            <span className="scat__actionNote" role="status">
+              {warning}
+            </span>
+          )}
+        </>
       );
     }
 
