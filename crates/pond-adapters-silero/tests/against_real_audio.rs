@@ -17,6 +17,10 @@
 //! US-accented, so they answer "does it fire on speech at all" and say nothing
 //! about how it behaves on an accent or in a room. That second question needs
 //! recordings of the person who will use it.
+//!
+//! Beside each clip, `<clip>.silero.txt` holds the probability the official
+//! wrapper gets for every window of it with the pinned model, written by
+//! `fixtures/reference.py`; rerun that when the model pin moves.
 
 use pond_adapters_silero::{SileroDetector, WINDOW};
 use pond_voice::dsp::{decode_wav, RmsDetector, SpeechDetector};
@@ -79,6 +83,62 @@ fn fridge_hum() -> Vec<f32> {
         .collect()
 }
 
+fn reference(text: &str) -> Vec<f32> {
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.parse().expect("one probability per line"))
+        .collect()
+}
+
+#[test]
+#[ignore = "needs the model; set SILERO_MODEL"]
+fn it_matches_the_official_wrapper_window_for_window() {
+    for (name, bytes, expected) in [
+        (
+            "speech-short",
+            &include_bytes!("fixtures/speech-short.wav")[..],
+            reference(include_str!("fixtures/speech-short.silero.txt")),
+        ),
+        (
+            "speech-long",
+            &include_bytes!("fixtures/speech-long.wav")[..],
+            reference(include_str!("fixtures/speech-long.silero.txt")),
+        ),
+    ] {
+        let samples = wav(bytes);
+        let mut silero = SileroDetector::new(model()).expect("load the model");
+        // The second pass follows a reset, so a context or state that survives one shows up.
+        for pass in ["fresh", "after a reset"] {
+            if pass != "fresh" {
+                silero
+                    .speech_probabilities(&fridge_hum())
+                    .expect("inference");
+                silero.reset();
+            }
+            let got: Vec<f32> = samples
+                .chunks(CAPTURE_CHUNK)
+                .flat_map(|c| silero.speech_probabilities(c).expect("inference"))
+                .collect();
+            assert_eq!(got.len(), expected.len(), "{name}: window count");
+            let worst = got
+                .iter()
+                .zip(&expected)
+                .map(|(g, e)| (g - e).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "{name:<22} {pass:<14} max |adapter - reference| {worst:.1e} over {} windows",
+                got.len()
+            );
+            for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+                assert!(
+                    (g - e).abs() <= 1e-4,
+                    "{name} ({pass}) window {i}: adapter {g}, official wrapper {e}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs the model; set SILERO_MODEL"]
 fn it_fires_on_speech() {
@@ -94,7 +154,7 @@ fn it_fires_on_speech() {
     ] {
         let (silero, rms) = sweep(&wav(bytes));
         println!("{name:<22} silero {silero:>5.1}%   rms {rms:>5.1}%");
-        // Measured ~92%; the floor allows for the clips' silent edges and the first window.
+        // Measured 92-96%; the floor allows for the clips' silent edges and the first window.
         assert!(
             silero >= 75.0,
             "{name}: silero called only {silero:.1}% of frames speech"
