@@ -143,6 +143,9 @@ export RUSTFLAGS=""
 # credentials service for a token unless told `off`. The check below that expects "not set up" is
 # about the route reaching the secret store, and needs the service out of the picture.
 export POND_CREDENTIALS_URL=off
+# The secret store reads the environment first: a developer's exported Brave key would make the
+# web search checks below report a key the scratch pond never stored.
+unset BRAVE_SEARCH_API_KEY
 
 if [ "$DO_BUILD" -eq 1 ]; then
   say "building pond-server (RUSTFLAGS empty, per ci.yml)"
@@ -328,7 +331,7 @@ if [ "$AUTH_OK" -eq 1 ]; then
   fi
   curl -s -o /dev/null -X POST "http://127.0.0.1:$AUTH_PORT/api/v1/onboard/complete"
 
-  for route in /settings /profiles /sessions /devices /memory; do
+  for route in /settings /profiles /sessions /devices /memory /web-search; do
     code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$AUTH_PORT/api/v1$route")
     case "$code" in
       401) printf '  PASS  GET %-10s requires a token\n' "$route" ;;
