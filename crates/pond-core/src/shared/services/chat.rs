@@ -354,6 +354,8 @@ pub struct ChatService {
     thinking_blocks: Arc<std::sync::Mutex<Vec<String>>>,
     /// The desktop shell's stop and interrupt commands; `None` outside `--json-events`.
     control: Option<VoiceControl>,
+    /// The last state announced was Speak, which a reused speculative reply may already be in.
+    speaking: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Result of one non-persisting agent stream, with the stats from its `Done` event.
@@ -439,6 +441,7 @@ impl ChatService {
             persist_thinking: false,
             thinking_blocks: Arc::new(std::sync::Mutex::new(Vec::new())),
             control: None,
+            speaking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1623,6 +1626,10 @@ impl ChatService {
                 end_session!(reason);
             }
 
+            // Subscribed before listening: a speculative reply can start speaking, and be
+            // interrupted, while the listen is still running.
+            let interrupted_while_listening = self.interrupt_signal();
+
             // `speculative`: a (provisional transcript, job) already streaming a reply.
             let (input, speculative) = if let Some(text) = pending_input.take() {
                 // Interrupt text: skip listening, but still emit Listen for the UI.
@@ -1766,11 +1773,6 @@ impl ChatService {
             });
             self.emit_event(WorkflowEvent::UserInput(input.clone()));
 
-            // ── Thinking → Speak (streaming), with wake-word interrupt ──
-            self.emit_event(WorkflowEvent::StateChanged {
-                state: WorkflowState::Thinking,
-            });
-
             // ── Phantom-turn gate ───────────────────────────────────────────
             // Reuse the speculative job only if its transcript matches: one persisted turn each.
             let reusable_speculative = match speculative {
@@ -1785,7 +1787,23 @@ impl ChatService {
                 None => None,
             };
 
-            let interrupted = self.interrupt_signal();
+            // Only a reused reply was audible during the listen; otherwise an Interrupt then was idle.
+            let interrupted = if reusable_speculative.is_some() {
+                interrupted_while_listening
+            } else {
+                self.interrupt_signal()
+            };
+
+            // ── Thinking → Speak (streaming), with wake-word interrupt ──
+            // Not over a reused reply already speaking: the shell would hide its Interrupt button.
+            let already_speaking = reusable_speculative.is_some()
+                && self.speaking.load(std::sync::atomic::Ordering::SeqCst);
+            if !already_speaking {
+                self.emit_event(WorkflowEvent::StateChanged {
+                    state: WorkflowState::Thinking,
+                });
+            }
+
             let input_for_task = input.clone();
             let chat_handle = reusable_speculative.unwrap_or_else(|| {
                 let svc = self.clone();
@@ -1965,6 +1983,10 @@ impl ChatService {
         match &event {
             WorkflowEvent::StateChanged { state } => {
                 tracing::debug!("Workflow state: {}", state);
+                self.speaking.store(
+                    *state == WorkflowState::Speak,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
             }
             WorkflowEvent::UserInput(text) => {
                 tracing::debug!("User input: {}", text);
