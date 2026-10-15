@@ -170,6 +170,13 @@ pub(crate) fn record_mono_f32_until_silence(
         elapsed_ms += POLL_MS;
         let fresh = reader.drain();
         samples.extend_from_slice(&fresh);
+        if fresh.is_empty() && !mic.state().is_open() {
+            // Nothing arrives to judge, so silence would never add up: end, don't wait out the cap.
+            tracing::debug!(
+                "Continue-record: the microphone stopped delivering; ending the capture"
+            );
+            break 'capture;
+        }
 
         for speech in judge_frames(&mut frames, detector, &fresh) {
             if speech {
@@ -306,6 +313,11 @@ pub(crate) fn record_mono_f32_vad(
         recorded_ms += POLL_MS;
         let fresh = reader.drain();
         samples.extend_from_slice(&fresh);
+        if fresh.is_empty() && !mic.state().is_open() {
+            // Nothing arrives to judge, so silence would never add up: end, don't wait out the cap.
+            tracing::debug!("VAD record: the microphone stopped delivering; ending the capture");
+            break 'capture;
+        }
 
         if let Some(sink) = audio_level_sink {
             if !fresh.is_empty() {
@@ -589,6 +601,10 @@ fn detection_loop(
     // Scope every close to this generation: after a cancelled turn this detached thread may
     // no longer own the mic, and closing the follow-up capture's session would deafen it.
     let session = open_mic_and_confirm(&mic)?;
+    // Another claim may have kept the device open, so the ring was not cleared: never read
+    // back past this session's start, where the last command (wake word and all) still sits.
+    let armed_at = mic.shared().written();
+    let since_armed = || (mic.shared().written() - armed_at) as usize;
 
     let sample_rate = pond_audio::CAPTURE_RATE_HZ;
 
@@ -613,7 +629,7 @@ fn detection_loop(
             return Err(anyhow!("wake-word detection cancelled"));
         }
 
-        let snapshot = mic.shared().recent(window_samples);
+        let snapshot = mic.shared().recent(window_samples.min(since_armed()));
 
         if snapshot.len() < window_samples / 2 {
             continue; // buffer not yet full enough — keep waiting
@@ -721,7 +737,7 @@ fn detection_loop(
             // Add `lookback_ms`: detection lags, so post-trigger audio alone loses the first words.
             let captured_ms = elapsed_ms + config.lookback_ms;
             let captured_samples = (captured_ms * sample_rate as u64 / 1000) as usize;
-            let command_audio = mic.shared().recent(captured_samples);
+            let command_audio = mic.shared().recent(captured_samples.min(since_armed()));
             tracing::debug!(
                 "KWS: captured {}ms ({}ms lookback + {}ms after the trigger)",
                 captured_ms,
@@ -1590,6 +1606,67 @@ mod tests {
             calls.load(Ordering::SeqCst),
             0,
             "the detector transcribed audio from before it opened"
+        );
+    }
+
+    #[test]
+    fn a_detector_never_hears_audio_from_before_its_session_while_the_mic_stays_open() {
+        let mic = scripted_mic(ScriptedCapture::silence(0, 20));
+        // Another claim (a reply's barge-in hold) keeps the device open, so nothing clears
+        // the ring between the last command and this detector.
+        let hold = mic.open_session();
+        assert!(mic.wait_for(|s| s.is_open(), Duration::from_secs(2)));
+        mic.shared().ring.lock().unwrap().push(&tone(1_000));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let detector = run_detector(&mic, quick_config(), &calls, &stop);
+
+        std::thread::sleep(Duration::from_millis(400));
+        stop.store(true, Ordering::SeqCst);
+        assert!(detector.join().expect("no panic").is_err(), "cancelled");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the detector transcribed the last session's audio"
+        );
+        assert!(
+            mic.state().is_open(),
+            "the hold's claim must outlive the detector's"
+        );
+        mic.close_session(hold);
+    }
+
+    /// Hears speech in every frame, so silence alone would never end a capture.
+    struct AlwaysSpeech;
+
+    impl SpeechDetector for AlwaysSpeech {
+        fn is_speech(&mut self, _frame: &[f32]) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_capture_ends_when_the_microphone_stops_delivering() {
+        let mic = scripted_mic(ScriptedCapture::silence(0, 20));
+        let closer = mic.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            closer.close();
+        });
+        let started = Instant::now();
+        let _ = record_mono_f32_until_silence(
+            &mic,
+            30,
+            200,
+            None,
+            &mut AlwaysSpeech,
+            &AtomicBool::new(false),
+        )
+        .expect("captured");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the capture waited for its cap after the device stopped ({:?})",
+            started.elapsed()
         );
     }
 
