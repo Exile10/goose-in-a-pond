@@ -14714,6 +14714,9 @@ fn env_or(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// Opens an MCP-UI card hint inside a tool result.
+const UI_HINT_MARKER: &str = "[[[mcp-ui:";
+
 /// Extract optional MCP-UI hint from tool result content.
 ///
 /// MCP servers can optionally prepend a structured JSON marker to their
@@ -14724,6 +14727,10 @@ fn env_or(name: &str, default: f32) -> f32 {
 /// Clean text for the LLM continues here
 /// ```
 ///
+/// The marker may also open a later content block of its own, annotated for
+/// the user only so the model never reads it. The adapter joins a result's
+/// text blocks with `\n`, so such a block starts a line.
+///
 /// The SSE layer calls this before forwarding tool results. The LLM only
 /// sees the clean text; the frontend gets a structured `"ui"` field in the
 /// SSE event for rich rendering.
@@ -14731,29 +14738,47 @@ fn env_or(name: &str, default: f32) -> f32 {
 /// Returns `(clean_content_for_llm, optional_ui_hint_json)`.
 fn extract_ui_hint(content: &str) -> (String, Option<serde_json::Value>) {
     let trimmed = content.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("[[[mcp-ui:") {
-        if let Some(end_idx) = rest.find("]]]") {
-            let hint_payload = &rest[..end_idx];
-            let clean_text = rest[end_idx + 3..].trim_start().to_string();
-            // hint_payload = "weather:{...}" -- split on first ':'
-            if let Some(colon_idx) = hint_payload.find(':') {
-                let card_type = &hint_payload[..colon_idx];
-                let json_str = &hint_payload[colon_idx + 1..];
-                if let Ok(data) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    return (
-                        clean_text,
-                        Some(serde_json::json!({
-                            "card_type": card_type,
-                            "data": data
-                        })),
-                    );
-                }
-            }
-            // Marker found but malformed JSON -- still strip it, no UI hint
-            return (clean_text, None);
+    if let Some(found) = trimmed.strip_prefix(UI_HINT_MARKER).and_then(parse_ui_hint) {
+        return found;
+    }
+    if let Some(at) = content.find(&format!("\n{UI_HINT_MARKER}")) {
+        let before = content[..at].trim_end();
+        let after = content[at + 1..]
+            .strip_prefix(UI_HINT_MARKER)
+            .and_then(parse_ui_hint);
+        if let Some((after, hint)) = after {
+            let clean = match (before.is_empty(), after.is_empty()) {
+                (_, true) => before.to_string(),
+                (true, false) => after,
+                (false, false) => format!("{before}\n{after}"),
+            };
+            return (clean, hint);
         }
     }
     (content.to_string(), None)
+}
+
+/// `rest` is what follows the marker's opening. `None` when the marker never closes.
+fn parse_ui_hint(rest: &str) -> Option<(String, Option<serde_json::Value>)> {
+    let end_idx = rest.find("]]]")?;
+    let hint_payload = &rest[..end_idx];
+    let clean_text = rest[end_idx + 3..].trim_start().to_string();
+    // hint_payload = "weather:{...}" -- split on first ':'
+    if let Some(colon_idx) = hint_payload.find(':') {
+        let card_type = &hint_payload[..colon_idx];
+        let json_str = &hint_payload[colon_idx + 1..];
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(json_str) {
+            return Some((
+                clean_text,
+                Some(serde_json::json!({
+                    "card_type": card_type,
+                    "data": data
+                })),
+            ));
+        }
+    }
+    // Marker found but malformed JSON -- still strip it, no UI hint
+    Some((clean_text, None))
 }
 
 /// POST /api/v1/faces/identify-burst — multi-frame consensus, so one lucky frame can't match.
@@ -17590,6 +17615,37 @@ mod tests {
         assert_eq!(ui["data"]["temp"], 72);
     }
 
+    /// The result `search_web` returns: the model's copy, then its card in a user-only block,
+    /// joined the way the goose adapter joins a result's text blocks.
+    #[test]
+    fn extract_ui_hint_finds_a_card_in_a_later_block() {
+        let input = "Web results for: what time\nJunction Mall (junction.co.ke)\nOpen 9am to 9pm.\n\
+                     [[[mcp-ui:search:{\"query\":\"what time\",\"results\":[{\"url\":\"https://x.test\"}]}]]]";
+        let (clean, hint) = extract_ui_hint(input);
+        assert_eq!(
+            clean,
+            "Web results for: what time\nJunction Mall (junction.co.ke)\nOpen 9am to 9pm."
+        );
+        let ui = hint.expect("the card in the second block is found");
+        assert_eq!(ui["card_type"], "search");
+        assert_eq!(ui["data"]["results"][0]["url"], "https://x.test");
+    }
+
+    #[test]
+    fn extract_ui_hint_keeps_the_blocks_around_a_card_in_the_middle() {
+        let (clean, hint) = extract_ui_hint("first\n[[[mcp-ui:x:{\"a\":1}]]]\nlast");
+        assert_eq!(clean, "first\nlast");
+        assert_eq!(hint.unwrap()["data"]["a"], 1);
+    }
+
+    #[test]
+    fn extract_ui_hint_leaves_marker_text_inside_a_line_alone() {
+        let input = "a result quoting [[[mcp-ui:x:{}]]] mid-line";
+        let (clean, hint) = extract_ui_hint(input);
+        assert_eq!(clean, input);
+        assert!(hint.is_none());
+    }
+
     #[test]
     fn extract_ui_hint_marker_without_colon_in_payload() {
         let input = "[[[mcp-ui:weather]]]\nSome text";
@@ -17787,6 +17843,24 @@ mod tests {
             "the marker must not be persisted -- it would be replayed into the \
              next prompt as literal text"
         );
+    }
+
+    #[test]
+    fn a_card_in_its_own_block_rides_the_frame_and_stays_out_of_the_transcript() {
+        let mut turn = accumulator();
+        let frame = frame_of(turn.absorb(AgentStreamEvent::ToolResult {
+            tool: "giap-knowledge__search_web".to_string(),
+            id: "call-2".to_string(),
+            content: "Web results for: q\nPassage.\n[[[mcp-ui:search:{\"query\":\"q\",\"results\":[]}]]]"
+                .to_string(),
+        }));
+        assert_eq!(frame["content"], "Web results for: q\nPassage.");
+        assert_eq!(
+            frame["ui"],
+            json!({"card_type": "search", "data": {"query": "q", "results": []}})
+        );
+        let persisted: Value = serde_json::from_str(&turn.tool_results[0]).unwrap();
+        assert_eq!(persisted["content"], "Web results for: q\nPassage.");
     }
 
     /// The handler's `ChatService` owns the `persist_thinking` gate; the translator never records.
