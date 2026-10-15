@@ -3,7 +3,7 @@
 //! question. Brave's results are used transiently and never written to disk (its terms, 3(b)(i)).
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 use pond_core::mcp::domain::tool_group::BRAVE_SEARCH_API_KEY;
@@ -12,6 +12,7 @@ use pond_core::mcp::domain::web_search::{
 };
 use pond_core::mcp::services::web_search_status::{self, WebSearchStatusBoard};
 use pond_core::shared::services::passages;
+use regex::Regex;
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{Annotations, CallToolResult, ContentBlock, ErrorData, Role, TextContent},
@@ -55,6 +56,9 @@ const MAX_BLOCKS_PER_PAGE: usize = 400;
 /// A non-heading block shorter than this is navigation, a caption or a button.
 const MIN_BLOCK_CHARS: usize = 40;
 
+/// A heading as it prefixes the blocks under it.
+const MAX_HEADING_BYTES: usize = 80;
+
 /// The model's copy, whole, in bytes: about 450 tokens.
 const RESULT_BUDGET: usize = 1_800;
 
@@ -79,11 +83,51 @@ const TOOL_NAME: &str = "search_web";
 const PAGE_USER_AGENT: &str =
     "goose-in-a-pond/0.1 (GIAP MCP; https://github.com/jarida-io/goose-in-a-pond)";
 
-/// Elements whose whole subtree is boilerplate or not text.
+/// Elements whose whole subtree is boilerplate or not text. `cite` and `sup` are citation
+/// apparatus: a reference title or a footnote marker, never the article's own words.
 const DROPPED: &[&str] = &[
     "script", "style", "noscript", "template", "svg", "iframe", "nav", "header", "footer", "aside",
-    "form",
+    "form", "cite", "sup",
 ];
+
+/// A class or id containing any of these marks reference apparatus: citation lists and
+/// navigation boxes. Short, dated and dense in title words, such lines outrank the article.
+const APPARATUS_MARKS: &[&str] = &["reference", "reflist", "citation", "navbox"];
+
+/// ARIA roles of regions that are not the page's content.
+const DROPPED_ROLES: &[&str] = &[
+    "navigation",
+    "contentinfo",
+    "complementary",
+    "doc-endnotes",
+    "doc-bibliography",
+    "doc-footnote",
+];
+
+/// Elements no class, id or role can drop: they are, or hold, the content.
+const NEVER_DROPPED: &[&str] = &["html", "body", "article"];
+
+// Mozilla Readability's unlikely-candidate test (Readability.js, Apache-2.0, Mozilla), ported as
+// an algorithm: a class or id that reads as page furniture drops its element unless it also
+// reads as content. As there, it is skipped for links and inside tables and code, so an
+// infobox keeps its cells.
+static UNLIKELY_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)-ad-|hidden|^hid$| hid$| hid |^hid |banner|combx|comment|com-|contact|foot|footer|footnote|gdpr|masthead|media|meta|outbrain|promo|related|scroll|share|shoutbox|sidebar|skyscraper|sponsor|shopping|tags|tool|widget",
+    )
+    .expect("the unlikely-candidate pattern")
+});
+static MAYBE_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)and|article|body|column|content|main|shadow")
+        .expect("the maybe-candidate pattern")
+});
+
+/// Elements inside which Readability does not apply its class and id test.
+const TABULAR: &[&str] = &["table", "code"];
+
+/// Readability's `DEFAULT_CHAR_THRESHOLD`: a walk keeping less text than this is retried
+/// without the class and id test.
+const READABILITY_CHAR_THRESHOLD: usize = 500;
 
 /// Elements whose text is a passage.
 const BLOCKS: &[&str] = &[
@@ -95,12 +139,18 @@ const BLOCKS: &[&str] = &[
     "h4",
     "td",
     "th",
+    "tr",
     "blockquote",
     "pre",
     "dd",
 ];
 
 const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4"];
+
+/// Cells of one table row form one block: an infobox row pairs a label with its value
+/// ("Length 472 km"), and neither half answers anything alone.
+const ROW: &str = "tr";
+const CELLS: &[&str] = &["td", "th"];
 
 /// Elements that run inside a line, so their text joins without a space.
 const INLINE: &[&str] = &[
@@ -498,7 +548,32 @@ async fn extract_off_thread(bodies: Vec<Option<String>>) -> Vec<Option<Vec<Strin
 /// The page's readable text blocks, in document order, boilerplate dropped.
 pub fn extract_blocks(html: &str) -> Vec<String> {
     let document = scraper::Html::parse_document(html);
+    let strict = walk(&document, true);
+    // Readability's retry: a page whose content sits under a class like
+    // "ContainerWithSidebarWrapper" loses all of it to the class test, so too little text means
+    // walking again without it. Tags, roles and citation apparatus are still dropped.
+    let blocks = if text_len(&strict) >= READABILITY_CHAR_THRESHOLD {
+        strict
+    } else {
+        let lenient = walk(&document, false);
+        if text_len(&lenient) > text_len(&strict) {
+            lenient
+        } else {
+            strict
+        }
+    };
+    blocks.into_iter().take(MAX_BLOCKS_PER_PAGE).collect()
+}
+
+fn text_len(blocks: &[String]) -> usize {
+    blocks.iter().map(|b| b.chars().count()).sum()
+}
+
+/// One walk of the document; `strip_unlikely` applies Readability's class and id test.
+fn walk(document: &scraper::Html, strip_unlikely: bool) -> Vec<String> {
     let mut out = Blocks::default();
+    // Open `table` and `code` elements around the node being visited.
+    let mut tabular = 0usize;
     // Iterative, so a deeply nested page cannot exhaust the stack.
     let mut stack = vec![(document.tree.root(), false)];
     while let Some((node, closing)) = stack.pop() {
@@ -510,13 +585,16 @@ pub fn extract_blocks(html: &str) -> Vec<String> {
                 let name = element.name();
                 if closing {
                     out.close(name);
+                    if TABULAR.contains(&name) {
+                        tabular = tabular.saturating_sub(1);
+                    }
                     continue;
                 }
-                let hidden = element
-                    .attr("aria-hidden")
-                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
-                if DROPPED.contains(&name) || hidden {
+                if is_boilerplate(element, strip_unlikely && tabular == 0) {
                     continue;
+                }
+                if TABULAR.contains(&name) {
+                    tabular += 1;
                 }
                 out.open(name);
                 stack.push((node, true));
@@ -536,14 +614,111 @@ pub fn extract_blocks(html: &str) -> Vec<String> {
     out.blocks
 }
 
+/// `block` as consecutive runs of whole sentences, each within `max_bytes` where a sentence
+/// allows: a long paragraph's answer can sit past where a clip of its head would end.
+fn sentence_windows(block: &str, max_bytes: usize) -> Vec<String> {
+    if block.len() <= max_bytes {
+        return vec![block.to_string()];
+    }
+    let mut windows = Vec::new();
+    let mut current = String::new();
+    for sentence in sentences(block) {
+        if !current.is_empty() && current.len() + 1 + sentence.len() > max_bytes {
+            windows.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(sentence);
+    }
+    if !current.is_empty() {
+        windows.push(current);
+    }
+    windows
+}
+
+/// Sentences split after `.`, `!` or `?` and a space, where the next starts with a capital, a
+/// digit, a quote or a bracket: the prototype's `_sentences` rule.
+fn sentences(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for i in 0..chars.len().saturating_sub(2) {
+        let (_, c) = chars[i];
+        let (space_at, space) = chars[i + 1];
+        let (next_at, next) = chars[i + 2];
+        let ends = matches!(c, '.' | '!' | '?') && space == ' ';
+        let starts = next.is_uppercase()
+            || next.is_ascii_digit()
+            || matches!(next, '"' | '\'' | '(' | '\u{201c}');
+        if ends && starts {
+            if let Some(sentence) = text.get(start..space_at) {
+                out.push(sentence);
+            }
+            start = next_at;
+        }
+    }
+    if let Some(rest) = text.get(start..).filter(|r| !r.is_empty()) {
+        out.push(rest);
+    }
+    out
+}
+
+/// Whether `element` and everything under it is page furniture rather than content.
+/// `class_test` applies Readability's class and id test (off inside tables and code).
+fn is_boilerplate(element: &scraper::node::Element, class_test: bool) -> bool {
+    let name = element.name();
+    if NEVER_DROPPED.contains(&name) {
+        return false;
+    }
+    if DROPPED.contains(&name) {
+        return true;
+    }
+    let attr = |key: &str| element.attr(key).unwrap_or_default();
+    if attr("aria-hidden").trim().eq_ignore_ascii_case("true") {
+        return true;
+    }
+    if attr("role")
+        .split_whitespace()
+        .any(|role| DROPPED_ROLES.iter().any(|r| r.eq_ignore_ascii_case(role)))
+    {
+        return true;
+    }
+    // Readability matches the class, a space, then the id.
+    let marks = format!("{} {}", attr("class"), attr("id"));
+    let lower = marks.to_ascii_lowercase();
+    if APPARATUS_MARKS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    if name == "a" || !class_test {
+        return false;
+    }
+    UNLIKELY_CANDIDATE.is_match(&marks) && !MAYBE_CANDIDATE.is_match(&marks)
+}
+
 /// Text blocks as the walk finds them. A block nested in another ends the outer one's current
-/// run, so no text is quoted twice.
+/// run, so no text is quoted twice. A heading is never a block of its own: it prefixes the blocks
+/// under it, so "Opening hours: Monday to Friday, 8 am to 5 pm" carries the words a question
+/// uses and the answer it wants, where the times alone would share no word with it.
 #[derive(Default)]
 struct Blocks {
     blocks: Vec<String>,
-    /// Whether each open block element is a heading, innermost last.
-    open: Vec<bool>,
+    /// The open block elements, innermost last.
+    open: Vec<BlockKind>,
     current: String,
+    /// The latest heading, which names the blocks that follow it.
+    heading: Option<String>,
+}
+
+/// What an open block is, which decides whether a short one is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    /// Kept only at [`MIN_BLOCK_CHARS`] or more.
+    Text,
+    /// A heading: it prefixes the blocks after it.
+    Heading,
+    /// A table row, kept whatever its length: its label says what its value is.
+    Row,
 }
 
 impl Blocks {
@@ -551,17 +726,28 @@ impl Blocks {
         self.blocks.len() >= MAX_BLOCKS_PER_PAGE
     }
 
+    /// A cell inside a row is part of the row's block, not a block of its own.
+    fn is_cell_of_open_row(&self, name: &str) -> bool {
+        CELLS.contains(&name) && self.open.last() == Some(&BlockKind::Row)
+    }
+
     fn open(&mut self, name: &str) {
-        if BLOCKS.contains(&name) {
+        if BLOCKS.contains(&name) && !self.is_cell_of_open_row(name) {
             self.flush();
-            self.open.push(HEADINGS.contains(&name));
+            self.open.push(if HEADINGS.contains(&name) {
+                BlockKind::Heading
+            } else if name == ROW {
+                BlockKind::Row
+            } else {
+                BlockKind::Text
+            });
         } else if !self.open.is_empty() && !INLINE.contains(&name) {
             self.current.push(' ');
         }
     }
 
     fn close(&mut self, name: &str) {
-        if BLOCKS.contains(&name) {
+        if BLOCKS.contains(&name) && !self.is_cell_of_open_row(name) {
             self.flush();
             self.open.pop();
         } else if !self.open.is_empty() && !INLINE.contains(&name) {
@@ -576,16 +762,35 @@ impl Blocks {
     }
 
     fn flush(&mut self) {
-        let heading = self.open.last().copied().unwrap_or(false);
+        let kind = self.open.last().copied().unwrap_or(BlockKind::Text);
         let collapsed = self
             .current
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
         self.current.clear();
-        let long_enough = heading || collapsed.chars().count() >= MIN_BLOCK_CHARS;
-        if !collapsed.is_empty() && long_enough && !self.blocks.contains(&collapsed) {
-            self.blocks.push(collapsed);
+        if collapsed.is_empty() {
+            return;
+        }
+        if kind == BlockKind::Heading {
+            let name = collapsed.trim_end_matches([':', '.', ' ']);
+            self.heading = Some(passages::clip(name, MAX_HEADING_BYTES));
+            return;
+        }
+        if kind == BlockKind::Text && collapsed.chars().count() < MIN_BLOCK_CHARS {
+            return;
+        }
+        let prefix = self
+            .heading
+            .as_ref()
+            .map(|h| format!("{h}: "))
+            .unwrap_or_default();
+        let room = MAX_PASSAGE_BYTES.saturating_sub(prefix.len());
+        for window in sentence_windows(&collapsed, room) {
+            let block = format!("{prefix}{window}");
+            if !self.blocks.contains(&block) {
+                self.blocks.push(block);
+            }
         }
     }
 }
@@ -943,16 +1148,18 @@ mod tests {
         let blocks = extract_blocks(PAGE);
         assert_eq!(
             blocks,
-            vec![
-                "Opening hours".to_string(),
-                "Junction Mall is open every day, from 8:30 in the morning to 9 in the evening."
-                    .to_string(),
-                "Parking is free for the first two hours with any purchase.".to_string(),
-                "Monday to Saturday, 8:30 am to 9:00 pm, Sunday 10 am to 6 pm.".to_string(),
-                "A visitor said the food court is the best in Nairobi by a long way.".to_string(),
-                "Ngong Road, Nairobi, next to the Ngong Racecourse roundabout.".to_string(),
-            ],
-            "headings stay whatever their length; short non-headings and `th` go"
+            [
+                "Junction Mall is open every day, from 8:30 in the morning to 9 in the evening.",
+                "Parking is free for the first two hours with any purchase.",
+                "Day Monday to Saturday, 8:30 am to 9:00 pm, Sunday 10 am to 6 pm.",
+                "A visitor said the food court is the best in Nairobi by a long way.",
+                "Ngong Road, Nairobi, next to the Ngong Racecourse roundabout.",
+            ]
+            .iter()
+            .map(|b| format!("Opening hours: {b}"))
+            .collect::<Vec<_>>(),
+            "the heading names every block under it; table rows stay whatever their length; \
+             short paragraphs go"
         );
     }
 
@@ -970,6 +1177,182 @@ mod tests {
         assert_eq!(
             blocks[1],
             "First cell line of the table here second line of it"
+        );
+    }
+
+    /// Readability's unlikely-candidate rule, case by case.
+    #[test]
+    fn page_furniture_is_dropped_by_class_and_id_unless_it_reads_as_content() {
+        let blocks = extract_blocks(&format!(
+            r#"<body>
+<div class="sidebar"><p>Sidebar text long enough to be a passage on any page at all.</p></div>
+<div id="comments"><p>A reader's comment long enough to be quoted, which is never wanted.</p></div>
+<div class="share-tools"><p>Share this article on every social network you have ever heard of.</p></div>
+<div class="hid"><p>An element whose class is exactly hid, long enough to be quoted here.</p></div>
+<div class="site-masthead"><p>The masthead carries the site's name and its tagline, nothing more.</p></div>
+<div class="gdpr-consent"><p>We use cookies to improve your experience of this website, accept them.</p></div>
+<div class="main-sidebar"><p>KEPT: a sidebar that is also main reads as content, so it stays.</p></div>
+<div class="content footer-links"><p>KEPT: content beats footer in one class string, so this stays.</p></div>
+<article class="related"><p>KEPT: an article is never dropped, whatever its class says about it.</p></article>
+<p><a class="promo" href="/x">KEPT: a link is never dropped by its class, as in Readability itself.</a></p>
+<table class="data"><tr><td class="meta-row">KEPT: Length 472 km</td></tr></table>
+<p>KEPT: the article's own paragraph, long enough to be quoted as a passage.</p>
+<p>KEPT: {}</p>
+</body>"#,
+            "and enough of the article to pass Readability's 500-character threshold, so the \
+             class test stands. "
+                .repeat(5)
+        ));
+        let all = blocks.join(
+            "
+",
+        );
+        for gone in [
+            "Sidebar text",
+            "comment",
+            "Share this",
+            "exactly hid",
+            "masthead",
+            "cookies",
+        ] {
+            assert!(
+                !all.contains(gone),
+                "{gone:?} survived:
+{all}"
+            );
+        }
+        let kept = blocks.iter().filter(|b| b.starts_with("KEPT")).count();
+        assert_eq!(kept, 7, "{all}");
+    }
+
+    /// The shape of a Wikipedia article: inline markers, a reference list, a navbox.
+    #[test]
+    fn citation_apparatus_is_dropped_and_an_infobox_kept() {
+        let blocks = extract_blocks(
+            r##"<body><div id="mw-content-text" class="mw-body-content">
+<table class="infobox ib-rail-line"><tbody>
+<tr><th class="infobox-label">Length</th><td class="infobox-data">472 km (293 mi)<sup class="reference"><a href="#cite_note-2">[2]</a></sup></td></tr>
+<tr><th class="infobox-label">Opened</th><td class="infobox-data">31 May 2017</td></tr>
+</tbody></table>
+<p>The line opened in 2017 and runs between Mombasa and Nairobi.<sup class="reference"><a href="#cite_note-1">[1]</a></sup></p>
+<div class="reflist"><ol class="references"><li id="cite_note-1"><span class="mw-cite-backlink">^</span>
+<span class="reference-text"><cite class="citation news">"Kenya opens Nairobi-Mombasa Madaraka Express railway". BBC News. 31 May 2017.</cite> Retrieved 31 May 2017.</span></li></ol></div>
+<ol class="references"><li>A second reference list, with a retrieval date: Retrieved 4 December 2016.</li></ol>
+<div role="navigation" class="navbox"><ul><li>Railway lines in Kenya, Uganda, Tanzania and South Sudan</li></ul></div>
+<section role="doc-endnotes"><p>Endnote text long enough to be a passage that is not wanted.</p></section>
+<div role="contentinfo"><p>The page's own footer, long enough to be quoted as a passage.</p></div>
+<div role="complementary"><p>Complementary text beside the article that nobody asked for.</p></div>
+</div></body>"##,
+        );
+        let all = blocks.join(
+            "
+",
+        );
+        assert!(
+            blocks.contains(
+                &"The line opened in 2017 and runs between Mombasa and Nairobi.".to_string()
+            ),
+            "{all}"
+        );
+        assert!(
+            blocks.contains(&"Length 472 km (293 mi)".to_string()),
+            "{all}"
+        );
+        assert!(blocks.contains(&"Opened 31 May 2017".to_string()), "{all}");
+        for gone in [
+            "[1]",
+            "[2]",
+            "Retrieved",
+            "BBC News",
+            "Railway lines",
+            "Endnote",
+            "own footer",
+            "Complementary",
+        ] {
+            assert!(
+                !all.contains(gone),
+                "{gone:?} survived:
+{all}"
+            );
+        }
+    }
+
+    /// GOV.UK's shape: the answer shares no word with the question, its heading does.
+    #[test]
+    fn a_heading_names_the_blocks_under_it() {
+        let blocks = extract_blocks(
+            "<main><h2>Visa requirements:</h2>\
+             <p>You must apply online for electronic travel authorisation before you travel.</p>\
+             <h2>Health</h2>\
+             <p>Check the latest vaccination advice for travellers at least eight weeks ahead.</p>\
+             <p>Carry a yellow fever certificate if you arrive from a country with the disease.</p></main>",
+        );
+        assert_eq!(
+            blocks,
+            [
+                "Visa requirements: You must apply online for electronic travel authorisation \
+                 before you travel.",
+                "Health: Check the latest vaccination advice for travellers at least eight weeks \
+                 ahead.",
+                "Health: Carry a yellow fever certificate if you arrive from a country with the \
+                 disease.",
+            ]
+        );
+        let ranked = passages::rank("Do I need a visa to visit Kenya?", &blocks);
+        assert_eq!(ranked[0].index, 0, "{ranked:?}");
+    }
+
+    /// The BBC's article sits under "ContainerWithSidebarWrapper", which the class test drops.
+    #[test]
+    fn a_page_lost_to_the_class_test_is_walked_again_without_it() {
+        let para = "A paragraph of the article itself, long enough to count, about the railway. ";
+        let html = format!(
+            r#"<body><nav><p>A navigation paragraph that is long enough to be a block.</p></nav>
+<div class="ssrcss-js09yk-ContainerWithSidebarWrapper"><main><article>
+<p>{0}</p><p>{0}</p></article></main></div>
+<footer><p>A footer paragraph that is long enough to be a block as well.</p></footer></body>"#,
+            para.repeat(4)
+        );
+        let blocks = extract_blocks(&html);
+        let all = blocks.join("\n");
+        assert!(all.contains("A paragraph of the article itself"), "{all}");
+        assert!(!all.contains("navigation paragraph"), "{all}");
+        assert!(!all.contains("footer paragraph"), "{all}");
+    }
+
+    #[test]
+    fn a_page_with_enough_content_keeps_the_class_test() {
+        let para = "A paragraph of the article itself, long enough to count, about the railway. ";
+        let html = format!(
+            r#"<body><main><p>First. {0}</p><p>Second. {0}</p></main>
+<div class="sidebar"><p>Sidebar text long enough to be a passage on any page at all.</p></div></body>"#,
+            para.repeat(4)
+        );
+        let all = extract_blocks(&html).join("\n");
+        assert!(!all.contains("Sidebar text"), "{all}");
+    }
+
+    #[test]
+    fn a_long_paragraph_is_split_into_runs_of_whole_sentences() {
+        let filler =
+            "The museum grew over the years and many galleries were added to it. ".repeat(12);
+        let block = format!(
+            "{filler}It was officially opened on 22 September 1930 and named the Coryndon Museum."
+        );
+        let windows = sentence_windows(&block, MAX_PASSAGE_BYTES);
+        assert!(windows.len() > 1, "{windows:?}");
+        assert!(
+            windows.iter().all(|w| w.len() <= MAX_PASSAGE_BYTES),
+            "{windows:?}"
+        );
+        assert!(windows
+            .last()
+            .unwrap()
+            .ends_with("named the Coryndon Museum."));
+        assert_eq!(windows.join(" "), block, "no text is lost or doubled");
+        assert_eq!(
+            sentence_windows("Short.", MAX_PASSAGE_BYTES),
+            vec!["Short."]
         );
     }
 
@@ -1517,5 +1900,158 @@ mod tests {
         assert!(copy.starts_with("Web results for:"), "{copy}");
         assert_eq!(board.status_for(Some(&key)), WebSearchStatus::Ok);
         assert_eq!(result.content.len(), 2);
+    }
+
+    /// One real page, and what its copy must and must not carry.
+    struct LivePage {
+        question: &'static str,
+        title: &'static str,
+        url: &'static str,
+        /// Article text the copy must quote, where the page has a lead worth pinning.
+        quoted: Option<&'static str>,
+        /// A substring of the answer, looked for case-insensitively in the copy.
+        answer: &'static str,
+        /// Text that must not reach the copy: navigation, footer, citation apparatus.
+        absent: &'static [&'static str],
+    }
+
+    /// Chosen for stability and shape: an encyclopedia article heavy with references, a Kenyan
+    /// institution's server-rendered page stating a constitutional fact, a 2017 news article
+    /// that has not moved since, and a government page inside a large header, menu and footer.
+    const LIVE_PAGES: &[LivePage] = &[
+        LivePage {
+            question: "How long is the railway from Mombasa to Nairobi, and when did it open?",
+            title: "Mombasa–Nairobi Standard Gauge Railway",
+            url: "https://en.wikipedia.org/wiki/Mombasa%E2%80%93Nairobi_Standard_Gauge_Railway",
+            quoted: Some("completed in 2017, was built as the first phase"),
+            answer: "km",
+            absent: &["Retrieved", "↑", "Railway Gazette", "BBC News"],
+        },
+        LivePage {
+            question: "How many elected members does Kenya's National Assembly have?",
+            title: "The National Assembly",
+            url: "https://www.parliament.go.ke/the-national-assembly",
+            quoted: None,
+            answer: "Two hundred and ninety",
+            absent: &["Copyright", "All rights reserved"],
+        },
+        LivePage {
+            question: "How much did the Mombasa to Nairobi railway cost?",
+            title: "Kenya opens Nairobi-Mombasa Madaraka Express railway",
+            url: "https://www.bbc.co.uk/news/world-africa-40092600",
+            quoted: None,
+            answer: "3.2bn",
+            absent: &[
+                "Skip to content",
+                "Accessibility Help",
+                "Most read",
+                "BBC Verify",
+            ],
+        },
+        LivePage {
+            question: "Do I need a visa to visit Kenya?",
+            title: "Kenya travel advice: entry requirements",
+            url: "https://www.gov.uk/foreign-travel-advice/kenya/entry-requirements",
+            quoted: None,
+            answer: "electronic travel authorisation",
+            absent: &[
+                "Births, death, marriages and care",
+                "Cookies on GOV.UK",
+                "Crown copyright",
+            ],
+        },
+    ];
+
+    /// Real pages, no key: the fetch, extract and rank half of the pipeline against the live web.
+    /// `cargo test -p pond-mcp-server live_pages -- --ignored --nocapture`; `DUMP_BLOCKS=1` also
+    /// prints each page's first blocks and top ranks. Brave is not called, so this spends
+    /// nothing: the hits stand in for what a search would have returned.
+    ///
+    /// It asserts extraction: every page is read, every quoted passage is the page's own text,
+    /// and no furniture or citation reaches the copy. Whether the ranker's two passages hold the
+    /// answer is printed per page; `REQUIRE_ANSWERS=1` turns a miss into a failure.
+    #[tokio::test]
+    #[ignore]
+    async fn live_pages_are_read_extracted_and_ranked() {
+        let client = page_client().expect("page client builds");
+
+        // The guard first: the pond's own API is refused before a byte is sent.
+        let local = vec![hit(
+            "Local",
+            "http://127.0.0.1:4000/api/v1/health",
+            "loopback",
+        )];
+        assert!(
+            fetch_pages(client, &local).await[0].is_none(),
+            "loopback was fetched"
+        );
+
+        let mut failures = Vec::new();
+        let mut misses = Vec::new();
+        for page in LIVE_PAGES {
+            let hits = vec![hit(page.title, page.url, "BRAVE DESCRIPTION STAND-IN.")];
+            let bodies = fetch_pages(client, &hits).await;
+            assert!(bodies[0].is_some(), "{} was not read", page.url);
+            let pages = extract_off_thread(bodies).await;
+            let blocks = pages[0].clone().unwrap_or_default();
+            eprintln!("\n=== {} ({} blocks)", page.url, blocks.len());
+            if std::env::var("DUMP_BLOCKS").is_ok() {
+                for (i, b) in blocks.iter().enumerate().take(12) {
+                    eprintln!("  block {i}: {}", b.chars().take(110).collect::<String>());
+                }
+                for r in passages::rank(page.question, &blocks).iter().take(8) {
+                    let head: String = blocks[r.index].chars().take(90).collect();
+                    eprintln!("  rank {:>3} score {:.2}: {head}", r.index, r.score);
+                }
+            }
+            let copy = model_copy(page.question, &hits, &pages).expect("something quotable");
+            eprintln!("{copy}");
+
+            assert!(copy.len() <= RESULT_BUDGET, "{} bytes", copy.len());
+            assert!(
+                !copy.contains("://"),
+                "the model's copy carries no URL: {copy}"
+            );
+            // Past the question and the source line, every line is one of the page's blocks.
+            for line in copy.lines().skip(2) {
+                if !blocks
+                    .iter()
+                    .any(|b| b.starts_with(line.trim_end_matches('\u{2026}')))
+                {
+                    failures.push(format!("{}: {line:?} is not the page's text", page.url));
+                }
+            }
+            if let Some(quoted) = page.quoted {
+                if !copy.contains(quoted) {
+                    failures.push(format!(
+                        "{}: the article's {quoted:?} is not quoted",
+                        page.url
+                    ));
+                }
+            }
+            for absent in page.absent {
+                if copy.contains(absent) {
+                    failures.push(format!("{}: {absent:?} reached the copy", page.url));
+                }
+            }
+            let found = copy.to_lowercase().contains(&page.answer.to_lowercase());
+            eprintln!(
+                "ANSWER {} {:?}",
+                if found { "found" } else { "MISSING" },
+                page.answer
+            );
+            if !found {
+                misses.push(format!("{}: no {:?} in the copy", page.url, page.answer));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+        eprintln!(
+            "\nanswers in the copy: {} of {}",
+            LIVE_PAGES.len() - misses.len(),
+            LIVE_PAGES.len()
+        );
+        if std::env::var("REQUIRE_ANSWERS").is_ok() {
+            assert!(misses.is_empty(), "{misses:#?}");
+        }
     }
 }

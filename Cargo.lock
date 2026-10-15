@@ -11886,6 +11886,7 @@ dependencies = [
  "pond-adapters-weather",
  "pond-core",
  "pond-net",
+ "regex",
  "reqwest 0.13.3",
  "rmcp",
  "schemars 1.2.1",
