@@ -169,11 +169,6 @@ pub const FIELD_RULES: &[FieldRule] = &[
         check: url(HTTP, "http://127.0.0.1:8081"),
         blank_ok: true,
     },
-    FieldRule {
-        key: "voice_kws_whisper_url",
-        check: url(HTTP, "http://127.0.0.1:8081"),
-        blank_ok: true,
-    },
     // ── Where the pond is ──────────────────────────────────────────────────
     FieldRule {
         key: "weather_latitude",

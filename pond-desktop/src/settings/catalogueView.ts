@@ -18,7 +18,6 @@ export function textValue(v: unknown): string {
 const NULLABLE_TEXT = new Set([
   "custom_system_prompt",
   "searxng_url",
-  "voice_kws_whisper_url",
 ]);
 
 /** List-valued text boxes, typed comma-separated; one left out is sent raw and 422s the whole Save. */

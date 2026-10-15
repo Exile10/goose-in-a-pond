@@ -1,11 +1,70 @@
 # Voice Pipeline Efficiency Guide
 
-This document covers performance characteristics, tuning parameters, and optimisation techniques
-for GIAP's wake-word detection and voice pipeline.
+> **Mostly retired.** Only the first section, on in-process Whisper and GPU memory, describes the
+> pond as it runs today. Everything under [Retired](#retired-the-http-whisper-detector) was written
+> for the HTTP whisper.cpp detector: a 1500 ms window sliding every 500 ms, a two-window re-check,
+> a spoken "thinking" quip, and a second whisper server for the wake word. None of that runs now.
+> For the detector's current knobs and live values, see
+> [Voice mode § Tuning](developer/voice-mode.md#tuning).
 
 ---
 
-## End-to-End Latency Map
+## When the GPU has no room for a transcription
+
+In-process Whisper (`pond-adapters-whisper`, built with `pond-adapters-whisper/cuda`) keeps the
+model weights on the GPU from startup and, since 2026-10-05, a `whisper_state` for each decode
+profile as well (`Engine` in `in_process.rs`). The accurate profile's state is made at load and
+decodes a second of silence there, which sizes its beam-search cache and reserves GGML's CUDA
+scratch pool. The wake-word profile's state is made on its first use. After that a transcription
+allocates nothing, so a GPU the LLM has filled no longer fails it: the CUDA test
+`a_kept_state_transcribes_on_a_full_gpu` fills the GPU with 35 states and still transcribes.
+
+Before, every transcription made and freed its own state, and each of its allocations was a
+chance to find no room. Two of the ways that failed took the Pond down:
+- **Growing the beam-search cache.** whisper.cpp freed the caller's state, a double free and a
+  `SIGBUS`. Fixed in the vendored source; see `vendor/whisper-rs-sys/POND-PATCH.md`.
+- **Reserving the scratch pool on a state's first decode** (`cuMemAddressReserve` in
+  `ggml-cuda.cu`). GGML aborts here by design. A kept state reserves its pool once, at load.
+
+What it costs, measured on the Jetson with `base` on 2026-10-05: one state is 170.6 MB:
+
+| Part | Size |
+|---|---|
+| KV caches: self, cross and pad | 6.29 + 18.87 + 3.15 MB |
+| Compute buffers: conv, encode, cross and decode | 17.24 + 23.09 + 4.66 + 97.29 MB |
+
+Five-beam decoding grows the self cache to seven decoders' worth, 44.03 MB. The accurate state
+therefore holds about 208 MB, plus its scratch pool. That much was already needed while any
+transcription ran. What changed is that it is no longer handed back to the LLM between calls.
+A Pond serving only the transcribe route, as the Jetson does, holds just the accurate state;
+local voice mode adds the wake-word state, another 170.6 MB. Preparing the state adds about 0.7 s
+to startup (`kind="whisper_state_prepared"`). Every state made is logged
+(`kind="whisper_state_created"`, with a running count), so a count that keeps rising shows states
+being lost to panics, which would put the allocations back on the call path.
+
+If preparing at load fails, the Pond logs `kind="whisper_state_not_prepared"` and starts anyway,
+and the first transcription makes the state as before. Such a call can still fail with no room.
+The log then shows `failed to reserve graph buffers`, Whisper's `failed to init ... allocator`,
+and `kind="whisper_transcription_failed"`. The transcribe routes answer 500 with the reason, and
+the wake-word loop moves to its next window. Calls with the same profile share one state, so
+they run one at a time.
+
+Whisper does not fall back to the CPU. On the Orin, CPU and GPU allocations come from the same
+memory, so a CPU retry competes for what just ran out, and a second, CPU-resident context
+would hold its weights all the time to cover a failure that clears when the LLM's turn ends.
+The next utterance reuses the kept state and normally succeeds once the LLM's turn ends; only a state that was never prepared, or was replaced after a panic, allocates again. If failures recur, the budget is the
+cause: the LLM's context size, not Whisper, is what to shrink.
+
+---
+
+## Retired: the HTTP whisper detector
+
+> Kept for its reasoning, not its numbers. The window, slide, ceiling and default values below are
+> not the current ones, the latency figures were measured over HTTP, and the
+> `voice_kws_whisper_url` setting the tiered-model and device-profile sections rely on no longer
+> exists. Whisper runs in process, with one model for both wake word and command.
+
+### End-to-End Latency Map
 
 ```
 User speaks "Hey Goose, what's the weather?"
@@ -53,7 +112,7 @@ User speaks "Hey Goose, what's the weather?"
        └─ Cooldown sleep (2000 ms) ← prevents TTS-echo re-trigger
 ```
 
-### Typical latency targets
+#### Typical latency targets
 
 | Optimisation state | Wake detect | Post-trigger | ASR | Total to first LLM token |
 |---|---|---|---|---|
@@ -63,7 +122,7 @@ User speaks "Hey Goose, what's the weather?"
 
 ---
 
-## `KeywordDetectorConfig` Reference
+### `KeywordDetectorConfig` Reference
 
 All fields are available via `KeywordDetectorConfig::default()` and the `Settings` DB.
 
@@ -80,9 +139,9 @@ All fields are available via `KeywordDetectorConfig::default()` and the `Setting
 
 ---
 
-## Optimisations Implemented
+### Optimisations Implemented
 
-### 1. Energy/RMS Gate
+#### 1. Energy/RMS Gate
 
 **Problem:** ~80–90% of whisper HTTP calls happen on silence. Each call takes 0.3–5s depending
 on the model.
@@ -124,7 +183,7 @@ curl -X PUT http://localhost:4000/api/v1/settings \
 
 ---
 
-### 2. VAD-Gated Post-Trigger Capture
+#### 2. VAD-Gated Post-Trigger Capture
 
 **Problem:** After wake-word confirmation the loop slept `post_trigger_ms = 4000 ms` unconditionally.
 For a 1-word command ("goose, time?") that adds 3.5 seconds of unnecessary dead time.
@@ -155,7 +214,7 @@ audio immediately — no need to wait the full ceiling.
 
 ---
 
-### 3. Dead-Zone Cooldown
+#### 3. Dead-Zone Cooldown
 
 **Problem:** After TTS finishes speaking, residual room echo or the assistant's own voice can
 re-trigger the wake-word detector on the next cycle.
@@ -177,7 +236,7 @@ the assistant is still speaking or just finished).
 
 ---
 
-### 4. Tiered Whisper Models
+#### 4. Tiered Whisper Models
 
 **Problem:** Wake-word detection only needs to recognise a small vocabulary. Using `base.en` (2s
 inference) for keyword spotting is wasteful. Command transcription needs accuracy.
@@ -208,7 +267,7 @@ unchanged. Both models fit in RAM simultaneously on Jetson Orin Nano (8 GB).
 
 ---
 
-## Whisper Model Comparison
+### Whisper Model Comparison
 
 | Model | Size | Inference (CPU) | Inference (Jetson) | Accuracy | Best for |
 |---|---|---|---|---|---|
@@ -222,9 +281,9 @@ Recommendation for `voice_whisper_url` (ASR): `base.en` or `small.en`
 
 ---
 
-## Device Tuning Profiles
+### Device Tuning Profiles
 
-### Raspberry Pi 4 (4 GB)
+#### Raspberry Pi 4 (4 GB)
 
 ```json
 {
@@ -237,7 +296,7 @@ Recommendation for `voice_whisper_url` (ASR): `base.en` or `small.en`
 ```
 Notes: Run `tiny.en` on 9001, `base.en` on 9000. Pi 4 is slow — tiered models make the biggest difference here. Set `slide_ms = 800` via config builder if CPU is maxed.
 
-### Jetson Orin Nano (8 GB)
+#### Jetson Orin Nano (8 GB)
 
 ```json
 {
@@ -250,53 +309,7 @@ Notes: Run `tiny.en` on 9001, `base.en` on 9000. Pi 4 is slow — tiered models 
 ```
 Notes: Build whisper.cpp with CUDA support (`make clean && WHISPER_CUDA=1 make`). Inference drops to ~0.5s for `base.en`. Both models load simultaneously with ~120 MB VRAM.
 
-#### When the GPU has no room for a transcription
-
-In-process Whisper (`pond-adapters-whisper`, built with `pond-adapters-whisper/cuda`) keeps the
-model weights on the GPU from startup and, since 2026-10-05, a `whisper_state` for each decode
-profile as well (`Engine` in `in_process.rs`). The accurate profile's state is made at load and
-decodes a second of silence there, which sizes its beam-search cache and reserves GGML's CUDA
-scratch pool. The wake-word profile's state is made on its first use. After that a transcription
-allocates nothing, so a GPU the LLM has filled no longer fails it: the CUDA test
-`a_kept_state_transcribes_on_a_full_gpu` fills the GPU with 35 states and still transcribes.
-
-Before, every transcription made and freed its own state, and each of its allocations was a
-chance to find no room. Two of the ways that failed took the Pond down:
-- **Growing the beam-search cache.** whisper.cpp freed the caller's state, a double free and a
-  `SIGBUS`. Fixed in the vendored source; see `vendor/whisper-rs-sys/POND-PATCH.md`.
-- **Reserving the scratch pool on a state's first decode** (`cuMemAddressReserve` in
-  `ggml-cuda.cu`). GGML aborts here by design. A kept state reserves its pool once, at load.
-
-What it costs, measured on the Jetson with `base` on 2026-10-05: one state is 170.6 MB:
-
-| Part | Size |
-|---|---|
-| KV caches: self, cross and pad | 6.29 + 18.87 + 3.15 MB |
-| Compute buffers: conv, encode, cross and decode | 17.24 + 23.09 + 4.66 + 97.29 MB |
-
-Five-beam decoding grows the self cache to seven decoders' worth, 44.03 MB. The accurate state
-therefore holds about 208 MB, plus its scratch pool. That much was already needed while any
-transcription ran. What changed is that it is no longer handed back to the LLM between calls.
-A Pond serving only the transcribe route, as the Jetson does, holds just the accurate state;
-local voice mode adds the wake-word state, another 170.6 MB. Preparing the state adds about 0.7 s
-to startup (`kind="whisper_state_prepared"`). Every state made is logged
-(`kind="whisper_state_created"`, with a running count), so a count that keeps rising shows states
-being lost to panics, which would put the allocations back on the call path.
-
-If preparing at load fails, the Pond logs `kind="whisper_state_not_prepared"` and starts anyway,
-and the first transcription makes the state as before. Such a call can still fail with no room.
-The log then shows `failed to reserve graph buffers`, Whisper's `failed to init ... allocator`,
-and `kind="whisper_transcription_failed"`. The transcribe routes answer 500 with the reason, and
-the wake-word loop moves to its next window. Calls with the same profile share one state, so
-they run one at a time.
-
-Whisper does not fall back to the CPU. On the Orin, CPU and GPU allocations come from the same
-memory, so a CPU retry competes for what just ran out, and a second, CPU-resident context
-would hold its weights all the time to cover a failure that clears when the LLM's turn ends.
-The next utterance reuses the kept state and normally succeeds once the LLM's turn ends; only a state that was never prepared, or was replaced after a panic, allocates again. If failures recur, the budget is the
-cause: the LLM's context size, not Whisper, is what to shrink.
-
-### Apple Silicon Mac (dev)
+#### Apple Silicon Mac (dev)
 
 ```json
 {
@@ -309,9 +322,9 @@ Notes: Same model for KWS and ASR is fine on Apple Silicon — `base.en` runs in
 
 ---
 
-## Planned Optimisations (Not Yet Implemented)
+### Planned Optimisations (Not Yet Implemented)
 
-### Non-Blocking Parallel Whisper Calls (P1)
+#### Non-Blocking Parallel Whisper Calls (P1)
 
 Currently the detection loop is synchronous — the slide timer waits for each whisper response
 before the next window. On slow hardware this means detection latency = `slide_ms + whisper_latency`
@@ -328,7 +341,7 @@ When a new window is ready while the worker is still processing the previous one
 is discarded (latest wins). The slide timer always sleeps exactly `slide_ms`. This brings detection
 latency back to ~`slide_ms` regardless of server response time.
 
-### Incremental 16 kHz Resample Buffer (P2)
+#### Incremental 16 kHz Resample Buffer (P2)
 
 66% of each 1500 ms window overlaps the previous (500 ms slide ÷ 1500 ms window). The current
 implementation resamples the full window from scratch every 500 ms — discarding 66% of the work.
@@ -339,7 +352,7 @@ eliminating per-window resampling entirely.
 
 ---
 
-## Calibrating the Energy Gate
+### Calibrating the Energy Gate
 
 The energy gate threshold should be set just above the ambient noise floor of your environment.
 

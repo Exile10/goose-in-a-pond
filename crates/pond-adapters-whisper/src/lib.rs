@@ -343,6 +343,8 @@ pub(crate) use pond_voice::dsp::encode_wav_mono_16k;
 // ── WhisperKeywordDetector ────────────────────────────────────────────────────
 
 /// Configuration for the sliding-window wake-word detector.
+/// The voice loop replaces `energy_threshold`, `post_trigger_silence_ms` and `cooldown_ms` with
+/// the `voice_kws_*` settings, so those three defaults are not what runs there.
 #[derive(Clone)]
 pub struct KeywordDetectorConfig {
     /// Window per cycle (ms): a two-word phrase; wider costs more and lets whisper invent context.
@@ -716,7 +718,7 @@ mod tests {
     use pond_voice::dsp::RmsDetector;
 
     // ── Detection tuning ──────────────────────────────────────────────────
-    // These check relationships between the knobs, not their (retunable) values.
+    // Code defaults only; the voice loop overrides three of them from `voice_kws_*` settings.
 
     #[test]
     fn the_lookback_covers_the_worst_case_detection_lag() {
@@ -779,12 +781,14 @@ mod tests {
         );
     }
 
+    /// Code default only: the voice loop uses `voice_kws_cooldown_ms`, which this does not bound.
+    /// Follow-ups are heard by the conversational listen, not here; this delays the next wake.
     #[test]
-    fn re_arming_is_quick_enough_to_answer_a_follow_up() {
+    fn the_code_default_cooldown_re_arms_within_a_second() {
         let c = KeywordDetectorConfig::default();
         assert!(
             c.cooldown_ms <= 1000,
-            "cooldown {}ms is dead time the user experiences as being ignored",
+            "cooldown {}ms is dead time in which the wake word does nothing",
             c.cooldown_ms
         );
     }

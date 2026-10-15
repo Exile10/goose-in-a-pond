@@ -316,11 +316,10 @@ All settings below are persisted in `pond_system.db` and writable via `PUT /api/
 | Setting | Default | Range | Description |
 |---|---|---|---|
 | `voice_wake_word` | `"goose"` | any string | The activation phrase |
-| `voice_kws_whisper_url` | `null` (= `voice_whisper_url`) | URL | Separate fast-model whisper for KWS |
-| `voice_kws_energy_threshold` | `0.01` | `0.0–1.0` | Min RMS to call whisper. `0.0` = disabled |
+| `voice_kws_energy_threshold` | `0.003` | `0.0–1.0` | Min RMS to call whisper. `0.0` = disabled |
 | `voice_kws_post_trigger_silence_ms` | `400` | `0–4000` | Silence to end capture early. `0` = disabled |
 | `voice_kws_cooldown_ms` | `2000` | `0–10000` | Sleep before re-arming after activation |
-| `voice_recording_duration_secs` | `3` | `1–30` | Hard ceiling for fresh command recording |
+| `voice_recording_duration_secs` | `3` | `1–300` | Recording ceiling for the browser voice path only; the voice loop ends on silence |
 
 ### Calibrating `voice_kws_energy_threshold`
 
