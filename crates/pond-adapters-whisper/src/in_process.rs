@@ -541,6 +541,9 @@ impl WhisperRsInput {
         let spec_wake_words = self.wake_words_snapshot();
         let mic = self.mic.clone();
         let detector = Arc::clone(&self.detector);
+        // Dropping a `spawn_blocking` handle only detaches it; this flag ends the capture.
+        let stop = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = crate::StopOnDrop(stop.clone());
         let capture_result = tokio::task::spawn_blocking(move || -> Result<SpeechCapture> {
             // Held for the whole capture; nothing else uses the detector mid-turn.
             let mut detector = detector
@@ -555,6 +558,7 @@ impl WhisperRsInput {
                     silence_ms,
                     Some(onset),
                     &mut **detector,
+                    &stop,
                 )?;
                 Ok(SpeechCapture::Samples(resample_to_16k(&samples, rate)))
             } else if let Some(wav) = captured {
@@ -565,6 +569,7 @@ impl WhisperRsInput {
                     silence_ms,
                     None,
                     &mut **detector,
+                    &stop,
                 )?;
                 let fresh_16k = resample_to_16k(&fresh_samples, fresh_rate);
                 let mut combined = captured_samples;
@@ -602,6 +607,7 @@ impl WhisperRsInput {
                     on_speculative_event.as_deref(),
                     audio_level_sink.as_deref(),
                     &mut **detector,
+                    &stop,
                 )?;
                 if samples.is_empty() {
                     return Ok(SpeechCapture::Empty);

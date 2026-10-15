@@ -13,9 +13,13 @@ const SHELL_STUB_SCRIPT = `
 (function () {
   const listeners = {};
 
+  // Every command the page sent, for asserting on controls that only invoke.
+  window.__invokedCommands__ = [];
+
   window.giap = {
     serverUrl: "http://127.0.0.1:4000",
     invoke: async function (command) {
+      window.__invokedCommands__.push(command);
       if (command === "server_health") return true;
       if (command === "ensure_server_running") return "http://127.0.0.1:4000";
       if (command === "start_voice_session") return "e2e-child-session";
@@ -134,6 +138,37 @@ test.describe("Voice session child-process mode (Architecture A)", () => {
 
     await emitEvent(page, "voice-state", "speak");
     await expect(page.getByText(/speaking/i).first()).toBeVisible({ timeout: 5_000 });
+  });
+
+  test("Interrupt shows only while the pond speaks, and asks the child to stop speaking", async ({ page }) => {
+    await navigateToVoiceMode(page);
+    await emitEvent(page, "voice-ready", { session_id: "sess-int" });
+    const interrupt = page.getByRole("button", { name: "Interrupt" });
+
+    await emitEvent(page, "voice-state", "listen");
+    await expect(page.getByText(/listening/i).first()).toBeVisible({ timeout: 5_000 });
+    await expect(interrupt).toHaveCount(0);
+
+    await emitEvent(page, "voice-state", "speak");
+    await expect(interrupt).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByRole("button", { name: /stop session/i })).toBeVisible();
+
+    await interrupt.click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (window as unknown as { __invokedCommands__: string[] }).__invokedCommands__,
+        ),
+      )
+      .toContain("interrupt_voice_turn");
+    const invoked = await page.evaluate(
+      () => (window as unknown as { __invokedCommands__: string[] }).__invokedCommands__,
+    );
+    expect(invoked).not.toContain("stop_voice_session");
+
+    // The child reports where it went next; the control goes with the speech.
+    await emitEvent(page, "voice-state", "wait");
+    await expect(interrupt).toHaveCount(0);
   });
 
   test("voice-transcript renders user text in transcript feed", async ({ page }) => {

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   classifyLine,
   classifyEnd,
+  encodeCommand,
   sessionToJoin,
   STDERR_TAIL_LINES,
   type LineClass,
@@ -111,7 +112,7 @@ describe("classifyLine: the NDJSON to shell-event mapping", () => {
 describe("classifyLine: exit lines", () => {
   // The reason is held until stdout closes, then reported once as voice-session-ended.
   it("classifies exit as exit, never as an event", () => {
-    for (const reason of ["stdin_eof", "dismissed", "error"]) {
+    for (const reason of ["stopped", "stdin_eof", "dismissed", "error"]) {
       const r = classifyLine(`{"event":"exit","reason":"${reason}"}`);
       expect(r).toEqual({ ok: true, value: { kind: "exit", reason } });
     }
@@ -225,5 +226,21 @@ describe("sessionToJoin", () => {
     expect(sessionToJoin("", newId)).toBe(FRESH);
     expect(sessionToJoin("   ", newId)).toBe(FRESH);
     expect(sessionToJoin("\t\n", newId)).toBe(FRESH);
+  });
+});
+
+describe("encodeCommand", () => {
+  // Byte-exact: the child's parser (`parse_stdin_line` in pond-core) reads one object per line.
+  it("writes each command as exactly one JSON line", () => {
+    expect(encodeCommand("interrupt")).toBe('{"cmd":"interrupt"}\n');
+    expect(encodeCommand("stop")).toBe('{"cmd":"stop"}\n');
+  });
+
+  it("never embeds a newline before the terminator", () => {
+    for (const cmd of ["interrupt", "stop"] as const) {
+      const line = encodeCommand(cmd);
+      expect(line.indexOf("\n")).toBe(line.length - 1);
+      expect(JSON.parse(line)).toEqual({ cmd });
+    }
   });
 });

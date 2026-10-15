@@ -26,7 +26,7 @@ const CHILD_STATE_MAP: Record<string, "idle" | "wait" | "recording" | "thinking"
 // By reason, not code: a signal-killed child reports code=null with reason "crashed".
 
 function isCleanExit(code: number | null, reason: string): boolean {
-  if (reason === "stdin_eof" || reason === "dismissed") return true;
+  if (reason === "stopped" || reason === "stdin_eof" || reason === "dismissed") return true;
   return false;
 }
 
@@ -72,8 +72,10 @@ export interface VoiceSessionAPI {
   warmingUp: boolean;
   /** Start the persistent child-process session. Returns the session uuid. */
   startSession(): Promise<string | null>;
-  /** Close child stdin to request clean exit; kills after 3s if still alive. */
+  /** Ask the child to stop and release the mic; the shell kills it if still alive after 3s. */
   stopSession(): Promise<void>;
+  /** Cut off the reply being spoken; the turn is not saved and the child waits for the wake word. */
+  interruptTurn(): Promise<void>;
   /** Clear transcript and context cards. */
   clearConversation(): void;
   /** Live mic RMS level (0-1) during wait/recording; 0 otherwise. */
@@ -337,6 +339,17 @@ export function useVoiceSession(): VoiceSessionAPI {
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── interruptTurn ────────────────────────────────────────────────────────
+  // The child reports the state that follows (wait), so nothing is reset here.
+
+  const interruptTurn = useCallback(async (): Promise<void> => {
+    try {
+      await invoke("interrupt_voice_turn");
+    } catch {
+      // Non-fatal: the reply plays out and the turn completes as usual.
+    }
+  }, []);
+
   // ── clearConversation ─────────────────────────────────────────────────────
 
   const clearConversation = useCallback(() => {
@@ -345,5 +358,5 @@ export function useVoiceSession(): VoiceSessionAPI {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return { sessionActive, connecting,
-    warmingUp, startSession, stopSession, clearConversation, audioLevel };
+    warmingUp, startSession, stopSession, interruptTurn, clearConversation, audioLevel };
 }

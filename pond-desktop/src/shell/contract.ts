@@ -4,7 +4,9 @@
 /** How a voice session ended. Open set: the child formats it from a variable, so `reason`
  *  widens this union with `string` and the renderer must tolerate unknown values. */
 export type VoiceEndReason =
-  /** Stdin closed, which is the clean shutdown handshake. */
+  /** The child honoured the shell's `stop` command: the clean shutdown handshake. */
+  | "stopped"
+  /** Stdin closed with no `stop` before it; also clean. */
   | "stdin_eof"
   /** The child chose to end the session itself. */
   | "dismissed"
@@ -25,6 +27,8 @@ export interface ShellCommands {
   start_voice_session: { args: { sessionId: string | null }; result: string };
   /** Stop the voice child and release the microphone. */
   stop_voice_session: { args: void; result: void };
+  /** Stop the voice child speaking and end its turn, persisting nothing; ignored between turns. */
+  interrupt_voice_turn: { args: void; result: void };
   /** Open a URL in the real browser (`window.open` in the shell opens an in-app window). */
   open_external: { args: { url: string }; result: void };
   /** The running server's host credential, read fresh (it rotates at every server start). */
@@ -74,6 +78,7 @@ export const SHELL_COMMANDS = [
   "ensure_server_running",
   "start_voice_session",
   "stop_voice_session",
+  "interrupt_voice_turn",
   "open_external",
   "host_credential",
 ] as const satisfies readonly ShellCommand[];

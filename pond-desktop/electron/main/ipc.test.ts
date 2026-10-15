@@ -19,7 +19,7 @@ import { appOrigins } from "./navigation";
 const hostCredential = vi.fn(() => "credential");
 const targets = {
   server: { healthCheck: vi.fn(), ensureRunning: vi.fn() },
-  voice: { start: vi.fn(), stop: vi.fn() },
+  voice: { start: vi.fn(), stop: vi.fn(), interrupt: vi.fn() },
   hostCredential,
 } as unknown as IpcTargets;
 
@@ -75,6 +75,19 @@ describe("IPC sender check", () => {
     registerIpc(targets, appOrigins("http://localhost:1420"));
     await expect(call("host_credential", dev)).resolves.toBe("credential");
     await expect(call("host_credential", invokeFrom("http://localhost:1421/"))).rejects.toThrow(/refused/);
+  });
+
+  it("routes an interrupt to the voice child and nothing else", async () => {
+    registerIpc(targets, appOrigins(undefined));
+    await call("interrupt_voice_turn", invokeFrom("app://giap/index.html"));
+    expect(targets.voice.interrupt).toHaveBeenCalledTimes(1);
+    expect(targets.voice.stop).not.toHaveBeenCalled();
+  });
+
+  it("refuses an interrupt from a page that is not the app", async () => {
+    registerIpc(targets, appOrigins(undefined));
+    await expect(call("interrupt_voice_turn", invokeFrom("https://evil.example/"))).rejects.toThrow(/refused/);
+    expect(targets.voice.interrupt).not.toHaveBeenCalled();
   });
 
   it("still opens only http(s) URLs externally", async () => {
