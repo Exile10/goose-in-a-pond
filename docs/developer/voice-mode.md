@@ -96,7 +96,7 @@ someone changes it under Settings > Voice > Listening.
 | `energy_threshold` | 0.003 | `voice_kws_energy_threshold` | Below this, a window never reaches whisper. Raise if a noisy room keeps waking it. |
 | `silence_threshold` | 0.0025 | code | Below this counts as end-of-speech. **Raise it and quiet sentence endings get cut off.** |
 | `post_trigger_silence_ms` | 400 | `voice_kws_post_trigger_silence_ms` | Silence that ends the capture. Raise if it cuts you off mid-thought. |
-| `cooldown_ms` | 2000 | `voice_kws_cooldown_ms` | Settling time before detection arms. Its first window reaches back past the moment it armed, so this keeps the request just heard, or a reply's tail, from re-triggering it. The wake word does nothing during it, which also delays a wake-word interrupt at the start of every turn. |
+| `cooldown_ms` | 2000 | `voice_kws_cooldown_ms` | Settling time before detection arms. Windows never reach audio from before the detector opened, so the request just heard cannot re-trigger it, and the first window covers only the end of this time, by which a reply's tail still sounding when the detector opened has died away. The wake word does nothing during it, which also delays a wake-word interrupt at the start of every turn. |
 
 The detector's own defaults for the three settings-driven knobs are 0.010, 800
 and 600. They were retuned with the detector; the settings defaults were not, so
