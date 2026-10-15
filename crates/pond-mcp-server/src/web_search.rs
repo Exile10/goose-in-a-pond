@@ -1904,6 +1904,8 @@ mod tests {
 
     /// One real page, and what its copy must and must not carry.
     struct LivePage {
+        /// The frozen fixture's file name, without `.json`.
+        slug: &'static str,
         question: &'static str,
         title: &'static str,
         url: &'static str,
@@ -1915,11 +1917,15 @@ mod tests {
         absent: &'static [&'static str],
     }
 
-    /// Chosen for stability and shape: an encyclopedia article heavy with references, a Kenyan
-    /// institution's server-rendered page stating a constitutional fact, a 2017 news article
-    /// that has not moved since, and a government page inside a large header, menu and footer.
+    /// Ten real pages, one per shape a web question lands on: an encyclopedia article heavy
+    /// with references, one whose answer sits in its infobox, a Kenyan institution stating a
+    /// constitutional fact, a government fee table, a government FAQ, two news reports that
+    /// have not moved since 2017 and 2018, a government page inside a large header and footer,
+    /// a park's opening hours and a shop's price. All are server-rendered and read with the
+    /// pond's own user agent.
     const LIVE_PAGES: &[LivePage] = &[
         LivePage {
+            slug: "wikipedia-sgr",
             question: "How long is the railway from Mombasa to Nairobi, and when did it open?",
             title: "Mombasa–Nairobi Standard Gauge Railway",
             url: "https://en.wikipedia.org/wiki/Mombasa%E2%80%93Nairobi_Standard_Gauge_Railway",
@@ -1928,6 +1934,7 @@ mod tests {
             absent: &["Retrieved", "↑", "Railway Gazette", "BBC News"],
         },
         LivePage {
+            slug: "parliament-national-assembly",
             question: "How many elected members does Kenya's National Assembly have?",
             title: "The National Assembly",
             url: "https://www.parliament.go.ke/the-national-assembly",
@@ -1936,19 +1943,16 @@ mod tests {
             absent: &["Copyright", "All rights reserved"],
         },
         LivePage {
+            slug: "bbc-sgr-opening",
             question: "How much did the Mombasa to Nairobi railway cost?",
             title: "Kenya opens Nairobi-Mombasa Madaraka Express railway",
             url: "https://www.bbc.co.uk/news/world-africa-40092600",
             quoted: None,
             answer: "3.2bn",
-            absent: &[
-                "Skip to content",
-                "Accessibility Help",
-                "Most read",
-                "BBC Verify",
-            ],
+            absent: &["Skip to content", "Accessibility Help", "Most read", "BBC Verify"],
         },
         LivePage {
+            slug: "govuk-kenya-entry",
             question: "Do I need a visa to visit Kenya?",
             title: "Kenya travel advice: entry requirements",
             url: "https://www.gov.uk/foreign-travel-advice/kenya/entry-requirements",
@@ -1960,7 +1964,98 @@ mod tests {
                 "Crown copyright",
             ],
         },
+        LivePage {
+            slug: "kws-nairobi-national-park",
+            question: "What time does Nairobi National Park close?",
+            title: "Nairobi National Park",
+            url: "https://www.kws.go.ke/nairobi-national-park",
+            quoted: None,
+            answer: "6:00 PM",
+            absent: &[],
+        },
+        LivePage {
+            slug: "kenyatronics-iphone",
+            question: "How much is the iPhone 17 Pro Max 256GB in Kenya?",
+            title: "Apple iPhone 17 Pro Max 256GB",
+            url: "https://www.kenyatronics.com/view-product/apple-iphone-17-pro-max-256gb",
+            quoted: None,
+            answer: "161,9",
+            absent: &[],
+        },
+        LivePage {
+            slug: "standard-sgr-two-million",
+            question: "How many passengers has the Madaraka Express carried?",
+            title: "SGR train clocks 2 million passengers",
+            url: "https://www.standardmedia.co.ke/business/article/2001301441/madaraka-express-clocks-2-million-passengers",
+            quoted: None,
+            answer: "million",
+            absent: &["Download App", "Popular this week"],
+        },
+        LivePage {
+            slug: "immigration-passport-fees",
+            question: "How much does a 34-page Kenyan passport cost?",
+            title: "Passport types and fees",
+            url: "https://immigration.go.ke/type-and-fees/",
+            quoted: None,
+            answer: "7,550",
+            absent: &[],
+        },
+        LivePage {
+            slug: "immigration-faq",
+            question: "How long does it take to get a Kenyan passport after biometrics?",
+            title: "Frequently asked questions",
+            url: "https://immigration.go.ke/faqs/",
+            quoted: None,
+            answer: "Fourteen days",
+            absent: &[],
+        },
+        LivePage {
+            slug: "wikipedia-jkia",
+            question: "What is the elevation of Jomo Kenyatta International Airport?",
+            title: "Jomo Kenyatta International Airport",
+            url: "https://en.wikipedia.org/wiki/Jomo_Kenyatta_International_Airport",
+            quoted: None,
+            answer: "1,624",
+            absent: &["Retrieved", "↑"],
+        },
     ];
+
+    /// Freeze each live page's extracted blocks as a JSON fixture, so selection can be compared
+    /// offline: `FREEZE_TO=<dir> cargo test -p pond-mcp-server freeze_live_pages -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn freeze_live_pages() {
+        let dir = std::path::PathBuf::from(std::env::var("FREEZE_TO").expect("set FREEZE_TO"));
+        let fetched = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let client = page_client().expect("page client builds");
+        for page in LIVE_PAGES {
+            let hits = vec![hit(page.title, page.url, "")];
+            let pages = extract_off_thread(fetch_pages(client, &hits).await).await;
+            let blocks = pages[0].clone().unwrap_or_default();
+            let contains = blocks
+                .iter()
+                .any(|b| b.to_lowercase().contains(&page.answer.to_lowercase()));
+            eprintln!(
+                "{}: {} blocks, answer extracted: {contains}",
+                page.slug,
+                blocks.len()
+            );
+            let fixture = serde_json::json!({
+                "url": page.url,
+                "title": page.title,
+                "fetched": fetched,
+                "question": page.question,
+                "answer": page.answer,
+                "blocks": blocks,
+            });
+            let path = dir.join(format!("{}.json", page.slug));
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&fixture).unwrap() + "\n",
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
+    }
 
     /// Real pages, no key: the fetch, extract and rank half of the pipeline against the live web.
     /// `cargo test -p pond-mcp-server live_pages -- --ignored --nocapture`; `DUMP_BLOCKS=1` also
