@@ -1,9 +1,10 @@
-//! Lexical passage ranking: BM25 over candidate texts against a question, plus an answer-type
-//! boost. No model and no I/O, so a tool can choose which part of what it fetched answers the
-//! question it was asked.
+//! Lexical passage ranking: BM25 over candidate texts against a question, an answer-type
+//! boost, and reciprocal rank fusion of the two. No model and no I/O, so a tool can choose which
+//! part of what it fetched answers the question it was asked.
 //!
-//! A port of `_terms` and `_bm25` in `experiments/knowledge-tools/kt/variants.py` and of
-//! `stem` and `boosted` in `kt/rankers.py`, where the bench measured them. IDF is computed over
+//! A port of `_terms` and `_bm25` in `experiments/knowledge-tools/kt/variants.py`, of `stem`
+//! and `boosted` in `kt/rankers.py`, and of `rrf` in `kt/copies.py`, where the bench measured
+//! them. IDF is computed over
 //! the candidates given, so words every candidate shares (a page's own title, the search terms
 //! themselves) weigh little.
 
@@ -38,6 +39,9 @@ const K1: f64 = 1.2;
 
 /// BM25 length normalisation: 0 ignores passage length, 1 normalises fully.
 const B: f64 = 0.75;
+
+/// Reciprocal rank fusion's constant: how little a first place outweighs a second.
+const RRF_K: f64 = 60.0;
 
 /// Appended to a passage [`clip`] had to cut mid-sentence.
 const ELLIPSIS: &str = "\u{2026}";
@@ -82,10 +86,14 @@ pub struct Ranked {
     pub score: f64,
 }
 
-/// Every candidate, best first; equal scores keep candidate order. A question with no content
-/// words and no answer type scores every candidate 0, so the order is the candidates' own.
+/// Every candidate, best first, by reciprocal rank fusion of plain BM25 and the answer-type
+/// boosted score: a passage both rankings place high beats one only the boost lifts. Equal
+/// scores keep candidate order; a candidate neither ranking scored has score 0, so a question
+/// with no content words and no answer type leaves the candidates' own order.
 pub fn rank<S: AsRef<str>>(question: &str, candidates: &[S]) -> Vec<Ranked> {
-    let mut ranked: Vec<Ranked> = scores(question, candidates)
+    let plain = plain_scores(question, candidates);
+    let boosted = with_answer_types(question, candidates, plain.clone());
+    let mut ranked: Vec<Ranked> = fuse(&[&plain, &boosted])
         .into_iter()
         .enumerate()
         .map(|(index, score)| Ranked { index, score })
@@ -97,16 +105,28 @@ pub fn rank<S: AsRef<str>>(question: &str, candidates: &[S]) -> Vec<Ranked> {
 
 /// Each candidate's score, in candidate order: BM25, then the answer-type boost.
 pub fn scores<S: AsRef<str>>(question: &str, candidates: &[S]) -> Vec<f64> {
+    with_answer_types(question, candidates, plain_scores(question, candidates))
+}
+
+/// Each candidate's BM25 score alone, in candidate order.
+pub fn plain_scores<S: AsRef<str>>(question: &str, candidates: &[S]) -> Vec<f64> {
     let query = query_stems(question);
-    let mut scores = if query.is_empty() {
-        vec![0.0; candidates.len()]
-    } else {
-        let units: Vec<Vec<String>> = candidates
-            .iter()
-            .map(|c| terms(c.as_ref()).iter().map(|t| stem(t)).collect())
-            .collect();
-        bm25(&units, &query)
-    };
+    if query.is_empty() {
+        return vec![0.0; candidates.len()];
+    }
+    let units: Vec<Vec<String>> = candidates
+        .iter()
+        .map(|c| terms(c.as_ref()).iter().map(|t| stem(t)).collect())
+        .collect();
+    bm25(&units, &query)
+}
+
+/// `scores` plus the top score for every answer type the question has and the candidate shows.
+fn with_answer_types<S: AsRef<str>>(
+    question: &str,
+    candidates: &[S],
+    mut scores: Vec<f64>,
+) -> Vec<f64> {
     let max = scores.iter().copied().fold(0.0_f64, f64::max);
     // Every score 0 boosts by 1, as the prototype does.
     let top = if max > 0.0 { max } else { 1.0 };
@@ -121,6 +141,21 @@ pub fn scores<S: AsRef<str>>(question: &str, candidates: &[S]) -> Vec<f64> {
         }
     }
     scores
+}
+
+/// Reciprocal rank fusion: each ranking adds `1 / (RRF_K + rank)` to every candidate it scored
+/// above zero (ranks from 1, ties in candidate order). A candidate no ranking scored stays at 0.
+fn fuse(rankings: &[&[f64]]) -> Vec<f64> {
+    let n = rankings.first().map_or(0, |r| r.len());
+    let mut fused = vec![0.0; n];
+    for scores in rankings {
+        let mut order: Vec<usize> = (0..n).filter(|&i| scores[i] > 0.0).collect();
+        order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+        for (position, index) in order.into_iter().enumerate() {
+            fused[index] += 1.0 / (RRF_K + position as f64 + 1.0);
+        }
+    }
+    fused
 }
 
 /// The question's distinct stems, in the order they first appear.
@@ -283,8 +318,10 @@ mod tests {
         words.iter().map(|w| w.to_string()).collect()
     }
 
+    /// The candidate the boosted score alone puts first; ties go to the earlier one.
     fn first(question: &str, candidates: &[&str]) -> usize {
-        rank(question, candidates)[0].index
+        let s = scores(question, candidates);
+        (0..s.len()).fold(0, |best, i| if s[i] > s[best] { i } else { best })
     }
 
     #[test]
@@ -376,13 +413,47 @@ mod tests {
         }
     }
 
-    /// BM25 with this module's stemmer and no answer-type boost.
     fn plain(question: &str, candidates: &[&str]) -> Vec<f64> {
-        let units: Vec<Vec<String>> = candidates
-            .iter()
-            .map(|c| terms(c).iter().map(|t| stem(t)).collect())
-            .collect();
-        bm25(&units, &query_stems(question))
+        plain_scores(question, candidates)
+    }
+
+    /// Numbers from the prototype's `rrf` in `kt/copies.py` on the same input, run with python3.
+    #[test]
+    fn the_fused_ranking_matches_the_prototype() {
+        let candidates = [
+            "Junction Mall is a shopping centre on Ngong Road in Nairobi.",
+            "Opening hours: Monday to Sunday, 9am to 9pm.",
+            "The mall opened in 2004 and was expanded in 2019.",
+            "Free parking for shoppers.",
+        ];
+        let ranked = rank("What time does Junction Mall open?", &candidates);
+        let got: Vec<(usize, f64)> = ranked.iter().map(|r| (r.index, r.score)).collect();
+        let want = [
+            (0, 0.032_522_474_881_015_34),
+            (1, 0.032_266_458_495_966_696),
+            (2, 0.032_002_048_131_080_39),
+            (3, 0.0),
+        ];
+        for ((gi, gs), (wi, ws)) in got.iter().zip(want) {
+            assert_eq!(*gi, wi, "{got:?}");
+            assert!((gs - ws).abs() < 1e-15, "{got:?}");
+        }
+    }
+
+    #[test]
+    fn fusion_adds_each_rankings_reciprocal_rank() {
+        // 0: high in BM25, unboosted; 1: low in BM25, boosted to the top; 2: second in both.
+        let plain = [3.0, 1.0, 2.0, 0.0];
+        let boosted = [3.0, 4.0, 3.5, 0.0];
+        let fused = fuse(&[&plain, &boosted]);
+        let expect = |ranks: &[f64]| ranks.iter().map(|r| 1.0 / (RRF_K + r)).sum::<f64>();
+        assert!((fused[0] - expect(&[1.0, 3.0])).abs() < 1e-15);
+        assert!((fused[1] - expect(&[3.0, 1.0])).abs() < 1e-15);
+        assert!((fused[2] - expect(&[2.0, 2.0])).abs() < 1e-15);
+        assert_eq!(
+            fused[3], 0.0,
+            "a candidate neither ranking scored stays out"
+        );
     }
 
     /// Plain BM25 picks the first candidate and the boost picks the second: the pair decides.
