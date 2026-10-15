@@ -45,6 +45,9 @@ sysinfo      = "0.38"
 # which the protocol carries base64-encoded.
 base64       = { workspace = true }
 notify-rust  = "4"
+# search_web: fetch pages concurrently in one task, and read them.
+futures      = { workspace = true }
+scraper      = { workspace = true }
 
 [dev-dependencies]
 pond-core = { path = "../pond-core", features = ["test-mocks"] }

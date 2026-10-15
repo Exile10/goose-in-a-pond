@@ -969,7 +969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_tools_are_actually_exposed_by_the_server() {
+    async fn every_composed_tool_is_actually_exposed_by_the_server() {
         use rmcp::handler::server::ServerHandler;
         let server = KnowledgeMcpServer::new(crate::build_http_client());
         let listed = server
@@ -980,9 +980,14 @@ mod tests {
 
         // Wolfram's #[tool_router] is composed in `new()`; losing that would still compile.
         assert!(names.contains(&"compute_answer"), "got: {names:?}");
-        // And the ones this file's sibling owns are still there.
+        // And the ones this file's siblings own are still there.
         assert!(names.contains(&"get_wikipedia_article"), "got: {names:?}");
-        assert_eq!(names.len(), 2, "giap-knowledge serves two tools: {names:?}");
+        assert!(names.contains(&"search_web"), "got: {names:?}");
+        assert_eq!(
+            names.len(),
+            3,
+            "giap-knowledge serves three tools: {names:?}"
+        );
     }
 
     #[tokio::test]

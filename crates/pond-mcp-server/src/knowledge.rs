@@ -1,4 +1,5 @@
-//! Knowledge MCP server: Wikipedia lookup, plus the Wolfram tools from [`crate::wolfram`].
+//! Knowledge MCP server: Wikipedia lookup, plus the Wolfram tool from [`crate::wolfram`] and web
+//! search from [`crate::web_search`].
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -67,18 +68,21 @@ pub struct KnowledgeMcpServer {
 
 #[tool_router]
 impl KnowledgeMcpServer {
-    /// Every tool from BOTH routers, without constructing the server or its deps.
+    /// Every tool from all three routers, without constructing the server or its deps.
     pub(crate) fn tool_defs() -> Vec<rmcp::model::Tool> {
         let mut tools = Self::tool_router().list_all();
         tools.extend(Self::wolfram_tool_router().list_all());
+        tools.extend(Self::web_search_tool_router().list_all());
         tools
     }
 
     pub fn new(http_client: reqwest::Client) -> Self {
         Self {
             http_client,
-            // One extension, two routers: the Wolfram tools live in `wolfram.rs`.
-            tool_router: Self::tool_router() + Self::wolfram_tool_router(),
+            // One extension, three routers: `wolfram.rs` and `web_search.rs` hold the others.
+            tool_router: Self::tool_router()
+                + Self::wolfram_tool_router()
+                + Self::web_search_tool_router(),
         }
     }
 
@@ -140,7 +144,7 @@ verbatim.")]
 }
 
 // `router = self.tool_router` is load-bearing: the default is this impl block's router
-// alone, which would drop the composed Wolfram tools from `list_tools`.
+// alone, which would drop the composed Wolfram and web search tools from `list_tools`.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KnowledgeMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -156,14 +160,16 @@ impl ServerHandler for KnowledgeMcpServer {
 
 /// Every tool these instructions name must be one this server lists.
 const KNOWLEDGE_INSTRUCTIONS: &str = "\
-GIAP Knowledge server: encyclopedia articles and computation.
+GIAP Knowledge server: encyclopedia articles, computation and web search.
 
-Tools: get_wikipedia_article (encyclopedia articles), compute_answer (computation).
+Tools: get_wikipedia_article (encyclopedia articles), compute_answer (computation), \
+search_web (the web; offered while a web search key is stored).
 
 If the answer has to be worked out (arithmetic, a unit or currency conversion, a date \
 difference, a statistic), use compute_answer. If it has to be read (who someone was, what \
 happened, what a place is like), use get_wikipedia_article; it auto-searches when the title is \
-not exact.
+not exact. If it is current, local or specific (news, opening hours, prices, products, \
+businesses, recent results), use search_web.
 After receiving results: synthesize in your own words. Do not parrot verbatim.
 In voice mode: 1-3 sentences. Offer to elaborate if the user wants more.";
 
