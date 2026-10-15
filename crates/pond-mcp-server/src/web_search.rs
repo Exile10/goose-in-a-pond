@@ -125,6 +125,14 @@ static UNLIKELY_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("the unlikely-candidate pattern")
 });
+// Beyond Readability: the "most popular" and "trending" rails news sites hang beside an article.
+// Readability ranks whole containers, so a rail rarely wins there; here every block is a
+// candidate, and the Standard's `popularstr-div` headline reached the copy once four passages a
+// page were allowed. Same test, same exemptions.
+static UNLIKELY_RAIL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)popular|trending|most-?read|most-?viewed|recommended")
+        .expect("the rail pattern")
+});
 static MAYBE_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)and|article|body|column|content|main|shadow")
         .expect("the maybe-candidate pattern")
@@ -701,7 +709,8 @@ fn is_boilerplate(element: &scraper::node::Element, class_test: bool) -> bool {
     if name == "a" || !class_test {
         return false;
     }
-    UNLIKELY_CANDIDATE.is_match(&marks) && !MAYBE_CANDIDATE.is_match(&marks)
+    (UNLIKELY_CANDIDATE.is_match(&marks) || UNLIKELY_RAIL.is_match(&marks))
+        && !MAYBE_CANDIDATE.is_match(&marks)
 }
 
 /// Text blocks as the walk finds them. A block nested in another ends the outer one's current
@@ -1946,6 +1955,38 @@ mod tests {
         let result = server.call_tool(params, ctx).await.unwrap();
         let copy = text_of(&result, 0);
         assert!(copy.contains("Web search is not set up"), "{copy}");
+    }
+
+    /// A news site's "popular this week" rail is furniture, not the article. The article is long
+    /// enough (over 500 chars) that the walk keeps the class test rather than retrying without it.
+    #[test]
+    fn a_popular_stories_rail_is_not_quoted() {
+        let html = r#"<html><body><article>
+            <p>The Madaraka Express ferried its two-millionth passenger this week, the operator said.</p>
+            <p>Passenger numbers have grown every quarter since the service began between Mombasa and
+            Nairobi, with the inter-county train carrying most of the traffic on weekdays.</p>
+            <p>The operator plans to add coaches over the holidays, when demand peaks, and says the
+            freight service now moves most of the containers that leave the port by land.</p>
+            <p>Fares are unchanged for the coming year, and tickets can be booked by phone or at the
+            terminus, which opens an hour before the first departure each morning.</p>
+            </article>
+            <ul class="list-group popularstr-div"><li><h3>Popular this week</h3>
+            <p>Kenya's Sh5.2bn drug plant opens its doors to the first patients in Kisumu county.</p></li></ul>
+            <div class="trending-rail"><p>A trending story that has nothing to do with the railway at all.</p></div>
+            </body></html>"#;
+        let blocks = extract_blocks(html);
+        assert!(
+            blocks.iter().any(|b| b.contains("two-millionth")),
+            "{blocks:?}"
+        );
+        assert!(
+            !blocks.iter().any(|b| b.contains("drug plant")),
+            "{blocks:?}"
+        );
+        assert!(
+            !blocks.iter().any(|b| b.contains("trending story")),
+            "{blocks:?}"
+        );
     }
 
     /// Run by hand with a real key: `BRAVE_SEARCH_API_KEY=... cargo test -p pond-mcp-server
