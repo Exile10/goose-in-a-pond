@@ -489,8 +489,11 @@ arguments. *Recommendation:* rename in one step, with both UIs updated in the sa
 
 ## 8. Web search (`search_web`), the first tool built on these rules
 
-**Status:** contract, 2026-10-15. Jerry chose the backend: **Brave Search API, with the
-household's own key**, settable from the desktop and from Goose on the Go. `search_web`
+**Status:** built 2026-10-15 on `feat/web-search`, not merged, not run on the Orin, not run
+against Brave with a real key. Jerry chose the backend: **Brave Search API, with the
+household's own key**, settable from the desktop and from Goose on the Go (its PR:
+jarida-io/goose-on-the-go#130). §8.8 records what was built where the contract below was
+amended, and what is still open. `search_web`
 searches, then fetches the top result pages, extracts their readable text, and feeds the
 model the passages that answer the question.
 
@@ -709,3 +712,54 @@ not. Neither model invented an answer in any arm: given results without the answ
 so. The caveat is the size of the evidence. Six synthetic cases, written by the same hand
 that wrote the boost patterns, make 6/6 an upper bound. The live-tool re-run in §8.6 is the
 real test.
+
+### 8.8 As built, and what is still open
+
+**Where the build differs from §8.3:**
+
+- **Ranking.** The ranker fuses plain and boosted BM25 by reciprocal rank (k = 60). When two or
+  fewer pages were read, it quotes up to four passages a page within 2,400 bytes; otherwise
+  two a page within 1,800.
+- **Extraction.** It ports Mozilla Readability's unlikely-candidate rule, with its retry
+  without the class test when a page yields under 500 characters, and adds:
+  - a "most popular / trending" rail pattern;
+  - drops for `cite`, `sup`, reference lists and navboxes, and the
+    navigation/contentinfo/complementary/endnote roles;
+  - table rows kept whole, so infobox rows survive;
+  - headings prefixed onto the blocks under them;
+  - long blocks split into runs of whole sentences.
+- **Stemmer.** It also drops a trailing `e` ("close" and "closing" meet), and "how long",
+  "distance" and "length" count as number questions.
+
+**Measured on ten real pages** (frozen in `fixtures/web/real/`, chosen before tuning; the answer
+is in every page's extracted text):
+
+- The answer reaches the model's copy on **6 of 10**, against 5 before the last iteration.
+- No citation, menu, rail or footer text reaches the copy.
+- The misses:
+  - two infobox rows ("Line length 472.3 km", an elevation) that share no word with the
+    question;
+  - two answer sentences, on GOV.UK and the BBC, that share almost none.
+- More misses sat in the extractor, on pages dropped while choosing the set: a 26-character
+  opening-hours paragraph under the 40-character rule, text in plain `div`s, and a Bootstrap
+  `media-block` that Readability's "media" pattern drops.
+- The synthetic six stay at 6 of 6, and the Wikipedia seventeen go from 10 to 13.
+
+**Found on the way, now fixed:**
+
+- The voice child (`chat --voice --json-events`) never installed a secret store, so every
+  keyed tool was keyless in voice. `run_chat` now installs a read-only one, which also turns
+  Wolfram on in voice for a pond with an AppID.
+- `enable_tool_group` could have widened a withheld tool back in. It cannot now.
+
+**Open, each recorded rather than engineered around:**
+
+| item | what | whose |
+|---|---|---|
+| History keeps results | Brave §3(b)(i) allows only transient storage of Search Results; chat history persists the tool message. Where pages were read, that message carries the pages' own text, not Brave's. | Jerry |
+| Guests can spend the allowance | `giap-knowledge` is not on the guest denylist, so a guest's question can spend the household's Brave credit. | Jerry |
+| 429 means two things | Brave answers 429 for a per-second burst as well as a spent quota; both show "used up". | follow-up |
+| The environment wins | The secret store reads the environment first, so an exported `BRAVE_SEARCH_API_KEY` turns the tool on, and `DELETE` cannot turn it off. | follow-up |
+| The direct dispatcher | On the mistral.rs backend (off by default) and the quarantined pond-agent, `convert_rmcp_result` joins every text block, so the card reaches the model and there is no per-turn key gate. | follow-up |
+| Status is per process | `rejected`/`quota` learned by the voice child never reach the serve process's `GET`; a restart reports a stored key `ok`. | follow-up |
+| Live Brave | The `#[ignore]` test `live_brave_search_answers_a_local_question` needs a household key; no run has spent a real search. | Jerry, with a key |
