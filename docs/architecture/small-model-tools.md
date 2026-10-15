@@ -484,3 +484,167 @@ choosing. Thinking-off E2B should not be presented as a model that looks things 
 **D7. Rename without aliases.** Nothing outside the pond calls the knowledge tools by name:
 the desktop matches them for labels and cards, and the dispatcher only describes their
 arguments. *Recommendation:* rename in one step, with both UIs updated in the same commit.
+
+---
+
+## 8. Web search (`search_web`), the first tool built on these rules
+
+**Status:** contract, 2026-10-15. Jerry chose the backend: **Brave Search API, with the
+household's own key**, settable from the desktop and from Goose on the Go. `search_web`
+searches, then fetches the top result pages, extracts their readable text, and feeds the
+model the passages that answer the question.
+
+### 8.1 Why Brave, and why not DuckDuckGo
+
+Primary sources, read 2026-10-15:
+
+| backend | why not, or why |
+|---|---|
+| **DuckDuckGo** | No web search API exists. The Instant Answer API returns abstracts and definitions: asked "what time does junction mall close" it returned nothing at all. Its own API page (an archived copy, found through search) says it "is not a full search results API" because DuckDuckGo "does not have the rights to fully syndicate" its results. The only route to real results is scraping its HTML pages, outside its authorised use and brittle against its rate limiting. Possible later as an opt-in backend, by Jerry's decision only. |
+| Google Custom Search JSON API | Closed to new customers; shuts down 2027-01-01. |
+| Tavily | §9.2 takes a "perpetual, and irrevocable license" to store and use every query. |
+| Mojeek | AI use explicitly allowed, £2 per 1,000, no free tier; a later backend behind the same port. |
+| SearXNG run by the pond | No key, but scrapes Google/Bing/DuckDuckGo against their terms, and costs RAM the Orin does not have. |
+| **Brave** | $5 per 1,000 searches, with $5 of free credit a month (about 1,000 searches). A card confirms identity. The household is the customer, which is what Brave's terms permit (§4(a): a key is not shared outside the customer's own contractors; §3(b)(iii): the API is not made available to third parties). |
+
+**Brave terms that bind the implementation:**
+
+- §3(b)(i): no storing or caching Search Results beyond transient use. Nothing is cached to
+  disk.
+- §3(b)(xiii): Search Results may not be used to evaluate or benchmark models. The bench uses
+  hand-written fixtures for web cases, never Brave output.
+- §3(b)(xii): no redistribution of results.
+- §4(d): attribution is optional, and if shown it must read "POWERED BY BRAVE" with the logo.
+
+**One conflict is Jerry's to settle.** Chat history persists tool results. Where pages were
+fetched, the model's copy carries the pages' own text (third-party content, not Brave's), plus
+titles and domains. Brave descriptions appear only when a page could not be read.
+
+### 8.2 The tool
+
+```text
+name:        giap-knowledge__search_web
+description: Search the web for anything current, local or specific that the encyclopedia
+             will not have: news, opening hours, prices, products, businesses, recent results.
+question:    string, REQUIRED. "The user's question, in their own words."
+```
+
+The `extra` catch-all absorbs `query`/`q`/`topic`. The tool is **offered only while a key is
+stored**. `giap-knowledge` always lists it, so no Goose or GIAP tool cache ever goes stale.
+The per-turn allow-set drops `giap-knowledge__search_web` when `BRAVE_SEARCH_API_KEY` is
+absent. The requirement table is policy in `pond-core` (`tool_group.rs`); the secret check is
+mechanism in `pond-mcp-server`. A key pasted on the phone puts the tool in the next turn's
+prompt with no restart. The handler re-checks the key at call time, which covers the race.
+
+### 8.3 Pipeline
+
+1. **Search.** `GET https://api.search.brave.com/res/v1/web/search`:
+   - parameters `q=<question>`, `count=8`, `extra_snippets=true`, `safesearch=moderate`,
+     `text_decorations=false`;
+   - headers `X-Subscription-Token: <key>`, `Accept: application/json`;
+   - 6 s timeout;
+   - `country` is not sent: Kenya is not a documented value.
+2. **Fetch.** The top 3 `http(s)` results are fetched concurrently:
+   - 5 s per page and a 7 s deadline overall;
+   - 1.5 MB cap, `text/html` only, at most 3 redirects;
+   - every URL and redirect hop goes through `check_egress`, so `allowlist` and `offline` modes
+     are honoured, and a refused page falls back to its snippets silently.
+3. **Guard.** Page fetches use a client whose DNS resolver refuses every non-public address:
+   - loopback, private, link-local, CGNAT, unique-local, multicast, unspecified;
+   - IPv4-mapped IPv6 forms of all of those;
+   - IP-literal URLs in those ranges as well.
+
+   A search result must never be able to make the pond read its own API, the Matter server or
+   the household's router. Brave's own host uses the ordinary client.
+4. **Extract.** HTML is parsed with `scraper`, a new workspace dependency:
+   - drop `script`, `style`, `noscript`, `template`, `svg`, `iframe`, `nav`, `header`,
+     `footer`, `aside`, `form` and `[aria-hidden=true]`;
+   - keep text blocks from `p`, `li`, `h1`–`h4`, `td`, `th`, `blockquote`, `pre`, `dd`;
+   - collapse whitespace, and drop non-heading blocks under 40 chars.
+5. **Rank.** The candidates are page blocks plus Brave's `description` and `extra_snippets`.
+   They are scored with BM25 against the full question: light stemming, IDF over the
+   candidates. This is the same ranker `look_up` will use; it is pure, so it lives in
+   `pond-core`.
+   - Take the best passages up to about 1,800 bytes, at most 2 per source.
+   - A source whose page was read contributes page text, not Brave's description.
+6. **Model's copy, plain text, no URLs, no Markdown:**
+
+   ```text
+   Web results for: <question>
+   <Title> (<domain>[, <age>])
+   <passage>
+   <passage>
+   <Title> (<domain>)
+   <passage>
+   ```
+
+7. **Card.** The card goes in a separate content block annotated `audience: ["user"]` (Goose
+   drops those before the provider). It carries the `[[[mcp-ui:search:{...}]]]` marker with
+   `{query, results: [{title, url, domain, snippet}]}`. The SSE layer finds the marker in any
+   block, not only the first.
+8. **Misses** go through `format.rs`, naming real tools only:
+
+   | condition | what the model is told |
+   |---|---|
+   | no results | `format_no_results`, offering `look_up` |
+   | 401/403 | "the web search key was rejected", and the settings status is set to `rejected` |
+   | 402/429 | "this month's web search allowance is used up" (`quota`) |
+   | network failure | `format_api_error` |
+   | key removed mid-turn | `format_dead_end` |
+
+9. **Egress.** `api.search.brave.com` joins `KNOWN_PUBLIC_SUFFIXES`. Page hosts classify as
+   they do today. Each request is recorded through `traced_get_with`, attributed to
+   `search_web`.
+
+### 8.4 HTTP contract (both apps use only this)
+
+All three routes require a token, like `/secrets`, and none returns the key.
+
+| route | does | answers |
+|---|---|---|
+| `GET /api/v1/web-search` | report state | `{"provider": "brave", "configured": bool, "status": "ok" \| "not_configured" \| "rejected" \| "quota" \| "unverified"}` |
+| `PUT /api/v1/web-search/key` `{"key": "..."}` | validate with ONE Brave request (`q=test`, `count=1`), then store as `BRAVE_SEARCH_API_KEY` | 200 `{"configured": true, "status": "ok"}`; 422 `{"error": "Brave did not accept this key."}` on 401/403, nothing stored; 200 `"quota"` when the key is valid but spent; 200 `"unverified"` when Brave could not be reached (stored, checked on first use) |
+| `DELETE /api/v1/web-search/key` | remove the key | 204 |
+
+### 8.5 What each app shows
+
+The same content in every surface. On the desktop it is one shared `connections/WebSearchPanel`,
+mounted wherever `ConnectionsPanel` already is: classic `sections/Context.tsx` and hub
+`hub/views/settings/Connections.tsx`, so there is one form. On Goose on the Go it is a new
+screen under Profile → Integrations.
+
+- **A status line:**
+
+  | status | shows |
+  |---|---|
+  | `ok` | "On, searching with Brave" |
+  | `not_configured` | "Off" |
+  | `rejected` | "Brave did not accept the key" |
+  | `quota` | "This month's free searches are used up" |
+  | `unverified` | "Saved, not yet checked" |
+
+- **A masked, write-only key field** with Save, and Remove when a key is stored. The key is
+  never read back.
+- **Help text:** "Get a free key at api-dashboard.search.brave.com. The free monthly credit
+  covers about 1,000 searches. Brave asks for a card to confirm who you are." The URL is a
+  link.
+- **The privacy line, always visible:** "When the pond searches the web, your question is
+  sent to Brave, and the top pages are read from their sites."
+
+### 8.6 Tests and gates
+
+- Unit tests:
+  - the resolver guard (every refused range, mapped forms, an IP literal, a redirect to
+    loopback);
+  - the extractor, on hand-written HTML: boilerplate dropped, blocks kept;
+  - the ranker;
+  - the result formatter (no URL, no Markdown, budget held);
+  - each Brave status mapping, against a stub server;
+  - the per-turn gate: no key, no tool; a key, the tool; removing it drops it again;
+  - the agent-visible projection of a result: no `mcp-ui`.
+- The three routes against a stub Brave.
+- `scripts/live-test.sh`, since the change adds routes.
+- An `#[ignore]` live test against Brave, run by hand with a real key.
+- Bench E6 (section 2): web-needing cases routed in `all` mode with `search_web` beside
+  `look_up` and `calculate`. Does it get called when needed, and does it steal encyclopedia
+  questions from `look_up`?
