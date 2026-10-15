@@ -4860,6 +4860,11 @@ async fn run_chat(
         )),
         pond_api::musickit::managed_url(),
     );
+    // The keys the builtin tools need (web search, Wolfram): read per call from the file the serve
+    // process writes, so a key saved from either app reaches this process's next turn.
+    pond_mcp_server::init_secret_deps(Arc::new(
+        pond_infra::file_secret_repository::ReadOnlySecretStore::new(&data_dir),
+    ));
 
     // Before any ONNX init (else ORT_DYLIB_PATH is unset and Piper::new() hangs), and after the
     // egress mode install, since it may download ~100 MB.

@@ -2,7 +2,7 @@
 //! prefix, so any move costs a full re-prefill. Sizes are the RAW pre-minify router form,
 //! since this crate must not depend on `pond-adapters-goose`; don't quote them as prompt cost.
 
-use pond_core::mcp::domain::tool_group::prefix_sort_key;
+use pond_core::mcp::domain::tool_group::{prefix_sort_key, required_secret};
 use rmcp::model::Tool;
 
 /// Every tool GIAP can offer, from the real routers, unordered (see [`ordered_tools`]).
@@ -85,6 +85,15 @@ pub fn ordered_tools(groups: &[&str]) -> Vec<PrefixEntry> {
         .collect()
 }
 
+/// [`ordered_tools`] as a turn offers them with no secret stored: a tool that needs one is
+/// withheld from the allow-set, so it is not in the prefix.
+pub fn ordered_keyless_tools(groups: &[&str]) -> Vec<PrefixEntry> {
+    ordered_tools(groups)
+        .into_iter()
+        .filter(|e| required_secret(&e.name).is_none())
+        .collect()
+}
+
 pub fn total_bytes(entries: &[PrefixEntry]) -> usize {
     entries.iter().map(|e| e.bytes).sum()
 }
@@ -106,10 +115,11 @@ mod tests {
         "giap-toolkit",
     ];
 
-    /// The fixture. Regenerate deliberately: a change means the next cold turn re-prefills.
+    /// The fixture: a default install, which stores no key. Regenerate deliberately: a change
+    /// means the next cold turn re-prefills.
     #[test]
     fn the_default_tool_prefix_is_unchanged() {
-        let entries = ordered_tools(DEFAULT_GROUPS);
+        let entries = ordered_keyless_tools(DEFAULT_GROUPS);
         let rendered: Vec<String> = entries
             .iter()
             .map(|e| format!("{} {}", e.bytes, e.name))
@@ -152,6 +162,38 @@ mod tests {
         );
 
         assert_eq!(entries.len(), 27, "tool count moved");
+    }
+
+    /// Storing the web search key adds one schema inside `giap-knowledge`: the prefix moves from
+    /// there on, once, and the core block and everything sorting before it stay byte-identical.
+    #[test]
+    fn storing_the_web_search_key_moves_the_prefix_only_from_search_web_on() {
+        let keyless = ordered_keyless_tools(DEFAULT_GROUPS);
+        let keyed = ordered_tools(DEFAULT_GROUPS);
+        assert_eq!(keyed.len(), keyless.len() + 1);
+        let at = keyed
+            .iter()
+            .position(|e| e.name == "giap-knowledge__search_web")
+            .expect("search_web is in the keyed block");
+        let shared = keyed
+            .iter()
+            .zip(&keyless)
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert_eq!(shared, at, "the prefix must hold up to search_web");
+        assert!(
+            keyed
+                .iter()
+                .take_while(|e| prefix_sort_key(&e.name).0 == 0)
+                .count()
+                <= at,
+            "search_web must sort after the core block"
+        );
+        let total = total_bytes(&keyed);
+        assert_eq!(
+            total, 13_958,
+            "the keyed tool block is now {total} raw bytes, was 13,958"
+        );
     }
 
     #[test]
