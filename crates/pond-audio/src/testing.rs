@@ -170,6 +170,43 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_started_back_delivers_audio_from_before_it_existed() {
+        // A ramp, so each sample names its own position in the script.
+        let script: Vec<f32> = (0..32_000).map(|i| i as f32 / 32_000.0).collect();
+        let (h, join) = spawn(
+            Box::new(ScriptedCapture::new(script, 20)),
+            16_000,
+            5_000,
+            true,
+        );
+        h.open();
+        settle(&h, |s| s.is_open());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let written = h.shared().written();
+        let back = 1_600;
+        let mut reader = MicReader::starting_back(h.shared().clone(), back);
+        let got = reader.drain();
+        let first = (got[0] * 32_000.0).round() as u64;
+        assert!(
+            first + back as u64 <= written + 320,
+            "must open {back} samples back; opened at {first} with {written} written"
+        );
+        assert!(first < written, "the pre-roll is missing");
+        assert_eq!(reader.dropped(), 0);
+
+        let mut greedy = MicReader::starting_back(h.shared().clone(), usize::MAX);
+        assert_eq!(
+            (greedy.drain()[0] * 32_000.0).round() as u64,
+            0,
+            "asking for more than is held starts at the oldest sample, not past it"
+        );
+
+        h.shutdown();
+        let _ = join.join();
+    }
+
+    #[test]
     fn draining_twice_does_not_repeat_audio() {
         let (h, join) = spawn(
             Box::new(ScriptedCapture::utterance(400, 100, 20)),

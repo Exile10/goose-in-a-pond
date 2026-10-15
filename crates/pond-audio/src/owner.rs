@@ -134,7 +134,15 @@ pub struct MicReader {
 impl MicReader {
     /// Begin reading from now, so a new capture never opens with the previous turn's tail.
     pub fn new(shared: Arc<MicShared>) -> Self {
-        let cursor = shared.written();
+        Self::starting_back(shared, 0)
+    }
+
+    /// Begin `back` samples before now, for speech already under way; never past what is held.
+    pub fn starting_back(shared: Arc<MicShared>, back: usize) -> Self {
+        let cursor = {
+            let ring = shared.ring.lock().unwrap_or_else(|e| e.into_inner());
+            ring.written() - back.min(ring.len()) as u64
+        };
         Self {
             shared,
             cursor,

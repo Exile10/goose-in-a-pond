@@ -1,6 +1,8 @@
 //! Barge-in detection, fed by whatever owns the mic (never the TTS port). Debounced so a cough
 //! or echo can't cut a reply; latched so a torn-down turn isn't torn down twice.
 
+use std::time::{Duration, Instant};
+
 /// Recent mic level; `None` (mic closed or disabled) must stay distinct from `Some(0.0)`.
 pub trait SpeechEnergy: Send + Sync {
     fn recent_rms(&self, window_ms: u64) -> Option<f32>;
@@ -8,6 +10,12 @@ pub trait SpeechEnergy: Send + Sync {
     /// Permanently no mic (unlike a momentary `None`), so a turn can skip the barge-in poll.
     fn is_inert(&self) -> bool {
         false
+    }
+
+    /// Keep the mic capturing while the hold lives, opening it if nobody else has.
+    /// Barge-in needs this: with no wake-word detector running, nothing else listens mid-reply.
+    fn hold_mic(&self) -> MicHold {
+        MicHold::none()
     }
 }
 
@@ -24,6 +32,34 @@ impl SpeechEnergy for NoEnergy {
     }
 }
 
+/// A claim on the microphone, released on drop.
+pub struct MicHold(Option<Box<dyn FnOnce() + Send>>);
+
+impl MicHold {
+    pub fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(release)))
+    }
+
+    /// A hold with nothing to release.
+    pub fn none() -> Self {
+        Self(None)
+    }
+}
+
+impl Drop for MicHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for MicHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("MicHold").field(&self.0.is_some()).finish()
+    }
+}
+
 /// How often the turn samples the level while speaking.
 pub const POLL_MS: u64 = 100;
 /// How much recent audio each sample covers.
@@ -32,6 +68,9 @@ pub const WINDOW_MS: u64 = 100;
 pub const THRESHOLD_WHILE_SPEAKING: f32 = 0.15;
 /// Loud windows needed in a row: ~300 ms at [`POLL_MS`], enough to reject a cough.
 pub const CONSECUTIVE_WINDOWS: u32 = 3;
+/// Audio the follow-up capture keeps from before the first loud window: the threshold is set
+/// above the reply's echo, so a softly spoken first syllable sits under it.
+pub const ONSET_PRE_ROLL_MS: u64 = 200;
 
 /// Debounced, latching barge-in detector.
 #[derive(Debug, Clone)]
@@ -40,6 +79,8 @@ pub struct BargeIn {
     required: u32,
     seen: u32,
     fired: bool,
+    /// Start of the current loud run's first window.
+    run_began: Option<Instant>,
 }
 
 impl BargeIn {
@@ -49,6 +90,7 @@ impl BargeIn {
             required,
             seen: 0,
             fired: false,
+            run_began: None,
         }
     }
 
@@ -58,24 +100,35 @@ impl BargeIn {
 
     /// Feed one window's level; true exactly once, on the window that confirms the interruption.
     pub fn on_rms(&mut self, rms: f32) -> bool {
+        self.on_window(rms, Instant::now()).is_some()
+    }
+
+    /// [`on_rms`](Self::on_rms) for a [`WINDOW_MS`] window ending at `end`; on confirming,
+    /// returns when the confirmed run began, i.e. when the user started talking over the reply.
+    pub fn on_window(&mut self, rms: f32, end: Instant) -> Option<Instant> {
         if self.fired {
-            return false;
+            return None;
         }
         if rms > self.threshold {
+            if self.seen == 0 {
+                let window = Duration::from_millis(WINDOW_MS);
+                self.run_began = Some(end.checked_sub(window).unwrap_or(end));
+            }
             self.seen += 1;
             if self.seen >= self.required {
                 self.fired = true;
-                return true;
+                return self.run_began;
             }
         } else {
-            self.seen = 0;
+            self.reset();
         }
-        false
+        None
     }
 
     /// Drop the loud run but keep the latch; a stale run must not finish on much later audio.
     pub fn reset(&mut self) {
         self.seen = 0;
+        self.run_began = None;
     }
 
     pub fn has_fired(&self) -> bool {
@@ -180,6 +233,64 @@ mod tests {
             !ClosedMic.is_inert(),
             "a closed microphone is momentarily silent, not permanently absent"
         );
+    }
+
+    #[test]
+    fn the_onset_is_the_start_of_the_confirmed_run_not_the_moment_it_confirmed() {
+        let t0 = Instant::now() + Duration::from_secs(1);
+        let at = |windows: u64| t0 + Duration::from_millis(windows * WINDOW_MS);
+        let mut b = BargeIn::while_speaking();
+
+        assert_eq!(b.on_window(LOUD, at(1)), None);
+        assert_eq!(b.on_window(QUIET, at(2)), None, "a cough, then quiet");
+        assert_eq!(b.on_window(LOUD, at(3)), None, "the real run starts here");
+        assert_eq!(b.on_window(LOUD, at(4)), None);
+        assert_eq!(
+            b.on_window(LOUD, at(5)),
+            Some(at(2)),
+            "the onset is where the run's first window began, not the abandoned cough"
+        );
+        assert_eq!(b.on_window(LOUD, at(6)), None, "latched");
+    }
+
+    #[test]
+    fn reset_forgets_where_the_run_began() {
+        let t0 = Instant::now() + Duration::from_secs(1);
+        let at = |windows: u64| t0 + Duration::from_millis(windows * WINDOW_MS);
+        let mut b = BargeIn::while_speaking();
+        b.on_window(LOUD, at(1));
+        b.reset();
+        b.on_window(LOUD, at(4));
+        b.on_window(LOUD, at(5));
+        assert_eq!(b.on_window(LOUD, at(6)), Some(at(3)));
+    }
+
+    #[test]
+    fn the_pre_roll_reaches_a_soft_syllable_but_not_far_into_the_reply() {
+        let debounce = POLL_MS * CONSECUTIVE_WINDOWS as u64;
+        assert!(
+            (WINDOW_MS..debounce).contains(&ONSET_PRE_ROLL_MS),
+            "{ONSET_PRE_ROLL_MS}ms: under a window misses a soft start; as long as the \
+             {debounce}ms debounce it mostly captures the reply's own echo"
+        );
+    }
+
+    #[test]
+    fn a_hold_releases_exactly_once_on_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let released = Arc::new(AtomicUsize::new(0));
+        let r = released.clone();
+        let hold = MicHold::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(hold);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+
+        drop(MicHold::none());
+        assert!(NoEnergy.hold_mic().0.is_none(), "no mic, nothing to hold");
     }
 
     #[test]

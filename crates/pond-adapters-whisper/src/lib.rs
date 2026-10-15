@@ -119,10 +119,12 @@ fn judge_frames(
 }
 
 /// Record until `silence_ms` of silence or `max_record_secs`; no onset wait, unlike the VAD path.
+/// `since` starts the clip back in the ring, for speech that began before the call.
 pub(crate) fn record_mono_f32_until_silence(
     mic: &MicHandle,
     max_record_secs: u32,
     silence_ms: u64,
+    since: Option<std::time::Instant>,
     detector: &mut dyn SpeechDetector,
 ) -> Result<(Vec<f32>, u32)> {
     const POLL_MS: u64 = 30;
@@ -133,7 +135,11 @@ pub(crate) fn record_mono_f32_until_silence(
     let session = open_mic_and_confirm(mic)?;
 
     let sample_rate = pond_audio::CAPTURE_RATE_HZ;
-    let mut reader = MicReader::new(mic.shared().clone());
+    // Converted at the cursor, not by the caller, so no audio slips by in between.
+    let back = since.map_or(0, |t| {
+        (t.elapsed().as_millis() * u128::from(sample_rate) / 1000) as usize
+    });
+    let mut reader = MicReader::starting_back(mic.shared().clone(), back);
     let mut samples: Vec<f32> = Vec::new();
     let mut frames = Windower::new(VAD_FRAME);
 
@@ -164,6 +170,7 @@ pub(crate) fn record_mono_f32_until_silence(
         }
     }
 
+    // This capture's claim only: a reply already speaking may hold the mic for barge-in.
     mic.close_session(session);
     Ok((samples, sample_rate))
 }
@@ -317,6 +324,7 @@ pub(crate) fn record_mono_f32_vad(
         }
     }
 
+    // A speculative reply may already be speaking and holding the mic for barge-in.
     mic.close_session(session);
 
     let speculative_transcript = if confirmed {
@@ -1305,7 +1313,7 @@ mod tests {
     fn a_late_continued_capture_spares_the_next_session() {
         assert_a_late_capture_spares_the_next_session(|mic| {
             let mut detector = RmsDetector::new(0.005);
-            record_mono_f32_until_silence(mic, 1, 200, &mut detector).expect("captured");
+            record_mono_f32_until_silence(mic, 1, 200, None, &mut detector).expect("captured");
         });
     }
 
@@ -1467,6 +1475,70 @@ mod tests {
             calls.load(Ordering::SeqCst),
             0,
             "the detector transcribed audio from before it opened"
+        );
+    }
+
+    // ── Barge-in: the follow-up capture starts where the user started talking ──
+
+    /// Each speech sample encodes its own position in the script, so a clip shows where it began.
+    fn numbered_speech(ms: u64) -> Vec<f32> {
+        (0..16 * ms as usize)
+            .map(|i| 0.25 + i as f32 * 1e-5)
+            .collect()
+    }
+
+    fn position(sample: f32) -> Option<u64> {
+        (sample != 0.0).then(|| ((sample - 0.25) / 1e-5).round() as u64)
+    }
+
+    #[test]
+    fn a_barge_in_capture_starts_at_the_onset_without_a_gap() {
+        let (mic, _join) = pond_audio::spawn(
+            Box::new(pond_audio::testing::ScriptedCapture::new(
+                numbered_speech(1_500),
+                20,
+            )),
+            pond_audio::CAPTURE_RATE_HZ,
+            15_000,
+            true,
+        );
+        // The reply's barge-in hold keeps the mic open from before the onset.
+        let hold = mic.open_session();
+        assert!(mic.wait_for(|s| s.is_open(), std::time::Duration::from_secs(2)));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let onset = std::time::Instant::now();
+        let at_onset = mic.shared().written();
+        // The debounce, and the turn being torn down, before the follow-up capture starts.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let at_capture = mic.shared().written();
+
+        let mut detector = RmsDetector::new(0.005);
+        let (clip, rate) =
+            record_mono_f32_until_silence(&mic, 5, 200, Some(onset), &mut detector).unwrap();
+        mic.close_session(hold);
+        assert_eq!(rate, pond_audio::CAPTURE_RATE_HZ);
+
+        let heard: Vec<u64> = clip.iter().filter_map(|s| position(*s)).collect();
+        let first = *heard.first().expect("the capture heard nothing");
+        assert!(
+            first < at_capture,
+            "the words said before the capture started are missing: clip opens at {first}, \
+             capture began at {at_capture}"
+        );
+        // Loose bounds: the scripted device runs a little slower than the clock.
+        assert!(
+            first <= at_onset + 800 && first + 3_200 >= at_onset,
+            "the clip should open at the onset ({at_onset}); it opens at {first}"
+        );
+        assert!(
+            heard.windows(2).all(|w| w[1] == w[0] + 1),
+            "the pre-roll and the live audio must join without a hole"
+        );
+        assert_eq!(
+            *heard.last().unwrap() + 1,
+            16 * 1_500,
+            "the capture must run to the end of the speech"
         );
     }
 }
