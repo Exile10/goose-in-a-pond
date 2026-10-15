@@ -141,6 +141,12 @@ pub const SEARCH_WEB_TOOL: &str = "giap-knowledge__search_web";
 /// Secret-store key holding the household's Brave Search API key.
 pub const BRAVE_SEARCH_API_KEY: &str = "BRAVE_SEARCH_API_KEY";
 
+/// Prefixed name of the Wolfram|Alpha computation tool.
+pub const COMPUTE_ANSWER_TOOL: &str = "giap-knowledge__compute_answer";
+
+/// Secret-store key holding the household's Wolfram|Alpha AppID.
+pub const WOLFRAM_APP_ID: &str = "WOLFRAM_APP_ID";
+
 /// A tool offered only while a secret is stored. Its server always lists it, so no tool cache
 /// goes stale; each turn's allow-set drops it while the secret is absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,11 +157,19 @@ pub struct ToolRequirement {
     pub secret: &'static str,
 }
 
-/// Every tool that needs a secret before a turn may offer it.
-pub const TOOL_REQUIREMENTS: &[ToolRequirement] = &[ToolRequirement {
-    tool: SEARCH_WEB_TOOL,
-    secret: BRAVE_SEARCH_API_KEY,
-}];
+/// Every tool that needs a secret before a turn may offer it. Offered keyless, compute_answer
+/// only returns a setup message, and with it on offer the bench's small models answered fewer sums
+/// correctly than with no tool at all.
+pub const TOOL_REQUIREMENTS: &[ToolRequirement] = &[
+    ToolRequirement {
+        tool: SEARCH_WEB_TOOL,
+        secret: BRAVE_SEARCH_API_KEY,
+    },
+    ToolRequirement {
+        tool: COMPUTE_ANSWER_TOOL,
+        secret: WOLFRAM_APP_ID,
+    },
+];
 
 /// The secret `tool_name` needs before a turn may offer it, if any.
 pub fn required_secret(tool_name: &str) -> Option<&'static str> {
@@ -319,13 +333,26 @@ mod requirement_tests {
     use super::*;
 
     #[test]
-    fn search_web_needs_the_brave_key_and_nothing_else_needs_one() {
+    fn each_keyed_builtin_needs_its_own_key_and_nothing_else_needs_one() {
         assert_eq!(
             required_secret("giap-knowledge__search_web"),
             Some("BRAVE_SEARCH_API_KEY")
         );
-        assert_eq!(required_secret("giap-knowledge__compute_answer"), None);
+        assert_eq!(
+            required_secret("giap-knowledge__compute_answer"),
+            Some("WOLFRAM_APP_ID")
+        );
+        assert_eq!(
+            required_secret("giap-knowledge__get_wikipedia_article"),
+            None
+        );
+        assert_eq!(
+            required_secret("giap-travel__book_ride"),
+            None,
+            "an account, not a key"
+        );
         assert_eq!(required_secret("search_web"), None, "names are prefixed");
+        assert_eq!(TOOL_REQUIREMENTS.len(), 2);
     }
 
     #[test]
@@ -340,6 +367,13 @@ mod requirement_tests {
             vec![SEARCH_WEB_TOOL]
         );
         assert!(tools_missing_secrets(tools, |s| s == BRAVE_SEARCH_API_KEY).is_empty());
+
+        let with_compute = [COMPUTE_ANSWER_TOOL, SEARCH_WEB_TOOL];
+        assert_eq!(
+            tools_missing_secrets(with_compute, |s| s == BRAVE_SEARCH_API_KEY),
+            vec![COMPUTE_ANSWER_TOOL],
+            "each tool follows its own key"
+        );
     }
 
     /// A requirement on a tool outside the catalog would never meet the allow-set it guards.

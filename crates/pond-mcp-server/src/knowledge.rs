@@ -162,8 +162,9 @@ impl ServerHandler for KnowledgeMcpServer {
 const KNOWLEDGE_INSTRUCTIONS: &str = "\
 GIAP Knowledge server: encyclopedia articles, computation and web search.
 
-Tools: get_wikipedia_article (encyclopedia articles), compute_answer (computation), \
-search_web (the web; offered while a web search key is stored).
+Tools: get_wikipedia_article (encyclopedia articles), compute_answer (computation; offered \
+while a computation key is stored), search_web (the web; offered while a web search key is \
+stored).
 
 If the answer has to be worked out (arithmetic, a unit or currency conversion, a date \
 difference, a statistic), use compute_answer. If it has to be read (who someone was, what \
@@ -475,10 +476,13 @@ impl KnowledgeMcpServer {
                     "[wikipedia] fallback search returned no results for '{}'",
                     query
                 );
-                Ok(crate::format::format_no_results(
-                    &format!("Wikipedia articles for '{}'", query),
-                    &["giap-knowledge__compute_answer"],
-                ))
+                // Name compute_answer only while the turn can be offering it.
+                let what = format!("Wikipedia articles for '{}'", query);
+                Ok(if crate::wolfram::app_id().await.is_some() {
+                    crate::format::format_no_results(&what, &["giap-knowledge__compute_answer"])
+                } else {
+                    crate::format::format_no_results(&what, &[])
+                })
             }
         }
     }

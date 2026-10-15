@@ -17,8 +17,9 @@ use crate::knowledge::{clean_query_for_search, KnowledgeMcpServer};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-/// Secret-store key holding the Wolfram|Alpha AppID.
-pub const WOLFRAM_APP_ID_KEY: &str = "WOLFRAM_APP_ID";
+/// Secret-store key holding the Wolfram|Alpha AppID; the per-turn gate withholds the tool
+/// without it.
+pub const WOLFRAM_APP_ID_KEY: &str = pond_core::mcp::domain::tool_group::WOLFRAM_APP_ID;
 
 const WOLFRAM_QUERY_BASE: &str = "https://api.wolframalpha.com/v2/query";
 const WOLFRAM_SIGNUP_URL: &str = "https://developer.wolframalpha.com/access";
@@ -267,7 +268,7 @@ pub fn redact_appid(s: &str) -> String {
     out
 }
 
-async fn app_id() -> Option<String> {
+pub(crate) async fn app_id() -> Option<String> {
     crate::secrets::secret(WOLFRAM_APP_ID_KEY)
         .await
         .map(|k| k.trim().to_string())

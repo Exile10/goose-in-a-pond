@@ -153,6 +153,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compute_answer_is_withheld_without_the_wolfram_app_id() {
+        let turn = [
+            "giap-knowledge__compute_answer",
+            "giap-knowledge__search_web",
+            "giap-knowledge__get_wikipedia_article",
+        ];
+        let only_brave = |key: &'static str| {
+            let value = (key == "BRAVE_SEARCH_API_KEY").then(|| "a-key".to_string());
+            async move { value }
+        };
+        assert_eq!(
+            withheld_by(turn, only_brave).await,
+            HashSet::from(["giap-knowledge__compute_answer".to_string()])
+        );
+        let both = |_key: &'static str| async { Some("a-key".to_string()) };
+        assert!(withheld_by(turn, both).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_turn_without_the_tool_reads_no_secret() {
         let reads = std::sync::atomic::AtomicUsize::new(0);
         let lookup = |_key: &'static str| {
