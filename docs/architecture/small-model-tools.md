@@ -763,3 +763,43 @@ is in every page's extracted text):
 | The direct dispatcher | On the mistral.rs backend (off by default) and the quarantined pond-agent, `convert_rmcp_result` joins every text block, so the card reaches the model and there is no per-turn key gate. | follow-up |
 | Status is per process | `rejected`/`quota` learned by the voice child never reach the serve process's `GET`; a restart reports a stored key `ok`. | follow-up |
 | Live Brave | The `#[ignore]` test `live_brave_search_answers_a_local_question` needs a household key; no run has spent a real search. | Jerry, with a key |
+
+### 8.9 Every tool that needs a key is off while its key is missing
+
+Jerry, 2026-10-15: "disable tools that need API keys and the API keys are not available".
+
+| tool | key | how it is turned off |
+|---|---|---|
+| `giap-knowledge__search_web` | `BRAVE_SEARCH_API_KEY` | per turn: withheld from the allow-set (§8.2) |
+| `giap-knowledge__compute_answer` | `WOLFRAM_APP_ID` | the same per-turn gate. Keyless, it only returned a setup message, and with it on offer both Gemma models got fewer sums right than with no tool at all (E2, arm K: 2 and 1 of 13) |
+| catalogue extensions: github, brave-search, slack | the key their catalogue entry marks `required` | at start and stop: never started without the key, and stopped when it is deleted |
+
+**Why extensions are gated differently.** An extension the pond never starts offers no tools, so
+no per-turn bookkeeping is needed for it. The rule for "cannot run without" is
+`SecretRequirement::blocks_install`, which install and the lifecycle share, so the two can never
+disagree. A sign-in (`oauth_flow`) never blocks; music declares nothing required.
+
+**What was wrong underneath, now fixed.** Installing a catalogue extension saved its server row
+with the key values in `env`: a plaintext copy in `pond_system.db`, beside the encrypted store.
+Start-up began from that copy, so deleting a key never turned the extension off.
+
+- Rows are now saved without key values.
+- Start-up scrubs existing rows once, injects keys from the store only, and skips an extension
+  whose key is missing, logging its name and the key's name.
+- `DELETE /api/v1/secrets/{key}` stops every running extension that needs that key, and keeps
+  it installed; saving the key again restarts it.
+
+**Not gated.** `book_ride` needs a linked Uber account, not a key. No UI can enter a Wolfram
+AppID today: the desktop's API-keys screen went with the settings catalogue on 2026-08-17. So
+`compute_answer` stays off on every pond until a key arrives by `PUT /api/v1/secrets/WOLFRAM_APP_ID`.
+
+**Verified.** Tests for the table, the rule, the gate and the start-up env preparation. In
+`pond-api/tests/keyed_extensions.rs`:
+
+- install refuses without the key and starts nothing;
+- install with the key saves no key value;
+- deleting the key stops the extension and keeps it installed;
+- deleting an unrelated key stops nothing;
+- a restart without the key is refused by name, and saving the key restarts it.
+
+`scripts/live-test.sh` passed: 145 checks, then 23 after a restart, then the auth phase.
