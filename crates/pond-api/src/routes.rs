@@ -309,6 +309,12 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/extensions/{name}/secrets",
             get(get_extension_secrets_handler).post(set_extension_secrets_handler),
         )
+        // ── Web search: keep out of PUBLIC_ROUTES, like `/secrets` ───────────
+        .route("/web-search", get(crate::web_search::status))
+        .route(
+            "/web-search/key",
+            put(crate::web_search::set_key).delete(crate::web_search::delete_key),
+        )
         // ── OAuth PKCE ─────────────────────────────────────────────────────────
         .route("/oauth/authorize", post(oauth_authorize_handler))
         .route("/oauth/callback", get(oauth_callback_handler))
