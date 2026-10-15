@@ -5398,9 +5398,12 @@ async fn run_chat(
     };
 
     // ── Wire barge-in energy ──
-    // Required: the default `NoEnergy` is inert, so barge-in by speaking would never fire.
-    chat_service =
-        chat_service.with_speech_energy(Arc::new(pond_audio::MicEnergy::new(&mic_handle)));
+    // Required for barge-in: the default `NoEnergy` is inert. Only with speech input, because
+    // it opens the mic while the reply plays and hands what it hears to the next capture.
+    if whisper_backend.is_some() {
+        chat_service =
+            chat_service.with_speech_energy(Arc::new(pond_audio::MicEnergy::new(&mic_handle)));
+    }
 
     // Spotify's Developer Policy III.7: Spotify pauses while this process makes a sound, its wake
     // ping included, so whatever the TTS. The server writes the secret store and refreshes the

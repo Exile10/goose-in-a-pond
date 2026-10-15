@@ -109,6 +109,8 @@ pub struct WhisperRsInput {
     silence_ms: u64,
     /// Pre-captured WAV bytes from the wake-word detector (one-breath path).
     captured: Mutex<Option<Vec<u8>>>,
+    /// When speech that barged in over a reply began; the next capture starts there.
+    onset: Mutex<Option<std::time::Instant>>,
     /// Normalized wake words, stripped because the capture reaches back past the trigger.
     /// `std` lock: it is set from inside the runtime, where tokio's `blocking_write` panics.
     wake_words: std::sync::RwLock<Vec<String>>,
@@ -151,6 +153,7 @@ impl WhisperRsInput {
             duration_secs: DEFAULT_DURATION_SECS,
             silence_ms: DEFAULT_SILENCE_MS,
             captured: Mutex::new(None),
+            onset: Mutex::new(None),
             wake_words: std::sync::RwLock::new(Vec::new()),
             audio_level_sink: None,
             mic,
@@ -482,6 +485,7 @@ impl WhisperRsInput {
         on_speculative_event: Option<Box<dyn Fn(SpeculativeSignal) + Send + Sync>>,
     ) -> Result<Option<String>> {
         let captured = self.captured.lock().unwrap().take();
+        let onset = self.onset.lock().unwrap().take();
         let max_record = self.duration_secs;
         let silence_ms = self.silence_ms;
         let audio_level_sink = self.audio_level_sink.clone();
@@ -501,10 +505,24 @@ impl WhisperRsInput {
                 .map_err(|_| anyhow!("speech detector mutex poisoned"))?;
             // Long-lived detector: clear the last turn's recurrent state and buffered leftovers.
             detector.reset();
-            if let Some(wav) = captured {
+            if let Some(onset) = onset {
+                let (samples, rate) = record_mono_f32_until_silence(
+                    &mic,
+                    max_record,
+                    silence_ms,
+                    Some(onset),
+                    &mut **detector,
+                )?;
+                Ok(SpeechCapture::Samples(resample_to_16k(&samples, rate)))
+            } else if let Some(wav) = captured {
                 let (captured_samples, _captured_rate) = decode_wav_mono_f32(&wav)?;
-                let (fresh_samples, fresh_rate) =
-                    record_mono_f32_until_silence(&mic, max_record, silence_ms, &mut **detector)?;
+                let (fresh_samples, fresh_rate) = record_mono_f32_until_silence(
+                    &mic,
+                    max_record,
+                    silence_ms,
+                    None,
+                    &mut **detector,
+                )?;
                 let fresh_16k = resample_to_16k(&fresh_samples, fresh_rate);
                 let mut combined = captured_samples;
                 // Skip ~200 ms of mic spin-up at the start of the fresh recording.
@@ -597,6 +615,10 @@ impl VoiceInput for WhisperRsInput {
 
     fn prime_with_captured(&self, wav: Vec<u8>) {
         *self.captured.lock().unwrap() = Some(wav);
+    }
+
+    fn prime_with_onset(&self, onset: std::time::Instant) {
+        *self.onset.lock().unwrap() = Some(onset);
     }
 }
 

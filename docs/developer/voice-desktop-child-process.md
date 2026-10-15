@@ -65,6 +65,11 @@ stderr). The spawn-binary contract test enforces this.
   the child exits cleanly with `exit: stdin_eof`. Kill is the 3-second fallback.
 - Barge-in and wake-word interruption happen inside the child, where they
   already work. The shell's `AudioKillSwitch` cannot reach the child's audio.
+- Talking over a reply ends the turn the way the wake word does: generation and
+  synthesis stop, nothing from the turn is persisted, and the next capture
+  starts from when the user began talking, so their words are transcribed. The
+  reply holds the mic open while it plays, so this works under `--no-wake-word`
+  too. Typed input (no speech model) has no barge-in.
 - The `InstantActivation` race that broke stdin / `--no-wake-word` mode is
   fixed: `StreamingWakeWordDetector::supports_interruption()` gates the
   `run_loop` interrupt race (`InstantActivation` returns false).
@@ -89,7 +94,10 @@ macOS:
    and `voice-ready` arrives (orb leaves the connecting state).
 3. Speak the wake word; confirm ping, live transcript, spoken reply, and the
    turn appearing in the chat sidebar under the voice session id.
-4. Barge in mid-reply; TTS must stop within ~1s.
+4. Barge in mid-reply with a question; TTS must stop within ~1s, the cut-off
+   reply must not appear in the chat sidebar, and the question you spoke over
+   it must be answered. Repeat in a terminal with
+   `pond-server chat --voice --no-wake-word`.
 5. While in a voice session, confirm the shell wake listener is suspended
    (no transcribe requests in serve logs) and `record_with_vad` is refused.
 6. Leave voice mode; confirm the child exits (no `pond-server chat` process
