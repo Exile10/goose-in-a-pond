@@ -79,20 +79,25 @@ pub(crate) fn decode_wav_mono_f32(wav: &[u8]) -> Result<(Vec<f32>, u32)> {
 // ── Audio capture ─────────────────────────────────────────────────────────────
 
 /// Open the shared mic and block until `Open`, `Denied` or `Failed`: `open()` is fire-and-forget.
+/// A failed open releases its claim: claims keep the device open until the last one is released.
 fn open_mic_and_confirm(mic: &MicHandle) -> Result<u64> {
     let generation = mic.open_session();
+    let failed = |e: anyhow::Error| {
+        mic.close_session(generation);
+        Err(e)
+    };
     if !mic.wait_for(
         |s| !matches!(s, MicState::Closed),
         std::time::Duration::from_secs(2),
     ) {
-        return Err(anyhow!("microphone did not respond"));
+        return failed(anyhow!("microphone did not respond"));
     }
     match mic.state() {
         MicState::Open => Ok(generation),
-        MicState::Denied => Err(anyhow!(
+        MicState::Denied => failed(anyhow!(
             "microphone is disabled in Settings (mic_enabled = false)"
         )),
-        MicState::Failed(e) => Err(anyhow!("microphone could not be opened: {}", e)),
+        MicState::Failed(e) => failed(anyhow!("microphone could not be opened: {}", e)),
         MicState::Closed => unreachable!("wait_for guarantees a non-Closed state"),
     }
 }
