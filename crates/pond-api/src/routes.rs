@@ -11086,11 +11086,7 @@ async fn install_marketplace_handler(
 
     if !ext.required_secrets.is_empty() {
         let mut missing = Vec::new();
-        for sr in &ext.required_secrets {
-            if !sr.required || sr.kind == pond_core::security::domain::secret::SecretKind::OAuthFlow
-            {
-                continue;
-            }
+        for sr in ext.blocking_secrets() {
             if secrets.contains_key(&sr.key) {
                 continue;
             }
@@ -11166,8 +11162,12 @@ async fn install_marketplace_handler(
 
     match manager.add_extension(req.clone()).await {
         Ok(info) => {
-            // Persist so the extension reconnects on restart
+            // Persist so the extension reconnects on restart. Key values stay in the secret store
+            // only, and the per-run token is minted again at every start.
             if let Some(repo) = &state.mcp_server_repo {
+                let mut row_env =
+                    pond_core::mcp::services::extension_env::without_declared_secrets(&env, &ext);
+                row_env.remove(crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY);
                 let cfg = pond_core::mcp::ports::mcp_server::McpServerConfig {
                     id: uuid::Uuid::new_v4().to_string(),
                     name: ext.id.clone(),
@@ -11175,7 +11175,7 @@ async fn install_marketplace_handler(
                     description: ext.description,
                     command: ext.command,
                     args: ext.args,
-                    env,
+                    env: row_env,
                     uri: ext.uri,
                     enabled: true,
                     created_at: chrono::Utc::now().to_rfc3339(),
@@ -11314,12 +11314,62 @@ async fn delete_secret_handler(
             .into_response();
     };
     match repo.delete(&key).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            stop_extensions_needing(&state, &key).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+/// Stop every installed catalogue extension that cannot run without `key`, now that it is gone.
+/// Its row stays enabled, so saving the key again starts it (`restart_extension_with_secrets`).
+async fn stop_extensions_needing(state: &AppState, key: &str) {
+    let (Some(mgr), Some(mp), Some(servers), Some(secrets)) = (
+        &state.extension_manager,
+        &state.marketplace,
+        &state.mcp_server_repo,
+        &state.secret_repo,
+    ) else {
+        return;
+    };
+    // The store reads the process environment first, so the key may still be there.
+    if secrets.get(key).await.ok().flatten().is_some() {
+        return;
+    }
+    let installed = match servers.list().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read installed extensions to stop those needing {key}");
+            return;
+        }
+    };
+    for row in installed.iter().filter(|r| r.enabled) {
+        let Ok(Some(ext)) = mp.get_by_id(&row.name).await else {
+            continue;
+        };
+        if !ext.blocking_secrets().any(|sr| sr.key == key) {
+            continue;
+        }
+        match mgr.remove_extension(&row.name).await {
+            Ok(()) => tracing::info!(
+                extension = %row.name,
+                key,
+                "stopped the extension: a key it cannot run without was removed"
+            ),
+            Err(e) => tracing::debug!(
+                extension = %row.name,
+                error = %e,
+                "the extension was not running when its key was removed"
+            ),
+        }
+        if let Some(registry) = &state.tool_registry {
+            registry.deregister_extension(&row.name).await;
+        }
     }
 }
 
@@ -11416,12 +11466,27 @@ async fn restart_extension_with_secrets(state: &AppState, ext_id: &str) -> Resul
         Err(e) => return Err(format!("Could not look up '{ext_id}': {e}")),
     };
 
-    let mut env = std::collections::HashMap::new();
-    for sr in ext.env_secrets() {
+    let mut stored = std::collections::HashMap::new();
+    for sr in &ext.required_secrets {
         if let Ok(Some(val)) = secret_repo.get(&sr.key).await {
-            env.insert(sr.key.clone(), val);
+            stored.insert(sr.key.clone(), val);
         }
     }
+    let prepared = pond_core::mcp::services::extension_env::prepare_extension_env(
+        &std::collections::HashMap::new(),
+        &ext,
+        &stored,
+    );
+    let mut env = match prepared.start {
+        Ok(env) => env,
+        Err(missing) => {
+            return Err(format!(
+                "{} cannot start without {}.",
+                ext.name,
+                missing.join(", ")
+            ))
+        }
+    };
     env.insert(
         crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
         crate::oauth_callback::internal_extension_token().to_string(),
