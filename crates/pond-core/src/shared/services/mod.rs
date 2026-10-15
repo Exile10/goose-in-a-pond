@@ -8,3 +8,4 @@ pub mod session_summary;
 pub mod session_title;
 pub mod stdin_input;
 pub mod turn_authority;
+pub mod voice_control;

@@ -48,6 +48,7 @@ use pond_core::shared::services::chat::ChatService;
 use pond_core::shared::services::in_process_event_bus::InProcessEventBus;
 use pond_core::shared::services::print_output::{PrintOutput, SilentOutput};
 use pond_core::shared::services::stdin_input::StdinInput;
+use pond_core::shared::services::voice_control::{pump_stdin, TypedLineInput, VoiceControl};
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::ports::session_storage::SessionStorage;
@@ -5295,7 +5296,7 @@ async fn run_chat(
                     Some(Arc::new(w))
                 }
                 Err(e) => {
-                    // NDJSON error too: the shell never writes stdin, so this session is deaf.
+                    // NDJSON error too: the shell writes only commands to stdin, so this session is deaf.
                     eout!("  Listen   FAILED to load speech model: {}", e);
                     eout!("           Falling back to typed input.");
                     out!("  Listen   FAILED to load speech model: {}", e);
@@ -5336,6 +5337,9 @@ async fn run_chat(
         }
     }
 
+    // Under --json-events stdin is the shell's command channel; typed turns share it.
+    let control = json_events.then(VoiceControl::new);
+    let mut typed_lines = None;
     let voice: Arc<dyn VoiceInput> = match &whisper_backend {
         Some(backend) => {
             out!(
@@ -5351,10 +5355,25 @@ async fn run_chat(
         }
         None => {
             out!("  Listen   typed input (no speech model)");
-            Arc::new(StdinInput::new())
+            if control.is_some() {
+                let (tx, typed) = TypedLineInput::channel();
+                typed_lines = Some(tx);
+                Arc::new(typed)
+            } else {
+                Arc::new(StdinInput::new())
+            }
         }
     };
     chat_service = chat_service.with_voice_input(voice);
+    if let Some(control) = &control {
+        chat_service = chat_service.with_control(control.clone());
+        let control = control.clone();
+        // A plain thread, not `spawn_blocking`: a stdin read cannot be cancelled, and runtime
+        // shutdown waits on blocking tasks.
+        std::thread::Builder::new()
+            .name("voice-control".into())
+            .spawn(move || pump_stdin(std::io::stdin().lock(), &control, typed_lines))?;
+    }
 
     // ── Wire wake word detector ──
     if no_wake_word || whisper_backend.is_none() {
