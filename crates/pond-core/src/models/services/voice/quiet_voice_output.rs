@@ -75,6 +75,10 @@ impl VoiceOutput for QuietVoiceOutput {
         self.inner.stop_speaking();
     }
 
+    fn is_playing(&self) -> Option<bool> {
+        self.inner.is_playing()
+    }
+
     fn start_thinking_tone(&self) {
         let generation = {
             let mut tone = lock(&self.tone);

@@ -583,6 +583,11 @@ impl ChatService {
             loop {
                 tokio::time::sleep(poll).await;
 
+                if voice_output.is_playing() == Some(false) {
+                    // Between sentences (a tool running): loud talk then is not over the reply.
+                    gate.reset();
+                    continue;
+                }
                 let Some(rms) = energy.recent_rms(barge::WINDOW_MS) else {
                     gate.reset();
                     if !warned_inert {
@@ -3822,6 +3827,60 @@ mod tests {
             mic.releases.load(Ordering::SeqCst),
             1,
             "a finished reply must let go of the mic"
+        );
+    }
+
+    /// A tool running between sentences plays nothing, so talk then is not over the reply.
+    #[tokio::test]
+    async fn talk_while_nothing_plays_between_sentences_is_not_a_barge_in() {
+        struct Loud(Arc<MicLog>);
+        impl SpeechEnergy for Loud {
+            fn recent_rms(&self, _window_ms: u64) -> Option<f32> {
+                Some(0.5)
+            }
+            fn hold_mic(&self) -> MicHold {
+                self.0.holds.fetch_add(1, Ordering::SeqCst);
+                let log = self.0.clone();
+                MicHold::new(move || {
+                    log.releases.fetch_add(1, Ordering::SeqCst);
+                })
+            }
+        }
+        #[derive(Default)]
+        struct NothingPlaying(CapturingSpeak);
+        #[async_trait::async_trait]
+        impl VoiceOutput for NothingPlaying {
+            async fn speak(&self, text: &str) -> Result<()> {
+                self.0.speak(text).await
+            }
+            fn is_playing(&self) -> Option<bool> {
+                Some(false)
+            }
+        }
+
+        let storage = Arc::new(InMemorySessionStorage::new());
+        storage.create_session("between".into()).await.unwrap();
+        let mic = Arc::new(MicLog::default());
+        let agent = Arc::new(LongFirstReply {
+            calls: AtomicUsize::new(0),
+            first_stream_dropped: Arc::new(AtomicBool::new(false)),
+        });
+        let svc = ChatService::new(agent, "between".into(), storage)
+            .with_voice_output(Arc::new(NothingPlaying::default()))
+            .with_speech_energy(Arc::new(Loud(mic.clone())));
+
+        let outcome = svc
+            .stream_response_inner("what is the weather this week".to_string(), Instant::now())
+            .await
+            .unwrap();
+        assert!(
+            outcome.barged_in.is_none(),
+            "talk over silence ended the turn"
+        );
+        assert!(outcome.text.contains("Tuesday"), "got {:?}", outcome.text);
+        assert_eq!(
+            mic.holds.load(Ordering::SeqCst),
+            mic.releases.load(Ordering::SeqCst)
         );
     }
 

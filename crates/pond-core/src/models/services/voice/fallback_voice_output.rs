@@ -56,6 +56,10 @@ impl VoiceOutput for FallbackVoiceOutput {
         self.primary.stop_speaking();
     }
 
+    fn is_playing(&self) -> Option<bool> {
+        self.primary.is_playing()
+    }
+
     fn start_thinking_tone(&self) {
         self.primary.start_thinking_tone();
     }
