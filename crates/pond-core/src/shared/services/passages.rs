@@ -30,6 +30,9 @@ const MIN_STEM_CHARS: usize = 3;
 /// After stripping, a stem is cut to this many characters.
 const STEM_CHARS: usize = 5;
 
+/// A stem longer than this loses a trailing `e`, so "close" meets "closing"; "time" keeps it.
+const KEEPS_TRAILING_E_UP_TO: usize = 4;
+
 /// BM25 term-frequency saturation.
 const K1: f64 = 1.2;
 
@@ -57,7 +60,10 @@ static ANSWER_TYPES: LazyLock<Vec<(Regex, Regex)>> = LazyLock::new(|| {
             r"(?i)\b(when|date|year|day)\b",
             r"(?i)\b(1[89]|20)\d{2}\b|\b\d{1,2} (january|february|march|april|may|june|july|august|september|october|november|december)\b",
         ),
-        (r"(?i)\b(how many|how far|percent|rate)\b", r"\d"),
+        (
+            r"(?i)\b(how many|how far|how long|percent|rate|distance|length)\b",
+            r"\d",
+        ),
     ]
     .into_iter()
     .map(|(question, answer)| {
@@ -139,8 +145,9 @@ pub fn terms(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// One suffix off (an `ies`/`ied` becomes `y`), then the first [`STEM_CHARS`] characters, so
-/// "opening" meets "open" and "studies" meets "studied".
+/// One suffix off (an `ies`/`ied` becomes `y`), a trailing `e` off, then the first
+/// [`STEM_CHARS`] characters, so "opening" meets "open", "closing" meets "close" and "studies"
+/// meets "studied".
 pub fn stem(term: &str) -> String {
     let mut stemmed = term.to_string();
     for suffix in SUFFIXES {
@@ -155,6 +162,9 @@ pub fn stem(term: &str) -> String {
             stemmed.push('y');
         }
         break;
+    }
+    if stemmed.ends_with('e') && stemmed.chars().count() > KEEPS_TRAILING_E_UP_TO {
+        stemmed.pop();
     }
     stemmed.chars().take(STEM_CHARS).collect()
 }
@@ -301,6 +311,16 @@ mod tests {
     }
 
     #[test]
+    fn closing_meets_close_and_a_short_word_keeps_its_e() {
+        assert_eq!(stem("close"), "clos");
+        for word in ["closing", "closes", "closed"] {
+            assert_eq!(stem(word), stem("close"), "{word}");
+        }
+        assert_eq!(stem("time"), "time");
+        assert_eq!(stem("larger"), stem("large"));
+    }
+
+    #[test]
     fn one_suffix_comes_off_then_the_five_character_cut() {
         assert_eq!(stem("attacked"), "attac");
         assert_eq!(stem("attacks"), stem("attacked"));
@@ -430,6 +450,24 @@ mod tests {
             &[
                 "Nairobi people love Nairobi, and people from all over live in Nairobi.",
                 "About 4.4 million people live there.",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_length_or_distance_question_lifts_the_passage_with_a_number() {
+        the_boost_decides(
+            "How long is the railway from Mombasa to Nairobi?",
+            &[
+                "The railway from Mombasa to Nairobi replaced the old Mombasa to Nairobi railway.",
+                "The new line is 472 km long.",
+            ],
+        );
+        the_boost_decides(
+            "What is the distance from Mombasa to Nairobi by road?",
+            &[
+                "Mombasa to Nairobi by road follows the Mombasa Road from Mombasa to Nairobi.",
+                "By road it is about 480 km.",
             ],
         );
     }
