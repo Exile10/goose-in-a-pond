@@ -7,7 +7,7 @@ use pond_core::models::ports::voice_input::{SpeculativeSignal, VoiceInput};
 use pond_voice::dsp::{RmsDetector, SpeechDetector};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use whisper_rs::{
@@ -494,6 +494,9 @@ impl WhisperRsInput {
         let spec_wake_words = self.wake_words_snapshot();
         let mic = self.mic.clone();
         let detector = Arc::clone(&self.detector);
+        // Dropping a `spawn_blocking` handle only detaches it; this flag ends the capture.
+        let stop = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = crate::StopOnDrop(stop.clone());
         let capture_result = tokio::task::spawn_blocking(move || -> Result<SpeechCapture> {
             // Held for the whole capture; nothing else uses the detector mid-turn.
             let mut detector = detector
@@ -503,8 +506,13 @@ impl WhisperRsInput {
             detector.reset();
             if let Some(wav) = captured {
                 let (captured_samples, _captured_rate) = decode_wav_mono_f32(&wav)?;
-                let (fresh_samples, fresh_rate) =
-                    record_mono_f32_until_silence(&mic, max_record, silence_ms, &mut **detector)?;
+                let (fresh_samples, fresh_rate) = record_mono_f32_until_silence(
+                    &mic,
+                    max_record,
+                    silence_ms,
+                    &mut **detector,
+                    &stop,
+                )?;
                 let fresh_16k = resample_to_16k(&fresh_samples, fresh_rate);
                 let mut combined = captured_samples;
                 // Skip ~200 ms of mic spin-up at the start of the fresh recording.
@@ -533,6 +541,7 @@ impl WhisperRsInput {
                     on_speculative_event.as_deref(),
                     audio_level_sink.as_deref(),
                     &mut **detector,
+                    &stop,
                 )?;
                 if samples.is_empty() {
                     return Ok(SpeechCapture::Empty);

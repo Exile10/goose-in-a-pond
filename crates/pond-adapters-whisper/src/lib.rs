@@ -97,18 +97,28 @@ fn open_mic_and_confirm(mic: &MicHandle) -> Result<u64> {
     }
 }
 
+/// Ends a capture whose caller went away. Scoped to its own session: by then this detached
+/// thread may no longer own the mic.
+fn capture_cancelled(mic: &MicHandle, session: u64) -> anyhow::Error {
+    tracing::debug!("speech capture cancelled; releasing the microphone");
+    mic.close_session(session);
+    anyhow!("speech capture cancelled")
+}
+
 /// Record until `silence_ms` of silence or `max_record_secs`; no onset wait, unlike the VAD path.
+/// `stop` cancels within one poll.
 pub(crate) fn record_mono_f32_until_silence(
     mic: &MicHandle,
     max_record_secs: u32,
     silence_ms: u64,
     detector: &mut dyn SpeechDetector,
+    stop: &AtomicBool,
 ) -> Result<(Vec<f32>, u32)> {
     const POLL_MS: u64 = 30;
 
     // Privacy gate before open, so the OS mic indicator stays dark when the mic is disabled.
     pond_core::models::domain::mic_gate::ensure_mic_enabled()?;
-    open_mic_and_confirm(mic)?;
+    let session = open_mic_and_confirm(mic)?;
 
     let sample_rate = pond_audio::CAPTURE_RATE_HZ;
     let mut reader = MicReader::new(mic.shared().clone());
@@ -120,6 +130,9 @@ pub(crate) fn record_mono_f32_until_silence(
 
     while elapsed_ms < max_ms {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+        if stop.load(Ordering::SeqCst) {
+            return Err(capture_cancelled(mic, session));
+        }
         elapsed_ms += POLL_MS;
         samples.extend(reader.drain());
 
@@ -155,6 +168,8 @@ pub(crate) type SpeculativeSpawn =
 
 /// Wait for onset, record until `silence_ms` of pause or the cap; empty samples = no speech.
 /// `speculative_spawn` runs once per silence run; `on_speculative_event` gets Ready/Invalidated.
+/// `stop` cancels within one poll.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_mono_f32_vad(
     mic: &MicHandle,
     max_wait_secs: u32,
@@ -164,6 +179,7 @@ pub(crate) fn record_mono_f32_vad(
     on_speculative_event: Option<&(dyn Fn(SpeculativeSignal) + Send + Sync)>,
     audio_level_sink: Option<&ThrottledAudioLevelSink>,
     detector: &mut dyn SpeechDetector,
+    stop: &AtomicBool,
 ) -> Result<(Vec<f32>, u32, Option<String>)> {
     // Onset only, and energy-based on purpose: a model detector needs a window or two of
     // context, so it under-reports at onset and would clip the first word.
@@ -172,7 +188,7 @@ pub(crate) fn record_mono_f32_vad(
 
     // Privacy gate before open, so the OS mic indicator stays dark when the mic is disabled.
     pond_core::models::domain::mic_gate::ensure_mic_enabled()?;
-    open_mic_and_confirm(mic)?;
+    let session = open_mic_and_confirm(mic)?;
 
     let sample_rate = pond_audio::CAPTURE_RATE_HZ;
     let mut reader = MicReader::new(mic.shared().clone());
@@ -185,6 +201,9 @@ pub(crate) fn record_mono_f32_vad(
 
     while waited_ms < max_wait_ms {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+        if stop.load(Ordering::SeqCst) {
+            return Err(capture_cancelled(mic, session));
+        }
         waited_ms += POLL_MS;
         samples.extend(reader.drain());
 
@@ -217,6 +236,9 @@ pub(crate) fn record_mono_f32_vad(
 
     while recorded_ms < max_record_ms {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+        if stop.load(Ordering::SeqCst) {
+            return Err(capture_cancelled(mic, session));
+        }
         recorded_ms += POLL_MS;
         samples.extend(reader.drain());
 
@@ -1008,6 +1030,45 @@ mod tests {
         );
     }
 
+    // ── Speech capture cancellation ─────────────────────────────────────────
+
+    #[test]
+    fn a_cancelled_capture_ends_within_a_poll_and_releases_the_mic() {
+        let (mic, _join) = pond_audio::spawn(
+            Box::new(pond_audio::testing::ScriptedCapture::silence(30_000, 20)),
+            pond_audio::CAPTURE_RATE_HZ,
+            15_000,
+            true,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture = std::thread::spawn({
+            let mic = mic.clone();
+            let stop = stop.clone();
+            move || {
+                let mut detector = RmsDetector::new(0.005);
+                let t0 = std::time::Instant::now();
+                // Room tone, so without the flag this serves out the whole 10 s onset wait.
+                let result =
+                    record_mono_f32_vad(&mic, 10, 10, 200, None, None, None, &mut detector, &stop);
+                (result, t0.elapsed())
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        stop.store(true, Ordering::SeqCst);
+
+        let (result, elapsed) = capture.join().expect("capture thread must not panic");
+        let err = result.expect_err("a cancelled capture must not report a recording");
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "took {elapsed:?}; cancellation should land within one 30 ms poll"
+        );
+        assert!(
+            mic.wait_for(|s| !s.is_open(), std::time::Duration::from_secs(2)),
+            "the cancelled capture must release the microphone"
+        );
+    }
+
     // ── Shared mic owner: the wake-word/VAD handoff race ────────────────────
 
     #[tokio::test]
@@ -1051,7 +1112,17 @@ mod tests {
         // Races the detector's close against this open, as `run_loop` does between turns.
         let result = tokio::task::spawn_blocking(move || {
             let mut detector = RmsDetector::new(0.005);
-            record_mono_f32_vad(&mic, 1, 1, 200, None, None, None, &mut detector)
+            record_mono_f32_vad(
+                &mic,
+                1,
+                1,
+                200,
+                None,
+                None,
+                None,
+                &mut detector,
+                &AtomicBool::new(false),
+            )
         })
         .await
         .expect("capture thread must not panic");
