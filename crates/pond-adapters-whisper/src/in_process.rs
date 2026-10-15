@@ -7,7 +7,7 @@ use pond_core::models::ports::voice_input::{SpeculativeSignal, VoiceInput};
 use pond_voice::dsp::{RmsDetector, SpeechDetector};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use whisper_rs::{
@@ -242,6 +242,18 @@ impl WhisperRsInput {
         samples: Vec<f32>,
         opts: TranscribeOpts,
     ) -> Result<String> {
+        Self::transcribe_unless_abandoned(engine, samples, opts, None)
+    }
+
+    /// As [`Self::transcribe_samples_with`], giving up once `abandoned` is raised: before
+    /// decoding if it was raised while this waited for the state, else at the next decode step.
+    fn transcribe_unless_abandoned(
+        engine: &Engine,
+        samples: Vec<f32>,
+        opts: TranscribeOpts,
+        abandoned: Option<&AtomicBool>,
+    ) -> Result<String> {
+        let is_abandoned = || abandoned.is_some_and(|flag| flag.load(Ordering::SeqCst));
         if samples.is_empty() {
             return Ok(String::new());
         }
@@ -259,6 +271,9 @@ impl WhisperRsInput {
             *held = None;
             held
         });
+        if is_abandoned() {
+            return Err(anyhow!(ABANDONED));
+        }
 
         // Catches Rust panics from whisper-rs; a C++ failure in whisper.cpp aborts regardless.
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<String> {
@@ -306,6 +321,18 @@ impl WhisperRsInput {
             if let Some(ctx_frames) = audio_ctx {
                 params.set_audio_ctx(ctx_frames);
             }
+            // Not `set_abort_callback_safe`: in whisper-rs 0.16 its trampoline reads the boxed
+            // closure as the wrong type, and the box is never freed.
+            if let Some(flag) = abandoned {
+                // SAFETY: `flag` outlives `state.full` below, the only call that reads it, and
+                // `abort_when_raised` only loads it.
+                unsafe {
+                    params.set_abort_callback(Some(abort_when_raised));
+                    params.set_abort_callback_user_data(
+                        flag as *const AtomicBool as *mut std::ffi::c_void,
+                    );
+                }
+            }
 
             state
                 .full(params, &samples)
@@ -325,6 +352,14 @@ impl WhisperRsInput {
 
         match result {
             Ok(Ok(text)) => Ok(text),
+            Ok(Err(_)) if is_abandoned() => {
+                tracing::debug!(
+                    kind = "whisper_transcription_abandoned",
+                    samples = sample_count,
+                    "whisper stopped a transcription nobody is waiting for"
+                );
+                Err(anyhow!(ABANDONED))
+            }
             // Most often the GPU had no room for something this call needed. The state is kept:
             // a failed decode leaves it usable, and making a new one would allocate again.
             Ok(Err(e)) => {
@@ -344,6 +379,14 @@ impl WhisperRsInput {
             }
         }
     }
+}
+
+const ABANDONED: &str = "transcription abandoned";
+
+/// whisper.cpp's abort hook, checked after the encoder and after each decode step.
+unsafe extern "C" fn abort_when_raised(flag: *mut std::ffi::c_void) -> bool {
+    // SAFETY: the user data installed beside this hook is a live `&AtomicBool`.
+    unsafe { &*(flag as *const AtomicBool) }.load(Ordering::SeqCst)
 }
 
 /// Route whisper.cpp's stderr logging into tracing; run on model load so no binary forgets it.
@@ -514,16 +557,24 @@ impl WhisperRsInput {
                 }
                 Ok(SpeechCapture::Samples(combined))
             } else {
-                let speculative_spawn: Box<SpeculativeSpawn> = Box::new(move |samples, rate| {
-                    let engine = engine_for_speculative.clone();
-                    let wake_words = spec_wake_words.clone();
-                    std::thread::spawn(move || -> Result<String> {
-                        let resampled = resample_to_16k(&samples, rate);
-                        let transcript = Self::transcribe_samples(&engine, resampled)?;
-                        // Strip here so speculative and confirmed transcripts stay byte-identical.
-                        Ok(strip_wake_words(transcript, &wake_words))
-                    })
-                });
+                let speculative_spawn: Box<SpeculativeSpawn> =
+                    Box::new(move |samples, rate, abandoned| {
+                        let engine = engine_for_speculative.clone();
+                        let wake_words = spec_wake_words.clone();
+                        std::thread::spawn(move || -> Result<String> {
+                            let resampled = resample_to_16k(&samples, rate);
+                            // Same profile as the full transcription, so the same state: an
+                            // abandoned job must give it up rather than make that one wait.
+                            let transcript = Self::transcribe_unless_abandoned(
+                                &engine,
+                                resampled,
+                                TranscribeOpts::accurate(),
+                                Some(&abandoned),
+                            )?;
+                            // Strip here so speculative and confirmed transcripts stay byte-identical.
+                            Ok(strip_wake_words(transcript, &wake_words))
+                        })
+                    });
                 let (samples, sample_rate, speculative_transcript) = record_mono_f32_vad(
                     &mic,
                     DEFAULT_ONSET_WAIT_SECS,
@@ -719,6 +770,16 @@ mod tests {
             "whisper inference wall time: {:?} (silence-confirmation window this overlaps with: {}ms)",
             elapsed, DEFAULT_SILENCE_MS
         );
+    }
+
+    #[test]
+    fn the_abort_hook_reads_the_flag_it_was_given() {
+        let flag = AtomicBool::new(false);
+        let data = &flag as *const AtomicBool as *mut std::ffi::c_void;
+        // SAFETY: `flag` is live for both calls.
+        assert!(!unsafe { abort_when_raised(data) });
+        flag.store(true, Ordering::SeqCst);
+        assert!(unsafe { abort_when_raised(data) });
     }
 
     #[test]
@@ -919,6 +980,59 @@ mod decode_profiles {
             .expect("decode");
         }
         assert_eq!(created(), 2, "the wake-word state is made once");
+    }
+
+    /// An abandoned speculative job shares the full transcription's state; it must give it up
+    /// at its next decode step rather than make that transcription wait out its decode.
+    #[test]
+    #[ignore]
+    fn an_abandoned_transcription_does_not_hold_up_the_next() {
+        let Some(ctx) = model() else {
+            eprintln!("set WHISPER_TEST_MODEL to run this");
+            return;
+        };
+        let short = jfk_samples();
+        // Three 30 s windows, so the decode runs long enough to abandon partway.
+        let long = short.repeat(8);
+
+        let t0 = std::time::Instant::now();
+        WhisperRsInput::transcribe_samples(&ctx, short.clone()).expect("decode");
+        let alone = t0.elapsed();
+        let t0 = std::time::Instant::now();
+        WhisperRsInput::transcribe_samples(&ctx, long.clone()).expect("decode");
+        let whole = t0.elapsed();
+
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let job = std::thread::spawn({
+            let (ctx, abandoned) = (ctx.clone(), abandoned.clone());
+            move || {
+                WhisperRsInput::transcribe_unless_abandoned(
+                    &ctx,
+                    long,
+                    TranscribeOpts::accurate(),
+                    Some(&abandoned),
+                )
+            }
+        });
+        std::thread::sleep(whole / 4);
+        abandoned.store(true, Ordering::SeqCst);
+
+        let t0 = std::time::Instant::now();
+        let text = WhisperRsInput::transcribe_samples(&ctx, short).expect("decode");
+        let waited = t0.elapsed();
+        let outcome = job.join().expect("the job must not panic");
+        eprintln!("\n  alone {alone:?}, whole {whole:?}, after abandoning {waited:?}\n");
+
+        let error = outcome.expect_err("an abandoned job returns no transcript");
+        assert!(error.to_string().contains("abandoned"), "{error:#}");
+        assert!(text.to_lowercase().contains("country"), "{text:?}");
+        assert!(
+            waited < alone + whole / 2,
+            "queued behind the abandoned job: {waited:?} (alone {alone:?}, whole {whole:?})"
+        );
+        // The aborted state still serves.
+        let again = WhisperRsInput::transcribe_samples(&ctx, jfk_samples()).expect("decode");
+        assert!(again.to_lowercase().contains("country"), "{again:?}");
     }
 
     #[test]

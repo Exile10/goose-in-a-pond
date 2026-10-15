@@ -62,7 +62,7 @@ impl Ring {
         self.written
     }
 
-    /// Drop everything buffered, keeping the write counter. Called at turn end.
+    /// Drop everything buffered, keeping the write counter.
     pub fn clear(&mut self) {
         self.samples.clear();
     }

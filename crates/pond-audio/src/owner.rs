@@ -247,6 +247,13 @@ pub fn run(mut device: Box<dyn CaptureDevice>, shared: Arc<MicShared>, rx: Recei
             shared.set_state(MicState::Denied);
             return;
         }
+        // Audio from before the device stopped isn't contiguous with what follows; a window
+        // over both would hand the next capture the last one's tail.
+        shared
+            .ring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         match device.start(shared.clone()) {
             Ok(()) => shared.set_state(MicState::Open),
             Err(e) => {
@@ -515,6 +522,33 @@ mod tests {
         assert!(
             h.handle.state().is_open(),
             "clear must not close the device"
+        );
+    }
+
+    /// `recent` readers (the wake-word window, its lookback) would otherwise splice the last
+    /// session's audio onto this one's.
+    #[test]
+    fn reopening_the_device_starts_from_an_empty_ring() {
+        let h = Harness::new(true, None);
+        h.handle.open();
+        h.settle(|s| s.is_open());
+        h.handle.close();
+        h.settle(|s| *s == MicState::Closed);
+        assert_eq!(h.handle.shared().recent(10).len(), 3, "kept while closed");
+
+        let mut reader = MicReader::new(h.handle.shared().clone());
+        h.handle.open();
+        h.settle(|s| s.is_open());
+        assert_eq!(
+            h.handle.shared().recent(10),
+            vec![0.1, 0.2, 0.3],
+            "only this session's audio"
+        );
+        assert_eq!(reader.drain(), vec![0.1, 0.2, 0.3]);
+        assert_eq!(
+            reader.dropped(),
+            0,
+            "a clear before the reader's audio loses none of it"
         );
     }
 

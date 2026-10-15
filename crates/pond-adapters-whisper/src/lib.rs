@@ -97,6 +97,27 @@ fn open_mic_and_confirm(mic: &MicHandle) -> Result<u64> {
     }
 }
 
+use pond_voice::dsp::VadEvent;
+
+use pond_voice::dsp::{SpeculativeVad, SpeechDetector, Windower};
+
+/// Samples per speech verdict: Silero's window at 16 kHz, and as good a frame as any for RMS.
+const VAD_FRAME: usize = 512;
+/// Audio covered by one verdict, so silence is counted in audio time rather than in polls.
+const VAD_FRAME_MS: u64 = VAD_FRAME as u64 * 1000 / pond_audio::CAPTURE_RATE_HZ as u64;
+
+/// Judge `fresh` in whole [`VAD_FRAME`] windows, carrying the remainder in `frames`, so the
+/// detector hears each sample exactly once. One verdict per window, oldest first.
+fn judge_frames(
+    frames: &mut Windower,
+    detector: &mut dyn SpeechDetector,
+    fresh: &[f32],
+) -> Vec<bool> {
+    let mut verdicts = Vec::new();
+    frames.push(fresh, |frame| verdicts.push(detector.is_speech(frame)));
+    verdicts
+}
+
 /// Record until `silence_ms` of silence or `max_record_secs`; no onset wait, unlike the VAD path.
 pub(crate) fn record_mono_f32_until_silence(
     mic: &MicHandle,
@@ -108,50 +129,79 @@ pub(crate) fn record_mono_f32_until_silence(
 
     // Privacy gate before open, so the OS mic indicator stays dark when the mic is disabled.
     pond_core::models::domain::mic_gate::ensure_mic_enabled()?;
-    open_mic_and_confirm(mic)?;
+    // This runs detached once its turn is cancelled, so its close is scoped to its own session.
+    let session = open_mic_and_confirm(mic)?;
 
     let sample_rate = pond_audio::CAPTURE_RATE_HZ;
     let mut reader = MicReader::new(mic.shared().clone());
     let mut samples: Vec<f32> = Vec::new();
+    let mut frames = Windower::new(VAD_FRAME);
 
     let max_ms = max_record_secs as u64 * 1000;
     let mut elapsed_ms: u64 = 0;
     let mut silent_for: u64 = 0;
 
-    while elapsed_ms < max_ms {
+    'capture: while elapsed_ms < max_ms {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         elapsed_ms += POLL_MS;
-        samples.extend(reader.drain());
+        let fresh = reader.drain();
+        samples.extend_from_slice(&fresh);
 
-        let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
-        let start = samples.len().saturating_sub(recent);
-
-        if !detector.is_speech(&samples[start..]) {
-            silent_for += POLL_MS;
+        for speech in judge_frames(&mut frames, detector, &fresh) {
+            if speech {
+                silent_for = 0;
+                continue;
+            }
+            silent_for += VAD_FRAME_MS;
             if silent_for >= silence_ms {
                 tracing::debug!(
                     "Continue-record: end-of-speech after {}ms silence ({}ms total)",
                     silent_for,
                     elapsed_ms
                 );
-                break;
+                break 'capture;
             }
-        } else {
-            silent_for = 0;
         }
     }
 
-    mic.close();
+    mic.close_session(session);
     Ok((samples, sample_rate))
 }
 
-use pond_voice::dsp::VadEvent;
-
-use pond_voice::dsp::{SpeculativeVad, SpeechDetector};
-
-/// Starts a background transcription, joined once end-of-speech is confirmed.
+/// Starts a background transcription that gives up once its flag is raised.
 pub(crate) type SpeculativeSpawn =
-    dyn Fn(Vec<f32>, u32) -> std::thread::JoinHandle<Result<String>> + Send + Sync;
+    dyn Fn(Vec<f32>, u32, Arc<AtomicBool>) -> std::thread::JoinHandle<Result<String>> + Send + Sync;
+
+/// A speculative transcription in flight. Dropping it abandons the job, which then frees the
+/// engine for the transcription that superseded it instead of making that one queue.
+struct SpeculativeJob {
+    handle: std::thread::JoinHandle<Result<String>>,
+    abandon: StopOnDrop,
+}
+
+impl SpeculativeJob {
+    fn start(spawn: &SpeculativeSpawn, samples: Vec<f32>, sample_rate: u32) -> Self {
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let handle = spawn(samples, sample_rate, abandoned.clone());
+        Self {
+            handle,
+            abandon: StopOnDrop(abandoned),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// The transcript, waiting for it if need be; `None` if the job failed.
+    fn join(self) -> Option<String> {
+        let Self { handle, abandon } = self;
+        let transcript = handle.join().ok().and_then(|r| r.ok());
+        // Only now: raised any earlier, it would abort the job being waited on.
+        drop(abandon);
+        transcript
+    }
+}
 
 /// Wait for onset, record until `silence_ms` of pause or the cap; empty samples = no speech.
 /// `speculative_spawn` runs once per silence run; `on_speculative_event` gets Ready/Invalidated.
@@ -172,7 +222,8 @@ pub(crate) fn record_mono_f32_vad(
 
     // Privacy gate before open, so the OS mic indicator stays dark when the mic is disabled.
     pond_core::models::domain::mic_gate::ensure_mic_enabled()?;
-    open_mic_and_confirm(mic)?;
+    // This runs detached once its turn is cancelled, so its close is scoped to its own session.
+    let session = open_mic_and_confirm(mic)?;
 
     let sample_rate = pond_audio::CAPTURE_RATE_HZ;
     let mut reader = MicReader::new(mic.shared().clone());
@@ -202,77 +253,77 @@ pub(crate) fn record_mono_f32_vad(
     }
 
     if !speech_detected {
-        mic.close();
+        mic.close_session(session);
         return Ok((samples, sample_rate, None)); // empty or just noise
     }
 
     // ── Record until end-of-speech ──────────────────────────────────────────
     let max_record_ms = max_record_secs as u64 * 1000;
     let mut recorded_ms: u64 = 0;
-    let mut vad = SpeculativeVad::new(silence_ms, POLL_MS);
-    let mut speculative: Option<std::thread::JoinHandle<Result<String>>> = None;
+    let mut vad = SpeculativeVad::new(silence_ms, VAD_FRAME_MS);
+    let mut frames = Windower::new(VAD_FRAME);
+    let mut speculative: Option<SpeculativeJob> = None;
     // Set after `Ready`: reused on `Confirmed`; tells `DiscardSpeculative` to send `Invalidated`.
     let mut speculative_ready: Option<String> = None;
     let mut confirmed = false;
 
-    while recorded_ms < max_record_ms {
+    'capture: while recorded_ms < max_record_ms {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         recorded_ms += POLL_MS;
-        samples.extend(reader.drain());
+        let fresh = reader.drain();
+        samples.extend_from_slice(&fresh);
 
-        let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
-        let start = samples.len().saturating_sub(recent);
-        let frame = &samples[start..];
         if let Some(sink) = audio_level_sink {
-            sink.maybe_emit(rms_energy(frame));
+            if !fresh.is_empty() {
+                sink.maybe_emit(rms_energy(&fresh));
+            }
         }
 
-        match vad.on_speech(detector.is_speech(frame)) {
-            VadEvent::SpawnSpeculative => {
-                if let Some(spawn) = speculative_spawn {
-                    let snapshot = samples.clone();
-                    speculative = Some(spawn(snapshot, sample_rate));
-                    speculative_ready = None;
-                }
-            }
-            VadEvent::DiscardSpeculative => {
-                if speculative_ready.is_some() {
-                    if let Some(cb) = on_speculative_event {
-                        cb(SpeculativeSignal::Invalidated);
+        for speech in judge_frames(&mut frames, detector, &fresh) {
+            match vad.on_speech(speech) {
+                VadEvent::SpawnSpeculative => {
+                    if let Some(spawn) = speculative_spawn {
+                        speculative =
+                            Some(SpeculativeJob::start(spawn, samples.clone(), sample_rate));
+                        speculative_ready = None;
                     }
                 }
-                speculative = None; // abandon the in-flight job, it covered a too-short clip
-                speculative_ready = None;
+                VadEvent::DiscardSpeculative => {
+                    if speculative_ready.is_some() {
+                        if let Some(cb) = on_speculative_event {
+                            cb(SpeculativeSignal::Invalidated);
+                        }
+                    }
+                    speculative = None; // abandon the in-flight job, it covered a too-short clip
+                    speculative_ready = None;
+                }
+                VadEvent::Confirmed => {
+                    tracing::debug!("VAD: end-of-speech confirmed ({}ms total)", recorded_ms);
+                    confirmed = true;
+                    break 'capture;
+                }
+                VadEvent::None => {}
             }
-            VadEvent::Confirmed => {
-                tracing::debug!("VAD: end-of-speech confirmed ({}ms total)", recorded_ms);
-                confirmed = true;
-                break;
-            }
-            VadEvent::None => {}
         }
 
         // Notify as soon as the job finishes, so the LLM can start before silence is confirmed.
-        if speculative_ready.is_none() {
-            if let Some(handle) = &speculative {
-                if handle.is_finished() {
-                    let handle = speculative.take().unwrap();
-                    if let Ok(Ok(transcript)) = handle.join() {
-                        speculative_ready = Some(transcript.clone());
-                        if let Some(cb) = on_speculative_event {
-                            cb(SpeculativeSignal::Ready(transcript));
-                        }
-                    }
+        if speculative_ready.is_none() && speculative.as_ref().is_some_and(|j| j.is_finished()) {
+            if let Some(transcript) = speculative.take().and_then(SpeculativeJob::join) {
+                speculative_ready = Some(transcript.clone());
+                if let Some(cb) = on_speculative_event {
+                    cb(SpeculativeSignal::Ready(transcript));
                 }
             }
         }
     }
 
-    mic.close();
+    mic.close_session(session);
 
     let speculative_transcript = if confirmed {
-        speculative_ready.or_else(|| speculative.and_then(|h| h.join().ok().and_then(|r| r.ok())))
+        speculative_ready.or_else(|| speculative.and_then(SpeculativeJob::join))
     } else {
+        // Abandoned before returning, so the full transcription doesn't queue behind it.
+        drop(speculative);
         None
     };
 
@@ -465,7 +516,7 @@ impl StreamingWakeWordDetector for WhisperKeywordDetector {
     }
 }
 
-/// Sets its flag on drop, so dropping the future stops the blocking thread it spawned.
+/// Sets its flag on drop, so dropping its owner stops the thread watching the flag.
 struct StopOnDrop(Arc<AtomicBool>);
 
 impl Drop for StopOnDrop {
@@ -602,7 +653,7 @@ fn detection_loop(
 
             while elapsed_ms < config.post_trigger_ms {
                 if !sleep_unless_stopped(poll_ms, &stop) {
-                    mic.close();
+                    mic.close_session(session);
                     return Err(anyhow!("wake-word detection cancelled"));
                 }
                 elapsed_ms += poll_ms;
@@ -644,7 +695,7 @@ fn detection_loop(
                 elapsed_ms
             );
 
-            mic.close();
+            mic.close_session(session);
             // Transcribing comes next, then the turn; a false wake has no turn, and this runs out.
             keep_quiet(QUIET_UNTIL_THE_TURN);
 
@@ -1060,6 +1111,325 @@ mod tests {
             result.is_ok(),
             "the follow-up capture must not fail from a device race: {:?}",
             result.err()
+        );
+    }
+
+    // ── Session-scoped closes ────────────────────────────────────────────────
+
+    use pond_audio::testing::ScriptedCapture;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// Hears `reply` in every window, counting the calls.
+    struct Hears {
+        reply: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl WhisperBackend for Hears {
+        fn transcribe_pcm_blocking(&self, _: &[f32]) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.reply.to_string())
+        }
+    }
+
+    fn scripted_mic(device: ScriptedCapture) -> MicHandle {
+        let (mic, _join) =
+            pond_audio::spawn(Box::new(device), pond_audio::CAPTURE_RATE_HZ, 15_000, true);
+        mic
+    }
+
+    /// A 16 kHz tone `ms` long, well above every speech threshold here.
+    fn tone(ms: u64) -> Vec<f32> {
+        (0..16 * ms as usize)
+            .map(|i| (i as f32 * 0.05).sin() * 0.5)
+            .collect()
+    }
+
+    fn quick_config() -> KeywordDetectorConfig {
+        KeywordDetectorConfig {
+            cooldown_ms: 0,
+            window_ms: 200,
+            slide_ms: 20,
+            lookback_ms: 100,
+            post_trigger_silence_ms: 0,
+            ..KeywordDetectorConfig::default()
+        }
+    }
+
+    /// Runs the detector on its own thread, as `spawn_blocking` does, hearing "goose".
+    fn run_detector(
+        mic: &MicHandle,
+        config: KeywordDetectorConfig,
+        calls: &Arc<AtomicUsize>,
+        stop: &Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<Result<WakeWordActivation>> {
+        let backend = Arc::new(Hears {
+            reply: "goose",
+            calls: calls.clone(),
+        });
+        let (mic, stop) = (mic.clone(), stop.clone());
+        std::thread::spawn(move || {
+            detection_loop(backend, vec!["goose".into()], config, stop, None, mic)
+        })
+    }
+
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Gives a close already sent time to land, then requires `session` to have survived it.
+    fn assert_still_open_then_close(mic: &MicHandle, session: u64) {
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            mic.state().is_open(),
+            "a stale close shut the device under a newer session"
+        );
+        // Vacuity control: the session that owns the device can still close it.
+        mic.close_session(session);
+        assert!(mic.wait_for(|s| *s == MicState::Closed, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_detector_cancelled_mid_capture_spares_a_newer_session() {
+        let mic = scripted_mic(ScriptedCapture::new(tone(10_000), 20));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = KeywordDetectorConfig {
+            post_trigger_ms: 10_000,
+            ..quick_config()
+        };
+        let detector = run_detector(&mic, config, &calls, &stop);
+
+        // Heard: from here on the detector is in its post-trigger capture.
+        wait_until("the wake word", || calls.load(Ordering::SeqCst) > 0);
+        let follow_up = mic.open_session();
+        stop.store(true, Ordering::SeqCst);
+        let outcome = detector.join().expect("the detector must not panic");
+        assert!(outcome.is_err(), "it was cancelled");
+
+        assert_still_open_then_close(&mic, follow_up);
+    }
+
+    #[test]
+    fn a_detector_finishing_its_capture_spares_a_newer_session() {
+        let mic = scripted_mic(ScriptedCapture::new(tone(10_000), 20));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = KeywordDetectorConfig {
+            post_trigger_ms: 400,
+            ..quick_config()
+        };
+        let detector = run_detector(&mic, config, &calls, &stop);
+
+        wait_until("the wake word", || calls.load(Ordering::SeqCst) > 0);
+        let follow_up = mic.open_session();
+        let activation = detector
+            .join()
+            .expect("the detector must not panic")
+            .expect("the wake word fires");
+        assert!(activation.captured_audio.is_some());
+
+        assert_still_open_then_close(&mic, follow_up);
+    }
+
+    /// A capture keeps running after its turn is cancelled; its close must not reach the
+    /// session the next turn opened meanwhile.
+    fn assert_a_late_capture_spares_the_next_session(
+        capture: impl FnOnce(&MicHandle) + Send + 'static,
+    ) {
+        let mic = scripted_mic(ScriptedCapture::new(tone(10_000), 20));
+        let running = {
+            let mic = mic.clone();
+            std::thread::spawn(move || capture(&mic))
+        };
+        // Open means the capture has claimed its generation, so the next claim is newer.
+        assert!(mic.wait_for(|s| s.is_open(), Duration::from_secs(2)));
+        let next = mic.open_session();
+        running.join().expect("the capture must not panic");
+
+        assert_still_open_then_close(&mic, next);
+    }
+
+    #[test]
+    fn a_late_vad_capture_spares_the_next_session() {
+        assert_a_late_capture_spares_the_next_session(|mic| {
+            let mut detector = RmsDetector::new(0.005);
+            record_mono_f32_vad(mic, 1, 1, 200, None, None, None, &mut detector).expect("captured");
+        });
+    }
+
+    #[test]
+    fn a_late_continued_capture_spares_the_next_session() {
+        assert_a_late_capture_spares_the_next_session(|mic| {
+            let mut detector = RmsDetector::new(0.005);
+            record_mono_f32_until_silence(mic, 1, 200, &mut detector).expect("captured");
+        });
+    }
+
+    // ── What the speech detector is fed ──────────────────────────────────────
+
+    /// Keeps every frame it judges; speech is energy, as for `RmsDetector`.
+    #[derive(Default)]
+    struct Judged {
+        frames: Vec<Vec<f32>>,
+    }
+
+    impl SpeechDetector for Judged {
+        fn is_speech(&mut self, frame: &[f32]) -> bool {
+            self.frames.push(frame.to_vec());
+            rms_energy(frame) >= 0.005
+        }
+    }
+
+    #[test]
+    fn the_speech_detector_hears_every_sample_once_in_whole_windows() {
+        // Every sample distinct, so a repeat or a gap shows; 20 ms slices polled every 30 ms
+        // never line up with a 512-sample window.
+        let speech: Vec<f32> = (0..16_000).map(|i| 0.1 + i as f32 * 1e-6).collect();
+        let mic = scripted_mic(ScriptedCapture::new(speech, 20));
+        let mut judged = Judged::default();
+        let (samples, _, _) =
+            record_mono_f32_vad(&mic, 1, 5, 300, None, None, None, &mut judged).expect("captured");
+
+        assert!(!judged.frames.is_empty());
+        for frame in &judged.frames {
+            assert_eq!(frame.len(), VAD_FRAME, "Silero needs exact windows");
+        }
+        let heard = judged.frames.concat();
+        let start = samples
+            .iter()
+            .position(|s| *s == heard[0])
+            .expect("the first judged sample is in the capture");
+        assert_eq!(
+            Some(&heard[..]),
+            samples.get(start..start + heard.len()),
+            "the detector must hear the capture in order, each sample once"
+        );
+        assert!(
+            samples.len() - (start + heard.len()) < VAD_FRAME,
+            "only the remainder short of a window may go unjudged"
+        );
+    }
+
+    #[test]
+    fn end_of_speech_waits_for_silence_ms_of_audio_not_of_polls() {
+        // 20 ms of audio every 60 ms: a device delivering at a third of real time.
+        let mic = scripted_mic(ScriptedCapture::new(tone(300), 20).paced(60));
+        let silence_ms = 300;
+        let mut detector = RmsDetector::new(0.005);
+        let (samples, _, _) =
+            record_mono_f32_vad(&mic, 2, 10, silence_ms, None, None, None, &mut detector)
+                .expect("captured");
+
+        let trailing_silence = samples.iter().rev().take_while(|s| **s == 0.0).count();
+        let needed = silence_ms as usize * 16;
+        assert!(
+            trailing_silence + VAD_FRAME > needed,
+            "ended after {trailing_silence} silent samples; {silence_ms} ms is {needed}"
+        );
+    }
+
+    // ── Abandoned speculative jobs ───────────────────────────────────────────
+
+    /// Stands in for the engine: a job holds `slot` while it decodes, until its flag is raised
+    /// or the decode runs its course, as a whisper decode with an abort hook does.
+    fn slot_holding_spawn(
+        slot: &Arc<Mutex<()>>,
+        started: &Arc<AtomicUsize>,
+    ) -> Box<SpeculativeSpawn> {
+        const DECODE: Duration = Duration::from_secs(10);
+        let (slot, started) = (slot.clone(), started.clone());
+        Box::new(move |_samples, _rate, abandoned| {
+            let (slot, started) = (slot.clone(), started.clone());
+            std::thread::spawn(move || {
+                let _held = slot.lock().unwrap();
+                started.fetch_add(1, Ordering::SeqCst);
+                let t0 = Instant::now();
+                while t0.elapsed() < DECODE {
+                    if abandoned.load(Ordering::SeqCst) {
+                        return Err(anyhow!("abandoned"));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok("a guess".to_string())
+            })
+        })
+    }
+
+    #[test]
+    fn an_abandoned_speculative_job_does_not_hold_up_the_full_transcription() {
+        let mut resumed = tone(300);
+        resumed.extend(vec![0.0; 16 * 150]);
+        resumed.extend(tone(3_000));
+        let mut capped = tone(300);
+        capped.extend(vec![0.0; 16 * 3_000]);
+
+        // Speech resumes after a short pause; or the cap ends the capture mid-pause.
+        for (case, script, silence_ms) in [
+            ("speech resumed", resumed, 400),
+            ("capped mid-pause", capped, 5_000),
+        ] {
+            let slot = Arc::new(Mutex::new(()));
+            let started = Arc::new(AtomicUsize::new(0));
+            let spawn = slot_holding_spawn(&slot, &started);
+            let mic = scripted_mic(ScriptedCapture::new(script, 20));
+            let mut detector = RmsDetector::new(0.005);
+
+            let (_, _, transcript) = record_mono_f32_vad(
+                &mic,
+                1,
+                1,
+                silence_ms,
+                Some(&*spawn),
+                None,
+                None,
+                &mut detector,
+            )
+            .expect("captured");
+            assert!(transcript.is_none(), "{case}: never confirmed");
+            assert!(
+                started.load(Ordering::SeqCst) > 0,
+                "{case}: the pause must have started a speculative job"
+            );
+
+            // The full transcription comes next and needs the same slot.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while slot.try_lock().is_err() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{case}: the full transcription queued behind an abandoned job"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    // ── Stale audio ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_reopened_detector_never_hears_the_last_session() {
+        let mic = scripted_mic(ScriptedCapture::silence(0, 20));
+        // The last session's tail, wake word and all, still buffered while the mic was closed.
+        mic.shared().ring.lock().unwrap().push(&tone(1_000));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let detector = run_detector(&mic, quick_config(), &calls, &stop);
+
+        assert!(mic.wait_for(|s| s.is_open(), Duration::from_secs(2)));
+        // Twenty slides of room tone.
+        std::thread::sleep(Duration::from_millis(400));
+        stop.store(true, Ordering::SeqCst);
+        assert!(detector.join().expect("no panic").is_err(), "cancelled");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the detector transcribed audio from before it opened"
         );
     }
 }
