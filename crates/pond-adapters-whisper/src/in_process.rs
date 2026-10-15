@@ -1061,14 +1061,15 @@ mod decode_profiles {
         );
 
         let mut decoded = 0;
-        let error = held
+        let (failed, error) = held
             .iter_mut()
-            .find_map(|state| match state.full(beam(), &samples) {
+            .enumerate()
+            .find_map(|(i, state)| match state.full(beam(), &samples) {
                 Ok(()) => {
                     decoded += 1;
                     None
                 }
-                Err(error) => Some(error),
+                Err(error) => Some((i, error)),
             })
             .expect("every state grew its cache; the GPU never filled");
         eprintln!("\n  {decoded} beam decodes fit before: {error}\n");
@@ -1077,8 +1078,21 @@ mod decode_profiles {
             "the decode failed somewhere other than growing its cache: {error}"
         );
 
-        // The failed state is dropped here with the rest; before the fix it was freed twice.
+        // The failed state has no self-attention cache; auto-detect decodes before whisper_full
+        // recreates it, and asserted on the missing buffer.
+        let mut failed = held.swap_remove(failed);
         drop(held);
+        let mut auto = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        auto.set_language(Some("auto"));
+        auto.set_print_progress(false);
+        auto.set_print_realtime(false);
+        auto.set_print_timestamps(false);
+        failed
+            .full(auto, &samples)
+            .expect("an auto-detect decode on the state whose cache could not grow");
+
+        // Dropped here; before the fix the failed state was freed twice.
+        drop(failed);
         let after = WhisperRsInput::transcribe_samples(&ctx, jfk_samples())
             .expect("memory released by the failed and the held states serves a transcription");
         assert!(after.to_lowercase().contains("country"), "{after:?}");
