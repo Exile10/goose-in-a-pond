@@ -10,6 +10,7 @@ use crate::owner::{CaptureDevice, MicShared};
 pub struct ScriptedCapture {
     samples: Vec<f32>,
     chunk_ms: u64,
+    period_ms: u64,
     /// Owned by the feeder thread; set on `stop` so it exits promptly.
     stop: Arc<AtomicBool>,
 }
@@ -17,11 +18,20 @@ pub struct ScriptedCapture {
 impl ScriptedCapture {
     /// Play `samples` in `chunk_ms` slices, then silence forever.
     pub fn new(samples: Vec<f32>, chunk_ms: u64) -> Self {
+        let chunk_ms = chunk_ms.max(1);
         Self {
             samples,
-            chunk_ms: chunk_ms.max(1),
+            chunk_ms,
+            period_ms: chunk_ms,
             stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Deliver each slice every `period_ms` instead: slower than real time when it exceeds
+    /// `chunk_ms`, as a stalling device does.
+    pub fn paced(mut self, period_ms: u64) -> Self {
+        self.period_ms = period_ms.max(1);
+        self
     }
 
     /// `speech_ms` of tone followed by `silence_ms` of quiet.
@@ -48,7 +58,7 @@ impl CaptureDevice for ScriptedCapture {
 
         let samples = self.samples.clone();
         let per_chunk = ((16_000 * self.chunk_ms) / 1000).max(1) as usize;
-        let period = std::time::Duration::from_millis(self.chunk_ms);
+        let period = std::time::Duration::from_millis(self.period_ms);
 
         std::thread::Builder::new()
             .name("pond-mic-scripted".into())
