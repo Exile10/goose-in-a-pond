@@ -84,10 +84,10 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     },
     ToolGroup {
         extension: "giap-knowledge",
-        description: "General reference knowledge and factual lookup: encyclopedia and Wikipedia \
-                      articles, definitions of words, books and authors, short factual answers \
-                      about history, science, geography, people and places, and computed answers \
-                      such as arithmetic, unit and currency conversion, dates and statistics.",
+        description: "Looking things up, working things out and searching the web: encyclopedia \
+                      articles about people, places and events, exact arithmetic, unit \
+                      conversions and dates, and the web for anything current, local or \
+                      specific, such as news, opening hours, prices and products.",
         core: false,
     },
     ToolGroup {
