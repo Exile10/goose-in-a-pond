@@ -150,26 +150,22 @@ impl ServerHandler for KnowledgeMcpServer {
                 "giap-knowledge",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(
-                "GIAP Knowledge server — reference lookups, definitions, and computation.\n\n\
-                 Tools: get_wikipedia_article (deep articles), \
-                 search_wikipedia (find articles), define_word (dictionary), search_books (book search), \
-                 compute_answer (Wolfram|Alpha), explore_computation (open a Wolfram suggestion).\n\n\
-                 Reading vs computing is the split. If the answer has to be worked out — \
-                 arithmetic, a unit or currency conversion, a date difference, a statistic — \
-                 use compute_answer. If it has to be read — who someone was, what happened, \
-                 what a place is like — use get_wikipedia_article; it auto-searches when the \
-                 title is not exact. Use search_wikipedia only to disambiguate between several \
-                 possible articles. For word definitions, use define_word. For book queries, \
-                 use search_books.\n\
-                 A compute_answer result may end with suggestions, each with an id like 'w3'. \
-                 When one of them is what the user actually meant, call explore_computation \
-                 with that id rather than guessing or re-asking.\n\
-                 After receiving results: synthesize in your own words. Do not parrot verbatim.\n\
-                 In voice mode: 1-3 sentences. Offer to elaborate if the user wants more.",
-            )
+            .with_instructions(KNOWLEDGE_INSTRUCTIONS)
     }
 }
+
+/// Every tool these instructions name must be one this server lists.
+const KNOWLEDGE_INSTRUCTIONS: &str = "\
+GIAP Knowledge server: encyclopedia articles and computation.
+
+Tools: get_wikipedia_article (encyclopedia articles), compute_answer (computation).
+
+If the answer has to be worked out (arithmetic, a unit or currency conversion, a date \
+difference, a statistic), use compute_answer. If it has to be read (who someone was, what \
+happened, what a place is like), use get_wikipedia_article; it auto-searches when the title is \
+not exact.
+After receiving results: synthesize in your own words. Do not parrot verbatim.
+In voice mode: 1-3 sentences. Offer to elaborate if the user wants more.";
 
 // ── MCP-UI hint helpers ───────────────────────────────────────────────────
 
@@ -577,6 +573,36 @@ mod tests {
     #[test]
     fn server_constructs() {
         let _server = test_server();
+    }
+
+    #[test]
+    fn the_instructions_name_only_tools_that_exist_and_every_one_that_does() {
+        use rmcp::handler::server::ServerHandler;
+        let instructions = test_server()
+            .get_info()
+            .instructions
+            .expect("giap-knowledge sends instructions");
+        let tools: Vec<String> = KnowledgeMcpServer::tool_defs()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let named: Vec<&str> = instructions
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| word.contains('_'))
+            .collect();
+        assert!(named.len() >= tools.len(), "the scan found {named:?}");
+        for name in &named {
+            assert!(
+                tools.iter().any(|t| t == name),
+                "{name} is not a tool: {tools:?}"
+            );
+        }
+        for tool in &tools {
+            assert!(
+                instructions.contains(tool.as_str()),
+                "{tool} is not described"
+            );
+        }
     }
 
     #[test]
