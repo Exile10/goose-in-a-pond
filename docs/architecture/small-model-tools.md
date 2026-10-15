@@ -561,12 +561,22 @@ prompt with no restart. The handler re-checks the key at call time, which covers
      `footer`, `aside`, `form` and `[aria-hidden=true]`;
    - keep text blocks from `p`, `li`, `h1`–`h4`, `td`, `th`, `blockquote`, `pre`, `dd`;
    - collapse whitespace, and drop non-heading blocks under 40 chars.
-5. **Rank.** The candidates are page blocks plus Brave's `description` and `extra_snippets`.
-   They are scored with BM25 against the full question: light stemming, IDF over the
-   candidates. This is the same ranker `look_up` will use; it is pure, so it lives in
-   `pond-core`.
+5. **Rank** (amended 2026-10-15, after E7). The candidates are page blocks plus Brave's
+   `description` and `extra_snippets`. They are scored with BM25 against the full question,
+   with two changes the bench showed are needed:
+   - **Suffix stemming before the five-character cut.** Strip one of `ations ation ings ing
+     edly ers ies ied ed es ly er s`, then cut to five, so "opening" meets "open".
+   - **An answer-type boost.** When the question asks a time, price, date or count ("what
+     time", "close", "how much", "cost", "when", "how many"…), passages carrying that shape (a
+     clock time, a currency amount, a year or date, a number) get the top score added.
+
+   This is retrieval inside a tool the model already chose to call, not routing. Plain BM25 put
+   the answer in the top two passages for 4 of 6 web cases; the amended ranker did for 6, with
+   Wikipedia unchanged at 11 of 17. The production MiniLM embedder managed 5, so the tool needs
+   no model (`kt/rankers.py`).
    - Take the best passages up to about 1,800 bytes, at most 2 per source.
    - A source whose page was read contributes page text, not Brave's description.
+   - The ranker is pure, so it lives in `pond-core`, where `look_up` will reuse it.
 6. **Model's copy, plain text, no URLs, no Markdown:**
 
    ```text
@@ -645,6 +655,39 @@ screen under Profile → Integrations.
 - The three routes against a stub Brave.
 - `scripts/live-test.sh`, since the change adds routes.
 - An `#[ignore]` live test against Brave, run by hand with a real key.
-- Bench E6 (section 2): web-needing cases routed in `all` mode with `search_web` beside
-  `look_up` and `calculate`. Does it get called when needed, and does it steal encyclopedia
-  questions from `look_up`?
+- Bench E6 and E7 (§8.7) are re-run against the live tool before it ships.
+
+### 8.7 What the bench measured for web search
+
+Both experiments ran on current main's captured prompt (`68eef8cb`), thinking off.
+
+**E6, calling.** 12 questions only the live web can answer (opening hours, prices, news, train
+times), asked beside the 40 earlier cases. The arm is `S1`: `look_up`, `calculate` and
+`search_web`.
+
+| `S1` | web questions to `search_web` | encyclopedia it took | sums it took | false calls |
+|---|---:|---:|---:|---:|
+| E2B | **12/12** | 4/17 | 0/11 | 0/8 |
+| E4B | **12/12** | 3/17 | 0/11 | 0/8 |
+| Llama 3.2 3B | 7/12 | 0/17 | 0/11 | 4/8 |
+| Granite 4.1 3B | 2/12 | 0/17 | 0/11 | 0/8 |
+
+E2B is the model that almost never looks anything up, and it calls `search_web` every time
+the question is plainly current ("today", "right now", "this month"): those read as live, and
+live is what the system prompt says to call tools for. The other families are weaker. Granite
+sent seven web questions to `get_current_weather`; Llama sent two there and three to `look_up`.
+
+**E7, reading back.** Six SYNTHETIC cases (`fixtures/web/synthetic.json`, hand-written,
+because Brave's §3(b)(xiii) forbids benchmarking on its results), with the `search_web` call
+forced. Each snippet looks like a real hit but lacks the answer; the page text has it.
+
+| correct / honest "the result does not say" (of 6) | snippets only (the old SearXNG format) | pages, plain BM25 | pages unreadable | pages, amended ranker |
+|---|---:|---:|---:|---:|
+| E2B | 0 / 6 | 4 / 2 | 0 / 6 | **6 / 0** |
+| E4B | 0 / 6 | 4 / 2 | 0 / 6 | **6 / 0** |
+
+Reading the pages is the whole difference between a web search that answers and one that does
+not. Neither model invented an answer in any arm: given results without the answer, both said
+so. The caveat is the size of the evidence. Six synthetic cases, written by the same hand
+that wrote the boost patterns, make 6/6 an upper bound. The live-tool re-run in §8.6 is the
+real test.
