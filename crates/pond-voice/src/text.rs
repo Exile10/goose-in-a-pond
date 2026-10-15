@@ -1383,8 +1383,8 @@ fn align_phrase(transcript: &str, prompt: &str, phrase: &str) -> Option<(String,
     for (i, row) in cost.iter_mut().enumerate() {
         row[0] = i as f32;
     }
-    for j in 0..=k {
-        cost[0][j] = j as f32;
+    for (j, c) in cost[0].iter_mut().enumerate() {
+        *c = j as f32;
     }
     for i in 1..=m {
         for j in 1..=k {
