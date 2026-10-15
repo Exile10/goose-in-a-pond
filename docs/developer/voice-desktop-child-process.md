@@ -107,7 +107,12 @@ thread holding the mic.
   synthesis stop, nothing from the turn is persisted, and the next capture
   starts from when the user began talking, so their words are transcribed. The
   reply holds the mic open while it plays, so this works under `--no-wake-word`
-  too. Typed input (no speech model) has no barge-in.
+  too. Typed input (no speech model) has no barge-in. It listens only while
+  audio is coming out, not between sentences while a tool runs.
+- There is no echo cancellation yet. The barge-in threshold sits above a
+  reply's echo at ordinary volume, so speakers turned up far enough can still
+  trigger it; and the follow-up capture reaches back past the onset, so its
+  transcript can begin with the reply's own last words. Headphones avoid both.
 - The `InstantActivation` race that broke stdin / `--no-wake-word` mode is
   fixed: `StreamingWakeWordDetector::supports_interruption()` gates the
   wake-word branch of the `run_loop` turn race (`InstantActivation` returns
