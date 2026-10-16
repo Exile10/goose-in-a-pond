@@ -82,6 +82,9 @@ the memory. The `ggml_backend_sched_alloc_splits` change above does not reach th
 path: it happens after the state, with its compute buffers, already exists. Now the
 state is left freeable and reusable. The cache is marked absent, with no buffer and a
 decoder count of zero, so another `whisper_full` on the state recreates it.
+`whisper_decode_with_state` recreates a one-decoder cache when it finds none, because
+language auto-detect decodes through it before `whisper_full` reaches its own check, and
+asserted on the missing buffer.
 `running_out_of_gpu_memory_while_decoding_is_an_error_not_a_crash` in
 `crates/pond-adapters-whisper` reproduces the failure on a CUDA build. Its doc comment
 says how to read a run that aborts in GGML's CUDA scratch pool instead
