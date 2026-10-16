@@ -3315,30 +3315,24 @@ async fn run_server(
         if let Some(mgr) = &extension_manager {
             match repo.list().await {
                 Ok(servers) => {
-                    for srv in servers
-                        .into_iter()
-                        .filter(|s: &pond_core::mcp::ports::mcp_server::McpServerConfig| s.enabled)
-                    {
+                    for srv in servers {
                         use pond_core::mcp::ports::extension_manager::AddExtensionRequest;
+                        use pond_core::security::ports::secret::SecretRepository;
 
-                        // A catalogue extension's keys come from the store alone: the row's
-                        // copies are dropped, and the row is saved once without them.
+                        // Every catalogue row, a disabled one too, gives up the keys the store
+                        // holds; a key only the row holds moves into the store first.
                         let mut env = srv.env.clone();
                         let mut scrubbed_row = None;
                         let mut missing_keys = None;
                         if let Ok(Some(ext)) = marketplace.get_by_id(&srv.name).await {
-                            let mut stored = std::collections::HashMap::new();
-                            if let Some(sr) = &secret_repo {
-                                for secret_req in &ext.required_secrets {
-                                    if let Ok(Some(val)) = sr.get(&secret_req.key).await {
-                                        stored.insert(secret_req.key.clone(), val);
-                                    }
-                                }
-                            }
+                            let store = secret_repo
+                                .as_ref()
+                                .map(|r| r.as_ref() as &dyn SecretRepository);
                             let prepared =
-                                pond_core::mcp::services::extension_env::prepare_extension_env(
-                                    &srv.env, &ext, &stored,
-                                );
+                                pond_core::mcp::services::extension_env::settle_saved_env(
+                                    &srv.env, &ext, store,
+                                )
+                                .await;
                             if prepared.row_changed {
                                 scrubbed_row = Some(prepared.row_env);
                             }
@@ -3388,6 +3382,9 @@ async fn run_server(
                             }
                         }
 
+                        if !srv.enabled {
+                            continue;
+                        }
                         if let Some(missing) = missing_keys {
                             tracing::warn!(
                                 extension = %srv.name,

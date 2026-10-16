@@ -11127,10 +11127,25 @@ async fn install_marketplace_handler(
         return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
     }
 
-    if let Some(repo) = &state.secret_repo {
+    // The saved row keeps no key, so a key the store did not take would be lost at the next start.
+    if !secrets.is_empty() {
+        let Some(repo) = &state.secret_repo else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Secret storage not available, so nothing was installed"})),
+            )
+                .into_response();
+        };
         for (key, value) in &secrets {
             if let Err(e) = repo.set(key, value).await {
-                tracing::warn!("Failed to store secret '{}': {e}", key);
+                tracing::warn!(key = %key, error = %e, "install: a key could not be stored");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!("Could not store '{key}', so nothing was installed")
+                    })),
+                )
+                    .into_response();
             }
         }
     }
@@ -11334,7 +11349,7 @@ async fn delete_secret_handler(
 }
 
 /// Stop every installed catalogue extension that cannot run without `key`, now that it is gone.
-/// Its row stays enabled, so saving the key again starts it (`restart_extension_with_secrets`).
+/// Its row is kept as it was, so saving the key again starts it when enabled.
 async fn stop_extensions_needing(state: &AppState, key: &str) {
     let (Some(mgr), Some(mp), Some(servers), Some(secrets)) = (
         &state.extension_manager,
@@ -11355,7 +11370,8 @@ async fn stop_extensions_needing(state: &AppState, key: &str) {
             return;
         }
     };
-    for row in installed.iter().filter(|r| r.enabled) {
+    // Disabled rows too: re-enabling restarts from the manager's cached config, key included.
+    for row in &installed {
         let Ok(Some(ext)) = mp.get_by_id(&row.name).await else {
             continue;
         };

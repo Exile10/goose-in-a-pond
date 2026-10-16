@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -22,8 +23,9 @@ const EXT: &str = "github";
 const KEY: &str = "GITHUB_PERSONAL_ACCESS_TOKEN";
 const VALUE: &str = "not-a-real-key";
 
+/// The secret store; every write fails while `writes_fail` is set.
 #[derive(Default)]
-struct Secrets(Mutex<HashMap<String, String>>);
+struct Secrets(Mutex<HashMap<String, String>>, AtomicBool);
 
 #[async_trait::async_trait]
 impl SecretRepository for Secrets {
@@ -31,6 +33,9 @@ impl SecretRepository for Secrets {
         Ok(self.0.lock().unwrap().get(key).cloned())
     }
     async fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        if self.1.load(Ordering::SeqCst) {
+            anyhow::bail!("the store is read-only");
+        }
         self.0.lock().unwrap().insert(key.into(), value.into());
         Ok(())
     }
@@ -306,4 +311,52 @@ async fn a_restart_without_the_key_is_refused_by_name_and_saving_it_restarts() {
     assert_eq!(body["restarted"], true, "{body}");
     let started = pond.manager.added.lock().unwrap().last().cloned().unwrap();
     assert_eq!(started.env.get(KEY).map(String::as_str), Some(VALUE));
+}
+
+#[tokio::test]
+async fn a_key_the_store_cannot_take_fails_the_install() {
+    let pond = pond().await;
+    pond.secrets.1.store(true, Ordering::SeqCst);
+    let (status, body) = call(
+        &pond,
+        Method::POST,
+        &format!("/api/v1/marketplace/{EXT}/install"),
+        Some(json!({ "secrets": { KEY: VALUE } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(!body.to_string().contains(VALUE), "{body}");
+    assert!(pond.manager.added.lock().unwrap().is_empty(), "it started");
+    assert!(
+        pond.rows.0.lock().unwrap().is_empty(),
+        "a row was saved for a key kept nowhere"
+    );
+}
+
+#[tokio::test]
+async fn deleting_the_key_stops_a_disabled_extension_too() {
+    let pond = pond().await;
+    install(&pond).await;
+    let (status, body) = call(
+        &pond,
+        Method::PATCH,
+        &format!("/api/v1/extensions/{EXT}"),
+        Some(json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _) = call(
+        &pond,
+        Method::DELETE,
+        &format!("/api/v1/secrets/{KEY}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        *pond.manager.removed.lock().unwrap(),
+        vec![EXT.to_string()],
+        "re-enabling would restart it from its cached config, the deleted key included"
+    );
 }
