@@ -1,0 +1,843 @@
+{
+ "model": "gemma-4-E2B-it-qat-UD-Q4_K_XL",
+ "exp": "e5",
+ "rows": [
+  {
+   "arm": "V1T",
+   "id": "r01",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Who was Wangari Maathai?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3816,
+   "prompt_ms": 8809.829,
+   "wall": 13.704,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r02",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What is Kisumu known for?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3815,
+   "prompt_ms": 832.18,
+   "wall": 4.094,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r03",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Who is Ngũgĩ wa Thiong'o?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3820,
+   "prompt_ms": 999.522,
+   "wall": 4.589,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r04",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Tell me about the Uganda Railway."
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3815,
+   "prompt_ms": 1034.112,
+   "wall": 3.155,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r05",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What happened at the Battle of Adwa?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3817,
+   "prompt_ms": 855.456,
+   "wall": 3.291,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r06",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What is M-Pesa?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3815,
+   "prompt_ms": 863.067,
+   "wall": 3.932,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r07",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Who was Dedan Kimathi?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3815,
+   "prompt_ms": 963.168,
+   "wall": 5.567,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r08",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "When did Lake Turkana get its current name, and what was it called before?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3825,
+   "prompt_ms": 1089.428,
+   "wall": 4.88,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r09",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Who won the men's marathon at the 2024 Olympics?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3824,
+   "prompt_ms": 1204.714,
+   "wall": 5.047,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r10",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Where was Barack Obama's father born?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3817,
+   "prompt_ms": 1111.917,
+   "wall": 3.999,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r11",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "The language mostly spoken in Lamu is Swahili.",
+   "finish": "stop",
+   "prompt_tokens": 3817,
+   "prompt_ms": 1067.052,
+   "wall": 3.062,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r12",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What building did Wangari Maathai campaign against in Uhuru Park?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3822,
+   "prompt_ms": 768.223,
+   "wall": 4.576,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r13",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Where is the new Lamu port being built?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3818,
+   "prompt_ms": 1021.45,
+   "wall": 4.346,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r14",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Which mobile operator ran M-Pesa in Afghanistan?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3819,
+   "prompt_ms": 1194.68,
+   "wall": 5.282,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "r15",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Which animals attacked the workers building the Uganda Railway?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3818,
+   "prompt_ms": 927.953,
+   "wall": 4.693,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c01",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "1234 times 17"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3820,
+   "prompt_ms": 985.629,
+   "wall": 3.715,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c02",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "(11 + 31 + 24) divided by 3"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3827,
+   "prompt_ms": 1247.858,
+   "wall": 5.296,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c03",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "Convert 72 degrees Fahrenheit to Celsius"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3817,
+   "prompt_ms": 976.785,
+   "wall": 3.301,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c04",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "How many days are there between 12 December 1963 and 14 October 2026?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3834,
+   "prompt_ms": 1032.648,
+   "wall": 6.029,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c05",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "15 percent of 2350"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3823,
+   "prompt_ms": 948.684,
+   "wall": 3.038,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c06",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "square root of 7 to five decimal places"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3822,
+   "prompt_ms": 1028.761,
+   "wall": 4.078,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c07",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "How many seconds are in 3.5 hours?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3819,
+   "prompt_ms": 891.872,
+   "wall": 3.365,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c08",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "What is 16 percent of 48,000?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3823,
+   "prompt_ms": 1072.037,
+   "wall": 3.943,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c09",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "2500 * 52"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3832,
+   "prompt_ms": 1316.373,
+   "wall": 4.38,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c10",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "3 to the power of 13"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3820,
+   "prompt_ms": 1012.144,
+   "wall": 3.662,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "c11",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "How many kilometres is 26.2 miles?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3819,
+   "prompt_ms": 1016.964,
+   "wall": 4.007,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "n01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "I am doing well today. How can I help you?",
+   "finish": "stop",
+   "prompt_tokens": 3815,
+   "prompt_ms": 1071.975,
+   "wall": 3.498,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "n02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "You're welcome. Feel free to reach out whenever you need anything else.",
+   "finish": "stop",
+   "prompt_tokens": 3817,
+   "prompt_ms": 1023.293,
+   "wall": 2.703,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "n03",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "The Nairobi sky weeps a gentle, warm shower,\nWashing the city streets in a vibrant flower.",
+   "finish": "stop",
+   "prompt_tokens": 3819,
+   "prompt_ms": 751.764,
+   "wall": 2.681,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "n04",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Here are a few ways to rewrite that more politely:\n\nCould you please send me the report when you have a moment?\n\nI would appreciate it if you could send the report soon.\n\nWould you mind sending the report at your earliest convenience?",
+   "finish": "stop",
+   "prompt_tokens": 3819,
+   "prompt_ms": 956.2,
+   "wall": 7.612,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "n05",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "2 plus 2"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3816,
+   "prompt_ms": 870.946,
+   "wall": 4.757,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "n06",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Today is Wednesday.",
+   "finish": "stop",
+   "prompt_tokens": 3817,
+   "prompt_ms": 909.932,
+   "wall": 3.176,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "x01",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Who was Wangari Maathai?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3829,
+   "prompt_ms": 1055.075,
+   "wall": 5.53,
+   "error": null
+  },
+  {
+   "arm": "V1T",
+   "id": "x02",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "compute",
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What is the capital of Ethiopia?"
+     }
+    },
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "What is 2355 metres in feet?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3828,
+   "prompt_ms": 928.361,
+   "wall": 5.852,
+   "error": null
+  }
+ ]
+}

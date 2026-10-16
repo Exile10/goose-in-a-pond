@@ -1,0 +1,1554 @@
+{
+ "model": "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+ "exp": "e4",
+ "rows": [
+  {
+   "arm": "V1P2",
+   "id": "c01",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "1234 times 17"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3832,
+   "prompt_ms": 17024.702,
+   "wall": 17.873,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c02",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "giap-knowledge__calculate{question: (11 + 31 + 24) divided by 3}",
+   "finish": "stop",
+   "prompt_tokens": 3839,
+   "prompt_ms": 612.98,
+   "wall": 1.567,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c03",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "Convert 72 degrees Fahrenheit to Celsius"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3829,
+   "prompt_ms": 589.469,
+   "wall": 1.484,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c04",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "How many days are there between 12 December 1963 and 14 October 2026?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3846,
+   "prompt_ms": 739.974,
+   "wall": 2.251,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c05",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "15 percent of 2,350 shillings"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3835,
+   "prompt_ms": 750.875,
+   "wall": 1.749,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c06",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "2.64575",
+   "finish": "stop",
+   "prompt_tokens": 3834,
+   "prompt_ms": 722.641,
+   "wall": 1.028,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c07",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "How many seconds are in 3.5 hours?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3831,
+   "prompt_ms": 558.476,
+   "wall": 1.535,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c08",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "16 percent of 48,000"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3835,
+   "prompt_ms": 705.669,
+   "wall": 1.699,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c09",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "2500 shillings multiplied by 52 weeks"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3844,
+   "prompt_ms": 784.33,
+   "wall": 1.764,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c10",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "3 to the power of 13"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3832,
+   "prompt_ms": 695.93,
+   "wall": 1.598,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c11",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "26.2 miles to kilometers"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3831,
+   "prompt_ms": 543.48,
+   "wall": 1.392,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "d01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "ephemeral means lasting for a very short time.",
+   "finish": "stop",
+   "prompt_tokens": 3830,
+   "prompt_ms": 662.619,
+   "wall": 1.083,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "d02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What does the Swahili word 'harambee' mean?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3833,
+   "prompt_ms": 590.454,
+   "wall": 1.698,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "I am functioning well, thank you for asking. How can I assist you this evening?",
+   "finish": "stop",
+   "prompt_tokens": 3827,
+   "prompt_ms": 540.004,
+   "wall": 1.226,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "You're welcome. Have a good night.",
+   "finish": "stop",
+   "prompt_tokens": 3829,
+   "prompt_ms": 629.102,
+   "wall": 1.065,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n03",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Rain washes the dust from Nairobi's green hills,\nA rhythmic drumming where the city softly spills.",
+   "finish": "stop",
+   "prompt_tokens": 3831,
+   "prompt_ms": 684.525,
+   "wall": 1.546,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n04",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Could you please send me the report when you have a moment?",
+   "finish": "stop",
+   "prompt_tokens": 3831,
+   "prompt_ms": 852.263,
+   "wall": 1.37,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n05",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "4",
+   "finish": "stop",
+   "prompt_tokens": 3828,
+   "prompt_ms": 569.936,
+   "wall": 0.637,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n06",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "It is Wednesday.",
+   "finish": "stop",
+   "prompt_tokens": 3829,
+   "prompt_ms": 588.677,
+   "wall": 0.756,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "o01",
+   "expect": "other:giap-weather",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-weather"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-weather__get_current_weather",
+     "args": {
+      "location": "Nairobi"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3830,
+   "prompt_ms": 556.919,
+   "wall": 1.357,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "o02",
+   "expect": "other:giap-memory",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-memory"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-memory__recall_memories",
+     "args": {
+      "query": "sister"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3829,
+   "prompt_ms": 507.579,
+   "wall": 1.256,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "o03",
+   "expect": "other:giap-schedule",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-schedule"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-schedule__set_timer",
+     "args": {
+      "duration": "6pm",
+      "name": "Call Mum",
+      "prompt": "Call mum"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3831,
+   "prompt_ms": 558.682,
+   "wall": 1.794,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "o04",
+   "expect": "other:giap-device-control",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-device-control"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-device-control__set_device_state",
+     "args": {
+      "device_id": "kitchen lights",
+      "power": false
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3826,
+   "prompt_ms": 617.69,
+   "wall": 1.715,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "x02",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "The capital of Ethiopia is Addis Ababa. 2,355 metres is 7,728.57 feet.",
+   "finish": "stop",
+   "prompt_tokens": 3840,
+   "prompt_ms": 769.35,
+   "wall": 1.749,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c01",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "21978",
+   "finish": "stop",
+   "prompt_tokens": 3802,
+   "prompt_ms": 16609.977,
+   "wall": 16.896,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c02",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "giap-knowledge__calculator{expression: (11 + 31 + 24) / 3}",
+   "finish": "stop",
+   "prompt_tokens": 3809,
+   "prompt_ms": 666.925,
+   "wall": 1.569,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c03",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "(72 - 32) * 5 / 9"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3799,
+   "prompt_ms": 521.055,
+   "wall": 1.608,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c04",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "days between 12 December 1963 and 14 October 2026"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3816,
+   "prompt_ms": 863.274,
+   "wall": 2.242,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c05",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "giap-knowledge__calculator{expression:<|\"|>15 percent of 2350<|\"|>}",
+   "finish": "stop",
+   "prompt_tokens": 3805,
+   "prompt_ms": 795.59,
+   "wall": 1.576,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c06",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "2.64575",
+   "finish": "stop",
+   "prompt_tokens": 3804,
+   "prompt_ms": 738.904,
+   "wall": 1.038,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c07",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "giap-knowledge__calculator{expression: \"3.5 hours * 60 minutes/hour * 60 seconds/minute\"}",
+   "finish": "stop",
+   "prompt_tokens": 3801,
+   "prompt_ms": 561.563,
+   "wall": 1.615,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c08",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "giap-knowledge__calculator{expression:<|\"|>16 percent of 48000<|\"|>}",
+   "finish": "stop",
+   "prompt_tokens": 3805,
+   "prompt_ms": 719.774,
+   "wall": 1.548,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c09",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "2500 * 52"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3814,
+   "prompt_ms": 793.669,
+   "wall": 1.684,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c10",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "1594323",
+   "finish": "stop",
+   "prompt_tokens": 3802,
+   "prompt_ms": 744.233,
+   "wall": 1.044,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c11",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "26.2 miles to kilometers"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3801,
+   "prompt_ms": 568.163,
+   "wall": 1.42,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "d01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "ephemeral means lasting for a very short time.",
+   "finish": "stop",
+   "prompt_tokens": 3800,
+   "prompt_ms": 583.016,
+   "wall": 0.983,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "d02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What does the Swahili word 'harambee' mean?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3803,
+   "prompt_ms": 611.135,
+   "wall": 1.734,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "I am functioning well, thank you for asking. How can I assist you this evening?",
+   "finish": "stop",
+   "prompt_tokens": 3797,
+   "prompt_ms": 633.384,
+   "wall": 1.315,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "You're welcome. Have a good night.",
+   "finish": "stop",
+   "prompt_tokens": 3799,
+   "prompt_ms": 668.229,
+   "wall": 1.077,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n03",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Grey clouds weep on Nairobi's green,\nWashing the dust, a vibrant scene.",
+   "finish": "stop",
+   "prompt_tokens": 3801,
+   "prompt_ms": 585.234,
+   "wall": 1.276,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n04",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Could you please send me the report when you have a moment?",
+   "finish": "stop",
+   "prompt_tokens": 3801,
+   "prompt_ms": 579.8,
+   "wall": 1.09,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n05",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "4",
+   "finish": "stop",
+   "prompt_tokens": 3798,
+   "prompt_ms": 597.198,
+   "wall": 0.686,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n06",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "It is Wednesday.",
+   "finish": "stop",
+   "prompt_tokens": 3799,
+   "prompt_ms": 610.669,
+   "wall": 0.828,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "o01",
+   "expect": "other:giap-weather",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-weather"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-weather__get_current_weather",
+     "args": {
+      "location": "Nairobi"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3800,
+   "prompt_ms": 643.513,
+   "wall": 1.591,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "o02",
+   "expect": "other:giap-memory",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-memory"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-memory__recall_memories",
+     "args": {
+      "query": "sister"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3799,
+   "prompt_ms": 707.868,
+   "wall": 1.48,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "o03",
+   "expect": "other:giap-schedule",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-schedule"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-schedule__set_timer",
+     "args": {
+      "duration": "6pm",
+      "name": "Call Mum",
+      "prompt": "Call mum"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3801,
+   "prompt_ms": 733.754,
+   "wall": 2.006,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "o04",
+   "expect": "other:giap-device-control",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-device-control"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-device-control__set_device_state",
+     "args": {
+      "device_id": "kitchen lights",
+      "power": false
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3796,
+   "prompt_ms": 623.545,
+   "wall": 1.733,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "x02",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "The capital of Ethiopia is Addis Ababa. 2,355 metres is 7,728.57 feet.",
+   "finish": "stop",
+   "prompt_tokens": 3810,
+   "prompt_ms": 878.242,
+   "wall": 1.865,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c01",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "21978",
+   "finish": "stop",
+   "prompt_tokens": 3828,
+   "prompt_ms": 17657.419,
+   "wall": 17.959,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c02",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "giap-knowledge__calculator{expression: (11 + 31 + 24) / 3}",
+   "finish": "stop",
+   "prompt_tokens": 3835,
+   "prompt_ms": 658.049,
+   "wall": 1.567,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c03",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "(72 - 32) * 5 / 9"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3825,
+   "prompt_ms": 543.954,
+   "wall": 1.659,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c04",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "days between 12 December 1963 and 14 October 2026"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3842,
+   "prompt_ms": 964.631,
+   "wall": 2.324,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c05",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "15 percent of 2350"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3831,
+   "prompt_ms": 847.529,
+   "wall": 1.776,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c06",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "2.64575",
+   "finish": "stop",
+   "prompt_tokens": 3830,
+   "prompt_ms": 794.891,
+   "wall": 1.096,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c07",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "3.5 hours * 60 minutes/hour * 60 seconds/minute"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3827,
+   "prompt_ms": 597.216,
+   "wall": 1.836,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c08",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "giap-knowledge__calculator{expression:<|\"|>16 percent of 48000<|\"|>}",
+   "finish": "stop",
+   "prompt_tokens": 3831,
+   "prompt_ms": 794.578,
+   "wall": 1.63,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c09",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "2500 * 52"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3840,
+   "prompt_ms": 814.766,
+   "wall": 1.673,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c10",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "3^13"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3828,
+   "prompt_ms": 808.447,
+   "wall": 1.561,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c11",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "26.2 miles to kilometers"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3827,
+   "prompt_ms": 602.12,
+   "wall": 1.46,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "d01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "The word ephemeral means lasting for a very short time.",
+   "finish": "stop",
+   "prompt_tokens": 3826,
+   "prompt_ms": 647.157,
+   "wall": 1.077,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "d02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What does the Swahili word 'harambee' mean?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3829,
+   "prompt_ms": 647.87,
+   "wall": 1.735,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "I am functioning well, thank you for asking. How can I assist you this evening?",
+   "finish": "stop",
+   "prompt_tokens": 3823,
+   "prompt_ms": 698.041,
+   "wall": 1.336,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "You're welcome. Have a good night.",
+   "finish": "stop",
+   "prompt_tokens": 3825,
+   "prompt_ms": 706.159,
+   "wall": 1.067,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n03",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Grey clouds weep on Nairobi's green,\nWashing the dust, a vibrant scene.",
+   "finish": "stop",
+   "prompt_tokens": 3827,
+   "prompt_ms": 648.315,
+   "wall": 1.36,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n04",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Could you please send me the report when you have a moment?",
+   "finish": "stop",
+   "prompt_tokens": 3827,
+   "prompt_ms": 623.126,
+   "wall": 1.13,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n05",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "4",
+   "finish": "stop",
+   "prompt_tokens": 3824,
+   "prompt_ms": 670.841,
+   "wall": 0.759,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n06",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "It is Wednesday.",
+   "finish": "stop",
+   "prompt_tokens": 3825,
+   "prompt_ms": 633.207,
+   "wall": 0.825,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "o01",
+   "expect": "other:giap-weather",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-weather"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-weather__get_current_weather",
+     "args": {
+      "location": "Nairobi"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3826,
+   "prompt_ms": 591.798,
+   "wall": 1.406,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "o02",
+   "expect": "other:giap-memory",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-memory"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-memory__recall_memories",
+     "args": {
+      "query": "sister"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3825,
+   "prompt_ms": 586.918,
+   "wall": 1.348,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "o03",
+   "expect": "other:giap-schedule",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-schedule"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-schedule__set_timer",
+     "args": {
+      "duration": "6pm",
+      "name": "Call Mum",
+      "prompt": "Call mum"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3827,
+   "prompt_ms": 640.278,
+   "wall": 1.928,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "o04",
+   "expect": "other:giap-device-control",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-device-control"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-device-control__set_device_state",
+     "args": {
+      "device_id": "kitchen lights",
+      "power": false
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 3822,
+   "prompt_ms": 863.224,
+   "wall": 1.997,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "x02",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "The capital of Ethiopia is Addis Ababa. 2,355 metres is 7,728.57 feet.",
+   "finish": "stop",
+   "prompt_tokens": 3836,
+   "prompt_ms": 873.53,
+   "wall": 1.864,
+   "error": null
+  }
+ ]
+}

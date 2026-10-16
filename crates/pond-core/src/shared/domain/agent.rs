@@ -75,6 +75,10 @@ pub enum AgentStreamEvent {
         id: String,
         tool: String,
         content: String,
+        /// The result's block annotated for the user alone, apart from `content`: only such a
+        /// block may become a card, so text a tool quotes from a web page can never forge one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<String>,
     },
     Text {
         content: String,

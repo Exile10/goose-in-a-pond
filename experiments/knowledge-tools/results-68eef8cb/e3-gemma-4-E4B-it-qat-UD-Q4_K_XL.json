@@ -1,0 +1,1618 @@
+{
+ "model": "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+ "exp": "e3",
+ "rows": [
+  {
+   "arm": "M0",
+   "id": "r01",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Wangari Maathai was a Kenyan environmental activist and political leader who was awarded the Nobel Peace Prize in 2004 for her work in environmentalism and democracy. She founded the Green Belt Movement, which aimed to combat deforestation and promote sustainable development in Kenya.",
+   "finish": "stop",
+   "prompt_tokens": 1056,
+   "prompt_ms": 5837.186,
+   "wall": 7.793,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r02",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Kisumu is known for being a major city in Kenya, situated on the shores of Lake Victoria. It is a significant center for trade, commerce, and culture in the region.",
+   "finish": "stop",
+   "prompt_tokens": 1055,
+   "prompt_ms": 702.598,
+   "wall": 2.205,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r03",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Ngũgĩ wa Thiong'o is a Kenyan author, essayist, and academic who is known for his works that explore themes of decolonization, African identity, and the struggle against oppression. He is a prominent figure in African literature and has written extensively in both English and Gikuyu.",
+   "finish": "stop",
+   "prompt_tokens": 1060,
+   "prompt_ms": 1053.654,
+   "wall": 3.159,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r04",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-knowledge"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1055,
+   "prompt_ms": 757.891,
+   "wall": 1.643,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r05",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "The Battle of Adwa was a major victory for the Ethiopian army against the invading Italian forces on March 1, 1896. It is considered a significant moment in African history because it was one of the first times an African nation successfully defeated a major European colonial power in a large-scale ",
+   "finish": "stop",
+   "prompt_tokens": 1057,
+   "prompt_ms": 678.274,
+   "wall": 4.064,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r06",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "M-Pesa is a mobile phone-based money transfer and mobile banking service that was launched in Kenya. It allows users to send and receive money using their mobile phones, and it has become a very popular and widely used financial service in East Africa.",
+   "finish": "stop",
+   "prompt_tokens": 1055,
+   "prompt_ms": 926.127,
+   "wall": 2.671,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r07",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Dedan Kimathi was a Kenyan revolutionary and a key figure in the Mau Mau uprising against British colonial rule in Kenya. He was a prominent leader among the Mau Mau fighters.",
+   "finish": "stop",
+   "prompt_tokens": 1055,
+   "prompt_ms": 691.967,
+   "wall": 1.921,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r08",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-knowledge"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1065,
+   "prompt_ms": 853.158,
+   "wall": 1.738,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r09",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-knowledge"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1064,
+   "prompt_ms": 906.918,
+   "wall": 1.775,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r10",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Barack Obama's father was born in Kenya.",
+   "finish": "stop",
+   "prompt_tokens": 1057,
+   "prompt_ms": 594.979,
+   "wall": 0.983,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r11",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "The main languages spoken in Lamu are Swahili and various local dialects.",
+   "finish": "stop",
+   "prompt_tokens": 1057,
+   "prompt_ms": 615.389,
+   "wall": 1.143,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r12",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-knowledge"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1062,
+   "prompt_ms": 688.242,
+   "wall": 1.561,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r13",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-knowledge"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1058,
+   "prompt_ms": 592.992,
+   "wall": 1.451,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r14",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-knowledge"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1059,
+   "prompt_ms": 660.989,
+   "wall": 1.526,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "r15",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-knowledge"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1058,
+   "prompt_ms": 618.127,
+   "wall": 1.483,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c01",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "21658",
+   "finish": "stop",
+   "prompt_tokens": 1060,
+   "prompt_ms": 879.745,
+   "wall": 1.073,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c02",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "22",
+   "finish": "stop",
+   "prompt_tokens": 1067,
+   "prompt_ms": 882.926,
+   "wall": 0.968,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c03",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "22.22 degrees Celsius",
+   "finish": "stop",
+   "prompt_tokens": 1057,
+   "prompt_ms": 632.659,
+   "wall": 0.887,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c04",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "The number of days between 12 December 1963 and 14 October 2026 is 21,777.",
+   "finish": "stop",
+   "prompt_tokens": 1074,
+   "prompt_ms": 781.534,
+   "wall": 1.92,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c05",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "352.5 shillings",
+   "finish": "stop",
+   "prompt_tokens": 1063,
+   "prompt_ms": 973.415,
+   "wall": 1.219,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c06",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "2.64575",
+   "finish": "stop",
+   "prompt_tokens": 1062,
+   "prompt_ms": 783.72,
+   "wall": 1.043,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c07",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "12600 seconds",
+   "finish": "stop",
+   "prompt_tokens": 1059,
+   "prompt_ms": 520.453,
+   "wall": 0.739,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c08",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "7680",
+   "finish": "stop",
+   "prompt_tokens": 1063,
+   "prompt_ms": 669.485,
+   "wall": 0.807,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c09",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "130000 shillings",
+   "finish": "stop",
+   "prompt_tokens": 1072,
+   "prompt_ms": 693.208,
+   "wall": 0.927,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c10",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "1594323",
+   "finish": "stop",
+   "prompt_tokens": 1060,
+   "prompt_ms": 681.81,
+   "wall": 0.917,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "c11",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "26.2 miles is 42.164 kilometres.",
+   "finish": "stop",
+   "prompt_tokens": 1059,
+   "prompt_ms": 538.792,
+   "wall": 1.027,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "d01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Ephemeral means lasting for a very short time.",
+   "finish": "stop",
+   "prompt_tokens": 1058,
+   "prompt_ms": 578.173,
+   "wall": 0.903,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "d02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "harambee means to pull together or to work together for a common goal.",
+   "finish": "stop",
+   "prompt_tokens": 1061,
+   "prompt_ms": 607.988,
+   "wall": 1.169,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "n01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "I am functioning well, thank you for asking. How can I assist you today?",
+   "finish": "stop",
+   "prompt_tokens": 1055,
+   "prompt_ms": 574.686,
+   "wall": 1.162,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "n02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "You are welcome.",
+   "finish": "stop",
+   "prompt_tokens": 1057,
+   "prompt_ms": 588.898,
+   "wall": 0.738,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "n03",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Grey clouds weep on Nairobi's green,\nWashing the dust, a vibrant scene.",
+   "finish": "stop",
+   "prompt_tokens": 1059,
+   "prompt_ms": 609.353,
+   "wall": 1.288,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "n04",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Could you please send me the report when you have a moment?",
+   "finish": "stop",
+   "prompt_tokens": 1059,
+   "prompt_ms": 550.477,
+   "wall": 1.008,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "n05",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "4",
+   "finish": "stop",
+   "prompt_tokens": 1056,
+   "prompt_ms": 608.895,
+   "wall": 0.662,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "n06",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "It is Wednesday.",
+   "finish": "stop",
+   "prompt_tokens": 1057,
+   "prompt_ms": 659.423,
+   "wall": 0.814,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "o01",
+   "expect": "other:giap-weather",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-weather"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1058,
+   "prompt_ms": 571.502,
+   "wall": 1.392,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "o02",
+   "expect": "other:giap-memory",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-memory"
+     }
+    }
+   ],
+   "content": "I need to check your memories to see what you told me about your sister.",
+   "finish": "tool_calls",
+   "prompt_tokens": 1057,
+   "prompt_ms": 553.299,
+   "wall": 1.97,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "o03",
+   "expect": "other:giap-schedule",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-schedule"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1059,
+   "prompt_ms": 802.697,
+   "wall": 1.657,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "o04",
+   "expect": "other:giap-device-control",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-device-control"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1054,
+   "prompt_ms": 650.689,
+   "wall": 1.595,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "x01",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Wangari Maathai was a Kenyan environmental activist and political figure known for her work in promoting sustainable development and environmental conservation. She won the Nobel Peace Prize in 2004, which was 22 years ago.",
+   "finish": "stop",
+   "prompt_tokens": 1069,
+   "prompt_ms": 760.63,
+   "wall": 2.324,
+   "error": null
+  },
+  {
+   "arm": "M0",
+   "id": "x02",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Addis Ababa is the capital of Ethiopia, and 2,355 metres is approximately 7,728.5 feet.",
+   "finish": "stop",
+   "prompt_tokens": 1068,
+   "prompt_ms": 869.7,
+   "wall": 1.89,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r01",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Who was Wangari Maathai?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1214,
+   "prompt_ms": 2686.558,
+   "wall": 3.566,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r02",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Kisumu is known for being a major city in Kenya, situated on the shores of Lake Victoria. It is a significant commercial and cultural hub in the western part of the country, and it is also recognized for its vibrant local markets and its role as a center for regional trade and agriculture.",
+   "finish": "stop",
+   "prompt_tokens": 1213,
+   "prompt_ms": 558.357,
+   "wall": 2.723,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r03",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Ngũgĩ wa Thiong'o is a Kenyan author, essayist, and academic who is known for his works that explore themes of decolonization, African identity, and the struggle against oppression.",
+   "finish": "stop",
+   "prompt_tokens": 1218,
+   "prompt_ms": 1093.082,
+   "wall": 2.567,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r04",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Uganda Railway"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1213,
+   "prompt_ms": 1080.037,
+   "wall": 1.886,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r05",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What happened at the Battle of Adwa?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1215,
+   "prompt_ms": 814.332,
+   "wall": 1.86,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r06",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "M-Pesa is a mobile phone-based money transfer and mobile banking service that was launched in Kenya. It allows users to send and receive money using their mobile phones, and it has become a very popular and widely used service in East Africa.",
+   "finish": "stop",
+   "prompt_tokens": 1213,
+   "prompt_ms": 833.936,
+   "wall": 3.485,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r07",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Who was Dedan Kimathi?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1213,
+   "prompt_ms": 1127.242,
+   "wall": 2.172,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r08",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "When did Lake Turkana get its current name and what was it called before?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1223,
+   "prompt_ms": 1288.965,
+   "wall": 2.648,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r09",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Who won the men's marathon at the 2024 Olympics?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1222,
+   "prompt_ms": 1171.179,
+   "wall": 2.577,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r10",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Where was Barack Obama's father born?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1215,
+   "prompt_ms": 850.077,
+   "wall": 1.997,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r11",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "The main languages spoken in Lamu are Swahili and Dholaviri.",
+   "finish": "stop",
+   "prompt_tokens": 1215,
+   "prompt_ms": 817.76,
+   "wall": 1.463,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r12",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What building did Wangari Maathai campaign against in Uhuru Park?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1220,
+   "prompt_ms": 1217.33,
+   "wall": 2.431,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r13",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "where is the new Lamu port being built"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1216,
+   "prompt_ms": 795.235,
+   "wall": 2.018,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r14",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Which mobile operator ran M-Pesa in Afghanistan?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1217,
+   "prompt_ms": 835.808,
+   "wall": 1.951,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "r15",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "animals that attacked workers building the Uganda Railway"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1216,
+   "prompt_ms": 805.177,
+   "wall": 1.809,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c01",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "21978",
+   "finish": "stop",
+   "prompt_tokens": 1218,
+   "prompt_ms": 1021.961,
+   "wall": 1.234,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c02",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "22",
+   "finish": "stop",
+   "prompt_tokens": 1225,
+   "prompt_ms": 805.238,
+   "wall": 0.893,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c03",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "22.22 degrees Celsius",
+   "finish": "stop",
+   "prompt_tokens": 1215,
+   "prompt_ms": 614.915,
+   "wall": 0.865,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c04",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "How many days are there between 12 December 1963 and 14 October 2026?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1232,
+   "prompt_ms": 729.025,
+   "wall": 2.187,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c05",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "352.5 shillings",
+   "finish": "stop",
+   "prompt_tokens": 1221,
+   "prompt_ms": 1229.205,
+   "wall": 1.464,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c06",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "2.64575",
+   "finish": "stop",
+   "prompt_tokens": 1220,
+   "prompt_ms": 782.897,
+   "wall": 1.033,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c07",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "25200 seconds",
+   "finish": "stop",
+   "prompt_tokens": 1217,
+   "prompt_ms": 544.584,
+   "wall": 0.76,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c08",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "9600",
+   "finish": "stop",
+   "prompt_tokens": 1221,
+   "prompt_ms": 724.812,
+   "wall": 0.874,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c09",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "You will have 130,000 shillings after 52 weeks.",
+   "finish": "stop",
+   "prompt_tokens": 1230,
+   "prompt_ms": 731.195,
+   "wall": 1.343,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c10",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "1594323",
+   "finish": "stop",
+   "prompt_tokens": 1218,
+   "prompt_ms": 766.423,
+   "wall": 1.039,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "c11",
+   "expect": "compute",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": false,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "26.2 miles is 42.164 kilometres.",
+   "finish": "stop",
+   "prompt_tokens": 1217,
+   "prompt_ms": 660.111,
+   "wall": 1.186,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "d01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "Ephemeral means lasting for a very short time.",
+   "finish": "stop",
+   "prompt_tokens": 1216,
+   "prompt_ms": 677.378,
+   "wall": 0.997,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "d02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "The Swahili word harambee means a call for community work or a gathering to achieve a common goal.",
+   "finish": "stop",
+   "prompt_tokens": 1219,
+   "prompt_ms": 634.212,
+   "wall": 1.385,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "n01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "I am functioning well, thank you for asking. How can I assist you today?",
+   "finish": "stop",
+   "prompt_tokens": 1213,
+   "prompt_ms": 667.515,
+   "wall": 1.272,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "n02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "You're welcome.",
+   "finish": "stop",
+   "prompt_tokens": 1215,
+   "prompt_ms": 724.055,
+   "wall": 0.905,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "n03",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Grey clouds weep on Nairobi's green hills,\nWashing the dust with a gentle, cool spill.",
+   "finish": "stop",
+   "prompt_tokens": 1217,
+   "prompt_ms": 646.187,
+   "wall": 1.399,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "n04",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [],
+   "content": "Could you please send me the report when you have a moment?",
+   "finish": "stop",
+   "prompt_tokens": 1217,
+   "prompt_ms": 660.976,
+   "wall": 1.14,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "n05",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "4",
+   "finish": "stop",
+   "prompt_tokens": 1214,
+   "prompt_ms": 702.701,
+   "wall": 0.757,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "n06",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "It is Wednesday.",
+   "finish": "stop",
+   "prompt_tokens": 1215,
+   "prompt_ms": 642.567,
+   "wall": 0.794,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "o01",
+   "expect": "other:giap-weather",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-weather"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1216,
+   "prompt_ms": 603.725,
+   "wall": 1.411,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "o02",
+   "expect": "other:giap-memory",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-memory"
+     }
+    }
+   ],
+   "content": "I need to check your memories to see what you told me about your sister.",
+   "finish": "tool_calls",
+   "prompt_tokens": 1215,
+   "prompt_ms": 672.346,
+   "wall": 2.102,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "o03",
+   "expect": "other:giap-schedule",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-schedule"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1217,
+   "prompt_ms": 1014.37,
+   "wall": 1.853,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "o04",
+   "expect": "other:giap-device-control",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-toolkit"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-toolkit__enable_tool_group",
+     "args": {
+      "group": "giap-device-control"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1212,
+   "prompt_ms": 720.106,
+   "wall": 1.651,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "x01",
+   "expect": "read",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "Who was Wangari Maathai"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 1227,
+   "prompt_ms": 916.964,
+   "wall": 1.781,
+   "error": null
+  },
+  {
+   "arm": "MC",
+   "id": "x02",
+   "expect": "read",
+   "verdict": "no_call",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": true,
+   "calls": [],
+   "content": "The capital of Ethiopia is Addis Ababa. 2,355 metres is 7,728.5 feet.",
+   "finish": "stop",
+   "prompt_tokens": 1226,
+   "prompt_ms": 899.978,
+   "wall": 1.798,
+   "error": null
+  }
+ ]
+}

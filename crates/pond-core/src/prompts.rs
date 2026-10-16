@@ -1974,6 +1974,7 @@ mod tests {
             dormant_groups_note(
                 &["giap-weather".to_string(), "giap-knowledge".to_string()],
                 &["giap-weather".to_string()],
+                |_| false,
             ),
         ];
         injected.extend(
