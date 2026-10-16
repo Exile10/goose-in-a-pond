@@ -70,7 +70,7 @@ fn public_or_refused(ip: IpAddr) -> Result<(), Refusal> {
 /// Whether `ip` is on the public internet. Refused: loopback, private, link-local, CGNAT,
 /// unique-local, multicast, unspecified, and the other ranges IANA marks not globally reachable
 /// (documentation, benchmarking, reserved, broadcast). An IPv6 form that embeds an IPv4 address
-/// (mapped, NAT64, 6to4) is judged by the address it embeds.
+/// (mapped, translated, NAT64, 6to4) is judged by the address it embeds.
 pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
@@ -107,6 +107,8 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         [0, 0, 0, 0, 0, 0, _, _] => false,
         // NAT64: a gateway would carry the request to the IPv4 address inside.
         [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => is_public_v4(embedded_v4(hi, lo)),
+        // IPv4-translated (SIIT, RFC 2765): a translator would do the same.
+        [0, 0, 0, 0, 0xffff, 0, hi, lo] => is_public_v4(embedded_v4(hi, lo)),
         // Local-use NAT64.
         [0x64, 0xff9b, 1, ..] => false,
         // Discard-only.
@@ -241,6 +243,9 @@ mod tests {
             "64:ff9b::a00:1",
             "2002:7f00:1::",
             "2002:c0a8:101::",
+            // IPv4-translated (SIIT) forms of loopback and a private address.
+            "::ffff:0:7f00:1",
+            "::ffff:0:c0a8:101",
         ] {
             assert!(!is_public(ip(refused)), "{refused} must be refused");
         }
@@ -260,6 +265,7 @@ mod tests {
             "::ffff:8.8.8.8",
             "64:ff9b::808:808",
             "2002:808:808::",
+            "::ffff:0:808:808",
         ] {
             assert!(is_public(ip(public)), "{public} must pass");
         }
