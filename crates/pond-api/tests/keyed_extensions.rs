@@ -13,7 +13,9 @@ use pond_core::mcp::ports::extension_manager::{
     AddExtensionRequest, ExtensionInfo, ExtensionManagerPort, ToolInfo,
 };
 use pond_core::mcp::ports::mcp_server::{McpServerConfig, McpServerRepository};
+use pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort;
 use pond_core::mcp::services::marketplace::BundledMarketplace;
+use pond_core::mcp::services::tool_registry::InMemoryToolRegistry;
 use pond_core::security::ports::secret::SecretRepository;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -108,7 +110,7 @@ impl ExtensionManagerPort for Manager {
         Ok(())
     }
     async fn list_tools(&self) -> anyhow::Result<Vec<String>> {
-        Ok(vec![])
+        Ok(vec![format!("{EXT}__create_issue")])
     }
     async fn list_tools_detailed(&self) -> anyhow::Result<Vec<ToolInfo>> {
         Ok(vec![])
@@ -123,6 +125,7 @@ struct Pond {
     secrets: Arc<Secrets>,
     rows: Arc<Rows>,
     manager: Arc<Manager>,
+    registry: Arc<InMemoryToolRegistry>,
     _dir: tempfile::TempDir,
 }
 
@@ -136,12 +139,14 @@ async fn pond() -> Pond {
     let secrets = Arc::new(Secrets::default());
     let rows = Arc::new(Rows::default());
     let manager = Arc::new(Manager::default());
+    let registry = Arc::new(InMemoryToolRegistry::new());
     let state = Arc::new(pond_api::AppState {
         handshake,
         secret_repo: Some(secrets.clone()),
         mcp_server_repo: Some(rows.clone()),
         extension_manager: Some(manager.clone()),
         marketplace: Some(Arc::new(BundledMarketplace::new())),
+        tool_registry: Some(registry.clone()),
         ..state
     });
     let router =
@@ -153,6 +158,7 @@ async fn pond() -> Pond {
         secrets,
         rows,
         manager,
+        registry,
         _dir: dir,
     }
 }
@@ -359,4 +365,71 @@ async fn deleting_the_key_stops_a_disabled_extension_too() {
         vec![EXT.to_string()],
         "re-enabling would restart it from its cached config, the deleted key included"
     );
+}
+
+async fn registered(pond: &Pond) -> Vec<String> {
+    pond.registry
+        .all_tools()
+        .await
+        .into_iter()
+        .map(|t| format!("{}__{}", t.extension_name, t.tool_name))
+        .collect()
+}
+
+#[tokio::test]
+async fn saving_the_key_through_the_generic_route_restarts_it() {
+    let pond = pond().await;
+    install(&pond).await;
+    let (status, _) = call(
+        &pond,
+        Method::DELETE,
+        &format!("/api/v1/secrets/{KEY}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        registered(&pond).await.is_empty(),
+        "its tools stayed listed"
+    );
+    let started_before = pond.manager.added.lock().unwrap().len();
+
+    let (status, body) = call(
+        &pond,
+        Method::PUT,
+        &format!("/api/v1/secrets/{KEY}"),
+        Some(json!({ "value": VALUE })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["restarted"], json!([EXT]), "{body}");
+    assert!(!body.to_string().contains(VALUE), "{body}");
+    let added = pond.manager.added.lock().unwrap().clone();
+    assert_eq!(added.len(), started_before + 1);
+    assert_eq!(
+        added.last().unwrap().env.get(KEY).map(String::as_str),
+        Some(VALUE)
+    );
+    assert_eq!(
+        registered(&pond).await,
+        vec![format!("{EXT}__create_issue")],
+        "the restarted extension's tools are listed again"
+    );
+}
+
+#[tokio::test]
+async fn saving_a_key_no_extension_takes_restarts_nothing() {
+    let pond = pond().await;
+    install(&pond).await;
+    let started_before = pond.manager.added.lock().unwrap().len();
+    let (status, body) = call(
+        &pond,
+        Method::PUT,
+        "/api/v1/secrets/UNRELATED_KEY",
+        Some(json!({ "value": "x" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["restarted"], json!([]), "{body}");
+    assert_eq!(pond.manager.added.lock().unwrap().len(), started_before);
 }

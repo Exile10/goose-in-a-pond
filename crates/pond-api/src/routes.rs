@@ -11206,24 +11206,7 @@ async fn install_marketplace_handler(
                     tracing::warn!("Failed to persist marketplace extension '{}': {e}", ext.id);
                 }
             }
-            if let Some(registry) = &state.tool_registry {
-                if let Ok(all_tools) = manager.list_tools().await {
-                    let prefix = format!("{}__", req.name);
-                    let ext_tools: Vec<(String, String)> = all_tools
-                        .iter()
-                        .filter(|t| t.starts_with(&prefix))
-                        .map(|t| {
-                            let tool_name = t.strip_prefix(&prefix).unwrap_or(t).to_string();
-                            (tool_name, String::new())
-                        })
-                        .collect();
-                    if !ext_tools.is_empty() {
-                        registry
-                            .register_extension_tools(&req.name, ext_tools)
-                            .await;
-                    }
-                }
-            }
+            register_extension_tools(&state, manager.as_ref(), &req.name).await;
             (StatusCode::CREATED, Json(json!(info))).into_response()
         }
         Err(e) => (
@@ -11310,7 +11293,17 @@ async fn set_secret_handler(
             .into_response();
     };
     match repo.set(&key, value).await {
-        Ok(()) => Json(json!({"key": key, "stored": true})).into_response(),
+        Ok(()) => {
+            // As the extension-scoped route does, so a key deleted here and saved here comes back.
+            let (restarted, restart_errors) = restart_extensions_taking(&state, &key).await;
+            Json(json!({
+                "key": key,
+                "stored": true,
+                "restarted": restarted,
+                "restart_errors": restart_errors,
+            }))
+            .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -11472,6 +11465,64 @@ fn refused_choice(
     })
 }
 
+/// Register `name`'s running tools with the tool registry, which the prose tool list is built from.
+async fn register_extension_tools(
+    state: &AppState,
+    manager: &dyn pond_core::mcp::ports::extension_manager::ExtensionManagerPort,
+    name: &str,
+) {
+    let Some(registry) = &state.tool_registry else {
+        return;
+    };
+    let Ok(all_tools) = manager.list_tools().await else {
+        return;
+    };
+    let prefix = format!("{name}__");
+    let ext_tools: Vec<(String, String)> = all_tools
+        .iter()
+        .filter_map(|t| t.strip_prefix(&prefix))
+        .map(|tool_name| (tool_name.to_string(), String::new()))
+        .collect();
+    if !ext_tools.is_empty() {
+        registry.register_extension_tools(name, ext_tools).await;
+    }
+}
+
+/// Restart every installed, enabled catalogue extension whose environment takes `key`: a child's
+/// environment is fixed at spawn. The names restarted, and each failure by name.
+async fn restart_extensions_taking(
+    state: &AppState,
+    key: &str,
+) -> (Vec<String>, serde_json::Map<String, Value>) {
+    let mut restarted = Vec::new();
+    let mut failed = serde_json::Map::new();
+    let (Some(mp), Some(servers)) = (&state.marketplace, &state.mcp_server_repo) else {
+        return (restarted, failed);
+    };
+    let installed = match servers.list().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read installed extensions to restart those taking {key}");
+            return (restarted, failed);
+        }
+    };
+    for row in installed.iter().filter(|r| r.enabled) {
+        let Ok(Some(ext)) = mp.get_by_id(&row.name).await else {
+            continue;
+        };
+        if !ext.env_secrets().any(|sr| sr.key == key) {
+            continue;
+        }
+        match restart_extension_with_secrets(state, &row.name).await {
+            Ok(()) => restarted.push(row.name.clone()),
+            Err(e) => {
+                failed.insert(row.name.clone(), Value::String(e));
+            }
+        }
+    }
+    (restarted, failed)
+}
+
 /// Respawns a marketplace extension so it reads current secrets (stdio env is fixed at spawn).
 /// Errs whenever it can't; starts even uninstalled ones, so whether to call it is caller policy.
 async fn restart_extension_with_secrets(state: &AppState, ext_id: &str) -> Result<(), String> {
@@ -11541,6 +11592,8 @@ async fn restart_extension_with_secrets(state: &AppState, ext_id: &str) -> Resul
     match mgr.add_extension(req).await {
         Ok(_) => {
             tracing::info!(extension = %ext_id, "restarted the extension with fresh credentials");
+            // A key's removal deregistered its tools (`stop_extensions_needing`).
+            register_extension_tools(state, mgr.as_ref(), ext_id).await;
             Ok(())
         }
         Err(e) => {
