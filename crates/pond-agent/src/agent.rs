@@ -504,6 +504,7 @@ impl Agent for PondAgent {
                             id: id.clone(),
                             tool: name.clone(),
                             content: result_text.clone(),
+                            card: None,
                         }))
                         .await;
 
