@@ -3293,3 +3293,18 @@ latency; not a PAI milestone).**
   (fails without the agent change), the native-tools helper, goose's eight goal tests, and
   goose-local-inference's 192 (the three context-cap failures predate this).
 - **Not verified on the Orin.** The household runs with the goal check off.
+
+**2026-10-16 — Headless setup and claiming (pond networking; touches PAI-2, not a PAI milestone).**
+
+- **Design.** [`pond-networking.md`](../pond-networking.md). A screenless pond is claimed with a
+  printed eleven-digit setup code (Luhn check digit) made at install or provision time, valid only
+  until the first device pairs, with the pond reading a short-lived pairing code aloud as the
+  fallback. Both feed the existing CPace exchange. BLE is the primary setup transport.
+- **What it does to PAI-2.** The setup code is a secret kept out of `Settings` and out of the
+  database (`<data>/setup/setup.json`, `0600`), and its `Debug` redacts. Its claim latch is read
+  live, like the onboarding state in §3.7, and factory reset re-arms it, so it is not a one-way
+  door. A later phase narrows the wizard's `UntilOnboarded` writes to loopback while unclaimed and
+  to a paired token once claimed, which closes the window where any LAN peer drives a fresh pond's
+  wizard. The spoken code is a new issuance route that never returns the code; whether presence in
+  earshot should count on a claimed pond is a setting.
+- **Invariants.** No egress, no prompt or KV change, no `Settings` field, no migration in P1.
