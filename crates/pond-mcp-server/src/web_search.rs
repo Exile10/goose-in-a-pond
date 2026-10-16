@@ -1,6 +1,7 @@
 //! `search_web` for `giap-knowledge`: one Brave search with the household's key, the top pages
 //! read through a client that reaches only public addresses, and the passages that answer the
-//! question. Brave's results are used transiently and never written to disk (its terms, 3(b)(i)).
+//! question. Brave's terms (3(b)(i)) allow only transient storage, yet chat history and goose's
+//! session store keep each result: open, in small-model-tools.md section 8.8.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, OnceLock};
