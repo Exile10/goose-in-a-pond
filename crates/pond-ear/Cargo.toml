@@ -11,6 +11,10 @@ build = "build.rs"
 name = "pond_ear"
 path = "src/lib.rs"
 
+[[bin]]
+name = "pond-ear"
+path = "src/bin/pond-ear.rs"
+
 [lints]
 workspace = true
 
