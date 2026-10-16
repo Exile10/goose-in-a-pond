@@ -48,7 +48,7 @@ this broken" question.
 | [Installation Guide](./developer/installation.md) | First-time setup, prerequisites, install script, LLM providers, troubleshooting |
 | [Creating Ports & Adapters](../docs/creating-ports-and-adapters.md) | Step-by-step guide for adding new capabilities while keeping the Core pure |
 | [Inference Optimization](./developer/inference_optimization.md) | Platform settings, context management, classifier tuning, memory pressure |
-| [Voice Pipeline Interrupt](./developer/voice_pipeline_interrupt.md) | Wake-word interrupt during inference/TTS, pipelined synthesis |
+| [Voice Pipeline Interrupt](./developer/voice_pipeline_interrupt.md) | Wake-word interrupt during inference/TTS. Partly retired: the race is current, the Piper sections are not |
 | [TDD Guide](./testing/tdd_guide.md) | Test-driven development practices — Core mocks first, then real adapters |
 | [Onboarding System](./Onboarding_Doc/Onboarding_guide.md) | Multi-step device onboarding flow and API protection |
 

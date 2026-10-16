@@ -8296,20 +8296,23 @@ async fn transcribe(
 
 /// `POST /api/v1/voice/calibrate`
 ///
-/// Accepts a WAV recording of the user saying their wake word/phrase, transcribes
-/// it via whisper.cpp, and stores the result as a calibration variant in settings.
+/// Accepts a WAV recording of a calibration sentence that contains the wake phrase,
+/// transcribes it via whisper.cpp, and stores the wake phrase *as heard* (a mishearing such
+/// as "gus" for "goose") as a trigger variant. Only the phrase is kept, never the sentence.
 ///
-/// Call this 5 times (one per recording sample) during the onboarding WakeWord step.
-/// The endpoint accumulates unique normalized variants and returns progress after each call.
+/// **Request** — multipart/form-data with an `audio` field (WAV bytes, 16-bit mono 16 kHz)
+/// and an optional `prompt` field: the sentence that was read out, which locates the phrase
+/// inside the transcript. Without it every calibration sentence is tried.
 ///
-/// **Request** — multipart/form-data with an `audio` field (WAV bytes, 16-bit mono 16 kHz).
-///
-/// **Response**
+/// **Response** — `heard` is null when the take did not contain the phrase; `new_variant`
+/// says whether it added a trigger. `sample_count` counts stored variants, not takes.
 /// ```json
 /// {
-///   "transcript":    "hey goose",
-///   "all_variants":  ["hey goose", "hey, goose", "a goose"],
-///   "sample_count":  3,
+///   "transcript":    "Hey gus, good morning.",
+///   "heard":         "gus",
+///   "new_variant":   true,
+///   "all_variants":  ["goose", "gus"],
+///   "sample_count":  2,
 ///   "target_count":  5,
 ///   "complete":      false
 /// }
@@ -8320,8 +8323,9 @@ async fn calibrate_wake_word(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     const TARGET_SAMPLES: usize = 5;
 
-    // ── Read audio field ─────────────────────────────────────────────────────
+    // ── Read audio and prompt fields ─────────────────────────────────────────
     let mut audio_bytes: Option<Vec<u8>> = None;
+    let mut prompt: Option<String> = None;
     let mut filename = "audio.wav".to_string();
     let mut content_type = "audio/wav".to_string();
 
@@ -8331,7 +8335,9 @@ async fn calibrate_wake_word(
             Json(json!({"error": format!("multipart error: {e}")})),
         )
     })? {
-        if field.name() == Some("audio") {
+        if field.name() == Some("prompt") {
+            prompt = field.text().await.ok().filter(|p| !p.trim().is_empty());
+        } else if field.name() == Some("audio") {
             filename = field.file_name().unwrap_or("audio.wav").to_string();
             content_type = field.content_type().unwrap_or("audio/wav").to_string();
             let bytes = field.bytes().await.map_err(|e| {
@@ -8431,17 +8437,9 @@ async fn calibrate_wake_word(
         ));
     }
 
-    // Must normalize exactly as the wake-word detector does.
-    let normalized: String = raw_transcript
-        .chars()
-        .map(|c| if c.is_alphabetic() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
+    let normalized = pond_voice::text::normalize_transcript(&raw_transcript);
 
-    // ── Load settings, append variant, save ─────────────────────────────────
+    // ── Load settings, append the phrase as heard, save ─────────────────────
     let mut settings = state.settings_repo.get().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -8449,13 +8447,16 @@ async fn calibrate_wake_word(
         )
     })?;
 
-    if !settings
-        .voice_wake_word_transcriptions
-        .contains(&normalized)
-    {
-        settings
-            .voice_wake_word_transcriptions
-            .push(normalized.clone());
+    let heard = pond_voice::text::extract_wake_variant(
+        &raw_transcript,
+        &settings.voice_wake_word,
+        prompt.as_deref(),
+    );
+    let new_variant = heard
+        .as_ref()
+        .is_some_and(|h| !settings.voice_wake_word_transcriptions.contains(h));
+    if let (true, Some(h)) = (new_variant, &heard) {
+        settings.voice_wake_word_transcriptions.push(h.clone());
     }
 
     let all_variants = settings.voice_wake_word_transcriptions.clone();
@@ -8472,6 +8473,8 @@ async fn calibrate_wake_word(
     Ok(Json(json!({
         "transcript":   raw_transcript,
         "normalized":   normalized,
+        "heard":        heard,
+        "new_variant":  new_variant,
         "all_variants": all_variants,
         "sample_count": sample_count,
         "target_count": TARGET_SAMPLES,

@@ -122,7 +122,6 @@ export interface Settings {
   embedding_provider?: string;
 
   // Voice KWS tuning
-  voice_kws_whisper_url?: string | null;
   voice_kws_energy_threshold?: number;
   voice_kws_post_trigger_silence_ms?: number;
   voice_kws_cooldown_ms?: number;
@@ -1026,6 +1025,10 @@ export interface TranscribeResponse {
 export interface CalibrateResponse {
   transcript:    string;
   normalized:    string;
+  /** The wake phrase as heard in this take; `null` when the take did not contain it. */
+  heard:         string | null;
+  /** Whether `heard` was new and became a trigger. */
+  new_variant:   boolean;
   all_variants:  string[];
   sample_count:  number;
   target_count:  number;

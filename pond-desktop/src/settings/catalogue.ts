@@ -6,7 +6,7 @@
 import type { Settings } from "../api/types";
 import {
   all, atLeast, hhmm, ianaTimezone, integer, latitude, longitude, oneOf,
-  optional, range, retentionMap, speechCategories, url, type Validator,
+  optional, range, retentionMap, speechCategories, url, wakePhrase, type Validator,
 } from "./validation";
 
 /** Does anything read this setting once it is saved? */
@@ -159,7 +159,7 @@ export const CATALOGUE: CatalogueCategory[] = [
       {
         name: "Wake word",
         entries: [
-          { key: "voice_wake_word", label: "Wake word", description: "The phrase that wakes the pond. Capitalisation does not matter.", control: { kind: "text", placeholder: "goose" }, consumer: "live" },
+          { key: "voice_wake_word", label: "Wake word", description: "The phrase that wakes the pond. Capitalisation does not matter.", control: { kind: "text", placeholder: "goose" }, consumer: "live", validate: wakePhrase },
           { key: "voice_wake_word_transcriptions", label: "Learned pronunciations", description: "Alternative spellings learned while training the wake word, so it still answers.", control: { kind: "text", placeholder: "Not calibrated" }, consumer: "live" },
         ],
       },
@@ -172,14 +172,8 @@ export const CATALOGUE: CatalogueCategory[] = [
           {
             key: "voice_recording_duration_secs", label: "Recording length", description: "How long it records after you speak to it.",
             control: { kind: "number", min: 1, unit: "seconds" }, consumer: "app",
-            note: "This app uses it. The pond's own microphone loop does not — it ends a recording on silence instead.",
+            note: "Only voice in a web browser uses it. The desktop app and the pond's own microphone end a recording on silence instead.",
             validate: all(integer, range(1, 300, "seconds")),
-          },
-          {
-            key: "voice_kws_whisper_url", label: "Wake-word server", description: "A separate listening service used only for hearing the wake word.",
-            control: { kind: "text", placeholder: "Uses the transcription server" }, consumer: "none",
-            note: "Nothing reads this. Wake-word detection uses the transcription server below, whatever you type here.",
-            validate: optional(url(["http://", "https://"], "http://127.0.0.1:9000")),
           },
         ],
       },

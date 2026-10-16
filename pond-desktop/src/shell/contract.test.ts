@@ -14,6 +14,7 @@ const EVERY_COMMAND: Record<ShellCommand, true> = {
   ensure_server_running: true,
   start_voice_session: true,
   stop_voice_session: true,
+  interrupt_voice_turn: true,
   open_external: true,
   host_credential: true,
 };

@@ -58,6 +58,8 @@ export function registerIpc(t: IpcTargets, allowedOrigins: readonly string[]): v
 
   handle("stop_voice_session", () => t.voice.stop());
 
+  handle("interrupt_voice_turn", () => t.voice.interrupt());
+
   handle("host_credential", () => t.hostCredential());
 
   handle("open_external", async (args) => {

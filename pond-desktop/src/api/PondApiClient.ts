@@ -2102,12 +2102,13 @@ export class PondApiClient {
   // ── Wake-word calibration ────────────────────────────────────
 
   /** Submit one WAV recording as a calibration sample. */
-  async calibrateWakeWord(wav: ArrayBuffer): Promise<CalibrateResponse> {
+  async calibrateWakeWord(wav: ArrayBuffer, prompt?: string): Promise<CalibrateResponse> {
     const headers: Record<string, string> = {};
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
 
     const form = new FormData();
     form.append("audio", new Blob([wav], { type: "audio/wav" }), "sample.wav");
+    if (prompt) form.append("prompt", prompt);
 
     const res = await fetch(`${this.base}/api/v1/voice/calibrate`, {
       method: "POST",

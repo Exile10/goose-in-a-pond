@@ -1,5 +1,14 @@
 # Voice Pipeline Interrupt System
 
+> **Partly retired.** The race itself is current: `run_loop` in
+> `crates/pond-core/src/shared/services/chat.rs` still runs each turn against
+> `wait_for_activation_with_audio()` in a `tokio::select!`. The rest predates the current voice
+> stack. Speech is Kokoro (`crates/pond-adapters-kokoro`), and the Piper adapter, its subprocess
+> and the pipelining described under it no longer exist. The response times assume a 400 ms
+> slide. The detector now slides every 200 ms, and it waits `voice_kws_cooldown_ms` (2000 ms by
+> default) before it arms, so the wake word cannot interrupt the first two seconds of a turn.
+> For the loop as it runs now, see [Voice mode](voice-mode.md).
+
 The wake word can interrupt GIAP during inference or TTS playback. Saying the wake word while the assistant is thinking or speaking immediately stops output and captures a new request.
 
 Last updated: April 29, 2026

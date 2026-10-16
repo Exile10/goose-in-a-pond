@@ -1,7 +1,8 @@
 //! Silero VAD as a [`SpeechDetector`], for end-of-speech: steady noise that an RMS gate calls
-//! speech scores ~0.08 here, speech ~0.95. It needs exact, non-overlapping 512-sample windows
-//! ([`Windower`]) with its LSTM state carried; the first windows after a reset score low, so
-//! onset stays on the energy gate.
+//! speech scores under 0.07 here, speech ~0.92. It is fed as the official wrapper feeds it: exact,
+//! non-overlapping 512-sample windows ([`Windower`]), each with the previous window's last 64
+//! samples in front, and the LSTM state carried; the first window after a reset can score low,
+//! so onset stays on the energy gate.
 
 use std::path::{Path, PathBuf};
 
@@ -11,20 +12,24 @@ use ort::session::Session;
 use ort::value::Tensor;
 use pond_voice::dsp::{SpeechDetector, Windower};
 
-/// Samples per inference. Fixed by the model.
+/// New samples per inference. Fixed by the model.
 pub const WINDOW: usize = 512;
+/// Samples of the previous window fed again in front of each new one, zeros after a reset, as
+/// `OnnxWrapper.__call__` in snakers4/silero-vad `src/silero_vad/utils_vad.py` does at 16 kHz.
+pub const CONTEXT: usize = 64;
 /// The model is trained at 16 kHz and the capture path already runs there.
 pub const SAMPLE_RATE: i64 = 16_000;
 /// Shape of the recurrent state the model threads between windows.
 const STATE_SHAPE: (usize, usize, usize) = (2, 1, 128);
 
-/// Speech probability threshold: Silero's default; not a knob (speech ~0.945, noise < 0.09).
+/// Speech probability threshold: Silero's default; not a knob (speech ~0.92, noise < 0.07).
 pub const DEFAULT_THRESHOLD: f32 = 0.5;
 
 pub struct SileroDetector {
     session: Session,
     windower: Windower,
     state: Array<f32, ndarray::Ix3>,
+    context: [f32; CONTEXT],
     threshold: f32,
     /// Last verdict, repeated when a short read completes no window; a silence default would
     /// inject spurious silence and end utterances early.
@@ -56,15 +61,31 @@ impl SileroDetector {
             session,
             windower: Windower::new(WINDOW),
             state: Array::zeros(STATE_SHAPE),
+            context: [0.0; CONTEXT],
             threshold,
             last: false,
         })
     }
 
-    /// Run one 512-sample window, advancing the recurrent state.
-    fn infer(&mut self, window: &[f32]) -> Result<f32> {
-        let input = Array::from_shape_vec((1, WINDOW), window.to_vec())
-            .context("silero: window was not 512 samples")?;
+    /// Speech probability of each window `frame` completes, oldest first; none for a short read.
+    pub fn speech_probabilities(&mut self, frame: &[f32]) -> Result<Vec<f32>> {
+        // Collected first, as the closure can't also borrow `session` and `state`.
+        let mut windows: Vec<[f32; WINDOW]> = Vec::new();
+        self.windower.push(frame, |w| {
+            let mut owned = [0.0f32; WINDOW];
+            owned.copy_from_slice(w);
+            windows.push(owned);
+        });
+        windows.iter().map(|w| self.infer(w)).collect()
+    }
+
+    /// Run one 512-sample window behind the carried context, advancing state and context.
+    fn infer(&mut self, window: &[f32; WINDOW]) -> Result<f32> {
+        let mut samples = Vec::with_capacity(CONTEXT + WINDOW);
+        samples.extend_from_slice(&self.context);
+        samples.extend_from_slice(window);
+        let input =
+            Array::from_shape_vec((1, CONTEXT + WINDOW), samples).expect("context + window fits");
         let sr = Array::from_shape_vec((), vec![SAMPLE_RATE]).expect("scalar shape is valid");
 
         let outputs = self
@@ -85,6 +106,7 @@ impl SileroDetector {
             .context("silero: returned state had an unexpected shape")?
             .into_dimensionality::<ndarray::Ix3>()
             .context("silero: returned state was not 3-dimensional")?;
+        self.context.copy_from_slice(&window[WINDOW - CONTEXT..]);
 
         let (_, prob) = outputs["output"]
             .try_extract_tensor::<f32>()
@@ -97,45 +119,29 @@ impl SileroDetector {
 
 impl SpeechDetector for SileroDetector {
     fn is_speech(&mut self, frame: &[f32]) -> bool {
-        // Inference failure counts as speech: a dead detector must not cut an utterance short;
-        // it degrades to the hard recording cap instead.
-        let mut latest = None;
-        let mut failure = None;
-
-        // Collected first, as the closure can't also borrow `session` and `state`.
-        let mut windows: Vec<[f32; WINDOW]> = Vec::new();
-        self.windower.push(frame, |w| {
-            let mut owned = [0.0f32; WINDOW];
-            owned.copy_from_slice(w);
-            windows.push(owned);
-        });
-
-        for window in &windows {
-            match self.infer(window) {
-                Ok(p) => latest = Some(p >= self.threshold),
-                Err(e) => {
-                    failure = Some(e);
-                    break;
+        match self.speech_probabilities(frame) {
+            Ok(probs) => {
+                if let Some(p) = probs.last() {
+                    self.last = *p >= self.threshold;
                 }
+                self.last
+            }
+            // Inference failure counts as speech: a dead detector must not cut an utterance
+            // short; it degrades to the hard recording cap instead.
+            Err(e) => {
+                tracing::warn!(error = %e, "silero VAD failed; treating as speech so the turn is not cut short");
+                self.last = true;
+                true
             }
         }
-
-        if let Some(e) = failure {
-            tracing::warn!(error = %e, "silero VAD failed; treating as speech so the turn is not cut short");
-            self.last = true;
-            return true;
-        }
-
-        if let Some(verdict) = latest {
-            self.last = verdict;
-        }
-        self.last
     }
 
     fn reset(&mut self) {
-        // All three, or the next utterance inherits this one's state, leftover samples or verdict.
+        // All four, or the next utterance inherits this one's state, context, leftover samples
+        // or verdict.
         self.windower.reset();
         self.state = Array::zeros(STATE_SHAPE);
+        self.context = [0.0; CONTEXT];
         self.last = false;
     }
 }

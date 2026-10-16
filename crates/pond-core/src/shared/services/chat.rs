@@ -1,7 +1,7 @@
 use crate::models::domain::message::{ChatMessage, Role, ToolCallRecord};
 use crate::models::ports::agent::Agent;
 use crate::models::ports::provider::LlmProvider;
-use crate::models::ports::speech_energy::SpeechEnergy;
+use crate::models::ports::speech_energy::{MicHold, SpeechEnergy};
 use crate::models::ports::voice_input::{SpeculativeSignal, VoiceInput};
 use crate::models::ports::voice_output::VoiceOutput;
 use crate::models::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
@@ -12,6 +12,7 @@ use crate::security::ports::event_log::EventLog;
 use crate::shared::domain::agent::{AgentRequest, AgentStreamEvent, WorkflowEvent, WorkflowState};
 use crate::shared::services::print_output::PrintOutput;
 use crate::shared::services::stdin_input::StdinInput;
+use crate::shared::services::voice_control::{StopReason, VoiceControl};
 use crate::user_data::domain::session::SessionMessage;
 use crate::user_data::ports::session_storage::SessionStorage;
 use anyhow::Result;
@@ -351,6 +352,10 @@ pub struct ChatService {
     persist_thinking: bool,
     /// This turn's reasoning, drained by `persist_assistant_turn`, which mints the id to key it.
     thinking_blocks: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The desktop shell's stop and interrupt commands; `None` outside `--json-events`.
+    control: Option<VoiceControl>,
+    /// The last state announced was Speak, which a reused speculative reply may already be in.
+    speaking: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Result of one non-persisting agent stream, with the stats from its `Done` event.
@@ -360,15 +365,49 @@ struct TurnOutcome {
     usage: Option<crate::models::ports::provider::UsageStats>,
     stats: Option<crate::shared::domain::turn_stats::TurnStats>,
     total_latency_ms: u64,
+    /// Set when the user spoke over the reply, which ended it unfinished.
+    barged_in: Option<BargedIn>,
+}
+
+/// The user talked over the reply.
+#[derive(Debug)]
+struct BargedIn {
+    /// When they started, pre-roll included; the follow-up capture begins here.
+    onset: std::time::Instant,
+    /// Keeps the mic open until the follow-up capture claims it, so nothing said is lost between.
+    hold: MicHold,
 }
 
 struct BargeInWatch {
     handle: tokio::task::JoinHandle<()>,
+    /// Here rather than in the task, so a reply heard out lets go of the mic as it ends; the
+    /// task takes it only to hand it on with a barge-in.
+    hold: Arc<std::sync::Mutex<Option<MicHold>>>,
 }
 
 impl Drop for BargeInWatch {
     fn drop(&mut self) {
         self.handle.abort();
+        let hold = self.hold.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(hold);
+    }
+}
+
+type SpeculativeReply = (String, tokio::task::JoinHandle<Result<TurnOutcome>>);
+
+/// Aborts and silences a speculative reply nobody took, e.g. when a stop drops the listen.
+struct SpeculativeJob {
+    job: Option<SpeculativeReply>,
+    voice_output: Arc<dyn VoiceOutput>,
+}
+
+impl Drop for SpeculativeJob {
+    fn drop(&mut self) {
+        if let Some((_, handle)) = self.job.take() {
+            handle.abort();
+            self.voice_output.stop_speaking();
+            self.voice_output.stop_thinking_tone();
+        }
     }
 }
 
@@ -401,6 +440,8 @@ impl ChatService {
             thinking_tone: true,
             persist_thinking: false,
             thinking_blocks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            control: None,
+            speaking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -520,7 +561,11 @@ impl ChatService {
         self
     }
 
-    fn watch_for_barge_in(&self) -> Option<BargeInWatch> {
+    /// Listen for the user talking over the reply, holding the mic open until then.
+    fn watch_for_barge_in(
+        &self,
+        barged: tokio::sync::oneshot::Sender<BargedIn>,
+    ) -> Option<BargeInWatch> {
         use pond_voice::barge;
 
         if self.speech_energy.is_inert() {
@@ -529,15 +574,23 @@ impl ChatService {
 
         let energy = self.speech_energy.clone();
         let voice_output = self.voice_output.clone();
+        let hold = Arc::new(std::sync::Mutex::new(Some(energy.hold_mic())));
+        let task_hold = hold.clone();
 
         let handle = tokio::spawn(async move {
             let mut gate = barge::BargeIn::while_speaking();
             let poll = std::time::Duration::from_millis(barge::POLL_MS);
+            let pre_roll = std::time::Duration::from_millis(barge::ONSET_PRE_ROLL_MS);
             let mut warned_inert = false;
 
             loop {
                 tokio::time::sleep(poll).await;
 
+                if voice_output.is_playing() == Some(false) {
+                    // Between sentences (a tool running): loud talk then is not over the reply.
+                    gate.reset();
+                    continue;
+                }
                 let Some(rms) = energy.recent_rms(barge::WINDOW_MS) else {
                     gate.reset();
                     if !warned_inert {
@@ -547,21 +600,78 @@ impl ChatService {
                     continue;
                 };
 
-                if gate.on_rms(rms) {
+                if let Some(began) = gate.on_window(rms, std::time::Instant::now()) {
                     tracing::debug!(rms, "barge-in: the user spoke over the reply");
+                    let onset = began.checked_sub(pre_roll).unwrap_or(began);
+                    let hold = task_hold
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .unwrap_or_else(MicHold::none);
+                    // Before silencing, so the turn ends before it can start another sentence.
+                    let _ = barged.send(BargedIn { onset, hold });
                     voice_output.stop_speaking();
                     return;
                 }
             }
         });
 
-        Some(BargeInWatch { handle })
+        Some(BargeInWatch { handle, hold })
     }
 
     /// Set the wake-word detector; defaults to `InstantActivation` (no wait).
     pub fn with_wake_word_detector(mut self, detector: Arc<dyn StreamingWakeWordDetector>) -> Self {
         self.wake_word_detector = detector;
         self
+    }
+
+    /// Let the desktop shell stop the session and interrupt turns (`run_loop` only).
+    pub fn with_control(mut self, control: VoiceControl) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    fn stop_requested(&self) -> Option<StopReason> {
+        self.control.as_ref().and_then(VoiceControl::stop_requested)
+    }
+
+    /// Never resolves without a control channel.
+    async fn stop_signal(&self) -> StopReason {
+        match &self.control {
+            Some(control) => control.stopped().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// The first interrupt after this call; never resolves without a control channel.
+    fn interrupt_signal(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let next = self.control.as_ref().map(VoiceControl::next_interrupt);
+        async move {
+            match next {
+                Some(next) => next.await,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// `fut`'s output, or the stop reason if a stop comes first. An earlier stop wins unpolled.
+    async fn unless_stopped<T>(
+        &self,
+        fut: impl std::future::Future<Output = T>,
+    ) -> std::result::Result<T, StopReason> {
+        tokio::select! {
+            biased;
+            reason = self.stop_signal() => Err(reason),
+            out = fut => Ok(out),
+        }
+    }
+
+    /// Silence and cancel a turn in flight; nothing of it has been persisted.
+    fn abandon_turn(&self, handle: &tokio::task::JoinHandle<Result<TurnOutcome>>) {
+        self.voice_output.stop_speaking();
+        self.voice_output.stop_thinking_tone();
+        // Stops Goose's inference within a token (drop-based).
+        handle.abort();
     }
 
     /// Override the system prompt; `prompts::build_system_prompt()` builds one from `Settings`.
@@ -946,6 +1056,10 @@ impl ChatService {
         let outcome = self
             .stream_response_inner(message.clone(), fired_at)
             .await?;
+        // Cut off by the user: not a completed reply, so not persisted as one.
+        if outcome.barged_in.is_some() {
+            return Ok(outcome.text);
+        }
 
         self.persist_assistant_response(&outcome.text, outcome.usage.as_ref())
             .await?;
@@ -992,6 +1106,8 @@ impl ChatService {
         let mut sentence_buf = String::new();
         let mut spoken_first = false;
         let mut barge_in: Option<BargeInWatch> = None;
+        let (barge_tx, mut barge_rx) = tokio::sync::oneshot::channel::<BargedIn>();
+        let mut barge_tx = Some(barge_tx);
         let mut thought_filter = crate::models::services::thought_filter::ThoughtFilter::new();
 
         // Pipelined TTS: `pending_audio` (WAV) plays while the next sentence is synthesized.
@@ -1033,8 +1149,11 @@ impl ChatService {
             }};
         }
 
-        while let Some(event_result) = stream.next().await {
-            match event_result? {
+        // Dropped mid-flight on a barge-in: that drops the stream, which stops generation, and
+        // ends synthesis with whatever sentence it was on.
+        let speaking = async {
+            while let Some(event_result) = stream.next().await {
+                match event_result? {
                 AgentStreamEvent::ToolCall { id, tool, .. } => {
                     // Shown, not spoken: the working tone covers tool use, and keeps playing.
                     self.emit_event(WorkflowEvent::ToolCall {
@@ -1075,8 +1194,8 @@ impl ChatService {
                             continue;
                         }
                         tone.stop();
-                        if barge_in.is_none() {
-                            barge_in = self.watch_for_barge_in();
+                        if let Some(tx) = barge_tx.take() {
+                            barge_in = self.watch_for_barge_in(tx);
                         }
                         speak_pipelined!(
                             self,
@@ -1140,50 +1259,65 @@ impl ChatService {
                     // Not spoken during streaming — informational only
                 }
             }
-        }
-
-        if let Some(last) = pending_audio.take() {
-            if let Err(e) = self.voice_output.play_audio(last).await {
-                tracing::warn!("TTS final playback failed: {}", e);
             }
-        }
 
-        // If the stream ended without Done, its filter tail must reach `full_text` here too.
-        let tail = thought_filter.flush();
-        if !tail.is_empty() {
-            if !spoken_first {
-                self.emit_event(WorkflowEvent::StateChanged {
-                    state: WorkflowState::Speak,
-                });
-            }
-            self.emit_event(WorkflowEvent::Token {
-                content: tail.clone(),
-            });
-            full_text.push_str(&tail);
-            sentence_buf.push_str(&tail);
-        }
-        let remainder = sentence_buf.trim().to_string();
-        if !remainder.is_empty() {
-            let spoken = strip_markdown_for_speech(&remainder);
-            if !spoken.is_empty() {
-                tone.stop();
-                if let Err(e) = self.voice_output.speak(&spoken).await {
-                    tracing::warn!("TTS final flush failed: {}", e);
+            if let Some(last) = pending_audio.take() {
+                if let Err(e) = self.voice_output.play_audio(last).await {
+                    tracing::warn!("TTS final playback failed: {}", e);
                 }
             }
+
+            // If the stream ended without Done, its filter tail must reach `full_text` here too.
+            let tail = thought_filter.flush();
+            if !tail.is_empty() {
+                if !spoken_first {
+                    self.emit_event(WorkflowEvent::StateChanged {
+                        state: WorkflowState::Speak,
+                    });
+                }
+                self.emit_event(WorkflowEvent::Token {
+                    content: tail.clone(),
+                });
+                full_text.push_str(&tail);
+                sentence_buf.push_str(&tail);
+            }
+            let remainder = sentence_buf.trim().to_string();
+            if !remainder.is_empty() {
+                let spoken = strip_markdown_for_speech(&remainder);
+                if !spoken.is_empty() {
+                    tone.stop();
+                    if let Err(e) = self.voice_output.speak(&spoken).await {
+                        tracing::warn!("TTS final flush failed: {}", e);
+                    }
+                }
+            }
+
+            // A turn that produced no speakable text still has to stop the tone.
+            tone.stop();
+
+            // Explicit drop: stop the barge-in watch now that TTS is done, after the tone.
+            drop(barge_in.take());
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let barged_in = tokio::select! {
+            biased;
+            Ok(barged) = &mut barge_rx => Some(barged),
+            finished = speaking => {
+                finished?;
+                None
+            }
+        };
+        if barged_in.is_some() {
+            self.voice_output.stop_speaking();
         }
-
-        // A turn that produced no speakable text still has to stop the tone.
-        tone.stop();
-
-        // Explicit drop: stop the barge-in watch now that TTS is done, after the tone.
-        drop(barge_in.take());
 
         Ok(TurnOutcome {
             text: full_text,
             usage: turn_usage,
             stats: turn_stats,
             total_latency_ms: fired_at.elapsed().as_millis() as u64,
+            barged_in,
         })
     }
 
@@ -1362,13 +1496,9 @@ impl ChatService {
 
     /// Listen while speculatively streaming a non-persisting reply to the provisional transcript.
     /// The caller must persist the job's result only if its `spec_transcript` is the final one.
-    #[allow(clippy::type_complexity)]
     async fn listen_with_speculative_chat(
         &self,
-    ) -> Result<(
-        Option<String>,
-        Option<(String, tokio::task::JoinHandle<Result<TurnOutcome>>)>,
-    )> {
+    ) -> Result<(Option<String>, Option<SpeculativeReply>)> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SpeculativeSignal>();
         let callback: Box<dyn Fn(SpeculativeSignal) + Send + Sync> = Box::new(move |signal| {
             let _ = tx.send(signal);
@@ -1378,13 +1508,16 @@ impl ChatService {
         tokio::pin!(listen_fut);
 
         // Keeps the fired-on transcript so `run_loop` can match it to the final one.
-        let mut speculative: Option<(String, tokio::task::JoinHandle<Result<TurnOutcome>>)> = None;
+        let mut speculative = SpeculativeJob {
+            job: None,
+            voice_output: self.voice_output.clone(),
+        };
 
         loop {
             tokio::select! {
                 result = &mut listen_fut => {
                     let transcript = result?;
-                    return Ok((transcript, speculative.take()));
+                    return Ok((transcript, speculative.job.take()));
                 }
                 Some(signal) = rx.recv() => {
                     match signal {
@@ -1398,13 +1531,13 @@ impl ChatService {
                             let handle = tokio::spawn(async move {
                                 svc.stream_response_inner(spec_text, fired_at).await
                             });
-                            speculative = Some((text, handle));
+                            speculative.job = Some((text, handle));
                         }
                         // Empty / dismissal / exit — let run_loop handle it normally.
                         SpeculativeSignal::Ready(_) => {}
                         SpeculativeSignal::Invalidated => {
                             // Speech resumed: abort the job and silence anything it started.
-                            if let Some((_, handle)) = speculative.take() {
+                            if let Some((_, handle)) = speculative.job.take() {
                                 handle.abort();
                                 self.voice_output.stop_speaking();
                                 self.voice_output.stop_thinking_tone();
@@ -1475,8 +1608,28 @@ impl ChatService {
                 }
             };
         }
+        // Leaves the loop; `run_chat` then releases the microphone and the process exits 0.
+        macro_rules! end_session {
+            ($reason:expr) => {{
+                let reason: StopReason = $reason;
+                self.emit_event(WorkflowEvent::Exit {
+                    reason: reason.as_exit_reason().to_string(),
+                });
+                diag!("\n  session stopped");
+                break;
+            }};
+        }
 
         loop {
+            // A stop that came in during a persist or a farewell is honoured once that work is done.
+            if let Some(reason) = self.stop_requested() {
+                end_session!(reason);
+            }
+
+            // Subscribed before listening: a speculative reply can start speaking, and be
+            // interrupted, while the listen is still running.
+            let interrupted_while_listening = self.interrupt_signal();
+
             // `speculative`: a (provisional transcript, job) already streaming a reply.
             let (input, speculative) = if let Some(text) = pending_input.take() {
                 // Interrupt text: skip listening, but still emit Listen for the UI.
@@ -1496,9 +1649,13 @@ impl ChatService {
                 }
 
                 // A mic that fails to open must not end the session; devices come and go.
-                let activation = match self.wait_for_activation_resiliently().await {
-                    Ok(a) => a,
-                    Err(e) => {
+                let activation = match self
+                    .unless_stopped(self.wait_for_activation_resiliently())
+                    .await
+                {
+                    Err(reason) => end_session!(reason),
+                    Ok(Ok(a)) => a,
+                    Ok(Err(e)) => {
                         self.emit_event(WorkflowEvent::Exit {
                             reason: "microphone_unavailable".to_string(),
                         });
@@ -1516,7 +1673,13 @@ impl ChatService {
                     self.voice_input.prime_with_captured(wav);
                 }
 
-                self.listen_with_speculative_chat().await?
+                match self
+                    .unless_stopped(self.listen_with_speculative_chat())
+                    .await
+                {
+                    Err(reason) => end_session!(reason),
+                    Ok(heard) => heard?,
+                }
             } else {
                 // ── Conversational turn — listen without wake word ──
                 self.emit_event(WorkflowEvent::StateChanged {
@@ -1524,7 +1687,13 @@ impl ChatService {
                 });
                 diag!("\n  listening");
 
-                self.listen_with_speculative_chat().await?
+                match self
+                    .unless_stopped(self.listen_with_speculative_chat())
+                    .await
+                {
+                    Err(reason) => end_session!(reason),
+                    Ok(heard) => heard?,
+                }
             };
 
             // Every early exit (no speech / dismissal / exit) must abort a live speculative job.
@@ -1604,11 +1773,6 @@ impl ChatService {
             });
             self.emit_event(WorkflowEvent::UserInput(input.clone()));
 
-            // ── Thinking → Speak (streaming), with wake-word interrupt ──
-            self.emit_event(WorkflowEvent::StateChanged {
-                state: WorkflowState::Thinking,
-            });
-
             // ── Phantom-turn gate ───────────────────────────────────────────
             // Reuse the speculative job only if its transcript matches: one persisted turn each.
             let reusable_speculative = match speculative {
@@ -1623,6 +1787,23 @@ impl ChatService {
                 None => None,
             };
 
+            // Only a reused reply was audible during the listen; otherwise an Interrupt then was idle.
+            let interrupted = if reusable_speculative.is_some() {
+                interrupted_while_listening
+            } else {
+                self.interrupt_signal()
+            };
+
+            // ── Thinking → Speak (streaming), with wake-word interrupt ──
+            // Not over a reused reply already speaking: the shell would hide its Interrupt button.
+            let already_speaking = reusable_speculative.is_some()
+                && self.speaking.load(std::sync::atomic::Ordering::SeqCst);
+            if !already_speaking {
+                self.emit_event(WorkflowEvent::StateChanged {
+                    state: WorkflowState::Thinking,
+                });
+            }
+
             let input_for_task = input.clone();
             let chat_handle = reusable_speculative.unwrap_or_else(|| {
                 let svc = self.clone();
@@ -1632,37 +1813,89 @@ impl ChatService {
             });
 
             // ── InstantActivation race guard ─────────────────────────────────
-            // `InstantActivation` would win the race and abort every turn: await directly.
-            if !self.wake_word_detector.supports_interruption() {
-                let chat_result = chat_handle.await;
-                if !self.finalize_confirmed_turn(chat_result, &input).await {
-                    first_turn = true;
-                }
-                continue;
+            // `InstantActivation` would win the race and abort every turn, so it never races.
+            enum Raced {
+                Turn(std::result::Result<Result<TurnOutcome>, tokio::task::JoinError>),
+                Stop(StopReason),
+                Interrupted,
+                Wake(Result<WakeWordActivation>),
             }
-
-            // Race the turn against the wake word; persistence happens only after it completes.
-            let wake_fut = self.wake_word_detector.wait_for_activation_with_audio();
-
             tokio::pin!(chat_handle);
-            tokio::pin!(wake_fut);
+            // Scoped so the wake detector is dropped, and lets go of the mic, before any
+            // follow-up capture below.
+            let raced = {
+                let wake_fut = async {
+                    if self.wake_word_detector.supports_interruption() {
+                        self.wake_word_detector
+                            .wait_for_activation_with_audio()
+                            .await
+                    } else {
+                        std::future::pending().await
+                    }
+                };
+                tokio::pin!(wake_fut);
+                tokio::pin!(interrupted);
 
-            tokio::select! {
-                chat_result = &mut chat_handle => {
-                    // Normal completion — agent finished before any interrupt.
+                // Persistence happens only after the turn completes. Biased so a turn that
+                // already finished is persisted rather than abandoned by a stop or interrupt in
+                // the same tick.
+                tokio::select! {
+                    biased;
+                    chat_result = &mut chat_handle => Raced::Turn(chat_result),
+                    reason = self.stop_signal() => Raced::Stop(reason),
+                    () = &mut interrupted => Raced::Interrupted,
+                    wake_result = &mut wake_fut => Raced::Wake(wake_result),
+                }
+            };
+
+            match raced {
+                // Ended like a wake-word interrupt: nothing persisted, straight back to Listen.
+                Raced::Turn(Ok(Ok(TurnOutcome {
+                    barged_in: Some(barged),
+                    ..
+                }))) => {
+                    diag!("\n  interrupted");
+                    self.voice_output.stop_thinking_tone();
+                    self.emit_event(WorkflowEvent::StateChanged {
+                        state: WorkflowState::Listen,
+                    });
+                    diag_inline!("  {}", self.voice_input.prompt());
+
+                    // The user is mid-sentence: capture from when they started, not from now.
+                    self.voice_input.prime_with_onset(barged.onset);
+                    let heard = self.unless_stopped(self.voice_input.listen()).await;
+                    // Only now: the capture has its own claim, so releasing this can't close it.
+                    drop(barged.hold);
+
+                    match heard {
+                        Err(reason) => end_session!(reason),
+                        Ok(Ok(Some(new_text))) if !new_text.is_empty() => {
+                            pending_input = Some(new_text);
+                        }
+                        _ => {
+                            diag!("  nothing heard");
+                            first_turn = true;
+                        }
+                    }
+                }
+                Raced::Turn(chat_result) => {
                     if !self.finalize_confirmed_turn(chat_result, &input).await {
                         first_turn = true;
                     }
                 }
-                wake_result = &mut wake_fut => {
-                    // Wake word detected during inference/TTS — INTERRUPT
+                Raced::Stop(reason) => {
+                    self.abandon_turn(&chat_handle);
+                    end_session!(reason);
+                }
+                Raced::Interrupted => {
                     diag!("\n  interrupted");
-
-                    self.voice_output.stop_speaking();
-                    self.voice_output.stop_thinking_tone();
-
-                    // Stops Goose's inference within a token (drop-based); nothing was persisted.
-                    chat_handle.abort();
+                    self.abandon_turn(&chat_handle);
+                    // Back to the wake word: an interrupt asks for quiet, not a new recording.
+                    first_turn = true;
+                }
+                Raced::Wake(wake_result) => {
+                    diag!("\n  interrupted");
+                    self.abandon_turn(&chat_handle);
 
                     // Stash the new speech for the next iteration, which keeps it interruptible.
                     match wake_result {
@@ -1676,8 +1909,9 @@ impl ChatService {
                                 self.voice_input.prime_with_captured(wav);
                             }
 
-                            match self.voice_input.listen().await {
-                                Ok(Some(new_text)) if !new_text.is_empty() => {
+                            match self.unless_stopped(self.voice_input.listen()).await {
+                                Err(reason) => end_session!(reason),
+                                Ok(Ok(Some(new_text))) if !new_text.is_empty() => {
                                     pending_input = Some(new_text);
                                 }
                                 _ => {
@@ -1749,6 +1983,10 @@ impl ChatService {
         match &event {
             WorkflowEvent::StateChanged { state } => {
                 tracing::debug!("Workflow state: {}", state);
+                self.speaking.store(
+                    *state == WorkflowState::Speak,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
             }
             WorkflowEvent::UserInput(text) => {
                 tracing::debug!("User input: {}", text);
@@ -3202,6 +3440,7 @@ mod tests {
                     usage: None,
                     stats: None,
                     total_latency_ms: 0,
+                    barged_in: None,
                 })),
                 "what is the answer",
             )
@@ -3280,6 +3519,793 @@ mod tests {
         assert_eq!(
             turn_complete_count, 0,
             "an interrupted turn must NOT emit turn_complete"
+        );
+    }
+
+    // ── Barge-in: speaking over the reply ends the turn ──────────────────
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// What the fake mic was asked to do.
+    #[derive(Default)]
+    struct MicLog {
+        holds: AtomicUsize,
+        releases: AtomicUsize,
+        readings: AtomicUsize,
+    }
+
+    impl MicLog {
+        fn held(&self) -> bool {
+            self.holds.load(Ordering::SeqCst) > self.releases.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Reads nothing until held open, like a closed mic; then hears the user talk over the
+    /// first reply, and quiet after that.
+    struct TalkOverFirstReply(Arc<MicLog>);
+
+    impl SpeechEnergy for TalkOverFirstReply {
+        fn recent_rms(&self, _window_ms: u64) -> Option<f32> {
+            if !self.0.held() {
+                return None;
+            }
+            let n = self.0.readings.fetch_add(1, Ordering::SeqCst);
+            Some(if n < pond_voice::barge::CONSECUTIVE_WINDOWS as usize {
+                0.5
+            } else {
+                0.0
+            })
+        }
+
+        fn hold_mic(&self) -> MicHold {
+            self.0.holds.fetch_add(1, Ordering::SeqCst);
+            let log = self.0.clone();
+            MicHold::new(move || {
+                log.releases.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+    }
+
+    /// Sets its flag when dropped, i.e. when the agent's stream is dropped.
+    struct SetOnDrop(Arc<AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The first reply runs on for seconds, so only an ended turn stops it; then it echoes.
+    struct LongFirstReply {
+        calls: AtomicUsize,
+        first_stream_dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::models::ports::agent::Agent for LongFirstReply {
+        async fn chat(
+            &self,
+            _request: crate::models::ports::agent::AgentRequest,
+        ) -> Result<crate::models::ports::agent::AgentResponse> {
+            anyhow::bail!("voice uses chat_stream")
+        }
+
+        async fn chat_stream(
+            &self,
+            request: crate::models::ports::agent::AgentRequest,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<crate::models::ports::agent::AgentStreamEvent>,
+            >,
+        > {
+            use crate::models::ports::agent::AgentStreamEvent as E;
+            use futures::StreamExt;
+
+            let session_id = request.session_id.clone();
+            let model_role = request.model_role.clone();
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let dropped = SetOnDrop(self.first_stream_dropped.clone());
+                let stream = async_stream::stream! {
+                    let _dropped = dropped;
+                    yield Ok(E::Text { content: "Monday will be sunny. ".to_string() });
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                    yield Ok(E::Text { content: "Tuesday brings rain. ".to_string() });
+                    yield Ok(E::Done { session_id, model_role, usage: None, stats: None });
+                };
+                return Ok(stream.boxed());
+            }
+            let reply = format!("Echo: {}", request.message);
+            let stream = async_stream::stream! {
+                yield Ok(E::Text { content: reply });
+                yield Ok(E::Done { session_id, model_role, usage: None, stats: None });
+            };
+            Ok(stream.boxed())
+        }
+    }
+
+    /// One `listen()`: the onset it was primed with, and the state of things when it ran.
+    struct Capture {
+        onset: Option<Instant>,
+        at: Instant,
+        mic_held: bool,
+        first_reply_dropped: bool,
+    }
+
+    /// Scripted speech that records every capture.
+    struct RecordingInput {
+        script: std::sync::Mutex<std::collections::VecDeque<Option<String>>>,
+        onset: std::sync::Mutex<Option<Instant>>,
+        captures: std::sync::Mutex<Vec<Capture>>,
+        mic: Arc<MicLog>,
+        first_reply_dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceInput for RecordingInput {
+        async fn listen(&self) -> Result<Option<String>> {
+            self.captures.lock().unwrap().push(Capture {
+                onset: self.onset.lock().unwrap().take(),
+                at: Instant::now(),
+                mic_held: self.mic.held(),
+                first_reply_dropped: self.first_reply_dropped.load(Ordering::SeqCst),
+            });
+            Ok(self.script.lock().unwrap().pop_front().flatten())
+        }
+
+        fn prime_with_onset(&self, onset: Instant) {
+            *self.onset.lock().unwrap() = Some(onset);
+        }
+    }
+
+    /// Activates on the listed calls (1-based) and otherwise never.
+    struct ActivatesOn(AtomicUsize, &'static [usize]);
+
+    #[async_trait::async_trait]
+    impl StreamingWakeWordDetector for ActivatesOn {
+        async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
+            let call = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            if !self.1.contains(&call) {
+                std::future::pending::<()>().await;
+            }
+            Ok(WakeWordActivation {
+                captured_audio: None,
+            })
+        }
+    }
+
+    struct BargeInRun {
+        persisted: Vec<SessionMessage>,
+        events: Vec<WorkflowEvent>,
+        captures: Vec<Capture>,
+        spoken: Vec<String>,
+        mic: Arc<MicLog>,
+    }
+
+    /// Ask a question, talk over the first sentence of the answer, then ask the follow-up.
+    async fn talk_over_the_reply(detector: Arc<dyn StreamingWakeWordDetector>) -> BargeInRun {
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "barge-in".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let mic = Arc::new(MicLog::default());
+        let first_reply_dropped = Arc::new(AtomicBool::new(false));
+        let input = Arc::new(RecordingInput {
+            script: std::sync::Mutex::new(
+                [
+                    Some("what is the weather this week"),
+                    Some("what about saturday"),
+                    None,
+                ]
+                .into_iter()
+                .map(|s| s.map(str::to_string))
+                .collect(),
+            ),
+            onset: std::sync::Mutex::new(None),
+            captures: std::sync::Mutex::new(Vec::new()),
+            mic: mic.clone(),
+            first_reply_dropped: first_reply_dropped.clone(),
+        });
+        let output = Arc::new(CapturingSpeak::default());
+        let collector = EventCollector::default();
+        let agent = Arc::new(LongFirstReply {
+            calls: AtomicUsize::new(0),
+            first_stream_dropped: first_reply_dropped,
+        });
+
+        let svc = ChatService::new(agent, session_id.clone(), storage.clone())
+            .with_voice_input(input.clone())
+            .with_voice_output(output.clone())
+            .with_speech_energy(Arc::new(TalkOverFirstReply(mic.clone())))
+            .with_wake_word_detector(detector)
+            .with_event_sink(collector.sink());
+
+        tokio::time::timeout(Duration::from_secs(10), svc.run_loop())
+            .await
+            .expect("the loop must not hang on a barge-in")
+            .unwrap();
+
+        let captures = std::mem::take(&mut *input.captures.lock().unwrap());
+        let spoken = output.spoken.lock().unwrap().clone();
+        BargeInRun {
+            persisted: storage.get_messages(&session_id).await.unwrap(),
+            events: collector.ndjson_events(),
+            captures,
+            spoken,
+            mic,
+        }
+    }
+
+    fn assert_the_barge_in_ended_the_turn(run: &BargeInRun) {
+        let persisted: Vec<(Role, &str)> = run
+            .persisted
+            .iter()
+            .map(|m| (m.message.role.clone(), m.message.content.as_str()))
+            .collect();
+        assert_eq!(
+            persisted,
+            vec![
+                (Role::User, "what about saturday"),
+                (Role::Assistant, "Echo: what about saturday"),
+            ],
+            "the interrupted reply must not be persisted as a completed turn"
+        );
+        assert!(
+            !run.spoken.iter().any(|s| s.contains("Tuesday")),
+            "synthesis went on after the barge-in: {:?}",
+            run.spoken
+        );
+        let completed = run
+            .events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TurnComplete { .. }))
+            .count();
+        assert_eq!(completed, 1, "only the follow-up turn completed");
+
+        let follow_up = &run.captures[1];
+        assert!(
+            follow_up.first_reply_dropped,
+            "the interrupted reply was still generating when the follow-up capture began"
+        );
+        let onset = follow_up
+            .onset
+            .expect("the follow-up capture must start from the barge-in onset, not from now");
+        let debounce_and_pre_roll = Duration::from_millis(
+            pond_voice::barge::POLL_MS * (pond_voice::barge::CONSECUTIVE_WINDOWS as u64 - 1)
+                + pond_voice::barge::WINDOW_MS
+                + pond_voice::barge::ONSET_PRE_ROLL_MS,
+        );
+        assert!(
+            follow_up.at.duration_since(onset) >= debounce_and_pre_roll,
+            "the capture must reach back past the debounce to the pre-roll; it reached {:?}",
+            follow_up.at.duration_since(onset)
+        );
+        assert!(
+            follow_up.mic_held,
+            "the mic was let go before the follow-up capture, losing what was said meanwhile"
+        );
+        assert!(
+            run.captures[0].onset.is_none() && run.captures[2..].iter().all(|c| c.onset.is_none()),
+            "only the capture after a barge-in starts in the past"
+        );
+        assert_eq!(
+            run.mic.holds.load(Ordering::SeqCst),
+            run.mic.releases.load(Ordering::SeqCst),
+            "every mic hold must be released"
+        );
+    }
+
+    /// With no wake-word detector nothing else listens mid-reply, so the watch must open the mic.
+    #[tokio::test]
+    async fn a_barge_in_ends_the_turn_unpersisted_and_captures_from_its_onset() {
+        let run = talk_over_the_reply(Arc::new(InstantActivation)).await;
+        assert_the_barge_in_ended_the_turn(&run);
+    }
+
+    #[tokio::test]
+    async fn a_barge_in_ends_the_turn_the_same_way_while_a_wake_word_detector_races_it() {
+        // 1: the first wake word. 2, 3: the races during each reply, which must not fire.
+        // 4: back to Wait once the script runs out, so the loop reaches end of input.
+        let run = talk_over_the_reply(Arc::new(ActivatesOn(AtomicUsize::new(0), &[1, 4]))).await;
+        assert_the_barge_in_ended_the_turn(&run);
+    }
+
+    #[tokio::test]
+    async fn a_reply_heard_out_releases_the_mic_and_reports_no_barge_in() {
+        struct Quiet(Arc<MicLog>);
+        impl SpeechEnergy for Quiet {
+            fn recent_rms(&self, _window_ms: u64) -> Option<f32> {
+                Some(0.0)
+            }
+            fn hold_mic(&self) -> MicHold {
+                self.0.holds.fetch_add(1, Ordering::SeqCst);
+                let log = self.0.clone();
+                MicHold::new(move || {
+                    log.releases.fetch_add(1, Ordering::SeqCst);
+                })
+            }
+        }
+
+        let storage = Arc::new(InMemorySessionStorage::new());
+        storage.create_session("heard-out".into()).await.unwrap();
+        let mic = Arc::new(MicLog::default());
+        let svc = ChatService::new(Arc::new(MockAgent::new()), "heard-out".into(), storage)
+            .with_voice_output(Arc::new(CapturingSpeak::default()))
+            .with_speech_energy(Arc::new(Quiet(mic.clone())));
+
+        let outcome = svc
+            .stream_response_inner("One. Two.".to_string(), Instant::now())
+            .await
+            .unwrap();
+        assert!(outcome.barged_in.is_none());
+        assert_eq!(outcome.text, "Echo: One. Two.");
+        assert_eq!(
+            mic.holds.load(Ordering::SeqCst),
+            1,
+            "the reply must hold the mic"
+        );
+        assert_eq!(
+            mic.releases.load(Ordering::SeqCst),
+            1,
+            "a finished reply must let go of the mic"
+        );
+    }
+
+    /// A tool running between sentences plays nothing, so talk then is not over the reply.
+    #[tokio::test]
+    async fn talk_while_nothing_plays_between_sentences_is_not_a_barge_in() {
+        struct Loud(Arc<MicLog>);
+        impl SpeechEnergy for Loud {
+            fn recent_rms(&self, _window_ms: u64) -> Option<f32> {
+                Some(0.5)
+            }
+            fn hold_mic(&self) -> MicHold {
+                self.0.holds.fetch_add(1, Ordering::SeqCst);
+                let log = self.0.clone();
+                MicHold::new(move || {
+                    log.releases.fetch_add(1, Ordering::SeqCst);
+                })
+            }
+        }
+        #[derive(Default)]
+        struct NothingPlaying(CapturingSpeak);
+        #[async_trait::async_trait]
+        impl VoiceOutput for NothingPlaying {
+            async fn speak(&self, text: &str) -> Result<()> {
+                self.0.speak(text).await
+            }
+            fn is_playing(&self) -> Option<bool> {
+                Some(false)
+            }
+        }
+
+        let storage = Arc::new(InMemorySessionStorage::new());
+        storage.create_session("between".into()).await.unwrap();
+        let mic = Arc::new(MicLog::default());
+        let agent = Arc::new(LongFirstReply {
+            calls: AtomicUsize::new(0),
+            first_stream_dropped: Arc::new(AtomicBool::new(false)),
+        });
+        let svc = ChatService::new(agent, "between".into(), storage)
+            .with_voice_output(Arc::new(NothingPlaying::default()))
+            .with_speech_energy(Arc::new(Loud(mic.clone())));
+
+        let outcome = svc
+            .stream_response_inner("what is the weather this week".to_string(), Instant::now())
+            .await
+            .unwrap();
+        assert!(
+            outcome.barged_in.is_none(),
+            "talk over silence ended the turn"
+        );
+        assert!(outcome.text.contains("Tuesday"), "got {:?}", outcome.text);
+        assert_eq!(
+            mic.holds.load(Ordering::SeqCst),
+            mic.releases.load(Ordering::SeqCst)
+        );
+    }
+
+    // ── Shell control: stdin `interrupt` and `stop` ───────────────────────
+
+    /// Speaks one sentence, then never finishes: a reply long enough to interrupt.
+    struct EndlessReplyAgent;
+
+    #[async_trait::async_trait]
+    impl Agent for EndlessReplyAgent {
+        async fn chat(
+            &self,
+            _request: AgentRequest,
+        ) -> Result<crate::shared::domain::agent::AgentResponse> {
+            unreachable!("the voice loop streams")
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: AgentRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<AgentStreamEvent>>> {
+            let stream = async_stream::stream! {
+                yield Ok(AgentStreamEvent::Text {
+                    content: "Once upon a time, a goose sat in a pond.".to_string(),
+                });
+                std::future::pending::<()>().await;
+            };
+            Ok(stream.boxed())
+        }
+    }
+
+    /// Counts `stop_speaking`; with `stop_at_turn_end`, stops the session as a turn finishes.
+    #[derive(Default)]
+    struct StopCountingSpeak {
+        stops: std::sync::atomic::AtomicUsize,
+        stop_at_turn_end: Option<VoiceControl>,
+    }
+
+    impl StopCountingSpeak {
+        fn stops(&self) -> usize {
+            self.stops.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceOutput for StopCountingSpeak {
+        async fn speak(&self, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        fn stop_speaking(&self) {
+            self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        // The last thing `stream_response_inner` does, with no await before the task returns.
+        fn end_utterance(&self) {
+            if let Some(control) = &self.stop_at_turn_end {
+                control.stop(StopReason::Requested);
+            }
+        }
+    }
+
+    /// Interruptible; hears the wake word at once the first time, then never again.
+    #[derive(Default)]
+    struct WakesOnce {
+        woken: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamingWakeWordDetector for WakesOnce {
+        async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
+            if self.woken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            Ok(WakeWordActivation {
+                captured_audio: None,
+            })
+        }
+        fn supports_interruption(&self) -> bool {
+            true
+        }
+    }
+
+    struct NeverHears;
+
+    #[async_trait::async_trait]
+    impl VoiceInput for NeverHears {
+        async fn listen(&self) -> Result<Option<String>> {
+            std::future::pending().await
+        }
+    }
+
+    /// Records every event, then hands it to `steer` to drive the loop from its own events.
+    fn steering_sink(
+        collector: &EventCollector,
+        steer: impl Fn(&WorkflowEvent) + Send + Sync + 'static,
+    ) -> WorkflowEventSink {
+        let record = collector.sink();
+        Arc::new(move |event: &WorkflowEvent| {
+            record(event);
+            steer(event);
+        })
+    }
+
+    fn is_state(event: &WorkflowEvent, wanted: WorkflowState) -> bool {
+        matches!(event, WorkflowEvent::StateChanged { state } if *state == wanted)
+    }
+
+    fn states_of(events: &[WorkflowEvent]) -> Vec<WorkflowState> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::StateChanged { state } => Some(*state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn exit_reasons(events: &[WorkflowEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::Exit { reason } => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn turn_completes(events: &[WorkflowEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::TurnComplete { .. }))
+            .count()
+    }
+
+    async fn run_bounded(svc: &ChatService) -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), svc.run_loop())
+            .await
+            .expect("run_loop must end instead of hanging")
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_ends_the_turn_persisting_nothing_and_returns_to_the_wake_word() {
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "shell-interrupt".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let control = VoiceControl::new();
+        let collector = EventCollector::default();
+        let output = Arc::new(StopCountingSpeak::default());
+        let svc = ChatService::new(
+            Arc::new(EndlessReplyAgent),
+            session_id.clone(),
+            storage.clone(),
+        )
+        .with_voice_input(Arc::new(ScriptedListenInput::new(["tell me a long story"])))
+        .with_voice_output(output.clone())
+        .with_control(control.clone())
+        .with_event_sink(steering_sink(&collector, move |event| {
+            if is_state(event, WorkflowState::Speak) {
+                control.apply(crate::shared::services::voice_control::ControlCommand::Interrupt);
+            }
+        }));
+
+        // InstantActivation: the turn is not raced against a wake word, only against the shell.
+        run_bounded(&svc).await.unwrap();
+
+        assert!(
+            storage.get_messages(&session_id).await.unwrap().is_empty(),
+            "an interrupted turn must persist nothing"
+        );
+        let events = collector.events.lock().unwrap().clone();
+        assert_eq!(
+            turn_completes(&events),
+            0,
+            "no turn_complete for an interrupted turn"
+        );
+        assert!(output.stops() >= 1, "the interrupt must stop speech");
+
+        let states = states_of(&events);
+        let speak = states
+            .iter()
+            .position(|s| *s == WorkflowState::Speak)
+            .expect("the reply started speaking");
+        assert_eq!(
+            states.get(speak + 1),
+            Some(&WorkflowState::Wait),
+            "after an interrupt the loop waits for the wake word; got {states:?}"
+        );
+        assert_eq!(exit_reasons(&events), vec!["stdin_eof"]);
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_wins_while_the_wake_word_race_is_armed_and_a_stop_ends_the_wait() {
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "shell-interrupt-race".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let control = VoiceControl::new();
+        let collector = EventCollector::default();
+        let output = Arc::new(StopCountingSpeak::default());
+        let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let svc = ChatService::new(
+            Arc::new(EndlessReplyAgent),
+            session_id.clone(),
+            storage.clone(),
+        )
+        .with_voice_input(Arc::new(ScriptedListenInput::new(["tell me a long story"])))
+        .with_voice_output(output.clone())
+        .with_wake_word_detector(Arc::new(WakesOnce::default()))
+        .with_control(control.clone())
+        .with_event_sink(steering_sink(&collector, move |event| {
+            if is_state(event, WorkflowState::Speak) {
+                control.interrupt();
+            }
+            // The second Wait is the one after the interrupt; the detector never wakes again.
+            if is_state(event, WorkflowState::Wait)
+                && waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1
+            {
+                control.stop(StopReason::Requested);
+            }
+        }));
+
+        run_bounded(&svc).await.unwrap();
+
+        assert!(storage.get_messages(&session_id).await.unwrap().is_empty());
+        let events = collector.events.lock().unwrap().clone();
+        assert_eq!(turn_completes(&events), 0);
+        assert!(output.stops() >= 1, "the interrupt must stop speech");
+        assert_eq!(exit_reasons(&events), vec!["stopped"]);
+        assert_eq!(
+            states_of(&events).last(),
+            Some(&WorkflowState::Wait),
+            "the stop must end the wake-word wait without listening"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_mid_turn_abandons_it_and_ends_the_loop() {
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "shell-stop-mid-turn".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let control = VoiceControl::new();
+        let collector = EventCollector::default();
+        let output = Arc::new(StopCountingSpeak::default());
+        let svc = ChatService::new(
+            Arc::new(EndlessReplyAgent),
+            session_id.clone(),
+            storage.clone(),
+        )
+        .with_voice_input(Arc::new(ScriptedListenInput::new([
+            "tell me a long story",
+            "more",
+        ])))
+        .with_voice_output(output.clone())
+        .with_control(control.clone())
+        .with_event_sink(steering_sink(&collector, move |event| {
+            if is_state(event, WorkflowState::Speak) {
+                control.apply(crate::shared::services::voice_control::ControlCommand::Stop);
+            }
+        }));
+
+        run_bounded(&svc).await.unwrap();
+
+        assert!(
+            storage.get_messages(&session_id).await.unwrap().is_empty(),
+            "an abandoned turn must persist nothing"
+        );
+        let events = collector.events.lock().unwrap().clone();
+        assert_eq!(turn_completes(&events), 0);
+        assert!(output.stops() >= 1, "the stop must silence the reply");
+        assert_eq!(exit_reasons(&events), vec!["stopped"]);
+        assert!(
+            matches!(events.last(), Some(WorkflowEvent::Exit { .. })),
+            "nothing may follow the exit; got {:?}",
+            events.last()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_listening_ends_the_loop() {
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "shell-stop-listening".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let control = VoiceControl::new();
+        let collector = EventCollector::default();
+        let svc = ChatService::new(Arc::new(MockAgent::new()), session_id, storage)
+            .with_voice_input(Arc::new(NeverHears))
+            .with_voice_output(Arc::new(CapturingSpeak::default()))
+            .with_control(control.clone())
+            .with_event_sink(steering_sink(&collector, move |event| {
+                if is_state(event, WorkflowState::Listen) {
+                    control.stop(StopReason::StdinEof);
+                }
+            }));
+
+        run_bounded(&svc).await.unwrap();
+
+        let events = collector.events.lock().unwrap().clone();
+        assert_eq!(exit_reasons(&events), vec!["stdin_eof"]);
+        assert_eq!(turn_completes(&events), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stop_requested_before_the_loop_opens_nothing() {
+        struct MustNotWait;
+
+        #[async_trait::async_trait]
+        impl StreamingWakeWordDetector for MustNotWait {
+            async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
+                panic!("a stopped session must not open the microphone")
+            }
+        }
+
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "shell-stop-early".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let control = VoiceControl::new();
+        control.stop(StopReason::Requested);
+        let collector = EventCollector::default();
+        let svc = ChatService::new(Arc::new(MockAgent::new()), session_id, storage)
+            .with_wake_word_detector(Arc::new(MustNotWait))
+            .with_control(control)
+            .with_event_sink(collector.sink());
+
+        run_bounded(&svc).await.unwrap();
+
+        let events = collector.events.lock().unwrap().clone();
+        assert!(
+            matches!(events.as_slice(), [WorkflowEvent::Exit { reason }] if reason == "stopped"),
+            "only the exit may be emitted; got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_sent_while_idle_does_not_cut_the_next_turn() {
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "shell-idle-interrupt".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let control = VoiceControl::new();
+        control.interrupt();
+        let collector = EventCollector::default();
+        let svc = ChatService::new(
+            Arc::new(MockAgent::new()),
+            session_id.clone(),
+            storage.clone(),
+        )
+        .with_voice_input(Arc::new(ScriptedListenInput::new(["hello there"])))
+        .with_voice_output(Arc::new(CapturingSpeak::default()))
+        .with_control(control)
+        .with_event_sink(collector.sink());
+
+        run_bounded(&svc).await.unwrap();
+
+        assert_eq!(storage.get_messages(&session_id).await.unwrap().len(), 2);
+        assert_eq!(turn_completes(&collector.events.lock().unwrap()), 1);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_already_finished_is_persisted_before_a_stop_is_honoured() {
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "shell-stop-after-turn".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let control = VoiceControl::new();
+        let collector = EventCollector::default();
+        let output = Arc::new(StopCountingSpeak {
+            stop_at_turn_end: Some(control.clone()),
+            ..StopCountingSpeak::default()
+        });
+        let svc = ChatService::new(
+            Arc::new(MockAgent::new()),
+            session_id.clone(),
+            storage.clone(),
+        )
+        .with_voice_input(Arc::new(ScriptedListenInput::new([
+            "hello there",
+            "unheard",
+        ])))
+        .with_voice_output(output.clone())
+        .with_control(control)
+        .with_event_sink(collector.sink());
+
+        run_bounded(&svc).await.unwrap();
+
+        assert_eq!(
+            storage.get_messages(&session_id).await.unwrap().len(),
+            2,
+            "a reply that was fully spoken must be persisted, not abandoned"
+        );
+        let events = collector.events.lock().unwrap().clone();
+        assert_eq!(turn_completes(&events), 1);
+        assert_eq!(output.stops(), 0, "nothing was cut off");
+        assert_eq!(exit_reasons(&events), vec!["stopped"]);
+        let transcripts = events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::Transcript { .. }))
+            .count();
+        assert_eq!(
+            transcripts, 1,
+            "the stop must come before the next turn is heard"
         );
     }
 

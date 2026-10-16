@@ -1092,6 +1092,25 @@ describe("calibrateWakeWord()", () => {
     expect(init.body).toBeInstanceOf(FormData);
   });
 
+  it("sends the sentence that was read out, so the server can find the phrase in it", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({
+        transcript: "Hey gus, good morning.",
+        normalized: "hey gus good morning",
+        heard: "gus",
+        new_variant: true,
+        all_variants: ["gus"],
+        sample_count: 1,
+        target_count: 5,
+        complete: false,
+      }),
+    );
+    const res = await client().calibrateWakeWord(new Uint8Array([0]).buffer, "Hey goose, good morning");
+    expect(res.heard).toBe("gus");
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.body as FormData).get("prompt")).toBe("Hey goose, good morning");
+  });
+
   it("throws ApiError on 422 (no speech detected)", async () => {
     fetchMock.mockResolvedValueOnce(errJson(422, "No speech detected"));
     const wav = new Uint8Array([0]).buffer;
