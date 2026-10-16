@@ -544,7 +544,7 @@ These are the **authoritative** fields read at runtime. Written by `sync_assignm
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `voice_wake_word` | `String` | `"goose"` | Wake word / phrase detected by `WhisperKeywordDetector` (case-insensitive substring) |
-| `voice_recording_duration_secs` | `u32` | `5` | Microphone capture duration per Whisper inference call |
+| `voice_recording_duration_secs` | `u32` | `3` | Recording ceiling for the browser voice path; the voice loop ends on silence and ignores it |
 | `voice_whisper_url` | `String` | `"http://127.0.0.1:9000"` | Custom remote whisper.cpp server URL |
 | `voice_tts_voice` | `String` | `""` | Piper ONNX voice filename (e.g. `"en_US-lessac-medium.onnx"`) |
 

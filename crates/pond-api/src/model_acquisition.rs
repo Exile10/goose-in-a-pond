@@ -113,6 +113,12 @@ pub(crate) fn carries_pictures(spec: &EncoderSpec, budgeted: bool) -> bool {
     .is_declared()
 }
 
+/// The Hugging Face listing of `repo`'s files that [`hf_file_entry`] reads. Without `blobs=true`
+/// its `siblings` carry no `size`. Not percent-encoded: HF returns 400 for `owner%2Fname`.
+pub(crate) fn hf_repo_files_url(repo: &str) -> String {
+    format!("https://huggingface.co/api/models/{repo}?blobs=true")
+}
+
 /// One file of a Hugging Face repository as "Add a model" lists it; `None` for a file that is no
 /// chat model. `pictures` is the add-on a download would bring, where this device carries it.
 pub(crate) fn hf_file_entry(repo: &str, sibling: &Value, budgeted: bool) -> Option<Value> {
@@ -892,6 +898,40 @@ mod tests {
         .unwrap();
         assert!(unlisted["pictures"].is_null());
         assert!(unlisted["size_mb"].is_null());
+    }
+
+    #[test]
+    fn a_repo_listing_asks_for_file_sizes_and_stays_on_the_hugging_face_host() {
+        let url = hf_repo_files_url("ggml-org/SmolVLM-256M-Instruct-GGUF");
+        assert_eq!(
+            url,
+            "https://huggingface.co/api/models/ggml-org/SmolVLM-256M-Instruct-GGUF?blobs=true"
+        );
+        assert_eq!(
+            pond_core::shared::services::egress::extract_host(&url),
+            "huggingface.co"
+        );
+    }
+
+    /// A sibling as HF lists it with `blobs=true`, where `size` is the file's, not its pointer's.
+    #[test]
+    fn a_search_result_sizes_a_file_from_its_blob_listing() {
+        let entry = hf_file_entry(
+            "ggml-org/SmolVLM-256M-Instruct-GGUF",
+            &json!({
+                "rfilename": "SmolVLM-256M-Instruct-Q8_0.gguf",
+                "blobId": "20da2c71b3530f722f1fc3397d4721a6b57d094e",
+                "size": 175_054_528u64,
+                "lfs": {
+                    "sha256": "2a31195d3769c0b0fd0a4906201666108834848db768af11de1d2cef7cd35e65",
+                    "size": 175_054_528u64,
+                    "pointerSize": 134
+                }
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(entry["size_mb"], 166);
     }
 
     /// Encoders and drafters beside a model are no models: neither name offers a download.

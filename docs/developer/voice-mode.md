@@ -20,7 +20,7 @@ You should see:
 
   Listen   ggml-small.en
   Wake     "goose"
-  Speak    en_US-lessac-medium
+  Speak    af_heart @ 1.00x
   Log      ~/Library/Application Support/goose-in-a-pond/logs/pond.log
 
   say "goose"
@@ -80,25 +80,40 @@ the answer was coming.
 
 ## Tuning
 
-`KeywordDetectorConfig` (`crates/pond-adapters-whisper/src/lib.rs`). Three
-settings override it at runtime: `voice_kws_energy_threshold`,
-`voice_kws_cooldown_ms`, `voice_kws_post_trigger_silence_ms`.
+The knobs are `KeywordDetectorConfig` (`crates/pond-adapters-whisper/src/lib.rs`).
+The voice loop builds it in `crates/pond-server/src/main.rs` (the wake-word
+wiring) and always replaces three of them with settings. For those three the
+code default never runs: what runs is the setting, which is the settings default
+(`default_kws_*` in `crates/pond-core/src/user_data/domain/settings.rs`) until
+someone changes it under Settings > Voice > Listening.
 
-| Knob | Default | What moving it does |
-|---|---|---|
-| `window_ms` | 1400 | Audio fed to whisper per cycle. Wider gives the model more to invent context from and costs more every cycle. |
-| `slide_ms` | 200 | Reaction floor. The wake word cannot be noticed sooner than the next slide plus one transcription. |
-| `lookback_ms` | 900 | How far back the capture reaches past the trigger. **Too low clips the first words of every request.** |
-| `post_trigger_ms` | 12000 | Ceiling on capture. Silence normally ends it far sooner. |
-| `energy_threshold` | 0.010 | Below this, a window never reaches whisper. Raise if a noisy room keeps waking it. |
-| `silence_threshold` | 0.0025 | Below this counts as end-of-speech. **Raise it and quiet sentence endings get cut off.** |
-| `post_trigger_silence_ms` | 800 | Silence that ends the capture. Raise if it cuts you off mid-thought. |
-| `cooldown_ms` | 600 | Settling time before re-arming, so the reply's own tail cannot re-trigger. |
+| Knob | Live value | Comes from | What moving it does |
+|---|---|---|---|
+| `window_ms` | 1400 | code | Audio fed to whisper per cycle. Wider gives the model more to invent context from and costs more every cycle. |
+| `slide_ms` | 200 | code | Reaction floor. The wake word cannot be noticed sooner than the next slide plus one transcription. |
+| `lookback_ms` | 900 | code | How far back the capture reaches past the trigger. **Too low clips the first words of every request.** |
+| `post_trigger_ms` | 12000 | code | Ceiling on capture. Silence normally ends it far sooner. |
+| `energy_threshold` | 0.003 | `voice_kws_energy_threshold` | Below this, a window never reaches whisper. Raise if a noisy room keeps waking it. |
+| `silence_threshold` | 0.0025 | code | Below this counts as end-of-speech. **Raise it and quiet sentence endings get cut off.** |
+| `post_trigger_silence_ms` | 400 | `voice_kws_post_trigger_silence_ms` | Silence that ends the capture. Raise if it cuts you off mid-thought. |
+| `cooldown_ms` | 2000 | `voice_kws_cooldown_ms` | Settling time before detection arms. Windows never reach audio from before the detector opened, so the request just heard cannot re-trigger it, and the first window covers only the end of this time, by which a reply's tail still sounding when the detector opened has died away. The wake word does nothing during it, which also delays a wake-word interrupt at the start of every turn. |
 
-The invariants between these are asserted in tests (`the_lookback_covers_...`,
-`the_ring_holds_everything_both_readers_can_ask_for`,
-`ending_a_sentence_is_judged_more_leniently_than_waking_whisper`). Retune the
-numbers freely; if a test fails, the relationship broke, not the number.
+The detector's own defaults for the three settings-driven knobs are 0.010, 800
+and 600. They were retuned with the detector; the settings defaults were not, so
+the two disagree, and only the settings reach a running pond.
+
+Follow-up turns do not wait on the cooldown: after a reply the loop listens for
+speech without the wake word, and goes back to waiting for it when nothing is
+heard.
+
+The relationships between the knobs are asserted in tests
+(`the_lookback_covers_...`, `the_ring_holds_everything_both_readers_can_ask_for`,
+`ending_a_sentence_is_judged_more_leniently_than_waking_whisper`). They run
+against the code defaults, not the settings. The silence-under-gate relation
+holds for the live values too, narrowly (0.0025 under 0.003). The cooldown bound
+in `the_code_default_cooldown_re_arms_within_a_second` (at most 1000 ms) does
+not: the live 2000 ms is outside it. Retune the numbers freely; if a test fails,
+the relationship broke, not the number.
 
 ## Why detection changed
 

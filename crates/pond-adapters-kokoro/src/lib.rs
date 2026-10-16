@@ -65,6 +65,8 @@ pub struct KokoroOutput {
     thinking_for: Arc<AtomicU64>,
     utterance: Arc<AtomicU64>,
     speech_interrupted: Arc<AtomicBool>,
+    /// Playbacks in flight; zero between sentences, e.g. while a tool runs.
+    playing: Arc<std::sync::atomic::AtomicUsize>,
     _audio_keeper: AudioKeeper,
     audio_handle: rodio::OutputStreamHandle,
     audio_level_sink: Option<Arc<ThrottledAudioLevelSink>>,
@@ -94,6 +96,7 @@ impl KokoroOutput {
             thinking_for: Arc::new(AtomicU64::new(TONE_OFF)),
             utterance: Arc::new(AtomicU64::new(1)),
             speech_interrupted: Arc::new(AtomicBool::new(false)),
+            playing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _audio_keeper: keeper,
             audio_handle: handle,
             audio_level_sink: None,
@@ -264,11 +267,17 @@ impl VoiceOutput for KokoroOutput {
         let interrupted = self.speech_interrupted.clone();
         let utterance = self.utterance.clone();
         let sink = self.audio_level_sink.clone();
+        let playing = Playing::start(&self.playing);
         tokio::task::spawn_blocking(move || {
+            let _playing = playing;
             play_wav(audio, &handle, &interrupted, &utterance, sink.as_deref())
         })
         .await
         .context("Kokoro playback task panicked")?
+    }
+
+    fn is_playing(&self) -> Option<bool> {
+        Some(self.playing.load(Ordering::SeqCst) > 0)
     }
 
     fn begin_utterance(&self) {
@@ -510,5 +519,21 @@ mod tests {
                 "wrapper disagreed for stored={stored:?}"
             );
         }
+    }
+}
+
+/// One playback in flight, counted until dropped, however the playback ends.
+struct Playing(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Playing {
+    fn start(count: &Arc<std::sync::atomic::AtomicUsize>) -> Playing {
+        count.fetch_add(1, Ordering::SeqCst);
+        Playing(count.clone())
+    }
+}
+
+impl Drop for Playing {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }

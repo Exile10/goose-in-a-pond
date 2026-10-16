@@ -402,24 +402,46 @@ fn get_cpp_link_stdlib(target: &str) -> Option<&'static str> {
     }
 }
 
-/// Bring the build's copy of the native sources up to date, rewriting only files that differ.
+/// Bring the build's copy of the native sources up to date, rewriting only files that differ
+/// and removing what the sources no longer have.
 ///
 /// The copy used to be made once per `OUT_DIR` and never refreshed, so an edited source
 /// compiled nothing and the previous library shipped. Unchanged files keep their timestamps,
-/// so CMake recompiles only what changed.
+/// so CMake recompiles only what changed. A removed header left in the copy would still
+/// satisfy an `#include`, and CMake globs would still compile a removed source.
 fn sync_sources(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
+    let mut names = std::collections::HashSet::new();
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let source = entry.path();
         let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let is_dir = entry.file_type()?.is_dir();
+        if std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir() != is_dir) {
+            remove(&target)?;
+        }
+        if is_dir {
             sync_sources(&source, &target)?;
         } else if std::fs::read(&target).ok() != Some(std::fs::read(&source)?) {
             std::fs::copy(&source, &target)?;
         }
+        names.insert(entry.file_name());
+    }
+    for entry in std::fs::read_dir(to)? {
+        let entry = entry?;
+        if !names.contains(&entry.file_name()) {
+            remove(&entry.path())?;
+        }
     }
     Ok(())
+}
+
+fn remove(path: &std::path::Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 fn add_link_search_path(dir: &std::path::Path) -> std::io::Result<()> {

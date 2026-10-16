@@ -230,8 +230,13 @@ pub fn permitted_groups(
 }
 
 /// The `<tool-groups>` block naming unloaded groups, saving a `list_tool_groups` round trip. It
-/// rides the user message: the system prefix must stay byte-identical for KV reuse.
-pub fn dormant_groups_note(available: &[String], loaded: &[String]) -> String {
+/// rides the user message: the system prefix must stay byte-identical for KV reuse. A keyed tool
+/// `is_withheld` holds back is not promised by its group's line.
+pub fn dormant_groups_note(
+    available: &[String],
+    loaded: &[String],
+    is_withheld: impl Fn(&str) -> bool,
+) -> String {
     let dormant: Vec<&'static crate::mcp::domain::tool_group::ToolGroup> = TOOL_GROUPS
         .iter()
         .filter(|g| available.iter().any(|a| a == g.extension))
@@ -248,11 +253,11 @@ pub fn dormant_groups_note(available: &[String], loaded: &[String]) -> String {
     );
     for g in dormant {
         // Head before ':' only: enough to choose by, a fraction of the tokens.
-        let gist = g
-            .description
+        let description = crate::mcp::domain::tool_group::group_description(g, &is_withheld);
+        let gist = description
             .split_once(':')
             .map(|(head, _)| head)
-            .unwrap_or(g.description);
+            .unwrap_or(description);
         out.push_str("- ");
         out.push_str(g.extension);
         out.push_str(": ");
@@ -487,7 +492,7 @@ mod tests {
         );
 
         // Offered: the note may name only permitted groups; empty `loaded` is the worst case.
-        let note = dormant_groups_note(&permitted, &[]);
+        let note = dormant_groups_note(&permitted, &[], |_| false);
         assert!(
             !note.is_empty(),
             "no note rendered, so the assertions below prove nothing"
@@ -742,7 +747,7 @@ mod tests {
     fn dormant_note_lists_only_unloaded_groups() {
         let avail = available();
         let loaded: Vec<String> = core_group_names().iter().map(|c| c.to_string()).collect();
-        let note = dormant_groups_note(&avail, &loaded);
+        let note = dormant_groups_note(&avail, &loaded, |_| false);
         assert!(note.contains("<tool-groups>"));
         assert!(note.contains("giap-weather"));
         assert!(
@@ -752,11 +757,50 @@ mod tests {
         assert!(note.contains("enable_tool_group"));
     }
 
+    /// The minimal prompt lists a dormant group by the head of its description, before the
+    /// first colon; this head was measured on the bench against the line it replaced.
+    #[test]
+    fn the_knowledge_group_is_listed_by_its_measured_head() {
+        let knowledge = crate::mcp::domain::tool_group::find_group("giap-knowledge").unwrap();
+        assert_eq!(
+            knowledge.description,
+            "Looking things up, working things out and searching the web: encyclopedia articles \
+             about people, places and events, exact arithmetic, unit conversions and dates, and \
+             the web for anything current, local or specific, such as news, opening hours, \
+             prices and products."
+        );
+        let note = dormant_groups_note(&available(), &[], |_| false);
+        assert!(
+            note.contains(
+                "\n- giap-knowledge: Looking things up, working things out and searching the web\n"
+            ),
+            "{note}"
+        );
+    }
+
+    /// A pond with no keys stored offers neither keyed tool, so the line promises neither.
+    #[test]
+    fn a_keyless_pond_is_not_promised_the_web() {
+        use crate::mcp::domain::tool_group::{COMPUTE_ANSWER_TOOL, SEARCH_WEB_TOOL};
+        let note = dormant_groups_note(&available(), &[], |t| {
+            t == SEARCH_WEB_TOOL || t == COMPUTE_ANSWER_TOOL
+        });
+        assert!(
+            note.contains("\n- giap-knowledge: Looking things up\n"),
+            "{note}"
+        );
+        let with_web = dormant_groups_note(&available(), &[], |t| t == COMPUTE_ANSWER_TOOL);
+        assert!(
+            with_web.contains("\n- giap-knowledge: Looking things up and searching the web\n"),
+            "{with_web}"
+        );
+    }
+
     /// In the default "all" mode the note must cost zero tokens.
     #[test]
     fn dormant_note_is_empty_when_nothing_is_dormant() {
         let avail = available();
-        assert!(dormant_groups_note(&avail, &avail).is_empty());
+        assert!(dormant_groups_note(&avail, &avail, |_| false).is_empty());
     }
 
     // ── Guest denial at the tool level ──────────────────────────────────────

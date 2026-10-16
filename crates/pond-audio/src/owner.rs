@@ -1,6 +1,7 @@
 //! Sole microphone owner: a second concurrent `build_input_stream` fails (ALSA without dmix).
 //! An OS thread (`cpal::Stream` is `!Send`); mic off closes the device so the OS light goes out.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -28,12 +29,15 @@ impl MicState {
 /// Commands accepted by the owner thread.
 #[derive(Debug)]
 pub enum MicCommand {
-    /// Open the device and begin filling the ring.
+    /// Open the device and begin filling the ring, unclaimed: only `Close` releases it.
     Open,
-    /// Stop capturing and release the device, unconditionally.
+    /// Stop capturing and release the device, unconditionally, claims and all.
     Close,
-    /// Stop capturing only if `generation` is still current.
-    /// Detached users outlive cancellation; a late `Close` would deafen whoever opened next.
+    /// Claim the device for session `generation`; it stays open while any claim is live.
+    Claim(u64),
+    /// Release session `generation`'s claim; the device closes once no claim is left.
+    /// Claims overlap (a reply's barge-in hold, a capture, a detector), so the last one
+    /// out closes the device rather than whichever claimed most recently.
     CloseIfGeneration(u64),
     /// Apply the privacy setting. `false` closes an open device immediately.
     SetEnabled(bool),
@@ -70,7 +74,7 @@ impl MicShared {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// The generation of the capture that currently owns the device.
+    /// The most recent claim token handed out.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }
@@ -134,7 +138,15 @@ pub struct MicReader {
 impl MicReader {
     /// Begin reading from now, so a new capture never opens with the previous turn's tail.
     pub fn new(shared: Arc<MicShared>) -> Self {
-        let cursor = shared.written();
+        Self::starting_back(shared, 0)
+    }
+
+    /// Begin `back` samples before now, for speech already under way; never past what is held.
+    pub fn starting_back(shared: Arc<MicShared>, back: usize) -> Self {
+        let cursor = {
+            let ring = shared.ring.lock().unwrap_or_else(|e| e.into_inner());
+            ring.written() - back.min(ring.len()) as u64
+        };
         Self {
             shared,
             cursor,
@@ -180,11 +192,11 @@ impl MicHandle {
     /// Claim the device; pass the returned token to [`close_session`](Self::close_session).
     pub fn open_session(&self) -> u64 {
         let generation = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = self.tx.send(MicCommand::Open);
+        let _ = self.tx.send(MicCommand::Claim(generation));
         generation
     }
 
-    /// Release the device only if `generation` still owns it.
+    /// Release `generation`'s claim; the device closes when no other claim is live.
     pub fn close_session(&self, generation: u64) {
         let _ = self.tx.send(MicCommand::CloseIfGeneration(generation));
     }
@@ -233,6 +245,8 @@ pub trait CaptureDevice: Send {
 /// Run the owner loop. Returns when `Shutdown` is received or the channel dies.
 pub fn run(mut device: Box<dyn CaptureDevice>, shared: Arc<MicShared>, rx: Receiver<MicCommand>) {
     let mut want_open = false;
+    let mut claims: BTreeSet<u64> = BTreeSet::new();
+    let mut unclaimed_open = false;
 
     // A helper so every path that opens the device applies the privacy gate.
     let apply = |device: &mut Box<dyn CaptureDevice>, want_open: bool| {
@@ -247,6 +261,13 @@ pub fn run(mut device: Box<dyn CaptureDevice>, shared: Arc<MicShared>, rx: Recei
             shared.set_state(MicState::Denied);
             return;
         }
+        // Audio from before the device stopped isn't contiguous with what follows; a window
+        // over both would hand the next capture the last one's tail.
+        shared
+            .ring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         match device.start(shared.clone()) {
             Ok(()) => shared.set_state(MicState::Open),
             Err(e) => {
@@ -258,7 +279,13 @@ pub fn run(mut device: Box<dyn CaptureDevice>, shared: Arc<MicShared>, rx: Recei
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            MicCommand::Open => {
+            MicCommand::Open | MicCommand::Claim(_) => {
+                match cmd {
+                    MicCommand::Claim(generation) => {
+                        claims.insert(generation);
+                    }
+                    _ => unclaimed_open = true,
+                }
                 // Idempotent: `CpalCapture::start` stops first, cutting off a reader mid-read.
                 if want_open && shared.state().is_open() {
                     continue;
@@ -267,16 +294,24 @@ pub fn run(mut device: Box<dyn CaptureDevice>, shared: Arc<MicShared>, rx: Recei
                 apply(&mut device, want_open);
             }
             MicCommand::Close => {
+                claims.clear();
+                unclaimed_open = false;
                 want_open = false;
                 apply(&mut device, want_open);
             }
             MicCommand::CloseIfGeneration(generation) => {
-                let current = shared.generation();
-                if current != generation {
+                if !claims.remove(&generation) {
                     tracing::debug!(
-                        stale = generation,
-                        current,
-                        "mic: ignoring a close from a capture that no longer owns the device"
+                        generation,
+                        "mic: ignoring a release of a claim that is not live"
+                    );
+                    continue;
+                }
+                if unclaimed_open || !claims.is_empty() {
+                    tracing::debug!(
+                        released = generation,
+                        live = claims.len(),
+                        "mic: still claimed, staying open"
                     );
                     continue;
                 }
@@ -518,6 +553,33 @@ mod tests {
         );
     }
 
+    /// `recent` readers (the wake-word window, its lookback) would otherwise splice the last
+    /// session's audio onto this one's.
+    #[test]
+    fn reopening_the_device_starts_from_an_empty_ring() {
+        let h = Harness::new(true, None);
+        h.handle.open();
+        h.settle(|s| s.is_open());
+        h.handle.close();
+        h.settle(|s| *s == MicState::Closed);
+        assert_eq!(h.handle.shared().recent(10).len(), 3, "kept while closed");
+
+        let mut reader = MicReader::new(h.handle.shared().clone());
+        h.handle.open();
+        h.settle(|s| s.is_open());
+        assert_eq!(
+            h.handle.shared().recent(10),
+            vec![0.1, 0.2, 0.3],
+            "only this session's audio"
+        );
+        assert_eq!(reader.drain(), vec![0.1, 0.2, 0.3]);
+        assert_eq!(
+            reader.dropped(),
+            0,
+            "a clear before the reader's audio loses none of it"
+        );
+    }
+
     #[test]
     fn shutdown_releases_the_device_and_joins() {
         let starts = Arc::new(AtomicUsize::new(0));
@@ -600,6 +662,31 @@ mod tests {
         );
 
         // Vacuity control: the current owner's release still works.
+        h.handle.close_session(capture);
+        h.settle(|s| matches!(s, MicState::Closed));
+    }
+
+    #[test]
+    fn releasing_a_newer_claim_leaves_an_older_live_claim_open() {
+        // A capture is recording when a reply's barge-in hold claims the mic on top of it;
+        // the hold is released first. The capture must keep hearing.
+        let h = Harness::new(true, None);
+        let capture = h.handle.open_session();
+        h.settle(|s| matches!(s, MicState::Open));
+        let hold = h.handle.open_session();
+
+        h.handle.close_session(hold);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            matches!(h.handle.state(), MicState::Open),
+            "releasing the newer hold closed the device under a live capture"
+        );
+
+        // A second release of the same claim changes nothing either.
+        h.handle.close_session(hold);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(matches!(h.handle.state(), MicState::Open));
+
         h.handle.close_session(capture);
         h.settle(|s| matches!(s, MicState::Closed));
     }

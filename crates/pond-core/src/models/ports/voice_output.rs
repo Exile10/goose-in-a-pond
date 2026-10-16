@@ -26,6 +26,12 @@ pub trait VoiceOutput: Send + Sync {
     /// Stop playback now (wake-word barge-in); must be safe when nothing is playing.
     fn stop_speaking(&self) {}
 
+    /// Whether audio is coming out right now; `None` when this output cannot tell.
+    /// Barge-in listens only while something plays, not across a tool call between sentences.
+    fn is_playing(&self) -> Option<bool> {
+        None
+    }
+
     /// Loop a soft tone during inference until `stop_thinking_tone()`.
     fn start_thinking_tone(&self) {}
 

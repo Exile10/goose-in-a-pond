@@ -29,4 +29,8 @@ pub trait VoiceInput: Send + Sync {
 
     /// Make the next `listen()` transcribe this wake-word capture instead of recording afresh.
     fn prime_with_captured(&self, _wav: Vec<u8>) {}
+
+    /// Make the next `listen()` capture speech already under way since `onset` (a barge-in),
+    /// from then rather than from now, and without waiting for speech to start again.
+    fn prime_with_onset(&self, _onset: std::time::Instant) {}
 }

@@ -202,10 +202,6 @@ pub struct Settings {
     #[serde(default = "Settings::default_wake_word")]
     pub voice_wake_word: String,
 
-    /// Separate whisper server for wake-word spotting; `None` uses `voice_whisper_url`.
-    #[serde(default)]
-    pub voice_kws_whisper_url: Option<String>,
-
     /// RMS floor below which wake-word windows skip whisper; 0.0 disables the gate.
     #[serde(default = "Settings::default_kws_energy_threshold")]
     pub voice_kws_energy_threshold: f32,
@@ -248,6 +244,7 @@ pub struct Settings {
     #[serde(default = "Settings::default_voice_thinking_tone_enabled")]
     pub voice_thinking_tone_enabled: bool,
 
+    /// Recording ceiling for the browser voice path only; the voice loop ends on silence.
     #[serde(default = "Settings::default_recording_duration")]
     pub voice_recording_duration_secs: u32,
 
@@ -737,7 +734,6 @@ impl Default for Settings {
             llm_temperature: Self::default_temperature(),
             llm_provider: Self::default_llm_provider(),
             voice_wake_word: Self::default_wake_word(),
-            voice_kws_whisper_url: None,
             voice_kws_energy_threshold: Self::default_kws_energy_threshold(),
             voice_kws_post_trigger_silence_ms: Self::default_kws_post_trigger_silence_ms(),
             voice_kws_cooldown_ms: Self::default_kws_cooldown_ms(),
@@ -2014,7 +2010,6 @@ mod tests {
             "voice_kws_cooldown_ms",
             "voice_kws_energy_threshold",
             "voice_kws_post_trigger_silence_ms",
-            "voice_kws_whisper_url",
             "voice_recording_duration_secs",
             "voice_thinking_tone_enabled",
             "voice_tts_quality",

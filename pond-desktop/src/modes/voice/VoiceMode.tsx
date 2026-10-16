@@ -2,7 +2,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { Button } from "@heroui/react";
-import { ChevronLeft, Mic, Square, Trash2, Radio, Volume2, RotateCcw } from "lucide-react";
+import { ChevronLeft, Hand, Mic, Square, Trash2, Radio, Volume2, RotateCcw } from "lucide-react";
 import { VoiceOrb } from "../../components/VoiceOrb";
 import { VoiceStream } from "./VoiceStream";
 import { api } from "../../api/PondApiClient";
@@ -232,6 +232,16 @@ function VoiceModeChildProcess() {
               <RotateCcw size={13} /> Retry
             </Button>
           </>
+        )}
+
+        {!isConnecting && !isError && session.sessionActive && voiceState === "speaking" && (
+          <Button
+            variant="ghost" size="sm"
+            onPress={() => session.interruptTurn()}
+            className="vm-interrupt-btn"
+          >
+            <Hand size={13} /> Interrupt
+          </Button>
         )}
 
         {!isConnecting && !isError && session.sessionActive && (

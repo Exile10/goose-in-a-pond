@@ -466,6 +466,7 @@ impl Agent for MistralRsAgent {
                         id: call.id.clone(),
                         tool: call.name.clone(),
                         content: content.clone(),
+                        card: None,
                     });
                     messages.push(ChatMessage::tool_result(content, call.id.clone()));
                 }
