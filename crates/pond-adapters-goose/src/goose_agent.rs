@@ -2860,6 +2860,10 @@ impl GooseAdapter {
             }
         };
 
+        // The keyed tools whose secret is not stored now, read once for the turn: the group lines
+        // must not promise them (6c), and the allow-set drops them (6e).
+        let keyless_tools = read_keyless_tools().await;
+
         // ── 6c. Per-session tool relevance ───────────────────────────────────
         // Goose always sends the full union, so narrowing is enforced by the shim per call.
         // It only picks which schemas ride the prompt (cost), not whether tools get used.
@@ -2889,6 +2893,7 @@ impl GooseAdapter {
             dormant_groups_note = pond_core::mcp::services::tool_selection::dormant_groups_note(
                 &groups.permitted,
                 &groups.loaded,
+                |tool| keyless_tools.contains(tool),
             );
 
             entitled_tools = Some(
@@ -3014,13 +3019,12 @@ impl GooseAdapter {
         // block (`prefix_sort_key`), so the prefix moves only from them on, and only when a key
         // comes or goes. Before the allow-set and the entitlement, which the delegation authority
         // is built from.
-        let withheld = pond_mcp_server::tools_withheld_for_missing_secrets(
-            allowed_tools
-                .iter()
-                .chain(entitled_tools.iter().flatten())
-                .map(String::as_str),
-        )
-        .await;
+        let withheld: HashSet<String> = allowed_tools
+            .iter()
+            .chain(entitled_tools.iter().flatten())
+            .filter(|tool| keyless_tools.contains(*tool))
+            .cloned()
+            .collect();
         let (allowed_tools, entitled_tools) = if withheld.is_empty() {
             (allowed_tools, entitled_tools)
         } else {
@@ -4768,10 +4772,12 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
             None
         };
 
-        // From the live cache only; a cold cache reports 0 rather than a guess.
+        // From the live cache only; a cold cache reports 0 rather than a guess. A keyed tool whose
+        // secret is not stored is neither counted nor promised.
+        let keyless_tools = read_keyless_tools().await;
         let mut counts: HashMap<String, usize> = HashMap::new();
         if let Some(cache) = self.cached_tools.read().await.as_ref() {
-            for tool in cache {
+            for tool in cache.iter().filter(|t| !keyless_tools.contains(*t)) {
                 if let Some(ext) = group_of_tool(tool) {
                     *counts.entry(ext.to_string()).or_insert(0) += 1;
                 }
@@ -4784,7 +4790,11 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
                 let group = find_group(extension)?;
                 Some(ToolGroupStatus {
                     extension: extension.clone(),
-                    description: group.description.to_string(),
+                    description: pond_core::mcp::domain::tool_group::group_description(
+                        group,
+                        |tool| keyless_tools.contains(tool),
+                    )
+                    .to_string(),
                     loaded: match &loaded {
                         Some(groups) => groups.iter().any(|g| g == extension),
                         None => true,
@@ -4918,6 +4928,17 @@ fn split_tool_result(content: &[rmcp::model::ContentBlock]) -> (String, Option<S
     }
     let card = (!user_only.is_empty()).then(|| user_only.join("\n"));
     (visible.join("\n"), card)
+}
+
+/// Every keyed tool whose secret is not stored now; the store is read on each call, so a key
+/// saved from any app reaches the next turn.
+async fn read_keyless_tools() -> HashSet<String> {
+    pond_mcp_server::tools_withheld_for_missing_secrets(
+        pond_core::mcp::domain::tool_group::TOOL_REQUIREMENTS
+            .iter()
+            .map(|r| r.tool),
+    )
+    .await
 }
 
 /// `tools` less `withheld`.
@@ -5366,7 +5387,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{needle}` is gone from the turn; re-anchor this test"))
         };
         let recipe = at("request.tool_group_allowlist");
-        let gate = at("tools_withheld_for_missing_secrets(");
+        let gate = at("without(allowed_tools, &withheld)");
         let allow_set = at("session_controls.set_allowed_tools(allowed_tools.clone())");
         let authority = at("self.turn_authorities.publish(");
         assert!(recipe < gate, "the gate must see the recipe-narrowed set");

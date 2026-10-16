@@ -84,10 +84,7 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     },
     ToolGroup {
         extension: "giap-knowledge",
-        description: "Looking things up, working things out and searching the web: encyclopedia \
-                      articles about people, places and events, exact arithmetic, unit \
-                      conversions and dates, and the web for anything current, local or \
-                      specific, such as news, opening hours, prices and products.",
+        description: KNOWLEDGE_WITH_WEB_AND_COMPUTE,
         core: false,
     },
     ToolGroup {
@@ -134,6 +131,39 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
         core: false,
     },
 ];
+
+/// giap-knowledge's line with both its keyed tools on offer: the line E8 measured.
+const KNOWLEDGE_WITH_WEB_AND_COMPUTE: &str =
+    "Looking things up, working things out and searching the web: encyclopedia articles about \
+     people, places and events, exact arithmetic, unit conversions and dates, and the web for \
+     anything current, local or specific, such as news, opening hours, prices and products.";
+/// The same line without the Wolfram tool, keeping E8's words for the web.
+const KNOWLEDGE_WITH_WEB: &str =
+    "Looking things up and searching the web: encyclopedia articles about people, places and \
+     events, and the web for anything current, local or specific, such as news, opening hours, \
+     prices and products.";
+const KNOWLEDGE_WITH_COMPUTE: &str =
+    "Looking things up and working things out: encyclopedia articles about people, places and \
+     events, and exact arithmetic, unit conversions and dates.";
+const KNOWLEDGE_ALONE: &str =
+    "Looking things up: encyclopedia articles about people, places and events.";
+
+/// `group`'s line as a turn shows it to the model: giap-knowledge's names only the keyed tools
+/// `is_withheld` lets the turn offer, so it never promises one the turn holds back.
+pub fn group_description(group: &ToolGroup, is_withheld: impl Fn(&str) -> bool) -> &'static str {
+    if group.extension != "giap-knowledge" {
+        return group.description;
+    }
+    match (
+        is_withheld(SEARCH_WEB_TOOL),
+        is_withheld(COMPUTE_ANSWER_TOOL),
+    ) {
+        (false, false) => KNOWLEDGE_WITH_WEB_AND_COMPUTE,
+        (false, true) => KNOWLEDGE_WITH_WEB,
+        (true, false) => KNOWLEDGE_WITH_COMPUTE,
+        (true, true) => KNOWLEDGE_ALONE,
+    }
+}
 
 /// Prefixed name of the web search tool.
 pub const SEARCH_WEB_TOOL: &str = "giap-knowledge__search_web";
@@ -374,6 +404,37 @@ mod requirement_tests {
             vec![COMPUTE_ANSWER_TOOL],
             "each tool follows its own key"
         );
+    }
+
+    #[test]
+    fn the_knowledge_line_names_only_the_keyed_tools_on_offer() {
+        let knowledge = find_group("giap-knowledge").unwrap();
+        let line = |withheld: &[&str]| group_description(knowledge, |t| withheld.contains(&t));
+        assert_eq!(line(&[]), knowledge.description, "E8's line");
+        assert!(
+            line(&[]).starts_with("Looking things up, working things out and searching the web:")
+        );
+
+        let web_only = line(&[COMPUTE_ANSWER_TOOL]);
+        assert!(web_only.contains("the web for anything current, local or specific, such as news, opening hours, prices and products"));
+        let compute_only = line(&[SEARCH_WEB_TOOL]);
+        let neither = line(&[SEARCH_WEB_TOOL, COMPUTE_ANSWER_TOOL]);
+        for (shown, promises_web, promises_compute) in [
+            (web_only, true, false),
+            (compute_only, false, true),
+            (neither, false, false),
+        ] {
+            assert_eq!(shown.contains("web"), promises_web, "{shown}");
+            assert_eq!(
+                shown.contains("working things out") || shown.contains("arithmetic"),
+                promises_compute,
+                "{shown}"
+            );
+            assert!(shown.contains("encyclopedia"), "{shown}");
+        }
+
+        let weather = find_group("giap-weather").unwrap();
+        assert_eq!(group_description(weather, |_| true), weather.description);
     }
 
     /// A requirement on a tool outside the catalog would never meet the allow-set it guards.
