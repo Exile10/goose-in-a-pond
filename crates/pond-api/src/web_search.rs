@@ -2,7 +2,7 @@
 //! remove it. The key is written once and never read back by any route. Contract: section 8.4 of
 //! `docs/architecture/small-model-tools.md`.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{
     extract::State,
@@ -27,6 +27,9 @@ const KEY_CHECK_TOOL: &str = "web_search_key_check";
 
 /// What a 401 or 403 from the key check answers.
 const KEY_REFUSED: &str = "Brave did not accept this key.";
+
+/// What a key that cannot travel in a request header answers.
+const NOT_A_KEY: &str = "That is not a Brave key: it has characters no key contains.";
 
 /// Where the key check goes and which status board the routes share with the tool. A request
 /// carries none in a running pond, which then uses Brave and the board `search_web` writes; tests
@@ -114,8 +117,13 @@ pub async fn set_key(
     else {
         return error(StatusCode::BAD_REQUEST, "Missing 'key' field");
     };
+    // A control character fails the check before it is sent, which reads as Brave unreachable
+    // and stores the key; a key is printable ASCII, so anything else is refused before Brave.
+    if !key.chars().all(|c| c.is_ascii_graphic()) {
+        return error(StatusCode::BAD_REQUEST, NOT_A_KEY);
+    }
 
-    let status = check_key(&state.http_client, &backend.brave_base, key).await;
+    let status = check_key(&backend.brave_base, key).await;
     if status == WebSearchStatus::Rejected {
         return error(StatusCode::UNPROCESSABLE_ENTITY, KEY_REFUSED);
     }
@@ -156,10 +164,28 @@ pub async fn delete_key(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// The pond's client for the key check. It follows no redirect: reqwest strips only its standard
+/// credential headers on one, so the key's header would go wherever it points.
+fn brave_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            pond_net::client_builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| tracing::warn!(error = %e, "web search: the key check client failed to build"))
+                .ok()
+        })
+        .as_ref()
+}
+
 /// What one Brave request (`q=test`, `count=1`) says about `key`. Brave unreachable, refused by
 /// the network mode, or answering something that says nothing about the key is `Unverified`:
 /// the key is stored and the first search checks it.
-async fn check_key(client: &reqwest::Client, base: &str, key: &str) -> WebSearchStatus {
+async fn check_key(base: &str, key: &str) -> WebSearchStatus {
+    let Some(client) = brave_client() else {
+        return WebSearchStatus::Unverified;
+    };
     let endpoint = format!("{}{BRAVE_WEB_SEARCH_PATH}", base.trim_end_matches('/'));
     let Ok(url) = reqwest::Url::parse_with_params(&endpoint, [("q", "test"), ("count", "1")])
     else {

@@ -254,9 +254,14 @@ news, opening hours, prices, products, businesses, recent results.")]
         let Some(key) = brave_key().await else {
             return Ok(text_result(&key_removed()));
         };
+        let Some(brave) = brave_client() else {
+            return Ok(text_result(&search_failed(
+                "the search client could not be built",
+            )));
+        };
         Ok(WebSearch {
             brave_base: BRAVE_API_BASE,
-            brave: &self.http_client,
+            brave,
             pages: page_client(),
             board: web_search_status::global(),
         }
@@ -270,6 +275,24 @@ async fn brave_key() -> Option<String> {
         .await
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty())
+}
+
+/// One client for Brave's host. It follows no redirect: reqwest strips only its standard credential
+/// headers on one, so the key's header would go wherever it points. `None` if TLS failed.
+fn brave_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            pond_net::client_builder()
+                .user_agent(PAGE_USER_AGENT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(
+                    |e| tracing::warn!(error = %e, "search_web's Brave client failed to build"),
+                )
+                .ok()
+        })
+        .as_ref()
 }
 
 /// One client for every page fetch in this process; `None` if TLS could not initialise.
@@ -368,7 +391,7 @@ struct BraveResult {
 /// One search, end to end. `brave_base` and both clients are injectable so tests hit stubs.
 struct WebSearch<'a> {
     brave_base: &'a str,
-    /// The ordinary pond client, for Brave's own host.
+    /// The pond's client for Brave's own host, following no redirect ([`brave_client`]).
     brave: &'a reqwest::Client,
     /// The public-only client; `None` answers from snippets alone.
     pages: Option<&'a reqwest::Client>,
@@ -1792,15 +1815,51 @@ mod tests {
         pages: Option<&reqwest::Client>,
         board: &'static WebSearchStatusBoard,
     ) -> CallToolResult {
-        let brave = crate::build_http_client();
         WebSearch {
             brave_base: &format!("http://127.0.0.1:{brave_port}"),
-            brave: &brave,
+            brave: brave_client().expect("the Brave client"),
             pages,
             board,
         }
         .run("test-key-123", "What time does Junction Mall close?")
         .await
+    }
+
+    /// A server answering every request with a redirect to `location`.
+    fn redirecting(location: String) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = vec![0u8; 16 * 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        port
+    }
+
+    /// A redirect from Brave's host is an answer, not a hop: the key's header goes nowhere else.
+    #[tokio::test]
+    async fn a_redirect_from_brave_is_never_followed() {
+        let (target, requests) = stub(vec![], 1);
+        let brave = redirecting(format!("http://127.0.0.1:{target}/res/v1/web/search"));
+        let result = search_against(brave, None, fresh_board()).await;
+        assert!(
+            text_of(&result, 0).contains("302"),
+            "{}",
+            text_of(&result, 0)
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "the redirect was followed, the key's header with it"
+        );
     }
 
     #[tokio::test]

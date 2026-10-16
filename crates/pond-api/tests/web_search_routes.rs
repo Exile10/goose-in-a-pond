@@ -295,3 +295,49 @@ async fn every_route_needs_a_token() {
         "a refused PUT stored nothing"
     );
 }
+
+#[tokio::test]
+async fn a_key_no_header_can_carry_is_refused_unchecked_and_unstored() {
+    let brave = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&brave)
+        .await;
+    let pond = pond(&brave.uri()).await;
+    for key in ["two\nlines", "curly\u{201c}quote", "inner space"] {
+        let (status, body) = put_key(&pond, key).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key:?}: {body}");
+        assert!(!body.contains(key), "{body}");
+    }
+    assert_eq!(pond.secrets.get(KEY_NAME).await.unwrap(), None);
+}
+
+/// A redirect from Brave's host is an answer, not a hop: the key's header goes nowhere else.
+#[tokio::test]
+async fn the_key_check_never_follows_a_redirect() {
+    let elsewhere = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&elsewhere)
+        .await;
+    let brave = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/res/v1/web/search"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("{}/collect", elsewhere.uri()).as_str()),
+        )
+        .expect(1)
+        .mount(&brave)
+        .await;
+    let pond = pond(&brave.uri()).await;
+
+    let (status, body) = put_key(&pond, "redirected-key").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"configured": true, "status": "unverified"})
+    );
+}
