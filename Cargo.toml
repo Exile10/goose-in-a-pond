@@ -8,6 +8,8 @@ members = [
     "crates/pond-audio",
     # Speaker-side counterpart: playback, output device, working tone (rodio).
     "crates/pond-audio-out",
+    # The ear: wake word, Voice Match, endpointing and echo cancellation. Std only, no crates.
+    "crates/pond-ear",
     "crates/pond-core",
     "crates/pond-api",
     "crates/pond-hf-cache",
@@ -229,6 +231,7 @@ pond-adapters-mesh-inference = { path = "crates/pond-adapters-mesh-inference" }
 pond-adapters-lightning = { path = "crates/pond-adapters-lightning" }
 pond-api               = { path = "crates/pond-api" }
 pond-hf-cache          = { path = "crates/pond-hf-cache" }
+pond-ear               = { path = "crates/pond-ear" }
 pond-infra             = { path = "crates/pond-infra" }
 pond-net               = { path = "crates/pond-net" }
 pond-infra-scheduler   = { path = "crates/pond-infra-scheduler" }
@@ -260,6 +263,14 @@ panic = "abort"
 # depends on it. Nothing here ships, so there is no size to reclaim anyway.
 [profile.release.build-override]
 strip = false
+
+# The ear runs every 10-32 ms in the voice child: its kernels need speed, not size, and a debug
+# build at opt-level 0 would not keep up with the microphone.
+[profile.release.package.pond-ear]
+opt-level = 3
+
+[profile.dev.package.pond-ear]
+opt-level = 3
 
 # NOTE: goose's own [patch.crates-io] (vendored v8, cudaforge) is ignored when building from this
 # root; replicate entries here if its build graph ever needs them.
