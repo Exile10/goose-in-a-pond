@@ -6794,8 +6794,7 @@ async fn list_hf_model_files(
         Some(r) if !r.is_empty() => r.clone(),
         _ => return Json(json!({"files": [], "error": "repo param required"})),
     };
-    // Don't percent-encode: HF returns 400 for `owner%2Fname`.
-    let url = format!("https://huggingface.co/api/models/{}", repo);
+    let url = crate::model_acquisition::hf_repo_files_url(&repo);
     let client = &state.http_client;
     // See search_gguf_models for why the refusal rides the body.
     let call = match pond_core::shared::services::egress::begin(&url, "GET") {
