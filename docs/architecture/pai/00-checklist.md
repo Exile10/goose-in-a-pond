@@ -3293,3 +3293,38 @@ latency; not a PAI milestone).**
   (fails without the agent change), the native-tools helper, goose's eight goal tests, and
   goose-local-inference's 192 (the three context-cap failures predate this).
 - **Not verified on the Orin.** The household runs with the goal check off.
+
+**2026-10-14 — Tools for small models: the knowledge tools, measured and redesigned (design
+only; touches PAI-2 and PAI-3).**
+
+- **What landed.** A design, [`small-model-tools.md`](../small-model-tools.md), and the bench
+  behind it, `experiments/knowledge-tools/`. The bench replays the provider shim's captured
+  payload against six small models and swaps only the knowledge tools. No code on the serving
+  path changed.
+- **Found on the way, each confirmed against code or a captured payload.** The model reads the
+  `[[[mcp-ui:…]]]` card JSON in every knowledge result: `extract_ui_hint` strips it for SSE
+  only, and its doc comment says otherwise. `get_wikipedia_article` advertises a `limit` for a
+  removed tool. `get_info` lists four tools that do not exist. A keyless pond's `compute_answer`
+  returns a setup message, after which E2B and E4B answered 2 and 1 of 13 sums. Under
+  `relevant`, a biography question loaded `giap-schedule`. Under `minimal` (this pond's
+  setting) E4B reached knowledge for 2 of 28 questions that needed it.
+- **PAI-2.** `look_up` would send the content words of the user's question to Wikipedia,
+  where `get_wikipedia_article` sends a model-chosen topic. Same host, same choke point; what
+  leaves differs in kind and belongs in the PAI-2 egress note when it is built. `calculate`
+  removes egress for every question its local parser handles.
+- **PAI-3.** Making `giap-knowledge` core (decision D1) adds 158 tokens to the `minimal`
+  preamble. A lookup's result shrinks by ~900 prompt tokens per turn, which is working set.
+- **Not verified on the Orin.** The ~1 s per lookup is August's recorded 862 tok/s prefill
+  (an older engine build) applied to the measured token saving, not a device measurement.
+
+**2026-10-15 — Keyed tools are off without their keys; extension keys left the database (PAI-2).**
+
+- **What was wrong.** A catalogue extension's install saved its server row with the API key
+  values in `env`, a plaintext copy in `pond_system.db` beside the encrypted secret store.
+  Start-up began from that copy, so deleting a key never turned the extension off.
+- **What landed** (#570). Rows are saved without key values. Start-up scrubs existing rows once,
+  injects keys from the store only, and does not start an extension whose required key is
+  missing. Deleting a key stops what needs it. `compute_answer`, like `search_web`, is withheld
+  from every turn without its key. See `small-model-tools.md` §8.9.
+- **Not verified on the Orin.** Any pond that installed github, brave-search or slack before
+  this keeps a plaintext copy of that key until its first start on the new build.
