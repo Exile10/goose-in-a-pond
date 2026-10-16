@@ -26,6 +26,8 @@ use serde_json::Value;
 use crate::format::{format_api_error, format_dead_end, format_no_results};
 use crate::knowledge::KnowledgeMcpServer;
 
+mod bounded_html;
+
 // ── Constants ──────────────────────────────────────────────────────────────
 
 /// Results asked of Brave.
@@ -46,6 +48,24 @@ const PAGES_DEADLINE: Duration = Duration::from_secs(7);
 
 /// A page is read up to this many bytes and parsed from what was read.
 const PAGE_BYTE_CAP: usize = 1_500_000;
+
+/// Nodes one page may build; past it the rest of the page is not read (`bounded_html`).
+const MAX_NODES_PER_PAGE: usize = 200_000;
+
+/// How long one page may take to parse; past it, what was built is used. A debug build parses
+/// tens of times slower, and the bench's page fixtures are frozen from one, so it waits longer.
+const PARSE_TIME_PER_PAGE: Duration = if cfg!(debug_assertions) {
+    Duration::from_secs(30)
+} else {
+    Duration::from_secs(1)
+};
+
+/// Every page's extraction together; past it, each page falls back to its snippets.
+const EXTRACT_DEADLINE: Duration = if cfg!(debug_assertions) {
+    Duration::from_secs(120)
+} else {
+    Duration::from_secs(4)
+};
 
 /// Redirects a page may take.
 const PAGE_MAX_REDIRECTS: usize = 3;
@@ -545,25 +565,32 @@ async fn read_capped(mut response: reqwest::Response, cap: usize) -> Option<Stri
     Some(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Each page's text blocks, parsed one page at a time off the async workers.
+/// Each page's text blocks, parsed one page at a time off the async workers, within
+/// [`EXTRACT_DEADLINE`].
 async fn extract_off_thread(bodies: Vec<Option<String>>) -> Vec<Option<Vec<String>>> {
     let count = bodies.len();
-    tokio::task::spawn_blocking(move || {
+    let parsing = tokio::task::spawn_blocking(move || {
         bodies
             .into_iter()
             .map(|body| body.map(|html| extract_blocks(&html)))
             .map(|blocks| blocks.filter(|b| !b.is_empty()))
             .collect()
-    })
-    .await
-    .unwrap_or_else(|_| vec![None; count])
+    });
+    match tokio::time::timeout(EXTRACT_DEADLINE, parsing).await {
+        Ok(Ok(pages)) => pages,
+        Ok(Err(_)) => vec![None; count],
+        Err(_) => {
+            tracing::info!(target: "giap::trace", kind = "web_pages_unparsed", "page extraction ran out of time; answering from snippets");
+            vec![None; count]
+        }
+    }
 }
 
 // ── Extraction (section 8.3 step 4) ────────────────────────────────────────
 
 /// The page's readable text blocks, in document order, boilerplate dropped.
 pub fn extract_blocks(html: &str) -> Vec<String> {
-    let document = scraper::Html::parse_document(html);
+    let document = bounded_html::parse_within(html, MAX_NODES_PER_PAGE, PARSE_TIME_PER_PAGE);
     let strict = walk(&document, true);
     // Readability's retry: a page whose content sits under a class like
     // "ContainerWithSidebarWrapper" loses all of it to the class test, so too little text means

@@ -187,6 +187,8 @@ url = "2.5.8"
 # so malformed markup parses the way a browser parses it; pure Rust, so it cross-compiles to
 # the Orin unchanged. `main` (a CLI binary) and `errors` (parse-error records) are off.
 scraper = { version = "0.27", default-features = false }
+# scraper's own parser, driven directly so search_web can parse a page within a node budget.
+html5ever = { version = "0.39", default-features = false }
 opentelemetry = { version = "0.32", default-features = false }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics"] }
 opentelemetry-http = { version = "0.32", default-features = false, features = ["internal-logs", "reqwest"] }

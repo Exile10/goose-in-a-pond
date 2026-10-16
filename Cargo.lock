@@ -11882,6 +11882,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "futures",
+ "html5ever",
  "notify-rust",
  "once_cell",
  "pond-adapters-weather",
