@@ -244,6 +244,7 @@ client reads it, the server never does · `NONE` = nothing reads it anywhere.
 | `cloud_fallback_enabled` | `false` | **NONE** | H:Privacy |
 | `mesh_enabled` | `false` | LIVE | **API** (Mesh.tsx displays, cannot set) |
 | `context_ingest_enabled` | `false` | LIVE | **API** |
+| `spoken_pairing_codes` | **`true`** | LIVE | H:Privacy, catalogue |
 
 ### 7. Extensions & Tools
 

@@ -716,6 +716,11 @@ pub struct Settings {
     /// Off by default: two more schemas in every prompt, useless until a source is connected.
     #[serde(default = "Settings::default_ext_context_enabled")]
     pub ext_context_enabled: bool,
+
+    /// May anyone on the household LAN ask the pond to read a pairing code aloud? On by default:
+    /// it is how a phone pairs a pond with no screen, and only someone in earshot can use it.
+    #[serde(default = "Settings::default_spoken_pairing_codes")]
+    pub spoken_pairing_codes: bool,
 }
 
 impl Default for Settings {
@@ -861,6 +866,7 @@ impl Default for Settings {
             proactive_review_enabled: false,
             context_ingest_enabled: false,
             ext_context_enabled: false,
+            spoken_pairing_codes: Self::default_spoken_pairing_codes(),
         }
     }
 }
@@ -1262,6 +1268,10 @@ impl Settings {
 
     fn default_context_ingest_enabled() -> bool {
         false
+    }
+
+    fn default_spoken_pairing_codes() -> bool {
+        true
     }
 
     fn default_ext_context_enabled() -> bool {
@@ -1949,6 +1959,8 @@ mod tests {
             "ext_travel_enabled",
             "ext_weather_enabled",
             "home_name",
+            // Privacy hub view and the catalogue's Privacy & Security section.
+            "spoken_pairing_codes",
             "llm_max_tokens",
             "llm_provider",
             "llm_temperature",
