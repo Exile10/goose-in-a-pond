@@ -229,6 +229,30 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     // Onboarding creates/patches; GET /profiles and DELETE /profiles/{id} are deliberately absent.
     (Method::POST, "/profiles", Exposure::UntilOnboarded),
     (Method::PATCH, "/profiles/{id}", Exposure::UntilOnboarded),
+    // Completion needs a chat model, so a paired device must reach these before onboarding (#365).
+    // Never tokenless: downloads spend the household's bandwidth and disk. The rest of /models
+    // (search, delete, cleanup, scan, ollama pull) stays behind the onboarding guard.
+    (Method::GET, "/models", Exposure::Authenticated),
+    (
+        Method::GET,
+        "/models/download/progress",
+        Exposure::Authenticated,
+    ),
+    (
+        Method::POST,
+        "/models/download/control",
+        Exposure::Authenticated,
+    ),
+    (
+        Method::POST,
+        "/models/{category}/{name}/download",
+        Exposure::Authenticated,
+    ),
+    (
+        Method::POST,
+        "/models/{category}/{name}/activate",
+        Exposure::Authenticated,
+    ),
     // Protected-router routes guarded by other means: the redirect target, by its PKCE nonce...
     (Method::GET, "/oauth/callback", Exposure::Always),
     // ...and extensions' refresh, checked against internal_extension_token in the handler.
@@ -721,6 +745,11 @@ mod tests {
         for (method, path) in [
             (Method::POST, "/api/v1/handshake/revoke"),
             (Method::POST, "/api/v1/voice/sample"),
+            (Method::GET, "/api/v1/models"),
+            (Method::GET, "/api/v1/models/download/progress"),
+            (Method::POST, "/api/v1/models/download/control"),
+            (Method::POST, "/api/v1/models/gguf/gemma/download"),
+            (Method::POST, "/api/v1/models/gguf/gemma/activate"),
             (Method::POST, "/api/v1/transcribe"),
             (Method::GET, "/api/v1/dev/goose"),
             (Method::POST, "/api/v1/oauth/authorize"),
@@ -961,6 +990,9 @@ mod tests {
 
         let expected = vec![
             "DELETE /voice/calibrate = UntilOnboarded".to_string(),
+            // Choosing the chat model completion requires, before onboarding (#365); token only.
+            "GET /models = Authenticated".to_string(),
+            "GET /models/download/progress = Authenticated".to_string(),
             "GET /player/status = HostOnly".to_string(),
             // Nothing secret (phase, model name, timestamps); the boot warm-up precedes any token.
             "GET /test = HostOnly".to_string(),
@@ -972,6 +1004,9 @@ mod tests {
             // One outbound geocoding call for a place NAME; no household data leaves. Wizard-only.
             "POST /handshake/revoke = Authenticated".to_string(),
             "POST /location/detect = UntilOnboarded".to_string(),
+            "POST /models/download/control = Authenticated".to_string(),
+            "POST /models/{category}/{name}/activate = Authenticated".to_string(),
+            "POST /models/{category}/{name}/download = Authenticated".to_string(),
             "POST /onboard = UntilOnboarded".to_string(),
             "POST /onboard/complete = UntilOnboarded".to_string(),
             // Once set up, the handler asks a caller with no token for the host credential.
@@ -995,6 +1030,53 @@ mod tests {
             "the set of state-dependent public routes changed. That is a security \
              decision -- if it is the right one, say so here."
         );
+    }
+
+    /// Exactly the model routes onboarding needs skip the guard (#365), and only with a token;
+    /// their neighbours are not on the allowlist at all.
+    #[test]
+    fn only_the_model_routes_onboarding_needs_skip_the_guard() {
+        for (method, path) in [
+            (Method::GET, "/api/v1/models"),
+            (Method::GET, "/api/v1/models/download/progress"),
+            (Method::POST, "/api/v1/models/download/control"),
+            (Method::POST, "/api/v1/models/gguf/gemma/download"),
+            (Method::POST, "/api/v1/models/gguf/gemma/activate"),
+        ] {
+            assert_eq!(
+                route_exposure(&method, path),
+                Some(Exposure::Authenticated),
+                "{method} {path}"
+            );
+            for pond in EVERY_STATE {
+                for from_host in [FROM_THE_HOST, FROM_THE_LAN] {
+                    assert!(
+                        !answers_without_token(&method, path, pond, from_host),
+                        "{method} {path} answered a tokenless caller in {pond:?}"
+                    );
+                }
+            }
+        }
+        for (method, path) in [
+            (Method::DELETE, "/api/v1/models/gguf/gemma"),
+            (
+                Method::POST,
+                "/api/v1/models/gguf/gemma/companions/pictures",
+            ),
+            (Method::POST, "/api/v1/models/scan"),
+            (Method::POST, "/api/v1/models/cleanup"),
+            (Method::GET, "/api/v1/models/disk-usage"),
+            (Method::GET, "/api/v1/models/search/gguf"),
+            (Method::POST, "/api/v1/models/ollama/pull"),
+            (Method::POST, "/api/v1/models/download/url"),
+            (Method::POST, "/api/v1/models/registry/refresh"),
+            (Method::GET, "/api/v1/models/capabilities"),
+            (Method::POST, "/api/v1/models"),
+            (Method::GET, "/api/v1/models/gguf/gemma/activate"),
+            (Method::POST, "/api/v1/models/gguf/gemma/activate/x"),
+        ] {
+            assert_eq!(route_exposure(&method, path), None, "{method} {path}");
+        }
     }
 
     #[test]

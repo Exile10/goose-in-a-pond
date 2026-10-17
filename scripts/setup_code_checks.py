@@ -12,8 +12,9 @@
            without making a sound
   reset-wizard
            after a host reset of the pond `card` claimed: its wizard refuses the tokenless host and
-           admits the claimant's token, completing it makes the claiming phone the primary
-           member's, and after `setup-code --rearm` the wizard reopens to the host
+           admits the claimant's token (the model list and download progress too, #365),
+           completing it makes the claiming phone the primary member's, and after
+           `setup-code --rearm` the wizard reopens to the host
 
 The launcher proves process and port ownership first. The setup code is read from
 `pond-server setup-code --json` and never printed, and neither is the claimant's token, which
@@ -163,6 +164,12 @@ def reset_wizard():
     check("a claimed, reset pond's wizard refuses the tokenless host", code == 401, "%s %s" % (code, text[:200]))
     code, _, text, _ = request("POST", "/onboard/reset")
     check("and so does its reset, until it is set up again", code == 401, "%s %s" % (code, text[:200]))
+    for path in ("/models", "/models/download/progress"):
+        code, _, text, _ = request("GET", path, None, bearer)
+        check("GET %s answers the claimant before onboarding (#365)" % path, code == 200,
+              "%s %s" % (code, text[:200]))
+        code, _, text, _ = request("GET", path)
+        check("and never a caller with no token", code == 401, "%s %s" % (code, text[:200]))
     code, _, text, owner = request("POST", "/profiles", {"display_name": "Live Owner"}, bearer)
     check("the claimant's token reopens the wizard", code == 201, "%s %s" % (code, text[:200]))
     owner_id = (owner or {}).get("id")

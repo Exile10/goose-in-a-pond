@@ -147,7 +147,14 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/test/speak", post(test_speak))
         // Profile create/patch are public so onboarding steps can write before completion
         .route("/profiles", post(create_profile))
-        .route("/profiles/{id}", patch(update_profile_prefs));
+        .route("/profiles/{id}", patch(update_profile_prefs))
+        // The chat model `/onboard/complete` requires: a paired device lists, fetches and picks
+        // it before onboarding (#365). A token in every state (PUBLIC_ROUTES).
+        .route("/models", get(list_models))
+        .route("/models/download/progress", get(get_download_progress))
+        .route("/models/download/control", post(download_control))
+        .route("/models/{category}/{name}/download", post(download_model))
+        .route("/models/{category}/{name}/activate", post(activate_model));
 
     // ───────────── Protected routes (require onboarding) ─────────────
     let protected_routes = Router::new()
@@ -222,7 +229,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/mesh/settlement", get(get_mesh_settlement_status))
         .route("/settings", get(get_settings))
         .route("/weather", get(get_weather))
-        .route("/models", get(list_models))
         .route("/models/capabilities", get(get_model_capabilities))
         .route("/models/vision-status", get(get_vision_status))
         .route("/models/memory-status", get(get_memory_status))
@@ -234,13 +240,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/models/search/gguf/files", get(list_hf_model_files))
         .route("/models/search/llamafile", get(search_llamafile_models))
         .route("/models/download/url", post(download_model_from_url))
-        .route("/models/download/progress", get(get_download_progress))
-        .route("/models/download/control", post(download_control))
         .route("/models/scan", post(scan_models))
         .route("/models/cleanup", post(cleanup_models))
         .route("/models/disk-usage", get(disk_usage))
-        .route("/models/{category}/{name}/download", post(download_model))
-        .route("/models/{category}/{name}/activate", post(activate_model))
         .route(
             "/models/{category}/{name}/companions/pictures",
             post(crate::model_acquisition::add_pictures),
