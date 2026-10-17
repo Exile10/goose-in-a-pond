@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::network::domain::claim::ClaimRefusal;
 use crate::network::domain::setup_code::SetupCode;
@@ -18,6 +18,8 @@ pub struct SetupClaimService {
     store: Arc<dyn SetupCodeStore>,
     // Held across the store calls so admission, and a claim's check-then-mark, are each one step.
     throttle: Mutex<SetupGuessThrottle>,
+    // `notify_one` keeps a permit, so a claim landing while nobody waits is still seen.
+    claimed: Notify,
 }
 
 impl SetupClaimService {
@@ -25,6 +27,7 @@ impl SetupClaimService {
         Self {
             store,
             throttle: Mutex::new(SetupGuessThrottle::new()),
+            claimed: Notify::new(),
         }
     }
 
@@ -60,8 +63,29 @@ impl SetupClaimService {
         }
         let record = self.store.mark_claimed(at).await?;
         throttle.record_success();
+        self.claimed.notify_one();
         tracing::info!(claimed_at = %at, "pond claimed with its setup code");
         Ok(record)
+    }
+
+    /// Any first pairing claims the pond, so a phone paired with a pairing code closes the card
+    /// too. `Ok(false)` when there was nothing to latch: no record, or already claimed.
+    pub async fn latch_claim(&self, at: DateTime<Utc>) -> anyhow::Result<bool> {
+        let _throttle = self.throttle.lock().await;
+        match self.store.load().await? {
+            Some(record) if !record.claim_state().is_claimed() => {}
+            _ => return Ok(false),
+        }
+        self.store.mark_claimed(at).await?;
+        self.claimed.notify_one();
+        tracing::info!(claimed_at = %at, "pond claimed by a pairing");
+        Ok(true)
+    }
+
+    /// Resolves once a claim this service latched lands, for whatever advertises the claim state.
+    /// A re-arm from another process is not signalled; readers poll for that.
+    pub async fn claim_latched(&self) {
+        self.claimed.notified().await;
     }
 
     /// Unclaimed when no code was ever made: nothing has latched yet.
@@ -265,6 +289,43 @@ mod tests {
                 "attempt {attempt} should still be free"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_pairing_latches_the_claim_once_and_keeps_the_first_timestamp() {
+        let store = Arc::new(MockSetupCodeStore::unclaimed());
+        let service = service(&store);
+        assert!(service.latch_claim(at(10)).await.unwrap());
+        assert!(!service.latch_claim(at(11)).await.unwrap());
+        assert_eq!(store.record().unwrap().claimed_at, Some(at(10)));
+        assert_eq!(
+            service.admit_setup_attempt(Instant::now()).await,
+            Err(ClaimRefusal::SetupCodeUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pairing_on_a_pond_with_no_record_has_nothing_to_latch() {
+        let store = Arc::new(MockSetupCodeStore::new());
+        assert!(!service(&store).latch_claim(at(10)).await.unwrap());
+        assert_eq!(store.record(), None);
+    }
+
+    #[tokio::test]
+    async fn a_latch_against_an_unreadable_store_is_an_error_not_a_silent_skip() {
+        let store = Arc::new(MockSetupCodeStore::unclaimed());
+        store.set_failing(true);
+        assert!(service(&store).latch_claim(at(10)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_claim_is_signalled_even_when_nobody_was_waiting_yet() {
+        let store = Arc::new(MockSetupCodeStore::unclaimed());
+        let service = service(&store);
+        service.latch_claim(at(10)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), service.claim_latched())
+            .await
+            .expect("the latch must leave a permit for a later waiter");
     }
 
     #[tokio::test]

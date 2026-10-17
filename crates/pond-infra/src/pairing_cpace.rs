@@ -47,6 +47,8 @@ const S_IN_BYTES: usize = 128;
 const MAC_KEY_PREFIX: &[u8] = b"CPaceMac";
 /// First field of the channel identifier; a breaking draft revision means a new label.
 const CHANNEL_LABEL: &[u8] = b"goose-pair-cpace-v1";
+/// The setup code's own label, so a setup run and a pairing run never share a generator.
+const SETUP_CHANNEL_LABEL: &[u8] = b"goose-setup-cpace-v1";
 /// Label of the phone's confirmation tag.
 const CLIENT_TAG_LABEL: &[u8] = b"goose-pair-cpace-client-v1";
 /// Label of the Pond's confirmation tag.
@@ -99,6 +101,15 @@ fn lv_cat(parts: &[&[u8]]) -> Vec<u8> {
 /// The channel identifier: this protocol's label, the TLS key pin, and the phone's id.
 pub fn channel_identifier(spki_pin: &str, client_id: &str) -> Vec<u8> {
     lv_cat(&[CHANNEL_LABEL, spki_pin.as_bytes(), client_id.as_bytes()])
+}
+
+/// As [`channel_identifier`], for a run whose password is the printed setup code.
+pub fn setup_channel_identifier(spki_pin: &str, client_id: &str) -> Vec<u8> {
+    lv_cat(&[
+        SETUP_CHANNEL_LABEL,
+        spki_pin.as_bytes(),
+        client_id.as_bytes(),
+    ])
 }
 
 /// The session identifier: the Pond's challenge, then the phone's nonce.
@@ -542,6 +553,43 @@ mod tests {
                 b"id"
             ]
             .concat()
+        );
+    }
+
+    #[test]
+    fn the_setup_channel_identifier_has_its_own_label() {
+        assert_eq!(
+            setup_channel_identifier("pin", "id"),
+            [
+                &[20u8][..],
+                b"goose-setup-cpace-v1",
+                &[3],
+                b"pin",
+                &[2],
+                b"id"
+            ]
+            .concat()
+        );
+        assert_ne!(
+            setup_channel_identifier(PIN, "phone-1"),
+            channel_identifier(PIN, "phone-1")
+        );
+    }
+
+    #[test]
+    fn a_setup_run_and_a_pairing_run_with_the_same_digits_do_not_agree() {
+        let code = b"79927398713";
+        let pond = Initiator::start(code, &setup_channel_identifier(PIN, "phone-1"), sid());
+        let phone = Responder::respond(
+            code,
+            &channel_identifier(PIN, "phone-1"),
+            &sid(),
+            &pond.share(),
+        )
+        .unwrap();
+        assert_eq!(
+            pond.finish(&phone.share(), &phone.confirmation()),
+            Err(CpaceError::InvalidConfirmation)
         );
     }
 
