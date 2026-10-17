@@ -18,6 +18,7 @@ mod model_download;
 mod node_path;
 mod ports;
 mod schedule_executors;
+mod spoken_code;
 mod system_deps;
 mod three_stage_consolidator;
 mod tracing_setup;
@@ -4136,6 +4137,11 @@ async fn run_server(
         Err(e) => tracing::warn!("failed to issue pairing code at startup: {e:#}"),
     }
 
+    // The voice when one is installed, else the bundled clips; built before `tts` moves below.
+    let announcer: Arc<dyn pond_core::network::ports::code_announcer::CodeAnnouncer> =
+        Arc::new(spoken_code::SpeakerCodeAnnouncer::new(tts.clone()));
+    let spoken_codes = Arc::new(pond_api::spoken_code::SpokenCodes::new(Some(announcer)));
+
     let state = Arc::new(AppState {
         tts_control: tts_control.clone(),
         // Before `db`: fields evaluate in source order and `db` is moved below.
@@ -4241,7 +4247,7 @@ async fn run_server(
         peer_capability_query,
         mesh_rebuild: Some(mesh_rebuild),
         setup_claims: Some(setup_claims.clone()),
-        spoken_codes: Default::default(),
+        spoken_codes,
     });
 
     // OAuth refresh updates secrets only; restarting extensions would break in-flight tool calls.
