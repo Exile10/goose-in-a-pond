@@ -3511,7 +3511,8 @@ polkit grant (touches PAI-2; not a PAI milestone).**
   over zbus, `scripts/lib/connect-setup.sh` (`giap.sh wifi-grant [remove|status]`, written by
   `giap.sh install` on production and Jetson installs, and four doctor lines), libdbus-1-dev in
   `install-deps.sh` and in CI's `rust` and `live-test` jobs, a `connect-setup` bash-tests job, a
-  `GET /network/status` check in `scripts/live-test.sh`, and `jetson-emu.sh box` seeding its git
+  `GET /network/status` check in `scripts/live-test.sh`, `examples/ble_peripheral` and
+  `examples/wifi_station` for the device run, and `jetson-emu.sh box` seeding its git
   dependencies from the Mac so the private llama-cpp fork resolves in the container.
 - **PAI-2: secrets in flight and privilege.** The passphrase is borrowed from the sealed message
   straight into the D-Bus message to NetworkManager; no `String` copy of it exists in the pond, and
