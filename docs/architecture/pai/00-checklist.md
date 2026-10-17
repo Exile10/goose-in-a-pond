@@ -3567,3 +3567,37 @@ PAI-2: a new credential; not a PAI milestone).**
   route, migration or wiring, the one handler change is covered by the route test, and a rebuild
   would replace the binary under the mock pond on :4100.
   **Not verified:** a real phone, any radio, anything on the Orin.
+
+**2026-10-17 — Pond networking P2, discovery: `_pond._tcp` behind a `ServiceAdvertiser` port, and
+mDNSResponder on macOS (touches PAI-2's LAN surface; not a PAI milestone).**
+
+- **What landed.** [`pond-networking.md`](../pond-networking.md#discovery-p2), on `feat/ble-setup`.
+  `PondAdvert` holds the TXT contract in pond-core, `ServiceAdvertiser` is the port, and
+  `DiscoveryService` publishes at startup, on a latched claim, and on a 60-second check that sees
+  a re-arm from another process and retries a failed publish. The adapters are in
+  `pond-connect/src/discovery/`: dns_sd through mDNSResponder on macOS, mdns-sd 0.11.5 everywhere
+  else. `pond-server/src/mdns_advertiser.rs` is gone, and the pond withdraws its advert on
+  shutdown.
+- **Why, measured on the Mac with mdns-sd's debug log.** A fresh mdns-sd pond answered queries;
+  the 36-hour-old mock on :4100 had read 10.8 MB on its 5353 socket and sent 4.9 KB, answering
+  nothing and logging nothing. mdns-sd also announced the Mac's own `<host>.local`, and
+  mDNSResponder renamed the Mac (`J3RRA4-35544` to `J3RRA4-35606`) within a second of a start.
+  Killed ponds left their PTRs for 75 minutes. What makes a fresh daemon go deaf was not found.
+- **PAI-2.** The TXT is unchanged and public: the pin, and the card's discriminator, which the BLE
+  local name already carries. mDNS stays spoofable, so clients still confirm the pin.
+- **Invariants.** No egress, no prompt or KV change, no setting, no migration, no route. A
+  responder that is down or refuses never stops the pond; the advert is retried.
+- **Verified on the Mac.** pond-core (14) and pond-connect (6) unit tests, and an ignored live test
+  that registers with mDNSResponder, resolves through `dns-sd`, updates the TXT and withdraws. A
+  scratch pond resolved through `dns-sd -L` ten minutes after start and from the Jetson's
+  `avahi-browse -rpt`, with `id` and `setup=1`, and the host name did not change; a pairing
+  dropped `setup=1` at once and a `setup-code --rearm` restored it at the next check; `kill -9`
+  withdrew it within 2 s. `scripts/live-test.sh` PASSED. In `jetson-emu.sh box` (linux/arm64): `cargo check -p
+  pond-connect --tests` clean, and the discovery tests pass (5), the selection test picking
+  mdns-sd.
+- **Not verified.** The packaged app: its bundle declares no `NSLocalNetworkUsageDescription`, and
+  if macOS denies it the adapter retries with a "local network access" reason. A re-registration
+  after mDNSResponder restarts (needs root). The mdns-sd path on the Orin (moved, not changed).
+- **Open.** mdns-sd 0.21.5 answers legacy unicast and left the host name alone in a 40-second run
+  beside mDNSResponder. Whether Linux should move to it, with its name probing beside avahi, is
+  a separate decision for a Jetson run.

@@ -49,6 +49,8 @@ crates/pond-connect/
   src/interfaces.rs    the host's IPv4 addresses, judged by pond-core's classifier
   src/status.rs        the `SetupRadios` port, for `GET /network/status`
   src/capabilities.rs  what this host can do, probed at runtime, with the reason when it cannot
+  src/discovery/       the `ServiceAdvertiser` port for `_pond._tcp`: dns_sd.rs (macOS, through
+                       mDNSResponder), mdns.rs (mdns-sd everywhere else); see pond-networking.md
 ```
 
 P5a ships `src/ble.rs` (the constants below) and `src/wifi/unsupported.rs`; `ble.rs` becomes
