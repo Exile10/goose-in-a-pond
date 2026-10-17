@@ -143,6 +143,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/voice/calibrate", post(calibrate_wake_word))
         .route("/voice/calibrate", delete(reset_wake_word_calibration))
         .route("/system/info", get(system_info))
+        // The setup channel's radios: a token in every state, so the wizard can show them.
+        .route("/network/status", get(crate::network::network_status))
         // Local diagnostics; network peers must authenticate, and speaking needs the credential.
         .route("/test", get(test_services))
         .route("/test/speak", post(test_speak))

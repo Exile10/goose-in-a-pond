@@ -2,6 +2,8 @@
 
 use axum::{extract::ConnectInfo, http::StatusCode, Extension, Json};
 use if_addrs::{IfAddr, Interface};
+use pond_core::network::domain::capability::Availability;
+use pond_core::network::ports::setup_radios::SetupRadios;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
@@ -130,6 +132,43 @@ pub fn require_lan(peer: Option<ConnectInfo<SocketAddr>>) -> Result<(), (StatusC
         StatusCode::FORBIDDEN,
         Json(json!({"error": "pairing_requires_lan"})),
     ))
+}
+
+/// What the household's status view says when no setup channel was wired into this server.
+const NO_SETUP_CHANNEL: &str = "this pond is not running the setup channel";
+
+/// `GET /api/v1/network/status`: the setup channel's radios and why each part is unavailable.
+/// A paired device's or the host's read, in every state, so the wizard can show it too.
+pub(crate) async fn network_status(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
+    radios: Option<Extension<std::sync::Arc<dyn SetupRadios>>>,
+) -> Json<Value> {
+    let enabled = match state.settings_repo.get().await {
+        Ok(settings) => Some(settings.ble_setup_enabled),
+        Err(error) => {
+            tracing::warn!(%error, "network status: settings unreadable");
+            None
+        }
+    };
+    let Some(Extension(radios)) = radios else {
+        let none = availability(&Availability::unavailable(NO_SETUP_CHANNEL));
+        return Json(json!({
+            "ble": {"enabled": enabled, "state": "unavailable", "reason": NO_SETUP_CHANNEL,
+                    "session_open": false},
+            "wifi": {"scan": none, "join": none},
+        }));
+    };
+    let ble = radios.ble();
+    let wifi = radios.wifi().await;
+    Json(json!({
+        "ble": {"enabled": enabled, "state": ble.as_str(), "reason": ble.reason(),
+                "session_open": radios.session_open()},
+        "wifi": {"scan": availability(&wifi.scan), "join": availability(&wifi.join)},
+    }))
+}
+
+fn availability(availability: &Availability) -> Value {
+    json!({"available": availability.is_available(), "reason": availability.reason()})
 }
 
 /// Additive transport fields for old clients of `/system/info`.

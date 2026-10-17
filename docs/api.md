@@ -72,6 +72,7 @@ All errors return JSON:
 | POST | /onboard/complete | Wizard (see Onboarding Gate) | Mark onboarding finished; makes the claiming device the owner's |
 | GET | /onboard/status | Public | Onboarding progress |
 | GET | /system/info | Public | Connection bootstrap; full record only with a valid bearer |
+| GET | /network/status | Token, every state | The BLE setup channel and Wi-Fi station, and why each part is off |
 | GET | /test | Public | Probe all backend services |
 | POST | /test/speak | Loopback + host credential | Play text on server speakers |
 | GET | /dev/goose | Public | Goose agent + MCP tool status |
@@ -216,6 +217,36 @@ update; version 2's HMAC pairing is no longer served to phones.
 `"insecure_dev": true` appears only while the debug-build plaintext development
 listener runs (`POND_DEV_INSECURE_LAN=1`); the key is absent otherwise. See
 [the security posture](auth-network-posture.md).
+
+---
+
+### GET /network/status (2026-10-17)
+
+The BLE setup channel's radios, for the household's status view (`docs/architecture/pond-setup-channel.md`).
+Never tokenless: a paired device's token or the host's credential, in every state, so the wizard
+can show it before onboarding.
+
+**Response 200**
+```json
+{
+  "ble": {
+    "enabled": true,
+    "state": "unavailable",
+    "reason": "macOS stopped the Bluetooth helper (SIGKILL) before the radio answered, which it does when the app the pond runs under has no Bluetooth permission",
+    "session_open": false
+  },
+  "wifi": {
+    "scan": { "available": false, "reason": "macOS shows Wi-Fi network names only to apps with Location permission; ..." },
+    "join": { "available": true, "reason": null }
+  }
+}
+```
+
+`ble.enabled` is the `ble_setup_enabled` setting (`null` if it could not be read). `ble.state` is
+`off` (not started, or still starting), `serving` (the GATT service is up, nothing advertised),
+`advertising`, or `unavailable` with `reason`. `session_open` is true while a phone holds the one
+setup session. A server built without the setup channel answers `unavailable` with
+`"this pond is not running the setup channel"` for every part.
 
 ---
 
