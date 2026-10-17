@@ -166,6 +166,27 @@ key schedule for the CPace vectors' setup-run `ISK` and `sid`, a session's first
 messages in order (`k_p2c` 0 in `pake_verify`, `k_c2p` 0, `k_p2c` 1, `k_c2p` 1), and two framed
 messages at ATT_MTU 23, so the phone can check itself byte for byte, as it does for CPace.
 
+### Resuming as a paired device (P5e, designed 2026-10-17)
+
+A phone that already paired with this pond can open a sealed channel with no code: after a BLE
+session dropped between the claim and `wifi_join`, or when a claimed pond lost its network and
+nobody wants to ask it to speak. It proves it holds its own refresh token without sending it.
+
+- `pake_init` with `"credential": "device"`. The password is the lowercase hex SHA-256 of the
+  phone's current refresh token, which is exactly what the pond stores (`session_tokens.refresh_hash`),
+  so neither side holds anything new. The channel identifier label is `goose-device-cpace-v1`.
+- The pond commits to the newest active refresh hash for the device named by `client_id`. When the
+  device has none, it runs the exchange against a random password, so a stranger cannot learn which
+  install ids are paired: the run fails at confirmation like any wrong guess.
+- A confirmed run rotates the session as `POST /handshake/refresh` does (the old refresh row is
+  revoked, a new pair is minted) and `pake_verify`'s `sealed` carries the new tokens.
+- The setup channel only: over HTTPS `credential: "device"` is `400 invalid_credential`, because
+  HTTPS already has `/handshake/refresh`.
+- Five failed confirmations per device per ten minutes, then `device_cooling` with `retry_after`.
+  The password has 256 bits, so this bounds load, not guessing.
+- Trust: anyone who can read `pond_system.db` holds every refresh hash, and so could resume as any
+  device; that reader already holds the household. An eavesdropper learns nothing (CPace).
+
 ### After the exchange (sealed)
 
 | `type` | Request fields | Response fields |
@@ -273,4 +294,5 @@ Wi-Fi, so try `wifi_join` only against a spare hotspot.
 | P5a | `pond-connect`: framing, sealing, messages, session over an in-memory transport; channel keys from the handshake for setup-channel runs; `WifiStation` port and mock; the vectors file | LANDED 2026-10-17 on `feat/ble-setup`: `crates/pond-connect` (setup channel, GATT and advertising constants, capabilities, an unsupported station); `WifiStation`, `should_advertise` and the shared `SpokenCodeService` in pond-core; `init_channel_pake`/`verify_channel_pake` on the handshake; the vectors. Mac unit and end-to-end tests over an in-memory transport at MTU 23 and 185; no radio, phone or Orin yet |
 | P5b | macOS adapters (helper peripheral, CoreWLAN) and server wiring: the Mac development loop with a real phone | BUILT 2026-10-17 on `feat/ble-setup`: `pond-server ble-helper`, the `HelperPeripheral` supervisor, the CoreWLAN station, the advertising controller, the 10-minute session cap, `ble_setup_enabled` in both desktop settings views, `GET /network/status`. On the Mac, under an agent's terminal, the helper starts, reads `not_determined`, and is aborted by TCC; the supervisor retries at 2, 8 and 30 s and reports why. CoreWLAN read without Location: names withheld (`not_permitted`), join available. Owed: advertising and a real phone from a Bluetooth-granted app (Terminal or the GIAP app) |
 | P5c | Linux adapters (bluer, NetworkManager), the polkit grant, doctor lines; compiled and unit-tested in `jetson-emu.sh box`, then verified on the Jetson last | BUILT 2026-10-17 on `feat/ble-setup`: `BluezPeripheral` (`ble/linux.rs`: GATT app, advertisement, a 10 s supervisor that re-registers after a bluetoothd restart or rfkill and re-applies the wanted advertisement), the OS-independent central router (`ble/linux/router.rs`), the NetworkManager station (`wifi/linux.rs`, zbus `async-io`), `giap.sh wifi-grant [remove\|status]` and its doctor lines (`scripts/lib/connect-setup.sh`), the grant written by `giap.sh install` on production and Jetson installs, and two drivers for the device run, `examples/ble_peripheral` (an unclaimed in-memory `Pond 7f3a`, so a claimed pond's state is never touched) and `examples/wifi_station`. **The name goes in the scan response:** BlueZ 5.64 adds the advertisement's `LocalName` only to the scan response (`generate_scan_rsp`), so the pond sets `LocalName` and never `Includes: ["local-name"]` (which would insert the adapter's own name); `Discoverable: true` writes flags 0x06 into its own data and leaves the adapter's discoverable and pairable switches alone. ADV_IND 21/31 bytes (flags, 128-bit UUID), scan response 11/31 (`Name (complete)`); a name over 29 bytes would be shortened, so it is refused. The session opens on a central's first `rx` write (BlueZ's StartNotify names no device); another central's write is ATT 0x03 as on macOS; notifications are `Value` changes, which BlueZ caps at ATT_MTU - 3 like the session (bluer's socket path caps two bytes lower, too few at MTU 23), and reach every subscriber, which the seal covers. A join adds its connection in memory, `Save()`s it only once it has an IPv4 address and deletes it otherwise, so a wrong passphrase never reaches disk. Box (linux/arm64, real bluer and zbus): 46 unit tests with a fake radio and a fake NetworkManager, clippy clean bar the toolchain-wide `double_must_use` on `#[async_trait]`. **Owed on the Jetson** (steps in the P5c report): `giap.sh wifi-grant` and `doctor`; `btmon` showing ADV_IND with `Flags: 0x06` and the service UUID, and `Name (complete): Pond <id>` in the scan response (the real pond advertises only while unclaimed or offline; a pond with paired phones is claimed, so use `ble_peripheral`); `busctl ... ActiveInstances` 1; a generic BLE app connecting with no pairing prompt and getting `hello` back; `wifi_station` `scan`, `not_found`, `wrong_password` and a real join; a bluetoothd restart healing within 10 s |
-| P5d | goose-on-the-go: BLE scan, connect, the exchange over BLE, Wi-Fi picker, then hand over to HTTPS | not started |
+| P5d | goose-on-the-go: BLE scan, connect, the exchange over BLE, Wi-Fi picker, then hand over to HTTPS | BUILT 2026-10-17: goose-on-the-go#136 (`plugins/pond-ble`, the setup-channel session, Find your Pond, Wi-Fi, two-screen owner setup); vectors byte for byte; no real radio yet |
+| P5e | Resuming as a paired device: `credential: "device"` keyed on the refresh hash | DESIGNED 2026-10-17 |
