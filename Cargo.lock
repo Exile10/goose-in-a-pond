@@ -11886,6 +11886,7 @@ dependencies = [
  "dispatch2",
  "futures",
  "libc",
+ "mdns-sd",
  "objc2",
  "objc2-core-bluetooth",
  "objc2-core-wlan",

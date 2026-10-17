@@ -5,6 +5,7 @@
 pub mod advertising;
 pub mod ble;
 pub mod capabilities;
+pub mod discovery;
 pub mod interfaces;
 pub mod setup_channel;
 pub mod status;
