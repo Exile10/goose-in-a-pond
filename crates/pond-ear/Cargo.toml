@@ -1,0 +1,23 @@
+[package]
+name = "pond-ear"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "The ear: wake word, voice activity, Voice Match and echo cancellation on one audio front end"
+build = "build.rs"
+
+[lib]
+name = "pond_ear"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pond-ear"
+path = "src/bin/pond-ear.rs"
+
+[lints]
+workspace = true
+
+# Std only, no crates at all: the hand-written engine is the point, and a zero-dependency crate
+# builds in seconds on the Orin and can never pull a runtime into the voice child.
+[dependencies]
