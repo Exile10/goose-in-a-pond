@@ -108,6 +108,11 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/handshake/pairing-code",
             get(handshake_pairing_code).post(handshake_issue_pairing_code),
         )
+        // Loopback or direct LAN: the pond reads a pairing code aloud and never returns it.
+        .route(
+            "/handshake/spoken-code",
+            post(crate::spoken_code::handshake_spoken_code),
+        )
         .route("/onboard", post(start_onboarding))
         .route("/onboard/complete", post(complete_onboarding))
         .route("/onboard/status", get(onboarding_status))

@@ -12,6 +12,7 @@ use crate::network::ports::code_announcer::CodeAnnouncer;
 pub struct MockCodeAnnouncer {
     announced: Mutex<Vec<String>>,
     failing: AtomicBool,
+    unavailable: AtomicBool,
 }
 
 impl MockCodeAnnouncer {
@@ -28,6 +29,11 @@ impl MockCodeAnnouncer {
     pub fn set_failing(&self, failing: bool) {
         self.failing.store(failing, Ordering::SeqCst);
     }
+
+    /// Reports no speaker up front, as a pond with no output device does.
+    pub fn set_unavailable(&self, unavailable: bool) {
+        self.unavailable.store(unavailable, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -38,6 +44,10 @@ impl CodeAnnouncer for MockCodeAnnouncer {
         }
         self.announced.lock().unwrap().push(digits.to_string());
         Ok(())
+    }
+
+    async fn is_available(&self) -> bool {
+        !self.unavailable.load(Ordering::SeqCst)
     }
 }
 
@@ -53,5 +63,8 @@ mod tests {
         announcer.set_failing(true);
         assert!(announcer.announce_code("000000").await.is_err());
         assert_eq!(announcer.announced(), vec!["123456", "654321"]);
+        assert!(announcer.is_available().await);
+        announcer.set_unavailable(true);
+        assert!(!announcer.is_available().await);
     }
 }

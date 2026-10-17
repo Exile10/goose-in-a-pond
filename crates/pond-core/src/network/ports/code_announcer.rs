@@ -6,4 +6,9 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait CodeAnnouncer: Send + Sync {
     async fn announce_code(&self, digits: &str) -> Result<()>;
+
+    /// Asked before a code is issued, so a pond with no speaker refuses without spending one.
+    async fn is_available(&self) -> bool {
+        true
+    }
 }

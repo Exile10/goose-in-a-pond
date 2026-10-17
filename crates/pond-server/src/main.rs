@@ -4167,6 +4167,8 @@ async fn run_server(
         mesh_provider: mesh_provider.clone(),
         peer_capability_query,
         mesh_rebuild: Some(mesh_rebuild),
+        setup_claims: None,
+        spoken_codes: Default::default(),
     });
 
     // OAuth refresh updates secrets only; restarting extensions would break in-flight tool calls.
