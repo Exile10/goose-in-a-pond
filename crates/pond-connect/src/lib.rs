@@ -7,6 +7,7 @@ pub mod ble;
 pub mod capabilities;
 pub mod interfaces;
 pub mod setup_channel;
+pub mod status;
 #[cfg(test)]
 mod test_support;
 pub mod wifi;

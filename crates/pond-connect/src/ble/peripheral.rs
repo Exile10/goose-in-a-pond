@@ -7,24 +7,13 @@ use async_trait::async_trait;
 
 use crate::setup_channel::SetupChannel;
 
+pub use pond_core::network::domain::peripheral::PeripheralStatus;
+
 /// Exactly what a pond may advertise beside the service UUID (spec: "Advertising").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advertisement {
     /// `Pond <id>`; it travels in the scan response where the UUID leaves no room.
     pub local_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeripheralStatus {
-    /// Not started yet.
-    Off,
-    /// The GATT service is registered and connections are served; nothing is advertised.
-    Serving,
-    Advertising,
-    /// Says why, so the dashboard and `doctor` can tell the household (no radio, no permission).
-    Unavailable {
-        reason: String,
-    },
 }
 
 #[derive(Debug, thiserror::Error)]
