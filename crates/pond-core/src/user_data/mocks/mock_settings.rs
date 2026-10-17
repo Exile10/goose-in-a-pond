@@ -147,6 +147,12 @@ fn build_settings(store: &HashMap<String, String>) -> Settings {
             s.spoken_pairing_codes = b;
         }
     }
+    // The setup channel's switch, for the same reason.
+    if let Some(v) = store.get("ble_setup_enabled") {
+        if let Ok(b) = v.parse() {
+            s.ble_setup_enabled = b;
+        }
+    }
     s
 }
 
