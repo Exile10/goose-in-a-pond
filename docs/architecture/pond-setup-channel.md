@@ -6,8 +6,9 @@ code, connects over BLE, claims or pairs with it, tells it which Wi-Fi to join, 
 over HTTPS on the address the pond reports. This document is the contract both sides build to: the
 pond in `crates/pond-connect`, the phone in goose-on-the-go.
 
-Status: **DESIGNED 2026-10-17; P5a LANDED 2026-10-17** (the OS-independent core, see
-[Phases](#phases)).
+Status: **DESIGNED 2026-10-17; P5a LANDED 2026-10-17** (the OS-independent core); **P5b BUILT
+2026-10-17** (the macOS adapters and the server wiring; a phone over a granted app still owed). See
+[Phases](#phases).
 
 ## Decisions
 
@@ -21,20 +22,29 @@ Status: **DESIGNED 2026-10-17; P5a LANDED 2026-10-17** (the OS-independent core,
 | 2026-10-17 | **`hello` names the discriminator `pond_id`.** Spec correction, agreed with goose-on-the-go. | The first draft called it `id`, which collides with the request `id` every response echoes. |
 | 2026-10-17 | **A pond advertises while unclaimed OR without a usable network.** Spec correction, agreed with goose-on-the-go. | An unclaimed pond on Ethernet must still be claimable from its card; a claimed pond with no network must still be reachable to give it one. |
 | 2026-10-17 | **Every refusal is `ok: false`, `pake_verify`'s included.** Spec correction, agreed with goose-on-the-go. | One rule for the phone's reader. A refused verify also carries `accepted: false`, `error` and `rejection_reason`, as the HTTPS body does. |
-| 2026-10-17 | **A session outlives advertising.** Agreed with goose-on-the-go. | `wifi_join` gives the pond an address, which can stop advertising while the phone still needs `status`. A session ends only when the phone disconnects, after 120 s with no request (every request restarts the timer), or on a framing or sealing failure. In `pond-connect` the session belongs to the connection's handle and no advertising object can reach it. |
+| 2026-10-17 | **A session outlives advertising.** Agreed with goose-on-the-go. | `wifi_join` gives the pond an address, which can stop advertising while the phone still needs `status`. A session ends only when the phone disconnects, after 120 s with no request (every request restarts the timer), or on a framing or sealing failure (and, since P5b, at the 10-minute cap below). In `pond-connect` the session belongs to the connection's handle and no advertising object can reach it. |
 | 2026-10-17 | **Each message starts its own chunk; no chunk carries bytes of two messages.** Agreed with goose-on-the-go. | Both readers then refuse an overrunning chunk the same way, and a reader never has to split a chunk between messages. |
 | 2026-10-17 | **The channel's own refusals:** `wrong_phase`, `unknown_type`, `invalid_request`, `too_many_attempts`, `internal_error`, and `unsupported` for a host with no Wi-Fi station. | The HTTPS API has no route for a request in the wrong phase, an unknown type, a malformed body, a fourth `pake_init` or a 500, so it has no code for them. Every other code is the API's. |
 | 2026-10-17 | **A run is finished only on the transport that started it, and only by the connection that started it.** | A BLE challenge id travels in the clear. Without this, anyone who overheard one could burn the phone's run with a verify over HTTPS. The keys come from `Handshake::init_channel_pake`/`verify_channel_pake`, which only in-process callers reach; no HTTPS route calls them (`setup_channel_keys_stay_in_process.rs`). |
 | 2026-10-17 | **A clear-phase refusal carries no host name.** | The HTTPS verify refusal includes `hostname`; over BLE in the clear that would tell anyone in range what the advertisement deliberately leaves out. `status` and the sealed tokens carry it. |
 | 2026-10-17 | **The vectors live beside their generator,** `crates/pond-connect/tests/fixtures/setup-channel-vectors.json`, and take their ISK and sid from the setup run in `crates/pond-infra/tests/fixtures/cpace-vectors.json`. | Sealing and framing are `pond-connect`'s, so its test regenerates the file; chaining the ISK lets the phone check the whole path from the card's digits to a sealed message. |
+| 2026-10-17 | **A session lasts at most 10 minutes from when it opened**, however busy (`MAX_SESSION_LIFETIME`; it ends `lifetime_cap`). Pond-side, P5b; goose-on-the-go reconnects and runs the exchange again. | Without it a phone sending a request every 119 s held the only session forever, which P5a left open. Ten minutes is several times a whole claim, scan and join. |
+| 2026-10-17 | **On macOS a refused central gets ATT error `0x03` (Write Not Permitted) on every `rx` write until it disconnects.** | CoreBluetooth gives a peripheral no way to drop a central. A second phone while one is connected, and a phone whose session ended, both meet it; the phone should read it as the session being over, and disconnect. |
+| 2026-10-17 | **`ble_setup_enabled` is the household's switch, on by default.** Off: no advertising and every new phone refused; a pond that starts with it off never touches the radio. A session already open runs to its own end. | Settings > Privacy, in both desktop settings views. A switch that reached into an open session would be the advertising controller ending one, which correction 5 rules out. |
+| 2026-10-17 | **The macOS helper speaks NDJSON on its stdin and stdout, and every per-phone message names a `link`**, one central's subscription, numbered by the helper and never reused. | A command meant for a phone that left and came back must reach nothing: the same captured-identity rule the desktop's voice child follows. |
 
 ## Crate layout
 
 ```
 crates/pond-connect/
   src/setup_channel/   framing, sealing, messages, the per-connection session (any OS, fully testable)
-  src/ble/             GATT layout; linux.rs (BlueZ via bluer), macos.rs (helper client), unsupported.rs
+  src/ble/             GATT layout; linux.rs (BlueZ via bluer), unsupported.rs;
+                       helper/ (the helper protocol and its supervisor, any OS);
+                       macos.rs + macos/helper.rs (the CoreBluetooth helper process)
   src/wifi/            linux.rs (NetworkManager over zbus), macos.rs (CoreWLAN), unsupported.rs
+  src/advertising.rs   the controller that applies `should_advertise` every 10 s
+  src/interfaces.rs    the host's IPv4 addresses, judged by pond-core's classifier
+  src/status.rs        the `SetupRadios` port, for `GET /network/status`
   src/capabilities.rs  what this host can do, probed at runtime, with the reason when it cannot
 ```
 
@@ -58,9 +68,11 @@ implements the ports and runs the transport. `pond-server` wires it.
   (`Pond c1cd`), matching the card's title. Nothing else: no host name, no household, no address,
   no claim state.
 - **When.** While the pond is unclaimed, or while it has no usable network (no IPv4 address on any
-  interface that is not loopback or a tunnel), checked every 10 s
-  (`pond_core::network::services::advertising::should_advertise`). Otherwise it does not advertise.
-  Stopping advertising never ends an open session. The setup window after a lost network is P6.
+  interface that is not loopback, link-local, a tunnel or a container bridge), checked every 10 s
+  (`pond_core::network::services::advertising::should_advertise`, applied by
+  `pond_connect::advertising`), and only while `ble_setup_enabled` is on. Otherwise it does not
+  advertise. Stopping advertising never ends an open session. The setup window after a lost
+  network is P6.
 - A phone scans for the service UUID, and when it holds a card, connects to the advertiser whose
   local name carries the card's id.
 
@@ -73,8 +85,9 @@ implements the ports and runs the transport. `pond-server` wires it.
 
 The phone subscribes to `tx`, then writes requests to `rx`. One connection at a time: a second
 central is refused while a session is open. A session closes when the phone disconnects, after
-120 s with no request (every request restarts the timer), on an unreadable frame, or on any sealing
-failure. Nothing else closes it: not advertising stopping, not the pond joining a network.
+120 s with no request (every request restarts the timer), 10 minutes after it opened however busy,
+on an unreadable frame, or on any sealing failure. Nothing else closes it: not advertising
+stopping, not the pond joining a network, not the household's switch.
 
 ## Framing
 
@@ -176,14 +189,88 @@ proven pin, with the tokens it already holds, and runs owner setup there (P4).
 
 | | Linux (Jetson, Pi) | macOS | Windows |
 |---|---|---|---|
-| BLE peripheral | BlueZ over D-Bus with `bluer` (needs `libdbus-1-dev` to build; the default D-Bus policy lets the pond's user serve GATT) | CoreBluetooth `CBPeripheralManager` in `pond-server ble-helper`, a child speaking NDJSON on stdin and stdout; the supervisor marks BLE unavailable if it dies | later (WinRT `GattServiceProvider`) |
+| BLE peripheral | BlueZ over D-Bus with `bluer` (needs `libdbus-1-dev` to build; the default D-Bus policy lets the pond's user serve GATT) | CoreBluetooth `CBPeripheralManager` in `pond-server ble-helper`, a child speaking NDJSON on stdin and stdout ([the macOS helper](#the-macos-helper)); the supervisor marks BLE unavailable if it dies and starts it at most three more times | later (WinRT `GattServiceProvider`) |
 | Wi-Fi | NetworkManager over D-Bus with `zbus`; needs the polkit grant `giap.sh install` writes, and `giap.sh doctor` checks for | CoreWLAN; scanning names networks only with Location permission on recent macOS, and the capability says so | later |
+
+## The macOS helper
+
+`pond-server ble-helper` is a hidden subcommand of the server's own binary, which the server starts
+with `std::env::current_exe()`. Only it touches CoreBluetooth: a `CBPeripheralManager` on the main
+dispatch queue, served by the main run loop (not `dispatch_main`, which `pthread_exit`s the main
+thread, runs its thread-local destructors and so drops the manager), with the power alert off (a headless pond has no one to read it; the status route
+says so instead). Once the radio is on it registers the primary service with `rx` (write with
+response) and `tx` (notify), re-registering after every power cycle, and it advertises only
+`CBAdvertisementDataServiceUUIDsKey` and `CBAdvertisementDataLocalNameKey`. It stops advertising and
+exits when the server closes its stdin, so an orphan never keeps showing the pond.
+
+One JSON object per line, bytes in standard base64. A `link` is one central's subscription to
+`tx`, numbered by the helper and never reused.
+
+| Way | Message | Meaning |
+|---|---|---|
+| in | `{"cmd":"advertise","local_name":"Pond c1cd"}` | Advertise the service UUID and this name; replaces an earlier name |
+| in | `{"cmd":"stop_advertising"}` | |
+| in | `{"cmd":"notify","link":1,"data":"<b64>"}` | One `tx` notification, in order. Held while `updateValue` reports a full queue, resumed on `peripheralManagerIsReadyToUpdateSubscribers` |
+| in | `{"cmd":"disconnect","link":1}` | The session on this link is over: its writes are answered `0x03` and it is sent nothing until it unsubscribes |
+| out | `{"event":"ready","protocol":1}` | First line, before the radio is touched |
+| out | `{"event":"authorization","authorization":"not_determined"}` | `CBManager.authorization`: `not_determined`, `restricted`, `denied`, `allowed_always`; read before the manager exists |
+| out | `{"event":"state","state":"powered_on"}` | `CBManagerState`: `unknown`, `resetting`, `unsupported`, `unauthorized`, `powered_off`, `powered_on` |
+| out | `{"event":"service_added"}` | The GATT service is registered |
+| out | `{"event":"advertising","local_name":"Pond c1cd"}`, `{"event":"advertising_stopped"}` | From `peripheralManagerDidStartAdvertising` and `stopAdvertising` |
+| out | `{"event":"subscribed","link":1,"central":"<uuid>","att_mtu":185}` | A phone subscribed to `tx`: the server opens a session, or answers `disconnect` |
+| out | `{"event":"mtu","link":1,"att_mtu":185}` | `maximumUpdateValueLength + 3` changed |
+| out | `{"event":"write","link":1,"data":"<b64>"}` | One `rx` write, already answered with success |
+| out | `{"event":"unsubscribed","link":1}` | The central unsubscribed or went away: the session ends `phone_disconnected` |
+| out | `{"event":"error","context":"add_service","message":"..."}` | Context `add_service`, `advertise`, `protocol`, or `radio` when no state came within 10 s |
+
+Each write reaches stdout before the helper answers it, so a server that falls behind slows the
+phone rather than queueing without bound. A batch of prepared writes whose offsets are not
+contiguous is answered `0x07` (Invalid Offset); a write from a central that has not subscribed, or
+to anything but `rx`, `0x03`; a read, `0x02`.
+
+**Supervision.** `HelperPeripheral` turns the helper's events into `PeripheralStatus`. When the
+helper dies, the open session ends `phone_disconnected`, BLE reads `unavailable` with the reason,
+and the server logs `kind="ble_unavailable"`. A SIGKILL or SIGABRT before the radio reported any
+state is read as the permission case. Measured 2026-10-17 on macOS 27.0.1, with Claude Code
+(`com.anthropic.claude-code`, whose bundle declares no `NSBluetoothAlwaysUsageDescription`) as the
+responsible app: the helper reports `authorization: not_determined`, then TCC aborts it (SIGABRT,
+termination namespace `TCC`, "attempted to access privacy-sensitive data without a usage
+description") within about 0.1 s of creating the manager when the server starts it, about 15 s
+when run alone. `docs/matter.md` measured SIGKILL for the Matter controller. It is started again after 2 s, 8 s and 30 s
+and then left off until the pond restarts; a helper that ran five minutes before dying gets the
+budget back. The advertising controller starts the helper the first time `ble_setup_enabled`
+reads on. `GET /api/v1/network/status` (a token in every state, [`api.md`](../api.md)) reports the
+peripheral, the switch, whether a session is open, and the Wi-Fi station's capabilities with their
+reasons.
+
+**Wi-Fi.** CoreWLAN behind `WifiStation`, each call on a blocking thread in its own autorelease
+pool. Without Location permission macOS withholds every SSID: `scan` then answers
+`not_permitted`, and the capability says why; no name is ever invented. `join` scans for the name,
+takes the strongest access point, and calls `associateToNetwork:password:` with a no-copy
+`NSString` over the pond's own buffer, which its deallocator zeroes when macOS lets go of it; then
+it waits up to 30 s for an IPv4 address on that interface (`no_address`). A supplicant or
+handshake failure with a passphrase reads as `wrong_password`, `kCWOperationNotPermittedErr` as
+`not_permitted`, anything else as `timeout`. A Mac that asks for an administrator to change
+networks (`requireAdministratorForAssociation`) offers no `join`.
+
+**Testing with a phone.** Run the pond from an app macOS lets use Bluetooth: Terminal (allowed in
+System Settings > Privacy & Security > Bluetooth) or the GIAP app, never from a tool whose bundle
+declares no Bluetooth use. With a scratch data dir, `tail -f /dev/null | POND_DATA_DIR=<dir>
+target/debug/pond-server serve --port <p> --https-port <q>`, and `pond-server setup-code` with the
+same `POND_DATA_DIR` prints the card. The log should read `ble_helper_ready`,
+`ble_authorization`, `ble_radio_state state=PoweredOn`, `ble_service_added`, then
+`ble_advertising_started local_name=Pond <id>`. A generic BLE app (nRF Connect) sees `Pond <id>`
+with the service UUID; subscribing to `tx` and writing
+`000000177b226964223a312c2274797065223a2268656c6c6f227d` to `rx` (at ATT_MTU 23, as
+`000000177b226964223a312c2274797065223a22` then `68656c6c6f227d`) is a framed
+`{"id":1,"type":"hello"}`, answered on `tx` with the card's `pond_id`. A join moves the Mac off its
+Wi-Fi, so try `wifi_join` only against a spare hotspot.
 
 ## Phases
 
 | Phase | Scope | Status |
 |---|---|---|
 | P5a | `pond-connect`: framing, sealing, messages, session over an in-memory transport; channel keys from the handshake for setup-channel runs; `WifiStation` port and mock; the vectors file | LANDED 2026-10-17 on `feat/ble-setup`: `crates/pond-connect` (setup channel, GATT and advertising constants, capabilities, an unsupported station); `WifiStation`, `should_advertise` and the shared `SpokenCodeService` in pond-core; `init_channel_pake`/`verify_channel_pake` on the handshake; the vectors. Mac unit and end-to-end tests over an in-memory transport at MTU 23 and 185; no radio, phone or Orin yet |
-| P5b | macOS adapters (helper peripheral, CoreWLAN) and server wiring: the Mac development loop with a real phone | not started |
+| P5b | macOS adapters (helper peripheral, CoreWLAN) and server wiring: the Mac development loop with a real phone | BUILT 2026-10-17 on `feat/ble-setup`: `pond-server ble-helper`, the `HelperPeripheral` supervisor, the CoreWLAN station, the advertising controller, the 10-minute session cap, `ble_setup_enabled` in both desktop settings views, `GET /network/status`. On the Mac, under an agent's terminal, the helper starts, reads `not_determined`, and is aborted by TCC; the supervisor retries at 2, 8 and 30 s and reports why. CoreWLAN read without Location: names withheld (`not_permitted`), join available. Owed: advertising and a real phone from a Bluetooth-granted app (Terminal or the GIAP app) |
 | P5c | Linux adapters (bluer, NetworkManager), the polkit grant, doctor lines; compiled and unit-tested in `jetson-emu.sh box`, then verified on the Jetson last | not started |
 | P5d | goose-on-the-go: BLE scan, connect, the exchange over BLE, Wi-Fi picker, then hand over to HTTPS | not started |

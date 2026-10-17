@@ -3463,3 +3463,42 @@ milestone).**
   `cpace-vectors.json` is unchanged. **Not run:** `scripts/live-test.sh`, since P5a adds no route
   or wiring and a rebuild would replace the binary under the mock pond running on :4100.
   **Not verified:** any radio, a real phone, anything on the Orin.
+
+**2026-10-17 — Pond networking P5b: the macOS BLE helper, CoreWLAN and the server wiring
+(touches PAI-2; not a PAI milestone).**
+
+- **What landed.** [`pond-setup-channel.md`](../pond-setup-channel.md) P5b, on `feat/ble-setup`:
+  `pond-server ble-helper` (CoreBluetooth, NDJSON on stdin and stdout) and its supervisor
+  `HelperPeripheral`; the CoreWLAN `WifiStation`; the advertising controller; a 10-minute cap on
+  a session; the `ble_setup_enabled` setting (on by default, in both desktop settings views);
+  `GET /api/v1/network/status`; the wiring in `run_server` from `AppState`'s own handshake,
+  limiter, settings, profiles, claims, onboarding and event log. The pure LAN classifier moved to
+  `pond_core::network::domain::interface`, and `pond-api`'s pairing boundary calls it unchanged.
+- **PAI-2: secrets in flight.** The Wi-Fi passphrase reaches CoreWLAN as a no-copy `NSString` over
+  the pond's own buffer, which its deallocator zeroes when macOS releases the string. The helper
+  only ever carries framed bytes, sealed once the exchange is done, and logs nothing but link
+  numbers, MTUs and state names; an unreadable command is reported by column, never by content.
+  `/network/status` is `Authenticated` in every state and is pinned in
+  `the_public_route_classification_is_pinned`.
+- **Not wiped, written down so it is not rediscovered:** CoreWLAN's own copies, and the UTF-16
+  copy `NSString` may make of a non-ASCII passphrase instead of using the buffer.
+- **Found while measuring.** `dispatch_main` `pthread_exit`s the main thread, which runs its
+  thread-local destructors: the helper's `CBPeripheralManager` was dropped the moment the queue
+  started (bluetoothd logged a check-in and an immediate `CBMsgIdCheckOut`). The helper now runs
+  the main run loop.
+- **Invariants.** No egress, no prompt or KV change, no migration. One new `Settings` field
+  (`ble_setup_enabled`: `upsert!`, `apply_key`, UI_WIRED; no install has a stored row, so no
+  `DEFAULT_ADOPTIONS` entry). One new route. A BLE failure never stops the pond: no setup record,
+  no adapter, or a dead helper each only switch BLE off, with the reason on the status route.
+- **Verified on the Mac.** Unit tests (the supervisor against in-memory pipes and real `/bin/sh`
+  children; the controller; the cap; CoreWLAN error and signal mapping); the route test; the
+  settings guards; `scripts/live-test.sh` (168 checks, 0 failed); desktop tests and typecheck; both
+  toggles rendered against a live pond, and the Hub's toggle writing `ble_setup_enabled`. A scratch
+  pond started its helper, which read `authorization: not_determined` and was then aborted by TCC
+  (SIGABRT, namespace TCC: no `NSBluetoothAlwaysUsageDescription` in the responsible app, Claude
+  Code); the supervisor retried at 2, 8 and 30 s and reported the reason. CoreWLAN without Location
+  permission: every SSID withheld (`scan` `not_permitted`), `join` available, status connected with
+  no name. **Not verified:** advertising, any phone, a real `wifi_join`, anything on the Orin.
+- **Open.** pond-server now links pond-connect, so on Linux it needs `libdbus-1-dev` wherever it
+  is built (CI's `rust` and `live-test` jobs). `/network/status` has no UI yet, and
+  `scripts/live-test.sh` does not check it.
