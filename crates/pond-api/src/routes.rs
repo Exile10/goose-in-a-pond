@@ -84,8 +84,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     // ───────────── Public routes (accessible before onboarding) ─────────────
     // "Public" = not behind `require_onboarding_complete`. Anonymous access is separate
     // (`middleware::PUBLIC_ROUTES`): the wizard's writes (`PUT /settings`,
-    // `POST /profiles`, `PATCH /profiles/{id}`, `POST /onboard/*`,
-    // `/voice/calibrate`) close to anonymous callers after onboarding. Classify new routes there.
+    // `POST /profiles`, `PATCH /profiles/{id}`, `POST /onboard/*`, `/voice/calibrate`) answer an
+    // anonymous caller only on an unclaimed pond's host, until onboarding. Classify new routes there.
     let public_routes = Router::new()
         .route("/health", get(health))
         .route("/handshake", post(handshake_handler))
@@ -1421,7 +1421,7 @@ async fn bearer_or_host_credential(
 /// Resets onboarding to `Welcome` and re-arms the onboarding guard. Open while the wizard runs;
 /// once the Pond is set up, a caller the middleware admitted only for being on the host must
 /// hold a token or the host credential, because a reset reopens the wizard's writes
-/// (`PUT /settings`, `POST /profiles`, `/onboard/*`) to every LAN and tailnet peer.
+/// (`PUT /settings`, `POST /profiles`, `/onboard/*`) to any tokenless process on an unclaimed host.
 async fn reset_onboarding(
     State(state): State<Arc<AppState>>,
     principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,

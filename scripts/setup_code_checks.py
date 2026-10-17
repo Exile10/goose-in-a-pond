@@ -6,9 +6,13 @@
   pairing  a fresh pond reports `unclaimed`, and a pairing-code pairing (the dashboard's loopback
            HMAC) claims it too
   restart  the claim survived a restart
+  reset-wizard
+           after a host reset of the pond `card` claimed: its wizard refuses the tokenless host and
+           admits the claimant's token; after `setup-code --rearm` it reopens to the host
 
 The launcher proves process and port ownership first. The setup code is read from
-`pond-server setup-code --json` and never printed.
+`pond-server setup-code --json` and never printed, and neither is the claimant's token, which
+`card` keeps in the scratch data directory (`0600`) for `reset-wizard`.
 """
 import base64
 import hashlib
@@ -27,6 +31,8 @@ DATA = Path(os.environ["POND_DATA_DIR"])
 BIN = os.environ["POND_SERVER_BIN"]
 PORT = int((DATA / ".runtime_api_port").read_text())
 HOST_ONLY = {"X-Pond-Host-Credential": (DATA / ".runtime_host_credential").read_text().strip()}
+CLAIMANT = DATA / "live-claimant.json"
+FULL_SETUP = {"user_name": "AuthProbe", "assistant_name": "Goose", "timezone": "UTC", "chat_model": "mock"}
 FAILURES = []
 
 
@@ -105,6 +111,9 @@ def card():
     check("the setup code claims the pond over loopback CPace", result.get("accepted") is True,
           str({k: v for k, v in result.items() if "token" not in k}))
     check("the pond then reports claimed", status() == "claimed", status())
+    if result.get("accepted") is True:
+        CLAIMANT.touch(mode=0o600)
+        CLAIMANT.write_text(json.dumps({"session_token": result["session_token"]}))
 
     code, _, text, _ = request("POST", "/handshake/pake/init", init_body("live-second-phone", "setup"))
     check("a second setup attempt is 409 setup_code_unavailable",
@@ -129,7 +138,33 @@ def restart():
     check("the claim survives a restart", status() == "claimed", status())
 
 
+def reset_wizard():
+    bearer = {"Authorization": "Bearer " + json.loads(CLAIMANT.read_text())["session_token"]}
+
+    code, _, text, _ = request("PUT", "/settings", FULL_SETUP)
+    check("a claimed, reset pond's wizard refuses the tokenless host", code == 401, "%s %s" % (code, text[:200]))
+    code, _, text, _ = request("POST", "/onboard/reset")
+    check("and so does its reset, until it is set up again", code == 401, "%s %s" % (code, text[:200]))
+    code, _, text, _ = request("PUT", "/settings", FULL_SETUP, bearer)
+    check("the claimant's token reopens the wizard", code == 200, "%s %s" % (code, text[:200]))
+    code, _, text, _ = request("POST", "/onboard/complete", None, bearer)
+    check("the claimant finishes setup as itself", code == 200, "%s %s" % (code, text[:200]))
+    code, _, text, _ = request("PUT", "/settings", FULL_SETUP)
+    check("the wizard closes again once set up", code == 401, "%s %s" % (code, text[:200]))
+
+    setup_code("--rearm")
+    check("a re-armed pond reports unclaimed", status() == "unclaimed", status())
+    code, _, text, _ = request("POST", "/onboard/reset", None, HOST_ONLY)
+    check("the host resets the re-armed pond", code == 200, "%s %s" % (code, text[:200]))
+    code, _, text, _ = request("PUT", "/settings", FULL_SETUP)
+    check("a re-armed, reset pond's wizard reopens to the host", code == 200, "%s %s" % (code, text[:200]))
+    code, _, text, _ = request("POST", "/onboard/complete")
+    check("the host finishes setup", code == 200, "%s %s" % (code, text[:200]))
+    code, _, text, _ = request("PUT", "/settings", FULL_SETUP)
+    check("and the wizard closes again", code == 401, "%s %s" % (code, text[:200]))
+
+
 if __name__ == "__main__":
     pond_cpace.check_vectors()
-    {"card": card, "pairing": pairing, "restart": restart}[sys.argv[1]]()
+    {"card": card, "pairing": pairing, "restart": restart, "reset-wizard": reset_wizard}[sys.argv[1]]()
     sys.exit(1 if FAILURES else 0)

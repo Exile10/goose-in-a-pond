@@ -156,12 +156,20 @@ enum Exposure {
     HostOnly,
     /// Authentication is required even before onboarding completes.
     Authenticated,
-    /// Public only while onboarding is incomplete. The wizard's own surface.
+    /// The wizard's own surface. Tokenless only from loopback while the pond is neither claimed
+    /// nor onboarded (the desktop before it pairs); once claimed, the claimant runs it as itself.
     UntilOnboarded,
     /// As [`Exposure::UntilOnboarded`], but still open to loopback once set up.
     /// Only `POST /onboard/reset`, for repair; its handler then asks a caller with no token for
     /// the host credential, the same proof re-pairing needs.
     UntilOnboardedThenHostOnly,
+}
+
+/// What a state-dependent route's tokenless answer depends on, read live on each request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PondSetup {
+    onboarded: bool,
+    claimed: bool,
 }
 
 /// Every pre-onboarding `(method, path, exposure)`; `{brace}` is one segment. Must match the
@@ -180,7 +188,7 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::POST, "/handshake/pairing-code", Exposure::Always),
     // A headless pond's way to pair a phone: LAN-gated in the handler, never returns the code.
     (Method::POST, "/handshake/spoken-code", Exposure::Always),
-    // Onboarding: runs before any device pairs, and must not afterwards.
+    // Onboarding: tokenless from an unclaimed pond's host, else the claimant's token, never after.
     (Method::POST, "/onboard", Exposure::UntilOnboarded),
     (Method::POST, "/onboard/complete", Exposure::UntilOnboarded),
     // ...except the status probe: a tokenless client must learn whether it needs the wizard.
@@ -269,15 +277,18 @@ fn route_exposure(method: &Method, path: &str) -> Option<Exposure> {
         .map(|(_, _, exposure)| *exposure)
 }
 
-/// Whether a tokenless caller is answered. Pure, so no cached "onboarded" latch can make
-/// `POST /onboard/reset` a one-way door (`reset_never_becomes_a_one_way_door` guards it).
-fn public_without_token(exposure: Exposure, onboarded: bool, peer_is_loopback: bool) -> bool {
+/// Whether a tokenless caller is answered: the table in `pond-networking.md`, "Claim before
+/// onboarding". Pure, so no cached latch can make `POST /onboard/reset` a one-way door
+/// (`reset_never_becomes_a_one_way_door` guards it).
+fn public_without_token(exposure: Exposure, pond: PondSetup, peer_is_loopback: bool) -> bool {
     match exposure {
         Exposure::Always => true,
         Exposure::HostOnly => peer_is_loopback,
         Exposure::Authenticated => false,
-        Exposure::UntilOnboarded => !onboarded,
-        Exposure::UntilOnboardedThenHostOnly => !onboarded || peer_is_loopback,
+        Exposure::UntilOnboarded => peer_is_loopback && !pond.claimed && !pond.onboarded,
+        Exposure::UntilOnboardedThenHostOnly => {
+            peer_is_loopback && (!pond.claimed || pond.onboarded)
+        }
     }
 }
 
@@ -302,6 +313,25 @@ async fn pond_is_onboarded(state: &crate::AppState) -> bool {
                 error = %e,
                 "could not read onboarding state; treating the pond as set up so the \
                  onboarding write holes stay shut"
+            );
+            true
+        }
+    }
+}
+
+/// Whether a device has claimed the pond, read live for the reason onboarding is. A failed read
+/// counts as claimed, which narrows access; a pond with no setup record reads as unclaimed.
+async fn pond_is_claimed(state: &crate::AppState) -> bool {
+    let Some(claims) = state.setup_claims.as_ref() else {
+        return false;
+    };
+    match claims.claim_state().await {
+        Ok(claim) => claim.is_claimed(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not read the claim state; treating the pond as claimed so its wizard \
+                 needs a paired device's token"
             );
             true
         }
@@ -366,12 +396,19 @@ pub async fn auth_middleware(
             .unwrap_or(false);
 
     if let Some(exposure) = route_exposure(req.method(), path.path()) {
-        // Only onboarding-dependent classes read the database; the rest ignore `onboarded`.
-        let onboarded = matches!(
+        // Only the state-dependent classes read pond state; the rest ignore it.
+        let state_dependent = matches!(
             exposure,
             Exposure::UntilOnboarded | Exposure::UntilOnboardedThenHostOnly
-        ) && pond_is_onboarded(state.as_ref()).await;
-        if public_without_token(exposure, onboarded, peer_is_loopback) {
+        );
+        let onboarded = state_dependent && pond_is_onboarded(state.as_ref()).await;
+        // The claim changes the answer only for a loopback peer before onboarding.
+        let claimed = state_dependent
+            && peer_is_loopback
+            && !onboarded
+            && pond_is_claimed(state.as_ref()).await;
+        let pond = PondSetup { onboarded, claimed };
+        if public_without_token(exposure, pond, peer_is_loopback) {
             let mut req = req;
             // `onboarded` here only for host recovery: the one privileged anonymous caller.
             // The wizard's own requests stay unattributed.
@@ -560,23 +597,84 @@ mod tests {
         assert_eq!(clients.len(), 1, "only the fresh entry should remain");
     }
 
-    /// The middleware's decision minus the DB read, built from the same two functions it calls.
+    /// The middleware's decision minus the state reads, built from the same two functions it calls.
     fn answers_without_token(
         method: &Method,
         path: &str,
-        onboarded: bool,
+        pond: PondSetup,
         peer_is_loopback: bool,
     ) -> bool {
         match route_exposure(method, path) {
-            Some(exposure) => public_without_token(exposure, onboarded, peer_is_loopback),
+            Some(exposure) => public_without_token(exposure, pond, peer_is_loopback),
             None => false,
         }
     }
 
-    const ONBOARDED: bool = true;
-    const SETTING_UP: bool = false;
+    /// A fresh pond nobody has paired with: the widest state.
+    const SETTING_UP: PondSetup = PondSetup {
+        onboarded: false,
+        claimed: false,
+    };
+    /// A phone (or the desktop) has paired, and the wizard is not finished.
+    const CLAIMED: PondSetup = PondSetup {
+        onboarded: false,
+        claimed: true,
+    };
+    const ONBOARDED: PondSetup = PondSetup {
+        onboarded: true,
+        claimed: true,
+    };
+    /// Set up before setup records existed, or re-armed afterwards.
+    const ONBOARDED_UNCLAIMED: PondSetup = PondSetup {
+        onboarded: true,
+        claimed: false,
+    };
+    const EVERY_STATE: [PondSetup; 4] = [SETTING_UP, CLAIMED, ONBOARDED, ONBOARDED_UNCLAIMED];
     const FROM_THE_HOST: bool = true;
     const FROM_THE_LAN: bool = false;
+
+    /// Every cell of the spec's table, for both classes, from the host and from the LAN.
+    #[test]
+    fn the_claim_before_onboarding_table_holds_cell_by_cell() {
+        // (pond, peer, wizard writes, reset)
+        let cells = [
+            (SETTING_UP, FROM_THE_HOST, true, true),
+            (SETTING_UP, FROM_THE_LAN, false, false),
+            (CLAIMED, FROM_THE_HOST, false, false),
+            (CLAIMED, FROM_THE_LAN, false, false),
+            (ONBOARDED, FROM_THE_HOST, false, true),
+            (ONBOARDED, FROM_THE_LAN, false, false),
+            (ONBOARDED_UNCLAIMED, FROM_THE_HOST, false, true),
+            (ONBOARDED_UNCLAIMED, FROM_THE_LAN, false, false),
+        ];
+        for (pond, from_host, wizard, reset) in cells {
+            assert_eq!(
+                public_without_token(Exposure::UntilOnboarded, pond, from_host),
+                wizard,
+                "wizard writes, {pond:?}, loopback={from_host}"
+            );
+            assert_eq!(
+                public_without_token(Exposure::UntilOnboardedThenHostOnly, pond, from_host),
+                reset,
+                "POST /onboard/reset, {pond:?}, loopback={from_host}"
+            );
+        }
+        // The other classes ignore pond state entirely.
+        for pond in EVERY_STATE {
+            for from_host in [FROM_THE_HOST, FROM_THE_LAN] {
+                assert!(public_without_token(Exposure::Always, pond, from_host));
+                assert!(!public_without_token(
+                    Exposure::Authenticated,
+                    pond,
+                    from_host
+                ));
+                assert_eq!(
+                    public_without_token(Exposure::HostOnly, pond, from_host),
+                    from_host
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_is_public_route() {
@@ -661,12 +759,12 @@ mod tests {
             SETTING_UP,
             FROM_THE_HOST
         ));
-        // ...while the wizard's PUT is open while the wizard runs.
+        // ...while the wizard's PUT is open to the host while the wizard runs.
         assert!(answers_without_token(
             &Method::PUT,
             "/api/v1/settings",
             SETTING_UP,
-            FROM_THE_LAN
+            FROM_THE_HOST
         ));
 
         // GET /profiles listed the whole household.
@@ -681,7 +779,7 @@ mod tests {
             &Method::POST,
             "/api/v1/profiles",
             SETTING_UP,
-            FROM_THE_LAN
+            FROM_THE_HOST
         ));
 
         // DELETE /profiles/{id} removes a household member.
@@ -702,45 +800,94 @@ mod tests {
             &Method::PATCH,
             "/api/v1/profiles/abc-123",
             SETTING_UP,
-            FROM_THE_LAN
+            FROM_THE_HOST
         ));
     }
+
+    /// The wizard every client runs, desktop and phone alike.
+    const WIZARD_WRITES: [(Method, &str); 11] = [
+        (Method::PUT, "/api/v1/settings"),
+        (Method::POST, "/api/v1/profiles"),
+        (Method::PATCH, "/api/v1/profiles/abc-123"),
+        (Method::POST, "/api/v1/onboard"),
+        (Method::POST, "/api/v1/onboard/complete"),
+        (Method::POST, "/api/v1/onboard/step/Basics"),
+        (Method::POST, "/api/v1/location/detect"),
+        (Method::GET, "/api/v1/warmup"),
+        (Method::POST, "/api/v1/voice/tts/apply"),
+        (Method::POST, "/api/v1/voice/calibrate"),
+        (Method::DELETE, "/api/v1/voice/calibrate"),
+    ];
 
     /// Being on the host is no excuse; only `/onboard/reset` gets one.
     #[test]
     fn the_onboarding_write_holes_close_once_the_pond_is_set_up() {
-        for (method, path) in [
-            (Method::PUT, "/api/v1/settings"),
-            (Method::POST, "/api/v1/profiles"),
-            (Method::PATCH, "/api/v1/profiles/abc-123"),
-            (Method::POST, "/api/v1/onboard"),
-            (Method::POST, "/api/v1/onboard/complete"),
-            (Method::POST, "/api/v1/onboard/step/Basics"),
-            (Method::POST, "/api/v1/voice/calibrate"),
-            (Method::DELETE, "/api/v1/voice/calibrate"),
-        ] {
+        for (method, path) in WIZARD_WRITES {
             assert!(
-                answers_without_token(&method, path, SETTING_UP, FROM_THE_LAN),
-                "{method} {path} must be open while the wizard runs, or onboarding \
-                 deadlocks on a pond nobody can finish setting up"
+                answers_without_token(&method, path, SETTING_UP, FROM_THE_HOST),
+                "{method} {path} must be open to the host while an unclaimed pond's wizard \
+                 runs, or the desktop cannot set up a pond it has not paired with"
             );
-            assert!(
-                !answers_without_token(&method, path, ONBOARDED, FROM_THE_LAN),
-                "{method} {path} must close once the pond is set up"
-            );
-            assert!(
-                !answers_without_token(&method, path, ONBOARDED, FROM_THE_HOST),
-                "{method} {path} must close once the pond is set up -- being on the \
-                 host is a recovery excuse for /onboard/reset alone"
-            );
+            for pond in [ONBOARDED, ONBOARDED_UNCLAIMED] {
+                assert!(
+                    !answers_without_token(&method, path, pond, FROM_THE_LAN),
+                    "{method} {path} must close once the pond is set up"
+                );
+                assert!(
+                    !answers_without_token(&method, path, pond, FROM_THE_HOST),
+                    "{method} {path} must close once the pond is set up -- being on the \
+                     host is a recovery excuse for /onboard/reset alone"
+                );
+            }
         }
 
         // The status probe must stay open: tokenless clients ask it whether they need the wizard.
-        assert!(answers_without_token(
-            &Method::GET,
-            "/api/v1/onboard/status",
-            ONBOARDED,
-            FROM_THE_LAN
+        for pond in EVERY_STATE {
+            assert!(answers_without_token(
+                &Method::GET,
+                "/api/v1/onboard/status",
+                pond,
+                FROM_THE_LAN
+            ));
+        }
+    }
+
+    /// Until P4 any LAN peer could drive a fresh pond's wizard; a phone now claims it first.
+    #[test]
+    fn no_tokenless_lan_peer_drives_the_wizard_in_any_state() {
+        for (method, path) in WIZARD_WRITES {
+            for pond in EVERY_STATE {
+                assert!(
+                    !answers_without_token(&method, path, pond, FROM_THE_LAN),
+                    "{method} {path} answered a tokenless LAN peer in {pond:?}"
+                );
+            }
+        }
+        for pond in EVERY_STATE {
+            assert!(!answers_without_token(
+                &Method::POST,
+                "/api/v1/onboard/reset",
+                pond,
+                FROM_THE_LAN
+            ));
+        }
+    }
+
+    /// Once a device has claimed the pond, the wizard is that device's: being on the host is no
+    /// longer enough, and the claimant's token is what admits it.
+    #[test]
+    fn a_claimed_pond_refuses_the_tokenless_host_until_it_is_set_up() {
+        for (method, path) in WIZARD_WRITES {
+            assert!(
+                !answers_without_token(&method, path, CLAIMED, FROM_THE_HOST),
+                "{method} {path} answered a tokenless host caller on a claimed pond"
+            );
+        }
+        assert!(!answers_without_token(
+            &Method::POST,
+            "/api/v1/onboard/reset",
+            CLAIMED,
+            FROM_THE_HOST
         ));
     }
 
@@ -771,18 +918,30 @@ mod tests {
              can only be repaired by reflashing it"
         );
 
-        // A reset pond is a fresh install: the wizard's routes reopen to anyone.
-        for (method, path) in [
-            (Method::PUT, "/api/v1/settings"),
-            (Method::POST, "/api/v1/profiles"),
-            (Method::PATCH, "/api/v1/profiles/abc-123"),
-            (Method::POST, "/api/v1/onboard/step/Basics"),
-            (Method::POST, "/api/v1/onboard/complete"),
-        ] {
+        // An unclaimed reset pond is a fresh install: the wizard reopens to the host.
+        for (method, path) in WIZARD_WRITES {
             assert!(
-                answers_without_token(&method, path, SETTING_UP, FROM_THE_LAN),
+                answers_without_token(&method, path, SETTING_UP, FROM_THE_HOST),
                 "{method} {path} must reopen after a reset, or a reset pond can only \
                  be fixed by reflashing it"
+            );
+        }
+
+        // A claimed reset pond reopens to a paired device's token. One that has lost every token
+        // is still not stuck: pairing answers in every state, so the host pairs again (as it
+        // already must to re-pair), and `setup-code --rearm` returns it to the column above.
+        for (method, path) in [
+            (Method::GET, "/api/v1/handshake/pairing-code"),
+            (Method::POST, "/api/v1/handshake/pairing-code"),
+            (Method::POST, "/api/v1/handshake/init"),
+            (Method::POST, "/api/v1/handshake/verify"),
+            (Method::POST, "/api/v1/handshake/pake/init"),
+            (Method::POST, "/api/v1/handshake/pake/verify"),
+        ] {
+            assert!(
+                answers_without_token(&method, path, CLAIMED, FROM_THE_HOST),
+                "{method} {path} must answer a claimed, reset pond's host, or a pond that lost \
+                 every token can only be repaired by reflashing it"
             );
         }
     }
@@ -821,7 +980,7 @@ mod tests {
             "POST /test/speak = HostOnly".to_string(),
             "POST /tts = HostOnly".to_string(),
             "POST /voice/calibrate = UntilOnboarded".to_string(),
-            // The wizard's voice step runs before any token exists; it closes after onboarding.
+            // The wizard's voice step; tokenless only on an unclaimed pond's host, until onboarded.
             "POST /voice/tts/apply = UntilOnboarded".to_string(),
             "PUT /settings = UntilOnboarded".to_string(),
         ];
