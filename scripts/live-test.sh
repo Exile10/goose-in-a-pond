@@ -363,6 +363,10 @@ if [ "$AUTH_OK" -eq 1 ]; then
   if ! POND_DATA_DIR="$AUTH_DIR" POND_SERVER_BIN="$BIN" python3 scripts/setup_code_checks.py card; then
     RC=1
   fi
+  # Its claimant can ask for a voice sample; nothing here asks for one that would make a sound.
+  if ! POND_DATA_DIR="$AUTH_DIR" POND_SERVER_BIN="$BIN" python3 scripts/setup_code_checks.py voice-sample; then
+    RC=1
+  fi
 
   if ! POND_DATA_DIR="$AUTH_DIR" python3 scripts/remote_auth_checks.py; then
     RC=1

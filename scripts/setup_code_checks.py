@@ -6,6 +6,10 @@
   pairing  a fresh pond reports `unclaimed`, and a pairing-code pairing (the dashboard's loopback
            HMAC) claims it too
   restart  the claim survived a restart
+  voice-sample
+           the voice sample needs the claimant's token, takes a voice and nothing else, and refuses
+           a voice that is not installed (or the whole route, on a pond with no voice engine)
+           without making a sound
   reset-wizard
            after a host reset of the pond `card` claimed: its wizard refuses the tokenless host and
            admits the claimant's token, completing it makes the claiming phone the primary
@@ -139,6 +143,19 @@ def restart():
     check("the claim survives a restart", status() == "claimed", status())
 
 
+def voice_sample():
+    bearer = {"Authorization": "Bearer " + json.loads(CLAIMANT.read_text())["session_token"]}
+    code, _, text, _ = request("POST", "/voice/sample", {"voice": "af_heart"})
+    check("the voice sample refuses a caller with no token", code == 401, "%s %s" % (code, text[:200]))
+    code, _, text, body = request("POST", "/voice/sample", {"voice": "af_heart", "text": "hi"}, bearer)
+    check("the voice sample takes no text from the caller",
+          code == 400 and body == {"error": "invalid request body"}, "%s %s" % (code, text[:200]))
+    code, _, text, body = request("POST", "/voice/sample", {"voice": "zz_not_installed"}, bearer)
+    check("an uninstalled voice is 404 unknown_voice, or 503 voice_unavailable with no engine",
+          (code, body) in ((404, {"error": "unknown_voice"}), (503, {"error": "voice_unavailable"})),
+          "%s %s" % (code, text[:200]))
+
+
 def reset_wizard():
     bearer = {"Authorization": "Bearer " + json.loads(CLAIMANT.read_text())["session_token"]}
 
@@ -174,5 +191,6 @@ def reset_wizard():
 
 if __name__ == "__main__":
     pond_cpace.check_vectors()
-    {"card": card, "pairing": pairing, "restart": restart, "reset-wizard": reset_wizard}[sys.argv[1]]()
+    {"card": card, "pairing": pairing, "restart": restart, "voice-sample": voice_sample,
+     "reset-wizard": reset_wizard}[sys.argv[1]]()
     sys.exit(1 if FAILURES else 0)

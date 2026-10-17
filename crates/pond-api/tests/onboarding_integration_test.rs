@@ -246,6 +246,7 @@ async fn app_with(
         mesh_rebuild: None,
         setup_claims,
         spoken_codes: Default::default(),
+        voice_samples: Default::default(),
     });
     (
         // As the dashboard listener wires it, so host recovery can present the credential.

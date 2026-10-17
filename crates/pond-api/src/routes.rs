@@ -131,6 +131,13 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Voice preview before pairing; a loopback peer without a token needs the host credential.
         .route("/tts", post(tts_synthesise))
         .route("/voice/tts/apply", post(apply_tts_settings))
+        // Hearing a voice before choosing it; a paired token in every state (PUBLIC_ROUTES).
+        .route(
+            "/voice/sample",
+            post(crate::voice_sample::voice_sample).layer(axum::extract::DefaultBodyLimit::max(
+                crate::voice_sample::VOICE_SAMPLE_BODY_LIMIT,
+            )),
+        )
         // Wake-word phrase calibration (public — used during onboarding WakeWord step)
         .route("/voice/calibrate", post(calibrate_wake_word))
         .route("/voice/calibrate", delete(reset_wake_word_calibration))

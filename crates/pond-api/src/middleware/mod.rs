@@ -219,6 +219,8 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::POST, "/voice/tts/apply", Exposure::UntilOnboarded),
     (Method::POST, "/voice/calibrate", Exposure::UntilOnboarded),
     (Method::DELETE, "/voice/calibrate", Exposure::UntilOnboarded),
+    // Speaks on the pond's speaker, so never tokenless; public only to skip the onboarding guard.
+    (Method::POST, "/voice/sample", Exposure::Authenticated),
     // Discovery needs system info before pairing; transcription and diagnostics stay protected.
     (Method::GET, "/system/info", Exposure::Always),
     (Method::GET, "/test", Exposure::HostOnly),
@@ -718,6 +720,7 @@ mod tests {
         // Refused in the WIDEST state (mid-onboarding, on the host) means refused everywhere.
         for (method, path) in [
             (Method::POST, "/api/v1/handshake/revoke"),
+            (Method::POST, "/api/v1/voice/sample"),
             (Method::POST, "/api/v1/transcribe"),
             (Method::GET, "/api/v1/dev/goose"),
             (Method::POST, "/api/v1/oauth/authorize"),
@@ -980,6 +983,8 @@ mod tests {
             "POST /test/speak = HostOnly".to_string(),
             "POST /tts = HostOnly".to_string(),
             "POST /voice/calibrate = UntilOnboarded".to_string(),
+            // A paired device hears a voice before choosing it, during onboarding too.
+            "POST /voice/sample = Authenticated".to_string(),
             // The wizard's voice step; tokenless only on an unclaimed pond's host, until onboarded.
             "POST /voice/tts/apply = UntilOnboarded".to_string(),
             "PUT /settings = UntilOnboarded".to_string(),
