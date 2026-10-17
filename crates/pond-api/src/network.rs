@@ -19,45 +19,12 @@ pub struct CompanionTransport {
 #[derive(Clone, Default)]
 pub struct EmbeddedAddress(pub std::sync::Arc<std::sync::RwLock<Option<String>>>);
 
-/// Whether an address belongs to Tailscale's IPv4 or IPv6 allocations.
-pub fn is_tailnet(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v) => u32::from(v) & 0xffc0_0000 == 0x6440_0000,
-        IpAddr::V6(v) => v.to_ipv4_mapped().map_or_else(
-            || v.octets()[..6] == [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0],
-            |v| is_tailnet(v.into()),
-        ),
-    }
-}
+pub use pond_core::network::domain::interface::is_tailnet;
 
-/// Exclude tunnels and container-only networks from the home LAN boundary. Overlay VPNs
-/// that present as Ethernet (ZeroTier, NetBird, Hamachi, Nebula) are not point-to-point, so
-/// only their names give them away; a peer reached through one is not in the house.
+/// Exclude tunnels and container-only networks from the home LAN boundary; the classification is
+/// pond-core's, shared with the setup channel's advertising decision.
 pub fn is_lan_interface(interface: &Interface) -> bool {
-    !interface.is_loopback()
-        && !interface.is_link_local()
-        && !is_tailnet(interface.ip())
-        && ![
-            "tailscale",
-            "utun",
-            "tun",
-            "tap",
-            "wg",
-            "wt",
-            "zt",
-            "feth",
-            "ham",
-            "nebula",
-            "ipsec",
-            "gif",
-            "stf",
-            "ppp",
-            "docker",
-            "veth",
-            "virbr",
-        ]
-        .iter()
-        .any(|prefix| interface.name.starts_with(prefix))
+    pond_core::network::domain::interface::is_lan_address(&interface.name, interface.ip())
 }
 
 /// Read current interface addresses; callers must fail closed on an error.
