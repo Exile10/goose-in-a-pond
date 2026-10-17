@@ -146,6 +146,36 @@ sends its pin in `hello` and the phone puts that pin into the channel identifier
 over HTTPS. A substituted pin fails confirmation the same way. **A completed exchange therefore
 proves the pin**, which is what lets a pond with no screen hand a phone its TLS identity.
 
+### Wire contract over the LAN (P3)
+
+The setup code and the spoken code reach a pond over the companion HTTPS listener first; the setup
+channel carries the same exchange later.
+
+- **Setup exchange.** `POST /api/v1/handshake/pake/init` takes an optional `"credential"`,
+  `"setup"` or `"pairing"` (absent means `"pairing"`; anything else is `400 invalid_credential`).
+  For `"setup"` the password is the eleven ASCII digits, and the channel identifier is
+  `lv_cat("goose-setup-cpace-v1", pin, client_id)`, so the two secrets never share a generator.
+  Everything else (session id, shares, tags, `verify`) is the pairing exchange unchanged.
+- **Setup refusals at `init`:** `409 {"error":"setup_code_unavailable"}` (claimed, or no code), and
+  `429 {"error":"setup_code_cooling","retry_after":<seconds>}` with a `Retry-After` header. The LAN
+  rule (`403 pairing_requires_lan`) and the existing refusals apply as before.
+- **Setup `verify`:** a run that confirms latches the claim, then registers the device (bound to the
+  household's only member if it has exactly one, otherwise to nobody) and mints its tokens. If
+  another device claimed in between, it answers `accepted: false` with
+  `setup_code_unavailable` and mints nothing. A setup run never answers `code_retired`.
+- **Every other pairing claims too.** A device that pairs with a pairing code, over loopback or by
+  CPace, latches the claim. A pond that already had paired devices when its setup record was made
+  is created claimed.
+- **Spoken code.** `POST /api/v1/handshake/spoken-code`, no body, no token, loopback or direct LAN
+  peers only. It issues an ordinary pairing code and reads it aloud; the phone then pairs with
+  `"credential": "pairing"`. Answers `202 {"spoken":true,"expires_at":"<RFC3339>"}`,
+  `429 {"error":"spoken_code_limited","retry_after":<seconds>}` with `Retry-After`,
+  `403 {"error":"spoken_codes_disabled"}` when the household turned it off (`spoken_pairing_codes`,
+  default on), and `503 {"error":"announcer_unavailable"}` when the pond cannot make a sound. **No
+  answer ever carries the code.**
+- **Discovery.** The `_pond._tcp` TXT record gains `id=<discriminator>` and, while unclaimed,
+  `setup=1`, so a phone that scanned a card connects to the pond with that `id`.
+
 ### Claim before onboarding
 
 Today a fresh pond's wizard is open to every LAN peer. With claiming in place, the wizard's writes
@@ -204,9 +234,9 @@ log or return it, and zeroizes its copy.
 | Phase | Scope | Status |
 |---|---|---|
 | P0 | This design | DESIGNED 2026-10-16 |
-| P1 | `pond-core/src/network/`: setup code, card, discriminator, claim policy, guess and spoken-code limits, `SetupCodeStore` and `CodeAnnouncer` ports; `FileSetupCodeStore`. Wi-Fi, transport and capability ports wait for the phases that use them | in progress |
+| P1 | `pond-core/src/network/`: setup code, card, discriminator, claim policy, guess and spoken-code limits, `SetupCodeStore` and `CodeAnnouncer` ports; `FileSetupCodeStore`. Wi-Fi, transport and capability ports wait for the phases that use them | LANDED 2026-10-16 |
 | P2 | Move interface classification and mDNS behind the context's ports; `GET /api/v1/network/status` with capabilities | not started |
-| P3 | `pond-server setup-code`, card at install and provision; CPace against the setup code with the claim latch; spoken fallback with bundled clips; goose-on-the-go reads `pond://setup` | not started |
+| P3 | `pond-server setup-code`, card at install and provision; CPace against the setup code with the claim latch; spoken fallback with bundled clips; goose-on-the-go reads `pond://setup` | LANDED 2026-10-17, server side (the wire contract above; Mac unit, route and live tests; no phone or Orin run yet). goose-on-the-go's half lands in its own repo |
 | P4 | Claim before onboarding; owner setup in goose-on-the-go | not started |
 | P5 | Setup channel and BLE: macOS adapter first (the Mac development loop), then Linux, verified on the Jetson last; Wi-Fi join | not started |
 | P6 | Connectivity watchdog; SoftAP and captive page on Linux | not started |
