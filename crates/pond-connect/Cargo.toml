@@ -23,6 +23,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 zeroize = "1"
 
+# The radio stacks, one table per OS, so neither adapter's dependencies reach the other's build.
+[target.'cfg(target_os = "linux")'.dependencies]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+
 [dev-dependencies]
 pond-core = { workspace = true, features = ["test-mocks"] }
 anyhow = { workspace = true }
