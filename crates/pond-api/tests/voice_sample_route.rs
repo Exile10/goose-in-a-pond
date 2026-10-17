@@ -113,10 +113,12 @@ async fn harness() -> Harness {
     harness_with(true).await
 }
 
-/// A phone paired over the LAN with a fresh pairing code; its session token.
+/// A phone paired with a fresh pairing code; its session token. Paired over loopback, because
+/// pairing needs a peer on one of the host's own LAN subnets, which a fixed address only is on some
+/// machines; the sample route takes the token from any peer.
 async fn paired(h: &Harness, client: &str) -> String {
     let code = h.handshake.issue_pairing_code().await.unwrap().code;
-    let (status, body) = pair_phone(&h.lan, &code, client, TEST_SPKI_PIN).await;
+    let (status, body) = pair_phone(&h.loopback, &code, client, TEST_SPKI_PIN).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     body["session_token"].as_str().unwrap().to_string()
 }
