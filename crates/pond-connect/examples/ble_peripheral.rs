@@ -1,10 +1,12 @@
-//! Serves the setup channel over this host's BLE peripheral for an unclaimed, in-memory pond
-//! (`Pond 7f3a`), so the radio can be checked with btmon and a generic BLE app without changing a
-//! real pond's claim. It answers `hello`; the exchange needs a real pond. Stop the real pond
-//! first, or a phone sees two setup services on one adapter.
+//! Serves the setup channel over this host's BLE peripheral for an unclaimed, throwaway pond
+//! (`Pond 7f3a`, setup code `7992-739-8713`), so the radio and a phone's whole claim can be
+//! checked without touching a real pond's claim. Its handshake runs on a temporary database.
+//!
+//! `--offline` reports no network, so a phone shows its Wi-Fi list. A join is refused unless
+//! `--allow-join` is given: on a headless board, a wrong join cuts off the only way in.
 //!
 //! ```text
-//! cargo run -p pond-connect --example ble_peripheral -- [seconds, default 300]
+//! cargo run -p pond-connect --example ble_peripheral -- [seconds, default 300] [--offline] [--allow-join]
 //! ```
 
 use std::sync::Arc;
@@ -13,34 +15,62 @@ use std::time::Duration;
 use async_trait::async_trait;
 use pond_connect::ble::{self, Advertisement};
 use pond_connect::setup_channel::{SetupChannel, SetupChannelConfig, SetupChannelContext};
+use pond_core::network::domain::capability::Availability;
+use pond_core::network::domain::wifi::{
+    JoinedNetwork, NetworkStatus, WifiCapabilities, WifiJoinError, WifiNetwork, WifiPassphrase,
+    WifiScanError,
+};
 use pond_core::network::mocks::mock_setup_code_store::MockSetupCodeStore;
+use pond_core::network::ports::wifi_station::WifiStation;
 use pond_core::network::services::setup_claim::SetupClaimService;
 use pond_core::network::services::spoken_code::SpokenCodeService;
-use pond_core::security::ports::handshake::{
-    Handshake, HandshakeRequest, HandshakeResponse, TokenCaller,
-};
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+use pond_infra::db::Database;
+use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 
-/// Issues and knows no token: `hello` needs none, and the exchange is a real pond's to check.
-struct NoTokens;
+/// The host's real station, reporting no network when asked and joining only when allowed.
+struct GuardedStation {
+    inner: Arc<dyn WifiStation>,
+    offline: bool,
+    allow_join: bool,
+}
 
 #[async_trait]
-impl Handshake for NoTokens {
-    async fn handshake(&self, _: HandshakeRequest) -> anyhow::Result<HandshakeResponse> {
-        anyhow::bail!("this example pond does not pair")
+impl WifiStation for GuardedStation {
+    async fn capabilities(&self) -> WifiCapabilities {
+        let real = self.inner.capabilities().await;
+        WifiCapabilities {
+            scan: real.scan,
+            join: if self.allow_join {
+                real.join
+            } else {
+                Availability::unavailable("this example joins only with --allow-join")
+            },
+        }
     }
-    async fn validate_token(&self, _: &str) -> anyhow::Result<bool> {
-        Ok(false)
+
+    async fn scan(&self) -> Result<Vec<WifiNetwork>, WifiScanError> {
+        self.inner.scan().await
     }
-    async fn caller_for_token(&self, _: &str) -> anyhow::Result<Option<TokenCaller>> {
-        Ok(None)
+
+    async fn join(
+        &self,
+        ssid: &str,
+        passphrase: Option<&WifiPassphrase>,
+        hidden: bool,
+    ) -> Result<JoinedNetwork, WifiJoinError> {
+        if !self.allow_join {
+            return Err(WifiJoinError::NotPermitted);
+        }
+        self.inner.join(ssid, passphrase, hidden).await
     }
-    async fn revoke_device(&self, _: &str) -> anyhow::Result<u64> {
-        Ok(0)
-    }
-    async fn revoke_token(&self, _: &str) -> anyhow::Result<()> {
-        Ok(())
+
+    async fn status(&self) -> NetworkStatus {
+        if self.offline {
+            return NetworkStatus::disconnected();
+        }
+        self.inner.status().await
     }
 }
 
@@ -49,28 +79,50 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
-    let seconds: u64 = std::env::args()
-        .nth(1)
-        .and_then(|arg| arg.parse().ok())
-        .unwrap_or(300);
-    let claims = Arc::new(SetupClaimService::new(Arc::new(
-        MockSetupCodeStore::unclaimed(),
-    )));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let seconds: u64 = args.iter().find_map(|arg| arg.parse().ok()).unwrap_or(300);
+    let offline = args.iter().any(|arg| arg == "--offline");
+    let allow_join = args.iter().any(|arg| arg == "--allow-join");
+
+    let store = MockSetupCodeStore::unclaimed();
+    let card = store
+        .record()
+        .expect("the mock store holds a record")
+        .card();
+    let claims = Arc::new(SetupClaimService::new(Arc::new(store)));
+    let scratch = tempfile::tempdir().expect("a temporary directory");
+    let db = Database::init(scratch.path())
+        .await
+        .expect("the temporary database");
+    // Any well-formed pin will do: the phone binds the one `hello` reports, and no TLS follows.
+    let pin = format!("sha256/{}=", "A".repeat(43));
+    let handshake = SqliteHandshakeAdapter::new(db.system.clone(), Some(pin.clone()))
+        .with_setup_claims(claims.clone());
+    println!(
+        "card {} setup code {} offline={offline} allow_join={allow_join}",
+        ble::local_name(MockSetupCodeStore::DISCRIMINATOR),
+        card.code.display()
+    );
+
     let channel = SetupChannel::new(
         SetupChannelContext::new(
             SetupChannelConfig {
                 discriminator: MockSetupCodeStore::DISCRIMINATOR,
-                pin: "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                pin,
                 https_port: 8443,
                 hostname: "pond-example".into(),
             },
-            Arc::new(NoTokens),
+            Arc::new(handshake),
             Arc::new(SpokenCodeService::default()),
             Arc::new(MockSettingsRepository::new()),
             Arc::new(MockProfileRepository::new()),
         )
         .with_claims(claims)
-        .with_wifi(pond_connect::wifi::platform()),
+        .with_wifi(Arc::new(GuardedStation {
+            inner: pond_connect::wifi::platform(),
+            offline,
+            allow_join,
+        })),
     );
     let peripheral = ble::platform();
     if let Err(error) = peripheral.start(Arc::new(channel)).await {
