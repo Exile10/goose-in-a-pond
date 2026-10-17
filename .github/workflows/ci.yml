@@ -197,7 +197,8 @@ jobs:
             -p pond-mcp-server \
             -p pond-adapters-mistralrs \
             -p pond-hf-cache \
-            -p pond-net
+            -p pond-net \
+            -p pond-connect
 
       # --ignored is NOT passed so the 28 live-hardware tests are skipped.
       - name: cargo test (fast crates)
@@ -223,7 +224,8 @@ jobs:
             -p pond-mesh-protocol \
             -p pond-mcp-server \
             -p pond-hf-cache \
-            -p pond-net
+            -p pond-net \
+            -p pond-connect
 
       # Gate the PRODUCTION binary's compilation (pulls the Goose submodule); slow on a cold cache.
       # `--all-targets` is load-bearing: without a target selector cargo builds lib + bins ONLY, so

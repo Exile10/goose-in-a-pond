@@ -1,0 +1,37 @@
+[package]
+name = "pond-connect"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "How a pond is found and reached: the BLE setup channel and its Wi-Fi station"
+
+[features]
+# Re-exports pond-core's mock station for the radio adapters' own tests.
+test-mocks = ["pond-core/test-mocks"]
+
+[dependencies]
+# Policy and ports only. No pond-api, no pond-server: they wire this crate, never the reverse.
+pond-core = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zeroize = "1"
+
+[dev-dependencies]
+pond-core = { workspace = true, features = ["test-mocks"] }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+# The real handshake and the phone's half of CPace, so the end-to-end test pairs like a phone.
+pond-infra = { workspace = true, features = ["cpace-client"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
