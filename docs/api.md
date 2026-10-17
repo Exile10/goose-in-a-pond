@@ -395,7 +395,9 @@ early: the run itself always uses the Pond's own pin.
 `credential` (2026-10-17) names the secret the phone holds: `"pairing"`, a six-digit pairing
 code, or `"setup"`, the eleven-digit code on the pond's printed setup card. Absent means
 `"pairing"`, so a phone that predates it pairs unchanged; goose-on-the-go omits it for a pairing
-code. Any other value, `null` included, is `400 {"error": "invalid_credential"}`. For `"setup"`
+code. Any other value, `null` included, is `400 {"error": "invalid_credential"}`; so is
+`"device"`, which only the BLE setup channel takes (a paired phone uses `/handshake/refresh`
+here). For `"setup"`
 the PRS is the eleven ASCII digits and CI is `lv_cat("goose-setup-cpace-v1", spki_pin, client_id)`,
 so the two secrets never share a generator; everything else, `verify` included, is the exchange
 above. The vector file's `setup` entry is one such run.
@@ -436,7 +438,7 @@ whatever the status:
 | init | 409 | `no_active_pairing_code` | No live code; show a new one |
 | init | 400 | `invalid_client_nonce` | `client_nonce` is not 32 bytes of base64 |
 | init | 503 | `pairing_busy` | Too many runs are waiting for their verify; retry shortly |
-| init | 400 | `invalid_credential` | `credential` is not `"setup"` or `"pairing"` |
+| init | 400 | `invalid_credential` | `credential` is not `"setup"` or `"pairing"` (`"device"` is the setup channel's only) |
 | init | 409 | `setup_code_unavailable` | `"setup"` on a pond that is claimed or has no setup code |
 | init | 429 | `setup_code_cooling` | Too many wrong setup codes; `retry_after` (whole seconds) and a `Retry-After` header say when |
 | verify | 429 | `pairing_busy` | The per-IP verify limit (10 a minute); `retry_after_secs` says when |

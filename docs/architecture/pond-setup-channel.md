@@ -7,8 +7,8 @@ over HTTPS on the address the pond reports. This document is the contract both s
 pond in `crates/pond-connect`, the phone in goose-on-the-go.
 
 Status: **DESIGNED 2026-10-17; P5a LANDED 2026-10-17** (the OS-independent core); **P5b BUILT
-2026-10-17** (the macOS adapters and the server wiring; a phone over a granted app still owed). See
-[Phases](#phases).
+2026-10-17** (the macOS adapters and the server wiring; a phone over a granted app still owed);
+**P5e LANDED 2026-10-17** (resuming as a paired device). See [Phases](#phases).
 
 ## Decisions
 
@@ -32,6 +32,9 @@ Status: **DESIGNED 2026-10-17; P5a LANDED 2026-10-17** (the OS-independent core)
 | 2026-10-17 | **On macOS a refused central gets ATT error `0x03` (Write Not Permitted) on every `rx` write until it disconnects.** | CoreBluetooth gives a peripheral no way to drop a central. A second phone while one is connected, and a phone whose session ended, both meet it; the phone should read it as the session being over, and disconnect. |
 | 2026-10-17 | **`ble_setup_enabled` is the household's switch, on by default.** Off: no advertising and every new phone refused; a pond that starts with it off never touches the radio. A session already open runs to its own end. | Settings > Privacy, in both desktop settings views. A switch that reached into an open session would be the advertising controller ending one, which correction 5 rules out. |
 | 2026-10-17 | **The macOS helper speaks NDJSON on its stdin and stdout, and every per-phone message names a `link`**, one central's subscription, numbered by the helper and never reused. | A command meant for a phone that left and came back must reach nothing: the same captured-identity rule the desktop's voice child follows. |
+| 2026-10-17 | **A device run is charged to its `client_id` when `pake_init` starts it, and a success clears the count**, as the setup code's throttle is charged at `init`. P5e, pond-side. | Charged at `verify`, runs started together would all reach the tag check; charged at `init`, at most five do. So a run the phone abandons counts as one of the five. |
+| 2026-10-17 | **A device run that confirms after its session was rotated (an HTTPS `refresh` in between) answers `invalid_or_expired_refresh`** and mints nothing. P5e, pond-side. | The phone proved it held that token, so `invalid_confirmation` would be untrue, and only the holder can reach this answer, so it tells nobody else anything. It is `refresh`'s own code for the same state. |
+| 2026-10-17 | **A resume is audited as `auth.device_resumed` (or `auth.device_resume_failed`), `method: "cpace-device"`**, never as `auth.device_paired`. P5e, pond-side. | It mints no device and changes no attribution; recording it as a pairing would read as a new phone in the household. |
 
 ## Crate layout
 
@@ -128,8 +131,8 @@ own connection started; any other `challenge_id` is `unknown_challenge` and spen
 |---|---|---|
 | `hello` | none | `protocol: 1`, `pond_id` (the discriminator), `claimed`, `pin` (`sha256/...`), `capabilities` (subset of `wifi_scan`, `wifi_join`, `spoken_code`) |
 | `spoken_code` | none | as `POST /handshake/spoken-code`: `spoken`, `expires_at`; or `spoken_code_limited`, `spoken_codes_disabled`, `announcer_unavailable`. The code is never sent. |
-| `pake_init` | as `POST /handshake/pake/init`: `credential`, `client_id`, `client_type`, `client_version`, `channel_binding` (the `pin` from `hello`), `client_nonce` | as the HTTPS answer: `challenge_id`, `challenge`, `expires_at`, `suite`, `share`; or its refusals |
-| `pake_verify` | as `POST /handshake/pake/verify`: `challenge_id`, `device_name`, `share`, `confirm` | `ok: true`, `accepted: true`, `server_proof` (hex) and `sealed`; or `ok: false`, `accepted: false`, `error` and `rejection_reason` (the same code) |
+| `pake_init` | as `POST /handshake/pake/init`: `credential` (`setup`, `pairing`, or here only `device`), `client_id`, `client_type`, `client_version`, `channel_binding` (the `pin` from `hello`), `client_nonce` | as the HTTPS answer: `challenge_id`, `challenge`, `expires_at`, `suite`, `share`; or its refusals, plus `device_cooling` with `retry_after` |
+| `pake_verify` | as `POST /handshake/pake/verify`: `challenge_id`, `device_name`, `share`, `confirm` | `ok: true`, `accepted: true`, `server_proof` (hex) and `sealed`; or `ok: false`, `accepted: false`, `error` and `rejection_reason` (the same code; for a device run, `invalid_or_expired_refresh` too) |
 
 The exchange is the HTTPS one exactly: the same channel identifiers (`goose-pair-cpace-v1` or
 `goose-setup-cpace-v1`, with the pond's pin and the `client_id`), the same claim latch, guess
@@ -166,7 +169,7 @@ key schedule for the CPace vectors' setup-run `ISK` and `sid`, a session's first
 messages in order (`k_p2c` 0 in `pake_verify`, `k_c2p` 0, `k_p2c` 1, `k_c2p` 1), and two framed
 messages at ATT_MTU 23, so the phone can check itself byte for byte, as it does for CPace.
 
-### Resuming as a paired device (P5e, designed 2026-10-17)
+### Resuming as a paired device (P5e, designed and landed 2026-10-17)
 
 A phone that already paired with this pond can open a sealed channel with no code: after a BLE
 session dropped between the claim and `wifi_join`, or when a claimed pond lost its network and
@@ -186,6 +189,35 @@ nobody wants to ask it to speak. It proves it holds its own refresh token withou
   The password has 256 bits, so this bounds load, not guessing.
 - Trust: anyone who can read `pond_system.db` holds every refresh hash, and so could resume as any
   device; that reader already holds the household. An eavesdropper learns nothing (CPace).
+
+As built (P5e, 2026-10-17):
+
+- **Init.** `credential: "device"` on `pake_init`, everything else as the pairing exchange. The
+  password is the 64 ASCII characters of the hash; the digest's 32 raw bytes, or upper-case hex,
+  fail confirmation (the vectors' `raw_digest` and `uppercase_hash` negatives). CI is
+  `lv_cat("goose-device-cpace-v1", pin, client_id)`. The pond commits to the newest row with
+  `device_id = client_id`, `revoked_at` unset and `refresh_expires_at` in the future; with none, to
+  64 random lowercase hex characters, a fresh stand-in per run, by the same path to
+  `invalid_confirmation`. Only a debug line (`device_run_unpaired`) says which case it was.
+- **Refusals at init**, in the clear and `ok: false`: `device_cooling` with `retry_after` (whole
+  seconds) once five runs for that `client_id` started inside ten rolling minutes without a
+  success; the connection's three-`pake_init` allowance applies as for any credential. The count
+  is charged when a run starts (decisions table), lives in memory, and is keyed by the claimed
+  `client_id` whether or not it is paired, so the limit reveals nothing either. At most 256 ids
+  are tracked; past that the stalest is dropped, which helps nobody, since a fresh id per attempt
+  does as much.
+- **Verify.** A confirmed run revokes the committed row and mints a new pair for the same device,
+  client and client type in one `BEGIN IMMEDIATE` transaction, the one `/handshake/refresh` now
+  shares. `sealed` holds that `HandshakeResponse`. No claim latch, no pairing code, no `devices`
+  write: the run's `device_name` renames nothing, and the device keeps its member. If the row was
+  rotated or revoked between init and verify, the answer is `invalid_or_expired_refresh` and
+  nothing is minted.
+- **HTTPS.** `pake/init` with `"device"` is `400 {"error": "invalid_credential"}`, decided in the
+  handshake adapter before anything is charged or started.
+- **Vectors.** `crates/pond-infra/tests/fixtures/cpace-vectors.json` has a `device` entry beside
+  `setup`, in its shape: refresh token `vector-refresh-0001` (the one the setup channel vectors'
+  sealed tokens carry), `refresh_hash`, `PRS`, the device label, the wire, and three negatives
+  (`raw_digest`, `uppercase_hash`, `setup_label`). `scripts/pond_cpace.py` reproduces it.
 
 ### After the exchange (sealed)
 
@@ -295,4 +327,4 @@ Wi-Fi, so try `wifi_join` only against a spare hotspot.
 | P5b | macOS adapters (helper peripheral, CoreWLAN) and server wiring: the Mac development loop with a real phone | BUILT 2026-10-17 on `feat/ble-setup`: `pond-server ble-helper`, the `HelperPeripheral` supervisor, the CoreWLAN station, the advertising controller, the 10-minute session cap, `ble_setup_enabled` in both desktop settings views, `GET /network/status`. On the Mac, under an agent's terminal, the helper starts, reads `not_determined`, and is aborted by TCC; the supervisor retries at 2, 8 and 30 s and reports why. CoreWLAN read without Location: names withheld (`not_permitted`), join available. Owed: advertising and a real phone from a Bluetooth-granted app (Terminal or the GIAP app) |
 | P5c | Linux adapters (bluer, NetworkManager), the polkit grant, doctor lines; compiled and unit-tested in `jetson-emu.sh box`, then verified on the Jetson last | BUILT 2026-10-17 on `feat/ble-setup`: `BluezPeripheral` (`ble/linux.rs`: GATT app, advertisement, a 10 s supervisor that re-registers after a bluetoothd restart or rfkill and re-applies the wanted advertisement), the OS-independent central router (`ble/linux/router.rs`), the NetworkManager station (`wifi/linux.rs`, zbus `async-io`), `giap.sh wifi-grant [remove\|status]` and its doctor lines (`scripts/lib/connect-setup.sh`), the grant written by `giap.sh install` on production and Jetson installs, and two drivers for the device run, `examples/ble_peripheral` (an unclaimed in-memory `Pond 7f3a`, so a claimed pond's state is never touched) and `examples/wifi_station`. **The name goes in the scan response:** BlueZ 5.64 adds the advertisement's `LocalName` only to the scan response (`generate_scan_rsp`), so the pond sets `LocalName` and never `Includes: ["local-name"]` (which would insert the adapter's own name); `Discoverable: true` writes flags 0x06 into its own data and leaves the adapter's discoverable and pairable switches alone. ADV_IND 21/31 bytes (flags, 128-bit UUID), scan response 11/31 (`Name (complete)`); a name over 29 bytes would be shortened, so it is refused. The session opens on a central's first `rx` write (BlueZ's StartNotify names no device); another central's write is ATT 0x03 as on macOS; notifications are `Value` changes, which BlueZ caps at ATT_MTU - 3 like the session (bluer's socket path caps two bytes lower, too few at MTU 23), and reach every subscriber, which the seal covers. A join adds its connection in memory, `Save()`s it only once it has an IPv4 address and deletes it otherwise, so a wrong passphrase never reaches disk. Box (linux/arm64, real bluer and zbus): 46 unit tests with a fake radio and a fake NetworkManager, clippy clean bar the toolchain-wide `double_must_use` on `#[async_trait]`. **Owed on the Jetson** (steps in the P5c report): `giap.sh wifi-grant` and `doctor`; `btmon` showing ADV_IND with `Flags: 0x06` and the service UUID, and `Name (complete): Pond <id>` in the scan response (the real pond advertises only while unclaimed or offline; a pond with paired phones is claimed, so use `ble_peripheral`); `busctl ... ActiveInstances` 1; a generic BLE app connecting with no pairing prompt and getting `hello` back; `wifi_station` `scan`, `not_found`, `wrong_password` and a real join; a bluetoothd restart healing within 10 s |
 | P5d | goose-on-the-go: BLE scan, connect, the exchange over BLE, Wi-Fi picker, then hand over to HTTPS | BUILT 2026-10-17: goose-on-the-go#136 (`plugins/pond-ble`, the setup-channel session, Find your Pond, Wi-Fi, two-screen owner setup); vectors byte for byte; no real radio yet |
-| P5e | Resuming as a paired device: `credential: "device"` keyed on the refresh hash | DESIGNED 2026-10-17 |
+| P5e | Resuming as a paired device: `credential: "device"` keyed on the refresh hash | LANDED 2026-10-17 on `feat/ble-setup`: `Credential::Device`, `DeviceResumeThrottle` and the `invalid_credential`/`device_cooling` refusals in pond-core; the device run in the SQLite handshake (newest active refresh hash or a random stand-in, rotation shared with `refresh`); `cpace-device` audits in the session; the vectors' `device` entry. Three pond-side decisions are in the decisions table (charged at init, `invalid_or_expired_refresh`, audited as a resume). Mac unit, route and end-to-end tests over an in-memory transport, and a log capture; no radio, phone or Orin yet. Owed: goose-on-the-go's side |

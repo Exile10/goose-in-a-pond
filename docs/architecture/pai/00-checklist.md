@@ -3533,3 +3533,37 @@ polkit grant (touches PAI-2; not a PAI milestone).**
   new status-route checks. **Not verified:** any radio, a phone, a real join, anything on the Orin.
 - **Open.** `docs/api.md` says the host credential answers `GET /network/status`; it does not
   (401, the route is `Exposure::Authenticated`, token only), so the live check asks with a token.
+
+**2026-10-17 — Pond networking P5e: resuming the setup channel as a paired device (touches
+PAI-2: a new credential; not a PAI milestone).**
+
+- **What landed.** [`pond-setup-channel.md`](../pond-setup-channel.md) P5e, on `feat/ble-setup`.
+  A paired phone opens a sealed channel with no code: `pake_init` with `credential: "device"`,
+  and the CPace password is the lowercase hex SHA-256 of its current refresh token, which is what
+  `session_tokens.refresh_hash` already holds. The label is `goose-device-cpace-v1`. A confirmed
+  run rotates that session in one transaction, the one `/handshake/refresh` now shares, and
+  `sealed` carries the new tokens.
+- **PAI-2, the new credential.** It is the setup channel's only. HTTPS answers
+  `400 invalid_credential` before anything is charged, because it already has
+  `/handshake/refresh`. An id with no active session runs against 64 random hex characters, so
+  it fails at confirmation by the same path, answer, log lines and audit event as a wrong token;
+  only a debug line says which it was. Five runs per `client_id` per rolling ten minutes, charged
+  at `init` like the setup code's throttle, then `device_cooling` with `retry_after`; a success
+  clears the count. The password has 256 bits, so this bounds load, not guessing. No claim latch,
+  no pairing code, no `devices` write: a resume never changes who the device belongs to (PAI-1).
+  A resume is audited as `auth.device_resumed` with `method: "cpace-device"`, never as a pairing.
+  Who can read `pond_system.db` can resume as any device, and already holds the household.
+- **Not wiped, written down so it is not rediscovered:** the committed hash lives in the waiting
+  run as a `Zeroizing<String>`, but sqlx's row buffer that read it from SQLite is not wiped.
+- **Invariants.** No egress, no prompt or KV change, no `Settings` field, no migration, no new
+  route; `pake/init`'s handler only maps the two new refusals (400 and 429). The
+  `cpace-vectors.json` values are byte-identical; only the `device` entry was added.
+- **Verified on the Mac.** pond-core, pond-infra, pond-api and pond-connect tests: a paired phone
+  resumes over an in-memory transport at ATT_MTU 23 and 185, gets new tokens, and its old refresh
+  token stops refreshing; a rotated token fails; an unknown id fails exactly as a wrong token does
+  (answer, audit attributes, and INFO-and-above log lines compared); cooling after five; HTTPS
+  refuses `device`; a capture of every log level finds no token, hash or key. The `device` vector
+  is reproduced by `scripts/pond_cpace.py`. **Not run:** `scripts/live-test.sh`: P5e adds no
+  route, migration or wiring, the one handler change is covered by the route test, and a rebuild
+  would replace the binary under the mock pond on :4100.
+  **Not verified:** a real phone, any radio, anything on the Orin.
