@@ -475,7 +475,7 @@ impl SetupSession {
             Ok(Err(refusal)) => {
                 if refusal == PakeRefusal::ChannelBindingMismatch {
                     // A phone at the wrong pond, or something relaying one: record it.
-                    self.audit_pairing(false, method(credential), None, Some(refusal.code()))
+                    self.audit_pairing(false, credential, None, Some(refusal.code()))
                         .await;
                 }
                 refused(
@@ -505,12 +505,12 @@ impl SetupSession {
         else {
             // Audited as HTTPS audits it, though nothing was spent.
             let device_name = request.device_name.as_deref();
-            self.audit_pairing(false, "cpace", device_name, Some(codes::UNKNOWN_CHALLENGE))
+            let unknown = Credential::Pairing;
+            self.audit_pairing(false, unknown, device_name, Some(codes::UNKNOWN_CHALLENGE))
                 .await;
             return verify_refused(id, codes::UNKNOWN_CHALLENGE);
         };
         let (_, credential) = runs.swap_remove(position);
-        let method = method(credential);
         let device_name = request.device_name.clone();
 
         let ChannelVerify { mut response, keys } =
@@ -520,7 +520,7 @@ impl SetupSession {
                     tracing::warn!(%error, "setup channel pake_verify failed");
                     self.audit_pairing(
                         false,
-                        method,
+                        credential,
                         device_name.as_deref(),
                         Some("internal_error"),
                     )
@@ -533,7 +533,7 @@ impl SetupSession {
                 .rejection_reason
                 .clone()
                 .unwrap_or_else(|| "rejected".into());
-            self.audit_pairing(false, method, device_name.as_deref(), Some(&reason))
+            self.audit_pairing(false, credential, device_name.as_deref(), Some(&reason))
                 .await;
             return verify_refused(id, &reason);
         }
@@ -554,7 +554,7 @@ impl SetupSession {
             return verify_refused(id, codes::INTERNAL_ERROR);
         };
         self.state = State::Sealed { cipher };
-        self.audit_pairing(true, method, device_name.as_deref(), None)
+        self.audit_pairing(true, credential, device_name.as_deref(), None)
             .await;
         ok(
             id,
@@ -639,33 +639,47 @@ impl SetupSession {
         }
     }
 
-    /// The same events as an HTTPS pairing, so the audit trail reads one way for both.
+    /// The same events as an HTTPS pairing, so the audit trail reads one way for both; a device
+    /// resuming its own session is recorded as that, never as a new pairing.
     async fn audit_pairing(
         &self,
         paired: bool,
-        method: &'static str,
+        credential: Credential,
         device_name: Option<&str>,
         reason: Option<&str>,
     ) {
         let device = device_name.unwrap_or("unnamed");
-        if paired {
-            tracing::info!(device, method, transport = TRANSPORT, "pairing accepted");
-        } else {
-            tracing::warn!(
+        let method = method(credential);
+        let resume = credential == Credential::Device;
+        let reason_text = reason.unwrap_or("unspecified");
+        match (paired, resume) {
+            (true, false) => {
+                tracing::info!(device, method, transport = TRANSPORT, "pairing accepted")
+            }
+            (true, true) => tracing::info!(device, method, transport = TRANSPORT, "device resumed"),
+            (false, false) => tracing::warn!(
                 device,
                 method,
                 transport = TRANSPORT,
-                reason = reason.unwrap_or("unspecified"),
+                reason = reason_text,
                 "pairing rejected"
-            );
+            ),
+            (false, true) => tracing::warn!(
+                device,
+                method,
+                transport = TRANSPORT,
+                reason = reason_text,
+                "device resume rejected"
+            ),
         }
         let Some(event_log) = self.ctx.event_log.as_ref() else {
             return;
         };
-        let action = if paired {
-            "auth.device_paired"
-        } else {
-            "auth.pairing_verify_failed"
+        let action = match (paired, resume) {
+            (true, false) => "auth.device_paired",
+            (true, true) => "auth.device_resumed",
+            (false, false) => "auth.pairing_verify_failed",
+            (false, true) => "auth.device_resume_failed",
         };
         let mut event = Event::new(EventCategory::Auth, action)
             .sensitivity(PrivacySensitivity::Sensitive)
@@ -687,6 +701,7 @@ fn method(credential: Credential) -> &'static str {
     match credential {
         Credential::Setup => "cpace-setup",
         Credential::Pairing => "cpace",
+        Credential::Device => "cpace-device",
     }
 }
 

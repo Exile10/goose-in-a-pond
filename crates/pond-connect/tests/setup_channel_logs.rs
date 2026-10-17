@@ -7,6 +7,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use common::*;
+use pond_infra::pairing_cpace::device_password;
 use serde_json::json;
 
 /// Formats every event at every level into one buffer, fields included.
@@ -30,6 +31,43 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+impl Capture {
+    fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    /// The lines written since `from` at `levels`, without their timestamps.
+    fn lines_since(&self, from: usize, levels: &[&str]) -> Vec<String> {
+        let text = String::from_utf8(self.0.lock().unwrap()[from..].to_vec()).unwrap();
+        text.lines()
+            .filter_map(|line| line.split_once(' ').map(|(_, rest)| rest.trim_start()))
+            .filter(|line| levels.iter().any(|level| line.starts_with(level)))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// One failed device run from a fresh connection, as the lines it logged.
+async fn failed_resume(
+    pond: &Pond,
+    capture: &Capture,
+    client_id: &str,
+) -> (Vec<String>, Vec<String>) {
+    let from = capture.len();
+    let mut phone = Phone::connect(pond, 23, client_id).await;
+    let refusal = phone
+        .pake("device", &device_password("not-the-token"))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refusal["error"], "invalid_confirmation");
+    phone.leave(pond).await;
+    (
+        capture.lines_since(from, &["INFO", "WARN", "ERROR"]),
+        capture.lines_since(from, &["DEBUG"]),
+    )
 }
 
 #[tokio::test]
@@ -59,8 +97,37 @@ async fn no_secret_reaches_a_log_line() {
     second.ask("spoken_code", json!({})).await;
     let spoken = wait_for_announcement(&pond.announcer).await;
     let second_paired = second.pake("pairing", &spoken).await.unwrap();
-    second.handle.writer.phone_disconnected().await;
-    second.ended().await;
+    second.leave(&pond).await;
+
+    let mut third = Phone::connect(&pond, 23, "install-e2e").await;
+    let old_hash = device_password(&paired.refresh_token);
+    let resumed = third.pake("device", &old_hash).await.unwrap();
+    third.leave(&pond).await;
+
+    let (wrong_token, wrong_token_debug) = failed_resume(&pond, &capture, "install-e2e").await;
+    let (unknown_id, unknown_id_debug) = failed_resume(&pond, &capture, "install-stranger").await;
+    assert!(
+        wrong_token
+            .iter()
+            .any(|line| line.contains("device run CPace attempt failed")),
+        "{wrong_token:#?}"
+    );
+    assert_eq!(
+        wrong_token, unknown_id,
+        "a wrong token and an unknown id log the same lines"
+    );
+    let unpaired = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|line| line.contains("device_run_unpaired"))
+            .count()
+    };
+    assert_eq!(unpaired(&wrong_token_debug), 0);
+    assert_eq!(
+        unpaired(&unknown_id_debug),
+        1,
+        "only a debug line says which case it was"
+    );
 
     let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     assert!(
@@ -83,6 +150,19 @@ async fn no_secret_reaches_a_log_line() {
         ("k_p2c", paired.keys_hex[0].clone()),
         ("k_c2p", paired.keys_hex[1].clone()),
         ("a second k_p2c", second_paired.keys_hex[0].clone()),
+        ("a resumed refresh hash", old_hash.to_string()),
+        ("a resumed session token", resumed.session_token.clone()),
+        ("a rotated refresh token", resumed.refresh_token.clone()),
+        (
+            "a rotated refresh hash",
+            device_password(&resumed.refresh_token).to_string(),
+        ),
+        ("a resumed k_p2c", resumed.keys_hex[0].clone()),
+        ("a resumed k_c2p", resumed.keys_hex[1].clone()),
+        (
+            "a wrong token's hash",
+            device_password("not-the-token").to_string(),
+        ),
     ] {
         assert!(!log.contains(&secret), "{name} reached a log line");
         assert!(!events.contains(&secret), "{name} reached the audit trail");

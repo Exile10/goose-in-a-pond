@@ -101,7 +101,8 @@ pub struct PakeInitRequest {
     pub channel_binding: String,
     /// 32 random bytes from the phone, standard base64: the second half of the session id.
     pub client_nonce: String,
-    /// The secret the phone holds: the card's setup code, or a pairing code.
+    /// The secret the phone holds: the card's setup code, a pairing code, or (on the setup
+    /// channel only) its own refresh token.
     #[serde(default)]
     pub credential: Credential,
 }
@@ -135,6 +136,10 @@ pub enum PakeRefusal {
     SetupCodeUnavailable,
     /// Too many wrong setup codes; nothing is checked until `retry_after` has passed.
     SetupCodeCooling { retry_after: RetryAfter },
+    /// `credential: "device"` over HTTPS, which has `/handshake/refresh` for that.
+    InvalidCredential,
+    /// Too many failed device runs for this `client_id`; none starts until `retry_after`.
+    DeviceCooling { retry_after: RetryAfter },
 }
 
 impl PakeRefusal {
@@ -147,12 +152,16 @@ impl PakeRefusal {
             Self::Busy => "pairing_busy",
             Self::SetupCodeUnavailable => "setup_code_unavailable",
             Self::SetupCodeCooling { .. } => "setup_code_cooling",
+            Self::InvalidCredential => "invalid_credential",
+            Self::DeviceCooling { .. } => "device_cooling",
         }
     }
 
     pub fn retry_after(self) -> Option<RetryAfter> {
         match self {
-            Self::SetupCodeCooling { retry_after } => Some(retry_after),
+            Self::SetupCodeCooling { retry_after } | Self::DeviceCooling { retry_after } => {
+                Some(retry_after)
+            }
             _ => None,
         }
     }
@@ -315,7 +324,8 @@ pub trait Handshake: Send + Sync {
     }
 
     /// As [`Self::init_pake`], for the in-process setup channel. The run is the same exchange
-    /// under the same limits, and only [`Self::verify_channel_pake`] can finish it.
+    /// under the same limits, and only [`Self::verify_channel_pake`] can finish it. Only here
+    /// may a phone name [`Credential::Device`].
     async fn init_channel_pake(
         &self,
         _request: PakeInitRequest,
@@ -361,5 +371,26 @@ pub trait Handshake: Send + Sync {
     /// The latest unexpired, unconsumed pairing code, if any, for the dashboard to re-display.
     async fn current_pairing_code(&self) -> Result<Option<PairingCode>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn the_device_refusals_carry_their_wire_codes() {
+        assert_eq!(PakeRefusal::InvalidCredential.code(), "invalid_credential");
+        assert_eq!(PakeRefusal::InvalidCredential.retry_after(), None);
+        let cooling = PakeRefusal::DeviceCooling {
+            retry_after: RetryAfter(Duration::from_secs(90)),
+        };
+        assert_eq!(cooling.code(), "device_cooling");
+        assert_eq!(
+            cooling.retry_after(),
+            Some(RetryAfter(Duration::from_secs(90)))
+        );
     }
 }

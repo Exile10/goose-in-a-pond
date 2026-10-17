@@ -9,7 +9,8 @@ use common::*;
 use pond_connect::setup_channel::SessionEnd;
 use pond_core::network::ports::setup_code_store::SetupCodeStore;
 use pond_core::security::domain::event::AttributeValue;
-use pond_core::security::ports::handshake::Handshake;
+use pond_core::security::ports::handshake::{Handshake, RefreshRequest};
+use pond_infra::pairing_cpace::device_password;
 use serde_json::{json, Value};
 
 #[tokio::test]
@@ -206,4 +207,199 @@ async fn a_second_phone_is_refused_while_a_session_is_open() {
     first.ended().await;
     wait_until_free(&pond.channel).await;
     assert!(pond.channel.open().is_ok());
+}
+
+/// The refused verify a phone reads when its password is wrong, whatever made it wrong.
+fn invalid_confirmation(id: &Value) -> Value {
+    json!({"id": id, "type": "pake_verify", "ok": false, "accepted": false,
+           "error": "invalid_confirmation", "rejection_reason": "invalid_confirmation"})
+}
+
+#[tokio::test]
+async fn a_paired_phone_resumes_over_the_channel_and_its_old_refresh_token_stops_working() {
+    for att_mtu in MTUS {
+        let pond = pond().await;
+        let (first, paired) = claim_and_join(&pond, att_mtu).await;
+        first.leave(&pond).await;
+
+        let mut phone = Phone::connect(&pond, att_mtu, "install-e2e").await;
+        let resumed = phone
+            .pake("device", &device_password(&paired.refresh_token))
+            .await
+            .expect("the paired phone resumes with no code");
+        assert_ne!(resumed.refresh_token, paired.refresh_token);
+        assert!(pond
+            .handshake
+            .validate_token(&resumed.session_token)
+            .await
+            .unwrap());
+        assert!(!pond
+            .handshake
+            .validate_token(&paired.session_token)
+            .await
+            .unwrap());
+        let replay = pond
+            .handshake
+            .refresh(RefreshRequest {
+                refresh_token: paired.refresh_token.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.rejection_reason.as_deref(),
+            Some("invalid_or_expired_refresh"),
+            "the old refresh token is spent"
+        );
+
+        let status = phone.ask("status", json!({})).await;
+        assert_eq!(status["ok"], true, "the channel is sealed");
+        assert_eq!(status["claimed"], true);
+        let record = pond.store.load().await.unwrap().unwrap();
+        assert_eq!(record.claimed_by.as_deref(), Some("install-e2e"));
+
+        let event = pond
+            .events
+            .all()
+            .into_iter()
+            .find(|event| event.action == "auth.device_resumed")
+            .expect("the resume is audited as a resume");
+        assert_eq!(
+            event.attributes.get("method"),
+            Some(&AttributeValue::from("cpace-device"))
+        );
+        assert_eq!(
+            event.attributes.get("transport"),
+            Some(&AttributeValue::from("setup_channel"))
+        );
+        assert_eq!(
+            pond.events
+                .all()
+                .iter()
+                .filter(|event| event.action == "auth.device_paired")
+                .count(),
+            1,
+            "a resume is not a new pairing"
+        );
+        phone.leave(&pond).await;
+    }
+}
+
+#[tokio::test]
+async fn a_rotated_refresh_token_cannot_resume_and_the_current_one_can() {
+    let pond = pond().await;
+    let (first, paired) = claim_and_join(&pond, 185).await;
+    first.leave(&pond).await;
+    let rotated = pond
+        .handshake
+        .refresh(RefreshRequest {
+            refresh_token: paired.refresh_token.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(rotated.accepted);
+
+    let mut phone = Phone::connect(&pond, 23, "install-e2e").await;
+    let refusal = phone
+        .pake("device", &device_password(&paired.refresh_token))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refusal, invalid_confirmation(&refusal["id"]));
+    assert!(phone.cipher.is_none(), "no keys for a stale token");
+
+    let current = rotated.refresh_token.unwrap();
+    let resumed = phone
+        .pake("device", &device_password(&current))
+        .await
+        .expect("the current token resumes on the same connection");
+    assert!(pond
+        .handshake
+        .validate_token(&resumed.session_token)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn an_unknown_install_id_is_refused_exactly_as_a_wrong_token_is() {
+    let pond = pond().await;
+    let (first, _) = claim_and_join(&pond, 185).await;
+    first.leave(&pond).await;
+
+    let mut known = Phone::connect(&pond, 23, "install-e2e").await;
+    let wrong = known
+        .pake("device", &device_password("not-the-token"))
+        .await
+        .err()
+        .unwrap();
+    known.leave(&pond).await;
+    let mut stranger = Phone::connect(&pond, 23, "install-stranger").await;
+    let unknown = stranger
+        .pake("device", &device_password("not-the-token"))
+        .await
+        .err()
+        .unwrap();
+
+    assert_eq!(wrong, invalid_confirmation(&wrong["id"]));
+    assert_eq!(
+        unknown, wrong,
+        "the answer says nothing about which ids are paired"
+    );
+    let failures: Vec<_> = pond
+        .events
+        .all()
+        .into_iter()
+        .filter(|event| event.action == "auth.device_resume_failed")
+        .map(|event| event.attributes)
+        .collect();
+    assert_eq!(failures.len(), 2);
+    assert_eq!(failures[0], failures[1], "and neither does the audit trail");
+}
+
+#[tokio::test]
+async fn five_failed_resumes_cool_the_device_and_each_connection_still_gets_three_inits() {
+    let pond = pond().await;
+    let (first, paired) = claim_and_join(&pond, 185).await;
+    first.leave(&pond).await;
+    let wrong = device_password("not-the-token");
+
+    let mut phone = Phone::connect(&pond, 185, "install-e2e").await;
+    for _ in 0..3 {
+        let refusal = phone.pake("device", &wrong).await.err().unwrap();
+        assert_eq!(refusal["error"], "invalid_confirmation");
+    }
+    let fourth = phone.pake("device", &wrong).await.err().unwrap();
+    assert_eq!(
+        fourth,
+        json!({"id": fourth["id"], "type": "pake_init", "ok": false, "error": "too_many_attempts"})
+    );
+    assert_eq!(phone.ended().await, Some(SessionEnd::AttemptsExhausted));
+    wait_until_free(&pond.channel).await;
+
+    let mut phone = Phone::connect(&pond, 185, "install-e2e").await;
+    for _ in 0..2 {
+        let refusal = phone.pake("device", &wrong).await.err().unwrap();
+        assert_eq!(refusal["error"], "invalid_confirmation");
+    }
+    let cooling = phone
+        .pake("device", &device_password(&paired.refresh_token))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(cooling["type"], "pake_init");
+    assert_eq!(cooling["ok"], false, "a refusal in the clear is ok: false");
+    assert_eq!(cooling["error"], "device_cooling");
+    let wait = cooling["retry_after"].as_u64().expect("whole seconds");
+    assert!((1..=600).contains(&wait), "waits {wait} s");
+    assert_eq!(cooling.as_object().unwrap().len(), 5, "{cooling}");
+    assert!(phone.cipher.is_none());
+    assert!(
+        pond.handshake
+            .refresh(RefreshRequest {
+                refresh_token: paired.refresh_token,
+            })
+            .await
+            .unwrap()
+            .accepted,
+        "cooling stops resumes over the channel, never the phone's session"
+    );
 }

@@ -24,6 +24,7 @@
 //!
 //! A run over the BLE setup channel also derives that channel's two keys from ISK
 //! (`docs/architecture/pond-setup-channel.md`, "Sealing"). ISK leaves this module as nothing else.
+//! A paired phone resuming there uses its refresh token's hash as the password, under its own label.
 //!
 //! The Pond side ([`Initiator`]) is crate-private. The phone side ([`Responder`]) exists only for
 //! tests and the `cpace-client` feature, which the integration tests use to pair like a phone.
@@ -54,6 +55,8 @@ const MAC_KEY_PREFIX: &[u8] = b"CPaceMac";
 const CHANNEL_LABEL: &[u8] = b"goose-pair-cpace-v1";
 /// The setup code's own label, so a setup run and a pairing run never share a generator.
 const SETUP_CHANNEL_LABEL: &[u8] = b"goose-setup-cpace-v1";
+/// A paired device's own label, so its refresh hash never shares a generator with a code.
+const DEVICE_CHANNEL_LABEL: &[u8] = b"goose-device-cpace-v1";
 /// Label of the phone's confirmation tag.
 const CLIENT_TAG_LABEL: &[u8] = b"goose-pair-cpace-client-v1";
 /// Label of the Pond's confirmation tag.
@@ -121,6 +124,28 @@ pub fn setup_channel_identifier(spki_pin: &str, client_id: &str) -> Vec<u8> {
         spki_pin.as_bytes(),
         client_id.as_bytes(),
     ])
+}
+
+/// As [`channel_identifier`], for a paired device resuming with its refresh token's hash.
+pub fn device_channel_identifier(spki_pin: &str, client_id: &str) -> Vec<u8> {
+    lv_cat(&[
+        DEVICE_CHANNEL_LABEL,
+        spki_pin.as_bytes(),
+        client_id.as_bytes(),
+    ])
+}
+
+/// A device run's password as the phone derives it: the lowercase hex SHA-256 of its current
+/// refresh token, the text the pond stores as `session_tokens.refresh_hash`.
+#[cfg(any(test, feature = "cpace-client"))]
+pub fn device_password(refresh_token: &str) -> Zeroizing<String> {
+    use std::fmt::Write as _;
+    let digest = sha2::Sha256::digest(refresh_token.as_bytes());
+    let mut password = Zeroizing::new(String::with_capacity(64));
+    for byte in digest {
+        let _ = write!(password, "{byte:02x}");
+    }
+    password
 }
 
 /// The session identifier: the Pond's challenge, then the phone's nonce.
@@ -796,6 +821,7 @@ mod tests {
                 carry them. K_mac is the draft's mac_key (section 10.4). Regenerate with CPACE_VECTORS_WRITE=1 cargo test -p pond-infra \
                 exchange_vectors.",
             "setup": setup_run(),
+            "device": device_run(),
             "spec": "draft-irtf-cfrg-cpace-21",
             "suite": SUITE,
             "labels": {
@@ -1010,6 +1036,192 @@ mod tests {
                 },
             ],
         })
+    }
+
+    /// A paired phone resuming over the setup channel, under the pairing run's pin, ids and
+    /// scalars. The token is the one the setup channel vectors' sealed answer hands the phone.
+    fn device_run() -> Value {
+        let refresh_token = "vector-refresh-0001";
+        let refresh_hash = device_password(refresh_token);
+        let pin = PIN;
+        let client_id = "install-abcdef";
+        let challenge: Vec<u8> = (0u8..32).collect();
+        let client_nonce: Vec<u8> = (32u8..64).collect();
+        let ya_bytes = unhex("da3d23700a9e5699258aef94dc060dfda5ebb61f02a5ea77fad53f4ff0976d08");
+        let yb_bytes = unhex("d2316b454718c35362d83d69df6320f38578ed5984651435e2949762d900b80d");
+        let prs = refresh_hash.as_bytes();
+
+        let ci = device_channel_identifier(pin, client_id);
+        let sid = session_id(&challenge, &client_nonce);
+        let gen_str = generator_string(prs, &ci, &sid);
+        let g = generator(prs, &ci, &sid);
+        let pond = Initiator::with_scalar(scalar(&ya_bytes), prs, &ci, sid.clone());
+        let ya = pond.share();
+        let phone = Responder::with_scalar(scalar(&yb_bytes), prs, &ci, &sid, &ya).unwrap();
+        let yb = phone.share();
+        let k = scalar_mult_vfy(&scalar(&yb_bytes), &ya).unwrap();
+        let isk = intermediate_session_key(&sid, k.as_slice(), &ya, &yb);
+        let t_client = phone.confirmation();
+        let t_server = finish_tag(pond, &yb, &t_client).unwrap();
+        assert!(phone.verify_server(&t_server));
+
+        let b64 = |b: &[u8]| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(b)
+        };
+        let rejected = |share: &[u8], tag: &[u8]| {
+            let pond = Initiator::with_scalar(scalar(&ya_bytes), prs, &ci, sid.clone());
+            match finish_tag(pond, share, tag) {
+                Ok(_) => "accepted",
+                Err(CpaceError::InvalidShare) => "invalid_share",
+                Err(CpaceError::InvalidConfirmation) => "invalid_confirmation",
+            }
+        };
+        // The phone's likeliest mistakes, each with the same scalar: the digest's raw bytes
+        // instead of its hex, upper-case hex, and the right hash under the setup label.
+        let raw_digest = sha2::Sha256::digest(refresh_token.as_bytes()).to_vec();
+        let raw = Responder::with_scalar(scalar(&yb_bytes), &raw_digest, &ci, &sid, &ya).unwrap();
+        let upper_hash = refresh_hash.to_ascii_uppercase();
+        let upper =
+            Responder::with_scalar(scalar(&yb_bytes), upper_hash.as_bytes(), &ci, &sid, &ya)
+                .unwrap();
+        let setup_ci = setup_channel_identifier(pin, client_id);
+        let setup_label =
+            Responder::with_scalar(scalar(&yb_bytes), prs, &setup_ci, &sid, &ya).unwrap();
+
+        json!({
+            "description": "A paired phone resuming over the setup channel: the same exchange as \
+                the pairing run above, with the lowercase hex SHA-256 of the phone's current \
+                refresh token as the password and the device channel label in CI. PRS is the 64 \
+                ASCII characters of refresh_hash, written in hex like every PRS here; the digest's \
+                32 raw bytes are not the password (negative raw_digest). pake_init carries \
+                \"credential\": \"device\"; everything else on the wire is the pairing exchange \
+                unchanged. The setup channel only: HTTPS answers invalid_credential.",
+            "credential": "device",
+            "labels": {
+                "channel": std::str::from_utf8(DEVICE_CHANNEL_LABEL).unwrap(),
+            },
+            "inputs": {
+                "refresh_token": refresh_token,
+                "refresh_hash": refresh_hash.as_str(),
+                "PRS": hex(prs),
+                "spki_pin": pin,
+                "client_id": client_id,
+                "challenge": hex(&challenge),
+                "client_nonce": hex(&client_nonce),
+                "ya": hex(&ya_bytes),
+                "yb": hex(&yb_bytes),
+                "ADa": "",
+                "ADb": "",
+            },
+            "outputs": {
+                "CI": hex(&ci),
+                "sid": hex(&sid),
+                "generator_string": hex(&gen_str),
+                "g": hex(&g.compress().to_bytes()),
+                "Ya": hex(&ya),
+                "Yb": hex(&yb),
+                "K": hex(k.as_slice()),
+                "ISK": hex(isk.as_slice()),
+                "K_mac": hex(Confirmation::derive(&sid, k.as_slice(), ya, yb).mac_key.as_slice()),
+                "T_client": hex(&t_client),
+                "T_server": hex(&t_server),
+            },
+            "wire": {
+                "init_request": {
+                    "client_id": client_id,
+                    "client_type": "gotg",
+                    "client_version": "1.0.0",
+                    "channel_binding": pin,
+                    "client_nonce": b64(&client_nonce),
+                    "credential": "device",
+                },
+                "init_response": {
+                    "challenge": b64(&challenge),
+                    "suite": SUITE,
+                    "share": b64(&ya),
+                },
+                "verify_request": {
+                    "share": b64(&yb),
+                    "confirm": hex(&t_client),
+                },
+                "verify_response": {
+                    "accepted": true,
+                    "server_proof": hex(&t_server),
+                },
+            },
+            "negative": [
+                {
+                    "name": "raw_digest",
+                    "phone_PRS": hex(&raw_digest),
+                    "Yb": hex(&raw.share()),
+                    "T_client": hex(&raw.confirmation()),
+                    "pond_result": rejected(&raw.share(), &raw.confirmation()),
+                },
+                {
+                    "name": "uppercase_hash",
+                    "phone_PRS": hex(upper_hash.as_bytes()),
+                    "Yb": hex(&upper.share()),
+                    "T_client": hex(&upper.confirmation()),
+                    "pond_result": rejected(&upper.share(), &upper.confirmation()),
+                },
+                {
+                    "name": "setup_label",
+                    "CI": hex(&setup_ci),
+                    "Yb": hex(&setup_label.share()),
+                    "T_client": hex(&setup_label.confirmation()),
+                    "pond_result": rejected(&setup_label.share(), &setup_label.confirmation()),
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn the_device_vector_is_the_refresh_hash_under_its_own_label() {
+        let run = exchange_run();
+        let device = &run["device"];
+        assert_eq!(device["credential"], "device");
+        assert_eq!(device["labels"]["channel"], "goose-device-cpace-v1");
+        assert_eq!(device["wire"]["init_request"]["credential"], "device");
+        let token = device["inputs"]["refresh_token"].as_str().unwrap();
+        let expected_hash = hex(&sha2::Sha256::digest(token.as_bytes()));
+        assert_eq!(device["inputs"]["refresh_hash"], expected_hash.as_str());
+        assert_eq!(
+            device["inputs"]["PRS"],
+            hex(expected_hash.as_bytes()).as_str(),
+            "the password is the hash's 64 ASCII characters"
+        );
+        for other in [&run, &run["setup"]] {
+            assert_ne!(device["outputs"]["CI"], other["outputs"]["CI"]);
+            assert_ne!(device["outputs"]["g"], other["outputs"]["g"]);
+            assert_ne!(device["outputs"]["ISK"], other["outputs"]["ISK"]);
+        }
+        for negative in device["negative"].as_array().unwrap() {
+            assert_eq!(
+                negative["pond_result"], "invalid_confirmation",
+                "{negative}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_device_channel_identifier_has_its_own_label() {
+        assert_eq!(
+            device_channel_identifier("pin", "id"),
+            [
+                &[21u8][..],
+                b"goose-device-cpace-v1",
+                &[3],
+                b"pin",
+                &[2],
+                b"id"
+            ]
+            .concat()
+        );
+        assert_ne!(
+            device_channel_identifier(PIN, "phone-1"),
+            setup_channel_identifier(PIN, "phone-1")
+        );
     }
 
     #[test]

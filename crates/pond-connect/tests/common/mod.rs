@@ -23,7 +23,7 @@ use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
 use pond_infra::db::Database;
 use pond_infra::file_setup_code_store::FileSetupCodeStore;
 use pond_infra::pairing_cpace::{
-    channel_identifier, session_id, setup_channel_identifier, Responder,
+    channel_identifier, device_channel_identifier, session_id, setup_channel_identifier, Responder,
 };
 use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use serde_json::{json, Value};
@@ -206,6 +206,7 @@ impl Phone {
         }
         let ci = match credential {
             "setup" => setup_channel_identifier(&pin, &self.client_id),
+            "device" => device_channel_identifier(&pin, &self.client_id),
             _ => channel_identifier(&pin, &self.client_id),
         };
         let challenge = B64.decode(init["challenge"].as_str().unwrap()).unwrap();
@@ -253,6 +254,13 @@ impl Phone {
     pub async fn ended(mut self) -> Option<SessionEnd> {
         while self.handle.notifications.next().await.is_some() {}
         self.handle.notifications.end()
+    }
+
+    /// Leaves, and waits until the pond can take the next phone.
+    pub async fn leave(self, pond: &Pond) {
+        self.handle.writer.phone_disconnected().await;
+        self.ended().await;
+        wait_until_free(&pond.channel).await;
     }
 }
 
