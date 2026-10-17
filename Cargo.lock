@@ -12098,7 +12098,6 @@ dependencies = [
  "hostname",
  "indoc",
  "libc",
- "mdns-sd",
  "pond-adapters-caldav",
  "pond-adapters-face-onnx",
  "pond-adapters-goose",

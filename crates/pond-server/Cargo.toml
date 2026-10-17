@@ -209,7 +209,6 @@ flate2 = "1"
 tar = "0.4"
 url = { workspace = true }
 sha2 = "0.10"
-mdns-sd = "0.11"
 qrcode  = "0.14"
 
 [dev-dependencies]

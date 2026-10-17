@@ -12,7 +12,6 @@ mod kokoro_control;
 mod litert_runtime;
 mod llamafile_process;
 mod llm_memory_consolidator;
-mod mdns_advertiser;
 use pond_server::tls_identity;
 mod model_download;
 mod node_path;
@@ -4410,31 +4409,36 @@ async fn run_server(
         tracing::info!("OAuth auto-refresh worker started — runs every 45 minutes");
     }
 
-    // Named binding, not `_`: dropping the handle deregisters the mDNS service.
-    let setup_advert = setup_record.as_ref().map(setup_advert_for);
-    let _mdns_handle = match mdns_advertiser::advertise(
-        &pairing_hostname,
-        https_port,
-        env!("CARGO_PKG_VERSION"),
-        &pairing_pin,
-        setup_advert.as_ref(),
-    ) {
-        Ok(h) => {
-            println!("  mDNS: advertising _pond._tcp.local. over HTTPS on port {https_port}");
-            let h = Arc::new(h);
-            tokio::spawn(keep_setup_advert_current(
-                h.clone(),
-                setup_store.clone(),
-                setup_claims.clone(),
-                setup_advert,
-            ));
-            Some(h)
+    // The run loop retries a failed first publish, so a responder that starts late still lands.
+    let discovery = pond_core::network::services::discovery::DiscoveryService::new(
+        pond_connect::discovery::platform(),
+        setup_store.clone(),
+        setup_claims.clone(),
+        pond_core::network::domain::pond_advert::PondAdvert::new(
+            &pairing_hostname,
+            https_port,
+            env!("CARGO_PKG_VERSION"),
+            &pairing_pin,
+        ),
+    );
+    let advertiser = discovery.advertiser();
+    let published = match discovery.publish_current().await {
+        Ok(advert) => {
+            println!(
+                "  mDNS: advertising _pond._tcp.local. over HTTPS on port {https_port} (via {})",
+                advertiser.responder()
+            );
+            Some(advert)
         }
         Err(e) => {
-            tracing::warn!("mDNS advertisement failed (LAN discovery disabled): {e:#}");
+            tracing::warn!("mDNS advertisement failed (LAN discovery off until it lands): {e:#}");
             None
         }
     };
+    tokio::spawn(discovery.run(
+        published,
+        pond_core::network::services::discovery::ADVERT_RECHECK_INTERVAL,
+    ));
 
     if !pond_api::web_ui_embedded() && !static_dir.exists() {
         tracing::warn!(
@@ -4672,6 +4676,8 @@ async fn run_server(
         }
     };
     tls_handle.shutdown();
+    // Goodbyes now, so phones drop the pond at once rather than when its records expire.
+    advertiser.withdraw().await;
     #[cfg(unix)]
     if let Err(error) = embedded.shutdown().await {
         tracing::warn!(%error, "embedded networking shutdown failed");
@@ -4722,56 +4728,6 @@ fn print_pairing_qr(url: &str) {
             }
         }
         Err(e) => tracing::warn!("QR code generation failed: {e:#}"),
-    }
-}
-
-/// How often the advertiser re-reads the claim, to see a `setup-code --rearm` made by another
-/// process; a claim made here is seen at once.
-const SETUP_ADVERT_POLL: std::time::Duration = std::time::Duration::from_secs(60);
-
-fn setup_advert_for(
-    record: &pond_core::network::domain::setup_record::SetupRecord,
-) -> mdns_advertiser::SetupAdvert {
-    mdns_advertiser::SetupAdvert {
-        id: record.discriminator.to_string(),
-        unclaimed: !record.claim_state().is_claimed(),
-    }
-}
-
-/// Re-announces `_pond._tcp` when the claim changes, so `setup=1` goes away once a phone pairs.
-async fn keep_setup_advert_current(
-    mdns: Arc<mdns_advertiser::MdnsHandle>,
-    store: Arc<pond_infra::file_setup_code_store::FileSetupCodeStore>,
-    claims: Arc<pond_core::network::services::setup_claim::SetupClaimService>,
-    mut advertised: Option<mdns_advertiser::SetupAdvert>,
-) {
-    use pond_core::network::ports::setup_code_store::SetupCodeStore as _;
-    loop {
-        tokio::select! {
-            _ = claims.claim_latched() => {}
-            _ = tokio::time::sleep(SETUP_ADVERT_POLL) => {}
-        }
-        let current = match store.load().await {
-            Ok(record) => record.as_ref().map(setup_advert_for),
-            // Keep what is advertised: the store refuses the card anyway while it is unreadable.
-            Err(error) => {
-                tracing::debug!(%error, "setup record unreadable; mDNS setup state unchanged");
-                continue;
-            }
-        };
-        if current == advertised {
-            continue;
-        }
-        match mdns.set_setup(current.as_ref()) {
-            Ok(()) => {
-                tracing::info!(
-                    setup_open = current.as_ref().is_some_and(|a| a.unclaimed),
-                    "mDNS: re-announced _pond._tcp with the new claim state"
-                );
-                advertised = current;
-            }
-            Err(error) => tracing::warn!(%error, "mDNS: could not re-announce the claim state"),
-        }
     }
 }
 
