@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use pond_core::network::domain::discriminator::Discriminator;
 
+pub mod helper;
 pub mod peripheral;
 pub mod unsupported;
 
