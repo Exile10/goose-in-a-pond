@@ -203,13 +203,16 @@ client reads it, the server never does · `NONE` = nothing reads it anywhere.
 | `voice_kws_energy_threshold` | `0.003` | LIVE | S |
 | `voice_kws_post_trigger_silence_ms` | `400` | LIVE | S |
 | `voice_kws_cooldown_ms` | `2000` | LIVE | S |
-| `voice_kws_whisper_url` | `null` | **NONE** | S |
 | `voice_whisper_url` | `"http://127.0.0.1:9000"` | LIVE | S |
 | `active_whisper_model` | `""` | LIVE | S, H:Voice |
 | `voice_recording_duration_secs` | `3` | **UI-ONLY** | S |
 | `voice_tts_voice` | `""` | LIVE | S, H:Voice, O |
 | `active_tts_model` | `""` | LIVE | S |
 | `voice_max_turns` | `8` | LIVE | **API** |
+
+`voice_kws_whisper_url` (was `null`, **NONE**) was removed on 2026-10-15: nothing read it once
+wake-word detection moved in process. `voice_recording_duration_secs` is read only by the browser
+voice path (`useVoicePipeline`); the desktop app and the pond's own voice loop end on silence.
 
 ### 5. Memory
 
@@ -364,9 +367,9 @@ from `H:Privacy` — an absent switch is honest, an inert one is not.
 ### Fix 2 — nine more toggles render without being operable (**severity: medium**)
 
 `cloud_fallback_enabled` (its only mention is a `TODO(cloud-fallback)` comment at `main.rs:1705`),
-`voice_kws_whisper_url`, `agent_goose_mode`, `tool_output_compaction`, `tool_call_validation`,
-`tool_request_detection`, `multi_tool_enabled`, `memory_graph_enabled`, `schedule_result_notify`
-(the result broadcast is unconditional).
+`voice_kws_whisper_url` (removed 2026-10-15), `agent_goose_mode`, `tool_output_compaction`,
+`tool_call_validation`, `tool_request_detection`, `multi_tool_enabled`, `memory_graph_enabled`,
+`schedule_result_notify` (the result broadcast is unconditional).
 
 Two of these have doc comments describing behaviour that does not exist —
 `voice_kws_whisper_url` claims `WhisperKeywordDetector` sends sliding windows to it, and

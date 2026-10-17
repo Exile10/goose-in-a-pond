@@ -6,6 +6,7 @@ import { Mic, RotateCcw, Check, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { ApiError } from "../api/types";
 import { AudioWaves } from "./AudioWaves";
+import { buildCalibrationPrompts } from "../modes/voice/wakePhrase";
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -23,20 +24,6 @@ interface Props {
 const RECORD_DURATION_MS = 3500;
 const COUNTDOWN_TICK_MS = 800;
 const MIN_SAMPLES_FOR_DONE = 3;
-
-// ── Calibration sentences ─────────────────────────────────────
-// Sentences containing the wake word capture natural pronunciation; the server extracts it.
-
-function buildCalibrationPrompts(phrase: string): string[] {
-  const p = phrase.trim();
-  return [
-    `${p}`,
-    `Hey ${p}, good morning`,
-    `OK ${p}, what time is it`,
-    `${p}, tell me a joke`,
-    `Thank you ${p}`,
-  ];
-}
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -60,7 +47,6 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
 
   const [prompts] = useState(() => buildCalibrationPrompts(phrase));
 
-  const prevSampleCount = useRef(0);
   const abortedRef = useRef(false);
   const recorderRef = useRef<FixedRecorder | null>(null);
 
@@ -128,11 +114,11 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
   // ── Submit the reviewed sample to the calibration API ─────────
   const submitSample = useCallback(async () => {
     if (!pendingWav || abortedRef.current) return;
-    prevSampleCount.current = sampleCount;
     setPhase("submitting");
 
     try {
-      const result = await api.calibrateWakeWord(pendingWav);
+      // The sentence read out tells the server where the wake phrase sits in the transcript.
+      const result = await api.calibrateWakeWord(pendingWav, prompts[sampleCount % prompts.length]);
 
       if (abortedRef.current) return;
 
@@ -141,21 +127,16 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
       setTargetCount(result.target_count);
       setVariants(result.all_variants);
 
-      // Unchanged sample_count means a duplicate variant.
-      if (result.sample_count === prevSampleCount.current && !result.complete) {
-        setSampleCount(result.sample_count);
-        setErrorMsg("Already have that transcription. Try the next sentence — the different context helps capture a new variant.");
+      if (result.heard === null) {
+        setErrorMsg(`That take did not catch "${phrase}". Read the sentence again, a little slower.`);
         setPhase("error");
         return;
       }
 
-      setSampleCount(result.sample_count);
-
-      if (result.complete) {
-        setPhase("complete");
-      } else {
-        setPhase("idle");
-      }
+      // Progress counts takes: hearing the phrase the same way every time is the good outcome.
+      const takes = sampleCount + 1;
+      setSampleCount(takes);
+      setPhase(takes >= result.target_count ? "complete" : "idle");
     } catch (e) {
       if (abortedRef.current) return;
       if (e instanceof ApiError) {
@@ -171,7 +152,7 @@ export function WakeWordCalibration({ phrase, onComplete, onCancel }: Props) {
       }
       setPhase("error");
     }
-  }, [pendingWav, sampleCount]);
+  }, [pendingWav, sampleCount, prompts, phrase]);
 
   // ── Discard the pending recording ─────────────────────────────
   const discardSample = useCallback(() => {

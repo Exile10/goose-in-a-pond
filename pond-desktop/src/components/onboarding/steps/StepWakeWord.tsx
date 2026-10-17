@@ -6,11 +6,15 @@ import { RadioCard } from "../primitives/RadioCard";
 import { FormLabel } from "../primitives/FormLabel";
 import { Lead } from "../primitives/StepShell";
 import { WAKE_PRESETS } from "../onboarding.constants";
+import { wakePhraseError, wakePhraseWarning } from "../../../modes/voice/wakePhrase";
 
 export function StepWakeWord() {
   const { draft, patch } = useOnboarding();
 
   const isCustom = draft.wakeWord === "custom";
+  const typed = draft.wakeWordCustom.trim();
+  const customError = isCustom && typed ? wakePhraseError(typed) : null;
+  const customWarning = isCustom && typed ? wakePhraseWarning(typed) : null;
 
   return (
     <div className="ob-step-content">
@@ -47,7 +51,10 @@ export function StepWakeWord() {
             value={draft.wakeWordCustom}
             onChange={(e) => patch({ wakeWordCustom: e.target.value })}
             required
+            aria-invalid={customError ? true : undefined}
           />
+          {customError && <p className="ob-field-error" role="alert">{customError}</p>}
+          {!customError && customWarning && <p className="ob-field-hint" role="status">{customWarning}</p>}
         </div>
       )}
 

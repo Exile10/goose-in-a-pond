@@ -1,0 +1,1835 @@
+{
+ "model": "Llama-3.2-3B-Instruct-Q4_K_M",
+ "exp": "e4",
+ "rows": [
+  {
+   "arm": "V1P2",
+   "id": "c01",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "1234 * 17"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5187,
+   "prompt_ms": 42899.425,
+   "wall": 44.653,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c02",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "(11 + 31 + 24) / 3"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5194,
+   "prompt_ms": 2374.159,
+   "wall": 4.772,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c03",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "72 degrees Fahrenheit to Celsius"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5186,
+   "prompt_ms": 2158.932,
+   "wall": 4.417,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c04",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "12 December 1963 to 14 October 2026 in days"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5198,
+   "prompt_ms": 2022.582,
+   "wall": 5.003,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c05",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "15% of 2350 shillings"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5192,
+   "prompt_ms": 1924.5,
+   "wall": 4.246,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c06",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "sqrt(7)",
+      "f": "5"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5192,
+   "prompt_ms": 2324.373,
+   "wall": 4.165,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c07",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "3.5 hours in seconds"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5189,
+   "prompt_ms": 1962.985,
+   "wall": 3.834,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c08",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "16 percent of 48,000"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5189,
+   "prompt_ms": 2239.941,
+   "wall": 4.317,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c09",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "2500 shillings * 52 weeks"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5201,
+   "prompt_ms": 1934.43,
+   "wall": 4.201,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c10",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "3 to the power of 13"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5189,
+   "prompt_ms": 2032.148,
+   "wall": 4.079,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "c11",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "26.2 miles in kilometres"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5188,
+   "prompt_ms": 2035.624,
+   "wall": 4.133,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "d01",
+   "expect": "none",
+   "verdict": "error",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "",
+   "finish": "error",
+   "prompt_tokens": null,
+   "prompt_ms": null,
+   "wall": null,
+   "error": "HTTP 500: {\"error\":{\"code\":500,\"message\":\"Failed to parse input at pos 47: {\\\"name\\\": \\\"giap-knowledge__look_up\\\", \\\"parameters\\\": {\\\"question\\\": \\\"What does the word \\\"ephemeral\\\" mean?\\\"}}\",\"type\":\"server_error\"}}"
+  },
+  {
+   "arm": "V1P2",
+   "id": "d02",
+   "expect": "none",
+   "verdict": "error",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "",
+   "finish": "error",
+   "prompt_tokens": null,
+   "prompt_ms": null,
+   "wall": null,
+   "error": "HTTP 500: {\"error\":{\"code\":500,\"message\":\"Failed to parse input at pos 47: {\\\"name\\\": \\\"giap-knowledge__look_up\\\", \\\"parameters\\\": {\\\"question\\\": \\\"What does the Swahili word \\\"harambee\\\" mean?\\\"}}\",\"type\":\"server_error\"}}"
+  },
+  {
+   "arm": "V1P2",
+   "id": "n01",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "How are you today?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5185,
+   "prompt_ms": 2065.053,
+   "wall": 3.927,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n02",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [],
+   "other": [
+    "other:giap-system"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-system__get_current_time",
+     "args": {}
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5186,
+   "prompt_ms": 2177.427,
+   "wall": 3.402,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n03",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "rain in Nairobi"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5188,
+   "prompt_ms": 2101.021,
+   "wall": 3.902,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n04",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [],
+   "other": [
+    "other:giap-memory"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-memory__recall_memories",
+     "args": {
+      "query": "report",
+      "limit": "10"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5190,
+   "prompt_ms": 1960.059,
+   "wall": 4.325,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n05",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculate",
+     "args": {
+      "question": "2 + 2"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5186,
+   "prompt_ms": 2127.931,
+   "wall": 4.684,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "n06",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What day of the week is it today?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5187,
+   "prompt_ms": 1810.777,
+   "wall": 4.473,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "o01",
+   "expect": "other:giap-weather",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-weather"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-weather__get_current_weather",
+     "args": {
+      "location": "Nairobi"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5187,
+   "prompt_ms": 1805.696,
+   "wall": 4.116,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "o02",
+   "expect": "other:giap-memory",
+   "verdict": "steal",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What did I tell you about my sister?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5187,
+   "prompt_ms": 2025.035,
+   "wall": 4.703,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "o03",
+   "expect": "other:giap-schedule",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-schedule"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-schedule__schedule_action",
+     "args": {
+      "id": "create_schedule",
+      "action": "run_now"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5189,
+   "prompt_ms": 1656.637,
+   "wall": 5.447,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "o04",
+   "expect": "other:giap-device-control",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-device-control"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-device-control__set_device_state",
+     "args": {
+      "device_id": "kitchen lights",
+      "power": "false"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5184,
+   "prompt_ms": 2425.203,
+   "wall": 6.251,
+   "error": null
+  },
+  {
+   "arm": "V1P2",
+   "id": "x02",
+   "expect": "read",
+   "verdict": "error",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "",
+   "finish": "error",
+   "prompt_tokens": null,
+   "prompt_ms": null,
+   "wall": null,
+   "error": "HTTP 500: {\"error\":{\"code\":500,\"message\":\"Failed to parse input at pos 146: ; {\\\"name\\\": \\\"giap-knowledge__calculate\\\", \\\"parameters\\\": {\\\"question\\\": \\\"2355 metres in feet\\\"}}; {\\\"name\\\": \\\"giap-knowledge__look_up\\\", \\\"parameters\\\": {\\\"question\\\": \\\"What is the capital of Ethiopia?\\\"}}; {\\\"name\\\": \\\"giap-knowledge__look_up\\\", \\\"parameters\\\": {\\\"question\\\": \\\"2355 metres in feet\\\"}}; {\\\"name\\\": \\\"giap-knowl"
+  },
+  {
+   "arm": "V3",
+   "id": "c01",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "1234 * 17"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5157,
+   "prompt_ms": 42329.672,
+   "wall": 45.677,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c02",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "(11 + 31 + 24) / 3"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5164,
+   "prompt_ms": 1767.749,
+   "wall": 4.337,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c03",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "72 degrees Fahrenheit"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5156,
+   "prompt_ms": 1938.008,
+   "wall": 3.81,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c04",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "12 Dec 1963 to 14 Oct 2026 in days"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5168,
+   "prompt_ms": 1865.936,
+   "wall": 4.946,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c05",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "15/100 * 2350"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5162,
+   "prompt_ms": 1684.361,
+   "wall": 3.406,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c06",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "sqrt(7)",
+      "format": "float",
+      "n": "5"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5162,
+   "prompt_ms": 2328.489,
+   "wall": 4.569,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c07",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "3.5*3600"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5159,
+   "prompt_ms": 2055.337,
+   "wall": 4.275,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c08",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "16/100 * 48000"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5159,
+   "prompt_ms": 1821.61,
+   "wall": 3.42,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c09",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "2500 * 52"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5171,
+   "prompt_ms": 2524.184,
+   "wall": 4.105,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c10",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "3**13"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5159,
+   "prompt_ms": 2099.655,
+   "wall": 3.68,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "c11",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "26.2 miles"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5158,
+   "prompt_ms": 1822.962,
+   "wall": 3.568,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "d01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What does the word "
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5159,
+   "prompt_ms": 2322.417,
+   "wall": 3.961,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "d02",
+   "expect": "none",
+   "verdict": "error",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "",
+   "finish": "error",
+   "prompt_tokens": null,
+   "prompt_ms": null,
+   "wall": null,
+   "error": "HTTP 500: {\"error\":{\"code\":500,\"message\":\"Failed to parse input at pos 47: {\\\"name\\\": \\\"giap-knowledge__look_up\\\", \\\"parameters\\\": {\\\"question\\\": \\\"What does the Swahili word \\\"harambee\\\" mean?\\\"}}\",\"type\":\"server_error\"}}"
+  },
+  {
+   "arm": "V3",
+   "id": "n01",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "How are you today?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5155,
+   "prompt_ms": 1548.038,
+   "wall": 3.672,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n02",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [],
+   "other": [
+    "other:giap-system"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-system__get_current_time",
+     "args": {}
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5156,
+   "prompt_ms": 1781.226,
+   "wall": 3.117,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n03",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "rain in Nairobi"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5158,
+   "prompt_ms": 2507.997,
+   "wall": 3.731,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n04",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [],
+   "other": [
+    "other:giap-memory"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-memory__recall_memories",
+     "args": {
+      "query": "report",
+      "limit": "10"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5160,
+   "prompt_ms": 2103.459,
+   "wall": 3.831,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n05",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "2+2"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5156,
+   "prompt_ms": 2255.195,
+   "wall": 3.649,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "n06",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What day of the week is it today?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5157,
+   "prompt_ms": 1914.073,
+   "wall": 3.635,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "o01",
+   "expect": "other:giap-weather",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-weather"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-weather__get_current_weather",
+     "args": {
+      "location": "Nairobi"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5157,
+   "prompt_ms": 2512.923,
+   "wall": 3.849,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "o02",
+   "expect": "other:giap-memory",
+   "verdict": "steal",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What did I tell you about my sister?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5157,
+   "prompt_ms": 1777.289,
+   "wall": 3.608,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "o03",
+   "expect": "other:giap-schedule",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-schedule"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-schedule__create_schedule",
+     "args": {
+      "id": "",
+      "name": "Remind me to call mum at 6pm",
+      "cron": "",
+      "prompt": "Call mum at 6pm",
+      "timezone": "UTC"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5159,
+   "prompt_ms": 1780.146,
+   "wall": 6.398,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "o04",
+   "expect": "other:giap-device-control",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-device-control"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-device-control__set_device_state",
+     "args": {
+      "device_id": "kitchen lights",
+      "power": "false"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5154,
+   "prompt_ms": 1633.179,
+   "wall": 4.523,
+   "error": null
+  },
+  {
+   "arm": "V3",
+   "id": "x02",
+   "expect": "read",
+   "verdict": "error",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "",
+   "finish": "error",
+   "prompt_tokens": null,
+   "prompt_ms": null,
+   "wall": null,
+   "error": "HTTP 500: {\"error\":{\"code\":500,\"message\":\"Failed to parse input at pos 146: ; {\\\"name\\\": \\\"giap-knowledge__calculator\\\", \\\"parameters\\\": {\\\"expression\\\": \\\"2355\\\"}}; {\\\"name\\\": \\\"giap-knowledge__look_up\\\", \\\"parameters\\\": {\\\"question\\\": \\\"What is 2,355 metres in feet?\\\"}}\",\"type\":\"server_error\"}}"
+  },
+  {
+   "arm": "V3P2",
+   "id": "c01",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "1234 * 17"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5183,
+   "prompt_ms": 38188.349,
+   "wall": 41.527,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c02",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "(11 + 31 + 24) / 3"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5190,
+   "prompt_ms": 1897.319,
+   "wall": 5.106,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c03",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "72 degrees Fahrenheit to Celsius"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5182,
+   "prompt_ms": 1563.744,
+   "wall": 4.4,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c04",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "12 Dec 1963 to 14 Oct 2026 in days"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5194,
+   "prompt_ms": 1745.605,
+   "wall": 4.219,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c05",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "15% * 2350"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5188,
+   "prompt_ms": 1522.87,
+   "wall": 3.877,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c06",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "sqrt(7)",
+      "format": "float",
+      "f": "5"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5188,
+   "prompt_ms": 1573.042,
+   "wall": 4.312,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c07",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "3.5*3600"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5185,
+   "prompt_ms": 1638.778,
+   "wall": 4.338,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c08",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "16/100 * 48000"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5185,
+   "prompt_ms": 1683.528,
+   "wall": 3.777,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c09",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "2500 * 52"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5197,
+   "prompt_ms": 1667.612,
+   "wall": 3.849,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c10",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "3**13"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5185,
+   "prompt_ms": 1699.661,
+   "wall": 3.491,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "c11",
+   "expect": "compute",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": true,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "26.2 miles"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5184,
+   "prompt_ms": 1695.237,
+   "wall": 3.748,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "d01",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What does the word "
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5185,
+   "prompt_ms": 1866.48,
+   "wall": 3.917,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "d02",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What does the Swahili word "
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5188,
+   "prompt_ms": 1584.484,
+   "wall": 4.506,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n01",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "How are you today?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5181,
+   "prompt_ms": 1861.531,
+   "wall": 3.712,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n02",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [],
+   "other": [
+    "other:giap-system"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-system__get_current_time",
+     "args": {}
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5182,
+   "prompt_ms": 1701.196,
+   "wall": 3.665,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n03",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "rain in Nairobi"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5184,
+   "prompt_ms": 1541.117,
+   "wall": 3.941,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n04",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [],
+   "other": [
+    "other:giap-memory"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-memory__recall_memories",
+     "args": {
+      "query": "report",
+      "limit": "10"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5186,
+   "prompt_ms": 1640.744,
+   "wall": 3.731,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n05",
+   "expect": "none",
+   "verdict": "ok",
+   "families": [
+    "compute"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__calculator",
+     "args": {
+      "expression": "2+2"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5182,
+   "prompt_ms": 1904.082,
+   "wall": 3.095,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "n06",
+   "expect": "none",
+   "verdict": "false_call",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What day of the week is it today?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5183,
+   "prompt_ms": 1984.927,
+   "wall": 3.812,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "o01",
+   "expect": "other:giap-weather",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-weather"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-weather__get_current_weather",
+     "args": {
+      "location": "Nairobi"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5183,
+   "prompt_ms": 1650.617,
+   "wall": 3.288,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "o02",
+   "expect": "other:giap-memory",
+   "verdict": "steal",
+   "families": [
+    "read"
+   ],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-knowledge__look_up",
+     "args": {
+      "question": "What did I tell you about my sister?"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5183,
+   "prompt_ms": 1729.639,
+   "wall": 4.002,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "o03",
+   "expect": "other:giap-schedule",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-schedule"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-schedule__schedule_action",
+     "args": {
+      "id": "",
+      "action": "run_now"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5185,
+   "prompt_ms": 1834.477,
+   "wall": 3.797,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "o04",
+   "expect": "other:giap-device-control",
+   "verdict": "ok",
+   "families": [],
+   "other": [
+    "other:giap-device-control"
+   ],
+   "arg_ok": null,
+   "head_answer_ok": null,
+   "calls": [
+    {
+     "name": "giap-device-control__set_device_state",
+     "args": {
+      "device_id": "kitchen lights",
+      "power": "false"
+     }
+    }
+   ],
+   "content": "",
+   "finish": "tool_calls",
+   "prompt_tokens": 5180,
+   "prompt_ms": 1781.303,
+   "wall": 4.249,
+   "error": null
+  },
+  {
+   "arm": "V3P2",
+   "id": "x02",
+   "expect": "read",
+   "verdict": "error",
+   "families": [],
+   "other": [],
+   "arg_ok": null,
+   "head_answer_ok": false,
+   "calls": [],
+   "content": "",
+   "finish": "error",
+   "prompt_tokens": null,
+   "prompt_ms": null,
+   "wall": null,
+   "error": "HTTP 500: {\"error\":{\"code\":500,\"message\":\"Failed to parse input at pos 146: ; {\\\"name\\\": \\\"giap-knowledge__calculator\\\", \\\"parameters\\\": {\\\"expression\\\": \\\"2355\\\"}}; {\\\"name\\\": \\\"giap-knowledge__look_up\\\", \\\"parameters\\\": {\\\"question\\\": \\\"What is 2,355 metres in feet?\\\"}}\",\"type\":\"server_error\"}}"
+  }
+ ]
+}

@@ -52,7 +52,8 @@ async fn send_traced(
     let session_id = egress::current_session_id();
 
     let start = std::time::Instant::now();
-    let result = builder.send().await;
+    // An error's text names its URL, whose query is what the user asked; it is logged below.
+    let result = builder.send().await.map_err(reqwest::Error::without_url);
     let latency_ms = start.elapsed().as_millis() as u64;
     let status = result.as_ref().ok().map(|r| r.status().as_u16());
 
@@ -90,5 +91,19 @@ mod tests {
     #[test]
     fn client_builds_without_panic() {
         let _client = build_http_client();
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_never_names_its_url() {
+        let error = traced_get(
+            &build_http_client(),
+            "http://127.0.0.1:1/search?q=a-private-question",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !format!("{error:#}").contains("private-question"),
+            "{error:#}"
+        );
     }
 }

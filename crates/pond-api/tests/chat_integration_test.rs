@@ -483,6 +483,7 @@ impl pond_core::models::ports::agent::Agent for ToolEmittingMockAgent {
                 id: "tc-1".to_string(),
                 tool: "giap__get_weather".to_string(),
                 content: "Sunny, 28°C".to_string(),
+                card: None,
             });
             yield Ok(AgentStreamEvent::Text { content: "Tool done".to_string() });
             yield Ok(AgentStreamEvent::Done { session_id, model_role, usage: None, stats: None });

@@ -64,6 +64,8 @@ import {
   type TranscribeResponse,
   type UserSkill,
   type WeatherApiResponse,
+  type WebSearchKeyStored,
+  type WebSearchState,
   type ZoneChoice,
   type DetectedPlace,
 } from "./types";
@@ -2010,6 +2012,22 @@ export class PondApiClient {
     );
   }
 
+  // ── Web search ───────────────────────────────────────────
+
+  /** An older pond answers with its web page, which `request` returns as undefined: callers guard. */
+  getWebSearch(): Promise<WebSearchState> {
+    return this.get("/api/v1/web-search");
+  }
+
+  /** Brave is asked once before anything is stored. A refused key is an ApiError with status 422. */
+  setWebSearchKey(key: string): Promise<WebSearchKeyStored> {
+    return this.put("/api/v1/web-search/key", { key });
+  }
+
+  deleteWebSearchKey(): Promise<void> {
+    return this.del("/api/v1/web-search/key");
+  }
+
   // ── Secrets ──────────────────────────────────────────────
 
   async listSecretKeys(): Promise<string[]> {
@@ -2102,12 +2120,13 @@ export class PondApiClient {
   // ── Wake-word calibration ────────────────────────────────────
 
   /** Submit one WAV recording as a calibration sample. */
-  async calibrateWakeWord(wav: ArrayBuffer): Promise<CalibrateResponse> {
+  async calibrateWakeWord(wav: ArrayBuffer, prompt?: string): Promise<CalibrateResponse> {
     const headers: Record<string, string> = {};
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
 
     const form = new FormData();
     form.append("audio", new Blob([wav], { type: "audio/wav" }), "sample.wav");
+    if (prompt) form.append("prompt", prompt);
 
     const res = await fetch(`${this.base}/api/v1/voice/calibrate`, {
       method: "POST",

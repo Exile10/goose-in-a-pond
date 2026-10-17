@@ -83,10 +83,6 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("llm_provider", &settings.llm_provider);
         upsert!("voice_wake_word", &settings.voice_wake_word);
         upsert!(
-            "voice_kws_whisper_url",
-            settings.voice_kws_whisper_url.as_deref().unwrap_or("")
-        );
-        upsert!(
             "voice_kws_energy_threshold",
             settings.voice_kws_energy_threshold.to_string()
         );
@@ -768,13 +764,6 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         }
         "llm_provider" => s.llm_provider = value.to_string(),
         "voice_wake_word" => s.voice_wake_word = value.to_string(),
-        "voice_kws_whisper_url" => {
-            s.voice_kws_whisper_url = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
         "voice_kws_energy_threshold" => {
             if let Ok(v) = value.parse() {
                 s.voice_kws_energy_threshold = v;

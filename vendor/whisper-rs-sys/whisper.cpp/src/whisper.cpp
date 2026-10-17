@@ -3942,6 +3942,18 @@ int whisper_encode(struct whisper_context * ctx, int offset, int n_threads) {
 }
 
 int whisper_decode_with_state(struct whisper_context * ctx, struct whisper_state * state, const whisper_token * tokens, int n_tokens, int n_past, int n_threads) {
+    // A whisper_full whose cache could not grow leaves none, and language auto-detect decodes here first.
+    if (!state->kv_self.buffer) {
+        if (!whisper_kv_cache_init(state->kv_self, state->backends[0], ctx->itype,
+                    ctx->model.hparams.n_text_state,
+                    ctx->model.hparams.n_text_layer,
+                    GGML_PAD(ctx->model.hparams.n_text_ctx, 256))) {
+            WHISPER_LOG_ERROR("%s: whisper_kv_cache_init() failed for self-attention cache\n", __func__);
+            return 1;
+        }
+        state->kv_self_n_dec = 1;
+    }
+
     whisper_batch_prep_legacy(state->batch, tokens, n_tokens, n_past, 0);
 
     whisper_kv_cache_seq_rm(state->kv_self, 0, n_past, -1);

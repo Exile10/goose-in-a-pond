@@ -11,9 +11,23 @@ class FakeChild extends EventEmitter {
   stdinEnded = false;
   killed: NodeJS.Signals | null = null;
   pid = 4242;
+  /** Every chunk written to stdin, in order. */
+  written: string[] = [];
+  /** Behave like a child that reads stdin: on `stop`, report `stopped` and exit 0. */
+  honoursStop = false;
 
   stdin = new Writable({
-    write: (_c, _e, cb) => cb(),
+    write: (chunk, _e, cb) => {
+      const line = String(chunk);
+      this.written.push(line);
+      if (this.honoursStop && line === '{"cmd":"stop"}\n') {
+        setImmediate(() => {
+          this.say('{"event":"exit","reason":"stopped"}');
+          void this.exit(0);
+        });
+      }
+      cb();
+    },
     final: (cb) => {
       this.stdinEnded = true;
       cb();
@@ -304,14 +318,72 @@ describe("the stale-reader guard", () => {
   });
 });
 
-describe("stopping", () => {
-  it("closes stdin first and does not kill a child that goes quietly", async () => {
+describe("commands on the child's stdin", () => {
+  it("writes an interrupt as one newline-delimited JSON line and keeps stdin open", async () => {
+    const h = harness();
+    await h.voice.start("s1");
+    const c = h.children[0]!;
+
+    h.voice.interrupt();
+    await tick();
+
+    expect(c.written).toEqual(['{"cmd":"interrupt"}\n']);
+    expect(c.stdinEnded).toBe(false);
+    expect(c.killed).toBe(null);
+    expect(h.voice.isActive).toBe(true);
+  });
+
+  it("ignores an interrupt when no session is running", () => {
+    const h = harness();
+    expect(() => h.voice.interrupt()).not.toThrow();
+  });
+
+  it("sends an interrupt to the current session only", async () => {
+    const h = harness();
+    await h.voice.start("session-A");
+    h.voice.killNow();
+    await h.voice.start("session-B");
+
+    h.voice.interrupt();
+    await tick();
+
+    expect(h.children[0]!.written).toEqual([]);
+    expect(h.children[1]!.written).toEqual(['{"cmd":"interrupt"}\n']);
+  });
+
+  it("writes nothing once a stop has closed stdin", async () => {
     const h = harness();
     await h.voice.start("s1");
     const c = h.children[0]!;
 
     const stopping = h.voice.stop();
     await tick();
+    h.voice.interrupt();
+    await stopping;
+
+    expect(c.written).toEqual(['{"cmd":"stop"}\n']);
+  });
+
+  // An unhandled `error` on the pipe would throw in the main process.
+  it("survives a write the child's dead pipe refuses", async () => {
+    const h = harness();
+    await h.voice.start("s1");
+    const c = h.children[0]!;
+
+    const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    expect(() => c.stdin.emit("error", epipe)).not.toThrow();
+  });
+});
+
+describe("stopping", () => {
+  it("sends stop, then closes stdin, and does not kill a child that goes quietly", async () => {
+    const h = harness();
+    await h.voice.start("s1");
+    const c = h.children[0]!;
+
+    const stopping = h.voice.stop();
+    await tick();
+    expect(c.written).toEqual(['{"cmd":"stop"}\n']);
     expect(c.stdinEnded).toBe(true);
 
     c.say('{"event":"exit","reason":"stdin_eof"}');
@@ -322,14 +394,36 @@ describe("stopping", () => {
     expect(h.voice.isActive).toBe(false);
   });
 
-  // The normal path: in voice mode the child never reads stdin.
-  it("escalates to SIGKILL when the child ignores stdin close", async () => {
+  // The shipped path: the child reads stdin, so stop never needs the kill.
+  it("lets a child that honours stop exit cleanly, well inside the real grace period", async () => {
+    const h = harness({ gracefulStopMs: 3_000 });
+    await h.voice.start("s1");
+    const c = h.children[0]!;
+    c.honoursStop = true;
+    c.say('{"event":"ready","session_id":"s1"}');
+    await tick();
+
+    const t0 = Date.now();
+    await h.voice.stop();
+
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(c.killed).toBe(null);
+    expect(h.voice.isActive).toBe(false);
+    expect(h.emitted.at(-1)).toEqual({
+      name: "voice-session-ended",
+      payload: { code: 0, reason: "stopped", session_id: "s1", detail: null },
+    });
+  });
+
+  // A stuck child, or a sidecar staged before the child read stdin.
+  it("escalates to SIGKILL when the child ignores stop", async () => {
     const h = harness();
     await h.voice.start("s1");
     const c = h.children[0]!;
 
     await h.voice.stop();
 
+    expect(c.written).toEqual(['{"cmd":"stop"}\n']);
     expect(c.killed).toBe("SIGKILL");
     expect(h.voice.isActive).toBe(false);
   });
@@ -337,6 +431,24 @@ describe("stopping", () => {
   it("is a no-op when no session is running", async () => {
     const h = harness();
     await expect(h.voice.stop()).resolves.toBeUndefined();
+  });
+
+  it("serialises an overlapping stop and start for a child that honours stop", async () => {
+    const h = harness({ gracefulStopMs: 3_000 });
+    await h.voice.start("s1");
+    h.children[0]!.honoursStop = true;
+
+    const stopping = h.voice.stop();
+    const starting = h.voice.start("s2");
+    await Promise.all([stopping, starting]);
+
+    expect(h.children).toHaveLength(2);
+    expect(h.children[0]!.killed).toBe(null);
+    expect(h.voice.sessionId).toBe("s2");
+    // s1's end was reported before s2 existed, so it reached the renderer.
+    const ended = h.emitted.filter((e) => e.name === "voice-session-ended");
+    expect(ended).toHaveLength(1);
+    expect(ended[0]!.payload).toMatchObject({ session_id: "s1", reason: "stopped" });
   });
 
   // ipcMain.handle callbacks interleave at every await, and stop() awaits a timer.

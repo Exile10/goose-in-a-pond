@@ -112,7 +112,8 @@ Renderer (React)                          Main process (TypeScript)
      │  invoke("ensure_server_running")  ──►   │  Spawns or attaches to pond-server
      │  invoke("server_health")          ──►   │  True when HTTP is answering
      │  invoke("start_voice_session")    ──►   │  Spawns the voice child
-     │  invoke("stop_voice_session")     ──►   │  Ends it, escalating to a kill
+     │  invoke("stop_voice_session")     ──►   │  Writes `stop` to its stdin; kills after 3 s
+     │  invoke("interrupt_voice_turn")   ──►   │  Writes `interrupt`: ends the turn it is speaking
      │  invoke("open_external", {url})   ──►   │  Opens the system browser
      │                                         │
      │  ◄──  "server-status" (bool)           │  Health loop

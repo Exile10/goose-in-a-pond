@@ -1,0 +1,50 @@
+{
+  "_doc": "Labels fixed BEFORE any run. expect: the knowledge family the turn needs (read, compute), 'none' for no tool, or 'other:<group>' when another group owns it and a knowledge call is a steal. accept: families that also count as right. arg: regexes the call's argument must match (accent-folded, case-insensitive) -- the proper-noun and grouping fidelity check. answer: regexes the final reply must match given the frozen result. wiki: the fixture article. calc: the exact result the compute fixture returns. Today is fixed at 2026-10-14 by the captured system-context.",
+  "cases": [
+    {"id": "r01", "q": "Who was Wangari Maathai?", "expect": "read", "arg": ["maathai"], "answer": ["nobel|green belt"], "wiki": "Wangari Maathai"},
+    {"id": "r02", "q": "What is Kisumu known for?", "expect": "read", "arg": ["kisumu"], "answer": ["lake victoria|port|third"], "wiki": "Kisumu"},
+    {"id": "r03", "q": "Who is Ngũgĩ wa Thiong'o?", "expect": "read", "arg": ["ngugi"], "answer": ["writ|novel|author|playwright"], "wiki": "Ngũgĩ wa Thiong'o"},
+    {"id": "r04", "q": "Tell me about the Uganda Railway.", "expect": "read", "arg": ["uganda railway"], "answer": ["mombasa|lunatic|1896|1901|kisumu"], "wiki": "Uganda Railway"},
+    {"id": "r05", "q": "What happened at the Battle of Adwa?", "expect": "read", "arg": ["adwa"], "answer": ["ethiopia"], "wiki": "Battle of Adwa"},
+    {"id": "r06", "q": "What is M-Pesa?", "expect": "read", "arg": ["m-?pesa"], "answer": ["mobile|money|safaricom|vodafone"], "wiki": "M-Pesa"},
+    {"id": "r07", "q": "Who was Dedan Kimathi?", "expect": "read", "arg": ["kimathi"], "answer": ["mau mau"], "wiki": "Dedan Kimathi"},
+    {"id": "r08", "q": "When did Lake Turkana get its current name, and what was it called before?", "expect": "read", "arg": ["turkana"], "answer": ["rudolf"], "wiki": "Lake Turkana"},
+    {"id": "r09", "q": "Who won the men's marathon at the 2024 Olympics?", "expect": "read", "arg": ["marathon"], "answer": ["tola"], "wiki": "Athletics at the 2024 Summer Olympics – Men's marathon"},
+    {"id": "r10", "q": "Where was Barack Obama's father born?", "expect": "read", "arg": ["obama"], "answer": ["kogelo|nyang|kenya|rachuonyo|kendu"], "wiki": "Barack Obama Sr."},
+    {"id": "r11", "q": "What language is mostly spoken in Lamu?", "expect": "read", "arg": ["lamu"], "answer": ["swahili|amu"], "wiki": "Lamu"},
+    {"id": "r12", "q": "What building did Wangari Maathai campaign against in Uhuru Park?", "expect": "read", "arg": ["maathai|uhuru"], "answer": ["times|media trust|complex|storey|kanu"], "wiki": "Wangari Maathai", "deep": 17135},
+    {"id": "r13", "q": "Where is the new Lamu port being built?", "expect": "read", "arg": ["lamu"], "answer": ["manda"], "wiki": "Lamu", "deep": 6728},
+    {"id": "r14", "q": "Which mobile operator ran M-Pesa in Afghanistan?", "expect": "read", "arg": ["m-?pesa"], "answer": ["roshan"], "wiki": "M-Pesa", "deep": 12424},
+    {"id": "r15", "q": "Which animals attacked the workers building the Uganda Railway?", "expect": "read", "arg": ["uganda railway"], "answer": ["lion"], "wiki": "Uganda Railway", "deep": 4367},
+
+    {"id": "c01", "q": "What is 1234 times 17?", "expect": "compute", "arg": ["1234", "17"], "answer": ["20,?978"], "calc": "1234 × 17 = 20978"},
+    {"id": "c02", "q": "What is (11 + 31 + 24) divided by 3?", "expect": "compute", "arg": ["11", "31", "24"], "answer": ["\\b22\\b"], "calc": "(11 + 31 + 24) / 3 = 22"},
+    {"id": "c03", "q": "Convert 72 degrees Fahrenheit to Celsius.", "expect": "compute", "arg": ["72"], "answer": ["22\\.2"], "calc": "72 °F = 22.22 °C"},
+    {"id": "c04", "q": "How many days are there between 12 December 1963 and 14 October 2026?", "expect": "compute", "arg": ["1963", "2026"], "answer": ["22,?952"], "calc": "From 12 December 1963 to 14 October 2026 is 22952 days"},
+    {"id": "c05", "q": "What is 15 percent of 2,350 shillings?", "expect": "compute", "arg": ["15", "2,?350"], "answer": ["352\\.5"], "calc": "15% of 2350 = 352.5"},
+    {"id": "c06", "q": "What is the square root of 7, to five decimal places?", "expect": "compute", "arg": ["7"], "answer": ["2\\.64575"], "calc": "√7 ≈ 2.64575"},
+    {"id": "c07", "q": "How many seconds are in 3.5 hours?", "expect": "compute", "arg": ["3\\.5"], "answer": ["12,?600"], "calc": "3.5 hours = 12600 seconds"},
+    {"id": "c08", "q": "What is 16 percent of 48,000?", "expect": "compute", "arg": ["16", "48,?000"], "answer": ["7,?680"], "calc": "16% of 48000 = 7680"},
+    {"id": "c09", "q": "If I save 2,500 shillings every week, how much will I have after 52 weeks?", "expect": "compute", "arg": ["2,?500", "52"], "answer": ["130,?000"], "calc": "2500 × 52 = 130000"},
+    {"id": "c10", "q": "What is 3 to the power of 13?", "expect": "compute", "arg": ["3", "13"], "answer": ["1,?594,?323"], "calc": "3^13 = 1594323"},
+    {"id": "c11", "q": "How many kilometres is 26.2 miles?", "expect": "compute", "arg": ["26\\.2"], "answer": ["42\\.1|42\\.2"], "calc": "26.2 miles = 42.16 km"},
+
+    {"id": "d01", "q": "What does the word 'ephemeral' mean?", "expect": "none", "accept": ["read", "compute"], "answer": ["short|brief|fleeting|temporar|lasting"]},
+    {"id": "d02", "q": "What does the Swahili word 'harambee' mean?", "expect": "none", "accept": ["read", "compute"], "answer": ["together|pull"]},
+
+    {"id": "n01", "q": "Hi! How are you today?", "expect": "none"},
+    {"id": "n02", "q": "Thanks, that's all for now.", "expect": "none"},
+    {"id": "n03", "q": "Write a two-line poem about rain in Nairobi.", "expect": "none"},
+    {"id": "n04", "q": "Rewrite this more politely: send me the report now.", "expect": "none"},
+    {"id": "n05", "q": "What is 2 plus 2?", "expect": "none", "accept": ["compute"], "answer": ["\\b4\\b|four"]},
+    {"id": "n06", "q": "What day of the week is it today?", "expect": "none", "accept": ["other:giap-system"], "answer": ["wednesday"]},
+
+    {"id": "o01", "q": "What's the weather in Nairobi right now?", "expect": "other:giap-weather"},
+    {"id": "o02", "q": "What did I tell you about my sister?", "expect": "other:giap-memory"},
+    {"id": "o03", "q": "Remind me to call mum at 6pm.", "expect": "other:giap-schedule"},
+    {"id": "o04", "q": "Turn off the kitchen lights.", "expect": "other:giap-device-control", "accept": ["other:giap-device"]},
+
+    {"id": "x01", "q": "Who was Wangari Maathai, and how many years ago did she win the Nobel Peace Prize?", "expect": "read", "accept": ["compute"], "arg": ["maathai"], "answer": ["\\b22\\b", "maathai|green belt|nobel"], "wiki": "Wangari Maathai", "calc": "2026 − 2004 = 22"},
+    {"id": "x02", "q": "What is the capital of Ethiopia, and what is 2,355 metres in feet?", "expect": "read", "accept": ["compute"], "answer": ["addis", "7,?72[0-9]"], "wiki": "Addis Ababa", "calc": "2355 metres = 7726.4 feet"}
+  ]
+}

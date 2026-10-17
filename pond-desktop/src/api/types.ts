@@ -122,7 +122,6 @@ export interface Settings {
   embedding_provider?: string;
 
   // Voice KWS tuning
-  voice_kws_whisper_url?: string | null;
   voice_kws_energy_threshold?: number;
   voice_kws_post_trigger_silence_ms?: number;
   voice_kws_cooldown_ms?: number;
@@ -1028,6 +1027,10 @@ export interface TranscribeResponse {
 export interface CalibrateResponse {
   transcript:    string;
   normalized:    string;
+  /** The wake phrase as heard in this take; `null` when the take did not contain it. */
+  heard:         string | null;
+  /** Whether `heard` was new and became a trigger. */
+  new_variant:   boolean;
   all_variants:  string[];
   sample_count:  number;
   target_count:  number;
@@ -1386,6 +1389,35 @@ export interface FaceModelsResponse {
   feature_enabled: boolean;  // false when pond-server lacks --features face-onnx
   models_dir: string | null;
   models: FaceModelEntry[];
+}
+
+// ── Web search ────────────────────────────────────────────────
+export type WebSearchStatus = "ok" | "not_configured" | "rejected" | "quota" | "unverified";
+
+/** `GET /api/v1/web-search`. The key itself is never returned. */
+export interface WebSearchState {
+  provider: "brave";
+  configured: boolean;
+  status: WebSearchStatus;
+}
+
+/** `PUT /api/v1/web-search/key` when the key was stored. A key Brave refused is a 422 instead. */
+export interface WebSearchKeyStored {
+  configured: true;
+  status: "ok" | "quota" | "unverified";
+}
+
+/** The 422 body of `PUT /api/v1/web-search/key`; nothing was stored. */
+export interface WebSearchKeyRejected {
+  error: string;
+}
+
+/** One result of a `search` card. */
+export interface WebSearchHit {
+  title: string;
+  url: string;
+  domain: string;
+  snippet: string;
 }
 
 // ── API Error ─────────────────────────────────────────────────
