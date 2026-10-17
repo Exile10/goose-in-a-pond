@@ -8,7 +8,8 @@
   restart  the claim survived a restart
   reset-wizard
            after a host reset of the pond `card` claimed: its wizard refuses the tokenless host and
-           admits the claimant's token; after `setup-code --rearm` it reopens to the host
+           admits the claimant's token, completing it makes the claiming phone the primary
+           member's, and after `setup-code --rearm` the wizard reopens to the host
 
 The launcher proves process and port ownership first. The setup code is read from
 `pond-server setup-code --json` and never printed, and neither is the claimant's token, which
@@ -145,10 +146,17 @@ def reset_wizard():
     check("a claimed, reset pond's wizard refuses the tokenless host", code == 401, "%s %s" % (code, text[:200]))
     code, _, text, _ = request("POST", "/onboard/reset")
     check("and so does its reset, until it is set up again", code == 401, "%s %s" % (code, text[:200]))
-    code, _, text, _ = request("PUT", "/settings", FULL_SETUP, bearer)
-    check("the claimant's token reopens the wizard", code == 200, "%s %s" % (code, text[:200]))
+    code, _, text, owner = request("POST", "/profiles", {"display_name": "Live Owner"}, bearer)
+    check("the claimant's token reopens the wizard", code == 201, "%s %s" % (code, text[:200]))
+    owner_id = (owner or {}).get("id")
+    code, _, text, _ = request("PUT", "/settings", {**FULL_SETUP, "primary_profile_id": owner_id}, bearer)
+    check("the claimant names the owner as the primary member", code == 200, "%s %s" % (code, text[:200]))
     code, _, text, _ = request("POST", "/onboard/complete", None, bearer)
     check("the claimant finishes setup as itself", code == 200, "%s %s" % (code, text[:200]))
+    code, _, text, me = request("GET", "/devices/self", None, bearer)
+    check("and the claiming phone now belongs to the owner",
+          code == 200 and ((me or {}).get("profile") or {}).get("id") == owner_id,
+          "%s %s" % (code, text[:200]))
     code, _, text, _ = request("PUT", "/settings", FULL_SETUP)
     check("the wizard closes again once set up", code == 401, "%s %s" % (code, text[:200]))
 

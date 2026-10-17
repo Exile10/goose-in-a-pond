@@ -1317,7 +1317,58 @@ async fn complete_onboarding(
                 Json(json!({"error": format!("Failed to complete onboarding: {}", e)})),
             )
         })?;
+    attribute_claimant_to_owner(&state, settings.primary_profile_id.as_deref()).await;
     Ok(Json(json!({"status": "completed"})))
+}
+
+/// The device that claimed the pond paired before it had members, so it belonged to nobody; it
+/// becomes the primary member's now. After completion is saved, so a failure here only logs.
+async fn attribute_claimant_to_owner(state: &Arc<AppState>, primary_profile_id: Option<&str>) {
+    let Some(claims) = state.setup_claims.as_ref() else {
+        return;
+    };
+    let failed = |device: Option<&str>, why: String| {
+        tracing::warn!(
+            kind = "owner_attribution_failed",
+            device = device.unwrap_or("unknown"),
+            error = %why,
+            "onboarding completed, but the device that claimed this pond was not attributed \
+             to its owner; it stays unattributed until a pairing code or Devices binds it"
+        );
+    };
+    let claimant = match claims.claimed_by().await {
+        Ok(Some(device)) => device,
+        Ok(None) => return,
+        Err(e) => return failed(None, format!("{e:#}")),
+    };
+    let attribution = device_attribution(state);
+    let current = match attribution.device_profile(&claimant).await {
+        Ok(current) => current,
+        Err(e) => return failed(Some(&claimant), format!("{e:#}")),
+    };
+    let members: Vec<String> = match state.profile_repo.list().await {
+        Ok(profiles) => profiles.into_iter().map(|p| p.id).collect(),
+        Err(e) => return failed(Some(&claimant), format!("{e:#}")),
+    };
+    let Some(owner) = pond_core::user_data::services::member_attribution::owner_for_claimant(
+        current.as_deref(),
+        primary_profile_id,
+        &members,
+    ) else {
+        return;
+    };
+    match attribution
+        .set_device_profile(&claimant, Some(&owner))
+        .await
+    {
+        Ok(()) => tracing::info!(
+            kind = "owner_attributed",
+            device = %claimant,
+            profile_id = %owner,
+            "the device that claimed this pond now belongs to its owner"
+        ),
+        Err(e) => failed(Some(&claimant), format!("{e:#}")),
+    }
 }
 
 /// Onboarding-status JSON shared by the status, step and reset routes so their shapes match.
