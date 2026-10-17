@@ -223,8 +223,9 @@ listener runs (`POND_DEV_INSECURE_LAN=1`); the key is absent otherwise. See
 ### GET /network/status (2026-10-17)
 
 The BLE setup channel's radios, for the household's status view (`docs/architecture/pond-setup-channel.md`).
-Never tokenless: a paired device's token or the host's credential, in every state, so the wizard
-can show it before onboarding.
+A paired device's token in every state, before onboarding included, so the wizard can show it. A
+caller without a token gets `401`, the host credential alone included: the route is
+`Exposure::Authenticated`, which the auth middleware enforces before any handler runs.
 
 **Response 200**
 ```json
@@ -232,7 +233,7 @@ can show it before onboarding.
   "ble": {
     "enabled": true,
     "state": "unavailable",
-    "reason": "macOS stopped the Bluetooth helper (SIGKILL) before the radio answered, which it does when the app the pond runs under has no Bluetooth permission",
+    "reason": "macOS stopped the Bluetooth helper (signal 6) before the radio answered, which it does when the app the pond runs under has no Bluetooth permission or declares no Bluetooth use; ...",
     "session_open": false
   },
   "wifi": {
