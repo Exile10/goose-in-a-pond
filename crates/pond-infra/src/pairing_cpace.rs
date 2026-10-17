@@ -22,13 +22,18 @@
 //! (`lv_cat`, the generator, ISK, the tags). It is held to the draft's Appendix B.3 vectors and
 //! to the cross-language exchange vectors in `tests/fixtures/cpace-vectors.json`.
 //!
+//! A run over the BLE setup channel also derives that channel's two keys from ISK
+//! (`docs/architecture/pond-setup-channel.md`, "Sealing"). ISK leaves this module as nothing else.
+//!
 //! The Pond side ([`Initiator`]) is crate-private. The phone side ([`Responder`]) exists only for
 //! tests and the `cpace-client` feature, which the integration tests use to pair like a phone.
 
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::traits::IsIdentity;
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use pond_core::security::ports::handshake::{ChannelKeys, CHANNEL_KEY_LEN};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha512};
 use subtle::ConstantTimeEq;
@@ -55,6 +60,12 @@ const CLIENT_TAG_LABEL: &[u8] = b"goose-pair-cpace-client-v1";
 const SERVER_TAG_LABEL: &[u8] = b"goose-pair-cpace-server-v1";
 /// `ADa` and `ADb`.
 const AD: &[u8] = b"";
+/// HKDF info for `k_p2c`, the key of what the Pond sends over the setup channel.
+pub const CHANNEL_POND_TO_PHONE_INFO: &str = "goose-setup-channel-v1 pond to phone";
+/// HKDF info for `k_c2p`, the key of what the phone sends.
+pub const CHANNEL_PHONE_TO_POND_INFO: &str = "goose-setup-channel-v1 phone to pond";
+/// Length of ISK and of the HKDF-SHA-512 pseudorandom key.
+const ISK_LEN: usize = 64;
 
 /// Length of an encoded ristretto255 element (a public share).
 pub const SHARE_LEN: usize = 32;
@@ -166,19 +177,47 @@ fn scalar_mult_vfy(scalar: &Scalar, share: &[u8]) -> Option<Zeroizing<[u8; 32]>>
 }
 
 /// `ISK = SHA-512(lv_cat(DSI_ISK, sid, K) || transcript_ir(Ya, ADa, Yb, ADb))`.
-fn intermediate_session_key(sid: &[u8], k: &[u8], ya: &[u8], yb: &[u8]) -> Zeroizing<[u8; 64]> {
+fn intermediate_session_key(
+    sid: &[u8],
+    k: &[u8],
+    ya: &[u8],
+    yb: &[u8],
+) -> Zeroizing<[u8; ISK_LEN]> {
     let mut hasher = Sha512::new();
     hasher.update(Zeroizing::new(lv_cat(&[DSI_ISK, sid, k])).as_slice());
     hasher.update(lv_cat(&[ya, AD]));
     hasher.update(lv_cat(&[yb, AD]));
-    let mut isk = Zeroizing::new([0u8; 64]);
+    let mut isk = Zeroizing::new([0u8; ISK_LEN]);
     isk.copy_from_slice(&hasher.finalize());
     isk
+}
+
+/// `prk = HKDF-Extract(SHA-512, salt = sid, ikm = ISK)`, then one HKDF-Expand per direction.
+fn channel_key_schedule(isk: &[u8], sid: &[u8]) -> (Zeroizing<[u8; ISK_LEN]>, ChannelKeys) {
+    let (mut extracted, hkdf) = Hkdf::<Sha512>::extract(Some(sid), isk);
+    let mut prk = Zeroizing::new([0u8; ISK_LEN]);
+    prk.copy_from_slice(&extracted);
+    extracted.as_mut_slice().zeroize();
+    let mut pond_to_phone = Zeroizing::new([0u8; CHANNEL_KEY_LEN]);
+    let mut phone_to_pond = Zeroizing::new([0u8; CHANNEL_KEY_LEN]);
+    hkdf.expand(
+        CHANNEL_POND_TO_PHONE_INFO.as_bytes(),
+        pond_to_phone.as_mut_slice(),
+    )
+    .expect("32 bytes is far inside HKDF-SHA-512's output limit");
+    hkdf.expand(
+        CHANNEL_PHONE_TO_POND_INFO.as_bytes(),
+        phone_to_pond.as_mut_slice(),
+    )
+    .expect("32 bytes is far inside HKDF-SHA-512's output limit");
+    (prk, ChannelKeys::new(&pond_to_phone, &phone_to_pond))
 }
 
 /// The keys both sides derive once they hold `K`.
 struct Confirmation {
     mac_key: Zeroizing<[u8; 64]>,
+    isk: Zeroizing<[u8; ISK_LEN]>,
+    sid: Vec<u8>,
     ya: [u8; SHARE_LEN],
     yb: [u8; SHARE_LEN],
 }
@@ -192,7 +231,17 @@ impl Confirmation {
         hasher.update(isk.as_slice());
         let mut mac_key = Zeroizing::new([0u8; 64]);
         mac_key.copy_from_slice(&hasher.finalize());
-        Self { mac_key, ya, yb }
+        Self {
+            mac_key,
+            isk,
+            sid: sid.to_vec(),
+            ya,
+            yb,
+        }
+    }
+
+    fn channel_keys(&self) -> ChannelKeys {
+        channel_key_schedule(self.isk.as_slice(), &self.sid).1
     }
 
     fn tag(&self, label: &[u8]) -> [u8; TAG_LEN] {
@@ -235,15 +284,33 @@ impl Initiator {
         self.share
     }
 
-    /// Check the phone's `Yb` and `T_client`; on success, the Pond's `T_server`.
-    pub(crate) fn finish(self, yb: &[u8], client_tag: &[u8]) -> Result<[u8; TAG_LEN], CpaceError> {
+    /// Check the phone's `Yb` and `T_client`; on success, the Pond's `T_server` and the run.
+    pub(crate) fn finish(self, yb: &[u8], client_tag: &[u8]) -> Result<Confirmed, CpaceError> {
         let k = scalar_mult_vfy(&self.scalar, yb).ok_or(CpaceError::InvalidShare)?;
         let yb: [u8; SHARE_LEN] = yb.try_into().map_err(|_| CpaceError::InvalidShare)?;
         let confirmation = Confirmation::derive(&self.sid, k.as_slice(), self.share, yb);
         if !bool::from(confirmation.client_tag().as_slice().ct_eq(client_tag)) {
             return Err(CpaceError::InvalidConfirmation);
         }
-        Ok(confirmation.server_tag())
+        Ok(Confirmed {
+            server_tag: confirmation.server_tag(),
+            confirmation,
+        })
+    }
+}
+
+/// A run the phone confirmed. Its ISK stays inside, wiped on drop, and comes out only as
+/// [`Confirmed::channel_keys`].
+pub(crate) struct Confirmed {
+    /// `T_server`, the Pond's proof, sent once the tokens exist.
+    pub(crate) server_tag: [u8; TAG_LEN],
+    confirmation: Confirmation,
+}
+
+impl Confirmed {
+    /// The setup channel's keys for this run. Called for a channel run only.
+    pub(crate) fn channel_keys(&self) -> ChannelKeys {
+        self.confirmation.channel_keys()
     }
 }
 
@@ -304,6 +371,25 @@ impl Responder {
             .ct_eq(server_tag)
             .into()
     }
+
+    /// The setup channel's keys, as the phone derives them from its own ISK.
+    pub fn channel_keys(&self) -> ChannelKeys {
+        self.confirmation.channel_keys()
+    }
+}
+
+/// Every value of the setup channel's key schedule for a given ISK, for the vector file.
+#[cfg(any(test, feature = "cpace-client"))]
+pub struct ChannelKeySchedule {
+    pub prk: [u8; ISK_LEN],
+    pub keys: ChannelKeys,
+}
+
+/// The key schedule over a caller's ISK and sid; a Pond's own ISK never reaches it.
+#[cfg(any(test, feature = "cpace-client"))]
+pub fn channel_key_schedule_for(isk: &[u8], sid: &[u8]) -> ChannelKeySchedule {
+    let (prk, keys) = channel_key_schedule(isk, sid);
+    ChannelKeySchedule { prk: *prk, keys }
 }
 
 #[cfg(test)]
@@ -345,6 +431,10 @@ mod tests {
 
     fn scalar(bytes: &[u8]) -> Scalar {
         scalar_from_bytes(bytes.try_into().unwrap()).unwrap()
+    }
+
+    fn finish_tag(pond: Initiator, yb: &[u8], tag: &[u8]) -> Result<[u8; TAG_LEN], CpaceError> {
+        pond.finish(yb, tag).map(|confirmed| confirmed.server_tag)
     }
 
     // ---- The draft's own vectors (Appendix A.1 and B.3) ----------------------------------
@@ -487,7 +577,7 @@ mod tests {
         let ci = channel_identifier(PIN, "phone-1");
         let pond = Initiator::start(b"482915", &ci, sid());
         let phone = Responder::respond(b"482915", &ci, &sid(), &pond.share()).unwrap();
-        let server_tag = pond.finish(&phone.share(), &phone.confirmation()).unwrap();
+        let server_tag = finish_tag(pond, &phone.share(), &phone.confirmation()).unwrap();
         assert!(phone.verify_server(&server_tag));
         assert_ne!(server_tag, phone.confirmation(), "the two tags must differ");
     }
@@ -498,7 +588,7 @@ mod tests {
         let pond = Initiator::start(b"482915", &ci, sid());
         let phone = Responder::respond(b"482916", &ci, &sid(), &pond.share()).unwrap();
         assert_eq!(
-            pond.finish(&phone.share(), &phone.confirmation()),
+            finish_tag(pond, &phone.share(), &phone.confirmation()),
             Err(CpaceError::InvalidConfirmation)
         );
     }
@@ -509,7 +599,7 @@ mod tests {
         let ci = channel_identifier(OTHER_PIN, "phone-1");
         let phone = Responder::respond(b"482915", &ci, &sid(), &pond.share()).unwrap();
         assert_eq!(
-            pond.finish(&phone.share(), &phone.confirmation()),
+            finish_tag(pond, &phone.share(), &phone.confirmation()),
             Err(CpaceError::InvalidConfirmation)
         );
     }
@@ -527,7 +617,7 @@ mod tests {
         assert_ne!(ya, again.share());
         // A failed confirmation returns no tag at all.
         let phone = Responder::respond(b"000000", &ci, &sid(), &ya).unwrap();
-        assert!(pond.finish(&phone.share(), &phone.confirmation()).is_err());
+        assert!(finish_tag(pond, &phone.share(), &phone.confirmation()).is_err());
     }
 
     #[test]
@@ -535,9 +625,64 @@ mod tests {
         let ci = channel_identifier(PIN, "phone-1");
         for bad in [vec![0u8; 32], vec![0xffu8; 32], vec![1u8; 31]] {
             let pond = Initiator::start(b"482915", &ci, sid());
-            assert_eq!(pond.finish(&bad, &[0u8; 64]), Err(CpaceError::InvalidShare));
+            assert_eq!(
+                finish_tag(pond, &bad, &[0u8; 64]),
+                Err(CpaceError::InvalidShare)
+            );
             assert!(Responder::respond(b"482915", &ci, &sid(), &bad).is_err());
         }
+    }
+
+    #[test]
+    fn both_sides_derive_the_same_channel_keys_and_each_direction_its_own() {
+        let ci = setup_channel_identifier(PIN, "phone-1");
+        let pond = Initiator::start(b"79927398713", &ci, sid());
+        let phone = Responder::respond(b"79927398713", &ci, &sid(), &pond.share()).unwrap();
+        let confirmed = pond.finish(&phone.share(), &phone.confirmation()).unwrap();
+        let (ours, theirs) = (confirmed.channel_keys(), phone.channel_keys());
+        assert_eq!(ours.pond_to_phone(), theirs.pond_to_phone());
+        assert_eq!(ours.phone_to_pond(), theirs.phone_to_pond());
+        assert_ne!(ours.pond_to_phone(), ours.phone_to_pond());
+
+        let again = Initiator::start(b"79927398713", &ci, sid());
+        let phone_again = Responder::respond(b"79927398713", &ci, &sid(), &again.share()).unwrap();
+        assert_ne!(
+            again
+                .finish(&phone_again.share(), &phone_again.confirmation())
+                .unwrap()
+                .channel_keys()
+                .pond_to_phone(),
+            ours.pond_to_phone(),
+            "a fresh run, with fresh scalars, has fresh keys"
+        );
+    }
+
+    /// RFC 5869 with SHA-512, spelled out with HMAC so the salt and the ikm cannot be swapped.
+    #[test]
+    fn the_channel_keys_are_hkdf_sha512_salted_with_the_session_id() {
+        let isk = [0x11u8; ISK_LEN];
+        let sid = session_id(&[7u8; 32], &[9u8; 32]);
+        let hmac = |key: &[u8], parts: &[&[u8]]| {
+            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key).unwrap();
+            for part in parts {
+                mac.update(part);
+            }
+            mac.finalize().into_bytes()
+        };
+        let prk = hmac(&sid, &[&isk]);
+        let p2c = hmac(&prk, &[CHANNEL_POND_TO_PHONE_INFO.as_bytes(), &[1]]);
+        let c2p = hmac(&prk, &[CHANNEL_PHONE_TO_POND_INFO.as_bytes(), &[1]]);
+
+        let schedule = channel_key_schedule_for(&isk, &sid);
+        assert_eq!(schedule.prk.as_slice(), prk.as_slice());
+        assert_eq!(
+            schedule.keys.pond_to_phone().as_slice(),
+            &p2c[..CHANNEL_KEY_LEN]
+        );
+        assert_eq!(
+            schedule.keys.phone_to_pond().as_slice(),
+            &c2p[..CHANNEL_KEY_LEN]
+        );
     }
 
     #[test]
@@ -588,7 +733,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pond.finish(&phone.share(), &phone.confirmation()),
+            finish_tag(pond, &phone.share(), &phone.confirmation()),
             Err(CpaceError::InvalidConfirmation)
         );
     }
@@ -618,7 +763,7 @@ mod tests {
         let k = scalar_mult_vfy(&scalar(&yb_bytes), &ya).unwrap();
         let isk = intermediate_session_key(&sid, k.as_slice(), &ya, &yb);
         let t_client = phone.confirmation();
-        let t_server = pond.finish(&yb, &t_client).unwrap();
+        let t_server = finish_tag(pond, &yb, &t_client).unwrap();
         assert!(phone.verify_server(&t_server));
 
         let b64 = |b: &[u8]| {
@@ -636,7 +781,7 @@ mod tests {
                 .unwrap();
         let rejected = |share: &[u8], tag: &[u8]| {
             let pond = Initiator::with_scalar(scalar(&ya_bytes), code.as_bytes(), &ci, sid.clone());
-            match pond.finish(share, tag) {
+            match finish_tag(pond, share, tag) {
                 Ok(_) => "accepted",
                 Err(CpaceError::InvalidShare) => "invalid_share",
                 Err(CpaceError::InvalidConfirmation) => "invalid_confirmation",
@@ -767,7 +912,7 @@ mod tests {
         let k = scalar_mult_vfy(&scalar(&yb_bytes), &ya).unwrap();
         let isk = intermediate_session_key(&sid, k.as_slice(), &ya, &yb);
         let t_client = phone.confirmation();
-        let t_server = pond.finish(&yb, &t_client).unwrap();
+        let t_server = finish_tag(pond, &yb, &t_client).unwrap();
         assert!(phone.verify_server(&t_server));
 
         let b64 = |b: &[u8]| {
@@ -776,7 +921,7 @@ mod tests {
         };
         let rejected = |share: &[u8], tag: &[u8]| {
             let pond = Initiator::with_scalar(scalar(&ya_bytes), code.as_bytes(), &ci, sid.clone());
-            match pond.finish(share, tag) {
+            match finish_tag(pond, share, tag) {
                 Ok(_) => "accepted",
                 Err(CpaceError::InvalidShare) => "invalid_share",
                 Err(CpaceError::InvalidConfirmation) => "invalid_confirmation",

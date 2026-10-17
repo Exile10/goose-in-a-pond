@@ -14,6 +14,9 @@
 //! label. That code is guarded by [`SetupClaimService`] (a guess throttle, and a claim latch read
 //! live) rather than by the pairing-code budget, and it never touches `pairing_codes`. Every
 //! completed pairing, by either secret, latches the claim.
+//!
+//! The BLE setup channel runs the same exchange in process (`init_channel_pake`), and only its
+//! accepted runs yield channel keys. A run is finished only on the transport that started it.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -33,14 +36,14 @@ use pond_core::network::domain::claim::ClaimRefusal;
 use pond_core::network::domain::credential::Credential;
 use pond_core::network::services::setup_claim::SetupClaimService;
 use pond_core::security::ports::handshake::{
-    ChallengeResponse, Handshake, HandshakeRequest, HandshakeResponse, InitRequest, PairingCode,
-    PakeChallenge, PakeInitRequest, PakeRefusal, PakeVerifyRequest, RefreshRequest, TokenCaller,
-    VerifyRequest,
+    ChallengeResponse, ChannelKeys, ChannelVerify, Handshake, HandshakeRequest, HandshakeResponse,
+    InitRequest, PairingCode, PakeChallenge, PakeInitRequest, PakeRefusal, PakeVerifyRequest,
+    RefreshRequest, TokenCaller, VerifyRequest,
 };
 use pond_core::user_data::ports::device_attribution::checked_profile_id;
 use pond_core::user_data::services::member_attribution::sole_member;
 
-use crate::pairing_cpace::{self, CpaceError, Initiator};
+use crate::pairing_cpace::{self, Confirmed, CpaceError, Initiator};
 
 const PAIRING_CODE_TTL_MIN: i64 = 10;
 const CHALLENGE_TTL_SEC: i64 = 60;
@@ -85,10 +88,23 @@ struct PakeState {
 struct PendingPake {
     initiator: Initiator,
     secret: RunSecret,
+    transport: RunTransport,
     client_id: String,
     client_type: String,
     expires_at: DateTime<Utc>,
 }
+
+/// Which surface started a run. A verify from the other one never burns it, or anyone who
+/// overheard a BLE challenge id could spend the phone's run over HTTPS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunTransport {
+    Https,
+    /// The in-process BLE setup channel: the only transport that receives channel keys.
+    SetupChannel,
+}
+
+/// The answer to a verify, and the channel keys when a setup-channel run was accepted.
+type RunOutcome = (HandshakeResponse, Option<ChannelKeys>);
 
 /// The password a run committed to, which decides the limits it is held to.
 enum RunSecret {
@@ -428,11 +444,12 @@ impl SqliteHandshakeAdapter {
         request: PakeVerifyRequest,
         client_id: String,
         client_type: String,
-    ) -> Result<HandshakeResponse> {
+        transport: RunTransport,
+    ) -> Result<RunOutcome> {
         let share = B64.decode(request.share.as_bytes()).unwrap_or_default();
         let confirm = hex_decode(&request.confirm).unwrap_or_default();
-        let server_tag = match initiator.finish(&share, &confirm) {
-            Ok(tag) => tag,
+        let confirmed = match initiator.finish(&share, &confirm) {
+            Ok(confirmed) => confirmed,
             Err(error) => {
                 let reason = match error {
                     CpaceError::InvalidShare => "invalid_share",
@@ -440,11 +457,11 @@ impl SqliteHandshakeAdapter {
                 };
                 // The throttle was charged when the run started; nothing else is spent here.
                 tracing::warn!(reason, "setup code CPace attempt failed");
-                return Ok(self.reject(reason));
+                return Ok((self.reject(reason), None));
             }
         };
         let Some(claims) = self.setup_claims.as_ref() else {
-            return Ok(self.reject(PakeRefusal::SetupCodeUnavailable.code()));
+            return Ok((self.reject(PakeRefusal::SetupCodeUnavailable.code()), None));
         };
         // Latched before any token exists, so a crash leaves a claimed pond, never a paired phone
         // beside a live card. `complete_setup_claim` issues the tokens to `client_id`.
@@ -460,13 +477,26 @@ impl SqliteHandshakeAdapter {
                     "setup pairing refused: the claim could not be recorded"
                 );
             }
-            return Ok(self.reject(PakeRefusal::SetupCodeUnavailable.code()));
+            return Ok((self.reject(PakeRefusal::SetupCodeUnavailable.code()), None));
         }
         let (session, refresh, expires) = self
             .complete_setup_claim(&client_id, &client_type, request.device_name)
             .await?;
-        Ok(HandshakeResponse {
-            server_proof: Some(hex_lower(&server_tag)),
+        Ok(self.accepted(&confirmed, session, refresh, expires, transport))
+    }
+
+    /// An accepted CPace answer. Channel keys exist only for a setup-channel run, and only now,
+    /// after the tokens they will carry were minted.
+    fn accepted(
+        &self,
+        confirmed: &Confirmed,
+        session: String,
+        refresh: String,
+        expires: DateTime<Utc>,
+        transport: RunTransport,
+    ) -> RunOutcome {
+        let response = HandshakeResponse {
+            server_proof: Some(hex_lower(&confirmed.server_tag)),
             ..self.response(
                 true,
                 Some(session),
@@ -474,7 +504,9 @@ impl SqliteHandshakeAdapter {
                 Some(expires.to_rfc3339()),
                 None,
             )
-        })
+        };
+        let keys = (transport == RunTransport::SetupChannel).then(|| confirmed.channel_keys());
+        (response, keys)
     }
 
     /// Consume the code, register the device and mint tokens, once a proof has verified.
@@ -539,6 +571,239 @@ impl SqliteHandshakeAdapter {
             "device paired"
         );
         Ok(Some((session, refresh, expires)))
+    }
+
+    /// CPace phase 1 for either transport; the run remembers which one started it.
+    async fn start_pake_run(
+        &self,
+        request: PakeInitRequest,
+        transport: RunTransport,
+    ) -> Result<std::result::Result<PakeChallenge, PakeRefusal>> {
+        // Before any refusal can return: otherwise runs committed to a code that has gone stay
+        // in memory until the next run starts.
+        let started = Self::now();
+        self.pake_state()
+            .pending
+            .retain(|_, run| run.expires_at > started);
+        // The run is under this Pond's own pin whatever the phone claims; the claim only lets a
+        // phone at the wrong Pond fail here, clearly, instead of at confirmation.
+        let Some(pin) = self.spki_pin.as_deref() else {
+            tracing::warn!("CPace pairing refused: this Pond has no TLS identity to bind");
+            return Ok(Err(PakeRefusal::ChannelBindingMismatch));
+        };
+        if request.channel_binding != pin {
+            tracing::warn!(
+                claimed = %request.channel_binding,
+                ours = pin,
+                "pairing refused: the phone pinned a key that is not this Pond's"
+            );
+            return Ok(Err(PakeRefusal::ChannelBindingMismatch));
+        }
+        let nonce = match B64.decode(request.client_nonce.as_bytes()) {
+            Ok(nonce) if nonce.len() == pairing_cpace::SID_PART_LEN => nonce,
+            _ => return Ok(Err(PakeRefusal::InvalidClientNonce)),
+        };
+
+        let (secret, password, ci) = match request.credential {
+            Credential::Pairing => {
+                // Commit to the newest active code: the one the dashboard and CLI show.
+                let newest: Option<(String,)> = sqlx::query_as(
+                    "SELECT code_hash FROM pairing_codes
+                     WHERE consumed_at IS NULL AND expires_at > ?
+                     ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(Self::now().to_rfc3339())
+                .fetch_optional(&self.pool)
+                .await?;
+                let Some((code_hash,)) = newest else {
+                    return Ok(Err(PakeRefusal::NoActivePairingCode));
+                };
+                let Some(code) = ISSUED_CODE_CACHE.read().await.get(&code_hash).cloned() else {
+                    // Issued by an earlier process: its plaintext is gone, so nobody can pair with it.
+                    return Ok(Err(PakeRefusal::NoActivePairingCode));
+                };
+                (
+                    RunSecret::Pairing { code_hash },
+                    zeroize::Zeroizing::new(code),
+                    pairing_cpace::channel_identifier(pin, &request.client_id),
+                )
+            }
+            Credential::Setup => {
+                let Some(claims) = self.setup_claims.as_ref() else {
+                    return Ok(Err(PakeRefusal::SetupCodeUnavailable));
+                };
+                let code = match claims.admit_setup_attempt(std::time::Instant::now()).await {
+                    Ok(code) => code,
+                    Err(ClaimRefusal::SetupCodeUnavailable) => {
+                        return Ok(Err(PakeRefusal::SetupCodeUnavailable))
+                    }
+                    Err(ClaimRefusal::SetupCodeCooling { retry_after }) => {
+                        tracing::warn!(
+                            retry_after_secs = retry_after.as_secs_ceil(),
+                            "setup code refused: too many wrong attempts, cooling down"
+                        );
+                        return Ok(Err(PakeRefusal::SetupCodeCooling { retry_after }));
+                    }
+                };
+                (
+                    RunSecret::Setup,
+                    zeroize::Zeroizing::new(code.digits().to_string()),
+                    pairing_cpace::setup_channel_identifier(pin, &request.client_id),
+                )
+            }
+        };
+
+        let challenge = Self::random_bytes(pairing_cpace::SID_PART_LEN);
+        let initiator = Initiator::start(
+            password.as_bytes(),
+            &ci,
+            pairing_cpace::session_id(&challenge, &nonce),
+        );
+        let share = initiator.share();
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Self::now();
+        let expires = now + Duration::seconds(CHALLENGE_TTL_SEC);
+        {
+            let mut state = self.pake_state();
+            state.pending.retain(|_, run| run.expires_at > now);
+            if state.pending.len() >= MAX_PENDING_PAKE {
+                tracing::warn!(
+                    pending = state.pending.len(),
+                    "CPace pairing refused: too many runs are waiting for their verify"
+                );
+                return Ok(Err(PakeRefusal::Busy));
+            }
+            state.pending.insert(
+                id.clone(),
+                PendingPake {
+                    initiator,
+                    secret,
+                    transport,
+                    client_id: request.client_id,
+                    client_type: request.client_type,
+                    expires_at: expires,
+                },
+            );
+        }
+        Ok(Ok(PakeChallenge {
+            challenge_id: id,
+            challenge: B64.encode(&challenge),
+            expires_at: expires.to_rfc3339(),
+            suite: pairing_cpace::SUITE.to_string(),
+            share: B64.encode(share),
+        }))
+    }
+
+    /// CPace phase 2 for either transport. A run is finished only on the transport that started it.
+    async fn finish_pake_run(
+        &self,
+        request: PakeVerifyRequest,
+        transport: RunTransport,
+    ) -> Result<RunOutcome> {
+        // 1. Burn the run before anything is checked: one attempt per challenge.
+        let run = {
+            let mut state = self.pake_state();
+            match state.pending.get(&request.challenge_id) {
+                Some(run) if run.transport == transport => {
+                    state.pending.remove(&request.challenge_id)
+                }
+                Some(_) => {
+                    tracing::warn!(
+                        kind = "pake_transport_mismatch",
+                        ?transport,
+                        "a verify named a run another transport started; the run is left alone"
+                    );
+                    None
+                }
+                None => None,
+            }
+        };
+        let Some(run) = run else {
+            return Ok((self.reject("unknown_challenge"), None));
+        };
+        if run.expires_at < Self::now() {
+            return Ok((self.reject("challenge_expired"), None));
+        }
+        let PendingPake {
+            initiator,
+            secret,
+            client_id,
+            client_type,
+            ..
+        } = run;
+        let code_hash = match secret {
+            RunSecret::Pairing { code_hash } => code_hash,
+            RunSecret::Setup => {
+                return self
+                    .verify_setup_run(initiator, request, client_id, client_type, transport)
+                    .await
+            }
+        };
+
+        // 2. The code the run committed to must still be live: not consumed by another device,
+        //    replaced by a newer code, expired, or retired by its failure budget.
+        if self.active_code_profile(&code_hash).await?.is_none() {
+            return Ok((self.reject("code_retired"), None));
+        }
+
+        // 3. Spend one attempt from the code's budget before the tag is checked, so concurrent
+        //    verifies cannot check more tags than the budget allows.
+        let attempt = {
+            let mut state = self.pake_state();
+            let spent = state.attempts.entry(code_hash.clone()).or_insert(0);
+            if *spent >= PAKE_FAILURE_BUDGET {
+                None
+            } else {
+                *spent += 1;
+                Some(*spent)
+            }
+        };
+        let Some(attempt) = attempt else {
+            return Ok((self.reject("code_retired"), None));
+        };
+
+        // 4. Check `Yb` and `T_client`. Undecodable input fails the same checks as a bad value.
+        let share = B64.decode(request.share.as_bytes()).unwrap_or_default();
+        let confirm = hex_decode(&request.confirm).unwrap_or_default();
+        let confirmed = match initiator.finish(&share, &confirm) {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                let reason = match error {
+                    CpaceError::InvalidShare => "invalid_share",
+                    CpaceError::InvalidConfirmation => "invalid_confirmation",
+                };
+                if attempt >= PAKE_FAILURE_BUDGET {
+                    self.retire_codes(std::slice::from_ref(&code_hash)).await?;
+                    tracing::warn!(
+                        attempts = attempt,
+                        "pairing code retired: its CPace failure budget is spent; issue a new code"
+                    );
+                    return Ok((self.reject("code_retired"), None));
+                }
+                tracing::warn!(
+                    reason,
+                    attempt,
+                    budget = PAKE_FAILURE_BUDGET,
+                    "CPace pairing attempt failed"
+                );
+                return Ok((self.reject(reason), None));
+            }
+        };
+
+        // 5. Consume the code, register the device, mint tokens, and only then prove ourselves.
+        let Some((session, refresh, expires)) = self
+            .complete_pairing(
+                &code_hash,
+                &client_id,
+                &client_type,
+                request.device_name,
+                "cpace",
+            )
+            .await?
+        else {
+            return Ok((self.reject("code_retired"), None));
+        };
+        Ok(self.accepted(&confirmed, session, refresh, expires, transport))
     }
 }
 
@@ -767,217 +1032,27 @@ impl Handshake for SqliteHandshakeAdapter {
         &self,
         request: PakeInitRequest,
     ) -> Result<std::result::Result<PakeChallenge, PakeRefusal>> {
-        // Before any refusal can return: otherwise runs committed to a code that has gone stay
-        // in memory until the next run starts.
-        let started = Self::now();
-        self.pake_state()
-            .pending
-            .retain(|_, run| run.expires_at > started);
-        // The run is under this Pond's own pin whatever the phone claims; the claim only lets a
-        // phone at the wrong Pond fail here, clearly, instead of at confirmation.
-        let Some(pin) = self.spki_pin.as_deref() else {
-            tracing::warn!("CPace pairing refused: this Pond has no TLS identity to bind");
-            return Ok(Err(PakeRefusal::ChannelBindingMismatch));
-        };
-        if request.channel_binding != pin {
-            tracing::warn!(
-                claimed = %request.channel_binding,
-                ours = pin,
-                "pairing refused: the phone pinned a key that is not this Pond's"
-            );
-            return Ok(Err(PakeRefusal::ChannelBindingMismatch));
-        }
-        let nonce = match B64.decode(request.client_nonce.as_bytes()) {
-            Ok(nonce) if nonce.len() == pairing_cpace::SID_PART_LEN => nonce,
-            _ => return Ok(Err(PakeRefusal::InvalidClientNonce)),
-        };
-
-        let (secret, password, ci) = match request.credential {
-            Credential::Pairing => {
-                // Commit to the newest active code: the one the dashboard and CLI show.
-                let newest: Option<(String,)> = sqlx::query_as(
-                    "SELECT code_hash FROM pairing_codes
-                     WHERE consumed_at IS NULL AND expires_at > ?
-                     ORDER BY created_at DESC LIMIT 1",
-                )
-                .bind(Self::now().to_rfc3339())
-                .fetch_optional(&self.pool)
-                .await?;
-                let Some((code_hash,)) = newest else {
-                    return Ok(Err(PakeRefusal::NoActivePairingCode));
-                };
-                let Some(code) = ISSUED_CODE_CACHE.read().await.get(&code_hash).cloned() else {
-                    // Issued by an earlier process: its plaintext is gone, so nobody can pair with it.
-                    return Ok(Err(PakeRefusal::NoActivePairingCode));
-                };
-                (
-                    RunSecret::Pairing { code_hash },
-                    zeroize::Zeroizing::new(code),
-                    pairing_cpace::channel_identifier(pin, &request.client_id),
-                )
-            }
-            Credential::Setup => {
-                let Some(claims) = self.setup_claims.as_ref() else {
-                    return Ok(Err(PakeRefusal::SetupCodeUnavailable));
-                };
-                let code = match claims.admit_setup_attempt(std::time::Instant::now()).await {
-                    Ok(code) => code,
-                    Err(ClaimRefusal::SetupCodeUnavailable) => {
-                        return Ok(Err(PakeRefusal::SetupCodeUnavailable))
-                    }
-                    Err(ClaimRefusal::SetupCodeCooling { retry_after }) => {
-                        tracing::warn!(
-                            retry_after_secs = retry_after.as_secs_ceil(),
-                            "setup code refused: too many wrong attempts, cooling down"
-                        );
-                        return Ok(Err(PakeRefusal::SetupCodeCooling { retry_after }));
-                    }
-                };
-                (
-                    RunSecret::Setup,
-                    zeroize::Zeroizing::new(code.digits().to_string()),
-                    pairing_cpace::setup_channel_identifier(pin, &request.client_id),
-                )
-            }
-        };
-
-        let challenge = Self::random_bytes(pairing_cpace::SID_PART_LEN);
-        let initiator = Initiator::start(
-            password.as_bytes(),
-            &ci,
-            pairing_cpace::session_id(&challenge, &nonce),
-        );
-        let share = initiator.share();
-        let id = uuid::Uuid::new_v4().to_string();
-        let now = Self::now();
-        let expires = now + Duration::seconds(CHALLENGE_TTL_SEC);
-        {
-            let mut state = self.pake_state();
-            state.pending.retain(|_, run| run.expires_at > now);
-            if state.pending.len() >= MAX_PENDING_PAKE {
-                tracing::warn!(
-                    pending = state.pending.len(),
-                    "CPace pairing refused: too many runs are waiting for their verify"
-                );
-                return Ok(Err(PakeRefusal::Busy));
-            }
-            state.pending.insert(
-                id.clone(),
-                PendingPake {
-                    initiator,
-                    secret,
-                    client_id: request.client_id,
-                    client_type: request.client_type,
-                    expires_at: expires,
-                },
-            );
-        }
-        Ok(Ok(PakeChallenge {
-            challenge_id: id,
-            challenge: B64.encode(&challenge),
-            expires_at: expires.to_rfc3339(),
-            suite: pairing_cpace::SUITE.to_string(),
-            share: B64.encode(share),
-        }))
+        self.start_pake_run(request, RunTransport::Https).await
     }
 
     async fn verify_pake(&self, request: PakeVerifyRequest) -> Result<HandshakeResponse> {
-        // 1. Burn the run before anything is checked: one attempt per challenge.
-        let Some(run) = self.pake_state().pending.remove(&request.challenge_id) else {
-            return Ok(self.reject("unknown_challenge"));
-        };
-        if run.expires_at < Self::now() {
-            return Ok(self.reject("challenge_expired"));
-        }
-        let PendingPake {
-            initiator,
-            secret,
-            client_id,
-            client_type,
-            ..
-        } = run;
-        let code_hash = match secret {
-            RunSecret::Pairing { code_hash } => code_hash,
-            RunSecret::Setup => {
-                return self
-                    .verify_setup_run(initiator, request, client_id, client_type)
-                    .await
-            }
-        };
+        let (response, _no_keys) = self.finish_pake_run(request, RunTransport::Https).await?;
+        Ok(response)
+    }
 
-        // 2. The code the run committed to must still be live: not consumed by another device,
-        //    replaced by a newer code, expired, or retired by its failure budget.
-        if self.active_code_profile(&code_hash).await?.is_none() {
-            return Ok(self.reject("code_retired"));
-        }
+    async fn init_channel_pake(
+        &self,
+        request: PakeInitRequest,
+    ) -> Result<std::result::Result<PakeChallenge, PakeRefusal>> {
+        self.start_pake_run(request, RunTransport::SetupChannel)
+            .await
+    }
 
-        // 3. Spend one attempt from the code's budget before the tag is checked, so concurrent
-        //    verifies cannot check more tags than the budget allows.
-        let attempt = {
-            let mut state = self.pake_state();
-            let spent = state.attempts.entry(code_hash.clone()).or_insert(0);
-            if *spent >= PAKE_FAILURE_BUDGET {
-                None
-            } else {
-                *spent += 1;
-                Some(*spent)
-            }
-        };
-        let Some(attempt) = attempt else {
-            return Ok(self.reject("code_retired"));
-        };
-
-        // 4. Check `Yb` and `T_client`. Undecodable input fails the same checks as a bad value.
-        let share = B64.decode(request.share.as_bytes()).unwrap_or_default();
-        let confirm = hex_decode(&request.confirm).unwrap_or_default();
-        let server_tag = match initiator.finish(&share, &confirm) {
-            Ok(tag) => tag,
-            Err(error) => {
-                let reason = match error {
-                    CpaceError::InvalidShare => "invalid_share",
-                    CpaceError::InvalidConfirmation => "invalid_confirmation",
-                };
-                if attempt >= PAKE_FAILURE_BUDGET {
-                    self.retire_codes(std::slice::from_ref(&code_hash)).await?;
-                    tracing::warn!(
-                        attempts = attempt,
-                        "pairing code retired: its CPace failure budget is spent; issue a new code"
-                    );
-                    return Ok(self.reject("code_retired"));
-                }
-                tracing::warn!(
-                    reason,
-                    attempt,
-                    budget = PAKE_FAILURE_BUDGET,
-                    "CPace pairing attempt failed"
-                );
-                return Ok(self.reject(reason));
-            }
-        };
-
-        // 5. Consume the code, register the device, mint tokens, and only then prove ourselves.
-        let Some((session, refresh, expires)) = self
-            .complete_pairing(
-                &code_hash,
-                &client_id,
-                &client_type,
-                request.device_name,
-                "cpace",
-            )
-            .await?
-        else {
-            return Ok(self.reject("code_retired"));
-        };
-        Ok(HandshakeResponse {
-            server_proof: Some(hex_lower(&server_tag)),
-            ..self.response(
-                true,
-                Some(session),
-                Some(refresh),
-                Some(expires.to_rfc3339()),
-                None,
-            )
-        })
+    async fn verify_channel_pake(&self, request: PakeVerifyRequest) -> Result<ChannelVerify> {
+        let (response, keys) = self
+            .finish_pake_run(request, RunTransport::SetupChannel)
+            .await?;
+        Ok(ChannelVerify { response, keys })
     }
 
     async fn pake_credential(&self, challenge_id: &str) -> Option<Credential> {
@@ -2640,6 +2715,165 @@ mod tests {
                 .unwrap_err(),
             PakeRefusal::SetupCodeUnavailable,
             "and the card fails closed"
+        );
+    }
+
+    // ---- The setup channel: the same exchange in process, with keys ---------------------
+
+    async fn channel_setup_run(
+        pond: &SetupPond,
+        password: &str,
+        client_id: &str,
+    ) -> (ChannelVerify, pairing_cpace::Responder) {
+        let nonce = [4u8; 32];
+        let challenge = pond
+            .hs
+            .init_channel_pake(setup_init_request(client_id, &nonce))
+            .await
+            .unwrap()
+            .expect("an unclaimed pond starts a setup run on the channel");
+        let ci = pairing_cpace::setup_channel_identifier(OURS, client_id);
+        let (phone, request) = answer_under(&challenge, password, &ci, client_id, &nonce);
+        (pond.hs.verify_channel_pake(request).await.unwrap(), phone)
+    }
+
+    #[tokio::test]
+    async fn an_accepted_channel_run_hands_over_the_keys_the_phone_derives() {
+        let pond = setup_pond(&[]).await;
+        let (verified, phone) = channel_setup_run(&pond, &pond.code, "ble-phone").await;
+        assert!(
+            verified.response.accepted,
+            "{:?}",
+            verified.response.rejection_reason
+        );
+        let proof = hex_decode(verified.response.server_proof.as_deref().unwrap()).unwrap();
+        assert!(phone.verify_server(&proof));
+
+        let keys = verified
+            .keys
+            .expect("an accepted channel run carries its keys");
+        let expected = phone.channel_keys();
+        assert_eq!(keys.pond_to_phone(), expected.pond_to_phone());
+        assert_eq!(keys.phone_to_pond(), expected.phone_to_pond());
+
+        assert!(pond
+            .store
+            .load()
+            .await
+            .unwrap()
+            .unwrap()
+            .claim_state()
+            .is_claimed());
+        let token = verified.response.session_token.unwrap();
+        assert!(pond.hs.validate_token(&token).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_refused_channel_run_has_no_keys_and_spends_what_https_would() {
+        let pond = setup_pond(&[]).await;
+        let (verified, _) = channel_setup_run(&pond, "34970112330", "ble-phone").await;
+        assert!(!verified.response.accepted);
+        assert_eq!(
+            verified.response.rejection_reason.as_deref(),
+            Some("invalid_confirmation")
+        );
+        assert!(verified.keys.is_none());
+        assert!(!pond
+            .store
+            .load()
+            .await
+            .unwrap()
+            .unwrap()
+            .claim_state()
+            .is_claimed());
+    }
+
+    #[tokio::test]
+    async fn a_channel_pairing_run_consumes_the_code_and_claims_like_https() {
+        let pond = setup_pond(&[]).await;
+        let pc = pond.hs.issue_pairing_code().await.unwrap();
+        let nonce = [6u8; 32];
+        let challenge = pond
+            .hs
+            .init_channel_pake(pake_init_request("ble-phone", OURS, &nonce))
+            .await
+            .unwrap()
+            .unwrap();
+        let (phone, request) = pake_answer(&challenge, &pc.code, "ble-phone", OURS, &nonce);
+        let verified = pond.hs.verify_channel_pake(request).await.unwrap();
+        assert!(verified.response.accepted);
+        assert_eq!(
+            verified.keys.unwrap().phone_to_pond(),
+            phone.channel_keys().phone_to_pond()
+        );
+        assert!(pond
+            .store
+            .load()
+            .await
+            .unwrap()
+            .unwrap()
+            .claim_state()
+            .is_claimed());
+        assert!(
+            pond.hs.current_pairing_code().await.unwrap().is_none(),
+            "the code is spent"
+        );
+    }
+
+    /// A BLE challenge id travels in the clear, so a verify over HTTPS that names it must not
+    /// burn the phone's run; and an HTTPS run never yields keys on the channel.
+    #[tokio::test]
+    async fn a_run_is_finished_only_on_the_transport_that_started_it() {
+        let pond = setup_pond(&[]).await;
+        let nonce = [4u8; 32];
+        let challenge = pond
+            .hs
+            .init_channel_pake(setup_init_request("ble-phone", &nonce))
+            .await
+            .unwrap()
+            .unwrap();
+        let ci = pairing_cpace::setup_channel_identifier(OURS, "ble-phone");
+        let (_, request) = answer_under(&challenge, &pond.code, &ci, "ble-phone", &nonce);
+        let over_https = pond.hs.verify_pake(request.clone()).await.unwrap();
+        assert!(!over_https.accepted);
+        assert_eq!(
+            over_https.rejection_reason.as_deref(),
+            Some("unknown_challenge")
+        );
+        assert!(
+            pond.hs
+                .verify_channel_pake(request)
+                .await
+                .unwrap()
+                .response
+                .accepted,
+            "the channel run was left alone"
+        );
+
+        let pc = pond.hs.issue_pairing_code().await.unwrap();
+        let challenge = pake_init(&pond.hs, "lan-phone", &nonce).await;
+        let (_, request) = pake_answer(&challenge, &pc.code, "lan-phone", OURS, &nonce);
+        let on_channel = pond.hs.verify_channel_pake(request.clone()).await.unwrap();
+        assert!(!on_channel.response.accepted);
+        assert!(on_channel.keys.is_none());
+        assert!(
+            pond.hs.verify_pake(request).await.unwrap().accepted,
+            "the HTTPS run was left alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claimed_pond_refuses_the_card_on_the_channel_too() {
+        let pond = setup_pond(&[]).await;
+        let (first, _) = channel_setup_run(&pond, &pond.code, "ble-phone").await;
+        assert!(first.response.accepted);
+        assert_eq!(
+            pond.hs
+                .init_channel_pake(setup_init_request("ble-phone-2", &[1u8; 32]))
+                .await
+                .unwrap()
+                .unwrap_err(),
+            PakeRefusal::SetupCodeUnavailable
         );
     }
 }

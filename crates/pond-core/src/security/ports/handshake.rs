@@ -171,6 +171,59 @@ pub struct PakeVerifyRequest {
     pub device_name: Option<String>,
 }
 
+/// Length of each setup-channel key (ChaCha20-Poly1305).
+pub const CHANNEL_KEY_LEN: usize = 32;
+
+/// The setup channel's per-direction keys from one accepted CPace run: its ISK stays in the
+/// adapter and only these leave, for one session. Wiped on drop; `Debug` redacts.
+pub struct ChannelKeys {
+    pond_to_phone: [u8; CHANNEL_KEY_LEN],
+    phone_to_pond: [u8; CHANNEL_KEY_LEN],
+}
+
+impl ChannelKeys {
+    pub fn new(
+        pond_to_phone: &[u8; CHANNEL_KEY_LEN],
+        phone_to_pond: &[u8; CHANNEL_KEY_LEN],
+    ) -> Self {
+        Self {
+            pond_to_phone: *pond_to_phone,
+            phone_to_pond: *phone_to_pond,
+        }
+    }
+
+    /// `k_p2c`: seals what the pond sends.
+    pub fn pond_to_phone(&self) -> &[u8; CHANNEL_KEY_LEN] {
+        &self.pond_to_phone
+    }
+
+    /// `k_c2p`: seals what the phone sends.
+    pub fn phone_to_pond(&self) -> &[u8; CHANNEL_KEY_LEN] {
+        &self.phone_to_pond
+    }
+}
+
+impl Drop for ChannelKeys {
+    fn drop(&mut self) {
+        crate::shared::domain::wipe::wipe(&mut self.pond_to_phone);
+        crate::shared::domain::wipe::wipe(&mut self.phone_to_pond);
+    }
+}
+
+impl std::fmt::Debug for ChannelKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChannelKeys(redacted)")
+    }
+}
+
+/// What a setup-channel `verify` produced: the answer HTTPS would give, and, only for an accepted
+/// run, the keys that seal the rest of the session.
+#[derive(Debug)]
+pub struct ChannelVerify {
+    pub response: HandshakeResponse,
+    pub keys: Option<ChannelKeys>,
+}
+
 /// Exchange a refresh token for a fresh session+refresh pair.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshRequest {
@@ -258,6 +311,25 @@ pub trait Handshake: Send + Sync {
     async fn verify_pake(&self, _request: PakeVerifyRequest) -> Result<HandshakeResponse> {
         Err(anyhow::anyhow!(
             "CPace pairing not supported by this adapter"
+        ))
+    }
+
+    /// As [`Self::init_pake`], for the in-process setup channel. The run is the same exchange
+    /// under the same limits, and only [`Self::verify_channel_pake`] can finish it.
+    async fn init_channel_pake(
+        &self,
+        _request: PakeInitRequest,
+    ) -> Result<std::result::Result<PakeChallenge, PakeRefusal>> {
+        Err(anyhow::anyhow!(
+            "the setup channel is not supported by this adapter"
+        ))
+    }
+
+    /// As [`Self::verify_pake`], plus the keys for an accepted run. No HTTP route calls this, so
+    /// only an in-process transport can hold them; an HTTPS run is unknown here, and the reverse.
+    async fn verify_channel_pake(&self, _request: PakeVerifyRequest) -> Result<ChannelVerify> {
+        Err(anyhow::anyhow!(
+            "the setup channel is not supported by this adapter"
         ))
     }
 
