@@ -1,6 +1,7 @@
 //! One phone's connection to the setup channel (`pond-setup-channel.md`): a state machine from rx
 //! writes to tx notifications, and the task that runs it. A transport only moves bytes.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,6 +32,9 @@ use crate::capabilities::SetupCapabilities;
 
 /// A session ends after this long with no request; every request starts it again.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// However busy it keeps, a session ends this long after it opened, so a phone pinging inside the
+/// idle timeout cannot hold the only session forever.
+pub const MAX_SESSION_LIFETIME: Duration = Duration::from_secs(600);
 /// Exchanges one connection may start; the guess limits proper are the handshake's, shared.
 pub const MAX_PAKE_INITS: u8 = 3;
 /// A dense block of flats can show more networks than one 16 KiB answer holds once sealed.
@@ -144,6 +148,8 @@ pub enum SessionEnd {
     Overrun,
     SealingFailure,
     AttemptsExhausted,
+    /// Open for [`MAX_SESSION_LIFETIME`], however active.
+    LifetimeCap,
 }
 
 impl SessionEnd {
@@ -156,6 +162,7 @@ impl SessionEnd {
             Self::Overrun => "overrun",
             Self::SealingFailure => "sealing_failure",
             Self::AttemptsExhausted => "attempts_exhausted",
+            Self::LifetimeCap => "lifetime_cap",
         }
     }
 }
@@ -191,6 +198,7 @@ pub struct SetupSession {
     att_mtu: u16,
     state: State,
     pake_inits: u8,
+    opened_at: Instant,
     last_request: Instant,
     ended: Option<SessionEnd>,
 }
@@ -203,6 +211,7 @@ impl SetupSession {
             att_mtu: DEFAULT_ATT_MTU,
             state: State::Clear { runs: Vec::new() },
             pake_inits: 0,
+            opened_at: now,
             last_request: now,
             ended: None,
         }
@@ -225,10 +234,24 @@ impl SetupSession {
         self.last_request + IDLE_TIMEOUT
     }
 
-    /// Ends the session if no request arrived for [`IDLE_TIMEOUT`].
-    pub fn expire_if_idle(&mut self, now: Instant) -> Option<SessionEnd> {
-        if self.ended.is_none() && now >= self.idle_deadline() {
-            self.finish(SessionEnd::Idle);
+    pub fn lifetime_deadline(&self) -> Instant {
+        self.opened_at + MAX_SESSION_LIFETIME
+    }
+
+    /// The sooner of the idle and lifetime deadlines: when [`Self::expire_if_due`] next matters.
+    pub fn deadline(&self) -> Instant {
+        self.idle_deadline().min(self.lifetime_deadline())
+    }
+
+    /// Ends the session at [`MAX_SESSION_LIFETIME`], or if no request arrived for
+    /// [`IDLE_TIMEOUT`].
+    pub fn expire_if_due(&mut self, now: Instant) -> Option<SessionEnd> {
+        if self.ended.is_none() {
+            if now >= self.lifetime_deadline() {
+                self.finish(SessionEnd::LifetimeCap);
+            } else if now >= self.idle_deadline() {
+                self.finish(SessionEnd::Idle);
+            }
         }
         self.ended
     }
@@ -242,6 +265,8 @@ impl SetupSession {
 
     /// One rx write, split anywhere. A write that completes a request is answered.
     pub async fn receive(&mut self, write: &[u8], now: Instant) -> Reply {
+        // A write that arrives after a deadline must not restart the idle timer.
+        self.expire_if_due(now);
         if let Some(end) = self.ended {
             return Reply {
                 notifications: Vec::new(),
@@ -700,10 +725,13 @@ fn log_answer(answer: &Value) {
 pub struct SetupChannel {
     ctx: Arc<SetupChannelContext>,
     slot: Arc<Semaphore>,
+    accepting: Arc<AtomicBool>,
 }
 
+/// The channel cannot take this phone now: another one holds the session, or the household
+/// switched BLE setup off. Either way the transport refuses the central.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("a setup session is already open")]
+#[error("the setup channel is not taking a phone now")]
 pub struct ChannelBusy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -715,6 +743,7 @@ impl SetupChannel {
         Self {
             ctx: Arc::new(ctx),
             slot: Arc::new(Semaphore::new(1)),
+            accepting: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -726,9 +755,22 @@ impl SetupChannel {
         self.slot.available_permits() == 0
     }
 
-    /// Starts the session for a phone that just connected; `ChannelBusy` while one is open, so
-    /// the transport refuses the second central. Needs a tokio runtime.
+    /// Off refuses every new phone; a session already open runs on to its own end.
+    pub fn set_accepting(&self, accepting: bool) {
+        self.accepting.store(accepting, Ordering::SeqCst);
+    }
+
+    pub fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::SeqCst)
+    }
+
+    /// Starts the session for a phone that just connected; `ChannelBusy` while one is open or
+    /// while the channel is not accepting, so the transport refuses that central. Needs a tokio
+    /// runtime.
     pub fn open(&self) -> Result<SessionHandle, ChannelBusy> {
+        if !self.is_accepting() {
+            return Err(ChannelBusy);
+        }
         let permit = self
             .slot
             .clone()
@@ -853,8 +895,8 @@ async fn run_session(
                     }
                 }
             },
-            _ = tokio::time::sleep_until(session.idle_deadline()) => {
-                if let Some(reason) = session.expire_if_idle(Instant::now()) {
+            _ = tokio::time::sleep_until(session.deadline()) => {
+                if let Some(reason) = session.expire_if_due(Instant::now()) {
                     break reason;
                 }
             }
@@ -1423,16 +1465,17 @@ mod tests {
         let mut phone = Phone::new(23);
         let step = IDLE_TIMEOUT - Duration::from_secs(1);
         let mut now = t0;
-        for id in 0..5 {
+        // Four steps and the idle end both land inside the lifetime cap.
+        for id in 0..4 {
             now += step;
-            assert_eq!(session.expire_if_idle(now), None);
+            assert_eq!(session.expire_if_due(now), None);
             phone
                 .ask(&mut session, json!({"id": id, "type": "hello"}), now)
                 .await;
         }
-        assert_eq!(session.expire_if_idle(now + step), None);
+        assert_eq!(session.expire_if_due(now + step), None);
         assert_eq!(
-            session.expire_if_idle(now + IDLE_TIMEOUT),
+            session.expire_if_due(now + IDLE_TIMEOUT),
             Some(SessionEnd::Idle)
         );
         let late = phone
@@ -1556,6 +1599,77 @@ mod tests {
             "dropping every writer is a disconnect"
         );
         assert_eq!(notifications.end(), Some(SessionEnd::PhoneDisconnected));
+        assert!(channel.open().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_session_ends_at_its_lifetime_cap_however_busy_it_is() {
+        let pond = pond();
+        let t0 = Instant::now();
+        let mut session = SetupSession::new(pond.ctx.clone(), t0);
+        let mut phone = Phone::new(23);
+        let step = IDLE_TIMEOUT - Duration::from_secs(1);
+        let mut now = t0;
+        let mut id = 0;
+        while now + step < t0 + MAX_SESSION_LIFETIME {
+            now += step;
+            id += 1;
+            phone
+                .ask(&mut session, json!({"id": id, "type": "hello"}), now)
+                .await;
+        }
+        assert_eq!(session.deadline(), t0 + MAX_SESSION_LIFETIME);
+        let late = phone
+            .send_raw(
+                &mut session,
+                br#"{"id":99,"type":"hello"}"#,
+                t0 + MAX_SESSION_LIFETIME,
+            )
+            .await;
+        assert!(late.notifications.is_empty());
+        assert_eq!(late.end, Some(SessionEnd::LifetimeCap));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_phone_pinging_inside_the_idle_timeout_is_still_let_go() {
+        let channel = SetupChannel::new(
+            Arc::try_unwrap(pond().ctx).unwrap_or_else(|_| panic!("only context")),
+        );
+        let mut handle = channel.open().unwrap();
+        let mut phone = Phone::new(185);
+        let opened = Instant::now();
+        let mut id = 0;
+        while ask_over(&mut handle, &mut phone, json!({"id": id, "type": "hello"}))
+            .await
+            .is_some()
+        {
+            id += 1;
+            tokio::time::sleep(IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        }
+        assert_eq!(handle.notifications.end(), Some(SessionEnd::LifetimeCap));
+        assert!(opened.elapsed() >= MAX_SESSION_LIFETIME);
+        assert!(opened.elapsed() < MAX_SESSION_LIFETIME + IDLE_TIMEOUT);
+        assert!(
+            !channel.is_session_open(),
+            "the slot is free for the next phone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_is_not_accepting_refuses_new_phones_and_keeps_the_open_one() {
+        let channel = SetupChannel::new(
+            Arc::try_unwrap(pond().ctx).unwrap_or_else(|_| panic!("only context")),
+        );
+        let mut open = channel.open().unwrap();
+        channel.set_accepting(false);
+        let mut phone = Phone::new(185);
+        let hello = ask_over(&mut open, &mut phone, json!({"id": 1, "type": "hello"})).await;
+        assert_eq!(hello.unwrap()["ok"], true, "the open session runs on");
+
+        open.writer.phone_disconnected().await;
+        assert_eq!(open.notifications.next().await, None);
+        assert_eq!(channel.open().err(), Some(ChannelBusy));
+        channel.set_accepting(true);
         assert!(channel.open().is_ok());
     }
 }
