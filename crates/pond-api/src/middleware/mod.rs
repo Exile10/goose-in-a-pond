@@ -208,8 +208,10 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::GET, "/time/zones", Exposure::Always),
     // Detection geolocates via an outbound call, so it is open only until onboarding finishes.
     (Method::POST, "/location/detect", Exposure::UntilOnboarded),
-    // Write-only, wizard-only. GET /settings is deliberately absent: it serialises all Settings.
+    // GET serialises all Settings, so it is never tokenless; a paired device reads it during the
+    // wizard, as the PUT's own answer already lets it.
     (Method::PUT, "/settings", Exposure::UntilOnboarded),
+    (Method::GET, "/settings", Exposure::Authenticated),
     // Warm-up banner during the wizard; afterwards `PondApiClient.get` sends the bearer token.
     (Method::GET, "/warmup", Exposure::UntilOnboarded),
     // Local Piper, no user data. The dashboard's voice preview and `playTtsSentence` may call it
@@ -745,6 +747,7 @@ mod tests {
         for (method, path) in [
             (Method::POST, "/api/v1/handshake/revoke"),
             (Method::POST, "/api/v1/voice/sample"),
+            (Method::GET, "/api/v1/settings"),
             (Method::GET, "/api/v1/models"),
             (Method::GET, "/api/v1/models/download/progress"),
             (Method::POST, "/api/v1/models/download/control"),
@@ -994,6 +997,8 @@ mod tests {
             "GET /models = Authenticated".to_string(),
             "GET /models/download/progress = Authenticated".to_string(),
             "GET /player/status = HostOnly".to_string(),
+            // The wizard resumes from what it saved; the PUT's answer already shows its caller this.
+            "GET /settings = Authenticated".to_string(),
             // Nothing secret (phase, model name, timestamps); the boot warm-up precedes any token.
             "GET /test = HostOnly".to_string(),
             "GET /warmup = UntilOnboarded".to_string(),

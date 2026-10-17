@@ -346,24 +346,24 @@ async fn devices_is_blocked_before_onboarding() {
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }
 
+/// The wizard resumes from what it saved, so a paired device reads settings before onboarding.
 #[tokio::test]
-async fn settings_is_blocked_before_onboarding() {
+async fn a_paired_device_reads_settings_before_onboarding() {
     let (app, _tmp) = app_with_step(None).await;
     let res: Response = app
         .oneshot(
             Request::builder()
                 .uri("/api/v1/settings")
-                // Auth runs first: without a token this would measure auth, not onboarding.
                 .header("Authorization", "Bearer test-token")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(res.status(), StatusCode::OK);
 }
 
-/// `GET /settings` serialises every setting, API keys included; checked through the real stack.
+/// `GET /settings` serialises every setting; checked through the real stack.
 #[tokio::test]
 async fn get_settings_without_a_token_is_unauthorized() {
     let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;

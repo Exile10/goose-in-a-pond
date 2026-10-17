@@ -540,7 +540,10 @@ Steps: `Welcome` → `Basics` → `Location` → `Accessibility` → `Personalit
 
 ### GET /settings
 
-Returns the full settings object.
+Returns the full settings object. It needs a paired device's token in every state, and since
+2026-10-17 that includes before onboarding completes, so a wizard resumes from what it saved
+(the desktop's `ensurePrimaryProfile`, the phone's owner setup) instead of reading the answer of an
+empty `PUT`. Without a token it is `401` whatever the state.
 
 **Response 200**
 ```json

@@ -120,8 +120,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/onboard/step/{name}", post(onboarding_step))
         // Reset onboarding back to the first step ("Start over" in Settings).
         .route("/onboard/reset", post(reset_onboarding))
-        // Settings write is public so onboarding steps can save before completion
-        .route("/settings", put(update_settings))
+        // The write is the wizard's; the read needs a token in every state, so the wizard can
+        // resume from what it saved without a PUT that answers with the whole record.
+        .route("/settings", get(get_settings).put(update_settings))
         // Warm-up readiness; anonymous during onboarding, like the /settings write (PUBLIC_ROUTES).
         .route("/warmup", get(get_warmup))
         // ── Time and place ────────────────────────────────────────────────
@@ -227,7 +228,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/mesh/self", get(get_mesh_self))
         .route("/mesh/settlement", get(get_mesh_settlement_status))
-        .route("/settings", get(get_settings))
         .route("/weather", get(get_weather))
         .route("/models/capabilities", get(get_model_capabilities))
         .route("/models/vision-status", get(get_vision_status))
