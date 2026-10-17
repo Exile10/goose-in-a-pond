@@ -1243,7 +1243,9 @@ impl ChatService {
                 AgentStreamEvent::Error { content } => {
                     return Err(anyhow::anyhow!("Agent stream error: {}", content));
                 }
-                AgentStreamEvent::ToolResult { id, tool, content } => {
+                AgentStreamEvent::ToolResult {
+                    id, tool, content, ..
+                } => {
                     // Not spoken; truncated so a huge payload cannot bloat one NDJSON line.
                     let content = truncate_tool_result(content);
                     self.emit_event(WorkflowEvent::ToolResult { tool, id, content });
