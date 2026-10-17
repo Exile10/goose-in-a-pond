@@ -3502,3 +3502,33 @@ milestone).**
 - **Open.** pond-server now links pond-connect, so on Linux it needs `libdbus-1-dev` wherever it
   is built (CI's `rust` and `live-test` jobs). `/network/status` has no UI yet, and
   `scripts/live-test.sh` does not check it.
+
+**2026-10-17 — Pond networking P5c: the Linux BLE peripheral, the NetworkManager station and the
+polkit grant (touches PAI-2; not a PAI milestone).**
+
+- **What landed.** [`pond-setup-channel.md`](../pond-setup-channel.md) P5c, on `feat/ble-setup`:
+  `BluezPeripheral` over bluer and the central router behind it, the NetworkManager `WifiStation`
+  over zbus, `scripts/lib/connect-setup.sh` (`giap.sh wifi-grant [remove|status]`, written by
+  `giap.sh install` on production and Jetson installs, and four doctor lines), libdbus-1-dev in
+  `install-deps.sh` and in CI's `rust` and `live-test` jobs, a `connect-setup` bash-tests job, a
+  `GET /network/status` check in `scripts/live-test.sh`, and `jetson-emu.sh box` seeding its git
+  dependencies from the Mac so the private llama-cpp fork resolves in the container.
+- **PAI-2: secrets in flight and privilege.** The passphrase is borrowed from the sealed message
+  straight into the D-Bus message to NetworkManager; no `String` copy of it exists in the pond, and
+  zbus frees its serialised buffer without wiping it (written down so it is not rediscovered). A
+  join's connection is added `persist=memory`, saved only once it has an IPv4 address and deleted
+  otherwise. Nothing logs it: `JoinRequest`'s `Debug` redacts it, and NetworkManager's error
+  messages are dropped, only their D-Bus names kept. The grant gives the pond's own user exactly
+  `settings.modify.system`, `network-control`, `wifi.scan` and `enable-disable-wifi`, refuses a user
+  name that could escape the file, and is removable. The pond never pairs over Bluetooth.
+- **Invariants.** No egress, no prompt or KV change, no migration, no new setting, no new route.
+  A BLE or Wi-Fi failure never stops the pond: `start` succeeds and keeps healing, and `status`
+  and `capabilities` carry the reason.
+- **Verified.** In `jetson-emu.sh box` (linux/arm64, real bluer and zbus, no radio): `cargo test
+  -p pond-connect` 106 + 8 + 1 + 3 passed, 46 of them the Linux adapters'; clippy with no warning
+  of the adapters' own beyond the toolchain-wide `double_must_use` on `#[async_trait]`. The bash
+  tests (19) under bash 5.2 and /bin/bash 3.2, and `giap.sh doctor` on Linux in a container. On the
+  Mac: `cargo check --locked -p pond-connect` and `scripts/live-test.sh --no-build` PASSED with the
+  new status-route checks. **Not verified:** any radio, a phone, a real join, anything on the Orin.
+- **Open.** `docs/api.md` says the host credential answers `GET /network/status`; it does not
+  (401, the route is `Exposure::Authenticated`, token only), so the live check asks with a token.
