@@ -140,7 +140,10 @@ jobs:
         # .proto files and fails with "Could not find `protoc`" without it. The
         # runner image does not ship one, and a developer machine usually does,
         # which is why this only ever broke in CI.
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev protobuf-compiler
+        #
+        # libdbus-1-dev is for bluer, pond-connect's BlueZ adapter: the fast crates list
+        # pond-connect, and pond-server links it.
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev protobuf-compiler
 
       - name: Validate private dependency credential routing
         run: |
@@ -435,6 +438,18 @@ jobs:
       - name: Tests
         run: bash scripts/lib/setup-code.test.sh
 
+  # The Linux setup channel's host side (scripts/lib/connect-setup.sh): the polkit grant in both
+  # flavours, its idempotence, dry run and removal, and the doctor lines, against a scratch root and
+  # fake pkaction, systemctl, busctl, btmgmt and nmcli.
+  connect-setup:
+    name: Setup channel host scripts - bash tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tests
+        run: bash scripts/lib/connect-setup.test.sh
+
   # Every shell script outside the goose/ submodule. Most of them run on the Jetson or a server and
   # no test can exercise them here, so this is the only check they get. A warning fails the job; a
   # note is printed and does not. The root .shellcheckrc makes it follow sourced files.
@@ -678,9 +693,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # Same packages as the Rust job; alsa-sys in pond-server's build needs libasound2-dev.
+      # Same packages as the Rust job: alsa-sys needs libasound2-dev, bluer libdbus-1-dev.
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-dev protobuf-compiler
 
       - name: Validate private dependency credential routing
         run: |
