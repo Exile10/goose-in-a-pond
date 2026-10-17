@@ -3427,3 +3427,39 @@ voice sample (touches PAI-1 and PAI-2; not a PAI milestone).**
   `pond-ear`'s `loading_costs_what_the_ear_says_it_holds` fails when its test binary runs its six
   tests in parallel and passes alone; `pond-ear` has no dependencies, so this change cannot reach
   it.
+
+**2026-10-17 — Pond networking P5a: the BLE setup channel's core (touches PAI-2; not a PAI
+milestone).**
+
+- **What landed.** [`pond-setup-channel.md`](../pond-setup-channel.md) P5a, on `feat/ble-setup`:
+  `crates/pond-connect` (framing, sealing, messages and the per-connection session, GATT and
+  advertising constants, capabilities); the `WifiStation` port, `should_advertise` and the shared
+  `SpokenCodeService` in `pond-core/src/network/`; `init_channel_pake`/`verify_channel_pake` on the
+  handshake port; `crates/pond-connect/tests/fixtures/setup-channel-vectors.json`. No radio code.
+  Five spec corrections agreed with goose-on-the-go are in the doc's decisions table (`pond_id`,
+  advertising is OR, every refusal is `ok: false`, the session outlives advertising, one message
+  per chunk).
+- **PAI-2: new secrets in flight.** CPace's ISK never leaves `pond-infra`: an accepted run hands
+  out only `k_p2c`/`k_c2p`, derived with HKDF-SHA-512, and only through the two channel methods,
+  which no route calls (`setup_channel_keys_stay_in_process.rs` scans `pond-api/src`). A run is
+  finished only on the transport that started it, so a BLE challenge id overheard in the clear
+  cannot be burned over HTTPS. `ChannelKeys` and `WifiPassphrase` are pond-core types; pond-core
+  has no zeroize, so both wipe themselves with a safe `fill(0)` behind `black_box`, and neither has
+  `Display`, `Serialize` or `Clone`. Opened plaintexts are `Zeroizing`, the session wipes its token
+  copies after sealing them, and `ChaCha20Poly1305` zeroizes its own key. A test captures every
+  log level and the audit trail through a whole claim, a Wi-Fi join, a wrong passphrase and a
+  spoken-code pairing, and finds no passphrase, code, token or key.
+- **Not wiped, written down so it is not rediscovered:** the HMAC states inside `hkdf` and `hmac`
+  (as with the existing CPace tags), and serde_json's scratch buffer when a passphrase arrives
+  with escapes.
+- **Open.** A central can hold the single session by sending a request every 119 s; the spec has
+  no session lifetime cap.
+- **Invariants.** No egress, no prompt or KV change, no `Settings` field, no migration, no route.
+  The spoken-code route keeps its answers byte for byte; its decision logic moved into
+  `SpokenCodeService` so the route and the channel share one limiter.
+- **Verified on the Mac.** Unit tests, and end-to-end tests where pond-infra's CPace responder
+  drives a session over an in-memory transport at ATT_MTU 23 and 185 against the real SQLite
+  handshake and setup record; the key schedule re-derived with Python's standard library.
+  `cpace-vectors.json` is unchanged. **Not run:** `scripts/live-test.sh`, since P5a adds no route
+  or wiring and a rebuild would replace the binary under the mock pond running on :4100.
+  **Not verified:** any radio, a real phone, anything on the Orin.

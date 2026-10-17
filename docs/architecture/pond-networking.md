@@ -223,6 +223,11 @@ role writes `chat_model`. This closes the onboarding half of #365.
 
 ## The setup channel
 
+**Superseded for BLE by [the setup channel contract](pond-setup-channel.md) (2026-10-17),** which
+is binding where the two differ: JSON rather than CBOR, no service data in the advertisement, the
+`goose-setup-channel-v1` key labels, and `spoken_code` rather than `speak_code`. The sketch below
+is kept for the SoftAP and LAN transports it also names.
+
 One message protocol, carried by any transport: BLE GATT, the SoftAP's HTTP listener, or the LAN
 HTTPS listener. The pond is the server.
 
@@ -274,7 +279,7 @@ log or return it, and zeroizes its copy.
 | P2 | Move interface classification and mDNS behind the context's ports; `GET /api/v1/network/status` with capabilities | not started |
 | P3 | `pond-server setup-code`, card at install and provision; CPace against the setup code with the claim latch; spoken fallback with bundled clips; goose-on-the-go reads `pond://setup` | LANDED 2026-10-17, server side (the wire contract above; Mac unit, route and live tests; no phone or Orin run yet). goose-on-the-go's half lands in its own repo |
 | P4 | Claim before onboarding, owner attribution and the voice sample (server); owner setup in goose-on-the-go | LANDED 2026-10-17, server side: the claim-aware wizard exposure, `claimed_by` and owner attribution at completion, `POST /voice/sample`, and the five model routes a phone needs before onboarding (#365). Mac unit, route and live tests, and the Kokoro sample seam against a real model; no phone or Orin run yet. Owner setup in goose-on-the-go is handed off (`.ai/handoffs/gotg-onboarding-and-setup.md`) |
-| P5 | Setup channel and BLE: macOS adapter first (the Mac development loop), then Linux, verified on the Jetson last; Wi-Fi join | not started |
+| P5 | Setup channel and BLE: macOS adapter first (the Mac development loop), then Linux, verified on the Jetson last; Wi-Fi join | P5a LANDED 2026-10-17: the OS-independent core in `crates/pond-connect` ([setup channel](pond-setup-channel.md#phases)); no radio adapter yet |
 | P6 | Connectivity watchdog; SoftAP and captive page on Linux | not started |
 | P7 | Matter BLE and Wi-Fi handoff through this layer; BT Classic accessories; Windows adapters | not started |
 
