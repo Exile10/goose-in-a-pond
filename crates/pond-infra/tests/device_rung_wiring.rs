@@ -243,7 +243,12 @@ fn every_principal_starts_with_no_device() {
 #[test]
 fn every_handshake_adapter_answers_who_a_token_belongs_to() {
     // (type name, why it legitimately cannot answer)
-    const ALLOWED_SILENT: [(&str, &str); 3] = [
+    const ALLOWED_SILENT: [(&str, &str); 4] = [
+        (
+            "CountingHandshake",
+            "pond-core's spoken-code test double: it only issues pairing codes and validates \
+             no token",
+        ),
         (
             "RejectingHandshake",
             "a pond-api test fixture that refuses every verify, so it issues no token and has \

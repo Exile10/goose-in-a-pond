@@ -141,6 +141,12 @@ fn build_settings(store: &HashMap<String, String>) -> Settings {
             s.ext_travel_enabled = b;
         }
     }
+    // The spoken pairing code's switch: a "turned off" test must not pass on the default.
+    if let Some(v) = store.get("spoken_pairing_codes") {
+        if let Ok(b) = v.parse() {
+            s.spoken_pairing_codes = b;
+        }
+    }
     s
 }
 
