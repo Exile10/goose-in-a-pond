@@ -6,18 +6,23 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use pond_audio::MicHandle;
-use pond_core::models::domain::audio_device::{AudioDevice, AudioDirection, ProbeOutcome};
+use pond_core::models::domain::audio_device::{
+    AudioDevice, AudioDirection, PairOutcome, ProbeOutcome,
+};
 use pond_core::models::domain::mic_gate;
 use pond_core::models::ports::audio_devices::AudioDeviceProber;
 
 use crate::names;
 use crate::probe;
+use crate::sound;
 
 /// cpal's only host on Linux is ALSA, whose listing opens every node.
 const ALSA: bool = cfg!(target_os = "linux");
 
 /// Time allowed beyond a probe's own wait for the driver to open and close the device.
 const OPEN_SLACK: Duration = Duration::from_secs(6);
+/// A whole sound test: opening both ends, the room, the sound, and the listening after it.
+const SOUND_TEST_LIMIT: Duration = Duration::from_secs(10);
 
 pub struct CpalProber {
     /// The process's mic owner. Input probes run on its thread, so nothing opens a microphone
@@ -126,6 +131,33 @@ impl AudioDeviceProber for CpalProber {
         ALSA
     }
 
+    fn hears(&self, speaker: &AudioDevice, mic: &AudioDevice) -> PairOutcome {
+        let off = || PairOutcome::Failed {
+            reason: "the microphone is off in Settings".to_string(),
+        };
+        if !mic_gate::mic_enabled() {
+            return off();
+        }
+        let (speaker, mic) = (speaker.id.clone(), mic.id.clone());
+        let Some(owner) = &self.mic else {
+            return sound::through_mic(&speaker, &mic);
+        };
+        // On the owner's thread, so nothing else opens a microphone during the test.
+        owner
+            .run_exclusive(SOUND_TEST_LIMIT, move |view| {
+                if !view.shared.enabled() {
+                    off()
+                } else if view.open_device.as_deref() == Some(mic.as_str()) {
+                    sound::through_open_mic(&speaker, view.shared)
+                } else {
+                    sound::through_mic(&speaker, &mic)
+                }
+            })
+            .unwrap_or_else(|| PairOutcome::Failed {
+                reason: "the sound test did not finish in time".to_string(),
+            })
+    }
+
     fn probe(
         &self,
         device: &AudioDevice,
@@ -220,6 +252,37 @@ mod tests {
             });
             println!("{direction:?} lazy choice: {choice} in {:?}", t.elapsed());
             assert!(choice.device.is_some());
+        }
+        let speaker = prober.default_device(AudioDirection::Output).unwrap();
+        let mic = prober.default_device(AudioDirection::Input).unwrap();
+        let t = std::time::Instant::now();
+        let heard = prober.hears(&speaker, &mic);
+        println!(
+            "sound test {} -> {}: {heard:?} in {:?}",
+            speaker.id,
+            mic.id,
+            t.elapsed()
+        );
+        let t = std::time::Instant::now();
+        let pair = AudioDeviceSelector::new(prober.clone()).select_by_sound(
+            &pond_core::models::services::voice::audio_devices::PairRequest {
+                input_pin: None,
+                output_pin: None,
+                mode: ProbeMode::Lazy,
+                exclude: &[],
+            },
+        );
+        match &pair {
+            pond_core::models::services::voice::audio_devices::SoundTest::Heard {
+                input,
+                output,
+            } => {
+                println!(
+                    "by sound in {:?}: speaker {output} / mic {input}",
+                    t.elapsed()
+                )
+            }
+            other => println!("by sound in {:?}: {other:?}", t.elapsed()),
         }
     }
 }

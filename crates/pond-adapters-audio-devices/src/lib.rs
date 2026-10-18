@@ -4,7 +4,9 @@
 pub mod names;
 pub mod probe;
 pub mod prober;
+pub mod sound;
 pub mod supervisor;
+pub mod tone;
 
 pub use prober::CpalProber;
 pub use supervisor::{
