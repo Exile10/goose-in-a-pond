@@ -34,7 +34,6 @@ ort = "=2.0.0-rc.12"
 espeak-rs = "0.2"
 # Only for the `OutputStreamHandle` type held by the adapter; playback itself
 # lives in pond-audio-out.
-rodio = "0.19"
 
 [dev-dependencies]
 tempfile = { workspace = true }

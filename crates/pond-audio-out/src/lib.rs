@@ -1,9 +1,13 @@
 //! Speaker-side audio for every GIAP TTS engine: output device, playback and the working tone.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use pond_core::shared::domain::agent::ThrottledAudioLevelSink;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+pub mod route;
+pub use route::{output_device, set_output_device};
 
 // ── Working tone ──────────────────────────────────────────────────────────────
 
@@ -44,7 +48,7 @@ fn working_tone_cycle() -> Vec<f32> {
 /// A generation, not a bool: two live turns' start/stop calls would interleave.
 pub fn start_thinking_tone_thread(thinking_for: Arc<AtomicU64>, mine: u64) {
     std::thread::spawn(move || {
-        use rodio::{OutputStream, Sink};
+        use rodio::Sink;
 
         // On a failed start, clear the claim only if a newer turn hasn't taken it.
         let release = |thinking_for: &AtomicU64| {
@@ -52,7 +56,7 @@ pub fn start_thinking_tone_thread(thinking_for: Arc<AtomicU64>, mine: u64) {
                 thinking_for.compare_exchange(mine, TONE_OFF, Ordering::SeqCst, Ordering::SeqCst);
         };
 
-        let Ok((_stream, handle)) = OutputStream::try_default() else {
+        let Ok((_stream, handle, _)) = route::open_routed() else {
             release(&thinking_for);
             return;
         };
@@ -94,16 +98,16 @@ unsafe impl Send for SendableStream {}
 
 /// Keeps the `!Send` output stream alive on its own thread and exposes its `Send` handle.
 /// Reusing one avoids macOS CoreAudio AudioUnit open/close churn, which degrades audio over turns.
+/// Opens the routed speaker; for one held across a route change, use [`Speaker`].
 pub struct AudioKeeper {
     pub handle: rodio::OutputStreamHandle,
     stop: Arc<AtomicBool>,
 }
 
 impl AudioKeeper {
-    /// Open the default output device on a keeper thread; `thread_name` should name the engine.
+    /// Open the routed output device on a keeper thread; `thread_name` should name the engine.
     pub fn try_new(thread_name: &str) -> Result<Self> {
-        let (stream, handle) =
-            rodio::OutputStream::try_default().context("audio output device unavailable")?;
+        let (stream, handle, opened) = route::open_routed()?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let sendable = SendableStream(stream);
@@ -111,6 +115,7 @@ impl AudioKeeper {
             .name(thread_name.to_string())
             .spawn(move || {
                 let _stream = sendable; // keep OutputStream alive on this thread
+                let _hold = route::Hold::new(opened);
                 while !stop_clone.load(Ordering::Relaxed) {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
@@ -123,6 +128,121 @@ impl AudioKeeper {
 impl Drop for AudioKeeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// How often a [`Speaker`]'s thread looks for a route change.
+const FOLLOW_POLL: Duration = Duration::from_millis(200);
+
+struct SpeakerState {
+    handle: rodio::OutputStreamHandle,
+    /// The route generation the stream was opened for.
+    generation: u64,
+    device: String,
+}
+
+/// The routed speaker, held open across utterances and reopened when the route moves, so
+/// connecting headphones takes effect on the next sentence. Cheap to clone.
+#[derive(Clone)]
+pub struct Speaker {
+    state: Arc<Mutex<SpeakerState>>,
+    _stop: Arc<StopOnDrop>,
+}
+
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Speaker {
+    /// Fails only when no output device opens at all.
+    pub fn try_new(thread_name: &str) -> Result<Self> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Arc<Mutex<SpeakerState>>>>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        std::thread::Builder::new()
+            .name(thread_name.to_string())
+            .spawn(move || {
+                // Opened here, not on the caller's thread: a CoreAudio stream must close on the
+                // thread that opened it, and this thread replaces it.
+                let generation = route::generation();
+                let (stream, handle, device) = match route::open_routed() {
+                    Ok(opened) => opened,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let mut stream = SendableStream(stream);
+                let mut hold = route::Hold::new(device.clone());
+                let state = Arc::new(Mutex::new(SpeakerState {
+                    handle,
+                    generation,
+                    device,
+                }));
+                let _ = ready_tx.send(Ok(state.clone()));
+                while !stopping.load(Ordering::Relaxed) {
+                    std::thread::sleep(FOLLOW_POLL);
+                    let wanted = route::generation();
+                    if state.lock().unwrap_or_else(|e| e.into_inner()).generation == wanted {
+                        continue;
+                    }
+                    match route::open_routed() {
+                        Ok((next, handle, device)) => {
+                            tracing::info!(device = %device, "speaker reopened on the new route");
+                            stream = SendableStream(next);
+                            hold = route::Hold::new(device.clone());
+                            *state.lock().unwrap_or_else(|e| e.into_inner()) = SpeakerState {
+                                handle,
+                                generation: wanted,
+                                device,
+                            };
+                        }
+                        Err(e) => {
+                            // Keep the old stream; mark the route seen so this does not spin.
+                            tracing::warn!(error = %e, "no speaker opened on the new route");
+                            state.lock().unwrap_or_else(|e| e.into_inner()).generation = wanted;
+                        }
+                    }
+                }
+                drop((stream, hold));
+            })
+            .context("speaker thread spawn failed")?;
+        let state = ready_rx
+            .recv()
+            .map_err(|_| anyhow!("speaker thread exited before opening"))??;
+        Ok(Self {
+            state,
+            _stop: Arc::new(StopOnDrop(stop)),
+        })
+    }
+
+    pub fn handle(&self) -> rodio::OutputStreamHandle {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .handle
+            .clone()
+    }
+
+    /// Changes whenever the stream is replaced; audio queued on the old one will never finish.
+    pub fn generation(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
+    }
+
+    /// The device this speaker has open.
+    pub fn device(&self) -> String {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .device
+            .clone()
     }
 }
 
@@ -158,10 +278,53 @@ fn compute_audio_envelope(wav: &[u8], window_ms: u64) -> Vec<f32> {
         .collect()
 }
 
+/// No progress for this long while audio is queued means the device stopped taking it. Generous,
+/// because a Bluetooth speaker can take a second to wake.
+const STALL_AFTER: Duration = Duration::from_secs(3);
+
 /// Interruptibly play WAV on an open handle; `audio_level_sink` gets one level per poll tick.
 pub fn play_wav(
     wav: Vec<u8>,
     handle: &rodio::OutputStreamHandle,
+    interrupted: &AtomicBool,
+    utterance: &AtomicU64,
+    audio_level_sink: Option<&ThrottledAudioLevelSink>,
+) -> Result<()> {
+    play(
+        wav,
+        handle,
+        || true,
+        interrupted,
+        utterance,
+        audio_level_sink,
+    )
+}
+
+/// [`play_wav`] on a [`Speaker`]. Stops when the speaker reopens elsewhere: what was queued on
+/// the old stream would never finish.
+pub fn play_wav_on(
+    wav: Vec<u8>,
+    speaker: &Speaker,
+    interrupted: &AtomicBool,
+    utterance: &AtomicU64,
+    audio_level_sink: Option<&ThrottledAudioLevelSink>,
+) -> Result<()> {
+    let generation = speaker.generation();
+    let handle = speaker.handle();
+    play(
+        wav,
+        &handle,
+        || speaker.generation() == generation,
+        interrupted,
+        utterance,
+        audio_level_sink,
+    )
+}
+
+fn play(
+    wav: Vec<u8>,
+    handle: &rodio::OutputStreamHandle,
+    still_current: impl Fn() -> bool,
     interrupted: &AtomicBool,
     utterance: &AtomicU64,
     audio_level_sink: Option<&ThrottledAudioLevelSink>,
@@ -181,6 +344,8 @@ pub fn play_wav(
     sink.append(decoder);
 
     let mut tick: usize = 0;
+    let mut position = sink.get_pos();
+    let mut moved_at = Instant::now();
     while !sink.empty() {
         if interrupted.load(Ordering::Relaxed) {
             sink.stop();
@@ -193,6 +358,20 @@ pub fn play_wav(
             sink.stop();
             tracing::debug!("TTS playback dropped: it belongs to a superseded turn");
             return Ok(());
+        }
+        if !still_current() {
+            sink.stop();
+            tracing::info!("TTS playback cut: the speaker changed mid-sentence");
+            return Ok(());
+        }
+        let now = sink.get_pos();
+        if now != position {
+            position = now;
+            moved_at = Instant::now();
+        } else if moved_at.elapsed() >= STALL_AFTER {
+            sink.stop();
+            route::report_stall(route::output_device());
+            return Err(anyhow!("the speaker stopped taking audio"));
         }
         if let (Some(level_sink), Some(env)) = (audio_level_sink, &envelope) {
             if let Some(&level) = env.get(tick) {

@@ -24,6 +24,8 @@ metal = ["whisper-rs/metal"]
 [dependencies]
 pond-voice = { path = "../pond-voice" }
 pond-audio = { path = "../pond-audio" }
+# The wake ping plays on the same speaker as the voice.
+pond-audio-out = { path = "../pond-audio-out" }
 pond-core = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

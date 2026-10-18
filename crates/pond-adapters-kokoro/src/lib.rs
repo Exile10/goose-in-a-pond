@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use pond_audio_out::{play_wav, start_thinking_tone_thread, AudioKeeper, TONE_OFF};
+use pond_audio_out::{play_wav_on, start_thinking_tone_thread, Speaker, TONE_OFF};
 use pond_core::models::ports::voice_output::VoiceOutput;
 use pond_core::shared::domain::agent::ThrottledAudioLevelSink;
 use pond_voice::dsp::{encode_wav_pcm16, f32_to_pcm16};
@@ -67,8 +67,8 @@ pub struct KokoroOutput {
     speech_interrupted: Arc<AtomicBool>,
     /// Playbacks in flight; zero between sentences, e.g. while a tool runs.
     playing: Arc<std::sync::atomic::AtomicUsize>,
-    _audio_keeper: AudioKeeper,
-    audio_handle: rodio::OutputStreamHandle,
+    /// Follows the household's speaker choice, so a new route takes effect on the next sentence.
+    speaker: Speaker,
     audio_level_sink: Option<Arc<ThrottledAudioLevelSink>>,
     /// Sample rate of the most recent synthesis, for diagnostics.
     last_sample_rate: Mutex<Option<u32>>,
@@ -83,8 +83,7 @@ impl KokoroOutput {
         let vocab = Vocab::load(&config.tokenizer_path)?;
         tracing::info!(symbols = vocab.len(), "Kokoro vocab loaded");
 
-        let keeper = AudioKeeper::try_new("kokoro-audio-keeper")?;
-        let handle = keeper.handle.clone();
+        let speaker = Speaker::try_new("kokoro-audio-keeper")?;
         Ok(Self {
             model_path: RwLock::new(config.model_path.clone()),
             config,
@@ -97,8 +96,7 @@ impl KokoroOutput {
             utterance: Arc::new(AtomicU64::new(1)),
             speech_interrupted: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            _audio_keeper: keeper,
-            audio_handle: handle,
+            speaker,
             audio_level_sink: None,
             last_sample_rate: Mutex::new(None),
         })
@@ -263,14 +261,14 @@ impl VoiceOutput for KokoroOutput {
         if audio.is_empty() {
             return Ok(());
         }
-        let handle = self.audio_handle.clone();
+        let speaker = self.speaker.clone();
         let interrupted = self.speech_interrupted.clone();
         let utterance = self.utterance.clone();
         let sink = self.audio_level_sink.clone();
         let playing = Playing::start(&self.playing);
         tokio::task::spawn_blocking(move || {
             let _playing = playing;
-            play_wav(audio, &handle, &interrupted, &utterance, sink.as_deref())
+            play_wav_on(audio, &speaker, &interrupted, &utterance, sink.as_deref())
         })
         .await
         .context("Kokoro playback task panicked")?
