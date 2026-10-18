@@ -253,16 +253,19 @@ mod tests {
             println!("{direction:?} lazy choice: {choice} in {:?}", t.elapsed());
             assert!(choice.device.is_some());
         }
-        let speaker = prober.default_device(AudioDirection::Output).unwrap();
-        let mic = prober.default_device(AudioDirection::Input).unwrap();
-        let t = std::time::Instant::now();
-        let heard = prober.hears(&speaker, &mic);
-        println!(
-            "sound test {} -> {}: {heard:?} in {:?}",
-            speaker.id,
-            mic.id,
-            t.elapsed()
-        );
+        // Every pair of what is known without listing: on a board, the default and the USB card.
+        for speaker in prober.quick_list(AudioDirection::Output) {
+            for mic in prober.quick_list(AudioDirection::Input) {
+                let t = std::time::Instant::now();
+                let heard = prober.hears(&speaker, &mic);
+                println!(
+                    "sound test {} -> {}: {heard:?} in {:?}",
+                    speaker.id,
+                    mic.id,
+                    t.elapsed()
+                );
+            }
+        }
         let t = std::time::Instant::now();
         let pair = AudioDeviceSelector::new(prober.clone()).select_by_sound(
             &pond_core::models::services::voice::audio_devices::PairRequest {
