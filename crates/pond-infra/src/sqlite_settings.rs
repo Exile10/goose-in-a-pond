@@ -620,8 +620,8 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!("audio_input_device", &settings.audio_input_device);
         upsert!("audio_output_device", &settings.audio_output_device);
         upsert!(
-            "audio_test_chime",
-            if settings.audio_test_chime {
+            "audio_sound_test",
+            if settings.audio_sound_test {
                 "true"
             } else {
                 "false"
@@ -1129,7 +1129,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "voice_thinking_tone_enabled" => s.voice_thinking_tone_enabled = value == "true",
         "audio_input_device" => s.audio_input_device = value.to_string(),
         "audio_output_device" => s.audio_output_device = value.to_string(),
-        "audio_test_chime" => s.audio_test_chime = value == "true",
+        "audio_sound_test" => s.audio_sound_test = value == "true",
         // A corrupt row is not "true", so the pond stays quiet.
         "unprompted_speech_enabled" => s.unprompted_speech_enabled = value == "true",
         // Stored verbatim; the speech gate parses them and treats unparseable as quiet hours.
