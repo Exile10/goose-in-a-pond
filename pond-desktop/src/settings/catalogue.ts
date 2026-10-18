@@ -20,7 +20,7 @@ export type Consumer =
 
 /** Where a picker's options come from when they are not a fixed list. `chat-models` adds LiteRT-LM
  *  models to `llm-models`: they can hold the conversation, the tool-call helper cannot. */
-export type OptionSource = "llm-models" | "chat-models" | "whisper-models" | "tts-voices" | "embedding-models" | "llm-providers" | "time-zones";
+export type OptionSource = "llm-models" | "chat-models" | "whisper-models" | "tts-voices" | "embedding-models" | "llm-providers" | "time-zones" | "audio-inputs" | "audio-outputs";
 
 export type Control =
   | { kind: "toggle" }
@@ -156,6 +156,14 @@ export const CATALOGUE: CatalogueCategory[] = [
     tier: "Household",
     blurb: "What wakes the assistant, how it listens, and the voice it answers in.",
     groups: [
+      {
+        name: "Microphone and speaker",
+        entries: [
+          { key: "audio_input_device", label: "Microphone", description: "The microphone to listen through. Automatic uses one that works, and moves when it stops working.", control: { kind: "lookup", source: "audio-inputs", placeholder: "Automatic" }, consumer: "live" },
+          { key: "audio_output_device", label: "Speaker", description: "The speaker to answer on. Automatic uses one that works, and follows headphones when they connect.", control: { kind: "lookup", source: "audio-outputs", placeholder: "Automatic" }, consumer: "live" },
+          { key: "audio_test_chime", label: "Let speaker tests be heard", description: "Play a short chime when the pond tests or moves to a speaker. Off, every test plays silence.", control: { kind: "toggle" }, consumer: "live" },
+        ],
+      },
       {
         name: "Wake word",
         entries: [

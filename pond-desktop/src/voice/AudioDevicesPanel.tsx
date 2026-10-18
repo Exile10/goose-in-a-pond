@@ -1,0 +1,187 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertTriangle, Loader2, Mic, MicOff, RefreshCw, Volume2 } from "lucide-react";
+import { api } from "../api/PondApiClient";
+import type { AudioChoice, AudioDeviceStatus, Settings } from "../api/types";
+import { Toggle } from "../hub/views/settings/controls";
+import { describeChoice, describeWhen, deviceOptions, isAudioStatus } from "./audioDevices";
+import "./audio-devices.css";
+
+/** Often enough that a headset plugged in shows up while the page is open; a GET reads a file. */
+const POLL_MS = 4_000;
+
+type PinKey = "audio_input_device" | "audio_output_device";
+
+interface Props {
+  /** `hub` for the touch panel, `catalogue` for the dense desktop list. */
+  variant: "hub" | "catalogue";
+  /** The hub has no catalogue rows, so the pickers and the chime switch live here. */
+  withPickers?: boolean;
+}
+
+export function AudioDevicesPanel({ variant, withPickers = false }: Props) {
+  const [status, setStatus] = useState<AudioDeviceStatus | null>(null);
+  const [settings, setSettings] = useState<Partial<Settings> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<"test" | "chime" | null>(null);
+  const [said, setSaid] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const alive = useRef(true);
+
+  const load = useCallback(async () => {
+    try {
+      const next = await api.getAudioDevices();
+      if (!alive.current) return;
+      if (isAudioStatus(next)) {
+        setStatus(next);
+        setError(null);
+      }
+    } catch {
+      if (alive.current) setError("The pond is not answering, so the devices in use are unknown.");
+    } finally {
+      if (alive.current) setNow(Date.now());
+    }
+  }, []);
+
+  useEffect(() => {
+    alive.current = true;
+    void load();
+    if (withPickers) {
+      api.getSettings().then(
+        (s) => alive.current && setSettings(s),
+        () => undefined,
+      );
+    }
+    const timer = window.setInterval(() => void load(), POLL_MS);
+    return () => {
+      alive.current = false;
+      window.clearInterval(timer);
+    };
+  }, [load, withPickers]);
+
+  async function test(chime: boolean) {
+    setBusy(chime ? "chime" : "test");
+    setSaid(null);
+    try {
+      const next = await api.testAudioDevices(chime);
+      if (!alive.current) return;
+      if (isAudioStatus(next)) {
+        setStatus(next);
+        const speaker = next.output.device?.label;
+        setSaid(chime && speaker ? `Played a test sound on ${speaker}.` : "Tested every device just now.");
+      }
+      setError(null);
+    } catch {
+      if (alive.current) setError("The test did not finish. Try again in a moment.");
+    } finally {
+      if (alive.current) {
+        setBusy(null);
+        setNow(Date.now());
+      }
+    }
+  }
+
+  async function pin(key: PinKey, value: string) {
+    setSettings((s) => ({ ...(s ?? {}), [key]: value }));
+    setSaid(value ? "Saved. Testing it now." : "Saved. The pond picks a device that works.");
+    try {
+      // The server chooses again on its own when a pin changes; the poll shows the result.
+      await api.updateSettings({ [key]: value });
+      window.setTimeout(() => void load(), 1_500);
+    } catch {
+      setSaid(null);
+      setError("That choice was not saved. Try again.");
+    }
+  }
+
+  async function setChime(on: boolean) {
+    setSettings((s) => ({ ...(s ?? {}), audio_test_chime: on }));
+    try {
+      await api.updateSettings({ audio_test_chime: on });
+    } catch {
+      setError("That switch was not saved. Try again.");
+    }
+  }
+
+  const rows: { key: PinKey; title: string; choice: AudioChoice | undefined }[] = [
+    { key: "audio_input_device", title: "Microphone", choice: status?.input },
+    { key: "audio_output_device", title: "Speaker", choice: status?.output },
+  ];
+
+  return (
+    <div className={`adev adev--${variant}`}>
+      {error && (
+        <p className="adev__error" role="status">
+          {error}
+        </p>
+      )}
+      <ul className="adev__list">
+        {rows.map(({ key, title, choice }) => {
+          const line = choice ? describeChoice(choice) : null;
+          const Icon =
+            line?.problem ? AlertTriangle : choice?.basis === "mic_off" ? MicOff : key === "audio_input_device" ? Mic : Volume2;
+          const pinned = settings?.[key] ?? "";
+          return (
+            <li className="adev__row" key={key}>
+              <Icon className="adev__icon" size={18} strokeWidth={2} aria-hidden="true" />
+              <div className="adev__text">
+                <span className="adev__title">{title}</span>
+                <span className="adev__line" data-problem={line?.problem || undefined}>
+                  {line ? line.text : "Finding out what is connected."}
+                </span>
+              </div>
+              {withPickers && (
+                <select
+                  className="adev__select"
+                  aria-label={`${title} to use`}
+                  value={pinned}
+                  disabled={settings === null}
+                  onChange={(e) => void pin(key, e.target.value)}
+                >
+                  {deviceOptions(choice, pinned).map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+
+      {withPickers && (
+        <div className="adev__row adev__row--switch">
+          <div className="adev__text">
+            <span className="adev__title">Let speaker tests be heard</span>
+            <span className="adev__line">
+              A short chime when the pond tests or moves to a speaker. Off, tests play silence.
+            </span>
+          </div>
+          {settings && (
+            // Remounted on load: Toggle reads `on` once, and settings arrive after mount.
+            <Toggle
+              key={`chime-${Boolean(settings.audio_test_chime)}`}
+              on={Boolean(settings.audio_test_chime)}
+              onChange={(on) => void setChime(on)}
+              label="Let speaker tests be heard"
+            />
+          )}
+        </div>
+      )}
+
+      <div className="adev__actions">
+        <button className="adev__btn" type="button" disabled={busy !== null} onClick={() => void test(false)}>
+          {busy === "test" ? <Loader2 className="adev__spin" size={14} aria-hidden="true" /> : <RefreshCw size={14} aria-hidden="true" />}
+          {busy === "test" ? "Testing" : "Test again"}
+        </button>
+        <button className="adev__btn" type="button" disabled={busy !== null} onClick={() => void test(true)}>
+          {busy === "chime" ? <Loader2 className="adev__spin" size={14} aria-hidden="true" /> : <Volume2 size={14} aria-hidden="true" />}
+          Play a test sound
+        </button>
+        <span className="adev__when" aria-live="polite">
+          {said ?? (status ? describeWhen(status, now) : "")}
+        </span>
+      </div>
+    </div>
+  );
+}

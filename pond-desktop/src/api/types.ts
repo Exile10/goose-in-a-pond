@@ -87,6 +87,12 @@ export interface Settings {
   /** Kokoro quantization (`q8` | `q8f16` | `q4f16` | `fp16` | `fp32`); picks the `.onnx` file. */
   voice_tts_quality?: string;
   voice_thinking_tone_enabled?: boolean;
+  /** Pinned microphone, by its system name; "" picks one that works. */
+  audio_input_device?: string;
+  /** Pinned speaker, by its system name; "" picks one that works. */
+  audio_output_device?: string;
+  /** Lets a speaker test be heard; off, every test plays silence. */
+  audio_test_chime?: boolean;
 
   // Model roles
   chat_provider?: string;
@@ -1519,4 +1525,57 @@ export interface DetectedPlace {
   has_coordinates: boolean;
   /** Why there are no coordinates, when there are none. Shown as-is. */
   note: string | null;
+}
+
+// ── Audio devices (`GET /api/v1/audio/devices`), mirroring pond-core's `audio_device` ──
+
+export type AudioDirection = "input" | "output";
+
+export type AudioDeviceKind = "sound_server" | "hardware" | "raw" | "virtual";
+
+/** What briefly opening a device found. A microphone is measured for level, never recorded. */
+export type AudioProbeOutcome =
+  | { result: "hearing"; level_dbfs: number }
+  | { result: "silent" }
+  | { result: "accepting" }
+  | { result: "stalled" }
+  | { result: "failed"; reason: string }
+  | { result: "untested" };
+
+export interface AudioDevice {
+  id: string;
+  label: string;
+  is_default: boolean;
+  kind: AudioDeviceKind;
+}
+
+export interface ProbedAudioDevice extends AudioDevice {
+  outcome: AudioProbeOutcome;
+}
+
+export type AudioChoiceBasis =
+  | "pinned"
+  | "system_default"
+  | "fallback"
+  | "best_effort"
+  | "no_device"
+  | "mic_off"
+  | "not_tested";
+
+export interface AudioChoice {
+  direction: AudioDirection;
+  device: AudioDevice | null;
+  outcome: AudioProbeOutcome;
+  basis: AudioChoiceBasis;
+  pinned: string | null;
+  devices: ProbedAudioDevice[];
+}
+
+export interface AudioDeviceStatus {
+  input: AudioChoice;
+  output: AudioChoice;
+  updated_at_ms: number;
+  /** `voice` when the voice session chose (it owns the microphone), `serve` otherwise. */
+  source: string;
+  pid: number;
 }

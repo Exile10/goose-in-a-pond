@@ -60,6 +60,7 @@ import {
   type MusicControlAction,
   type NowPlayingApiResponse,
   type Settings,
+  type AudioDeviceStatus,
   type UsageSummary,
   type TranscribeResponse,
   type UserSkill,
@@ -451,6 +452,18 @@ export class PondApiClient {
    */
   updateSettings(patch: Partial<Settings>): Promise<Settings> {
     return this.put("/api/v1/settings", patch);
+  }
+
+  // ── Audio devices ─────────────────────────────────────────
+
+  getAudioDevices(): Promise<AudioDeviceStatus> {
+    return this.get("/api/v1/audio/devices");
+  }
+
+  /** Test every device again and use what works. `chime` makes the speaker test audible. */
+  testAudioDevices(chime = false): Promise<AudioDeviceStatus> {
+    // A full test can wait on a slow Bluetooth microphone and the voice session's answer.
+    return this.post("/api/v1/audio/devices/test", { chime }, 30_000);
   }
 
   // ── Weather ───────────────────────────────────────────────

@@ -54,6 +54,8 @@ vi.mock("../api/PondApiClient", () => ({
     resetOnboarding: vi.fn(),
     listTimeZones: vi.fn(),
     detectLocation: vi.fn(),
+    getAudioDevices: vi.fn().mockRejectedValue(new Error("not under test here")),
+    testAudioDevices: vi.fn(),
   },
 }));
 

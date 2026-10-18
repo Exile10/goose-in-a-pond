@@ -6,6 +6,7 @@ import { api } from "../../../api/PondApiClient";
 import type { Settings, ModelEntry } from "../../../api/types";
 import { useVoicePreview } from "../../../voice/useVoicePreview";
 import { VoicePicker } from "./VoicePicker";
+import { AudioDevicesPanel } from "../../../voice/AudioDevicesPanel";
 import "./voice-picker.css";
 import {
   clampPace,
@@ -289,6 +290,11 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
           {error}
         </div>
       )}
+
+      {/* ── Devices: what it hears through and speaks on ──────── */}
+      <Card title="Microphone and speaker">
+        <AudioDevicesPanel variant="hub" withPickers />
+      </Card>
 
       {/* ── Listening card ──────────────────────────────────── */}
       <Card title="Listening">
