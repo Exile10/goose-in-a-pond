@@ -129,6 +129,24 @@ export interface DeviceOption {
   label: string;
 }
 
+/** A picker row is narrow, so the last test is a word or two, not the status sentence's phrase. */
+function shortly(outcome: AudioProbeOutcome): string | null {
+  switch (outcome.result) {
+    case "hearing":
+      return "hears sound";
+    case "silent":
+      return "silent";
+    case "accepting":
+      return "works";
+    case "stalled":
+      return "no response";
+    case "failed":
+      return "won't open";
+    case "untested":
+      return null;
+  }
+}
+
 /** Picker rows: "Automatic" first, then each device with what its last test found. A pin that
  *  is not connected stays listed, or opening the picker would silently drop it. */
 export function deviceOptions(choice: AudioChoice | undefined, pinned: string): DeviceOption[] {
@@ -136,8 +154,9 @@ export function deviceOptions(choice: AudioChoice | undefined, pinned: string): 
   const devices = choice?.devices ?? [];
   for (const d of devices) {
     const parts: string[] = [];
-    if (d.is_default) parts.push("system default");
-    if (d.outcome.result !== "untested") parts.push(heard(d.outcome));
+    if (d.is_default) parts.push("default");
+    const tested = shortly(d.outcome);
+    if (tested) parts.push(tested);
     rows.push({
       value: d.id,
       label: parts.length ? `${d.label} (${parts.join(", ")})` : d.label,

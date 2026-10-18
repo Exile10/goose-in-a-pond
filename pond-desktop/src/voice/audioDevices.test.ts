@@ -102,7 +102,7 @@ describe("deviceOptions", () => {
     const opts = deviceOptions(choice({ devices: [builtIn, phone] }), "");
     expect(opts).toEqual([
       { value: "", label: "Automatic" },
-      { value: "MacBook Air Microphone", label: "MacBook Air Microphone (system default, hearing sound)" },
+      { value: "MacBook Air Microphone", label: "MacBook Air Microphone (default, hears sound)" },
       { value: "Phone", label: "Phone" },
     ]);
   });

@@ -50,7 +50,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.getAudioDevices).mockResolvedValue(status());
   vi.mocked(api.testAudioDevices).mockResolvedValue(status());
-  vi.mocked(api.getSettings).mockResolvedValue({ audio_input_device: "", audio_test_chime: false });
+  vi.mocked(api.getSettings).mockResolvedValue({ audio_input_device: "", audio_test_chime: false } as never);
   vi.mocked(api.updateSettings).mockResolvedValue({} as never);
 });
 

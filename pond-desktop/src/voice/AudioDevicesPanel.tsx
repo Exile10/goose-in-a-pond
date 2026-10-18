@@ -16,9 +16,11 @@ interface Props {
   variant: "hub" | "catalogue";
   /** The hub has no catalogue rows, so the pickers and the chime switch live here. */
   withPickers?: boolean;
+  /** Every fresh status, so pickers rendered elsewhere list what the last test found. */
+  onStatus?: (status: AudioDeviceStatus) => void;
 }
 
-export function AudioDevicesPanel({ variant, withPickers = false }: Props) {
+export function AudioDevicesPanel({ variant, withPickers = false, onStatus }: Props) {
   const [status, setStatus] = useState<AudioDeviceStatus | null>(null);
   const [settings, setSettings] = useState<Partial<Settings> | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -26,6 +28,9 @@ export function AudioDevicesPanel({ variant, withPickers = false }: Props) {
   const [said, setSaid] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const alive = useRef(true);
+  // A ref, so a parent re-rendering with a new callback does not restart the poll.
+  const report = useRef(onStatus);
+  report.current = onStatus;
 
   const load = useCallback(async () => {
     try {
@@ -33,6 +38,7 @@ export function AudioDevicesPanel({ variant, withPickers = false }: Props) {
       if (!alive.current) return;
       if (isAudioStatus(next)) {
         setStatus(next);
+        report.current?.(next);
         setError(null);
       }
     } catch {
@@ -66,6 +72,7 @@ export function AudioDevicesPanel({ variant, withPickers = false }: Props) {
       if (!alive.current) return;
       if (isAudioStatus(next)) {
         setStatus(next);
+        report.current?.(next);
         const speaker = next.output.device?.label;
         setSaid(chime && speaker ? `Played a test sound on ${speaker}.` : "Tested every device just now.");
       }

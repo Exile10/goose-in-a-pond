@@ -1175,7 +1175,7 @@ export function SettingsCatalogueView({
                     <div className="scat__groupHead">
                       <h3>In use now</h3>
                     </div>
-                    <AudioDevicesPanel variant="catalogue" />
+                    <AudioDevicesPanel variant="catalogue" onStatus={setAudio} />
                   </section>
                 )}
 
