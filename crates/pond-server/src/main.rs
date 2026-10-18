@@ -3,6 +3,7 @@
 //! TODO: `scripts/setup.sh`: dedicated vs shared host URL, port 80→8080→4000→5000, mDNS, systemd.
 
 mod asset_root;
+mod audio_devices;
 mod composite_model_catalog_provider;
 mod conversation_extractor;
 mod filesystem_model_storage;
@@ -1149,6 +1150,25 @@ async fn run_server(
         15_000,
         settings.mic_enabled,
     );
+
+    // Choose the speaker before Kokoro opens one. The mic is only tested on request, or by the
+    // voice session, which owns it.
+    {
+        let supervisor = audio_devices::start(
+            pond_adapters_audio_devices::Role::Serve,
+            &data_dir,
+            Some(mic_handle.clone()),
+            Arc::new(SqliteSettingsRepository::new(db.system.clone())),
+            None,
+        );
+        match supervisor.wait_ready(std::time::Duration::from_secs(5)) {
+            Some(status) => println!("  ✅ Speaker: {}", status.output),
+            None => println!("  ⚠  Speaker: still being tested; using the system default"),
+        }
+        pond_api::audio_devices::install(Arc::new(
+            pond_adapters_audio_devices::PondAudioControl::new(supervisor, data_dir.clone()),
+        ));
+    }
 
     // One resolution for both voice models, shared with the `chat` path.
     let voice_models = voice_models::resolve_voice_models(
@@ -4924,6 +4944,51 @@ async fn run_chat(
         settings.mic_enabled,
     );
 
+    // Voice owns the mic, so it tests and follows the devices; it starts now so the probes
+    // overlap the model loads below. Later problems go out as NDJSON errors, once `ready` is out.
+    let audio_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let audio_supervisor = if voice_mode {
+        let ready = audio_ready.clone();
+        let reported = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let on_change: pond_adapters_audio_devices::ChangeFn = Arc::new(move |status, trigger| {
+            if !ready.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            if !json_events {
+                println!(
+                    "  Audio    {} / {} ({trigger:?})",
+                    status.input, status.output
+                );
+                return;
+            }
+            let problems: Vec<String> = [status.input.problem(), status.output.problem()]
+                .into_iter()
+                .flatten()
+                .collect();
+            let mut reported = reported.lock().unwrap_or_else(|e| e.into_inner());
+            for problem in problems.iter().filter(|p| !reported.contains(p)) {
+                write_ndjson_line(&pond_core::shared::domain::agent::WorkflowEvent::Error {
+                    message: format!("audio: {problem}"),
+                });
+            }
+            *reported = problems;
+        });
+        Some(audio_devices::start(
+            pond_adapters_audio_devices::Role::Voice,
+            &data_dir,
+            Some(mic_handle.clone()),
+            Arc::new(SqliteSettingsRepository::new(db.system.clone())),
+            Some(on_change),
+        ))
+    } else {
+        // A text session never opens the mic; its replies still play on the pinned speaker.
+        let pinned = settings.audio_output_device.trim();
+        if !pinned.is_empty() {
+            pond_audio_out::set_output_device(Some(pinned.to_string()));
+        }
+        None
+    };
+
     let voice_models = voice_models::resolve_voice_models(
         &settings,
         &SqliteModelRepository::new(db.system.clone()),
@@ -5477,6 +5542,26 @@ async fn run_chat(
         started
     };
 
+    // Kokoro opens the speaker as it loads, so let the first choice land before it does.
+    if let Some(status) = audio_supervisor
+        .as_ref()
+        .and_then(|s| s.wait_ready(std::time::Duration::from_secs(6)))
+    {
+        out!("  Hear     {}", status.input);
+        out!("  Play     {}", status.output);
+        for problem in [status.input.problem(), status.output.problem()]
+            .into_iter()
+            .flatten()
+        {
+            out!("  Audio    {problem}");
+            if json_events {
+                deferred_diagnostics
+                    .borrow_mut()
+                    .push(format!("audio: {problem}"));
+            }
+        }
+    }
+
     // ── Wire TTS output ──
     // Never stdout under --json-events: the text already streams as NDJSON `token` events.
     let text_fallback = || -> Arc<dyn VoiceOutput> {
@@ -5634,6 +5719,7 @@ async fn run_chat(
                 message: message.clone(),
             });
         }
+        audio_ready.store(true, std::sync::atomic::Ordering::SeqCst);
 
         if let Err(e) = chat_service.run_loop().await {
             write_ndjson_line(&WorkflowEvent::Error {
@@ -5642,13 +5728,20 @@ async fn run_chat(
             write_ndjson_line(&WorkflowEvent::Exit {
                 reason: "error".to_string(),
             });
+            if let Some(s) = &audio_supervisor {
+                s.stop();
+            }
             mic_handle.shutdown();
             return Err(e);
         }
     } else {
+        audio_ready.store(true, std::sync::atomic::Ordering::SeqCst);
         chat_service.run_loop().await?;
     }
 
+    if let Some(s) = &audio_supervisor {
+        s.stop();
+    }
     mic_handle.shutdown();
     Ok(())
 }
@@ -7172,13 +7265,14 @@ async fn run_calibrate(
         settings.voice_wake_word = phrase.clone();
     }
 
-    // Own mic owner: calibration never runs alongside the wake-word detector.
-    let (mic_handle, _mic_owner_join) = pond_audio::spawn(
-        Box::new(pond_audio::CpalCapture::new()),
-        pond_audio::CAPTURE_RATE_HZ,
-        15_000,
-        true,
-    );
+    // Own mic owner: calibration never runs alongside the wake-word detector. The pinned mic,
+    // so the variants are learned through the microphone voice will hear them on.
+    let capture = match settings.audio_input_device.trim() {
+        "" => pond_audio::CpalCapture::new(),
+        pinned => pond_audio::CpalCapture::with_device(pinned),
+    };
+    let (mic_handle, _mic_owner_join) =
+        pond_audio::spawn(Box::new(capture), pond_audio::CAPTURE_RATE_HZ, 15_000, true);
     let whisper = WhisperRsInput::new(whisper_model_path.clone(), mic_handle.clone())
         .with_context(|| format!("loading whisper model: {}", whisper_model_path.display()))?;
     let mut collected = 0usize;

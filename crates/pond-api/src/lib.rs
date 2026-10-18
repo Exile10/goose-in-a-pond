@@ -1,5 +1,6 @@
 //! REST API under `/api/v1/`; protected routes take a Bearer token from `POST /api/v1/handshake`.
 
+pub mod audio_devices;
 pub mod cleanup;
 pub mod download_failure;
 pub mod host_guard;
