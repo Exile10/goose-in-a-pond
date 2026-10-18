@@ -466,8 +466,8 @@ fn att_error(refusal: Refusal) -> ReqError {
     }
 }
 
-/// Notifications go out as `Value` changes, which BlueZ caps at ATT_MTU - 3 per device: the same
-/// limit the session chunks to. bluer's socket path would cap them two bytes lower, below what an
+/// Notifications go out as `Value` changes, which BlueZ caps at ATT_MTU - 3 per device, at or
+/// above the session's own chunk limit. bluer's socket path would cap them two bytes lower, below what an
 /// ATT_MTU of 23 needs.
 struct BluezNotifier {
     notifier: AsyncMutex<CharacteristicNotifier>,

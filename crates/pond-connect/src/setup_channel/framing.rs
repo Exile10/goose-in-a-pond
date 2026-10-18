@@ -1,5 +1,6 @@
 //! A message on the wire is a 4-byte big-endian length and then its bytes, split across ATT
-//! writes or notifications of at most `ATT_MTU - 3` bytes (`pond-setup-channel.md`, "Framing").
+//! writes or notifications of at most `min(ATT_MTU - 3, 512)` bytes (`pond-setup-channel.md`,
+//! "Framing").
 //! Each message starts its own chunk, and no chunk carries bytes of two messages.
 
 /// The largest message either side sends or accepts.
@@ -11,6 +12,9 @@ pub const ATT_HEADER_LEN: u16 = 3;
 pub const DEFAULT_ATT_MTU: u16 = 23;
 /// The largest ATT_MTU the Core spec allows.
 pub const MAX_ATT_MTU: u16 = 517;
+/// ATT caps an attribute value at 512 bytes, below what MTU 517 leaves, and Android discards a
+/// longer notification: measured on an A16, where every 514-byte chunk vanished.
+pub const MAX_CHUNK_LEN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FrameError {
@@ -34,7 +38,7 @@ pub fn encode(message: &[u8]) -> Result<Vec<u8>, FrameError> {
 
 /// Bytes per write or notification at this ATT_MTU, clamped to what the spec allows.
 pub fn chunk_len(att_mtu: u16) -> usize {
-    usize::from(att_mtu.clamp(DEFAULT_ATT_MTU, MAX_ATT_MTU) - ATT_HEADER_LEN)
+    usize::from(att_mtu.clamp(DEFAULT_ATT_MTU, MAX_ATT_MTU) - ATT_HEADER_LEN).min(MAX_CHUNK_LEN)
 }
 
 /// `frame` as the writes or notifications that carry it.
@@ -145,7 +149,7 @@ mod tests {
         assert_eq!(chunk_len(23), 20);
         assert_eq!(chunk_len(185), 182);
         assert_eq!(chunk_len(0), 20, "below the minimum reads as the minimum");
-        assert_eq!(chunk_len(u16::MAX), 514);
+        assert_eq!(chunk_len(u16::MAX), MAX_CHUNK_LEN);
         let frame = encode(&[7u8; 50]).unwrap();
         let sizes: Vec<usize> = chunks(&frame, 23).map(<[u8]>::len).collect();
         assert_eq!(sizes, [20, 20, 14]);
@@ -180,6 +184,14 @@ mod tests {
             assert_eq!(received.as_deref(), Some(sent.as_slice()), "round {round}");
             assert!(reassembler.is_idle());
         }
+    }
+
+    #[test]
+    fn no_chunk_is_longer_than_an_attribute_value() {
+        assert_eq!(chunk_len(515), 512);
+        assert_eq!(chunk_len(MAX_ATT_MTU), MAX_CHUNK_LEN);
+        let frame = encode(&[7u8; 2_000]).unwrap();
+        assert!(chunks(&frame, MAX_ATT_MTU).all(|chunk| chunk.len() <= MAX_CHUNK_LEN));
     }
 
     #[test]

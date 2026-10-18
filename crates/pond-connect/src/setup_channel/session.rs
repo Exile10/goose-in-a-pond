@@ -217,7 +217,7 @@ impl SetupSession {
         }
     }
 
-    /// The link's ATT_MTU once negotiated; notifications are split to `att_mtu - 3`.
+    /// The link's ATT_MTU once negotiated; notifications are split to [`framing::chunk_len`].
     pub fn set_att_mtu(&mut self, att_mtu: u16) {
         self.att_mtu = att_mtu;
     }
@@ -867,7 +867,7 @@ pub struct SessionNotifications {
 }
 
 impl SessionNotifications {
-    /// The next tx notification, at most `att_mtu - 3` bytes.
+    /// The next tx notification, at most [`framing::chunk_len`] bytes.
     pub async fn next(&mut self) -> Option<Vec<u8>> {
         self.outbound.recv().await
     }
