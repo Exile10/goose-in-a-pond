@@ -30,7 +30,7 @@ impl CpalProber {
         Self { mic }
     }
 
-    fn cards() -> Vec<(String, String)> {
+    fn cards() -> Vec<names::Card> {
         if !ALSA {
             return Vec::new();
         }
@@ -39,7 +39,7 @@ impl CpalProber {
             .unwrap_or_default()
     }
 
-    fn describe(name: &str, is_default: bool, cards: &[(String, String)]) -> AudioDevice {
+    fn describe(name: &str, is_default: bool, cards: &[names::Card]) -> AudioDevice {
         AudioDevice {
             id: name.to_string(),
             label: if ALSA {
@@ -49,6 +49,7 @@ impl CpalProber {
             },
             is_default,
             kind: names::kind_of(name),
+            plugged_in: names::card_of(name, cards).is_some_and(names::Card::plugged_in),
         }
     }
 
@@ -104,10 +105,25 @@ impl AudioDeviceProber for CpalProber {
     }
 
     fn quick_list(&self, direction: AudioDirection) -> Vec<AudioDevice> {
-        if ALSA {
-            return Vec::new();
+        if !ALSA {
+            return self.devices(direction).unwrap_or_default();
         }
-        self.devices(direction).unwrap_or_default()
+        // Read from /proc rather than by opening nodes: the default, and each plugged-in card's
+        // shared route (`sysdefault` mixes, so the voice and the thinking tone can both play).
+        let cards = Self::cards();
+        let pcm = std::fs::read_to_string("/proc/asound/pcm").unwrap_or_default();
+        let mut out: Vec<AudioDevice> = self.default_device(direction).into_iter().collect();
+        for card in cards.iter().filter(|c| c.plugged_in()) {
+            if names::card_directions(&pcm, card.index, direction) {
+                let name = format!("sysdefault:CARD={}", card.id);
+                out.push(Self::describe(&name, false, &cards));
+            }
+        }
+        out
+    }
+
+    fn plugged_in_first(&self) -> bool {
+        ALSA
     }
 
     fn probe(
