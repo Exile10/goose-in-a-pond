@@ -52,7 +52,7 @@ async fn blocking(
 /// Choose again without waiting, after a settings save changed what the choice depends on.
 pub fn reselect_in_background() {
     if let Ok(control) = control() {
-        tokio::task::spawn_blocking(move || control.retest(false));
+        tokio::task::spawn_blocking(move || control.reselect());
     }
 }
 
@@ -116,6 +116,7 @@ mod tests {
             self.chimes.lock().unwrap().push(chime);
             status()
         }
+        fn reselect(&self) {}
     }
 
     static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

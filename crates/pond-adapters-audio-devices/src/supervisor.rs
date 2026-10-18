@@ -23,8 +23,9 @@ const FINGERPRINT_EVERY: Duration = Duration::from_secs(2);
 const MIC_STALL: Duration = Duration::from_secs(3);
 /// Spaces out reselects after failures, so a device that keeps failing is not hammered.
 const FAILURE_BACKOFF: Duration = Duration::from_secs(5);
-/// How long serve waits for the voice session to answer a retest request.
-const VOICE_ANSWER_WAIT: Duration = Duration::from_secs(12);
+/// How long serve waits for the voice session to answer a retest request: a full test's budget
+/// plus one slow device still opening when it runs out, inside the UI's 30 s request timeout.
+const VOICE_ANSWER_WAIT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -60,6 +61,8 @@ pub enum Trigger {
     DevicesChanged,
     InputLost,
     OutputStalled,
+    /// A pin or the mic switch changed: chosen again as at startup, never a full test.
+    SettingsChanged,
     Retest,
 }
 
@@ -97,6 +100,13 @@ struct StatusFile {
 struct RetestRequest {
     id: u64,
     chime: bool,
+    /// False for a settings change: the voice session chooses again lazily, as at startup.
+    #[serde(default = "full_by_default")]
+    full: bool,
+}
+
+fn full_by_default() -> bool {
+    true
 }
 
 fn audio_dir(data_dir: &Path) -> PathBuf {
@@ -411,7 +421,16 @@ impl Inner {
                 if let Some(req) = read_json::<RetestRequest>(&request_path(&self.data_dir)) {
                     if handled != Some(req.id) {
                         handled = Some(req.id);
-                        self.retest(req.chime, Some(req.id));
+                        if req.full {
+                            self.retest(req.chime, Some(req.id));
+                        } else {
+                            self.pass(
+                                Trigger::SettingsChanged,
+                                ProbeMode::Lazy,
+                                BOTH,
+                                Some(req.id),
+                            );
+                        }
                     }
                 }
             }
@@ -523,7 +542,12 @@ impl AudioDeviceControl for PondAudioControl {
         // The voice session holds the microphone, so it runs the test; this process only
         // re-checks the speaker it announces on.
         let id = now_ms();
-        write_json(&request_path(&self.data_dir), &RetestRequest { id, chime });
+        let request = RetestRequest {
+            id,
+            chime,
+            full: true,
+        };
+        write_json(&request_path(&self.data_dir), &request);
         self.serve.inner.pass(
             Trigger::Retest,
             ProbeMode::Full,
@@ -543,6 +567,21 @@ impl AudioDeviceControl for PondAudioControl {
         }
         tracing::warn!("the voice session did not answer the device test in time");
         self.status()
+    }
+
+    fn reselect(&self) {
+        if live_voice(&self.data_dir).is_some() {
+            let request = RetestRequest {
+                id: now_ms(),
+                chime: false,
+                full: false,
+            };
+            write_json(&request_path(&self.data_dir), &request);
+        }
+        // Lazy, so serve still opens no microphone: its input stays untested or off.
+        self.serve
+            .inner
+            .pass(Trigger::SettingsChanged, ProbeMode::Lazy, BOTH, None);
     }
 }
 
@@ -816,13 +855,52 @@ mod tests {
 
         write_json(
             &request_path(dir.path()),
-            &RetestRequest { id: 7, chime: true },
+            &RetestRequest {
+                id: 7,
+                chime: true,
+                full: true,
+            },
         );
         wait_until("the answer", || {
             read_json::<StatusFile>(&status_path(dir.path(), Role::Voice))
                 .is_some_and(|f| f.answered == Some(7))
         });
         assert_eq!(*m.chimes.lock().unwrap(), ["Built-in speakers"]);
+        voice.stop();
+    }
+
+    #[test]
+    fn a_settings_change_reselects_without_a_full_test() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = machine();
+        m.plug(AudioDirection::Input, "Phone", false, hearing());
+        let serve = start(&m, Role::Serve, dir.path(), prefs(None, true, false));
+        serve.wait_ready(Duration::from_secs(5)).unwrap();
+        let control = PondAudioControl::new(serve.clone(), dir.path().to_path_buf());
+        control.reselect();
+        let opened = m.probes.lock().unwrap().clone();
+        assert!(
+            !opened.iter().any(|p| p == "Built-in mic" || p == "Phone"),
+            "serve opened a microphone for a settings change: {opened:?}"
+        );
+
+        // A voice session answers the same change lazily: the default hears, so nothing else opens.
+        let voice = start(&m, Role::Voice, dir.path(), prefs(None, true, false));
+        voice.wait_ready(Duration::from_secs(5)).unwrap();
+        m.probes.lock().unwrap().clear();
+        let request = RetestRequest {
+            id: 9,
+            chime: false,
+            full: false,
+        };
+        write_json(&request_path(dir.path()), &request);
+        wait_until("the lazy answer", || {
+            read_json::<StatusFile>(&status_path(dir.path(), Role::Voice))
+                .is_some_and(|f| f.answered == Some(9))
+        });
+        assert!(!m.probes.lock().unwrap().contains(&"Phone".to_string()));
+        serve.stop();
         voice.stop();
     }
 

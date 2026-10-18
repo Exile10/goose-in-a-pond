@@ -16,6 +16,9 @@ use crate::probe;
 /// cpal's only host on Linux is ALSA, whose listing opens every node.
 const ALSA: bool = cfg!(target_os = "linux");
 
+/// Time allowed beyond a probe's own wait for the driver to open and close the device.
+const OPEN_SLACK: Duration = Duration::from_secs(6);
+
 pub struct CpalProber {
     /// The process's mic owner. Input probes run on its thread, so nothing opens a microphone
     /// beside it, and the device it has open is measured rather than reopened.
@@ -123,7 +126,9 @@ impl AudioDeviceProber for CpalProber {
             return probe::probe_input(&device.id, wait);
         };
         let id = device.id.clone();
-        mic.run_exclusive(wait + Duration::from_secs(3), move |view| {
+        // Opening can block inside the driver: an idle Continuity iPhone mic took longer than
+        // three seconds on the Mac. Past this, the device is not answering, not the owner.
+        mic.run_exclusive(wait + OPEN_SLACK, move |view| {
             if !view.shared.enabled() {
                 ProbeOutcome::Untested
             } else if view.open_device.as_deref() == Some(id.as_str()) {
@@ -132,9 +137,7 @@ impl AudioDeviceProber for CpalProber {
                 probe::probe_input(&id, wait)
             }
         })
-        .unwrap_or_else(|| ProbeOutcome::Failed {
-            reason: "the microphone owner did not answer".to_string(),
-        })
+        .unwrap_or(ProbeOutcome::Stalled)
     }
 
     fn fingerprint(&self) -> String {

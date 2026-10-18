@@ -43,4 +43,8 @@ pub trait AudioDeviceControl: Send + Sync {
     /// Test every device again, apply what is chosen, and report it. `chime` also plays a short
     /// sound on the chosen speaker, which is the only time a test is audible.
     fn retest(&self, chime: bool) -> AudioDeviceStatus;
+
+    /// Choose again the way startup does, after a setting the choice depends on changed. Returns
+    /// at once; it never opens a microphone the process would not open at startup.
+    fn reselect(&self);
 }
