@@ -269,6 +269,14 @@ routes that list, fetch and pick one (`GET /models`, `GET /models/download/progr
 (`Exposure::Authenticated`), and never answer a tokenless caller. Activating a model for the chat
 role writes `chat_model`. This closes the onboarding half of #365.
 
+**The phone's own device during setup** (2026-10-18). `GET /devices/self`,
+`POST`/`DELETE /devices/{id}/push-token` and `GET /notifications/stream?device_id=` take a paired
+device's token before onboarding too (`Exposure::Authenticated`), and each handler admits only the
+caller's own device (`device_mismatch` otherwise). On an A16 against a real pond all four were
+`403 onboarding_required` for the whole of owner setup: the stream retried about once a second, and
+the phone's push token, refused once, was never registered. `POST /devices/{id}/heartbeat` stays
+behind the guard, because it names whatever device id it is given.
+
 ## The setup channel
 
 **Superseded for BLE by [the setup channel contract](pond-setup-channel.md) (2026-10-17),** which

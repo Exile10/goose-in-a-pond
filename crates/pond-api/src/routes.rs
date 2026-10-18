@@ -155,6 +155,15 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // it before onboarding (#365). A token in every state (PUBLIC_ROUTES).
         .route("/models", get(list_models))
         .route("/models/download/progress", get(get_download_progress))
+        // A paired phone's own device from its first minute, owner setup included: who it
+        // belongs to, its push token, its notification stream. Each handler admits only the
+        // caller's own device, and a token in every state (PUBLIC_ROUTES).
+        .route("/devices/self", get(device_self))
+        .route(
+            "/devices/{id}/push-token",
+            post(register_push_token).delete(delete_push_token),
+        )
+        .route("/notifications/stream", get(notifications_stream))
         .route("/models/download/control", post(download_control))
         .route("/models/{category}/{name}/download", post(download_model))
         .route("/models/{category}/{name}/activate", post(activate_model));
@@ -205,7 +214,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/commission", post(commission_device))
-        .route("/devices/self", get(device_self))
         .route("/matter/status", get(matter_status))
         .route(
             "/devices/{id}",
@@ -213,10 +221,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
         .route("/devices/{id}/offline", post(device_offline))
-        .route(
-            "/devices/{id}/push-token",
-            post(register_push_token).delete(delete_push_token),
-        )
         // Private mesh: trust-circle peers + self invite.
         .route("/mesh/peers", get(list_mesh_peers).post(add_mesh_peer))
         .route(
@@ -304,8 +308,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/context/index/health", get(context_index_health))
         .route("/context/index/rebuild", post(rebuild_context_index))
         .route("/proposals/{id}/decide", post(decide_proposal))
-        // Foreground push: per-device notification stream.
-        .route("/notifications/stream", get(notifications_stream))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
         .route(
             "/extensions",
