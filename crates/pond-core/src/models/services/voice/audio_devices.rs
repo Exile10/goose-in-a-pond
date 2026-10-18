@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::models::domain::audio_device::{
-    choose, probe_order, settles, AudioChoice, AudioDevice, AudioDirection, ProbeOutcome,
-    ProbedDevice,
+    choose, pair_order, probe_order, settles, AudioChoice, AudioDevice, AudioDirection,
+    ChoiceBasis, PairOutcome, ProbeOutcome, ProbedDevice,
 };
 use crate::models::ports::audio_devices::AudioDeviceProber;
 
@@ -42,6 +42,36 @@ pub struct SelectRequest<'a> {
     pub mic_enabled: bool,
 }
 
+/// Devices from each direction's own order that a sound test pairs up: the first few are where
+/// the right pair is; pairing every APE node on a Jetson would take minutes.
+pub const PAIR_CANDIDATES: usize = 4;
+pub const MAX_PAIRS: usize = 8;
+pub const PAIR_BUDGET: Duration = Duration::from_secs(12);
+
+#[derive(Debug, Clone)]
+pub struct PairRequest<'a> {
+    pub input_pin: Option<&'a str>,
+    pub output_pin: Option<&'a str>,
+    pub mode: ProbeMode,
+    pub exclude: &'a [String],
+}
+
+/// What a sound test found across the pairs it tried.
+#[derive(Debug, Clone, PartialEq)]
+// Made once per choice and moved straight into the status; boxing would buy nothing.
+#[allow(clippy::large_enum_variant)]
+pub enum SoundTest {
+    /// The first pair in order that heard each other, as the choice for each direction.
+    Heard {
+        input: AudioChoice,
+        output: AudioChoice,
+    },
+    /// Pairs were tried and no microphone heard any speaker.
+    NotHeard { tried: usize },
+    /// There was no speaker or no microphone to pair.
+    NotRun,
+}
+
 pub struct AudioDeviceSelector {
     prober: Arc<dyn AudioDeviceProber>,
 }
@@ -53,6 +83,85 @@ impl AudioDeviceSelector {
 
     pub fn prober(&self) -> &Arc<dyn AudioDeviceProber> {
         &self.prober
+    }
+
+    /// The devices a sound test considers, best first. A lazy test pairs what is known without
+    /// listing (on ALSA the default and the plugged-in cards); a full one lists everything.
+    fn pair_candidates(
+        &self,
+        dir: AudioDirection,
+        pinned: Option<&str>,
+        mode: ProbeMode,
+        exclude: &[String],
+    ) -> Vec<AudioDevice> {
+        let mut listed = match mode {
+            ProbeMode::Lazy => self.prober.quick_list(dir),
+            ProbeMode::Full => self.prober.devices(dir).unwrap_or_default(),
+        };
+        if let Some(default) = self.prober.default_device(dir) {
+            if !listed.iter().any(|d| d.id == default.id) {
+                listed.insert(0, default);
+            }
+        }
+        listed.retain(|d| !exclude.contains(&d.id));
+        let plugged_first = self.prober.plugged_in_first();
+        probe_order(&listed, pinned, plugged_first)
+            .into_iter()
+            .take(PAIR_CANDIDATES)
+            .cloned()
+            .collect()
+    }
+
+    /// Try speaker and microphone pairs in order of preference and stop at the first where the
+    /// microphone hears the speaker's test sound: the one check that proves both work.
+    pub fn select_by_sound(&self, req: &PairRequest<'_>) -> SoundTest {
+        let input_pin = req.input_pin.map(str::trim).filter(|p| !p.is_empty());
+        let output_pin = req.output_pin.map(str::trim).filter(|p| !p.is_empty());
+        let speakers =
+            self.pair_candidates(AudioDirection::Output, output_pin, req.mode, req.exclude);
+        let mics = self.pair_candidates(AudioDirection::Input, input_pin, req.mode, req.exclude);
+        if speakers.is_empty() || mics.is_empty() {
+            return SoundTest::NotRun;
+        }
+        let started = Instant::now();
+        let mut tried = 0usize;
+        for (s, m) in pair_order(speakers.len(), mics.len()) {
+            if tried >= MAX_PAIRS || started.elapsed() >= PAIR_BUDGET {
+                break;
+            }
+            tried += 1;
+            match self.prober.hears(&speakers[s], &mics[m]) {
+                PairOutcome::Heard { room_dbfs, .. } => {
+                    let output = heard_choice(
+                        AudioDirection::Output,
+                        &speakers,
+                        s,
+                        ProbeOutcome::Accepting,
+                        output_pin,
+                        &mics[m].label,
+                    );
+                    let input = heard_choice(
+                        AudioDirection::Input,
+                        &mics,
+                        m,
+                        ProbeOutcome::Hearing {
+                            level_dbfs: room_dbfs,
+                        },
+                        input_pin,
+                        &speakers[s].label,
+                    );
+                    return SoundTest::Heard { input, output };
+                }
+                PairOutcome::NotHeard => {}
+                PairOutcome::Failed { reason } => tracing::debug!(
+                    speaker = %speakers[s].id,
+                    mic = %mics[m].id,
+                    %reason,
+                    "sound test could not run on this pair"
+                ),
+            }
+        }
+        SoundTest::NotHeard { tried }
     }
 
     pub fn select(&self, req: &SelectRequest<'_>) -> AudioChoice {
@@ -140,6 +249,47 @@ impl AudioDeviceSelector {
     }
 }
 
+/// The choice a heard pair makes for one direction. A pin passed over for another device reads
+/// as a fallback, so the household is told their choice did not make a sound that was heard.
+fn heard_choice(
+    direction: AudioDirection,
+    ordered: &[AudioDevice],
+    chosen: usize,
+    outcome: ProbeOutcome,
+    pinned: Option<&str>,
+    partner: &str,
+) -> AudioChoice {
+    let device = ordered[chosen].clone();
+    let basis = if Some(device.id.as_str()) == pinned {
+        ChoiceBasis::Pinned
+    } else if pinned.is_some() {
+        ChoiceBasis::Fallback
+    } else {
+        ChoiceBasis::Heard
+    };
+    AudioChoice {
+        direction,
+        devices: ordered
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let found = if i == chosen {
+                    outcome.clone()
+                } else {
+                    ProbeOutcome::Untested
+                };
+                ProbedDevice::new(d.clone(), found)
+            })
+            .collect(),
+        device: Some(device),
+        outcome,
+        basis,
+        pinned: pinned.map(str::to_string),
+        heard_with: Some(partner.to_string()),
+        unheard: false,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -158,6 +308,9 @@ pub(crate) mod tests {
         /// Mimics ALSA, where only an explicit listing reveals anything but the default.
         pub no_quick_list: bool,
         pub plugged_in_first: bool,
+        /// `(speaker, mic)` pairs that hear each other.
+        pub heard: Vec<(String, String)>,
+        pub pairs_tried: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeProber {
@@ -213,6 +366,18 @@ pub(crate) mod tests {
         }
         fn plugged_in_first(&self) -> bool {
             self.plugged_in_first
+        }
+        fn hears(&self, speaker: &AudioDevice, mic: &AudioDevice) -> PairOutcome {
+            let pair = (speaker.id.clone(), mic.id.clone());
+            self.pairs_tried.lock().unwrap().push(pair.clone());
+            if self.heard.contains(&pair) {
+                PairOutcome::Heard {
+                    margin_db: 30.0,
+                    room_dbfs: -50.0,
+                }
+            } else {
+                PairOutcome::NotHeard
+            }
         }
     }
 
@@ -451,5 +616,119 @@ pub(crate) mod tests {
             0,
             "no ALSA listing without a USB card"
         );
+    }
+
+    fn board(heard: &[(&str, &str)]) -> FakeProber {
+        let mut fake = FakeProber {
+            plugged_in_first: true,
+            ..Default::default()
+        };
+        fake.outputs
+            .push(AudioDevice::new("default", true, DeviceKind::SoundServer));
+        fake.outputs.push(
+            AudioDevice::new("sysdefault:CARD=Device", false, DeviceKind::Hardware).plugged_in(),
+        );
+        fake.inputs
+            .push(AudioDevice::new("default", true, DeviceKind::SoundServer));
+        fake.inputs.push(
+            AudioDevice::new("sysdefault:CARD=Device", false, DeviceKind::Hardware).plugged_in(),
+        );
+        fake.heard = heard
+            .iter()
+            .map(|(s, m)| (s.to_string(), m.to_string()))
+            .collect();
+        fake
+    }
+
+    fn by_sound(
+        p: &Arc<FakeProber>,
+        input_pin: Option<&str>,
+        output_pin: Option<&str>,
+    ) -> SoundTest {
+        AudioDeviceSelector::new(p.clone()).select_by_sound(&PairRequest {
+            input_pin,
+            output_pin,
+            mode: ProbeMode::Lazy,
+            exclude: &[],
+        })
+    }
+
+    /// The first pair tried is the two first choices; when they hear each other, nothing else
+    /// plays a sound.
+    #[test]
+    fn the_first_pair_that_hears_itself_is_chosen_and_no_other_is_tried() {
+        let p = Arc::new(board(&[
+            ("sysdefault:CARD=Device", "sysdefault:CARD=Device"),
+            ("default", "sysdefault:CARD=Device"),
+        ]));
+        let SoundTest::Heard { input, output } = by_sound(&p, None, None) else {
+            panic!("expected a pair to be heard");
+        };
+        assert_eq!(output.device_id(), Some("sysdefault:CARD=Device"));
+        assert_eq!(input.device_id(), Some("sysdefault:CARD=Device"));
+        assert_eq!(output.basis, ChoiceBasis::Heard);
+        assert_eq!(output.heard_with.as_deref(), Some("sysdefault:CARD=Device"));
+        assert_eq!(p.pairs_tried.lock().unwrap().len(), 1);
+    }
+
+    /// The Jetson's onboard path takes audio and makes no sound, which only a listener can tell.
+    #[test]
+    fn a_speaker_nobody_hears_is_passed_over_for_one_the_mic_hears() {
+        let mut fake = board(&[("sysdefault:CARD=Device", "sysdefault:CARD=Device")]);
+        fake.plugged_in_first = false;
+        let p = Arc::new(fake);
+        let SoundTest::Heard { input, output } = by_sound(&p, None, None) else {
+            panic!("expected the USB pair");
+        };
+        assert_eq!(output.device_id(), Some("sysdefault:CARD=Device"));
+        assert_eq!(input.device_id(), Some("sysdefault:CARD=Device"));
+        let tried = p.pairs_tried.lock().unwrap().clone();
+        assert_eq!(
+            tried.first().map(|(s, m)| (s.as_str(), m.as_str())),
+            Some(("default", "default")),
+            "defaults go first where a person picked them"
+        );
+    }
+
+    #[test]
+    fn a_pinned_speaker_that_is_heard_keeps_its_pin() {
+        let p = Arc::new(board(&[
+            ("default", "sysdefault:CARD=Device"),
+            ("sysdefault:CARD=Device", "sysdefault:CARD=Device"),
+        ]));
+        let SoundTest::Heard { output, .. } = by_sound(&p, None, Some("default")) else {
+            panic!("expected the pinned speaker to be heard");
+        };
+        assert_eq!(output.device_id(), Some("default"));
+        assert_eq!(output.basis, ChoiceBasis::Pinned);
+    }
+
+    #[test]
+    fn a_pinned_speaker_nobody_hears_gives_way_and_says_so() {
+        let p = Arc::new(board(&[(
+            "sysdefault:CARD=Device",
+            "sysdefault:CARD=Device",
+        )]));
+        let SoundTest::Heard { output, .. } = by_sound(&p, None, Some("default")) else {
+            panic!("expected the USB pair");
+        };
+        assert_eq!(output.device_id(), Some("sysdefault:CARD=Device"));
+        assert_eq!(output.basis, ChoiceBasis::Fallback);
+        assert_eq!(output.pinned.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn when_nothing_is_heard_the_test_says_so_within_its_cap() {
+        let p = Arc::new(board(&[]));
+        assert_eq!(by_sound(&p, None, None), SoundTest::NotHeard { tried: 4 });
+    }
+
+    #[test]
+    fn with_no_microphone_there_is_nothing_to_pair() {
+        let mut fake = board(&[]);
+        fake.inputs.clear();
+        let p = Arc::new(fake);
+        assert_eq!(by_sound(&p, None, None), SoundTest::NotRun);
+        assert!(p.pairs_tried.lock().unwrap().is_empty());
     }
 }

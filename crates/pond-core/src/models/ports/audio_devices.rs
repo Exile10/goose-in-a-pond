@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::models::domain::audio_device::{
-    AudioDevice, AudioDeviceStatus, AudioDirection, ProbeOutcome,
+    AudioDevice, AudioDeviceStatus, AudioDirection, PairOutcome, ProbeOutcome,
 };
 
 /// Blocking by design: a probe opens a real device, and CoreAudio streams must be opened and
@@ -33,6 +33,11 @@ pub trait AudioDeviceProber: Send + Sync {
 
     /// Play a short, soft chime on a speaker. Only on the household's say-so.
     fn chime(&self, device: &AudioDevice) -> Result<(), String>;
+
+    /// Play a short test sound on `speaker` while `mic` listens, and say whether it was heard.
+    /// Audible by design, so only where the household lets tests be heard; the microphone is
+    /// read for that sound alone and nothing it hears is kept.
+    fn hears(&self, speaker: &AudioDevice, mic: &AudioDevice) -> PairOutcome;
 
     /// Whether a plugged-in device goes ahead of the default: true where a sound server picks
     /// the default by priority (a board), false where a person picks it (CoreAudio).

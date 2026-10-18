@@ -140,6 +140,9 @@ pub enum ChoiceBasis {
     /// Nothing is pinned, and a device the household plugged in works. Tried ahead of the
     /// default where a sound server's priority, not a person, chose the default.
     PluggedIn,
+    /// Nothing is pinned, and this speaker played a test sound that this microphone heard: the
+    /// first pair, in order of preference, shown to work together.
+    Heard,
     /// The pin or the default did not work, so the best device that does was taken instead.
     Fallback,
     /// No device proved itself; this one is used anyway so it can start working, and the
@@ -165,6 +168,38 @@ pub struct AudioChoice {
     pub pinned: Option<String>,
     /// Every device considered, in the order tried; untried ones read `Untested`.
     pub devices: Vec<ProbedDevice>,
+    /// The device at the other end of the sound test that proved this one, by label.
+    #[serde(default)]
+    pub heard_with: Option<String>,
+    /// A sound test ran and no microphone heard any speaker, so this is a silent check's pick.
+    #[serde(default)]
+    pub unheard: bool,
+}
+
+/// What one sound test found: a speaker played a short sound while a microphone listened.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum PairOutcome {
+    /// The microphone heard it, `margin_db` above the room, which measured `room_dbfs`.
+    Heard {
+        margin_db: f32,
+        room_dbfs: f32,
+    },
+    /// Both opened, and the microphone did not hear it: nothing plugged in, muted, too quiet.
+    NotHeard,
+    Failed {
+        reason: String,
+    },
+}
+
+/// The order to try speaker and microphone pairs in, as indexes into each one's own order: both
+/// first choices together, then each first choice with the other's next best, and so on.
+pub fn pair_order(speakers: usize, mics: usize) -> Vec<(usize, usize)> {
+    let mut pairs: Vec<(usize, usize)> = (0..speakers)
+        .flat_map(|s| (0..mics).map(move |m| (s, m)))
+        .collect();
+    pairs.sort_by_key(|&(s, m)| (s + m, s));
+    pairs
 }
 
 impl AudioChoice {
@@ -176,6 +211,8 @@ impl AudioChoice {
             basis: ChoiceBasis::MicOff,
             pinned: pinned.map(str::to_string),
             devices: Vec::new(),
+            heard_with: None,
+            unheard: false,
         }
     }
 
@@ -198,6 +235,8 @@ impl AudioChoice {
             basis: ChoiceBasis::NotTested,
             pinned: pinned.map(str::to_string),
             devices: ordered,
+            heard_with: None,
+            unheard: false,
         }
     }
 
@@ -211,6 +250,10 @@ impl AudioChoice {
         let label = self.device.as_ref().map(|d| d.label.as_str()).unwrap_or("");
         match (self.basis, &self.outcome) {
             (ChoiceBasis::MicOff | ChoiceBasis::NotTested, _) => None,
+            _ if self.unheard && self.direction == AudioDirection::Output => Some(format!(
+                "no microphone heard the speaker '{label}' play its test sound: check that it is \
+                 switched on and turned up"
+            )),
             (ChoiceBasis::NoDevice, _) => Some(format!("no {noun} was found")),
             (_, ProbeOutcome::Silent) => Some(format!(
                 "the {noun} '{label}' hears only silence: check its mute switch and the \
@@ -241,6 +284,7 @@ impl std::fmt::Display for AudioChoice {
             ChoiceBasis::Pinned => "pinned".to_string(),
             ChoiceBasis::SystemDefault => "system default".to_string(),
             ChoiceBasis::PluggedIn => "plugged in".to_string(),
+            ChoiceBasis::Heard => "heard together".to_string(),
             ChoiceBasis::Fallback => match &self.pinned {
                 Some(pin) if pin != &device.id => format!("'{pin}' unavailable"),
                 _ => "default unavailable".to_string(),
@@ -259,7 +303,10 @@ impl std::fmt::Display for AudioChoice {
             ProbeOutcome::Failed { reason } => format!("failed: {reason}"),
             ProbeOutcome::Untested => "untested".to_string(),
         };
-        write!(f, "{} ({why}; {found})", device.label)
+        match &self.heard_with {
+            Some(partner) => write!(f, "{} ({why}; {found}; with {partner})", device.label),
+            None => write!(f, "{} ({why}; {found})", device.label),
+        }
     }
 }
 
@@ -331,6 +378,8 @@ pub fn choose(
         basis,
         pinned: pinned.map(str::to_string),
         devices: ordered.iter().map(|p| (*p).clone()).collect(),
+        heard_with: None,
+        unheard: false,
     };
 
     if let Some(pin) = ordered
@@ -366,6 +415,8 @@ pub fn choose(
         basis: ChoiceBasis::NoDevice,
         pinned: pinned.map(str::to_string),
         devices: Vec::new(),
+        heard_with: None,
+        unheard: false,
     }
 }
 
