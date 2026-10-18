@@ -98,9 +98,13 @@ async fn main() {
     let pin = format!("sha256/{}=", "A".repeat(43));
     let handshake = SqliteHandshakeAdapter::new(db.system.clone(), Some(pin.clone()))
         .with_setup_claims(claims.clone());
+    let advertisement = Advertisement {
+        pond_id: MockSetupCodeStore::DISCRIMINATOR,
+    };
     println!(
-        "card {} setup code {} offline={offline} allow_join={allow_join}",
-        ble::local_name(MockSetupCodeStore::DISCRIMINATOR),
+        "card {} uuid {} setup code {} offline={offline} allow_join={allow_join}",
+        advertisement.local_name(),
+        ble::uuid_string(advertisement.service_uuid()),
         card.code.display()
     );
 
@@ -128,14 +132,11 @@ async fn main() {
     if let Err(error) = peripheral.start(Arc::new(channel)).await {
         eprintln!("start: {error}");
     }
-    let advertisement = Advertisement {
-        local_name: ble::local_name(MockSetupCodeStore::DISCRIMINATOR),
-    };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
     let mut last = None;
     while tokio::time::Instant::now() < deadline {
         // Asked again each round, as the server's controller does after a failure.
-        let applied = peripheral.advertise(Some(advertisement.clone())).await;
+        let applied = peripheral.advertise(Some(advertisement)).await;
         let status = peripheral.status();
         let line = format!("{status:?} {applied:?}");
         if last.as_ref() != Some(&line) {

@@ -6,8 +6,12 @@
 use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use pond_connect::ble::{
+    self, Advertisement, ADVERTISED_UUID_PREFIX_STR, SERVICE_UUID, SERVICE_UUID_STR,
+};
 use pond_connect::setup_channel::framing;
 use pond_connect::setup_channel::sealing::{nonce, ChannelCipher};
+use pond_core::network::domain::discriminator::Discriminator;
 use pond_core::security::ports::handshake::HandshakeResponse;
 use pond_infra::pairing_cpace::{
     channel_key_schedule_for, CHANNEL_PHONE_TO_POND_INFO, CHANNEL_POND_TO_PHONE_INFO,
@@ -60,6 +64,13 @@ fn sealed_entry(
         entry["envelope"] = json!(json!({ "sealed": sealed_b64 }).to_string());
     }
     entry
+}
+
+/// A Complete List of 128-bit Service UUIDs holding one UUID, as it goes on the air.
+fn uuid_ad_structure(uuid: u128) -> Vec<u8> {
+    let mut bytes = vec![0x11, 0x07];
+    bytes.extend_from_slice(&uuid.to_le_bytes());
+    bytes
 }
 
 fn vectors() -> Value {
@@ -143,14 +154,34 @@ fn vectors() -> Value {
         .flat_map(|message| message["chunks"].as_array().unwrap().clone())
         .collect();
 
+    // The structure an A16 read from the Jetson's advertisement on 2026-10-18, before the id moved
+    // into the UUID: the byte order is the air's, not the text's.
+    assert_eq!(
+        hex(&uuid_ad_structure(SERVICE_UUID)),
+        "11072c36dd79234eb0996c4b38e0bd515b18"
+    );
+    let advertisement = Advertisement {
+        pond_id: Discriminator::new(0x7f3a),
+    };
+
     json!({
-        "description": "The BLE setup channel's keys, sealing and framing \
+        "description": "The BLE setup channel's advertisement, keys, sealing and framing \
             (docs/architecture/pond-setup-channel.md). ISK and sid are the setup run's in \
             cpace-vectors.json. Byte strings are lowercase hex; `plaintext` is the exact bytes \
             sealed. The four sealed messages are one session's first four, in order. Regenerate \
             with SETUP_CHANNEL_VECTORS_WRITE=1 cargo test -p pond-connect --test setup_channel_vectors.",
         "spec": "docs/architecture/pond-setup-channel.md",
         "protocol": 1,
+        "advertisement": {
+            "rule": "the advertised UUID is the GATT service UUID with its last 2 bytes replaced \
+                by the card's id; the local name is a label in the scan response, never relied on",
+            "pond_id": "7f3a",
+            "prefix": ADVERTISED_UUID_PREFIX_STR,
+            "service_uuid": ble::uuid_string(advertisement.service_uuid()),
+            "uuid_ad_structure": hex(&uuid_ad_structure(advertisement.service_uuid())),
+            "local_name": advertisement.local_name(),
+            "gatt_service_uuid": SERVICE_UUID_STR,
+        },
         "kdf": {
             "hash": "SHA-512",
             "extract": "HKDF-Extract(salt = sid, ikm = ISK)",

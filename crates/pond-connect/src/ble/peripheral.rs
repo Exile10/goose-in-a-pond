@@ -1,19 +1,33 @@
 //! What every OS's peripheral offers the server. It only moves bytes: the GATT service carries
-//! [`SetupChannel`] sessions, and the advertisement carries nothing but the local name.
+//! [`SetupChannel`] sessions, and the advertisement carries nothing but the card's id.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use pond_core::network::domain::discriminator::Discriminator;
+
 use crate::setup_channel::SetupChannel;
 
 pub use pond_core::network::domain::peripheral::PeripheralStatus;
 
-/// Exactly what a pond may advertise beside the service UUID (spec: "Advertising").
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Exactly what a pond may advertise (spec: "Advertising"): its card's id, in the service UUID
+/// and in the local name, and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Advertisement {
-    /// `Pond <id>`; it travels in the scan response where the UUID leaves no room.
-    pub local_name: String,
+    pub pond_id: Discriminator,
+}
+
+impl Advertisement {
+    /// In the advertising PDU, where every scan sees it.
+    pub const fn service_uuid(self) -> u128 {
+        super::advertised_service_uuid(self.pond_id)
+    }
+
+    /// In the scan response, when the stack sends one; a phone never depends on it.
+    pub fn local_name(self) -> String {
+        super::local_name(self.pond_id)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

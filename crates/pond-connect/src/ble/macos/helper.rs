@@ -287,6 +287,13 @@ struct Link {
     refused: bool,
 }
 
+/// The pond's advertisement, as the helper is told it: the helper derives nothing.
+#[derive(Clone, PartialEq, Eq)]
+struct Wanted {
+    service_uuid: String,
+    local_name: String,
+}
+
 struct Helper {
     manager: Retained<CBPeripheralManager>,
     _delegate: Retained<Delegate>,
@@ -296,9 +303,9 @@ struct Helper {
     powered_on: bool,
     service_added: bool,
     /// What the pond last asked to advertise.
-    wanted: Option<String>,
+    wanted: Option<Wanted>,
     /// What `startAdvertising` was last called with.
-    advertised: Option<String>,
+    advertised: Option<Wanted>,
     links: HashMap<u64, Link>,
     by_central: HashMap<String, u64>,
     next_link: u64,
@@ -343,8 +350,14 @@ impl Helper {
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::Advertise { local_name } => {
-                self.wanted = Some(local_name);
+            Command::Advertise {
+                service_uuid,
+                local_name,
+            } => {
+                self.wanted = Some(Wanted {
+                    service_uuid,
+                    local_name,
+                });
                 self.apply_advertising();
             }
             Command::StopAdvertising => {
@@ -468,13 +481,13 @@ impl Helper {
                 self.manager.stopAdvertising();
             }
         }
-        let Some(local_name) = self.wanted.clone() else {
+        let Some(wanted) = self.wanted.clone() else {
             self.advertised = None;
             emit(&Event::AdvertisingStopped);
             return;
         };
-        let uuids = NSArray::from_retained_slice(&[uuid(SERVICE_UUID_STR)]);
-        let name = NSString::from_str(&local_name);
+        let uuids = NSArray::from_retained_slice(&[uuid(&wanted.service_uuid)]);
+        let name = NSString::from_str(&wanted.local_name);
         // SAFETY: framework constants, valid for the process's life.
         let keys: [&NSString; 2] = unsafe {
             [
@@ -483,16 +496,18 @@ impl Helper {
             ]
         };
         let values: [&AnyObject; 2] = [&uuids, &name];
-        // The service UUID and the name, and nothing else: CoreBluetooth would allow no more.
+        // One UUID and the name, and nothing else: CoreBluetooth would allow no more.
         let advertisement = NSDictionary::from_slices(&keys, &values);
         // SAFETY: a dictionary of the two keys CoreBluetooth documents for a peripheral.
         unsafe { self.manager.startAdvertising(Some(&advertisement)) };
-        self.advertised = Some(local_name);
+        self.advertised = Some(wanted);
     }
 
     fn on_advertising_started(&mut self, error: Option<String>) {
         match (error, self.advertised.clone()) {
-            (None, Some(local_name)) => emit(&Event::Advertising { local_name }),
+            (None, Some(wanted)) => emit(&Event::Advertising {
+                local_name: wanted.local_name,
+            }),
             (None, None) => {}
             (Some(message), _) => {
                 self.advertised = None;

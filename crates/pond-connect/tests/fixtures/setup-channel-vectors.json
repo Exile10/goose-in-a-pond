@@ -1,11 +1,20 @@
 {
+  "advertisement": {
+    "gatt_service_uuid": "185b51bd-e038-4b6c-99b0-4e2379dd362c",
+    "local_name": "Pond 7f3a",
+    "pond_id": "7f3a",
+    "prefix": "185b51bd-e038-4b6c-99b0-4e2379dd",
+    "rule": "the advertised UUID is the GATT service UUID with its last 2 bytes replaced by the card's id; the local name is a label in the scan response, never relied on",
+    "service_uuid": "185b51bd-e038-4b6c-99b0-4e2379dd7f3a",
+    "uuid_ad_structure": "11073a7fdd79234eb0996c4b38e0bd515b18"
+  },
   "aead": {
     "associated_data": "",
     "cipher": "ChaCha20-Poly1305",
     "nonce": "4 zero bytes || 8-byte big-endian counter, one counter per direction from 0",
     "tag_bytes": 16
   },
-  "description": "The BLE setup channel's keys, sealing and framing (docs/architecture/pond-setup-channel.md). ISK and sid are the setup run's in cpace-vectors.json. Byte strings are lowercase hex; `plaintext` is the exact bytes sealed. The four sealed messages are one session's first four, in order. Regenerate with SETUP_CHANNEL_VECTORS_WRITE=1 cargo test -p pond-connect --test setup_channel_vectors.",
+  "description": "The BLE setup channel's advertisement, keys, sealing and framing (docs/architecture/pond-setup-channel.md). ISK and sid are the setup run's in cpace-vectors.json. Byte strings are lowercase hex; `plaintext` is the exact bytes sealed. The four sealed messages are one session's first four, in order. Regenerate with SETUP_CHANNEL_VECTORS_WRITE=1 cargo test -p pond-connect --test setup_channel_vectors.",
   "framed": {
     "att_mtu": 23,
     "chunk_bytes": 20,

@@ -14,8 +14,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
-    /// Advertise the service UUID and this local name, nothing else; replaces any earlier name.
+    /// Advertise exactly this UUID and local name; replaces any earlier advertisement.
     Advertise {
+        service_uuid: String,
         local_name: String,
     },
     StopAdvertising,
@@ -144,9 +145,14 @@ mod tests {
         let cases: Vec<(Command, serde_json::Value)> = vec![
             (
                 Command::Advertise {
+                    service_uuid: "185b51bd-e038-4b6c-99b0-4e2379ddc1cd".into(),
                     local_name: "Pond c1cd".into(),
                 },
-                json!({"cmd": "advertise", "local_name": "Pond c1cd"}),
+                json!({
+                    "cmd": "advertise",
+                    "service_uuid": "185b51bd-e038-4b6c-99b0-4e2379ddc1cd",
+                    "local_name": "Pond c1cd",
+                }),
             ),
             (Command::StopAdvertising, json!({"cmd": "stop_advertising"})),
             (

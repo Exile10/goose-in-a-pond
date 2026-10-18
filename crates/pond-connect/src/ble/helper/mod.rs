@@ -109,7 +109,7 @@ impl Radio {
 struct Shared {
     status: RwLock<PeripheralStatus>,
     /// The controller's last wish, so a restarted helper picks it up.
-    wanted: Mutex<Option<String>>,
+    wanted: Mutex<Option<Advertisement>>,
     /// The running helper's stdin, while there is one.
     commands: Mutex<Option<mpsc::UnboundedSender<Command>>>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
@@ -182,12 +182,8 @@ impl BlePeripheral for HelperPeripheral {
     }
 
     async fn advertise(&self, advertisement: Option<Advertisement>) -> Result<(), BleError> {
-        let name = advertisement.map(|a| a.local_name);
-        *self.shared.wanted.lock().unwrap_or_else(|e| e.into_inner()) = name.clone();
-        let command = match name {
-            Some(local_name) => Command::Advertise { local_name },
-            None => Command::StopAdvertising,
-        };
+        *self.shared.wanted.lock().unwrap_or_else(|e| e.into_inner()) = advertisement;
+        let command = advertisement.map_or(Command::StopAdvertising, advertise_command);
         if self.shared.send(command) {
             return Ok(());
         }
@@ -300,6 +296,13 @@ struct Link {
     writer: SessionWriter,
 }
 
+fn advertise_command(advertisement: Advertisement) -> Command {
+    Command::Advertise {
+        service_uuid: super::uuid_string(advertisement.service_uuid()),
+        local_name: advertisement.local_name(),
+    }
+}
+
 /// Runs one helper to its end. Returns how it ended and whether the radio ever answered.
 async fn drive(
     process: HelperProcess,
@@ -313,13 +316,9 @@ async fn drive(
     } = process;
     let (commands, outbox) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_commands(stdin, outbox));
-    let resume = shared
-        .wanted
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    if let Some(local_name) = resume {
-        let _ = commands.send(Command::Advertise { local_name });
+    let resume = *shared.wanted.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(advertisement) = resume {
+        let _ = commands.send(advertise_command(advertisement));
     }
     shared.set_commands(Some(commands.clone()));
 

@@ -28,9 +28,13 @@ pub fn platform() -> Arc<dyn BlePeripheral> {
     ));
 }
 
-/// The primary service, and the only UUID a pond advertises.
+/// The GATT service a phone connects to. A pond advertises [`advertised_service_uuid`] instead.
 pub const SERVICE_UUID: u128 = 0x185b51bd_e038_4b6c_99b0_4e2379dd362c;
 pub const SERVICE_UUID_STR: &str = "185b51bd-e038-4b6c-99b0-4e2379dd362c";
+
+/// The service UUID's first 14 bytes; the advertised UUID ends in the card's id instead.
+pub const ADVERTISED_UUID_PREFIX: u128 = SERVICE_UUID & !0xffff;
+pub const ADVERTISED_UUID_PREFIX_STR: &str = "185b51bd-e038-4b6c-99b0-4e2379dd";
 
 /// `rx`: the phone writes requests here, with response.
 pub const RX_CHARACTERISTIC_UUID: u128 = 0x72172de5_d65e_47ad_857d_1b9dd7623d33;
@@ -42,8 +46,20 @@ pub const TX_CHARACTERISTIC_UUID_STR: &str = "1065b140-d075-431c-b981-7e1a735960
 
 pub const LOCAL_NAME_PREFIX: &str = "Pond ";
 
-/// `Pond c1cd`, matching the card's title. With a 128-bit UUID and the flags it no longer fits
-/// one 31-byte advertisement, so a peripheral may carry it in the scan response.
+/// `185b51bd-e038-4b6c-99b0-4e2379ddc1cd` for `Pond c1cd`. The id rides in the advertising PDU
+/// itself because scan responses are optional: the Jetson's BlueZ sends an empty one, and iOS
+/// background scans never ask.
+pub const fn advertised_service_uuid(discriminator: Discriminator) -> u128 {
+    ADVERTISED_UUID_PREFIX | discriminator.value() as u128
+}
+
+/// The card id a phone reads from an advertised UUID; `None` for anyone else's UUID.
+pub fn discriminator_from_service_uuid(uuid: u128) -> Option<Discriminator> {
+    (uuid & !0xffff == ADVERTISED_UUID_PREFIX).then(|| Discriminator::new(uuid as u16))
+}
+
+/// `Pond c1cd`, matching the card's title. A label only: it fits nowhere but the scan response,
+/// which a phone may never see.
 pub fn local_name(discriminator: Discriminator) -> String {
     format!("{LOCAL_NAME_PREFIX}{discriminator}")
 }
@@ -79,6 +95,32 @@ mod tests {
         assert_eq!(
             uuid_string(TX_CHARACTERISTIC_UUID),
             TX_CHARACTERISTIC_UUID_STR
+        );
+    }
+
+    #[test]
+    fn the_advertised_uuid_ends_in_the_cards_id() {
+        let id = Discriminator::new(0x7f3a);
+        assert_eq!(
+            uuid_string(advertised_service_uuid(id)),
+            "185b51bd-e038-4b6c-99b0-4e2379dd7f3a"
+        );
+        assert!(uuid_string(ADVERTISED_UUID_PREFIX).starts_with(ADVERTISED_UUID_PREFIX_STR));
+        assert_eq!(
+            discriminator_from_service_uuid(advertised_service_uuid(id)),
+            Some(id)
+        );
+        assert_eq!(
+            discriminator_from_service_uuid(SERVICE_UUID),
+            Some(Discriminator::new(0x362c))
+        );
+        assert_eq!(
+            discriminator_from_service_uuid(RX_CHARACTERISTIC_UUID),
+            None
+        );
+        assert_eq!(
+            discriminator_from_service_uuid(advertised_service_uuid(id) ^ (1 << 16)),
+            None
         );
     }
 

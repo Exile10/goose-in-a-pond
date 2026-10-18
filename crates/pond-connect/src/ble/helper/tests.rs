@@ -11,6 +11,10 @@ use crate::test_support::{test_pond, TestPond};
 
 const PIPE: usize = 1 << 20;
 
+const POND_7F3A: Advertisement = Advertisement {
+    pond_id: pond_core::network::domain::discriminator::Discriminator::new(0x7f3a),
+};
+
 /// The helper's end of one launch: it reads the pond's commands and plays CoreBluetooth back.
 struct FakeHelper {
     commands: Lines<BufReader<DuplexStream>>,
@@ -223,15 +227,11 @@ async fn advertising_follows_the_pond_and_the_switch_refuses_phones() {
     let mut helper = rig.next_helper().await;
     helper.come_up().await;
     rig.wait_for(|s| *s == PeripheralStatus::Serving).await;
-    rig.peripheral
-        .advertise(Some(Advertisement {
-            local_name: "Pond 7f3a".into(),
-        }))
-        .await
-        .unwrap();
+    rig.peripheral.advertise(Some(POND_7F3A)).await.unwrap();
     assert_eq!(
         helper.next_command().await,
         Command::Advertise {
+            service_uuid: "185b51bd-e038-4b6c-99b0-4e2379dd7f3a".into(),
             local_name: "Pond 7f3a".into()
         }
     );
@@ -324,12 +324,7 @@ async fn a_helper_that_dies_ends_the_session_and_comes_back_advertising() {
     let mut rig = Rig::start(RestartPolicy::default()).await;
     let mut helper = rig.next_helper().await;
     helper.come_up().await;
-    rig.peripheral
-        .advertise(Some(Advertisement {
-            local_name: "Pond 7f3a".into(),
-        }))
-        .await
-        .unwrap();
+    rig.peripheral.advertise(Some(POND_7F3A)).await.unwrap();
     helper.next_command().await;
     helper.say(subscribed(1, 185)).await;
     helper.ask(1, 185, json!({"id": 1, "type": "hello"})).await;
@@ -353,9 +348,7 @@ async fn a_helper_that_dies_ends_the_session_and_comes_back_advertising() {
         "the phone's session ended with it"
     );
     rig.peripheral
-        .advertise(Some(Advertisement {
-            local_name: "Pond 7f3a".into(),
-        }))
+        .advertise(Some(POND_7F3A))
         .await
         .expect("a restarting helper takes the wish with it");
 
@@ -363,6 +356,7 @@ async fn a_helper_that_dies_ends_the_session_and_comes_back_advertising() {
     assert_eq!(
         again.next_command().await,
         Command::Advertise {
+            service_uuid: "185b51bd-e038-4b6c-99b0-4e2379dd7f3a".into(),
             local_name: "Pond 7f3a".into()
         },
         "the restarted helper resumes what the pond asked for"

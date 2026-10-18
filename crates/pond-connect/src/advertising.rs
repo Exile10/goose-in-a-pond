@@ -11,7 +11,7 @@ use pond_core::network::services::advertising::{should_advertise, ADVERTISING_CH
 use pond_core::network::services::setup_claim::SetupClaimService;
 use pond_core::user_data::ports::settings::SettingsRepository;
 
-use crate::ble::{local_name, Advertisement, BlePeripheral};
+use crate::ble::{Advertisement, BlePeripheral};
 use crate::interfaces::NetworkProbe;
 use crate::setup_channel::SetupChannel;
 
@@ -49,7 +49,7 @@ impl AdvertisingController {
         network: Arc<dyn NetworkProbe>,
     ) -> Self {
         let advertisement = Advertisement {
-            local_name: local_name(channel.config().discriminator),
+            pond_id: channel.config().discriminator,
         };
         Self {
             peripheral,
@@ -131,7 +131,7 @@ impl AdvertisingController {
     }
 
     async fn apply(&mut self, decision: Decision) {
-        let wanted = decision.advertise.then(|| self.advertisement.clone());
+        let wanted = decision.advertise.then_some(self.advertisement);
         match self.peripheral.advertise(wanted).await {
             Ok(()) => {
                 self.applied = Some(decision.advertise);
@@ -197,7 +197,7 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap()
-                .push(advertisement.map(|a| a.local_name));
+                .push(advertisement.map(Advertisement::local_name));
             if self.failing.load(Ordering::SeqCst) {
                 return Err(BleError::Unavailable("Bluetooth is off".into()));
             }

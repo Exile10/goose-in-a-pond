@@ -33,9 +33,6 @@ use router::{Notifier, NotifierStopped, Radio, Refusal, Router};
 
 /// How often the peripheral checks that bluetoothd still holds its registration.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
-/// A scan response holds 31 bytes and a Complete Local Name spends 2 on its header; BlueZ shortens
-/// a longer name to a Shortened Local Name rather than refuse it.
-const MAX_LOCAL_NAME_BYTES: usize = 29;
 const BLUEZ_BUS_NAME: &str = "org.bluez";
 const SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
 
@@ -119,9 +116,6 @@ impl BlePeripheral for BluezPeripheral {
     }
 
     async fn advertise(&self, advertisement: Option<Advertisement>) -> Result<(), BleError> {
-        if let Some(advertisement) = &advertisement {
-            check_local_name(&advertisement.local_name)?;
-        }
         let mut control = self.shared.control.lock().await;
         control.wanted = advertisement;
         let reason = unavailable_reason(&control);
@@ -372,26 +366,16 @@ fn bluez_reason(error: &bluer::Error) -> String {
     }
 }
 
-fn check_local_name(name: &str) -> Result<(), BleError> {
-    if name.is_empty() || name.len() > MAX_LOCAL_NAME_BYTES {
-        return Err(BleError::Failed(format!(
-            "a local name of {} bytes does not fit a scan response whole (1 to {MAX_LOCAL_NAME_BYTES})",
-            name.len()
-        )));
-    }
-    Ok(())
-}
-
-/// The spec's advertisement and nothing else. `LocalName`, never `Includes: ["local-name"]`: BlueZ
-/// 5.64 puts `LocalName` in the scan response only, where the include would put the adapter's own
-/// name. `Discoverable` writes the LE flags into this advertisement without making the adapter
-/// discoverable.
+/// The spec's advertisement and nothing else. The UUID carries the card's id; `LocalName` only
+/// labels it, since BlueZ 5.64 puts it in a scan response the Jetson sends empty. Never
+/// `Includes: ["local-name"]`, which would add the adapter's own name. `Discoverable` writes the
+/// LE flags into this advertisement without making the adapter discoverable.
 fn le_advertisement(advertisement: &Advertisement) -> LeAdvertisement {
     LeAdvertisement {
         advertisement_type: AdvertisementType::Peripheral,
-        service_uuids: BTreeSet::from([Uuid::from_u128(SERVICE_UUID)]),
+        service_uuids: BTreeSet::from([Uuid::from_u128(advertisement.service_uuid())]),
         discoverable: Some(true),
-        local_name: Some(advertisement.local_name.clone()),
+        local_name: Some(advertisement.local_name()),
         ..Default::default()
     }
 }
@@ -415,8 +399,12 @@ async fn sync_advertising(live: &mut Live, wanted: Option<&Advertisement>) -> Re
         .advertise(le_advertisement(wanted))
         .await
         .map_err(|error| BleError::Failed(format!("BlueZ refused the advertisement: {error}")))?;
-    tracing::info!(local_name = %wanted.local_name, "advertising the setup channel");
-    live.advertising = Some((wanted.clone(), handle));
+    tracing::info!(
+        service_uuid = %Uuid::from_u128(wanted.service_uuid()),
+        local_name = %wanted.local_name(),
+        "advertising the setup channel"
+    );
+    live.advertising = Some((*wanted, handle));
     Ok(())
 }
 
@@ -556,7 +544,6 @@ impl Radio for BluezRadio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ble::local_name;
     use pond_core::network::domain::discriminator::Discriminator;
 
     /// Flags (3) and a complete list of one 128-bit UUID (18); a legacy PDU carries 31.
@@ -566,13 +553,13 @@ mod tests {
     #[test]
     fn the_advertisement_is_the_uuid_and_the_name_and_nothing_else() {
         let advertisement = Advertisement {
-            local_name: local_name(Discriminator::new(0xc1cd)),
+            pond_id: Discriminator::new(0xc1cd),
         };
         let le = le_advertisement(&advertisement);
         assert_eq!(le.advertisement_type, AdvertisementType::Peripheral);
         assert_eq!(
             le.service_uuids,
-            BTreeSet::from([Uuid::from_u128(SERVICE_UUID)])
+            BTreeSet::from([Uuid::parse_str("185b51bd-e038-4b6c-99b0-4e2379ddc1cd").unwrap()])
         );
         assert_eq!(le.local_name.as_deref(), Some("Pond c1cd"));
         assert_eq!(le.discoverable, Some(true));
@@ -586,20 +573,17 @@ mod tests {
     }
 
     #[test]
-    fn the_name_cannot_share_the_pdu_with_the_uuid_but_fits_the_scan_response_whole() {
-        let name = local_name(Discriminator::new(0xc1cd));
+    fn the_id_fits_the_advertising_pdu_and_the_name_only_the_scan_response() {
+        let advertisement = Advertisement {
+            pond_id: Discriminator::new(0xffff),
+        };
+        assert!(ADV_DATA_LEN <= LEGACY_PDU_LEN);
+        let name = advertisement.local_name();
         assert!(
             ADV_DATA_LEN + 2 + name.len() > LEGACY_PDU_LEN,
-            "if this ever fits, BlueZ still sends it in the scan response"
+            "if the name ever fits beside the UUID, the spec can say so"
         );
         assert!(2 + name.len() <= LEGACY_PDU_LEN);
-        assert!(check_local_name(&name).is_ok());
-        assert!(check_local_name(&"x".repeat(MAX_LOCAL_NAME_BYTES)).is_ok());
-        assert!(
-            check_local_name(&"x".repeat(MAX_LOCAL_NAME_BYTES + 1)).is_err(),
-            "BlueZ would shorten it, and a phone would no longer find the card's id"
-        );
-        assert!(check_local_name("").is_err());
     }
 
     #[test]
@@ -645,7 +629,7 @@ mod tests {
             "{status:?}"
         );
         let advertisement = Advertisement {
-            local_name: "Pond 7f3a".into(),
+            pond_id: Discriminator::new(0x7f3a),
         };
         assert!(matches!(
             peripheral.advertise(Some(advertisement)).await,
@@ -660,7 +644,7 @@ mod tests {
         let peripheral = BluezPeripheral::new();
         assert_eq!(peripheral.status(), PeripheralStatus::Off);
         let advertisement = Advertisement {
-            local_name: "Pond c1cd".into(),
+            pond_id: Discriminator::new(0xc1cd),
         };
         assert!(matches!(
             peripheral.advertise(Some(advertisement)).await,
