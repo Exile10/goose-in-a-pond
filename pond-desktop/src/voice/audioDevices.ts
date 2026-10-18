@@ -80,6 +80,8 @@ export function describeChoice(choice: AudioChoice): ChoiceLine {
       return { text: `${device.label}, your choice, ${state}.${hint}`, problem: silent };
     case "system_default":
       return { text: `${device.label}, the system default, ${state}.${hint}`, problem: silent };
+    case "plugged_in":
+      return { text: `${device.label}, plugged in, ${state}.${hint}`, problem: silent };
     case "fallback": {
       const pin = choice.pinned;
       if (pin && pin !== device.id) {

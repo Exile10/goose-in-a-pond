@@ -62,6 +62,13 @@ impl AudioDeviceSelector {
             return AudioChoice::mic_off(pinned);
         }
         let excluded = |d: &AudioDevice| req.exclude.iter().any(|x| x == &d.id);
+        // Only worth the listing when something is actually plugged in.
+        let plugged_first = self.prober.plugged_in_first()
+            && self
+                .prober
+                .quick_list(dir)
+                .iter()
+                .any(|d| d.plugged_in && !excluded(d));
         let started = Instant::now();
         let budget = match req.mode {
             ProbeMode::Lazy => LAZY_BUDGET,
@@ -71,7 +78,7 @@ impl AudioDeviceSelector {
         // With nothing pinned the default usually settles it, and on ALSA listing means opening
         // every node, so try the default before asking for the list.
         let mut default_probe: Option<ProbedDevice> = None;
-        if req.mode == ProbeMode::Lazy && pinned.is_none() {
+        if req.mode == ProbeMode::Lazy && pinned.is_none() && !plugged_first {
             if let Some(default) = self.prober.default_device(dir).filter(|d| !excluded(d)) {
                 let outcome = self.prober.probe(&default, dir, FIRST_CHOICE_WAIT);
                 if outcome.proven() {
@@ -83,7 +90,7 @@ impl AudioDeviceSelector {
                             .filter(|d| d.id != default.id)
                             .map(|d| ProbedDevice::new(d, ProbeOutcome::Untested)),
                     );
-                    return choose(dir, devices, None);
+                    return choose(dir, devices, None, false);
                 }
                 default_probe = Some(ProbedDevice::new(default, outcome));
             }
@@ -102,8 +109,10 @@ impl AudioDeviceSelector {
         let mut probed = Vec::with_capacity(listed.len());
         let mut tried = 0usize;
         let mut settled = false;
-        for device in probe_order(&listed, pinned) {
-            let first_choice = Some(device.id.as_str()) == pinned || device.is_default;
+        for device in probe_order(&listed, pinned, plugged_first) {
+            let first_choice = Some(device.id.as_str()) == pinned
+                || device.is_default
+                || (plugged_first && device.plugged_in);
             let outcome = if excluded(device) {
                 ProbeOutcome::Failed {
                     reason: STOPPED_WORKING.to_string(),
@@ -127,7 +136,7 @@ impl AudioDeviceSelector {
             }
             probed.push(ProbedDevice::new(device.clone(), outcome));
         }
-        choose(dir, probed, pinned)
+        choose(dir, probed, pinned, plugged_first)
     }
 }
 
@@ -148,6 +157,7 @@ pub(crate) mod tests {
         pub listings: Mutex<usize>,
         /// Mimics ALSA, where only an explicit listing reveals anything but the default.
         pub no_quick_list: bool,
+        pub plugged_in_first: bool,
     }
 
     impl FakeProber {
@@ -200,6 +210,9 @@ pub(crate) mod tests {
         }
         fn chime(&self, _: &AudioDevice) -> Result<(), String> {
             Ok(())
+        }
+        fn plugged_in_first(&self) -> bool {
+            self.plugged_in_first
         }
     }
 
@@ -394,5 +407,47 @@ pub(crate) mod tests {
             "all silent keeps the default"
         );
         assert_eq!(c.basis, ChoiceBasis::BestEffort);
+    }
+
+    /// The Jetson: PulseAudio's default is the board's analog path, which takes audio and has
+    /// nothing plugged in. The USB card is tried first, and the default is never opened.
+    #[test]
+    fn on_a_board_the_usb_card_is_tried_before_a_default_that_also_works() {
+        let mut fake = FakeProber::default();
+        fake.plugged_in_first = true;
+        fake.outputs
+            .push(AudioDevice::new("default", true, DeviceKind::SoundServer));
+        fake.outputs.push(
+            AudioDevice::new("sysdefault:CARD=Device", false, DeviceKind::Hardware).plugged_in(),
+        );
+        fake.outcomes
+            .insert("default".into(), ProbeOutcome::Accepting);
+        fake.outcomes
+            .insert("sysdefault:CARD=Device".into(), ProbeOutcome::Accepting);
+        let p = Arc::new(fake);
+        let c = AudioDeviceSelector::new(p.clone()).select(&SelectRequest {
+            direction: AudioDirection::Output,
+            pinned: None,
+            mode: ProbeMode::Lazy,
+            exclude: &[],
+            mic_enabled: true,
+        });
+        assert_eq!(c.device_id(), Some("sysdefault:CARD=Device"));
+        assert_eq!(c.basis, ChoiceBasis::PluggedIn);
+        assert_eq!(p.probed(), ["sysdefault:CARD=Device"]);
+    }
+
+    #[test]
+    fn with_nothing_plugged_in_a_board_keeps_the_cheap_default_only_start() {
+        let mut fake = FakeProber::with(&[("default", true, hearing())]);
+        fake.plugged_in_first = true;
+        let p = Arc::new(fake);
+        let c = select(p.clone(), None, ProbeMode::Lazy);
+        assert_eq!(c.device_id(), Some("default"));
+        assert_eq!(
+            *p.listings.lock().unwrap(),
+            0,
+            "no ALSA listing without a USB card"
+        );
     }
 }

@@ -28,7 +28,8 @@ pub fn kind_of(name: &str) -> DeviceKind {
     if matches!(lower.as_str(), "default" | "pipewire" | "pulse") {
         return DeviceKind::SoundServer;
     }
-    if lower.starts_with("hw:") {
+    // `plughw` converts formats but, like `hw`, holds the card for itself while open.
+    if lower.starts_with("hw:") || lower.starts_with("plughw:") {
         return DeviceKind::Raw;
     }
     if VIRTUAL_HINTS.iter().any(|h| lower.contains(h)) {
@@ -50,19 +51,61 @@ pub fn alsa_worth_offering(name: &str, direction: AudioDirection) -> bool {
     }
 }
 
-/// `/proc/asound/cards` as `(id, long name)`: ` 0 [Device   ]: USB-Audio - USB PnP Audio Device`.
-pub fn parse_cards(text: &str) -> Vec<(String, String)> {
+/// One line of `/proc/asound/cards`: ` 0 [Device   ]: USB-Audio - USB PnP Audio Device`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Card {
+    pub index: u32,
+    pub id: String,
+    pub driver: String,
+    pub name: String,
+}
+
+impl Card {
+    /// A card the household plugged in, rather than one built into the board.
+    pub fn plugged_in(&self) -> bool {
+        self.driver.eq_ignore_ascii_case("USB-Audio")
+    }
+}
+
+pub fn parse_cards(text: &str) -> Vec<Card> {
     text.lines()
         .filter_map(|line| {
             let open = line.find('[')?;
             let close = line.find(']')?;
+            let index = line.get(..open)?.trim().parse().ok()?;
             let id = line.get(open + 1..close)?.trim();
-            let rest = line.get(close + 1..)?;
-            let long = rest.split_once(" - ").map(|(_, n)| n).unwrap_or(rest);
-            let long = long.trim().trim_start_matches(':').trim();
-            (!id.is_empty()).then(|| (id.to_string(), long.to_string()))
+            let rest = line.get(close + 1..)?.trim().trim_start_matches(':').trim();
+            let (driver, name) = rest.split_once(" - ").unwrap_or(("", rest));
+            (!id.is_empty()).then(|| Card {
+                index,
+                id: id.to_string(),
+                driver: driver.trim().to_string(),
+                name: name.trim().to_string(),
+            })
         })
         .collect()
+}
+
+/// Which directions each card offers, from `/proc/asound/pcm`:
+/// `00-00: USB Audio : USB Audio : playback 1 : capture 1`.
+pub fn card_directions(pcm: &str, card: u32, direction: AudioDirection) -> bool {
+    let word = match direction {
+        AudioDirection::Input => "capture",
+        AudioDirection::Output => "playback",
+    };
+    pcm.lines().any(|line| {
+        line.split('-')
+            .next()
+            .and_then(|c| c.trim().parse::<u32>().ok())
+            == Some(card)
+            && line.contains(word)
+    })
+}
+
+/// The card an ALSA name routes to, by its `CARD=` field.
+pub fn card_of<'a>(name: &str, cards: &'a [Card]) -> Option<&'a Card> {
+    let id = alsa_field(name, "CARD")?;
+    cards.iter().find(|c| c.id == id)
 }
 
 fn alsa_field<'a>(name: &'a str, key: &str) -> Option<&'a str> {
@@ -72,7 +115,7 @@ fn alsa_field<'a>(name: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// What to call an ALSA PCM: the card's own name, not `plughw:CARD=Device,DEV=0`.
-pub fn alsa_label(name: &str, cards: &[(String, String)]) -> String {
+pub fn alsa_label(name: &str, cards: &[Card]) -> String {
     let plugin = name.split(':').next().unwrap_or(name);
     match plugin {
         "default" => return "System default".to_string(),
@@ -85,8 +128,8 @@ pub fn alsa_label(name: &str, cards: &[(String, String)]) -> String {
     };
     let long = cards
         .iter()
-        .find(|(id, _)| id == card)
-        .map(|(_, long)| long.as_str())
+        .find(|c| c.id == card)
+        .map(|c| c.name.as_str())
         .unwrap_or(card);
     let dev = alsa_field(name, "DEV");
     match (plugin, dev) {
@@ -110,14 +153,23 @@ mod tests {
     #[test]
     fn the_cards_of_the_household_jetson_parse() {
         let cards = parse_cards(JETSON_CARDS);
+        let summary: Vec<(u32, &str, &str, bool)> = cards
+            .iter()
+            .map(|c| (c.index, c.id.as_str(), c.name.as_str(), c.plugged_in()))
+            .collect();
         assert_eq!(
-            cards,
+            summary,
             [
-                ("Device".to_string(), "USB PnP Audio Device".to_string()),
-                ("HDA".to_string(), "NVIDIA Jetson Orin Nano HDA".to_string()),
-                ("APE".to_string(), "NVIDIA Jetson Orin Nano APE".to_string()),
+                (0, "Device", "USB PnP Audio Device", true),
+                (1, "HDA", "NVIDIA Jetson Orin Nano HDA", false),
+                (2, "APE", "NVIDIA Jetson Orin Nano APE", false),
             ]
         );
+        assert_eq!(
+            card_of("sysdefault:CARD=Device", &cards).map(|c| c.index),
+            Some(0)
+        );
+        assert_eq!(card_of("default", &cards), None);
     }
 
     #[test]
@@ -191,11 +243,27 @@ mod tests {
         assert_eq!(kind_of("default"), DeviceKind::SoundServer);
         assert_eq!(kind_of("pipewire"), DeviceKind::SoundServer);
         assert_eq!(kind_of("hw:CARD=Device,DEV=0"), DeviceKind::Raw);
-        assert_eq!(kind_of("plughw:CARD=Device,DEV=0"), DeviceKind::Hardware);
+        assert_eq!(kind_of("plughw:CARD=Device,DEV=0"), DeviceKind::Raw);
+        assert_eq!(kind_of("sysdefault:CARD=Device"), DeviceKind::Hardware);
         assert_eq!(kind_of("MacBook Air Microphone"), DeviceKind::Hardware);
         assert_eq!(kind_of("BlackHole 2ch"), DeviceKind::Virtual);
         assert_eq!(kind_of("ZoomAudioDevice"), DeviceKind::Virtual);
         assert_eq!(kind_of("Microsoft Teams Audio"), DeviceKind::Virtual);
         assert_eq!(kind_of("jerr\u{2019}s Microphone"), DeviceKind::Hardware);
+    }
+
+    #[test]
+    fn a_cards_directions_come_from_proc_asound_pcm() {
+        let pcm = "00-00: USB Audio : USB Audio : playback 1 : capture 1\n\
+                   01-03: HDMI 0 : HDMI 0 : playback 1\n\
+                   02-00: tegra-dlink-0 XBAR-ADMAIF1-0 : : playback 1 : capture 1\n";
+        assert!(card_directions(pcm, 0, AudioDirection::Input));
+        assert!(card_directions(pcm, 0, AudioDirection::Output));
+        assert!(card_directions(pcm, 1, AudioDirection::Output));
+        assert!(
+            !card_directions(pcm, 1, AudioDirection::Input),
+            "HDMI has no microphone"
+        );
+        assert!(!card_directions(pcm, 7, AudioDirection::Output));
     }
 }

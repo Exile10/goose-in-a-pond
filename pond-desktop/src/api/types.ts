@@ -1547,6 +1547,8 @@ export interface AudioDevice {
   label: string;
   is_default: boolean;
   kind: AudioDeviceKind;
+  /** Plugged in by the household (a USB card), as opposed to built into the board. */
+  plugged_in?: boolean;
 }
 
 export interface ProbedAudioDevice extends AudioDevice {
@@ -1556,6 +1558,7 @@ export interface ProbedAudioDevice extends AudioDevice {
 export type AudioChoiceBasis =
   | "pinned"
   | "system_default"
+  | "plugged_in"
   | "fallback"
   | "best_effort"
   | "no_device"

@@ -260,7 +260,12 @@ impl Inner {
             } else {
                 quick
             };
-            return AudioChoice::not_tested(AudioDirection::Input, quick, pinned);
+            return AudioChoice::not_tested(
+                AudioDirection::Input,
+                quick,
+                pinned,
+                self.selector.prober().plugged_in_first(),
+            );
         }
         self.selector.select(&SelectRequest {
             direction: AudioDirection::Input,
@@ -518,8 +523,8 @@ impl PondAudioControl {
             .status()
             .or_else(|| self.serve.wait_ready(Duration::from_secs(5)))
             .unwrap_or_else(|| AudioDeviceStatus {
-                input: AudioChoice::not_tested(AudioDirection::Input, Vec::new(), None),
-                output: AudioChoice::not_tested(AudioDirection::Output, Vec::new(), None),
+                input: AudioChoice::not_tested(AudioDirection::Input, Vec::new(), None, false),
+                output: AudioChoice::not_tested(AudioDirection::Output, Vec::new(), None, false),
                 updated_at_ms: now_ms(),
                 source: Role::Serve.name().to_string(),
                 pid: std::process::id(),
@@ -909,7 +914,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut status = AudioDeviceStatus {
             input: AudioChoice::mic_off(None),
-            output: AudioChoice::not_tested(AudioDirection::Output, Vec::new(), None),
+            output: AudioChoice::not_tested(AudioDirection::Output, Vec::new(), None, false),
             updated_at_ms: 1,
             source: "voice".into(),
             pid: u32::MAX - 1,
