@@ -1,4 +1,5 @@
 //! Voice-pipeline services.
+pub mod audio_devices;
 pub mod fallback_voice_output;
 pub mod instant_activation;
 pub mod quiet;
