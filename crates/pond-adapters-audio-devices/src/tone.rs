@@ -6,14 +6,20 @@ use pond_core::models::domain::audio_device::{dbfs, PairOutcome};
 /// Not a musical interval on purpose: a voice's harmonics land on multiples of one pitch, and no
 /// voice's pitch divides both of these.
 pub const FREQS: [f32; 2] = [1031.0, 1523.0];
-pub const TONE_MS: u64 = 350;
-/// Soft: the test is heard in the room every time the pond chooses its devices.
-const AMPLITUDE: f32 = 0.18;
+pub const TONE_MS: u64 = 400;
+/// Measured on the Jetson's USB card with its speaker at -17 dB: 0.18 did not clear a room its
+/// +31 dB microphone gain makes loud; 0.45 stood 26 dB clear. Still short enough to be a blip.
+const AMPLITUDE: f32 = 0.3;
 const WINDOW_MS: u32 = 20;
-/// Both tones must stand this far above what the room had at those frequencies before.
+/// Each tone must stand this far above what the room had at its frequency before the sound.
 const MIN_MARGIN_DB: f32 = 12.0;
-/// And make up this share of what the microphone heard, so a loud room is not mistaken for them.
-const MIN_TONE_SHARE: f32 = 0.3;
+/// And this far above the frequencies either side of it in the same moment, which a voice or a
+/// knock raises together; a hum far below them does not count against the tones at all.
+const MIN_PEAK_DB: f32 = 8.0;
+/// Hz between a tone and the neighbours it is compared with.
+const NEIGHBOUR_HZ: f32 = 170.0;
+/// Consecutive-enough evidence: one window could be a fluke, the sound lasts twenty.
+const MIN_HIT_WINDOWS: usize = 3;
 /// Windows skipped at the start, where a stream opening can click.
 const SETTLE_WINDOWS: usize = 2;
 
@@ -40,13 +46,15 @@ pub fn tone_samples(rate: u32) -> Vec<f32> {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Window {
-    /// Power at each test frequency, in the same units as `energy`.
+    /// Power at each test frequency.
     tone: [f32; 2],
+    /// Power either side of each test frequency, averaged.
+    beside: [f32; 2],
     /// Mean square of the window.
     energy: f32,
 }
 
-/// Goertzel power at `freq` over `x`, scaled so a pure sine there reads as its mean square.
+/// Goertzel power at `freq` over `x`, which the caller has already windowed.
 fn goertzel(x: &[f32], freq: f32, rate: f32) -> f32 {
     let coeff = 2.0 * (2.0 * std::f32::consts::PI * freq / rate).cos();
     let (mut s1, mut s2) = (0.0f32, 0.0f32);
@@ -55,24 +63,31 @@ fn goertzel(x: &[f32], freq: f32, rate: f32) -> f32 {
         s2 = s1;
         s1 = s0;
     }
-    let power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
-    2.0 * power / (x.len() as f32 * x.len() as f32)
+    (s1 * s1 + s2 * s2 - coeff * s1 * s2) / (x.len() as f32 * x.len() as f32)
 }
 
 /// Folds a microphone's frames into per-window levels as they arrive, keeping no samples.
 pub struct Listener {
     rate: u32,
     window: usize,
+    /// A Hann window, so a loud sound at one frequency does not leak into the others.
+    hann: Vec<f32>,
     pending: Vec<f32>,
     windows: Vec<Window>,
 }
 
 impl Listener {
     pub fn new(rate: u32) -> Self {
-        let window = (rate * WINDOW_MS / 1000).max(1) as usize;
+        let window = (rate * WINDOW_MS / 1000).max(2) as usize;
+        let hann = (0..window)
+            .map(|i| {
+                0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (window - 1) as f32).cos()
+            })
+            .collect();
         Self {
             rate,
             window,
+            hann,
             pending: Vec::with_capacity(window),
             windows: Vec::new(),
         }
@@ -83,8 +98,24 @@ impl Listener {
             self.pending.push(v);
             if self.pending.len() == self.window {
                 let energy = self.pending.iter().map(|v| v * v).sum::<f32>() / self.window as f32;
-                let tone = FREQS.map(|f| goertzel(&self.pending, f, self.rate as f32));
-                self.windows.push(Window { tone, energy });
+                let shaped: Vec<f32> = self
+                    .pending
+                    .iter()
+                    .zip(&self.hann)
+                    .map(|(v, w)| v * w)
+                    .collect();
+                let rate = self.rate as f32;
+                let tone = FREQS.map(|f| goertzel(&shaped, f, rate));
+                let beside = FREQS.map(|f| {
+                    (goertzel(&shaped, f - NEIGHBOUR_HZ, rate)
+                        + goertzel(&shaped, f + NEIGHBOUR_HZ, rate))
+                        / 2.0
+                });
+                self.windows.push(Window {
+                    tone,
+                    beside,
+                    energy,
+                });
                 self.pending.clear();
             }
         }
@@ -111,28 +142,23 @@ impl Listener {
             };
         }
         let mean = |f: &dyn Fn(&Window) -> f32| room.iter().map(f).sum::<f32>() / room.len() as f32;
-        let room_energy = mean(&|w| w.energy);
-        let room_dbfs = dbfs(room_energy.sqrt());
-        let Some(loudest) = after
+        let room_dbfs = dbfs(mean(&|w| w.energy).sqrt());
+        let before = [mean(&|w| w.tone[0]), mean(&|w| w.tone[1])];
+        let db = |a: f32, b: f32| 10.0 * (a.max(1e-15) / b.max(1e-15)).log10();
+        // The weaker of the two tones' margins over the room, for each window both stand out in.
+        let hits: Vec<f32> = after
             .iter()
-            .max_by(|a, b| (a.tone[0] + a.tone[1]).total_cmp(&(b.tone[0] + b.tone[1])))
-        else {
-            return PairOutcome::NotHeard;
-        };
-        if loudest.energy <= 0.0 {
-            return PairOutcome::NotHeard;
-        }
-        let share = (loudest.tone[0] + loudest.tone[1]) / loudest.energy;
-        let margins: Vec<f32> = (0..2)
-            .map(|i| {
-                let before = mean(&|w| w.tone[i]).max(1e-12);
-                10.0 * (loudest.tone[i].max(1e-12) / before).log10()
+            .filter_map(|w| {
+                let margins = [db(w.tone[0], before[0]), db(w.tone[1], before[1])];
+                let peaks = [db(w.tone[0], w.beside[0]), db(w.tone[1], w.beside[1])];
+                let stands_out = margins.iter().all(|m| *m >= MIN_MARGIN_DB)
+                    && peaks.iter().all(|p| *p >= MIN_PEAK_DB);
+                stands_out.then(|| margins[0].min(margins[1]))
             })
             .collect();
-        let margin_db = margins.iter().copied().fold(f32::INFINITY, f32::min);
-        if margin_db >= MIN_MARGIN_DB && share >= MIN_TONE_SHARE {
+        if hits.len() >= MIN_HIT_WINDOWS {
             PairOutcome::Heard {
-                margin_db,
+                margin_db: hits.iter().copied().fold(f32::MIN, f32::max),
                 room_dbfs,
             }
         } else {
@@ -213,6 +239,37 @@ mod tests {
     fn a_muted_microphone_hears_nothing() {
         let zeros = vec![0.0; quarter_second()];
         assert_eq!(hear(zeros.clone(), zeros), PairOutcome::NotHeard);
+    }
+
+    /// The Jetson's case: a microphone at full gain hears a loud low hum all the time. The tones
+    /// are a small part of what it hears, and still plainly there.
+    #[test]
+    fn the_test_sound_is_heard_over_a_loud_low_hum() {
+        let rate = RATE as f32;
+        let hum = |n: usize, phase: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = (i + phase) as f32 / rate;
+                    (2.0 * std::f32::consts::PI * 100.0 * t).sin() * 0.05
+                        + (2.0 * std::f32::consts::PI * 300.0 * t).sin() * 0.02
+                })
+                .collect()
+        };
+        let tone: Vec<f32> = tone_samples(RATE).iter().map(|v| v * 0.03).collect();
+        let n = quarter_second();
+        let mut during = hum(tone.len(), n);
+        for (d, t) in during.iter_mut().zip(&tone) {
+            *d += t;
+        }
+        assert!(matches!(hear(hum(n, 0), during), PairOutcome::Heard { .. }));
+    }
+
+    /// A knock or a burst of noise raises every frequency at once, not two of them.
+    #[test]
+    fn a_burst_of_noise_during_the_test_is_not_taken_for_it() {
+        let quiet = noise(quarter_second(), 0.002, 3);
+        let burst = noise(quarter_second(), 0.3, 11);
+        assert_eq!(hear(quiet, burst), PairOutcome::NotHeard);
     }
 
     /// Someone talking during the test is loud, but not at both frequencies at once.

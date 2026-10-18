@@ -12,8 +12,9 @@ use crate::tone::{self, Listener};
 
 /// What the room sounds like before the test sound, to judge the sound against.
 const ROOM: Duration = Duration::from_millis(250);
-/// Listening on after the sound ends: a Bluetooth speaker can lag by a few hundred milliseconds.
-const TAIL: Duration = Duration::from_millis(450);
+/// Listening on after the sound ends: a Bluetooth speaker, or ALSA's dmix on a USB card, can lag
+/// by several hundred milliseconds.
+const TAIL: Duration = Duration::from_millis(900);
 /// How long a microphone may take to deliver its first frames.
 const FIRST_FRAMES: Duration = Duration::from_millis(1_500);
 const TONE_RATE: u32 = 48_000;
