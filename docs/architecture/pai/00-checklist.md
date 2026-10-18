@@ -3601,3 +3601,16 @@ mDNSResponder on macOS (touches PAI-2's LAN surface; not a PAI milestone).**
 - **Open.** mdns-sd 0.21.5 answers legacy unicast and left the host name alone in a 40-second run
   beside mDNSResponder. Whether Linux should move to it, with its name probing beside avahi, is
   a separate decision for a Jetson run.
+
+**2026-10-17 — A phone's device row is its own (PAI-1 and PAI-2; not a PAI milestone).**
+
+- **What landed.** `PUT /api/v1/devices/{id}` checked nothing about the caller, so any paired token
+  could rename any device, another member's phone included, and an omitted hostname or room was
+  written back as NULL. Now a paired client's row (`gotg`, `desktop`, `cli`) changes only for that
+  device's own token or the host credential, shared rows (Matter, sensors) for any authenticated
+  caller, and omitted fields keep their values. The policy is `device_edit` in pond-core; the
+  route logs each refusal as `kind="device_edit_denied"`. Found by the goose-on-the-go BLE
+  session while adding a rename after setup.
+- **Not changed, and worth deciding.** `DELETE /devices/{id}` still lets any paired device remove
+  any other, by design (`removing_a_device_queues_its_remote_revocation_first` removes a phone with
+  another device's token). Removal revokes the phone's sessions, so this is the stronger power.
