@@ -268,6 +268,11 @@ async fn a_paired_phone_resumes_over_the_channel_and_its_old_refresh_token_stops
             Some(&AttributeValue::from("cpace-device"))
         );
         assert_eq!(
+            event.attributes.get("client_id"),
+            Some(&AttributeValue::from("install-e2e")),
+            "a resume sends no name, so the trail names the device it resumed"
+        );
+        assert_eq!(
             event.attributes.get("transport"),
             Some(&AttributeValue::from("setup_channel"))
         );

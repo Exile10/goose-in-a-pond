@@ -174,11 +174,18 @@ pub struct Reply {
     pub end: Option<SessionEnd>,
 }
 
+/// One exchange this connection started. A resume names its device only by `client_id`.
+struct Run {
+    challenge_id: String,
+    credential: Credential,
+    client_id: String,
+}
+
 enum State {
     /// Before the exchange. Remembers the runs this connection started, so a verify can name only
     /// its own.
     Clear {
-        runs: Vec<(String, Credential)>,
+        runs: Vec<Run>,
     },
     Sealed {
         cipher: ChannelCipher,
@@ -461,10 +468,15 @@ impl SetupSession {
             return refused(id, KIND, codes::INVALID_REQUEST, None);
         };
         let credential = request.credential;
+        let client_id = request.client_id.clone();
         match self.ctx.handshake.init_channel_pake(request).await {
             Ok(Ok(challenge)) => {
                 if let State::Clear { runs } = &mut self.state {
-                    runs.push((challenge.challenge_id.clone(), credential));
+                    runs.push(Run {
+                        challenge_id: challenge.challenge_id.clone(),
+                        credential,
+                        client_id,
+                    });
                 }
                 ok(
                     id,
@@ -475,7 +487,8 @@ impl SetupSession {
             Ok(Err(refusal)) => {
                 if refusal == PakeRefusal::ChannelBindingMismatch {
                     // A phone at the wrong pond, or something relaying one: record it.
-                    self.audit_pairing(false, credential, None, Some(refusal.code()))
+                    let client_id = Some(client_id.as_str());
+                    self.audit_pairing(false, credential, None, client_id, Some(refusal.code()))
                         .await;
                 }
                 refused(
@@ -501,16 +514,22 @@ impl SetupSession {
         };
         let Some(position) = runs
             .iter()
-            .position(|(run, _)| *run == request.challenge_id)
+            .position(|run| run.challenge_id == request.challenge_id)
         else {
             // Audited as HTTPS audits it, though nothing was spent.
             let device_name = request.device_name.as_deref();
             let unknown = Credential::Pairing;
-            self.audit_pairing(false, unknown, device_name, Some(codes::UNKNOWN_CHALLENGE))
+            let reason = Some(codes::UNKNOWN_CHALLENGE);
+            self.audit_pairing(false, unknown, device_name, None, reason)
                 .await;
             return verify_refused(id, codes::UNKNOWN_CHALLENGE);
         };
-        let (_, credential) = runs.swap_remove(position);
+        let Run {
+            credential,
+            client_id,
+            ..
+        } = runs.swap_remove(position);
+        let client_id = Some(client_id);
         let device_name = request.device_name.clone();
 
         let ChannelVerify { mut response, keys } =
@@ -522,6 +541,7 @@ impl SetupSession {
                         false,
                         credential,
                         device_name.as_deref(),
+                        client_id.as_deref(),
                         Some("internal_error"),
                     )
                     .await;
@@ -533,8 +553,15 @@ impl SetupSession {
                 .rejection_reason
                 .clone()
                 .unwrap_or_else(|| "rejected".into());
-            self.audit_pairing(false, credential, device_name.as_deref(), Some(&reason))
-                .await;
+            let device = device_name.as_deref();
+            self.audit_pairing(
+                false,
+                credential,
+                device,
+                client_id.as_deref(),
+                Some(&reason),
+            )
+            .await;
             return verify_refused(id, &reason);
         }
         let Some(keys) = keys else {
@@ -554,8 +581,14 @@ impl SetupSession {
             return verify_refused(id, codes::INTERNAL_ERROR);
         };
         self.state = State::Sealed { cipher };
-        self.audit_pairing(true, credential, device_name.as_deref(), None)
-            .await;
+        self.audit_pairing(
+            true,
+            credential,
+            device_name.as_deref(),
+            client_id.as_deref(),
+            None,
+        )
+        .await;
         ok(
             id,
             RequestType::PakeVerify,
@@ -640,23 +673,32 @@ impl SetupSession {
     }
 
     /// The same events as an HTTPS pairing, so the audit trail reads one way for both; a device
-    /// resuming its own session is recorded as that, never as a new pairing.
+    /// resuming its own session is recorded as that, never as a new pairing. A resume sends no
+    /// name, so a proven one is recorded by its `client_id`; a failed one names nothing, so the
+    /// trail never tells an unknown device from a wrong token.
     async fn audit_pairing(
         &self,
         paired: bool,
         credential: Credential,
         device_name: Option<&str>,
+        client_id: Option<&str>,
         reason: Option<&str>,
     ) {
         let device = device_name.unwrap_or("unnamed");
         let method = method(credential);
         let resume = credential == Credential::Device;
+        let client_id = client_id.filter(|_| resume && paired);
         let reason_text = reason.unwrap_or("unspecified");
         match (paired, resume) {
             (true, false) => {
                 tracing::info!(device, method, transport = TRANSPORT, "pairing accepted")
             }
-            (true, true) => tracing::info!(device, method, transport = TRANSPORT, "device resumed"),
+            (true, true) => tracing::info!(
+                client_id = client_id.unwrap_or("unknown"),
+                method,
+                transport = TRANSPORT,
+                "device resumed"
+            ),
             (false, false) => tracing::warn!(
                 device,
                 method,
@@ -665,7 +707,6 @@ impl SetupSession {
                 "pairing rejected"
             ),
             (false, true) => tracing::warn!(
-                device,
                 method,
                 transport = TRANSPORT,
                 reason = reason_text,
@@ -687,6 +728,9 @@ impl SetupSession {
             .attr("transport", TRANSPORT);
         if let Some(name) = device_name {
             event = event.attr("device_name", name);
+        }
+        if let Some(client_id) = client_id {
+            event = event.attr("client_id", client_id);
         }
         if let Some(reason) = reason.filter(|_| !paired) {
             event = event.attr("rejection_reason", reason);
