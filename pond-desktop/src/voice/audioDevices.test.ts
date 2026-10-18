@@ -74,6 +74,14 @@ describe("describeChoice", () => {
     expect(line.text).toMatch(/every microphone hears only silence/);
   });
 
+  it("says a plugged-in card is used because it was plugged in", () => {
+    const usb = { ...device("USB PnP Audio Device", { result: "accepting" }), plugged_in: true };
+    const line = describeChoice(
+      choice({ direction: "output", device: usb, outcome: usb.outcome, basis: "plugged_in", devices: [usb] }),
+    );
+    expect(line).toEqual({ text: "USB PnP Audio Device, plugged in, taking audio.", problem: false });
+  });
+
   it("treats the mic switch as a choice, not a fault", () => {
     expect(describeChoice(choice({ basis: "mic_off" }))).toEqual({
       text: "Off in Privacy. The pond is not listening.",

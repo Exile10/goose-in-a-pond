@@ -30,8 +30,8 @@ pub enum DeviceKind {
     /// A physical device opened directly.
     #[default]
     Hardware,
-    /// A hardware node with no format conversion (ALSA `hw:`), which opens only at its native
-    /// format and locks the card while open.
+    /// A hardware node opened directly (ALSA `hw:`, `plughw:`): it locks the card while open, so
+    /// nothing else can play or record on it meanwhile.
     Raw,
     /// Software that carries no sound until something is routed into it: loopbacks, meeting-app
     /// drivers, aggregates. Chosen last because it opens fine and then delivers silence.
@@ -57,6 +57,9 @@ pub struct AudioDevice {
     pub label: String,
     pub is_default: bool,
     pub kind: DeviceKind,
+    /// Plugged in by the household (a USB card), as opposed to built into the board.
+    #[serde(default)]
+    pub plugged_in: bool,
 }
 
 impl AudioDevice {
@@ -67,7 +70,18 @@ impl AudioDevice {
             id,
             is_default,
             kind,
+            plugged_in: false,
         }
+    }
+
+    pub fn plugged_in(mut self) -> Self {
+        self.plugged_in = true;
+        self
+    }
+
+    pub fn with_kind(mut self, kind: DeviceKind) -> Self {
+        self.kind = kind;
+        self
     }
 }
 
@@ -123,6 +137,9 @@ pub enum ChoiceBasis {
     Pinned,
     /// Nothing is pinned, and the system's own default works.
     SystemDefault,
+    /// Nothing is pinned, and a device the household plugged in works. Tried ahead of the
+    /// default where a sound server's priority, not a person, chose the default.
+    PluggedIn,
     /// The pin or the default did not work, so the best device that does was taken instead.
     Fallback,
     /// No device proved itself; this one is used anyway so it can start working, and the
@@ -167,9 +184,10 @@ impl AudioChoice {
         direction: AudioDirection,
         devices: Vec<AudioDevice>,
         pinned: Option<&str>,
+        plugged_in_first: bool,
     ) -> Self {
         let pinned = pinned.map(str::trim).filter(|p| !p.is_empty());
-        let ordered: Vec<ProbedDevice> = probe_order(&devices, pinned)
+        let ordered: Vec<ProbedDevice> = probe_order(&devices, pinned, plugged_in_first)
             .into_iter()
             .map(|d| ProbedDevice::new(d.clone(), ProbeOutcome::Untested))
             .collect();
@@ -222,6 +240,7 @@ impl std::fmt::Display for AudioChoice {
         let why = match self.basis {
             ChoiceBasis::Pinned => "pinned".to_string(),
             ChoiceBasis::SystemDefault => "system default".to_string(),
+            ChoiceBasis::PluggedIn => "plugged in".to_string(),
             ChoiceBasis::Fallback => match &self.pinned {
                 Some(pin) if pin != &device.id => format!("'{pin}' unavailable"),
                 _ => "default unavailable".to_string(),
@@ -257,16 +276,24 @@ pub struct AudioDeviceStatus {
 }
 
 /// The order to try devices in: the pin, then the system default, then the rest best-first.
+/// With `plugged_in_first`, plugged-in devices go ahead of the default: on a board the sound
+/// server picks its default by priority, while the household plugged the USB card in on purpose.
 /// Enumeration order breaks ties, so a platform's own ordering survives.
-pub fn probe_order<'a>(devices: &'a [AudioDevice], pinned: Option<&str>) -> Vec<&'a AudioDevice> {
+pub fn probe_order<'a>(
+    devices: &'a [AudioDevice],
+    pinned: Option<&str>,
+    plugged_in_first: bool,
+) -> Vec<&'a AudioDevice> {
     let mut order: Vec<(usize, &AudioDevice)> = devices.iter().enumerate().collect();
     order.sort_by_key(|(i, d)| {
         let tier = if Some(d.id.as_str()) == pinned {
             0
+        } else if plugged_in_first && d.plugged_in && d.kind != DeviceKind::Virtual {
+            1 + d.kind.rank()
         } else if d.is_default {
-            1
+            5
         } else {
-            2 + d.kind.rank()
+            6 + d.kind.rank()
         };
         (tier, *i)
     });
@@ -288,10 +315,11 @@ pub fn choose(
     direction: AudioDirection,
     devices: Vec<ProbedDevice>,
     pinned: Option<&str>,
+    plugged_in_first: bool,
 ) -> AudioChoice {
     let pinned = pinned.map(str::trim).filter(|p| !p.is_empty());
     let plain: Vec<AudioDevice> = devices.iter().map(|p| p.device.clone()).collect();
-    let ordered: Vec<&ProbedDevice> = probe_order(&plain, pinned)
+    let ordered: Vec<&ProbedDevice> = probe_order(&plain, pinned, plugged_in_first)
         .into_iter()
         .filter_map(|d| devices.iter().find(|p| p.device.id == d.id))
         .collect();
@@ -312,7 +340,11 @@ pub fn choose(
         return pick(pin, ChoiceBasis::Pinned);
     }
     if let Some(best) = ordered.iter().find(|p| p.outcome.proven()) {
-        let basis = if pinned.is_none() && best.device.is_default {
+        let basis = if pinned.is_some() {
+            ChoiceBasis::Fallback
+        } else if plugged_in_first && best.device.plugged_in {
+            ChoiceBasis::PluggedIn
+        } else if best.device.is_default {
             ChoiceBasis::SystemDefault
         } else {
             ChoiceBasis::Fallback
@@ -394,6 +426,7 @@ mod tests {
                 probed("Built-in", true, hearing()),
             ],
             None,
+            false,
         );
         assert_eq!(c.device_id(), Some("Built-in"));
         assert_eq!(c.basis, ChoiceBasis::SystemDefault);
@@ -409,6 +442,7 @@ mod tests {
                 probed("USB mic", false, hearing()),
             ],
             Some("USB mic"),
+            false,
         );
         assert_eq!(c.device_id(), Some("USB mic"));
         assert_eq!(c.basis, ChoiceBasis::Pinned);
@@ -424,6 +458,7 @@ mod tests {
                 probed("Headset", false, ProbeOutcome::Silent),
             ],
             Some("Headset"),
+            false,
         );
         assert_eq!(c.device_id(), Some("Headset"));
         assert_eq!(c.basis, ChoiceBasis::Pinned);
@@ -437,6 +472,7 @@ mod tests {
             IN,
             vec![probed("Built-in", true, hearing())],
             Some("USB mic"),
+            false,
         );
         assert_eq!(c.device_id(), Some("Built-in"));
         assert_eq!(c.basis, ChoiceBasis::Fallback);
@@ -453,6 +489,7 @@ mod tests {
                 probed("AirPods", false, failed()),
             ],
             Some("AirPods"),
+            false,
         );
         assert_eq!(c.device_id(), Some("Speakers"));
         assert_eq!(c.basis, ChoiceBasis::Fallback);
@@ -468,6 +505,7 @@ mod tests {
                 probed("USB mic", false, hearing()),
             ],
             None,
+            false,
         );
         assert_eq!(c.device_id(), Some("USB mic"));
         assert_eq!(c.basis, ChoiceBasis::Fallback);
@@ -484,6 +522,7 @@ mod tests {
                 probed("Built-in", true, ProbeOutcome::Silent),
             ],
             None,
+            false,
         );
         assert_eq!(c.device_id(), Some("Built-in"));
         assert_eq!(c.basis, ChoiceBasis::BestEffort);
@@ -499,6 +538,7 @@ mod tests {
                 probed("Built-in", true, failed()),
             ],
             None,
+            false,
         );
         assert_eq!(c.device_id(), Some("Built-in"));
         assert_eq!(c.basis, ChoiceBasis::BestEffort);
@@ -507,7 +547,7 @@ mod tests {
 
     #[test]
     fn no_devices_means_no_choice_and_a_clear_problem() {
-        let c = choose(OUT, vec![], None);
+        let c = choose(OUT, vec![], None, false);
         assert_eq!(c.device, None);
         assert_eq!(c.basis, ChoiceBasis::NoDevice);
         assert_eq!(c.problem().as_deref(), Some("no speaker was found"));
@@ -522,6 +562,7 @@ mod tests {
                 probed("USB speaker", false, ProbeOutcome::Accepting),
             ],
             None,
+            false,
         );
         assert_eq!(c.device_id(), Some("USB speaker"));
     }
@@ -535,13 +576,19 @@ mod tests {
                 probed("USB mic", false, hearing()),
             ],
             None,
+            false,
         );
         assert_eq!(c.device_id(), Some("USB mic"));
     }
 
     #[test]
     fn a_blank_pin_means_automatic() {
-        let c = choose(IN, vec![probed("Built-in", true, hearing())], Some("  "));
+        let c = choose(
+            IN,
+            vec![probed("Built-in", true, hearing())],
+            Some("  "),
+            false,
+        );
         assert_eq!(c.basis, ChoiceBasis::SystemDefault);
         assert_eq!(c.pinned, None);
     }
@@ -556,7 +603,7 @@ mod tests {
             dev("default", true, DeviceKind::SoundServer),
             dev("USB mic", false, DeviceKind::Hardware),
         ];
-        let ids: Vec<&str> = probe_order(&devices, Some("USB mic"))
+        let ids: Vec<&str> = probe_order(&devices, Some("USB mic"), false)
             .into_iter()
             .map(|d| d.id.as_str())
             .collect();
@@ -586,6 +633,7 @@ mod tests {
                 ProbedDevice::new(dev("USB mic", false, DeviceKind::Hardware), hearing()),
             ],
             None,
+            false,
         );
         assert_eq!(c.device_id(), Some("USB mic"));
     }
@@ -621,6 +669,7 @@ mod tests {
                 dev("Built-in", true, DeviceKind::Hardware),
             ],
             None,
+            false,
         );
         assert_eq!(c.device_id(), Some("Built-in"));
         assert_eq!(c.basis, ChoiceBasis::NotTested);
@@ -643,11 +692,12 @@ mod tests {
     #[test]
     fn the_status_round_trips_through_json_for_the_other_process() {
         let status = AudioDeviceStatus {
-            input: choose(IN, vec![probed("Built-in", true, hearing())], None),
+            input: choose(IN, vec![probed("Built-in", true, hearing())], None, false),
             output: choose(
                 OUT,
                 vec![probed("Speakers", true, ProbeOutcome::Accepting)],
                 None,
+                false,
             ),
             updated_at_ms: 1,
             source: "voice".into(),
@@ -658,5 +708,93 @@ mod tests {
         assert!(json.contains("\"basis\":\"system_default\""), "{json}");
         let back: AudioDeviceStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back, status);
+    }
+
+    fn usb(id: &str) -> AudioDevice {
+        AudioDevice::new(id, false, DeviceKind::Hardware).plugged_in()
+    }
+
+    /// The Jetson: PulseAudio defaults to the board's analog path, which nothing is plugged
+    /// into and which takes audio all the same. The USB card is the one the household connected.
+    #[test]
+    fn on_a_board_a_plugged_in_card_beats_a_built_in_default_that_also_works() {
+        let devices = vec![
+            ProbedDevice::new(
+                dev("default", true, DeviceKind::SoundServer),
+                ProbeOutcome::Accepting,
+            ),
+            ProbedDevice::new(usb("sysdefault:CARD=Device"), ProbeOutcome::Accepting),
+        ];
+        let c = choose(OUT, devices.clone(), None, true);
+        assert_eq!(c.device_id(), Some("sysdefault:CARD=Device"));
+        assert_eq!(c.basis, ChoiceBasis::PluggedIn);
+        assert_eq!(c.problem(), None);
+
+        // Where a person picked the default (CoreAudio), their default stands.
+        let c = choose(OUT, devices, None, false);
+        assert_eq!(c.device_id(), Some("default"));
+        assert_eq!(c.basis, ChoiceBasis::SystemDefault);
+    }
+
+    #[test]
+    fn a_plugged_in_card_that_fails_gives_way_to_the_default() {
+        let c = choose(
+            IN,
+            vec![
+                ProbedDevice::new(dev("default", true, DeviceKind::SoundServer), hearing()),
+                ProbedDevice::new(usb("sysdefault:CARD=Device"), failed()),
+            ],
+            None,
+            true,
+        );
+        assert_eq!(c.device_id(), Some("default"));
+        assert_eq!(c.basis, ChoiceBasis::SystemDefault);
+    }
+
+    #[test]
+    fn a_pin_still_beats_a_plugged_in_card() {
+        let c = choose(
+            OUT,
+            vec![
+                ProbedDevice::new(usb("sysdefault:CARD=Device"), ProbeOutcome::Accepting),
+                ProbedDevice::new(
+                    dev("hdmi:CARD=HDA,DEV=0", false, DeviceKind::Hardware),
+                    ProbeOutcome::Accepting,
+                ),
+            ],
+            Some("hdmi:CARD=HDA,DEV=0"),
+            true,
+        );
+        assert_eq!(c.device_id(), Some("hdmi:CARD=HDA,DEV=0"));
+        assert_eq!(c.basis, ChoiceBasis::Pinned);
+    }
+
+    /// The card's shared route mixes; the raw node locks the card, so the shared one goes first.
+    #[test]
+    fn a_plugged_in_cards_shared_route_is_tried_before_its_raw_node() {
+        let devices = vec![
+            dev("default", true, DeviceKind::SoundServer),
+            usb("plughw:CARD=Device,DEV=0").with_kind(DeviceKind::Raw),
+            usb("sysdefault:CARD=Device"),
+        ];
+        let ids: Vec<&str> = probe_order(&devices, None, true)
+            .into_iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "sysdefault:CARD=Device",
+                "plughw:CARD=Device,DEV=0",
+                "default"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_status_written_before_plugged_in_existed_still_reads() {
+        let old = r#"{"id":"Built-in","label":"Built-in","is_default":true,"kind":"hardware"}"#;
+        let d: AudioDevice = serde_json::from_str(old).unwrap();
+        assert!(!d.plugged_in);
     }
 }

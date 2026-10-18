@@ -33,6 +33,12 @@ pub trait AudioDeviceProber: Send + Sync {
 
     /// Play a short, soft chime on a speaker. Only on the household's say-so.
     fn chime(&self, device: &AudioDevice) -> Result<(), String>;
+
+    /// Whether a plugged-in device goes ahead of the default: true where a sound server picks
+    /// the default by priority (a board), false where a person picks it (CoreAudio).
+    fn plugged_in_first(&self) -> bool {
+        false
+    }
 }
 
 /// What the API asks of the process that chose the devices. Blocking, like the prober.
