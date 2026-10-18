@@ -91,8 +91,8 @@ export interface Settings {
   audio_input_device?: string;
   /** Pinned speaker, by its system name; "" picks one that works. */
   audio_output_device?: string;
-  /** Lets a speaker test be heard; off, every test plays silence. */
-  audio_test_chime?: boolean;
+  /** Choose the speaker and mic by a short test sound (on); off, they are checked silently. */
+  audio_sound_test?: boolean;
 
   // Model roles
   chat_provider?: string;
@@ -1563,6 +1563,7 @@ export type AudioChoiceBasis =
   | "pinned"
   | "system_default"
   | "plugged_in"
+  | "heard"
   | "fallback"
   | "best_effort"
   | "no_device"
@@ -1576,6 +1577,10 @@ export interface AudioChoice {
   basis: AudioChoiceBasis;
   pinned: string | null;
   devices: ProbedAudioDevice[];
+  /** The device at the other end of the sound test that proved this one, by label. */
+  heard_with?: string | null;
+  /** A sound test ran and no microphone heard any speaker. */
+  unheard?: boolean;
 }
 
 export interface AudioDeviceStatus {

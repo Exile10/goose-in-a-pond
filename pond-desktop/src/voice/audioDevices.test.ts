@@ -82,6 +82,37 @@ describe("describeChoice", () => {
     expect(line).toEqual({ text: "USB PnP Audio Device, plugged in, taking audio.", problem: false });
   });
 
+  it("names the pair a sound test proved, from each end", () => {
+    const speakers = device("MacBook Air Speakers", { result: "accepting" }, true);
+    const out = describeChoice(
+      choice({ direction: "output", device: speakers, outcome: speakers.outcome, basis: "heard", devices: [speakers], heard_with: "MacBook Air Microphone" }),
+    );
+    expect(out).toEqual({ text: "MacBook Air Speakers, heard by MacBook Air Microphone.", problem: false });
+    const mic = describeChoice(
+      choice({ device: builtIn, outcome: builtIn.outcome, basis: "heard", devices: [builtIn], heard_with: "MacBook Air Speakers" }),
+    );
+    expect(mic.text).toBe("MacBook Air Microphone, which heard MacBook Air Speakers.");
+  });
+
+  it("says a pinned speaker was not heard when another one was", () => {
+    const usb = device("USB speaker", { result: "accepting" });
+    const hdmi = device("HDMI", { result: "untested" });
+    const line = describeChoice(
+      choice({ direction: "output", device: usb, outcome: usb.outcome, basis: "fallback", pinned: "HDMI", devices: [usb, hdmi], heard_with: "USB mic" }),
+    );
+    expect(line.text).toBe("USB speaker, heard by USB mic: your choice, HDMI, was not heard.");
+  });
+
+  it("flags a speaker no microphone heard, and says what to check", () => {
+    const board = device("Built-in Audio", { result: "accepting" }, true);
+    const line = describeChoice(
+      choice({ direction: "output", device: board, outcome: board.outcome, basis: "system_default", devices: [board], unheard: true }),
+    );
+    expect(line.problem).toBe(true);
+    expect(line.text).toMatch(/no microphone heard it/);
+    expect(line.text).toMatch(/turned up/);
+  });
+
   it("treats the mic switch as a choice, not a fault", () => {
     expect(describeChoice(choice({ basis: "mic_off" }))).toEqual({
       text: "Off in Privacy. The pond is not listening.",
