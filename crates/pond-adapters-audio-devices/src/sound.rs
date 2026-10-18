@@ -26,6 +26,10 @@ fn failed(reason: impl ToString) -> PairOutcome {
 }
 
 fn play(speaker: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Ok(player) = std::env::var("GIAP_TEST_PLAYER") {
+        return tests::play_with(&player, speaker);
+    }
     pond_audio_out::route::play_samples_exactly(
         Some(speaker),
         tone::tone_samples(TONE_RATE),
@@ -141,9 +145,46 @@ pub fn listen_while_playing(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cpal::traits::HostTrait;
+
+    /// Play the test sound through an outside player (`aplay`), to tell the pond's playback path
+    /// apart from the speaker and the room.
+    pub(crate) fn play_with(player: &str, speaker: &str) -> Result<(), String> {
+        let samples = tone::tone_samples(TONE_RATE);
+        let mut wav = Vec::new();
+        let data = samples.len() as u32 * 2;
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        for v in [
+            16u32,
+            1 | (1 << 16),
+            TONE_RATE,
+            TONE_RATE * 2,
+            2 | (16 << 16),
+        ] {
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data.to_le_bytes());
+        for v in samples {
+            wav.extend_from_slice(&((v.clamp(-1.0, 1.0) * 32_767.0) as i16).to_le_bytes());
+        }
+        let path = std::env::temp_dir().join("giap-sound-test.wav");
+        std::fs::write(&path, wav).map_err(|e| e.to_string())?;
+        let status = std::process::Command::new(player)
+            .args(["-q", "-D", speaker])
+            .arg(&path)
+            .status()
+            .map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&path);
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("{player} failed"))
+    }
 
     /// Real hardware: where in time the test sound arrives, window by window. Set
     /// GIAP_TEST_SPEAKER / GIAP_TEST_MIC to pick devices; the defaults are used otherwise.
@@ -156,6 +197,9 @@ mod tests {
             .unwrap_or_else(|_| name(host.default_output_device()));
         let mic =
             std::env::var("GIAP_TEST_MIC").unwrap_or_else(|_| name(host.default_input_device()));
+        if let Some(d) = probe::find(AudioDirection::Output, &speaker) {
+            println!("output config cpal picks: {:?}", d.default_output_config());
+        }
         let (listener, tone_from) =
             listen_while_playing(&speaker, &mic, Duration::from_secs(3)).expect("ran");
         println!("{speaker} -> {mic}: sound starts at window {tone_from}");
