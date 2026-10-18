@@ -126,6 +126,31 @@ impl Listener {
         self.windows.len()
     }
 
+    /// Per window after `tone_from`: each tone's margin over the room and over its neighbours.
+    #[cfg(test)]
+    pub fn trace(&self, tone_from: usize) -> Vec<String> {
+        let room = self.windows.get(SETTLE_WINDOWS..tone_from).unwrap_or(&[]);
+        let n = room.len().max(1) as f32;
+        let before = [0, 1].map(|i| room.iter().map(|w| w.tone[i]).sum::<f32>() / n);
+        let db = |a: f32, b: f32| 10.0 * (a.max(1e-15) / b.max(1e-15)).log10();
+        self.windows
+            .iter()
+            .enumerate()
+            .skip(tone_from)
+            .map(|(k, w)| {
+                format!(
+                    "{:>4} {:>5}ms  1031: room {:+6.1} beside {:+6.1}   1523: room {:+6.1} beside {:+6.1}",
+                    k,
+                    (k - tone_from) as u32 * WINDOW_MS,
+                    db(w.tone[0], before[0]),
+                    db(w.tone[0], w.beside[0]),
+                    db(w.tone[1], before[1]),
+                    db(w.tone[1], w.beside[1]),
+                )
+            })
+            .collect()
+    }
+
     /// Whether the test sound, started at window `tone_from`, was heard above the room before it.
     pub fn verdict(&self, tone_from: usize) -> PairOutcome {
         let room: Vec<Window> = self

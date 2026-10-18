@@ -69,13 +69,23 @@ pub fn through_open_mic(speaker: &str, shared: &MicShared) -> PairOutcome {
 
 /// Test with a microphone opened for the purpose, then closed.
 pub fn through_mic(speaker: &str, mic: &str) -> PairOutcome {
+    match listen_while_playing(speaker, mic, TAIL) {
+        Ok((listener, tone_from)) => listener.verdict(tone_from),
+        Err(outcome) => outcome,
+    }
+}
+
+/// Open `mic`, measure the room, play the test sound on `speaker`, and listen on for `tail`.
+/// The listener comes back with the window the sound started at.
+pub fn listen_while_playing(
+    speaker: &str,
+    mic: &str,
+    tail: Duration,
+) -> Result<(Listener, usize), PairOutcome> {
     let Some(device) = probe::find(AudioDirection::Input, mic) else {
-        return failed("microphone not connected");
+        return Err(failed("microphone not connected"));
     };
-    let config = match device.default_input_config() {
-        Ok(c) => c,
-        Err(e) => return failed(e),
-    };
+    let config = device.default_input_config().map_err(failed)?;
     let channels = config.channels().max(1) as usize;
     let listener = Arc::new(Mutex::new(Listener::new(config.sample_rate().0)));
     let on_err = |e| tracing::debug!(error = %e, "sound test input stream error");
@@ -101,35 +111,57 @@ pub fn through_mic(speaker: &str, mic: &str) -> PairOutcome {
         cpal::SampleFormat::I16 => build!(i16, |s: i16| s as f32 / 32_768.0),
         cpal::SampleFormat::U16 => build!(u16, |s: u16| (s as f32 - 32_768.0) / 32_768.0),
         cpal::SampleFormat::I32 => build!(i32, |s: i32| s as f32 / 2_147_483_648.0),
-        other => return failed(format!("unsupported sample format {other:?}")),
-    };
-    let stream = match stream {
-        Ok(s) => s,
-        Err(e) => return failed(e),
-    };
-    if let Err(e) = stream.play() {
-        return failed(e);
+        other => return Err(failed(format!("unsupported sample format {other:?}"))),
     }
+    .map_err(failed)?;
+    stream.play().map_err(failed)?;
     let windows = || listener.lock().unwrap_or_else(|e| e.into_inner()).windows();
     let opened = Instant::now();
     while windows() == 0 {
         if opened.elapsed() >= FIRST_FRAMES {
-            return failed("the microphone delivered nothing");
+            return Err(failed("the microphone delivered nothing"));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let outcome = with_quiet(|| {
+    let tone_from = with_quiet(|| {
         std::thread::sleep(ROOM);
         let tone_from = windows();
-        if let Err(e) = play(speaker) {
-            return failed(e);
-        }
-        std::thread::sleep(TAIL);
-        listener
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .verdict(tone_from)
-    });
+        play(speaker).map(|()| {
+            std::thread::sleep(tail);
+            tone_from
+        })
+    })
+    .map_err(failed)?;
     drop(stream);
-    outcome
+    let listener = Arc::try_unwrap(listener)
+        .map_err(|_| failed("the microphone stream outlived the test"))?
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
+    Ok((listener, tone_from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cpal::traits::HostTrait;
+
+    /// Real hardware: where in time the test sound arrives, window by window. Set
+    /// GIAP_TEST_SPEAKER / GIAP_TEST_MIC to pick devices; the defaults are used otherwise.
+    #[test]
+    #[ignore = "plays a sound and opens this machine's microphone"]
+    fn sound_test_timeline_on_this_machine() {
+        let host = cpal::default_host();
+        let name = |d: Option<cpal::Device>| d.and_then(|d| d.name().ok()).unwrap_or_default();
+        let speaker = std::env::var("GIAP_TEST_SPEAKER")
+            .unwrap_or_else(|_| name(host.default_output_device()));
+        let mic =
+            std::env::var("GIAP_TEST_MIC").unwrap_or_else(|_| name(host.default_input_device()));
+        let (listener, tone_from) =
+            listen_while_playing(&speaker, &mic, Duration::from_secs(3)).expect("ran");
+        println!("{speaker} -> {mic}: sound starts at window {tone_from}");
+        for line in listener.trace(tone_from) {
+            println!("{line}");
+        }
+        println!("verdict: {:?}", listener.verdict(tone_from));
+    }
 }
