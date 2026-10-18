@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use crate::owner::{CaptureDevice, MicShared};
+use crate::owner::{CaptureDevice, MicShared, MicState};
 use crate::ring::{i16_to_f32, to_mono_f32, u16_to_f32};
 
 /// `cpal::Stream` is `!Send` (CoreAudio ties listeners to its thread); it never leaves the owner.
@@ -18,6 +18,8 @@ pub struct CpalCapture {
     stream: Option<SendableStream>,
     /// Preferred device name; `None` uses the host default.
     preferred: Option<String>,
+    /// What the open stream is on, which is the default when `preferred` was not found.
+    opened: Option<String>,
 }
 
 impl CpalCapture {
@@ -28,8 +30,8 @@ impl CpalCapture {
     /// Capture from a named device instead of the host default.
     pub fn with_device(name: impl Into<String>) -> Self {
         Self {
-            stream: None,
             preferred: Some(name.into()),
+            ..Self::default()
         }
     }
 
@@ -65,6 +67,7 @@ impl CaptureDevice for CpalCapture {
         self.stop();
 
         let device = self.pick()?;
+        let name = device.name().ok();
         let supported = device
             .default_input_config()
             .map_err(|e| format!("no usable input config: {e}"))?;
@@ -72,6 +75,16 @@ impl CaptureDevice for CpalCapture {
         let channels = supported.channels() as usize;
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
+
+        // A lost device stops calling back, so nothing downstream would ever notice; the state
+        // is what the device supervisor watches to move to another.
+        let lost = shared.clone();
+        let on_err = move |e: cpal::StreamError| {
+            tracing::warn!(error = %e, "input stream error");
+            if matches!(e, cpal::StreamError::DeviceNotAvailable) {
+                lost.set_state(MicState::Failed(format!("input device lost: {e}")));
+            }
+        };
 
         // Resample once, here, so subscribers only ever see 16 kHz mono f32.
         let push = move |mono: Vec<f32>| {
@@ -81,8 +94,6 @@ impl CaptureDevice for CpalCapture {
             drop(ring);
             shared.bump();
         };
-
-        let on_err = |e| tracing::warn!(error = %e, "input stream error");
 
         let stream = match format {
             cpal::SampleFormat::F32 => device.build_input_stream(
@@ -118,12 +129,24 @@ impl CaptureDevice for CpalCapture {
             "microphone open (normalised to 16 kHz mono)"
         );
         self.stream = Some(SendableStream(stream));
+        self.opened = name;
         Ok(())
     }
 
     fn stop(&mut self) {
         // Dropping the stream closes the device, which turns the OS mic indicator off.
         self.stream = None;
+        self.opened = None;
+    }
+
+    fn retarget(&mut self, device: Option<String>) -> bool {
+        let changed = self.preferred != device;
+        self.preferred = device;
+        changed
+    }
+
+    fn opened(&self) -> Option<String> {
+        self.opened.clone()
     }
 }
 

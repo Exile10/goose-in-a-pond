@@ -647,6 +647,74 @@ def section_web_search():
     )
 
 
+AUDIO_PIN = "Live Test Speaker That Is Not Here"
+
+
+def section_audio_devices():
+    """The device routes on a real server: what is in use, a test that never opens a mic the
+    household switched off, and a pinned speaker that is not connected giving way.
+
+    The mic is switched off for the test so this suite never opens a microphone on the machine
+    running it, which also checks the privacy rule over HTTP. The pin is left for the restart.
+    """
+    print("\n=== audio devices ===")
+    probed = {"pinned", "system_default", "fallback", "best_effort"}
+
+    code, body = call("GET", "/api/v1/audio/devices")
+    if not expect(
+        "GET /audio/devices answers",
+        code,
+        200,
+        body,
+        ("both directions", isinstance(body, dict) and "input" in body and "output" in body),
+        ("chosen by serve", isinstance(body, dict) and body.get("source") == "serve"),
+        (
+            "serve has not opened the mic on its own",
+            isinstance(body, dict) and body["input"]["basis"] not in probed,
+        ),
+    ):
+        return
+
+    code, body = call("POST", "/api/v1/audio/devices/test", "not an object")
+    expect("POST /audio/devices/test with a bad body is refused", code, 422, body)
+
+    code, body = call(
+        "PUT", "/api/v1/settings", {"mic_enabled": False, "audio_output_device": AUDIO_PIN}
+    )
+    if not expect("mic off and a speaker pinned", code, 200, body):
+        return
+    try:
+        code, body = call("POST", "/api/v1/audio/devices/test", {"chime": False})
+        expect(
+            "a test with the mic off opens no input, and a missing pin gives way",
+            code,
+            200,
+            body,
+            ("mic off", isinstance(body, dict) and body["input"]["basis"] == "mic_off"),
+            ("no input listed", isinstance(body, dict) and body["input"]["devices"] == []),
+            ("pin echoed", isinstance(body, dict) and body["output"]["pinned"] == AUDIO_PIN),
+            ("pin not used", isinstance(body, dict) and body["output"]["basis"] != "pinned"),
+        )
+    finally:
+        code, body = call("PUT", "/api/v1/settings", {"mic_enabled": True})
+        expect("mic switched back on", code, 200, body)
+
+
+def section_audio_devices_after_restart():
+    """A pin is a setting: a fresh process must start from it, then give it back."""
+    print("\n=== audio devices after restart ===")
+    code, body = call("GET", "/api/v1/audio/devices")
+    expect(
+        "the speaker pin survives a restart",
+        code,
+        200,
+        body,
+        ("pin", isinstance(body, dict) and body["output"]["pinned"] == AUDIO_PIN),
+    )
+    code, body = call("PUT", "/api/v1/settings", {"audio_output_device": ""})
+    expect("the speaker pin is cleared", code, 200, body)
+
+
 def section_web_search_after_restart():
     """The key is in the secret store, so it survives; its status was in memory, so it does not."""
     print("\n=== web search settings after restart ===")
@@ -1623,6 +1691,7 @@ def main():
         section_secret_store_after_restart()
         section_web_search_after_restart()
         section_network_mode_after_restart()
+        section_audio_devices_after_restart()
         section_lane_clock_after_restart()
         section_picture_support_after_restart()
     else:
@@ -1635,6 +1704,7 @@ def main():
         section_network_mode()
         section_music_player()
         section_web_search()
+        section_audio_devices()
         # First pass only. It creates a profile by name, which would collide
         # with the row it left behind, and the process counters it reads are
         # zero on a fresh process by design -- so on the restart pass it would

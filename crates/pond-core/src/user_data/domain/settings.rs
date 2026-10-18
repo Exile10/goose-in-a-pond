@@ -244,6 +244,20 @@ pub struct Settings {
     #[serde(default = "Settings::default_voice_thinking_tone_enabled")]
     pub voice_thinking_tone_enabled: bool,
 
+    /// Microphone the household pinned, by the name the system gives it; empty picks one that
+    /// works. A pin that is unplugged or broken gives way until it is back.
+    #[serde(default)]
+    pub audio_input_device: String,
+
+    /// Speaker the household pinned, as `audio_input_device` is for the microphone.
+    #[serde(default)]
+    pub audio_output_device: String,
+
+    /// Lets a speaker test be heard: a short chime when the pond tests or moves to a speaker.
+    /// Off, every test plays silence.
+    #[serde(default)]
+    pub audio_test_chime: bool,
+
     /// Recording ceiling for the browser voice path only; the voice loop ends on silence.
     #[serde(default = "Settings::default_recording_duration")]
     pub voice_recording_duration_secs: u32,
@@ -754,6 +768,9 @@ impl Default for Settings {
             voice_tts_quality: Self::default_tts_quality(),
             vad_backend: Self::default_vad_backend(),
             voice_thinking_tone_enabled: Self::default_voice_thinking_tone_enabled(),
+            audio_input_device: String::new(),
+            audio_output_device: String::new(),
+            audio_test_chime: false,
             voice_recording_duration_secs: Self::default_recording_duration(),
             voice_whisper_url: Self::default_whisper_url(),
             active_llm_model: Self::default_active_llm_model(),
@@ -2035,6 +2052,10 @@ mod tests {
             "voice_kws_post_trigger_silence_ms",
             "voice_recording_duration_secs",
             "voice_thinking_tone_enabled",
+            // The Voice hub view's and the catalogue's audio device panel.
+            "audio_input_device",
+            "audio_output_device",
+            "audio_test_chime",
             "voice_tts_quality",
             "voice_tts_speed",
             "voice_tts_voice",

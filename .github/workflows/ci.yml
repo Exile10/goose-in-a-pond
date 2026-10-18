@@ -181,6 +181,8 @@ jobs:
           cargo clippy --locked \
             -p pond-voice \
             -p pond-audio \
+            -p pond-audio-out \
+            -p pond-adapters-audio-devices \
             -p pond-ear \
             -p pond-core \
             -p pond-infra \
@@ -209,6 +211,8 @@ jobs:
           cargo test --locked \
             -p pond-voice \
             -p pond-audio \
+            -p pond-audio-out \
+            -p pond-adapters-audio-devices \
             -p pond-ear \
             -p pond-core \
             -p pond-infra \

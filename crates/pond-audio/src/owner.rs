@@ -45,6 +45,30 @@ pub enum MicCommand {
     Clear,
     /// Stop the thread. Joinable, so a device handoff can know the device is really released.
     Shutdown,
+    /// Capture from this device from now on (`None`: the system default). An open capture moves
+    /// to it at once, and a lost one is reopened even when the name is unchanged.
+    Retarget(Option<String>),
+    /// Run a job on the owner thread, between commands, so nothing else opens a device while it
+    /// runs. Device probes go through here to keep this thread the only opener.
+    Exclusive(ExclusiveJob),
+    /// Restart a wanted capture on its current device: one that stalled while still "open".
+    Reopen,
+}
+
+/// A job for [`MicCommand::Exclusive`].
+pub struct ExclusiveJob(pub Box<dyn FnOnce(&OwnerView<'_>) + Send>);
+
+impl std::fmt::Debug for ExclusiveJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExclusiveJob")
+    }
+}
+
+/// What an exclusive job may know about the owner.
+pub struct OwnerView<'a> {
+    /// The device open right now, by name: measure it from the ring rather than open it twice.
+    pub open_device: Option<String>,
+    pub shared: &'a Arc<MicShared>,
 }
 
 /// Shared state a subscriber can read without going through the channel.
@@ -209,6 +233,27 @@ impl MicHandle {
     pub fn shutdown(&self) {
         let _ = self.tx.send(MicCommand::Shutdown);
     }
+    pub fn retarget(&self, device: Option<String>) {
+        let _ = self.tx.send(MicCommand::Retarget(device));
+    }
+    pub fn reopen(&self) {
+        let _ = self.tx.send(MicCommand::Reopen);
+    }
+
+    /// Run `job` on the owner thread and wait for its answer; `None` if the owner is gone or the
+    /// job outlived `timeout`.
+    pub fn run_exclusive<R: Send + 'static>(
+        &self,
+        timeout: std::time::Duration,
+        job: impl FnOnce(&OwnerView<'_>) -> R + Send + 'static,
+    ) -> Option<R> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = ExclusiveJob(Box::new(move |view| {
+            let _ = tx.send(job(view));
+        }));
+        self.tx.send(MicCommand::Exclusive(job)).ok()?;
+        rx.recv_timeout(timeout).ok()
+    }
 
     /// Read access to the buffer and state.
     pub fn shared(&self) -> &Arc<MicShared> {
@@ -240,6 +285,14 @@ pub trait CaptureDevice: Send {
     fn start(&mut self, shared: Arc<MicShared>) -> Result<(), String>;
     /// Release the device. Idempotent.
     fn stop(&mut self);
+    /// Open this device on the next `start` (`None`: the system default). True if it changed.
+    fn retarget(&mut self, _device: Option<String>) -> bool {
+        false
+    }
+    /// The device the last successful `start` opened, by name.
+    fn opened(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Run the owner loop. Returns when `Shutdown` is received or the channel dies.
@@ -344,6 +397,26 @@ pub fn run(mut device: Box<dyn CaptureDevice>, shared: Arc<MicShared>, rx: Recei
                 shared.set_state(MicState::Closed);
                 return;
             }
+            MicCommand::Retarget(name) => {
+                tracing::info!(device = ?name, "microphone target");
+                let moved = device.retarget(name);
+                let lost = matches!(shared.state(), MicState::Failed(_));
+                if want_open && (moved || lost) {
+                    apply(&mut device, want_open);
+                }
+            }
+            MicCommand::Reopen => {
+                if want_open {
+                    apply(&mut device, want_open);
+                }
+            }
+            MicCommand::Exclusive(ExclusiveJob(job)) => {
+                let view = OwnerView {
+                    open_device: shared.state().is_open().then(|| device.opened()).flatten(),
+                    shared: &shared,
+                };
+                job(&view);
+            }
         }
     }
     // Channel closed: release the device rather than holding it forever.
@@ -383,6 +456,9 @@ mod tests {
         stops: Arc<AtomicUsize>,
         open: Arc<AtomicBool>,
         fail_with: Option<String>,
+        target: Option<String>,
+        /// Every device `start` opened, in order.
+        opened_on: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl CaptureDevice for FakeDevice {
@@ -392,12 +468,23 @@ mod tests {
                 return Err(e.clone());
             }
             self.open.store(true, Ordering::SeqCst);
+            self.opened_on.lock().unwrap().push(self.target.clone());
             shared.ring.lock().unwrap().push(&[0.1, 0.2, 0.3]);
             Ok(())
         }
         fn stop(&mut self) {
             self.stops.fetch_add(1, Ordering::SeqCst);
             self.open.store(false, Ordering::SeqCst);
+        }
+        fn retarget(&mut self, device: Option<String>) -> bool {
+            let changed = self.target != device;
+            self.target = device;
+            changed
+        }
+        fn opened(&self) -> Option<String> {
+            self.open
+                .load(Ordering::SeqCst)
+                .then(|| self.target.clone().unwrap_or_else(|| "default".into()))
         }
     }
 
@@ -419,6 +506,7 @@ mod tests {
                 stops: stops.clone(),
                 open: open.clone(),
                 fail_with: fail_with.map(str::to_string),
+                ..Default::default()
             };
             let (handle, join) = spawn(Box::new(dev), 16_000, 2_000, enabled);
             Self {
@@ -590,6 +678,7 @@ mod tests {
             stops: stops.clone(),
             open: open.clone(),
             fail_with: None,
+            ..Default::default()
         };
         let (handle, join) = spawn(Box::new(dev), 16_000, 1_000, true);
         handle.open();
@@ -689,5 +778,152 @@ mod tests {
 
         h.handle.close_session(capture);
         h.settle(|s| matches!(s, MicState::Closed));
+    }
+
+    /// Every device the fake opened, in order.
+    type Opened = Arc<Mutex<Vec<Option<String>>>>;
+
+    fn spawn_fake() -> (MicHandle, std::thread::JoinHandle<()>, Opened) {
+        let opened_on = Arc::new(Mutex::new(Vec::new()));
+        let dev = FakeDevice {
+            opened_on: opened_on.clone(),
+            ..Default::default()
+        };
+        let (handle, join) = spawn(Box::new(dev), 16_000, 1_000, true);
+        (handle, join, opened_on)
+    }
+
+    #[test]
+    fn retargeting_an_open_capture_moves_it_to_the_new_device() {
+        let (h, join, opened_on) = spawn_fake();
+        let claim = h.open_session();
+        assert!(h.wait_for(|s| s.is_open(), std::time::Duration::from_secs(2)));
+        h.retarget(Some("USB mic".into()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while opened_on.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            *opened_on.lock().unwrap(),
+            [None, Some("USB mic".to_string())]
+        );
+        assert!(h.state().is_open());
+        h.close_session(claim);
+        h.shutdown();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn retargeting_a_closed_capture_opens_nothing_until_it_is_claimed() {
+        let (h, join, opened_on) = spawn_fake();
+        h.retarget(Some("USB mic".into()));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            opened_on.lock().unwrap().is_empty(),
+            "the privacy of a closed mic"
+        );
+        h.open();
+        assert!(h.wait_for(|s| s.is_open(), std::time::Duration::from_secs(2)));
+        assert_eq!(*opened_on.lock().unwrap(), [Some("USB mic".to_string())]);
+        h.shutdown();
+        join.join().unwrap();
+    }
+
+    /// A device lost mid-capture reports `Failed`; pointing the owner at a working one recovers.
+    #[test]
+    fn a_lost_device_is_reopened_by_a_retarget_even_to_the_same_name() {
+        let (h, join, opened_on) = spawn_fake();
+        h.open();
+        assert!(h.wait_for(|s| s.is_open(), std::time::Duration::from_secs(2)));
+        h.shared()
+            .set_state(MicState::Failed("input device lost".into()));
+        h.retarget(None);
+        assert!(h.wait_for(|s| s.is_open(), std::time::Duration::from_secs(2)));
+        assert_eq!(opened_on.lock().unwrap().len(), 2);
+        h.shutdown();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn reopen_restarts_a_wanted_capture_and_leaves_a_closed_one_closed() {
+        let (h, join, opened_on) = spawn_fake();
+        h.reopen();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            opened_on.lock().unwrap().is_empty(),
+            "nobody wanted the mic"
+        );
+        h.open();
+        assert!(h.wait_for(|s| s.is_open(), std::time::Duration::from_secs(2)));
+        h.reopen();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while opened_on.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(opened_on.lock().unwrap().len(), 2);
+        h.shutdown();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn an_exclusive_job_sees_the_open_device_and_runs_between_commands() {
+        let (h, join, _) = spawn_fake();
+        assert_eq!(
+            h.run_exclusive(std::time::Duration::from_secs(2), |v| v.open_device.clone()),
+            Some(None),
+            "nothing is open yet"
+        );
+        h.retarget(Some("USB mic".into()));
+        h.open();
+        assert!(h.wait_for(|s| s.is_open(), std::time::Duration::from_secs(2)));
+        let seen = h.run_exclusive(std::time::Duration::from_secs(2), |v| {
+            (v.open_device.clone(), v.shared.recent(3))
+        });
+        assert_eq!(
+            seen,
+            Some((Some("USB mic".to_string()), vec![0.1, 0.2, 0.3]))
+        );
+        h.shutdown();
+        join.join().unwrap();
+    }
+
+    /// A claim sent while a probe runs waits for it: the owner never opens beside a probe.
+    #[test]
+    fn a_claim_during_an_exclusive_job_waits_for_it_to_finish() {
+        let (h, join, opened_on) = spawn_fake();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let prober = h.clone();
+        let job = std::thread::spawn(move || {
+            prober.run_exclusive(std::time::Duration::from_secs(5), move |v| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                v.open_device.clone()
+            })
+        });
+        started_rx.recv().unwrap();
+        let claim = h.open_session();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(
+            opened_on.lock().unwrap().is_empty(),
+            "the owner opened the device while a probe held it"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(job.join().unwrap(), Some(None));
+        assert!(h.wait_for(|s| s.is_open(), std::time::Duration::from_secs(2)));
+        h.close_session(claim);
+        h.shutdown();
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn an_exclusive_job_on_a_dead_owner_answers_none_instead_of_hanging() {
+        let (h, join, _) = spawn_fake();
+        h.shutdown();
+        join.join().unwrap();
+        assert_eq!(
+            h.run_exclusive(std::time::Duration::from_millis(200), |_| 1),
+            None
+        );
     }
 }

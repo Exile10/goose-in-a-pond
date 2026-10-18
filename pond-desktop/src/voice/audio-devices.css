@@ -1,0 +1,153 @@
+/* ────────────────────────────────────────────────────────────
+   Microphone and speaker in use, and why.
+
+   Chrome, not content (DESIGN.md §3): a hairline and no offset. The sentence
+   carries the state. A problem is marked by its icon and its words, never by a
+   hue, so it reads the same on a dim panel and to a screen reader.
+   ──────────────────────────────────────────────────────────── */
+
+.adev {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.adev__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.adev__row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--grey-200, #e8e4ee);
+}
+
+.adev__row:last-child {
+  border-bottom: 0;
+}
+
+.adev__icon {
+  flex: 0 0 auto;
+  color: var(--color-text-secondary, #566178);
+}
+
+.adev__text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 18rem;
+}
+
+.adev__title {
+  font: 700 14px var(--font-body, Quicksand, sans-serif);
+  color: var(--color-text, #171616);
+}
+
+/* Slate on Jarida White, 5.97:1; a problem steps up to charcoal, 17.35:1, rather than to a hue. */
+.adev__line {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--color-text-secondary, #566178);
+  max-width: 64ch;
+}
+
+.adev__line[data-problem] {
+  color: var(--color-text, #171616);
+  font-weight: 600;
+}
+
+.adev__select {
+  flex: 0 1 260px;
+  min-width: 180px;
+  height: 36px;
+  border: 1px solid var(--color-border, #e2e8f0);
+  border-radius: 8px;
+  padding: 0 10px;
+  font: 13px var(--font-body, Quicksand, sans-serif);
+  color: var(--color-text, #171616);
+  background: var(--color-surface, #fff);
+}
+
+.adev__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 8px;
+}
+
+.adev__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--color-border, #e2e8f0);
+  border-radius: 9px;
+  background: var(--color-surface, #fff);
+  color: var(--color-text, #171616);
+  font: 700 13px var(--font-body, Quicksand, sans-serif);
+  cursor: pointer;
+}
+
+.adev__btn:hover:not(:disabled) {
+  background: var(--color-accent-subtle, #f4ecff);
+}
+
+.adev__btn:focus-visible,
+.adev__select:focus-visible {
+  outline: 2px solid var(--color-accent, #8c4bff);
+  outline-offset: 2px;
+}
+
+.adev__btn:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.adev__when,
+.adev__error {
+  font-size: 12.5px;
+  color: var(--color-text-secondary, #566178);
+}
+
+.adev__error {
+  margin: 0;
+  color: var(--color-text, #171616);
+}
+
+.adev__spin {
+  animation: adev-spin 1s linear infinite;
+}
+
+@keyframes adev-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .adev__spin {
+    animation: none;
+  }
+}
+
+/* The hub is read from across a room and driven by a finger: every target clears 44px. */
+.adev--hub .adev__btn,
+.adev--hub .adev__select {
+  min-height: 44px;
+  height: auto;
+  font-size: 14px;
+}
+
+.adev--hub .adev__line {
+  font-size: 14px;
+}

@@ -11427,6 +11427,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond-adapters-audio-devices"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "libc",
+ "pond-audio",
+ "pond-audio-out",
+ "pond-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "pond-adapters-caldav"
 version = "0.1.0"
 dependencies = [
@@ -11516,7 +11531,6 @@ dependencies = [
  "pond-audio-out",
  "pond-core",
  "pond-voice",
- "rodio",
  "serde_json",
  "tempfile",
  "tokio",
@@ -11759,6 +11773,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "pond-audio",
+ "pond-audio-out",
  "pond-core",
  "pond-voice",
  "rodio",
@@ -12098,6 +12113,7 @@ dependencies = [
  "hostname",
  "indoc",
  "libc",
+ "pond-adapters-audio-devices",
  "pond-adapters-caldav",
  "pond-adapters-face-onnx",
  "pond-adapters-goose",

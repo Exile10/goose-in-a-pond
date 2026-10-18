@@ -1,4 +1,5 @@
 pub mod acceleration;
+pub mod audio_device;
 pub mod conversation_model;
 pub mod curated;
 pub mod device_budget;

@@ -28,8 +28,8 @@ fn play_wake_ping(quiet: Option<Arc<pond_core::models::services::voice::quiet::Q
             quiet.until_quiet_blocking(PING_WAITS_AT_MOST);
             hold
         });
-        use rodio::{OutputStream, Sink};
-        let Ok((_stream, handle)) = OutputStream::try_default() else {
+        use rodio::Sink;
+        let Ok((_stream, handle, _)) = pond_audio_out::route::open_routed() else {
             return;
         };
         let Ok(sink) = Sink::try_new(&handle) else {
