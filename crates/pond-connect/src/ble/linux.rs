@@ -25,6 +25,7 @@ use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, StreamExt};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use super::peripheral::{Advertisement, BleError, BlePeripheral, PeripheralStatus};
 use super::{RX_CHARACTERISTIC_UUID, SERVICE_UUID, TX_CHARACTERISTIC_UUID};
@@ -33,6 +34,13 @@ use router::{Notifier, NotifierStopped, Radio, Refusal, Router};
 
 /// How often the peripheral checks that bluetoothd still holds its registration.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+/// Refused advertisements in a row before the adapter is power-cycled. On the Jetson a controller
+/// stuck answering `Busy` reached D-Bus only as "Failed to register advertisement", and only a
+/// power cycle cleared it.
+const REFUSALS_BEFORE_RESET: u32 = 3;
+/// A controller that a power cycle does not cure is left alone this long before the next one.
+const RESET_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+const RESET_OFF_TIME: Duration = Duration::from_secs(2);
 const BLUEZ_BUS_NAME: &str = "org.bluez";
 const SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
 
@@ -70,6 +78,9 @@ struct Control {
     /// The adapter is powered on at most once per process, so a deliberate power-off (Matter's
     /// raw-HCI commissioning takes the adapter down) is never fought.
     power_attempted: bool,
+    /// Advertisements BlueZ refused since the last one it took.
+    refusals: u32,
+    last_reset: Option<Instant>,
     supervisor: Option<JoinHandle<()>>,
 }
 
@@ -125,6 +136,7 @@ impl BlePeripheral for BluezPeripheral {
             None if wanted.is_none() => Ok(()),
             None => Err(BleError::Unavailable(reason)),
         };
+        after_advertising(&mut control, &result).await;
         self.shared.publish(&control);
         result
     }
@@ -176,10 +188,15 @@ impl SharedState {
         match bring_up(&mut control).await {
             Ok(()) => {
                 let Control { live, wanted, .. } = &mut *control;
-                if let Some(live) = live {
-                    if let Err(error) = sync_advertising(live, wanted.as_ref()).await {
+                let restored = match live {
+                    Some(live) => Some(sync_advertising(live, wanted.as_ref()).await),
+                    None => None,
+                };
+                if let Some(result) = restored {
+                    if let Err(error) = &result {
                         tracing::warn!(%error, "could not restore the setup channel's advertisement");
                     }
+                    after_advertising(&mut control, &result).await;
                 }
             }
             Err(reason) => control.reason = Some(reason),
@@ -378,6 +395,75 @@ fn le_advertisement(advertisement: &Advertisement) -> LeAdvertisement {
         local_name: Some(advertisement.local_name()),
         ..Default::default()
     }
+}
+
+/// Counts refusals, and power-cycles the adapter once they persist. The next health check then
+/// registers everything again.
+async fn after_advertising(control: &mut Control, result: &Result<(), BleError>) {
+    match result {
+        Ok(()) => control.refusals = 0,
+        Err(BleError::Unavailable(_)) => {}
+        Err(BleError::Failed(_)) => {
+            control.refusals += 1;
+            if !reset_due(control.refusals, control.last_reset, Instant::now()) {
+                return;
+            }
+            let Some(live) = &control.live else {
+                return;
+            };
+            match adapter_is_idle(&live.adapter).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!("the adapter is in use; not power-cycling it");
+                    return;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "could not tell whether the adapter is in use");
+                    return;
+                }
+            }
+            let refusals = std::mem::take(&mut control.refusals);
+            control.last_reset = Some(Instant::now());
+            tracing::warn!(
+                kind = "ble_adapter_reset",
+                refusals,
+                "BlueZ kept refusing the setup channel's advertisement; power-cycling the Bluetooth adapter"
+            );
+            let cycled = power_cycle(&live.adapter).await;
+            if let Some(live) = control.live.take() {
+                live.router.shutdown();
+            }
+            control.reason = Some(match cycled {
+                Ok(()) => "power-cycled the Bluetooth adapter after it kept refusing to advertise; registering again".to_string(),
+                Err(error) => format!("power-cycling the Bluetooth adapter failed: {error}"),
+            });
+        }
+    }
+}
+
+fn reset_due(refusals: u32, last_reset: Option<Instant>, now: Instant) -> bool {
+    refusals >= REFUSALS_BEFORE_RESET
+        && last_reset.is_none_or(|at| now.duration_since(at) >= RESET_COOLDOWN)
+}
+
+/// Powered, with no device connected and nothing else advertising: a power cycle would cut
+/// nobody off, and an adapter Matter has taken down is never powered off here.
+async fn adapter_is_idle(adapter: &Adapter) -> bluer::Result<bool> {
+    if !adapter.is_powered().await? || adapter.active_advertising_instances().await? > 0 {
+        return Ok(false);
+    }
+    for address in adapter.device_addresses().await? {
+        if adapter.device(address)?.is_connected().await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn power_cycle(adapter: &Adapter) -> bluer::Result<()> {
+    adapter.set_powered(false).await?;
+    tokio::time::sleep(RESET_OFF_TIME).await;
+    adapter.set_powered(true).await
 }
 
 /// Re-registers only when what is wanted changed, so the server's periodic call costs nothing.
@@ -584,6 +670,21 @@ mod tests {
             "if the name ever fits beside the UUID, the spec can say so"
         );
         assert!(2 + name.len() <= LEGACY_PDU_LEN);
+    }
+
+    #[test]
+    fn the_adapter_is_reset_after_three_refusals_and_then_not_for_half_an_hour() {
+        let now = Instant::now();
+        assert!(!reset_due(REFUSALS_BEFORE_RESET - 1, None, now));
+        assert!(reset_due(REFUSALS_BEFORE_RESET, None, now));
+        let recent = Some(now);
+        let later = now + RESET_COOLDOWN;
+        assert!(!reset_due(
+            REFUSALS_BEFORE_RESET,
+            recent,
+            now + RESET_COOLDOWN / 2
+        ));
+        assert!(reset_due(REFUSALS_BEFORE_RESET, recent, later));
     }
 
     #[test]
