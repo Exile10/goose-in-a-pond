@@ -3614,3 +3614,27 @@ mDNSResponder on macOS (touches PAI-2's LAN surface; not a PAI milestone).**
 - **Not changed, and worth deciding.** `DELETE /devices/{id}` still lets any paired device remove
   any other, by design (`removing_a_device_queues_its_remote_revocation_first` removes a phone with
   another device's token). Removal revokes the phone's sessions, so this is the stronger power.
+
+**2026-10-16 — Gemma 4 E4B decodes at 25 tok/s on the Orin, 32 with MTP (inference speed; not a
+PAI milestone).**
+
+- **What landed.** llama-cpp-rs-giap `8ac8291` (on `5324a2e`), pinned here. The batch-1 quantized
+  mat-vec on the Orin read weights at about 52 GB/s, against about 82 GB/s for a plain streaming
+  kernel on the same board: four warps shared each 2,560-wide row and nothing reused the
+  activations across rows. Orin (cc 8.7) now has its own MMVQ row: 4 rows per block, 2 warps up to
+  batch 3 and 1 warp from 4 to 8. The fused gate/up kernel is skipped there for quantized weights,
+  since two tuned mat-vecs plus the GLU are faster. Rows past the end of a matrix are clamped once
+  before the K loop; a guard inside the loop (the first version) made every load conditional and
+  cost 21% of decode and 63% of verify speed.
+- **Invariants.** No `Settings` field, migration, egress or profile path. Other GPUs keep upstream's
+  parameters: the row is chosen only when the device's highest compiled arch is 8.7. Desktops
+  (Metal) are untouched.
+- **Verified on the Orin** (llama-bench, E4B QAT Q4_0, f16 KV, flash attention, MAXN_SUPER):
+  decode 19.9 -> 28.4 tok/s at depth 0 and 19.2 -> 26.6 at 4,096; batches of 2/5/8 at depth 2,048
+  35/73/83 -> 44/93/116. `test-backend-ops` MUL_MAT 1187/1187 and MUL_MAT_ID 869/869 against the
+  CPU. llama-server with the E4B drafter: 27.9-34.9 -> 35.8-41.0 tok/s at the same acceptance.
+- **Verified on the Orin, in the pond** (scratch pond, E4B QAT at 16K, ten turns of 45-303 tokens
+  over 4,000-6,700-token prompts, `.ai/experiments/orin-tg26-2026-10-16/drive_decode.py`). Plain
+  decode median 18.2 -> 25.1 tok/s; with `mtp-gemma-4-E4B-it` attached 22.1 -> 32.0 (23.8-45.7).
+  First token 0.42-0.54 s. Lowest available memory 3,376 MB plain and 3,185 MB with the drafter.
+  The household pond was not changed: it still runs LiteRT E4B (12-14 tok/s at 8K).
