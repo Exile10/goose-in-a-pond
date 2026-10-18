@@ -30,11 +30,18 @@ fn play(speaker: &str) -> Result<(), String> {
     if let Ok(player) = std::env::var("GIAP_TEST_PLAYER") {
         return tests::play_with(&player, speaker);
     }
+    #[cfg(test)]
+    let volume = std::env::var("GIAP_TEST_GAIN")
+        .ok()
+        .and_then(|g| g.parse().ok())
+        .unwrap_or(1.0);
+    #[cfg(not(test))]
+    let volume = 1.0;
     pond_audio_out::route::play_samples_exactly(
         Some(speaker),
         tone::tone_samples(TONE_RATE),
         TONE_RATE,
-        1.0,
+        volume,
     )
     .map_err(|e| e.to_string())
 }
