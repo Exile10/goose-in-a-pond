@@ -225,6 +225,8 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::POST, "/voice/sample", Exposure::Authenticated),
     // Discovery needs system info before pairing; transcription and diagnostics stay protected.
     (Method::GET, "/system/info", Exposure::Always),
+    // Names the radios and why they are off; nothing a stranger in range should read.
+    (Method::GET, "/network/status", Exposure::Authenticated),
     (Method::GET, "/test", Exposure::HostOnly),
     // Speaks on the host's speaker; the handler also asks for the host credential.
     (Method::POST, "/test/speak", Exposure::HostOnly),
@@ -253,6 +255,24 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (
         Method::POST,
         "/models/{category}/{name}/activate",
+        Exposure::Authenticated,
+    ),
+    // A paired phone's own device during owner setup: each handler admits only the caller's own
+    // device. Heartbeat is not here: it names any device id it is given.
+    (Method::GET, "/devices/self", Exposure::Authenticated),
+    (
+        Method::POST,
+        "/devices/{id}/push-token",
+        Exposure::Authenticated,
+    ),
+    (
+        Method::DELETE,
+        "/devices/{id}/push-token",
+        Exposure::Authenticated,
+    ),
+    (
+        Method::GET,
+        "/notifications/stream",
         Exposure::Authenticated,
     ),
     // Protected-router routes guarded by other means: the redirect target, by its PKCE nonce...
@@ -992,10 +1012,16 @@ mod tests {
         state_dependent.sort();
 
         let expected = vec![
+            // A phone's own device during owner setup; each handler admits only that device.
+            "DELETE /devices/{id}/push-token = Authenticated".to_string(),
             "DELETE /voice/calibrate = UntilOnboarded".to_string(),
+            "GET /devices/self = Authenticated".to_string(),
             // Choosing the chat model completion requires, before onboarding (#365); token only.
             "GET /models = Authenticated".to_string(),
             "GET /models/download/progress = Authenticated".to_string(),
+            // The setup radios and why each is off; a token in every state, never tokenless.
+            "GET /network/status = Authenticated".to_string(),
+            "GET /notifications/stream = Authenticated".to_string(),
             "GET /player/status = HostOnly".to_string(),
             // The wizard resumes from what it saved; the PUT's answer already shows its caller this.
             "GET /settings = Authenticated".to_string(),
@@ -1003,6 +1029,7 @@ mod tests {
             "GET /test = HostOnly".to_string(),
             "GET /warmup = UntilOnboarded".to_string(),
             "PATCH /profiles/{id} = UntilOnboarded".to_string(),
+            "POST /devices/{id}/push-token = Authenticated".to_string(),
             // The music player bridge and extension egress: the handlers check the internal
             // token; HostOnly because no legitimate caller is off the host.
             "POST /extension/egress = HostOnly".to_string(),

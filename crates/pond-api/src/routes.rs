@@ -143,6 +143,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/voice/calibrate", post(calibrate_wake_word))
         .route("/voice/calibrate", delete(reset_wake_word_calibration))
         .route("/system/info", get(system_info))
+        // The setup channel's radios: a token in every state, so the wizard can show them.
+        .route("/network/status", get(crate::network::network_status))
         // Local diagnostics; network peers must authenticate, and speaking needs the credential.
         .route("/test", get(test_services))
         .route("/test/speak", post(test_speak))
@@ -153,6 +155,15 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // it before onboarding (#365). A token in every state (PUBLIC_ROUTES).
         .route("/models", get(list_models))
         .route("/models/download/progress", get(get_download_progress))
+        // A paired phone's own device from its first minute, owner setup included: who it
+        // belongs to, its push token, its notification stream. Each handler admits only the
+        // caller's own device, and a token in every state (PUBLIC_ROUTES).
+        .route("/devices/self", get(device_self))
+        .route(
+            "/devices/{id}/push-token",
+            post(register_push_token).delete(delete_push_token),
+        )
+        .route("/notifications/stream", get(notifications_stream))
         .route("/models/download/control", post(download_control))
         .route("/models/{category}/{name}/download", post(download_model))
         .route("/models/{category}/{name}/activate", post(activate_model));
@@ -203,7 +214,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/commission", post(commission_device))
-        .route("/devices/self", get(device_self))
         .route("/matter/status", get(matter_status))
         .route(
             "/devices/{id}",
@@ -211,10 +221,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
         .route("/devices/{id}/offline", post(device_offline))
-        .route(
-            "/devices/{id}/push-token",
-            post(register_push_token).delete(delete_push_token),
-        )
         // Private mesh: trust-circle peers + self invite.
         .route("/mesh/peers", get(list_mesh_peers).post(add_mesh_peer))
         .route(
@@ -302,8 +308,6 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/context/index/health", get(context_index_health))
         .route("/context/index/rebuild", post(rebuild_context_index))
         .route("/proposals/{id}/decide", post(decide_proposal))
-        // Foreground push: per-device notification stream.
-        .route("/notifications/stream", get(notifications_stream))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
         .route(
             "/extensions",
@@ -654,7 +658,8 @@ pub(crate) fn too_many_requests(code: &str, retry_after_secs: u64) -> axum::resp
 fn cpace_method(credential: Option<Credential>) -> &'static str {
     match credential {
         Some(Credential::Setup) => "cpace-setup",
-        _ => "cpace",
+        Some(Credential::Device) => "cpace-device",
+        Some(Credential::Pairing) | None => "cpace",
     }
 }
 
@@ -911,8 +916,8 @@ async fn handshake_verify(
 }
 
 /// CPace phase 1 (public, direct LAN peers): commit to the current pairing code, or to the
-/// printed setup code when `credential` is `"setup"`, and answer with the Pond's share. See
-/// `pond_core::security::ports::handshake`.
+/// printed setup code when `credential` is `"setup"`, and answer with the Pond's share; the
+/// adapter refuses `"device"` here. See `pond_core::security::ports::handshake`.
 async fn handshake_pake_init(
     State(state): State<Arc<AppState>>,
     peer: Result<
@@ -949,9 +954,10 @@ async fn handshake_pake_init(
         PakeRefusal::NoActivePairingCode | PakeRefusal::SetupCodeUnavailable => {
             StatusCode::CONFLICT
         }
-        PakeRefusal::InvalidClientNonce => StatusCode::BAD_REQUEST,
+        PakeRefusal::InvalidClientNonce | PakeRefusal::InvalidCredential => StatusCode::BAD_REQUEST,
         PakeRefusal::Busy => StatusCode::SERVICE_UNAVAILABLE,
-        PakeRefusal::SetupCodeCooling { retry_after } => {
+        PakeRefusal::SetupCodeCooling { retry_after }
+        | PakeRefusal::DeviceCooling { retry_after } => {
             return Err(too_many_requests(
                 refusal.code(),
                 retry_after.as_secs_ceil(),
