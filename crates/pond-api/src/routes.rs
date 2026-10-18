@@ -171,6 +171,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     // ───────────── Protected routes (require onboarding) ─────────────
     let protected_routes = Router::new()
         .route("/transcribe", post(transcribe))
+        // Which microphone and speaker are in use and why; a test opens real devices.
+        .route("/audio/devices", get(crate::audio_devices::status))
+        .route("/audio/devices/test", post(crate::audio_devices::test))
         .route("/dev/goose", get(goose_status))
         .route("/chat", post(chat))
         .route("/chat/runs/{run_id}/events", get(reattach_run_events))
@@ -5298,6 +5301,14 @@ async fn update_settings(
 
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
+
+    // A new pin, or the mic switched, takes effect now rather than at the next device change.
+    if current.audio_input_device != merged.audio_input_device
+        || current.audio_output_device != merged.audio_output_device
+        || current.mic_enabled != merged.mic_enabled
+    {
+        crate::audio_devices::reselect_in_background();
+    }
 
     // Unconditional: it's cheap, and a skipped re-install would silently drop the restriction.
     pond_core::shared::services::egress::set_network_mode(

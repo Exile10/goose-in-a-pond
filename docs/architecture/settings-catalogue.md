@@ -209,6 +209,14 @@ client reads it, the server never does · `NONE` = nothing reads it anywhere.
 | `voice_tts_voice` | `""` | LIVE | S, H:Voice, O |
 | `active_tts_model` | `""` | LIVE | S |
 | `voice_max_turns` | `8` | LIVE | **API** |
+| `audio_input_device` | `""` | LIVE | S, H:Voice |
+| `audio_output_device` | `""` | LIVE | S, H:Voice |
+| `audio_test_chime` | `false` | LIVE | S, H:Voice |
+
+The three `audio_*` rows are pins and an opt-in, not the device choice itself. An empty pin means
+automatic: the pond tests the system default and moves to another device that works when it does
+not, or when a device comes or goes (`pond-adapters-audio-devices`). What is in use, and why, is
+`GET /api/v1/audio/devices`; both settings surfaces show it beside the pickers.
 
 `voice_kws_whisper_url` (was `null`, **NONE**) was removed on 2026-10-15: nothing read it once
 wake-word detection moved in process. `voice_recording_duration_secs` is read only by the browser

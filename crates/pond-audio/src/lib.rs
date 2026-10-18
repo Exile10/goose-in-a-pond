@@ -8,5 +8,8 @@ pub mod testing;
 
 pub use cpal_device::{input_device_names, CpalCapture};
 pub use energy::MicEnergy;
-pub use owner::{spawn, CaptureDevice, MicCommand, MicHandle, MicReader, MicShared, MicState};
+pub use owner::{
+    spawn, CaptureDevice, ExclusiveJob, MicCommand, MicHandle, MicReader, MicShared, MicState,
+    OwnerView,
+};
 pub use ring::{Ring, CAPTURE_RATE_HZ};

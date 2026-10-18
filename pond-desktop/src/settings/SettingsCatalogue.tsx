@@ -10,7 +10,10 @@ import {
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { BackgroundJobs } from "./BackgroundJobs";
+import { AudioDevicesPanel } from "../voice/AudioDevicesPanel";
+import { deviceOptions, isAudioStatus } from "../voice/audioDevices";
 import type {
+  AudioDeviceStatus,
   ModelEntry,
   Settings,
   ZoneChoice,
@@ -60,7 +63,7 @@ function Mark({ consumer }: { consumer: Consumer }) {
 /** Registry filters per picker, by `provider` (the Models page's equivalent is `rolesFor`). The
  *  chat picker offers only what can hold a conversation: a helper is never one. */
 const PROVIDERS: Record<
-  Exclude<OptionSource, "llm-providers" | "time-zones">,
+  Exclude<OptionSource, "llm-providers" | "time-zones" | AudioSource>,
   (m: ModelEntry) => boolean
 > = {
   "llm-models": (m) => ["gguf", "llamafile", "ollama"].includes(m.provider),
@@ -78,6 +81,18 @@ const PROVIDERS: Record<
 interface Option {
   value: string;
   label: string;
+}
+
+type AudioSource = "audio-inputs" | "audio-outputs";
+
+function isAudioSource(source: OptionSource): source is AudioSource {
+  return source === "audio-inputs" || source === "audio-outputs";
+}
+
+/** The devices the last test saw. "Automatic" is the picker's own empty row, so it is dropped. */
+function audioOptions(status: AudioDeviceStatus, source: AudioSource): Option[] {
+  const choice = source === "audio-inputs" ? status.input : status.output;
+  return deviceOptions(choice, "").filter((o) => o.value !== "");
 }
 
 /** A stored value as its picker shows it: the server reads a provider of `gguf`, which this page
@@ -126,6 +141,8 @@ function optionsFor(
   zones: ZoneChoice[],
   meshEnabled?: boolean,
 ): Option[] {
+  // Devices come from the pond's last test, not the registry; the call site reads them.
+  if (isAudioSource(source)) return [];
   if (source === "time-zones") {
     // "Africa/Nairobi — Nairobi (+03:00)"; today's offset tells similar-named zones apart.
     return zones.map((z) => ({
@@ -365,7 +382,8 @@ function EntryRow({
                     (o) => o.value === shownValue(control.source, String(value)),
                   ) && (
                     <option value={String(value)}>
-                      {String(value)} — not installed
+                      {String(value)} —{" "}
+                      {isAudioSource(control.source) ? "not connected" : "not installed"}
                     </option>
                   )}
                 {options.map((o) => (
@@ -435,6 +453,7 @@ export function SettingsCatalogueView({
   const [baseline, setBaseline] = useState<Partial<Settings>>({});
   const [models, setModels] = useState<ModelEntry[] | null>(null);
   const [zones, setZones] = useState<ZoneChoice[]>([]);
+  const [audio, setAudio] = useState<AudioDeviceStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -524,6 +543,15 @@ export function SettingsCatalogueView({
     allZones()
       .then((z) => !cancelled && setZones(z))
       .catch(() => {});
+    // The device pickers list what the pond last saw; without it they fall back to text.
+    void (async () => {
+      try {
+        const a = await api.getAudioDevices();
+        if (!cancelled && isAudioStatus(a)) setAudio(a);
+      } catch {
+        // Text boxes, as for an unreachable registry.
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -1140,6 +1168,17 @@ export function SettingsCatalogueView({
                   visibility gate for free: selecting another category or typing
                   in the box unmounts the component and stops the interval,
                   with no `visibilitychange` plumbing needed on this surface. */}
+                {/* What is in use now, beside the pickers that change it. Like the
+                  watcher below, a panel rather than an entry: it is not a field. */}
+                {!searching && category.id === "voice" && (
+                  <section className="scat__group">
+                    <div className="scat__groupHead">
+                      <h3>In use now</h3>
+                    </div>
+                    <AudioDevicesPanel variant="catalogue" onStatus={setAudio} />
+                  </section>
+                )}
+
                 {!searching && category.id === "automation" && (
                   <section className="scat__group">
                     <div className="scat__groupHead">
@@ -1180,7 +1219,11 @@ export function SettingsCatalogueView({
                           error={errors[e.key] ?? null}
                           options={
                             e.control.kind === "lookup"
-                              ? // Zones come from their own call, so they must not wait on `models`.
+                              ? isAudioSource(e.control.source)
+                                ? audio
+                                  ? audioOptions(audio, e.control.source)
+                                  : null
+                                : // Zones come from their own call, so they must not wait on `models`.
                                 e.control.source === "time-zones"
                                 ? zones.length
                                   ? optionsFor(e.control.source, [], zones)

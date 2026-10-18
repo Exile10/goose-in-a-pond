@@ -8,6 +8,8 @@ members = [
     "crates/pond-audio",
     # Speaker-side counterpart: playback, output device, working tone (rodio).
     "crates/pond-audio-out",
+    # Finds, tests and watches the microphones and speakers; picks the ones in use.
+    "crates/pond-adapters-audio-devices",
     # The ear: wake word, Voice Match, endpointing and echo cancellation. Std only, no crates.
     "crates/pond-ear",
     "crates/pond-core",

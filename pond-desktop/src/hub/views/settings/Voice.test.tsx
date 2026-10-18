@@ -8,6 +8,8 @@ vi.mock("../../../api/PondApiClient", () => ({
     listModels: vi.fn(),
     synthesizeSpeech: vi.fn(),
     resetWakeWordCalibration: vi.fn().mockResolvedValue(undefined),
+    getAudioDevices: vi.fn().mockRejectedValue(new Error("not under test here")),
+    testAudioDevices: vi.fn(),
   },
 }));
 
