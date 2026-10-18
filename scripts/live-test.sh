@@ -340,7 +340,7 @@ if [ "$AUTH_OK" -eq 1 ]; then
   fi
   curl -s -o /dev/null -X POST "http://127.0.0.1:$AUTH_PORT/api/v1/onboard/complete"
 
-  for route in /settings /profiles /sessions /devices /memory /web-search; do
+  for route in /settings /profiles /sessions /devices /memory /web-search /audio/devices; do
     code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$AUTH_PORT/api/v1$route")
     case "$code" in
       401) printf '  PASS  GET %-10s requires a token\n' "$route" ;;
