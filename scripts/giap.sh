@@ -134,6 +134,7 @@ D_BIN_REL=""; D_BIN_REL_WHEN=""; D_BIN_DBG=""; D_STAMP=""; D_DESKTOP=""
 D_SVC_SCOPE=""; D_SVC_ACTIVE=""; D_SVC_ENABLED=""; D_LINGER=""; D_SVC_SYS_STATE=""
 D_DATA_DIR=""; D_PORT=""; D_HEALTH=""; D_PROCS=0
 D_RAM_TOTAL=""; D_RAM_AVAIL=""; D_DISK_FREE=""; D_TGT_DBG=""; D_TGT_REL=""
+BUILD_MIN_AVAIL_MB=3000
 D_PWR=""; D_OC=""; D_DISPLAY=""; D_SUDO=""
 D_ENGINE=""
 D_LITERT_MAC=""; D_LITERT_MAC_TAG=""; D_LITERT_MAC_DIR=""; D_LITERT_LNX=""; D_LITERT_LNX_TAG=""; D_LITERT_LNX_DIR=""
@@ -1004,6 +1005,11 @@ action_build_ui() {
       return 1
     fi
   fi
+  # A checkout that pulled a new lockfile would otherwise build against the old packages.
+  if [ ! -d pond-desktop/node_modules ] || [ pond-desktop/package-lock.json -nt pond-desktop/node_modules/.package-lock.json ]; then
+    info "the UI's packages are missing or older than package-lock.json: installing them"
+    ( cd pond-desktop && run npm ci --no-audit --no-fund ) || { bad "npm ci failed"; return 1; }
+  fi
   ( cd pond-desktop && run npm run build ) || { bad "UI build failed"; return 1; }
   # cargo's rerun-if-changed on dist is mtime-based; make sure it fires.
   run_sh "find pond-desktop/dist -exec touch {} +"
@@ -1022,12 +1028,12 @@ action_build_server() {
       warn "CUDA is '$D_CUDA_STATE' on this Jetson — the build would be CPU-only."
       confirm "Continue anyway?" || return 1
     fi
-    if [ "$D_SVC_ACTIVE" = "active" ]; then
-      warn "the service is running and holding a model; the release link may be OOM-killed."
-      if confirm "Stop the service for the build and restart it after?"; then
-        run systemctl --user stop "$SERVICE_NAME"
-        RESTART_SVC_AFTER=true
-      fi
+    # The deploy's rule: below 3 GB available the release link is OOM-killed beside a loaded model.
+    detect_resources
+    if [ "$D_SVC_ACTIVE" = "active" ] && [ "${D_RAM_AVAIL:-0}" -lt "$BUILD_MIN_AVAIL_MB" ]; then
+      info "${D_RAM_AVAIL:-?} MB available: stopping the pond for the build; it starts again after"
+      run systemctl --user stop "$SERVICE_NAME"
+      RESTART_SVC_AFTER=true
     fi
     info "This is the slow one — roughly 35 minutes from clean on an Orin Nano."
   fi
