@@ -1045,11 +1045,15 @@ action_build_server() {
     run_sh "SQLX_OFFLINE=true $cb build -p pond-server --release"
   fi
   local rc=$?
-  if [ $rc -eq 0 ]; then
+  # The remote-access helper is Go; a host without Go still gets a working pond, just without it.
+  if [ $rc -eq 0 ] && command -v go >/dev/null 2>&1; then
     run bash "$REPO_ROOT/scripts/build-network-helper.sh" "$REPO_ROOT/target/release"
     rc=$?
+  elif [ $rc -eq 0 ]; then
+    warn "no Go on this host: the remote-access helper (pondnet) was not built, so remote access stays off here"
+    note "install Go (go.mod pins the toolchain), then run this build again"
   fi
-  if [ $rc -eq 0 ]; then write_build_stamp; ok "server and network helper built"; else bad "build failed (exit $rc)"; fi
+  if [ $rc -eq 0 ]; then write_build_stamp; ok "pond-server built"; else bad "build failed (exit $rc)"; fi
   if [ "${RESTART_SVC_AFTER:-false}" = true ]; then
     run systemctl --user start "$SERVICE_NAME"; RESTART_SVC_AFTER=false
   fi
