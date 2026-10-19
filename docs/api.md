@@ -1885,19 +1885,32 @@ Deletes a user-defined template. Built-in templates (`is_system = true`) cannot 
 
 ## System Prompt Extras
 
-Per-key extra instructions injected via `agent.extend_system_prompt(key, instruction)` on every chat turn. Active extras are injected in `sort_order` ascending order.
+Short household notes added to the system prompt on every chat turn while `active`, in `sort_order`
+ascending order, then by `key`. Each reaches the model as
+`<extension-notes name="{key}">{instruction}</extension-notes>`, so the Pond checks every write and,
+at render time, escapes `&`, `<`, `>` and `"` and leaves out (with a `kind="prompt_extra_skipped"`
+warning) any stored row that breaks the rules below. Rows saved before these rules existed are
+treated the same way.
+
+| Limit | Value | Why |
+|---|---|---|
+| `key` | `^[a-z0-9_]{1,64}$` | It is the wrapper's `name` attribute; the GOTG app makes keys of this form. |
+| `instruction` | non-blank, at most 1,000 characters | About 250 tokens, a sixth of the Jetson's 1,500-token system-prompt budget. |
+| Active extras | at most 20 | Every one is re-read every turn. |
+| Active instructions combined | at most 4,000 characters | About 1,000 tokens, so the extras cannot crowd out the base prompt. |
+
+The constants live in `crates/pond-core/src/user_data/domain/prompt_extra.rs`.
 
 ### GET /agent/extras
 
-**Response 200** — array of extra objects:
+**Response 200** — array of extra objects, active and inactive:
 ```json
 [
   {
     "key": "safety",
     "instruction": "Never suggest actions that could cause physical harm.",
     "active": true,
-    "sort_order": 0,
-    "updated_at": "2026-04-09 10:00:00"
+    "sort_order": 0
   }
 ]
 ```
@@ -1906,7 +1919,9 @@ Per-key extra instructions injected via `agent.extend_system_prompt(key, instruc
 
 ### POST /agent/extras
 
-Creates or updates an extra. Identified by `key` — upsert semantics.
+Creates or updates an extra. Identified by `key` — upsert semantics. `active` defaults to `true`
+and `sort_order` to `0`. Replacing an extra does not count against the limits twice, and saving an
+inactive one never hits the active-set limits.
 
 **Request**
 ```json
@@ -1923,11 +1938,27 @@ Creates or updates an extra. Identified by `key` — upsert semantics.
 { "key": "language", "status": "ok" }
 ```
 
+**Errors** — `400` with `{ "error": "<sentence>", "code": "<code>" }`:
+
+| `code` | Meaning |
+|---|---|
+| `invalid_key` | The key is empty, longer than 64, or has a character outside `a-z`, `0-9`, `_`. |
+| `empty_instruction` | The instruction is empty or only whitespace. |
+| `instruction_too_long` | The instruction is over 1,000 characters. |
+| `too_many_extras` | Saving it active would make more than 20 active extras. |
+| `extras_too_long` | Saving it active would take the active instructions over 4,000 characters. |
+
+A malformed JSON body is also `400`, with an `error` and no `code`.
+
 ---
 
 ### DELETE /agent/extras/{key}
 
-**Response 204** — no body
+**Response 204** — no body. Deleting a well-formed key that does not exist is also `204`.
+
+**Response 400** `{ "code": "invalid_key" }` — the key is malformed and no stored row has it. A
+malformed key that a row saved before the key rules does carry is deleted, since that row is no
+longer rendered and this is the only way to clear it.
 
 ---
 
@@ -2019,7 +2050,7 @@ prunes it. Rewording clears the memory's embedding, which is rebuilt on the next
 
 ## Skills
 
-User-defined skills are markdown instruction blocks injected as `skill:<name>` system prompt extras on every turn when `active = true`.
+User-defined skills are markdown instruction blocks. Every turn, the name and description of each skill with `active = true` go into one `<extension-notes name="skills">` block; the content loads on demand through `giap-device__load_skill`. Skills are not prompt extras and do not count against the extras limits.
 
 ### GET /skills
 

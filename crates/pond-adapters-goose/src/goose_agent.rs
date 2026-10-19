@@ -24,6 +24,7 @@ use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::models::services::prompt_builder::build_prompt_partition;
 use pond_core::prompts::PromptState;
 use pond_core::user_data::domain::memory::{cosine_similarity, MemoryFragment};
+use pond_core::user_data::domain::prompt_extra::render_extension_notes;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
 use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
@@ -2622,14 +2623,9 @@ impl GooseAdapter {
         let mut shim_appendix: Vec<String> = Vec::new();
 
         // Outside prefix_hash by design; <extension-notes> sets it apart from core prompt sections.
+        // Checked and escaped again here: rows saved before the write rules may break them.
         if let Ok(extras) = extras_result {
-            for extra in extras {
-                let body = format!(
-                    "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
-                    extra.key, extra.instruction
-                );
-                shim_appendix.push(body);
-            }
+            shim_appendix.extend(render_extension_notes(&extras));
         }
 
         // Only name + description per turn; `giap-device__load_skill` fetches the rest on demand.

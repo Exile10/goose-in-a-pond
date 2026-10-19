@@ -61,7 +61,9 @@ use pond_core::models::domain::taxonomy::{
     is_companion_file, is_helper_architecture, ON_DISK_PLACEHOLDER,
 };
 use pond_core::user_data::domain::memory::MemoryFragment;
-use pond_core::user_data::domain::prompt_extra::PromptExtra;
+use pond_core::user_data::domain::prompt_extra::{
+    check_active_set, validate_key, PromptExtra, PromptExtraViolation,
+};
 use pond_core::user_data::domain::prompt_template::PromptTemplate;
 use pond_core::user_data::domain::recipe::AgentRecipe;
 use pond_core::user_data::domain::skill::UserSkill;
@@ -13061,19 +13063,78 @@ async fn upsert_prompt_extra(
         }
     };
     let extra = PromptExtra {
-        key: req.key.clone(),
+        key: req.key,
         instruction: req.instruction,
         active: req.active,
         sort_order: req.sort_order,
     };
-    match repo.upsert(&extra).await {
-        Ok(()) => Json(json!({"key": req.key, "status": "ok"})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    if let Err(violation) = extra.validate() {
+        return prompt_extra_refusal(&extra.key, Some(&extra.instruction), violation);
     }
+    let existing = match repo.list_all().await {
+        Ok(existing) => existing,
+        Err(e) => {
+            tracing::error!(
+                kind = "prompt_extra_save_failed",
+                key = %extra.key,
+                error = %e,
+                "could not read the stored prompt extras to check the limits"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(violation) = check_active_set(&existing, &extra) {
+        return prompt_extra_refusal(&extra.key, Some(&extra.instruction), violation);
+    }
+    match repo.upsert(&extra).await {
+        Ok(()) => {
+            tracing::info!(
+                kind = "prompt_extra_saved",
+                key = %extra.key,
+                active = extra.active,
+                instruction_chars = extra.instruction.chars().count(),
+                "saved a prompt extra"
+            );
+            Json(json!({"key": extra.key, "status": "ok"})).into_response()
+        }
+        Err(e) => {
+            tracing::error!(
+                kind = "prompt_extra_save_failed",
+                key = %extra.key,
+                error = %e,
+                "could not save a prompt extra"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// 400 for an extra that breaks a write rule; logs the reason and the size, never the text.
+fn prompt_extra_refusal(
+    key: &str,
+    instruction: Option<&str>,
+    violation: PromptExtraViolation,
+) -> axum::response::Response {
+    tracing::warn!(
+        kind = "prompt_extra_refused",
+        key = ?key,
+        reason = violation.code(),
+        instruction_chars = instruction.map(|text| text.chars().count()),
+        "refused a prompt extra"
+    );
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": violation.message(), "code": violation.code()})),
+    )
+        .into_response()
 }
 
 async fn delete_prompt_extra(
@@ -13090,13 +13151,46 @@ async fn delete_prompt_extra(
                 .into_response()
         }
     };
+    // A malformed key is refused unless a row saved before the key rules carries it: that row
+    // is no longer rendered, and deleting it is the only way to clear it from the list.
+    if validate_key(&key).is_err() {
+        let stored = match repo.list_all().await {
+            Ok(all) => all.iter().any(|e| e.key == key),
+            Err(e) => {
+                tracing::error!(
+                    kind = "prompt_extra_delete_failed",
+                    error = %e,
+                    "could not read the stored prompt extras"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        if !stored {
+            return prompt_extra_refusal(&key, None, PromptExtraViolation::InvalidKey);
+        }
+    }
     match repo.delete(&key).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(()) => {
+            tracing::info!(kind = "prompt_extra_deleted", key = ?key, "deleted a prompt extra");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            tracing::error!(
+                kind = "prompt_extra_delete_failed",
+                key = ?key,
+                error = %e,
+                "could not delete a prompt extra"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     }
 }
 
