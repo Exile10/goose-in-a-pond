@@ -182,3 +182,6 @@ features = [
     "Win32_Media_Multimedia",
     "Win32_UI_Shell_PropertiesSystem",
 ]
+
+# Keep this vendored crate outside the application workspace members.
+[workspace]

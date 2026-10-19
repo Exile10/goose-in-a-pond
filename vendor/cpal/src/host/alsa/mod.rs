@@ -247,12 +247,18 @@ impl Device {
         sample_format: SampleFormat,
         stream_type: alsa::Direction,
     ) -> Result<StreamInner, BuildStreamError> {
-        let handle_result = self
-            .handles
-            .lock()
-            .unwrap()
-            .take(&self.name, stream_type)
-            .map_err(|e| (e, e.errno()));
+        let handle_result = {
+            let mut handles = self.handles.lock().unwrap();
+            // Pond: listing opened both directions, and the one this stream leaves would stay
+            // open for as long as the device is kept. See POND-PATCH.md.
+            match stream_type {
+                alsa::Direction::Playback => handles.capture = None,
+                alsa::Direction::Capture => handles.playback = None,
+            }
+            handles
+                .take(&self.name, stream_type)
+                .map_err(|e| (e, e.errno()))
+        };
 
         let handle = match handle_result {
             Err((_, libc::EBUSY)) => return Err(BuildStreamError::DeviceNotAvailable),
