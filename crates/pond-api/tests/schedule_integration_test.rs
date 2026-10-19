@@ -5,7 +5,7 @@ use axum::http::{Request, StatusCode};
 use pond_api::{build_router, AppState};
 use pond_core::shared::mocks::mock_agent::MockAgent;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
-use pond_core::user_data::domain::schedule::{Schedule, ScheduleRun};
+use pond_core::user_data::domain::schedule::{OneShotTimePassed, Schedule, ScheduleRun};
 use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
@@ -135,12 +135,24 @@ impl SchedulerPort for InMemoryScheduler {
             .ok_or_else(|| anyhow::anyhow!("not found"))
     }
 
+    /// Mirrors the port contract: a paused one-shot whose time has passed is refused.
     async fn resume_task(&self, id: &str) -> anyhow::Result<()> {
         let mut guard = self.tasks.lock().await;
-        guard
+        let task = guard
             .get_mut(id)
-            .map(|t| t.paused = false)
-            .ok_or_else(|| anyhow::anyhow!("not found"))
+            .ok_or_else(|| anyhow::anyhow!("not found"))?;
+        if let Some(at) = task
+            .fire_at
+            .filter(|at| task.paused && *at <= chrono::Utc::now())
+        {
+            return Err(OneShotTimePassed {
+                id: id.to_string(),
+                fire_at: at,
+            }
+            .into());
+        }
+        task.paused = false;
+        Ok(())
     }
 
     async fn run_now(&self, id: &str) -> anyhow::Result<()> {
@@ -167,6 +179,9 @@ impl SchedulerPort for InMemoryScheduler {
         }
         if let Some(kind) = req.kind {
             task.kind = kind;
+        }
+        if let Some(at) = req.fire_at {
+            task.fire_at = Some(at);
         }
         Ok(task.clone())
     }
@@ -527,6 +542,81 @@ async fn pause_and_resume_schedule() {
         .find(|t| t.get("id").and_then(|v| v.as_str()) == Some("pausable"))
         .expect("task not found after resume");
     assert_eq!(task2.get("paused").and_then(|v| v.as_bool()), Some(false));
+}
+
+/// Resuming a paused one-shot whose time passed is a 409 with a stable code, not the 404 a
+/// missing schedule gets: the schedule is there, and the answer says to edit its time.
+#[tokio::test]
+async fn resuming_a_one_shot_whose_time_passed_is_a_conflict_not_a_not_found() {
+    let (app, _tmp) = make_app().await;
+    app.clone()
+        .oneshot(auth_post(
+            "/api/v1/schedules",
+            serde_json::json!({
+                "id": "missed",
+                "name": "Water the plants",
+                "cron": "0 0 10 * * *",
+                "prompt": "water the plants"
+            }),
+        ))
+        .await
+        .unwrap();
+    let past = chrono::Utc::now() - chrono::Duration::hours(1);
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/schedules/missed")
+                .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "fire_at": past })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let pause = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/schedules/missed/pause",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(pause.status(), StatusCode::OK);
+
+    let resume = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/schedules/missed/resume",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resume.status(), StatusCode::CONFLICT);
+    let json = json_body(resume).await;
+    assert_eq!(
+        json.get("code").and_then(|v| v.as_str()),
+        Some("one_shot_time_passed")
+    );
+    assert!(
+        json.get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|e| e.contains("edit its time first")),
+        "the error must say what to do: {json}"
+    );
+
+    let missing = app
+        .oneshot(auth_post(
+            "/api/v1/schedules/ghost/resume",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

@@ -25,6 +25,25 @@ impl TaskKind {
 /// Display-only `cron` sentinel for a one-shot (like `"@event"` for sensor rules); never parsed.
 pub const CRON_ONCE: &str = "@once";
 
+/// Resuming a paused one-shot whose `fire_at` passed while it was paused.
+///
+/// A pause is the household saying "not at that time"; firing on resume, hours late, is not
+/// what was paused. A one-shot the pond merely slept through still fires late at startup,
+/// because nobody asked it to wait. The schedule stays paused and listed, so editing its time
+/// and resuming it again works. Callers downcast an `anyhow::Error` to this to answer with a
+/// conflict rather than a generic failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "schedule '{id}' was set to fire once at {fire_at}, which passed while it was paused; \
+     edit its time first, then resume it"
+)]
+pub struct OneShotTimePassed {
+    /// The paused schedule's id.
+    pub id: String,
+    /// The instant it was meant to fire at.
+    pub fire_at: DateTime<Utc>,
+}
+
 // ── Sensor/event-triggered rules ─────────────────────────────────────────────
 
 /// Which bus-event family a rule listens to.

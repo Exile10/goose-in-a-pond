@@ -35,7 +35,9 @@ use pond_core::shared::ports::event_bus::BusEvent;
 use pond_core::shared::services::chat::ChatService;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::domain::profile::CreateProfileRequest;
-use pond_core::user_data::domain::schedule::{Schedule, SensorTriggerSpec, TaskKind};
+use pond_core::user_data::domain::schedule::{
+    OneShotTimePassed, Schedule, SensorTriggerSpec, TaskKind,
+};
 use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
 use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::domain::settings::Settings;
@@ -9985,6 +9987,11 @@ async fn resume_schedule(
     };
     match scheduler.resume_task(&id).await {
         Ok(()) => (StatusCode::OK, Json(json!({"resumed": id}))),
+        // The schedule exists and stays paused: a conflict with its state, not a missing id.
+        Err(e) if e.downcast_ref::<OneShotTimePassed>().is_some() => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": e.to_string(), "code": "one_shot_time_passed"})),
+        ),
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
     }
 }
