@@ -938,8 +938,9 @@ action_install() {
   run_sh "bash scripts/install.sh$args"
   local rc=$?
 
+  BUILD_STARTED_SVC=false
   if [ "${RESTART_SVC_AFTER:-false}" = true ]; then
-    run systemctl --user start "$SERVICE_NAME"; RESTART_SVC_AFTER=false
+    run systemctl --user start "$SERVICE_NAME"; RESTART_SVC_AFTER=false; BUILD_STARTED_SVC=true
   fi
   detect_all
   if [ $rc -eq 0 ]; then
@@ -1359,7 +1360,10 @@ action_update() {
   detect_service
   case "$D_SVC_SCOPE" in
     user|system)
-      if [ "$rebuilt" = true ] || [ "$D_SVC_ACTIVE" != "active" ]; then svc_ctl restart || return 1; fi
+      # A build that stopped the pond has already started it on the new binary.
+      if [ "$D_SVC_ACTIVE" != "active" ] || { [ "$rebuilt" = true ] && [ "$BUILD_STARTED_SVC" != true ]; }; then
+        svc_ctl restart || return 1
+      fi
       local tries=0
       detect_runtime
       while [ "$DRY_RUN" != true ] && [ "$D_HEALTH" != "200" ] && [ $tries -lt 30 ]; do
