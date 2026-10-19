@@ -8,6 +8,8 @@
 #   bash scripts/giap.sh doctor       # non-interactive: health report, exit 1 on FAIL
 #   bash scripts/giap.sh status       # non-interactive: detection banner only
 #   bash scripts/giap.sh build        # non-interactive: build UI + server for THIS host
+#   bash scripts/giap.sh update       # bring this pond to its branch's newest code: pull, Node, build, restart, grants, doctor
+#   bash scripts/giap.sh update -y    # ... answering yes to each step (downloads, a service stop for the build)
 #   bash scripts/giap.sh node         # find, or download and verify, the Node this repo needs
 #   bash scripts/giap.sh node --check # only report; change nothing (exit 1 if the shell's node is wrong)
 #   bash scripts/giap.sh node --method nvm|fnm|volta|download --major N --install-deps
@@ -453,6 +455,20 @@ DOC_FAIL=0; DOC_WARN=0; DOC_UNK=0
 doctor() {
   DOC_FAIL=0; DOC_WARN=0; DOC_UNK=0
   head1 "Doctor — read-only checks"
+
+  # 0. how far behind its branch this checkout is, as of the last fetch (no network here)
+  local upstream_ref behind_n
+  upstream_ref="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
+  if [ -n "$upstream_ref" ]; then
+    behind_n="$(git rev-list --count "HEAD..$upstream_ref" 2>/dev/null || echo 0)"
+    if [ "${behind_n:-0}" != "0" ]; then
+      warn "$behind_n commit(s) behind $upstream_ref as of the last fetch"
+      note "fix: bash scripts/giap.sh update"
+      DOC_WARN=$((DOC_WARN+1))
+    else
+      ok "code matches $upstream_ref as of the last fetch ($D_SHA)"
+    fi
+  fi
 
   # 1. submodule pin vs checkout
   case "$D_SUB_STATE" in
@@ -1283,6 +1299,84 @@ action_logs() {
   esac
 }
 
+# Brings this pond to its branch's newest code and leaves it running and healthy, so a household never
+# has to know which step a release added. Each step is skipped when it has nothing to do.
+action_update() {
+  head1 "Update this pond"
+  if [ "$D_DIRTY" != "clean" ]; then
+    bad "this checkout has local changes ($D_DIRTY); updating would build them in, so stopping here"
+    note "see them with: git status"
+    return 1
+  fi
+  local upstream remote behind ahead
+  upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
+  [ -n "$upstream" ] || upstream="origin/$D_BRANCH"
+  remote="${upstream%%/*}"
+  run git fetch --quiet "$remote" || { bad "could not reach $remote to look for updates"; return 1; }
+  ahead="$(git rev-list --count "$upstream..HEAD" 2>/dev/null || echo '?')"
+  behind="$(git rev-list --count "HEAD..$upstream" 2>/dev/null || echo '?')"
+  if [ "$ahead" != "0" ]; then
+    bad "this checkout has $ahead commit(s) that are not on $upstream; refusing to move it"
+    return 1
+  fi
+  if [ "$behind" = "0" ]; then
+    ok "code: already the newest on $upstream ($D_SHA)"
+  else
+    info "$behind new commit(s) on $upstream"
+    run git merge --ff-only --quiet "$upstream" || { bad "could not fast-forward to $upstream"; return 1; }
+  fi
+  run git submodule sync --quiet --recursive
+  run git submodule update --init --recursive --quiet || { bad "the goose submodule did not update"; return 1; }
+  detect_repo
+
+  if [ "$D_NODE_OK" != true ] || [ "$D_NODE_REPO_OK" != true ]; then
+    if node_ensure auto ""; then node_use_repo >/dev/null 2>&1; detect_toolchain; fi
+  fi
+  if [ "$D_NODE_OK" = true ]; then ok "node $D_NODE"; else warn "no Node in range: the web UI cannot be rebuilt here"; fi
+
+  # The stamp names the commit the binary was built from, so an unchanged pond skips the long build.
+  detect_ui; detect_binaries
+  local built_from rebuilt=false
+  built_from="$(printf '%s' "$D_STAMP" | sed -n 's/.* git=\([^ ]*\).*/\1/p')"
+  if [ -n "$built_from" ] && [ "$built_from" = "$D_SHA" ] && [ "$D_UI_STATE" = "built" ]; then
+    ok "pond-server is already built from $D_SHA"
+  else
+    if [ "$D_NODE_OK" = true ]; then action_build_ui || return 1; fi
+    action_build_server || return 1
+    rebuilt=true
+  fi
+
+  detect_service
+  case "$D_SVC_SCOPE" in
+    user|system)
+      if [ "$rebuilt" = true ] || [ "$D_SVC_ACTIVE" != "active" ]; then svc_ctl restart || return 1; fi
+      local tries=0
+      detect_runtime
+      while [ "$DRY_RUN" != true ] && [ "$D_HEALTH" != "200" ] && [ $tries -lt 30 ]; do
+        sleep 2; tries=$((tries+1)); detect_runtime
+      done
+      if [ "$DRY_RUN" = true ] || [ "$D_HEALTH" = "200" ]; then ok "the pond is up (health 200)"
+      else bad "the pond did not answer its health check after the restart"; note "see: bash scripts/giap.sh logs"; fi
+      ;;
+    *) info "no service unit here; run the pond as you usually do (menu 20 installs one)" ;;
+  esac
+
+  # A permission a release starts to need is asked for here, once, rather than discovered later.
+  if [ "$D_OS" = "linux" ] && command -v nmcli >/dev/null 2>&1; then
+    local pond_user grant
+    if pond_user="$(connect_pond_user)"; then
+      grant="$(connect_grant_state "$pond_user")"
+      if [ "$grant" != "present" ]; then
+        info "a phone cannot give this pond a Wi-Fi network yet: that needs a one-time permission (sudo)"
+        if confirm "Grant it now?"; then connect_grant_install "$pond_user"; fi
+      fi
+    fi
+  fi
+
+  detect_all
+  doctor
+}
+
 action_deploy() {
   head1 "Deploy to the Jetson"
   if [ "$D_IS_JETSON" = true ]; then
@@ -1335,6 +1429,7 @@ show_menu() {
   say "  11) Build the web UI"
   say "  12) Build pond-server (release, correct features for this host)"
   say "  13) Build both (UI then server)"
+  say "  17) Update this pond (newest code, build, restart, grants, doctor)"
   [ "$D_IS_JETSON" = false ] && say "  14) Deploy to the Jetson (from this dev machine)"
   say "  15) LiteRT-LM library — status, and building it (for .litertlm models)"
   [ "$D_OS" = "linux" ] && say "  16) Let the pond join Wi-Fi from the BLE setup channel (polkit grant, sudo)"
@@ -1373,6 +1468,7 @@ menu_loop() {
       11) action_build_ui; pause ;;
       12) action_build_server; pause ;;
       13) action_build_ui && action_build_server; pause ;;
+      17) action_update; pause ;;
       14) action_deploy; pause ;;
       15) action_litert_menu; pause ;;
       16) action_wifi_grant; pause ;;
@@ -1445,6 +1541,7 @@ case "$CMD" in
   doctor)    banner; doctor; [ "$DOC_FAIL" -gt 0 ] && exit 1 || exit 0 ;;
   install)   action_install ;;
   build)     action_build_ui; action_build_server ;;
+  update)    action_update ;;
   build-ui)  action_build_ui ;;
   build-desktop) action_build_desktop ;;
   deploy)    action_deploy ;;
