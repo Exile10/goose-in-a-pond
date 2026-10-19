@@ -1438,8 +1438,8 @@
 .mem-card__seg-icon--context     { background: var(--mem-context-bg);      color: var(--mem-context); }
 .mem-card__seg-icon--none        { background: var(--grey-100);            color: var(--grey-400); }
 
-/* Tier badge */
-.mem-tier-badge {
+/* Kept marker: the permanent tier, the only tier worth a badge */
+.mem-kept-badge {
   font-size: 9px;
   font-weight: var(--weight-semibold);
   letter-spacing: 0.04em;
@@ -1447,21 +1447,9 @@
   border-radius: var(--radius-sm);
   white-space: nowrap;
   font-family: var(--font-mono);
-}
-.mem-tier-badge--permanent {
   background: rgba(140, 75, 255, 0.10);
   color: var(--purple-700);
   border: 1px solid rgba(140, 75, 255, 0.20);
-}
-.mem-tier-badge--long {
-  background: transparent;
-  color: var(--grey-500);
-  border: 1px solid var(--grey-300);
-}
-.mem-tier-badge--short {
-  background: transparent;
-  color: var(--grey-400);
-  border: 1px dashed var(--grey-300);
 }
 
 /* Source indicator */

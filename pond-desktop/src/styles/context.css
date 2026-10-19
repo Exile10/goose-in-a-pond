@@ -216,7 +216,10 @@
   gap: var(--space-2);
 }
 
-.ctx__tier {
+.ctx__badges { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+
+.ctx__category,
+.ctx__kept {
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -226,7 +229,7 @@
   background: var(--color-accent-soft);
   color: var(--color-accent);
 }
-.ctx__tier[data-tier="permanent"] {
+.ctx__kept {
   background: var(--color-text);
   color: var(--color-surface);
 }
