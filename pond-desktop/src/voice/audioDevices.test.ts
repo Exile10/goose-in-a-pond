@@ -192,12 +192,17 @@ describe("describeBoard", () => {
     expect(describeBoard({ ...base, sound_server: null })).toBeNull();
   });
 
-  it("says the other programs follow the pond's choice", () => {
-    const line = describeBoard({
+  it("says the pond's choice is also the board's default, and no more than that", () => {
+    const both = describeBoard({
       ...base,
       sound_server: { server: "pulseaudio", speaker: usb, mic: usb, problems: [] },
     });
-    expect(line).toEqual({ text: "Every other program on the board uses them too.", problem: false });
+    expect(both).toEqual({ text: "Both are also the board's defaults for other programs.", problem: false });
+    const speaker = describeBoard({
+      ...base,
+      sound_server: { server: "pulseaudio", speaker: usb, mic: null, problems: [] },
+    });
+    expect(speaker?.text).toBe("The speaker is also the board's default for other programs.");
   });
 
   it("names each level it raised and why", () => {

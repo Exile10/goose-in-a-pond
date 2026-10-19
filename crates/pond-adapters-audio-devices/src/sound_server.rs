@@ -1,6 +1,7 @@
 //! The board's sound server (PulseAudio, or PipeWire's PulseAudio service), told through
 //! `pactl`: which speaker and microphone are its defaults, and their levels. The pond itself
-//! opens the ALSA card directly; this is so every other program on the board agrees with it.
+//! opens the ALSA card directly, and holds it while it runs; this makes the same pair the default
+//! for every other program, which can play through it once the pond lets go.
 
 use std::io::Read;
 use std::process::{Command, Stdio};

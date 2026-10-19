@@ -335,8 +335,8 @@ impl std::fmt::Display for LevelChange {
     }
 }
 
-/// What the pond told the board's sound server, so every program on the board uses the pair the
-/// pond chose. Linux boards only: on a Mac the person picks the defaults.
+/// What the pond told the board's sound server, so other programs on the board default to the pair
+/// the pond chose. Linux boards only: on a Mac the person picks the defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SoundServerDefaults {
     /// The server, as it names itself (`pulseaudio`).

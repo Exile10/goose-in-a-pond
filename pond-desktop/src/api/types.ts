@@ -1595,7 +1595,7 @@ export interface AudioLevelChange {
   to: string;
 }
 
-/** What the pond told the board's sound server, so every program uses the same pair. */
+/** What the pond told the board's sound server, so other programs default to the same pair. */
 export interface SoundServerDefaults {
   server: string;
   speaker: string | null;

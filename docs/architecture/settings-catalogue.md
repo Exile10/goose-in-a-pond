@@ -228,6 +228,9 @@ source and unmutes them, and when no pair is heard it unmutes the preferred pair
 below the device's natural level (100% for a speaker, the card's 0 dB for a microphone) for one more
 test, putting it back if that is not heard either. A Mac's defaults and volume are never touched.
 Serve leaves the board's defaults to a live voice session, whose microphone choice is the real one.
+The pond itself still opens the card directly, and its speaker holds a dmix client on it for as long
+as serve runs, so a PulseAudio program sent to that default cannot play until the pond lets go.
+Routing the pond through the sound server would lift that; it is not done yet.
 
 `voice_kws_whisper_url` (was `null`, **NONE**) was removed on 2026-10-15: nothing read it once
 wake-word detection moved in process. `voice_recording_duration_secs` is read only by the browser

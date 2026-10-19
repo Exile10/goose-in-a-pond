@@ -55,8 +55,8 @@ pub trait AudioDeviceProber: Send + Sync {
 
     fn restore_levels(&self, _changes: &[LevelChange]) {}
 
-    /// Make the chosen devices the sound server's own defaults, unmuted, so every program on the
-    /// board uses them. `None` where there is no sound server whose defaults the pond may set.
+    /// Make the chosen devices the sound server's own defaults, unmuted, so other programs on the
+    /// board default to them. `None` where no sound server's defaults are the pond's to set.
     fn set_system_defaults(
         &self,
         _input: Option<&AudioDevice>,
