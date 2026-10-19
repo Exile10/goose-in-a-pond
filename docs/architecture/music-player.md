@@ -142,6 +142,29 @@ documentation, and is controlled by hand, never by the assistant. Spotify's
 
 The only voice route Spotify offers is its Commercial Hardware programme, for organisations.
 
+### OAuth redirect URI
+
+The provider sends the browser back to the `redirect_uri` the sign-in sent, so it has to be an
+address that browser can reach. A dashboard reached through an SSH tunnel
+(`ssh -N -L 9080:localhost:8080 pond`, then `http://localhost:9080`) cannot reach the port the pond
+bound, only the tunnel's, so the URI follows the origin the browser is on
+(`pond-api` `oauth_callback.rs` `redirect_uri_for`, for Spotify and Uber alike):
+
+- The dashboard sends its own server origin as `origin` in `POST /api/v1/oauth/authorize` and
+  `POST /api/v1/uber/accounts/connect`; without it the request's `Origin` header is used.
+- Only an `http` loopback origin (`localhost`, `127.0.0.1`, `[::1]`) with an explicit port is
+  followed, and the host is always written `127.0.0.1`, the loopback form Spotify requires:
+  `http://localhost:9080` gives `http://127.0.0.1:9080/api/v1/oauth/callback`.
+- Anything else (no origin, `https`, a LAN or other host, no port) gets the port the pond bound,
+  `http://127.0.0.1:<api_port>/api/v1/oauth/callback`, as before.
+- The chosen URI is kept with the sign-in, and the token exchange sends exactly it.
+
+So a household's Spotify app registers one `http://127.0.0.1:<port>/api/v1/oauth/callback` for
+every port its dashboard is opened on (8080 on the pond, 9080 through the tunnel, 4000 in
+development). The Music extension's settings and the missing-client-ID error both name the URI this
+browser's sign-in will send. A started sign-in logs `kind="oauth_start"` with the provider and
+the redirect URI only, never the authorize URL, which carries the client ID and `state`.
+
 ## Spotify pauses while GIAP speaks
 
 Policy III.7, as Jarida asked on 2026-09-30: "pause Spotify while GIAP speaks". Every sound the pond

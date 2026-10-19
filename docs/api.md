@@ -2222,8 +2222,12 @@ install's `secrets`) answers 403 with `"code": "secret_reserved"` for such a key
 
 **Request**
 ```json
-{ "profile_id": "p-1" }
+{ "profile_id": "p-1", "origin": "http://localhost:9080" }
 ```
+
+`origin` (optional) is the origin the desktop reaches the pond at, and sets where Uber sends the
+browser back; without it the request's `Origin` header is used. See "OAuth redirect URI" in
+`docs/architecture/music-player.md` for which origins are followed.
 
 **Response 200**
 ```json

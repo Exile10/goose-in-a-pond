@@ -13,6 +13,9 @@ pub struct PkceSession {
     pub provider_id: String,
     /// Sent to the token endpoint only, never the authorization endpoint.
     pub code_verifier: String,
+    /// The `redirect_uri` the authorize request sent. The token exchange must send exactly this,
+    /// so it is kept rather than worked out again.
+    pub redirect_uri: String,
     /// Optional marketplace extension to auto-install after successful auth.
     pub extension_id: Option<String>,
     /// The household member a per-member sign-in (Uber) is for; `None` for household-wide ones.
@@ -102,6 +105,45 @@ pub async fn peek_outcome(outcomes: &OAuthOutcomes, state_nonce: &str) -> Option
     map.get(state_nonce)
         .filter(|r| r.recorded_at.elapsed() < OUTCOME_TTL)
         .map(|r| r.outcome.clone())
+}
+
+/// Path of the one callback route every provider sends the browser back to.
+pub const CALLBACK_PATH: &str = "/api/v1/oauth/callback";
+
+/// The `redirect_uri` to send a provider, from the origin the browser reaches this server at.
+///
+/// The provider sends the browser back to this URI, so it has to be somewhere that browser can
+/// reach. Behind an SSH tunnel (`ssh -L 9080:localhost:8080`) that is the tunnel's local port, not
+/// the port this server bound. Only an `http` loopback origin with an explicit port is followed,
+/// and `localhost` and `[::1]` become `127.0.0.1`, the loopback form Spotify accepts. Anything else
+/// (no origin, `https`, another host, a missing or bad port) gets this server's own `api_port`.
+pub fn redirect_uri_for(origin: Option<&str>, api_port: u16) -> String {
+    let port = match origin.map(|o| (o, loopback_port(o))) {
+        Some((_, Some(port))) => port,
+        Some((origin, None)) => {
+            tracing::debug!(
+                kind = "oauth_redirect_fallback",
+                origin = %origin,
+                api_port,
+                "origin is not an http loopback origin with a port; redirecting to the bound port"
+            );
+            api_port
+        }
+        None => api_port,
+    };
+    format!("http://127.0.0.1:{port}{CALLBACK_PATH}")
+}
+
+/// The port of an `http://localhost:N`, `http://127.0.0.1:N` or `http://[::1]:N` origin.
+fn loopback_port(origin: &str) -> Option<u16> {
+    let (host, port) = origin.strip_prefix("http://")?.rsplit_once(':')?;
+    if !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+        return None;
+    }
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    port.parse::<u16>().ok().filter(|&port| port != 0)
 }
 
 /// Generate a PKCE `(code_verifier, code_challenge)` pair (S256).
@@ -202,6 +244,7 @@ mod tests {
         PkceSession {
             provider_id: "uber".to_string(),
             code_verifier: String::new(),
+            redirect_uri: redirect_uri_for(None, 4000),
             extension_id: None,
             profile_id: Some("liz".to_string()),
             created_at: std::time::Instant::now() - age,
@@ -229,6 +272,54 @@ mod tests {
             assert_eq!(fresh.profile_id.as_deref(), Some("liz"));
             assert!(take_session(&sessions, "new").await.is_none(), "single use");
         });
+    }
+
+    // ── Redirect URI ─────────────────────────────────────────
+
+    #[test]
+    fn a_tunnelled_localhost_origin_keeps_its_port_on_127_0_0_1() {
+        assert_eq!(
+            redirect_uri_for(Some("http://localhost:9080"), 8080),
+            "http://127.0.0.1:9080/api/v1/oauth/callback"
+        );
+    }
+
+    #[test]
+    fn a_loopback_origin_keeps_its_port() {
+        assert_eq!(
+            redirect_uri_for(Some("http://127.0.0.1:4000"), 8080),
+            "http://127.0.0.1:4000/api/v1/oauth/callback"
+        );
+        assert_eq!(
+            redirect_uri_for(Some("http://[::1]:9080"), 8080),
+            "http://127.0.0.1:9080/api/v1/oauth/callback"
+        );
+    }
+
+    #[test]
+    fn anything_but_an_http_loopback_origin_with_a_port_gets_the_bound_port() {
+        let bound = "http://127.0.0.1:8080/api/v1/oauth/callback";
+        for origin in [
+            "http://evil.example:9080",
+            "http://192.168.1.20:9080",
+            "http://127.0.0.2:9080",
+            "https://localhost:9080",
+            "http://localhost",
+            "http://localhost:",
+            "http://localhost:0",
+            "http://localhost:99999",
+            "http://localhost:+9080",
+            "http://localhost:9080/",
+            "http://localhost:9080/path",
+            "http://user@localhost:9080",
+            "http://localhost.evil.example:9080",
+            "tauri://localhost",
+            "null",
+            "",
+        ] {
+            assert_eq!(redirect_uri_for(Some(origin), 8080), bound, "{origin}");
+        }
+        assert_eq!(redirect_uri_for(None, 8080), bound);
     }
 
     // ── Flow outcomes ────────────────────────────────────────

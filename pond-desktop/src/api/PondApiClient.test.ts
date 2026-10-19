@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { PondApiClient } from "./PondApiClient";
+import { PondApiClient, oauthRedirectUri } from "./PondApiClient";
 import { ApiError } from "./types";
 
 // ── fetch mock helpers ────────────────────────────────────────────────────────
@@ -512,6 +512,37 @@ describe("updatePrompt()", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toContain("/prompts/balanced");
     expect(init.method).toBe("PUT");
+  });
+});
+
+// ── OAuth sign-in origin ──────────────────────────────────────────────────────
+
+describe("initiateOAuth()", () => {
+  it("tells the server the origin this browser reaches it at", async () => {
+    fetchMock.mockResolvedValueOnce(okJson({ auth_url: "https://accounts.example/a", state: "s" }));
+    await new PondApiClient("http://localhost:9080").initiateOAuth("spotify", "music");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:9080/api/v1/oauth/authorize");
+    expect(JSON.parse(init.body as string)).toEqual({
+      provider: "spotify",
+      extension_id: "music",
+      origin: "http://localhost:9080",
+    });
+  });
+});
+
+describe("oauthRedirectUri()", () => {
+  it("keeps a tunnelled port and names the host 127.0.0.1", () => {
+    expect(oauthRedirectUri("http://localhost:9080")).toBe(
+      "http://127.0.0.1:9080/api/v1/oauth/callback",
+    );
+    expect(oauthRedirectUri("http://127.0.0.1:4000")).toBe(
+      "http://127.0.0.1:4000/api/v1/oauth/callback",
+    );
+  });
+
+  it("takes an origin without a port to be on its scheme's default port", () => {
+    expect(oauthRedirectUri("http://pond.local")).toBe("http://127.0.0.1:80/api/v1/oauth/callback");
   });
 });
 

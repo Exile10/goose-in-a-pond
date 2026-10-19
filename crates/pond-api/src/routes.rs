@@ -11938,20 +11938,39 @@ async fn client_id_from(
         .or_else(|| provider.bundled_client_id.clone())
 }
 
-/// What to do when there is no client ID, with the redirect URI the household's app must register.
-fn missing_client_id_message(provider: &str, api_port: u16) -> String {
+/// What to do when there is no client ID, with the exact redirect URI the household's app must
+/// register: the one this sign-in sends, so the instruction cannot name a different port.
+fn missing_client_id_message(provider: &str, redirect_uri: &str) -> String {
     format!(
         "Add your {provider} client ID first. {provider}'s developer terms do not allow one app ID for \
          every household, so each registers its own: create an app at \
-         https://developer.spotify.com/dashboard, add the redirect URI \
-         http://127.0.0.1:{api_port}/api/v1/oauth/callback, add your {provider} account under User \
-         Management, then paste the app's Client ID into the Music extension's settings."
+         https://developer.spotify.com/dashboard, add the redirect URI {redirect_uri}, add your \
+         {provider} account under User Management, then paste the app's Client ID into the Music \
+         extension's settings."
     )
 }
 
+/// The origin a sign-in was started from: the client's `origin` field, else the request's
+/// `Origin` header. [`crate::oauth_callback::redirect_uri_for`] decides whether to follow it.
+pub(crate) fn sign_in_origin<'a>(
+    stated: Option<&'a str>,
+    headers: &'a axum::http::HeaderMap,
+) -> Option<&'a str> {
+    stated.or_else(|| {
+        headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+    })
+}
+
 /// `POST /api/v1/oauth/authorize` — starts PKCE; the client opens the returned `auth_url`.
+///
+/// Body: `provider`, optional `extension_id`, and optional `origin`, the origin the browser reaches
+/// this server at, which sets where the provider sends it back (see
+/// [`crate::oauth_callback::redirect_uri_for`]).
 async fn oauth_authorize_handler(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     use crate::oauth_callback;
@@ -11959,6 +11978,10 @@ async fn oauth_authorize_handler(
 
     let provider_id = body["provider"].as_str().unwrap_or("").to_string();
     let extension_id = body["extension_id"].as_str().map(String::from);
+    let redirect_uri = oauth_callback::redirect_uri_for(
+        sign_in_origin(body["origin"].as_str(), &headers),
+        state.api_port,
+    );
 
     // Find provider config by ID or by token_key (frontend may send the secret key name)
     let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
@@ -11980,7 +12003,7 @@ async fn oauth_authorize_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": missing_client_id_message(&provider.display_name, state.api_port),
+                "error": missing_client_id_message(&provider.display_name, &redirect_uri),
                 "code": "client_id_missing",
             })),
         )
@@ -11996,6 +12019,7 @@ async fn oauth_authorize_handler(
         oauth_callback::PkceSession {
             provider_id: provider.id.clone(),
             code_verifier,
+            redirect_uri: redirect_uri.clone(),
             extension_id,
             profile_id: None,
             created_at: std::time::Instant::now(),
@@ -12003,7 +12027,6 @@ async fn oauth_authorize_handler(
     )
     .await;
 
-    let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
     let scopes = provider.scopes.join(" ");
 
     let auth_url = format!(
@@ -12016,11 +12039,12 @@ async fn oauth_authorize_handler(
         urlencoding::encode(&code_challenge),
     );
 
+    // The URL itself carries the household's client ID and the state nonce, so it is not logged.
     tracing::info!(
-        provider = %provider_id,
+        kind = "oauth_start",
+        provider = %provider.id,
         redirect_uri = %redirect_uri,
-        "OAuth authorize URL: {}",
-        auth_url
+        "OAuth sign-in started"
     );
 
     Json(json!({"auth_url": auth_url, "state": state_nonce})).into_response()
@@ -12098,7 +12122,7 @@ async fn oauth_callback_handler(
     };
 
     let Some(client_id) = resolve_client_id(&state, provider).await else {
-        let message = missing_client_id_message(&provider.display_name, state.api_port);
+        let message = missing_client_id_message(&provider.display_name, &session.redirect_uri);
         fail(&message).await;
         return Html(format!(
             "<h1>Authorization failed</h1><p>{}</p>",
@@ -12107,8 +12131,6 @@ async fn oauth_callback_handler(
         .into_response();
     };
 
-    // redirect_uri must exactly match the one sent in the authorize request.
-    let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
     // Egress refusals go through `fail` so the UI polling `/oauth/status/{state}` sees why.
     let call = match pond_core::shared::services::egress::begin(&provider.token_url, "POST") {
         Ok(c) => c,
@@ -12128,7 +12150,8 @@ async fn oauth_callback_handler(
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
+            // Exactly the one the authorize request sent, or the provider refuses the code.
+            ("redirect_uri", session.redirect_uri.as_str()),
             ("client_id", client_id.as_str()),
             ("code_verifier", session.code_verifier.as_str()),
         ])
@@ -12316,7 +12339,10 @@ async fn oauth_refresh_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": missing_client_id_message(&provider.display_name, state.api_port),
+                "error": missing_client_id_message(
+                    &provider.display_name,
+                    &crate::oauth_callback::redirect_uri_for(None, state.api_port),
+                ),
                 "code": "client_id_missing",
             })),
         )

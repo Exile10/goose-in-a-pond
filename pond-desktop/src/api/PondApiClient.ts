@@ -95,6 +95,24 @@ export function defaultServerUrl(): string {
   return "http://127.0.0.1:4000";
 }
 
+/**
+ * The OAuth redirect URI the server sends a provider when this client starts a sign-in from
+ * `serverUrl`, which is what a household's own Spotify app must register. The server follows an
+ * `http` loopback origin's port and always writes the host as 127.0.0.1, the loopback form Spotify
+ * accepts (`redirect_uri_for` in `oauth_callback.rs`). Any other origin gets the port the server
+ * bound, which this client can only take to be the one in `serverUrl`.
+ */
+export function oauthRedirectUri(serverUrl: string): string {
+  let port = "4000";
+  try {
+    const url = new URL(serverUrl);
+    port = url.port || (url.protocol === "https:" ? "443" : "80");
+  } catch {
+    /* the server's default port */
+  }
+  return `http://127.0.0.1:${port}/api/v1/oauth/callback`;
+}
+
 /** Just above the server's 180s pairing timeout, so the server's error surfaces, not an abort. */
 const COMMISSION_TIMEOUT_MS = 190_000;
 
@@ -345,7 +363,8 @@ export class PondApiClient {
   /** Members who connected their own Uber account on this pond (host only). */
   uberAccounts(): Promise<{ connected: string[] }> { return this.hostRequest('GET', '/api/v1/uber/accounts'); }
   /** Start a member's Uber sign-in; open `auth_url`, then follow `state` with `getOAuthStatus`. */
-  connectUber(profileId: string): Promise<{ auth_url: string; state: string }> { return this.hostRequest('POST', '/api/v1/uber/accounts/connect', { profile_id: profileId }); }
+  /** `origin` tells the server where this browser reaches it, so Uber sends the browser back there. */
+  connectUber(profileId: string): Promise<{ auth_url: string; state: string }> { return this.hostRequest('POST', '/api/v1/uber/accounts/connect', { profile_id: profileId, origin: this.base }); }
   disconnectUber(profileId: string): Promise<void> { return this.hostRequest('DELETE', `/api/v1/uber/accounts/${encodeURIComponent(profileId)}`); }
   remoteStatus(): Promise<{ state: string; authUrl?: string }> { return this.hostRequest('GET', '/api/v1/remote-access'); }
   prepareRemoteIdentity(): Promise<{ household: string; publicKey: string }> { return this.hostRequest('POST', '/api/v1/remote-access/identity', {}); }
@@ -2170,7 +2189,11 @@ export class PondApiClient {
 
   // ── OAuth PKCE ──────────────────────────────────────────────
 
-  /** Start an OAuth PKCE flow. Returns the authorization URL to open in a browser. */
+  /**
+   * Start an OAuth PKCE flow. Returns the authorization URL to open in a browser.
+   * `origin` is where this browser reaches the server (an SSH tunnel's local port, say), so the
+   * provider sends the browser back somewhere it can reach; see `oauthRedirectUri`.
+   */
   async initiateOAuth(
     provider: string,
     extensionId?: string,
@@ -2178,6 +2201,7 @@ export class PondApiClient {
     return this.post("/api/v1/oauth/authorize", {
       provider,
       extension_id: extensionId,
+      origin: this.base,
     });
   }
 

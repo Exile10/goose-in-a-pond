@@ -11849,6 +11849,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-http 0.7.0",
  "tracing",
+ "tracing-subscriber",
  "urlencoding",
  "uuid",
  "wiremock",

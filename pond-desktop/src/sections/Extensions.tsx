@@ -26,7 +26,7 @@ import {
   Music,
   ExternalLink,
 } from "lucide-react";
-import { api } from "../api/PondApiClient";
+import { api, oauthRedirectUri } from "../api/PondApiClient";
 import { followSignIn, openExternal } from "../api/followSignIn";
 import { useAppState } from "../state/useAppContext";
 import { useConfirm, ErrorBanner } from "../components/shared";
@@ -176,13 +176,7 @@ const SHOWN_FOR: Record<string, (key: string, choices: Record<string, string>) =
 
 /** The redirect URI the pond sends Spotify, which the household's own Spotify app must register. */
 function spotifyRedirectUri(): string {
-  let port = "4000";
-  try {
-    port = new URL(api.serverUrl()).port || port;
-  } catch {
-    /* the default port */
-  }
-  return `http://127.0.0.1:${port}/api/v1/oauth/callback`;
+  return oauthRedirectUri(api.serverUrl());
 }
 
 /** OAuth sign-in block for a single oauth_flow requirement. */

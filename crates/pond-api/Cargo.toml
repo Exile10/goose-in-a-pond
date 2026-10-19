@@ -83,6 +83,8 @@ aws-lc-rs = "1"
 async-trait = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
+# Tests only: capture what a handler logs, to check that no secret reaches the log.
+tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 pond-adapters-llamafile = { workspace = true }

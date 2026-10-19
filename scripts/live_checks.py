@@ -779,6 +779,26 @@ def section_music_player():
             ("says why", lambda b: isinstance(b, dict) and "internal token" in json.dumps(b)),
         )
 
+    # Spotify sign-in follows the origin the browser is on, so a dashboard reached through an SSH
+    # tunnel is sent back through it. With no client ID stored here the start stops before Spotify,
+    # and its message names the exact redirect URI this start would send.
+    for label, origin, port in [
+        ("a tunnelled localhost origin keeps its port", "http://localhost:9080", "9080"),
+        ("a non-loopback origin gets the bound port", "http://evil.example:9080", api_port()),
+    ]:
+        code, body = call(
+            "POST", "/api/v1/oauth/authorize", {"provider": "spotify", "origin": origin}
+        )
+        want = "http://127.0.0.1:%s/api/v1/oauth/callback" % port
+        expect(
+            "Spotify sign-in redirect: " + label,
+            code,
+            400,
+            body,
+            ("is client_id_missing", lambda b: isinstance(b, dict) and b.get("code") == "client_id_missing"),
+            ("names " + want, lambda b, want=want: isinstance(b, dict) and want in b.get("error", "")),
+        )
+
     # No key has been stored in this scratch pond, so the route must say what to add.
     code, body = call("GET", "/api/v1/musickit/developer-token")
     expect(
