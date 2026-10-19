@@ -483,10 +483,11 @@ impl Inner {
         // A request left from before this session started is not ours to answer.
         let mut handled: Option<u64> =
             read_json::<RetestRequest>(&request_path(&self.data_dir)).map(|r| r.id);
-        self.pass(Trigger::Startup, ProbeMode::Lazy, BOTH, None);
-
+        // Taken before the first choice, not after: a device that comes or goes while it runs
+        // must still read as a change, or startup misses a USB card that arrived a moment late.
         let prober = self.selector.prober().clone();
         let mut fingerprint = prober.fingerprint();
+        self.pass(Trigger::Startup, ProbeMode::Lazy, BOTH, None);
         let mut fingerprint_at = Instant::now();
         let mut mic_written = 0u64;
         let mut mic_moved_at = Instant::now();
@@ -871,6 +872,36 @@ mod tests {
         m.unplug("USB mic");
         wait_until("the fallback", || {
             sup.status().unwrap().input.device_id() == Some("Built-in mic")
+        });
+        sup.stop();
+    }
+
+    /// The race CI found: a mic plugged in right as the first choice lands. Plugged from the
+    /// on_change callback, which runs inside that very first pass.
+    #[test]
+    fn a_device_plugged_in_during_the_startup_choice_is_still_noticed() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = machine();
+        let plug = m.clone();
+        let on_change: ChangeFn = Arc::new(move |_, trigger| {
+            if trigger == Trigger::Startup {
+                plug.plug(AudioDirection::Input, "USB mic", false, hearing());
+            }
+        });
+        let sup = AudioSupervisor::spawn(
+            SupervisorConfig {
+                role: Role::Voice,
+                data_dir: dir.path().to_path_buf(),
+                mic: None,
+                prefs: prefs(Some("USB mic"), true, false),
+                on_change: Some(on_change),
+            },
+            m.clone(),
+        );
+        sup.wait_ready(Duration::from_secs(5)).unwrap();
+        wait_until("the mic plugged in during startup", || {
+            sup.status().unwrap().input.device_id() == Some("USB mic")
         });
         sup.stop();
     }
