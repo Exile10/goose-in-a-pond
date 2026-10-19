@@ -811,6 +811,21 @@ async fn emit_pairing_outcome(
         *last = Some(std::time::Instant::now());
     }
 
+    if let Err(e) = sender
+        .broadcast(pairing_notification(paired, device_name))
+        .await
+    {
+        tracing::warn!(error = %e, action, "failed to push pairing notification");
+    }
+}
+
+/// The broadcast for a pairing outcome. Either way a tap opens the devices screen, where the
+/// household sees what is paired and can remove a device it does not recognise.
+fn pairing_notification(
+    paired: bool,
+    device_name: Option<&str>,
+) -> pond_core::mcp::ports::notification::Notification {
+    use pond_core::mcp::ports::notification::{Notification, OpenScreen};
     let (category, title, body) = if paired {
         (
             "info",
@@ -829,17 +844,14 @@ async fn emit_pairing_outcome(
                 .to_string(),
         )
     };
-    let notification = pond_core::mcp::ports::notification::Notification {
+    Notification {
         id: uuid::Uuid::new_v4().to_string(),
         target: "broadcast".to_string(),
         category: category.to_string(),
         title,
         body,
         timestamp: chrono::Utc::now().to_rfc3339(),
-        data: None,
-    };
-    if let Err(e) = sender.broadcast(notification).await {
-        tracing::warn!(error = %e, action, "failed to push pairing notification");
+        data: Some(OpenScreen::Devices.data()),
     }
 }
 
@@ -17007,6 +17019,19 @@ async fn clear_session_user_handler(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pairing_notification_opens_the_devices_screen() {
+        let paired = super::pairing_notification(true, Some("Pixel"));
+        assert_eq!(paired.category, "info");
+        assert_eq!(paired.title, "New device paired");
+        assert!(paired.body.contains("\"Pixel\""));
+        assert_eq!(paired.data, Some(json!({"open": "devices"})));
+
+        let failed = super::pairing_notification(false, None);
+        assert_eq!(failed.category, "alert");
+        assert_eq!(failed.title, "Failed pairing attempt");
+        assert_eq!(failed.data, Some(json!({"open": "devices"})));
+    }
 
     /// Tailnet address detection; the range check stops the probe's LAN answer passing as remote.
     mod tailnet_range {

@@ -3701,28 +3701,11 @@ async fn run_server(
         let mut rx = schedule_result_tx.subscribe();
         let sender = notification_sender.clone();
         tokio::spawn(async move {
-            use pond_core::user_data::domain::schedule::RunStatus;
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
-                        let (category, body) = match ev.status {
-                            RunStatus::Completed => ("info", ev.result.clone().unwrap_or_default()),
-                            RunStatus::Failed => (
-                                "alert",
-                                ev.error
-                                    .clone()
-                                    .unwrap_or_else(|| "Task failed".to_string()),
-                            ),
-                            RunStatus::Running => continue, // not user-facing
-                        };
-                        let notification = pond_core::mcp::ports::notification::Notification {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            target: "broadcast".to_string(),
-                            category: category.to_string(),
-                            title: format!("Schedule: {}", ev.schedule_label),
-                            body,
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                            data: None,
+                        let Some(notification) = schedule_result_notification(&ev) else {
+                            continue; // a running schedule is not user-facing
                         };
                         let _ = sender.broadcast(notification).await;
                     }
@@ -6550,7 +6533,6 @@ async fn run_proactive_reviewer(
     lane: Arc<crate::inference_lane_runner::InferenceLane>,
     profiles: Arc<dyn pond_core::user_data::ports::profile::ProfileRepository>,
 ) {
-    use pond_core::mcp::ports::notification::Notification;
     use pond_core::user_data::services::consolidation_schedule as sched;
     use pond_core::user_data::services::inference_lane::LaneJob;
     use pond_core::user_data::services::proactive_review as review;
@@ -6827,23 +6809,11 @@ async fn run_proactive_reviewer(
                 tracing::warn!(error = %e, "proactive reviewer: could not persist a proposal");
                 continue;
             }
-            // Only the member's paired devices, never a broadcast. `action_required`, not `alert`:
-            // the speech gate voices only `alert`, and suggestions shouldn't be read aloud.
+            // Only the member's paired devices, never a broadcast.
             let report = sender
                 .send_to_profile(
                     audience.profile_id(),
-                    Notification {
-                        id: format!("proposal-{}", proposal.id()),
-                        target: String::new(),
-                        category: "action_required".to_string(),
-                        title: "A suggestion".to_string(),
-                        body: proposal.summary(),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        data: Some(serde_json::json!({
-                            "proposal_id": proposal.id(),
-                            "rationale": proposal.rationale(),
-                        })),
-                    },
+                    proposal_notification(proposal.id(), proposal.summary(), proposal.rationale()),
                 )
                 .await;
             tracing::info!(
@@ -6854,6 +6824,61 @@ async fn run_proactive_reviewer(
                 "proposal made"
             );
         }
+    }
+}
+
+/// The phone notification for a finished schedule run, or `None` while it is still running.
+///
+/// It names the schedule and the run in its `open` hint, so a tap opens the schedules screen.
+fn schedule_result_notification(
+    ev: &pond_core::user_data::domain::schedule::ScheduleResultEvent,
+) -> Option<pond_core::mcp::ports::notification::Notification> {
+    use pond_core::mcp::ports::notification::{Notification, OpenScreen};
+    use pond_core::user_data::domain::schedule::RunStatus;
+    let (category, body) = match ev.status {
+        RunStatus::Completed => ("info", ev.result.clone().unwrap_or_default()),
+        RunStatus::Failed => (
+            "alert",
+            ev.error
+                .clone()
+                .unwrap_or_else(|| "Task failed".to_string()),
+        ),
+        RunStatus::Running => return None,
+    };
+    let open = OpenScreen::Schedule {
+        schedule_id: ev.schedule_id.clone(),
+        run_id: ev.run_id.clone(),
+    };
+    Some(Notification {
+        id: uuid::Uuid::new_v4().to_string(),
+        target: "broadcast".to_string(),
+        category: category.to_string(),
+        title: format!("Schedule: {}", ev.schedule_label),
+        body,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: Some(open.data()),
+    })
+}
+
+/// The member's notification for a proactive proposal. `action_required`, not `alert`: the speech
+/// gate voices only `alert`, and suggestions shouldn't be read aloud. A tap opens chat.
+fn proposal_notification(
+    proposal_id: &str,
+    summary: String,
+    rationale: &str,
+) -> pond_core::mcp::ports::notification::Notification {
+    use pond_core::mcp::ports::notification::{Notification, OpenScreen};
+    let mut fields = serde_json::Map::new();
+    fields.insert("proposal_id".into(), proposal_id.into());
+    fields.insert("rationale".into(), rationale.into());
+    Notification {
+        id: format!("proposal-{proposal_id}"),
+        target: String::new(),
+        category: "action_required".to_string(),
+        title: "A suggestion".to_string(),
+        body: summary,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: Some(OpenScreen::Chat.merged_into(fields)),
     }
 }
 
@@ -9794,6 +9819,60 @@ async fn run_pairing(refresh: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn schedule_event(
+        status: pond_core::user_data::domain::schedule::RunStatus,
+    ) -> pond_core::user_data::domain::schedule::ScheduleResultEvent {
+        pond_core::user_data::domain::schedule::ScheduleResultEvent {
+            schedule_id: "sched-1".into(),
+            schedule_label: "Daily Brief".into(),
+            run_id: "run-9".into(),
+            status,
+            result: Some("All quiet".into()),
+            error: Some("model unavailable".into()),
+            duration_ms: Some(12),
+        }
+    }
+
+    #[test]
+    fn a_finished_schedule_notification_opens_its_schedule() {
+        use pond_core::user_data::domain::schedule::RunStatus;
+        let hint =
+            serde_json::json!({"open": "schedule", "schedule_id": "sched-1", "run_id": "run-9"});
+
+        let done = super::schedule_result_notification(&schedule_event(RunStatus::Completed))
+            .expect("a completed run is user-facing");
+        assert_eq!(done.category, "info");
+        assert_eq!(done.title, "Schedule: Daily Brief");
+        assert_eq!(done.body, "All quiet");
+        assert_eq!(done.data, Some(hint.clone()));
+
+        let failed = super::schedule_result_notification(&schedule_event(RunStatus::Failed))
+            .expect("a failed run is user-facing");
+        assert_eq!(failed.category, "alert");
+        assert_eq!(failed.body, "model unavailable");
+        assert_eq!(failed.data, Some(hint));
+    }
+
+    #[test]
+    fn a_running_schedule_sends_no_notification() {
+        use pond_core::user_data::domain::schedule::RunStatus;
+        assert!(super::schedule_result_notification(&schedule_event(RunStatus::Running)).is_none());
+    }
+
+    #[test]
+    fn a_proposal_notification_keeps_its_fields_and_opens_chat() {
+        let n = super::proposal_notification("p-1", "Water the plants?".into(), "It is dry");
+        assert_eq!(n.id, "proposal-p-1");
+        assert_eq!(n.category, "action_required");
+        assert_eq!(n.body, "Water the plants?");
+        assert_eq!(
+            n.data,
+            Some(
+                serde_json::json!({"proposal_id": "p-1", "rationale": "It is dry", "open": "chat"})
+            )
+        );
+    }
+
     /// A blocking thread that never finishes must not keep the process from exiting.
     #[test]
     fn shutdown_does_not_wait_for_a_stuck_blocking_thread() {
