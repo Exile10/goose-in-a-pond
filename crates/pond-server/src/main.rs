@@ -1222,9 +1222,12 @@ async fn run_server(
             Some(status) => println!("  ✅ Speaker: {}", status.output),
             None => println!("  ⚠  Speaker: still being tested; using the system default"),
         }
-        pond_api::audio_devices::install(Arc::new(
-            pond_adapters_audio_devices::PondAudioControl::new(supervisor, data_dir.clone()),
+        let control = Arc::new(pond_adapters_audio_devices::PondAudioControl::new(
+            supervisor,
+            data_dir.clone(),
         ));
+        pond_api::audio_devices::install(control.clone());
+        pond_mcp_server::init_audio_control(control);
     }
 
     // One resolution for both voice models, shared with the `chat` path.
@@ -5110,13 +5113,21 @@ async fn run_chat(
             }
             *reported = problems;
         });
-        Some(audio_devices::start(
+        let supervisor = audio_devices::start(
             pond_adapters_audio_devices::Role::Voice,
             &data_dir,
             Some(mic_handle.clone()),
             Arc::new(SqliteSettingsRepository::new(db.system.clone())),
             Some(on_change),
-        ))
+        );
+        // The assistant's tools run in this process, so asking it to switch reaches this choice.
+        pond_mcp_server::init_audio_control(Arc::new(
+            pond_adapters_audio_devices::PondAudioControl::new(
+                supervisor.clone(),
+                data_dir.clone(),
+            ),
+        ));
+        Some(supervisor)
     } else {
         // A text session never opens the mic; its replies still play on the pinned speaker.
         let pinned = settings.audio_output_device.trim();

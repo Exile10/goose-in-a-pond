@@ -1,4 +1,5 @@
 // ── Modular MCP servers ─────────────────────────────────────────────────────
+pub mod audio;
 pub mod context;
 pub mod device;
 pub mod device_control;
@@ -168,6 +169,7 @@ pub use toolkit::ToolkitMcpServer;
 pub use travel::TravelMcpServer;
 pub use weather::WeatherMcpServer;
 
+pub use audio::init_audio_control;
 pub use device::{init_device_deps, spawn_device_server};
 pub use device_control::{init_device_control_deps, spawn_device_control_server};
 pub use knowledge::{init_knowledge_deps, spawn_knowledge_server};
