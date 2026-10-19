@@ -386,7 +386,8 @@ async fn download_via_hf_cache(
     let approx_total = approx_size_mb * 1_048_576;
     let mut last_printed = 0u64;
     let reported_name = progress_name(dest);
-    let progress = |downloaded: u64, total: u64| {
+    let mut announced: Option<u32> = None;
+    let mut progress = |downloaded: u64, total: u64| {
         let effective_total = if total == 0 {
             approx_total.max(1)
         } else {
@@ -413,9 +414,29 @@ async fn download_via_hf_cache(
         // Nothing can cancel a CLI download.
         true
     };
+    let on_event = |event: pond_hf_cache::DownloadEvent| match event {
+        pond_hf_cache::DownloadEvent::Progress { downloaded, total } => {
+            announced = None;
+            progress(downloaded, total)
+        }
+        pond_hf_cache::DownloadEvent::Reconnecting(r) => {
+            // Reported on every poll of the wait; said once per wait.
+            if announced != Some(r.attempt) {
+                announced = Some(r.attempt);
+                eprint!(
+                    "\n  the connection dropped; reconnecting in {}s (attempt {} of {})",
+                    r.delay.as_secs(),
+                    r.attempt,
+                    r.max_attempts
+                );
+                std::io::stderr().flush().ok();
+            }
+            true
+        }
+    };
 
     let blob_path = fetch
-        .download_to_blob(&client, token.as_deref(), progress)
+        .download_to_blob(&client, token.as_deref(), on_event)
         .await
         .with_context(|| format!("hf_cache fetch {repo_id}/{filename}@{revision}"))?;
     eprintln!();

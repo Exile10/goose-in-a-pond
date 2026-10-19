@@ -141,6 +141,38 @@ of which no other quant is on disk, and which is assigned to a role that loads a
 tool, asr, tts or embedding; never think or task, which select nothing yet), and its add-on only
 if it had one, through the same tracker.
 
+### Downloads that drop (2026-10-19)
+
+Hugging Face's CDN closes long transfers early. On the Jetson, one 4.2 GB GGUF stopped four
+times, at 0.85, 2.36, 2.40 and 3.92 GB. Each time the body ended short ("the transfer ended
+after N of 4215695776 bytes"), and someone had to press download again. Every press resumed
+correctly with a Range request, so the only thing missing was a retry. Now:
+
+- **Retry.** `HfFetch::download_to_blob` in `crates/pond-hf-cache` retries by itself. This covers
+  the tracked dashboard path and the CLI's `setup`. It retries a body that ended short
+  (`TransferError::Short`), a failed or dropped connection, and a failed chunk read. Each
+  attempt goes through the same HEAD, then a GET with Range from the `.incomplete`.
+- **Attempt limit.** It allows eight attempts in a row that bring no new bytes. An attempt that
+  gets further resets the count, so a file that drops every gigabyte still arrives.
+- **Backoff.** It waits 2 s before the next attempt, doubling each time up to 60 s.
+- **Not retried.** A size or etag refusal, a range the server answered from the wrong byte, an
+  overlong body, an HTTP status, a disk error or a network-mode denial. Asking again would get
+  the same answer.
+- **Stalls.** `build_redirect_aware_client` sets a 60 s `read_timeout`, which is per read, not
+  for the whole transfer. A connection that goes silent fails, and the failure is retried.
+- **Pause and cancel.** The callback is asked again on every 250 ms poll of the wait. A pause or
+  cancel during the wait stops the download at once, through the same `Stopped` path as
+  between chunks.
+- **Logs.** Each retry logs `kind="download_retry"` with the attempt, bytes on disk and the
+  delay. Giving up logs `kind="download_gave_up"`.
+- **Dashboard.** While a transfer waits, its tracker entry stays `downloading` and carries
+  `reconnecting: {attempt, max_attempts}`. The card reads "Reconnecting (attempt n of 8)",
+  from the `models.download.reconnecting` key in `pond-desktop/src/i18n.ts`.
+- **Failed entries.** A failure that left a resumable file carries `pond_hf_cache::KeptPartial`.
+  The tracker records the file as the entry's `partial`. Such an `error` entry is not evicted
+  after five minutes, the same as a paused one, so the card keeps its reason and "Try again".
+  `cancel` on it deletes the file, and the card offers Stop for that.
+
 ## Storage layout
 
 `crates/pond-core/src/models/domain/model_layout.rs` is the one mapping from (category, file) to a

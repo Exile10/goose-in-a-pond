@@ -6,7 +6,9 @@ import {
 import type { ModelEngine } from "../../api/types";
 import { PICTURES_LEFT_OUT } from "../../sections/models/modelsView";
 import type { AddOn, FitReading, SourceChip as Chip } from "../../sections/models/modelsView";
-import { pausedText, type ModelTransfer, type TransferAction } from "../../sections/models/modelDownloads";
+import {
+  pausedText, reconnectingText, type ModelTransfer, type TransferAction,
+} from "../../sections/models/modelDownloads";
 import "../../styles/model-marks.css";
 
 // The small, repeated words of a Models screen. Both surfaces compose them, so an engine, a
@@ -245,6 +247,12 @@ export function TransferView({
       {transfer.state === "paused" && (
         <p className="mm-xfer__note">{pausedText(transfer.resumable)}</p>
       )}
+      {transfer.reconnecting && (
+        <p className="mm-xfer__note" role="status">
+          <Loader2 size={14} className="mm-spin" aria-hidden="true" />
+          {reconnectingText(transfer.reconnecting)}
+        </p>
+      )}
       {finishing && (
         <p className="mm-xfer__note" role="status">
           <Loader2 size={14} className="mm-spin" aria-hidden="true" />
@@ -266,6 +274,8 @@ export function TransferView({
               <span>Try again</span>
             </button>
           )}
+          {/* A failure that kept a partial file waits here until resumed or stopped. */}
+          {transfer.state === "error" && <ControlButton action="cancel" busy={busy} onControl={onControl} />}
           {transfer.state === "downloading" && (
             <>
               <ControlButton action="pause" busy={busy} onControl={onControl} />
