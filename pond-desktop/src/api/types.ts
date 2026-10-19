@@ -1276,10 +1276,15 @@ export interface Extension {
   description: string;
   tools: string[];
   enabled: boolean;
-  /** Extension connection status: "connected", "error", or "loading" */
+  /**
+   * Whether the extension runs: "connected" (with tools), "no_tools" (running, with no tools
+   * here on purpose), "error" (failed to start), or "disabled".
+   */
   status?: string;
   /** Last error message if status is "error" */
   last_error?: string | null;
+  /** For "no_tools", the extension's own explanation; absent when it gave none. */
+  status_reason?: string | null;
 }
 
 export interface AddExtensionRequest {

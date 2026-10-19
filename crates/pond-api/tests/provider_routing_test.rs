@@ -90,6 +90,7 @@ impl ExtensionManagerPort for StubExtensionManager {
             enabled: true,
             status: "connected".to_string(),
             last_error: None,
+            status_reason: None,
         }])
     }
 

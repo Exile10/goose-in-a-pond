@@ -11009,7 +11009,10 @@ async fn list_extensions_handler(State(state): State<Arc<AppState>>) -> axum::re
     };
     match manager.list_extensions().await {
         Ok(mut exts) => {
-            // Merge in persisted-but-disabled extensions so the UI sees them
+            // Merge in saved extensions the manager does not report: switched off, or enabled
+            // but not running. The manager reports every running extension, tools or none, and
+            // a failed start with its own error, so only a row it knows nothing of gets the
+            // generic failure text.
             if let Some(repo) = &state.mcp_server_repo {
                 if let Ok(persisted) = repo.list().await {
                     let live_names: std::collections::HashSet<String> =
@@ -11032,6 +11035,7 @@ async fn list_extensions_handler(State(state): State<Arc<AppState>>) -> axum::re
                                 } else {
                                     None
                                 },
+                                status_reason: None,
                             });
                         }
                     }

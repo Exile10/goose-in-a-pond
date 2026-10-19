@@ -1,13 +1,15 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use goose::agents::extension::Envs;
+use goose::agents::extension_manager::{is_first_class_extension, is_hidden_extension};
 use goose::agents::{Agent as GooseAgent, ExtensionConfig};
+use goose::config::extensions::name_to_key;
 use goose::config::GooseMode;
 use goose::session::session_manager::{SessionManager, SessionType};
 use pond_core::mcp::ports::extension_manager::{
     AddExtensionRequest, ExtensionInfo, ExtensionManagerPort, ToolInfo,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -128,6 +130,64 @@ impl GiapGooseExtensionManager {
     pub async fn register_config(&self, name: String, config: ExtensionConfig) {
         self.extension_configs.write().await.insert(name, config);
     }
+
+    /// Every running extension, keyed as its tools are prefixed, with the `instructions` its
+    /// MCP server sent at initialize. Platform extensions are left out: a first-class one's
+    /// tools are unprefixed, so it would read as tool-less, and a hidden one is not the user's.
+    async fn running_extensions(&self) -> HashMap<String, String> {
+        // Only fills a `{{WORKING_DIR}}` placeholder, which a status reason does not need.
+        let working_dir = std::env::current_dir().unwrap_or_default();
+        self.agent
+            .extension_manager
+            .get_extensions_info(&working_dir)
+            .await
+            .into_iter()
+            .filter(|info| {
+                !is_first_class_extension(&info.name) && !is_hidden_extension(&info.name)
+            })
+            .map(|info| (info.name, info.instructions))
+            .collect()
+    }
+
+    /// Logs, once per connect, an extension that started but offers the assistant no tools,
+    /// and returns its reason for the dashboard.
+    async fn note_tool_less(&self, name: &str) -> Option<String> {
+        let reason = self
+            .running_extensions()
+            .await
+            .get(&name_to_key(name))
+            .and_then(|instructions| no_tools_reason(instructions));
+        tracing::info!(
+            kind = "extension_without_tools",
+            extension = %name,
+            reason = reason.as_deref().unwrap_or("none given"),
+            "the extension is running but offers the assistant no tools"
+        );
+        reason
+    }
+}
+
+/// Longest reason shown for a tool-less extension; instructions are written for the model and
+/// can run to paragraphs.
+const MAX_REASON_CHARS: usize = 200;
+
+/// The first sentence of an extension's instructions, as a short reason it has no tools.
+fn no_tools_reason(instructions: &str) -> Option<String> {
+    let text = instructions.trim();
+    let end = [text.find(". ").map(|i| i + 1), text.find('\n')]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(text.len());
+    let sentence = text[..end].trim();
+    if sentence.is_empty() {
+        return None;
+    }
+    if sentence.chars().count() <= MAX_REASON_CHARS {
+        return Some(sentence.to_string());
+    }
+    let cut: String = sentence.chars().take(MAX_REASON_CHARS).collect();
+    Some(format!("{}...", cut.trim_end()))
 }
 
 /// Split `ext_name__tool_name` into its parts; a name without `__` goes to `"default"`.
@@ -154,18 +214,32 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             ext_map.entry(ext_name).or_default().push(tool_name);
         }
 
+        // Status comes from whether an extension runs, not from its tools: one that runs but
+        // lists none on purpose must not read as a failure.
+        let running = self.running_extensions().await;
         let disabled = self.disabled.read().await;
         let errors = self.errors.read().await;
 
-        Ok(ext_map
+        // A failed start that the user then switched off is reported as disabled, by the route.
+        let failed = errors.keys().filter(|name| !disabled.contains(*name));
+        let names: BTreeSet<String> = ext_map
+            .keys()
+            .chain(running.keys())
+            .chain(failed)
+            .cloned()
+            .collect();
+
+        Ok(names
             .into_iter()
-            .map(|(name, tools)| {
-                let (status, last_error) = if let Some(err) = errors.get(&name) {
-                    ("error".to_string(), Some(err.clone()))
+            .map(|name| {
+                let tools = ext_map.remove(&name).unwrap_or_default();
+                let (status, last_error, status_reason) = if let Some(err) = errors.get(&name) {
+                    ("error", Some(err.clone()), None)
                 } else if tools.is_empty() {
-                    ("loading".to_string(), None)
+                    let reason = running.get(&name).and_then(|i| no_tools_reason(i));
+                    ("no_tools", None, reason)
                 } else {
-                    ("connected".to_string(), None)
+                    ("connected", None, None)
                 };
                 ExtensionInfo {
                     kind: "builtin".to_string(),
@@ -173,8 +247,9 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
                     enabled: !disabled.contains(&name),
                     name,
                     tools,
-                    status,
+                    status: status.to_string(),
                     last_error,
+                    status_reason,
                 }
             })
             .collect())
@@ -316,10 +391,11 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             }
         }
 
-        let status = if discovered_tools.is_empty() {
-            "loading".to_string()
+        // The engine accepted the start, so it is running: no tools is a choice, not a failure.
+        let (status, status_reason) = if discovered_tools.is_empty() {
+            ("no_tools", self.note_tool_less(&request.name).await)
         } else {
-            "connected".to_string()
+            ("connected", None)
         };
 
         Ok(ExtensionInfo {
@@ -328,8 +404,9 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
             description: request.description,
             tools: discovered_tools,
             enabled: true,
-            status,
+            status: status.to_string(),
             last_error: None,
+            status_reason,
         })
     }
 
@@ -377,6 +454,14 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
                         .add_extension(config.clone(), &session_id)
                         .await
                         .map_err(|e| anyhow!("Failed to re-enable extension: {}", e))?;
+                    if self
+                        .agent
+                        .list_tools(&session_id, Some(name.to_string()))
+                        .await
+                        .is_empty()
+                    {
+                        self.note_tool_less(name).await;
+                    }
                 }
                 disabled.remove(name);
             }
@@ -414,6 +499,32 @@ mod tests {
             GiapGooseExtensionManager::new(agent, session_manager.clone()),
             session_manager,
         )
+    }
+
+    #[test]
+    fn a_reason_is_the_first_sentence_of_the_instructions() {
+        let music = "No music service can be controlled by the assistant on this computer: \
+                     Apple Music needs a Mac. Spotify is never controlled by the assistant.";
+        assert_eq!(
+            no_tools_reason(music).as_deref(),
+            Some(
+                "No music service can be controlled by the assistant on this computer: \
+                 Apple Music needs a Mac."
+            )
+        );
+        assert_eq!(
+            no_tools_reason("First line\nsecond line").as_deref(),
+            Some("First line")
+        );
+        assert_eq!(no_tools_reason("  \n "), None);
+        assert_eq!(no_tools_reason(""), None);
+    }
+
+    #[test]
+    fn a_long_reason_is_cut_short() {
+        let reason = no_tools_reason(&"word ".repeat(100)).unwrap();
+        assert!(reason.ends_with("..."));
+        assert!(reason.chars().count() <= MAX_REASON_CHARS + 3);
     }
 
     #[tokio::test]

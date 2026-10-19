@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import {
   Button,
   Card,
@@ -652,7 +653,7 @@ export function SecretConfigModal({
 
 // ── Extension Card ────────────────────────────────────────────
 
-function ExtensionCard({
+export function ExtensionCard({
   ext,
   onToggle,
   onDelete,
@@ -669,7 +670,10 @@ function ExtensionCard({
   secretStatus?: SecretStatus;
   disabled: boolean;
 }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  // Running, with no tools on purpose: neutral, not a failure.
+  const toolLess = ext.status === "no_tools";
 
   return (
     <div className={`ext-card${ext.enabled ? " ext-card--enabled" : " ext-card--disabled"}`}>
@@ -686,7 +690,9 @@ function ExtensionCard({
                 title={
                   ext.status === "error" && ext.last_error
                     ? `Error: ${ext.last_error}`
-                    : ext.status.charAt(0).toUpperCase() + ext.status.slice(1)
+                    : toolLess
+                      ? t("extensions.noTools")
+                      : ext.status.charAt(0).toUpperCase() + ext.status.slice(1)
                 }
                 aria-label={`Status: ${ext.status}`}
               />
@@ -725,6 +731,12 @@ function ExtensionCard({
           {ext.last_error && (
             <div className="ext-card__error-line" title={ext.last_error}>
               {ext.last_error}
+            </div>
+          )}
+          {toolLess && (
+            <div className="ext-card__note-line">
+              <span className="ext-card__note-title">{t("extensions.noTools")}</span>
+              {ext.status_reason || t("extensions.noToolsGeneric")}
             </div>
           )}
         </div>
