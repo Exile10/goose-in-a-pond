@@ -106,6 +106,8 @@ mod tests {
             updated_at_ms: 1,
             source: "serve".into(),
             pid: 1,
+            raised: Vec::new(),
+            sound_server: None,
         }
     }
 

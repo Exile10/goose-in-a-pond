@@ -212,14 +212,22 @@ client reads it, the server never does · `NONE` = nothing reads it anywhere.
 | `audio_input_device` | `""` | LIVE | S, H:Voice |
 | `audio_output_device` | `""` | LIVE | S, H:Voice |
 | `audio_sound_test` | `true` | LIVE | S, H:Voice |
+| `audio_manage_system` | `true` | LIVE | S, H:Voice |
 
-The three `audio_*` rows are two pins and a switch, not the device choice itself. An empty pin
+The four `audio_*` rows are two pins and two switches, not the device choice itself. An empty pin
 means automatic. With `audio_sound_test` on (the default), every choice (startup, a device coming or
 going, a test) plays a short soft sound on a speaker and keeps the first speaker and microphone pair
 in order of preference where the microphone hears it; off, or when no pair is heard, each device is
 checked silently instead (`pond-adapters-audio-devices`). It replaced `audio_test_chime` on
 2026-10-18, whose rows are now ignored. What is in use, and why, is `GET /api/v1/audio/devices`;
 both settings surfaces show it beside the pickers.
+
+`audio_manage_system` (on by default) acts on Linux only, where a board has no sound menu or volume
+keys: after each choice the pond makes the chosen pair PulseAudio's (or PipeWire's) default sink and
+source and unmutes them, and when no pair is heard it unmutes the preferred pair and raises a volume
+below the device's natural level (100% for a speaker, the card's 0 dB for a microphone) for one more
+test, putting it back if that is not heard either. A Mac's defaults and volume are never touched.
+Serve leaves the board's defaults to a live voice session, whose microphone choice is the real one.
 
 `voice_kws_whisper_url` (was `null`, **NONE**) was removed on 2026-10-15: nothing read it once
 wake-word detection moved in process. `voice_recording_duration_secs` is read only by the browser

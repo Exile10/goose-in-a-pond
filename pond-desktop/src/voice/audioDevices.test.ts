@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AudioChoice, AudioDeviceStatus, ProbedAudioDevice } from "../api/types";
-import { describeChoice, describeWhen, deviceOptions, isAudioStatus } from "./audioDevices";
+import { describeBoard, describeChoice, describeWhen, deviceOptions, isAudioStatus } from "./audioDevices";
 
 function device(id: string, outcome: ProbedAudioDevice["outcome"], is_default = false): ProbedAudioDevice {
   return { id, label: id, is_default, kind: "hardware", outcome };
@@ -174,5 +174,57 @@ describe("describeWhen and isAudioStatus", () => {
     expect(isAudioStatus(undefined)).toBe(false);
     expect(isAudioStatus("<html>")).toBe(false);
     expect(isAudioStatus({ input: {}, output: {} })).toBe(false);
+  });
+});
+
+describe("describeBoard", () => {
+  const base: AudioDeviceStatus = {
+    input: choice({}),
+    output: choice({ direction: "output" }),
+    updated_at_ms: 1,
+    source: "voice",
+    pid: 1,
+  };
+  const usb = "USB PnP Audio Device Analog Stereo";
+
+  it("says nothing where the pond changed nothing on the board", () => {
+    expect(describeBoard(base)).toBeNull();
+    expect(describeBoard({ ...base, sound_server: null })).toBeNull();
+  });
+
+  it("says the other programs follow the pond's choice", () => {
+    const line = describeBoard({
+      ...base,
+      sound_server: { server: "pulseaudio", speaker: usb, mic: usb, problems: [] },
+    });
+    expect(line).toEqual({ text: "Every other program on the board uses them too.", problem: false });
+  });
+
+  it("names each level it raised and why", () => {
+    const line = describeBoard({
+      ...base,
+      raised: [
+        { device: usb, what: "volume", from: "51%", to: "100%" },
+        { device: usb, what: "mute", from: "on", to: "off" },
+      ],
+    });
+    expect(line?.text).toBe(
+      `So its test sound was heard, the pond turned ${usb} up from 51% to 100% and unmuted ${usb}.`,
+    );
+    expect(line?.problem).toBe(false);
+  });
+
+  it("flags what the board's sound server would not take", () => {
+    const line = describeBoard({
+      ...base,
+      sound_server: {
+        server: "pulseaudio",
+        speaker: null,
+        mic: usb,
+        problems: ["pulseaudio lists no speaker on 'HDMI'"],
+      },
+    });
+    expect(line?.problem).toBe(true);
+    expect(line?.text).toContain("pulseaudio lists no speaker on 'HDMI'");
   });
 });

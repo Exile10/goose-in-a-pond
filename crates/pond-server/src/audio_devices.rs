@@ -21,6 +21,7 @@ pub fn prefs_of(settings: &Settings) -> AudioPrefs {
         output_pin: pin(&settings.audio_output_device),
         mic_enabled: settings.mic_enabled,
         sound_test: settings.audio_sound_test,
+        manage_system: settings.audio_manage_system,
     }
 }
 
@@ -67,5 +68,6 @@ mod tests {
         assert_eq!(p.output_pin.as_deref(), Some("AirPods"));
         assert!(!p.sound_test);
         assert!(p.mic_enabled);
+        assert!(p.manage_system, "on unless the household turns it off");
     }
 }

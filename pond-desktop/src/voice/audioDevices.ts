@@ -4,6 +4,7 @@
 import type {
   AudioChoice,
   AudioDeviceStatus,
+  AudioLevelChange,
   AudioProbeOutcome,
   ProbedAudioDevice,
 } from "../api/types";
@@ -135,6 +136,30 @@ export function describeChoice(choice: AudioChoice): ChoiceLine {
       };
   }
   return { text: `${device.label}, ${state}.`, problem: false };
+}
+
+function raisedPhrase(change: AudioLevelChange): string {
+  return change.what === "mute"
+    ? `unmuted ${change.device}`
+    : `turned ${change.device} up from ${change.from} to ${change.to}`;
+}
+
+/** What the pond changed on the board itself, or null when it changed nothing there. */
+export function describeBoard(status: AudioDeviceStatus): ChoiceLine | null {
+  const parts: string[] = [];
+  const raised = status.raised ?? [];
+  if (raised.length) {
+    parts.push(`So its test sound was heard, the pond ${raised.map(raisedPhrase).join(" and ")}.`);
+  }
+  const board = status.sound_server;
+  if (board?.problems.length) {
+    parts.push(`The board's own sound settings could not follow: ${board.problems.join("; ")}.`);
+    return { text: parts.join(" "), problem: true };
+  }
+  if (board && (board.speaker || board.mic)) {
+    parts.push("Every other program on the board uses them too.");
+  }
+  return parts.length ? { text: parts.join(" "), problem: false } : null;
 }
 
 /** "Tested 12 seconds ago by the voice session." Says which process, since only voice hears. */

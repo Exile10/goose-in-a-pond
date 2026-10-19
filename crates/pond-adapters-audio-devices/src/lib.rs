@@ -5,6 +5,7 @@ pub mod names;
 pub mod probe;
 pub mod prober;
 pub mod sound;
+pub mod sound_server;
 pub mod supervisor;
 pub mod tone;
 
