@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use crate::models::domain::audio_device::{
-    AudioDevice, AudioDeviceStatus, AudioDirection, PairOutcome, ProbeOutcome,
+    AudioDevice, AudioDeviceStatus, AudioDirection, LevelChange, PairOutcome, ProbeOutcome,
+    SoundServerDefaults,
 };
 
 /// Blocking by design: a probe opens a real device, and CoreAudio streams must be opened and
@@ -43,6 +44,25 @@ pub trait AudioDeviceProber: Send + Sync {
     /// the default by priority (a board), false where a person picks it (CoreAudio).
     fn plugged_in_first(&self) -> bool {
         false
+    }
+
+    /// Unmute this pair and turn a volume below full up to full, for one more sound test after
+    /// none was heard. Returns what changed, to put back if that did not help. Empty where the
+    /// pond may not or cannot: a Mac's volume is the person's, and a speaker's knob is its own.
+    fn raise_levels(&self, _speaker: &AudioDevice, _mic: &AudioDevice) -> Vec<LevelChange> {
+        Vec::new()
+    }
+
+    fn restore_levels(&self, _changes: &[LevelChange]) {}
+
+    /// Make the chosen devices the sound server's own defaults, unmuted, so other programs on the
+    /// board default to them. `None` where no sound server's defaults are the pond's to set.
+    fn set_system_defaults(
+        &self,
+        _input: Option<&AudioDevice>,
+        _output: Option<&AudioDevice>,
+    ) -> Option<SoundServerDefaults> {
+        None
     }
 }
 

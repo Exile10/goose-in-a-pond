@@ -258,6 +258,11 @@ pub struct Settings {
     #[serde(default = "Settings::default_audio_sound_test")]
     pub audio_sound_test: bool,
 
+    /// On a Linux board, makes the chosen speaker and microphone the sound server's defaults,
+    /// unmuted, and raises a level too low for the test sound to be heard. A Mac is left alone.
+    #[serde(default = "Settings::default_audio_manage_system")]
+    pub audio_manage_system: bool,
+
     /// Recording ceiling for the browser voice path only; the voice loop ends on silence.
     #[serde(default = "Settings::default_recording_duration")]
     pub voice_recording_duration_secs: u32,
@@ -771,6 +776,7 @@ impl Default for Settings {
             audio_input_device: String::new(),
             audio_output_device: String::new(),
             audio_sound_test: Self::default_audio_sound_test(),
+            audio_manage_system: Self::default_audio_manage_system(),
             voice_recording_duration_secs: Self::default_recording_duration(),
             voice_whisper_url: Self::default_whisper_url(),
             active_llm_model: Self::default_active_llm_model(),
@@ -952,6 +958,10 @@ impl Settings {
     }
     /// On: a speaker that takes audio and makes no sound is only caught by listening for it.
     fn default_audio_sound_test() -> bool {
+        true
+    }
+    /// On: a board has no volume keys or sound menu, so nobody else will fix them.
+    fn default_audio_manage_system() -> bool {
         true
     }
     fn default_recording_duration() -> u32 {
@@ -2060,6 +2070,7 @@ mod tests {
             "audio_input_device",
             "audio_output_device",
             "audio_sound_test",
+            "audio_manage_system",
             "voice_tts_quality",
             "voice_tts_speed",
             "voice_tts_voice",

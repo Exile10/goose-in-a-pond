@@ -59,6 +59,10 @@
   max-width: 64ch;
 }
 
+.adev__board {
+  margin: 0;
+}
+
 .adev__line[data-problem] {
   color: var(--color-text, #171616);
   font-weight: 600;

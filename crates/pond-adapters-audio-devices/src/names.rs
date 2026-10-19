@@ -108,6 +108,19 @@ pub fn card_of<'a>(name: &str, cards: &'a [Card]) -> Option<&'a Card> {
     cards.iter().find(|c| c.id == id)
 }
 
+/// The index of the card an ALSA name routes to: `CARD=Device`, `CARD=0`, or `hw:0,0`.
+pub fn card_index(name: &str, cards: &[Card]) -> Option<u32> {
+    if let Some(card) = alsa_field(name, "CARD") {
+        return cards
+            .iter()
+            .find(|c| c.id == card)
+            .map(|c| c.index)
+            .or_else(|| card.parse().ok());
+    }
+    let (_, args) = name.split_once(':')?;
+    args.split(',').next()?.trim().parse().ok()
+}
+
 fn alsa_field<'a>(name: &'a str, key: &str) -> Option<&'a str> {
     let (_, args) = name.split_once(':')?;
     args.split(',')
@@ -250,6 +263,17 @@ mod tests {
         assert_eq!(kind_of("ZoomAudioDevice"), DeviceKind::Virtual);
         assert_eq!(kind_of("Microsoft Teams Audio"), DeviceKind::Virtual);
         assert_eq!(kind_of("jerr\u{2019}s Microphone"), DeviceKind::Hardware);
+    }
+
+    #[test]
+    fn a_card_is_found_by_its_id_its_number_or_a_bare_hw_name() {
+        let cards = parse_cards(JETSON_CARDS);
+        assert_eq!(card_index("sysdefault:CARD=Device", &cards), Some(0));
+        assert_eq!(card_index("plughw:CARD=APE,DEV=0", &cards), Some(2));
+        assert_eq!(card_index("hw:CARD=1,DEV=3", &cards), Some(1));
+        assert_eq!(card_index("hw:2,0", &cards), Some(2));
+        assert_eq!(card_index("default", &cards), None);
+        assert_eq!(card_index("pulse", &cards), None);
     }
 
     #[test]

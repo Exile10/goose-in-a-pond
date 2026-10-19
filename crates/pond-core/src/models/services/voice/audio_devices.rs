@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::models::domain::audio_device::{
     choose, pair_order, probe_order, settles, AudioChoice, AudioDevice, AudioDirection,
-    ChoiceBasis, PairOutcome, ProbeOutcome, ProbedDevice,
+    ChoiceBasis, LevelChange, PairOutcome, ProbeOutcome, ProbedDevice,
 };
 use crate::models::ports::audio_devices::AudioDeviceProber;
 
@@ -54,6 +54,8 @@ pub struct PairRequest<'a> {
     pub output_pin: Option<&'a str>,
     pub mode: ProbeMode,
     pub exclude: &'a [String],
+    /// When no pair is heard, raise the first pair's software levels and try it once more.
+    pub raise_levels: bool,
 }
 
 /// What a sound test found across the pairs it tried.
@@ -65,6 +67,8 @@ pub enum SoundTest {
     Heard {
         input: AudioChoice,
         output: AudioChoice,
+        /// Levels raised before the pair was heard; kept, since they are why it was.
+        raised: Vec<LevelChange>,
     },
     /// Pairs were tried and no microphone heard any speaker.
     NotHeard { tried: usize },
@@ -123,6 +127,31 @@ impl AudioDeviceSelector {
         if speakers.is_empty() || mics.is_empty() {
             return SoundTest::NotRun;
         }
+        let heard = |s: usize, m: usize, room_dbfs: f32, raised: Vec<LevelChange>| {
+            let output = heard_choice(
+                AudioDirection::Output,
+                &speakers,
+                s,
+                ProbeOutcome::Accepting,
+                output_pin,
+                &mics[m].label,
+            );
+            let input = heard_choice(
+                AudioDirection::Input,
+                &mics,
+                m,
+                ProbeOutcome::Hearing {
+                    level_dbfs: room_dbfs,
+                },
+                input_pin,
+                &speakers[s].label,
+            );
+            SoundTest::Heard {
+                input,
+                output,
+                raised,
+            }
+        };
         let started = Instant::now();
         let mut tried = 0usize;
         for (s, m) in pair_order(speakers.len(), mics.len()) {
@@ -131,27 +160,7 @@ impl AudioDeviceSelector {
             }
             tried += 1;
             match self.prober.hears(&speakers[s], &mics[m]) {
-                PairOutcome::Heard { room_dbfs, .. } => {
-                    let output = heard_choice(
-                        AudioDirection::Output,
-                        &speakers,
-                        s,
-                        ProbeOutcome::Accepting,
-                        output_pin,
-                        &mics[m].label,
-                    );
-                    let input = heard_choice(
-                        AudioDirection::Input,
-                        &mics,
-                        m,
-                        ProbeOutcome::Hearing {
-                            level_dbfs: room_dbfs,
-                        },
-                        input_pin,
-                        &speakers[s].label,
-                    );
-                    return SoundTest::Heard { input, output };
-                }
+                PairOutcome::Heard { room_dbfs, .. } => return heard(s, m, room_dbfs, Vec::new()),
                 PairOutcome::NotHeard => {}
                 PairOutcome::Failed { reason } => tracing::debug!(
                     speaker = %speakers[s].id,
@@ -159,6 +168,20 @@ impl AudioDeviceSelector {
                     %reason,
                     "sound test could not run on this pair"
                 ),
+            }
+        }
+        // Every pair opened and none was heard: a muted or turned-down level is the likeliest
+        // cause the pond can fix, on the pair it would most like to use.
+        if req.raise_levels {
+            let raised = self.prober.raise_levels(&speakers[0], &mics[0]);
+            if !raised.is_empty() {
+                tried += 1;
+                if let PairOutcome::Heard { room_dbfs, .. } =
+                    self.prober.hears(&speakers[0], &mics[0])
+                {
+                    return heard(0, 0, room_dbfs, raised);
+                }
+                self.prober.restore_levels(&raised);
             }
         }
         SoundTest::NotHeard { tried }
@@ -311,6 +334,10 @@ pub(crate) mod tests {
         /// `(speaker, mic)` pairs that hear each other.
         pub heard: Vec<(String, String)>,
         pub pairs_tried: Mutex<Vec<(String, String)>>,
+        /// Pairs heard only once their levels are raised, and whether they are now.
+        pub too_quiet: Vec<(String, String)>,
+        pub levels_raised: Mutex<bool>,
+        pub restored: Mutex<usize>,
     }
 
     impl FakeProber {
@@ -370,7 +397,8 @@ pub(crate) mod tests {
         fn hears(&self, speaker: &AudioDevice, mic: &AudioDevice) -> PairOutcome {
             let pair = (speaker.id.clone(), mic.id.clone());
             self.pairs_tried.lock().unwrap().push(pair.clone());
-            if self.heard.contains(&pair) {
+            let loud_enough = *self.levels_raised.lock().unwrap() && self.too_quiet.contains(&pair);
+            if self.heard.contains(&pair) || loud_enough {
                 PairOutcome::Heard {
                     margin_db: 30.0,
                     room_dbfs: -50.0,
@@ -378,6 +406,20 @@ pub(crate) mod tests {
             } else {
                 PairOutcome::NotHeard
             }
+        }
+        fn raise_levels(&self, speaker: &AudioDevice, _: &AudioDevice) -> Vec<LevelChange> {
+            *self.levels_raised.lock().unwrap() = true;
+            vec![LevelChange {
+                device: speaker.id.clone(),
+                what: "volume".into(),
+                from: "20%".into(),
+                to: "100%".into(),
+                undo: vec!["20%".into()],
+            }]
+        }
+        fn restore_levels(&self, changes: &[LevelChange]) {
+            *self.levels_raised.lock().unwrap() = false;
+            *self.restored.lock().unwrap() += changes.len();
         }
     }
 
@@ -650,6 +692,7 @@ pub(crate) mod tests {
             output_pin,
             mode: ProbeMode::Lazy,
             exclude: &[],
+            raise_levels: false,
         })
     }
 
@@ -661,7 +704,7 @@ pub(crate) mod tests {
             ("sysdefault:CARD=Device", "sysdefault:CARD=Device"),
             ("default", "sysdefault:CARD=Device"),
         ]));
-        let SoundTest::Heard { input, output } = by_sound(&p, None, None) else {
+        let SoundTest::Heard { input, output, .. } = by_sound(&p, None, None) else {
             panic!("expected a pair to be heard");
         };
         assert_eq!(output.device_id(), Some("sysdefault:CARD=Device"));
@@ -677,7 +720,7 @@ pub(crate) mod tests {
         let mut fake = board(&[("sysdefault:CARD=Device", "sysdefault:CARD=Device")]);
         fake.plugged_in_first = false;
         let p = Arc::new(fake);
-        let SoundTest::Heard { input, output } = by_sound(&p, None, None) else {
+        let SoundTest::Heard { input, output, .. } = by_sound(&p, None, None) else {
             panic!("expected the USB pair");
         };
         assert_eq!(output.device_id(), Some("sysdefault:CARD=Device"));
@@ -721,6 +764,62 @@ pub(crate) mod tests {
     fn when_nothing_is_heard_the_test_says_so_within_its_cap() {
         let p = Arc::new(board(&[]));
         assert_eq!(by_sound(&p, None, None), SoundTest::NotHeard { tried: 4 });
+    }
+
+    fn raising(p: &Arc<FakeProber>) -> SoundTest {
+        AudioDeviceSelector::new(p.clone()).select_by_sound(&PairRequest {
+            input_pin: None,
+            output_pin: None,
+            mode: ProbeMode::Lazy,
+            exclude: &[],
+            raise_levels: true,
+        })
+    }
+
+    /// The nano's USB speaker sat at -17 dB: a level the pond can raise, unlike the knob.
+    #[test]
+    fn a_pair_too_quiet_to_hear_is_heard_once_its_levels_are_raised_and_they_stay() {
+        let mut fake = board(&[]);
+        fake.too_quiet = vec![(
+            "sysdefault:CARD=Device".to_string(),
+            "sysdefault:CARD=Device".to_string(),
+        )];
+        let p = Arc::new(fake);
+        let SoundTest::Heard { output, raised, .. } = raising(&p) else {
+            panic!("expected the raised pair to be heard");
+        };
+        assert_eq!(output.device_id(), Some("sysdefault:CARD=Device"));
+        assert_eq!(raised.len(), 1);
+        assert_eq!(
+            *p.restored.lock().unwrap(),
+            0,
+            "the raise is why it was heard"
+        );
+        assert_eq!(
+            p.pairs_tried.lock().unwrap().len(),
+            5,
+            "four pairs, then one retry"
+        );
+    }
+
+    #[test]
+    fn levels_raised_for_nothing_are_put_back() {
+        let p = Arc::new(board(&[]));
+        assert_eq!(raising(&p), SoundTest::NotHeard { tried: 5 });
+        assert_eq!(*p.restored.lock().unwrap(), 1);
+        assert!(!*p.levels_raised.lock().unwrap());
+    }
+
+    #[test]
+    fn levels_are_left_alone_unless_the_household_allows_it() {
+        let mut fake = board(&[]);
+        fake.too_quiet = vec![(
+            "sysdefault:CARD=Device".to_string(),
+            "sysdefault:CARD=Device".to_string(),
+        )];
+        let p = Arc::new(fake);
+        assert_eq!(by_sound(&p, None, None), SoundTest::NotHeard { tried: 4 });
+        assert!(!*p.levels_raised.lock().unwrap());
     }
 
     #[test]

@@ -3,7 +3,7 @@ import { AlertTriangle, Loader2, Mic, MicOff, RefreshCw, Volume2 } from "lucide-
 import { api } from "../api/PondApiClient";
 import type { AudioChoice, AudioDeviceStatus, Settings } from "../api/types";
 import { Toggle } from "../hub/views/settings/controls";
-import { describeChoice, describeWhen, deviceOptions, isAudioStatus } from "./audioDevices";
+import { describeBoard, describeChoice, describeWhen, deviceOptions, isAudioStatus } from "./audioDevices";
 import "./audio-devices.css";
 
 /** Often enough that a headset plugged in shows up while the page is open; a GET reads a file. */
@@ -100,14 +100,16 @@ export function AudioDevicesPanel({ variant, withPickers = false, onStatus }: Pr
     }
   }
 
-  async function setSoundTest(on: boolean) {
-    setSettings((s) => ({ ...(s ?? {}), audio_sound_test: on }));
+  async function setSwitch(key: "audio_sound_test" | "audio_manage_system", on: boolean) {
+    setSettings((s) => ({ ...(s ?? {}), [key]: on }));
     try {
-      await api.updateSettings({ audio_sound_test: on });
+      await api.updateSettings({ [key]: on });
     } catch {
       setError("That switch was not saved. Try again.");
     }
   }
+
+  const board = status ? describeBoard(status) : null;
 
   const rows: { key: PinKey; title: string; choice: AudioChoice | undefined }[] = [
     { key: "audio_input_device", title: "Microphone", choice: status?.input },
@@ -156,6 +158,12 @@ export function AudioDevicesPanel({ variant, withPickers = false, onStatus }: Pr
         })}
       </ul>
 
+      {board && (
+        <p className="adev__line adev__board" data-problem={board.problem || undefined}>
+          {board.text}
+        </p>
+      )}
+
       {withPickers && (
         <div className="adev__row adev__row--switch">
           <div className="adev__text">
@@ -170,8 +178,29 @@ export function AudioDevicesPanel({ variant, withPickers = false, onStatus }: Pr
             <Toggle
               key={`sound-test-${settings.audio_sound_test !== false}`}
               on={settings.audio_sound_test !== false}
-              onChange={(on) => void setSoundTest(on)}
+              onChange={(on) => void setSwitch("audio_sound_test", on)}
               label="Find them by sound"
+            />
+          )}
+        </div>
+      )}
+
+      {withPickers && (
+        <div className="adev__row adev__row--switch">
+          <div className="adev__text">
+            <span className="adev__title">Set up the board's sound</span>
+            <span className="adev__line">
+              On a Linux board like the nano, the pair the pond picks becomes every program's
+              default, unmuted, and a level too low to be heard is turned up. A Mac's own settings
+              are never changed.
+            </span>
+          </div>
+          {settings && (
+            <Toggle
+              key={`manage-system-${settings.audio_manage_system !== false}`}
+              on={settings.audio_manage_system !== false}
+              onChange={(on) => void setSwitch("audio_manage_system", on)}
+              label="Set up the board's sound"
             />
           )}
         </div>

@@ -93,6 +93,9 @@ export interface Settings {
   audio_output_device?: string;
   /** Choose the speaker and mic by a short test sound (on); off, they are checked silently. */
   audio_sound_test?: boolean;
+  /** On a Linux board: make the chosen pair the sound server's defaults, and raise a level too
+   *  low to be heard. A Mac is left alone. */
+  audio_manage_system?: boolean;
 
   // Model roles
   chat_provider?: string;
@@ -1583,6 +1586,23 @@ export interface AudioChoice {
   unheard?: boolean;
 }
 
+/** A level the pond raised so its test sound was heard. */
+export interface AudioLevelChange {
+  /** The device, as the board's sound server names it. */
+  device: string;
+  what: "volume" | "mute";
+  from: string;
+  to: string;
+}
+
+/** What the pond told the board's sound server, so other programs default to the same pair. */
+export interface SoundServerDefaults {
+  server: string;
+  speaker: string | null;
+  mic: string | null;
+  problems: string[];
+}
+
 export interface AudioDeviceStatus {
   input: AudioChoice;
   output: AudioChoice;
@@ -1590,4 +1610,6 @@ export interface AudioDeviceStatus {
   /** `voice` when the voice session chose (it owns the microphone), `serve` otherwise. */
   source: string;
   pid: number;
+  raised?: AudioLevelChange[];
+  sound_server?: SoundServerDefaults | null;
 }

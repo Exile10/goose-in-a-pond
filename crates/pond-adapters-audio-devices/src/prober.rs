@@ -7,7 +7,7 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait};
 use pond_audio::MicHandle;
 use pond_core::models::domain::audio_device::{
-    AudioDevice, AudioDirection, PairOutcome, ProbeOutcome,
+    AudioDevice, AudioDirection, LevelChange, PairOutcome, ProbeOutcome, SoundServerDefaults,
 };
 use pond_core::models::domain::mic_gate;
 use pond_core::models::ports::audio_devices::AudioDeviceProber;
@@ -15,6 +15,7 @@ use pond_core::models::ports::audio_devices::AudioDeviceProber;
 use crate::names;
 use crate::probe;
 use crate::sound;
+use crate::sound_server::{self, SystemPactl};
 
 /// cpal's only host on Linux is ALSA, whose listing opens every node.
 const ALSA: bool = cfg!(target_os = "linux");
@@ -216,6 +217,29 @@ impl AudioDeviceProber for CpalProber {
     fn chime(&self, device: &AudioDevice) -> Result<(), String> {
         pond_audio_out::route::play_chime(Some(&device.id)).map_err(|e| e.to_string())
     }
+
+    // Linux only: on a Mac the person sets the volume and the defaults.
+    fn raise_levels(&self, speaker: &AudioDevice, mic: &AudioDevice) -> Vec<LevelChange> {
+        if !ALSA {
+            return Vec::new();
+        }
+        sound_server::raise_levels(&SystemPactl, &Self::cards(), speaker, mic)
+    }
+
+    fn restore_levels(&self, changes: &[LevelChange]) {
+        sound_server::restore_levels(&SystemPactl, changes);
+    }
+
+    fn set_system_defaults(
+        &self,
+        input: Option<&AudioDevice>,
+        output: Option<&AudioDevice>,
+    ) -> Option<SoundServerDefaults> {
+        if !ALSA {
+            return None;
+        }
+        sound_server::set_defaults(&SystemPactl, &Self::cards(), input, output)
+    }
 }
 
 #[cfg(test)]
@@ -273,15 +297,18 @@ mod tests {
                 output_pin: None,
                 mode: ProbeMode::Lazy,
                 exclude: &[],
+                // Changes the board's levels, and keeps them if that is what got the sound heard.
+                raise_levels: std::env::var("GIAP_TEST_RAISE").is_ok(),
             },
         );
         match &pair {
             pond_core::models::services::voice::audio_devices::SoundTest::Heard {
                 input,
                 output,
+                raised,
             } => {
                 println!(
-                    "by sound in {:?}: speaker {output} / mic {input}",
+                    "by sound in {:?}: speaker {output} / mic {input}; raised {raised:?}",
                     t.elapsed()
                 )
             }

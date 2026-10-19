@@ -53,6 +53,9 @@ pub struct AudioPrefs {
     pub mic_enabled: bool,
     /// `Settings::audio_sound_test`: choose the speaker and microphone by a short test sound.
     pub sound_test: bool,
+    /// `Settings::audio_manage_system`: make the choice the board's own defaults, and raise a
+    /// level too low for the test sound to be heard.
+    pub manage_system: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,15 +304,15 @@ impl Inner {
 
         // Every choice is made by sound where the household allows it: serve leaves the test to a
         // voice session that is running, since that session holds the microphone.
-        let by_sound = prefs.sound_test
-            && prefs.mic_enabled
-            && (self.role == Role::Voice || live_voice(&self.data_dir).is_none());
+        let in_charge = self.role == Role::Voice || live_voice(&self.data_dir).is_none();
+        let by_sound = prefs.sound_test && prefs.mic_enabled && in_charge;
         let sound = by_sound.then(|| {
             self.selector.select_by_sound(&PairRequest {
                 input_pin: prefs.input_pin.as_deref(),
                 output_pin: prefs.output_pin.as_deref(),
                 mode,
                 exclude: &exclude,
+                raise_levels: prefs.manage_system,
             })
         });
         self.played.store(
@@ -319,11 +322,19 @@ impl Inner {
             ),
             Ordering::SeqCst,
         );
+        let mut raised = Vec::new();
         let (input, output) = match sound {
-            Some(SoundTest::Heard { input, output }) => (
-                self.with_the_rest(input, mode, &prefs, &exclude),
-                self.with_the_rest(output, mode, &prefs, &exclude),
-            ),
+            Some(SoundTest::Heard {
+                input,
+                output,
+                raised: by_raising,
+            }) => {
+                raised = by_raising;
+                (
+                    self.with_the_rest(input, mode, &prefs, &exclude),
+                    self.with_the_rest(output, mode, &prefs, &exclude),
+                )
+            }
             not_heard => {
                 let input = match (&previous, which.input) {
                     (Some(prev), false) => prev.input.clone(),
@@ -345,12 +356,27 @@ impl Inner {
         }
         pond_audio_out::set_output_device(output.device_id().map(str::to_string));
 
+        // Serve leaves the board's defaults to a live voice session, whose microphone choice is
+        // the real one; two processes setting them would take turns overriding each other.
+        let sound_server = (prefs.manage_system && in_charge)
+            .then(|| {
+                let mic = (!matches!(input.basis, ChoiceBasis::MicOff | ChoiceBasis::NoDevice))
+                    .then_some(input.device.as_ref())
+                    .flatten();
+                self.selector
+                    .prober()
+                    .set_system_defaults(mic, output.device.as_ref())
+            })
+            .flatten();
+
         let status = AudioDeviceStatus {
             input,
             output,
             updated_at_ms: now_ms(),
             source: self.role.name().to_string(),
             pid: std::process::id(),
+            raised,
+            sound_server,
         };
         let changed = previous.as_ref().is_none_or(|p| {
             p.input.device_id() != status.input.device_id()
@@ -586,8 +612,8 @@ impl Inner {
     }
 }
 
-/// The API's view for the server process: the voice session's choice while one runs, since it
-/// owns the microphone, and the server's own otherwise.
+/// The control for the API and the assistant's tool. In the server process it shows the voice
+/// session's choice while one runs, since that owns the microphone, and the server's otherwise.
 pub struct PondAudioControl {
     serve: AudioSupervisor,
     data_dir: PathBuf,
@@ -608,6 +634,8 @@ impl PondAudioControl {
                 updated_at_ms: now_ms(),
                 source: Role::Serve.name().to_string(),
                 pid: std::process::id(),
+                raised: Vec::new(),
+                sound_server: None,
             })
     }
 }
@@ -674,7 +702,7 @@ impl AudioDeviceControl for PondAudioControl {
 mod tests {
     use super::*;
     use pond_core::models::domain::audio_device::{
-        AudioDevice, DeviceKind, PairOutcome, ProbeOutcome,
+        AudioDevice, DeviceKind, PairOutcome, ProbeOutcome, SoundServerDefaults,
     };
     use std::collections::HashMap;
 
@@ -689,6 +717,8 @@ mod tests {
         /// `(speaker, mic)` pairs that hear each other, and every pair a sound test tried.
         heard: Mutex<Vec<(String, String)>>,
         sound_tests: Mutex<Vec<(String, String)>>,
+        /// Every `(mic, speaker)` made the board's default.
+        defaults_set: Mutex<Vec<(Option<String>, Option<String>)>>,
     }
 
     impl Machine {
@@ -752,6 +782,22 @@ mod tests {
                 PairOutcome::NotHeard
             }
         }
+        fn set_system_defaults(
+            &self,
+            input: Option<&AudioDevice>,
+            output: Option<&AudioDevice>,
+        ) -> Option<SoundServerDefaults> {
+            self.defaults_set
+                .lock()
+                .unwrap()
+                .push((input.map(|d| d.id.clone()), output.map(|d| d.id.clone())));
+            Some(SoundServerDefaults {
+                server: "pulseaudio".into(),
+                speaker: output.map(|d| d.label.clone()),
+                mic: input.map(|d| d.label.clone()),
+                problems: Vec::new(),
+            })
+        }
     }
 
     fn hearing() -> ProbeOutcome {
@@ -777,6 +823,7 @@ mod tests {
             output_pin: None,
             mic_enabled,
             sound_test,
+            manage_system: true,
         })
     }
 
@@ -1040,14 +1087,69 @@ mod tests {
                 updated_at_ms: 1,
                 source: "voice".into(),
                 pid: 1,
+                raised: Vec::new(),
+                sound_server: None,
             },
             answered: None,
         };
         write_json(&status_path(dir.path(), Role::Voice), &fake_voice);
         let sup = start(&m, Role::Serve, dir.path(), prefs(None, true, true));
-        sup.wait_ready(Duration::from_secs(5)).unwrap();
+        let status = sup.wait_ready(Duration::from_secs(5)).unwrap();
         assert!(m.sound_tests.lock().unwrap().is_empty());
+        assert!(
+            m.defaults_set.lock().unwrap().is_empty(),
+            "the voice session sets the board's defaults, from its own microphone choice"
+        );
+        assert_eq!(status.sound_server, None);
         sup.stop();
+    }
+
+    #[test]
+    fn the_choice_becomes_the_boards_default_unless_the_household_says_not() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = machine();
+        let sup = start(&m, Role::Voice, dir.path(), prefs(None, true, false));
+        let status = sup.wait_ready(Duration::from_secs(5)).unwrap();
+        sup.stop();
+        assert_eq!(
+            *m.defaults_set.lock().unwrap(),
+            [(
+                Some("Built-in mic".to_string()),
+                Some("Built-in speakers".to_string())
+            )]
+        );
+        assert_eq!(
+            status.sound_server.and_then(|s| s.speaker).as_deref(),
+            Some("Built-in speakers")
+        );
+
+        let m = machine();
+        let dir = tempfile::tempdir().unwrap();
+        let hands_off: PrefsFn = Arc::new(|| AudioPrefs {
+            mic_enabled: true,
+            manage_system: false,
+            ..Default::default()
+        });
+        let sup = start(&m, Role::Voice, dir.path(), hands_off);
+        let status = sup.wait_ready(Duration::from_secs(5)).unwrap();
+        sup.stop();
+        assert!(m.defaults_set.lock().unwrap().is_empty());
+        assert_eq!(status.sound_server, None);
+    }
+
+    #[test]
+    fn with_the_mic_off_only_the_speaker_becomes_the_boards_default() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = machine();
+        let sup = start(&m, Role::Voice, dir.path(), prefs(None, false, false));
+        sup.wait_ready(Duration::from_secs(5)).unwrap();
+        sup.stop();
+        assert_eq!(
+            *m.defaults_set.lock().unwrap(),
+            [(None, Some("Built-in speakers".to_string()))]
+        );
     }
 
     #[test]
@@ -1160,6 +1262,8 @@ mod tests {
             updated_at_ms: 1,
             source: "voice".into(),
             pid: u32::MAX - 1,
+            raised: Vec::new(),
+            sound_server: None,
         };
         write_json(
             &status_path(dir.path(), Role::Voice),

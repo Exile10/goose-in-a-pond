@@ -627,6 +627,14 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "audio_manage_system",
+            if settings.audio_manage_system {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // Unprompted speech
         upsert!(
             "unprompted_speech_enabled",
@@ -1130,6 +1138,8 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "audio_input_device" => s.audio_input_device = value.to_string(),
         "audio_output_device" => s.audio_output_device = value.to_string(),
         "audio_sound_test" => s.audio_sound_test = value == "true",
+        // A corrupt row reads false: the board's own settings are left as they are.
+        "audio_manage_system" => s.audio_manage_system = value == "true",
         // A corrupt row is not "true", so the pond stays quiet.
         "unprompted_speech_enabled" => s.unprompted_speech_enabled = value == "true",
         // Stored verbatim; the speech gate parses them and treats unparseable as quiet hours.

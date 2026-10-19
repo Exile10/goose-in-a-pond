@@ -310,6 +310,44 @@ impl std::fmt::Display for AudioChoice {
     }
 }
 
+/// A software level the pond raised so its test sound was heard: a sound server's volume or
+/// mute, never a speaker's own knob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LevelChange {
+    /// The device, as the sound server names it.
+    pub device: String,
+    /// `volume` or `mute`.
+    pub what: String,
+    pub from: String,
+    pub to: String,
+    /// The adapter's way back, if raising it did not help; it never leaves the process.
+    #[serde(skip)]
+    pub undo: Vec<String>,
+}
+
+impl std::fmt::Display for LevelChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} from {} to {}",
+            self.device, self.what, self.from, self.to
+        )
+    }
+}
+
+/// What the pond told the board's sound server, so other programs on the board default to the pair
+/// the pond chose. Linux boards only: on a Mac the person picks the defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoundServerDefaults {
+    /// The server, as it names itself (`pulseaudio`).
+    pub server: String,
+    /// The server's own names for the speaker and microphone that are now its defaults.
+    pub speaker: Option<String>,
+    pub mic: Option<String>,
+    #[serde(default)]
+    pub problems: Vec<String>,
+}
+
 /// What the pond is using right now, as written to disk for the other process and the UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioDeviceStatus {
@@ -320,6 +358,12 @@ pub struct AudioDeviceStatus {
     /// `voice` when the voice session chose, which owns the microphone; `serve` otherwise.
     pub source: String,
     pub pid: u32,
+    /// Levels this choice raised so the test sound was heard.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raised: Vec<LevelChange>,
+    /// Set when the household lets the pond make its choice the board's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound_server: Option<SoundServerDefaults>,
 }
 
 /// The order to try devices in: the pin, then the system default, then the rest best-first.
@@ -753,12 +797,36 @@ mod tests {
             updated_at_ms: 1,
             source: "voice".into(),
             pid: 42,
+            raised: Vec::new(),
+            sound_server: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"result\":\"hearing\""), "{json}");
         assert!(json.contains("\"basis\":\"system_default\""), "{json}");
+        assert!(
+            !json.contains("raised") && !json.contains("sound_server"),
+            "a status from before these fields reads the same: {json}"
+        );
         let back: AudioDeviceStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back, status);
+    }
+
+    /// The way back is the adapter's, and only in the process that raised the level.
+    #[test]
+    fn a_raised_level_is_shown_without_how_to_undo_it() {
+        let change = LevelChange {
+            device: "USB PnP Audio Device Analog Stereo".into(),
+            what: "volume".into(),
+            from: "51%".into(),
+            to: "100%".into(),
+            undo: vec!["set-sink-volume".into(), "usb".into(), "33595".into()],
+        };
+        assert_eq!(
+            change.to_string(),
+            "USB PnP Audio Device Analog Stereo volume from 51% to 100%"
+        );
+        let json = serde_json::to_string(&change).unwrap();
+        assert!(!json.contains("33595"), "{json}");
     }
 
     fn usb(id: &str) -> AudioDevice {

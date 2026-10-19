@@ -1,5 +1,8 @@
 //! Device MCP server: registered devices, user profile and user skills.
 
+use pond_core::models::domain::audio_device::{
+    AudioDevice, AudioDeviceStatus, AudioDirection, ChoiceBasis,
+};
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::user_data::ports::skill::UserSkillRepository;
@@ -22,6 +25,14 @@ use std::sync::Arc;
 pub struct GetRecipeParams {
     /// Recipe name (slug).
     pub name: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct AudioDeviceParams {
+    /// "speaker" or "microphone"
+    pub which: String,
+    /// Its name, or "automatic"; omit to list
+    pub device: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -123,6 +134,96 @@ impl DeviceMcpServer {
                 None,
             )),
         }
+    }
+
+    #[tool(
+        description = "Switch the speaker or microphone ('use the USB speaker'), or back to \
+                       automatic. No device: lists them."
+    )]
+    async fn set_audio_device(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<AudioDeviceParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use crate::audio::{self, Pick};
+        let text = |t: String| Ok(CallToolResult::success(vec![ContentBlock::text(t)]));
+        let Some(control) = audio::audio_control() else {
+            return text("This pond is not choosing its own speaker and microphone here.".into());
+        };
+        let Some(direction) = audio::direction_of(&params.0.which) else {
+            return text("Say which: \"speaker\" or \"microphone\".".into());
+        };
+        let blocking = |f: Box<dyn FnOnce() -> AudioDeviceStatus + Send>| async move {
+            tokio::task::spawn_blocking(f).await.map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("audio devices: {e}"),
+                    None,
+                )
+            })
+        };
+        let c = control.clone();
+        let before = blocking(Box::new(move || c.status())).await?;
+        let choice = match direction {
+            AudioDirection::Input => &before.input,
+            AudioDirection::Output => &before.output,
+        };
+        let said = params.0.device.as_deref().map(str::trim).unwrap_or("");
+        if said.is_empty() {
+            return text(audio::listing(choice));
+        }
+        if choice.basis == ChoiceBasis::MicOff {
+            return text("The microphone is off in Settings, so there is none to switch.".into());
+        }
+        let known: Vec<AudioDevice> = choice.devices.iter().map(|p| p.device.clone()).collect();
+        let (pin, asked) = match audio::resolve(&known, said) {
+            Pick::Automatic => (String::new(), None),
+            Pick::One(d) => (d.id.clone(), Some(d)),
+            Pick::Several(labels) => {
+                return text(format!("Which one: {}?", labels.join(", ")));
+            }
+            Pick::Nothing => {
+                return text(format!(
+                    "No {} called '{said}'. {}",
+                    direction.noun(),
+                    audio::listing(choice)
+                ));
+            }
+        };
+        let key = audio::pin_key(direction);
+        let saved = async {
+            self.settings_repo.set_key(key, pin).await?;
+            self.settings_repo
+                .mark_user_set(&std::iter::once(key.to_string()).collect())
+                .await
+        };
+        if let Err(e) = saved.await {
+            return Err(ErrorData::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("could not save the {}: {e}", direction.noun()),
+                None,
+            ));
+        }
+        // A running voice session chooses again on its own thread and may play its test sound
+        // first, so its answer is waited for.
+        let after = blocking(Box::new(move || {
+            control.reselect();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            loop {
+                let now = control.status();
+                if now.updated_at_ms > before.updated_at_ms || std::time::Instant::now() >= deadline
+                {
+                    return now;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }))
+        .await?;
+        let choice = match direction {
+            AudioDirection::Input => &after.input,
+            AudioDirection::Output => &after.output,
+        };
+        text(audio::outcome(choice, asked.as_ref()))
     }
 
     #[tool(description = "Get user profile: name, assistant name, timezone, location.")]
@@ -242,7 +343,8 @@ impl ServerHandler for DeviceMcpServer {
                  get_model_assignments (active LLM config), list_skills (active user skill \
                  names + descriptions), load_skill (a skill's full instructions by name — call \
                  this when a listed skill looks relevant before acting on it), \
-                 get_recipe (YAML agent recipe by name).",
+                 get_recipe (YAML agent recipe by name), set_audio_device (switch the \
+                 speaker or microphone, or list them).",
             )
     }
 }
@@ -438,6 +540,145 @@ mod tests {
             .filter_map(|c| c.as_text().map(|t| t.text.clone()))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Records the pin the tool saves, so the fake control can choose it as the pond would.
+    #[derive(Default)]
+    struct PinSettings {
+        set: std::sync::Mutex<Vec<(String, String)>>,
+        marked: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl SettingsRepository for PinSettings {
+        async fn get(&self) -> anyhow::Result<Settings> {
+            Ok(Settings::default())
+        }
+        async fn update(&self, _: &Settings) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_key(&self, _: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn set_key(&self, key: &str, value: String) -> anyhow::Result<()> {
+            self.set.lock().unwrap().push((key.to_string(), value));
+            Ok(())
+        }
+        async fn mark_user_set(
+            &self,
+            keys: &std::collections::HashSet<String>,
+        ) -> anyhow::Result<()> {
+            self.marked.lock().unwrap().extend(keys.iter().cloned());
+            Ok(())
+        }
+    }
+
+    struct FakeAudio {
+        settings: Arc<PinSettings>,
+        status: std::sync::Mutex<AudioDeviceStatus>,
+    }
+    impl pond_core::models::ports::audio_devices::AudioDeviceControl for FakeAudio {
+        fn status(&self) -> AudioDeviceStatus {
+            self.status.lock().unwrap().clone()
+        }
+        fn retest(&self, _: bool) -> AudioDeviceStatus {
+            self.status()
+        }
+        fn reselect(&self) {
+            use pond_core::models::domain::audio_device::{choose, ProbeOutcome, ProbedDevice};
+            let pin = self
+                .settings
+                .set
+                .lock()
+                .unwrap()
+                .last()
+                .map(|(_, v)| v.clone());
+            let mut status = self.status.lock().unwrap();
+            let probed: Vec<ProbedDevice> = status
+                .output
+                .devices
+                .iter()
+                .map(|p| ProbedDevice::new(p.device.clone(), ProbeOutcome::Accepting))
+                .collect();
+            status.output = choose(AudioDirection::Output, probed, pin.as_deref(), false);
+            status.updated_at_ms += 1;
+        }
+    }
+
+    #[tokio::test]
+    async fn asking_for_a_speaker_by_name_pins_it_and_reports_the_switch() {
+        use pond_core::models::domain::audio_device::{
+            choose, AudioChoice, DeviceKind, ProbeOutcome, ProbedDevice,
+        };
+        let settings = Arc::new(PinSettings::default());
+        let mut usb = AudioDevice::new("sysdefault:CARD=Device", false, DeviceKind::Hardware);
+        usb.label = "USB PnP Audio Device".into();
+        let speakers = vec![
+            ProbedDevice::new(
+                AudioDevice::new("Built-in speakers", true, DeviceKind::Hardware),
+                ProbeOutcome::Accepting,
+            ),
+            ProbedDevice::new(usb, ProbeOutcome::Untested),
+        ];
+        let status = AudioDeviceStatus {
+            input: AudioChoice::mic_off(None),
+            output: choose(AudioDirection::Output, speakers, None, false),
+            updated_at_ms: 1,
+            source: "serve".into(),
+            pid: 1,
+            raised: Vec::new(),
+            sound_server: None,
+        };
+        crate::audio::init_audio_control(Arc::new(FakeAudio {
+            settings: settings.clone(),
+            status: std::sync::Mutex::new(status),
+        }));
+        let server = DeviceMcpServer::new(
+            Arc::new(StubDeviceRegistry),
+            settings.clone(),
+            Arc::new(StubSkills),
+        );
+        let ask = |which: &str, device: Option<&str>| {
+            let server = server.clone();
+            let params = AudioDeviceParams {
+                which: which.into(),
+                device: device.map(str::to_string),
+            };
+            async move {
+                let ctx = make_ctx(server.clone()).await;
+                tool_text(
+                    &server
+                        .set_audio_device(ctx, Parameters(params))
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+
+        let listed = ask("speaker", None).await;
+        assert_eq!(
+            listed,
+            "Speakers: Built-in speakers (in use), USB PnP Audio Device. Chosen automatically."
+        );
+        let switched = ask("speaker", Some("the USB speaker")).await;
+        assert!(
+            switched.starts_with("The speaker is now USB PnP Audio Device (pinned"),
+            "{switched}"
+        );
+        assert_eq!(
+            *settings.set.lock().unwrap(),
+            [(
+                "audio_output_device".to_string(),
+                "sysdefault:CARD=Device".to_string()
+            )]
+        );
+        assert_eq!(*settings.marked.lock().unwrap(), ["audio_output_device"]);
+        let unknown = ask("speaker", Some("the headphones")).await;
+        assert!(
+            unknown.starts_with("No speaker called 'the headphones'."),
+            "{unknown}"
+        );
+        let off = ask("microphone", Some("USB")).await;
+        assert!(off.contains("off in Settings"), "{off}");
     }
 
     #[tokio::test]
