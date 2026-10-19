@@ -253,10 +253,10 @@ pub struct Settings {
     #[serde(default)]
     pub audio_output_device: String,
 
-    /// Lets a speaker test be heard: a short chime when the pond tests or moves to a speaker.
-    /// Off, every test plays silence.
-    #[serde(default)]
-    pub audio_test_chime: bool,
+    /// Chooses the speaker and microphone by sound: each choice plays a short soft test sound
+    /// and keeps the first pair where the microphone hears it. Off, devices are checked silently.
+    #[serde(default = "Settings::default_audio_sound_test")]
+    pub audio_sound_test: bool,
 
     /// Recording ceiling for the browser voice path only; the voice loop ends on silence.
     #[serde(default = "Settings::default_recording_duration")]
@@ -770,7 +770,7 @@ impl Default for Settings {
             voice_thinking_tone_enabled: Self::default_voice_thinking_tone_enabled(),
             audio_input_device: String::new(),
             audio_output_device: String::new(),
-            audio_test_chime: false,
+            audio_sound_test: Self::default_audio_sound_test(),
             voice_recording_duration_secs: Self::default_recording_duration(),
             voice_whisper_url: Self::default_whisper_url(),
             active_llm_model: Self::default_active_llm_model(),
@@ -948,6 +948,10 @@ impl Settings {
         "silero".to_string()
     }
     fn default_voice_thinking_tone_enabled() -> bool {
+        true
+    }
+    /// On: a speaker that takes audio and makes no sound is only caught by listening for it.
+    fn default_audio_sound_test() -> bool {
         true
     }
     fn default_recording_duration() -> u32 {
@@ -2055,7 +2059,7 @@ mod tests {
             // The Voice hub view's and the catalogue's audio device panel.
             "audio_input_device",
             "audio_output_device",
-            "audio_test_chime",
+            "audio_sound_test",
             "voice_tts_quality",
             "voice_tts_speed",
             "voice_tts_voice",

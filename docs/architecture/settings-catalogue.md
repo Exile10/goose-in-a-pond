@@ -211,12 +211,15 @@ client reads it, the server never does · `NONE` = nothing reads it anywhere.
 | `voice_max_turns` | `8` | LIVE | **API** |
 | `audio_input_device` | `""` | LIVE | S, H:Voice |
 | `audio_output_device` | `""` | LIVE | S, H:Voice |
-| `audio_test_chime` | `false` | LIVE | S, H:Voice |
+| `audio_sound_test` | `true` | LIVE | S, H:Voice |
 
-The three `audio_*` rows are pins and an opt-in, not the device choice itself. An empty pin means
-automatic: the pond tests the system default and moves to another device that works when it does
-not, or when a device comes or goes (`pond-adapters-audio-devices`). What is in use, and why, is
-`GET /api/v1/audio/devices`; both settings surfaces show it beside the pickers.
+The three `audio_*` rows are two pins and a switch, not the device choice itself. An empty pin
+means automatic. With `audio_sound_test` on (the default), every choice (startup, a device coming or
+going, a test) plays a short soft sound on a speaker and keeps the first speaker and microphone pair
+in order of preference where the microphone hears it; off, or when no pair is heard, each device is
+checked silently instead (`pond-adapters-audio-devices`). It replaced `audio_test_chime` on
+2026-10-18, whose rows are now ignored. What is in use, and why, is `GET /api/v1/audio/devices`;
+both settings surfaces show it beside the pickers.
 
 `voice_kws_whisper_url` (was `null`, **NONE**) was removed on 2026-10-15: nothing read it once
 wake-word detection moved in process. `voice_recording_duration_secs` is read only by the browser

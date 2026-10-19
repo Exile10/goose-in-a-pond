@@ -161,7 +161,7 @@ export const CATALOGUE: CatalogueCategory[] = [
         entries: [
           { key: "audio_input_device", label: "Microphone", description: "The microphone to listen through. Automatic uses one that works, and moves when it stops working.", control: { kind: "lookup", source: "audio-inputs", placeholder: "Automatic" }, consumer: "live" },
           { key: "audio_output_device", label: "Speaker", description: "The speaker to answer on. Automatic uses one that works, and follows headphones when they connect.", control: { kind: "lookup", source: "audio-outputs", placeholder: "Automatic" }, consumer: "live" },
-          { key: "audio_test_chime", label: "Let speaker tests be heard", description: "Play a short chime when the pond tests or moves to a speaker. Off, every test plays silence.", control: { kind: "toggle" }, consumer: "live" },
+          { key: "audio_sound_test", label: "Find them by sound", description: "Play a short, soft sound to check that a speaker and a microphone hear each other. Off, the pond checks them silently.", control: { kind: "toggle" }, consumer: "live" },
         ],
       },
       {

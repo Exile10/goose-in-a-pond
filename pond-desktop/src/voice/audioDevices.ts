@@ -53,12 +53,38 @@ function whyNot(device: ProbedAudioDevice | undefined): string {
 
 const SILENCE_HINT = "Check its mute switch, and that the pond may use the microphone.";
 
+/** "heard by the mic" for a speaker, "which heard the speaker" for a mic. */
+function byEar(choice: AudioChoice, partner: string): string {
+  return choice.direction === "output" ? `heard by ${partner}` : `which heard ${partner}`;
+}
+
 export function describeChoice(choice: AudioChoice): ChoiceLine {
   const noun = NOUN[choice.direction];
   const device = choice.device;
   const state = heard(choice.outcome);
   const silent = choice.outcome.result === "silent";
   const hint = silent ? ` ${SILENCE_HINT}` : "";
+  const partner = choice.heard_with ?? null;
+
+  if (device && partner) {
+    const ear = byEar(choice, partner);
+    if (choice.basis === "pinned") return { text: `${device.label}, your choice, ${ear}.`, problem: false };
+    if (choice.basis === "fallback" && choice.pinned && choice.pinned !== device.id) {
+      const pinned = choice.devices.find((d) => d.id === choice.pinned);
+      const what = choice.direction === "output" ? "was not heard" : "did not hear it";
+      return {
+        text: `${device.label}, ${ear}: your choice, ${pinned?.label ?? choice.pinned}, ${what}.`,
+        problem: false,
+      };
+    }
+    return { text: `${device.label}, ${ear}.`, problem: false };
+  }
+  if (device && choice.unheard && choice.direction === "output") {
+    return {
+      text: `${device.label}, but no microphone heard it play its test sound. Check that it is switched on and turned up.`,
+      problem: true,
+    };
+  }
 
   switch (choice.basis) {
     case "mic_off":

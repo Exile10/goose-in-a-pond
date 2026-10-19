@@ -100,10 +100,10 @@ export function AudioDevicesPanel({ variant, withPickers = false, onStatus }: Pr
     }
   }
 
-  async function setChime(on: boolean) {
-    setSettings((s) => ({ ...(s ?? {}), audio_test_chime: on }));
+  async function setSoundTest(on: boolean) {
+    setSettings((s) => ({ ...(s ?? {}), audio_sound_test: on }));
     try {
-      await api.updateSettings({ audio_test_chime: on });
+      await api.updateSettings({ audio_sound_test: on });
     } catch {
       setError("That switch was not saved. Try again.");
     }
@@ -159,18 +159,19 @@ export function AudioDevicesPanel({ variant, withPickers = false, onStatus }: Pr
       {withPickers && (
         <div className="adev__row adev__row--switch">
           <div className="adev__text">
-            <span className="adev__title">Let speaker tests be heard</span>
+            <span className="adev__title">Find them by sound</span>
             <span className="adev__line">
-              A short chime when the pond tests or moves to a speaker. Off, tests play silence.
+              A short, soft sound checks that a speaker and a microphone hear each other. Off, they
+              are checked silently.
             </span>
           </div>
           {settings && (
             // Remounted on load: Toggle reads `on` once, and settings arrive after mount.
             <Toggle
-              key={`chime-${Boolean(settings.audio_test_chime)}`}
-              on={Boolean(settings.audio_test_chime)}
-              onChange={(on) => void setChime(on)}
-              label="Let speaker tests be heard"
+              key={`sound-test-${settings.audio_sound_test !== false}`}
+              on={settings.audio_sound_test !== false}
+              onChange={(on) => void setSoundTest(on)}
+              label="Find them by sound"
             />
           )}
         </div>

@@ -154,15 +154,32 @@ pub fn chime_samples(rate: u32) -> Vec<f32> {
 
 /// Play [`chime_samples`] on `device`, and wait for it to finish.
 pub fn play_chime(device: Option<&str>) -> Result<()> {
-    let (_stream, handle, _) = open_output(device)?;
-    let sink = rodio::Sink::try_new(&handle).map_err(|e| anyhow!("no sink: {e}"))?;
-    sink.set_volume(0.5);
     let rate = 44_100;
-    sink.append(rodio::buffer::SamplesBuffer::new(
-        1,
-        rate,
-        chime_samples(rate),
-    ));
+    play_samples_exactly(device, chime_samples(rate), rate, 0.5)
+}
+
+/// Play mono `samples` on exactly `device` and wait for them to finish. Unlike [`open_output`]
+/// this never falls back to the default: a sound test of one speaker must not sound on another.
+pub fn play_samples_exactly(
+    device: Option<&str>,
+    samples: Vec<f32>,
+    rate: u32,
+    volume: f32,
+) -> Result<()> {
+    let (_stream, handle) = match device {
+        Some(name) => {
+            let found = find_output(name).ok_or_else(|| anyhow!("speaker '{name}' not found"))?;
+            rodio::OutputStream::try_from_device(&found).map_err(|e| {
+                forget_devices();
+                anyhow!("speaker '{name}' failed to open: {e}")
+            })?
+        }
+        None => rodio::OutputStream::try_default()
+            .map_err(|e| anyhow!("audio output device unavailable: {e}"))?,
+    };
+    let sink = rodio::Sink::try_new(&handle).map_err(|e| anyhow!("no sink: {e}"))?;
+    sink.set_volume(volume);
+    sink.append(rodio::buffer::SamplesBuffer::new(1, rate, samples));
     sink.sleep_until_end();
     Ok(())
 }

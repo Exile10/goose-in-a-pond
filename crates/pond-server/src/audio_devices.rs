@@ -20,7 +20,7 @@ pub fn prefs_of(settings: &Settings) -> AudioPrefs {
         input_pin: pin(&settings.audio_input_device),
         output_pin: pin(&settings.audio_output_device),
         mic_enabled: settings.mic_enabled,
-        chime: settings.audio_test_chime,
+        sound_test: settings.audio_sound_test,
     }
 }
 
@@ -61,11 +61,11 @@ mod tests {
         let mut s = Settings::default();
         s.audio_input_device = "  ".into();
         s.audio_output_device = "AirPods".into();
-        s.audio_test_chime = true;
+        s.audio_sound_test = false;
         let p = prefs_of(&s);
         assert_eq!(p.input_pin, None);
         assert_eq!(p.output_pin.as_deref(), Some("AirPods"));
-        assert!(p.chime);
+        assert!(!p.sound_test);
         assert!(p.mic_enabled);
     }
 }

@@ -9,11 +9,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pond_audio::{MicHandle, MicState};
 use pond_core::models::domain::audio_device::{
-    AudioChoice, AudioDeviceStatus, AudioDirection, ChoiceBasis,
+    AudioChoice, AudioDeviceStatus, AudioDirection, ChoiceBasis, ProbeOutcome, ProbedDevice,
 };
 use pond_core::models::ports::audio_devices::{AudioDeviceControl, AudioDeviceProber};
 use pond_core::models::services::voice::audio_devices::{
-    AudioDeviceSelector, ProbeMode, SelectRequest,
+    AudioDeviceSelector, PairRequest, ProbeMode, SelectRequest, SoundTest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,8 +51,8 @@ pub struct AudioPrefs {
     pub input_pin: Option<String>,
     pub output_pin: Option<String>,
     pub mic_enabled: bool,
-    /// `Settings::audio_test_chime`: the household agreed to hear a test.
-    pub chime: bool,
+    /// `Settings::audio_sound_test`: choose the speaker and microphone by a short test sound.
+    pub sound_test: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +176,8 @@ struct Inner {
     exclude: Mutex<Vec<String>>,
     /// One pass at a time: the watch thread and a retest must never probe together.
     selecting: Mutex<()>,
+    /// The last pass played the test sound, so a retest need not add a chime on top.
+    played: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -198,6 +200,7 @@ impl AudioSupervisor {
             ready: Condvar::new(),
             exclude: Mutex::new(Vec::new()),
             selecting: Mutex::new(()),
+            played: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
         let watcher = inner.clone();
@@ -296,19 +299,43 @@ impl Inner {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
-        let input = match (&previous, which.input) {
-            (Some(prev), false) => prev.input.clone(),
-            _ => self.input_choice(&prefs, mode, &exclude),
-        };
-        let output = match (&previous, which.output) {
-            (Some(prev), false) => prev.output.clone(),
-            _ => self.selector.select(&SelectRequest {
-                direction: AudioDirection::Output,
-                pinned: prefs.output_pin.as_deref(),
+        // Every choice is made by sound where the household allows it: serve leaves the test to a
+        // voice session that is running, since that session holds the microphone.
+        let by_sound = prefs.sound_test
+            && prefs.mic_enabled
+            && (self.role == Role::Voice || live_voice(&self.data_dir).is_none());
+        let sound = by_sound.then(|| {
+            self.selector.select_by_sound(&PairRequest {
+                input_pin: prefs.input_pin.as_deref(),
+                output_pin: prefs.output_pin.as_deref(),
                 mode,
                 exclude: &exclude,
-                mic_enabled: prefs.mic_enabled,
-            }),
+            })
+        });
+        self.played.store(
+            matches!(
+                sound,
+                Some(SoundTest::Heard { .. } | SoundTest::NotHeard { .. })
+            ),
+            Ordering::SeqCst,
+        );
+        let (input, output) = match sound {
+            Some(SoundTest::Heard { input, output }) => (
+                self.with_the_rest(input, mode, &prefs, &exclude),
+                self.with_the_rest(output, mode, &prefs, &exclude),
+            ),
+            not_heard => {
+                let input = match (&previous, which.input) {
+                    (Some(prev), false) => prev.input.clone(),
+                    _ => self.input_choice(&prefs, mode, &exclude),
+                };
+                let mut output = match (&previous, which.output) {
+                    (Some(prev), false) => prev.output.clone(),
+                    _ => self.silent_choice(AudioDirection::Output, mode, &prefs, &exclude),
+                };
+                output.unheard = matches!(not_heard, Some(SoundTest::NotHeard { .. }));
+                (input, output)
+            }
         };
 
         if let Some(mic) = &self.mic {
@@ -331,9 +358,6 @@ impl Inner {
                 || p.input.basis != status.input.basis
                 || p.output.basis != status.output.basis
         });
-        let speaker_moved = previous
-            .as_ref()
-            .is_some_and(|p| p.output.device_id() != status.output.device_id());
         if changed {
             tracing::info!(
                 ?trigger,
@@ -352,10 +376,6 @@ impl Inner {
         *self.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(status.clone());
         self.ready.notify_all();
 
-        // Audible only on the household's say-so, and never at startup, where the pond speaks.
-        if prefs.chime && trigger == Trigger::DevicesChanged && speaker_moved {
-            self.chime(&status);
-        }
         if changed || matches!(trigger, Trigger::Startup | Trigger::Retest) {
             if let Some(on_change) = &self.on_change {
                 on_change(&status, trigger);
@@ -378,10 +398,68 @@ impl Inner {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         let status = self.pass(Trigger::Retest, ProbeMode::Full, BOTH, answered);
-        if chime || (self.prefs)().chime {
+        // Asked to hear the speaker: the sound test already played on it, unless none ran.
+        if chime && !self.played.load(Ordering::SeqCst) {
             self.chime(&status);
         }
         status
+    }
+
+    fn silent_choice(
+        &self,
+        direction: AudioDirection,
+        mode: ProbeMode,
+        prefs: &AudioPrefs,
+        exclude: &[String],
+    ) -> AudioChoice {
+        self.selector.select(&SelectRequest {
+            direction,
+            pinned: match direction {
+                AudioDirection::Input => prefs.input_pin.as_deref(),
+                AudioDirection::Output => prefs.output_pin.as_deref(),
+            },
+            mode,
+            exclude,
+            mic_enabled: prefs.mic_enabled,
+        })
+    }
+
+    /// A heard pair names only the devices it paired; the picker needs the rest too. A full test
+    /// also checks them silently, so the household sees what each one does.
+    fn with_the_rest(
+        &self,
+        mut heard: AudioChoice,
+        mode: ProbeMode,
+        prefs: &AudioPrefs,
+        exclude: &[String],
+    ) -> AudioChoice {
+        let rest: Vec<ProbedDevice> = match mode {
+            ProbeMode::Full => {
+                self.silent_choice(heard.direction, mode, prefs, exclude)
+                    .devices
+            }
+            ProbeMode::Lazy => self
+                .selector
+                .prober()
+                .quick_list(heard.direction)
+                .into_iter()
+                .map(|d| ProbedDevice::new(d, ProbeOutcome::Untested))
+                .collect(),
+        };
+        for p in rest {
+            match heard
+                .devices
+                .iter_mut()
+                .find(|d| d.device.id == p.device.id)
+            {
+                // The pair test only proved its own pair; what the silent check found stands
+                // for the rest.
+                Some(known) if known.outcome == ProbeOutcome::Untested => known.outcome = p.outcome,
+                Some(_) => {}
+                None => heard.devices.push(p),
+            }
+        }
+        heard
     }
 
     fn exclude(&self, device: Option<String>) {
@@ -405,10 +483,11 @@ impl Inner {
         // A request left from before this session started is not ours to answer.
         let mut handled: Option<u64> =
             read_json::<RetestRequest>(&request_path(&self.data_dir)).map(|r| r.id);
-        self.pass(Trigger::Startup, ProbeMode::Lazy, BOTH, None);
-
+        // Taken before the first choice, not after: a device that comes or goes while it runs
+        // must still read as a change, or startup misses a USB card that arrived a moment late.
         let prober = self.selector.prober().clone();
         let mut fingerprint = prober.fingerprint();
+        self.pass(Trigger::Startup, ProbeMode::Lazy, BOTH, None);
         let mut fingerprint_at = Instant::now();
         let mut mic_written = 0u64;
         let mut mic_moved_at = Instant::now();
@@ -594,7 +673,9 @@ impl AudioDeviceControl for PondAudioControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pond_core::models::domain::audio_device::{AudioDevice, DeviceKind, ProbeOutcome};
+    use pond_core::models::domain::audio_device::{
+        AudioDevice, DeviceKind, PairOutcome, ProbeOutcome,
+    };
     use std::collections::HashMap;
 
     /// A scripted machine whose devices can be unplugged between passes.
@@ -605,6 +686,9 @@ mod tests {
         outcomes: Mutex<HashMap<String, ProbeOutcome>>,
         probes: Mutex<Vec<String>>,
         chimes: Mutex<Vec<String>>,
+        /// `(speaker, mic)` pairs that hear each other, and every pair a sound test tried.
+        heard: Mutex<Vec<(String, String)>>,
+        sound_tests: Mutex<Vec<(String, String)>>,
     }
 
     impl Machine {
@@ -656,6 +740,18 @@ mod tests {
             self.chimes.lock().unwrap().push(d.id.clone());
             Ok(())
         }
+        fn hears(&self, speaker: &AudioDevice, mic: &AudioDevice) -> PairOutcome {
+            let pair = (speaker.id.clone(), mic.id.clone());
+            self.sound_tests.lock().unwrap().push(pair.clone());
+            if self.heard.lock().unwrap().contains(&pair) {
+                PairOutcome::Heard {
+                    margin_db: 25.0,
+                    room_dbfs: -55.0,
+                }
+            } else {
+                PairOutcome::NotHeard
+            }
+        }
     }
 
     fn hearing() -> ProbeOutcome {
@@ -674,13 +770,13 @@ mod tests {
         m
     }
 
-    fn prefs(input_pin: Option<&str>, mic_enabled: bool, chime: bool) -> PrefsFn {
+    fn prefs(input_pin: Option<&str>, mic_enabled: bool, sound_test: bool) -> PrefsFn {
         let input_pin = input_pin.map(str::to_string);
         Arc::new(move || AudioPrefs {
             input_pin: input_pin.clone(),
             output_pin: None,
             mic_enabled,
-            chime,
+            sound_test,
         })
     }
 
@@ -780,12 +876,42 @@ mod tests {
         sup.stop();
     }
 
+    /// The race CI found: a mic plugged in right as the first choice lands. Plugged from the
+    /// on_change callback, which runs inside that very first pass.
     #[test]
-    fn headphones_arriving_as_the_new_default_take_over_and_chime_only_when_agreed() {
+    fn a_device_plugged_in_during_the_startup_choice_is_still_noticed() {
         let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let m = machine();
-        let sup = start(&m, Role::Voice, dir.path(), prefs(None, true, true));
+        let plug = m.clone();
+        let on_change: ChangeFn = Arc::new(move |_, trigger| {
+            if trigger == Trigger::Startup {
+                plug.plug(AudioDirection::Input, "USB mic", false, hearing());
+            }
+        });
+        let sup = AudioSupervisor::spawn(
+            SupervisorConfig {
+                role: Role::Voice,
+                data_dir: dir.path().to_path_buf(),
+                mic: None,
+                prefs: prefs(Some("USB mic"), true, false),
+                on_change: Some(on_change),
+            },
+            m.clone(),
+        );
+        sup.wait_ready(Duration::from_secs(5)).unwrap();
+        wait_until("the mic plugged in during startup", || {
+            sup.status().unwrap().input.device_id() == Some("USB mic")
+        });
+        sup.stop();
+    }
+
+    #[test]
+    fn headphones_arriving_as_the_new_default_take_over() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = machine();
+        let sup = start(&m, Role::Voice, dir.path(), prefs(None, true, false));
         sup.wait_ready(Duration::from_secs(5)).unwrap();
 
         // The OS makes connected headphones the default.
@@ -804,8 +930,123 @@ mod tests {
             sup.status().unwrap().output.device_id() == Some("AirPods")
         });
         assert_eq!(pond_audio_out::output_device().as_deref(), Some("AirPods"));
-        wait_until("the chime", || !m.chimes.lock().unwrap().is_empty());
-        assert_eq!(*m.chimes.lock().unwrap(), ["AirPods"]);
+        assert!(
+            m.chimes.lock().unwrap().is_empty(),
+            "silent checks make no sound"
+        );
+        assert!(m.sound_tests.lock().unwrap().is_empty());
+        sup.stop();
+    }
+
+    /// The nano's case: the default speaker takes audio and makes no sound. Only the pair the
+    /// microphone hears is used, for both directions.
+    #[test]
+    fn startup_uses_the_first_speaker_and_mic_that_hear_each_other() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = machine();
+        m.plug(
+            AudioDirection::Output,
+            "USB speaker",
+            false,
+            ProbeOutcome::Accepting,
+        );
+        m.plug(AudioDirection::Input, "USB mic", false, hearing());
+        m.heard
+            .lock()
+            .unwrap()
+            .push(("USB speaker".into(), "USB mic".into()));
+        let sup = start(&m, Role::Voice, dir.path(), prefs(None, true, true));
+        let status = sup.wait_ready(Duration::from_secs(5)).unwrap();
+        assert_eq!(status.output.device_id(), Some("USB speaker"));
+        assert_eq!(status.input.device_id(), Some("USB mic"));
+        assert_eq!(status.output.basis, ChoiceBasis::Heard);
+        assert_eq!(status.output.heard_with.as_deref(), Some("USB mic"));
+        assert_eq!(
+            pond_audio_out::output_device().as_deref(),
+            Some("USB speaker")
+        );
+        let tried = m.sound_tests.lock().unwrap().clone();
+        assert_eq!(
+            tried.first().map(|(s, m)| (s.as_str(), m.as_str())),
+            Some(("Built-in speakers", "Built-in mic")),
+            "the defaults are paired first"
+        );
+        sup.stop();
+    }
+
+    #[test]
+    fn a_full_test_by_sound_still_reports_what_each_other_device_does() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = machine();
+        m.plug(AudioDirection::Input, "Phone", false, ProbeOutcome::Silent);
+        m.heard
+            .lock()
+            .unwrap()
+            .push(("Built-in speakers".into(), "Built-in mic".into()));
+        let sup = start(&m, Role::Voice, dir.path(), prefs(None, true, true));
+        sup.wait_ready(Duration::from_secs(5)).unwrap();
+        let status = sup.retest(false);
+        assert_eq!(status.input.basis, ChoiceBasis::Heard);
+        let phone = status
+            .input
+            .devices
+            .iter()
+            .find(|d| d.device.id == "Phone")
+            .unwrap();
+        assert_eq!(phone.outcome, ProbeOutcome::Silent);
+        sup.stop();
+    }
+
+    #[test]
+    fn when_no_pair_is_heard_the_silent_choice_stands_and_says_so() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = machine();
+        let sup = start(&m, Role::Voice, dir.path(), prefs(None, true, true));
+        let status = sup.wait_ready(Duration::from_secs(5)).unwrap();
+        assert_eq!(status.output.device_id(), Some("Built-in speakers"));
+        assert!(status.output.unheard);
+        assert!(status.output.problem().unwrap().contains("turned up"));
+        // The test sound already played, so asking to hear the speaker adds no chime.
+        sup.retest(true);
+        assert!(m.chimes.lock().unwrap().is_empty());
+        sup.stop();
+    }
+
+    #[test]
+    fn with_sound_tests_off_a_requested_chime_still_plays() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = machine();
+        let sup = start(&m, Role::Voice, dir.path(), prefs(None, true, false));
+        sup.wait_ready(Duration::from_secs(5)).unwrap();
+        sup.retest(true);
+        assert_eq!(*m.chimes.lock().unwrap(), ["Built-in speakers"]);
+        sup.stop();
+    }
+
+    /// Serve does not test by sound beside a voice session, which holds the microphone.
+    #[test]
+    fn serve_leaves_the_sound_test_to_a_live_voice_session() {
+        let _g = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let m = machine();
+        let fake_voice = StatusFile {
+            status: AudioDeviceStatus {
+                input: AudioChoice::mic_off(None),
+                output: AudioChoice::not_tested(AudioDirection::Output, Vec::new(), None, false),
+                updated_at_ms: 1,
+                source: "voice".into(),
+                pid: 1,
+            },
+            answered: None,
+        };
+        write_json(&status_path(dir.path(), Role::Voice), &fake_voice);
+        let sup = start(&m, Role::Serve, dir.path(), prefs(None, true, true));
+        sup.wait_ready(Duration::from_secs(5)).unwrap();
+        assert!(m.sound_tests.lock().unwrap().is_empty());
         sup.stop();
     }
 
