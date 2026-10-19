@@ -9797,6 +9797,8 @@ struct ApiCreateScheduleRequest {
     id: Option<String>,
     #[serde(alias = "label")]
     name: String,
+    /// Required unless `fire_at` is given, which makes the stored cron the `"@once"` sentinel.
+    #[serde(default)]
     cron: String,
     /// The prompt to send to the agent (shorthand for AgentPrompt kind).
     prompt: Option<String>,
@@ -9806,12 +9808,19 @@ struct ApiCreateScheduleRequest {
     kind: Option<TaskKind>,
     /// Legacy field: `{"webhook_url": "..."}` or `{"prompt": "..."}`.
     payload: Option<serde_json::Value>,
-    /// Fire once at `cron`'s next occurrence instead of recurring.
+    /// Fire once at this instant instead of recurring; must be in the future.
+    #[serde(default)]
+    fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fire once at `cron`'s next occurrence instead of recurring; ignored if `fire_at` is set.
     #[serde(default)]
     once: bool,
 }
 
 /// `POST /api/v1/schedules` — create a new scheduled task.
+///
+/// A one-off is `fire_at` (an instant), or `once` with a `cron` whose next occurrence is the
+/// instant, as `PUT` accepts. A `fire_at` already past is a 400: the scheduler would fire it
+/// on the spot, which is not what scheduling it for then asked for.
 async fn create_schedule(
     State(state): State<Arc<AppState>>,
     result: Result<Json<ApiCreateScheduleRequest>, JsonRejection>,
@@ -9865,8 +9874,24 @@ async fn create_schedule(
         }
     }
 
+    if let Some(at) = api_req.fire_at.filter(|at| *at <= chrono::Utc::now()) {
+        tracing::warn!(
+            kind = "schedule_create_refused",
+            reason = "fire_at_in_past",
+            fire_at = %at,
+            "a one-off was asked for at a time already past"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("fire_at {at} has already passed; choose a time in the future"),
+                "code": "fire_at_in_past",
+            })),
+        );
+    }
+
     let req = CreateScheduleRequest {
-        fire_at: None,
+        fire_at: api_req.fire_at,
         once: api_req.once,
         id: api_req
             .id

@@ -5,7 +5,7 @@ use axum::http::{Request, StatusCode};
 use pond_api::{build_router, AppState};
 use pond_core::shared::mocks::mock_agent::MockAgent;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
-use pond_core::user_data::domain::schedule::{OneShotTimePassed, Schedule, ScheduleRun};
+use pond_core::user_data::domain::schedule::{OneShotTimePassed, Schedule, ScheduleRun, CRON_ONCE};
 use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
@@ -98,11 +98,17 @@ impl SchedulerPort for InMemoryScheduler {
         if guard.contains_key(&req.id) {
             anyhow::bail!("task '{}' already exists", req.id);
         }
+        // As the real adapter stores it: a `fire_at` makes a one-shot with the sentinel cron.
+        let cron = if req.fire_at.is_some() {
+            CRON_ONCE.to_string()
+        } else {
+            req.cron
+        };
         let schedule = Schedule {
-            fire_at: None,
+            fire_at: req.fire_at,
             id: req.id.clone(),
             label: req.label,
-            cron: req.cron,
+            cron,
             timezone: req.timezone,
             kind: req.kind,
             last_run: None,
@@ -617,6 +623,94 @@ async fn resuming_a_one_shot_whose_time_passed_is_a_conflict_not_a_not_found() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+/// A phone creates a one-off with `POST` and a `fire_at`, as `PUT` already allowed.
+#[tokio::test]
+async fn create_one_off_with_fire_at() {
+    let (app, _tmp) = make_app().await;
+    let at = chrono::Utc::now() + chrono::Duration::hours(2);
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/schedules",
+            serde_json::json!({
+                "id": "once",
+                "name": "Take the bread out",
+                "prompt": "remind me to take the bread out",
+                "timezone": "Africa/Nairobi",
+                "fire_at": at,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = json_body(resp).await;
+    assert_eq!(json.get("cron").and_then(|v| v.as_str()), Some(CRON_ONCE));
+    let stored: chrono::DateTime<chrono::Utc> = json
+        .get("fire_at")
+        .and_then(|v| v.as_str())
+        .expect("a one-off create must carry its fire_at")
+        .parse()
+        .unwrap();
+    assert_eq!(stored, at);
+}
+
+/// A `fire_at` already past is refused with a code, not created to fire on the spot.
+#[tokio::test]
+async fn create_with_a_past_fire_at_is_refused() {
+    let (app, _tmp) = make_app().await;
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/v1/schedules",
+            serde_json::json!({
+                "id": "late",
+                "name": "Too late",
+                "prompt": "too late",
+                "fire_at": chrono::Utc::now() - chrono::Duration::minutes(5),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = json_body(resp).await;
+    assert_eq!(
+        json.get("code").and_then(|v| v.as_str()),
+        Some("fire_at_in_past")
+    );
+
+    let list = json_body(app.oneshot(auth_get("/api/v1/schedules")).await.unwrap()).await;
+    assert_eq!(
+        list.as_array().map(Vec::len),
+        Some(0),
+        "a refused create stored a schedule"
+    );
+}
+
+/// A plain cron create is untouched by the one-off fields: no `fire_at`, its own cron.
+#[tokio::test]
+async fn create_with_a_cron_stays_recurring() {
+    let (app, _tmp) = make_app().await;
+    let resp = app
+        .oneshot(auth_post(
+            "/api/v1/schedules",
+            serde_json::json!({
+                "id": "daily",
+                "name": "Daily",
+                "cron": "0 0 7 * * *",
+                "prompt": "good morning",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = json_body(resp).await;
+    assert_eq!(
+        json.get("cron").and_then(|v| v.as_str()),
+        Some("0 0 7 * * *")
+    );
+    assert!(json.get("fire_at").is_some_and(|v| v.is_null()));
 }
 
 #[tokio::test]

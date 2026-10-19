@@ -1632,11 +1632,24 @@ All schedule endpoints return `503` if the scheduler failed to initialise at sta
 
 The `WebhookTaskExecutor` POSTs `payload` to `payload.webhook_url` on each fire.
 
+A one-off (2026-10-19) takes `fire_at`, an RFC 3339 instant, in place of `cron`; it is stored with
+the cron `"@once"`, fires once and is then removed. `"once": true` with a `cron` fires once at that
+cron's next occurrence in `timezone` instead. `fire_at` wins if both are given.
+
+```json
+{
+  "name": "Take the bread out",
+  "prompt": "Remind me to take the bread out.",
+  "timezone": "Africa/Nairobi",
+  "fire_at": "2026-10-19T15:30:00Z"
+}
+```
+
 **Response 201** — task object
 
 | Code | Meaning |
 |------|---------|
-| 400 | Invalid cron expression or missing fields |
+| 400 | Invalid cron expression or missing fields; `"code": "fire_at_in_past"` when `fire_at` has passed |
 | 503 | Scheduler not configured |
 
 ---
@@ -1664,6 +1677,12 @@ The `WebhookTaskExecutor` POSTs `payload` to `payload.webhook_url` on each fire.
 **Response 200**
 ```json
 { "resumed": "morning-brief" }
+```
+
+**Response 409** — a one-off whose `fire_at` passed while it was paused. It stays paused; edit its
+time with `PUT /schedules/{id}`, then resume it.
+```json
+{ "error": "schedule 'bread' was set to fire once at ..., which passed while it was paused; edit its time first, then resume it", "code": "one_shot_time_passed" }
 ```
 
 ---
