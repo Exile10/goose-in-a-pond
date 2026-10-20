@@ -439,7 +439,8 @@ the Apple Music token fetch only. Connecting a member's own Uber account (the ho
 sends it, through the same `egress::begin_as(.., "giap-credentials")` gate and egress log:
 (1) `GET /v1/uber/client`, no body, when a sign-in starts; (2) `POST /v1/uber/token` with Uber's
 single-use authorization code and the pond's loopback return address
-(`http://127.0.0.1:<port>/api/v1/oauth/callback`), when the member comes back from Uber's page;
+(`http://127.0.0.1:<port>/api/v1/oauth/callback`, the port the sign-in was started with; see
+`docs/architecture/music-player.md`, "OAuth redirect URI"), when the member comes back from Uber's page;
 (3) `POST /v1/uber/refresh` with the member's refresh token, when a booking or a ride being followed
 needs an access token within ten minutes of lapsing. No name or profile id is sent. The service adds
 the secret, forwards to Uber, and passes back the access token, refresh token, lifetime and scope; it
