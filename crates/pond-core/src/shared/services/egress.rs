@@ -236,8 +236,87 @@ fn append_event(event: Event) {
     });
 }
 
-/// One gated outbound call for new adapters: the gate, then the timer, then the record.
-/// An `Err` from `begin` means the request must not be made; dropping it records nothing.
+/// What the pond itself reaches the internet for, when no chat tool is making the call.
+///
+/// A closed set, so a host-made call has to say which of these it is: it can never be filed under
+/// whichever chat tool last ran, which is how Spotify's token refresh came to show as "Weather" on
+/// the activity screen. The wire names are what `egress.http` and `egress.denied` events carry in
+/// their `tool` attribute, so they are stable: the dashboard and the phone match on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressPurpose {
+    /// A model provider's endpoint, called for a chat turn or a background job.
+    Assistant,
+    /// An OAuth token endpoint: finishing a sign-in, or refreshing one.
+    SignIn,
+    /// A music service's own API, such as Spotify's player endpoints.
+    Music,
+    /// Jarida's credentials service, for a managed key or a sign-in it brokers.
+    Credentials,
+    /// Uber's Riders API, on the member's own account.
+    Rides,
+    /// The one Brave request that checks a web search key before it is stored.
+    WebSearchKeyCheck,
+    /// Finding, sizing or downloading a model or one of its files.
+    Models,
+    /// Speech recognition sent to a configured Whisper server.
+    Voice,
+    /// The health check of the services the pond depends on.
+    Diagnostics,
+    /// A schedule's webhook.
+    Schedules,
+    /// Probing a remote MCP extension's address before it is added.
+    Extensions,
+    /// Push notifications through Firebase Cloud Messaging.
+    Push,
+}
+
+impl EgressPurpose {
+    /// Every purpose, for tests that pin the wire names.
+    pub const ALL: [EgressPurpose; 12] = [
+        Self::Assistant,
+        Self::SignIn,
+        Self::Music,
+        Self::Credentials,
+        Self::Rides,
+        Self::WebSearchKeyCheck,
+        Self::Models,
+        Self::Voice,
+        Self::Diagnostics,
+        Self::Schedules,
+        Self::Extensions,
+        Self::Push,
+    ];
+
+    /// The name the event log records in the `tool` attribute.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Assistant => "giap-assistant",
+            Self::SignIn => "giap-sign-in",
+            Self::Music => "giap-music",
+            Self::Credentials => "giap-credentials",
+            Self::Rides => "giap-rides",
+            Self::WebSearchKeyCheck => "web_search_key_check",
+            Self::Models => "giap-models",
+            Self::Voice => "giap-voice",
+            Self::Diagnostics => "giap-diagnostics",
+            Self::Schedules => "giap-schedules",
+            Self::Extensions => "giap-extensions",
+            Self::Push => "giap-push",
+        }
+    }
+}
+
+/// As [`check_egress`], for a call the pond makes on its own account: refusals are filed under
+/// `purpose` with no session, never under the chat tool or turn in flight.
+pub fn check_egress_as(url: &str, purpose: EgressPurpose) -> Result<(), EgressDenied> {
+    check_egress_for(url, purpose.as_str(), "")
+}
+
+/// One gated outbound call the pond makes on its own account: the gate, then the timer, then the
+/// record. An `Err` from `begin_as` or `begin_for` means the request must not be made; dropping
+/// the call records nothing. There is deliberately no constructor that reads the chat tool in
+/// flight: that one was set by whichever tool ran last and is never cleared, so a host call that
+/// read it was filed under an unrelated tool. Chat tools record through [`record_egress`].
 #[must_use = "an EgressCall that is never finished records no egress"]
 pub struct EgressCall {
     url: String,
@@ -248,28 +327,27 @@ pub struct EgressCall {
 
 /// Whose call it is, for the record.
 enum Attribution {
-    /// The chat tool and session in flight.
-    InFlight,
-    /// This tool, in the session in flight: not filed under whatever tool is in flight.
-    Tool(String),
-    /// This tool and session, whatever turn is in flight.
-    Named { tool: String, session_id: String },
+    /// This purpose, in the session in flight.
+    InSession(EgressPurpose),
+    /// This purpose and session, whatever turn is in flight.
+    Named {
+        purpose: EgressPurpose,
+        session_id: String,
+    },
 }
 
-/// Open a gated outbound call to `url`. See [`EgressCall`].
-pub fn begin(url: &str, method: &'static str) -> Result<EgressCall, EgressDenied> {
-    check_egress(url)?;
-    Ok(EgressCall::new(url, method, Attribution::InFlight))
-}
-
-/// As [`begin`], attributed to `tool` and not to the process-global one: for a call the host makes
-/// on its own account, such as fetching a credential, rather than on a chat tool's behalf.
-pub fn begin_as(url: &str, method: &'static str, tool: &str) -> Result<EgressCall, EgressDenied> {
-    check_egress_for(url, tool, &current_session_id())?;
+/// Open a gated outbound call to `url`, filed under `purpose` in the session in flight: for a call
+/// a chat turn causes that is not itself a chat tool's, such as a model provider call.
+pub fn begin_as(
+    url: &str,
+    method: &'static str,
+    purpose: EgressPurpose,
+) -> Result<EgressCall, EgressDenied> {
+    check_egress_for(url, purpose.as_str(), &current_session_id())?;
     Ok(EgressCall::new(
         url,
         method,
-        Attribution::Tool(tool.to_string()),
+        Attribution::InSession(purpose),
     ))
 }
 
@@ -278,15 +356,15 @@ pub fn begin_as(url: &str, method: &'static str, tool: &str) -> Result<EgressCal
 pub fn begin_for(
     url: &str,
     method: &'static str,
-    tool: &str,
+    purpose: EgressPurpose,
     session_id: &str,
 ) -> Result<EgressCall, EgressDenied> {
-    check_egress_for(url, tool, session_id)?;
+    check_egress_for(url, purpose.as_str(), session_id)?;
     Ok(EgressCall::new(
         url,
         method,
         Attribution::Named {
-            tool: tool.to_string(),
+            purpose,
             session_id: session_id.to_string(),
         },
     ))
@@ -305,19 +383,17 @@ impl EgressCall {
     /// The `(tool, session)` this call is recorded under, read now.
     pub fn recorded_as(&self) -> (String, String) {
         match &self.attribution {
-            Attribution::InFlight => (current_tool(), current_session_id()),
-            Attribution::Tool(tool) => (tool.clone(), current_session_id()),
-            Attribution::Named { tool, session_id } => (tool.clone(), session_id.clone()),
+            Attribution::InSession(purpose) => (purpose.as_str().to_string(), current_session_id()),
+            Attribution::Named {
+                purpose,
+                session_id,
+            } => (purpose.as_str().to_string(), session_id.clone()),
         }
     }
 
     /// Record the completed call. `None` means the request never got a status.
     pub fn finish(self, status: Option<u16>) {
         let latency_ms = self.started.elapsed().as_millis() as u64;
-        if matches!(self.attribution, Attribution::InFlight) {
-            record_egress(&self.url, self.method, status, latency_ms);
-            return;
-        }
         let (tool, session_id) = self.recorded_as();
         record_egress_for(
             &self.url,
@@ -718,7 +794,7 @@ mod tests {
         let call = begin_for(
             "https://api.uber.com/v1.2/requests",
             "GET",
-            "giap-rides",
+            EgressPurpose::Rides,
             "",
         )
         .expect("open mode permits it");
@@ -727,6 +803,60 @@ mod tests {
             ("giap-rides".to_string(), String::new())
         );
         call.finish(Some(200));
+    }
+
+    /// The Jetson's activity feed filed Spotify's token refresh under `get_current_weather`, the
+    /// tool that had last run: a host call must be filed under its own purpose whatever ran last.
+    #[test]
+    fn a_host_call_is_never_filed_under_the_chat_tool_that_ran_last() {
+        set_current_tool("get_current_weather");
+        let refresh = begin_for(
+            "https://accounts.spotify.com/api/token",
+            "POST",
+            EgressPurpose::SignIn,
+            "",
+        )
+        .expect("open mode permits it");
+        assert_eq!(refresh.recorded_as().0, "giap-sign-in");
+        refresh.finish(Some(400));
+
+        let provider = begin_as(
+            "https://api.example.com/v1/chat",
+            "LLM",
+            EgressPurpose::Assistant,
+        )
+        .expect("open mode permits it");
+        assert_eq!(provider.recorded_as().0, "giap-assistant");
+        provider.finish(Some(200));
+    }
+
+    /// The wire names are matched by the dashboard and the phone: pinned and distinct.
+    #[test]
+    fn every_purpose_has_its_own_stable_wire_name() {
+        let names: Vec<&str> = EgressPurpose::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "giap-assistant",
+                "giap-sign-in",
+                "giap-music",
+                "giap-credentials",
+                "giap-rides",
+                "web_search_key_check",
+                "giap-models",
+                "giap-voice",
+                "giap-diagnostics",
+                "giap-schedules",
+                "giap-extensions",
+                "giap-push",
+            ]
+        );
+        let distinct: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            names.len(),
+            "two purposes share a wire name"
+        );
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ use pond_core::shared::services::egress;
 use crate::AppState;
 
 /// The egress record's name for the key check, which no chat turn makes.
-const KEY_CHECK_TOOL: &str = "web_search_key_check";
+const KEY_CHECK_TOOL: egress::EgressPurpose = egress::EgressPurpose::WebSearchKeyCheck;
 
 /// What a 401 or 403 from the key check answers.
 const KEY_REFUSED: &str = "Brave did not accept this key.";

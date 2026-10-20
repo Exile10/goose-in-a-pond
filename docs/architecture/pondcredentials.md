@@ -40,7 +40,7 @@ key. Otherwise, if `POND_CREDENTIALS_URL` names a service, it asks that:
 
 - **Once a month.** The token lives 30 days and is refetched when a fifth of its life is left (or under
   a day), so a household holds weeks of validity at all times.
-- **Through the gate.** The fetch is `egress::begin_as(.., "giap-credentials")`: refused under
+- **Through the gate.** The fetch is `egress::begin_as(.., EgressPurpose::Credentials)` (`giap-credentials`): refused under
   `network_mode = offline` before anything is sent, and recorded in the egress log under that name.
 - **Kindly to a service that is down.** A failure stands for a minute so the player's ten-second retry
   does not hammer it, and a token still inside its life is served if a refresh fails.

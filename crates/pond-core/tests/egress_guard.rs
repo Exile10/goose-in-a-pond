@@ -19,7 +19,7 @@ const MAX_UNGATED: usize = 0;
 const TRACKER_SYMBOLS: &[&str] = &[
     "record_egress(",
     "check_egress(",
-    "egress::begin(",
+    "check_egress_as(",
     "egress::begin_as(",
     "egress::begin_for(",
     "traced_send(",
@@ -554,9 +554,9 @@ fn every_entry_point_installs_the_gate_before_it_downloads() {
              ~100 MB ONNX Runtime fetch -- if it moved, move this assertion \
              with it rather than deleting it.",
         );
-    let gate_at = ort.find("egress::check_egress(").expect(
+    let gate_at = ort.find("egress::check_egress_as(").expect(
         "`download_and_extract_ort` shells out to curl for a ~100 MB github.com \
-         transfer and no longer calls check_egress. The egress guard finds \
+         transfer and no longer calls check_egress_as. The egress guard finds \
          senders by looking for `reqwest` and is structurally blind to a \
          subprocess, so nothing else in this file can catch it: `offline` and \
          `allowlist` would both silently permit the largest single outbound \
@@ -567,7 +567,7 @@ fn every_entry_point_installs_the_gate_before_it_downloads() {
         .expect("`download_and_extract_ort` no longer shells out to curl -- re-derive this test");
     assert!(
         gate_at < curl_at,
-        "`download_and_extract_ort` calls check_egress at byte {gate_at} but \
+        "`download_and_extract_ort` calls check_egress_as at byte {gate_at} but \
          spawns curl at byte {curl_at}. A refusal after the bytes are on the \
          wire is not a refusal."
     );

@@ -250,8 +250,11 @@ fn parts_json(files: &[TrackedFile]) -> Vec<Value> {
 /// Refuse up front what the network mode would refuse mid-transfer.
 fn check_egress(files: &[TrackedFile]) -> Result<(), Refusal> {
     for f in files {
-        pond_core::shared::services::egress::check_egress(&f.url)
-            .map_err(|denied| refusal(StatusCode::BAD_GATEWAY, "blocked", denied.to_string()))?;
+        pond_core::shared::services::egress::check_egress_as(
+            &f.url,
+            pond_core::shared::services::egress::EgressPurpose::Models,
+        )
+        .map_err(|denied| refusal(StatusCode::BAD_GATEWAY, "blocked", denied.to_string()))?;
     }
     Ok(())
 }

@@ -46,6 +46,7 @@ use pond_core::user_data::ports::device_registry::RegisterDeviceRequest;
 use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
 use pond_core::user_data::ports::session_storage::SessionStorageError;
 use pond_core::user_data::services::identity_resolution;
+use pond_core::user_data::services::oauth_providers;
 use pond_core::user_data::services::onboarding::OnboardingService;
 use pond_core::user_data::services::suggestion::GroupsKnown;
 use serde::{Deserialize, Serialize};
@@ -6909,7 +6910,12 @@ async fn search_gguf_models(
     );
     let client = &state.http_client;
     // Refuse with a 200 + `error`: the dashboard renders that but throws on a non-2xx.
-    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        &url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    ) {
         Ok(c) => c,
         Err(denied) => return Json(json!({"models": [], "error": denied.to_string()})),
     };
@@ -6954,7 +6960,12 @@ async fn search_llamafile_models(
     let url = "https://api.github.com/repos/Mozilla-Ocho/llamafile/releases?per_page=5";
     let client = &state.http_client;
     // See search_gguf_models for why the refusal rides the body.
-    let call = match pond_core::shared::services::egress::begin(url, "GET") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    ) {
         Ok(c) => c,
         Err(denied) => return Json(json!({"models": [], "error": denied.to_string()})),
     };
@@ -7013,7 +7024,12 @@ async fn list_hf_model_files(
     let url = crate::model_acquisition::hf_repo_files_url(&repo);
     let client = &state.http_client;
     // See search_gguf_models for why the refusal rides the body.
-    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        &url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    ) {
         Ok(c) => c,
         Err(denied) => return Json(json!({"files": [], "error": denied.to_string()})),
     };
@@ -7084,7 +7100,10 @@ async fn download_model_from_url(
     }
 
     // Refuse synchronously, not just in the task: the caller chooses this host.
-    if let Err(denied) = pond_core::shared::services::egress::check_egress(&url) {
+    if let Err(denied) = pond_core::shared::services::egress::check_egress_as(
+        &url,
+        pond_core::shared::services::egress::EgressPurpose::Models,
+    ) {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": denied.to_string()})),
@@ -7257,8 +7276,13 @@ pub(crate) async fn spawn_tracked_download<F>(
             let partial = part_path(&dest);
             let fetched = async {
                 // Gated here as well as in callers: every non-HF transfer passes this point.
-                let call = pond_core::shared::services::egress::begin(&url, "GET")
-                    .map_err(|denied| crate::download_failure::plain_denied(&denied))?;
+                let call = pond_core::shared::services::egress::begin_for(
+                    &url,
+                    "GET",
+                    pond_core::shared::services::egress::EgressPurpose::Models,
+                    "",
+                )
+                .map_err(|denied| crate::download_failure::plain_denied(&denied))?;
                 let sent = client.get(&url).send().await;
                 call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
                 let resp = sent.map_err(|e| crate::download_failure::plain_request(&e))?;
@@ -7504,7 +7528,12 @@ pub(crate) async fn fetch_tts_config(state: &AppState, record: &ModelRecord) {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
     // A separate hop to its own host: gate it separately from the weights.
-    match pond_core::shared::services::egress::begin(url, "GET") {
+    match pond_core::shared::services::egress::begin_for(
+        url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    ) {
         Err(denied) => tracing::warn!("TTS config file {name} not fetched: {denied}"),
         Ok(call) => {
             let sent = state.http_client.get(url).send().await;
@@ -8492,9 +8521,13 @@ async fn transcribe(
     }
 
     let whisper_url = format!("{}/inference", state.whisper_url);
-    // `voice_whisper_url` is free text, so audio may go off-box: gate it. `check_egress`, not
-    // `begin`, so each utterance doesn't log an event and drown the privacy feed.
-    pond_core::shared::services::egress::check_egress(&whisper_url).map_err(|denied| {
+    // `voice_whisper_url` is free text, so audio may go off-box: gate it. `check_egress_as`, not
+    // `begin_for`, so each utterance doesn't log an event and drown the privacy feed.
+    pond_core::shared::services::egress::check_egress_as(
+        &whisper_url,
+        pond_core::shared::services::egress::EgressPurpose::Voice,
+    )
+    .map_err(|denied| {
         (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": denied.to_string()})),
@@ -8632,7 +8665,11 @@ async fn calibrate_wake_word(
     } else {
         let whisper_url = format!("{}/inference", state.whisper_url);
         // Gated for the same reason as in `transcribe`: the host is configurable.
-        pond_core::shared::services::egress::check_egress(&whisper_url).map_err(|denied| {
+        pond_core::shared::services::egress::check_egress_as(
+            &whisper_url,
+            pond_core::shared::services::egress::EgressPurpose::Voice,
+        )
+        .map_err(|denied| {
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": denied.to_string()})),
@@ -9797,7 +9834,10 @@ async fn test_speak(
 /// GETs `url` for status and latency; gated since `whisper_url` is user-set (loopback passes).
 async fn probe(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Value {
     let t0 = std::time::Instant::now();
-    if let Err(denied) = pond_core::shared::services::egress::check_egress(url) {
+    if let Err(denied) = pond_core::shared::services::egress::check_egress_as(
+        url,
+        pond_core::shared::services::egress::EgressPurpose::Diagnostics,
+    ) {
         return json!({
             "status": "refused",
             "url": url,
@@ -12220,7 +12260,12 @@ async fn oauth_callback_handler(
     };
 
     // Egress refusals go through `fail` so the UI polling `/oauth/status/{state}` sees why.
-    let call = match pond_core::shared::services::egress::begin(&provider.token_url, "POST") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        &provider.token_url,
+        "POST",
+        pond_core::shared::services::egress::EgressPurpose::SignIn,
+        "",
+    ) {
         Ok(c) => c,
         Err(denied) => {
             let reason = denied.to_string();
@@ -12437,7 +12482,12 @@ async fn oauth_refresh_handler(
             .into_response();
     };
 
-    let call = match pond_core::shared::services::egress::begin(&provider.token_url, "POST") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        &provider.token_url,
+        "POST",
+        pond_core::shared::services::egress::EgressPurpose::SignIn,
+        "",
+    ) {
         Ok(c) => c,
         Err(denied) => {
             return (
@@ -12534,8 +12584,21 @@ async fn oauth_refresh_handler(
             Json(resp_body).into_response()
         }
         Ok(resp) => {
+            let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            tracing::warn!(provider = %provider_id, error = %err, "OAuth token refresh failed");
+            tracing::warn!(kind = "oauth.refresh_failed", provider = %provider_id, status = %status, error = %err, "OAuth token refresh failed");
+            if oauth_providers::refresh_token_rejected(status.as_u16(), &err) {
+                oauth_providers::forget_rejected_sign_in(repo.as_ref(), provider).await;
+                // Not 401: the dashboard reads a 401 as its own pairing lapsing and re-pairs.
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("{} rejected the saved sign-in. Sign in to {} again.", provider.display_name, provider.display_name),
+                        "code": "sign_in_required",
+                    })),
+                )
+                    .into_response();
+            }
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("Refresh failed: {}", err)})),
@@ -12589,7 +12652,13 @@ pub(crate) async fn refresh_spotify_token(
     let client_id = client_id_from(Some(repo), provider).await?;
 
     // Each hop is gated where it's made: one gate up front lets a copy-pasted retry slip past.
-    let call = pond_core::shared::services::egress::begin(&provider.token_url, "POST").ok()?;
+    let call = pond_core::shared::services::egress::begin_for(
+        &provider.token_url,
+        "POST",
+        pond_core::shared::services::egress::EgressPurpose::SignIn,
+        "",
+    )
+    .ok()?;
     let sent = http
         .post(&provider.token_url)
         .form(&[
@@ -12601,7 +12670,21 @@ pub(crate) async fn refresh_spotify_token(
         .await;
     call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
     let resp = sent.ok()?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            kind = "oauth.refresh_failed",
+            provider = %provider.id,
+            status = %status,
+            error = oauth_providers::token_error_code(&body).as_deref().unwrap_or(""),
+            "Spotify token refresh failed"
+        );
+        // Every 401 from Spotify's API lands here, so a dead refresh token kept would be sent
+        // again on each poll of the music controls.
+        if oauth_providers::refresh_token_rejected(status.as_u16(), &body) {
+            oauth_providers::forget_rejected_sign_in(repo, provider).await;
+        }
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
@@ -12659,8 +12742,13 @@ async fn spotify_api_call(
     let url = format!("https://api.spotify.com/v1{path}");
 
     let method_label = static_method_label(&method);
-    let call = pond_core::shared::services::egress::begin(&url, method_label)
-        .map_err(|denied| Refused(denied.to_string()))?;
+    let call = pond_core::shared::services::egress::begin_for(
+        &url,
+        method_label,
+        pond_core::shared::services::egress::EgressPurpose::Music,
+        "",
+    )
+    .map_err(|denied| Refused(denied.to_string()))?;
     let sent = state
         .http_client
         .request(method.clone(), &url)
@@ -12678,8 +12766,13 @@ async fn spotify_api_call(
         .await
         .ok_or(NotConnected)?;
     // The retry is its own request with a fresh credential, so it gets its own gate.
-    let retry = pond_core::shared::services::egress::begin(&url, method_label)
-        .map_err(|denied| Refused(denied.to_string()))?;
+    let retry = pond_core::shared::services::egress::begin_for(
+        &url,
+        method_label,
+        pond_core::shared::services::egress::EgressPurpose::Music,
+        "",
+    )
+    .map_err(|denied| Refused(denied.to_string()))?;
     let sent = state
         .http_client
         .request(method, &url)

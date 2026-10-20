@@ -336,7 +336,7 @@ crate already owns the goose-coexisting backend singleton, the model loader and 
 metal/cuda feature wiring, and depends on `pond-core`. Selected by `embedding_provider = "gguf"`,
 which the default build reaches because `local-inference` now pulls `pond-inference` (no new native
 compile — llama.cpp is already built by `goose-agent` and `local-inference`). The model is fetched
-once through `HttpModelDownloader` → `model_download::download_file`, which calls `egress::begin`, so
+once through `HttpModelDownloader` → `model_download::download_file`, which calls `egress::begin_for(.., EgressPurpose::Models, "")`, so
 the download is `network_mode`-gated (invariant 4).
 
 **Dimension decided: 768, `nomic-embed-text-v1.5`, mean-pooled.** See §2 open-decision 1. Not

@@ -4354,9 +4354,11 @@ async fn run_server(
                     };
 
                     // On refusal skip this tick only; the user may loosen network_mode later.
-                    let call = match pond_core::shared::services::egress::begin(
+                    let call = match pond_core::shared::services::egress::begin_for(
                         &provider.token_url,
                         "POST",
+                        pond_core::shared::services::egress::EgressPurpose::SignIn,
+                        "",
                     ) {
                         Ok(call) => call,
                         Err(denied) => {
@@ -4395,11 +4397,31 @@ async fn run_server(
                             }
                         }
                         Ok(resp) => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            let oauth =
+                                pond_core::user_data::services::oauth_providers::token_error_code(
+                                    &body,
+                                );
                             tracing::warn!(
+                                kind = "oauth.refresh_failed",
                                 provider = %provider.id,
-                                status = %resp.status(),
+                                status = %status,
+                                error = oauth.as_deref().unwrap_or(""),
                                 "OAuth auto-refresh failed"
                             );
+                            // A rejected refresh token never recovers: forget it, or this tick
+                            // sends it again every 45 minutes for as long as the pond runs.
+                            if pond_core::user_data::services::oauth_providers::refresh_token_rejected(
+                                status.as_u16(),
+                                &body,
+                            ) {
+                                pond_core::user_data::services::oauth_providers::forget_rejected_sign_in(
+                                    repo.as_ref(),
+                                    provider,
+                                )
+                                .await;
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -7279,10 +7301,13 @@ fn download_and_extract_ort(
     let tgz = tmp_dir.join("ort.tgz");
 
     // ── Download ─────────────────────────────────────────────────────────
-    // The curl subprocess is egress too. `check_egress`, not `EgressCall`: this fn is sync and
+    // The curl subprocess is egress too. `check_egress_as`, not `EgressCall`: this fn is sync and
     // `finish` reaches `tokio::spawn`, which panics with no runtime on the thread.
-    pond_core::shared::services::egress::check_egress(url)
-        .map_err(|denied| anyhow::anyhow!("{denied}"))?;
+    pond_core::shared::services::egress::check_egress_as(
+        url,
+        pond_core::shared::services::egress::EgressPurpose::Models,
+    )
+    .map_err(|denied| anyhow::anyhow!("{denied}"))?;
 
     let status = Command::new("curl")
         .args([

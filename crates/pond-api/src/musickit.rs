@@ -37,7 +37,7 @@ pub const MANAGED_URL_ENV: &str = "POND_CREDENTIALS_URL";
 /// it phones home.
 const DEFAULT_MANAGED_URL: Option<&str> = Some("https://credentials.jarida.io");
 /// The name a fetch is filed under in the egress log, so a person can see the pond called home.
-const MANAGED_TOOL: &str = "giap-credentials";
+const MANAGED_TOOL: egress::EgressPurpose = egress::EgressPurpose::Credentials;
 
 const NOT_SET_UP: &str = "Apple Music sign-in is not available on this pond yet: no shared \
                           credentials are set up. To use your own, add your Apple Music Team ID, Key ID \

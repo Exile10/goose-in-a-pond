@@ -26,7 +26,8 @@ const PRODUCT_ID_ENV: &str = "GIAP_UBER_PRODUCT_ID";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// What Uber calls are filed under in the egress log. No chat turn makes them: they come from the
 /// phone's ride routes and the tracker, so none may be filed under the turn in flight.
-const EGRESS_TOOL: &str = "giap-rides";
+const EGRESS_TOOL: pond_core::shared::services::egress::EgressPurpose =
+    pond_core::shared::services::egress::EgressPurpose::Rides;
 
 /// Where to reach Uber and which product to ask for.
 #[derive(Debug, Clone, PartialEq)]
