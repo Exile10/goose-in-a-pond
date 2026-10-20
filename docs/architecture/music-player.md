@@ -170,6 +170,15 @@ every 45 minutes and a token lasts an hour, so the child's is current while the 
 expired the child says so once in its log and GIAP speaks over Spotify. Every call goes through the
 `network_mode` gate, and a sound waits at most 1.5 s for the pause.
 
+**A rejected sign-in is forgotten (2026-10-20).** When Spotify answers a refresh with 400
+`invalid_grant`, the refresh token is dead for good (revoked, or the app's access removed).
+`oauth_providers::forget_rejected_sign_in` then deletes both `SPOTIFY_ACCESS_TOKEN` and
+`SPOTIFY_REFRESH_TOKEN`, keeps `SPOTIFY_CLIENT_ID`, and logs `kind="oauth.sign_in_rejected"` once.
+The music controls then report `connected: false` and the token is gone from the secret list, so Spotify reads as
+not connected and offers sign-in, and nothing sends the dead token again. Before this, the 45-minute worker and every
+401 on the now-playing poll re-sent it: the Jetson recorded about 7,900 refused refreshes in six
+days. Any other refusal (a wrong client ID, an outage) keeps the sign-in.
+
 **Policy III.3.** III.3 forbids a "voice-enabled SDA that enables a user to control Spotify with their
 voice". The pause gives nobody that: nothing said to GIAP plays, skips or stops Spotify, the music comes
 back by itself, and the pause happens because GIAP is about to make a sound, not because of anything

@@ -44,6 +44,7 @@ use pond_core::user_data::ports::device_registry::RegisterDeviceRequest;
 use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
 use pond_core::user_data::ports::session_storage::SessionStorageError;
 use pond_core::user_data::services::identity_resolution;
+use pond_core::user_data::services::oauth_providers;
 use pond_core::user_data::services::onboarding::OnboardingService;
 use pond_core::user_data::services::suggestion::GroupsKnown;
 use serde::{Deserialize, Serialize};
@@ -12469,8 +12470,21 @@ async fn oauth_refresh_handler(
             Json(resp_body).into_response()
         }
         Ok(resp) => {
+            let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            tracing::warn!(provider = %provider_id, error = %err, "OAuth token refresh failed");
+            tracing::warn!(kind = "oauth.refresh_failed", provider = %provider_id, status = %status, error = %err, "OAuth token refresh failed");
+            if oauth_providers::refresh_token_rejected(status.as_u16(), &err) {
+                oauth_providers::forget_rejected_sign_in(repo.as_ref(), provider).await;
+                // Not 401: the dashboard reads a 401 as its own pairing lapsing and re-pairs.
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("{} rejected the saved sign-in. Sign in to {} again.", provider.display_name, provider.display_name),
+                        "code": "sign_in_required",
+                    })),
+                )
+                    .into_response();
+            }
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("Refresh failed: {}", err)})),
@@ -12542,7 +12556,21 @@ pub(crate) async fn refresh_spotify_token(
         .await;
     call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
     let resp = sent.ok()?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            kind = "oauth.refresh_failed",
+            provider = %provider.id,
+            status = %status,
+            error = oauth_providers::token_error_code(&body).as_deref().unwrap_or(""),
+            "Spotify token refresh failed"
+        );
+        // Every 401 from Spotify's API lands here, so a dead refresh token kept would be sent
+        // again on each poll of the music controls.
+        if oauth_providers::refresh_token_rejected(status.as_u16(), &body) {
+            oauth_providers::forget_rejected_sign_in(repo, provider).await;
+        }
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;

@@ -4414,11 +4414,31 @@ async fn run_server(
                             }
                         }
                         Ok(resp) => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            let oauth =
+                                pond_core::user_data::services::oauth_providers::token_error_code(
+                                    &body,
+                                );
                             tracing::warn!(
+                                kind = "oauth.refresh_failed",
                                 provider = %provider.id,
-                                status = %resp.status(),
+                                status = %status,
+                                error = oauth.as_deref().unwrap_or(""),
                                 "OAuth auto-refresh failed"
                             );
+                            // A rejected refresh token never recovers: forget it, or this tick
+                            // sends it again every 45 minutes for as long as the pond runs.
+                            if pond_core::user_data::services::oauth_providers::refresh_token_rejected(
+                                status.as_u16(),
+                                &body,
+                            ) {
+                                pond_core::user_data::services::oauth_providers::forget_rejected_sign_in(
+                                    repo.as_ref(),
+                                    provider,
+                                )
+                                .await;
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(
