@@ -2139,6 +2139,23 @@ Partial update.
 
 ---
 
+## Notification data
+
+A notification (on `/notifications/stream`, and in the list it backs) is `{id, target, category,
+title, body, timestamp, data}`; `category` is `alert`, `info` or `action_required`. `data` is
+optional and keyed by what the phone does on a tap:
+
+| Key | Values | Sent by |
+|---|---|---|
+| `action` | `open_url`, `ride_offer`, `ride_update` | travel; see [rides and maps](architecture/rides-and-maps.md) and *Rides* below |
+| `open` (2026-10-19) | `schedule` (with `schedule_id`, `run_id`), `devices`, `chat` | schedule run finished or failed; pairing succeeded or failed; Matter; a proactive suggestion (beside its `proposal_id`, `rationale`) |
+
+`open` is the screen a tap opens. Its set is closed (`OpenScreen` in
+`pond-core/src/mcp/ports/notification.rs`, the only place that writes it), and GOTG checks it
+against the same three screens and checks the ids' shape, ignoring anything else. A pond older
+than this sends no `open`, and the tap opens the app where it was. The FCM wake is data-only and
+carries none of this: the phone reads the notification itself from the stream.
+
 ## Rides
 
 A member books a ride from **their own paired phone**. The member is the one the phone's pairing
