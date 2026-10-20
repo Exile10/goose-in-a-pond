@@ -225,18 +225,52 @@ async fn each_phone_fetches_and_acknowledges_only_its_own_copy() {
 #[tokio::test]
 async fn pending_and_ack_need_a_paired_device_token() {
     let h = pond().await;
-    let (status, _) = send(&h.lan, Method::GET, "/api/v1/notifications/pending", None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, _) = send(&h.lan, Method::POST, &ack_path("n:phone"), None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, _) = send(
-        &h.lan,
-        Method::GET,
-        "/api/v1/notifications/pending",
-        Some("not-a-token"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let phone = paired(&h, "phone-a").await;
+    h.sender.broadcast(notice("secret-plan")).await.unwrap();
+    let own = per_device_notification_id("secret-plan", &phone.device);
+    assert!(
+        pending_ids(&h, &phone).await.contains(&own),
+        "vacuity control: there is a queued notice a refused caller could leak"
+    );
+
+    // The same token, revoked: what an unpaired phone still holds.
+    let revoked = paired(&h, "phone-revoked").await;
+    h.handshake.revoke_token(&revoked.token).await.unwrap();
+
+    for (who, bearer) in [
+        ("no token", None),
+        ("a malformed token", Some("not-a-token")),
+        ("a revoked token", Some(revoked.token.as_str())),
+    ] {
+        for (method, path) in [
+            (Method::GET, "/api/v1/notifications/pending".to_string()),
+            (Method::POST, ack_path(&own)),
+        ] {
+            let response = respond(&h.lan, method.clone(), &path, bearer).await;
+            // Status first: a body predicate alone would pass against an error payload.
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} with {who}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains("secret-plan")
+                    && !text.contains("water the plants")
+                    && !text.contains("notifications")
+                    && !text.contains("acknowledged"),
+                "{method} {path} with {who} leaked: {text}"
+            );
+        }
+    }
+
+    assert!(
+        pending_ids(&h, &phone).await.contains(&own),
+        "a refused ack changed nothing"
+    );
 }
 
 type SseBody =
