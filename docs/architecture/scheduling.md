@@ -74,6 +74,36 @@ When they go forward, a time inside the skipped hour runs when the clocks land (
 speaks judges quiet hours in the household's `timezone` setting, the zone schedules default to,
 not in the machine's.
 
+## Resuming a paused one-shot (2026-10-19)
+
+A one-shot stores the `"@once"` sentinel as its `cron` and its instant in `fire_at`. Until
+2026-10-19 `resume_task` re-registered every paused schedule from its `cron`, so resuming a paused
+one-shot asked the cron parser to read `"@once"`, failed ("invalid cron expression '@once'"), and
+`POST /api/v1/schedules/{id}/resume` turned that into a 404 for a schedule that plainly existed.
+Resume now tests `fire_at` before `cron`, as rehydration already did, and re-arms a one-shot at its
+own instant.
+
+If that instant passed while the schedule was paused, resume refuses with
+`OneShotTimePassed` (`pond-core/src/user_data/domain/schedule.rs`), logged as
+`kind="schedule_resume_refused"`, and the route answers **409** with
+`"code": "one_shot_time_passed"` and an error that says to edit its time first. The schedule stays
+paused and listed; a `PUT` with a new `fire_at` followed by a resume works. This is deliberately
+different from startup, where an armed one-shot the pond slept through fires late: nobody asked
+that one to wait, whereas a pause is the household saying "not at that time", and firing it hours
+late on resume is not what was paused. A successful resume of either kind logs
+`kind="schedule_resumed"`. Recurring schedules resume exactly as before, at their next occurrence.
+
+### Creating a one-off over REST (2026-10-19)
+
+`POST /api/v1/schedules` takes the same one-off fields `PUT` does. `fire_at` (an RFC 3339 instant)
+makes a one-shot: the stored `cron` is `"@once"` and `cron` may be omitted from the body. `once: true`
+with a `cron` makes a one-shot at that cron's next occurrence in the schedule's `timezone`, which is
+what the phone app sends (a cron pinned to one date and time). `fire_at` wins if both are given. A
+`fire_at` that has already passed is a **400** with `"code": "fire_at_in_past"`, logged as
+`kind="schedule_create_refused"`, rather than a schedule that fires the moment it is created. Until
+2026-10-19 the route dropped `fire_at`, so the only REST way to an exact instant was a `PUT` after
+the create.
+
 ## Execution Flow
 
 1. The task's one-shot job fires at its next local occurrence and arms the one after it
@@ -147,11 +177,11 @@ Sensor rules have no dedicated REST surface today — they are created by POSTin
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/schedules` | List all schedules |
-| POST | `/api/v1/schedules` | Create (accepts name, cron, prompt, timezone, kind) |
+| POST | `/api/v1/schedules` | Create (accepts name, cron, prompt, timezone, kind; a one-off with `fire_at` or `once`, see below) |
 | GET | `/api/v1/schedules/upcoming` | Active schedules sorted by next fire |
 | DELETE | `/api/v1/schedules/{id}` | Delete |
 | POST | `/api/v1/schedules/{id}/pause` | Pause |
-| POST | `/api/v1/schedules/{id}/resume` | Resume |
+| POST | `/api/v1/schedules/{id}/resume` | Resume; 409 `one_shot_time_passed` for a one-shot whose time passed while paused |
 | POST | `/api/v1/schedules/{id}/run-now` | Fire immediately (202 Accepted) |
 | GET | `/api/v1/schedules/{id}/runs` | Execution history |
 | GET | `/api/v1/schedules/events` | SSE stream of completion events |
