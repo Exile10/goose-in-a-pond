@@ -1513,7 +1513,7 @@ queued and relayed exactly like a targeted notice. That copy's id is
 the live broadcast copy only.
 
 **One notice, one id per phone.** The stream skips a broadcast when the device it serves has its
-own queued copy (the copy arrives on its own, and is marked delivered once streamed). The push
+own queued copy (the copy arrives on its own, and stays undelivered until the phone acks it). The push
 wake's `notification_id`, the stream and `/pending` therefore all carry the same per-device id,
 and a client that dedupes by `id` shows the notice once however it arrived. A copy that fails to
 queue has no row, so the stream still sends that phone the broadcast copy.
@@ -1521,15 +1521,33 @@ queue has no row, so the stream still sends that phone the broadcast copy.
 ### GET /notifications/stream?device_id={id}
 
 Server-sent events, one notification per `data:` line. On connect it sends every undelivered
-notification queued for the device, oldest first, and marks them delivered; then it tails live
-notifications for the device. `device_id` must be the caller's own device (`403
-device_mismatch` otherwise).
+notification queued for the device, oldest first; then it tails live notifications for the
+device. `device_id` must be the caller's own device (`403 device_mismatch` otherwise). Every 15 s
+of quiet it sends an SSE comment (axum's default keep-alive), which the app ignores.
+
+**Who marks a notice delivered (2026-10-20).** For a **phone** (`device_type = "gotg"`) only
+`POST /notifications/{id}/ack` does; the stream never does, on connect or live. A write into a
+connection the phone abandoned without closing (Wi-Fi and data turned off) succeeds on the Pond's
+side for as long as the kernel buffers it, so before this change such a notice was stamped
+delivered while the phone was offline, and the push wake's `/pending` then came back empty. Each
+new stream connection therefore re-sends every copy the phone has not acked; the app dedupes by
+`id` and acks each item after presenting it. The keep-alive does not close that gap: it too is a
+write that succeeds into a half-open connection, and only TCP retransmission timeouts end one.
+**Any other device** (a desktop, a speaker) has no ack path, so the stream marks what it sends
+delivered, as before. `notifications_stream_flushed` logs each connect's re-send count and
+whether the device acks.
+
+An app build from before the ack route never acks, so its queued copies stay undelivered: each
+reconnect and wake offers them again (it shows each id once per run, by its own dedupe), until the
+pruning pass below removes them at 30 days or beyond the newest 500 for that phone. The table
+stays bounded either way.
 
 ### GET /notifications/pending
 
 For a phone a push wake brought back, or one reconnecting: the caller's undelivered
-notifications, oldest first. The device comes from the token; there is no parameter. It does not
-mark anything delivered.
+notifications, oldest first: for a phone, every copy it has not acked, including those the stream
+already sent. The device comes from the token; there is no parameter. It does not mark anything
+delivered.
 
 **Response 200**
 ```json

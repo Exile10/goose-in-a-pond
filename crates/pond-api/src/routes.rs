@@ -10385,6 +10385,14 @@ struct NotificationStreamParams {
 /// Drains its offline queue, then tails live events for it or `"broadcast"`; dedupe by `id`.
 /// A broadcast the device has its own queued copy of (a paired phone) is skipped: that copy
 /// arrives on its own, under the per-device id the push wake and `/pending` also use.
+///
+/// A phone ([`PHONE_CLIENT_TYPE`]) acknowledges each notice with `POST .../{id}/ack`, and only
+/// that marks its copy delivered: a write into a half-open connection (a phone that dropped off
+/// the network without closing it) succeeds, so a stream write is no proof the notice arrived.
+/// Every connection therefore re-sends each copy the phone has not acknowledged. Any other
+/// device has no ack path, so the stream marks what it sends delivered, as it always has.
+///
+/// [`PHONE_CLIENT_TYPE`]: pond_core::mcp::ports::notification_recipients::PHONE_CLIENT_TYPE
 async fn notifications_stream(
     State(state): State<Arc<AppState>>,
     axum::Extension(principal): axum::Extension<pond_core::security::ports::policy::Principal>,
@@ -10416,12 +10424,14 @@ async fn notifications_stream(
                 Json(json!({ "error": "device lookup failed" })),
             )
         })?;
-    if exists.is_none() {
+    let Some(device) = exists else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "unknown device" })),
         ));
-    }
+    };
+    let ack_required =
+        device.device_type == pond_core::mcp::ports::notification_recipients::PHONE_CLIENT_TYPE;
 
     // Not the chat `sse_semaphore`: phones hold these open indefinitely and would starve chat.
     let permit = state
@@ -10452,13 +10462,27 @@ async fn notifications_stream(
                     ids.push(n.id.clone());
                     yield Ok(Event::default().data(data));
                 }
-                if !ids.is_empty() {
+                tracing::info!(
+                    kind = "notifications_stream_flushed",
+                    count = ids.len(),
+                    ack_required,
+                    "notifications: queued notices sent on connect"
+                );
+                if !ack_required && !ids.is_empty() {
                     if let Err(e) = queue.mark_delivered(&ids).await {
-                        tracing::warn!(error = %e, "notifications: flush mark_delivered failed");
+                        tracing::warn!(
+                            kind = "notification_mark_delivered_failed",
+                            error = %e,
+                            "notifications: flush mark_delivered failed"
+                        );
                     }
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "notifications: flush query failed"),
+            Err(e) => tracing::warn!(
+                kind = "notifications_stream_flush_failed",
+                error = %e,
+                "notifications: flush query failed"
+            ),
         }
 
         loop {
@@ -10475,9 +10499,13 @@ async fn notifications_stream(
                         let id = n.id.clone();
                         let data = serde_json::to_string(&n).unwrap_or_default();
                         yield Ok(Event::default().data(data));
-                        if targeted {
+                        if targeted && !ack_required {
                             if let Err(e) = queue.mark_delivered(&[id]).await {
-                                tracing::warn!(error = %e, "notifications: live mark_delivered failed");
+                                tracing::warn!(
+                                    kind = "notification_mark_delivered_failed",
+                                    error = %e,
+                                    "notifications: live mark_delivered failed"
+                                );
                             }
                         }
                     }

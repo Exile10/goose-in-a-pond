@@ -26,6 +26,7 @@ struct Harness {
     lan: axum::Router,
     handshake: Arc<pond_infra::sqlite_handshake::SqliteHandshakeAdapter>,
     sender: Arc<dyn NotificationSender>,
+    pool: sqlx::SqlitePool,
     _dir: tempfile::TempDir,
 }
 
@@ -41,7 +42,7 @@ async fn pond() -> Harness {
     let (tx, _) = tokio::sync::broadcast::channel::<Notification>(64);
     let sender: Arc<dyn NotificationSender> = Arc::new(
         BroadcastNotificationSender::new(tx.clone(), queue.clone(), None)
-            .with_household_recipients(Arc::new(SqliteNotificationRecipients::new(pool))),
+            .with_household_recipients(Arc::new(SqliteNotificationRecipients::new(pool.clone()))),
     );
     state.notification_tx = tx;
     state.notification_queue = Some(queue);
@@ -59,6 +60,7 @@ async fn pond() -> Harness {
         lan,
         handshake,
         sender,
+        pool,
         _dir: dir,
     }
 }
@@ -323,9 +325,10 @@ async fn a_connected_phone_sees_a_household_notice_once() {
         "the phone gets its own copy live and not the broadcast copy as well"
     );
     drop(body);
-    assert!(
-        pending_ids(&h, &a).await.is_empty(),
-        "streaming the copy live marks it delivered, so a later wake finds nothing to repeat"
+    assert_eq!(
+        pending_ids(&h, &a).await,
+        vec![per_device_notification_id("sched-2", &a.device)],
+        "streaming the copy is no proof it arrived; it waits for the phone's ack"
     );
 }
 
@@ -345,4 +348,115 @@ async fn a_notice_that_lands_while_the_stream_connects_is_sent_once() {
         ids_until_quiet(&mut body).await,
         vec![per_device_notification_id("sched-3", &a.device)]
     );
+}
+
+/// When the copy was first stamped delivered, read straight from the table.
+async fn delivered_at(h: &Harness, id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT delivered_at FROM notifications WHERE id = ?")
+        .bind(id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
+}
+
+/// The Jetson report of 2026-10-20: the phone dropped off the network with its stream still
+/// held open, a Run now wrote the notice into the dead connection, and the stream marked it
+/// delivered, so the wake's `/pending` came back empty. A write is no proof of arrival.
+#[tokio::test]
+async fn a_stream_write_leaves_a_phones_copy_undelivered_until_it_is_acked() {
+    let h = pond().await;
+    let a = paired(&h, "phone-a").await;
+    settle(&h, &[&a]).await;
+    let copy = per_device_notification_id("run-now", &a.device);
+
+    // Connected before the notice and on the drain path after it: both writes count.
+    let mut body = open_stream(&h, &a).await;
+    assert!(ids_until_quiet(&mut body).await.is_empty());
+    h.sender.broadcast(notice("run-now")).await.unwrap();
+    assert_eq!(ids_until_quiet(&mut body).await, vec![copy.clone()]);
+    drop(body);
+    let mut body = open_stream(&h, &a).await;
+    assert_eq!(ids_until_quiet(&mut body).await, vec![copy.clone()]);
+    drop(body);
+
+    assert_eq!(
+        delivered_at(&h, &copy).await,
+        None,
+        "neither the live write nor the connect drain stamps the copy"
+    );
+    assert_eq!(
+        pending_ids(&h, &a).await,
+        vec![copy.clone()],
+        "so the push wake still finds it"
+    );
+
+    let (status, body) = send(&h.lan, Method::POST, &ack_path(&copy), Some(&a.token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        delivered_at(&h, &copy).await.is_some(),
+        "the ack is what stamps it"
+    );
+    assert!(pending_ids(&h, &a).await.is_empty());
+}
+
+/// Every new connection re-sends what the phone has not acknowledged, and only that.
+#[tokio::test]
+async fn a_reconnecting_phone_is_resent_every_unacked_copy() {
+    let h = pond().await;
+    let a = paired(&h, "phone-a").await;
+    settle(&h, &[&a]).await;
+    h.sender.broadcast(notice("first")).await.unwrap();
+    h.sender.broadcast(notice("second")).await.unwrap();
+    let first = per_device_notification_id("first", &a.device);
+    let second = per_device_notification_id("second", &a.device);
+
+    let mut body = open_stream(&h, &a).await;
+    assert_eq!(
+        ids_until_quiet(&mut body).await,
+        vec![first.clone(), second.clone()]
+    );
+    drop(body);
+
+    let (status, _) = send(&h.lan, Method::POST, &ack_path(&first), Some(&a.token)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut body = open_stream(&h, &a).await;
+    assert_eq!(
+        ids_until_quiet(&mut body).await,
+        vec![second.clone()],
+        "the acked copy is not sent again; the unacked one is"
+    );
+    drop(body);
+    assert_eq!(pending_ids(&h, &a).await, vec![second]);
+}
+
+/// A desktop or any other non-phone listener has no ack path; its stream marks what it sends.
+#[tokio::test]
+async fn a_non_phone_stream_still_marks_what_it_sends_delivered() {
+    let h = pond().await;
+    let desk = paired(&h, "desk").await;
+    settle(&h, &[&desk]).await;
+    sqlx::query("UPDATE devices SET device_type = 'desktop' WHERE id = ?")
+        .bind(&desk.device)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let mut targeted = notice("for-desk");
+    targeted.target = desk.device.clone();
+    h.sender.send(targeted).await.unwrap();
+    assert_eq!(
+        pending_ids(&h, &desk).await,
+        vec!["for-desk".to_string()],
+        "vacuity control: the row is queued before the stream sends it"
+    );
+
+    let mut body = open_stream(&h, &desk).await;
+    assert_eq!(
+        ids_until_quiet(&mut body).await,
+        vec!["for-desk".to_string()]
+    );
+    drop(body);
+    assert!(delivered_at(&h, "for-desk").await.is_some());
+    assert!(pending_ids(&h, &desk).await.is_empty());
 }
