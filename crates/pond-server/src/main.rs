@@ -4502,6 +4502,16 @@ async fn run_server(
         });
     }
 
+    // One station for the setup channel and the connections routes, so a join over Bluetooth and
+    // one over HTTPS never run at once.
+    let wifi_station = pond_connect::wifi::platform();
+    let connections = Arc::new(pond_api::connections::Connections::new(
+        pond_core::network::services::wifi_connections::WifiConnections::new(wifi_station.clone()),
+        pond_connect::wired::platform(),
+        pairing_hostname.clone(),
+        https_port,
+    ));
+
     // The BLE setup channel, over the same ports AppState holds. No setup record means no card id
     // to advertise, so no BLE; nothing here can stop the pond.
     let ble_radios = match setup_record.as_ref() {
@@ -4515,7 +4525,7 @@ async fn run_server(
             },
             setup_claims.clone(),
             pond_connect::ble::platform(),
-            pond_connect::wifi::platform(),
+            wifi_station,
         )),
         None => {
             tracing::warn!(
@@ -4536,10 +4546,24 @@ async fn run_server(
         embedded.clone(),
     );
     if let Some(radios) = ble_radios {
-        // `GET /network/status` on both listeners a household's devices use.
+        // `GET /network/status` and `GET /connections` on every listener a household's devices use.
         listeners.dashboard = listeners.dashboard.layer(axum::Extension(radios.clone()));
+        #[cfg(unix)]
+        {
+            listeners.embedded = listeners.embedded.layer(axum::Extension(radios.clone()));
+        }
         listeners.companion = listeners.companion.layer(axum::Extension(radios));
     }
+    listeners.dashboard = listeners
+        .dashboard
+        .layer(axum::Extension(connections.clone()));
+    #[cfg(unix)]
+    {
+        listeners.embedded = listeners
+            .embedded
+            .layer(axum::Extension(connections.clone()));
+    }
+    listeners.companion = listeners.companion.layer(axum::Extension(connections));
     #[cfg(unix)]
     match embedded.config() {
         Ok(config) if config.enabled => {

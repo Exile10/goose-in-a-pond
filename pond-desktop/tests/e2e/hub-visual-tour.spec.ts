@@ -30,6 +30,7 @@ const SETTINGS_TOUR: Array<{ row: RegExp; label: string }> = [
   { row: /^Memory$/,            label: "Settings_Memory" },
   { row: /^Extensions/,         label: "Settings_Extensions" },
   { row: /^Logs$/,              label: "Settings_Logs" },
+  { row: /^Connections$/,       label: "Settings_Connections" },
   { row: /^Privacy$/,           label: "Settings_Privacy" },
   { row: /^Rooms/,              label: "Settings_Rooms" },
   { row: /^Cameras$/,           label: "Settings_Cameras" },

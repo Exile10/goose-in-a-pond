@@ -44,6 +44,19 @@ pub fn is_valid_ssid(ssid: &str) -> bool {
     !ssid.is_empty() && ssid.len() <= MAX_SSID_BYTES
 }
 
+/// Whether a passphrase is all a join needs. The pond can only send a passphrase, and an
+/// enterprise network asks for a username and a certificate, so it is refused before any attempt.
+pub fn joinable(security: WifiSecurity) -> Result<(), WifiJoinError> {
+    match security {
+        WifiSecurity::Enterprise => Err(WifiJoinError::UnsupportedSecurity),
+        WifiSecurity::Open
+        | WifiSecurity::Wep
+        | WifiSecurity::Wpa
+        | WifiSecurity::Wpa2
+        | WifiSecurity::Wpa3 => Ok(()),
+    }
+}
+
 /// One entry per SSID, strongest first, as the phone shows them. Every access point of a network
 /// reports separately, and a hidden one reports no name at all.
 pub fn rank_networks(networks: Vec<WifiNetwork>) -> Vec<WifiNetwork> {
@@ -137,6 +150,8 @@ pub enum WifiJoinError {
     Unsupported,
     #[error("the Wi-Fi station is busy")]
     Busy,
+    #[error("this network asks for more than a passphrase")]
+    UnsupportedSecurity,
 }
 
 impl WifiJoinError {
@@ -149,6 +164,7 @@ impl WifiJoinError {
             Self::NotPermitted => "not_permitted",
             Self::Unsupported => "unsupported",
             Self::Busy => "busy",
+            Self::UnsupportedSecurity => "unsupported_security",
         }
     }
 }
@@ -162,11 +178,42 @@ pub enum WifiScanError {
     Unsupported,
     #[error("the Wi-Fi station is busy")]
     Busy,
+    /// Only the HTTPS route's budget produces this; the station itself always answers.
+    #[error("the scan did not finish in time")]
+    Timeout,
 }
 
 impl WifiScanError {
     pub fn code(self) -> &'static str {
         match self {
+            Self::NotPermitted => "not_permitted",
+            Self::Unsupported => "unsupported",
+            Self::Busy => "busy",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Why a saved network was not forgotten, in the join's codes where the meaning is the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WifiForgetError {
+    #[error("no saved network has that name")]
+    NotFound,
+    #[error("the pond is on that network now")]
+    InUse,
+    #[error("this pond is not allowed to forget a saved network")]
+    NotPermitted,
+    #[error("this host cannot forget a Wi-Fi network")]
+    Unsupported,
+    #[error("the Wi-Fi station is busy")]
+    Busy,
+}
+
+impl WifiForgetError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::InUse => "in_use",
             Self::NotPermitted => "not_permitted",
             Self::Unsupported => "unsupported",
             Self::Busy => "busy",
@@ -200,11 +247,42 @@ impl NetworkStatus {
     }
 }
 
+/// The network the station is on now, as the saved network it was joined with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentNetwork {
+    pub ssid: String,
+    /// 0 to [`MAX_SIGNAL`]; `None` when the OS does not say.
+    pub signal: Option<u8>,
+}
+
+/// One entry of the HTTPS networks list: the setup channel's [`WifiNetwork`] plus `current`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListedNetwork {
+    pub ssid: String,
+    pub security: WifiSecurity,
+    pub signal: u8,
+    pub known: bool,
+    pub current: bool,
+}
+
+impl ListedNetwork {
+    pub fn new(network: WifiNetwork, current: Option<&str>) -> Self {
+        Self {
+            current: current == Some(network.ssid.as_str()),
+            ssid: network.ssid,
+            security: network.security,
+            signal: network.signal.min(MAX_SIGNAL),
+            known: network.known,
+        }
+    }
+}
+
 /// What a station can do on this host now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WifiCapabilities {
     pub scan: Availability,
     pub join: Availability,
+    pub forget: Availability,
 }
 
 impl WifiCapabilities {
@@ -212,6 +290,7 @@ impl WifiCapabilities {
         Self {
             scan: Availability::Available,
             join: Availability::Available,
+            forget: Availability::Available,
         }
     }
 
@@ -219,6 +298,76 @@ impl WifiCapabilities {
         Self {
             scan: Availability::unavailable(reason),
             join: Availability::unavailable(reason),
+            forget: Availability::unavailable(reason),
+        }
+    }
+
+    /// No adapter, no station on this OS, or the radio switched off. Forget is left out: a Mac
+    /// never offers it, and that says nothing about whether it has a station.
+    pub fn is_unavailable(&self) -> bool {
+        !self.scan.is_available() && !self.join.is_available()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WifiLinkState {
+    Connected,
+    Disconnected,
+    Unavailable,
+}
+
+/// The Wi-Fi section of `GET /connections`: one state, and the details that state has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiLink {
+    pub state: WifiLinkState,
+    /// Why, for `unavailable` only.
+    pub reason: Option<String>,
+    pub ssid: Option<String>,
+    pub address: Option<Ipv4Addr>,
+    pub signal: Option<u8>,
+}
+
+impl WifiLink {
+    /// A link still joining reads as disconnected: the household cannot reach the pond on it yet.
+    /// A connected link wins over the capabilities, which may fail to read on their own.
+    pub fn read(
+        status: &NetworkStatus,
+        current: Option<&CurrentNetwork>,
+        capabilities: &WifiCapabilities,
+    ) -> Self {
+        if status.state == NetworkState::Connected {
+            let ssid = current
+                .map(|current| current.ssid.clone())
+                .or_else(|| status.ssid.clone());
+            let signal = current
+                .filter(|current| Some(&current.ssid) == ssid.as_ref())
+                .and_then(|current| current.signal)
+                .map(|signal| signal.min(MAX_SIGNAL));
+            return Self {
+                state: WifiLinkState::Connected,
+                reason: None,
+                ssid,
+                address: status.ipv4,
+                signal,
+            };
+        }
+        let (state, reason) = if capabilities.is_unavailable() {
+            let reason = capabilities
+                .join
+                .reason()
+                .or(capabilities.scan.reason())
+                .map(str::to_string);
+            (WifiLinkState::Unavailable, reason)
+        } else {
+            (WifiLinkState::Disconnected, None)
+        };
+        Self {
+            state,
+            reason,
+            ssid: None,
+            address: None,
+            signal: None,
         }
     }
 }
@@ -298,6 +447,7 @@ mod tests {
             WifiJoinError::NotPermitted,
             WifiJoinError::Unsupported,
             WifiJoinError::Busy,
+            WifiJoinError::UnsupportedSecurity,
         ]
         .into_iter()
         .map(WifiJoinError::code)
@@ -311,12 +461,156 @@ mod tests {
                 "timeout",
                 "not_permitted",
                 "unsupported",
-                "busy"
+                "busy",
+                "unsupported_security"
             ]
         );
         assert_eq!(WifiScanError::NotPermitted.code(), "not_permitted");
         assert_eq!(WifiScanError::Unsupported.code(), "unsupported");
         assert_eq!(WifiScanError::Busy.code(), "busy");
+        assert_eq!(WifiScanError::Timeout.code(), "timeout");
+        let forget: Vec<&str> = [
+            WifiForgetError::NotFound,
+            WifiForgetError::InUse,
+            WifiForgetError::NotPermitted,
+            WifiForgetError::Unsupported,
+            WifiForgetError::Busy,
+        ]
+        .into_iter()
+        .map(WifiForgetError::code)
+        .collect();
+        assert_eq!(
+            forget,
+            [
+                "not_found",
+                "in_use",
+                "not_permitted",
+                "unsupported",
+                "busy"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_an_enterprise_network_asks_for_more_than_a_passphrase() {
+        assert_eq!(
+            joinable(WifiSecurity::Enterprise),
+            Err(WifiJoinError::UnsupportedSecurity)
+        );
+        for security in [
+            WifiSecurity::Open,
+            WifiSecurity::Wep,
+            WifiSecurity::Wpa,
+            WifiSecurity::Wpa2,
+            WifiSecurity::Wpa3,
+        ] {
+            assert_eq!(joinable(security), Ok(()), "{security:?}");
+        }
+    }
+
+    #[test]
+    fn a_listed_network_is_current_only_by_its_exact_name() {
+        let listed = ListedNetwork::new(network("Home", 70, true), Some("Home"));
+        assert_eq!(
+            serde_json::to_value(&listed).unwrap(),
+            serde_json::json!({"ssid": "Home", "security": "wpa2", "signal": 70, "known": true,
+                               "current": true})
+        );
+        assert!(!ListedNetwork::new(network("Home", 70, true), Some("home")).current);
+        assert!(!ListedNetwork::new(network("Home", 70, true), None).current);
+    }
+
+    fn connected(ssid: Option<&str>) -> NetworkStatus {
+        NetworkStatus {
+            state: NetworkState::Connected,
+            ssid: ssid.map(str::to_string),
+            ipv4: Some(Ipv4Addr::new(192, 168, 1, 11)),
+        }
+    }
+
+    #[test]
+    fn a_connected_link_names_its_network_signal_and_address() {
+        let current = CurrentNetwork {
+            ssid: "Home".into(),
+            signal: Some(70),
+        };
+        let link = WifiLink::read(
+            &connected(Some("Home")),
+            Some(&current),
+            &WifiCapabilities::unsupported("permissions unreadable"),
+        );
+        assert_eq!(
+            link,
+            WifiLink {
+                state: WifiLinkState::Connected,
+                reason: None,
+                ssid: Some("Home".into()),
+                address: Some(Ipv4Addr::new(192, 168, 1, 11)),
+                signal: Some(70),
+            },
+            "a working link is reported even when the capabilities cannot be read"
+        );
+        let other = CurrentNetwork {
+            ssid: "Cafe".into(),
+            signal: Some(30),
+        };
+        let link = WifiLink::read(
+            &connected(Some("Home")),
+            None,
+            &WifiCapabilities::available(),
+        );
+        assert_eq!((link.ssid.as_deref(), link.signal), (Some("Home"), None));
+        let link = WifiLink::read(
+            &connected(None),
+            Some(&other),
+            &WifiCapabilities::available(),
+        );
+        assert_eq!(
+            (link.ssid.as_deref(), link.signal),
+            (Some("Cafe"), Some(30)),
+            "the saved network's name stands in when the OS withholds the live one"
+        );
+    }
+
+    #[test]
+    fn a_link_is_unavailable_only_when_neither_scan_nor_join_works() {
+        let joining = NetworkStatus {
+            state: NetworkState::Connecting,
+            ssid: Some("Home".into()),
+            ipv4: None,
+        };
+        let link = WifiLink::read(&joining, None, &WifiCapabilities::available());
+        assert_eq!(
+            link,
+            WifiLink {
+                state: WifiLinkState::Disconnected,
+                reason: None,
+                ssid: None,
+                address: None,
+                signal: None,
+            }
+        );
+        let link = WifiLink::read(
+            &NetworkStatus::disconnected(),
+            None,
+            &WifiCapabilities::unsupported("this host has no Wi-Fi adapter"),
+        );
+        assert_eq!(link.state, WifiLinkState::Unavailable);
+        assert_eq!(
+            link.reason.as_deref(),
+            Some("this host has no Wi-Fi adapter")
+        );
+
+        let mac = WifiCapabilities {
+            scan: Availability::Available,
+            join: Availability::Available,
+            forget: Availability::unavailable("administrators only"),
+        };
+        assert!(!mac.is_unavailable());
+        assert_eq!(
+            WifiLink::read(&NetworkStatus::disconnected(), None, &mac).state,
+            WifiLinkState::Disconnected
+        );
     }
 
     #[test]

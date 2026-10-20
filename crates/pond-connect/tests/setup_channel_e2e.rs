@@ -7,6 +7,8 @@ mod common;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use common::*;
 use pond_connect::setup_channel::SessionEnd;
+use pond_core::network::domain::wifi::WifiSecurity;
+use pond_core::network::mocks::mock_wifi_station::sample_network;
 use pond_core::network::ports::setup_code_store::SetupCodeStore;
 use pond_core::security::domain::event::AttributeValue;
 use pond_core::security::ports::handshake::{Handshake, RefreshRequest};
@@ -35,6 +37,33 @@ async fn a_phone_claims_a_pond_with_its_card_and_puts_it_on_wifi() {
         phone.handle.writer.phone_disconnected().await;
         assert_eq!(phone.ended().await, Some(SessionEnd::PhoneDisconnected));
     }
+}
+
+#[tokio::test]
+async fn joining_an_enterprise_network_is_refused_as_unsupported_security() {
+    let pond = pond().await;
+    let (mut phone, _) = claim_and_join(&pond, 185).await;
+    pond.station.add_network(
+        sample_network("Office", WifiSecurity::Enterprise, 90),
+        Some(HOME_PASSPHRASE),
+    );
+    let scan = phone.ask("wifi_scan", json!({})).await;
+    assert_eq!(
+        scan["networks"][0],
+        json!({"ssid": "Office", "security": "enterprise", "signal": 90, "known": false}),
+        "listed, so the household recognises theirs"
+    );
+    let refusal = phone
+        .ask(
+            "wifi_join",
+            json!({"ssid": "Office", "passphrase": HOME_PASSPHRASE}),
+        )
+        .await;
+    assert_eq!(
+        refusal,
+        json!({"id": refusal["id"], "type": "wifi_join", "ok": false,
+               "error": "unsupported_security"})
+    );
 }
 
 #[tokio::test]

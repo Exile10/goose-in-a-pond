@@ -240,7 +240,7 @@ As built (P5e, 2026-10-17):
 |---|---|---|
 | `status` | none | `claimed`, `onboarded`, `network` (`state`: `connected`, `connecting` or `disconnected`; `ssid`; `ipv4`), `https_port`, `hostname` |
 | `wifi_scan` | none | `networks`: `[{ssid, security, signal, known}]`. `security` is `open`, `wep`, `wpa`, `wpa2`, `wpa3` or `enterprise`; `signal` is 0 to 100; strongest first; one entry per SSID |
-| `wifi_join` | `ssid`, `passphrase` (omitted for open networks), `hidden` (optional) | `address` (IPv4), `https_port`, `hostname`; or `wrong_password`, `not_found`, `no_address`, `timeout`, `not_permitted`, `unsupported`, `busy` |
+| `wifi_join` | `ssid`, `passphrase` (omitted for open networks), `hidden` (optional) | `address` (IPv4), `https_port`, `hostname`; or `wrong_password`, `not_found`, `no_address`, `timeout`, `not_permitted`, `unsupported`, `busy`, `unsupported_security` (an enterprise network: listed by `wifi_scan`, refused before any attempt; `pond-connections.md` v1.1) |
 
 A sealed channel is a paired device's: the exchange that opened it minted the device's tokens. On
 a claimed pond, only a spoken code opens one, so changing a claimed pond's Wi-Fi needs someone in

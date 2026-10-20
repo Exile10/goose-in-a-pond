@@ -3638,3 +3638,36 @@ PAI milestone).**
   decode median 18.2 -> 25.1 tok/s; with `mtp-gemma-4-E4B-it` attached 22.1 -> 32.0 (23.8-45.7).
   First token 0.42-0.54 s. Lowest available memory 3,376 MB plain and 3,185 MB with the drafter.
   The household pond was not changed: it still runs LiteRT E4B (12-14 tok/s at 8K).
+
+**2026-10-19 — The connections and pairing settings, server side (touches PAI-2; not a PAI
+milestone).**
+
+- **What landed.** [`pond-connections.md`](../pond-connections.md) v1.1, on
+  `feat/connections-and-pairing`: `GET /connections`, `GET /connections/wifi/networks`,
+  `POST /connections/wifi/join`, `DELETE /connections/wifi/networks/{ssid}` and `GET /setup/status`
+  (`pond-api/src/connections.rs`); `WifiStation::current` and `::forget`, a `WiredInterfaces` port
+  and `SetupRadios::advertising_as` in pond-core; the `connection_changes` policy and the
+  `WifiConnections` service; NetworkManager forget and the current network from the active
+  connection's profile, a sysfs and a macOS wired reader, and `SerialStation`, which makes the
+  setup channel and the HTTPS routes share one radio, one operation at a time (`busy` otherwise).
+  `unsupported_security` refuses an enterprise network from its scan entry before any attempt, on
+  both transports.
+- **PAI-2: two new write routes can take the pond off the network.** A join can move it to
+  another LAN and forgetting the current network drops the link. They take a token in every state
+  and never answer without one (`Exposure::Authenticated`, pinned); the handler then asks
+  `may_change_connections`: the host credential, the device that claimed the pond (so owner setup
+  can fix the network before any member is attributed), or a device attributed to a member.
+  Anyone else, a guest's phone, may read and gets `403 not_allowed`, logged as
+  `connections_change_denied`; a failed attribution read refuses. Forgetting the network the pond
+  is on needs `?confirm=true` (`409 in_use`), judged by both the saved profile and the live link.
+  A join runs on its own task, so a client that loses the pond mid-join cannot cancel it half
+  done, leaving an unsaved connection behind.
+- **PAI-2: the passphrase is never logged.** It is parsed straight into `WifiPassphrase` (redacting
+  `Debug`, no `Serialize`, wiped on drop); a malformed body is answered `invalid_request` with the
+  parse error dropped unread, since serde quotes a mistyped value; the logs carry the SSID and
+  whether a passphrase was given, never its text. `connections_passphrase_logs.rs` captures every
+  event at TRACE through joins that succeed, fail, time out, are refused and are too long, and
+  finds none of it. The OS keeps it only once a join succeeds, as before.
+- **Invariants.** No migration, no new setting, no egress, no prompt or KV change.
+  `GET /network/status` answers as it did. The setup channel's wire is unchanged but for the new
+  `unsupported_security` code.

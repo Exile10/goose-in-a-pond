@@ -61,6 +61,11 @@ import {
   type NowPlayingApiResponse,
   type Settings,
   type AudioDeviceStatus,
+  type Connections,
+  type SetupStatus,
+  type WifiJoinRequest,
+  type WifiJoinResult,
+  type WifiNetwork,
   type UsageSummary,
   type TranscribeResponse,
   type UserSkill,
@@ -115,6 +120,9 @@ export function oauthRedirectUri(serverUrl: string): string {
 
 /** Just above the server's 180s pairing timeout, so the server's error surfaces, not an abort. */
 const COMMISSION_TIMEOUT_MS = 190_000;
+/** A scan answers within 15s and a join within 45s; the margin lets the server's refusal arrive first. */
+const WIFI_SCAN_TIMEOUT_MS = 20_000;
+const WIFI_JOIN_TIMEOUT_MS = 60_000;
 
 export class PondApiClient {
   /** Mutable: the shell can correct this when the sidecar binds a fallback port. */
@@ -356,8 +364,8 @@ export class PondApiClient {
     const credential = await hostCredential();
     return credential ? { "X-Pond-Host-Credential": credential } : {};
   }
-  private async hostRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
-    return this.request<T>(method, path, body, undefined, await this.hostHeaders());
+  private async hostRequest<T>(method: string, path: string, body?: unknown, timeout?: number): Promise<T> {
+    return this.request<T>(method, path, body, timeout, await this.hostHeaders());
   }
 
   /** Members who connected their own Uber account on this pond (host only). */
@@ -569,6 +577,56 @@ export class PondApiClient {
     req: { name: string; hostname?: string; room?: string },
   ): Promise<Device> {
     return this.hostRequest<Device>("PUT", `/api/v1/devices/${encodeURIComponent(id)}`, req);
+  }
+
+  // ── Connections ───────────────────────────────────────────
+
+  /** Every link at once: Wi-Fi, Ethernet, Bluetooth, and whether this caller may change them. */
+  getConnections(): Promise<Connections> {
+    return this.get("/api/v1/connections");
+  }
+
+  /** Scans now, strongest first. Takes a paired token; hidden networks are not listed. */
+  scanWifi(): Promise<WifiNetwork[]> {
+    return this.request<{ networks: WifiNetwork[] }>(
+      "GET",
+      "/api/v1/connections/wifi/networks",
+      undefined,
+      WIFI_SCAN_TIMEOUT_MS,
+    ).then((r) => r?.networks ?? []);
+  }
+
+  /**
+   * Waits for the pond to join. A wrong passphrase answers 401, which `send` would take for an
+   * expired token, re-pair and then repeat the join with the passphrase, so the retry is made
+   * here and only for a 401 that is not that refusal.
+   */
+  async joinWifi(req: WifiJoinRequest): Promise<WifiJoinResult> {
+    const headers = await this.hostHeaders();
+    const attempt = () =>
+      this.send("POST", "/api/v1/connections/wifi/join", req, WIFI_JOIN_TIMEOUT_MS, true, headers);
+    let res: Response;
+    try {
+      res = await attempt();
+    } catch (e) {
+      if (!(e instanceof ApiError) || e.status !== 401 || e.message === "wrong_password") throw e;
+      await this.reauthenticate();
+      res = await attempt();
+    }
+    return res.json() as Promise<WifiJoinResult>;
+  }
+
+  /** Forgetting the network the pond is on needs `confirm`; without it the pond answers `in_use`. */
+  forgetWifi(ssid: string, confirm = false): Promise<void> {
+    return this.hostRequest<void>(
+      "DELETE",
+      `/api/v1/connections/wifi/networks/${encodeURIComponent(ssid)}${confirm ? "?confirm=true" : ""}`,
+    );
+  }
+
+  /** Whether the setup card has been claimed. Never carries its code. */
+  getSetupStatus(): Promise<SetupStatus> {
+    return this.get("/api/v1/setup/status");
   }
 
   // ── Mesh ──────────────────────────────────────────────────

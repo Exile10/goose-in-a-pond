@@ -150,6 +150,24 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/system/info", get(system_info))
         // The setup channel's radios: a token in every state, so the wizard can show them.
         .route("/network/status", get(crate::network::network_status))
+        // The connections settings, from the claimant's first minute so owner setup can fix the
+        // network. A token in every state; the writes ask `connection_changes` in the handler.
+        .route("/connections", get(crate::connections::connections))
+        .route(
+            "/connections/wifi/networks",
+            get(crate::connections::wifi_networks),
+        )
+        .route(
+            "/connections/wifi/join",
+            post(crate::connections::wifi_join).layer(axum::extract::DefaultBodyLimit::max(
+                crate::connections::JOIN_BODY_LIMIT,
+            )),
+        )
+        .route(
+            "/connections/wifi/networks/{ssid}",
+            delete(crate::connections::wifi_forget),
+        )
+        .route("/setup/status", get(crate::connections::setup_status))
         // Local diagnostics; network peers must authenticate, and speaking needs the credential.
         .route("/test", get(test_services))
         .route("/test/speak", post(test_speak))
