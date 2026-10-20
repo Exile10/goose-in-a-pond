@@ -384,11 +384,25 @@ List all loaded MCP extensions and their tools.
       "tools": ["giap__get_current_weather", "giap__recall_memories"],
       "enabled": true,
       "status": "connected",
-      "last_error": null
+      "last_error": null,
+      "status_reason": null
     }
   ]
 }
 ```
+
+`status` says whether the extension runs, not how many tools it lists:
+
+| `status` | Meaning | Dashboard |
+|----------|---------|-----------|
+| `connected` | Running, with tools the assistant can call. | Green dot |
+| `no_tools` | Running, but it lists no tools here on purpose, such as the music extension on a Pond that is not a Mac (Apple Music needs macOS, and Spotify is never offered to the assistant). `status_reason` is the first sentence of the `instructions` the server sent at initialize, at most 200 characters, or `null` when it sent none; the dashboard then shows a generic line. | Grey dot, "Running, no assistant tools here", and the reason |
+| `error` | It failed to start. `last_error` is the engine's own error when the start was attempted in this run; a saved, enabled extension the engine has no record of gets the generic "Extension failed to load". | Red dot and the error |
+| `disabled` | Saved, and switched off by the user. | Grey dot |
+
+An MCP server that wants to explain why it has no tools should send a short first sentence in
+its `initialize` result's `instructions`. Each connect of a tool-less extension logs one info
+line with `kind="extension_without_tools"`, the extension name and that reason.
 
 | Code | Meaning |
 |------|---------|

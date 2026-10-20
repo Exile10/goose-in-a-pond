@@ -48,6 +48,9 @@ void i18n.use(initReactI18next).init({
       litert_library_missing: 'Needs the LiteRT-LM library, which this Pond does not have yet',
       other: 'This pond cannot run this model',
     },
+  }, extensions: {
+    noTools: 'Running, no assistant tools here',
+    noToolsGeneric: 'This extension is running, but it gives the assistant nothing to use on this Pond.',
   }, pairing: {
     unavailable: 'HTTPS pairing is unavailable. Check the Pond server logs.',
     fingerprint: 'Public-key fingerprint', address: 'HTTPS address',
