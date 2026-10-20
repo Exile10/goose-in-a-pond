@@ -5,6 +5,7 @@ import { DetailShell } from "./DetailShell";
 import { Card, Row, Toggle } from "./controls";
 import { api } from "../../../api/PondApiClient";
 import type { MemoryFragment, MemorySegment } from "../../../api/types";
+import { segmentLabel } from "../../../memory/labels";
 
 // ─── Icon path strings ────────────────────────────────────────
 const TRASH_PATH =
@@ -20,17 +21,6 @@ const SEG_COLOR: Record<MemorySegment, string> = {
   routine:      "#A855F7",
   knowledge:    "#16A34A",
   context:      "#6B7280",
-};
-
-const SEG_LABEL: Record<MemorySegment, string> = {
-  identity:     "Identity",
-  preference:   "Preference",
-  correction:   "Correction",
-  relationship: "Relationship",
-  project:      "Project",
-  routine:      "Routine",
-  knowledge:    "Knowledge",
-  context:      "Context",
 };
 
 // ─── Mock fallback (offline / first paint) ───────────────────
@@ -185,7 +175,7 @@ function Composer({ onSave, onCancel }: ComposerProps) {
         >
           <option value="">Auto-classify</option>
           {segOptions.map((s) => (
-            <option key={s} value={s}>{SEG_LABEL[s]}</option>
+            <option key={s} value={s}>{segmentLabel(s)}</option>
           ))}
         </select>
 
