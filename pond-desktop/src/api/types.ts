@@ -1620,3 +1620,101 @@ export interface AudioDeviceStatus {
   raised?: AudioLevelChange[];
   sound_server?: SoundServerDefaults | null;
 }
+
+// ── Connections (docs/architecture/pond-connections.md) ──────────────────────
+
+export type WifiState = "connected" | "disconnected" | "unavailable";
+export type WifiSecurity = "open" | "wep" | "wpa" | "wpa2" | "wpa3" | "enterprise";
+
+/** What the OS lets the pond do about Wi-Fi; `reason` says why not when `available` is false. */
+export interface ConnectionCapability {
+  available: boolean;
+  reason: string | null;
+}
+
+export interface WifiLink {
+  state: WifiState;
+  ssid: string | null;
+  address: string | null;
+  /** A percentage, 0 to 100. */
+  signal: number | null;
+  capabilities: {
+    scan: ConnectionCapability;
+    join: ConnectionCapability;
+    forget: ConnectionCapability;
+  };
+  /** Why `state` is `unavailable`. */
+  reason?: string | null;
+}
+
+export interface EthernetLink {
+  interface: string;
+  link: "up" | "down";
+  address: string | null;
+  speed_mbps: number | null;
+}
+
+export type BluetoothState = "off" | "serving" | "advertising" | "unavailable";
+
+export interface BluetoothLink {
+  enabled: boolean;
+  state: BluetoothState;
+  reason: string | null;
+  advertising_as: string | null;
+  session_open: boolean;
+}
+
+export interface Connections {
+  hostname: string;
+  https_port: number | null;
+  wifi: WifiLink;
+  ethernet: EthernetLink[];
+  bluetooth: BluetoothLink;
+  /** Whether this caller may use the Wi-Fi write routes. Who the caller is, not what the OS allows. */
+  can_change: { allowed: boolean; reason: string | null };
+}
+
+export interface WifiNetwork {
+  ssid: string;
+  security: WifiSecurity;
+  /** A percentage, 0 to 100. */
+  signal: number;
+  known: boolean;
+  current: boolean;
+}
+
+export interface WifiJoinRequest {
+  ssid: string;
+  /** Left out for an open network. */
+  passphrase?: string;
+  hidden: boolean;
+}
+
+export interface WifiJoinResult {
+  ssid: string;
+  address: string;
+  https_port: number | null;
+  hostname: string;
+}
+
+/** The setup card's state. Never its code. */
+export interface SetupStatus {
+  id: string;
+  claimed: boolean;
+  claimed_at: string | null;
+  claimed_by_this_device: boolean;
+}
+
+/** The `{"error": "<code>"}` values the connections routes answer with. */
+export type ConnectionErrorCode =
+  | "not_allowed"
+  | "not_permitted"
+  | "unsupported"
+  | "busy"
+  | "in_use"
+  | "wrong_password"
+  | "not_found"
+  | "timeout"
+  | "no_address"
+  | "invalid_request"
+  | "unsupported_security";

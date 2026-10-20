@@ -359,8 +359,6 @@ export const CATALOGUE: CatalogueCategory[] = [
             note: "Nothing reads this. There is no cloud fallback to switch on yet — the pond stays local either way.",
           },
           { key: "mesh_enabled", label: "Talk to your other ponds", description: "Let this pond talk to your other ponds.", control: { kind: "toggle" }, consumer: "live", proposed: true },
-          { key: "spoken_pairing_codes", label: "Say pairing codes aloud", description: "Let a phone on your home network ask the pond to read out a code for pairing. Only someone in the room can hear it.", control: { kind: "toggle" }, consumer: "live" },
-          { key: "ble_setup_enabled", label: "Set up over Bluetooth", description: "Let a phone nearby find the pond over Bluetooth to claim it or give it Wi-Fi. It only shows itself while unclaimed or offline.", control: { kind: "toggle" }, consumer: "live" },
         ],
       },
       {
@@ -377,6 +375,26 @@ export const CATALOGUE: CatalogueCategory[] = [
           },
           { key: "telemetry_enabled", label: "Record how it performs", description: "Keep a record of how fast it responds, so you can see how it is performing.", control: { kind: "toggle" }, consumer: "live" },
           { key: "context_ingest_enabled", label: "Build personal context from sensors", description: "Let what the sensors and cameras notice become part of what it knows.", control: { kind: "toggle" }, consumer: "live", proposed: true },
+        ],
+      },
+    ],
+  },
+  {
+    id: "connections",
+    name: "Connections",
+    tier: "Household",
+    blurb: "How the pond reaches your home network and your phone: Wi-Fi, a cable, Bluetooth and pairing.",
+    groups: [
+      {
+        name: "Bluetooth",
+        entries: [
+          { key: "ble_setup_enabled", label: "Set up over Bluetooth", description: "Let a phone nearby find the pond over Bluetooth to claim it or give it Wi-Fi. It only shows itself while unclaimed or offline.", control: { kind: "toggle" }, consumer: "live" },
+        ],
+      },
+      {
+        name: "Pairing",
+        entries: [
+          { key: "spoken_pairing_codes", label: "Say pairing codes aloud", description: "Let a phone on your home network ask the pond to read out a code for pairing. Only someone in the room can hear it.", control: { kind: "toggle" }, consumer: "live" },
         ],
       },
     ],

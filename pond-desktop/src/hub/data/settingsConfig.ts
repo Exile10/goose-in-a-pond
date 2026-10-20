@@ -12,6 +12,7 @@ export const HX_PATHS = {
   cctv:      "M3 7l14-4 1.5 4.5L4.5 12 3 7zM4.2 11.5L6 17M9 9.5V13a2 2 0 0 1-2 2H4M19 17h2M20 15v4",
   shield:    "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z",
   bell:      "M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0",
+  wifi:      "M12 20h.01M2 8.82a15 15 0 0 1 20 0M5 12.859a10 10 0 0 1 14 0M8.5 16.429a5 5 0 0 1 7 0",
   palette:   "M12 22a10 10 0 1 1 0-20 8 8 0 0 1 0 16h-2a2 2 0 0 0 0 4zM7.5 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2zM12 7.5a1 1 0 1 0 0-2 1 1 0 0 0 0 2zM16.5 11a1 1 0 1 0 0-2 1 1 0 0 0 0 2z",
 } as const;
 
@@ -27,6 +28,7 @@ export type SettingsRowId =
   | "memory"
   | "extensions"
   | "logs"
+  | "network"
   | "background"
   | "privacy"
   | "rooms"
@@ -149,6 +151,14 @@ export const SETTINGS: SettingsGroup[] = [
         bg: "#F1F5F9",
         label: "Logs",
         sub: "Server activity & diagnostics",
+      },
+      {
+        id: "network",
+        iconPath: HX_PATHS.wifi,
+        color: "#0369A1",
+        bg: "#E0F2FE",
+        label: "Connections",
+        sub: "Wi-Fi, cable, Bluetooth and pairing",
       },
       {
         id: "privacy",
