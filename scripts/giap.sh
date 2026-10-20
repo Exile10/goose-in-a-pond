@@ -714,7 +714,10 @@ doctor() {
     note "to start over: move $sec_file aside, restart, re-enter keys, re-authorise connectors"
     DOC_FAIL=$((DOC_FAIL+1))
   else
-    km="$(stat -f '%Lp' "$key_file" 2>/dev/null || stat -c '%a' "$key_file" 2>/dev/null || echo '?')"
+    # GNU stat reads -f as a filesystem query and prints a block before failing, so pick by OS.
+    if [ "$D_OS" = "macos" ]; then km="$(stat -f '%Lp' "$key_file" 2>/dev/null)"
+    else km="$(stat -c '%a' "$key_file" 2>/dev/null)"; fi
+    km="${km:-?}"
     if [ "$km" = "600" ]; then
       ok "secret store encrypted; key present at $key_file (0600)"
     else
