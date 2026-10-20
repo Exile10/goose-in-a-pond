@@ -17,8 +17,9 @@ use objc2_core_wlan::{CWErr, CWInterface, CWNetwork, CWSecurity, CWWiFiClient};
 use objc2_foundation::{NSString, NSUInteger, NSUTF8StringEncoding};
 use pond_core::network::domain::capability::Availability;
 use pond_core::network::domain::wifi::{
-    JoinedNetwork, NetworkState, NetworkStatus, WifiCapabilities, WifiJoinError, WifiNetwork,
-    WifiPassphrase, WifiScanError, WifiSecurity, MAX_SIGNAL,
+    joinable, CurrentNetwork, JoinedNetwork, NetworkState, NetworkStatus, WifiCapabilities,
+    WifiForgetError, WifiJoinError, WifiNetwork, WifiPassphrase, WifiScanError, WifiSecurity,
+    MAX_SIGNAL,
 };
 use pond_core::network::ports::wifi_station::WifiStation;
 use tokio::time::Instant;
@@ -38,6 +39,10 @@ const NAMES_HIDDEN: &str =
      Services";
 const ADMIN_ONLY: &str = "this Mac asks for an administrator to change Wi-Fi networks \
      (System Settings > Wi-Fi > Advanced)";
+/// CoreWLAN removes a saved network only through `commitConfiguration` with an administrator's
+/// authorization, which a pond running as a user does not hold.
+const FORGET_ADMIN_ONLY: &str = "macOS lets only an administrator remove a saved Wi-Fi network; \
+     remove it in System Settings > Wi-Fi";
 
 pub fn platform() -> Arc<dyn WifiStation> {
     Arc::new(CoreWlanStation::default())
@@ -115,6 +120,15 @@ impl WifiStation for CoreWlanStation {
             .await
             .unwrap_or_else(NetworkStatus::disconnected)
     }
+
+    async fn current(&self) -> Option<CurrentNetwork> {
+        blocking(read_current).await.flatten()
+    }
+
+    async fn forget(&self, ssid: &str) -> Result<(), WifiForgetError> {
+        tracing::info!(%ssid, "a saved Wi-Fi network cannot be forgotten without an administrator on macOS");
+        Err(WifiForgetError::NotPermitted)
+    }
 }
 
 /// Runs `work` on a blocking thread inside an autorelease pool; `None` if that thread panicked.
@@ -158,7 +172,11 @@ fn probe(names_hidden: bool) -> WifiCapabilities {
     } else {
         Availability::Available
     };
-    WifiCapabilities { scan, join }
+    WifiCapabilities {
+        scan,
+        join,
+        forget: Availability::unavailable(FORGET_ADMIN_ONLY),
+    }
 }
 
 enum ScanFailure {
@@ -281,6 +299,7 @@ fn associate(
         .filter(|n| unsafe { n.ssid() }.is_none_or(|name| name.to_string() == ssid))
         .max_by_key(|n| unsafe { n.rssiValue() })
         .ok_or(WifiJoinError::NotFound)?;
+    joinable(security(&network))?;
     let had_secret = secret.is_some();
     let password = secret.map(passphrase_string).transpose()?;
     // SAFETY: associating our own interface with a network it just scanned.
@@ -367,6 +386,20 @@ fn read_status() -> NetworkStatus {
     NetworkStatus { state, ssid, ipv4 }
 }
 
+/// Named only while associated: CoreWLAN keeps the last SSID for a moment after a drop.
+fn read_current() -> Option<CurrentNetwork> {
+    let interface = interface()?;
+    // SAFETY: plain property reads.
+    let (ssid, rssi) = unsafe { (interface.ssid(), interface.rssiValue()) };
+    if rssi == 0 {
+        return None;
+    }
+    Some(CurrentNetwork {
+        ssid: ssid?.to_string(),
+        signal: Some(signal(rssi)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +440,15 @@ mod tests {
         drop(string);
     }
 
+    #[tokio::test]
+    async fn forgetting_is_refused_rather_than_faked() {
+        let station = CoreWlanStation::default();
+        assert_eq!(
+            station.forget("Home").await,
+            Err(WifiForgetError::NotPermitted)
+        );
+    }
+
     /// Reads this Mac's own radio; joins nothing.
     #[tokio::test]
     #[ignore = "reads this Mac's Wi-Fi hardware"]
@@ -414,7 +456,9 @@ mod tests {
         let station = CoreWlanStation::default();
         let capabilities = station.capabilities().await;
         eprintln!("capabilities: {capabilities:?}");
+        assert!(!capabilities.forget.is_available());
         eprintln!("status: {:?}", station.status().await);
+        eprintln!("current: {:?}", station.current().await);
         match station.scan().await {
             Ok(networks) => assert!(networks.iter().all(|n| !n.ssid.is_empty())),
             Err(error) => eprintln!("scan refused: {error:?}"),

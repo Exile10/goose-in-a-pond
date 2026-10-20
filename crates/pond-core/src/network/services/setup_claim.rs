@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::network::domain::claim::ClaimRefusal;
 use crate::network::domain::setup_code::SetupCode;
-use crate::network::domain::setup_record::{ClaimState, SetupRecord};
+use crate::network::domain::setup_record::{ClaimState, SetupRecord, SetupStatus};
 use crate::network::ports::setup_code_store::SetupCodeStore;
 use crate::network::services::setup_guess_throttle::SetupGuessThrottle;
 
@@ -101,6 +101,11 @@ impl SetupClaimService {
             .load()
             .await?
             .map_or(ClaimState::Unclaimed, |record| record.claim_state()))
+    }
+
+    /// The card's state for a paired device's settings screen; `None` when no code was ever made.
+    pub async fn setup_status(&self) -> anyhow::Result<Option<SetupStatus>> {
+        Ok(self.store.load().await?.map(|record| record.status()))
     }
 
     /// The device whose pairing latched the claim; `None` when nothing latched or nobody was
@@ -225,6 +230,26 @@ mod tests {
         store.rearm().await.unwrap();
         assert_eq!(service.admit_setup_attempt(now).await.unwrap(), code);
         assert_eq!(service.claimed_by().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_setup_status_follows_the_record_and_never_carries_the_code() {
+        let store = Arc::new(MockSetupCodeStore::new());
+        assert_eq!(service(&store).setup_status().await.unwrap(), None);
+
+        let store = Arc::new(MockSetupCodeStore::unclaimed());
+        let service = service(&store);
+        let status = service.setup_status().await.unwrap().unwrap();
+        assert_eq!(status.claim, ClaimState::Unclaimed);
+        assert!(!format!("{status:?}").contains(MockSetupCodeStore::fixed_record().code.digits()));
+
+        service.record_claim(at(10), "card-phone").await.unwrap();
+        let status = service.setup_status().await.unwrap().unwrap();
+        assert_eq!(status.claim, ClaimState::Claimed { at: at(10) });
+        assert!(status.claimed_by(Some("card-phone")));
+
+        store.set_failing(true);
+        assert!(service.setup_status().await.is_err());
     }
 
     #[tokio::test]

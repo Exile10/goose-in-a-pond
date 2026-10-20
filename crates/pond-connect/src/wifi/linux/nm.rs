@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use pond_core::network::domain::capability::Availability;
 use pond_core::network::domain::wifi::{
-    WifiCapabilities, WifiJoinError, WifiNetwork, WifiScanError, WifiSecurity, MAX_SIGNAL,
+    joinable, WifiCapabilities, WifiForgetError, WifiJoinError, WifiNetwork, WifiScanError,
+    WifiSecurity, MAX_SIGNAL,
 };
 
 pub(super) const DEVICE_TYPE_WIFI: u32 = 2;
@@ -146,6 +147,9 @@ pub(super) trait NetworkManager: Send + Sync + 'static {
     async fn saved_connections(&self) -> Result<Vec<SavedConnection>, NmError>;
     async fn device_state(&self, device: &str) -> Result<DeviceState, NmError>;
     async fn active_ssid(&self, device: &str) -> Result<Option<Vec<u8>>, NmError>;
+    async fn active_access_point(&self, device: &str) -> Result<Option<AccessPoint>, NmError>;
+    /// The saved connection an active connection was activated from.
+    async fn connection_of(&self, active_connection: &str) -> Result<Option<String>, NmError>;
     async fn ipv4(&self, device: &str) -> Result<Option<Ipv4Addr>, NmError>;
     async fn state_changes(&self, device: &str)
         -> Result<BoxStream<'static, StateChange>, NmError>;
@@ -197,7 +201,10 @@ pub(super) fn security(flags: u32, wpa_flags: u32, rsn_flags: u32) -> WifiSecuri
 /// WPA2 (transition mode) joins as `wpa-psk`, which every supplicant build supports.
 pub(super) fn key_mgmt(ap: &AccessPoint) -> Result<Option<KeyMgmt>, WifiJoinError> {
     let key_mgmt = ap.wpa_flags | ap.rsn_flags;
-    match security(ap.flags, ap.wpa_flags, ap.rsn_flags) {
+    let security = security(ap.flags, ap.wpa_flags, ap.rsn_flags);
+    joinable(security)?;
+    match security {
+        // Enterprise is refused just above; a WEP key is not a passphrase NetworkManager takes.
         WifiSecurity::Enterprise | WifiSecurity::Wep => Err(WifiJoinError::Unsupported),
         WifiSecurity::Wpa | WifiSecurity::Wpa2 => Ok(Some(KeyMgmt::WpaPsk)),
         WifiSecurity::Wpa3 if key_mgmt & SEC_KEY_MGMT_PSK != 0 => Ok(Some(KeyMgmt::WpaPsk)),
@@ -276,21 +283,39 @@ pub(super) fn scan_error(error: &NmError) -> WifiScanError {
     }
 }
 
+/// A refused delete, as the spec's code. Every refusal past polkit's is NetworkManager saying no.
+pub(super) fn forget_error(error: &NmError) -> WifiForgetError {
+    match error {
+        NmError::Unreachable(_) => WifiForgetError::Unsupported,
+        NmError::Refused(_) => WifiForgetError::NotPermitted,
+    }
+}
+
+/// The object went away between listing and the call: for a delete, the work is already done.
+pub(super) fn is_gone(name: &str) -> bool {
+    name == "org.freedesktop.DBus.Error.UnknownObject"
+        || name == "org.freedesktop.DBus.Error.UnknownMethod"
+}
+
 pub(super) fn is_permission_denied(name: &str) -> bool {
     name.ends_with(".PermissionDenied") || name == "org.freedesktop.DBus.Error.AccessDenied"
 }
 
-/// Scanning works without the grant (NetworkManager's own periodic scan), joining does not.
+/// Scanning works without the grant (NetworkManager's own periodic scan), joining does not, and
+/// forgetting needs the half of it that deletes system connections.
 pub(super) fn capabilities(permissions: &HashMap<String, String>) -> WifiCapabilities {
     let granted = |action: &str| permissions.get(action).map(String::as_str) == Some("yes");
-    let join = if granted(PERMISSION_MODIFY_SYSTEM) && granted(PERMISSION_NETWORK_CONTROL) {
-        Availability::Available
-    } else {
-        Availability::unavailable(NO_GRANT)
+    let when = |allowed: bool| {
+        if allowed {
+            Availability::Available
+        } else {
+            Availability::unavailable(NO_GRANT)
+        }
     };
     WifiCapabilities {
         scan: Availability::Available,
-        join,
+        join: when(granted(PERMISSION_MODIFY_SYSTEM) && granted(PERMISSION_NETWORK_CONTROL)),
+        forget: when(granted(PERMISSION_MODIFY_SYSTEM)),
     }
 }
 
@@ -392,8 +417,17 @@ mod tests {
         assert_eq!(km(0, 0, SEC_KEY_MGMT_OWE), Ok(Some(KeyMgmt::Owe)));
         assert_eq!(
             km(AP_FLAGS_PRIVACY, 0, SEC_KEY_MGMT_802_1X),
-            Err(WifiJoinError::Unsupported),
+            Err(WifiJoinError::UnsupportedSecurity),
             "a passphrase alone cannot join an enterprise network"
+        );
+        assert_eq!(
+            km(AP_FLAGS_PRIVACY, SEC_KEY_MGMT_802_1X, 0),
+            Err(WifiJoinError::UnsupportedSecurity),
+            "WPA's 802.1X key management is enterprise too"
+        );
+        assert_eq!(
+            km(AP_FLAGS_PRIVACY, 0, SEC_KEY_MGMT_EAP_SUITE_B_192),
+            Err(WifiJoinError::UnsupportedSecurity)
         );
         assert_eq!(km(AP_FLAGS_PRIVACY, 0, 0), Err(WifiJoinError::Unsupported));
         assert!(KeyMgmt::Sae.needs_passphrase() && !KeyMgmt::Owe.needs_passphrase());
@@ -515,9 +549,10 @@ mod tests {
     }
 
     #[test]
-    fn joining_needs_both_grants_and_scanning_needs_neither() {
+    fn joining_needs_both_grants_forgetting_one_and_scanning_neither() {
         let mut permissions = HashMap::new();
         assert_eq!(capabilities(&permissions).join.reason(), Some(NO_GRANT));
+        assert_eq!(capabilities(&permissions).forget.reason(), Some(NO_GRANT));
         assert!(capabilities(&permissions).scan.is_available());
 
         permissions.insert(PERMISSION_MODIFY_SYSTEM.to_string(), "yes".to_string());
@@ -527,8 +562,35 @@ mod tests {
             Some(NO_GRANT),
             "auth needs a polkit agent a headless pond does not have"
         );
+        assert!(capabilities(&permissions).forget.is_available());
         permissions.insert(PERMISSION_NETWORK_CONTROL.to_string(), "yes".to_string());
         assert!(capabilities(&permissions).join.is_available());
+    }
+
+    #[test]
+    fn a_refused_delete_reads_as_the_specs_codes() {
+        assert_eq!(
+            forget_error(&NmError::Refused(
+                "org.freedesktop.NetworkManager.Settings.PermissionDenied".into()
+            )),
+            WifiForgetError::NotPermitted
+        );
+        assert_eq!(
+            forget_error(&NmError::Refused(
+                "org.freedesktop.NetworkManager.Failed".into()
+            )),
+            WifiForgetError::NotPermitted
+        );
+        assert_eq!(
+            forget_error(&NmError::Unreachable(
+                "NetworkManager is not running".into()
+            )),
+            WifiForgetError::Unsupported
+        );
+        assert!(is_gone("org.freedesktop.DBus.Error.UnknownObject"));
+        assert!(!is_gone(
+            "org.freedesktop.NetworkManager.Settings.PermissionDenied"
+        ));
     }
 
     #[test]

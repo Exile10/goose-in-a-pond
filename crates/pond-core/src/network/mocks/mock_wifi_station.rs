@@ -1,14 +1,14 @@
 //! In-memory [`WifiStation`] standing in for the OS network manager.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 
 use crate::network::domain::wifi::{
-    JoinedNetwork, NetworkState, NetworkStatus, WifiCapabilities, WifiJoinError, WifiNetwork,
-    WifiPassphrase, WifiScanError, WifiSecurity,
+    joinable, CurrentNetwork, JoinedNetwork, NetworkState, NetworkStatus, WifiCapabilities,
+    WifiForgetError, WifiJoinError, WifiNetwork, WifiPassphrase, WifiScanError, WifiSecurity,
 };
 use crate::network::ports::wifi_station::WifiStation;
 
@@ -24,6 +24,7 @@ pub struct JoinAttempt {
 struct Reachable {
     passphrase: Option<String>,
     hidden: bool,
+    security: WifiSecurity,
 }
 
 pub struct MockWifiStation {
@@ -34,6 +35,9 @@ pub struct MockWifiStation {
     capabilities: Mutex<WifiCapabilities>,
     scan_error: Mutex<Option<WifiScanError>>,
     join_error: Mutex<Option<WifiJoinError>>,
+    forget_error: Mutex<Option<WifiForgetError>>,
+    saved: Mutex<BTreeSet<String>>,
+    forgotten: Mutex<Vec<String>>,
 }
 
 impl MockWifiStation {
@@ -50,20 +54,29 @@ impl MockWifiStation {
             capabilities: Mutex::new(WifiCapabilities::available()),
             scan_error: Mutex::new(None),
             join_error: Mutex::new(None),
+            forget_error: Mutex::new(None),
+            saved: Mutex::new(BTreeSet::new()),
+            forgotten: Mutex::new(Vec::new()),
         }
     }
 
     /// A network in range that a scan reports; `passphrase` is `None` for an open one.
     pub fn with_network(self, network: WifiNetwork, passphrase: Option<&str>) -> Self {
+        self.add_network(network, passphrase);
+        self
+    }
+
+    /// As [`Self::with_network`], on a station already shared.
+    pub fn add_network(&self, network: WifiNetwork, passphrase: Option<&str>) {
         self.reachable.lock().unwrap().insert(
             network.ssid.clone(),
             Reachable {
                 passphrase: passphrase.map(str::to_string),
                 hidden: false,
+                security: network.security,
             },
         );
         self.visible.lock().unwrap().push(network);
-        self
     }
 
     /// A network in range that no scan reports, joinable only when asked for as hidden.
@@ -73,9 +86,42 @@ impl MockWifiStation {
             Reachable {
                 passphrase: passphrase.map(str::to_string),
                 hidden: true,
+                security: if passphrase.is_some() {
+                    WifiSecurity::Wpa2
+                } else {
+                    WifiSecurity::Open
+                },
             },
         );
         self
+    }
+
+    /// A network the OS already holds credentials for: scans mark it known, `forget` deletes it.
+    pub fn with_saved(self, ssid: &str) -> Self {
+        self.saved.lock().unwrap().insert(ssid.to_string());
+        self
+    }
+
+    /// Puts the station on `ssid` as if it had joined it earlier, saving it.
+    pub fn connect_to(&self, ssid: &str) {
+        self.saved.lock().unwrap().insert(ssid.to_string());
+        *self.status.lock().unwrap() = NetworkStatus {
+            state: NetworkState::Connected,
+            ssid: Some(ssid.to_string()),
+            ipv4: Some(Self::ADDRESS),
+        };
+    }
+
+    pub fn saved(&self) -> Vec<String> {
+        self.saved.lock().unwrap().iter().cloned().collect()
+    }
+
+    pub fn forgotten(&self) -> Vec<String> {
+        self.forgotten.lock().unwrap().clone()
+    }
+
+    pub fn fail_forgets(&self, error: Option<WifiForgetError>) {
+        *self.forget_error.lock().unwrap() = error;
     }
 
     pub fn set_capabilities(&self, capabilities: WifiCapabilities) {
@@ -121,7 +167,18 @@ impl WifiStation for MockWifiStation {
         if let Some(error) = *self.scan_error.lock().unwrap() {
             return Err(error);
         }
-        Ok(self.visible.lock().unwrap().clone())
+        let saved = self.saved.lock().unwrap();
+        Ok(self
+            .visible
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|mut network| {
+                network.known |= saved.contains(&network.ssid);
+                network
+            })
+            .collect())
     }
 
     async fn join(
@@ -141,6 +198,9 @@ impl WifiStation for MockWifiStation {
         let outcome = match self.reachable.lock().unwrap().get(ssid) {
             None => Err(WifiJoinError::NotFound),
             Some(network) if network.hidden && !hidden => Err(WifiJoinError::NotFound),
+            Some(network) if joinable(network.security).is_err() => {
+                Err(WifiJoinError::UnsupportedSecurity)
+            }
             Some(network) if network.passphrase.as_deref() != passphrase.map(|p| p.expose()) => {
                 Err(WifiJoinError::WrongPassword)
             }
@@ -150,17 +210,45 @@ impl WifiStation for MockWifiStation {
             }),
         };
         if let Ok(joined) = &outcome {
-            *self.status.lock().unwrap() = NetworkStatus {
-                state: NetworkState::Connected,
-                ssid: Some(joined.ssid.clone()),
-                ipv4: Some(joined.ipv4),
-            };
+            self.connect_to(&joined.ssid);
         }
         outcome
     }
 
     async fn status(&self) -> NetworkStatus {
         self.status.lock().unwrap().clone()
+    }
+
+    async fn current(&self) -> Option<CurrentNetwork> {
+        let status = self.status.lock().unwrap().clone();
+        if status.state != NetworkState::Connected {
+            return None;
+        }
+        let ssid = status.ssid?;
+        let signal = self
+            .visible
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|network| network.ssid == ssid)
+            .map(|network| network.signal)
+            .max();
+        Some(CurrentNetwork { ssid, signal })
+    }
+
+    async fn forget(&self, ssid: &str) -> Result<(), WifiForgetError> {
+        if let Some(error) = *self.forget_error.lock().unwrap() {
+            return Err(error);
+        }
+        if !self.saved.lock().unwrap().remove(ssid) {
+            return Err(WifiForgetError::NotFound);
+        }
+        self.forgotten.lock().unwrap().push(ssid.to_string());
+        let mut status = self.status.lock().unwrap();
+        if status.ssid.as_deref() == Some(ssid) {
+            *status = NetworkStatus::disconnected();
+        }
+        Ok(())
     }
 }
 
@@ -218,11 +306,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_enterprise_network_is_refused_before_its_passphrase_is_tried() {
+        let station = MockWifiStation::new().with_network(
+            sample_network("Office", WifiSecurity::Enterprise, 60),
+            Some("hunter2hunter2"),
+        );
+        assert_eq!(
+            station
+                .join("Office", Some(&passphrase("hunter2hunter2")), false)
+                .await,
+            Err(WifiJoinError::UnsupportedSecurity)
+        );
+        assert_eq!(station.current().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_saved_network_is_known_current_once_joined_and_forgotten_off_the_link() {
+        let station = MockWifiStation::new()
+            .with_network(sample_network("Home", WifiSecurity::Wpa2, 70), None)
+            .with_saved("Cafe");
+        assert!(!station.scan().await.unwrap()[0].known);
+        station.join("Home", None, false).await.unwrap();
+        assert!(station.scan().await.unwrap()[0].known);
+        assert_eq!(
+            station.current().await,
+            Some(CurrentNetwork {
+                ssid: "Home".into(),
+                signal: Some(70)
+            })
+        );
+        assert_eq!(
+            station.forget("Attic").await,
+            Err(WifiForgetError::NotFound)
+        );
+        station.forget("Cafe").await.unwrap();
+        assert_eq!(station.current().await.unwrap().ssid, "Home");
+        station.forget("Home").await.unwrap();
+        assert_eq!(station.current().await, None);
+        assert_eq!(station.status().await, NetworkStatus::disconnected());
+        assert_eq!(station.forgotten(), ["Cafe", "Home"]);
+        assert!(station.saved().is_empty());
+    }
+
+    #[tokio::test]
     async fn forced_failures_and_capabilities_are_reported() {
         let station = MockWifiStation::new();
         station.fail_scans(Some(WifiScanError::NotPermitted));
         station.fail_joins(Some(WifiJoinError::Busy));
+        station.fail_forgets(Some(WifiForgetError::NotPermitted));
         station.set_capabilities(WifiCapabilities::unsupported("no adapter"));
+        assert_eq!(
+            station.forget("Home").await,
+            Err(WifiForgetError::NotPermitted)
+        );
         assert_eq!(station.scan().await, Err(WifiScanError::NotPermitted));
         assert_eq!(
             station.join("Home", None, false).await,

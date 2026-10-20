@@ -227,6 +227,25 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     (Method::GET, "/system/info", Exposure::Always),
     // Names the radios and why they are off; nothing a stranger in range should read.
     (Method::GET, "/network/status", Exposure::Authenticated),
+    // The connections settings and the setup card's state. Never tokenless: the writes can move
+    // the pond off the network, and their handlers also ask who the caller is.
+    (Method::GET, "/connections", Exposure::Authenticated),
+    (
+        Method::GET,
+        "/connections/wifi/networks",
+        Exposure::Authenticated,
+    ),
+    (
+        Method::POST,
+        "/connections/wifi/join",
+        Exposure::Authenticated,
+    ),
+    (
+        Method::DELETE,
+        "/connections/wifi/networks/{ssid}",
+        Exposure::Authenticated,
+    ),
+    (Method::GET, "/setup/status", Exposure::Authenticated),
     (Method::GET, "/test", Exposure::HostOnly),
     // Speaks on the host's speaker; the handler also asks for the host credential.
     (Method::POST, "/test/speak", Exposure::HostOnly),
@@ -1012,9 +1031,14 @@ mod tests {
         state_dependent.sort();
 
         let expected = vec![
+            // The connections settings: a token in every state; the writes' handlers also ask
+            // whether the caller is the host, the claimant or a member's device.
+            "DELETE /connections/wifi/networks/{ssid} = Authenticated".to_string(),
             // A phone's own device during owner setup; each handler admits only that device.
             "DELETE /devices/{id}/push-token = Authenticated".to_string(),
             "DELETE /voice/calibrate = UntilOnboarded".to_string(),
+            "GET /connections = Authenticated".to_string(),
+            "GET /connections/wifi/networks = Authenticated".to_string(),
             "GET /devices/self = Authenticated".to_string(),
             // Choosing the chat model completion requires, before onboarding (#365); token only.
             "GET /models = Authenticated".to_string(),
@@ -1025,10 +1049,13 @@ mod tests {
             "GET /player/status = HostOnly".to_string(),
             // The wizard resumes from what it saved; the PUT's answer already shows its caller this.
             "GET /settings = Authenticated".to_string(),
+            // The setup card's state, never its code.
+            "GET /setup/status = Authenticated".to_string(),
             // Nothing secret (phase, model name, timestamps); the boot warm-up precedes any token.
             "GET /test = HostOnly".to_string(),
             "GET /warmup = UntilOnboarded".to_string(),
             "PATCH /profiles/{id} = UntilOnboarded".to_string(),
+            "POST /connections/wifi/join = Authenticated".to_string(),
             "POST /devices/{id}/push-token = Authenticated".to_string(),
             // The music player bridge and extension egress: the handlers check the internal
             // token; HostOnly because no legitimate caller is off the host.

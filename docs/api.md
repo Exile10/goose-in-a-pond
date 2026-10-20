@@ -73,6 +73,11 @@ All errors return JSON:
 | GET | /onboard/status | Public | Onboarding progress |
 | GET | /system/info | Public | Connection bootstrap; full record only with a valid bearer |
 | GET | /network/status | Token, every state | The BLE setup channel and Wi-Fi station, and why each part is off |
+| GET | /connections | Token, every state | Wi-Fi, Ethernet and Bluetooth at once, and whether this caller may change them |
+| GET | /connections/wifi/networks | Token, every state | Scan now: the ranked Wi-Fi list |
+| POST | /connections/wifi/join | Token, every state; changers only | Move the pond onto a Wi-Fi network |
+| DELETE | /connections/wifi/networks/{ssid} | Token, every state; changers only | Forget a saved Wi-Fi network |
+| GET | /setup/status | Token, every state | The setup card's state, never its code |
 | GET | /test | Public | Probe all backend services |
 | POST | /test/speak | Loopback + host credential | Play text on server speakers |
 | GET | /dev/goose | Public | Goose agent + MCP tool status |
@@ -249,6 +254,119 @@ caller without a token gets `401`, the host credential alone included: the route
 `advertising`, or `unavailable` with `reason`. `session_open` is true while a phone holds the one
 setup session. A server built without the setup channel answers `unavailable` with
 `"this pond is not running the setup channel"` for every part.
+
+---
+
+### Connections and pairing settings (2026-10-19)
+
+The household's view of the pond's network links, from goose-on-the-go and both desktop settings
+views. **The contract is [`docs/architecture/pond-connections.md`](architecture/pond-connections.md)
+(v1.1)**; this section is the server's account of it. Every route takes a paired device's token in
+every state, before onboarding included, and never answers a caller without one: each is
+`Exposure::Authenticated` on the public router, the host credential alone included (`401`). Every
+refusal is `{"error": "<code>"}`.
+
+**Who may change the network** (`pond_core::network::services::connection_changes`): a request with
+the host credential (`X-Pond-Host-Credential`, the dashboard listener only), the device that claimed
+the pond (before onboarding attributes it, so owner setup can fix the network), or a device
+attributed to a household member. Anyone else with a token, a guest's phone, may read but gets
+`403 not_allowed` on a write; the handler asks before it reads the body, and logs the refusal as
+`kind="connections_change_denied"`. A failed attribution read narrows: it refuses.
+
+The routes share the setup channel's Wi-Fi station instance, and that station runs one radio
+operation at a time: a scan, join or forget while another runs (over Bluetooth or HTTPS) is `409
+busy`.
+
+#### GET /connections
+
+```json
+{
+  "hostname": "nano",
+  "https_port": 4443,
+  "wifi": {
+    "state": "connected", "reason": null,
+    "ssid": "Home", "address": "192.168.1.11", "signal": 70,
+    "capabilities": {
+      "scan":   {"available": true,  "reason": null},
+      "join":   {"available": false, "reason": "this pond may not change its Wi-Fi: the installer's network grant is missing (bash scripts/giap.sh wifi-grant)"},
+      "forget": {"available": false, "reason": "..."}
+    }
+  },
+  "ethernet": [{"interface": "eth0", "link": "up", "address": "192.168.1.20", "speed_mbps": 1000}],
+  "bluetooth": {"enabled": true, "state": "advertising", "reason": null, "advertising_as": "Pond 4e81", "session_open": false},
+  "can_change": {"allowed": true, "reason": null}
+}
+```
+
+- `wifi.state` is `connected`, `disconnected` (a link still joining reads as disconnected), or
+  `unavailable` when neither scan nor join works on this host (no adapter, no station for the OS,
+  the radio switched off), with `reason`. `ssid`, `address` and `signal` (0 to 100) are `null`
+  unless connected; `ssid` is the saved network the link was joined with.
+- `wifi.capabilities.forget`: Linux needs the `settings.modify.system` half of the polkit grant;
+  macOS never offers it (CoreWLAN removes a saved network only with an administrator's
+  authorization), and says so.
+- `ethernet`: every wired interface, up or down, sorted by name; `[]` when there is none. Linux
+  reads `/sys/class/net` (type 1, no `wireless`/`phy80211`, not under `/sys/devices/virtual`);
+  macOS takes Ethernet-framed interfaces whose medium is Ethernet, with the link from the medium's
+  status. `address` is the first IPv4 that is neither loopback nor link-local; `speed_mbps` only
+  for a live link.
+- `bluetooth` is `GET /network/status`'s `ble` plus `advertising_as`, the label phones see while
+  the pond advertises.
+- `can_change.reason` is about who the caller is; what the OS allows is in `wifi.capabilities`.
+- `503 unsupported`: a server wired without a Wi-Fi station.
+
+#### GET /connections/wifi/networks
+
+Scans now, answering within 15 s (`SCAN_BUDGET`): one entry per SSID, strongest first, at most 50,
+hidden networks left out.
+
+```json
+{"networks": [{"ssid": "Home", "security": "wpa2", "signal": 70, "known": true, "current": true}]}
+```
+
+`503 unsupported`, `403 not_permitted` (macOS without Location permission), `409 busy`, and `504
+timeout` if the station has not answered within the budget (the scan carries on and keeps the radio
+busy until it ends).
+
+#### POST /connections/wifi/join
+
+Changers only. Body `{"ssid": "Home", "passphrase": "…", "hidden": false}`, at most 4 KiB;
+`passphrase` omitted for an open network. Waits up to 45 s (`JOIN_BUDGET`) on its own task, so a
+join that moves the pond to another LAN, and drops this very connection, still finishes and saves
+or undoes its connection.
+
+| Status | Body |
+|---|---|
+| 200 | `{"ssid", "address", "https_port", "hostname"}` |
+| 400 | `invalid_request` (malformed body, SSID empty or over 32 bytes, passphrase empty or over 64 bytes) or `unsupported_security` (an enterprise network, refused from its scan entry before any attempt; the setup channel's `wifi_join` answers the same) |
+| 401 | `wrong_password` |
+| 403 | `not_allowed` (this caller) or `not_permitted` (the OS: no polkit grant) |
+| 404 | `not_found` |
+| 409 | `busy` |
+| 502 | `no_address` |
+| 503 | `unsupported` |
+| 504 | `timeout` |
+
+The passphrase is never logged, stored in settings or echoed: the body is parsed into
+`WifiPassphrase` (redacting `Debug`, no `Serialize`, wiped on drop), a parse error is answered
+without being read, and `connections_passphrase_logs.rs` captures every log line of joins that
+succeed, fail and are refused to prove it.
+
+#### DELETE /connections/wifi/networks/{ssid}[?confirm=true]
+
+Changers only. `{ssid}` is percent-encoded. Deletes every saved profile of that SSID. `204`; `404
+not_found`; `409 in_use` when the pond is on that network now (by its saved profile or its live
+link) and `confirm` is not `true`; `403 not_allowed` / `not_permitted`; `503 unsupported`; `409
+busy`; `400 invalid_request` for an SSID over 32 bytes or a `confirm` that is not `true`/`false`.
+
+#### GET /setup/status
+
+```json
+{"id": "4e81", "claimed": true, "claimed_at": "2026-10-18T18:06:12Z", "claimed_by_this_device": false}
+```
+
+Never the code. A pond with no setup record answers `id: null, claimed: false`; an unreadable
+record is `500 internal_error`. Re-arming stays on the host (`pond-server setup-code --rearm`).
 
 ---
 

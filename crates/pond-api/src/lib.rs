@@ -2,6 +2,7 @@
 
 pub mod audio_devices;
 pub mod cleanup;
+pub mod connections;
 pub mod download_failure;
 pub mod host_guard;
 pub(crate) mod image_normalize;

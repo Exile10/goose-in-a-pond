@@ -26,10 +26,14 @@ impl SetupRadios for Radios {
     fn session_open(&self) -> bool {
         true
     }
+    fn advertising_as(&self) -> Option<String> {
+        None
+    }
     async fn wifi(&self) -> WifiCapabilities {
         WifiCapabilities {
             scan: Availability::unavailable("no Location permission"),
             join: Availability::Available,
+            forget: Availability::unavailable("administrators only"),
         }
     }
 }

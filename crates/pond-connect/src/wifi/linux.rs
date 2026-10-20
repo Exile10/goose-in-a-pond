@@ -13,8 +13,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use pond_core::network::domain::wifi::{
-    JoinedNetwork, NetworkState, NetworkStatus, WifiCapabilities, WifiJoinError, WifiNetwork,
-    WifiPassphrase, WifiScanError,
+    CurrentNetwork, JoinedNetwork, NetworkState, NetworkStatus, WifiCapabilities, WifiForgetError,
+    WifiJoinError, WifiNetwork, WifiPassphrase, WifiScanError, MAX_SIGNAL,
 };
 use pond_core::network::ports::wifi_station::WifiStation;
 use tokio::time::Instant;
@@ -119,6 +119,19 @@ impl<N: NetworkManager> NetworkManagerStation<N> {
             }
         }
         Ok(())
+    }
+
+    /// The SSID of the saved connection `active` was activated from, which names a hidden
+    /// network that its access point does not.
+    async fn profile_ssid(&self, active: &str) -> Option<Vec<u8>> {
+        let profile = self.nm.connection_of(active).await.ok().flatten()?;
+        self.nm
+            .saved_connections()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|saved| saved.path == profile)
+            .map(|saved| saved.ssid)
     }
 
     async fn known_ssids(&self) -> HashSet<Vec<u8>> {
@@ -430,6 +443,63 @@ impl<N: NetworkManager> WifiStation for NetworkManagerStation<N> {
             ipv4,
         }
     }
+
+    async fn current(&self) -> Option<CurrentNetwork> {
+        let device = self.device().await.ok()?;
+        let state = self.nm.device_state(&device.path).await.ok()?;
+        if state.state != STATE_ACTIVATED {
+            return None;
+        }
+        let access_point = self
+            .nm
+            .active_access_point(&device.path)
+            .await
+            .ok()
+            .flatten();
+        let profile = match &state.active_connection {
+            Some(active) => self.profile_ssid(active).await,
+            None => None,
+        };
+        let ssid = profile.or_else(|| {
+            access_point
+                .as_ref()
+                .map(|ap| ap.ssid.clone())
+                .filter(|ssid| !ssid.is_empty())
+        })?;
+        Some(CurrentNetwork {
+            ssid: String::from_utf8(ssid).ok()?,
+            signal: access_point.map(|ap| ap.strength.min(MAX_SIGNAL)),
+        })
+    }
+
+    /// Every saved profile of that SSID goes, so none of them autoconnects to it again.
+    async fn forget(&self, ssid: &str) -> Result<(), WifiForgetError> {
+        let saved = self
+            .nm
+            .saved_connections()
+            .await
+            .map_err(|error| nm::forget_error(&error))?;
+        let profiles: Vec<String> = saved
+            .into_iter()
+            .filter(|saved| saved.ssid == ssid.as_bytes())
+            .map(|saved| saved.path)
+            .collect();
+        if profiles.is_empty() {
+            return Err(WifiForgetError::NotFound);
+        }
+        for profile in &profiles {
+            match self.nm.delete(profile).await {
+                Ok(()) => {}
+                Err(NmError::Refused(name)) if nm::is_gone(&name) => {}
+                Err(error) => {
+                    tracing::warn!(%ssid, ?error, "NetworkManager refused to forget a saved network");
+                    return Err(nm::forget_error(&error));
+                }
+            }
+        }
+        tracing::info!(%ssid, profiles = profiles.len(), "forgot a saved Wi-Fi network");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +556,9 @@ mod tests {
         wireless: Mutex<(bool, bool)>,
         scan_refusal: Mutex<Option<String>>,
         add_refusal: Mutex<Option<String>>,
+        delete_refusals: Mutex<HashMap<String, String>>,
+        active_profile: Mutex<Option<String>>,
+        active_strength: Mutex<u8>,
         outcome: Mutex<Outcome>,
         last_scan: Mutex<i64>,
         signals: broadcast::Sender<StateChange>,
@@ -524,6 +597,9 @@ mod tests {
                 wireless: Mutex::new((true, true)),
                 scan_refusal: Mutex::new(None),
                 add_refusal: Mutex::new(None),
+                delete_refusals: Mutex::new(HashMap::new()),
+                active_profile: Mutex::new(None),
+                active_strength: Mutex::new(73),
                 outcome: Mutex::new(Outcome::Joins),
                 last_scan: Mutex::new(1_000),
                 signals: broadcast::channel(64).0,
@@ -651,6 +727,27 @@ mod tests {
             Ok(*self.ipv4.lock().unwrap())
         }
 
+        async fn active_access_point(&self, _device: &str) -> Result<Option<AccessPoint>, NmError> {
+            let strength = *self.active_strength.lock().unwrap();
+            Ok(self
+                .active_ssid
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|ssid| AccessPoint {
+                    path: "/org/freedesktop/NetworkManager/AccessPoint/active".into(),
+                    ssid: ssid.clone(),
+                    flags: AP_FLAGS_PRIVACY,
+                    wpa_flags: 0,
+                    rsn_flags: WPA2,
+                    strength,
+                }))
+        }
+
+        async fn connection_of(&self, _active: &str) -> Result<Option<String>, NmError> {
+            Ok(self.active_profile.lock().unwrap().clone())
+        }
+
         async fn state_changes(
             &self,
             _device: &str,
@@ -732,11 +829,15 @@ mod tests {
         }
 
         async fn delete(&self, connection: &str) -> Result<(), NmError> {
+            if let Some(name) = self.delete_refusals.lock().unwrap().get(connection) {
+                return Err(NmError::Refused(name.clone()));
+            }
             self.calls
                 .lock()
                 .unwrap()
                 .deleted
                 .push(connection.to_string());
+            self.saved.lock().unwrap().retain(|c| c.path != connection);
             Ok(())
         }
     }
@@ -1096,5 +1197,132 @@ mod tests {
         );
         assert_eq!(station.status().await.state, NetworkState::Connecting);
         assert_eq!(station.status().await.ipv4, None);
+    }
+
+    fn saved(path: &str, ssid: &str) -> SavedConnection {
+        SavedConnection {
+            path: path.into(),
+            ssid: ssid.as_bytes().to_vec(),
+        }
+    }
+
+    fn on_network(nm: &FakeNm, ssid: Option<&[u8]>, profile: Option<&str>) {
+        FakeNm::set(
+            &nm.state,
+            DeviceState {
+                state: STATE_ACTIVATED,
+                reason: 0,
+                active_connection: Some("/ActiveConnection/1".into()),
+            },
+        );
+        FakeNm::set(&nm.active_ssid, ssid.map(<[u8]>::to_vec));
+        FakeNm::set(&nm.active_profile, profile.map(str::to_string));
+        FakeNm::set(&nm.ipv4, Some(ADDRESS));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_enterprise_network_is_refused_before_anything_is_added() {
+        let (station, nm) = new_station();
+        FakeNm::set(
+            &nm.listed,
+            vec![ap("Office", AP_FLAGS_PRIVACY, 0x200 | 0x8 | 0x80, 80)],
+        );
+        assert_eq!(
+            station.join("Office", Some(&passphrase()), false).await,
+            Err(WifiJoinError::UnsupportedSecurity)
+        );
+        nm.calls(|calls| {
+            assert!(calls.added.is_empty() && calls.activated.is_empty());
+            assert_eq!(calls.scans, 0, "the listed access point said enough");
+        });
+        assert!(
+            nm.psks.lock().unwrap().is_empty(),
+            "the passphrase went nowhere"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_current_network_is_named_by_its_saved_profile_with_its_signal() {
+        let (station, nm) = new_station();
+        assert_eq!(station.current().await, None);
+        FakeNm::set(
+            &nm.saved,
+            vec![saved("/Settings/3", "Cafe"), saved("/Settings/7", "Vault")],
+        );
+        on_network(&nm, Some(b"".as_slice()), Some("/Settings/7"));
+        assert_eq!(
+            station.current().await,
+            Some(CurrentNetwork {
+                ssid: "Vault".into(),
+                signal: Some(73),
+            }),
+            "a hidden network's access point names nothing; its profile does"
+        );
+
+        on_network(&nm, Some(b"Home".as_slice()), None);
+        assert_eq!(station.current().await.unwrap().ssid, "Home");
+
+        FakeNm::set(
+            &nm.state,
+            DeviceState {
+                state: 70,
+                reason: 0,
+                active_connection: Some("/ActiveConnection/1".into()),
+            },
+        );
+        assert_eq!(station.current().await, None, "still joining is not on it");
+        FakeNm::set(&nm.lookup, DeviceLookup::Missing);
+        assert_eq!(station.current().await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forgetting_deletes_every_profile_of_that_ssid_and_nothing_else() {
+        let (station, nm) = new_station();
+        FakeNm::set(
+            &nm.saved,
+            vec![
+                saved("/Settings/1", "Home"),
+                saved("/Settings/2", "Cafe"),
+                saved("/Settings/3", "Home"),
+            ],
+        );
+        station.forget("Home").await.unwrap();
+        nm.calls(|calls| {
+            assert_eq!(
+                calls.deleted,
+                vec!["/Settings/1".to_string(), "/Settings/3".to_string()]
+            )
+        });
+        assert_eq!(station.forget("Home").await, Err(WifiForgetError::NotFound));
+        assert_eq!(
+            station.forget("home").await,
+            Err(WifiForgetError::NotFound),
+            "an SSID is matched byte for byte"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_delete_is_not_permitted_and_a_vanished_one_is_already_done() {
+        let (station, nm) = new_station();
+        FakeNm::set(
+            &nm.saved,
+            vec![saved("/Settings/1", "Home"), saved("/Settings/2", "Home")],
+        );
+        nm.delete_refusals.lock().unwrap().insert(
+            "/Settings/1".into(),
+            "org.freedesktop.DBus.Error.UnknownObject".into(),
+        );
+        station.forget("Home").await.unwrap();
+
+        let (station, nm) = new_station();
+        FakeNm::set(&nm.saved, vec![saved("/Settings/1", "Home")]);
+        nm.delete_refusals.lock().unwrap().insert(
+            "/Settings/1".into(),
+            "org.freedesktop.NetworkManager.Settings.PermissionDenied".into(),
+        );
+        assert_eq!(
+            station.forget("Home").await,
+            Err(WifiForgetError::NotPermitted)
+        );
     }
 }
