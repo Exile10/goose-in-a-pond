@@ -420,6 +420,16 @@ pub struct DownloadEntry {
     /// Whether a pause keeps what has arrived: a Hugging Face transfer resumes from its
     /// `.incomplete`, while a `.part` transfer starts again from zero.
     pub resumable: bool,
+    /// Set while a `downloading` transfer waits to reconnect after its connection dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnecting: Option<DownloadReconnect>,
+}
+
+/// Which reconnect a dropped transfer is waiting on, for "Reconnecting (attempt 2 of 8)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct DownloadReconnect {
+    pub attempt: u32,
+    pub max_attempts: u32,
 }
 
 impl DownloadEntry {
@@ -440,6 +450,7 @@ impl DownloadEntry {
             partial: None,
             error: None,
             resumable: false,
+            reconnecting: None,
         }
     }
 
@@ -450,9 +461,11 @@ impl DownloadEntry {
         self.status == "downloading" && std::sync::Arc::strong_count(&self.control) > 1
     }
 
-    /// Paused entries wait for the household, so only finished ones age out.
+    /// Paused entries wait for the household, and so does a failed one that kept a partial file
+    /// to resume from: its card keeps the reason and "Try again". Only the rest age out.
     pub fn expired(&self, now: std::time::Instant, after: std::time::Duration) -> bool {
-        self.status != "paused"
+        let waits = self.status == "paused" || (self.status == "error" && self.partial.is_some());
+        !waits
             && self
                 .finished_at
                 .is_some_and(|t| now.duration_since(t) >= after)

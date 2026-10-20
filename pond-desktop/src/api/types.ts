@@ -1210,6 +1210,8 @@ export interface DownloadEntry {
   /** Whether a pause keeps the partial file to resume from: true for a Hugging Face transfer, false for
    *  any other host, whose pause discards it and whose resume starts again from the beginning. */
   resumable?: boolean;
+  /** Set while a `downloading` transfer waits to reconnect after its connection dropped. */
+  reconnecting?: { attempt: number; max_attempts: number };
 }
 
 /** The server's answer to pausing, resuming or stopping a model's download: each part it moved. */

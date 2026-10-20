@@ -6075,8 +6075,9 @@ async fn control_one(
                     .store(crate::DL_PAUSE, std::sync::atomic::Ordering::Relaxed);
                 return Ok("pausing");
             }
-            DownloadAction::Cancel if entry.status == "paused" => {
-                // No transfer is running to see the flag: throw the partial file away here.
+            DownloadAction::Cancel if matches!(entry.status.as_str(), "paused" | "error") => {
+                // No transfer is running to see the flag: throw the partial file away here. A
+                // failed transfer that kept one waits on its card until resumed or cancelled.
                 if let Some(partial) = entry.partial.take() {
                     let _ = tokio::fs::remove_file(&partial).await;
                 }
@@ -6310,7 +6311,7 @@ async fn refresh_model_registry(
 }
 
 /// GET /api/v1/models/download/progress — also evicts entries finished over 5 min ago; a
-/// paused one stays until the household resumes or cancels it.
+/// paused one, or a failed one that kept a partial file, stays until resumed or cancelled.
 async fn get_download_progress(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut tracker = state.download_tracker.write().await;
     let now = std::time::Instant::now();
@@ -7174,6 +7175,7 @@ fn register(
     entry.finished_at = None;
     entry.error = None;
     entry.partial = None;
+    entry.reconnecting = None;
     entry.url = Some(file.url.clone());
     entry.model_id = file.model_id.clone();
     entry.part = file.part.map(str::to_string);
@@ -7327,6 +7329,7 @@ pub(crate) async fn spawn_tracked_download<F>(
             let mut t = tracker.write().await;
             if let Some(e) = t.get_mut(&key) {
                 e.status = "done".to_string();
+                e.reconnecting = None;
                 e.finished_at = Some(std::time::Instant::now());
             }
         }
@@ -7335,6 +7338,7 @@ pub(crate) async fn spawn_tracked_download<F>(
             let Some(e) = t.get_mut(&key) else {
                 return;
             };
+            e.reconnecting = None;
             // A pause or a cancel already set its own status; it is not a failure.
             if matches!(e.status.as_str(), "paused" | "cancelled") {
                 tracing::info!("Download {} {}", key, e.status);
@@ -7384,23 +7388,47 @@ async fn download_via_hf_cache_tracked(
     let tracker_owned = Arc::clone(tracker);
     let tracker_key_owned = tracker_key.to_string();
     let progress_control = Arc::clone(&control);
-    let progress = move |downloaded: u64, total: u64| -> bool {
-        let tracker_owned = Arc::clone(&tracker_owned);
-        let key = tracker_key_owned.clone();
-        tokio::spawn(async move {
-            let mut t = tracker_owned.write().await;
-            if let Some(e) = t.get_mut(&key) {
-                e.downloaded_bytes = downloaded;
-                if total > 0 && e.total_bytes != Some(total) {
-                    e.total_bytes = Some(total);
-                }
+    // A wait to reconnect is reported on every poll; the entry is written once per wait.
+    let mut announced: Option<u32> = None;
+    let on_event = move |event: pond_hf_cache::DownloadEvent| -> bool {
+        type Update = Box<dyn FnOnce(&mut DownloadEntry) + Send>;
+        let update: Option<Update> = match event {
+            pond_hf_cache::DownloadEvent::Progress { downloaded, total } => {
+                announced = None;
+                Some(Box::new(move |e| {
+                    e.downloaded_bytes = downloaded;
+                    e.reconnecting = None;
+                    if total > 0 && e.total_bytes != Some(total) {
+                        e.total_bytes = Some(total);
+                    }
+                }))
             }
-        });
+            pond_hf_cache::DownloadEvent::Reconnecting(r) if announced != Some(r.attempt) => {
+                announced = Some(r.attempt);
+                Some(Box::new(move |e| {
+                    e.reconnecting = Some(crate::DownloadReconnect {
+                        attempt: r.attempt,
+                        max_attempts: r.max_attempts,
+                    });
+                }))
+            }
+            pond_hf_cache::DownloadEvent::Reconnecting(_) => None,
+        };
+        if let Some(update) = update {
+            let tracker_owned = Arc::clone(&tracker_owned);
+            let key = tracker_key_owned.clone();
+            tokio::spawn(async move {
+                let mut t = tracker_owned.write().await;
+                if let Some(e) = t.get_mut(&key) {
+                    update(e);
+                }
+            });
+        }
         progress_control.load(std::sync::atomic::Ordering::Relaxed) == crate::DL_RUN
     };
 
     let blob_path = match fetch
-        .download_to_blob(&client, token.as_deref(), progress)
+        .download_to_blob(&client, token.as_deref(), on_event)
         .await
     {
         Ok(p) => p,
@@ -7418,10 +7446,20 @@ async fn download_via_hf_cache_tracked(
                 entry.status = if cancelled { "cancelled" } else { "paused" }.to_string();
                 entry.finished_at = cancelled.then(std::time::Instant::now);
                 entry.partial = if cancelled { None } else { partial };
+                entry.reconnecting = None;
             }
             return Err(if cancelled { "cancelled" } else { "paused" }.to_string());
         }
-        Err(e) => return Err(crate::download_failure::plain_failure(&e)),
+        Err(e) => {
+            // Recorded so the failed entry keeps its card, and a cancel can delete the file.
+            if let Some(kept) = pond_hf_cache::kept_partial(&e) {
+                let mut t = tracker.write().await;
+                if let Some(entry) = t.get_mut(tracker_key) {
+                    entry.partial = Some(kept.to_path_buf());
+                }
+            }
+            return Err(crate::download_failure::plain_failure(&e));
+        }
     };
 
     if let Some(parent) = dest.parent() {

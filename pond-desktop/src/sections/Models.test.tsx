@@ -554,6 +554,27 @@ describe("what is coming down", () => {
     await waitFor(() => expect(api.controlModelDownload).toHaveBeenCalledWith(e4b().id, "resume"));
   });
 
+  it("says which reconnect a dropped download is on, and keeps its controls", async () => {
+    setup({ downloads: [{ ...both()[0], reconnecting: { attempt: 2, max_attempts: 8 } }, both()[1]] });
+    renderModels();
+    const recommended = await band("Recommended for this pond");
+    const card = within(recommended).getByRole("article", { name: "Gemma 4 E4B, llama.cpp" });
+    expect(within(card).getByText("The connection dropped. Reconnecting (attempt 2 of 8)")).toBeTruthy();
+    expect(within(card).getByRole("button", { name: "Pause" })).toBeTruthy();
+    expect(within(card).getByRole("button", { name: "Stop" })).toBeTruthy();
+  });
+
+  it("offers Stop beside Try again on a failed download, which throws away what it kept", async () => {
+    const reason = "The connection dropped before the file finished. Resume to carry on from where it stopped.";
+    setup({ downloads: [{ ...both()[0], status: "error", error: reason }, both()[1]] });
+    renderModels();
+    const recommended = await band("Recommended for this pond");
+    expect(within(recommended).getByRole("alert").textContent).toBe(reason);
+    expect(within(recommended).getByRole("button", { name: "Try again" })).toBeTruthy();
+    fireEvent.click(within(recommended).getByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(api.controlModelDownload).toHaveBeenCalledWith(e4b().id, "cancel"));
+  });
+
   it("shows a pictures part arriving on an installed model's own row", async () => {
     setup({
       models: [e2b({ ...HERE, companions: [{ kind: "pictures", label: "Gemma 4 E2B", size_bytes: 986_833_728, state: "downloading" }] })],
