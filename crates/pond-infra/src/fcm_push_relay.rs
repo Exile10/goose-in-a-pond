@@ -12,7 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use pond_core::mcp::ports::notification::Notification;
 use pond_core::mcp::ports::notification_relay::NotificationRelay;
-use pond_core::shared::services::egress::{check_egress, record_egress};
+use pond_core::shared::services::egress::{self, EgressPurpose};
 use pond_core::user_data::domain::push_token::PushPlatform;
 use pond_core::user_data::ports::push_token::PushTokenRepository;
 use serde::Deserialize;
@@ -147,9 +147,7 @@ impl FcmPushRelay {
         .context("signing FCM auth assertion")?;
 
         // Sensitive host: both restrictive egress modes refuse the token exchange.
-        check_egress(&self.account.token_uri)?;
-
-        let started = Instant::now();
+        let call = egress::begin_for(&self.account.token_uri, "POST", EgressPurpose::Push, "")?;
         let response = self
             .http
             .post(&self.account.token_uri)
@@ -159,22 +157,8 @@ impl FcmPushRelay {
             ])
             .send()
             .await;
-        let latency = started.elapsed().as_millis() as u64;
-        let response = match response {
-            Ok(r) => {
-                record_egress(
-                    &self.account.token_uri,
-                    "POST",
-                    Some(r.status().as_u16()),
-                    latency,
-                );
-                r
-            }
-            Err(e) => {
-                record_egress(&self.account.token_uri, "POST", None, latency);
-                return Err(anyhow!("FCM token exchange failed: {e}"));
-            }
-        };
+        call.finish(response.as_ref().ok().map(|r| r.status().as_u16()));
+        let response = response.map_err(|e| anyhow!("FCM token exchange failed: {e}"))?;
         if !response.status().is_success() {
             return Err(anyhow!(
                 "FCM token exchange rejected (HTTP {})",
@@ -227,9 +211,7 @@ impl NotificationRelay for FcmPushRelay {
         let body = wake_message(&stored.token, notification);
 
         // Gate the send too: a token cached before the mode was tightened would keep pushing.
-        check_egress(&url)?;
-
-        let started = Instant::now();
+        let call = egress::begin_for(&url, "POST", EgressPurpose::Push, "")?;
         let response = self
             .http
             .post(&url)
@@ -237,17 +219,8 @@ impl NotificationRelay for FcmPushRelay {
             .json(&body)
             .send()
             .await;
-        let latency = started.elapsed().as_millis() as u64;
-        let response = match response {
-            Ok(r) => {
-                record_egress(&url, "POST", Some(r.status().as_u16()), latency);
-                r
-            }
-            Err(e) => {
-                record_egress(&url, "POST", None, latency);
-                return Err(anyhow!("FCM send failed: {e}"));
-            }
-        };
+        call.finish(response.as_ref().ok().map(|r| r.status().as_u16()));
+        let response = response.map_err(|e| anyhow!("FCM send failed: {e}"))?;
 
         let prefix = token_log_prefix(&stored.token);
         if response.status().is_success() {
@@ -593,7 +566,7 @@ mod tests {
         );
         relay.relay(&notif()).await.expect_err("404 send");
 
-        // `record_egress` spawns the append, so let it land.
+        // `finish` spawns the append, so let it land.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let events = captured
@@ -612,6 +585,7 @@ mod tests {
             assert_eq!(ev.category, EventCategory::Network);
             assert_eq!(ev.attributes.get("method"), Some(&"POST".into()));
             assert_eq!(ev.attributes.get("host"), Some(&"127.0.0.1".into()));
+            assert_eq!(ev.attributes.get("tool"), Some(&"giap-push".into()));
             // Loopback mock; real googleapis.com traffic classifies as Sensitive.
             assert_eq!(ev.privacy_sensitivity, PrivacySensitivity::Internal);
         }

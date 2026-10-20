@@ -168,8 +168,13 @@ impl ScheduleExecutor for AgentScheduleExecutor {
                 tracing::info!("[scheduler] firing webhook for task {task_id}: {webhook_url}");
                 // A user-typed URL is the most direct exfiltration path: `begin` gates it and
                 // `finish` records every outcome, timeouts included.
-                let call = pond_core::shared::services::egress::begin(webhook_url, "POST")
-                    .map_err(|e| anyhow::anyhow!("task {task_id}: {e}"))?;
+                let call = pond_core::shared::services::egress::begin_for(
+                    webhook_url,
+                    "POST",
+                    pond_core::shared::services::egress::EgressPurpose::Schedules,
+                    "",
+                )
+                .map_err(|e| anyhow::anyhow!("task {task_id}: {e}"))?;
 
                 let sent = self.http_client.post(webhook_url).send().await;
                 call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));

@@ -254,7 +254,11 @@ impl GiapProviderShim {
     ) -> Result<Option<pond_core::shared::services::egress::EgressCall>, ProviderError> {
         match &self.endpoint {
             None => Ok(None),
-            Some(url) => match pond_core::shared::services::egress::begin(url, "LLM") {
+            Some(url) => match pond_core::shared::services::egress::begin_as(
+                url,
+                "LLM",
+                pond_core::shared::services::egress::EgressPurpose::Assistant,
+            ) {
                 Ok(call) => Ok(Some(call)),
                 Err(denied) => Err(ProviderError::RequestFailed(format!(
                     "GIAP refused this model call before it left the machine: {denied}"

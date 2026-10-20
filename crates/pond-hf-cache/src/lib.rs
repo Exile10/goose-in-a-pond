@@ -843,7 +843,12 @@ async fn head_with_redirects(
             }
         }
         // Egress-gate every hop, not just `url`: an HF redirect may point at a third-party host.
-        let call = pond_core::shared::services::egress::begin(&current, "HEAD")?;
+        let call = pond_core::shared::services::egress::begin_for(
+            &current,
+            "HEAD",
+            pond_core::shared::services::egress::EgressPurpose::Models,
+            "",
+        )?;
         let sent = req.send().await;
         call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
         let resp = sent.with_context(|| format!("HEAD {current}"))?;
@@ -917,7 +922,12 @@ async fn get_with_redirects(
             req = req.header(reqwest::header::RANGE, r);
         }
         // Per hop, as in the HEAD loop; the file-level egress guard can't see a missed site.
-        let call = pond_core::shared::services::egress::begin(&current, "GET")?;
+        let call = pond_core::shared::services::egress::begin_for(
+            &current,
+            "GET",
+            pond_core::shared::services::egress::EgressPurpose::Models,
+            "",
+        )?;
         let sent = req.send().await;
         call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
         let resp = sent.with_context(|| format!("GET {current}"))?;

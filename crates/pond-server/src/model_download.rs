@@ -253,7 +253,12 @@ pub async fn ensure_espeak_ng_data(data_dir: &Path) {
     println!("  downloading espeak-ng-data...");
 
     // Restrictive modes refuse github.com (Sensitive); intended, this fetch is optional.
-    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+    let call = match pond_core::shared::services::egress::begin_for(
+        &url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    ) {
         Ok(call) => call,
         Err(denied) => {
             tracing::warn!("espeak-ng-data download refused: {denied}");
@@ -484,8 +489,13 @@ pub async fn download_file_reporting(
     }
     // HF and github.com classify Sensitive, so `allowlist` refuses model downloads by design;
     // don't add them to `KNOWN_PUBLIC_SUFFIXES` to soften that.
-    let call = pond_core::shared::services::egress::begin(url, "GET")
-        .with_context(|| format!("Failed to fetch {url}"))?;
+    let call = pond_core::shared::services::egress::begin_for(
+        url,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    )
+    .with_context(|| format!("Failed to fetch {url}"))?;
     let sent = req.send().await;
     call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
     let resp = sent.with_context(|| format!("Failed to fetch {url}"))?;
@@ -726,8 +736,13 @@ async fn fetch_buffalo_l_zip(out_dir: &Path, embed_dest: &Path, detect_dest: &Pa
 
     let client = pond_net::client_builder().build()?;
     // `cfg`-gated senders still need the egress gate: the guard scans source, not the binary.
-    let call = pond_core::shared::services::egress::begin(BUFFALO_L_ZIP_URL, "GET")
-        .context("Failed to fetch buffalo_l.zip")?;
+    let call = pond_core::shared::services::egress::begin_for(
+        BUFFALO_L_ZIP_URL,
+        "GET",
+        pond_core::shared::services::egress::EgressPurpose::Models,
+        "",
+    )
+    .context("Failed to fetch buffalo_l.zip")?;
     let sent = client.get(BUFFALO_L_ZIP_URL).send().await;
     call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
     let resp = sent.context("Failed to fetch buffalo_l.zip")?;

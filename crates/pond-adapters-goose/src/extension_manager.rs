@@ -209,8 +209,13 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
                     .build()
                     .unwrap_or_default();
                 // A user-typed URI: gate egress before probing, not after the packet has left.
-                let call = pond_core::shared::services::egress::begin(uri, "GET")
-                    .map_err(|e| anyhow!("Cannot reach MCP server at {}: {}", uri, e))?;
+                let call = pond_core::shared::services::egress::begin_for(
+                    uri,
+                    "GET",
+                    pond_core::shared::services::egress::EgressPurpose::Extensions,
+                    "",
+                )
+                .map_err(|e| anyhow!("Cannot reach MCP server at {}: {}", uri, e))?;
                 let probed = client.get(uri).send().await;
                 call.finish(probed.as_ref().ok().map(|r| r.status().as_u16()));
                 match probed {

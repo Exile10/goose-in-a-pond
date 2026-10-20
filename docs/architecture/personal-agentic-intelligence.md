@@ -213,7 +213,7 @@ good it looks in isolation.
    all tools; every failure path in *access* must narrow to none. Where those two conflict, access
    wins.
 4. **Egress is tracked at the adapter, and now gated there too.** Any crate that reaches the
-   network with its own `reqwest::Client` goes through `egress::begin` / `EgressCall::finish`
+   network with its own `reqwest::Client` goes through `egress::begin_for` / `begin_as` and `EgressCall::finish`
    (PAI-2 P5), which checks `network_mode` before the socket opens and records the call either way.
    Verified 2026-08-05: `crates/pond-core/tests/egress_guard.rs` fails the build for an HTTP-sending
    source file that is in none of its three classification lists. The old wording — "copy

@@ -325,8 +325,17 @@ existing fail-Sensitive default, which is exactly the right polarity for this. `
 everything but loopback, which makes "prove it is not phoning home" a one-setting demonstration
 rather than a packet capture.
 
-Every new outbound adapter uses `egress::begin` / `EgressCall::finish` (P5) rather than copying
-`traced_send` from `pond-adapters-weather`. Verified 2026-08-05: `traced_send` is at lines 12-31 of
+Every new outbound adapter uses `egress::begin_for` / `begin_as` and `EgressCall::finish` (P5)
+rather than copying `traced_send` from `pond-adapters-weather`.
+
+**Attribution (2026-10-20).** A call the pond makes on its own account names its purpose from the
+closed `EgressPurpose` set (`giap-sign-in`, `giap-music`, `giap-models`, `giap-push`, ...), which
+the event log records as the `tool` attribute. There is no longer a plain `egress::begin(url,
+method)`: it read the process-global chat tool, which is set by whichever tool ran last and never
+cleared, so the Jetson's activity feed filed thousands of Spotify token refreshes and player calls
+under `get_current_weather`, `get_wikipedia_article` and other unrelated tools. Only chat tools'
+own adapters (`record_egress`, `check_egress`, `traced_send`, `traced_get`) still read the tool in
+flight; a host pre-flight gate uses `check_egress_as(url, purpose)`. Verified 2026-08-05: `traced_send` is at lines 12-31 of
 `pond-adapters-weather/src/lib.rs`, not 15-30 -- cite the symbol, not the range.
 
 **The guard as originally specified is not implementable, and the correction matters.** "Every crate

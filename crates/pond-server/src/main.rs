@@ -4371,9 +4371,11 @@ async fn run_server(
                     };
 
                     // On refusal skip this tick only; the user may loosen network_mode later.
-                    let call = match pond_core::shared::services::egress::begin(
+                    let call = match pond_core::shared::services::egress::begin_for(
                         &provider.token_url,
                         "POST",
+                        pond_core::shared::services::egress::EgressPurpose::SignIn,
+                        "",
                     ) {
                         Ok(call) => call,
                         Err(denied) => {
@@ -7254,10 +7256,13 @@ fn download_and_extract_ort(
     let tgz = tmp_dir.join("ort.tgz");
 
     // ── Download ─────────────────────────────────────────────────────────
-    // The curl subprocess is egress too. `check_egress`, not `EgressCall`: this fn is sync and
+    // The curl subprocess is egress too. `check_egress_as`, not `EgressCall`: this fn is sync and
     // `finish` reaches `tokio::spawn`, which panics with no runtime on the thread.
-    pond_core::shared::services::egress::check_egress(url)
-        .map_err(|denied| anyhow::anyhow!("{denied}"))?;
+    pond_core::shared::services::egress::check_egress_as(
+        url,
+        pond_core::shared::services::egress::EgressPurpose::Models,
+    )
+    .map_err(|denied| anyhow::anyhow!("{denied}"))?;
 
     let status = Command::new("curl")
         .args([

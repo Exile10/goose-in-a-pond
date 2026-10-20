@@ -105,7 +105,13 @@ impl SpotifyFocus {
         }
         let label = if method == Method::GET { "GET" } else { "PUT" };
         // The gate logs its own refusals.
-        let call = pond_core::shared::services::egress::begin(url.as_str(), label).ok()?;
+        let call = pond_core::shared::services::egress::begin_for(
+            url.as_str(),
+            label,
+            pond_core::shared::services::egress::EgressPurpose::Music,
+            "",
+        )
+        .ok()?;
         let sent = self
             .http
             .request(method, url)
