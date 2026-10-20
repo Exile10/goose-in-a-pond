@@ -89,7 +89,8 @@ test.describe("Hub — Accounts: Uber", () => {
     expect(popup.url()).toContain("auth.uber.com");
     await expect(popup).toHaveTitle("Uber sign-in stand-in");
     await expect(panel.getByText("Connected", { exact: true })).toBeVisible({ timeout: 10_000 });
-    expect(state.connectBody).toEqual({ profile_id: "p-jerry" });
+    // The dashboard sends the origin it reaches the pond on, so Uber returns the browser there.
+    expect(state.connectBody).toEqual({ profile_id: "p-jerry", origin: "http://127.0.0.1:4000" });
   });
 
   test("disconnecting forgets only that member", async ({ page }) => {
@@ -112,6 +113,7 @@ test.describe("Classic — Context, Sources: Uber", () => {
     await panel.getByRole("button", { name: "Connect Uber" }).click();
     await expect(await opened).toHaveTitle("Uber sign-in stand-in");
     await expect(panel.getByText("Connected", { exact: true })).toHaveCount(2, { timeout: 10_000 });
-    expect(state.connectBody).toEqual({ profile_id: "p-jerry" });
+    // The dashboard sends the origin it reaches the pond on, so Uber returns the browser there.
+    expect(state.connectBody).toEqual({ profile_id: "p-jerry", origin: "http://127.0.0.1:4000" });
   });
 });
