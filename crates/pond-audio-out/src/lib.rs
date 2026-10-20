@@ -176,8 +176,8 @@ impl Speaker {
                         return;
                     }
                 };
-                let mut stream = SendableStream(stream);
-                let mut hold = route::Hold::new(device.clone());
+                let mut stream = Some(SendableStream(stream));
+                let mut hold = Some(route::Hold::new(device.clone()));
                 let state = Arc::new(Mutex::new(SpeakerState {
                     handle,
                     generation,
@@ -190,11 +190,14 @@ impl Speaker {
                     if state.lock().unwrap_or_else(|e| e.into_inner()).generation == wanted {
                         continue;
                     }
+                    // Release the old PCM before opening the new one so ALSA never sees two
+                    // streams on the same card at once.
+                    drop((stream.take(), hold.take()));
                     match route::open_routed() {
                         Ok((next, handle, device)) => {
                             tracing::info!(device = %device, "speaker reopened on the new route");
-                            stream = SendableStream(next);
-                            hold = route::Hold::new(device.clone());
+                            stream = Some(SendableStream(next));
+                            hold = Some(route::Hold::new(device.clone()));
                             *state.lock().unwrap_or_else(|e| e.into_inner()) = SpeakerState {
                                 handle,
                                 generation: wanted,
@@ -202,7 +205,6 @@ impl Speaker {
                             };
                         }
                         Err(e) => {
-                            // Keep the old stream; mark the route seen so this does not spin.
                             tracing::warn!(error = %e, "no speaker opened on the new route");
                             state.lock().unwrap_or_else(|e| e.into_inner()).generation = wanted;
                         }
