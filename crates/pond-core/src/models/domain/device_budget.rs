@@ -506,18 +506,25 @@ pub fn device_window(gguf_path: Option<&Path>, chat_model: &str) -> DeviceWindow
         .filter(|m| m.is_file())
         .map(|m| m.len());
     let kv_kib_per_token = gguf_path.and_then(kv_cost_from_header);
-    let encoder_bytes = match budgeted_declaration(gguf_path, chat_model, true) {
-        VisionDeclaration::Declared(spec) => spec.size_bytes,
-        _ => 0,
+    let encoder_spec = match budgeted_declaration(gguf_path, chat_model, true) {
+        VisionDeclaration::Declared(spec) => Some(spec),
+        _ => None,
     };
+    let encoder_bytes = encoder_spec.as_ref().map_or(0, |s| s.size_bytes);
     let model_bytes = file_len.unwrap_or(ASSUMED_LARGEST_MODEL_BYTES);
+    let mut window = context_size_with_encoder(
+        llm_budget_mb(),
+        model_bytes,
+        encoder_bytes,
+        kv_kib_per_token,
+    );
+    if let Some(spec) = encoder_spec {
+        if is_vision_allowlisted(&spec.dir) && window < 8192 {
+            window = 8192;
+        }
+    }
     DeviceWindow {
-        window: context_size_with_encoder(
-            llm_budget_mb(),
-            model_bytes,
-            encoder_bytes,
-            kv_kib_per_token,
-        ),
+        window,
         model_bytes,
         weights_known: file_len.is_some(),
         kv_kib_per_token,
