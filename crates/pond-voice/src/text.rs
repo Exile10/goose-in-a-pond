@@ -2,17 +2,21 @@
 //!
 //! TypeScript ports of these functions live under `pond-desktop/src/`; keep them in step.
 
-/// Split completed sentences out of a buffer, returning `(sentences, remainder)`.
-pub fn split_sentences(text: &str) -> (Vec<String>, String) {
+/// Split speakable units out of a streaming buffer, returning `(units, remainder)`.
+///
+/// When `allow_clauses` is true, clause marks (`,`, `;`, `:`, `—`) split if at least
+/// `MIN_CLAUSE_WORDS` words have accumulated.
+pub fn split_speech_units(text: &str, allow_clauses: bool) -> (Vec<String>, String) {
     const MAX_BUF: usize = 250;
-    let mut sentences: Vec<String> = Vec::with_capacity(8);
+    const MIN_CLAUSE_WORDS: usize = 4;
+    let mut units: Vec<String> = Vec::with_capacity(8);
     let mut remainder = text.to_string();
 
     loop {
         // Force-flush at max buffer: break at last space within the limit
         if remainder.len() > MAX_BUF {
             if let Some(split_at) = remainder[..MAX_BUF].rfind(' ') {
-                sentences.push(remainder[..split_at].to_string());
+                units.push(remainder[..split_at].to_string());
                 remainder = remainder[split_at + 1..].to_string();
                 continue;
             }
@@ -20,27 +24,49 @@ pub fn split_sentences(text: &str) -> (Vec<String>, String) {
 
         let mut found = false;
         let chars: Vec<(usize, char)> = remainder.char_indices().collect();
-        for (idx, (i, ch)) in chars.iter().enumerate() {
-            if matches!(ch, '.' | '?' | '!') {
+        for (i, ch) in chars.iter().copied() {
+            let is_terminal = matches!(ch, '.' | '?' | '!');
+            let is_clause = allow_clauses && matches!(ch, ',' | ';' | ':' | '—');
+
+            if is_terminal || is_clause {
+                let prefix = &remainder[..i];
+                if ch == ',' {
+                    let prev_is_digit =
+                        prefix.chars().next_back().is_some_and(|c| c.is_ascii_digit());
+                    let next_is_digit = remainder[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit());
+                    if prev_is_digit && next_is_digit {
+                        continue;
+                    }
+                }
+
+                if is_clause {
+                    let word_count = prefix.split_whitespace().count();
+                    if word_count < MIN_CLAUSE_WORDS {
+                        continue;
+                    }
+                }
+
                 let next = i + ch.len_utf8();
                 let after = &remainder[next..];
                 if after.is_empty() || after.starts_with(' ') || after.starts_with('\n') {
-                    sentences.push(remainder[..next].to_string());
+                    units.push(remainder[..next].to_string());
                     remainder = after
                         .trim_start_matches(|c: char| c == ' ' || c == '\n')
                         .to_string();
                     found = true;
                     break;
                 }
-            } else if *ch == '\n' {
-                let chunk = remainder[..*i].trim().to_string();
+            } else if ch == '\n' {
+                let chunk = remainder[..i].trim().to_string();
                 if !chunk.is_empty() {
-                    sentences.push(chunk);
+                    units.push(chunk);
                 }
                 let next = i + 1;
                 remainder = remainder[next..].to_string();
                 found = true;
-                let _ = idx;
                 break;
             }
         }
@@ -50,7 +76,12 @@ pub fn split_sentences(text: &str) -> (Vec<String>, String) {
         }
     }
 
-    (sentences, remainder)
+    (units, remainder)
+}
+
+/// Split completed sentences out of a buffer, returning `(sentences, remainder)`.
+pub fn split_sentences(text: &str) -> (Vec<String>, String) {
+    split_speech_units(text, false)
 }
 
 /// Convert markdown to plain text for TTS, then apply `normalize_for_speech`.
@@ -875,6 +906,75 @@ pub fn filter_thinking(chunk: &str, mut in_block: bool) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_sentences_splits_on_terminals_and_newlines() {
+        let text = "Hello world. How are you? I'm fine!\nNew paragraph.";
+        let (sentences, remainder) = split_sentences(text);
+        assert_eq!(
+            sentences,
+            vec![
+                "Hello world.",
+                "How are you?",
+                "I'm fine!",
+                "New paragraph."
+            ]
+        );
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_sentences_keeps_unpunctuated_tail() {
+        let (sentences, remainder) = split_sentences("First sentence. Second part");
+        assert_eq!(sentences, vec!["First sentence."]);
+        assert_eq!(remainder, "Second part");
+    }
+
+    #[test]
+    fn split_speech_units_splits_opening_clause_after_min_words() {
+        let partial = "I would be glad to help with that, and here are the";
+        let (units, remainder) = split_speech_units(partial, true);
+        assert_eq!(units, vec!["I would be glad to help with that,"]);
+        assert_eq!(remainder, "and here are the");
+
+        let full = "I would be glad to help with that, and here are the details.";
+        let (units, remainder) = split_speech_units(full, true);
+        assert_eq!(
+            units,
+            vec![
+                "I would be glad to help with that,",
+                "and here are the details."
+            ]
+        );
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_keeps_short_clauses_with_sentence() {
+        let text = "Sure, let's start the project.";
+        let (units, remainder) = split_speech_units(text, true);
+        assert_eq!(units, vec!["Sure, let's start the project."]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_does_not_split_numeric_commas() {
+        let text = "There are 1,000 units ready.";
+        let (units, remainder) = split_speech_units(text, true);
+        assert_eq!(units, vec!["There are 1,000 units ready."]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_sentences_ignores_clauses_even_when_long() {
+        let text = "I would be glad to help with that, and here are the details.";
+        let (sentences, remainder) = split_sentences(text);
+        assert_eq!(
+            sentences,
+            vec!["I would be glad to help with that, and here are the details."]
+        );
+        assert_eq!(remainder, "");
+    }
 
     #[test]
     fn punctuation_survives_the_whole_speech_pass() {

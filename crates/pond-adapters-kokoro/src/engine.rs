@@ -120,6 +120,13 @@ impl Engine {
                 .with_intra_threads(n)
                 .map_err(|e| anyhow!("failed to set ort intra-op threads to {n}: {e}"))?;
         }
+        builder = builder
+            .with_memory_pattern(false)
+            .map_err(|e| anyhow!("failed to disable ort memory pattern: {e}"))?;
+        let cpu = ort::ep::CPU::default().with_arena_allocator(false).build();
+        builder = builder
+            .with_execution_providers([cpu])
+            .map_err(|e| anyhow!("failed to set ort cpu execution provider: {e}"))?;
         if let Some(cache_out) = save_optimized_to {
             builder = match builder.with_optimized_model_path(cache_out) {
                 Ok(b) => b,

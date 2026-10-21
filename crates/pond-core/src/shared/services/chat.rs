@@ -291,7 +291,7 @@ impl Drop for WorkingTone {
 }
 
 // TTS text handling is in `pond-voice` so the desktop shell (separate workspace) shares it.
-use pond_voice::text::{split_sentences, strip_markdown_for_speech};
+use pond_voice::text::{split_speech_units, strip_markdown_for_speech};
 
 /// Re-exported to keep pond-core's public API path.
 pub use pond_voice::text::filter_thinking;
@@ -1110,47 +1110,65 @@ impl ChatService {
         let mut barge_tx = Some(barge_tx);
         let mut thought_filter = crate::models::services::thought_filter::ThoughtFilter::new();
 
-        // Pipelined TTS: `pending_audio` (WAV) plays while the next sentence is synthesized.
-        let mut pending_audio: Option<Vec<u8>> = None;
-        let mut first_sentence_spoken = false;
+        enum AudioItem {
+            Wav(Vec<u8>),
+            Fallback(String),
+        }
 
-        macro_rules! speak_pipelined {
-            ($self:expr, $text:expr, $pending:expr, $first_spoken:expr) => {{
-                let text = $text;
-                if !*$first_spoken {
-                    // First sentence: plain speak() (clause-split) so audio starts at once.
-                    *$first_spoken = true;
-                    if let Err(e) = $self.voice_output.speak(&text).await {
-                        tracing::warn!("TTS failed: {}", e);
-                    }
-                } else {
-                    // Subsequent sentences: synthesize-ahead pipeline.
-                    match $self.voice_output.synthesize(&text).await {
-                        Ok(Some(new_wav)) => {
-                            if let Some(prev) = $pending.take() {
-                                if let Err(e) = $self.voice_output.play_audio(prev).await {
-                                    tracing::warn!("TTS playback failed: {}", e);
-                                }
-                            }
-                            *$pending = Some(new_wav);
+        let (speech_tx, mut speech_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<AudioItem>(16);
+
+        let voice_for_synth = self.voice_output.clone();
+        let synth_handle = tokio::spawn(async move {
+            while let Some(text) = speech_rx.recv().await {
+                let spoken = strip_markdown_for_speech(&text);
+                if spoken.is_empty() {
+                    continue;
+                }
+                match voice_for_synth.synthesize(&spoken).await {
+                    Ok(Some(wav)) if !wav.is_empty() => {
+                        if audio_tx.send(AudioItem::Wav(wav)).await.is_err() {
+                            break;
                         }
-                        _ => {
-                            if let Some(prev) = $pending.take() {
-                                if let Err(e) = $self.voice_output.play_audio(prev).await {
-                                    tracing::warn!("TTS playback failed: {}", e);
-                                }
-                            }
-                            if let Err(e) = $self.voice_output.speak(&text).await {
-                                tracing::warn!("TTS failed: {}", e);
-                            }
+                    }
+                    _ => {
+                        if audio_tx.send(AudioItem::Fallback(spoken)).await.is_err() {
+                            break;
                         }
                     }
                 }
-            }};
-        }
+            }
+        });
 
-        // Dropped mid-flight on a barge-in: that drops the stream, which stops generation, and
-        // ends synthesis with whatever sentence it was on.
+        let voice_for_playback = self.voice_output.clone();
+        let playback_handle = tokio::spawn(async move {
+            while let Some(item) = audio_rx.recv().await {
+                match item {
+                    AudioItem::Wav(wav) => {
+                        if let Err(e) = voice_for_playback.play_audio(wav).await {
+                            tracing::warn!("TTS playback failed: {}", e);
+                        }
+                    }
+                    AudioItem::Fallback(spoken) => {
+                        if let Err(e) = voice_for_playback.speak(&spoken).await {
+                            tracing::warn!("TTS failed: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+
+        struct TaskGuard(Option<tokio::task::JoinHandle<()>>);
+        impl Drop for TaskGuard {
+            fn drop(&mut self) {
+                if let Some(h) = self.0.take() {
+                    h.abort();
+                }
+            }
+        }
+        let mut synth_guard = TaskGuard(Some(synth_handle));
+        let mut playback_guard = TaskGuard(Some(playback_handle));
+
         let speaking = async {
             while let Some(event_result) = stream.next().await {
                 match event_result? {
@@ -1186,23 +1204,16 @@ impl ChatService {
                     full_text.push_str(&content);
                     sentence_buf.push_str(&content);
 
-                    let (sentences, remainder) = split_sentences(&sentence_buf);
+                    let (units, remainder) = split_speech_units(&sentence_buf, true);
                     sentence_buf = remainder;
-                    for sentence in sentences {
-                        let spoken = strip_markdown_for_speech(&sentence);
-                        if spoken.is_empty() {
-                            continue;
-                        }
+                    for unit in units {
                         tone.stop();
                         if let Some(tx) = barge_tx.take() {
                             barge_in = self.watch_for_barge_in(tx);
                         }
-                        speak_pipelined!(
-                            self,
-                            spoken,
-                            &mut pending_audio,
-                            &mut first_sentence_spoken
-                        );
+                        if speech_tx.send(unit).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 AgentStreamEvent::Done { usage, stats, .. } => {
@@ -1226,16 +1237,11 @@ impl ChatService {
                     }
                     let remainder = sentence_buf.trim().to_string();
                     if !remainder.is_empty() {
-                        let spoken = strip_markdown_for_speech(&remainder);
-                        if !spoken.is_empty() {
-                            tone.stop();
-                            speak_pipelined!(
-                                self,
-                                spoken,
-                                &mut pending_audio,
-                                &mut first_sentence_spoken
-                            );
+                        tone.stop();
+                        if let Some(tx) = barge_tx.take() {
+                            barge_in = self.watch_for_barge_in(tx);
                         }
+                        let _ = speech_tx.send(remainder).await;
                     }
                     sentence_buf.clear();
                     break;
@@ -1263,12 +1269,6 @@ impl ChatService {
             }
             }
 
-            if let Some(last) = pending_audio.take() {
-                if let Err(e) = self.voice_output.play_audio(last).await {
-                    tracing::warn!("TTS final playback failed: {}", e);
-                }
-            }
-
             // If the stream ended without Done, its filter tail must reach `full_text` here too.
             let tail = thought_filter.flush();
             if !tail.is_empty() {
@@ -1285,13 +1285,20 @@ impl ChatService {
             }
             let remainder = sentence_buf.trim().to_string();
             if !remainder.is_empty() {
-                let spoken = strip_markdown_for_speech(&remainder);
-                if !spoken.is_empty() {
-                    tone.stop();
-                    if let Err(e) = self.voice_output.speak(&spoken).await {
-                        tracing::warn!("TTS final flush failed: {}", e);
-                    }
+                tone.stop();
+                if let Some(tx) = barge_tx.take() {
+                    barge_in = self.watch_for_barge_in(tx);
                 }
+                let _ = speech_tx.send(remainder).await;
+            }
+            sentence_buf.clear();
+
+            drop(speech_tx);
+            if let Some(h) = synth_guard.0.take() {
+                let _ = h.await;
+            }
+            if let Some(h) = playback_guard.0.take() {
+                let _ = h.await;
             }
 
             // A turn that produced no speakable text still has to stop the tone.
@@ -3905,6 +3912,52 @@ mod tests {
         assert_eq!(
             mic.holds.load(Ordering::SeqCst),
             mic.releases.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn pipelined_tts_streams_synthesis_and_playback_concurrently() {
+        #[derive(Default)]
+        struct MockPipelinedVoice {
+            actions: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl VoiceOutput for MockPipelinedVoice {
+            async fn speak(&self, text: &str) -> Result<()> {
+                self.actions.lock().unwrap().push(format!("speak:{text}"));
+                Ok(())
+            }
+            async fn synthesize(&self, text: &str) -> Result<Option<Vec<u8>>> {
+                self.actions.lock().unwrap().push(format!("synth:{text}"));
+                Ok(Some(text.as_bytes().to_vec()))
+            }
+            async fn play_audio(&self, audio: Vec<u8>) -> Result<()> {
+                let text = String::from_utf8_lossy(&audio).to_string();
+                self.actions.lock().unwrap().push(format!("play:{text}"));
+                Ok(())
+            }
+        }
+
+        let storage = Arc::new(InMemorySessionStorage::new());
+        storage.create_session("stream-tts".into()).await.unwrap();
+        let voice = Arc::new(MockPipelinedVoice::default());
+        let svc = ChatService::new(Arc::new(MockAgent::new()), "stream-tts".into(), storage)
+            .with_voice_output(voice.clone());
+
+        let outcome = svc
+            .stream_response_inner("Hello world. How are you today?".to_string(), Instant::now())
+            .await
+            .unwrap();
+        assert!(outcome.barged_in.is_none());
+        let actions = voice.actions.lock().unwrap().clone();
+        assert!(
+            actions.iter().any(|a| a.starts_with("synth:")),
+            "expected synthesis actions, got {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| a.starts_with("play:")),
+            "expected playback actions, got {actions:?}"
         );
     }
 
