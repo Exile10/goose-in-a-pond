@@ -733,6 +733,11 @@ async fn run_setup(model: &str) -> Result<()> {
 
     let setup_model_repo = SqliteModelRepository::new(db_setup.system.clone());
     let settings_repo_setup = SqliteSettingsRepository::new(db_setup.system.clone());
+    if let Ok(settings) = settings_repo_setup.get().await {
+        if settings.picture_support_download_enabled {
+            pond_core::models::domain::device_budget::allow_gemma_vision();
+        }
+    }
     println!("  📋 Fetching model catalog from upstream sources...");
     seed_model_catalog(&setup_model_repo, &data_dir).await;
     ensure_tts_is_set_up(&setup_model_repo, &settings_repo_setup).await;
@@ -1199,6 +1204,9 @@ async fn run_server(
 
     // Apply the mic privacy setting before anything can open a device.
     pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
+    if settings.picture_support_download_enabled {
+        pond_core::models::domain::device_budget::allow_gemma_vision();
+    }
 
     // Serve never opens the mic (only `/transcribe`), but `WhisperRsInput::new` needs a handle.
     let (mic_handle, _mic_owner_join) = pond_audio::spawn(

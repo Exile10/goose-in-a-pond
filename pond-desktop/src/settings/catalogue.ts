@@ -247,6 +247,13 @@ export const CATALOGUE: CatalogueCategory[] = [
             ] },
             validate: oneOf(["goose"]),
           },
+          {
+            key: "picture_support_download_enabled",
+            label: "Allow picture support downloads",
+            description: "Allow downloading vision encoder files (mmproj) for vision-capable models on budgeted devices.",
+            control: { kind: "toggle" },
+            consumer: "live",
+          },
           // Commented out while llama.cpp lacks speculative decoding; restore with the setting.
           // { key: "speculative_decoding_enabled", label: "Guess ahead with a helper model", description: "A small helper model guesses the next few words and the main model checks each one, so answers stay the same and only the speed changes (this is called speculative decoding). On a Jetson it measured faster; on a Mac it measured slower, so try it off if replies feel slow. Only Gemma 4 E2B and E4B have a helper; turning it on downloads it (57 MB) if it is not on this device. Changing it reloads the model, so the next reply waits for that.", control: { kind: "toggle" }, consumer: "live" },
         ],

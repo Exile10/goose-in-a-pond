@@ -5419,6 +5419,12 @@ async fn update_settings(
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
 
+    if merged.picture_support_download_enabled {
+        pond_core::models::domain::device_budget::allow_gemma_vision();
+    } else {
+        pond_core::models::domain::device_budget::clear_vision_allowlist();
+    }
+
     // A new pin, or the mic switched, takes effect now rather than at the next device change.
     if current.audio_input_device != merged.audio_input_device
         || current.audio_output_device != merged.audio_output_device
