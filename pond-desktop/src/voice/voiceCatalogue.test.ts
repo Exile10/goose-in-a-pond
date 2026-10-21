@@ -200,7 +200,8 @@ describe("preview statements", () => {
 
 describe("quality advice", () => {
   it("recommends the best tier that actually fits", () => {
-    expect(recommendedQuality(200)).toBe("q8");        // nothing fits; fall back
+    expect(recommendedQuality(50)).toBe("q8f16");      // nothing fits; fall back
+    expect(recommendedQuality(200)).toBe("q8");        // balanced fits
     expect(recommendedQuality(6000)).toBe("fp32");     // plenty of room
   });
 
@@ -234,11 +235,11 @@ describe("quality advice", () => {
 });
 
 describe("onboarding tier", () => {
-  it("is the smallest tier, and smaller than the everyday default", () => {
+  it("is the smallest tier, matching the compact everyday default", () => {
     expect(ONBOARDING_QUALITY).toBe("q8f16");
     const setup = describeQuality(ONBOARDING_QUALITY);
     const everyday = describeQuality(DEFAULT_QUALITY);
-    expect(setup.sizeMb).toBeLessThan(everyday.sizeMb);
+    expect(setup.sizeMb).toBeLessThanOrEqual(everyday.sizeMb);
     expect(Math.min(...VOICE_QUALITY_TIERS.map((t) => t.sizeMb))).toBe(setup.sizeMb);
   });
 });

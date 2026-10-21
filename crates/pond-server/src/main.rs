@@ -1369,11 +1369,18 @@ async fn run_server(
                     }
                     out.set_speed(settings.voice_tts_speed);
                     println!(
-                        "  ✅ Kokoro TTS: {} @ {:.2}x (weights load on first utterance)",
+                        "  ✅ Kokoro TTS: {} @ {:.2}x",
                         out.voice().await,
                         out.speed()
                     );
-                    Some(Arc::new(out))
+                    let arc = Arc::new(out);
+                    let prewarm_arc = arc.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = prewarm_arc.prewarm().await {
+                            tracing::debug!("Kokoro background prewarm deferred: {e}");
+                        }
+                    });
+                    Some(arc)
                 }
                 Err(e) => {
                     tracing::warn!("Kokoro TTS unavailable: {e}");

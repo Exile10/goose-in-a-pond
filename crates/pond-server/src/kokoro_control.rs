@@ -187,6 +187,19 @@ impl TtsControl for KokoroTtsControl {
         }
         Ok(wav)
     }
+
+    async fn unload(&self) -> Result<()> {
+        self.engine.unload().await;
+        Ok(())
+    }
+
+    async fn is_loaded(&self) -> bool {
+        self.engine.is_loaded().await
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        self.engine.prewarm().await
+    }
 }
 
 #[cfg(test)]

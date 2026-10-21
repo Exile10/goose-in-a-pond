@@ -12,6 +12,7 @@ use axum::http::{header, Method, Request, StatusCode};
 use pond_api::test_support::{pair_phone, TEST_SPKI_PIN};
 use pond_api::{build_router, AppState};
 use pond_core::models::mocks::mock_tts_control::MockTtsControl;
+use pond_core::models::ports::tts_control::TtsControl;
 use pond_core::models::ports::voice_output::VoiceOutput;
 use pond_core::models::services::voice::voice_sample::VOICE_SAMPLE_SENTENCE;
 use pond_core::security::ports::handshake::Handshake;
@@ -306,4 +307,97 @@ async fn the_sample_is_still_reachable_once_the_pond_is_set_up() {
         sample(&h.loopback, Some(GEORGE), None).await.status,
         StatusCode::UNAUTHORIZED
     );
+}
+
+async fn onboard(h: &Harness, token: &str) {
+    let mut settings = h.settings.get().await.unwrap();
+    settings.user_name = "Jerry".into();
+    settings.assistant_name = "Goose".into();
+    settings.timezone = "UTC".into();
+    settings.chat_model = "mock".into();
+    h.settings.update(&settings).await.unwrap();
+    let _ = h
+        .lan
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/onboard/complete")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tts_unload_and_prewarm_controls_loaded_state() {
+    let h = harness().await;
+    let token = paired(&h, "phone").await;
+    onboard(&h, &token).await;
+
+    let res = h
+        .lan
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/voice/tts/status")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["loaded"], true);
+
+    let res = h
+        .lan
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/voice/tts/unload")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(!h.control.is_loaded().await);
+
+    let res = h
+        .lan
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/voice/tts/prewarm")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(h.control.is_loaded().await);
+}
+
+#[tokio::test]
+async fn revoke_model_unloads_kokoro_voice() {
+    let h = harness().await;
+    let token = paired(&h, "phone").await;
+    onboard(&h, &token).await;
+    assert!(h.control.is_loaded().await);
+
+    let res = h
+        .lan
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/models/tts_kokoro/af_heart/revoke")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(!h.control.is_loaded().await);
 }

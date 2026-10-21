@@ -279,6 +279,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/models/{category}/{name}/companions/pictures",
             post(crate::model_acquisition::add_pictures),
         )
+        .route("/models/{category}/{name}/revoke", post(revoke_model))
+        .route("/voice/tts/unload", post(unload_tts))
+        .route("/voice/tts/prewarm", post(prewarm_tts))
+        .route("/voice/tts/status", get(status_tts))
         .route("/models/{category}/{name}", delete(delete_model))
         .route("/profiles", get(list_profiles))
         .route("/profiles/{id}", get(get_profile).delete(delete_profile))
@@ -1707,6 +1711,84 @@ async fn apply_tts_settings(
         "downloaded_weights": applied.downloaded_weights,
         "engine_reloaded": applied.engine_reloaded,
         "installed_voices": control.installed_voices().await,
+    })))
+}
+
+async fn unload_tts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(control) = state.tts_control.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "No speech engine is running"})),
+        ));
+    };
+    control.unload().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(json!({"status": "unloaded"})))
+}
+
+async fn prewarm_tts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(control) = state.tts_control.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "No speech engine is running"})),
+        ));
+    };
+    control.prewarm().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(json!({"status": "ready"})))
+}
+
+async fn status_tts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(control) = state.tts_control.clone() else {
+        return Ok(Json(json!({"available": false, "loaded": false})));
+    };
+    let loaded = control.is_loaded().await;
+    Ok(Json(json!({"available": true, "loaded": loaded})))
+}
+
+async fn revoke_model(
+    State(state): State<Arc<AppState>>,
+    Path((category, name)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unknown category '{}'", category)})),
+        )
+    })?;
+
+    match cat {
+        ModelCategory::TtsKokoro => {
+            if let Some(control) = state.tts_control.as_ref() {
+                control.unload().await.map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                })?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(Json(json!({
+        "status": "revoked",
+        "category": category,
+        "name": name,
     })))
 }
 

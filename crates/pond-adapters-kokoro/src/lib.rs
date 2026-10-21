@@ -169,6 +169,35 @@ impl KokoroOutput {
         self.model_path.read().await.clone()
     }
 
+    /// Ensure the engine is loaded in RAM, loading and caching on disk if absent.
+    pub async fn ensure_loaded(&self) -> Result<()> {
+        let mut engine_guard = self.engine.write().await;
+        if engine_guard.is_none() {
+            let path = self.model_path.read().await.clone();
+            let threads = self.config.intra_threads;
+            let loaded = tokio::time::timeout(
+                LOAD_TIMEOUT,
+                tokio::task::spawn_blocking(move || Engine::load(&path, threads)),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Kokoro model load timed out after {}s — the ONNX Runtime library is \
+                     probably missing or version-incompatible",
+                    LOAD_TIMEOUT.as_secs()
+                )
+            })?
+            .context("Kokoro model load panicked")??;
+            *engine_guard = Some(loaded);
+        }
+        Ok(())
+    }
+
+    /// Prewarm the model into RAM ahead of time.
+    pub async fn prewarm(&self) -> Result<()> {
+        self.ensure_loaded().await
+    }
+
     /// Mono f32 at [`SAMPLE_RATE`]; empty for text that phonemizes to nothing.
     pub async fn synth_samples(&self, text: &str) -> Result<Vec<f32>> {
         self.synth_samples_with(text, None).await
@@ -210,26 +239,8 @@ impl KokoroOutput {
         };
         let speed = self.speed();
 
+        self.ensure_loaded().await?;
         let mut engine_guard = self.engine.write().await;
-        if engine_guard.is_none() {
-            let path = self.model_path.read().await.clone();
-            let threads = self.config.intra_threads;
-            // Bounded: with `load-dynamic` and no dylib, ort's init hangs rather than failing.
-            let loaded = tokio::time::timeout(
-                LOAD_TIMEOUT,
-                tokio::task::spawn_blocking(move || Engine::load(&path, threads)),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Kokoro model load timed out after {}s — the ONNX Runtime library is \
-                     probably missing or version-incompatible",
-                    LOAD_TIMEOUT.as_secs()
-                )
-            })?
-            .context("Kokoro model load panicked")??;
-            *engine_guard = Some(loaded);
-        }
         let engine = engine_guard.as_mut().expect("engine was just loaded above");
 
         let mut samples = Vec::new();
@@ -351,7 +362,7 @@ pub fn host_default_quality() -> &'static str {
     if aarch64_linux() {
         "q4f16"
     } else {
-        "q8"
+        "q8f16"
     }
 }
 
@@ -498,8 +509,8 @@ mod tests {
 
     #[test]
     fn the_silent_tier_is_never_selected_on_aarch64() {
-        assert_ne!(host_default_quality(), "q8f16");
         if aarch64_linux() {
+            assert_ne!(host_default_quality(), "q8f16");
             assert_eq!(usable_quality("q8f16"), "q4f16");
         } else {
             assert_eq!(usable_quality("q8f16"), "q8f16");
@@ -508,16 +519,16 @@ mod tests {
 
     #[test]
     fn a_default_tier_is_replaced_by_a_host_that_needs_a_different_one() {
-        assert_eq!(tier_to_adopt_for("q4f16", "q8", "q8"), Some("q4f16"));
-        assert_eq!(tier_to_adopt_for("q4f16", "", "q8"), Some("q4f16"));
-        assert_eq!(tier_to_adopt_for("q4f16", "  ", "q8"), Some("q4f16"));
+        assert_eq!(tier_to_adopt_for("q4f16", "q8f16", "q8f16"), Some("q4f16"));
+        assert_eq!(tier_to_adopt_for("q4f16", "", "q8f16"), Some("q4f16"));
+        assert_eq!(tier_to_adopt_for("q4f16", "  ", "q8f16"), Some("q4f16"));
     }
 
     #[test]
     fn a_chosen_tier_is_never_overwritten() {
-        for chosen in ["fp32", "fp16", "q4", "q8f16"] {
+        for chosen in ["fp32", "fp16", "q4", "q8"] {
             assert_eq!(
-                tier_to_adopt_for("q4f16", chosen, "q8"),
+                tier_to_adopt_for("q4f16", chosen, "q8f16"),
                 None,
                 "{chosen} is a choice, not a default"
             );
@@ -527,16 +538,16 @@ mod tests {
     /// A redundant write every boot would make `updated_at` stop meaning a household change.
     #[test]
     fn adopting_is_a_no_op_once_it_has_happened() {
-        assert_eq!(tier_to_adopt_for("q4f16", "q4f16", "q8"), None);
-        assert_eq!(tier_to_adopt(host_default_quality(), "q8"), None);
+        assert_eq!(tier_to_adopt_for("q4f16", "q4f16", "q8f16"), None);
+        assert_eq!(tier_to_adopt(host_default_quality(), "q8f16"), None);
     }
 
     #[test]
     fn the_wrapper_passes_this_hosts_tier_through() {
         for stored in ["", "q8", "fp32", "q4f16"] {
             assert_eq!(
-                tier_to_adopt(stored, "q8"),
-                tier_to_adopt_for(host_default_quality(), stored, "q8"),
+                tier_to_adopt(stored, "q8f16"),
+                tier_to_adopt_for(host_default_quality(), stored, "q8f16"),
                 "wrapper disagreed for stored={stored:?}"
             );
         }

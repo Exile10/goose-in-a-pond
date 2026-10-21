@@ -947,7 +947,7 @@ impl Settings {
         1.0
     }
     fn default_tts_quality() -> String {
-        "q8".to_string()
+        "q8f16".to_string()
     }
     /// A one-time 2 MB download beats shipping a detector that can't tell a fridge from a voice.
     fn default_vad_backend() -> String {
