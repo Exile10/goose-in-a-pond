@@ -11880,9 +11880,12 @@ name = "pond-audio-out"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "futures",
  "pond-core",
  "pond-voice",
  "rodio",
+ "tokio",
  "tracing",
 ]
 

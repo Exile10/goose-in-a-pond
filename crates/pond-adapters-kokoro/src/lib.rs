@@ -7,6 +7,7 @@ use pond_audio_out::{play_wav_on, start_thinking_tone_thread, Speaker, TONE_OFF}
 use pond_core::models::ports::voice_output::VoiceOutput;
 use pond_core::shared::domain::agent::ThrottledAudioLevelSink;
 use pond_voice::dsp::{encode_wav_pcm16, f32_to_pcm16};
+use pond_voice::text::split_speech_units;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -279,11 +280,68 @@ impl KokoroOutput {
 #[async_trait]
 impl VoiceOutput for KokoroOutput {
     async fn speak(&self, text: &str) -> Result<()> {
-        let wav = self.synth_wav(text).await?;
-        if wav.is_empty() {
+        let (units, remainder) = split_speech_units(text, true);
+        let mut all_units = units;
+        let remainder = remainder.trim();
+        if !remainder.is_empty() {
+            all_units.push(remainder.to_string());
+        }
+        if all_units.is_empty() {
             return Ok(());
         }
-        self.play_audio(wav).await
+        if all_units.len() == 1 {
+            let wav = self.synth_wav(&all_units[0]).await?;
+            if !wav.is_empty() {
+                self.play_audio(wav).await?;
+            }
+            return Ok(());
+        }
+
+        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let speaker = self.speaker.clone();
+        let interrupted = self.speech_interrupted.clone();
+        let utterance = self.utterance.clone();
+        let sink = self.audio_level_sink.clone();
+        let playing = self.playing.clone();
+
+        let playback_handle = tokio::spawn(async move {
+            while let Some(audio) = audio_rx.recv().await {
+                if audio.is_empty() {
+                    continue;
+                }
+                if interrupted.load(Ordering::Relaxed) {
+                    break;
+                }
+                let speaker = speaker.clone();
+                let interrupted = interrupted.clone();
+                let utterance = utterance.clone();
+                let sink = sink.clone();
+                let playing = Playing::start(&playing);
+                let res = tokio::task::spawn_blocking(move || {
+                    let _playing = playing;
+                    play_wav_on(audio, &speaker, &interrupted, &utterance, sink.as_deref())
+                })
+                .await;
+                if res.is_err() {
+                    break;
+                }
+            }
+        });
+
+        for unit in all_units {
+            if self.speech_interrupted.load(Ordering::Relaxed) {
+                break;
+            }
+            let wav = self.synth_wav(&unit).await?;
+            if !wav.is_empty() {
+                if audio_tx.send(wav).await.is_err() {
+                    break;
+                }
+            }
+        }
+        drop(audio_tx);
+        let _ = playback_handle.await;
+        Ok(())
     }
 
     async fn synthesize(&self, text: &str) -> Result<Option<Vec<u8>>> {

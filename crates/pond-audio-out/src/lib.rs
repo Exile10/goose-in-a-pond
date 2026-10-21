@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod bus;
 pub mod route;
+pub use bus::AudioBus;
 pub use route::{output_device, set_output_device};
 
 // ── Working tone ──────────────────────────────────────────────────────────────

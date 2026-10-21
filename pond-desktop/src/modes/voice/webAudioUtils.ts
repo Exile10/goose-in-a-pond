@@ -285,6 +285,79 @@ const ABBREV_RE = /(?:Mr|Mrs|Ms|Dr|Prof|St|Jr|Sr|vs|etc|approx|dept|govt)\./i;
 const MAX_SENTENCE_CHARS = 250;
 
 /**
+ * Split speakable units out of a streaming buffer, returning `[units, remainder]`.
+ * Port of `split_speech_units` in `crates/pond-voice/src/text.rs`.
+ *
+ * When `allowClauses` is true, clause marks (`,`, `;`, `:`, `—`) split if at least
+ * 4 words have accumulated.
+ */
+export function splitSpeechUnits(text: string, allowClauses: boolean = true): [string[], string] {
+  const MAX_BUF = 250;
+  const MIN_CLAUSE_WORDS = 4;
+  const units: string[] = [];
+  let remainder = text;
+
+  while (true) {
+    if (remainder.length > MAX_BUF) {
+      const splitAt = remainder.slice(0, MAX_BUF).lastIndexOf(" ");
+      if (splitAt !== -1) {
+        units.push(remainder.slice(0, splitAt));
+        remainder = remainder.slice(splitAt + 1);
+        continue;
+      }
+    }
+
+    let found = false;
+    for (let i = 0; i < remainder.length; i++) {
+      const ch = remainder[i];
+      const isTerminal = ch === "." || ch === "?" || ch === "!";
+      const isClause = allowClauses && (ch === "," || ch === ";" || ch === ":" || ch === "—");
+
+      if (isTerminal || isClause) {
+        const prefix = remainder.slice(0, i);
+        if (ch === ",") {
+          const prevIsDigit = /\d$/.test(prefix);
+          const nextIsDigit = /^\d/.test(remainder.slice(i + 1));
+          if (prevIsDigit && nextIsDigit) {
+            continue;
+          }
+        }
+
+        if (isClause) {
+          const wordCount = prefix.trim().split(/\s+/).filter(Boolean).length;
+          if (wordCount < MIN_CLAUSE_WORDS) {
+            continue;
+          }
+        }
+
+        const next = i + 1;
+        const after = remainder.slice(next);
+        if (after.length === 0 || after.startsWith(" ") || after.startsWith("\n")) {
+          units.push(remainder.slice(0, next));
+          remainder = after.replace(/^[ \n]+/, "");
+          found = true;
+          break;
+        }
+      } else if (ch === "\n") {
+        const chunk = remainder.slice(0, i).trim();
+        if (chunk.length > 0) {
+          units.push(chunk);
+        }
+        remainder = remainder.slice(i + 1);
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      break;
+    }
+  }
+
+  return [units, remainder];
+}
+
+/**
  * Sentences for incremental TTS, not split at common abbreviations; force-flushed at MAX_SENTENCE_CHARS
  * so code or lists can't pile up. Port of `split_sentences` in `crates/pond-voice/src/text.rs`.
  */
