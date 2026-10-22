@@ -4,7 +4,8 @@
 // independent entry point that simply doesn't render below the width those panels use.
 
 import { useState, type FormEvent } from "react";
-import { HubIco, micEl } from "../primitives/HubIco";
+import { HubIco } from "../primitives/HubIco";
+import { micEl } from "../primitives/icons";
 import "./home-composer.css";
 
 export interface HomeComposerProps {
