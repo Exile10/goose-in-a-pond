@@ -300,10 +300,10 @@ export function splitSpeechUnits(text: string, allowClauses: boolean = true): [s
 
   while (true) {
     if (remainder.length > MAX_BUF) {
-      const splitAt = remainder.slice(0, MAX_BUF).lastIndexOf(" ");
-      if (splitAt !== -1) {
-        units.push(remainder.slice(0, splitAt));
-        remainder = remainder.slice(splitAt + 1);
+      const match = remainder.slice(0, MAX_BUF).match(/\s\S*$/);
+      if (match && match.index !== undefined) {
+        units.push(remainder.slice(0, match.index).trim());
+        remainder = remainder.slice(match.index).replace(/^\s+/, "");
         continue;
       }
     }
@@ -355,22 +355,35 @@ export function splitSpeechUnits(text: string, allowClauses: boolean = true): [s
         const next = i + 1;
         const after = remainder.slice(next);
         const isBoundary = isClause
-          ? (after.startsWith(" ") || after.startsWith("\n"))
-          : (after.length === 0 || after.startsWith(" ") || after.startsWith("\n"));
+          ? /^\s/.test(after)
+          : (after.length === 0 || /^\s/.test(after));
         if (isBoundary) {
           units.push(remainder.slice(0, next));
-          remainder = after.replace(/^[ \n]+/, "");
+          remainder = after.replace(/^\s+/, "");
           found = true;
           break;
         }
       } else if (ch === "\n") {
-        const chunk = remainder.slice(0, i).trim();
-        if (chunk.length > 0) {
-          units.push(chunk);
+        const prefix = remainder.slice(0, i).trim();
+        if (prefix.length === 0) {
+          remainder = remainder.slice(i + 1).replace(/^\s+/, "");
+          found = true;
+          break;
         }
-        remainder = remainder.slice(i + 1);
-        found = true;
-        break;
+
+        const wordCount = prefix.split(/\s+/).filter(Boolean).length;
+        if (wordCount < MIN_CLAUSE_WORDS) {
+          continue;
+        }
+
+        const after = remainder.slice(i + 1);
+        const isParagraphBreak = /^\r?\n|^\s*\n/.test(after);
+        if (isParagraphBreak) {
+          units.push(prefix);
+          remainder = after.replace(/^\s+/, "");
+          found = true;
+          break;
+        }
       }
     }
 

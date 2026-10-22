@@ -153,10 +153,14 @@ pub fn phonemize(text: &str) -> Result<String> {
                 text: run,
                 leading_space,
             } => {
+                let clean_run: String = run.split_whitespace().collect::<Vec<_>>().join(" ");
+                if clean_run.is_empty() {
+                    continue;
+                }
                 let spoken = {
                     // Ignore poisoning: the lock guards no data of ours.
                     let _guard = ESPEAK.lock().unwrap_or_else(|e| e.into_inner());
-                    espeak_rs::text_to_phonemes(run, "en-us", None)
+                    espeak_rs::text_to_phonemes(&clean_run, "en-us", None)
                         .map_err(|e| anyhow!("espeak phonemization failed: {e}"))?
                 }
                 .join(" ");

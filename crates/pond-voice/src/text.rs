@@ -63,11 +63,13 @@ pub fn split_speech_units(text: &str, allow_clauses: bool) -> (Vec<String>, Stri
     let mut remainder = text.to_string();
 
     loop {
-        // Force-flush at max buffer: break at last space within the limit
+        // Force-flush at max buffer: break at last whitespace within the limit
         if remainder.len() > MAX_BUF {
-            if let Some(split_at) = remainder[..MAX_BUF].rfind(' ') {
-                units.push(remainder[..split_at].to_string());
-                remainder = remainder[split_at + 1..].to_string();
+            if let Some(split_at) = remainder[..MAX_BUF].rfind(|c: char| c.is_whitespace()) {
+                units.push(remainder[..split_at].trim().to_string());
+                remainder = remainder[split_at..]
+                    .trim_start_matches(|c: char| c.is_whitespace())
+                    .to_string();
                 continue;
             }
         }
@@ -130,27 +132,46 @@ pub fn split_speech_units(text: &str, allow_clauses: bool) -> (Vec<String>, Stri
                 let next = i + ch.len_utf8();
                 let after = &remainder[next..];
                 let is_boundary = if is_clause {
-                    after.starts_with(' ') || after.starts_with('\n')
+                    after.chars().next().map_or(false, |c| c.is_whitespace())
                 } else {
-                    after.is_empty() || after.starts_with(' ') || after.starts_with('\n')
+                    after.is_empty() || after.chars().next().map_or(false, |c| c.is_whitespace())
                 };
                 if is_boundary {
                     units.push(remainder[..next].to_string());
                     remainder = after
-                        .trim_start_matches(|c: char| c == ' ' || c == '\n')
+                        .trim_start_matches(|c: char| c.is_whitespace())
                         .to_string();
                     found = true;
                     break;
                 }
             } else if ch == '\n' {
-                let chunk = remainder[..i].trim().to_string();
-                if !chunk.is_empty() {
-                    units.push(chunk);
+                let prefix = remainder[..i].trim();
+                if prefix.is_empty() {
+                    remainder = remainder[i + 1..]
+                        .trim_start_matches(|c: char| c.is_whitespace())
+                        .to_string();
+                    found = true;
+                    break;
                 }
-                let next = i + 1;
-                remainder = remainder[next..].to_string();
-                found = true;
-                break;
+
+                let word_count = prefix.split_whitespace().count();
+                if word_count < MIN_CLAUSE_WORDS {
+                    continue;
+                }
+
+                let after = &remainder[i + 1..];
+                let is_paragraph_break = after.starts_with('\n')
+                    || after.starts_with("\r\n")
+                    || (after.starts_with(' ') && after.trim_start_matches(' ').starts_with('\n'));
+
+                if is_paragraph_break {
+                    units.push(prefix.to_string());
+                    remainder = after
+                        .trim_start_matches(|c: char| c.is_whitespace())
+                        .to_string();
+                    found = true;
+                    break;
+                }
             }
         }
 
@@ -1113,6 +1134,39 @@ mod tests {
         let (units, remainder) = split_speech_units(partial, true);
         assert!(units.is_empty());
         assert_eq!(remainder, "I would be glad to help with that,");
+    }
+
+    #[test]
+    fn split_speech_units_does_not_split_short_header_or_single_newline() {
+        let text = "Weather Updates\nThe temperature is 25.3 degrees Celsius.";
+        let (units, remainder) = split_speech_units(text, true);
+        assert_eq!(
+            units,
+            vec!["Weather Updates\nThe temperature is 25.3 degrees Celsius."]
+        );
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_collapses_huge_whitespace_and_tabs_at_boundary() {
+        let text = "First sentence.\t\t\n\n   Second sentence.";
+        let (units, remainder) = split_speech_units(text, false);
+        assert_eq!(units, vec!["First sentence.", "Second sentence."]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_splits_paragraph_break_when_words_sufficient() {
+        let text = "This is a long introductory paragraph without period\n\nSecond paragraph.";
+        let (units, remainder) = split_speech_units(text, false);
+        assert_eq!(
+            units,
+            vec![
+                "This is a long introductory paragraph without period",
+                "Second paragraph."
+            ]
+        );
+        assert_eq!(remainder, "");
     }
 
     #[test]

@@ -61,6 +61,30 @@ describe("splitSpeechUnits", () => {
     ]);
     expect(rem).toBe("");
   });
+
+  it("does not split on short unpunctuated header or single newline", () => {
+    const text = "Weather Updates\nThe temperature is 25.3 degrees Celsius.";
+    const [units, rem] = splitSpeechUnits(text, true);
+    expect(units).toEqual(["Weather Updates\nThe temperature is 25.3 degrees Celsius."]);
+    expect(rem).toBe("");
+  });
+
+  it("collapses huge whitespace and tabs at boundary", () => {
+    const text = "First sentence.\t\t\n\n   Second sentence.";
+    const [units, rem] = splitSpeechUnits(text, false);
+    expect(units).toEqual(["First sentence.", "Second sentence."]);
+    expect(rem).toBe("");
+  });
+
+  it("splits paragraph break when word count is sufficient", () => {
+    const text = "This is a long introductory paragraph without period\n\nSecond paragraph.";
+    const [units, rem] = splitSpeechUnits(text, false);
+    expect(units).toEqual([
+      "This is a long introductory paragraph without period",
+      "Second paragraph."
+    ]);
+    expect(rem).toBe("");
+  });
 });
 
 describe("normalizeForSpeech", () => {
