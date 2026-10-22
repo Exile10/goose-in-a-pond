@@ -114,7 +114,9 @@ impl Vocab {
 
 /// Punctuation in Kokoro's vocab, kept because misaki (its reference G2P) keeps it as prosody.
 /// `$` is omitted: `normalize_for_speech` spells out currency first.
-const PROSODY_PUNCT: &[char] = &['.', ',', '!', '?', ';', ':', '"', '(', ')'];
+const PROSODY_PUNCT: &[char] = &[
+    '.', ',', '!', '?', ';', ':', '"', '(', ')', '—', '…', '“', '”',
+];
 
 /// Phonemize `text`, keeping the punctuation espeak throws away.
 ///
@@ -153,7 +155,13 @@ pub fn phonemize(text: &str) -> Result<String> {
                 text: run,
                 leading_space,
             } => {
-                let clean_run: String = run.split_whitespace().collect::<Vec<_>>().join(" ");
+                let clean_run: String = run
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 if clean_run.is_empty() {
                     continue;
                 }
@@ -174,7 +182,12 @@ pub fn phonemize(text: &str) -> Result<String> {
                 }
                 out.push_str(spoken);
             }
-            Segment::Punct(c) => out.push(c),
+            Segment::Punct { ch, leading_space } => {
+                if leading_space && !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                out.push(ch);
+            }
         }
     }
 
@@ -184,7 +197,7 @@ pub fn phonemize(text: &str) -> Result<String> {
 /// One run of the source: speech to be phonemized, or a mark to be kept.
 enum Segment<'a> {
     Speech { text: &'a str, leading_space: bool },
-    Punct(char),
+    Punct { ch: char, leading_space: bool },
 }
 
 /// Split into speech and `PROSODY_PUNCT` runs; apostrophes and hyphens stay in the word.
@@ -200,9 +213,12 @@ fn segments(text: &str) -> Vec<Segment<'_>> {
                     text: &text[start..i],
                     leading_space,
                 });
+                leading_space = false;
             }
-            out.push(Segment::Punct(c));
-            // Whitespace after the mark, if any, sets this again below.
+            out.push(Segment::Punct {
+                ch: c,
+                leading_space,
+            });
             leading_space = false;
         } else if run_start.is_none() {
             if c.is_whitespace() {
@@ -226,7 +242,14 @@ fn segments(text: &str) -> Vec<Segment<'_>> {
 pub fn chunk(text: &str, vocab: &Vocab) -> Result<(Vec<Chunk>, usize)> {
     let mut out = Vec::new();
 
-    let phonemized = phonemize(text)?;
+    let normalized = pond_voice::text::strip_markdown_for_speech(text);
+    let target = if normalized.trim().is_empty() {
+        text
+    } else {
+        &normalized
+    };
+
+    let phonemized = phonemize(target)?;
     let (ids, kept, dropped) = vocab.encode(&phonemized);
     if ids.is_empty() {
         return Ok((out, dropped));
@@ -479,5 +502,57 @@ mod tests {
             entries.join(",")
         ))
         .expect("test vocab")
+    }
+
+    #[test]
+    fn stress_test_real_world_inputs() {
+        let Ok(vocab) = Vocab::load(std::path::Path::new("testdata/tokenizer.json")) else {
+            return;
+        };
+
+        let cases = [
+            "Good morning! Here is your daily brief.",
+            "Good morning — here is your daily brief.",
+            "Good morning – here is your daily brief.",
+            "🌤️ Weather: Sunny, 22°C with a 10% chance of rain.",
+            "• Calendar: 10:00 AM standup, 2:30 PM review.",
+            "Tasks:\n- [ ] Fix Kokoro TTS\n- [x] Test on Jetson",
+            "1. First item: review PR #42 (priority: high)",
+            "Wait... let me see… okay!",
+            "“Smart quotes” and ‘single quotes’ and normal \"quotes\".",
+            "He said: (whispering) don't tell anyone!",
+            "Price is $1,250.50 or KES 150,000.",
+            "Speed was 120km/h and power was 3.5kW.",
+            "Visit https://github.com/example/repo for more info.",
+            "Error: file /tmp/test.log not found; exit code: 1.",
+            "café and résumé",
+            "3–5 days, ±2 degrees, 50% off.",
+        ];
+
+        let weird_cases = [
+            "🌤️ Sunny and warm! 🎉",
+            "Status: ✅ Complete and ❌ Failed",
+            "Equation: ∑(x) ≈ √y ≠ z",
+            "Zero width: a\u{200b}b\u{feff}c\u{a0}d",
+            "Control chars: \u{0000}\u{0007}\u{001b}test",
+            "Only symbols: @#$%^&*()_+",
+            "Only punctuation: ... --- !!! ???",
+            "Chinese: 你好世界",
+            "Arabic: مرحبا بالعالم",
+            "Russian: Привет мир",
+        ];
+
+        for case in cases {
+            let res = chunk(case, &vocab);
+            assert!(res.is_ok(), "failed to chunk {case:?}: {:?}", res.err());
+            let (chunks, dropped) = res.unwrap();
+            assert!(!chunks.is_empty(), "empty chunks for {case:?}");
+            assert_eq!(dropped, 0, "dropped phonemes for {case:?}");
+        }
+
+        for case in weird_cases {
+            let res = chunk(case, &vocab);
+            assert!(res.is_ok(), "failed to chunk weird case {case:?}: {:?}", res.err());
+        }
     }
 }

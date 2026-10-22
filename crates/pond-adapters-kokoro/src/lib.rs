@@ -280,6 +280,7 @@ impl KokoroOutput {
 #[async_trait]
 impl VoiceOutput for KokoroOutput {
     async fn speak(&self, text: &str) -> Result<()> {
+        self.begin_utterance();
         let (units, remainder) = split_speech_units(text, true);
         let mut all_units = units;
         let remainder = remainder.trim();

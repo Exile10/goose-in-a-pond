@@ -247,13 +247,18 @@ pub fn strip_line_prefix(line: &str) -> &str {
     if let Some(rest) = line.strip_prefix("> ").or_else(|| line.strip_prefix('>')) {
         return rest.trim_start();
     }
-    // Unordered lists: - / * / +
+    // Unordered lists: - / * / + / •
     if let Some(rest) = line
         .strip_prefix("- ")
         .or_else(|| line.strip_prefix("* "))
         .or_else(|| line.strip_prefix("+ "))
+        .or_else(|| line.strip_prefix("• "))
     {
-        return rest;
+        return rest
+            .strip_prefix("[ ] ")
+            .or_else(|| rest.strip_prefix("[x] "))
+            .or_else(|| rest.strip_prefix("[X] "))
+            .unwrap_or(rest);
     }
     // Ordered lists: 1. 2. 10. etc.
     let bytes = line.as_bytes();
@@ -262,7 +267,12 @@ pub fn strip_line_prefix(line: &str) -> &str {
         i += 1;
     }
     if i > 0 && bytes.get(i) == Some(&b'.') && bytes.get(i + 1) == Some(&b' ') {
-        return &line[i + 2..];
+        let rest = &line[i + 2..];
+        return rest
+            .strip_prefix("[ ] ")
+            .or_else(|| rest.strip_prefix("[x] "))
+            .or_else(|| rest.strip_prefix("[X] "))
+            .unwrap_or(rest);
     }
     line
 }
@@ -910,20 +920,37 @@ pub fn try_read_unit_suffix(chars: &[char], i: usize) -> Option<(String, usize)>
 /// Scan a decimal number at `start`, returning `(text, chars_consumed)`; `("", 0)` if none.
 pub fn read_number(chars: &[char], start: usize) -> (String, usize) {
     let mut j = start;
-    while j < chars.len() && chars[j].is_ascii_digit() {
-        j += 1;
+    let mut num_str = String::new();
+    while j < chars.len() {
+        if chars[j].is_ascii_digit() {
+            num_str.push(chars[j]);
+            j += 1;
+        } else if chars[j] == ','
+            && j > start
+            && chars[j - 1].is_ascii_digit()
+            && chars.get(j + 1).map_or(false, |c| c.is_ascii_digit())
+            && chars.get(j + 2).map_or(false, |c| c.is_ascii_digit())
+            && chars.get(j + 3).map_or(false, |c| c.is_ascii_digit())
+            && (j + 4 >= chars.len() || !chars[j + 4].is_ascii_digit() || chars[j + 4] == '.' || chars[j + 4] == ',')
+        {
+            // Thousands separator comma between digits: e.g. 1,000 or 1,250,000
+            j += 1;
+        } else {
+            break;
+        }
     }
     if chars.get(j) == Some(&'.') && chars.get(j + 1).map_or(false, |c| c.is_ascii_digit()) {
+        num_str.push('.');
         j += 1;
         while j < chars.len() && chars[j].is_ascii_digit() {
+            num_str.push(chars[j]);
             j += 1;
         }
     }
     if j == start {
         return (String::new(), 0);
     }
-    let s: String = chars[start..j].iter().collect();
-    (s, j - start)
+    (num_str, j - start)
 }
 
 /// Parse a time like `3:45pm`, `15:30` or `9am` at `start`, returning `(spoken, consumed)`.
@@ -1252,6 +1279,15 @@ mod tests {
     }
 
     #[test]
+    fn markdown_checkboxes_stripped() {
+        let md = "- [ ] Unfinished task\n- [x] Finished task\n1. [ ] Ordered task";
+        assert_eq!(
+            strip_markdown_for_speech(md),
+            "Unfinished task Finished task Ordered task"
+        );
+    }
+
+    #[test]
     fn markdown_hr_dropped() {
         assert_eq!(
             strip_markdown_for_speech("before\n---\nafter"),
@@ -1340,6 +1376,22 @@ mod tests {
         assert_eq!(
             normalize_for_speech("That costs $50"),
             "That costs 50 dollars"
+        );
+    }
+
+    #[test]
+    fn normalize_dollars_with_commas() {
+        assert_eq!(
+            normalize_for_speech("Price: $1,250.50"),
+            "Price: 1250.50 dollars"
+        );
+    }
+
+    #[test]
+    fn normalize_kenyan_currency_with_commas() {
+        assert_eq!(
+            normalize_for_speech("around KES 150,000"),
+            "around 150000 Kenyan shillings"
         );
     }
 
