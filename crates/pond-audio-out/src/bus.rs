@@ -47,7 +47,7 @@ impl AudioBus {
 
     /// Deliver text speech units, optionally waiting for speaker playback to finish.
     pub async fn speak_text(&self, text: &str, wait_for_playback: bool) -> Result<()> {
-        let (units, remainder) = split_speech_units(text, false);
+        let (units, remainder) = split_speech_units(text, true);
         let mut all_units = units;
         let remainder = remainder.trim();
         if !remainder.is_empty() {
@@ -179,7 +179,6 @@ impl AudioBus {
 
         let mut full_text = String::new();
         let mut sentence_buf = String::new();
-        let mut first_unit = true;
 
         while let Some(event_result) = stream.next().await {
             match event_result? {
@@ -187,10 +186,9 @@ impl AudioBus {
                     full_text.push_str(&content);
                     sentence_buf.push_str(&content);
 
-                    let (units, remainder) = split_speech_units(&sentence_buf, first_unit);
+                    let (units, remainder) = split_speech_units(&sentence_buf, true);
                     sentence_buf = remainder;
                     for unit in units {
-                        first_unit = false;
                         let clean = unit.trim().to_string();
                         if !clean.is_empty() && speech_tx.send(clean).await.is_err() {
                             break;

@@ -121,9 +121,9 @@ impl Engine {
                 .map_err(|e| anyhow!("failed to set ort intra-op threads to {n}: {e}"))?;
         }
         builder = builder
-            .with_memory_pattern(false)
-            .map_err(|e| anyhow!("failed to disable ort memory pattern: {e}"))?;
-        let cpu = ort::ep::CPU::default().with_arena_allocator(false).build();
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow!("failed to set ort optimization level: {e}"))?;
+        let cpu = ort::ep::CPU::default().build();
         builder = builder
             .with_execution_providers([cpu])
             .map_err(|e| anyhow!("failed to set ort cpu execution provider: {e}"))?;
