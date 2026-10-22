@@ -597,9 +597,9 @@ export class PondApiClient {
   }
 
   /**
-   * Waits for the pond to join. A wrong passphrase answers 401, which `send` would take for an
-   * expired token, re-pair and then repeat the join with the passphrase, so the retry is made
-   * here and only for a 401 that is not that refusal.
+   * Waits for the pond to join. A wrong passphrase answers 422 since contract v1.2, but a v1.1 pond
+   * answers 401, which `send` would take for an expired token, re-pair and then repeat the join with
+   * the passphrase, so the retry is made here and only for a 401 that is not that refusal.
    */
   async joinWifi(req: WifiJoinRequest): Promise<WifiJoinResult> {
     const headers = await this.hostHeaders();

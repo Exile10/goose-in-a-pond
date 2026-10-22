@@ -351,7 +351,8 @@ fn scan_status(error: WifiScanError) -> StatusCode {
 
 fn join_status(error: WifiJoinError) -> StatusCode {
     match error {
-        WifiJoinError::WrongPassword => StatusCode::UNAUTHORIZED,
+        // Not 401: every client reads 401 as an expired token and would re-pair, then resend.
+        WifiJoinError::WrongPassword => StatusCode::UNPROCESSABLE_ENTITY,
         WifiJoinError::NotFound => StatusCode::NOT_FOUND,
         WifiJoinError::NoAddress => StatusCode::BAD_GATEWAY,
         WifiJoinError::Timeout => StatusCode::GATEWAY_TIMEOUT,
