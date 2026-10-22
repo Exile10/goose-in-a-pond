@@ -2,6 +2,56 @@
 //!
 //! TypeScript ports of these functions live under `pond-desktop/src/`; keep them in step.
 
+fn is_abbrev_suffix(prefix: &str) -> bool {
+    let Some(last) = prefix.split_whitespace().next_back() else {
+        return false;
+    };
+    let clean = last.trim_start_matches(|c: char| !c.is_alphanumeric());
+    if clean.is_empty() {
+        return false;
+    }
+    let lower = clean.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "dr" | "mr"
+            | "mrs"
+            | "ms"
+            | "prof"
+            | "st"
+            | "jr"
+            | "sr"
+            | "vs"
+            | "etc"
+            | "approx"
+            | "dept"
+            | "govt"
+            | "inc"
+            | "ltd"
+            | "corp"
+            | "min"
+            | "max"
+            | "temp"
+            | "est"
+            | "jan"
+            | "feb"
+            | "mar"
+            | "apr"
+            | "jun"
+            | "jul"
+            | "aug"
+            | "sep"
+            | "sept"
+            | "oct"
+            | "nov"
+            | "dec"
+            | "e.g"
+            | "i.e"
+            | "u.s"
+            | "a.m"
+            | "p.m"
+    ) || (clean.len() == 1 && clean.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
 /// Split speakable units out of a streaming buffer, returning `(units, remainder)`.
 ///
 /// When `allow_clauses` is true, clause marks (`,`, `;`, `:`, `—`) split if at least
@@ -42,6 +92,34 @@ pub fn split_speech_units(text: &str, allow_clauses: bool) -> (Vec<String>, Stri
                     }
                 }
 
+                if ch == ':' {
+                    let prev_is_digit =
+                        prefix.chars().next_back().is_some_and(|c| c.is_ascii_digit());
+                    let next_is_digit = remainder[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit());
+                    if prev_is_digit && next_is_digit {
+                        continue;
+                    }
+                }
+
+                if ch == '.' {
+                    let prev_is_digit =
+                        prefix.chars().next_back().is_some_and(|c| c.is_ascii_digit());
+                    let next_is_digit = remainder[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit());
+                    let after_is_empty = remainder[i + 1..].is_empty();
+                    if prev_is_digit && (next_is_digit || after_is_empty) {
+                        continue;
+                    }
+                    if is_abbrev_suffix(prefix) {
+                        continue;
+                    }
+                }
+
                 if is_clause {
                     let word_count = prefix.split_whitespace().count();
                     if word_count < MIN_CLAUSE_WORDS {
@@ -51,7 +129,12 @@ pub fn split_speech_units(text: &str, allow_clauses: bool) -> (Vec<String>, Stri
 
                 let next = i + ch.len_utf8();
                 let after = &remainder[next..];
-                if after.is_empty() || after.starts_with(' ') || after.starts_with('\n') {
+                let is_boundary = if is_clause {
+                    after.starts_with(' ') || after.starts_with('\n')
+                } else {
+                    after.is_empty() || after.starts_with(' ') || after.starts_with('\n')
+                };
+                if is_boundary {
                     units.push(remainder[..next].to_string());
                     remainder = after
                         .trim_start_matches(|c: char| c == ' ' || c == '\n')
@@ -395,6 +478,13 @@ pub const UNIT_SUFFIXES: &[(&str, &str)] = &[
     ("lb", " pounds"),
     ("oz", " ounces"),
     ("st", " stone"),
+    // ── Currency ──
+    ("KES", " Kenyan shillings"),
+    ("kes", " Kenyan shillings"),
+    ("KSh", " Kenyan shillings"),
+    ("Ksh", " Kenyan shillings"),
+    ("ksh", " Kenyan shillings"),
+    ("KSH", " Kenyan shillings"),
     // ── Volume ──
     ("mL", " milliliters"),
     ("dL", " deciliters"),
@@ -596,6 +686,34 @@ pub fn normalize_for_speech(text: &str) -> String {
                 out.push_str(unit);
                 i += 1 + advance;
                 continue;
+            }
+        }
+
+        // ── Kenyan Currency Prefix: KSh / KES ──────────────────────────────────
+        if (ch == 'K' || ch == 'k') && (i == 0 || !chars[i - 1].is_alphabetic()) {
+            let window: String = chars[i..len.min(i + 4)].iter().collect();
+            let upper = window.to_ascii_uppercase();
+            if upper.starts_with("KSH") || upper.starts_with("KES") {
+                let code_len = 3;
+                let after = i + code_len;
+                let mut num_start = after;
+                if num_start < len && chars[num_start] == '.' {
+                    num_start += 1;
+                }
+                if num_start < len && chars[num_start] == ' ' {
+                    num_start += 1;
+                }
+                let (num_str, advance) = read_number(&chars, num_start);
+                if advance > 0 {
+                    out.push_str(&num_str);
+                    out.push_str(" Kenyan shillings");
+                    i = num_start + advance;
+                    continue;
+                } else if after >= len || !chars[after].is_alphabetic() {
+                    out.push_str("Kenyan shillings");
+                    i = if after < len && chars[after] == '.' { after + 1 } else { after };
+                    continue;
+                }
             }
         }
 
@@ -966,6 +1084,38 @@ mod tests {
     }
 
     #[test]
+    fn split_speech_units_does_not_split_numeric_decimals() {
+        let text = "The temperature is 25.3 degrees Celsius.";
+        let (units, remainder) = split_speech_units(text, true);
+        assert_eq!(units, vec!["The temperature is 25.3 degrees Celsius."]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_does_not_split_streaming_decimals() {
+        let partial = "The temperature is 25.";
+        let (units, remainder) = split_speech_units(partial, true);
+        assert!(units.is_empty());
+        assert_eq!(remainder, "The temperature is 25.");
+    }
+
+    #[test]
+    fn split_speech_units_does_not_split_abbreviations() {
+        let text = "Dr. Smith arrived at 7:30 a.m. today.";
+        let (units, remainder) = split_speech_units(text, true);
+        assert_eq!(units, vec!["Dr. Smith arrived at 7:30 a.m. today."]);
+        assert_eq!(remainder, "");
+    }
+
+    #[test]
+    fn split_speech_units_clauses_do_not_split_on_empty_tail() {
+        let partial = "I would be glad to help with that,";
+        let (units, remainder) = split_speech_units(partial, true);
+        assert!(units.is_empty());
+        assert_eq!(remainder, "I would be glad to help with that,");
+    }
+
+    #[test]
     fn split_sentences_ignores_clauses_even_when_long() {
         let text = "I would be glad to help with that, and here are the details.";
         let (sentences, remainder) = split_sentences(text);
@@ -1157,6 +1307,22 @@ mod tests {
     #[test]
     fn normalize_euros() {
         assert_eq!(normalize_for_speech("Costs €20"), "Costs 20 euros");
+    }
+
+    #[test]
+    fn normalize_kenyan_currency() {
+        assert_eq!(
+            normalize_for_speech("dollar to KSH conversion"),
+            "dollar to Kenyan shillings conversion"
+        );
+        assert_eq!(
+            normalize_for_speech("around 129.83 KES"),
+            "around 129.83 Kenyan shillings"
+        );
+        assert_eq!(
+            normalize_for_speech("costs KSh 130 per unit"),
+            "costs 130 Kenyan shillings per unit"
+        );
     }
 
     #[test]

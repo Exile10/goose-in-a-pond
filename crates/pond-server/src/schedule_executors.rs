@@ -120,9 +120,9 @@ impl AgentScheduleExecutor {
                 match self.agent.chat_stream(request.clone()).await {
                     Ok(stream) => {
                         tracing::info!("[scheduler] task {task_id}: streaming tokens into audio bus");
-                        let full_text = bus.speak_stream(stream, false).await?;
+                        let full_text = bus.speak_stream(stream, true).await?;
                         tracing::info!(
-                            "[scheduler] task {task_id} completed ({} chars, speech backgrounded)",
+                            "[scheduler] task {task_id} completed ({} chars, speech finished)",
                             full_text.len()
                         );
                         return Ok(full_text);
@@ -144,8 +144,8 @@ impl AgentScheduleExecutor {
 
         if should_speak {
             if let Some(bus) = &self.audio_bus {
-                tracing::info!("[scheduler] task {task_id}: speaking response aloud (backgrounded)");
-                if let Err(e) = bus.speak_text(&response.text, false).await {
+                tracing::info!("[scheduler] task {task_id}: speaking response aloud");
+                if let Err(e) = bus.speak_text(&response.text, true).await {
                     tracing::warn!("[scheduler] task {task_id}: TTS failed: {e}");
                 }
             }

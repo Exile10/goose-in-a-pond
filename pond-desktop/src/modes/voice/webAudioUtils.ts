@@ -281,7 +281,8 @@ export function playPingTone(): void {
 
 // ── Sentence Splitter ─────────────────────────────────────────────
 
-const ABBREV_RE = /(?:Mr|Mrs|Ms|Dr|Prof|St|Jr|Sr|vs|etc|approx|dept|govt)\./i;
+const ABBREV_RE = /(?:Mr|Mrs|Ms|Dr|Prof|St|Jr|Sr|vs|etc|approx|dept|govt|inc|ltd|corp|min|max|temp|est|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|e\.g|i\.e|u\.s|a\.m|p\.m)\./i;
+const ABBREV_WORD_RE = /^(?:dr|mr|mrs|ms|prof|st|jr|sr|vs|etc|approx|dept|govt|inc|ltd|corp|min|max|temp|est|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|e\.g|i\.e|u\.s|a\.m|p\.m)$/i;
 const MAX_SENTENCE_CHARS = 250;
 
 /**
@@ -323,6 +324,27 @@ export function splitSpeechUnits(text: string, allowClauses: boolean = true): [s
           }
         }
 
+        if (ch === ":") {
+          const prevIsDigit = /\d$/.test(prefix);
+          const nextIsDigit = /^\d/.test(remainder.slice(i + 1));
+          if (prevIsDigit && nextIsDigit) {
+            continue;
+          }
+        }
+
+        if (ch === ".") {
+          const prevIsDigit = /\d$/.test(prefix);
+          const nextIsDigit = /^\d/.test(remainder.slice(i + 1));
+          const afterIsEmpty = remainder.slice(i + 1).length === 0;
+          if (prevIsDigit && (nextIsDigit || afterIsEmpty)) {
+            continue;
+          }
+          const lastWord = prefix.trim().split(/\s+/).pop()?.replace(/^[^\w]+/, "") ?? "";
+          if (ABBREV_WORD_RE.test(lastWord) || /^[a-zA-Z]$/.test(lastWord)) {
+            continue;
+          }
+        }
+
         if (isClause) {
           const wordCount = prefix.trim().split(/\s+/).filter(Boolean).length;
           if (wordCount < MIN_CLAUSE_WORDS) {
@@ -332,7 +354,10 @@ export function splitSpeechUnits(text: string, allowClauses: boolean = true): [s
 
         const next = i + 1;
         const after = remainder.slice(next);
-        if (after.length === 0 || after.startsWith(" ") || after.startsWith("\n")) {
+        const isBoundary = isClause
+          ? (after.startsWith(" ") || after.startsWith("\n"))
+          : (after.length === 0 || after.startsWith(" ") || after.startsWith("\n"));
+        if (isBoundary) {
           units.push(remainder.slice(0, next));
           remainder = after.replace(/^[ \n]+/, "");
           found = true;
@@ -448,6 +473,9 @@ const SYMBOL_RULES: [RegExp, string][] = [
   [/\$(\d+(?:\.\d+)?)/g, "$1 dollars"],
   [/€(\d+(?:\.\d+)?)/g, "$1 euros"],
   [/£(\d+(?:\.\d+)?)/g, "$1 pounds"],
+  [/(\d+(?:\.\d+)?)\s*(?:KES|KSh|Ksh|ksh)/gi, "$1 Kenyan shillings"],
+  [/(?:KES|KSh|Ksh|ksh)\.?\s*(\d+(?:\.\d+)?)/gi, "$1 Kenyan shillings"],
+  [/\b(?:KES|KSH)\b/g, "Kenyan shillings"],
   // Abbreviations
   [/\be\.g\./gi, "for example"],
   [/\bi\.e\./gi, "that is"],
