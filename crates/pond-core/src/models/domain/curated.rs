@@ -144,12 +144,18 @@ pub fn for_record(record: &ModelRecord) -> Option<&'static CuratedModel> {
     find(&record.category, &record.name)
 }
 
-/// The size and hash a Hugging Face file must have: a pick, or a paired picture add-on.
+/// The size and hash a Hugging Face file must have: a pick, a drafter, or a paired picture add-on.
 pub fn file_pin(repo: &str, revision: &str, filename: &str) -> Option<FilePin> {
     if let Some(pick) = pinned(repo, revision, filename) {
         return Some(FilePin {
             size_bytes: pick.size_bytes,
             sha256: pick.sha256,
+        });
+    }
+    if let Some(drafter) = super::drafter::drafter_pin(repo, filename) {
+        return Some(FilePin {
+            size_bytes: drafter.size_bytes,
+            sha256: drafter.sha256,
         });
     }
     super::vision_pairing::encoder_pinned(repo, revision, filename).map(|spec| FilePin {
@@ -231,6 +237,21 @@ mod tests {
         let litert = find(&ModelCategory::Litert, "gemma-4-E2B-it.litertlm").unwrap();
         assert_eq!(litert.name(), litert.filename);
         assert!(super::super::litert::is_litert_model(litert.name()));
+    }
+
+    #[test]
+    fn file_pin_resolves_drafters() {
+        let pin = file_pin(
+            "unsloth/gemma-4-E2B-it-qat-GGUF",
+            "main",
+            "mtp-gemma-4-E2B-it.gguf",
+        )
+        .unwrap();
+        assert_eq!(pin.size_bytes, 59_235_648);
+        assert_eq!(
+            pin.sha256,
+            "586f2460b909008640981ec34060aa864e03c144fbabfb3173c4335087e4aae0"
+        );
     }
 
     #[test]
