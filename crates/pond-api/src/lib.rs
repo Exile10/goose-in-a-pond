@@ -358,17 +358,61 @@ pub fn spawn_prefix_prewarm(state: Arc<AppState>, voice_mode: bool) {
             let mut w = state.warmup.write().unwrap_or_else(|e| e.into_inner());
             *w = WarmupStatus {
                 phase: pond_core::models::ports::agent::WarmupPhase::Warming,
-                model,
+                model: model.clone(),
                 started_unix_ms: unix_ms(),
                 finished_unix_ms: None,
             };
         }
+        if let Some(sender) = state.notification_sender.as_ref() {
+            let notification = pond_core::mcp::ports::notification::Notification {
+                id: format!("warmup-{}", unix_ms()),
+                target: "broadcast".to_string(),
+                category: "info".to_string(),
+                title: "Pond is getting ready".to_string(),
+                body: "Precompiling prompt and tools into cache for fast inference.".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                data: Some(serde_json::json!({
+                    "kind": "pond_warmup",
+                    "state": "warming",
+                    "model": model,
+                })),
+            };
+            let _ = sender.broadcast(notification).await;
+        }
         let warm = state.warmup.clone();
+        let notif_sender = state.notification_sender.clone();
         let progress = Arc::new(move |phase: pond_core::models::ports::agent::WarmupPhase| {
             let mut w = warm.write().unwrap_or_else(|e| e.into_inner());
             use pond_core::models::ports::agent::WarmupPhase as P;
             if !matches!(phase, P::Warming) {
                 w.finished_unix_ms = Some(unix_ms());
+                if let Some(sender) = notif_sender.as_ref() {
+                    let is_ready = matches!(phase, P::Ready);
+                    let notification = pond_core::mcp::ports::notification::Notification {
+                        id: format!("warmup-{}", unix_ms()),
+                        target: "broadcast".to_string(),
+                        category: "info".to_string(),
+                        title: if is_ready {
+                            "Pond is ready".to_string()
+                        } else {
+                            "Pond ready (warm-up finished)".to_string()
+                        },
+                        body: if is_ready {
+                            "Prompt and tools are precompiled. Responses will be fast.".to_string()
+                        } else {
+                            "Warm-up complete.".to_string()
+                        },
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        data: Some(serde_json::json!({
+                            "kind": "pond_warmup",
+                            "state": if is_ready { "ready" } else { "finished" },
+                        })),
+                    };
+                    let sender_clone = sender.clone();
+                    tokio::spawn(async move {
+                        let _ = sender_clone.broadcast(notification).await;
+                    });
+                }
             }
             w.phase = phase;
         });

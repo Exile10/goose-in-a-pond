@@ -2716,6 +2716,22 @@ async fn drive_turn(
         }
     }
 
+    // ── Check if engine is warming up ───────────────────────────────────
+    {
+        let is_warming = {
+            let w = state.warmup.read().unwrap_or_else(|e| e.into_inner());
+            matches!(w.phase, pond_core::models::ports::agent::WarmupPhase::Warming)
+        };
+        if is_warming {
+            let status = serde_json::json!({
+                "type": "status",
+                "content": "Pond is getting ready (precompiling prompt & tools for fast responses)…"
+            })
+            .to_string();
+            run.push(status, false);
+        }
+    }
+
     let mut usage_prompt_tokens: u32 = 0;
     let mut usage_completion_tokens: u32 = 0;
     let mut turn_stats: Option<pond_core::shared::domain::turn_stats::TurnStats> = None;
@@ -5529,6 +5545,26 @@ async fn get_warmup(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut v = serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}));
     if let Some(obj) = v.as_object_mut() {
         obj.insert("elapsed_ms".into(), json!(elapsed_ms));
+        let (reason, message) = match &snapshot.phase {
+            pond_core::models::ports::agent::WarmupPhase::Warming => (
+                "Precompiling prompt & tools into KV cache for fast inference",
+                "The pond is getting ready (precompiling prompt prefix and tools for fast responses)...",
+            ),
+            pond_core::models::ports::agent::WarmupPhase::Ready => (
+                "Static prefix resident in KV cache",
+                "The pond is ready.",
+            ),
+            pond_core::models::ports::agent::WarmupPhase::Skipped { reason } => (
+                reason.as_str(),
+                "Warm-up skipped.",
+            ),
+            pond_core::models::ports::agent::WarmupPhase::Failed { reason } => (
+                reason.as_str(),
+                "Warm-up failed; first turn will prefill on-demand.",
+            ),
+        };
+        obj.insert("reason".into(), json!(reason));
+        obj.insert("message".into(), json!(message));
     }
     Json(v)
 }

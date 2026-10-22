@@ -519,8 +519,8 @@ pub fn device_window(gguf_path: Option<&Path>, chat_model: &str) -> DeviceWindow
         kv_kib_per_token,
     );
     if let Some(spec) = encoder_spec {
-        if is_vision_allowlisted(&spec.dir) && window < 8192 {
-            window = 8192;
+        if is_vision_allowlisted(&spec.dir) && window < 16384 {
+            window = 16384;
         }
     }
     DeviceWindow {
