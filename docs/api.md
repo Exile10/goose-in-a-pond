@@ -339,7 +339,7 @@ or undoes its connection.
 |---|---|
 | 200 | `{"ssid", "address", "https_port", "hostname"}` |
 | 400 | `invalid_request` (malformed body, SSID empty or over 32 bytes, passphrase empty or over 64 bytes) or `unsupported_security` (an enterprise network, refused from its scan entry before any attempt; the setup channel's `wifi_join` answers the same) |
-| 401 | `wrong_password` |
+| 422 | `wrong_password` (not 401, which clients take for an expired token; ponds before contract v1.2 answered 401) |
 | 403 | `not_allowed` (this caller) or `not_permitted` (the OS: no polkit grant) |
 | 404 | `not_found` |
 | 409 | `busy` |

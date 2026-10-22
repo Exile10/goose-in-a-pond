@@ -123,6 +123,16 @@ describe("joinWifi()", () => {
     expect(((await settled) as ApiError).status).toBe(408);
   });
 
+  it("reads a v1.2 pond's 422 wrong_password without re-pairing", async () => {
+    fetchMock.mockImplementation(async () => refusal(422, "wrong_password"));
+    const err = (await client().joinWifi(request).catch((e: unknown) => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(422);
+    expect(err.message).toBe("wrong_password");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(urlOf(0)).not.toContain("handshake");
+  });
+
   it("does not re-pair or send the passphrase twice when the pond says wrong_password", async () => {
     fetchMock.mockImplementation(async () => refusal(401, "wrong_password"));
     const err = (await client().joinWifi(request).catch((e: unknown) => e)) as ApiError;

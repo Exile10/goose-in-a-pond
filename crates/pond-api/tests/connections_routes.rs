@@ -219,7 +219,10 @@ async fn every_join_refusal_keeps_its_code_and_status() {
     let home = json!({"ssid": "Home", "passphrase": PASSPHRASE}).to_string();
 
     for (error, status) in [
-        (WifiJoinError::WrongPassword, StatusCode::UNAUTHORIZED),
+        (
+            WifiJoinError::WrongPassword,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
         (WifiJoinError::NotFound, StatusCode::NOT_FOUND),
         (WifiJoinError::Timeout, StatusCode::GATEWAY_TIMEOUT),
         (WifiJoinError::NoAddress, StatusCode::BAD_GATEWAY),
@@ -249,7 +252,11 @@ async fn every_join_refusal_keeps_its_code_and_status() {
     let wrong = json!({"ssid": "Home", "passphrase": "not-the-passphrase"}).to_string();
     assert_eq!(
         join(&pond.lan, token, &wrong).await,
-        (StatusCode::UNAUTHORIZED, json!({"error": "wrong_password"}))
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "wrong_password"})
+        ),
+        "a wrong passphrase is never a 401, which clients take for an expired token"
     );
     assert_eq!(
         join(&pond.lan, token, r#"{"ssid": "Nowhere"}"#).await,

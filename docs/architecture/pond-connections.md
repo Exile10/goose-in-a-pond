@@ -4,7 +4,7 @@ How a household sees and changes the pond's network links (Wi-Fi, Ethernet, Blue
 pairing settings, from goose-on-the-go and from both desktop settings views. The setup channel
 (`pond-setup-channel.md`) covers a pond with no network; this covers a pond that is already reachable.
 
-Status: **contract v1.1, 2026-10-19** (v1 plus five clarifications agreed with goose-on-the-go). Server side in `pond-core::network` (ports) and `pond-connect`
+Status: **contract v1.2, 2026-10-22** (v1.1 plus `wrong_password` on 422 and the clarifications below). Server side in `pond-core::network` (ports) and `pond-connect`
 (adapters); the phone and desktop build against the shapes below.
 
 ## Decisions
@@ -18,6 +18,7 @@ Status: **contract v1.1, 2026-10-19** (v1 plus five clarifications agreed with g
 | 2026-10-19 | **Ethernet is read-only.** | There is nothing to choose on a cable; the household needs to see the link and the address. |
 | 2026-10-19 | **Bluetooth's switch is the existing `ble_setup_enabled` setting.** | One switch, already in both desktop views; this adds what the radio is doing to the same screen. |
 | 2026-10-19 | **v1.1: `can_change` carries its reason, `signal` is a percentage, nulls are explicit, a scan answers within 15 s, and enterprise networks are listed but refused with `unsupported_security`.** Asked by goose-on-the-go. | Each lets a screen say what is wrong and what fixes it, instead of greying a button out with no explanation. A pond can only send a passphrase, and an enterprise network needs a username and certificate. |
+| 2026-10-22 | **v1.2: a wrong Wi-Fi passphrase answers `422 wrong_password`, not 401.** Found by the desktop build. | Every client reads 401 as an expired token: it refreshes or re-pairs, then resends the join with the passphrase. A 401 here made a typo re-pair the phone. The setup channel's code is unchanged (it has no HTTP status). Ponds from v1.1 still answer 401, so a client maps by the `error` code, not the status. |
 | 2026-10-19 | **A phone asking for a pairing code for another device is not in v1.** | It needs a decision on what proves the asker is that member (see "Open"). Codes stay host-issued: the desktop, the dashboard, or `pond-server pairing`. |
 
 ## Routes
@@ -35,6 +36,7 @@ Any paired token, in every state. Never tokenless.
   "https_port": 4443,
   "wifi": {
     "state": "connected",
+    "reason": null,
     "ssid": "Home",
     "address": "192.168.1.11",
     "signal": 70,
@@ -59,15 +61,20 @@ Any paired token, in every state. Never tokenless.
 ```
 
 - `wifi.state`: `connected` | `disconnected` | `unavailable` (no Wi-Fi hardware or no station on this
-  OS; `reason` says which). `ssid`, `address`, `signal` are `null` when not connected.
+  OS). `wifi.reason` says why when `unavailable`, and is `null` otherwise. `ssid`, `address`,
+  `signal` are `null` when not connected.
 - `signal`, here and in the networks list, is a percentage, 0 to 100.
 - `ethernet`: one entry per wired interface, `[]` when there is none. `link`: `up` | `down`.
   `address` is the first IPv4, or `null` when there is none. `speed_mbps` is `null` when the OS does
   not say.
-- `bluetooth.state`: `off` | `serving` | `advertising` | `unavailable`, with `reason` for the last.
+- `bluetooth.state`: `off` (the switch is off, or the pond never started the radio) | `serving`
+  (ready, and a phone that already knows the pond can connect, but not advertising: the pond is
+  claimed and online) | `advertising` (phones can find it) | `unavailable`, with `reason` for the last.
   `advertising_as` is the label phones see (`Pond <id>`), `null` when not advertising.
-- `can_change`: `{"allowed": bool, "reason": string | null}`, whether this caller may use the write
-  routes below, so a screen can disable them and say why. It covers only who the caller is
+- `can_change`: `{"allowed": bool, "reason": string | null}`, whether this caller may use the Wi-Fi
+  write routes below, so a screen can disable them and say why. It does not cover the two switches
+  in `PUT /settings` (`ble_setup_enabled`, `spoken_pairing_codes`), which follow the settings route's
+  own rules. It covers only who the caller is
   (`reason` like "Only the phone that set up this pond, or a household member's device, can change
   its network"). What the OS allows is in `wifi.capabilities.*`.
 
@@ -86,7 +93,8 @@ a client timeout of 20 s is enough.
   (`unsupported_security`): a pond can only send a passphrase.
 - `known`: the pond has this network saved. `current`: the pond is on it now.
 - Refusals: `503 unsupported` (no station), `403 not_permitted` (the OS refuses the scan; macOS
-  without Location permission), `409 busy` (a join is in progress).
+  without Location permission), `409 busy` (a join is in progress), `504 timeout` (no fresh scan
+  within the time above).
 
 ### `POST /connections/wifi/join`
 
@@ -95,7 +103,7 @@ Changers only (see Decisions). Body: `{"ssid": "Home", "passphrase": "…", "hid
 
 - `200 {"ssid": "Home", "address": "192.168.1.11", "https_port": 4443, "hostname": "nano"}`
 - `400 invalid_request` (empty or over-long SSID, a passphrase of the wrong length),
-  `401 wrong_password`, `404 not_found`, `504 timeout`, `502 no_address`,
+  `422 wrong_password` (v1.2; v1.1 ponds answer 401), `404 not_found`, `504 timeout`, `502 no_address`,
   `400 unsupported_security` (an enterprise network; the setup channel's `wifi_join` answers the same),
   `403 not_permitted` (the polkit grant is missing on Linux), `403 not_allowed` (this caller may not
   change the pond's network), `503 unsupported`, `409 busy`.
@@ -132,6 +140,9 @@ Any paired token. The setup card's state, never its code.
 {"id": "4e81", "claimed": true, "claimed_at": "2026-10-18T18:06:12Z", "claimed_by_this_device": false}
 ```
 
+`claimed_by_this_device` is about the caller's paired device, so it is always `false` for the
+desktop on the pond's own host, which acts with the host credential rather than as a device.
+
 Re-arming the card stays on the host (`pond-server setup-code --rearm`).
 
 ## Errors at a glance
@@ -143,7 +154,9 @@ Re-arming the card stays on the host (`pond-server setup-code --rearm`).
 | `unsupported` | 503 | no Wi-Fi station on this host |
 | `busy` | 409 | a scan or join is already running |
 | `in_use` | 409 | forgetting the current network without `confirm` |
-| `wrong_password`, `not_found`, `timeout`, `no_address` | 401, 404, 504, 502 | join |
+| `wrong_password` | 422 (401 before v1.2) | join |
+| `not_found`, `timeout`, `no_address` | 404, 504, 502 | join |
+| `timeout` | 504 | scan |
 | `invalid_request` | 400 | malformed body or SSID |
 | `unsupported_security` | 400 | joining an enterprise network |
 
