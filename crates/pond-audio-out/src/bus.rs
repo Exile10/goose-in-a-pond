@@ -5,7 +5,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use pond_core::models::ports::voice_output::VoiceOutput;
 use pond_core::shared::domain::agent::AgentStreamEvent;
-use pond_voice::text::{split_speech_units, strip_markdown_for_speech};
+use pond_voice::text::split_speech_units;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -103,7 +103,7 @@ impl AudioBus {
         });
 
         for unit in all_units {
-            let clean = strip_markdown_for_speech(&unit);
+            let clean = unit.trim().to_string();
             if !clean.is_empty() && speech_tx.send(clean).await.is_err() {
                 break;
             }
@@ -191,7 +191,7 @@ impl AudioBus {
                     sentence_buf = remainder;
                     for unit in units {
                         first_unit = false;
-                        let clean = strip_markdown_for_speech(&unit);
+                        let clean = unit.trim().to_string();
                         if !clean.is_empty() && speech_tx.send(clean).await.is_err() {
                             break;
                         }
@@ -209,7 +209,7 @@ impl AudioBus {
 
         let remainder = sentence_buf.trim();
         if !remainder.is_empty() {
-            let clean = strip_markdown_for_speech(remainder);
+            let clean = remainder.to_string();
             if !clean.is_empty() {
                 let _ = speech_tx.send(clean).await;
             }
@@ -279,7 +279,8 @@ mod tests {
         });
 
         let bus = AudioBus::new(voice.clone());
-        let text = "First clause of speech, followed by the second clause here. And a third sentence.";
+        let text =
+            "First clause of speech, followed by the second clause here. And a third sentence.";
         bus.speak_text(text, true).await.unwrap();
 
         assert!(voice.synthesized.load(Ordering::SeqCst) >= 2);

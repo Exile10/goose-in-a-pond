@@ -291,7 +291,7 @@ impl Drop for WorkingTone {
 }
 
 // TTS text handling is in `pond-voice` so the desktop shell (separate workspace) shares it.
-use pond_voice::text::{split_speech_units, strip_markdown_for_speech};
+use pond_voice::text::split_speech_units;
 
 /// Re-exported to keep pond-core's public API path.
 pub use pond_voice::text::filter_thinking;
@@ -1121,7 +1121,7 @@ impl ChatService {
         let voice_for_synth = self.voice_output.clone();
         let synth_handle = tokio::spawn(async move {
             while let Some(text) = speech_rx.recv().await {
-                let spoken = strip_markdown_for_speech(&text);
+                let spoken = text.trim().to_string();
                 if spoken.is_empty() {
                     continue;
                 }
@@ -3946,7 +3946,10 @@ mod tests {
             .with_voice_output(voice.clone());
 
         let outcome = svc
-            .stream_response_inner("Hello world. How are you today?".to_string(), Instant::now())
+            .stream_response_inner(
+                "Hello world. How are you today?".to_string(),
+                Instant::now(),
+            )
             .await
             .unwrap();
         assert!(outcome.barged_in.is_none());
