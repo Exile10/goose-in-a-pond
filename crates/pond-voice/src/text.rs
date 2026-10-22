@@ -58,7 +58,7 @@ fn is_abbrev_suffix(prefix: &str) -> bool {
 /// `MIN_CLAUSE_WORDS` words have accumulated.
 pub fn split_speech_units(text: &str, allow_clauses: bool) -> (Vec<String>, String) {
     const MAX_BUF: usize = 250;
-    const MIN_CLAUSE_WORDS: usize = 2;
+    const MIN_CLAUSE_WORDS: usize = 3;
     let mut units: Vec<String> = Vec::with_capacity(8);
     let mut remainder = text.to_string();
 
