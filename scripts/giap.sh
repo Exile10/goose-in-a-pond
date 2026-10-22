@@ -1034,8 +1034,8 @@ action_build_server() {
     fi
     # The deploy's rule: below 3 GB available the release link is OOM-killed beside a loaded model.
     detect_resources
-    if [ "$D_SVC_ACTIVE" = "active" ] && [ "${D_RAM_AVAIL:-0}" -lt "$BUILD_MIN_AVAIL_MB" ]; then
-      info "${D_RAM_AVAIL:-?} MB available: stopping the pond for the build; it starts again after"
+    if [ "$D_SVC_ACTIVE" = "active" ]; then
+      info "stopping the pond for the build to free memory and CPU cores; it starts again after"
       run systemctl --user stop "$SERVICE_NAME"
       RESTART_SVC_AFTER=true
     fi
@@ -1043,10 +1043,12 @@ action_build_server() {
   fi
   local cb; cb="$(cargo_bin)"
   if [ -n "$feats" ]; then
+    export CMAKE_CUDA_ARCHITECTURES=87
+    export CUDA_COMPUTE_CAP=87
     run_sh "PATH=\$HOME/.cargo/bin:/usr/local/cuda/bin:\$PATH SQLX_OFFLINE=true CMAKE_CUDA_ARCHITECTURES=87 CUDA_COMPUTE_CAP=87 \
-      $cb build -p pond-server --features $feats --release"
+      $cb build -p pond-server --bin pond-server --features $feats --release"
   else
-    run_sh "SQLX_OFFLINE=true $cb build -p pond-server --release"
+    run_sh "SQLX_OFFLINE=true $cb build -p pond-server --bin pond-server --release"
   fi
   local rc=$?
   # The remote-access helper is Go; a host without Go still gets a working pond, just without it.
