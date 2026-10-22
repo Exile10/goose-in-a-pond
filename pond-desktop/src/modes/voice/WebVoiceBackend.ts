@@ -8,7 +8,7 @@ import type {
 import {
   MIC_CONSTRAINTS,
   encodeWav, calculateRms, downsampleTo16k, getAudioContext, closeAudioContext,
-  playPingTone, playThinkingTone, splitSentences, stripMarkdown, normalizeForSpeech,
+  playPingTone, playThinkingTone, splitSentences, splitSpeechUnits, stripMarkdown, normalizeForSpeech,
   isWhisperArtifact, checkDismissal, getToolAnnouncement, getQuip,
   filterThinkingFull, createVadState, advanceVad, DEFAULT_VAD_CONFIG,
   registerTtsSource, clearTtsSource, stopTtsPlayback, isTtsInterrupted, resetTtsInterrupt,
@@ -351,11 +351,9 @@ export class WebVoiceBackend implements VoiceBackend {
     return (!t || isWhisperArtifact(t)) ? null : t;
   }
 
-  private async playTtsSentence(text: string, signal: AbortSignal, authToken?: string): Promise<void> {
-    if (this.cancelled || signal.aborted || isTtsInterrupted()) return;
+  private async fetchTtsBuffer(text: string, signal: AbortSignal, authToken?: string): Promise<AudioBuffer | null> {
+    if (this.cancelled || signal.aborted || isTtsInterrupted()) return null;
     try {
-      // The token admits it; without one the server asks for the host credential, which a
-      // restart rotates under a page that keeps its token.
       const headers: Record<string, string> = { "Content-Type": "application/json", ...(await api.hostHeaders()) };
       if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
       const res = await fetch(`${this.serverUrl}/api/v1/tts`, {
@@ -364,25 +362,36 @@ export class WebVoiceBackend implements VoiceBackend {
         body: JSON.stringify({ text }),
         signal,
       });
-      if (!res.ok) { console.warn("TTS failed:", res.status); return; }
+      if (!res.ok) { console.warn("TTS failed:", res.status); return null; }
 
       const data = await res.arrayBuffer();
-      if (this.cancelled || signal.aborted || isTtsInterrupted()) return;
+      if (this.cancelled || signal.aborted || isTtsInterrupted()) return null;
       const actx = getAudioContext();
-      const buf = await actx.decodeAudioData(data);
-      if (this.cancelled || signal.aborted || isTtsInterrupted()) return;
-
-      return new Promise<void>((resolve) => {
-        const src = actx.createBufferSource();
-        src.buffer = buf;
-        src.connect(actx.destination);
-        this.ttsSource = src;
-        registerTtsSource(src, resolve);
-        src.onended = () => { this.ttsSource = null; clearTtsSource(); resolve(); };
-        src.start(0);
-      });
+      return await actx.decodeAudioData(data);
     } catch (err) {
       if ((err as Error).name !== "AbortError") console.warn("TTS error:", err);
+      return null;
+    }
+  }
+
+  private async playAudioBuffer(buf: AudioBuffer): Promise<void> {
+    if (this.cancelled || isTtsInterrupted()) return;
+    const actx = getAudioContext();
+    return new Promise<void>((resolve) => {
+      const src = actx.createBufferSource();
+      src.buffer = buf;
+      src.connect(actx.destination);
+      this.ttsSource = src;
+      registerTtsSource(src, resolve);
+      src.onended = () => { this.ttsSource = null; clearTtsSource(); resolve(); };
+      src.start(0);
+    });
+  }
+
+  private async playTtsSentence(text: string, signal: AbortSignal, authToken?: string): Promise<void> {
+    const buf = await this.fetchTtsBuffer(text, signal, authToken);
+    if (buf) {
+      await this.playAudioBuffer(buf);
     }
   }
 
@@ -422,7 +431,7 @@ export class WebVoiceBackend implements VoiceBackend {
     const decoder = new TextDecoder();
     let sseBuf = "", thinkIn = false, firstSent = false, ttsBuf = "";
     let ttftLogged = false;
-    const ttsQ: string[] = [];
+    const ttsQ: Promise<AudioBuffer | null>[] = [];
     let playing = false;
 
     const playNext = async (): Promise<void> => {
@@ -432,14 +441,19 @@ export class WebVoiceBackend implements VoiceBackend {
         return;
       }
       playing = true;
-      const cleaned = normalizeForSpeech(stripMarkdown(ttsQ.shift()!));
-      if (cleaned.trim()) await this.playTtsSentence(cleaned, controller.signal, opts.authToken);
+      const nextPromise = ttsQ.shift()!;
+      const buf = await nextPromise;
+      if (buf && !this.cancelled && !isTtsInterrupted()) {
+        await this.playAudioBuffer(buf);
+      }
       return playNext();
     };
 
     const enqueue = (s: string): void => {
+      const cleaned = normalizeForSpeech(stripMarkdown(s));
+      if (!cleaned.trim()) return;
       if (!firstSent) { firstSent = true; onFirst(); }
-      ttsQ.push(s);
+      ttsQ.push(this.fetchTtsBuffer(cleaned, controller.signal, opts.authToken));
       if (!playing) { this.onStateChange?.("speaking"); void playNext(); }
     };
 
@@ -472,10 +486,10 @@ export class WebVoiceBackend implements VoiceBackend {
             if (vis) {
               this.onAgentToken?.(vis, false);
               ttsBuf += vis;
-              const sents = splitSentences(ttsBuf);
-              if (sents.length > 1) {
-                for (let i = 0; i < sents.length - 1; i++) enqueue(sents[i]);
-                ttsBuf = sents[sents.length - 1];
+              const [units, remainder] = splitSpeechUnits(ttsBuf, true);
+              if (units.length > 0) {
+                for (const u of units) enqueue(u);
+                ttsBuf = remainder;
               }
             }
           }
@@ -503,7 +517,10 @@ export class WebVoiceBackend implements VoiceBackend {
       }
     } finally { reader.releaseLock(); }
 
-    if (ttsBuf.trim() && !this.cancelled) enqueue(ttsBuf.trim());
+    if (ttsBuf.trim() && !this.cancelled) {
+      enqueue(ttsBuf.trim());
+      ttsBuf = "";
+    }
 
     // Wait for TTS queue to drain (exits immediately if interrupted)
     await new Promise<void>((resolve) => {

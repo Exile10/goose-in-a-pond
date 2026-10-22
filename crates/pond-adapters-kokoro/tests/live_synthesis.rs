@@ -346,3 +346,27 @@ async fn a_sample_in_another_voice_leaves_the_selected_voice_alone() {
     assert!(output.synth_wav_in_voice("../escape", text).await.is_err());
     assert_eq!(output.voice().await, pond_adapters_kokoro::DEFAULT_VOICE);
 }
+
+#[test]
+#[ignore = "needs Kokoro weights; set KOKORO_DIR"]
+fn disk_cache_speeds_up_model_load() {
+    let Some(dir) = model_dir() else {
+        panic!("set KOKORO_DIR");
+    };
+    let model_path = dir.join(model_file());
+    let cache_path = Engine::cache_path(&model_path);
+
+    let t0 = Instant::now();
+    let _engine = Engine::load(&model_path, intra_threads()).expect("cached load");
+    let cached_load = t0.elapsed();
+
+    assert!(cache_path.exists(), "cache file should exist after load");
+    assert!(Engine::is_cache_valid(&cache_path, &model_path));
+
+    println!(
+        "kokoro load: cached load took {:.2} ms (cache size: {} MB)",
+        cached_load.as_secs_f64() * 1000.0,
+        cache_path.metadata().map(|m| m.len() / (1024 * 1024)).unwrap_or(0)
+    );
+}
+

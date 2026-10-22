@@ -230,13 +230,13 @@ describe("Hub voice settings \u2014 voice and quality", () => {
     });
   });
 
-  it("defaults quality to the balanced tier when unset", async () => {
+  it("defaults quality to the compact tier when unset", async () => {
     vi.mocked(api.getSettings).mockResolvedValue(
       voiceSettings({ voice_tts_quality: undefined }) as never,
     );
     await renderVoice();
 
     const select = screen.getByLabelText("Voice quality") as HTMLSelectElement;
-    await waitFor(() => expect(select.value).toBe("q8"));
+    await waitFor(() => expect(select.value).toBe("q8f16"));
   });
 });

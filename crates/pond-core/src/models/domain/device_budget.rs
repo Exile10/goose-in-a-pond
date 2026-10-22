@@ -316,6 +316,61 @@ fn host_is_tegra() -> bool {
 /// from MemAvailable each cold text turn, which only a board reading can clear.
 pub const DEVICE_MEASURED_VISION: &[&str] = &[];
 
+/// Pinned Gemma family vision encoder directories supported on Jetson devices.
+pub const GEMMA_VISION_ALLOWLIST: &[&str] = &[
+    "gemma-4-e2b-it-qat",
+    "gemma-4-e2b-it",
+    "gemma-4-e4b-it-qat",
+    "gemma-4-e4b-it",
+];
+
+static RUNTIME_VISION_ALLOWLIST: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+/// Set the runtime allowlist of vision encoder directories.
+pub fn set_vision_allowlist(dirs: &[&str]) {
+    let mut list = RUNTIME_VISION_ALLOWLIST
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    list.clear();
+    for d in dirs {
+        list.push((*d).to_string());
+    }
+}
+
+/// Allow the Gemma family vision encoders on this process.
+pub fn allow_gemma_vision() {
+    set_vision_allowlist(GEMMA_VISION_ALLOWLIST);
+}
+
+/// Clear the runtime vision allowlist.
+pub fn clear_vision_allowlist() {
+    if let Some(lock) = RUNTIME_VISION_ALLOWLIST.get() {
+        if let Ok(mut list) = lock.lock() {
+            list.clear();
+        }
+    }
+}
+
+/// Check whether an encoder directory is on the vision allowlist.
+pub fn is_vision_allowlisted(dir: &str) -> bool {
+    if let Some(lock) = RUNTIME_VISION_ALLOWLIST.get() {
+        if let Ok(guard) = lock.lock() {
+            if guard.iter().any(|d| d.eq_ignore_ascii_case(dir)) {
+                return true;
+            }
+        }
+    }
+    if let Ok(env_val) = std::env::var("POND_VISION_ALLOWLIST") {
+        let val = env_val.trim();
+        if val == "1" || val.eq_ignore_ascii_case("gemma") || val.eq_ignore_ascii_case("all") {
+            return GEMMA_VISION_ALLOWLIST.iter().any(|d| d.eq_ignore_ascii_case(dir));
+        }
+        return val.split(',').any(|part| part.trim().eq_ignore_ascii_case(dir));
+    }
+    false
+}
+
 /// Whether, and with which encoder, a model reads pictures on this device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisionDeclaration {
@@ -363,10 +418,11 @@ pub fn declare(
     if !budgeted {
         return VisionDeclaration::Declared(spec);
     }
-    if !measured.contains(&spec.dir) {
+    let allowlisted = is_vision_allowlisted(spec.dir);
+    if !measured.contains(&spec.dir) && !allowlisted {
         return VisionDeclaration::NotOnThisDevice(spec);
     }
-    if fit(&spec).fits() {
+    if allowlisted || fit(&spec).fits() {
         VisionDeclaration::Declared(spec)
     } else {
         VisionDeclaration::NotOnThisDevice(spec)
@@ -450,18 +506,25 @@ pub fn device_window(gguf_path: Option<&Path>, chat_model: &str) -> DeviceWindow
         .filter(|m| m.is_file())
         .map(|m| m.len());
     let kv_kib_per_token = gguf_path.and_then(kv_cost_from_header);
-    let encoder_bytes = match budgeted_declaration(gguf_path, chat_model, true) {
-        VisionDeclaration::Declared(spec) => spec.size_bytes,
-        _ => 0,
+    let encoder_spec = match budgeted_declaration(gguf_path, chat_model, true) {
+        VisionDeclaration::Declared(spec) => Some(spec),
+        _ => None,
     };
+    let encoder_bytes = encoder_spec.as_ref().map_or(0, |s| s.size_bytes);
     let model_bytes = file_len.unwrap_or(ASSUMED_LARGEST_MODEL_BYTES);
+    let mut window = context_size_with_encoder(
+        llm_budget_mb(),
+        model_bytes,
+        encoder_bytes,
+        kv_kib_per_token,
+    );
+    if let Some(spec) = encoder_spec {
+        if is_vision_allowlisted(&spec.dir) && window < 16384 {
+            window = 16384;
+        }
+    }
     DeviceWindow {
-        window: context_size_with_encoder(
-            llm_budget_mb(),
-            model_bytes,
-            encoder_bytes,
-            kv_kib_per_token,
-        ),
+        window,
         model_bytes,
         weights_known: file_len.is_some(),
         kv_kib_per_token,
@@ -1033,5 +1096,21 @@ mod tests {
             budgeted_from(false, false, true),
             "a CPU build on the board"
         );
+    }
+
+    #[test]
+    fn allowlist_enables_gemma_vision_on_budgeted_device() {
+        let e2b = Some(by_dir("gemma-4-e2b-it"));
+        clear_vision_allowlist();
+        assert!(!is_vision_allowlisted("gemma-4-e2b-it"));
+        assert!(!declare(e2b, true, &[], |_| VisionFit::Fits { window: 16384 }).is_declared());
+
+        allow_gemma_vision();
+        assert!(is_vision_allowlisted("gemma-4-e2b-it"));
+        assert!(is_vision_allowlisted("gemma-4-e4b-it"));
+        assert!(declare(e2b, true, &[], |_| VisionFit::Fits { window: 16384 }).is_declared());
+
+        clear_vision_allowlist();
+        assert!(!is_vision_allowlisted("gemma-4-e2b-it"));
     }
 }

@@ -279,6 +279,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/models/{category}/{name}/companions/pictures",
             post(crate::model_acquisition::add_pictures),
         )
+        .route("/models/{category}/{name}/revoke", post(revoke_model))
+        .route("/voice/tts/unload", post(unload_tts))
+        .route("/voice/tts/prewarm", post(prewarm_tts))
+        .route("/voice/tts/status", get(status_tts))
         .route("/models/{category}/{name}", delete(delete_model))
         .route("/profiles", get(list_profiles))
         .route("/profiles/{id}", get(get_profile).delete(delete_profile))
@@ -1710,6 +1714,84 @@ async fn apply_tts_settings(
     })))
 }
 
+async fn unload_tts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(control) = state.tts_control.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "No speech engine is running"})),
+        ));
+    };
+    control.unload().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(json!({"status": "unloaded"})))
+}
+
+async fn prewarm_tts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(control) = state.tts_control.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "No speech engine is running"})),
+        ));
+    };
+    control.prewarm().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(json!({"status": "ready"})))
+}
+
+async fn status_tts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(control) = state.tts_control.clone() else {
+        return Ok(Json(json!({"available": false, "loaded": false})));
+    };
+    let loaded = control.is_loaded().await;
+    Ok(Json(json!({"available": true, "loaded": loaded})))
+}
+
+async fn revoke_model(
+    State(state): State<Arc<AppState>>,
+    Path((category, name)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let cat = ModelCategory::from_str(&category).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unknown category '{}'", category)})),
+        )
+    })?;
+
+    match cat {
+        ModelCategory::TtsKokoro => {
+            if let Some(control) = state.tts_control.as_ref() {
+                control.unload().await.map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                })?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(Json(json!({
+        "status": "revoked",
+        "category": category,
+        "name": name,
+    })))
+}
+
 // ── TTS request ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -2631,6 +2713,22 @@ async fn drive_turn(
                     }
                 }
             }
+        }
+    }
+
+    // ── Check if engine is warming up ───────────────────────────────────
+    {
+        let is_warming = {
+            let w = state.warmup.read().unwrap_or_else(|e| e.into_inner());
+            matches!(w.phase, pond_core::models::ports::agent::WarmupPhase::Warming)
+        };
+        if is_warming {
+            let status = serde_json::json!({
+                "type": "status",
+                "content": "Pond is getting ready (precompiling prompt & tools for fast responses)…"
+            })
+            .to_string();
+            run.push(status, false);
         }
     }
 
@@ -5337,6 +5435,12 @@ async fn update_settings(
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
 
+    if merged.picture_support_download_enabled {
+        pond_core::models::domain::device_budget::allow_gemma_vision();
+    } else {
+        pond_core::models::domain::device_budget::clear_vision_allowlist();
+    }
+
     // A new pin, or the mic switched, takes effect now rather than at the next device change.
     if current.audio_input_device != merged.audio_input_device
         || current.audio_output_device != merged.audio_output_device
@@ -5441,6 +5545,26 @@ async fn get_warmup(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut v = serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}));
     if let Some(obj) = v.as_object_mut() {
         obj.insert("elapsed_ms".into(), json!(elapsed_ms));
+        let (reason, message) = match &snapshot.phase {
+            pond_core::models::ports::agent::WarmupPhase::Warming => (
+                "Precompiling prompt & tools into KV cache for fast inference",
+                "The pond is getting ready (precompiling prompt prefix and tools for fast responses)...",
+            ),
+            pond_core::models::ports::agent::WarmupPhase::Ready => (
+                "Static prefix resident in KV cache",
+                "The pond is ready.",
+            ),
+            pond_core::models::ports::agent::WarmupPhase::Skipped { reason } => (
+                reason.as_str(),
+                "Warm-up skipped.",
+            ),
+            pond_core::models::ports::agent::WarmupPhase::Failed { reason } => (
+                reason.as_str(),
+                "Warm-up failed; first turn will prefill on-demand.",
+            ),
+        };
+        obj.insert("reason".into(), json!(reason));
+        obj.insert("message".into(), json!(message));
     }
     Json(v)
 }

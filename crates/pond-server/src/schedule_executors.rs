@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use pond_audio_out::AudioBus;
 use pond_core::models::ports::agent::Agent;
 use pond_core::models::ports::voice_output::VoiceOutput;
 use pond_core::shared::domain::agent::AgentRequest;
@@ -26,7 +27,7 @@ pub struct AgentScheduleExecutor {
     /// Limit concurrent scheduled runs to avoid starving interactive chat.
     semaphore: Semaphore,
     /// Speaks a finished `AgentPrompt` response, gated by `speakable_now`; `None` without TTS.
-    voice_output: Option<Arc<dyn VoiceOutput>>,
+    audio_bus: Option<AudioBus>,
     settings_repo: Option<Arc<dyn SettingsRepository>>,
 }
 
@@ -45,7 +46,7 @@ impl AgentScheduleExecutor {
             http_client: pond_net::client(),
             device_control,
             semaphore: Semaphore::new(max_concurrent.max(1) as usize),
-            voice_output,
+            audio_bus: voice_output.map(AudioBus::new),
             settings_repo,
         }
     }
@@ -78,12 +79,31 @@ impl AgentScheduleExecutor {
             .create_session(session_id.clone())
             .await;
 
+        let should_speak = match (&self.audio_bus, &self.settings_repo) {
+            (Some(_), Some(repo)) => match repo.get().await {
+                Ok(settings) if Self::speakable_now(&settings) => true,
+                Ok(_) => {
+                    tracing::debug!(
+                        "[scheduler] task {task_id}: not speaking (consent off or quiet hours)"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[scheduler] task {task_id}: could not read settings, staying silent: {e}"
+                    );
+                    false
+                }
+            },
+            _ => false,
+        };
+
         let request = AgentRequest {
             message: prompt.to_string(),
             session_id,
             model_role: "task".to_string(),
             images: vec![],
-            voice_mode: false,
+            voice_mode: should_speak,
             canvas_mode: false,
             // Schedules have no owner, so a reminder is household context.
             profile_scope: ProfileScope::Household,
@@ -93,27 +113,41 @@ impl AgentScheduleExecutor {
             warmup: false,
         };
 
-        tracing::info!("[scheduler] executing prompt for task {task_id}");
+        tracing::info!("[scheduler] executing prompt for task {task_id} (speak={should_speak})");
+
+        if should_speak {
+            if let Some(bus) = &self.audio_bus {
+                match self.agent.chat_stream(request.clone()).await {
+                    Ok(stream) => {
+                        tracing::info!("[scheduler] task {task_id}: streaming tokens into audio bus");
+                        let full_text = bus.speak_stream(stream, true).await?;
+                        tracing::info!(
+                            "[scheduler] task {task_id} completed ({} chars, speech finished)",
+                            full_text.len()
+                        );
+                        return Ok(full_text);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[scheduler] task {task_id}: chat_stream failed ({e}), falling back to batch chat"
+                        );
+                    }
+                }
+            }
+        }
+
         let response = self.agent.chat(request).await?;
         tracing::info!(
             "[scheduler] task {task_id} completed ({} chars)",
             response.text.len()
         );
 
-        if let (Some(voice), Some(settings_repo)) = (&self.voice_output, &self.settings_repo) {
-            match settings_repo.get().await {
-                Ok(settings) if Self::speakable_now(&settings) => {
-                    tracing::info!("[scheduler] task {task_id}: speaking response aloud");
-                    if let Err(e) = voice.speak(&response.text).await {
-                        tracing::warn!("[scheduler] task {task_id}: TTS failed: {e}");
-                    }
+        if should_speak {
+            if let Some(bus) = &self.audio_bus {
+                tracing::info!("[scheduler] task {task_id}: speaking response aloud");
+                if let Err(e) = bus.speak_text(&response.text, true).await {
+                    tracing::warn!("[scheduler] task {task_id}: TTS failed: {e}");
                 }
-                Ok(_) => tracing::debug!(
-                    "[scheduler] task {task_id}: not speaking (consent off or quiet hours)"
-                ),
-                Err(e) => tracing::warn!(
-                    "[scheduler] task {task_id}: could not read settings, staying silent: {e}"
-                ),
             }
         }
 

@@ -289,6 +289,8 @@ export interface Settings {
   voice_max_turns?: number;
   /** ONNX detector that labels motion events. Needs a `vision-onnx` build. */
   vision_classifier_model?: string;
+  /** Allow downloading picture support (vision encoder mmproj) on budgeted devices. */
+  picture_support_download_enabled?: boolean;
 }
 
 /** Matter runtime: `enabled` = intent, `state` = reality (differ while starting or unreachable). */

@@ -190,6 +190,14 @@ impl SettingsRepository for SqliteSettingsRepository {
             settings.vision_motion_threshold.to_string()
         );
         upsert!("vision_classifier_model", &settings.vision_classifier_model);
+        upsert!(
+            "picture_support_download_enabled",
+            if settings.picture_support_download_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // Matter
         upsert!("matter_ws_url", &settings.matter_ws_url);
         upsert!(
@@ -921,6 +929,9 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             }
         }
         "vision_classifier_model" => s.vision_classifier_model = value.to_string(),
+        "picture_support_download_enabled" => {
+            s.picture_support_download_enabled = value == "true"
+        }
         // Matter
         // Legacy `matter_enabled` is ignored: its toggle is gone, so an old `false` would stick.
         "matter_enabled" => {}

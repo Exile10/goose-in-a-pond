@@ -336,6 +336,10 @@ pub struct Settings {
     #[serde(default = "Settings::default_vision_classifier_model")]
     pub vision_classifier_model: String,
 
+    /// Allow downloading picture support (vision encoder mmproj) on budgeted devices.
+    #[serde(default = "Settings::default_picture_support_download_enabled")]
+    pub picture_support_download_enabled: bool,
+
     // ── Matter ─────────────────────────────────────────────────────────────
     #[serde(default = "Settings::default_matter_ws_url")]
     pub matter_ws_url: String,
@@ -794,6 +798,7 @@ impl Default for Settings {
             vision_fps: Self::default_vision_fps(),
             vision_motion_threshold: Self::default_vision_motion_threshold(),
             vision_classifier_model: Self::default_vision_classifier_model(),
+            picture_support_download_enabled: Self::default_picture_support_download_enabled(),
             matter_ws_url: Self::default_matter_ws_url(),
             matter_ble_enabled: Self::default_matter_ble_enabled(),
             mesh_enabled: Self::default_mesh_enabled(),
@@ -947,7 +952,7 @@ impl Settings {
         1.0
     }
     fn default_tts_quality() -> String {
-        "q8".to_string()
+        "q8f16".to_string()
     }
     /// A one-time 2 MB download beats shipping a detector that can't tell a fridge from a voice.
     fn default_vad_backend() -> String {
@@ -1011,6 +1016,9 @@ impl Settings {
     }
     fn default_vision_classifier_model() -> String {
         "".to_string()
+    }
+    fn default_picture_support_download_enabled() -> bool {
+        false
     }
     fn default_matter_ws_url() -> String {
         DEFAULT_MATTER_WS_URL.to_string()
@@ -2061,6 +2069,7 @@ mod tests {
             "vision_enabled",
             "vision_fps",
             "vision_motion_threshold",
+            "picture_support_download_enabled",
             "voice_kws_cooldown_ms",
             "voice_kws_energy_threshold",
             "voice_kws_post_trigger_silence_ms",
