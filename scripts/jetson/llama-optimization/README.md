@@ -1,20 +1,27 @@
 # Jetson Orin Nano — llama.cpp Setup & Optimization
 
 Scripts to turn a **Jetson Orin Nano 8GB "Super"** (JetPack 6.2.1 / L4T R36.4.7,
-CUDA 12.6) into an optimized, CUDA-accelerated **llama.cpp** inference node for
-GIAP on-device intelligence.
+CUDA 12.6) into an optimized, CUDA-accelerated standalone **llama.cpp** node:
+a `llama-server` and `llama-bench` built from source, for benchmarking and for
+comparing against the pond.
 
-Everything here was validated live on the target device. Each script is
-idempotent, documented, and safe to re-run.
+The pond does not use any of it. pond-server runs llama.cpp in process through
+goose's engine and builds its own copy with `cargo`
+([docs/developer/inference_optimization.md](../../../docs/developer/inference_optimization.md)).
+
+Each script is idempotent and safe to re-run; they were validated on the device
+when written (2026-07).
 
 ---
 
 ## TL;DR
 
 ```bash
-cd ~/jetson-llama-optimization
-./run-all.sh          # deps → perf mode → CUDA build → model → benchmark
+bash scripts/jetson.sh optimize                 # from the repo root on the board; runs run-all.sh
+cd scripts/jetson/llama-optimization && ./run-all.sh   # the same
 ```
+
+`run-all.sh` goes deps → perf mode → CUDA build → model → benchmark.
 
 Or step by step:
 
@@ -22,7 +29,7 @@ Or step by step:
 |---|--------|--------------|-------|
 | 00 | `00-system-info.sh` | Read-only health/inventory snapshot → `reports/` | no |
 | 01 | `01-install-deps.sh` | Build toolchain + **CMake≥3.27** + ccache/ninja + `jtop` | yes |
-| 02 | `02-performance-mode.sh` | `MAXN_SUPER` + `jetson_clocks` + perf governor | yes |
+| 02 | `02-performance-mode.sh` | `MAXN_SUPER` + `jetson_clocks` + perf governor (the pond itself runs at 25 W; see [jetson-dev-routine.md](../../../docs/developer/jetson-dev-routine.md)) | yes |
 | 03 | `03-build-llama-cpp.sh` | Build llama.cpp with CUDA (sm_87) → `~/.local/bin` | no |
 | 04 | `04-download-model.sh` | Fetch a GGUF sized for 8GB → `~/models` | no |
 | 05 | `05-benchmark.sh` | `llama-bench` + tegrastats telemetry → `reports/` | no¹ |
@@ -136,12 +143,13 @@ journalctl -fu llama-server.service
 ## Serve on boot
 
 ```bash
-./06-install-services.sh                 # serves newest model on 127.0.0.1:8080
-HOST=0.0.0.0 ./06-install-services.sh     # expose on LAN (no auth — careful)
-curl http://127.0.0.1:8080/v1/models
+PORT=8090 ./06-install-services.sh       # serves the newest model on 127.0.0.1:8090
+curl http://127.0.0.1:8090/v1/models
 ```
 
-Ollama (port 11434) and llama-server (port 8080) **do not collide**.
+`06-install-services.sh` defaults to port **8080, which the pond's own service holds on the
+board**: set `PORT` when both run. Ollama (11434) collides with neither. `HOST=0.0.0.0` exposes
+the server on the LAN with no auth.
 
 ---
 

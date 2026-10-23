@@ -1,72 +1,67 @@
-# Jetson (Orin Nano) build & deploy
+# Jetson (Orin Nano) scripts
 
-> **Start with `bash scripts/giap.sh`** — the menu-driven entry point for
-> install, build, service control and diagnostics on any host, the Jetson
-> included. It detects the board and whether CUDA is genuinely usable, stops the
-> service before a release link so the linker is not OOM-killed, and its doctor
-> catches the states below before you hit them:
-> `bash scripts/giap.sh doctor` (exits 1 on FAIL).
->
-> From the dev machine, `bash scripts/giap.sh deploy` wraps `jetson.sh deploy`
-> and refuses to run when HEAD is missing from a deploy remote — the exact
-> silent-stale-build failure this page warns about below.
->
-> This page documents the Jetson-specific verbs that `giap.sh` delegates to.
+`bash scripts/giap.sh` is the front door on every host, the Jetson included: it detects the board
+and whether CUDA is usable, builds with the right features, stops the service before a release
+link, and `giap.sh doctor` (exit 1 on any FAIL) catches the bad states. From the Mac,
+`bash scripts/giap.sh deploy` checks that HEAD is on the deploy remotes and then runs
+`scripts/jetson.sh deploy`. The day-to-day procedure, service layout and checks are in
+[docs/developer/jetson-dev-routine.md](../../docs/developer/jetson-dev-routine.md).
 
-Everything Jetson lives here, driven by the single entry point at the repo root:
+This directory holds what `scripts/jetson.sh` dispatches to:
 
 ```bash
 bash scripts/jetson.sh <command>
 ```
 
-| Command | Where it runs | What it does |
+| Command | Runs on | What it does |
 |---|---|---|
-| `deploy` | dev machine | One-command deploy: reset the nano's checkout to `origin/<branch>`, build the web UI locally (nano's Node is too old for Vite), rsync `dist/`, release-build with CUDA on the device, restart the user service, health-check. |
-| `build [--cuda]` | ON the Jetson | Native build. `--cuda` enables GPU inference (sm_87) — GPU builds MUST be on-device (nvcc + JetPack must match). |
-| `docker-build [--full]` | dev machine (arm64) | CPU-only aarch64 binary via a native `linux/arm64` container (no cross/qemu on Apple Silicon). No CUDA possible here. |
-| `optimize` | ON the Jetson | The llama.cpp optimization suite (`llama-optimization/`): deps, perf mode (max clocks), CUDA sm_87 llama.cpp build, model download, benchmark, services. |
-| `probe-mlc [--keep]` | ON the Jetson | Experiment: MLC-LLM serve + tool-call quality probe. |
+| `deploy [--branch BR] [--no-restart]` | the Mac | `deploy.sh`: copies the recorded LiteRT-LM library, hard-resets the board's checkout to `origin/<branch>` (default `main`) with its submodule, builds and rsyncs the web UI, runs the CUDA release build on the board detached (following it across dropped connections), restarts the user service and health-checks it. `JETSON_HOST` picks another ssh alias (default `nano`), `JETSON_DATA_DIR` another data directory |
+| `build [--cuda]` | the board | `build-native.sh`: apt packages, the web UI with the `npm` on `PATH`, and `cargo build --release`, with `pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda` under `--cuda`. `giap.sh build` does the same job and also provides Node, stops the service and writes the build stamp |
+| `docker-build [--full]` | an arm64 host with Docker | `build-docker.sh`: a CPU-only aarch64 binary in a `linux/arm64` container, written to `target-jetson/release/pond-server`. `--full` adds in-process GGUF inference. No CUDA is possible here |
+| `optimize` | the board | `llama-optimization/run-all.sh`: a standalone CUDA llama.cpp build and benchmark suite; see [its README](llama-optimization/README.md) |
+| `probe-mlc [--keep]` | the board | `mlc-toolcall-probe.sh`: MLC-LLM serve plus a streaming tool-call quality probe (an experiment) |
+| `bakeoff <prep\|capture\|c1\|c2\|c3\|c4\|report>` | the board | The inference-engine bake-off harness; see [bakeoff/README.md](bakeoff/README.md) |
 
-## Daily loop (dev machine)
+Other files here:
 
-```bash
-# 1. Push to BOTH remotes — the nano pulls `origin` (JERRYFROMKENYA fork).
-#    Pushing only jarida-io means the deploy silently builds stale code.
-git push origin main && git push jarida-io main
+| File | What it is |
+|---|---|
+| `kiosk.sh` | Puts the dashboard on an attached panel with one Weston compositor and no desktop (`probe`, `enable-drm`, `start`, ...). Needs `nvidia-drm` loaded first |
+| `sudoers-giap` | A sudoers drop-in listing the commands a deploy needs without a password; its header has the install and removal commands |
+| `ggml-toolchain.cmake` | Pins `GGML_NATIVE=OFF` for builds that are not on the board |
 
-# 2. Deploy (stop the device service first for big builds — the release link
-#    can OOM if a model is resident: ssh nano 'systemctl --user stop goose-in-a-pond')
-bash scripts/jetson.sh deploy
-```
-
-Prereqs already true on `nano.local`: ssh alias `nano` (`~/.ssh/config`, key
-`nano_jetson`), `loginctl enable-linger nano`, user systemd unit
-`goose-in-a-pond.service` on :8080.
+The board's LiteRT-LM library is built with `bash scripts/giap.sh litert build linux-arm64` (Docker
+on the Mac, or natively on the board followed by `giap.sh litert import` on the Mac); `deploy`
+ships whatever package the Mac records. See
+[docs/developer/litert-lm.md](../../docs/developer/litert-lm.md).
 
 ## First-time device setup
 
 ```bash
 ssh nano
-git clone --recurse-submodules https://github.com/JERRYFROMKENYA/goose-in-a-pond
+git clone --recurse-submodules <the repository's origin URL> goose-in-a-pond
 cd goose-in-a-pond
-bash scripts/jetson.sh build --cuda
-bash scripts/jetson.sh optimize        # perf mode + benchmark (optional but recommended)
+bash scripts/giap.sh build        # Node, web UI, CUDA release build, build stamp
+bash scripts/giap.sh              # menu: "Install the service" writes the user unit on port 8080
+loginctl enable-linger "$USER"    # start at boot, survive logout
 ```
 
-## Gotchas (all learned the hard way)
+`deploy` restarts a **user** unit. `giap.sh install` runs `scripts/install.sh`, which writes a
+**system** unit of the same name when none exists; on a board meant for `deploy`, install the user
+unit first so `install` skips its own.
 
-- **`-C target-cpu=native` landmine**: `.cargo/config.toml` sets it for on-device
-  builds. Any cross/containerized build must override it (`target-cpu=cortex-a78`
-  for rustc) or the binary SIGILLs on the Orin. C/C++ needs a valid `-march` ISA
-  string (`-march=armv8.2-a+fp16+dotprod`) — a CPU *name* is rustc-only.
-  `ggml-toolchain.cmake` pins `GGML_NATIVE=OFF` for the same reason.
-- **NvMap OOM (error 12)**: `sync && echo 3 > /proc/sys/vm/drop_caches` before
-  loading a model with `-ngl` — the GPU carveout hits a ~586 MiB wall otherwise.
-  Baked into the `llama-optimization` scripts.
-- **Link OOM**: never run a chat/model-load while a release build is linking on
-  the 8 GB device; stop the service first.
-- **Memory bandwidth is the ceiling**: decode tok/s ≈ 102 / model_GB on the 8GB
-  Super. Keep models ≤ GPU budget with ~1 GB headroom for KV cache.
-- Hand-edits to the model registry's Jetson tuning block are reverted at every
-  provider init by `apply_jetson_settings` (`pond-adapters-local-inference`) —
-  the constants in code are the only knob.
+## Gotchas
+
+- **`-C target-cpu=native`** in `.cargo/config.toml` is right on the board and wrong anywhere
+  else: a cross or container build must override it (`target-cpu=cortex-a78` for rustc) or the
+  binary SIGILLs. C and C++ need an ISA string (`-march=armv8.2-a+fp16+dotprod`), not a CPU name;
+  `ggml-toolchain.cmake` covers ggml.
+- **The board pulls `origin`.** Push the branch there (and to `jarida-io`) before deploying, or the
+  deploy builds stale code.
+- **NvMap error 12** on a model load: page cache NvMap cannot reclaim. Stop the pond,
+  `sync; echo 3 > /proc/sys/vm/drop_caches`, start it.
+- **Link OOM**: no chat or model load while a release build links. `deploy` stops the pond below
+  3,000 MB free; `giap.sh build` stops it always.
+- **The registry's tuning block is code.** `apply_jetson_settings`
+  (`crates/pond-adapters-local-inference/src/lib.rs`) re-stamps every row of the chat model at each
+  provider build, so hand edits to goose's registry do not survive.
