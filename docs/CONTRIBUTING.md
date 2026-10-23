@@ -96,7 +96,10 @@ memory, prefill/decode throughput).
 
 ## Checks
 
-These mirror `.github/workflows/ci.yml`, which is the source of truth.
+These mirror `.github/workflows/ci.yml`, which is the source of truth. `bash scripts/giap.sh check`
+runs them for the areas your branch changes (`--all` for every area, `--dry-run` to see the
+commands); the sections below are what it runs. New contributors start at the
+[quick start](QUICKSTART.md).
 
 ### Rust
 

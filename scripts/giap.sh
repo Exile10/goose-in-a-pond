@@ -20,6 +20,7 @@
 #   bash scripts/giap.sh models pairings --check # only compare it (exit 1 if the committed table is stale)
 #   bash scripts/giap.sh wifi-grant [remove|status]  # Linux: let the pond's user join Wi-Fi from the BLE setup channel (sudo)
 #   bash scripts/giap.sh provision --host HOST --key FILE  # save a Pond's setup card, give it a device certificate (operator; must come first)
+#   bash scripts/giap.sh check [AREA…] [--all|--e2e|--full|--base REF|--dry-run]  # the checks CI runs, for what this branch changes (must come first)
 #   bash scripts/giap.sh --dry-run …  # print every command instead of running it
 #
 # It auto-detects the host (Jetson / Linux / macOS), whether CUDA is usable, and
@@ -67,6 +68,15 @@ cd "$REPO_ROOT" || exit 1
 # preferred major comes from .nvmrc.
 # shellcheck source=lib/node-setup.sh
 source "$HERE/lib/node-setup.sh"
+# `check` runs what CI runs, on the repo's Node; like provision it takes only its own options.
+# shellcheck source=lib/local-checks.sh
+source "$HERE/lib/local-checks.sh"
+if [ "${1:-}" = check ]; then
+  shift
+  node_use_repo >/dev/null 2>&1
+  LC_REPO="$REPO_ROOT" lc_main "$@"
+  exit $?
+fi
 
 DRY_RUN=false
 ASSUME_YES=false
@@ -1532,6 +1542,7 @@ while [ $# -gt 0 ]; do
     -h|--help|help) usage; exit 0 ;;
     -*)        bad "unknown option: $1"; usage; exit 2 ;;
     provision) bad "provision takes only its own options and must come first: bash scripts/giap.sh provision --host HOST --key FILE"; exit 2 ;;
+    check)     bad "check takes only its own options and must come first: bash scripts/giap.sh check --dry-run"; exit 2 ;;
     *) if [ -z "$CMD" ]; then CMD="$1"
        elif [ -z "$CMD_SUB" ]; then CMD_SUB="$1"
        elif [ -z "$CMD_ARG" ]; then CMD_ARG="$1"
