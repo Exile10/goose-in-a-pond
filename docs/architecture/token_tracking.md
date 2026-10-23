@@ -1,120 +1,119 @@
 # Token Usage Tracking
 
-Two systems in GIAP count tokens. They answer different questions, they are allowed to disagree,
-and conflating them has been a recurring source of wrong claims in this repository.
+Two systems in GIAP count tokens. They answer different questions and are allowed to disagree.
 
 | | **Accounting** | **Budgeting** |
 |---|---|---|
-| Question | what did that turn cost? | how much history fits in the next one? |
-| When | after the stream drains | before the agent turn starts |
+| Question | what did that turn cost? | how much fits in the next prompt? |
+| When | after the stream drains | before a prompt is assembled |
 | Source | the provider's own `Usage` events, aggregated into `TurnStats` | the `TokenCounter` port |
-| Accuracy | real when the provider reports; chars/4 only when it does not | **never exact** (section 2.2) |
-| Consumers | `sessions` totals, `GET /usage/summary`, the savings card, `TurnMetrics` | `turn_trimmer`, `CompactionProfile` |
-
-They meet in exactly one place, and it is the most load-bearing line here: the previous turn's
-**accounting** number is fed back into the next turn's **budget** as the overshoot correction.
-That feedback is what bounds the budget-side error, which is why it is not optional.
-
-Verified against code 2026-08-06. PAI-3 P1 and P2 are landed; P3's catalog work is in flight and
-P4-P5 are designed, so section 3's rung-3 row is the line here most likely to move next.
+| Accuracy | real when the provider reports usage; chars/4 only when it does not | never exact (section 2.2) |
+| Consumers | `sessions` totals, assistant rows, `GET /usage/summary`, `TurnMetrics`, the `turn_stats` SSE frame | `CompactionProfile`, `turn_trimmer`, `ContextGovernor` |
 
 ---
 
-## 1. Accounting -- what the turn actually cost
+## 1. Accounting: what the turn cost
 
-### 1.1 Flow
+### 1.1 Flow (REST chat route)
 
 ```
   GooseAdapter::chat_stream
-        |
-        | aggregates every per-inference Usage event of the turn into
-        | TurnStats  (a turn with tool round-trips has several inferences)
+        |  aggregates every per-inference Usage event of the turn into TurnStats
+        |  (a turn with tool round-trips has several inferences)
         v
-  AgentStreamEvent::Done { usage: Some(UsageStats), stats: Some(TurnStats) }
+  AgentStreamEvent::Done { usage: Some(UsageStats), stats: Option<TurnStats> }
         |
-        +--> SSE done event: { usage: { prompt_tokens, completion_tokens } }
+        +--> SSE `turn_stats` frame (turn_stats_frame in pond-api routes.rs)
         |
-        +--> session_storage.increment_usage(session_id, prompt, completion, model)
-        |         -> sessions.total_prompt_tokens += N, total_completion_tokens += N
+        +--> ChatService::persist_assistant_turn(.., Some((prompt, completion)), model)
+        |       -> session_messages.prompt_tokens / completion_tokens on the assistant row
+        |       -> SessionStorage::increment_usage -> sessions.total_* += N
         |
-        +--> session_messages.prompt_tokens / completion_tokens on the assistant row
+        +--> TurnMetrics -> pond_logs.db turn_metrics   (when settings.telemetry_enabled)
         |
-        +--> TurnMetrics.context_utilization_pct, via the telemetry sink in routes.rs
-        |
-        +--> last_prompt_tokens_handle()[session_id] = turn_stats.prompt_tokens
-                  -> read back by trim_goose_history as `last_real` (section 2.3)
+        +--> SSE `done` frame: { usage: { prompt_tokens, completion_tokens } }
 ```
+
+The voice path goes through `ChatService` directly: `record_turn_outcome` calls `increment_usage`
+and records `TurnMetrics`, and `persist_assistant_response` writes the assistant row.
 
 ### 1.2 Real counts are the primary path
 
-`GooseAdapter` accumulates the provider's per-inference `Usage` events into `TurnStats`
-(`crates/pond-core/src/shared/domain/turn_stats.rs`) and reports those counts directly:
+`TurnStats` (`crates/pond-core/src/shared/domain/turn_stats.rs`) is the per-turn aggregate:
 
-```rust
-let usage = if saw_usage {
-    turn_stats.context_used_tokens = Some(turn_stats.prompt_tokens);
-    UsageStats { prompt_tokens:     turn_stats.prompt_tokens,
-                 completion_tokens: turn_stats.completion_tokens }
-} else { /* heuristic fallback, 1.3 */ };
-```
+| Field | Meaning |
+|---|---|
+| `prompt_tokens` | prompt size of the **final** inference: the turn's real context load |
+| `prefilled_tokens` | prompt tokens actually decoded, summed over inferences (the prefill-rate basis) |
+| `reused_prefix_tokens` | prompt tokens served from a retained KV cache; `None` for HTTP providers |
+| `completion_tokens` | generated tokens, summed over inferences |
+| `reasoning_tokens` | hidden reasoning tokens counted by GIAP (section 1.4); `None` = not counted |
+| `context_used_tokens` / `context_limit_tokens` | final prompt size and the engine's allocated `n_ctx`; `context_pct()` derives the percentage |
+| `ttft_ms`, `model_load_ms`, `prefill_ms`, `decode_ms`, `*_tok_per_sec` | timings; `finalize_rates()` derives the rates |
+| `inference_count`, `reengagements`, `draft_accept_rate` | loop shape and speculative-decoding acceptance |
 
-`TurnStats.prompt_tokens` is the size of the **final** inference -- the turn's real context load --
-while `completion_tokens` is summed across the turn. `TurnStats` also carries
-`context_limit_tokens`, the engine's actual allocated `n_ctx`; that field is what makes
-`WindowSource::EngineReported` reachable in section 3, and `context_pct()` derives used/limit from
-the pair.
+When the provider emitted `Usage` events (`saw_usage`), `GooseAdapter` reports `UsageStats` straight
+from `TurnStats` and sets `context_used_tokens = prompt_tokens`.
 
 ### 1.3 The chars/4 fallback
 
-The characters-per-token heuristic survives only for providers that emit no `Usage` events at all:
+Only for providers that emit no `Usage` events at all:
 
 ```
 prompt_tokens     ~= user_message.len() / 4          (floored at 1)
 completion_tokens ~= accumulated_output_chars / 4    (floored at 1)
 ```
 
-In that case `stats` is `None` on the `Done` event (`saw_usage.then_some(turn_stats)`), so a
-consumer that needs real numbers can tell. `UsageStats` on its own cannot: it carries no
-provenance flag, and nothing downstream reconstructs one.
+In that case `stats` on the `Done` event is `None` (`saw_usage.then_some(turn_stats)`), so a
+consumer that needs real numbers can tell. `UsageStats` itself carries no provenance flag, and the
+`sessions` totals mix real and fallback counts without distinguishing them.
 
-**The UI does not distinguish them either, and an earlier version of this document said it did.**
-`formatTokens` in `pond-desktop/src/components/UsageStatsCard.tsx` prefixes `~` to any count of
-1000 or more, as a rounding marker for the `k` suffix, and prints counts below 1000 bare. It is not
-an estimation marker and it never reads provenance. If estimate-vs-real needs to be visible, it has
-to be plumbed; today it is not.
+### 1.4 Reasoning tokens
 
-### 1.4 Persistence
+No provider reports hidden reasoning, so `GooseAdapter::count_reasoning_tokens` counts thinking
+blocks with the same `TokenCounter` the budget side uses (section 2.1). The count is reported
+alongside `completion_tokens`, never subtracted from it.
 
-`0016_session_usage.sql` adds the per-session totals:
+| Where | Written by |
+|---|---|
+| `TurnStats.reasoning_tokens`, `UsageStats.reasoning_tokens` | `GooseAdapter::chat_stream` |
+| `turn_metrics.reasoning_tokens` (logs migration `0008`) | both chat paths' telemetry |
+| `session_messages.reasoning_tokens` (system migration `0039`) | the voice path only; `persist_assistant_turn`'s `(prompt, completion)` tuple cannot carry it, so REST rows stay `NULL` |
 
-```sql
-ALTER TABLE sessions ADD COLUMN total_prompt_tokens     INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE sessions ADD COLUMN total_completion_tokens INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE sessions ADD COLUMN model_name TEXT;
-```
+`NULL` means "not counted", never zero. `GooseAdapter::observed_reasoning_samples` reads the
+non-`NULL` values among the newest 400 message rows (`recent_reasoning_samples`) to size the output
+reserve (section 2.4).
 
-`0029_message_token_counts.sql` adds the per-message columns:
+### 1.5 Persistence
 
-```sql
-ALTER TABLE session_messages ADD COLUMN prompt_tokens     INTEGER;
-ALTER TABLE session_messages ADD COLUMN completion_tokens INTEGER;
-```
+System database (`crates/pond-infra/migrations/system/`):
 
-Assistant rows carry the turn's prompt and completion sizes; user and tool rows stay `NULL`.
+| Migration | Columns |
+|---|---|
+| `0016_session_usage.sql` | `sessions.total_prompt_tokens`, `total_completion_tokens` (NOT NULL DEFAULT 0), `model_name` |
+| `0029_message_token_counts.sql` | `session_messages.prompt_tokens`, `completion_tokens` (assistant rows; user and tool rows stay `NULL`) |
+| `0039_reasoning_tokens.sql` | `session_messages.reasoning_tokens` (nullable, no default) |
 
-`SessionStorage::increment_usage()` adds tokens atomically after each chat response:
+`SqliteSessionStorage::increment_usage` adds atomically (`persist_assistant_turn` skips the call
+when both counts are zero):
 
 ```sql
 UPDATE sessions SET
     total_prompt_tokens     = total_prompt_tokens + ?,
     total_completion_tokens = total_completion_tokens + ?,
-    model_name = COALESCE(?, model_name)
+    model_name = COALESCE(?, model_name),
+    updated_at = datetime('now')
 WHERE id = ?
 ```
 
+Per-turn telemetry (`TurnMetrics`, `crates/pond-core/src/security/domain/turn_metrics.rs`) lives in
+`pond_logs.db` (`turn_metrics`, logs migrations `0005`, `0007`, `0008`, `0010`) and is read through
+`GET /api/v1/telemetry/turns` and `GET /api/v1/telemetry/summary`. Its `context_utilization_pct` is
+`context_used_tokens` over the window `ContextGovernor` resolves for the turn (section 3).
+
 ---
 
-## 2. Budgeting -- how much history fits (PAI-3 P2)
+## 2. Budgeting: how much fits
 
 ### 2.1 The `TokenCounter` port
 
@@ -123,149 +122,132 @@ WHERE id = ?
 ```rust
 pub trait TokenCounter: Send + Sync {
     fn count(&self, text: &str) -> usize;   // excludes the per-message envelope
-    fn is_exact(&self) -> bool;             // uses the ACTIVE model's vocabulary?
-    fn name(&self) -> &'static str;         // "chars/4", "tiktoken-o200k"
+    fn is_exact(&self) -> bool;             // true ONLY for the active model's own vocabulary
+    fn name(&self) -> &'static str;         // label for logs and telemetry
 }
 ```
 
-Implementations must be cheap enough to call once per message per turn: this runs on the
-hard-real-time trim path, which never blocks and never calls a model. Injecting the counter is what
-lets `pond-core` do the arithmetic while carrying no tokenizer dependency of its own.
-
-Two implementations exist:
+It is called per message, so implementations must be cheap, never block and never call a model.
+Injecting it keeps `pond-core` free of a tokenizer dependency.
 
 | Implementation | Where | `name()` | `is_exact()` |
 |---|---|---|---|
 | `HeuristicTokenCounter` | `pond-core`, `models/services/context/token_counting.rs` | `chars/4` | `false` |
 | `TiktokenCounter` | `pond-adapters-goose/src/token_counter.rs` | `tiktoken-o200k` | `false` |
 
-`HeuristicTokenCounter` is `text.len() / CHARS_PER_TOKEN` with `CHARS_PER_TOKEN = 4` -- the exact
-arithmetic the trimmer used to hardcode, so adopting the port changed no behaviour on its own.
-`len()` is **bytes**, so multi-byte scripts are over-counted rather than under-counted; that is the
-safe direction (it shrinks the history budget instead of overflowing the window) and a test exists
-so nobody "fixes" it to `chars().count()` without realising they are removing a margin.
+`HeuristicTokenCounter` is `text.len() / 4`. `len()` is **bytes**, so multi-byte scripts are
+over-counted, which is the safe direction (a smaller budget, not an overflowed window); the test
+`multibyte_text_is_over_counted_which_is_the_safe_direction` pins it.
+`PER_MESSAGE_TOKEN_OVERHEAD = 4` lives beside it and is added by the trimmer, not the counter.
 
-`PER_MESSAGE_TOKEN_OVERHEAD = 4` lives alongside it and is added by the **trimmer**, not the
-counter: it is a property of the chat template's message envelope rather than of the text.
+`TiktokenCounter` wraps `goose::token_counter::TokenCounter`: `tiktoken_rs::o200k_base` with a
+blake3-keyed LRU cache, embedded in the crate so it works offline. `GooseAdapter::token_counter_cell`
+builds it once; on failure it logs `token counter unavailable, falling back to chars/4` and every
+caller gets `HeuristicTokenCounter`.
 
-`TiktokenCounter` wraps `goose::token_counter::TokenCounter`, which is `tiktoken_rs::o200k_base`
-(GPT-4o's vocabulary) with its own blake3-keyed LRU cache, so re-counting an unchanged history
-every turn is cheap. `o200k_base` is embedded in the crate, so it works offline.
+### 2.2 No counter is exact
 
-`GooseAdapter::token_counter()` builds the tiktoken counter once through a `OnceCell`, and on
-failure logs `token counter unavailable, falling back to chars/4` and returns the heuristic. Both
-budget paths (`trim_goose_history` and the session-hydration replay) take whichever they get.
+A counter is exact only with the active model's own vocabulary. tiktoken over a Gemma GGUF is a
+real BPE over the real bytes and still inexact; it beats chars/4 mainly on JSON tool results and
+non-Latin text. The active model's tokenizer sits inside `goose-local-inference`'s private
+`llamacpp` module, and `pond-inference`'s tokenizer belongs to the quarantined `pond-agent` path with
+its own model instance, so neither is wired in.
 
-### 2.2 No counter is exact, and the port says so on purpose
+### 2.3 Who trims what
 
-A counter is exact only when it uses **the active model's own vocabulary**. tiktoken over a Gemma
-GGUF is a real BPE over the real bytes and still not exact, because the vocabularies differ.
-Nothing may report `is_exact() == true` on the strength of being a real tokenizer alone.
+Goose owns the live conversation and compacts it itself. GIAP supplies the window through
+`GOOSE_CONTEXT_LIMIT` (section 3.2) and leaves `GOOSE_AUTO_COMPACT_THRESHOLD` and
+`GOOSE_TOOL_PAIR_SUMMARIZATION` unset, so Goose's defaults apply (`goose_env_knobs` in
+`goose_agent.rs`).
 
-tiktoken is nonetheless a large improvement on chars/4 exactly where the trim path spends its
-budget: **tool results** (JSON is punctuation-dense, and `len()/4` misjudges it by an amount that
-varies with the payload) and **non-Latin text** (`len()` counts bytes).
+GIAP's own trimmer, `turn_trimmer::trim_history`, runs through `plan_replay` when
+`GooseAdapter::hydrate_goose_session` replays stored history into a fresh Goose session (for
+example after Goose's `sessions.db` was wiped). It strips stale `<system-context>` blocks,
+head+tail-truncates tool results to `TOOL_RESULT_MAX_BYTES` (1,500), splices the rolling summary,
+optionally re-cuts tool results older than the verbatim horizon, and drops the oldest complete
+turns until the estimate fits. Images are capped separately (`image_history`,
+`MAX_HISTORY_REPLAY_IMAGES = 1`).
 
-Exactness is deliberately deferred, with the cost written down in the adapter's module docs. The
-active model's tokenizer lives behind `LlamaModel::str_to_token` inside `goose-local-inference`,
-whose `llamacpp` module is private, so reaching it needs a fork-side patch carried in
-`docs/goose-patch-management.md` and re-applied on every upstream rebase. `pond-inference` has a
-genuine GGUF tokenizer, but it belongs to the quarantined `PondAgent` path (Q2-05) and uses its own
-model instance -- using it here would load the model twice, which an 8 GB Jetson cannot afford.
+The mistral.rs agent and the quarantined `pond-agent` budget history in characters through
+`available_history_chars`.
 
-### 2.3 The overshoot correction, and why it is load-bearing
+### 2.4 `CompactionProfile`
 
-Because no counter is exact, the estimate is corrected by measurement. `trim_history` takes the
-previous turn's **real** prompt count (`last_real`, from the accounting side) alongside the
-counter. When that real count overshot `CompactionProfile::usable_prompt_tokens()`, the effective
-history budget shrinks by the overshoot, floored at `MIN_HISTORY_TOKENS = 64`:
+`crates/pond-core/src/models/services/context/context_budget.rs`. `from_context_window` interpolates
+piecewise-linearly over six anchors (4,096 / 8,192 / 12,288 / 32,768 / 65,536 / 128,000 tokens) and is
+flat outside them; each anchor sets the compaction threshold, memory and system-prompt budgets, the
+history budget and the output reserve.
+
+`GooseAdapter::turn_profile` builds the live profile:
+
+1. `CompactionProfile::for_windows(window, ContextGovernor::prompt_window(provider, window))`:
+   preamble budgets from the clamped prompt window, history from the full window plus what the
+   clamp frees.
+2. `.with_history_reserved(fraction)`: holds back the share of history the session's live child
+   agents hold (the orchestrator's `DeviceLedger`, keyed by GIAP session id).
+3. `observed_output_reserve(samples, anchor, window)`: once at least 20 measured reasoning samples
+   exist, the reserve becomes `2 * p95`, rounded up to 256, capped at 25% of the window, and never
+   below the anchor.
+
+`usable_prompt_tokens()` is the window minus the output reserve; `usable_history_tokens()` further
+subtracts the system-prompt and memory budgets.
+
+### 2.5 The overshoot correction
+
+`turn_trimmer::effective_history_budget(profile, last_real_prompt_tokens)` shrinks the history
+budget by however much a previous turn's **real** prompt overshot `usable_prompt_tokens()`,
+floored at `MIN_HISTORY_TOKENS = 64`:
 
 ```rust
-budget = budget.saturating_sub(real - usable).max(MIN_HISTORY_TOKENS);
+tokens = tokens.saturating_sub(real - usable).max(MIN_HISTORY_TOKENS);
 ```
 
-The floor exists so a catastrophic overshoot still leaves enough room that the assistant does not
-forget the message it is answering. The correction converges in one turn -- which means the budget
-is wrong for one turn every time the conversation's shape changes, and that is the accepted cost of
-not having an exact counter.
-
-Two further under-counts this bounds: `TrimMessage` is text-only, so a replayed image contributes
-only its surrounding text rather than the ~250 tokens it really costs (`MAX_HISTORY_REPLAY_IMAGES`
-is what keeps that to roughly one image's worth), and the image cap itself runs in the adapter
-*after* `trim_history` returns.
-
-The wiring: `GooseAdapter` records `turn_stats.prompt_tokens` into
-`last_prompt_tokens_handle()` keyed by GIAP session id, **only when `saw_usage`** -- a chars/4
-fallback number is never fed back as if it were measured. `trim_goose_history` reads it back for
-the session it is about to trim.
+It bounds the counter's error by measurement. `plan_replay` passes `None` (a replay has no previous
+turn in the new engine session). `GooseAdapter` records each turn's real `prompt_tokens` per GIAP
+session (`last_prompt_tokens_handle`), only when `saw_usage`, but no budget path reads that map.
 
 ---
 
-## 3. The window the budget is measured against (PAI-3 P1)
+## 3. The window budgets are measured against
 
-A token count is only half of a budget; the other half is the window. Before PAI-3 P1 four code
-paths answered "how big is this model's context window?" independently, and the worst of them --
-the live history trimmer -- read `GOOSE_CONTEXT_LIMIT` from the process environment and fell back
-to a hardcoded 8192.
+### 3.1 `ContextGovernor`
 
-`ContextGovernor` (`pond-core`, `models/services/context/context_governor.rs`) now owns that
-answer. It is stateless: every result is a pure function of `ContextInputs`, which is what makes the
-precedence testable without a live engine.
+`crates/pond-core/src/models/services/context/context_governor.rs` is the single answer to "how
+big is this model's window". It is stateless: `resolve(&ContextInputs) -> WindowResolution { tokens,
+source }`.
 
-```rust
-pub struct WindowResolution { pub tokens: usize, pub source: WindowSource }
-```
+| Rung | `WindowSource` | Input | `is_exact()` |
+|---|---|---|---|
+| 1 | `EngineReported` | `EngineWindow { tokens, model }` from `TurnStats.context_limit_tokens`; ignored if the model differs | yes |
+| 2 | `Registry` | pinned `context_size` in Goose's local model registry (`local` / `gguf` only) | yes |
+| 3 | `CatalogRecord` | `ModelRecord.context_length`; clamped to 32,768 for on-device providers, and a lower override wins (reported as `Override`) | no |
+| 4 | `Override` | `Settings.context_window_override` (0 = unset) | no |
+| 5 | `Heuristic` | caller-supplied `capability_window`, else 32,768 for `local` / `gguf`, else `ModelCapabilities::from_model_name` | no |
 
-| Rung | `WindowSource` | Input | `is_exact()` | Status |
-|---|---|---|---|---|
-| 1 | `EngineReported` | `TurnStats.context_limit_tokens`, wrapped in `EngineWindow { tokens, model }` | **yes** | live in `routes.rs` telemetry |
-| 2 | `Registry` | pinned `context_size` from Goose's local model registry | **yes** | live in `GooseAdapter::resolve_window` |
-| 3 | `CatalogRecord` | `ModelRecord.context_length` | no | wired, but no production caller supplies it -- see below |
-| 4 | `Override` | `Settings.context_window_override` | no | live |
-| 5 | `Heuristic` | caller-supplied `capability_window`, else `ModelCapabilities::from_model_name` | no | live |
+Allocations (rungs 1-2) outrank the user override because budgeting past the allocation only makes
+the engine truncate. `WindowSource::label()` returns `engine` / `registry` / `catalog` / `override` /
+`heuristic`; no HTTP response or UI reads it.
 
-Rung 3 has never been producible in production. Every `ContextInputs` construction site passes
-`catalog_context_length: None`, and the only thing that has ever produced the variant is the
-governor's own unit test -- a branch with full test coverage and no fixture production can build,
-which is the `ProfileScope::Owner` shape exactly. PAI-3 P3 is populating
-`ModelRecord.context_length` in the catalog providers; supplying it at the two live call sites is
-P3b. The row above is wiring, not evidence that the field is consulted.
+Callers:
 
-Rungs 1 and 2 outrank the user override deliberately: an override is a preference, an allocation is
-a fact, and budgeting above the allocation only makes the engine truncate.
+| Caller | Rungs it supplies |
+|---|---|
+| `GooseAdapter::resolve_window` (sets `GOOSE_CONTEXT_LIMIT`, feeds `turn_profile`) | 2, 3 (looked up only without a pin), 4, 5 without `capability_window` |
+| REST chat telemetry in `pond-api` `routes.rs` | 1, 3, 4, 5 with `capability_window` from `agent.capabilities()` |
+| mistral.rs agent, `pond-server` mistral.rs wiring, `pond-agent` | 4, 5 |
 
-`EngineWindow` carries the model it was measured for, and the governor discards a reading whose
-model does not match the active one. `TurnStats` is recorded per turn, so immediately after a model
-swap the newest reading describes the model just left.
+`ContextGovernor::prompt_window(provider, resolved)` clamps the **preamble** side to 8,192 for
+`local` and `gguf` providers, which re-prefill it every turn; history budgets get the full window.
 
-`WindowSource::is_exact()` is `true` for `EngineReported` and `Registry` only. It answers a
-different question from `TokenCounter::is_exact()` -- *is this window a real allocation?* rather
-than *is this count the model's own tokenization?* -- and today the two never both say yes, because
-no counter says yes at all. `WindowSource::label()` (`engine` / `registry` / `catalog` / `override`
-/ `heuristic`) exists so the provenance is displayable; nothing in `pond-desktop` reads it yet.
+### 3.2 `GOOSE_CONTEXT_LIMIT`
 
-`ContextGovernor::prompt_window(provider, resolved)` clamps the **preamble** side to 8192 for
-`local` and `gguf` providers and leaves HTTP providers alone. History budgets get the raw window.
-Conflating the two silently grows the KV prefix on local providers, which is what an unclamped 32K
-profile did: a 9.4K-token prompt and roughly 17 s TTFT for a one-line question.
-
-### `GOOSE_CONTEXT_LIMIT` is written and never read
-
-`goose_env_knobs` still exports it, because it flows into Ollama's `options.num_ctx` -- so the
-reported limit, the request's `num_ctx` and the KV cache agree. Deleting the *write* would
-desynchronise them. What P1 deleted is the two *reads*, and two guards keep them deleted:
-
-- `this_module_does_not_read_the_environment` (in `context_governor.rs`) -- no `std::env` in the
-  module body.
-- `no_budget_path_reads_the_context_limit_from_the_environment` (in `goose_agent.rs`) -- no
-  `env::var("GOOSE_CONTEXT_LIMIT")` outside the adapter's test module.
-
-Both parse source text with `include_str!`, so both are the kind of check that can silently match
-nothing. Only one has been watched fail: on 2026-08-06 `std::env::var("GOOSE_CONTEXT_LIMIT")` was
-put back into `ContextGovernor::prompt_window`, and
-`this_module_does_not_read_the_environment` failed with `context_governor must not read process
-environment variables`, with the other sixteen governor tests still green. The twin in
-`goose_agent.rs` has **not** been mutated, so treat it as unproven until it has been.
+`GooseAdapter::apply_goose_env_knobs` runs every turn and exports the resolved window as
+`GOOSE_CONTEXT_LIMIT` (via `goose_env_knobs`) whenever the knob signature changes. Goose reads it:
+its config's context limit (which its compaction plans against), Ollama's `options.num_ctx`, and the
+in-process llama.cpp and LiteRT engines' context size when no registry pin applies. GIAP code never
+reads it back; two source-scanning tests guard that:
+`this_module_does_not_read_the_environment` (`context_governor.rs`) and
+`no_budget_path_reads_the_context_limit_from_the_environment` (`goose_agent.rs`).
 
 ---
 
@@ -273,67 +255,49 @@ environment variables`, with the other sixteen governor tests still green. The t
 
 ### `GET /api/v1/usage/summary`
 
-Aggregates all sessions:
+Aggregates every session:
 
 ```json
 {
   "total_prompt_tokens": 12500,
   "total_completion_tokens": 8200,
+  "total_reasoning_tokens": 3100,
+  "counted_reasoning_turns": 42,
   "total_tokens": 20700,
   "session_count": 15,
-  "cloud_input_price_per_million": 2.50,
-  "cloud_output_price_per_million": 10.00
+  "cloud_input_price_per_million": 2.5,
+  "cloud_output_price_per_million": 10.0
 }
 ```
 
-Pricing comes from settings (`cloud_input_price_per_million`, `cloud_output_price_per_million`).
+`total_tokens` is prompt plus completion; reasoning is reported separately and not priced.
+`counted_reasoning_turns` tells "no thinking" apart from "not counted". The reasoning sum walks every
+session's messages. Prices come from settings, defaulting to 2.50 and 10.00.
 
 ### `GET /api/v1/sessions`
 
-Includes per-session tokens:
-
-```json
-{
-  "sessions": [{
-    "id": "...",
-    "title": "Weather chat",
-    "total_prompt_tokens": 500,
-    "total_completion_tokens": 300,
-    "model_name": "gemma3:4b",
-    "created_at": "...",
-    "updated_at": "..."
-  }]
-}
-```
+Each entry carries `id`, `title` (stored, else derived from the first user message), `preview`,
+`message_count`, `total_prompt_tokens`, `total_completion_tokens`, `model_name`, `created_at`,
+`updated_at`.
 
 ---
 
-## 5. Cost savings
+## 5. Cost-savings settings
 
-The Dashboard "Usage & Savings" card compares on-device inference ($0) with cloud API pricing:
+| Setting | Default | Where set |
+|---|---|---|
+| `cloud_input_price_per_million` | 2.50 | settings catalogue (`pond-desktop/src/settings/catalogue.ts`) |
+| `cloud_output_price_per_million` | 10.00 | same |
 
-```
-saved = (prompt_tokens     / 1,000,000) * cloud_input_price
-      + (completion_tokens / 1,000,000) * cloud_output_price
-```
-
-Default comparison: GPT-4o ($2.50/M input, $10.00/M output). Configurable via settings.
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `cloud_input_price_per_million` | 2.50 | Cloud API input token price per million |
-| `cloud_output_price_per_million` | 10.00 | Cloud API output token price per million |
-
-Note that the totals being priced mix real provider counts and chars/4 fallbacks without
-distinguishing them (1.3), so the savings figure inherits whatever error the fallback contributed.
+The savings figure is `prompt / 1e6 * input_price + completion / 1e6 * output_price`, computed in
+`pond-desktop/src/components/UsageStatsCard.tsx`. No view mounts that component and
+`PondApiClient.getUsageSummary` has no caller, so the desktop does not show the figure. The per-turn
+surface the desktop does show is `TurnStatsFooter` (`ctx used/limit`), fed by the `turn_stats` frame.
 
 ---
 
 ## Related documents
 
-- [Model Capabilities](./model_capabilities.md) -- where `context_window_tokens` sits in the
-  governor's precedence, and why it is the last rung rather than the number budgets derive from.
-- [PAI-3 Context governor](./pai/03-context-governor.md) -- the design, its invariants, and the
-  phases still outstanding.
-- [Inference Optimization](../developer/inference_optimization.md) -- the hardware reasons the
-  preamble is clamped.
+- [Model Capabilities](./model_capabilities.md): where `context_window_tokens` enters the governor.
+- [PAI-3 Context governor](./pai/03-context-governor.md): the design and its phases.
+- [Inference Optimization](../developer/inference_optimization.md): platform-specific inference settings.
