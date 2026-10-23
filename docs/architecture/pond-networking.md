@@ -5,7 +5,8 @@ claimed by its first phone. This document is the design for doing that over Blue
 and wired links, on any host the pond runs on (Jetson, a Linux single-board computer, a Mac, later
 Windows), through one networking context instead of the five places networking lives today.
 
-Status: **DESIGNED 2026-10-16.** Phase status is in [Phases](#phases).
+Status (2026-10-23): P1 to P5 are on main, server side; P6 is partial (a pond advertises over BLE
+whenever it has no usable network); P7 is not started. Detail per phase is in [Phases](#phases).
 
 ## Decisions
 
@@ -18,7 +19,10 @@ Status: **DESIGNED 2026-10-16.** Phase status is in [Phases](#phases).
 | 2026-10-16 | **Windows gets ports that leave room for it, not adapters yet.** | `pond-server` does not run on Windows today (six `cfg(windows)` blocks, no CI runner). *Default, awaiting confirmation.* |
 | 2026-10-17 | **On macOS the pond registers `_pond._tcp` with the system's mDNSResponder; elsewhere it runs mdns-sd.** | mDNSResponder already owns UDP 5353 and the Mac's host name. Beside it, mdns-sd renamed the Mac on start and, after a day and a half, read queries without answering them ([Discovery](#discovery-p2)). One responder per host. |
 
-## What exists (verified 2026-10-16)
+## Starting point (verified 2026-10-16, before P1)
+
+The baseline this design answers. Several bullets are no longer true; [Phases](#phases) says what
+changed.
 
 - **No setup radio code anywhere.** Neither this repo nor goose-on-the-go has BLE, SoftAP, Wi-Fi
   join or captive-portal code. Bluetooth appears only in Matter accessory commissioning
@@ -78,6 +82,20 @@ pond-adapters-net-macos    CoreWLAN, CoreBluetooth (objc2), mdns-sd
 pond-adapters-net-windows  WinRT (windows crate), mdns-sd            -- later
 ```
 
+**As built.** The adapters landed in one crate, `crates/pond-connect`, with per-OS modules rather
+than one crate per OS ([setup channel](pond-setup-channel.md#crate-layout)), and the ports took
+these names:
+
+| Designed | Built |
+|---|---|
+| `SetupCodeStore`, `CodeAnnouncer`, `WifiStation`, `ServiceAdvertiser` | as named, in `pond-core/src/network/ports/` |
+| `RadioCapabilities` | `pond-core/src/network/domain/capability.rs`, probed by `pond-connect/src/capabilities.rs`, reported through the `SetupRadios` port (`GET /network/status`) |
+| `InterfaceInventory` | not a port: `pond-connect/src/interfaces.rs` and `pond-api/src/network.rs` read getifaddrs directly, judged by `pond-core/src/network/domain/interface.rs`; wired links have their own `WiredInterfaces` port |
+| `SetupTransport`, `SetupService` | the setup channel session in `pond-connect/src/setup_channel/` |
+| `ClaimPolicy` | `SetupClaimService` (`services/setup_claim.rs`), `SetupGuessThrottle`, `SpokenCodeLimiter`, `DeviceResumeThrottle` |
+| `ConnectivityWatchdog` | not built; `services/advertising.rs::should_advertise`, applied every 10 s, covers advertising while offline |
+| `pond-adapters-net-{linux,macos,windows}` | `pond-connect` (`ble/`, `wifi/`, `wired/`, `discovery/`); no Windows modules |
+
 Each adapter reports its capabilities at runtime (`RadioCapabilities`), so the dashboard and the
 phone only offer what this host can do, and say why when they cannot ("this Mac cannot run a setup
 hotspot"). Adapters are picked at compile time by target OS, with a mock for tests.
@@ -87,22 +105,21 @@ adapter. Once the Linux adapter exists, Matter commissioning should reach BLE th
 than through its own stack, and take the household Wi-Fi credential from `WifiStation` for the
 devices it commissions.
 
-The existing modules move behind these ports in phase 2: the pure parts of
-`pond-api/src/network.rs` (what counts as LAN, tailnet, tunnel) become domain rules, getifaddrs
-becomes the `InterfaceInventory` adapter, and `mdns_advertiser.rs` becomes the mdns-sd
-`ServiceAdvertiser`. `pond-net` stays the egress leaf it is; `embedded_network.rs` stays where it is
-until remote access needs something from this context. The adapters landed in one crate,
-`crates/pond-connect`, rather than one per OS ([setup channel](pond-setup-channel.md#crate-layout)).
+Phase 2's plan was to move the existing modules behind these ports: the pure parts of
+`pond-api/src/network.rs` (what counts as LAN, tailnet, tunnel) into domain rules (done), getifaddrs
+into an `InterfaceInventory` adapter (not done), and the mDNS advertiser into a `ServiceAdvertiser`
+(done). `pond-net` stays the egress leaf it is; `embedded_network.rs` stays where it is until remote
+access needs something from this context.
 
 ### Discovery (P2)
 
-Landed 2026-10-17 on `feat/ble-setup`. `_pond._tcp` goes out through the `ServiceAdvertiser` port
+Landed 2026-10-17. `_pond._tcp` goes out through the `ServiceAdvertiser` port
 (`pond-core/src/network/ports/service_advertiser.rs`). The TXT contract is the domain's
 `PondAdvert`: `v`, `scheme`, `pin`, then `id=<discriminator>` and, while unclaimed, `setup=1`.
 `DiscoveryService` publishes it at startup and again when a claim this process latches lands, or,
-on its 60-second check, when the setup record reads differently (a `setup-code --rearm` from
-another process) or the last publish failed. `mdns_advertiser.rs` is gone; its tunnel exclusion
-moved with mdns-sd. The adapters are in `pond-connect/src/discovery/`:
+on its 60-second check (`ADVERT_RECHECK_INTERVAL`), when the setup record reads differently (a
+`setup-code --rearm` from another process) or the last publish failed. The adapters are in
+`pond-connect/src/discovery/`:
 
 | Host | Responder | When the claim changes | Goodbyes |
 |---|---|---|---|
@@ -165,8 +182,9 @@ setup code. Once claimed it never accepts the setup code again until it is reset
   per 30 s doubling to one per 10 min, across all clients, held in memory. At that rate ten digits
   outlast the hardware.
 - **Lifecycle.** `claimed_at` is written before the first device's tokens are returned, and read
-  live on every attempt. Factory reset (host-only, like `POST /onboard/reset` once onboarded)
-  clears it, which re-arms the same printed code. It is a latch with a door, not a one-way door.
+  live on every attempt. Clearing it re-arms the same printed code: a latch with a door, not a
+  one-way door. As built the door is `pond-server setup-code --rearm`, run on the host; there is no
+  factory reset (see Open questions).
 
 ### The spoken fallback
 
@@ -175,8 +193,8 @@ code (six digits, ten minutes, retired after ten failures; the existing `issue_p
 and reads it aloud twice. **The code is never in any response**: whoever asks learns only that it
 was spoken, and only someone in earshot can use it.
 
-- Triggered by the setup channel (BLE or LAN) or by voice ("pair a new phone") once the pond has its
-  wake word and speech models.
+- Triggered by the setup channel (BLE) or `POST /handshake/spoken-code` (LAN). A voice trigger
+  ("pair a new phone") is designed, not built.
 - At most one code per 30 s and ten per hour, whatever asks.
 - A fresh pond may have no voice downloaded yet, so a short set of English digit clips is compiled
   into the binary. The configured TTS voice is used when one is installed.
@@ -316,35 +334,37 @@ log or return it, and zeroizes its copy.
 
 ## Self-healing
 
-- **Lost network.** When the pond has had no usable network for five minutes it opens a setup
-  window: BLE advertising starts, and the phone app offers to move the pond to a new network. A
-  claimed pond needs a spoken code to accept new credentials.
-- **SoftAP** (Linux) starts only when no known network is in range after a scan, because the radio
+- **Lost network.** Designed: after five minutes with no usable network the pond opens a setup
+  window. Built: a pond advertises over BLE whenever it has no usable network, checked every 10 s
+  (`should_advertise`), with no delay and no separate window. A claimed pond accepts new
+  credentials from a phone that proves a spoken code, or resumes as an already paired device (P5e).
+- **SoftAP** (Linux, not built; only its SSID, `Discriminator::softap_ssid`, exists) starts only when no known network is in range after a scan, because the radio
   cannot be an access point and a station at once. It alternates with rescans, and its SSID is
   `Pond-Setup-<discriminator>` with the setup code as its WPA2 passphrase, so the card covers it.
-- **Privileges** come from `giap.sh install`: the polkit grant (`.pkla` on polkit 0.105, a
-  `rules.d` file on newer ones) for the pond's user, scoped to NetworkManager's Wi-Fi actions.
-  `giap.sh doctor` checks rfkill, `bluetooth.service`, the grant, and the adapter's AP support.
+- **Privileges** come from `giap.sh install` or `giap.sh wifi-grant`: the polkit grant (`.pkla`
+  before polkit 0.106, a `rules.d` file after) for the pond's user, scoped to NetworkManager's
+  Wi-Fi actions (`scripts/lib/connect-setup.sh`). `giap.sh doctor` reports the grant.
 
 ## Phases
 
 | Phase | Scope | Status |
 |---|---|---|
-| P0 | This design | DESIGNED 2026-10-16 |
+| P0 | This design | Done 2026-10-16 |
 | P1 | `pond-core/src/network/`: setup code, card, discriminator, claim policy, guess and spoken-code limits, `SetupCodeStore` and `CodeAnnouncer` ports; `FileSetupCodeStore`. Wi-Fi, transport and capability ports wait for the phases that use them | LANDED 2026-10-16 |
-| P2 | Move interface classification and mDNS behind the context's ports; `GET /api/v1/network/status` with capabilities | Discovery LANDED 2026-10-17 ([Discovery](#discovery-p2)): the `ServiceAdvertiser` port, mDNSResponder on macOS, mdns-sd elsewhere; Mac unit, live and dns-sd tests, and the Jetson resolving a Mac-hosted pond. The classification rules moved to `pond-core` and the status route landed with P5b; the getifaddrs `InterfaceInventory` port has not |
-| P3 | `pond-server setup-code`, card at install and provision; CPace against the setup code with the claim latch; spoken fallback with bundled clips; goose-on-the-go reads `pond://setup` | LANDED 2026-10-17, server side (the wire contract above; Mac unit, route and live tests; no phone or Orin run yet). goose-on-the-go's half lands in its own repo |
-| P4 | Claim before onboarding, owner attribution and the voice sample (server); owner setup in goose-on-the-go | LANDED 2026-10-17, server side: the claim-aware wizard exposure, `claimed_by` and owner attribution at completion, `POST /voice/sample`, and the five model routes a phone needs before onboarding (#365). Mac unit, route and live tests, and the Kokoro sample seam against a real model; no phone or Orin run yet. Owner setup in goose-on-the-go is handed off (`.ai/handoffs/gotg-onboarding-and-setup.md`) |
-| P5 | Setup channel and BLE: macOS adapter first (the Mac development loop), then Linux, verified on the Jetson last; Wi-Fi join | P5a LANDED 2026-10-17: the OS-independent core in `crates/pond-connect` ([setup channel](pond-setup-channel.md#phases)); no radio adapter yet |
-| P6 | Connectivity watchdog; SoftAP and captive page on Linux | not started |
-| P7 | Matter BLE and Wi-Fi handoff through this layer; BT Classic accessories; Windows adapters | not started |
+| P2 | Move interface classification and mDNS behind the context's ports; `GET /api/v1/network/status` with capabilities | LANDED except the `InterfaceInventory` port. Discovery 2026-10-17 ([Discovery](#discovery-p2)): the `ServiceAdvertiser` port, mDNSResponder on macOS, mdns-sd elsewhere. The classification rules are in `pond-core/src/network/domain/interface.rs`; the status route landed with P5b |
+| P3 | `pond-server setup-code`, card at install and provision; CPace against the setup code with the claim latch; spoken fallback with bundled clips; goose-on-the-go reads `pond://setup` | LANDED 2026-10-17, server side (the wire contract above; Mac unit, route and live tests). An A16 ran the claim against a Jetson over BLE on 2026-10-18 ([setup channel decisions](pond-setup-channel.md#decisions)). goose-on-the-go's half is in its own repo |
+| P4 | Claim before onboarding, owner attribution and the voice sample (server); owner setup in goose-on-the-go | LANDED 2026-10-17, server side: the claim-aware wizard exposure, `claimed_by` and owner attribution at completion, `POST /voice/sample`, and the five model routes a phone needs before onboarding (#365). Mac unit, route and live tests, and the Kokoro sample seam against a real model. An A16 ran owner setup against a real pond on 2026-10-18, which found the `onboarding_required` gap closed under "The phone's own device during setup". Owner setup in goose-on-the-go is handed off (`.ai/handoffs/gotg-onboarding-and-setup.md`, local and gitignored) |
+| P5 | Setup channel and BLE: macOS adapter first (the Mac development loop), then Linux, verified on the Jetson last; Wi-Fi join | LANDED, server side: the core, the macOS helper and CoreWLAN station, BlueZ and NetworkManager on Linux, device resume, and the connections routes for Wi-Fi over HTTPS ([pond-connections.md](pond-connections.md)). Per-sub-phase status: [setup channel](pond-setup-channel.md#phases) |
+| P6 | Connectivity watchdog; SoftAP and captive page on Linux | partial: BLE advertising whenever offline (`should_advertise`); no watchdog, SoftAP or captive page |
+| P7 | Matter BLE and Wi-Fi handoff through this layer; BT Classic accessories; Windows adapters | not started: Matter still drives BLE through its own stack (`matter-server/src/ble.ts`) |
 
 ## Open questions
 
 - What should reset to factory state mean beyond re-arming the code: forget Wi-Fi, devices,
-  household authority? Today only `POST /onboard/reset` exists.
-- Re-provisioning a claimed pond without anyone in earshot (a phone holding a valid refresh token,
-  over BLE) needs a proof that does not send the token in the clear. The token is stored hashed.
+  household authority? Today only `POST /onboard/reset` and `setup-code --rearm` exist.
+- Answered by P5e: re-provisioning a claimed pond without anyone in earshot uses
+  `credential: "device"` over BLE, a CPace run keyed on the stored refresh hash, so the token is
+  never sent.
 - Setting the Wi-Fi regulatory domain needs `CAP_NET_ADMIN`; whether the polkit grant or a oneshot
   unit sets it from the phone's country.
 - Whether goose-on-the-go should listen for the spoken code itself (microphone) rather than ask the

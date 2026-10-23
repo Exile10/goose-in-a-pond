@@ -1,482 +1,223 @@
-# Database Schema — Goose In A Pond
+# Database schema
 
-> Last updated: April 2026 — reflects migrations 0001–0016 (system) and 0001–0003 (logs)
+GIAP keeps its state in three SQLite files under the data directory. `Database::init`
+(`crates/pond-infra/src/db.rs`) opens and migrates all three with `sqlx::migrate!`, in this order:
 
-## Overview
+| Pool | File | Migrations | Versions | Tables | Holds |
+|---|---|---|---|---|---|
+| `db.system` | `pond_system.db` | `crates/pond-infra/migrations/system/` | 0001–0060 (0024 unused, 59 files) | 38 | Authoritative household data: conversations, members, devices, memory, settings, pairing |
+| `db.logs` | `pond_logs.db` | `crates/pond-infra/migrations/logs/` | 0001–0010 | 6 | High-volume, prunable data: operational log, audit events, sensors, camera events, turn metrics |
+| `db.vectors` | `pond_vectors.db` | `crates/pond-infra/migrations/vectors/` | 0001–0002 | 1 | Derived embedding index, rebuildable from `pond_system.db` |
 
-GIAP uses **two SQLite databases** to separate concerns:
+Every connection runs with `foreign_keys` ON, WAL journaling, `synchronous=NORMAL`, an 8 MB page
+cache and a 32 MB mmap, four connections per pool (`Database::connect`). Vector connections also
+`ATTACH` `pond_system.db` as `sys` so retrieval can join live source rows
+(`SqliteVectorIndex::connect`), which is why the vector migrations run after the system ones.
 
-| Database | File | Purpose |
-|----------|------|---------|
-| **System** | `pond_system.db` | Core app data — sessions, profiles, devices, settings, memory |
-| **Logs** | `pond_logs.db` | Telemetry, sensor time-series, camera events, audit trail |
+Queries are runtime `sqlx::query`/`query_as` calls; there are no compile-time `query!` macros and no
+`.sqlx/` directory. Migration versions must be unique per database
+(`migration_versions_are_unique_within_each_database` in `db.rs`).
 
-Both are initialized via `sqlx::migrate!()` in `pond-infra/src/db.rs`. Migration files:
-- `crates/pond-infra/migrations/system/`
-- `crates/pond-infra/migrations/logs/`
+Not in these files:
 
-The two connection pools are exposed as `db.system` and `db.logs` respectively. **Never use `db.system` for sensor or camera writes** — those tables live in `db.logs`.
+- **Goose's own state.** Goose keeps its conversation store (`sessions.db`) under
+  `<data_dir>/engine/`, which `pin_goose_state_under` (`crates/pond-server/src/main.rs`) sets as
+  `GOOSE_PATH_ROOT`. The GIAP REST API never reads it; chat history is `sessions` /
+  `session_messages` below, and `engine_session_map` links the two.
+- **Credentials.** `FileSecretRepository` keeps them encrypted in `<data_dir>/secrets.json`
+  (`crates/pond-infra/src/file_secret_repository.rs`). `secret_migration.rs` moves any legacy
+  `api_key_*` rows out of `settings`.
 
----
-
-## `pond_system.db` — Core Application Data
-
-### `onboarding_state`
-
-Singleton row (enforced by `CHECK(id=1)`) tracking first-run setup progress.
-
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `id` | INTEGER | PK, CHECK(id=1) | Forces single row |
-| `current_step` | TEXT | NOT NULL | `VerifyDevice` → `CreateProfile` → `ConfigurePersonality` → `ConnectDevices` → `Completed` |
-| `updated_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-
----
-
-### `sessions`
-
-Conversation threads. Each `POST /api/v1/chat` call either creates or reuses a session.
-
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `id` | TEXT | PK | UUID |
-| `title` | TEXT | Nullable | Auto-generated after first LLM exchange |
-| `profile_id` | TEXT | FK → profiles(id), Nullable | Household member who owns this session |
-| `input_mode` | TEXT | NOT NULL, DEFAULT 'rest' | `rest` or `voice` |
-| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-| `updated_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-
-Indexes: `idx_sessions_updated_at` on `(updated_at DESC)`
+Cross-database references (`sensor_readings.device_id`, `events.session_id`, `vectors.row_id`)
+are logical only: SQLite cannot enforce a foreign key across files.
 
 ---
 
-### `session_messages`
+## `pond_system.db`
 
-Individual messages within a session. TTL: keep most recent **500 per session** (pruned every 6 hours by background task).
+FK = enforced foreign key. Key columns, not full column lists; read the migration or
+`sqlite3 pond_system.db .schema <table>` for the rest.
 
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `id` | TEXT | PK | UUID |
-| `session_id` | TEXT | NOT NULL, FK → sessions(id) ON DELETE CASCADE | |
-| `role` | TEXT | NOT NULL, CHECK IN ('user','assistant','system') | |
-| `content` | TEXT | NOT NULL | |
-| `embedding` | BLOB | Nullable | f32 LE bytes — reserved for future per-message semantic search |
-| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
+### Conversations
 
-Indexes: `idx_session_messages_session_id`, `idx_session_messages_created_at`
+| Table | Purpose | Key columns |
+|---|---|---|
+| `sessions` | One row per conversation | `title`, `title_source`, `title_through_message_id`; `profile_id` (FK `profiles`), `identification_source`, `identification_confidence`; `input_mode`; `total_prompt_tokens`, `total_completion_tokens`, `model_name`; `rolling_summary`, `rolling_summary_through_id`, `rolling_summary_updated_at`; batch-extraction cursor `extracted_through_id`, `extracted_at`, `extraction_attempts` |
+| `session_messages` | Messages in a session | `session_id` (FK, cascade), `role` (`user`/`assistant`/`system`/`tool`), `content`, `tool_call_id`, `tool_calls_json`, `prompt_tokens`, `completion_tokens`, `reasoning_tokens`, `liked`, `embedding` |
+| `session_thinking` | Reasoning text kept beside its message when `persist_thinking` is on | `message_id`, `session_id` (both FK, cascade), `block_index`, `content` |
+| `message_attachments` | Metadata for chat image attachments; the bytes live under `<data_dir>/attachments/<session_id>/` | `message_id`, `session_id` (FK, cascade), `ordinal`, `mime_type`, `byte_size`, `file_path` |
+| `engine_session_map` | GIAP session id to the Goose engine's own session id, so a restart resumes the same engine conversation | `session_id` (PK), `engine_session_id` |
+| `session_tool_groups` | Tool groups (MCP extension names) chosen once per session when `tool_selection_mode` narrows | `session_id` (PK), `groups` |
 
-> **Context budget**: `ChatService` loads the most recent 100 messages then calls `trim_to_budget()` to cap at ~9 952 chars (≈3K tokens) before sending to the LLM. This prevents silent context overflow on a 7B model.
+### Household, devices and pairing
 
----
+| Table | Purpose | Key columns |
+|---|---|---|
+| `onboarding_state` | Singleton (`CHECK(id=1)`) holding the wizard's current `OnboardingStep` | `current_step` |
+| `profiles` | Household members | `display_name`, `avatar_emoji`, `preferences` (JSON). Deleting a profile releases its sessions and expires its drafts and reminders (triggers `trg_profiles_delete_*`) |
+| `devices` | Paired clients and registered devices | `name`, `device_type`, `hostname`, `ip_address`, `capabilities` (JSON), `last_seen`, `room`, `profile_id` (FK, set null). `is_online` is stored but never read: `SqliteDeviceRegistry` derives it from `last_seen` within 300 s |
+| `pairing_codes` | Single-use pairing codes; only the SHA-256 hash is stored | `code_hash` (PK), `expires_at`, `consumed_at`, `profile_id` (FK, set null) |
+| `handshake_challenges` | Short-lived per-handshake challenges | `client_id`, `challenge`, `client_type`, `expires_at`, `consumed_at` |
+| `session_tokens` | Issued bearer and refresh tokens, hashes only | `token_hash` (PK), `refresh_hash`, `device_id`, `client_id`, `client_type`, `expires_at`, `refresh_expires_at`, `last_seen_at`, `revoked_at` |
+| `push_tokens` | One FCM/APNs token per device | `device_id` (PK, FK cascade), `token`, `platform` |
+| `notifications` | Offline queue for targeted notifications; broadcasts are not queued | `device_id` (FK cascade), `category`, `title`, `body`, `data`, `delivered_at` |
+| `face_embeddings` | Per-member face vectors | `profile_id` (FK cascade), `embedding`, `model_dims`, `model_name` |
+| `face_profile_thresholds` | Per-member face match threshold | `profile_id` (PK, FK cascade), `match_threshold` |
 
-### `profiles`
+### Memory, proposals and personal context
 
-Household members. Each person who uses the Pond gets a profile. Sessions are linked to a profile; memory fragments are scoped to one.
+| Table | Purpose | Key columns |
+|---|---|---|
+| `memory_fragments` | Curated long-term memory | `profile_id` (FK cascade; null = household-wide), `session_id` (FK set null), `content`, `source`, `tags` (JSON), `segment`, `importance`, `tier`, `decay_rate`, `access_count`, `last_accessed_at`, `lifecycle`, `superseded_by`, `corrects`, `embedding` |
+| `memory_events` | Audit trail of memory lifecycle events | `event_kind`, `memory_id`, `session_id`, `data` |
+| `consolidation_runs` | One row per memory consolidation pass | `mode`, `memory_count`, `accepted`, `rejected`, `duration_ms`, `details` |
+| `memory_edges` | Edges between memories (`from_id`, `to_id`, `relation`). No code reads or writes it, and its foreign keys name a `memories` table that does not exist | |
+| `suggestion_queue` | Suggestions the pond composed for Home | `profile_id`, `prompt`, `reason`, `source_memory_id`, `answered_by`, `state` (`queued`/`taken`/`dismissed`) |
+| `reminders` | Dated utterances held for proposal instead of becoming memories | `about`, `when_said`, `about_key`, `session_id`, `window_id`, `subject`, `profile_id`, `said_at`, `disposition` (`pending`/`proposed`/`dismissed`/`expired`), `decided_at` |
+| `drafts` | Staged actions awaiting approval, and proactive proposals (`origin = 'proactive'`) | `session_id`, `kind`, `summary`, `payload` (JSON), `status`, `profile_id`, `identification_source`, `origin`, `expires_at`, `rationale`. Triggers require a rationale and an expiry on proposals and refuse approving an expired row |
+| `context_sources` | Per-member sources of personal context (accounts, sensors, devices) | `kind`, `provider`, `profile_id` (FK cascade), `scopes`, `cursor`, `last_sync`, `status`, `secret_ref`. Owner and kind are immutable (triggers) |
+| `context_items` | The personal-context corpus, one row per item a source produced | `source_id` (FK cascade), `external_id`, `profile_id` (must match the source's, trigger), `source_kind`, `item_kind`, `occurred_at`, `title`, `body`, `participants`, `sensitivity`, `embedding` |
 
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `id` | TEXT | PK | UUID |
-| `display_name` | TEXT | NOT NULL | "Jerry", "Alice" |
-| `avatar_emoji` | TEXT | NOT NULL, DEFAULT 'duck' | Emoji character, e.g. 🦆 |
-| `preferences` | TEXT | NOT NULL, DEFAULT '{}' | JSON object — `{"language":"sw","timezone":"Africa/Nairobi"}` |
-| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-| `updated_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
+### Configuration, models and prompts
 
-Indexes: `idx_profiles_created_at`
+| Table | Purpose | Key columns |
+|---|---|---|
+| `settings` | Flat key/value store behind `Settings`; see [settings-catalogue.md](settings-catalogue.md) | `key` (PK), `value`, `updated_at`, `is_user_set` (set by a `PUT /api/v1/settings` patch; exempts the row from `DEFAULT_ADOPTIONS`) |
+| `models` | Model catalogue | `category`, `name`, `filename`, `url`, `hf_id`, `size_mb`, `ram_estimate_mb`, `recommended_role`, `context_length`, `quantization`, ASR and TTS fields, `downloaded`, `is_custom` |
+| `model_role_assignments` | Which model fills each role (`chat`, `asr`, `tts`, ...) | `role` (PK), `model_id` |
+| `prompt_templates` | System-prompt templates; built-ins are reseeded at boot unless customised | `name` (PK), `content`, `description`, `is_system`, `is_customized`, `factory_version` |
+| `prompt_extras` | Keyed extra instructions added to the system prompt | `key` (PK), `instruction`, `active`, `sort_order` |
+| `user_skills` | Household-written skills | `name` (unique), `content`, `description`, `icon`, `active` |
+| `agent_recipes` | Goose recipe YAML | `name` (unique), `description`, `yaml`, `active` |
+| `mcp_servers` | User-added MCP servers | `name`, `kind` (`stdio`/`streamable_http`), `command`, `args`, `env`, `uri`, `enabled` |
+| `lane_job_runs` | When each inference-lane job last ran, so a restart does not reset the cadence | `job` (PK), `last_run_at` |
+| `rides` | Ride offers and bookings per member, kept across restarts | `profile_id` (FK cascade), `saved` (JSON), `updated_at` |
 
-> **Note**: `preferences` is stored as JSON text in SQLite (serialized by `pond-infra`). In Rust (`pond-core`), it is typed as `HashMap<String, String>` — never `serde_json::Value`, because `pond-core` has no `serde_json` dependency.
+### Private mesh
 
----
+| Table | Purpose | Key columns |
+|---|---|---|
+| `mesh_trusted_peers` | Peers this pond trusts | `peer_id` (PK), `trust_scope`, `last_known_address` |
+| `mesh_credit_balances` | Credit per peer, in millisats | `peer_id` (PK), `balance_millisats` |
+| `mesh_usage_tally` | Tokens lent to and borrowed from each peer | `peer_id` (PK), `tokens_borrowed`, `tokens_lent` |
 
-### `devices`
-
-Registered devices: GOTG mobile clients, smart home sensors, other Pond instances.
-
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `id` | TEXT | PK | UUID |
-| `name` | TEXT | NOT NULL | User-facing name ("Jerry's Phone") |
-| `hostname` | TEXT | Nullable | mDNS hostname |
-| `device_type` | TEXT | NOT NULL, DEFAULT 'gotg' | `gotg`, `sensor`, `camera`, `pond`, etc. |
-| `ip_address` | TEXT | Nullable | Direct IP |
-| `capabilities` | TEXT | NOT NULL, DEFAULT '[]' | JSON array — `["chat","tts","push"]` |
-| `last_seen` | TEXT | Nullable | Datetime of last heartbeat (`POST /api/v1/devices/{id}/heartbeat`) |
-| `is_online` | INTEGER | NOT NULL, DEFAULT 0 | Stored as hint; **computed live** at read-time from `last_seen > now − 5min` |
-| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-| `updated_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-
-> **`is_online` is computed, not trusted from DB**: the `SqliteDeviceRegistry` reads `last_seen` and derives `is_online` in Rust. The stored column is a fallback for devices that have never heartbeated.
-
----
-
-### `settings`
-
-Flat key-value store for GIAP configuration.
-
-| Column | Type | Constraints |
-|--------|------|-------------|
-| `key` | TEXT | PK |
-| `value` | TEXT | NOT NULL |
-| `updated_at` | TEXT | NOT NULL, DEFAULT datetime('now') |
-
-**Current keys and defaults:**
-
-| Category | Key | Default |
-|----------|-----|---------|
-| Assistant identity | `assistant_name` | `"Goose"` |
-| | `assistant_personality` | `"friendly and concise"` |
-| | `user_name` | `"Friend"` |
-| | `timezone` | `"UTC"` |
-| LLM behaviour | `llm_max_tokens` | `"1024"` |
-| | `llm_temperature` | `"0.7"` |
-| | `llm_provider` | `"llamafile"` |
-| | `chat_provider` | `"llamafile"` |
-| | `chat_model` | `""` |
-| | `think_provider` | `""` |
-| | `think_model` | `""` |
-| | `task_provider` | `""` |
-| | `task_model` | `""` |
-| Prompt system | `prompt_style` | `"balanced"` |
-| | `custom_system_prompt` | `""` |
-| | `prompt_addendum` | `""` |
-| Agent behaviour | `agent_goose_mode` | `"auto"` |
-| | `agent_max_turns` | `"50"` (0 = uncapped) |
-| | `agent_memory_inject` | `"false"` |
-| | `agent_memory_limit` | `"5"` |
-| Voice pipeline | `voice_wake_word` | `"goose"` |
-| | `voice_tts_voice` | `"en_US-lessac-medium.onnx"` |
-| | `voice_recording_duration_secs` | `"5"` |
-| | `voice_whisper_url` | `"http://127.0.0.1:9000"` |
-| Data retention | `retention_event_log_days` | `"30"` |
-| | `retention_sensor_days` | `"7"` |
-| | `retention_session_messages_keep` | `"500"` |
-
-Missing keys fall back to Rust defaults (`Settings::default()`). The `SqliteSettingsRepository::update()` issues **one `INSERT OR REPLACE` per key** — never batched, because `sqlx::query()` with multi-statement SQL silently only executes the first statement.
+The `settings` table also carries raw keys that are not `Settings` fields, written through
+`SettingsRepository::set_key`: `mesh_identity_secret` (mesh identity keypair) and
+`lightning_wallet_mnemonic` (`lightning` builds only). `apply_key` ignores them on read, so
+`GET /api/v1/settings` never returns them.
 
 ---
 
-### `memory_fragments`
+## `pond_logs.db`
 
-Semantic/recency memory store. Stores snippets of conversation or notable facts, optionally with an embedding vector for cosine similarity search.
+Never write sensor, camera or telemetry rows to `db.system`; they live here.
 
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `id` | TEXT | PK | |
-| `profile_id` | TEXT | FK → profiles(id) ON DELETE CASCADE, Nullable | `NULL` = global memory |
-| `session_id` | TEXT | FK → sessions(id) ON DELETE SET NULL, Nullable | Which conversation it came from |
-| `content` | TEXT | NOT NULL | The remembered text |
-| `embedding` | BLOB | Nullable | f32 LE bytes (384 dims). `NULL` until a real `EmbeddingProvider` is wired |
-| `source` | TEXT | NOT NULL, DEFAULT 'chat' | `chat`, `note`, `sensor_summary` |
-| `tags` | TEXT | NOT NULL, DEFAULT '[]' | JSON array |
-| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-
-Indexes: `idx_memory_fragments_profile_id`, `idx_memory_fragments_created_at`
-
-**Search strategy:**
-- If embeddings exist → cosine similarity in Rust (O(n), fine at home-assistant scale)
-- If no embeddings stored yet → falls back to recency (`ORDER BY created_at DESC`)
-- Embeddings encoded as raw little-endian f32 BLOBs: `4 bytes × dims`
+| Table | Purpose | Key columns |
+|---|---|---|
+| `event_log` | Operational log written by `pond-server`'s tracing drain; read by the log viewer. `serve --debug` tails it to stdout (`tail_event_log`) | `timestamp`, `level`, `source`, `message`, `metadata` |
+| `events` | Unified activity and audit events (`EventLog`) | `timestamp`, `category`, `action`, `session_id`, `trace_id`, `attributes`, `privacy_sensitivity` |
+| `sensor_readings` | Sensor time series | `device_id` (logical ref to `devices.id`), `sensor_type`, `value`, `unit`, `created_at` |
+| `camera_events` | Vision detections | `camera_id`, `event_type`, `confidence`, `snapshot_path`, `metadata`, `acknowledged` |
+| `turn_metrics` | Per-turn performance telemetry, recorded when `telemetry_enabled` | `session_id`, `turn_number`, token counts, `ttft_ms`, `prefill_ms`, `total_latency_ms`, `decode_tok_per_sec`, `prefill_tok_per_sec`, `prefilled_tokens`, `reused_prefix_tokens`, `context_utilization_pct`, `context_limit_tokens`, tool name and latency, `model_name` |
+| `system_info` | Key/value snapshots. Created by migration 0001; no code reads or writes it | `key`, `value` |
 
 ---
 
-### `prompt_templates`
+## `pond_vectors.db`
 
-Editable named system prompt templates. Seeded at `run_setup()` with 4 built-in styles (`balanced`, `concise`, `technical`, `warm`) via `INSERT OR IGNORE` so user edits are never overwritten. The active template is selected by `settings.prompt_style`.
+| Table | Purpose | Key columns |
+|---|---|---|
+| `vectors` | Embeddings for three corpora: `memory` (`memory_fragments`), `context` (`context_items`) and `summary` (`sessions.rolling_summary`) | PK `(corpus, row_id, chunk_ix)`; `chunk_start`, `chunk_len` (span into the source text, null = whole text), `model_id`, `dims`, `vector` (little-endian f32), `source_rev`, `embedded_at` |
 
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `name` | TEXT | PK | `"balanced"`, `"concise"`, `"technical"`, `"warm"`, or user-defined |
-| `content` | TEXT | NOT NULL | Supports `{{assistant_name}}` etc. placeholders |
-| `description` | TEXT | NOT NULL, DEFAULT `''` | Human-readable label shown in UI |
-| `is_system` | INTEGER | NOT NULL, DEFAULT 0 | `1` = built-in (not deletable via API, still editable) |
-| `updated_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-
----
-
-### `prompt_extras`
-
-Per-key extra instructions injected into the system prompt via `agent.extend_system_prompt(key, instruction)` on every turn.
-
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `key` | TEXT | PK | e.g. `"safety"`, `"language"`, `"home_rules"` |
-| `instruction` | TEXT | NOT NULL | Extra instruction text |
-| `active` | INTEGER | NOT NULL, DEFAULT 1 | `1` = injected this turn |
-| `sort_order` | INTEGER | NOT NULL, DEFAULT 0 | Injection order |
-| `updated_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
+The table deliberately has no text column and no foreign keys. A source row and its vector cannot
+be deleted atomically across files under WAL, so orphans are expected; an orphan holds only an
+offset, resolves to nothing on the join, and `VectorIndex::prune_orphans` (called from
+`crates/pond-core/src/context/index_maintenance.rs`) removes it. Retrieval filters on `model_id`,
+so vectors from a different embedder are never scored together. Deleting the file is safe: the pond
+re-embeds.
 
 ---
 
-### `user_skills`
+## Ports and adapters
 
-User-defined skills injected as named system prompt extras (`skill:<name>`) on every turn.
+Ports are traits in `crates/pond-core/src/`; adapters are in `crates/pond-infra/src/`. Apart from
+`serve --debug`'s `event_log` tail and the context-index rebuild route (`rebuild_context_index` in
+`crates/pond-api/src/routes.rs`, which clears `vectors`), no SQL runs outside `pond-infra`.
 
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `id` | TEXT | PK | UUID |
-| `name` | TEXT | NOT NULL, UNIQUE | Human-readable skill name |
-| `content` | TEXT | NOT NULL | Markdown instructions |
-| `active` | INTEGER | NOT NULL, DEFAULT 1 | `1` = injected this turn |
-| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-
----
-
-### `agent_recipes`
-
-Goose Recipe YAML definitions runnable via `POST /api/v1/recipes/{name}/run`.
-
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `id` | TEXT | PK | UUID |
-| `name` | TEXT | NOT NULL, UNIQUE | Slug: `"morning_briefing"`, `"lock_doors"` |
-| `description` | TEXT | NOT NULL, DEFAULT `''` | |
-| `yaml` | TEXT | NOT NULL | Goose Recipe YAML content |
-| `active` | INTEGER | NOT NULL, DEFAULT 1 | |
-| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-
----
-
-## `pond_logs.db` — Telemetry and Sensor Data
-
-### `event_log`
-
-General-purpose application event log. TTL: **30 days** (configurable via `settings.retention_event_log_days`).
-
-| Column | Type | Constraints |
-|--------|------|-------------|
-| `id` | INTEGER | PK AUTOINCREMENT |
-| `timestamp` | TEXT | NOT NULL, DEFAULT datetime('now') |
-| `level` | TEXT | NOT NULL, DEFAULT 'INFO' — `DEBUG`, `INFO`, `WARN`, `ERROR` |
-| `source` | TEXT | NOT NULL |
-| `message` | TEXT | NOT NULL |
-| `metadata` | TEXT | Nullable — JSON blob |
+| Port (path under `pond-core/src/`) | Adapter | Tables |
+|---|---|---|
+| `OnboardingRepository` (`user_data/ports/onboarding.rs`) | `SqlxOnboardingRepository` (`onboarding.rs`) | `onboarding_state` |
+| `SessionStorage` (`user_data/ports/session_storage.rs`) | `SqliteSessionStorage` | `sessions`, `session_messages`, `session_thinking`, `message_attachments`, `engine_session_map`, `session_tool_groups` |
+| `SettingsRepository` (`user_data/ports/settings.rs`) | `SqliteSettingsRepository` | `settings` |
+| `ProfileRepository` (`user_data/ports/profile.rs`) | `SqliteProfileRepository` | `profiles` |
+| `DeviceRegistry` (`user_data/ports/device_registry.rs`) | `SqliteDeviceRegistry` | `devices` |
+| `DeviceAttribution` (`user_data/ports/device_attribution.rs`) | `SqliteDeviceAttribution` | `devices`, `push_tokens` |
+| `Handshake` (`security/ports/handshake.rs`) | `SqliteHandshakeAdapter` | `pairing_codes`, `handshake_challenges`, `session_tokens`, `devices`, `profiles` |
+| `PushTokenRepository` (`user_data/ports/push_token.rs`) | `SqlitePushTokenRepository` | `push_tokens` |
+| `NotificationQueueRepository` (`mcp/ports/notification_queue.rs`) | `SqliteNotificationQueue` | `notifications` |
+| `FaceRecognition` (`user_data/ports/face_recognition.rs`) | `SqliteFaceRecognition` | `face_embeddings`, `face_profile_thresholds` |
+| `MemoryRepository` (`user_data/ports/memory_repository.rs`) | `SqliteMemoryRepository` | `memory_fragments`, `memory_events`, `consolidation_runs` |
+| `SuggestionQueueRepository` (`user_data/ports/suggestion_queue.rs`) | `SqliteSuggestionQueue` | `suggestion_queue` (reads `memory_fragments`) |
+| `ReminderRepository` (`user_data/ports/reminder_repository.rs`) | `SqliteReminderRepository` | `reminders` |
+| `DraftRepository` (`user_data/ports/draft.rs`) | `SqliteDraftRepository` | `drafts` |
+| `ProposalRepository` (`user_data/ports/proposal.rs`) | `SqliteProposalRepository` | `drafts` (rows with `origin = 'proactive'`) |
+| `ContextRepository` (`context/ports.rs`) | `SqliteContextRepository` | `context_sources`, `context_items` |
+| `VectorIndex` (`context/vector_index.rs`) | `SqliteVectorIndex` | `vectors` (joins `sys.*` sources) |
+| `ModelRepository` (`models/ports/model_repository.rs`) | `SqliteModelRepository` | `models`, `model_role_assignments` |
+| `PromptTemplateRepository` (`user_data/ports/prompt_template.rs`) | `SqlitePromptTemplateRepository` | `prompt_templates` |
+| `PromptExtraRepository` (`user_data/ports/prompt_extra.rs`) | `SqlitePromptExtraRepository` | `prompt_extras` |
+| `UserSkillRepository` (`user_data/ports/skill.rs`) | `SqliteSkillRepository` | `user_skills` |
+| `AgentRecipeRepository` (`user_data/ports/recipe.rs`) | `SqliteRecipeRepository` | `agent_recipes` |
+| `McpServerRepository` (`mcp/ports/mcp_server.rs`) | `SqliteMcpServerRepository` | `mcp_servers` |
+| `LaneRunLog` (`user_data/ports/lane_run_log.rs`) | `SqliteLaneRunLog` | `lane_job_runs` |
+| `RideStore` (`rides/ports.rs`) | `SqliteRideStore` | `rides` |
+| `PeerDirectory` (`mesh/ports/peer_directory.rs`) | `SqlitePeerDirectory` | `mesh_trusted_peers` |
+| `CreditLedger` (`mesh/ports/credit_ledger.rs`) | `SqliteCreditLedger` | `mesh_credit_balances` |
+| `UsageTally` (`mesh/ports/usage_tally.rs`) | `SqliteUsageTally` | `mesh_usage_tally` |
+| `OperationalLogRepository` (`security/ports/event_log.rs`) | `SqliteOperationalLog` (`sqlite_event_log.rs`) | `event_log` |
+| `EventLog` (`security/ports/event_log.rs`) | `SqliteEventLog` | `events` |
+| `SecurityPolicy` (`security/ports/policy.rs`) | `SqliteSecurityPolicy` | none of its own; audits through `EventLog` into `events` |
+| `SensorStorage` / `CameraStorage` (`user_data/ports/sensor_storage.rs`, `camera_storage.rs`) | `SqliteSensorStorage` / `SqliteCameraStorage` (`sqlite_sensor.rs`) | `sensor_readings` / `camera_events` |
+| `TelemetryPort` (`security/ports/telemetry.rs`) | `SqliteTelemetry` | `turn_metrics` |
 
 ---
 
-### `system_info`
+## Retention
 
-Hardware/system telemetry snapshots (CPU temp, memory, uptime, etc.).
+`pond_infra::pruning::run_pruning`, spawned once by `pond-server`, runs `prune_once` every
+6 hours. The first pass is 6 hours after start (it never prunes at startup), and each pass re-reads
+`Settings`, so a retention change applies on the next pass.
 
-| Column | Type | Constraints |
-|--------|------|-------------|
-| `id` | INTEGER | PK AUTOINCREMENT |
-| `timestamp` | TEXT | NOT NULL, DEFAULT datetime('now') |
-| `key` | TEXT | NOT NULL |
-| `value` | TEXT | NOT NULL |
+| Table | Rule | Setting (default) |
+|---|---|---|
+| `event_log` | Delete rows older than N days | `retention_event_log_days` (30) |
+| `sensor_readings` | Delete rows older than N days | `retention_sensor_days` (7) |
+| `camera_events` | Delete **acknowledged** rows older than 14 days; unacknowledged rows are kept | none; fixed in `PruningConfig` |
+| `events` | Delete rows at `Sensitive` or above older than the cap, then each category past its retention; `0` keeps that category forever | `retention_sensitive_days` (7, `0` = no cap), `retention_events_days` (30), `retention_events_by_category` (per-category override) |
+| `session_messages` | Keep the newest N messages per session, delete the rest | `retention_session_messages_keep` (500) |
+| `face_embeddings` | Delete rows whose profile no longer exists | none |
 
----
+For `event_log`, `sensor_readings` and `session_messages`, `0` is not special-cased: it deletes
+every row (for the first two, every row older than the pass). Only the `events` rules treat `0` as
+"forever".
 
-### `sensor_readings`
-
-Time-series IoT sensor data. TTL: **7 days** (configurable via `settings.retention_sensor_days`).
-
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `id` | INTEGER | PK AUTOINCREMENT | |
-| `device_id` | TEXT | NOT NULL | Logical reference to `devices.id` (no FK — logs DB can't FK to system DB) |
-| `sensor_type` | TEXT | NOT NULL | `temperature`, `humidity`, `motion`, `door`, `energy`, `light_level` |
-| `value` | REAL | NOT NULL | Numeric reading |
-| `unit` | TEXT | NOT NULL | `C`, `%`, `lux`, `kWh`, `boolean` |
-| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-
-Indexes: `idx_sensor_readings_device_type` on `(device_id, sensor_type)`, `idx_sensor_readings_created_at`
+Nothing in `pruning.rs` or any adapter deletes old rows from `turn_metrics`, `memory_events`,
+`consolidation_runs`, `notifications`, `handshake_challenges` or `session_tokens`. Memory decay
+and archiving (`memory_cleanup_enabled`) and vector orphan pruning run outside this module.
 
 ---
 
-### `camera_events`
+## Conventions
 
-Vision detection events. TTL: **14 days for acknowledged events**; unacknowledged alerts are kept indefinitely until dismissed.
-
-| Column | Type | Constraints | Notes |
-|--------|------|-------------|-------|
-| `id` | INTEGER | PK AUTOINCREMENT | Returned by `POST /api/v1/camera/events` |
-| `camera_id` | TEXT | NOT NULL | Logical reference to a device |
-| `event_type` | TEXT | NOT NULL | `motion`, `person`, `pet`, `package`, `vehicle` |
-| `confidence` | REAL | Nullable | Model confidence 0.0–1.0 |
-| `snapshot_path` | TEXT | Nullable | Local path to captured frame |
-| `metadata` | TEXT | Nullable | JSON — bounding boxes, zone info, etc. |
-| `acknowledged` | INTEGER | NOT NULL, DEFAULT 0 | 0 = active alert, 1 = dismissed via `PATCH .../acknowledge` |
-| `created_at` | TEXT | NOT NULL, DEFAULT datetime('now') | |
-
-Indexes: `idx_camera_events_created_at`, `idx_camera_events_camera_id`
-
----
-
-## Entity-Relationship Diagram
-
-```
-pond_system.db
-─────────────────────────────────────────────────────────────
-onboarding_state (singleton)
-
-profiles ──────────────────────────────────────────┐
-  │                                                 │
-  ├──< sessions >──< session_messages               │
-  │                                                 │
-  └──< memory_fragments <───────────────────────────┘
-         (session_id → sessions, nullable)
-
-devices
-
-settings (flat KV)
-models + model_role_assignments
-
-prompt_templates    (named editable system prompts)
-prompt_extras       (per-key extra instructions)
-user_skills         (named skills injected per turn)
-agent_recipes       (Goose Recipe YAML definitions)
-
-pond_logs.db
-─────────────────────────────────────────────────────────────
-event_log
-system_info
-sensor_readings   (device_id → devices.id, logical ref)
-camera_events     (camera_id → devices.id, logical ref)
-```
-
-> Cross-DB foreign keys are **logical only** — SQLite cannot enforce FK constraints across database files. `device_id` in `sensor_readings` matches `devices.id` by convention; the application layer is responsible for consistency.
-
----
-
-## TTL Pruning
-
-A background task in `pond-infra/src/pruning.rs` runs every **6 hours** and enforces retention limits:
-
-| Table | Retention | Rule |
-|-------|-----------|------|
-| `event_log` | 30 days | DELETE rows older than `retention_event_log_days` |
-| `sensor_readings` | 7 days | DELETE rows older than `retention_sensor_days` |
-| `camera_events` | 14 days | DELETE acknowledged rows older than 14 days; unacknowledged kept |
-| `session_messages` | 500/session | DELETE oldest rows beyond `retention_session_messages_keep` per session |
-
-All retention values are read from the `settings` table at server startup.
-
----
-
-## Port → Table Mapping
-
-| Port Trait | Tables | DB | Status |
-|-----------|--------|-----|--------|
-| `OnboardingRepository` | `onboarding_state` | System | ✅ Implemented |
-| `SessionStorage` | `sessions`, `session_messages` | System | ✅ Implemented |
-| `SettingsRepository` | `settings` | System | ✅ Implemented |
-| `ProfileRepository` | `profiles` | System | ✅ Implemented |
-| `DeviceRegistry` | `devices` | System | ✅ Implemented |
-| `MemoryRepository` | `memory_fragments` | System | ✅ Implemented |
-| `ModelRepository` | `models`, `model_role_assignments` | System | ✅ Implemented |
-| `PromptTemplateRepository` | `prompt_templates` | System | ✅ Implemented |
-| `PromptExtraRepository` | `prompt_extras` | System | ✅ Implemented |
-| `UserSkillRepository` | `user_skills` | System | ✅ Implemented |
-| `AgentRecipeRepository` | `agent_recipes` | System | ✅ Implemented |
-| `EmbeddingProvider` | — (stateless, generates BLOBs) | — | ⚪ Stub — real model deferred |
-| `SensorStorage` | `sensor_readings` | Logs | ✅ Implemented |
-| `CameraStorage` | `camera_events` | Logs | ✅ Implemented |
-| `LlmProvider` | — (stateless HTTP calls) | — | ✅ No table needed |
-| `VoiceInput` | — (real-time audio) | — | ✅ No table needed |
-| `VoiceOutput` | — (real-time audio) | — | ✅ No table needed |
-| `WakeWordDetector` | — (real-time audio) | — | ✅ No table needed |
-| `Agent` | — (Goose agentic loop) | — | ✅ No table needed |
-| `Handshake` | `auth_tokens` (planned) | System | 🔴 Table not yet created |
-| `NotificationSender` | `notifications` (planned) | System | 🔴 Table not yet created |
-
----
-
-## REST API → Table Reference
-
-| Endpoint | Method | Table(s) |
-|----------|--------|---------|
-| `/api/v1/settings` | GET, PUT | `settings` |
-| `/api/v1/profiles` | GET, POST | `profiles` |
-| `/api/v1/profiles/{id}` | GET, PATCH, DELETE | `profiles` |
-| `/api/v1/devices` | GET, POST | `devices` |
-| `/api/v1/devices/{id}` | DELETE | `devices` |
-| `/api/v1/devices/{id}/heartbeat` | POST | `devices` (updates `last_seen`) |
-| `/api/v1/chat` | POST | `sessions`, `session_messages` |
-| `/api/v1/sessions` | GET | `sessions` |
-| `/api/v1/sessions/{id}` | PATCH | `sessions` (rename title) |
-| `/api/v1/sensors` | POST | `sensor_readings` (logs DB) |
-| `/api/v1/sensors/{device_id}` | GET | `sensor_readings` (logs DB) |
-| `/api/v1/camera/events` | GET, POST | `camera_events` (logs DB) |
-| `/api/v1/camera/events/{id}/acknowledge` | PATCH | `camera_events` (logs DB) |
-| `/api/v1/prompts` | GET | `prompt_templates` |
-| `/api/v1/prompts/{name}` | GET, PUT, DELETE | `prompt_templates` |
-| `/api/v1/agent/extras` | GET, POST | `prompt_extras` |
-| `/api/v1/agent/extras/{key}` | DELETE | `prompt_extras` |
-| `/api/v1/memories` | GET, POST | `memory_fragments` |
-| `/api/v1/memories/{id}` | DELETE | `memory_fragments` |
-| `/api/v1/skills` | GET, POST | `user_skills` |
-| `/api/v1/skills/{id}` | PUT, DELETE | `user_skills` |
-| `/api/v1/recipes` | GET, POST | `agent_recipes` |
-| `/api/v1/recipes/{id}` | PUT, DELETE | `agent_recipes` |
-| `/api/v1/recipes/{name}/run` | POST | `agent_recipes` (read) + agent |
-| `/api/v1/agent/tools` | GET | — (reads from Goose extension manager) |
-
----
-
-## Migration History
-
-### System DB
-
-| File | What it does |
-|------|-------------|
-| `0001_initial.sql` | `onboarding_state`, `sessions`, `session_messages`, `devices`, `settings` |
-| `0002_add_indexes_and_title.sql` | Adds `title` to sessions; performance indexes |
-| `0003_profiles.sql` | `profiles` table; adds `profile_id` + `input_mode` to sessions |
-| `0004_devices_enhanced.sql` | Adds `device_type`, `ip_address`, `capabilities`, `last_seen`, `is_online` to devices |
-| `0005_memory.sql` | `memory_fragments` table; adds `embedding` BLOB to `session_messages` |
-| `0006_settings_extended.sql` | New settings keys: `prompt_style`, `custom_system_prompt`, `prompt_addendum`, model role fields |
-| `0007_models.sql` | `models` table — persistent model catalog |
-| `0008_model_role_assignments.sql` | `model_role_assignments` join table |
-| `0009_prompt_templates.sql` | `prompt_templates` table — editable named system prompts |
-| `0010_prompt_extras.sql` | `prompt_extras` table — per-key extra instructions |
-| `0011_skills.sql` | `user_skills` table — named skills injected per turn |
-| `0012_recipes.sql` | `agent_recipes` table — Goose Recipe YAML definitions |
-| `0013_face_embeddings.sql` | `face_embeddings` table — per-profile face embedding vectors |
-| `0014_face_profile_thresholds.sql` | Per-profile cosine-similarity match thresholds |
-| `0015_memory_segments.sql` | Adds `segment`, `importance`, `tier`, `decay_rate`, `access_count`, `last_accessed_at`, `lifecycle`, `superseded_by` to `memory_fragments` |
-| `0016_session_usage.sql` | Adds `total_prompt_tokens`, `total_completion_tokens`, `model_name` to `sessions` |
-
-### Logs DB
-
-| File | What it does |
-|------|-------------|
-| `0001_initial.sql` | `event_log`, `system_info` |
-| `0002_sensor_readings.sql` | `sensor_readings` table + indexes |
-| `0003_camera_events.sql` | `camera_events` table + indexes |
-
----
-
-## Design Decisions
-
-### Why SQLite (not Postgres)?
-Local-first, zero config, single file, already proven for sessions and onboarding. Easy backup (`cp pond_system.db pond_system.db.bak`). Can be reconsidered for Q4 if multi-user or network deployment requirements emerge.
-
-### Why two databases?
-Separation of lifecycle: logs/sensor data are pruned on a 7–30 day TTL without touching application data. High-frequency sensor writes don't contend with system queries. The two `sqlx` pools (`db.system`, `db.logs`) make the boundary explicit at the type level.
-
-### Why TEXT for timestamps?
-`datetime('now')` produces `"YYYY-MM-DD HH:MM:SS"` — human-readable, works with all SQLite date functions, consistent with every existing table. 1-second resolution is sufficient for all current use cases. For tables with sub-second insertion rates, always secondary-sort by `rowid ASC` as a tiebreaker.
-
-### Why JSON blobs for capabilities/preferences/tags?
-These fields are read-as-blob and not queried relationally. `capabilities` on a device varies wildly by type. `preferences` on a profile is a sparse, extensible set. Using JSON avoids a new migration every time a new preference key is added. If a field starts being queried with `json_extract()` frequently, normalize it.
-
-### Why no FK from logs DB to system DB?
-SQLite cannot enforce FK constraints across attached databases. `device_id` in `sensor_readings` is a logical reference only — enforced by the application, not the database. This is an acceptable tradeoff given the performance and separation benefits of two files.
-
-### Why is `is_online` stored but also computed?
-`is_online` in `devices` is set to `1` on `register()` and `heartbeat()`. But it's never trusted at read-time — `SqliteDeviceRegistry` always computes the live value from `last_seen > now − 5min`. The stored column exists so that a raw SQL query gives a reasonable answer even without running through the adapter.
-
----
-
-## Planned Additions (Not Yet Implemented)
-
-| Table | DB | Unlocks |
-|-------|----|---------|
-| `auth_tokens` | System | Full GIAP ↔ GOTG handshake with token-based auth |
-| `notifications` | System | Push notifications to GOTG mobile app |
-| `routines` | System | Scheduled/triggered automations (Morning Routine, etc.) |
-| `feedback` | System | Upvote/downvote/correction loop for self-improvement |
-| `device_commands` | System | Audit trail for smart device commands |
-| `prompt_rewrites` | Logs | Audit trail for agent self-rewriting prompts |
-| `privacy_audit_log` | Logs | Per-action privacy audit ("what did Goose do?") |
-| `mcp_extensions` | System | Registry of installed MCP server extensions (Q4) |
+- **Two plus one files.** Logs and sensor data churn on a days-long TTL without touching
+  household data, and high-frequency writes do not contend with system queries. Vectors are a
+  third file so derived data never travels with the authoritative database.
+- **TEXT timestamps.** Most columns default to `datetime('now')` (`YYYY-MM-DD HH:MM:SS`, UTC).
+  Some adapter-written columns are RFC 3339, for example `drafts.expires_at`, whose format the
+  triggers compare. Where rows can share a second, sort by `rowid` as a tiebreak.
+- **JSON in TEXT** for sparse, unqueried shapes (`devices.capabilities`, `profiles.preferences`,
+  `memory_fragments.tags`, `drafts.payload`). Normalise a field once it is queried with
+  `json_extract()`.
+- **Settings need no migration.** A new `Settings` field is a new row; it needs an `upsert!` and an
+  `apply_key` arm in `sqlite_settings.rs`, not a schema change. Changing a shipped default does
+  need a migration, paired with a `DEFAULT_ADOPTIONS` entry (see the settings catalogue).

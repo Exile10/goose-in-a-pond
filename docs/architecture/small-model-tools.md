@@ -1,6 +1,9 @@
 # Tools for small models, from the ground up
 
-**Status:** design, measured, not implemented. The knowledge tools are the first group redesigned.
+**Status (2026-10-23):** the knowledge-tool redesign (sections 4 and 6) is measured and not built:
+the pond still serves `get_wikipedia_article` and `compute_answer`. Built from this document:
+`search_web` (section 8, merged 2026-10-16), the per-turn withholding of keyed tools (section 8.9),
+`get_info` naming only the served tools, and decision D4.
 **Written:** 2026-10-14. Payload captured on `main` at `e440485b`; the decisive arms re-run
 on a capture from `68eef8cb` (section 2).
 **Evidence:** [`experiments/knowledge-tools/`](../../experiments/knowledge-tools/). It replays the
@@ -43,7 +46,7 @@ time, starting with knowledge: the group every factual question needs.
 | tool | argument | backend | result |
 |---|---|---|---|
 | `get_wikipedia_article` | `topic` (optional), `limit` (optional) | MediaWiki extract, exact title then search | card JSON + the first 4,000 bytes of the article + source |
-| `compute_answer` | `query` (optional) | Wolfram\|Alpha Full Results API, needs an AppID | card JSON + up to 5 pods; **without an AppID, a setup message** |
+| `compute_answer` | `query` (optional) | Wolfram\|Alpha Full Results API, needs an AppID | card JSON + up to 5 pods; **without an AppID it is withheld from the turn** (section 8.9; it used to return a setup message) |
 
 Found while mapping it, each confirmed against the code or a captured payload:
 
@@ -58,7 +61,8 @@ Found while mapping it, each confirmed against the code or a captured payload:
 3. **Nothing is required.** `required: []` on both, by the standard's own rule ("make everything
    optional"). The server then rescues bad calls by scanning ten alternative keys and, as a last
    resort, stripping question prefixes off the user's last message.
-4. **The server's instructions advertise six tools.** `get_info` lists `search_wikipedia`,
+4. **The server's instructions advertised six tools** (fixed 2026-10-15, `bd15bab7`: `KNOWLEDGE_INSTRUCTIONS`
+   in `knowledge.rs` now names `get_wikipedia_article`, `compute_answer` and `search_web`). `get_info` listed `search_wikipedia`,
    `define_word`, `search_books` and `explore_computation`, none of which exist. None of the
    three captured payloads carries them (the shim replaces Goose's system prompt), so on the chat
    path they reach no model; they are wrong anyway, and anything else that reads them is misled.
@@ -66,8 +70,8 @@ Found while mapping it, each confirmed against the code or a captured payload:
 5. **The ToolCaller path is dead code.** `resolve_topic` and the standard both make a FunctionGemma
    ToolCaller the "primary" parameter source; `main.rs` hard-wires it to `None`, and CLAUDE.md
    rules a separate tool-calling model out of the main loop.
-6. **A keyless pond cannot compute.** Without a Wolfram AppID, `compute_answer` returns "requires
-   an API key", so arithmetic, the one thing a small model reliably gets wrong in its head, has no
+6. **A keyless pond cannot compute.** Without a Wolfram AppID, `compute_answer` returned "requires
+   an API key" (since 2026-10-15 it is withheld instead, section 8.9), so arithmetic, the one thing a small model reliably gets wrong in its head, has no
    working tool on a fresh install.
 7. **In the narrowed modes knowledge is not on offer.** For "Who was Wangari Maathai?":
    `minimal` (Jerry's own pond) offers only the toolkit and E4B answered from memory without
@@ -390,6 +394,12 @@ question:    string, REQUIRED. "The calculation, as the user asked it."
 
 ## 6. Plan
 
+**Status (2026-10-23):** step 1 is half done: the SSE layer reads a card from the user-audience
+block the goose adapter passes as `AgentStreamEvent::ToolResult`'s `card` (`b433e647`), and
+`search_web` sends its card that way, but `prepend_knowledge_hint` and
+Wolfram's `with_ui_hint` still put `[[[mcp-ui:…]]]` in the model's text. Steps 2-7 are not started:
+there is no `calc.rs`, no `look_up` or `calculate`, and no arithmetic sentence in `prompts.rs`.
+
 Each step is its own commit and leaves the pond working. Gates per CLAUDE.md: fmt, the fast-crate
 clippy/test set, `cargo check -p pond-server -p pond-adapters-goose`, `scripts/live-test.sh`
 (the SSE `ui` field is a handler change), then the bench re-run against the live tools.
@@ -489,8 +499,8 @@ arguments. *Recommendation:* rename in one step, with both UIs updated in the sa
 
 ## 8. Web search (`search_web`), the first tool built on these rules
 
-**Status:** built 2026-10-15 on `feat/web-search`, not merged, not run on the Orin, not run
-against Brave with a real key. Jerry chose the backend: **Brave Search API, with the
+**Status:** built 2026-10-15 on `feat/web-search` and merged to main 2026-10-16 (PR #576, which
+carried #570); not run on the Orin, not run against Brave with a real key. Jerry chose the backend: **Brave Search API, with the
 household's own key**, settable from the desktop and from Goose on the Go (its PR:
 jarida-io/goose-on-the-go#130). §8.8 records what was built where the contract below was
 amended, and what is still open. `search_web`
@@ -739,7 +749,7 @@ real test.
 - **Stemmer.** It also drops a trailing `e` ("close" and "closing" meet), and "how long",
   "distance" and "length" count as number questions.
 
-**Measured on ten real pages** (frozen in `fixtures/web/real/`, chosen before tuning; the answer
+**Measured on ten real pages** (frozen in `experiments/knowledge-tools/fixtures/web/real/`, chosen before tuning; the answer
 is in every page's extracted text):
 
 - The answer reaches the model's copy on **6 of 10**, against 5 before the last iteration.

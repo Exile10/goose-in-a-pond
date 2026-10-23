@@ -4060,6 +4060,9 @@ impl AgentPort for GooseAdapter {
             let recorded = recorded_gguf_file(repo.as_deref(), &model).await;
             Self::register_gguf_model_from(&model, &dd, recorded.as_deref());
             pictures.spawn_settle(&dd, &model);
+            if pond_core::models::domain::device_budget::budgeted_device() {
+                crate::mtp_drafter::attach_drafter(&dd, &model);
+            }
         });
     }
 

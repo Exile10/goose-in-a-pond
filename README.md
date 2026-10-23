@@ -10,7 +10,7 @@
   [![Apache License 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
   [![CC BY 4.0](https://licensebuttons.net/l/by/4.0/80x15.png)](http://creativecommons.org/licenses/by/4.0/)
   [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
-  [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](https://github.com/jarida-io/goose-in-a-pond)
+  [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Jetson-lightgrey)](https://github.com/jarida-io/goose-in-a-pond)
 
 </div>
 
@@ -18,58 +18,53 @@
 
 ## What is Goose In A Pond?
 
-**Goose In A Pond (GIAP)** is a fully offline, privacy-first AI assistant for your smart home. It runs entirely on edge hardware — primarily targeting the **NVIDIA Jetson Orin Nano** — with no mandatory cloud dependency. Your data, devices, and conversations never leave your local network.
+**Goose In A Pond (GIAP)** is a privacy-first household assistant that runs on hardware you own. Its
+primary target is the **NVIDIA Jetson Orin Nano (8 GB)**; it also runs on macOS and Linux. Inference,
+speech and memory stay on the device, and nothing needs a cloud account to work.
 
-GIAP is built on [Block's Goose](https://github.com/aaif-goose/goose) open-source agent framework and extends it with a complete smart home layer: device registry, voice I/O, cron scheduling, memory, and a companion mobile app called **Goose On The Go (GOTG)**.
+GIAP is built on Block's [Goose](https://github.com/aaif-goose/goose) agent framework, pinned as the
+`goose/` submodule, and adds the household layer: voice, memory and personal context, devices,
+schedules, a desktop app, and a phone companion, **Goose On The Go (GOTG)**.
 
-### Key capabilities
+### What it does
 
-| Capability | Description |
+| Capability | How |
 |---|---|
-| **Local LLM** | Ollama, llamafile, or in-process GGUF — no API keys |
-| **Voice I/O** | Whisper ASR (whisper.cpp) + Piper TTS, fully on-device |
-| **Smart devices** | Register, query, and control devices via MCP tools |
-| **Persistent memory** | SQLite-backed memory fragments injected into every prompt |
-| **Schedules** | Cron-style task automation with webhook dispatch |
-| **Desktop app** | Native Electron app (macOS) with GUI, Voice, and Canvas modes |
-| **Mobile companion** | Goose On The Go — remote control via authenticated REST API |
-| **Privacy** | All inference, voice, and memory runs 100% on-device |
+| **Local models** | In-process GGUF through Goose's llama.cpp provider by default; LiteRT-LM on the Jetson and Mac; or an Ollama, llamafile or mistral.rs server. Models are recommended for the hardware and downloaded on first use |
+| **Voice** | Wake word (matched on Whisper's transcript), end of speech (Silero), speech recognition (whisper-rs, in-process) and speech (Kokoro), all on-device |
+| **Tools** | GIAP's own MCP servers (devices, memory, schedules, weather, web search, knowledge, travel and more) plus any MCP server the household adds |
+| **Memory and personal context** | Memory extracted from conversations, and a local vector index over personal context, injected per turn |
+| **Devices** | Matter devices through a bundled matter.js controller; camera motion and face recognition (optional features) |
+| **Schedules and rules** | Cron or one-shot routines that run an agent prompt or a webhook, and rules that fire on a sensor, camera or device event |
+| **Desktop app** | Electron app for macOS with a GUI mode and a voice mode |
+| **Phone companion** | GOTG pairs over pinned HTTPS. A pond with no screen is set up by scanning its printed setup card, over Bluetooth |
+| **Remote access** | An embedded tailnet node (`native/pondnet`) reaches the pond away from home without an OS VPN |
+| **Services** | Music (Apple Music, Spotify), calendar and mail (CalDAV, IMAP), rides (Uber), each on the household's own account |
 
 ---
 
 ## Architecture
 
-GIAP uses a **Hexagonal (Ports & Adapters)** architecture. The core domain never imports from Goose or any framework — it only talks through trait interfaces.
+Hexagonal (ports and adapters). `pond-core` is the domain and imports no framework; every adapter
+implements a trait (a port) defined there, and `pond-server` wires them together.
 
 ```
-pond-server  (binary — wires everything together)
-    │
-pond-api     (Axum HTTP router + REST DTOs)
-    │
-pond-core    (domain logic — pure Rust, no external deps)
-  ├── domain/    pure types: ChatMessage, Device, Schedule, Memory …
-  ├── ports/     async_trait interfaces: Agent, LlmProvider, VoiceInput …
-  └── services/  ChatService, context compaction, mock implementations
-    │
-pond-infra                  (SQLite via SQLx — two databases)
-pond-infra-scheduler        (tokio-cron-scheduler adapter)
-pond-adapters-goose         (wraps Block's Goose agent)
-pond-adapters-weather       (Open-Meteo HTTP client)
-pond-adapters-whisper       (Whisper ASR + wake word detection)
-pond-adapters-piper         (Piper TTS subprocess adapter)
-pond-adapters-ollama        (Ollama HTTP provider)
-pond-adapters-llamafile     (llamafile / OpenAI-compat provider)
-pond-adapters-local-inference (in-process GGUF via llama-cpp-2)
-pond-adapters-mcp-memory    (flat-file MCP memory)
-pond-mcp-server             (GIAP as a Goose builtin MCP extension)
-pond-desktop                (Electron desktop app — React + TypeScript)
+pond-server            binary: CLI, composition root, HTTP + HTTPS listeners
+  pond-api             Axum router and DTOs; embeds the web dashboard
+  pond-core            domain: ports, services and types, by bounded context
+  pond-infra           SQLite: pond_system.db, pond_logs.db, pond_vectors.db
+  pond-adapters-goose  the live agent engine (wraps Goose)
+  pond-mcp-server      GIAP's tools, as Goose builtin MCP extensions
+  pond-adapters-*      models, voice, devices, services, mesh
+  pond-voice, pond-audio, pond-audio-out           microphone, text and speaker primitives
+  pond-ear             wake word, Voice Match, echo cancellation (built, not yet wired in)
+  pond-net, pond-connect                             egress, setup channel, Wi-Fi
+pond-desktop           Electron app (React + TypeScript), macOS
+native/pondnet         Go: the embedded tailnet node and mobile bindings
+matter-server          Node: the matter.js controller
 ```
 
-**Detailed docs:**
-- [Architecture Overview](./docs/architecture/components.md)
-- [Data Flow & Lifecycle](./docs/architecture/data_flow.md)
-- [Visual Workflow (Weather example)](./docs/architecture/visual_workflow.md)
-- [Creating Ports & Adapters](./docs/creating-ports-and-adapters.md)
+Every crate is described in [docs/architecture/components.md](./docs/architecture/components.md).
 
 ---
 
@@ -134,14 +129,14 @@ You don't need these if you use `giap.sh`, but these are the commands it runs:
 
 ```bash
 # The genuinely fast set: no Goose, no llama-cpp-2
-SQLX_OFFLINE=true cargo build -p pond-core -p pond-infra -p pond-api
+cargo build -p pond-core -p pond-infra -p pond-api
 
 # Build the web UI FIRST, or the server embeds a placeholder dashboard
 (cd pond-desktop && npm ci && npm run build)
 
 # pond-server pulls in Goose AND llama-cpp-2 through its default features,
 # so a cold build takes 10-35 minutes
-SQLX_OFFLINE=true cargo build -p pond-server --release
+cargo build -p pond-server --release
 
 # The userspace network helper, placed next to the binary
 bash scripts/build-network-helper.sh target/release
@@ -229,7 +224,7 @@ the deploy builds stale code and still reports success. `giap.sh deploy` refuses
 on both. After a deploy the service listens on 8080, not 4000, so tunnel that port:
 `ssh -N -L 8080:127.0.0.1:8080 user@<host>`, then open `http://localhost:8080`. See
 **[scripts/jetson/README.md](./scripts/jetson/README.md)** and
-**[docs/jetson-build-and-run.txt](./docs/jetson-build-and-run.txt)**.
+**[docs/developer/jetson-dev-routine.md](./docs/developer/jetson-dev-routine.md)**.
 
 ### 9. Desktop app (macOS)
 
@@ -240,138 +235,106 @@ npm run dev:electron             # dev: Vite + Electron, starts pond-server for 
 npm run bundle:app               # release .app (or: bash scripts/giap.sh build-desktop)
 ```
 
-The desktop app has three modes: the GUI, the Voice orb, and the Canvas floating overlay.
+The desktop app has two modes: the GUI and the voice screen.
 On Linux there's no desktop shell. Use the server's own dashboard instead.
 
 ---
 
-## Voice Input (Whisper ASR)
+## Voice
 
-GIAP uses [whisper.cpp](https://github.com/ggerganov/whisper.cpp) for speech recognition via its HTTP server — no C++ bindings or long compile times.
-
-**Linux / macOS:**
 ```bash
-git clone https://github.com/ggerganov/whisper.cpp
-cd whisper.cpp && make server
-./server -m ~/.local/share/goose-in-a-pond/models/ggml-base.en.bin --port 9000
+./target/release/pond-server chat --voice                  # wake word, listen, reply aloud
+./target/release/pond-server chat --voice --no-wake-word   # listen on every turn
 ```
 
-**Windows:**
-```powershell
-git clone https://github.com/ggerganov/whisper.cpp
-cd whisper.cpp
-cmake -B build && cmake --build build --config Release --target server
-.\build\bin\Release\server.exe -m %APPDATA%\goose-in-a-pond\models\ggml-base.en.bin --port 9000
-```
-
-Then start GIAP in voice mode:
-```bash
-cargo run -p pond-server -- chat --voice
-```
+The first run downloads whichever voice models are missing. Recognition runs in-process through whisper-rs (Metal on macOS, CUDA on the Jetson); speech is
+Kokoro. The desktop app runs this same command as a child process (`--json-events`) and drives its
+voice screen from the events.
 
 ---
 
-## Agent & Data Management
+## Everyday commands
 
 ```bash
-# One-shot agentic query
-cargo run -p pond-server -- agent chat "what is the weather?"
-cargo run -p pond-server -- agent tools    # list loaded MCP tools
-cargo run -p pond-server -- agent extras   # list system prompt extras
-
-# Prompt templates
-cargo run -p pond-server -- prompts list
-cargo run -p pond-server -- prompts show balanced
-cargo run -p pond-server -- prompts reset balanced
-
-# User skills (injected into system prompt)
-cargo run -p pond-server -- skills list
-cargo run -p pond-server -- skills add "greet" --content "Always greet users by name."
-cargo run -p pond-server -- skills toggle <uuid>
-cargo run -p pond-server -- skills remove <uuid>
-
-# Memory
-cargo run -p pond-server -- memories list
-cargo run -p pond-server -- memories add "User prefers Celsius"
-cargo run -p pond-server -- memories remove <uuid>
-
-# Status
-cargo run -p pond-server -- status
+pond-server agent chat "what is the weather?"   # one turn through the agent, no voice
+pond-server agent tools                         # MCP tools the agent can see
+pond-server models list                         # the model catalogue
+pond-server prompts list | show NAME | reset NAME
+pond-server skills list | add NAME --content TEXT | toggle ID | remove ID
+pond-server memories list | add TEXT | remove ID
+pond-server pairing                             # pairing code and QR for the phone
+pond-server setup-code                          # the printed setup card
+pond-server dashboard                           # a sign-in link for the web dashboard
+pond-server status
 ```
+
+Every command and flag is in [docs/cli.md](./docs/cli.md).
 
 ---
 
 ## Testing
 
 ```bash
-# All tests
-cargo test
-
-# Single crate (fast iteration)
-cargo test -p pond-core
-cargo test -p pond-api
-cargo test -p pond-adapters-whisper
-cargo test -p pond-adapters-ollama
-
-# Desktop frontend tests
-cd pond-desktop && npm test
-
-# Live integration tests (require real hardware/services)
-cargo test -p pond-adapters-whisper -- --ignored live_transcription_of_jfk_wav
-cargo test -p pond-adapters-ollama  -- --ignored live_ollama_completion
-cargo test -p pond-adapters-piper   -- --ignored live_speak
+make test                                   # a quick subset: pond-core, pond-api, pond-infra
+cargo test -p pond-core                     # one crate
+cargo test -p pond-core <name>              # one test
+cargo test -p <crate> -- --ignored          # live tests that need hardware, models or keys
+cargo check -p pond-server -p pond-adapters-goose --all-targets   # the production binary
+scripts/live-test.sh                        # the real server over HTTP, restarts included
+cd pond-desktop && npm test && npm run typecheck && npx playwright test
 ```
 
-Test fixtures live in `tests/blobs/` — `jfk.wav` is the canonical whisper.cpp sample (JFK's 1961 inaugural address, public domain, 16-bit mono 16 kHz).
-
-See the [TDD Guide](./docs/testing/tdd_guide.md) for the full testing philosophy.
+The full fast-crate list CI runs is in [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
+Unit tests never exercise startup ordering, migrations against a database that already has rows,
+or auth middleware; `scripts/live-test.sh` does, and is required for any change to a migration,
+route, handler or startup code. See the [testing guide](./docs/testing/tdd_guide.md).
 
 ---
 
-## Tech Stack
+## Tech stack
 
 | Layer | Technology |
 |---|---|
-| Core language | Rust (stable) |
-| Agent framework | [Goose](https://github.com/aaif-goose/goose) by Block |
-| HTTP API | Axum 0.8 |
-| Database | SQLite via SQLx (two DBs: `pond_system.db`, `pond_logs.db`) |
-| Desktop shell | Electron |
-| Desktop UI | React 19 + TypeScript + Vite |
-| Speech-to-text | whisper.cpp (HTTP server mode) |
-| Text-to-speech | Piper TTS (subprocess) |
-| Local LLM | Ollama / llamafile / llama-cpp-2 (in-process) |
-| Scheduling | tokio-cron-scheduler |
-| Testing | cargo test + vitest + wiremock |
+| Core | Rust (`rust-version` 1.91.1) |
+| Agent | [Goose](https://github.com/aaif-goose/goose), MCP via `rmcp` |
+| HTTP | Axum 0.8, rustls |
+| Storage | SQLite via SQLx (three databases) |
+| Local inference | llama.cpp (through Goose and `llama-cpp-2`), LiteRT-LM |
+| Speech | whisper-rs, Silero VAD, Kokoro |
+| Desktop | Electron, React 19, TypeScript, Vite, HeroUI, `@jarida/ink` |
+| Networking | Go (`native/pondnet`): tsnet against a Headscale coordinator |
+| Devices | matter.js (`matter-server/`) |
+| Tests | cargo test, Vitest, Playwright, `scripts/live-test.sh` |
 
 ---
 
 ## Documentation
 
-| Document | Description |
+Start at the **[documentation index](./docs/README.md)**. The most used pages:
+
+| Document | For |
 |---|---|
-| [Architecture Overview](./docs/architecture/components.md) | Crate-by-crate breakdown |
-| [Data Flow](./docs/architecture/data_flow.md) | How a request travels through the system |
-| [Visual Workflow](./docs/architecture/visual_workflow.md) | Flowcharts and sequence diagrams |
-| [Ports & Adapters Guide](./docs/creating-ports-and-adapters.md) | How to add new capabilities |
-| [Matter](./docs/matter.md) | Controller lifecycle, commissioning, and troubleshooting |
-| [TDD Guide](./docs/testing/tdd_guide.md) | Test-driven development practices |
-| [Contributing](./docs/CONTRIBUTING.md) | Contribution workflow |
+| [Installation](./docs/developer/installation.md) | What `giap.sh install` does, prerequisites, troubleshooting |
+| [Components](./docs/architecture/components.md) | Every crate and what it owns |
+| [Data flow](./docs/architecture/data_flow.md) | One chat turn from request to response |
+| [CLI](./docs/cli.md) and [REST API](./docs/api.md) | Reference |
+| [Remote access](./docs/remote-access.md) | Reaching the pond away from home |
+| [Design](./DESIGN.md) | The design rules for every surface |
+| [Contributing](./docs/CONTRIBUTING.md) | Branches, commits, comments, tests |
 
 ---
 
 ## Contributing
 
-We welcome contributions from Rust developers, embedded systems engineers, AI/ML researchers, mobile developers (Android/iOS), and technical writers.
+Contributions are welcome from Rust developers, embedded systems engineers, AI/ML researchers, mobile
+developers and technical writers. Read the [Contributing Guide](./docs/CONTRIBUTING.md), then:
 
-Read the [Contributing Guide](./docs/CONTRIBUTING.md) then:
-
-1. Fork the repo and clone with `--recursive`
-2. Create a branch: `git checkout -b feat/your-feature`
-3. Follow the hexagonal architecture — new capabilities go through ports
-4. Write tests first (`cargo test -p pond-core` for fast iteration)
-5. Run `cargo fmt && cargo clippy` before submitting
-6. Open a pull request
+1. Fork the repo and clone it with `--recursive`.
+2. Branch: `git checkout -b feat/your-feature`.
+3. Keep the hexagonal split: new capabilities go through a port in `pond-core`.
+4. Write the tests first against the port's mock (`cargo test -p pond-core`).
+5. Run `cargo fmt --check` and the clippy command from `ci.yml`.
+6. Open a pull request.
 
 ---
 
@@ -414,5 +377,5 @@ and licensed under the Apache License, Version 2.0 and CC BY 4.0.
 ---
 
 <div align="center">
-  <sub>Built with ❤️ by <a href="https://jarida.io">Jarida Open Source</a> · Nairobi, Kenya</sub>
+  <sub>Built by <a href="https://jarida.io">Jarida Open Source</a> · Nairobi, Kenya</sub>
 </div>

@@ -1,241 +1,231 @@
-# Creating Ports and Adapters in Goose-in-a-Pond
+# Creating Ports and Adapters
 
-This guide documents how to create a new port (trait) in `pond-core` and its
-corresponding adapter in `pond-adapters-goose`. Follow these steps to keep the
-hexagonal architecture consistent.
+How to add a capability without breaking the hexagonal split: the core defines what it needs as a
+trait (a port), and an adapter crate implements it. The mock exists and passes its tests before
+the real adapter is written.
 
-`pond-core` is organized into four quadrants plus `shared/`. Before you start,
-pick the `<quadrant>` your capability belongs to and substitute it in the paths
-below: `user_data` (household facts), `models` (inference/routing), `mcp` (tool
-surface and extensions), `security` (secrets/auth/audit), or `shared`
-(agent-loop plumbing used by all).
+```
+0. Pick a bounded context   crates/pond-core/src/<context>/
+1. Domain types             <context>/domain/
+2. Port trait               <context>/ports/
+3. Mock + tests             <context>/mocks/
+4. Real adapter             crates/pond-adapters-<name>/  (or pond-infra for SQLite)
+5. Wire                     crates/pond-server/src/main.rs
+```
 
----
+## 0. Pick a bounded context
 
-## 1. Define Domain Types
+| Context | Holds |
+|---|---|
+| `models` | agents, LLM providers, inference, embeddings, voice in and out, wake word, model catalogue |
+| `mcp` | the tool surface: extensions, tool registry and dispatch, notifications |
+| `user_data` | household data: sessions, settings, memories, skills, devices, profiles, schedules, sensors |
+| `security` | pairing (handshake), secrets, policy, event log, redaction, remote access |
+| `shared` | agent-loop plumbing: `ChatService`, event bus, orchestrator |
+| `mesh` | pond-to-pond inference and credit |
+| `network` | setup code, setup radios, Wi-Fi, service advertising |
+| `context` | the context index: ingest, chunking, vector index, retrieval |
+| `rides` | ride booking and tracking |
 
-Create the types that your port needs in `pond-core/src/<quadrant>/domain/`.
+Most contexts have `domain/`, `ports/`, `services/` and `mocks/` directories; `context` and
+`rides` keep `domain.rs`, `ports.rs` and `mocks.rs` as single files. The example below adds a
+fictional `ParcelTracker` to `user_data`.
 
-**File:** `crates/pond-core/src/<quadrant>/domain/<your_types>.rs`
+## 1. Domain types
+
+Plain Rust types. `pond-core` imports no framework: no `goose`, `sqlx`, `axum`, `reqwest`.
+
+`crates/pond-core/src/user_data/domain/parcel.rs`:
 
 ```rust
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct YourDomainType {
-    pub field: String,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Parcel {
+    pub tracking_number: String,
+    pub status: ParcelStatus,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ParcelStatus { InTransit, OutForDelivery, Delivered }
 ```
 
-Then register the module:
+Add `pub mod parcel;` to `user_data/domain/mod.rs`.
 
-```rust
-// crates/pond-core/src/<quadrant>/domain/mod.rs
-pub mod your_types;
-```
+## 2. Port trait
 
-> **Rule:** Domain types must NOT import from `goose::*`. They belong to the
-> pond domain and must be adapter-agnostic.
+One trait per capability, `Send + Sync` so it can live in an `Arc<dyn …>`.
 
----
-
-## 2. Define the Port Trait
-
-Create the trait in `pond-core/src/<quadrant>/ports/`.
-
-**File:** `crates/pond-core/src/<quadrant>/ports/<your_port>.rs`
+`crates/pond-core/src/user_data/ports/parcel.rs`:
 
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::<quadrant>::domain::your_types::YourDomainType;
+use crate::user_data::domain::parcel::Parcel;
 
-/// Driven Port: <PortName>
-///
-/// Describe what this port abstracts.
+/// Looks up a parcel's delivery status with its carrier.
 #[async_trait]
-pub trait YourPort: Send + Sync {
-    async fn do_something(&self, input: YourDomainType) -> Result<YourDomainType>;
-    fn name(&self) -> String;
+pub trait ParcelTracker: Send + Sync {
+    async fn track(&self, tracking_number: &str) -> Result<Parcel>;
 }
 ```
 
-Register:
+Add `pub mod parcel;` to `user_data/ports/mod.rs`.
 
-```rust
-// crates/pond-core/src/<quadrant>/ports/mod.rs
-pub mod your_port;
-```
+## 3. Mock and tests
 
----
-
-## 3. Create a Mock Implementation
-
-Create a mock for testing in `pond-core/src/<quadrant>/mocks/`.
-
-**File:** `crates/pond-core/src/<quadrant>/mocks/mock_<name>.rs`
+`crates/pond-core/src/user_data/mocks/mock_parcel.rs`:
 
 ```rust
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::<quadrant>::domain::your_types::YourDomainType;
-use crate::<quadrant>::ports::your_port::YourPort;
+use std::sync::Mutex;
+use crate::user_data::domain::parcel::{Parcel, ParcelStatus};
+use crate::user_data::ports::parcel::ParcelTracker;
 
-pub struct MockYourPort;
-
-impl MockYourPort {
-    pub fn new() -> Self { Self }
+/// Answers every lookup as in transit and records what was asked.
+#[derive(Default)]
+pub struct MockParcelTracker {
+    pub asked: Mutex<Vec<String>>,
 }
 
 #[async_trait]
-impl YourPort for MockYourPort {
-    async fn do_something(&self, input: YourDomainType) -> Result<YourDomainType> {
-        Ok(YourDomainType { field: format!("Mock: {}", input.field) })
+impl ParcelTracker for MockParcelTracker {
+    async fn track(&self, tracking_number: &str) -> Result<Parcel> {
+        self.asked.lock().unwrap().push(tracking_number.to_string());
+        Ok(Parcel { tracking_number: tracking_number.into(), status: ParcelStatus::InTransit })
     }
-    fn name(&self) -> String { "mock".to_string() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_mock() {
-        let mock = MockYourPort::new();
-        let result = mock.do_something(YourDomainType { field: "hi".into() }).await.unwrap();
-        assert_eq!(result.field, "Mock: hi");
+    async fn records_each_lookup() {
+        let mock = MockParcelTracker::default();
+        mock.track("AB123").await.unwrap();
+        assert_eq!(*mock.asked.lock().unwrap(), vec!["AB123".to_string()]);
+    }
+
+    #[test]
+    fn works_as_a_trait_object() {
+        let _: Arc<dyn ParcelTracker> = Arc::new(MockParcelTracker::default());
     }
 }
 ```
 
-Register:
-
-```rust
-// crates/pond-core/src/<quadrant>/mocks/mod.rs
-pub mod mock_your_port;
-```
-
----
-
-## 4. Create the Adapter
-
-Adapters live in the crate that matches their dependency:
-
-| Adapter type | Crate |
-|---|---|
-| Wraps Goose built-in types | `pond-adapters-goose/src/` |
-| Pure HTTP (no Goose dep) | `pond-adapters-<name>/src/` or `pond-server/src/` |
-| SQLite persistence | `pond-infra/src/` |
-
-**File:** `crates/pond-adapters-goose/src/<name>_adapter.rs` (example: Goose-backed)
-
-```rust
-use anyhow::Result;
-use async_trait::async_trait;
-use pond_core::<quadrant>::domain::your_types::YourDomainType;
-use pond_core::<quadrant>::ports::your_port::YourPort;
-use std::sync::Arc;
-
-use goose::some_module::GooseThing;
-
-pub struct GooseYourPortAdapter {
-    inner: Arc<GooseThing>,
-}
-
-impl GooseYourPortAdapter {
-    pub fn new(inner: Arc<GooseThing>) -> Self { Self { inner } }
-    fn to_goose(input: &YourDomainType) -> GooseInput { /* ... */ }
-    fn from_goose(output: &GooseOutput) -> YourDomainType { /* ... */ }
-}
-
-#[async_trait]
-impl YourPort for GooseYourPortAdapter {
-    async fn do_something(&self, input: YourDomainType) -> Result<YourDomainType> {
-        let out = self.inner.goose_method(Self::to_goose(&input)).await?;
-        Ok(Self::from_goose(&out))
-    }
-    fn name(&self) -> String { "goose".to_string() }
-}
-```
-
-> **Workspace exclusion rule:** `pond-adapters-goose` and any crate importing `goose::*` must stay in `workspace.exclude` in the root `Cargo.toml`. See `AGENTS.md` for details.
-
----
-
-## 5. Wire Into the Service Layer
-
-Inject the port in `ChatService` or create a new service:
-
-```rust
-pub struct YourService {
-    port: Arc<dyn YourPort>,
-}
-
-impl YourService {
-    pub fn new(port: Arc<dyn YourPort>) -> Self {
-        Self { port }
-    }
-}
-```
-
-Wire in `pond-server/src/main.rs`:
-
-```rust
-let port = Arc::new(MockYourPort::new());  // or GooseYourPortAdapter
-let service = YourService::new(port);
-```
-
----
-
-## 6. Verify
+Add `pub mod mock_parcel;` to `user_data/mocks/mod.rs`. The `mocks` module is compiled under
+`#[cfg(any(test, feature = "test-mocks"))]`, so other crates' tests reach it by enabling
+`pond-core`'s `test-mocks` feature.
 
 ```bash
-# Unit tests
-cargo test -p pond-core
-
-# Full workspace build
-cargo build
-
-# Run the server
-cargo run -p pond-server
+cargo test -p pond-core parcel
 ```
 
----
+If a service in `pond-core` uses the port, write its tests against the mock now, before any
+adapter exists.
 
-## Reference: Existing Ports
+## 4. Real adapter
 
-| Port | Domain Types | Mock | Adapters |
+A new crate under `crates/` (add it to `members` in the root `Cargo.toml`), or an existing
+adapter crate when the capability is closely related. SQLite implementations live in
+`pond-infra`.
+
+`crates/pond-adapters-parcels/Cargo.toml`:
+
+```toml
+[package]
+name = "pond-adapters-parcels"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pond-core   = { path = "../pond-core" }
+pond-net    = { path = "../pond-net" }
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+reqwest     = { workspace = true }
+serde_json  = { workspace = true }
+
+[dev-dependencies]
+tokio    = { workspace = true }
+wiremock = { workspace = true }
+```
+
+Rules for the adapter:
+
+- **HTTP clients come from `pond_net::client()` or `pond_net::client_builder()`.**
+  `crates/pond-core/tests/egress_guard.rs` fails the build when a crate builds a `reqwest` client
+  any other way, and requires every file that sends HTTP to be classified: either it reports the
+  request to the egress tracker (`check_egress`, `record_egress`, `traced_send`, …) or it is
+  loopback-only. Add the new file to the right list there.
+- **Convert at the boundary.** Translate the external API's types into the domain types inside
+  the adapter; nothing from the external API leaks into `pond-core`.
+- **Tests:** a `wiremock` happy path, the error paths (HTTP 500, connection refused), trait-object
+  use, and an `#[ignore = "<what it needs>"]` live test against the real service. See the
+  [testing guide](../testing/tdd_guide.md).
+
+A crate that depends on Goose (`goose` with `default-features = false`, never `code-mode`) is an
+ordinary workspace member but must stay off the fast-crate lists in
+`.github/workflows/ci.yml`, which prove the rest of the workspace builds without Goose.
+
+## 5. Wire into pond-server
+
+`crates/pond-server/src/main.rs` constructs every adapter and hands it to the services or to
+`pond_api::AppState` (`crates/pond-api/src/lib.rs`). Add the field to `AppState`, then to
+`pond_api::test_support::app_state()` so the API tests keep compiling.
+
+If handlers reach the port as an axum `Extension` instead, attach it in
+`listeners::compose()` (`crates/pond-server/src/listeners.rs`) on the listener that should serve
+it, and add an assertion to `crates/pond-server/tests/listener_wiring.rs` that the other
+listeners do not. Which listener carries an extension is a security decision: the loopback
+dashboard, the HTTPS companion and remote access serve different callers.
+
+A change to wiring, routes or migrations needs `scripts/live-test.sh` before it is done.
+
+If the model should be able to use the capability, it also needs an MCP tool in
+`pond-mcp-server`; see the [MCP server standard](mcp-server-standard.md).
+
+## Existing ports
+
+There are about a hundred port traits; `grep -rn "^pub trait" crates/pond-core/src` lists them.
+The most used:
+
+| Port | File (under `crates/pond-core/src/`) | Mock | Adapters |
 |---|---|---|---|
-| `Agent` | `AgentRequest`, `AgentResponse` | `MockAgent` | `GooseAdapter` (pond-adapters-goose) |
-| `LlmProvider` | `ChatMessage`, `Role` | `MockProvider`, `FallbackProvider` | `GooseProviderAdapter`, `LlamafileProvider`, `LocalInferenceProvider` |
-| `SessionStorage` | `ChatSession`, `ChatMessage` | `InMemorySessionStorage` | `SqliteSessionStorage` (pond-infra) |
-| `VoiceInput` | — | `StdinInput` | `WhisperInput` (pond-adapters-whisper) |
-| `VoiceOutput` | — | `PrintOutput` | `PiperOutput` (pond-adapters-piper) |
-| `WakeWordDetector` | — | `InstantActivation` | `WhisperKeywordDetector` (pond-adapters-whisper) |
-| `OnboardingRepository` | `OnboardingStep` | *(inline in tests)* | `SqlxOnboardingRepository` (pond-infra) |
-| `DeviceRegistry` | `Device`, `RegisterDeviceRequest` | *(inline in tests)* | `SqliteDeviceRegistry` (pond-infra) |
-| `Handshake` | — | `MockHandshake` | — |
-| `SettingsRepository` | `Settings` | `MockSettingsRepository` | `SqliteSettingsRepository` (pond-infra) |
-| `SchedulerPort` | `ScheduledTask`, `CreateTaskRequest` | — | `CronSchedulerAdapter` (pond-infra-scheduler) |
-| `McpMemoryPort` | — | — | `GooseMcpMemoryAdapter` (pond-adapters-mcp-memory) |
-| `ExtensionManagerPort` | — | — | `GiapGooseExtensionManager` (pond-adapters-goose) |
-| `ModelRepository` | `ModelRecord`, `ModelRoleAssignment` | *(inline in tests)* | `SqliteModelRepository` (pond-infra) |
-| `ModelCatalogProvider` | `ModelRecord`, `BinaryRecord` | — | `HttpModelCatalogProvider` (pond-server) |
-| `ModelDownloader` | — | — | `HttpModelDownloader` (pond-server) |
-| `ModelStorage` | — | — | `FilesystemModelStorage` (pond-server) |
-| `ModelScheduler` | `DownloadStatus` | — | *(not yet implemented)* |
-| `WeatherProvider` | `WeatherData` | — | `OpenMeteoWeatherAdapter` (pond-adapters-weather) |
-| `SensorStorage` | `SensorReading` | `MockSensorStorage` | `SqliteSensorStorage` (pond-infra) |
-| `CameraStorage` | `CameraImage` | `MockCameraStorage` | `SqliteCameraStorage` (pond-infra) |
-| `ProfileRepository` | `Profile` | `MockProfileRepository` | *(SQLite impl in pond-infra)* |
-| `MemoryRepository` | — | `MockMemoryRepository` | *(SQLite impl in pond-infra)* |
+| `Agent` | `models/ports/agent.rs` | `MockAgent` | `GooseAdapter` (pond-adapters-goose), `MistralRsAgent` (pond-adapters-mistralrs), `PondAgent` (quarantined) |
+| `LlmProvider` | `models/ports/provider.rs` | `MockProvider` | `GooseProviderAdapter`, `OllamaProvider`, `LlamafileProvider`, `LocalInferenceLlmAdapter`, `FallbackProvider` |
+| `EmbeddingProvider` | `models/ports/embedding.rs` | `MockEmbeddingProvider` | `GgufEmbeddingProvider` (pond-inference), `FastembedEmbeddingProvider` (pond-infra) |
+| `VoiceInput` | `models/ports/voice_input.rs` | `StdinInput` | `WhisperRsInput` (pond-adapters-whisper) |
+| `VoiceOutput` | `models/ports/voice_output.rs` | `PrintOutput` | `KokoroOutput` (pond-adapters-kokoro) |
+| `StreamingWakeWordDetector` | `models/ports/wake_word.rs` | `InstantActivation` | `WhisperKeywordDetector` |
+| `TtsControl` | `models/ports/tts_control.rs` | `MockTtsControl` | `KokoroTtsControl` (pond-server) |
+| `ModelRepository` | `models/ports/model_repository.rs` | `MockModelRepository` | `SqliteModelRepository` (pond-infra) |
+| `SessionStorage` | `user_data/ports/session_storage.rs` | `InMemorySessionStorage` | `SqliteSessionStorage` (pond-infra) |
+| `SettingsRepository` | `user_data/ports/settings.rs` | `MockSettingsRepository` | `SqliteSettingsRepository` (pond-infra) |
+| `MemoryRepository` | `user_data/ports/memory_repository.rs` | `MockMemoryRepository` | `SqliteMemoryRepository` (pond-infra) |
+| `UserSkillRepository` | `user_data/ports/skill.rs` | `MockSkillRepository` | `SqliteSkillRepository` (pond-infra) |
+| `PromptTemplateRepository` | `user_data/ports/prompt_template.rs` | `MockPromptTemplateRepository` | `SqlitePromptTemplateRepository` (pond-infra) |
+| `DeviceRegistry` | `user_data/ports/device_registry.rs` | `MockDeviceRegistry` | `SqliteDeviceRegistry` (pond-infra) |
+| `SchedulerPort` | `user_data/ports/scheduler.rs` | none | `CronSchedulerAdapter` (pond-infra-scheduler) |
+| `Handshake` | `security/ports/handshake.rs` | `MockHandshake` (pond-infra) | `SqliteHandshakeAdapter` (pond-infra) |
+| `SecretRepository` | `security/ports/secret.rs` | none | `FileSecretRepository` (pond-infra) |
+| `EventLog` | `security/ports/event_log.rs` | `MockEventLog` | `SqliteEventLog` (pond-infra) |
+| `ExtensionManagerPort` | `mcp/ports/extension_manager.rs` | none | `GiapGooseExtensionManager` (pond-adapters-goose) |
+| `NotificationSender` | `mcp/ports/notification.rs` | none | `BroadcastNotificationSender` (pond-infra) |
+| `McpKnowledgePort` | `mcp/ports/mcp_knowledge.rs` | none | `GooseMcpMemoryAdapter` (pond-adapters-mcp-memory) |
+| `EventBus` | `shared/ports/event_bus.rs` | none | `InProcessEventBus` (`shared/services/`) |
 
----
+A few ports live in their adapter crate rather than `pond-core`: `WeatherProvider` is defined in
+`pond-adapters-weather` beside its implementation, `OpenMeteoWeatherAdapter`.
 
-## Key Principles
+## Principles
 
-1. **Domain types are adapter-agnostic** — never import `goose::*` in `pond-core`
-2. **Adapters convert at the boundary** — `to_goose()` / `from_goose()` methods
-3. **Always create a mock first** — enables testing without Goose compilation
-4. **One port per service** — don't merge unrelated capabilities
-5. **Port traits are `Send + Sync`** — required for async multi-threaded use
+1. Domain types and ports are framework-free; `pond-core` never imports `goose`.
+2. Mock first, adapter second: the mock's tests pass before the adapter exists.
+3. Adapters translate at the boundary.
+4. One port per capability.
+5. Ports are `Send + Sync`.
+6. Adapter tests cover the error paths, not just the happy path.

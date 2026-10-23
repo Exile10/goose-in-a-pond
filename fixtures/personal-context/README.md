@@ -1,5 +1,12 @@
 # Synthetic household personal-context corpus
 
+> Status (2026-10-23): the measurements below are from 2026-09-04 and still describe the pipeline:
+> `Files` and `Chat` still need a read connector and `Mobile` still needs `POST /api/v1/context/ingest`,
+> which does not exist. One correction to "What it does not prove": a production embedder does run on
+> the Orin, the GGUF one (`embedding_provider = "gguf"`, verified through the deployed binary
+> 2026-08-17, `docs/architecture/personal-context-index.md` section 7); the default, `fastembed`, is
+> the one that did not initialise there when measured on 2026-08-12.
+
 403 items across a fictional three-person Nairobi household, spanning all eight
 `SourceKind`s and all five `ItemKind`s over a 42-day window. Fictional and
 committable on purpose: it is a fixture, and a corpus modelled on a real

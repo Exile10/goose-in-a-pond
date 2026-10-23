@@ -4,14 +4,15 @@
 
 This is one small service that holds **one Apple MusicKit key** and answers **one question**: a
 signed developer token, good for 30 days. It exists so a household can play Apple Music without
-opening the Apple developer portal.
+opening the Apple developer portal. It can also relay Uber sign-ins
+([below](#optional-the-uber-sign-in-relay)), which is off until you add the overlay.
 
 What it holds: the key, in a file mounted read-only. It is never in an environment variable, an
 image, a log line or a response.
 
-What it learns: that some address asked for a token. It does not read a body, set a cookie, or ask
-who anyone is. It keeps no address: the rate limit is memory only, and the health counters are two
-numbers. Caddy has no access log, on purpose.
+What it learns: that some address asked for a token. The token route does not read a body, set a
+cookie, or ask who anyone is. It keeps no address: the rate limit is memory only, and the health
+counters are bare totals. Caddy has no access log, on purpose.
 
 What a token is worth: **anyone who can reach the service can get one**, exactly as anyone can read
 the token out of any MusicKit web page. A token is not a user's account: playing still needs that
@@ -22,8 +23,9 @@ The service is not a public offer of Jarida's key to third-party software: it is
 ponds need no key. Anyone can still call it; that is the limit above, stated once.
 
 The image is pinned by digest, runs as a non-root user with no shell, on a read-only filesystem
-with every capability dropped. The service's own port is on the private Compose network; only
-`POST /v1/musickit/developer-token` is reachable from outside.
+with every capability dropped. The service's own port is on the private Compose network; from
+outside, Caddy passes only `POST /v1/musickit/developer-token`, `GET /v1/uber/client` and
+`POST /v1/uber/token` / `/v1/uber/refresh`, and answers everything else, `/healthz` included, 404.
 
 ## What you need
 
@@ -159,7 +161,7 @@ Without the overlay the Uber routes answer 503, and nothing else changes.
 curl -s -X POST https://<YOUR_DOMAIN>/v1/musickit/developer-token | head -c 160     # a token
 curl -s -o /dev/null -w '%{http_code}\n' https://<YOUR_DOMAIN>/healthz                 # 404: not public
 docker compose logs pondcredentials      # the key id and lifetimes; never the key, never an address
-docker compose exec gateway wget -qO- pondcredentials:8080/healthz                     # the two counters
+docker compose exec gateway wget -qO- pondcredentials:8080/healthz                     # issued, limited, uber_relayed, uptime_s
 ```
 
 The check that matters is Apple's. Take the token the service returns and ask Apple's catalog for a song
@@ -175,7 +177,7 @@ The service refuses to start with a missing setting or a key that cannot sign, a
 ## Pointing ponds at it
 
 Every pond already points at `https://credentials.jarida.io`: that address is `DEFAULT_MANAGED_URL` in
-`crates/pond-api/src/musickit.rs`, set on 2026-09-29 and pinned by a test. A pond uses the service only
+`crates/pond-api/src/musickit.rs`, pinned by a test. A pond uses the service only
 when the household has stored no key of its own, and every call goes through `network_mode` and shows in
 the pond's egress log as `giap-credentials`. A pond asks only after its owner presses Sign in to Apple
 Music (or has signed in before), and keeps the token in its secret store, so a restart does not ask again:
@@ -184,15 +186,17 @@ about one call every 24 days for a household that uses it, and none for one that
 To point a pond at another deployment, set `POND_CREDENTIALS_URL=https://<YOUR_DOMAIN>` in its environment.
 To turn it off, set `POND_CREDENTIALS_URL=off`. **A test or a scratch pond must do that**, or it calls this
 server: the route tests and `scripts/live-test.sh` set it. If you move the service, change the constant,
-and read the privacy notes (`docs/architecture/pondcredentials.md`) first.
+and read the privacy notes ([pondcredentials.md](../../docs/architecture/pondcredentials.md)) first.
 
 ## Rotating the key
 
 Apple keeps a token valid until it expires **or its key is revoked**, and a pond only refetches when
 its token has a fifth of its life left. So **never revoke first**:
 
-1. Create a new MusicKit key. Put it on the droplet, change `APPLE_KEY_ID` in `.env`, and
-   `docker compose up -d`. New tokens are signed by the new key at once.
+1. Create a new MusicKit key. Copy it over `runtime/secrets/apple.p8` (then `chown` and `chmod` as
+   above), change `APPLE_KEY_ID` in `.env`, and
+   `docker compose up -d --no-build --force-recreate pondcredentials`. New tokens are signed by the
+   new key at once.
 2. Wait 30 days, the life of the last token signed by the old key.
 3. Revoke the old key in Apple's portal.
 
@@ -205,8 +209,7 @@ is not free; if it proves too long, lower `TOKEN_TTL_DAYS` and accept more calls
 
 ## Not verified
 
-The Docker image has not been built and the compose stack has not been started: the machine this was
-written on had no running Docker daemon. What was run: the service's tests and its real binary, the
-exact `cargo build --release --locked` the Dockerfile uses, `docker compose config`, a real pond
-fetching a real token from the real binary, and the `doctl` flag names against `doctl`'s own help.
-The Caddyfile and every `doctl` command are unrun, and no droplet exists.
+The 2026-09-29 deployment record ([pondcredentials.md](../../docs/architecture/pondcredentials.md#verification))
+covers the image build, the droplet, Caddy's certificate and Apple accepting a fetched token. No
+record exists of an unattended restart of the stack after a reboot, of the key rotation above on the
+live droplet, or of the Uber overlay against a real Uber app. Nothing in this kit monitors uptime.

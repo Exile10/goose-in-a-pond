@@ -1,380 +1,485 @@
-# Memory System (Enhanced)
+# Memory System
 
-Segment-based memory with importance scoring, exponential decay, automatic extraction from conversations, and periodic consolidation. Inspired by [boop-agent](https://github.com/raroque/boop-agent).
+What the pond remembers about the people it talks to. Memories are rows in `memory_fragments`
+(`pond_system.db`), each with a segment, importance, tier, decay state and lifecycle. A background
+batch engine reads stored conversations and writes them; each turn reads the most relevant back
+into context; a decay pass archives what has gone stale; an idle consolidation pass merges and
+prunes. The decay formula is the adaptive half-life from
+[boop-agent](https://github.com/raroque/boop-agent).
 
 ## Architecture
 
 ```
-  Conversation Turn
-        │
-        ▼
-  ┌─────────────┐    tokio::spawn (async, never blocks SSE)
-  │  Memory     │───────────────────────────────────────────┐
-  │  Extractor  │  LLM: "Extract durable facts as JSON"     │
-  └─────────────┘                                           │
-        │ Vec<ExtractedFact>                                │
-        ▼                                                   │
-  ┌─────────────┐    quality gate, then dedup against the   │
-  │  Extraction │    50 most recent memories                │
-  │  Service    │    rate limited (configurable interval)    │
-  └──────┬──────┘                                           │
-         │ MemoryFragment::from_extraction()                │
-         ▼                                                  │
-  ┌─────────────┐                                           │
-  │  SQLite     │◄──────────────────────────────────────────┘
-  │  memory_    │    segment, importance, tier, decay_rate,
-  │  fragments  │    access_count, last_accessed_at, lifecycle
-  └──────┬──────┘
-         │ every 6 hours
-         ▼
-  ┌─────────────┐    effective_score = importance * exp(-λt) * reinforcement
-  │  Cleanup    │    < 0.05 → prune  |  < 0.15 → archive
-  │  Service    │    permanent tier exempt
-  └─────────────┘
-         │ after 15 min of user inactivity (opt-in, cancelled by activity)
-         ▼
-  ┌─────────────┐    three-stage adversarial pipeline:
-  │  Consolidat.│    Proposer -> Adversary -> Judge (3 LLM calls)
-  │  Service    │    merge / prune / split / recategorize
-  └─────────────┘
+  chat turn ──> ChatService::persist_assistant_turn ──> sessions / session_messages
+                (no memory work on the turn path)              │
+                                                               │ inference lane: memory_extraction
+                                                               │ (idle 15 min, embedder required)
+                                                               ▼
+                                         BatchExtractionService::run_pass
+                                           one window per conversation, one model call each
+                                           (LlmConversationExtractor)
+                                           write gate: fact_defect, subject gate, dedup bands
+                                           dated items ──> reminders ──> proposals
+                                                               │
+  save_memory (MCP) ──────────┐                                │
+  POST /api/v1/memories ──────┴──────────────> memory_fragments <┘
+                                                 │    │    │
+  each turn: GooseAdapter ranks and injects <────┘    │    └──> inference lane: consolidation
+  cleanup (every memory_cleanup_interval_hours) <─────┘         merge / prune / split / recategorize
 ```
 
-## Memory Segments
+Every memory write goes through `RedactingMemoryRepository`
+(`pond-core/src/user_data/services/redacting_memory_repository.rs`), which strips
+credential-shaped material at `RedactionLevel::Secrets` before storage and drops the embedding of
+a row that held a secret.
 
-| Segment | Default Importance | Default Tier | Decay Rate | Description |
-|---------|-------------------|-------------|------------|-------------|
-| Identity | 0.8 | Permanent | 0.00 | Name, role, location — core facts |
-| Correction | 0.9 | Long | 0.01 | User correcting the assistant |
-| Preference | 0.7 | Long | 0.01 | Likes, dislikes, habits |
-| Relationship | 0.7 | Long | 0.01 | People the user knows |
-| Project | 0.6 | Long | 0.01 | Ongoing work, goals |
-| Knowledge | 0.5 | Long | 0.01 | Factual knowledge |
-| Context | 0.3 | Short | 0.10 | Transient situation (expires fast) |
+## Data model
 
-## Memory Tiers
+### Segments
 
-| Tier | Decay Rate | Behavior |
-|------|-----------|----------|
-| Permanent | 0.00 | Never decays; never pruned by cleanup or consolidation |
-| Long | 0.01 | Retained for weeks/months |
-| Short | 0.10 | Expires within days |
+| Segment | Default importance | Default tier (`MemorySegment::default_tier`) | Meaning |
+|---------|-------------------:|-------------|---------|
+| Correction | 0.9 | Long | The person fixed something that was wrong |
+| Identity | 0.8 | Permanent | Who they are: role, home, circumstances |
+| Preference | 0.7 | Long | Likes, dislikes, defaults, style |
+| Relationship | 0.7 | Long | A person or pet they know |
+| Routine | 0.65 | Long | A habit; only batch extraction can see one |
+| Project | 0.6 | Long | Ongoing work or goal |
+| Knowledge | 0.5 | Long | A fact not about the person |
+| Context | 0.3 | Short | Transient situation |
 
-## Lifecycle States
+Batch extraction does not use the segment default tier: every extracted memory is `Long` (see
+[Kinds](#kinds-and-segments)).
 
-- **Active** — included in searches and agent context
-- **Archived** — hidden from recall, retained in DB
-- **Merged** — consolidated into another memory, `superseded_by` links to replacement
+### Tiers and lifecycle
 
-## Decay Formula
+| Tier | `decay_rate` | Behaviour |
+|------|-------------:|-----------|
+| Permanent | 0.00 | Never decays; cleanup skips it; consolidation never prunes it, and a merge or split involving it stays Permanent |
+| Long | 0.01 | Decays slowly |
+| Short | 0.10 | Decays fastest |
 
-```
-effective_score = importance * exp(-decay_rate * days_since_access) * (1 + ln(access_count + 1) * 0.1)
-```
+Lifecycle: `active` (recalled and injected), `archived` (hidden from every search, kept in the
+table), `merged` (superseded; `superseded_by` names the replacement).
 
-- `days_since_access`: days since `last_accessed_at` (or `created_at` if never accessed)
-- `access_count`: incremented each time the memory is recalled or injected into a prompt
-- Reinforcement term `(1 + ln(N+1) * 0.1)`: frequently recalled memories resist decay
+Other columns: `profile_id` (the member it belongs to; `NULL` means household), `session_id`,
+`source` (`extraction`, `mcp_tool`, `api`, ...), `tags`, `embedding` (BLOB), `access_count`,
+`last_accessed_at`, and `corrects` (for a correction, the claim it overturns, so consolidation
+cannot revert it).
 
-**Thresholds** (configurable via settings):
-- Below `memory_prune_threshold` (default 0.05) → pruned
-- Below `memory_archive_threshold` (default 0.15) → archived
-- Permanent tier → exempt from decay
+## Batch extraction
 
-## Background Extraction
+`BatchExtractionService` (`pond-core/src/user_data/services/memory_extraction.rs`) is the only
+code that extracts memories. The chat handlers persist turns with plain `persist_assistant_turn`;
+`crates/pond-api/tests/stream_handler_parity.rs` (`neither_stream_handler_extracts_inline`) fails
+the build if either handler extracts inline.
 
-After each chat response is persisted, a background task extracts durable facts:
+### When a pass runs
 
-1. **Rate limit**: skips if last extraction was < `memory_extraction_interval_secs` (default 10s) ago
-2. **Minimum length**: skips if both user message and response are < 15 chars
-3. **LLM call**: compact prompt asks for `{"facts":[…]}` (see `crates/pond-server/src/llm_memory_extractor.rs`)
-4. **Normalise**: collapse whitespace, drop an invented label prefix ("Active Project: …")
-5. **Quality gate**: reject content that cannot survive outside its conversation (below)
-6. **Dedup**: substring *and* token overlap against the 50 most recent memories, plus
-   the facts already stored by this same run — corrections exempt (below)
-7. **Reclassify**: a `Project` fact that is really a captured request is filed as `Context`
-8. **Storage**: each fact becomes a `MemoryFragment::from_extraction()` with segment/importance/tier
+The loop in `pond-server/src/main.rs` polls every 60 s (first poll 60 s after start) and asks the
+[inference lane](#the-inference-lane) for the `memory_extraction` slot. It is spawned only when an
+embedding provider exists at startup; without one nothing is extracted, and the pass reports
+`blocked_on = "no_embedder"`. A pass needs all of:
 
-The extraction prompt is the entire per-turn prefill of a job that runs after *every* turn,
-on the same single-slot local model that is serving chat, so its length is felt as latency
-on the next user message, not just as context. It is held to ~400 tokens (1589 chars) and a
-unit test fails the build above `EXTRACTION_PROMPT_CEILING` (1800 chars) — it had reached
-2466 by accretion, roughly doubling that background prefill.
+- `memory_extraction_enabled` and an embedder that has not failed in the last 300 s
+  (`EMBED_FAILURE_COOLDOWN_SECS`);
+- real user activity since the process started (HTTP routes, or a human session's `updated_at`,
+  which covers the out-of-process voice child);
+- `memory_extraction_idle_secs` (900) of quiet;
+- `memory_extraction_interval_secs` (60) since the last pass.
 
-`MemoryExtractionService` is the **write gate**: steps 4–7 run there, in `pond-core`, for
-every extractor adapter. `LlmMemoryExtractor` applies the same normalise/gate/dedup checks
-while parsing, but only so junk cannot consume the `memory_extraction_max_facts` budget
-ahead of good facts — the core service does not trust it.
+Settings are re-read every tick. In-process activity during a pass cancels it between windows, so
+activity costs at most one window's inference.
+
+### What a pass reads
+
+- Conversations: every human session (`SessionOrigin::is_human`; the scheduler's `sched-`
+  sessions and the proposal session are skipped). The most recently active conversation goes
+  first, then the backlog with never-examined conversations at the front, oldest first.
+- Per conversation, one window: messages after the cursor (`sessions.extracted_through_id`,
+  migration `0056`), up to `memory_extraction_window_messages` (20) and `EXTRACTION_WINDOW_CHARS`
+  (6000), cut to end on an assistant reply. Fewer than two new messages is skipped.
+- Up to `memory_extraction_sessions_per_pass` (3) model calls per pass, and at most
+  `EXTRACTION_PASS_MAX_SECS` (300) of wall clock.
+- Who the window is about: `resolve_window_subject` names the member from the session's
+  `SessionIdentity`. With no identity, a single-member pond uses `settings.user_name` (or "the
+  user"); on a multi-member pond the conversation is not mined, only counted
+  (`sessions_unnameable`), because filing one member's habits under another's name is worse than
+  losing them.
+- Up to 8 known memories (`KNOWN_MEMORIES_SHOWN`, 800 chars) about that subject, ranked as turn
+  injection ranks them, so the model builds on them instead of restating them.
+
+The cursor advances after each window. A watermark naming a deleted message resets the cursor and
+the conversation is re-walked; `already_mined` skips windows that already wrote rows. A reply with
+no parseable JSON counts an attempt; after `MAX_PARSE_ATTEMPTS` (3) the walk steps past the window.
+A window whose first exchange alone exceeds the budget is stepped past unread.
+
+### The extraction prompt
+
+`LlmConversationExtractor` (`pond-server/src/conversation_extractor.rs`) sends one system prompt
+and one user message (known memories, then the conversation) per window, within
+`EXTRACTION_PROMPT_BUDGET_TOKENS` (2400). The rendered system prompt is held under
+`EXTRACTION_PROMPT_CEILING` (2300 chars, enforced by a test). Its opening differs from every chat
+prompt so Goose's prefix reuse does not overwrite the chat's cached prefix. It carries no worked
+example, because small models copy examples. The model answers
+`{"memories":[{"note","kind"}],"reminders":[{"about","when"}]}`, at most
+`memory_extraction_max_facts` (3) memories per window.
+
+### Kinds and segments
+
+The model chooses from a closed five-value catalogue (`MemoryKind`,
+`pond-core/src/user_data/ports/conversation_extractor.rs`); an unknown label is rejected and
+counted, never defaulted.
+
+| Kind | Stored segment | Importance |
+|------|----------------|-----------:|
+| relationship | Relationship | 0.7 |
+| preference | Preference | 0.7 |
+| routine | Routine | 0.65 |
+| correction | Correction | 0.9 |
+| context | Identity | 0.8 |
+
+All five are stored in the `Long` tier. `context` maps to `Identity`, not to the store's
+transient `Context` segment, and is not `Permanent`, because a household's circumstances change.
+
+### The write gate
+
+Each candidate is normalised (`normalise_fact_content`: whitespace collapsed, an invented label
+prefix such as "Active Project:" dropped), then:
+
+1. **Quality gate**: `fact_defect()` refuses it outright (below).
+2. **Subject gate**: an Identity, Relationship, Preference or Routine candidate that never names
+   the subject (`names_subject`: "the user" or the member's name) is demoted to `Knowledge`
+   (importance 0.5), not rejected.
+3. **Bands**: compared with what the subject's store already holds (below). `Same` and `Related`
+   are dropped and the id they lost to is recorded; `New` and `Unscored` are written.
+4. **Write**, unless `memory_extraction_mode` is `shadow`. The banding vector becomes the row's
+   embedding.
+
+Every window logs a `memory_events` row (`event_kind = extracted`, `memory_id = window:<id>`) with
+counts of what was offered, kept, refused, dated, demoted and dropped; each stored memory logs its
+own row with its window, kind and band. Fact text never reaches the INFO log.
+
+`memory_extraction_mode` is `write` by default; `shadow` bands and logs but writes nothing;
+`reinforce` currently behaves as `write` (a match is still dropped). An unrecognised value reads
+as `shadow`.
 
 ### Fact quality gate
 
-A stored memory is injected into the **assistant's** context many turns later, with none
-of the conversation that produced it. Content that only made sense inside that
-conversation does not merely waste tokens, it misleads. `fact_defect()` in
-`pond-core/src/user_data/domain/memory.rs` rejects three classes outright:
+A stored memory is injected into the assistant's context many turns later, with none of the
+conversation that produced it. Content that only made sense inside that conversation misleads.
+`fact_defect()` in `pond-core/src/user_data/domain/memory.rs` refuses, in this order:
 
-| Defect | Example (real rows from a production store) | Rule |
-|--------|---------------------------------------------|------|
-| `UnresolvedReference` | "The user's mother lives in the latter city." | "the latter"/"the former" with no named referent, a non-expletive "there", a deictic like "that place", or a sentence opening on a bare pronoun |
-| `FirstPerson` | "My mom's name is Florence…" | any of "I / me / my / we / our", including contractions ("I'm", "I've", "We're") — in the assistant's context "my mother" reads as the *assistant's* mother |
+| Defect | Example | Rule |
+|--------|---------|------|
 | `TooShort` | "Tea." | fewer than `MIN_FACT_CONTENT_LEN` (8) characters |
+| `FirstPerson` | "My mom's name is Florence." | "I / me / my / we / our" and contractions ("I'm", "We're"); in the assistant's context "my mother" reads as the assistant's |
+| `UnresolvedReference` | "The user's mother lives in the latter city." | "the latter"/"the former" without two named antecedents, a non-expletive "there" or a deictic ("that place") with none, or a sentence opening on a bare pronoun |
+| `EchoedExample` | (none today) | an exact copy of a prompt example; `EXTRACTION_EXAMPLE_FACTS` is empty while the prompt has none |
+| `CalendarDate` | "The user has a dentist appointment next Tuesday." | a one-off date or time (`carries_calendar_date`); a habit's recurring timing ("every Saturday") is kept |
+| `Fragment` | "The user's cat is called" | ends on a word that leads into something missing |
 
-The gate is deliberately hard to trip. A rejected fact is *lost*, so every rule is anchored
-to a token pattern a well-formed third-person sentence cannot produce, and each has
-explicit escapes: "The user's therapist…" is not "there", "lives in the US" is not "us",
-"Type I diabetes" is not "I", "There is a spare key…" is the expletive, "grew up in the
-former Yugoslavia" names its referent, and "moved from Nairobi to Kisumu and prefers the
-latter" resolves inside its own sentence. Defective facts are **not repaired**: conjugating
-"I like" into "The user likes" or inventing the referent of "the latter" is the judgement
-we do not have at write time, and a wrong repair outlives the conversation that could have
-corrected it. The extraction prompt carries the same rules with a worked example, so
-compliance is the common case and the gate is the backstop.
+The gate is deliberately hard to trip. A refused fact is lost, so every rule is anchored to a
+token pattern a well-formed third-person sentence cannot produce, and each has escapes: "The
+user's therapist" is not "there", "lives in the US" is not "us", "Type I diabetes" is not "I",
+"There is a spare key" is the expletive, "grew up in the former Yugoslavia" names its referent,
+and "moved from Nairobi to Kisumu and prefers the latter" resolves inside its own sentence.
+Defective facts are not repaired: rewriting "I like" into "The user likes", or inventing the
+referent of "the latter", is a judgement nothing has at write time, and a wrong repair outlives
+the conversation that could have corrected it. The prompt carries the same rules, so compliance
+is the common case and the gate is the backstop.
 
-Two rules here were tightened and then deliberately loosened again, because each
-refinement destroyed more real facts than the imprecision it removed:
+Two rules are deliberately looser than they could be, because each tighter version destroyed
+more real facts than the imprecision it removed:
 
-- **"mine" is not a first-person marker at all.** It is a common noun ("a coal mine") far
-  more often than a predicate pronoun ("that laptop is mine"), and no rule separated the two
-  cleanly: checking the previous token alone let one adjective discard "The user works in a
-  **coal** mine near Kakamega."; walking back past premodifiers to find a determiner then
-  admitted "a friend **of** mine works at Jarida" as third person. Both directions were
-  wrong, so the disambiguation is gone and "mine" is simply not checked. The cost is that
-  "That laptop is mine now." is stored — one imprecise row, against a rule that was
-  destroying correct ones.
-- **An antecedent only has to precede its anaphor.** The old test asked whether *any* token
-  after the first was capitalised, which a name, city, month or weekday satisfies — i.e.
-  most real facts — so the rule almost never fired. Antecedents are now counted
-  **positionally**, before the deictic, and nothing else about them is inspected. Requiring
-  a *place* antecedent for "there" and "that city" (a proper noun after a locative
-  preposition) looked more precise and destroyed every fact whose place arrives through a
-  copula: "The user's home town is Kisumu and his parents still live there." "the
-  latter"/"the former" still need `CONTRASTIVE_ANTECEDENTS` (2) because they *select between
-  two* candidates, which is what catches the original production row ("The user's mother
-  Florence lives in the latter city" names a person, not a city). The residual imprecision
-  is that a single earlier name of any kind resolves "that place" — "The user's brother
-  Peter enjoyed that place in March." is stored, vaguely.
+- **"mine" is not a first-person marker.** It is a noun ("a coal mine") more often than a
+  pronoun, and no rule separated the two cleanly in both directions. The cost is that "That
+  laptop is mine now." is stored.
+- **An antecedent only has to precede its anaphor.** Proper nouns before the deictic are counted
+  positionally and nothing else about them is inspected. Requiring a place antecedent for
+  "there" or "that city" destroyed facts whose place arrives through a copula ("The user's home
+  town is Kisumu and his parents still live there"). "the latter"/"the former" still need
+  `CONTRASTIVE_ANTECEDENTS` (2) because they select between two. The residual imprecision: one
+  earlier name of any kind resolves "that place".
 
-### Captured requests are not projects
+### Dates become reminders
 
-"Set a reminder to water the plants every evening at 6 PM" is a task the assistant already
-carried out, not an ongoing commitment — but it was landing in the `Project` segment
-(`Long` tier, decay 0.01) and staying there forever. A `Project` fact that
-`is_captured_request()` recognises is reclassified to `Context`: importance 0.3, `Short`
-tier, so it still informs the next few turns and then archives itself in about a week. It
-is reclassified rather than dropped because the short-horizon information is genuinely
-useful; only its permanence was wrong. The rule fires **only** for `Project` — an
-imperative in a `Preference` ("Use one word for goodbyes") is a real standing instruction
-and must keep its tier.
+A `CalendarDate` note is refused as a memory because, read back months later, a dated fact
+misleads. When `memory_date_proposals_enabled` (default true) and the window's last message is
+under `REMINDER_MAX_AGE_DAYS` (7) old, the model is also asked for reminders: `about` plus
+`when_said`, the person's own words about the timing, never a parsed date. They land in the
+`reminders` table (migration `0057`, deduplicated on `(window_id, about_key)`). After each pass,
+`promote_pending_reminders` turns up to 50 pending reminders into proposals; one with no member to
+address stays `pending`. `GET /api/v1/reminders` lists them.
 
-A bare imperative opener is **grammar, not transience**, and keying on it alone demoted
-exactly the long-lived commitments the `Project` segment exists for: "Build a treehouse for
-the children this summer", "Write a novel about beekeeping", "Run the Nairobi marathon in
-October", "Design the new logo for Jarida". Two signals are therefore required — an
-imperative opener from `TASK_VERBS` **and** a named assistant artifact in the object
-(`ASSISTANT_ARTIFACT_NOUNS`: reminder, function, script, email, summary …, things that get
-produced and finished).
+### Dedup bands
 
-The **object is the whole signal**; the verb never is. An "assistant-only verb" list was
-tried as a second single-signal arm and it demoted "Convert the garage into a workshop this
-year" and "Install the solar panels on the roof before the rains" — year-long undertakings
-that happen to open on a verb an assistant also answers to. There is no verb that means
-"this is assistant work" independent of what it acts on, so the list is gone. The cost is
-under-firing: "Translate the poem into Swahili." and "Explain how the decay formula works."
-are captured requests and are no longer demoted. That is the intended direction — the rule
-is calibrated to **under-demote**, because missing a captured request leaves a stale
-`Project` row that consolidation can retire, while demoting a real project drops it to
-`Short` tier and it decays out of the store inside a week.
+`dispose_candidates` scores each candidate against the subject's own store (another member's
+identical row is a different person's fact):
 
-### Dedup without embeddings
+| Band | Test | Outcome |
+|------|------|---------|
+| Same | lexical duplicate of one of the 50 most recent rows (`DEDUP_RECENT_WINDOW`, plus rows this window wrote), or cosine to the nearest of 5 neighbours at or above `memory_reinforce_threshold` (0.94) | dropped |
+| Related | cosine at or above `memory_relate_threshold` (0.78) | dropped |
+| New | cosine below 0.78 | written |
+| Unscored | the embed failed or no neighbour has a vector | written |
 
-Semantic dedup (cosine ≥ `SEMANTIC_DEDUP_THRESHOLD`) is inert when
-`embedding_provider = "none"`: nothing is embedded, so nothing is compared. The
-non-semantic path in `memory_relevance.rs` therefore has to stand alone, and substring
-containment is not enough — "The user's mother's name is Florence." and "My mom's name is
-Florence…" share no substring at all. `is_duplicate_content()` layers:
+The settings source marks both thresholds as unmeasured defaults; `shadow` mode exists to measure
+them on real history.
 
-1. **Polarity** — opposite polarity is never a duplicate ("is happy" / "is not happy"),
-   checked first because a token measure is negation-blind.
-2. **Argument order** — a token measure is *also* order-blind, and "prefers dark mode over
-   light mode" against "prefers light mode over dark mode" reduces to the **identical**
-   token set: Jaccard 1.00, containment 1.00. `is_argument_swap()` catches the reversal by
-   splitting both texts at a shared `ORDER_SENSITIVE_MARKERS` connective (over, than, to,
-   from, instead, rather, before, after, versus …) and checking whether its arguments
-   crossed in both directions. "from" is there for the reversed journey — "moved **to**
-   Nairobi from Kisumu" against "moved **to** Kisumu from Nairobi", which splitting at "to"
-   cannot see because the crossing is entirely on one side of it. Copulas are deliberately
-   absent from that list — "Florence is the user's mother" and "The user's mother is
-   Florence" are one fact, so a general order-sensitivity test (Kendall tau, bigram
-   equality) would break them; only these connectives make word order meaning-bearing.
-3. **Substring containment**, case-insensitive — the cheap exact-restatement case.
-4. **Token overlap** — content words after possessive stripping, crude singularisation,
-   kinship aliasing (mom → mother), and a dedup-specific stopword list that also drops
-   "user" (every third-person fact has it, so it carries no signal). Duplicate requires
-   Jaccard ≥ 0.45 **and** containment ≥ 0.8 over the shorter side.
+The lexical test is `is_duplicate_content()` in `memory_relevance.rs`, layered because a token
+measure alone is blind to meaning-bearing differences:
 
-Both floors are required. Jaccard alone misses a short restatement of a long fact;
-containment alone merges "prefers dark mode" with "prefers dark roast coffee". The pair is
-tuned against real duplicate and non-duplicate rows (`memory_relevance.rs` tests) —
-notably, "mother lives in Kisumu" vs "mother lives in Nairobi" clears Jaccard but fails
-containment, which is the right answer: contradictions must both be stored and left to
-consolidation. The measure is only trusted when both sides have ≥ 3 content words.
+1. **Polarity**: opposite polarity is never a duplicate ("is happy" / "is not happy").
+2. **Argument order**: "prefers dark mode over light mode" and "prefers light mode over dark mode"
+   have identical token sets. `is_argument_swap()` splits both at a shared
+   `ORDER_SENSITIVE_MARKERS` connective (over, than, to, from, instead, rather, before, after,
+   versus ...) and checks whether the arguments crossed in both directions. Copulas are not on
+   the list: "Florence is the user's mother" and "The user's mother is Florence" are one fact.
+3. **Substring containment**, case-insensitive.
+4. **Token overlap**: content words after possessive stripping, crude singularisation, kinship
+   aliasing (mom to mother) and a dedup stopword list that also drops "user". A duplicate needs
+   Jaccard at least `LEXICAL_DEDUP_JACCARD` (0.45) **and** containment over the shorter side at
+   least `LEXICAL_DEDUP_CONTAINMENT` (0.8), with at least 3 content words on each side.
 
-Comparison window is `DEDUP_RECENT_WINDOW` (50, up from 20). These strings never reach an
-LLM prompt, so the window is sized for recall, not tokens.
+Both floors are required: Jaccard alone misses a short restatement of a long fact; containment
+alone merges "prefers dark mode" with "prefers dark roast coffee". "mother lives in Kisumu" against
+"mother lives in Nairobi" clears Jaccard but fails containment, which is right: contradictions are
+both stored and left to consolidation.
 
-### Corrections are exempt from dedup
+### Corrections are never deduplicated
 
-A correction restates the claim it overturns, in almost the same words — which is exactly
-what both the lexical measure and the ≥ 0.92 cosine pass score as a duplicate. Dropping it
-leaves the **stale** row standing, so the store ends up asserting the thing the user just
-took the trouble to deny. That is the worst outcome the memory system can produce, and it
-is silent.
+A correction restates the claim it overturns in almost the same words, which both the lexical and
+the cosine test score as a duplicate. Dropping it would leave the stale row standing, so the store
+would assert what the person just denied. A `Correction` candidate therefore skips the drop and is
+written; both rows sit in the store and consolidation, which never prunes a correction, retires
+the old one.
 
-So a fact whose segment is `Correction` **or** that carries a `corrects` field (the same
-disjunction as `MemoryFragment::is_correction()`, since a small model routinely sets one
-without the other) skips both dedup passes and is written. Both halves of the pair then
-sit in the store and consolidation supersedes the old row — that path is the only one that
-knows which of the two won, and it already refuses to prune a `Correction`. The exemption
-is enforced in `MemoryExtractionService` (the write gate) and mirrored in
-`LlmMemoryExtractor`'s parse-time prefilter, where the segment and `corrects` field are now
-read *before* the dedup check so the exemption can see them.
+### Status
 
-## Auto-Classification
+`GET /api/v1/memories/extraction-status` returns `ExtractionEngineStatus`: mode, when the last
+pass finished, windows read, memories written, dates refused and lost, reminders written and lost,
+unattributed conversations, and `blocked_on` (`no_embedder`, `no_provider`, `provider_error`,
+`unnameable_subject`, `session_list_failed`) so a stalled engine does not look idle. It resets on
+restart.
 
-When saving via MCP tool without explicit segment, `auto_classify_segment()` uses keyword heuristics:
-- "I prefer/like/hate" → Preference
-- "My name is/I am a" → Identity
-- "Actually/No, that's wrong" → Correction
-- "My wife/friend/boss" → Relationship
-- "Working on/my project" → Project
-- "Right now/currently" → Context
-- Default → Knowledge
+## Other writers
+
+| Writer | Gate | Owner | Embedding |
+|--------|------|-------|-----------|
+| `save_memory` MCP tool (`giap-memory`) | none; `auto_classify_segment()` picks the segment when none is given | household (`profile_id` NULL) | embedded at write when a provider exists |
+| `POST /api/v1/memories` | none | household | none at write; filled by the embedding sweep |
+
+`auto_classify_segment()` (`pond-mcp-server/src/memory.rs`) is a keyword heuristic used only by
+`save_memory`: "actually / no, / that's wrong" gives Correction, "my name is / I live in / I work
+at" Identity, "my wife / my friend / my boss" Relationship, "I prefer / I like / my favourite"
+Preference, "working on / my project / deadline" Project, "right now / currently" Context,
+anything else Knowledge. `save_memory` also takes `supersedes` (ids marked `merged`) and
+`corrects`.
+
+Rows written without a vector are embedded by the index-maintenance lane job
+(`run_memory_embedding_sweep`, `pond-core/src/context/index_maintenance.rs`) and by a backfill
+spawned at startup (`memory_relevance::run_backfill`, then `run_dimension_repair` for rows
+embedded by another model).
+
+## Recall and injection
+
+Each turn, `GooseAdapter` (`pond-adapters-goose/src/goose_agent.rs`) builds the memory block when
+`agent_memory_inject` is on (default true) and the turn's `ProfileScope` allows personal data, so an
+unidentified speaker gets none:
+
+1. Candidates: the most recent rows plus topical ones (vector search with `embed_query`, or a
+   keyword search via `keyword_terms` when there is no embedder), from a pool of
+   `max(agent_memory_limit * 8, 40)`, all within the turn's scope.
+2. Rank with `rank_by_relevance`: `0.5 * similarity + 0.3 * importance + 0.2 * recency`, recency
+   halving every 14 days from `created_at` (`RECENCY_HALF_LIFE_DAYS`).
+3. Keep the context profile's `max_memory_fragments` (3 to 15, by context size,
+   `pond-core/src/models/services/context/context_budget.rs`) within its `memory_token_budget`.
+4. Send only lines not already shown earlier in the conversation, inside the user message's
+   `<system-context>`, which keeps the system-prompt prefix stable for KV reuse.
+5. `record_access` on each injected memory, which feeds decay.
+
+Only active rows are searched; archived and merged rows are never recalled.
+
+`recall_memories` (MCP) searches the whole household: vector search when a query and embedder are
+available, keyword fallback otherwise, recency order without a query (default limit 10). It
+records access and logs a `recalled` event per result.
+
+## Decay and cleanup
+
+`memory_cleanup::effective_score` (`pond-core/src/user_data/services/memory_cleanup.rs`):
+
+```
+adaptive_half_life = memory_decay_base_half_life_days * (1 + importance)
+lambda             = (ln 2 / adaptive_half_life) * memory_decay_beta * (1 + decay_rate)
+score              = importance * exp(-lambda * days_since_access) * (1 + ln(access_count + 1) * 0.1)
+```
+
+clamped to `[0, 1]`. `days_since_access` counts from `last_accessed_at`, or `created_at` if never
+accessed. Permanent rows return their importance unchanged.
+
+`run_cleanup` scores the newest 1000 active rows that have an importance. Below
+`memory_archive_threshold` (0.15) a row is archived and logged `archived`; below
+`memory_prune_threshold` (0.05) it is also archived, but logged `pruned`. Nothing is deleted.
+Empty-content rows are always pruned. With the defaults (half-life 11.25 days, beta 0.8) a memory
+that is never recalled archives after roughly:
+
+| Segment (importance, decay_rate) | Days to archive |
+|----------------------------------|----------------:|
+| Correction (0.9, 0.01) | 68 |
+| Preference, Relationship (0.7, 0.01) | 53 |
+| Routine (0.65, 0.01) | 49 |
+| Knowledge (0.5, 0.01) | 36 |
+| Context (0.3, 0.10) | 17 |
+
+Cleanup is plain SQL, so it runs on its own timer, not the inference lane. The loop is spawned at
+startup only if `memory_cleanup_enabled` is true, and its interval and thresholds are read once at
+startup: changing them needs a restart.
 
 ## Consolidation
 
-Opt-in (`memory_consolidation_enabled`, default false — it needs a meaningful
-number of memories to be useful). Two modes, selected by
-`memory_consolidation_mode`:
+The only pass that removes what extraction got wrong. Two modes, `memory_consolidation_mode`:
 
-- **`single`** (default) — one LLM call
-  (`crates/pond-server/src/llm_memory_consolidator.rs`). Every proposal is
-  applied. On a 3B on-device model this is the sane choice for a background
-  chore; the audit trail records each action as accepted *without* review so it
-  never implies a scrutiny that did not happen.
-- **`adversarial`** — three sequential LLM calls
-  (`crates/pond-server/src/three_stage_consolidator.rs`), cancellable between
-  stages:
-  1. **Proposer** reads the batch and proposes actions
-     (`Merge` / `Prune` / `Split` / `Recategorize`).
-  2. **Adversary** challenges each proposal, arguing against destructive or
-     lossy changes.
-  3. **Judge** rules on each exchange; only accepted actions are applied.
+- **`single`** (default): one LLM call (`pond-server/src/llm_memory_consolidator.rs`); every
+  proposal is applied, and the audit trail records each action as accepted without review.
+- **`adversarial`**: three sequential calls (`pond-server/src/three_stage_consolidator.rs`),
+  cancellable between stages: a Proposer proposes `Merge` / `Prune` / `Split` / `Recategorize`, an
+  Adversary argues against destructive or lossy changes, a Judge rules; only accepted actions are
+  applied.
 
-Both modes share one apply path,
-`pond_core::user_data::services::memory_consolidation::apply_actions`, so the
-correction-safety guards cannot drift between them. Those guards are
-unconditional: a `Correction` memory is never pruned, a merge involving one is
-forced to `segment=Correction`, `corrects` metadata propagates to the merged
-fragment (and, on a split, to the first `Correction`-segment entry), and a
-replacement that fails to insert aborts before its sources are marked
-superseded. The `Permanent` tier gets the same protection, so a kept memory
-stays kept: it is never pruned, a merge with a kept source is kept, and every
-piece split from one is kept. These guards change only which rows stay active;
-nothing on the prompt path reads `tier`. Every lifecycle change is written to `memory_events`, and each run
-is recorded in `consolidation_runs` tagged with the mode that produced it.
+Both modes apply through `memory_consolidation::apply_actions`, so the guards cannot drift: a
+`Correction` is never pruned, a merge involving one is forced to `segment = Correction` and carries
+`corrects` forward (a split gives it to the first `Correction` entry), a replacement that fails to
+insert aborts before its sources are superseded, and a `Permanent` row is never pruned while a
+merge or split involving one stays `Permanent`. A consolidation prune archives the row. Every
+lifecycle change is written to `memory_events`; each run is recorded in `consolidation_runs` with
+its mode.
 
-**Batch cap**: `select_batch` bounds each run at
-`memory_consolidation_batch_size` eligible (segmented) memories, **oldest
-first** — duplicates cluster in time, so a contiguous window is the ordering
-most likely to hold both halves of a duplicate pair. Whatever does not fit is
-logged as `deferred`, never silently dropped. Known limitation: the window does
-not rotate, so on a store larger than the batch, newer memories are not reached
-until the oldest ones are acted on. Advancing a persisted cursor would need a
-schema column and is deliberately future work.
+**Batch**: `select_batch` takes up to `memory_consolidation_batch_size` (50) segmented rows,
+oldest first, because duplicates cluster in time. Fewer than `MIN_MEMORIES_TO_CONSOLIDATE` (6)
+skips the run. What does not fit is logged as deferred.
 
-**Trigger and control**: the scheduler policy lives in
-`pond_core::user_data::services::consolidation_schedule` and is *at most one run
-per `memory_consolidation_interval_hours`, and only after 15 minutes of
-inactivity following real user activity in this process lifetime*. A freshly
-booted server that nobody has talked to never consolidates, however long it
-idles. The enable toggle, mode, interval, and batch size are all re-read from
-the settings DB on every tick, so changing them in Settings takes effect without
-a restart.
+**Trigger**: the `consolidation` lane job, polled every 60 s. It needs
+`memory_consolidation_enabled` (default true), activity since start, `INACTIVITY_THRESHOLD_SECS`
+(15 min) of quiet, and `memory_consolidation_interval_hours` (24) since the last run. Enable,
+mode, interval and batch size are re-read every tick.
 
-Activity is a **two-source** signal, because the terminal voice loop runs in a
-separate OS process (`pond-server chat --json-events`) and cannot reach the
-server's in-memory state: the in-process `last_user_activity` clock (reset by
-every route through `AppState::note_user_activity`) *and* the newest
-`sessions.updated_at` in `pond_system.db`, which the voice child bumps through
-`ChatService` on every turn it persists. Either source going active both holds a
-run off and cancels one already in flight (adversarial stages check the token
-between calls; a stage already inside an LLM call finishes first).
+**Cancellation**: `AppState::note_user_activity`, called by routes that start user work, cancels
+an in-flight run directly. A watcher also samples the in-process clock every 500 ms and human
+session activity in the database every 2 s, which catches the out-of-process voice child. A stage
+already inside an LLM call finishes first.
 
-`POST /api/v1/memory/consolidate` streams a run's events over SSE for the
-desktop's consolidation banner, and `.../consolidate/stop` cancels it.
+`POST /api/v1/memory/consolidate` runs a pass immediately and streams `ConsolidationEvent`s over
+SSE (for the desktop banner); it refuses when consolidation is disabled and does not wait for the
+lane. `POST /api/v1/memory/consolidate/stop` cancels.
 
-Known gaps (tracked in `docs/architecture/context-and-reasoning-roadmap.md`):
+Known gaps (also tracked in [context-and-reasoning-roadmap.md](./context-and-reasoning-roadmap.md)):
 
-- The batch window does not rotate (above).
-- The 15-minute inactivity threshold is a compile-time constant
-  (`INACTIVITY_THRESHOLD_SECS`) rather than a setting.
-- Cross-process cancellation is poll-based, not pushed: the in-process clock is
-  sampled every 500 ms and the DB every 2 s, so an out-of-process voice turn can
-  wait up to about two seconds behind an in-flight LLM call.
-- An attempt consumes the interval budget even when cancelled or skipped for too
-  few memories. On a device the user touches every evening this can starve
-  consolidation for long stretches. The tradeoff is deliberate — retrying at the
-  next idle window is what made the old loop churn — but it is the part of the
-  policy most likely to want revisiting after Jetson soak time.
+- The batch window does not rotate: on a store larger than the batch, newer rows are not reached
+  until the oldest are acted on.
+- The 15-minute threshold is a constant, not a setting.
+- An attempt spends the interval even when cancelled or skipped for too few memories; on a
+  device used every evening this can starve consolidation. Retrying at the next idle window is
+  what made an earlier loop churn, so the trade-off is deliberate.
 
-## MCP Tools
+## The inference lane
+
+Background jobs that spend inference share one slot (`pond-core/src/user_data/services/inference_lane.rs`,
+runtime in `pond-server/src/inference_lane_runner.rs`), because concurrent jobs on the single
+resident model evict each other's KV cache. At most one runs at a time; the least recently run
+eligible job wins, ties going to declaration order. Each job has its own enable toggle, interval
+floor and quiet requirement, and waits for real user activity since boot unless it is marked
+exempt (`JobState::exempt_from_activity_gate`). Last-run times
+persist in `lane_job_runs` (migration `0059`) so a restart does not make every job look starved.
+
+| Job (wire name) | Memory relevance |
+|-----------------|------------------|
+| `compaction` | none |
+| `consolidation` | merges and prunes memories |
+| `titling` | none |
+| `proactive_review` | none |
+| `summary_refresh` | none |
+| `index_maintenance` | embeds memory rows that have no vector |
+| `memory_extraction` | writes memories and reminders |
+| `suggestion_generation` | composes Home suggestions from memories into `suggestion_queue` (migration `0058`), gated by `suggestion_generation_enabled` |
+
+`GET /api/v1/lane` reports each job's state; `POST /api/v1/lane/jobs/{job}/run` runs one now,
+waiving its quiet period, interval floor and activity gate.
+
+## MCP tools (`giap-memory`)
 
 | Tool | Description |
 |------|-------------|
-| `save_memory` | Save with optional segment, importance, tier. Auto-classifies if segment omitted. |
-| `recall_memories` | Vector search when a query is given and an embedding provider is available (keyword fallback otherwise); recency-ordered without a query. Returns segment + importance metadata. Records access. |
-| `forget_memory` | Delete by ID or exact content match. |
+| `recall_memories` | Query-based (semantic, keyword fallback) or recent recall across the household; returns segment, importance and ids; records access |
+| `save_memory` | Save with optional segment, importance, tier, tags, `supersedes`, `corrects`; auto-classifies when segment is omitted |
+| `forget_memory` | Delete by id, or by exact content match |
 
 ## REST API
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/memories` | List recent memories (up to 50) |
-| POST | `/api/v1/memories` | Save with content, source, tags; embedded at write |
+| GET | `/api/v1/memories` | The 50 most recent active memories, household-wide |
+| POST | `/api/v1/memories` | Save `content`, optional `tags`, `source` (default `api`), `segment`, `importance`, `tier`; embedded at write |
 | PUT | `/api/v1/memories/{id}` | Reword, change tier, or both; absent fields are kept, and new words' vector replaces the old |
-| DELETE | `/api/v1/memories/{id}` | Delete by ID |
+| DELETE | `/api/v1/memories/{id}` | Delete |
+| GET | `/api/v1/memories/extraction-status` | Batch engine status |
+| GET | `/api/v1/reminders` | Reminders captured from conversations |
+| POST | `/api/v1/reminders/{id}/dismiss` | Dismiss a reminder |
+| POST | `/api/v1/memory/consolidate` | Run consolidation now (SSE) |
+| POST | `/api/v1/memory/consolidate/stop` | Cancel a running consolidation |
+| GET | `/api/v1/lane` | Inference-lane job status |
+| POST | `/api/v1/lane/jobs/{job}/run` | Run one lane job now |
 
-Both writes embed with the same provider and index the extraction path uses. A row stored without a
-vector (the embedder failed, or the redactor dropped a vector of a credential) is embedded later by
-the boot backfill or by the index maintenance sweep, which runs in household quiet.
+`POST` and `PUT /api/v1/memories` embed with the same provider and index the extraction path
+uses. A row stored without a vector (the embedder failed, or the redactor dropped a vector of a
+credential) is embedded later by the boot backfill or by the index maintenance sweep, which runs in
+household quiet.
 
 ## Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `agent_memory_inject` | true | Inject the most relevant memories into each turn's user message |
-| `agent_memory_limit` | 5 | Max memories to inject |
-| `memory_extraction_enabled` | false | Enable background extraction |
-| `memory_cleanup_enabled` | false | Enable periodic decay cleanup |
-| `memory_consolidation_enabled` | false | Enable periodic merge/prune |
-| `memory_prune_threshold` | 0.05 | Score below which memories are pruned |
-| `memory_archive_threshold` | 0.15 | Score below which memories are archived |
-| `memory_cleanup_interval_hours` | 6 | Hours between cleanup runs |
-| `memory_consolidation_interval_hours` | 24 | Hours between consolidation runs |
-| `memory_consolidation_batch_size` | 20 | Max memories per consolidation batch |
-| `memory_extraction_max_facts` | 3 | Max facts extracted per turn |
-| `memory_extraction_interval_secs` | 10 | Minimum seconds between extractions |
+| `agent_memory_inject` | true | Inject ranked memories into each turn |
+| `agent_memory_limit` | 5 | Sizes the injection candidate pool (`max(limit * 8, 40)`); the injected count comes from the context profile |
+| `memory_extraction_enabled` | true | Run batch extraction |
+| `memory_extraction_mode` | `write` | `shadow` / `write` / `reinforce` (internal, not a user control) |
+| `memory_extraction_sessions_per_pass` | 3 | Model calls (windows) per pass |
+| `memory_extraction_window_messages` | 20 | Messages per window |
+| `memory_extraction_idle_secs` | 900 | Quiet before a pass |
+| `memory_extraction_interval_secs` | 60 | Minimum gap between passes |
+| `memory_extraction_max_facts` | 3 | Memories per window |
+| `memory_reinforce_threshold` | 0.94 | Cosine for the Same band |
+| `memory_relate_threshold` | 0.78 | Cosine for the Related band |
+| `memory_date_proposals_enabled` | true | Ask for reminders from recent windows |
+| `memory_extraction_first_pass_at` | empty | Meant to record the first completed pass; nothing writes it yet |
+| `memory_cleanup_enabled` | true | Run decay cleanup (read at startup) |
+| `memory_cleanup_interval_hours` | 6 | Hours between cleanup runs (read at startup) |
+| `memory_decay_base_half_life_days` | 11.25 | Base half-life before importance scaling |
+| `memory_decay_beta` | 0.8 | Decay steepness |
+| `memory_archive_threshold` | 0.15 | Score below which a row is archived |
+| `memory_prune_threshold` | 0.05 | Score below which a row is archived and logged as pruned |
+| `memory_consolidation_enabled` | true | Run idle consolidation |
+| `memory_consolidation_mode` | `single` | `single` or `adversarial` |
+| `memory_consolidation_interval_hours` | 24 | Minimum gap between runs |
+| `memory_consolidation_batch_size` | 50 | Rows per run (floor 6) |
+| `suggestion_generation_enabled` | true | Compose suggestions from memories |
+| `embedding_provider` | `fastembed` | `fastembed`, `gguf` or `none`; `none` stops batch extraction |
+| `memory_graph_enabled` | false | Stored, but nothing reads it: graph retrieval over `memory_edges` is not wired |
 
-## Database Schema (migration 0015)
+## Database
 
-```sql
-ALTER TABLE memory_fragments ADD COLUMN segment TEXT;
-ALTER TABLE memory_fragments ADD COLUMN importance REAL;
-ALTER TABLE memory_fragments ADD COLUMN tier TEXT DEFAULT 'long';
-ALTER TABLE memory_fragments ADD COLUMN decay_rate REAL;
-ALTER TABLE memory_fragments ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE memory_fragments ADD COLUMN last_accessed_at TEXT;
-ALTER TABLE memory_fragments ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active';
-ALTER TABLE memory_fragments ADD COLUMN superseded_by TEXT;
-```
+All in `pond_system.db`; migrations in `crates/pond-infra/migrations/system/`.
 
-All columns are optional/defaulted — backward compatible with existing memories.
+| Migration | Adds |
+|-----------|------|
+| `0005_memory.sql` | `memory_fragments` (id, profile_id, session_id, content, embedding, source, tags, created_at) |
+| `0015_memory_segments.sql` | segment, importance, tier, decay_rate, access_count, last_accessed_at, lifecycle, superseded_by |
+| `0017_memory_edges.sql` | `memory_edges` (causal graph; no production writer) |
+| `0019_memory_corrects.sql` | `corrects` |
+| `0020_memory_events.sql` | `memory_events` audit log |
+| `0021_consolidation_runs.sql` | `consolidation_runs` |
+| `0036_enable_memory_consolidation.sql` | turns consolidation on where the stored value was still the old default |
+| `0056_session_extraction_cursor.sql` | `sessions.extracted_through_id`, `extracted_at`, `extraction_attempts` |
+| `0057_reminders.sql` | `reminders` |
+| `0058_suggestion_queue.sql` | `suggestion_queue` |
+| `0059_lane_job_runs.sql` | `lane_job_runs` |

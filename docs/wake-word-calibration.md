@@ -1,372 +1,180 @@
-# Wake-Word Phrase Calibration
+# Wake-word calibration
 
-Custom wake-word phrases are calibrated by recording the user reading a few sentences that contain
-the phrase. GIAP passes each recording through Whisper, finds the wake phrase *as heard* inside the
-transcript (a mishearing such as "gus" for "goose"), and stores only that as a trigger variant. The
-sliding-window detector then fires on the wake word itself or any stored variant, as whole words.
+The live wake word is Whisper transcription matching: `WhisperKeywordDetector`
+(`crates/pond-adapters-whisper/src/lib.rs`) transcribes a 1.4 s window every 200 ms and fires
+when the transcript contains a trigger as whole words. Calibration teaches it how Whisper hears
+the phrase in this household's voices: the user reads a few sentences containing the phrase, and
+the server stores the phrase *as heard* (a mishearing such as "gus" for "goose") as an extra
+trigger.
 
----
+The "hey goose" CNN in `crates/pond-ear` is a separate detector that the voice loop does not load
+([pond-ear](developer/pond-ear.md)). Calibration has no effect on it.
 
-## How It Works
-
-Whisper does not produce a deterministic transcript — the same audio may yield:
-
-```
-"hey goose"
-"hey, goose."
-"Hey Goose!"
-"a goose"
-```
-
-Normalization removes the punctuation and case. What it cannot remove is a mishearing, so calibration
-stores how Whisper hears the phrase in this user's voice (the _calibration variants_). The detector
-uses `OR` matching: it fires when the transcript contains the wake word **or** any stored variant as
-whole words, so "goose" never fires on "mongoose".
-
-Only the phrase is ever stored, never the calibration sentence around it. The server aligns the
-transcript with the sentence that was read out and keeps the words standing where the phrase stands,
-so "Hey gus, good morning" stores "gus" (not "good", which spells closer to "goose"). Variants stored
-by older builds as whole sentences are reduced to their phrase when the detector loads them.
+## What the detector matches
 
 ```
-User says "Hey Goose" (one breath)
-        │
-        ▼
-cpal ring buffer captures audio continuously
-        │
-        ▼
-Sliding 1500 ms window → POST /inference (whisper.cpp)
-        │
-        ▼
-normalize_transcript("Hey, goose.") → "hey goose"
-        │
-        ▼
-Does it contain the wake word or a variant, as whole words?   ←── OR across all variants
-        │ YES
-        ▼
-(optional hysteresis re-check)
-        │
-        ▼
-Wake word confirmed — return captured command audio
+mic ring (16 kHz) -> 1.4 s window every 200 ms -> energy gate (voice_kws_energy_threshold)
+  -> Whisper, wake_word() profile -> strip_whisper_artifacts -> normalize_transcript
+  -> contains_trigger(transcript, t) for any trigger t -> ping, capture, transcribe the request
 ```
 
----
+Triggers, built by `WhisperKeywordDetector::new` and `with_transcriptions`:
 
-## API Reference
+1. `voice_wake_word`, normalized (lowercase letter-only words). Always a trigger.
+2. Each stored variant in `voice_wake_word_transcriptions`, reduced to the phrase as heard by
+   `extract_wake_variant` (a variant stored as a whole sentence is cut down when the detector
+   loads).
+3. For "goose" and "hey goose" only, built-in mishearings (`builtin_fuzzy_variants`): "goos",
+   "gooes", "gus", "gooch", "hey goose", "a goose", "the goose" for "goose"; "hey goos",
+   "hey gus", "a goose", "hey gooch" for "hey goose".
+
+Matching is whole words (`pond_voice::text::contains_trigger`), so "goose" never fires on
+"mongoose". There is no second-window re-check. The same triggers are stripped from the start of
+the request transcript (`strip_leading_wake_word`).
+
+## How a take becomes a variant
+
+1. The client shows a sentence from `calibration_prompts(phrase)` (`crates/pond-voice/src/text.rs`;
+   the desktop mirror is `buildCalibrationPrompts` in `pond-desktop/src/modes/voice/wakePhrase.ts`):
+   the phrase alone, "Hey <phrase>, good morning", "OK <phrase>, what time is it",
+   "<phrase>, tell me a joke", "Thank you <phrase>".
+2. The take is transcribed with the `accurate()` profile (beam search).
+3. `extract_wake_variant` aligns the transcript with the sentence word by word (edit-distance word
+   cost, gaps cost 1) and keeps the transcript words standing where the phrase stands. "Hey gus,
+   good morning" stores "gus", not "good", which spells closer to "goose".
+4. The result is dropped if it is further than 0.67 from the phrase (word edit distance over the
+   longer length): "gus" for "goose" is 0.6 and kept, "bruce" is 0.8 and dropped. Only the phrase
+   is stored, never the sentence or the audio.
+
+The detector itself transcribes with the cheaper `wake_word()` profile (greedy, 2 threads), so a
+stored variant comes from a different decode than the one it is matched against.
+
+## API
 
 ### `POST /api/v1/voice/calibrate`
 
-Submit one recording of a calibration sentence. Call it once per take, about five times.
+One take. Call it once per sentence, about five times. Exposure `UntilOnboarded`
+(`crates/pond-api/src/middleware/mod.rs`): tokenless from loopback while the pond is neither
+claimed nor onboarded, otherwise it needs a token.
 
-**Permission:** Public (accessible before onboarding is complete)
+Request: `multipart/form-data`.
 
-**Request** — `multipart/form-data`
+| Field | Required | Description |
+|---|---|---|
+| `audio` | yes | WAV (16-bit mono 16 kHz recommended; other WAV layouts are decoded and resampled) |
+| `prompt` | no | The sentence read out; locates the phrase in the take. Without it every calibration sentence is tried and the best alignment wins |
 
-| Field    | Type        | Required | Description                                                     |
-|----------|-------------|----------|-----------------------------------------------------------------|
-| `audio`  | binary/file | yes      | WAV audio (16-bit mono 16 kHz recommended)                      |
-| `prompt` | text        | no       | The sentence that was read out; locates the phrase in the take. Without it, each sentence from `calibration_prompts` is tried |
-
-**Response** — `200 OK`
+Response `200 OK`:
 
 ```json
 {
-  "transcript":    "Hey gus, good morning.",
-  "normalized":    "hey gus good morning",
-  "heard":         "gus",
-  "new_variant":   true,
-  "all_variants":  ["gus"],
-  "sample_count":  1,
-  "target_count":  5,
-  "complete":      false
+  "transcript":   "Hey gus, good morning.",
+  "normalized":   "hey gus good morning",
+  "heard":        "gus",
+  "new_variant":  true,
+  "all_variants": ["gus"],
+  "sample_count": 1,
+  "target_count": 5,
+  "complete":     false
 }
 ```
 
-| Field          | Type             | Description                                              |
-|----------------|------------------|----------------------------------------------------------|
-| `transcript`   | `string`         | Raw Whisper transcript for this take                     |
-| `normalized`   | `string`         | The whole transcript, normalized (not what is stored)    |
-| `heard`        | `string \| null` | The wake phrase as heard; `null` when the take missed it |
-| `new_variant`  | `boolean`        | Whether `heard` was new and became a trigger             |
-| `all_variants` | `string[]`       | All stored variants                                      |
-| `sample_count` | `number`         | How many variants are stored, **not** how many takes      |
-| `target_count` | `number`         | Takes the client should ask for (currently 5)            |
-| `complete`     | `boolean`        | `sample_count >= target_count`; kept for older clients    |
+| Field | Description |
+|---|---|
+| `transcript` | Raw Whisper transcript of the take |
+| `normalized` | The whole transcript normalized (not what is stored) |
+| `heard` | The phrase as heard; `null` when the take did not contain it |
+| `new_variant` | Whether `heard` was new and was stored |
+| `all_variants` | Every stored variant |
+| `sample_count` | Stored variants, not takes |
+| `target_count` | Takes to ask for (5) |
+| `complete` | `sample_count >= target_count`; kept for older clients |
 
-Hearing the phrase correctly every time is the good outcome and stores nothing new, so a client
-counts its own successful takes (a take with a non-null `heard`) rather than `sample_count`.
+Hearing the phrase correctly every time stores nothing new, so a client counts its own successful
+takes (non-null `heard`) rather than `sample_count`.
 
-**Error responses**
+Transcription is in process (`AppState::transcribe_audio`, the same Whisper model as `/transcribe`).
+Only when no Whisper model loaded at startup does the route post to `voice_whisper_url`
+(`/inference` on a whisper.cpp server), gated by the network mode.
 
-| Status | Reason                                   |
-|--------|------------------------------------------|
-| 400    | Missing `audio` field or multipart error |
-| 422    | No speech detected in the recording      |
-| 502    | Whisper server unreachable               |
-| 500    | Settings read/write failure              |
-
----
+| Status | Reason |
+|---|---|
+| 400 | Missing `audio` field or a multipart error |
+| 422 | No speech in the recording |
+| 500 | In-process transcription failed, or settings read/write failed |
+| 502 | External fallback only: egress denied, server unreachable, or a bad response |
 
 ### `DELETE /api/v1/voice/calibrate`
 
-Reset calibration — clears all stored variants. The detector keeps the normalized
-`voice_wake_word` phrase from settings, which is always a trigger.
+Clears every stored variant. The detector keeps `voice_wake_word` and the built-ins. Same
+exposure. Response: `{"cleared": true, "message": "Wake-word calibration data cleared"}`.
 
-**Permission:** Public
+## Clients
 
-**Response** — `200 OK`
+- **Desktop app.** `WakeWordCalibration` (`pond-desktop/src/components/WakeWordCalibration.tsx`),
+  mounted from the settings catalogue. It records 3.5 s per take (`recordFixedDuration` in
+  `micRecorder.ts`), sends each with its sentence through `api.calibrateWakeWord(wav, prompt)`,
+  and resets with `api.resetWakeWordCalibration()` (`pond-desktop/src/api/PondApiClient.ts`).
+  The hub's Voice settings view (`pond-desktop/src/hub/views/settings/Voice.tsx`) shows the
+  stored variants and a reset.
+- **`pond-server calibrate`** (`run_calibrate` in `crates/pond-server/src/main.rs`):
 
-```json
-{
-  "cleared": true,
-  "message": "Wake-word calibration data cleared"
-}
-```
+  ```bash
+  pond-server calibrate [--phrase "hey pond"] [--samples 5] [--reset]
+  ```
 
----
+  It loads the in-process Whisper model named by `active_whisper_model` from
+  `<data_dir>/models/`, opens the pinned microphone (`audio_input_device`), and for each sample
+  waits for Enter, records until silence and stores the variant exactly as the API does, with the
+  phrase itself as the prompt (say the phrase, not a sentence). `--phrase` also saves
+  `voice_wake_word`. A repeat of a stored variant counts as a sample. It writes the same settings
+  the live detector reads, so it targets the live wake path.
 
-## Frontend Implementation Guide
+  `--whisper-url` is still accepted and does nothing: transcription is in process. The command
+  does not take the voice lock ([Voice mode](developer/voice-mode.md#one-session-per-device)), so
+  stop any running voice session first or the two will contend for the microphone.
 
-### Minimal flow (5-sample recording loop)
+Calibration is optional: the detector always fires on the wake word itself.
 
-```typescript
-const TARGET_SAMPLES = 5;
+## Settings
 
-async function runWakeWordCalibration(phrase: string): Promise<void> {
-  // 1. Let the user set their phrase (saved via PUT /api/v1/settings)
-  await api.updateSettings({ voice_wake_word: phrase });
+Stored in `pond_system.db` (flat settings table), writable with `PUT /api/v1/settings`.
 
-  // 2. Optionally reset any previous calibration data
-  await fetch('/api/v1/voice/calibrate', { method: 'DELETE' });
-
-  const prompts = buildCalibrationPrompts(phrase); // src/modes/voice/wakePhrase.ts
-  let takes = 0;
-
-  while (takes < TARGET_SAMPLES) {
-    // 3. Show the sentence to read
-    const prompt = prompts[takes % prompts.length];
-    showPrompt(`Read: "${prompt}" (${takes + 1} / ${TARGET_SAMPLES})`);
-
-    // 4. Record a 3.5 second clip from the microphone
-    const wavBlob = await recordWav(3500);
-
-    // 5. Submit it with the sentence, so the server can find the phrase
-    const form = new FormData();
-    form.append('audio', wavBlob, 'sample.wav');
-    form.append('prompt', prompt);
-
-    const resp = await fetch('/api/v1/voice/calibrate', {
-      method: 'POST',
-      body: form,
-    });
-    const data = await resp.json();
-
-    if (!resp.ok) {
-      showError(data.error);
-      continue; // let the user retry
-    }
-
-    if (data.heard === null) {
-      showError(`That take did not catch "${phrase}". Try again.`);
-      continue;
-    }
-    takes += 1;
-    showProgress(`Heard: "${data.transcript}" (${takes} / ${TARGET_SAMPLES})`);
-  }
-
-  showSuccess('Wake-word calibration complete!');
-}
-```
-
-### Recording helper (`recordWav`)
-
-The server expects a WAV file. Browser `MediaRecorder` produces WebM/Opus by default — you need
-to convert to WAV before submitting. Use `audiobuffer-to-wav` or a small encoder:
-
-```typescript
-async function recordWav(durationMs: number): Promise<Blob> {
-  const stream   = await navigator.mediaDevices.getUserMedia({ audio: true });
-  const ctx      = new AudioContext({ sampleRate: 16000 });
-  const source   = ctx.createMediaStreamSource(stream);
-  const recorder = ctx.createScriptProcessor(4096, 1, 1);
-  const chunks: Float32Array[] = [];
-
-  recorder.onaudioprocess = (e) => {
-    chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-  };
-  source.connect(recorder);
-  recorder.connect(ctx.destination);
-
-  await new Promise(r => setTimeout(r, durationMs));
-
-  stream.getTracks().forEach(t => t.stop());
-  recorder.disconnect();
-  source.disconnect();
-
-  // Concatenate all chunks
-  const total = chunks.reduce((n, c) => n + c.length, 0);
-  const pcm   = new Float32Array(total);
-  let   pos   = 0;
-  for (const chunk of chunks) { pcm.set(chunk, pos); pos += chunk.length; }
-
-  return encodeWav(pcm, 16000);
-}
-
-function encodeWav(samples: Float32Array, sampleRate: number): Blob {
-  const dataLen   = samples.length * 2;
-  const buffer    = new ArrayBuffer(44 + dataLen);
-  const view      = new DataView(buffer);
-  const writeStr  = (off: number, str: string) =>
-    [...str].forEach((c, i) => view.setUint8(off + i, c.charCodeAt(0)));
-  const writeU16  = (off: number, v: number) => view.setUint16(off, v, true);
-  const writeU32  = (off: number, v: number) => view.setUint32(off, v, true);
-
-  writeStr(0, 'RIFF');  writeU32(4, 36 + dataLen);  writeStr(8, 'WAVE');
-  writeStr(12, 'fmt '); writeU32(16, 16);            writeU16(20, 1);
-  writeU16(22, 1);      writeU32(24, sampleRate);    writeU32(28, sampleRate * 2);
-  writeU16(32, 2);      writeU16(34, 16);            writeStr(36, 'data');
-  writeU32(40, dataLen);
-
-  let off = 44;
-  for (const s of samples) {
-    view.setInt16(off, Math.max(-32768, Math.min(32767, s * 32767)), true);
-    off += 2;
-  }
-  return new Blob([buffer], { type: 'audio/wav' });
-}
-```
-
-### Displaying calibration progress
-
-```typescript
-interface CalibrateResponse {
-  transcript:    string;
-  normalized:    string;
-  heard:         string | null;
-  new_variant:   boolean;
-  all_variants:  string[];
-  sample_count:  number;
-  target_count:  number;
-  complete:      boolean;
-}
-```
-
-Show the user the raw `transcript` so they can see what Whisper heard ("Did you say: *hey goose*?"),
-and a progress bar driven by successful takes over `target_count`.
-
----
-
-## `PondApiClient` integration (`TypeScript`)
-
-Add these two methods to your `PondApiClient` class:
-
-```typescript
-/** Submit one WAV recording of `prompt` as a calibration take. */
-async calibrateWakeWord(wav: Blob, prompt?: string): Promise<CalibrateResponse> {
-  const form = new FormData();
-  form.append('audio', wav, 'sample.wav');
-  if (prompt) form.append('prompt', prompt);
-  const resp = await this.fetch('/api/v1/voice/calibrate', {
-    method: 'POST',
-    body:   form,
-  });
-  if (!resp.ok) {
-    const data = await resp.json();
-    throw new Error(data.error ?? `calibration failed (${resp.status})`);
-  }
-  return resp.json() as Promise<CalibrateResponse>;
-}
-
-/** Clear all calibration data and revert to the raw wake-word phrase. */
-async resetWakeWordCalibration(): Promise<void> {
-  const resp = await this.fetch('/api/v1/voice/calibrate', { method: 'DELETE' });
-  if (!resp.ok) throw new Error(`reset failed (${resp.status})`);
-}
-```
-
----
-
-## Onboarding Integration
-
-The WakeWord step (`OnboardingStep::WakeWord`) is the canonical place to run calibration.
-The recommended UX sequence is:
-
-1. Show a text input for the user's desired phrase (default: "goose"). Save it via `PUT /api/v1/settings`.
-2. Show a microphone button with the label **"Say your phrase now"**.
-3. On each click: record 3.5 s of the shown sentence, submit it with its `prompt`, display what was heard.
-4. After 5 takes with a non-null `heard`, enable **"Continue"** to advance onboarding.
-5. Include a **"Start over"** button that calls `DELETE /api/v1/voice/calibrate` and resets the take count to 0.
-
-Calibration is optional: the detector always fires on the wake word itself, and variants only add
-the user's mishearings.
-
----
-
-## Settings Storage
-
-Calibration data is persisted in `pond_system.db` as a JSON array:
-
-| Settings key                       | Type         | Default |
-|------------------------------------|--------------|---------|
-| `voice_wake_word`                  | `String`     | `"goose"` |
-| `voice_wake_word_transcriptions`   | `Vec<String>` | `[]` (uncalibrated) |
-
-The detector always normalises `voice_wake_word` and uses it as a trigger, then adds the stored
-variants and, for "goose" and "hey goose", a few built-in mishearings. `voice_wake_word` must be one
-to four words of letters (apostrophes and hyphens allowed); the server refuses anything else, since
-the detector's normalization would drop it and the phrase could never match.
-
----
-
-## Architecture Notes
-
-The calibration system is intentionally thin:
-
-- **No ML training** — "training" means storing Whisper's own transcriptions of the user's voice.
-  Whisper already handles the acoustic modelling; we just teach the detector what strings Whisper
-  is likely to produce for this user's pronunciation.
-- **No audio stored** — only the wake phrase as heard is persisted, not the raw WAV or the sentence.
-- **Stateless accumulation** — each `POST /api/v1/voice/calibrate` call is idempotent with respect
-  to duplicate variants (they're de-duplicated before saving).
-- **Backward compatible** — `voice_wake_word_transcriptions` defaults to `[]`; existing installs
-  with no calibration data continue to work exactly as before.
-
----
-
-## Detector Tuning Reference
-
-All settings below are persisted in `pond_system.db` and writable via `PUT /api/v1/settings`.
-
-| Setting | Default | Range | Description |
+| Setting | Default | Validation | Use |
 |---|---|---|---|
-| `voice_wake_word` | `"goose"` | any string | The activation phrase |
-| `voice_kws_energy_threshold` | `0.003` | `0.0–1.0` | Min RMS to call whisper. `0.0` = disabled |
-| `voice_kws_post_trigger_silence_ms` | `400` | `0–4000` | Silence to end capture early. `0` = disabled |
-| `voice_kws_cooldown_ms` | `2000` | `0–10000` | Sleep before re-arming after activation |
-| `voice_recording_duration_secs` | `3` | `1–300` | Recording ceiling for the browser voice path only; the voice loop ends on silence |
+| `voice_wake_word` | `"goose"` | 1 to 4 words, at most 40 characters, letters, spaces, apostrophes and hyphens only (`Check::WakePhrase`) | The phrase; always a trigger |
+| `voice_wake_word_transcriptions` | `[]` | | Calibrated variants |
+| `voice_kws_energy_threshold` | `0.003` | UI: 0 to 1 | Windows below this RMS skip Whisper; `0` disables the gate |
+| `voice_kws_post_trigger_silence_ms` | `400` | UI: integer >= 0 | Silence that ends the post-trigger capture; `0` always runs to the 12 s ceiling |
+| `voice_kws_cooldown_ms` | `2000` | UI: integer >= 0 | Delay before detection arms each time it starts |
+| `voice_recording_duration_secs` | `3` | 1 to 300 | Browser voice path only; the voice loop ends on silence |
 
-### Calibrating `voice_kws_energy_threshold`
+The settings UI groups these under Settings > Voice > Wake word and Settings > Voice > Listening.
+The full detector table, including the knobs that are code constants, is in
+[Voice mode](developer/voice-mode.md#tuning).
 
-Run with `RUST_LOG=trace` and stay quiet — the trace log shows the RMS of each skipped window:
+### Setting the energy gate
+
+Each window skipped by the gate is logged at `trace`:
+
+```bash
+RUST_LOG=pond_adapters_whisper=trace cargo run -p pond-server -- chat --voice
+```
 
 ```
 TRACE pond_adapters_whisper: KWS: silent window skipped (rms=0.0082)
 ```
 
-Set the threshold ~20% above the highest idle RMS you observe. In a noisy open-plan office you
-may need `0.025`; in a quiet room `0.008` is fine.
+Stay quiet for ten seconds, note the highest idle RMS, and set `voice_kws_energy_threshold` about
+20% above it. Then speak and check that windows reach Whisper (`KWS window: "..."` at `debug`,
+which the log file records by default).
 
-### Tuning `voice_kws_post_trigger_silence_ms`
+### Cooldown
 
-Lower values exit the capture window sooner but risk clipping the end of long commands. Increase
-if you notice commands being cut off mid-sentence. Disable (`0`) if commands are consistently
-long or your room has significant reverb.
-
-### Tuning `voice_kws_cooldown_ms`
-
-Set to at least the length of your longest TTS response plus ~500 ms for room settling. The
-startup print in `pond-server chat` shows the active value:
+The detector sleeps `voice_kws_cooldown_ms` every time it starts, including at the start of each
+turn, where it races the reply. The wake word cannot interrupt a reply during that time. The
+startup banner shows the phrase and how many variants are stored:
 
 ```
-  Energy gate:   0.010 RMS  |  cooldown: 2000ms  |  VAD silence: 400ms
+  Wake     "goose" (2 calibrated variants)
 ```

@@ -8,6 +8,31 @@ desktop app and to the Jetson. Nothing is downloaded at runtime.
 Everything here is behind `scripts/giap.sh`; the logic is `scripts/lib/litert-setup.sh` and its
 tests are `scripts/lib/litert-setup.test.sh`.
 
+## Running a LiteRT-LM model
+
+A `.litertlm` file is one of the in-process engines under `chat_provider = "local"`
+([inference_optimization.md](inference_optimization.md#choosing-the-chat-provider-and-engine)).
+Choosing one as the chat model is all it takes: `litert_model::register`
+(`crates/pond-adapters-goose/src/litert_model.rs`) gives the file a goose registry row with
+`backend_id = "litert"`, and the provider build runs it on the `litert` backend. Files live in
+`<data_dir>/models/litertlm/`; the curated picks are the Gemma 4 E2B and E4B builds from
+`litert-community` ([models.md](models.md#the-curated-list)).
+
+The engine options come from `pond_core::models::domain::litert::engine_options` and are stamped
+by `apply_litert_settings` (log line `Applied LiteRT-LM settings`):
+
+| Option | Budgeted device (the Orin) | Elsewhere | Override |
+|---|---|---|---|
+| Context (`max_num_tokens`) | 8,192 | 16,384 | none; fixed for the engine's life |
+| Execution | GPU | GPU | `GIAP_LITERT_BACKEND=gpu\|cpu` |
+| Multi-token prediction | off | on, except E2B on the CPU | `GIAP_LITERT_SPECULATIVE=on\|off` |
+| Prefill chunk sizes compiled | 128 only | every size the model ships | `LITERT_PREFILL_SIGNATURES` |
+
+The Orin's 8,192 is measured: 4,096 cannot hold the pond's first prompt, and 16,384 ran out of
+memory with E4B on the GPU. Compiling only the 128-token prefill chunk there kept the GPU's share
+of RAM from growing across a compaction. A LiteRT-LM model reads no pictures in the pond: the
+backend sends text only, so the library's image fixes below are not exercised by GIAP.
+
 ## What is shipped
 
 | File | What it is |
@@ -34,8 +59,10 @@ WebGPU. On an M4 with E2B, Metal measured warm turns at 129-142 ms to the first 
 |---|---|---|
 | The desktop app | Metal | Staging leaves out the WebGPU accelerator, its sampler and Dawn (`LITERT_DESKTOP_LEAVES_OUT`); the app is 41 MB smaller for it |
 | A pond run from the source checkout | WebGPU | The Orin's accelerator, so tests on a Mac reflect the Orin |
-| The same, with `GIAP_LITERT_ACCELERATOR=metal` | Metal | pond-server points the backend at `<package>.metal/`: hard links to the package's files except WebGPU's, as the app carries them | The library statically contains its own Rust std, allocator, abseil and protobuf, which
-is why it stays behind `RTLD_LOCAL`. Their third-party notices are not collected into the package yet.
+| The same, with `GIAP_LITERT_ACCELERATOR=metal` | Metal | pond-server points the backend at `<package>.metal/`: hard links to the package's files except WebGPU's, as the app carries them |
+
+The library statically contains its own Rust std, allocator, abseil and protobuf, which is why it
+stays behind `RTLD_LOCAL`. Their third-party notices are not collected into the package yet.
 
 ## The pin
 
@@ -150,16 +177,16 @@ backend falls back to its own search.
 With nothing recorded, staging and deploy warn and carry on: the app or the device then runs without
 the litert backend. A recorded package that fails verification stops them.
 
-### With no library at all (2026-10-13)
+### With no library at all
 
 After deciding, pond-server checks the places goose's backend searches (`GOOSE_LITERT_LIB_DIR`,
 `litert-lm/` beside the executable, the executable's directory, `<data dir>/engine/data/litert-lm/lib`)
-and, when none holds the library, logs a `WARN` naming them. The catalogue then lists every
-LiteRT-LM model as unavailable (`litert_library_missing`), the dashboard disables it with "Needs the
-LiteRT-LM library: run giap.sh litert build", and the pond refuses to download or switch to one with a
-409 ([models.md](models.md#an-engine-this-pond-cannot-run-2026-10-13)). Before this, a Jetson nothing
-was deployed to offered the model, accepted the switch, and failed every turn with `liblitert-lm.so
-not found`. Install the package, then restart the pond: the check runs once, at startup.
+and, when none holds the library, logs which it searched (a `WARN` when LiteRT-LM models are on
+disk). The catalogue then lists every LiteRT-LM model as unavailable (`litert_library_missing`), the
+dashboard disables it with "Needs the LiteRT-LM library: run giap.sh litert build", and the pond
+refuses to download or switch to one with a 409
+([models.md](models.md#an-engine-this-pond-cannot-run)). Install the package, then restart the
+pond: the check runs once, at startup.
 
 ## When Bazel stalls on downloads
 

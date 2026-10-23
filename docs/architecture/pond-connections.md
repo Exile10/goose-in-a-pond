@@ -4,8 +4,12 @@ How a household sees and changes the pond's network links (Wi-Fi, Ethernet, Blue
 pairing settings, from goose-on-the-go and from both desktop settings views. The setup channel
 (`pond-setup-channel.md`) covers a pond with no network; this covers a pond that is already reachable.
 
-Status: **contract v1.2, 2026-10-22** (v1.1 plus `wrong_password` on 422 and the clarifications below). Server side in `pond-core::network` (ports) and `pond-connect`
-(adapters); the phone and desktop build against the shapes below.
+Status: **contract v1.2, 2026-10-22** (v1.1 plus `wrong_password` on 422 and the clarifications
+below), implemented. Routes in `crates/pond-api/src/connections.rs`, who may change what in
+`pond-core::network::services::connection_changes`, scan and join budgets in
+`pond-core::network::services::wifi_connections`, the OS adapters in `pond-connect`
+(`wifi/`, `wired/`, `ble/`). Route tests: `crates/pond-api/tests/connections_routes.rs`. The
+desktop client is `pond-desktop/src/api/types.ts` ("Connections").
 
 ## Decisions
 
@@ -14,7 +18,7 @@ Status: **contract v1.2, 2026-10-22** (v1.1 plus `wrong_password` on 422 and the
 | 2026-10-19 | **One read, `GET /api/v1/connections`, describes every link at once.** | A settings screen draws all three sections from one request, and the phone polls one route while a join settles. |
 | 2026-10-19 | **Reads take any paired token; changes take the host credential, the device that claimed the pond, or a device attributed to a household member.** | Moving the pond to another network can cut every phone off it. An unattributed device (a guest's phone) can see the links but not change them. The claimant counts before onboarding finishes, so owner setup can fix the network. |
 | 2026-10-19 | **The setup channel's Wi-Fi codes and shapes are reused unchanged.** | The phone already speaks them over Bluetooth (`wifi_scan`, `wifi_join`); the same reader handles both transports. |
-| 2026-10-19 | **Forgetting the network the pond is using now needs `"confirm": true`.** | Without another usable link it takes the pond off the LAN, and the household then needs the setup channel to bring it back. |
+| 2026-10-19 | **Forgetting the network the pond is using now needs `?confirm=true`.** | Without another usable link it takes the pond off the LAN, and the household then needs the setup channel to bring it back. |
 | 2026-10-19 | **Ethernet is read-only.** | There is nothing to choose on a cable; the household needs to see the link and the address. |
 | 2026-10-19 | **Bluetooth's switch is the existing `ble_setup_enabled` setting.** | One switch, already in both desktop views; this adds what the radio is doing to the same screen. |
 | 2026-10-19 | **v1.1: `can_change` carries its reason, `signal` is a percentage, nulls are explicit, a scan answers within 15 s, and enterprise networks are listed but refused with `unsupported_security`.** Asked by goose-on-the-go. | Each lets a screen say what is wrong and what fixes it, instead of greying a button out with no explanation. A pond can only send a passphrase, and an enterprise network needs a username and certificate. |
@@ -42,7 +46,7 @@ Any paired token, in every state. Never tokenless.
     "signal": 70,
     "capabilities": {
       "scan":   {"available": true,  "reason": null},
-      "join":   {"available": false, "reason": "the pond's user may not change Wi-Fi (run: bash scripts/giap.sh wifi-grant)"},
+      "join":   {"available": false, "reason": "this pond may not change its Wi-Fi: the installer's network grant is missing (bash scripts/giap.sh wifi-grant)"},
       "forget": {"available": false, "reason": "..."}
     }
   },

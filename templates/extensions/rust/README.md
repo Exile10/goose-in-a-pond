@@ -1,50 +1,44 @@
-# GIAP Extension Template -- Rust
+# GIAP Extension Template: Rust
 
-A minimal MCP (Model Context Protocol) server that provides example tools for GIAP.
+A minimal MCP server over stdio using only `serde` and `serde_json`: no async runtime, no MCP SDK.
+`src/main.rs` reads one JSON-RPC message per line from stdin and writes one per line to stdout. The
+empty `[workspace]` table in `Cargo.toml` keeps it out of the GIAP workspace, so it builds on its
+own from this folder. For a larger server, the `rmcp` crate (what GIAP's builtins use) handles the
+protocol.
 
-## Quick Start
+## Tools
 
-1. Build the extension:
-   ```bash
-   cargo build --release
-   ```
+- `greet`: a greeting for `name`
+- `timestamp`: the current Unix time in seconds
 
-2. Run the server:
-   ```bash
-   cargo run
-   ```
+## Try it
 
-3. Register in GIAP:
-   ```bash
-   curl -X POST http://localhost:4000/api/v1/extensions \
-     -H "Content-Type: application/json" \
-     -d '{"name": "example-rust", "kind": "stdio", "command": "./target/release/giap-extension-example"}'
-   ```
+```bash
+cargo build --release
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  | ./target/release/giap-extension-example
+```
 
-Or add via the GIAP desktop app: Extensions > Add Extension.
+## Add it to GIAP
 
-## Provided Tools
+In the desktop app: Extensions > Add Extension, or Settings > Extensions > Add server in the hub.
+Over the API (see [Building Extensions](../../../docs/developer/extensions.md#over-the-api) for the
+port and authentication):
 
-- `greet` -- Generate a friendly greeting
-- `timestamp` -- Get the current server timestamp (Unix epoch seconds)
+```bash
+curl -X POST "$API/extensions" -H "Content-Type: application/json" \
+  -d '{"name": "example-rust", "kind": "stdio", "command": "/absolute/path/to/target/release/giap-extension-example"}'
+```
 
-## How It Works
+Use the binary's absolute path: a relative one resolves against the server's working directory,
+not this folder. The tools then appear as `example-rust__greet` and `example-rust__timestamp`.
 
-This server implements the MCP protocol over stdio (stdin/stdout). GIAP starts it as a child process and communicates via JSON-RPC messages.
+## Adding a tool
 
-Key protocol methods:
-- `initialize` -- Handshake, declares capabilities
-- `tools/list` -- Returns available tool schemas
-- `tools/call` -- Executes a tool with arguments
+1. Add its definition to the `tools/list` arm in `src/main.rs`.
+2. Add an arm for it under `tools/call`.
+3. Rebuild, then restart the extension: switch it off and on in the app, or restart the server.
 
-## Adding Your Own Tools
-
-1. Add a tool definition to the `tools/list` match arm in `src/main.rs`
-2. Add a handler case in the `tools/call` match arm
-3. Rebuild and restart the extension in GIAP
-
-## Dependencies
-
-This template uses only `serde` and `serde_json` -- no async runtime, no framework. For extensions that need HTTP clients or async I/O, add `tokio` and `reqwest` as needed.
-
-See the [GIAP Extensions Guide](../../../docs/developer/extensions.md) for full documentation.
+Log to stderr; stdout carries only protocol messages.
