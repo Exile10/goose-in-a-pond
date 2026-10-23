@@ -1,8 +1,23 @@
 # Voice mode
 
-One loop: wake word, request, working tone, spoken answer. This is what the
-terminal path (`pond-server chat`) and the desktop shell both run — the desktop
-spawns exactly this command as a child process.
+One loop: wake word, request, working tone, spoken answer. The terminal (`pond-server chat --voice`)
+and the desktop app run the same loop; the desktop spawns it as a child process
+([Desktop voice: the child process](voice-desktop-child-process.md)).
+
+| Stage | Code |
+|---|---|
+| Microphone (one owner, 16 kHz mono ring) | `crates/pond-audio` (`pond_audio::spawn`, `MicHandle`) |
+| Device choice and supervision | `crates/pond-adapters-audio-devices`, started in `run_chat` with `Role::Voice` |
+| Wake word | `WhisperKeywordDetector` in `crates/pond-adapters-whisper/src/lib.rs` |
+| End of speech | `pond-adapters-silero` (`vad_backend = "silero"`, the default) or an RMS gate |
+| Speech to text | `WhisperRsInput` in `crates/pond-adapters-whisper/src/in_process.rs` (whisper-rs 0.16, in process) |
+| The turn | `ChatService::run_loop` and `stream_response_inner` in `crates/pond-core/src/shared/services/chat.rs` |
+| Speech text | `crates/pond-voice/src/text.rs` ([TTS text normalization](../tts-text-normalization.md)) |
+| Text to speech | `KokoroOutput` in `crates/pond-adapters-kokoro` |
+| Playback, wake ping, working tone | `crates/pond-audio-out` |
+
+`crates/pond-ear` (a hand-written wake word, VAD, echo canceller and Voice Match) is not wired into
+this loop yet; see [pond-ear](pond-ear.md).
 
 ## Running it
 
@@ -10,197 +25,188 @@ spawns exactly this command as a child process.
 cargo run -p pond-server -- chat --voice
 ```
 
-On the Jetson, `bash scripts/giap.sh` and the desktop app both take this path;
-the flags above are what the desktop passes.
+| Flag | Effect |
+|---|---|
+| `--voice` | Microphone input; downloads the configured Whisper model if missing |
+| `--wake-word <phrase>` | Overrides `voice_wake_word` for this run |
+| `--no-wake-word` | Every turn starts listening at once (`InstantActivation`) |
+| `--tts kokoro\|none` | `none` prints replies instead of speaking them |
+| `--session-id <id>` | Chat session to continue (default `default-session`) |
+| `--json-events` | NDJSON on stdout for the desktop shell |
+| `-P/--provider`, `-M/--model` | Override the chat provider and model (persisted unless `mock`) |
 
-You should see:
+The banner names each part, or says why it is missing, because a silent assistant and a broken one
+look the same from outside:
 
 ```
   Goose in a Pond 0.1.0 — voice
 
-  Listen   ggml-small.en
+  Listen   ggml-base.en
   Wake     "goose"
+  Hear     <microphone in use>
+  Play     <speaker in use>
   Speak    af_heart @ 1.00x
-  Log      ~/Library/Application Support/goose-in-a-pond/logs/pond.log
-
-  say "goose"
+  Log      <data_dir>/logs/pond.log
 ```
 
-Then: say **"goose"**, keep talking, and the request lands in one breath —
-"Goose, what's the weather in Nairobi?" is a single utterance, not a wake word
-followed by a pause followed by a command.
+When no Whisper model resolves, `Listen` says why and the session falls back to typed input (the
+default `active_whisper_model` is empty until one is chosen on the Models page). `Speak` reports a missing
+Kokoro install instead of downloading it: `chat` never fetches the 92 MB engine, `serve` does.
+Silero (2 MB) is fetched here if missing. With a `local`/`gguf` provider the loop then says
+"Warming up." and prewarms the prompt prefix (`POND_DISABLE_PREWARM=1` skips it). It always speaks
+a greeting, "Hi <name>, ready to take your first request.", before it starts listening.
 
-Every line printed above is load-bearing. If a model failed to resolve, its line
-says so instead of being absent, because a silent voice assistant and a broken
-one look identical from the outside.
+Say the wake word and keep talking: "Goose, what's the weather in Nairobi?" is one utterance, not a
+wake word, a pause and a command.
 
 ## One session per device
 
-A voice session owns the microphone and the speaker, and there is one of each.
-A second session does not degrade gracefully — it fights, and the symptoms
-never name the cause: two assistants answering in different voices, or a
-"stream configuration is not supported by the device" error from whichever one
-lost the race to open the input.
-
-So the second one refuses to start and says who has the lock:
+A voice session owns the microphone and the speaker. A second one does not degrade; it fights,
+and the symptoms never name the cause: two voices answering, or a "stream configuration is not
+supported" error from whichever lost the race for the input. So every `chat` run takes a lock
+first, and a second one refuses to start and names the holder:
 
 ```
 another voice session (pid 25718) is already running on this device.
-
-Voice needs sole use of the microphone and speaker. Two sessions answer in
-different voices and take the audio device from each other.
-
+...
 Stop the other session first — `kill 25718`.
 ```
 
-`crates/pond-server/src/voice_lock.rs`. Two properties worth knowing:
+`crates/pond-server/src/voice_lock.rs`:
 
-- **The lock is not in the data directory.** It is per-user, in the temp
-  directory. A session started with `POND_DATA_DIR` pointed at a scratch
-  profile takes the *same microphone* as the real one, so it must take the
-  same lock — scoping it to the data directory would permit exactly the pair
-  it exists to prevent.
-- **It is `flock`, not a pidfile.** The kernel releases it when the holder
-  dies, however it dies, so `kill -9` frees it and there is no such thing as a
-  stale lock to reconcile. The PID inside the file is only there to name the
-  holder in the message.
+- **Per user, in the temp directory** (`giap-voice-<uid>.lock`), not in the data directory. A
+  session on a scratch `POND_DATA_DIR` uses the same microphone, so it must take the same lock.
+- **`flock`, not a pidfile.** The kernel releases it when the holder dies, however it dies, so
+  there is no stale lock. The PID inside only names the holder.
+
+Under `--json-events` the refusal is an `error` line and `exit: already_running`.
 
 ## The turn
 
-| | What the user gets |
+| Moment | What the user gets |
 |---|---|
-| Wake word heard | a short two-tone ping, immediately |
-| Working | a soft chime every ~2.6s, mostly silence |
-| Answer ready | the tone stops, the reply is spoken sentence by sentence |
+| Wake word heard | a two-note ping (C6 then E6, about 220 ms) |
+| Working | a soft chime (G4 + E5) every 2.6 s, mostly silence; off with `voice_thinking_tone_enabled = false` |
+| Answer ready | the tone stops and the reply is spoken clause by clause as it streams |
+| Tool calls | shown in the UI (`tool_call`/`tool_result`), never spoken; the tone keeps playing |
 
-There is **no spoken filler** and **no tool narration**. Both existed; both said
-what the tone already says, and both had to finish synthesizing and playing
-before the answer could start — delaying the answer in order to announce that
-the answer was coming.
+There is no spoken filler and no tool narration: both would have to finish playing before the
+answer could start.
+
+After a reply the loop listens again without the wake word (a follow-up turn). If nothing is heard
+within 10 s it goes back to waiting for the wake word.
+
+Control phrases are matched against the whole utterance (`pond_voice::control::classify`):
+"bye", "goodbye", "dismissed", "go to sleep", "that's all", "never mind", "stop", "stop listening"
+end the conversation with a farewell and return to the wake word; "exit" and "quit" end the
+session (`exit: dismissed`). "Stop the kitchen timer" is a request, not a dismissal.
+
+Transcripts pass through `strip_whisper_artifacts`: bracketed and parenthesised tags
+(`[BLANK_AUDIO]`, `(music)`), known silence hallucinations ("thank you", "thanks for watching"),
+one- and two-character results, and a single word repeated are dropped.
+
+How a turn ends early (wake word, talking over the reply, the desktop's Interrupt, stop) is in
+[Voice pipeline interrupt](voice_pipeline_interrupt.md).
 
 ## Tuning
 
-The knobs are `KeywordDetectorConfig` (`crates/pond-adapters-whisper/src/lib.rs`).
-The voice loop builds it in `crates/pond-server/src/main.rs` (the wake-word
-wiring) and always replaces three of them with settings. For those three the
-code default never runs: what runs is the setting, which is the settings default
-(`default_kws_*` in `crates/pond-core/src/user_data/domain/settings.rs`) until
-someone changes it under Settings > Voice > Listening.
+### Wake-word detector
+
+`KeywordDetectorConfig` in `crates/pond-adapters-whisper/src/lib.rs`. `run_chat` replaces three of
+its fields with settings, so for those the code default never runs; what runs is the setting
+(defaults in `crates/pond-core/src/user_data/domain/settings.rs`, editable under
+Settings > Voice > Listening).
 
 | Knob | Live value | Comes from | What moving it does |
 |---|---|---|---|
-| `window_ms` | 1400 | code | Audio fed to whisper per cycle. Wider gives the model more to invent context from and costs more every cycle. |
-| `slide_ms` | 200 | code | Reaction floor. The wake word cannot be noticed sooner than the next slide plus one transcription. |
-| `lookback_ms` | 900 | code | How far back the capture reaches past the trigger. **Too low clips the first words of every request.** |
-| `post_trigger_ms` | 12000 | code | Ceiling on capture. Silence normally ends it far sooner. |
-| `energy_threshold` | 0.003 | `voice_kws_energy_threshold` | Below this, a window never reaches whisper. Raise if a noisy room keeps waking it. |
-| `silence_threshold` | 0.0025 | code | Below this counts as end-of-speech. **Raise it and quiet sentence endings get cut off.** |
-| `post_trigger_silence_ms` | 400 | `voice_kws_post_trigger_silence_ms` | Silence that ends the capture. Raise if it cuts you off mid-thought. |
-| `cooldown_ms` | 2000 | `voice_kws_cooldown_ms` | Settling time before detection arms. Windows never reach audio from before the detector opened, so the request just heard cannot re-trigger it, and the first window covers only the end of this time, by which a reply's tail still sounding when the detector opened has died away. The wake word does nothing during it, which also delays a wake-word interrupt at the start of every turn. |
+| `window_ms` | 1400 | code | Audio transcribed per cycle. Wider gives Whisper more to invent context from and costs more every cycle. |
+| `slide_ms` | 200 | code | Reaction floor: the wake word is noticed no sooner than the next slide plus one transcription. |
+| `lookback_ms` | 900 | code | How far the capture reaches back past the trigger. Too low clips the first words of every request. |
+| `post_trigger_ms` | 12000 | code | Ceiling on the capture after the trigger. Silence normally ends it far sooner. |
+| `energy_threshold` | 0.003 | `voice_kws_energy_threshold` | Windows quieter than this never reach Whisper. Raise it if a noisy room keeps waking it. |
+| `silence_threshold` | 0.0025 | code | Below this counts as silence after the trigger. Raise it and quiet sentence endings get cut. |
+| `post_trigger_silence_ms` | 400 | `voice_kws_post_trigger_silence_ms` | Silence that ends the post-trigger capture. |
+| `cooldown_ms` | 2000 | `voice_kws_cooldown_ms` | Settling time before detection arms. The detector never reads audio from before it opened, so the request just heard cannot re-trigger it. The wake word does nothing during it, which also delays a wake-word interrupt at the start of every turn. |
 
-The detector's own defaults for the three settings-driven knobs are 0.010, 800
-and 600. They were retuned with the detector; the settings defaults were not, so
-the two disagree, and only the settings reach a running pond.
+The code defaults for the three settings-driven knobs are 0.010, 800 and 600; the settings defaults
+were not retuned with them, and only the settings reach a running pond.
 
-Follow-up turns do not wait on the cooldown: after a reply the loop listens for
-speech without the wake word, and goes back to waiting for it when nothing is
-heard.
+The relationships between knobs are asserted in tests (`the_lookback_covers_the_worst_case_detection_lag`,
+`the_ring_holds_everything_both_readers_can_ask_for`,
+`ending_a_sentence_is_judged_more_leniently_than_waking_whisper`) against the code defaults. The
+silence-under-gate relation also holds for the live values, narrowly (0.0025 under 0.003). The
+bound in `the_code_default_cooldown_re_arms_within_a_second` (at most 1000 ms) does not: the live
+2000 ms is outside it. Retune freely; a failing test means a relationship broke, not a number.
 
-The relationships between the knobs are asserted in tests
-(`the_lookback_covers_...`, `the_ring_holds_everything_both_readers_can_ask_for`,
-`ending_a_sentence_is_judged_more_leniently_than_waking_whisper`). They run
-against the code defaults, not the settings. The silence-under-gate relation
-holds for the live values too, narrowly (0.0025 under 0.003). The cooldown bound
-in `the_code_default_cooldown_re_arms_within_a_second` (at most 1000 ms) does
-not: the live 2000 ms is outside it. Retune the numbers freely; if a test fails,
-the relationship broke, not the number.
+### Request capture
 
-## Why detection changed
+After the trigger, `WhisperRsInput` keeps recording until end of speech and joins that to the
+captured clip. Follow-up turns wait for onset first.
 
-**Whole-word matching.** `transcript.contains("goose")` fired on "mongoose" and
-"gooseberry". It now matches word sequences (`pond_voice::text::contains_trigger`).
+| Parameter | Value | Where |
+|---|---|---|
+| Onset wait (follow-up turns) | 10 s, onset is RMS >= 0.010 | `DEFAULT_ONSET_WAIT_SECS`, `record_mono_f32_vad` |
+| End of speech | 800 ms of non-speech | `DEFAULT_SILENCE_MS` |
+| Speech detector | Silero v5, threshold 0.5, 512-sample windows; RMS 0.005 when `vad_backend = "rms"` or Silero fails to load | `build_speech_detector` in `main.rs`, `pond-adapters-silero` |
+| Hard cap | 30 s | `DEFAULT_DURATION_SECS` |
 
-**No more two-window re-check.** Any transcript of three tokens or fewer used to
-require detection in two consecutive windows — and "goose" is always one token,
-so every real activation needed whisper to independently produce the same
-one-syllable word twice, 150 ms apart, from different audio. It frequently
-declined. The re-check existed to suppress the substring false positives that
-whole-word matching now rejects outright, in one pass.
+Onset stays on the energy gate on purpose: a freshly reset Silero under-reports its first window
+and would clip the first word.
 
-**Lookback.** Detection lags the wake word by a slide plus a transcription.
-Capture used to start *after* the trigger fired, so everything spoken in that gap
-was discarded — "Goose, what's the weather" arrived as "the weather". The capture
-now reaches backwards, and the wake word is removed from the *transcript*
-(`strip_leading_wake_word`) rather than from the audio.
+## How detection works
 
-## Why ASR changed
+- **Whole-word matching.** A window's transcript fires when it contains the wake word or a
+  calibrated variant as whole words (`pond_voice::text::contains_trigger`), so "goose" never fires
+  on "mongoose". For "goose" and "hey goose" a few built-in mishearings are added
+  (`builtin_fuzzy_variants`). Calibration is in [Wake-word calibration](../wake-word-calibration.md).
+- **One pass.** A match fires at once; there is no second-window re-check.
+- **Lookback.** Detection lags the wake word by a slide plus a transcription, so the capture
+  reaches back `lookback_ms` and the wake word is removed from the transcript
+  (`strip_leading_wake_word`), not from the audio.
 
-Two profiles, because the callers want opposite things
-(`TranscribeOpts`, `crates/pond-adapters-whisper/src/in_process.rs`):
+## Two decode profiles
 
-- **`wake_word()`** — greedy, 2 threads, mel context capped to the clip. Runs
-  several times a second forever and only has to recognise one known word.
-- **`accurate()`** — beam search (width 5), all threads, full context,
-  non-speech tokens suppressed, temperature fallback on low-confidence
-  segments. Runs once per turn, and its output *becomes the model's prompt* — a
-  word lost here is the whole request misunderstood.
+`TranscribeOpts` in `crates/pond-adapters-whisper/src/in_process.rs`:
 
-Measured on `tests/blobs/jfk.wav` with `ggml-base.en.bin`:
+- **`wake_word()`**: greedy, 2 threads, audio context fitted to the clip. Runs several times a
+  second and only has to recognise one known phrase.
+- **`accurate()`**: beam search (width 5), the default thread count (2 to 6), full context,
+  non-speech tokens suppressed, temperature fallback on low-confidence segments. Runs once per
+  turn, and its output becomes the model's prompt.
 
-```
-cheap      "And so my fellow Americans asked not what your country can do for you, … ♪"
-accurate   "And so my fellow Americans, ask not what your country can do for you, …"
-```
-
-Greedy produced "**asked** not" and a spurious music annotation. Beam search was
-also *faster* on this clip. Reproduce it:
+Measured on `tests/blobs/jfk.wav` with `ggml-base.en.bin`: greedy produced "asked not" and a
+spurious music annotation where beam search produced "ask not", and beam search was also faster on
+that clip. Reproduce:
 
 ```bash
 WHISPER_TEST_MODEL="$HOME/Library/Application Support/goose-in-a-pond/models/ggml-base.en.bin" \
   cargo test -p pond-adapters-whisper --features metal decode_profiles -- --ignored --nocapture
 ```
 
+What each profile keeps resident on the GPU is in [Voice pipeline efficiency](../voice-pipeline-efficiency.md).
+
 ## Logs
 
-The console is deliberately near-silent: warnings and errors only, plus the
-curated turn lines (which are printed directly, not through tracing). Everything
-else goes to `<data_dir>/logs/pond.log.<date>`, which is named on startup.
+The console shows warnings and errors only, plus the banner and turn lines (printed directly, not
+through tracing). Everything else goes to the daily file `<data_dir>/logs/pond.log.<YYYY-MM-DD>`
+(`crates/pond-server/src/tracing_setup.rs`).
 
-The file keeps GIAP's voice crates at `debug` — which windows matched, what the
-transcript was before and after the wake word came off, which voice synthesized.
-Those are the lines you need when a session misbehaves, and requiring a
-reproduction with `RUST_LOG=debug` means the interesting run is always the one
-that was not recorded.
+The file keeps `pond_adapters_whisper`, `pond_core::shared::services::chat` and `pond_server` at
+`debug`: which windows were transcribed, whether they matched, what the transcript was before and
+after the wake word came off. A misbehaving session is then already on record.
 
-Third-party native libraries are silenced by name: llama.cpp, ggml, whisper.cpp,
-ONNX Runtime, goose. They warn about things a user cannot act on. Anything
-genuinely wrong with GIAP is logged by GIAP.
-
-Two traps that produced most of the old console noise, both fixed:
-
-- **whisper.cpp bypassed tracing entirely** until `install_logging_hooks()` was
-  called, so no filter could reach it. That was the
-  `whisper_full_with_state: decoder 0: score = …` wall.
-- **The quiet console filter replaced the carve-outs instead of adding to
-  them.** A bare `warn` directive is not "warn, keeping the rules above" — every
-  target silenced above came back at WARN on precisely the surface the setting
-  exists to keep quiet.
-
-`RUST_LOG` still overrides both layers for a full-verbosity session.
+Third-party native libraries are silenced by target (llama.cpp, ggml, whisper.cpp, ONNX Runtime,
+goose, rmcp): they warn about things a user cannot act on. whisper.cpp reaches tracing only
+because `install_logging_hooks` is called once when the engine loads. The quiet console filter
+repeats those carve-outs, because a bare `warn` directive replaces them rather than adding to
+them. `RUST_LOG` overrides both layers.
 
 ## Known remaining noise
 
-`clip_model_loader: tensor[N]: …` — roughly 1400 lines when a model with a
-vision/audio projector (e.g. Gemma-4 E2B) loads. This is llama.cpp's `clip.cpp`
-writing **directly to stderr**: it uses `common_log`, not the `llama_log_set`
-callback that `send_logs_to_tracing` installs, so no tracing filter can see it.
-The C struct `mtmd_context_params` has a `verbosity` field, but
-`llama-cpp-2` 0.1.146's `MtmdContextParams` wrapper does not expose it.
-
-Two ways out, neither taken here because both reach past the voice layer:
-
-1. A goose-fork patch constructing the raw `mtmd_context_params` with
-   `verbosity = GGML_LOG_LEVEL_ERROR` (see `docs/goose-patch-management.md`).
-2. Not loading the projector at all for voice sessions — it is a vision/audio
-   encoder that a voice-only turn never uses, and on an 8 GB Jetson it is not
-   free. This changes image-input behaviour, so it is a product decision.
+`clip_model_loader: tensor[N]: ...`, about 1400 lines, when a model with a vision or audio
+projector (Gemma 4 E2B, for one) loads. llama.cpp's `clip.cpp` writes these straight to stderr
+through `common_log`, not the callback `send_logs_to_tracing` installs, so no filter sees them.
+`mtmd_context_params` has a `verbosity` field, but `MtmdContextParams` in llama-cpp-2 0.1.156 (the
+fork pinned in the root `Cargo.toml`) does not expose it. Either a fork patch that sets it, or not
+loading the projector for voice sessions, would remove them; the second changes image input, so it
+is a product decision.

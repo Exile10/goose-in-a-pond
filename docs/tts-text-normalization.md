@@ -1,180 +1,170 @@
-# TTS Text Normalization
+# TTS text normalization
 
-The voice pipeline normalizes symbols, units, and abbreviations to their spoken equivalents
-before sending text to the Piper TTS engine. This ensures the TTS pronounces "5km" as
-"5 kilometers" rather than spelling out "k m".
+How model output becomes text Kokoro can say: split into speech units as it streams, stripped of
+markdown, and with symbols, units and abbreviations spelled out ("5km" as "5 kilometers", not
+"k m"). All of it is in `crates/pond-voice/src/text.rs`.
 
----
+## Where it runs
 
-## Implementation
+```
+model tokens -> ThoughtFilter (reasoning removed) -> split_speech_units(buf, true)
+  -> KokoroOutput::synthesize(unit)
+       tokenizer::chunk: strip_markdown_for_speech -> normalize_for_speech
+                         -> phonemize (espeak-ng, per run of speech, punctuation kept)
+                         -> vocab ids -> chunks of at most 510 tokens
+  -> play
+```
 
-The normalization runs in `normalize_for_speech()`, which lives in exactly one place now:
+| Step | Function | Callers |
+|---|---|---|
+| Split a streaming buffer into units | `split_speech_units(text, allow_clauses)` | `ChatService::stream_response_inner` (voice loop), `AudioBus::speak_stream` / `speak_text` (`crates/pond-audio-out/src/bus.rs`, spoken scheduled tasks), `KokoroOutput::speak` |
+| Markdown to plain text, then normalize | `strip_markdown_for_speech` -> `normalize_for_speech` | `tokenizer::chunk` in `crates/pond-adapters-kokoro/src/tokenizer.rs`, so every Kokoro synthesis: the voice loop, `AudioBus`, `POST /api/v1/tts`, voice previews |
 
-- **Rust:** `crates/pond-voice/src/text.rs`, used by the server and both voice adapters.
+Normalization happens inside the Kokoro adapter, not in the callers, so every path gets it once.
+If normalizing leaves nothing, the raw text is phonemized instead. The token stream shown in the
+UI and stored in history is the model's text, not the normalized one.
 
-There used to be a second, verbatim 981-line copy in the Tauri desktop shell, because that shell
-was a separate cargo workspace and could not import `pond-core`. The Electron migration deleted
-it. The remaining duplication is the TypeScript side — `pond-desktop/src/modes/voice/webAudioUtils.ts`
-— which the browser voice path needs and which carries parity comments pointing back here.
+## Splitting into speech units
 
----
+`split_speech_units` returns `(units, remainder)`; the remainder waits for more tokens, and the
+caller flushes it when the stream ends. With `allow_clauses = true` (every caller in the voice
+path) a reply starts playing after its first clause, not its first sentence.
 
-## Processing Order
+| Rule | Detail |
+|---|---|
+| Sentence ends | `.`, `?`, `!` followed by whitespace or the end of the buffer |
+| Clause marks | `,` `;` `:` and em dash, only with `allow_clauses`, only once at least 3 words (`MIN_CLAUSE_WORDS`) have accumulated since the last split, and only when whitespace follows (never at the end of the buffer, where the next token may continue the number or word) |
+| Numbers | `,` and `:` between digits do not split (`1,000`, `3:45`); `.` after a digit does not split when a digit follows or the buffer ends there (a decimal still streaming) |
+| Abbreviations | `.` after a known abbreviation (`Dr`, `Mr`, `etc`, `e.g`, `a.m`, month names and others in `is_abbrev_suffix`) or a single letter does not split |
+| Newlines | A blank line after at least 3 words splits; a single newline does not; a newline with nothing before it is dropped |
+| Force flush | Past 250 bytes (`MAX_BUF`) the buffer is cut at the last whitespace |
 
-The function walks the text character by character. The check order matters:
+`split_sentences(text)` is the same with `allow_clauses = false`.
 
-1. **Time** — `3:45pm` consumed as a unit, not split
-2. **Unit suffix** — `5kg` matched after the digit ends
-3. **Abbreviations** — `e.g.` expanded at word boundary before dot handling
-4. **Period/dot** — context-dependent: "point", "dot", or punctuation
-5. **Degree symbol** — `°C`, `°F`, `°K`, bare `°`
-6. **Percent** — `%`
-7. **Currency** — 19 currency symbols with singular/plural
-8. **Ampersand** — `&` at word boundary
-9. **At-sign** — `@` at word boundary
-10. **Number sign** — `#5` to "number 5"
-11. **En dash** — `3–5` to "3 to 5"
-12. **Standalone symbols** — math, fractions, legal marks
-13. **Fallthrough** — character passed as-is
+## Markdown
 
----
+`strip_markdown_for_speech` works line by line, joins lines with a space, then calls
+`normalize_for_speech`:
 
-## Unit Suffixes (~85 entries)
+- Code fences (```` ``` ```` or `~~~`) and everything inside them are dropped, as are horizontal
+  rules and images.
+- Headers, blockquote markers, list markers (`-`, `*`, `+`, bullet, `1.`) and task checkboxes
+  (`[ ]`, `[x]`) are removed.
+- Links keep their text; bold, italic, strikethrough and inline code keep their content.
 
-Matched only when preceded by a digit. Allows one optional space (`5kg` and `5 kg`).
-Sorted longest-first for greedy matching. Alphabetic continuation guard prevents false
-positives ("5mining" does not match "min").
+## `normalize_for_speech`: order of checks
 
-| Category | Units | Example |
-|----------|-------|---------|
-| Compound | km/h, m/s, ft/s, MB/s, fl oz | `100km/h` -> "100 kilometers per hour" |
-| Data | KB, MB, GB, TB, PB, EB, KiB, MiB, GiB, TiB | `10GB` -> "10 gigabytes" |
-| Data speed | kbps, Mbps, Gbps | `100Mbps` -> "100 megabits per second" |
-| Frequency | Hz, kHz, MHz, GHz, THz | `3.5GHz` -> "3.5 gigahertz" |
-| Power | W, mW, kW, MW, GW | `500W` -> "500 watts" |
-| Voltage | V, mV, kV | `5V` -> "5 volts" |
-| Current | A, mA, uA | `10mA` -> "10 milliamps" |
-| Resistance | ohm, kohm, Mohm | `10kohm` -> "10 kilohms" |
-| Pressure | Pa, kPa, MPa, psi, bar, atm, mmHg | `32psi` -> "32 P S I" |
-| Energy | J, kJ, MJ, kWh, kcal, cal, BTU, eV, Wh | `2kWh` -> "2 kilowatt hours" |
-| Sound | dB, dBA | `80dB` -> "80 decibels" |
-| Duration | ms, ns, us, sec, min, hr, hrs | `200ms` -> "200 milliseconds" |
-| Speed | mph, knots | `60mph` -> "60 miles per hour" |
-| Length | m, km, cm, mm, nm, um, mi, ft, yd | `5km` -> "5 kilometers" |
-| Weight | g, kg, mg, ug, oz, lb, lbs, st | `75kg` -> "75 kilograms" |
-| Volume | L, mL, dL, kL, gal, qt, pt | `500mL` -> "500 milliliters" |
-| Area | m2, km2, ft2, in2, cm2, ha | `50m2` -> "50 square meters" |
-| Volume (cubic) | cm3, m3 | `10m3` -> "10 cubic meters" |
+One pass, character by character. The first rule that matches consumes the characters:
 
-### Decimal + Unit
+1. **Time** at a digit not preceded by a digit: `H` or `HH` (0 to 23), optional `:MM`, optional
+   `am`/`pm` not followed by a letter. A bare number is not a time. `3:45pm` -> "3 45 PM",
+   `15:30` -> "15 30", `3:00pm` -> "3 PM".
+2. **Unit suffix** right after a digit, with at most one space (`UNIT_SUFFIXES`).
+3. **Degree sign**: `°C` "degrees Celsius", `°F` "degrees Fahrenheit", `°K` "kelvin", bare "degrees".
+4. **Percent**: " percent".
+5. **Abbreviation** at a word boundary (`ABBREVIATIONS`).
+6. **Dot**: between digits "point", unless the digits run into a unit (`3.5GHz` -> "3.5 gigahertz");
+   between letters "dot" (`google.com`); otherwise kept as punctuation.
+7. **Currency symbol** followed by a number (`CURRENCY_SYMBOLS`): number first, then the unit,
+   singular for `1`, `1.0` and `1.00`. Thousands separators are dropped: `$1,250.50` -> "1250.50 dollars".
+8. **Kenyan shilling prefix**: `KSh`/`KES` in any case, optional `.` and space, then a number:
+   `KES 150,000` -> "150000 Kenyan shillings". Alone, it reads "Kenyan shillings".
+9. **Ampersand** next to whitespace: "and".
+10. **At sign** next to whitespace: "at".
+11. **Number sign** before a digit: `#5` -> "number 5".
+12. **En dash**: between digits " to " (`3–5` -> "3 to 5"), otherwise a pause (", ").
+13. **Standalone symbol** (`STANDALONE_SYMBOLS`).
+14. Anything else passes through.
 
-When a decimal number precedes a unit, the dot is kept as a decimal:
-`3.5GHz` -> "3.5 gigahertz" (not "3 point 5 gigahertz").
+Runs of whitespace left by substitutions are collapsed at the end.
 
-The function peeks ahead after the decimal digits to check for a unit suffix.
+Examples from the tests: `192.168.1.1` -> "192 point 168 point 1 point 1", `v3.2` -> "v3 point 2",
+`meet @ 3pm` -> "meet at 3 PM", `Hello.` -> "Hello.".
 
----
+## Tables
 
-## Currency Symbols (19 entries)
+### `UNIT_SUFFIXES` (104 entries)
 
-| Symbol | Singular | Plural | Example |
-|--------|----------|--------|---------|
-| $ | dollar | dollars | `$50` -> "50 dollars" |
-| GBP | pound | pounds | `GBP30` -> "30 pounds" |
-| EUR | euro | euros | `EUR20` -> "20 euros" |
-| JPY | yen | yen | `JPY500` -> "500 yen" |
-| INR | rupee | rupees | `INR1` -> "1 rupee" |
-| RUB | ruble | rubles | |
-| KRW | won | won | |
-| ILS | shekel | shekels | |
-| NGN | naira | naira | |
-| PHP | peso | pesos | |
-| TRY | lira | lira | |
-| UAH | hryvnia | hryvnias | |
-| GHS | cedi | cedis | |
-| CRC | colon | colones | |
-| VND | dong | dong | |
-| LAK | kip | kip | |
-| MNT | tugrik | tugriks | |
-| ESP | peseta | pesetas | |
-| CHF | franc | francs | |
+Matched in table order and the first match wins, so a unit is listed before any unit it starts
+with. A unit followed by a letter is not a match ("5mining" is not "5 minutes").
 
-Singular detection: `$1` and `$1.00` use singular form; all other values use plural.
+| Group | Suffixes |
+|---|---|
+| Compound | km/h, mi/h, KB/s, MB/s, m/s, ft/s, fl oz |
+| Data | KiB, MiB, GiB, TiB, KB, MB, GB, TB, PB, EB |
+| Data rate | kbps, Mbps, Gbps, bps |
+| Energy | kWh, kcal, BTU ("B T U"), MJ, kJ, cal, eV, Wh, J |
+| Frequency | THz, GHz, MHz, kHz, Hz |
+| Power, voltage, current | GW, MW, kW, mW, W; kV, mV, V; mA, μA, A |
+| Resistance | MΩ, kΩ, Ω |
+| Pressure | MPa, kPa, mmHg, atm, bar, psi ("P S I"), Pa |
+| Sound | dBA ("D B A"), dB |
+| Duration | hrs, sec, min, ms, ns, μs, hr |
+| Speed | mph |
+| Area and volume | km², cm², m², ft², in², cm³, m³, ha |
+| Length | km, cm, mm, nm, μm, mi, ft, yd, m |
+| Mass | kg, mg, μg, lbs, lb, oz, st ("stone"), g |
+| Volume | mL, dL, kL, gal, qt, pt, L |
+| Currency codes | KES, kes, KSh, Ksh, ksh, KSH ("Kenyan shillings") |
 
----
+### `CURRENCY_SYMBOLS` (19 entries)
 
-## Period / Dot Handling
+| Symbol | Spoken | Symbol | Spoken |
+|---|---|---|---|
+| $ | dollar / dollars | ₦ | naira |
+| £ | pound / pounds | ₱ | peso / pesos |
+| € | euro / euros | ₺ | lira |
+| ¥ | yen | ₴ | hryvnia / hryvnias |
+| ₹ | rupee / rupees | ₵ | cedi / cedis |
+| ₽ | ruble / rubles | ₡ | colon / colones |
+| ₩ | won | ₫ | dong |
+| ₪ | shekel / shekels | ₭ | kip |
+| ₣ | franc / francs | ₮ | tugrik / tugriks |
+| ₧ | peseta / pesetas | | |
 
-Context-dependent:
+### `ABBREVIATIONS` (44 entries; `approx.` is listed twice)
 
-| Context | Example | Output |
-|---------|---------|--------|
-| Between digits (no unit) | `3.14` | "3 point 14" |
-| Between digits (with unit) | `3.5GHz` | "3.5 gigahertz" |
-| Between letters (domain) | `google.com` | "google dot com" |
-| IP address | `192.168.1.1` | "192 point 168 point 1 point 1" |
-| Sentence end | `Hello.` | "Hello." (passthrough) |
-| Abbreviation | `e.g.` | "for example" |
+Matched case-insensitively at the start of a word (start of text, or after whitespace, `(`, `,`,
+`"`, `'`, `[`).
 
----
-
-## Abbreviations (35+ entries)
-
-Matched case-insensitively at word boundaries only.
-
-| Category | Abbreviations |
-|----------|--------------|
-| Latin | e.g., i.e., etc., vs. |
+| Group | Abbreviations |
+|---|---|
+| Latin | e.g. (for example), i.e. (that is), etc. (etcetera), vs. (versus) |
 | Titles | Dr., Mr., Mrs., Ms., Prof., Jr., Sr. |
-| Business | Inc., Corp., Ltd. |
-| Geography | St., Ave., Blvd., Ft., Mt. |
+| Organisations | Inc., Corp., Ltd., Dept., Govt., Assn. |
+| Places | St. (saint), Ave., Blvd., Ft. (fort), Mt. |
 | Reference | No., Vol., Ch., Pg., Fig. |
-| Measurement | Approx., Max., Min., Temp., Est. |
-| Months | Jan., Feb., Mar., Apr., Jun., Jul., Aug., Sep., Oct., Nov., Dec. |
+| Measures | Approx., Max., Min., Temp., Est. (established) |
+| Months | Jan. to Dec., without May |
 
----
+### `STANDALONE_SYMBOLS` (36 entries)
 
-## Standalone Symbols (~35 entries)
+| Group | Symbols |
+|---|---|
+| Math | ± (plus or minus), × (times), ÷ (divided by), ∞, ≈, ≤, ≥, ≠, √ (square root of), π, ² (squared), ³ (cubed) |
+| Fractions | ½, ⅓, ⅔, ¼, ¾, ⅕, ⅖, ⅗, ⅘, ⅙, ⅚, ⅛, ⅜, ⅝, ⅞ |
+| Legal | U+00A9 (copyright), U+00AE (registered), U+2122 (trademark), § (section), ¶ (paragraph) |
+| Typographic | dagger and double dagger (dropped), bullet and em dash (a pause, ", ") |
 
-| Category | Symbols | Spoken Form |
-|----------|---------|-------------|
-| Math | +/-, x, /, inf, approx, <=, >=, !=, sqrt, pi | "plus or minus", "times", etc. |
-| Superscript | 2, 3 | "squared", "cubed" |
-| Fractions | 1/2, 1/3, 2/3, 1/4, 3/4, 1/5-4/5, 1/6, 5/6, 1/8-7/8 | "one half", "one third", etc. |
-| Legal | (c), (R), TM, section, paragraph | "copyright", "registered", etc. |
-| Typographic | bullet, em dash | comma pause |
-| En dash | 3-5 | "3 to 5" (range) or ", " (other) |
-| Number sign | #5 | "number 5" |
+## Adding an entry
 
----
+1. Add it to the right `const` table in `crates/pond-voice/src/text.rs`. In `UNIT_SUFFIXES`, put
+   it before any shorter unit it begins with.
+2. Add a test in the same file's `tests` module.
+3. Run `cargo test -p pond-voice`.
 
-## False Positive Prevention
+The `tests` module has 81 tests: 51 `normalize_*`, 13 `split_*`, 11 `markdown_*`, 5 `filter_*` and
+one punctuation test.
 
-- **Alphabetic continuation guard:** "5mining" does NOT match "min" because 'i' follows
-- **Word boundary check:** abbreviations only fire at word starts (after space/punctuation)
-- **Digit prerequisite:** unit suffixes only fire when preceded by a digit
-- **Single space tolerance:** "5 kg" matches, "5  kg" (double space) does not
+## The browser voice path
 
----
+`pond-desktop/src/modes/voice/webAudioUtils.ts` carries TypeScript versions used by
+`WebVoiceBackend` before it posts each unit to `/api/v1/tts` (where Kokoro normalizes again):
 
-## Adding New Entries
+- `splitSpeechUnits` ports `split_speech_units` but splits clauses after 4 words, not 3.
+- `stripMarkdown` ports `strip_markdown_for_speech`.
+- `normalizeForSpeech` is not a port: a short regex list covering times, a few units (kg, MB/s,
+  KB/s, GB, MB, KB, ms, Hz), $, €, £, Kenyan shillings, e.g., i.e., Dr., Mr., Mrs., °C, °F, %, +, &,
+  ±, √, π and three fractions.
 
-1. Add to the appropriate `const` table in `crates/pond-voice/src/text.rs`
-2. For `UNIT_SUFFIXES`: sort by length descending (longest first)
-3. Add a test in the same file's `#[cfg(test)]` module
-4. Run `cargo test -p pond-voice -- normalize_` to verify
-5. If the browser voice path needs the same behaviour, mirror it in
-   `pond-desktop/src/modes/voice/webAudioUtils.ts` and note the parity there
-
----
-
-## Test Coverage
-
-48 normalization tests covering all categories:
-- Temperature, percent, time (existing)
-- Unit suffixes: kg, km/h, GHz, kWh, MB, m2, dB, mph (new)
-- Currencies: yen, rupee singular/plural (new)
-- Standalone: +/-, pi, fractions, copyright, squared, number sign (new)
-- Dots: decimal, domain, sentence-end, IP, version (new)
-- Abbreviations: e.g., i.e., etc., Dr. (new)
-- False positives: "asking", "5mining" (new)
+The desktop app's own voice mode never runs these; it uses the Rust path in the voice child.
