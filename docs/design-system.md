@@ -1,6 +1,6 @@
 # GIAP Desktop — Design System
 
-> **Canonical approach**: HeroUI component library + shared primitives from `components/shared/` + token-based CSS classes in `styles/sections.css`. Design tokens live in `styles/design-tokens.css`.
+> **Canonical approach**: HeroUI component library + shared primitives from `components/shared/` + token-based CSS classes in `styles/sections.css`. Design tokens live in `styles/design-tokens.css`, kept in step with `@jarida/ink` by `src/ink-adoption.test.ts`. Paths are relative to `pond-desktop/src/`.
 
 ---
 
@@ -191,7 +191,7 @@ Elevation is state. One pick is raised (the model in use, else the first suggest
 
 ## HeroUI Components
 
-Use HeroUI (`@heroui/react`) for interactive widgets: `Button`, `Input`, `Switch`, `Tabs`, `Card/CardContent`, `Chip`, `Modal`.
+Use HeroUI (`@heroui/react`) for interactive widgets: `Button`, `Input`, `Switch`, `Tabs`, `Card/CardContent`, `Chip`, `Separator`. Dialogs are not HeroUI: use `useConfirm()` or `ConfirmDialog` from `components/shared/`.
 
 ### Button Variants
 
