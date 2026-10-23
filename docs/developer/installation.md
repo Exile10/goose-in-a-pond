@@ -1,272 +1,282 @@
 # Installation Guide
 
-## Quick Start
+## Quick start
 
 ```bash
 git clone --recursive https://github.com/jarida-io/goose-in-a-pond.git
 cd goose-in-a-pond
-bash scripts/giap.sh          # menu: install, build, service, logs, doctor
+bash scripts/giap.sh          # menu: diagnose, install and build, service, desktop, logs
 ```
 
-`scripts/giap.sh` is the primary interface. It detects the host (Jetson /
-generic Linux / macOS), whether CUDA is usable, and the known bad states, then
-offers only the actions that apply. Non-interactive equivalents:
+`scripts/giap.sh` is the front door. It detects the host (Jetson, other Linux, macOS), whether
+CUDA is usable, the service unit's scope and the known bad states, then offers only the actions
+that apply. Every verb also runs without the menu:
 
-```bash
-bash scripts/giap.sh install     # first-time install (-y to skip confirmations)
-bash scripts/giap.sh build       # web UI + pond-server with this host's features
-bash scripts/giap.sh doctor      # health report; exits 1 on any FAIL
-```
+| Command | Does |
+|---|---|
+| `giap.sh doctor` | health report; exits 1 on any FAIL. Run it after every install |
+| `giap.sh status` | the detection banner only |
+| `giap.sh install` | first-time install through `scripts/install.sh`, with guardrails (below) |
+| `giap.sh build` | web UI, then a release `pond-server` with this host's features, then `pondnet` if Go is present |
+| `giap.sh build-ui` | `npm ci` when the lock is newer, `npm run build`, then touch `dist` so cargo re-embeds it |
+| `giap.sh update` | pull, Node, build, restart, Wi-Fi grant, doctor |
+| `giap.sh build-desktop` | macOS: `npm ci && npm run bundle:app` (stages a release sidecar first) |
+| `giap.sh gui` | macOS: launch the built app against the running server (`GIAP_SERVER_PORT`) |
+| `giap.sh deploy` | from a dev machine: `scripts/jetson.sh deploy` |
+| `giap.sh logs` | today's `<data_dir>/logs/pond.log.YYYY-MM-DD` (UTC; not journald) |
+| `giap.sh node [--check] [--method M] [--major N] [--install-deps]` | find or download a Node in range |
+| `giap.sh litert status\|build\|import` | the LiteRT-LM library that runs `.litertlm` models |
+| `giap.sh models pairings [--check]` | regenerate the vision pairing table |
+| `giap.sh wifi-grant [remove\|status]` | Linux: the polkit grant for the BLE setup channel |
+| `giap.sh provision --host H --key F` | operator: fetch a pond's setup card, give it a device certificate |
 
-Always run `doctor` after installing.
-
-### What `giap.sh install` does
-
-It delegates the work to `scripts/install.sh` — which remains the only place
-that knows the full sequence — and adds the guardrails install.sh cannot have,
-because they depend on host state it does not inspect:
-
-- **Refuses to add a second service unit.** `install.sh` writes a root-owned
-  unit to `/etc/systemd/system/`; a Jetson set up by hand runs a *user* unit of
-  the same name. Both installed means two servers, each loading its own ~3 GB
-  model into one memory pool. `giap.sh` passes `--no-service` when a unit exists
-  at either scope.
-- **Warns when Node is too old to build the web UI**, since the server would
-  then embed the `build.rs` placeholder and nothing at runtime can tell you.
-- **Stops a running service before a Jetson release build**, because the linker
-  is OOM-killed while a model is resident.
-
-## Install Script Options
-
-`scripts/install.sh` is what `giap.sh install` calls underneath. Its real flags
-(from `scripts/lib/install-common.sh`):
-
-```
-bash scripts/install.sh [OPTIONS]
-
-Modes (auto-detected if omitted):
-  --production      Linux: systemd service + mDNS + auto-start
-  --jetson          Jetson Orin Nano (CUDA auto-detect, SQLX_OFFLINE)
-  --minimal         Fastest: server + DB only, no model downloads
-
-Build:
-  --full            Build the entire workspace including Goose (10+ min)
-  --desktop         Also build the Electron desktop app (macOS only)
-  --no-verify       Skip the post-install health check
-
-Models:
-  --ollama          Use Ollama as the LLM provider
-  --llamafile       Use llamafile as the LLM provider
-  --no-models       Skip all model downloads
-  --whisper-model MODEL   tiny|base|small (default: base)
-
-Production:
-  --port PORT       Override the port
-  --dedicated       Set hostname to 'pond', serve on port 80
-  --shared          Keep hostname, use a non-privileged port
-  --no-service      Skip systemd service creation
-  --data-dir DIR    Override the data directory
-```
-
-There is no `--fast` flag; it was documented here but never parsed.
+Global flags: `--dry-run` prints each command instead of running it; `-y` answers yes to
+confirmations. Without a terminal and without `-y`, an action that needs confirmation refuses.
+The `Makefile` targets forward to these commands.
 
 ## Prerequisites
 
 | Requirement | macOS | Linux |
-|------------|-------|-------|
-| Git | Xcode CLI tools | `apt install git` |
-| Rust | [rustup.rs](https://rustup.rs) | [rustup.rs](https://rustup.rs) |
+|---|---|---|
+| Git | Xcode command line tools | `apt install git` |
+| Rust (`rust-version` 1.91.1) | [rustup.rs](https://rustup.rs) | [rustup.rs](https://rustup.rs) |
 | C compiler | `xcode-select --install` | `apt install build-essential` |
-| cmake | `brew install cmake` | `apt install cmake` |
-| pkg-config | `brew install pkg-config` | `apt install pkg-config` |
-| libdbus (BlueZ for the BLE setup channel) | not needed | `apt install libdbus-1-dev` |
-| Node.js (desktop and tests; the UI build needs less) | `bash scripts/giap.sh node` | `bash scripts/giap.sh node` |
+| cmake, pkg-config | `brew install cmake pkg-config` | `apt install cmake pkg-config` |
+| ALSA, D-Bus, OpenSSL headers | not needed | `apt install libasound2-dev libdbus-1-dev libssl-dev` |
+| Go (`native/pondnet/go.mod`: 1.27.2) | [go.dev](https://go.dev/dl/) | [go.dev](https://go.dev/dl/) |
+| Node | `bash scripts/giap.sh node` | `bash scripts/giap.sh node` |
+| Read access to `jarida-io/llama-cpp-rs-giap` | see [CONTRIBUTING](../CONTRIBUTING.md#prerequisites) | same |
 
-The install script auto-installs cmake and pkg-config via Homebrew (macOS) or apt (Linux), and
-libdbus-1-dev on Linux.
+`install.sh` installs cmake and pkg-config through Homebrew, and the Linux packages through apt,
+dnf or pacman. On a production or Jetson install it also checks for the LLVM tools (`clang`,
+`lld`, `llvm-ar` and friends).
+
+Go builds `pondnet`, the remote-access helper, beside `pond-server`. `giap.sh build` skips it
+with a warning when Go is missing (remote access then stays off); `install.sh` counts a failed
+helper build as a failed build.
 
 ### Node
 
-Three different floors, each read off the packages that set it, not chosen:
+Three floors, each read off the packages that set it:
 
 | For | Needs | Because |
 |-----|-------|---------|
-| The desktop app and the tests (the repo's range) | `^22.13.0 \|\| ^24.0.0 \|\| >=26.0.0` | ESLint 10 wants 22.13+ in the 22 line; vitest 5 rules out the odd-numbered 23 and 25 |
+| The desktop app and the tests (the repo's range) | `^22.13.0 \|\| ^24.0.0 \|\| >=26.0.0` | ESLint 10 wants 22.13+ in the 22 line; vitest 5 rules out 23 and 25 |
 | Building the web UI | `^20.19.0 \|\| >=22.12.0` | Vite 8. A server (the Jetson) only needs this |
-| The Matter controller | `>=20.19 <22.0 \|\| >=22.13` | matter.js 0.17. Every Node in the repo's range qualifies; a server with only the UI floor may not, and the doctor says so |
+| The Matter controller | `>=20.19 <22.0 \|\| >=22.13` | matter.js 0.17. Every Node in the repo's range qualifies |
 
-`.nvmrc` says `22`, `pond-desktop/package.json` carries the range as `engines`, and CI's frontend job
-runs on 22. A Node outside the range is the usual reason `npm test` or `npm run dev:electron` fails in a way
-that does not look like a Node problem.
+`.nvmrc` says `22`, `pond-desktop/package.json` carries the range as `engines`, and CI's frontend
+jobs run on 22. A Node outside the range is the usual reason `npm test` or `npm run dev:electron`
+fails in a way that does not look like a Node problem.
 
 ```bash
 bash scripts/giap.sh node                  # check; use one you have; else offer a download
-bash scripts/giap.sh node --check          # report only, change nothing (exit 1 if the shell's node is wrong)
-bash scripts/giap.sh node -y               # no prompts (scripts, CI)
-bash scripts/giap.sh node --dry-run        # say what it would do
-bash scripts/giap.sh node --method nvm     # install through nvm (or fnm, volta); default: auto
+bash scripts/giap.sh node --check          # report only (exit 1 if the shell's node is wrong)
+bash scripts/giap.sh node -y               # no prompts
+bash scripts/giap.sh node --method nvm     # install through nvm, fnm or volta; default: auto
 bash scripts/giap.sh node --major 24       # which major to install when none is present
 bash scripts/giap.sh node --install-deps   # then `npm ci` in pond-desktop and extensions/music
 ```
 
-What it does, in this order, stopping at the first that works:
+It stops at the first of these that works:
 
-1. **The Node on your PATH**, if it is inside the range. Nothing else happens.
-2. **One already installed**: it looks in nvm, fnm, volta, asdf and in `~/.giap/node` (an earlier run of
-   this). It asks each binary for its version and skips one that will not run. If one is inside the range
-   it is **recorded** in `~/.giap/node/.path`, and nothing is downloaded.
-3. **An install**, only after asking (`-y` answers for you; with no terminal and no `-y` it refuses):
-   through nvm, fnm or volta if you have one, else a download from `nodejs.org/dist` into `~/.giap/node`.
-   The download is **checked against the SHA-256 nodejs.org publishes** in the release's `SHASUMS256.txt`,
-   unpacked beside its destination and moved into place only after the check passes; on a mismatch nothing
-   is installed and the run fails, naming both hashes. It is https only (TLS 1.2+). Builds exist for macOS and Linux on
-   arm64 and x64, so the Jetson is covered; anything else is reported, not guessed at.
+1. **The Node on your PATH**, if it is inside the range.
+2. **One already installed** under nvm, fnm, volta, asdf or `~/.giap/node`. It asks each binary
+   for its version and skips one that will not run. One in range is **recorded** in
+   `~/.giap/node/.path`; nothing is downloaded.
+3. **An install**, only after asking: through nvm, fnm or volta if present, else a download from
+   `nodejs.org/dist` into `~/.giap/node`, checked against the release's `SHASUMS256.txt` before
+   it is moved into place. https only (TLS 1.2+). macOS and Linux, arm64 and x64.
 
-Nothing is installed globally and nothing is added to a shell profile. `GIAP_NODE_HOME` moves the download
+Nothing is installed globally or added to a shell profile. `GIAP_NODE_HOME` moves the download
 folder; `GIAP_NODE_DIST_URL` points it at a mirror.
 
-The recorded Node is what makes the rest of `giap.sh` work whatever your shell's default is: every command
-(`build`, `doctor`, the menu) puts the right Node first on PATH for its own run if the shell's is outside the
-range, and says so in the banner and the doctor. Your own shell is left alone; `giap.sh node` prints the line to type
-(`nvm use 26.10.0`, `export PATH=...`). `giap.sh build-ui` and `giap.sh install` do the same when they find
-a Node that cannot build the UI, and offer the download before falling back to "build it elsewhere and rsync".
+Every other `giap.sh` command puts the recorded Node first on PATH for its own run when the
+shell's is outside the range, and says so. **The pond reads the record too**
+(`crates/pond-server/src/node_path.rs`): at start, if the `node` on its PATH is outside the range
+or missing, it puts the recorded one first, so the Matter controller and stdio extensions run on
+it. That is the Jetson's case, where a systemd service's PATH finds apt's old Node first. The
+record is read only at start, so restart the pond after `giap.sh node`; the log line is
+`node_path_recorded`. Tests: `bash scripts/lib/node-setup.test.sh` (CI job `node-setup`).
 
-**The pond reads the record too** (`crates/pond-server/src/node_path.rs`). When it starts, if the `node` on
-its own PATH is outside the range, or there is none, it puts the recorded one first, so the Matter controller
-and the stdio extensions it starts run on it. That is the Jetson's case: apt's Node 12 in `/usr/bin` comes
-first on a systemd service's PATH. A `node` inside the range is left alone, which is the order `giap.sh`
-itself takes, and without a record nothing is asked. It asks each binary for its version, as the script does,
-and gives up on one that has not answered in 3 seconds. The record is read only at start, so **restart the
-pond after `giap.sh node`**; its log says what it did (`node_path_recorded`). The doctor says whether the
-pond will use the Node it is reporting on: an installed one that `giap.sh` found but never recorded, it will
-not.
+## What `giap.sh install` does
 
-The script is tested in `scripts/lib/node-setup.test.sh` (against a fake nodejs.org, so no network; run by
-CI's `node-setup` job): `bash scripts/lib/node-setup.test.sh`.
+It runs `scripts/install.sh` and adds three guardrails that depend on host state:
 
-## What Gets Installed
+- **No second service unit.** `install.sh` writes a system unit; a Jetson set up by hand runs a
+  user unit of the same name, and both means two servers each loading a model into one memory
+  pool. `giap.sh` passes `--no-service` when a unit exists at either scope.
+- **Node too old for the web UI.** It offers to fix Node first; otherwise the server embeds
+  whatever is already in `pond-desktop/dist`.
+- **Jetson with the service running.** It offers to stop the service for the build, because the
+  release link is OOM-killed beside a resident model, and restarts it after.
 
-### Data Directory
+It asks for Full (default) or Minimal, then confirms the exact `install.sh` command.
 
-| Platform | Default Path |
-|----------|-------------|
+### `scripts/install.sh`
+
+```
+bash scripts/install.sh [OPTIONS]
+
+Modes (auto-detected: Jetson -> jetson; Linux without a display -> production; else dev):
+  --production      Linux: systemd service + mDNS
+  --jetson          Jetson Orin Nano (CUDA features when CUDA is usable)
+  --minimal         server + databases only, no model downloads
+
+Build:
+  --full            cargo build --workspace instead of the server crates only
+  --desktop         also run `npm install` in pond-desktop
+  --no-verify       skip the post-install health check
+
+Models:
+  --ollama          install Ollama if needed and pull gemma4:e2b
+  --llamafile       download the gemma-2-2b-it llamafile into <data_dir>/bin
+  --no-models       skip model downloads
+  --whisper-model MODEL   tiny|base|small (default: base)
+
+Production:
+  --port PORT       override the port
+  --dedicated       set the hostname to 'pond', serve on port 80
+  --shared          keep the hostname, use a non-privileged port
+  --no-service      skip the systemd unit
+  --data-dir DIR    override the data directory
+```
+
+Its steps, in order:
+
+1. Pre-flight: `git`, `cargo`, `cc`.
+2. `git submodule update --init --recursive` if `goose/Cargo.toml` is missing.
+3. System packages (above).
+4. `cargo build -p pond-core -p pond-infra -p pond-api -p pond-server`: debug in dev mode,
+   `--release` otherwise. A Jetson with CUDA adds
+   `--features pond-adapters-local-inference/cuda,pond-adapters-whisper/cuda`. Then
+   `scripts/build-network-helper.sh` builds `pondnet`.
+5. `pond-server setup --model <size>` (next section).
+6. The printed setup card (below).
+7. Unless `--minimal`: the LLM step (Ollama when it is installed or on production/Jetson,
+   llamafile with `--llamafile`, else nothing), and a Piper voice file under `models/tts/` that
+   the Kokoro TTS engine does not use.
+8. Production and Jetson: the systemd unit and mDNS.
+9. Linux: the Wi-Fi polkit grant on production and Jetson; a dev machine only prints the command.
+10. `--desktop`: `npm install` in `pond-desktop`.
+11. Unless `--no-verify` or systemd already runs it: start the server and check its health.
+
+### `pond-server setup`
+
+Safe to run again. It initialises `pond_system.db`, `pond_logs.db` and `pond_vectors.db` with all
+migrations; moves flat model files into the `hf_cache` blob layout; fetches the model catalogue;
+assigns Kokoro's default voice to the `tts` role if no voice is assigned; seeds the four
+built-in prompt templates; downloads the Whisper GGML model (`tiny`, `base` or `small`); and
+checks for the ONNX Runtime, `espeak-ng-data` and a microphone. Whisper runs in-process
+(`whisper-rs`); there is no Whisper binary to download.
+
+## Data directory
+
+| Platform | Default |
+|---|---|
 | macOS | `~/Library/Application Support/goose-in-a-pond/` |
-| Linux | `~/.local/share/goose-in-a-pond/` |
-| Custom | Set `POND_DATA_DIR=/path` or `--data-dir` |
-
-### Directory Structure
+| Linux | `~/.local/share/goose-in-a-pond/` (`$XDG_DATA_HOME` honoured by the installer) |
+| Any | `POND_DATA_DIR=/path`, or `install.sh --data-dir` |
 
 ```
 $DATA_DIR/
-├── pond_system.db              SQLite (sessions, settings, memory, skills)
-├── pond_logs.db                SQLite (telemetry, sensor readings)
-├── schedules.json              Scheduled task definitions
-├── schedule_runs.json          Execution history
-├── bin/
-│   ├── whisper-server          Whisper ASR binary
-│   ├── piper                   Piper TTS binary
-│   └── espeak-ng-data/         TTS voice data
+├── pond_system.db          authoritative: sessions, settings, memories, skills, devices, models
+├── pond_logs.db            telemetry, event log, sensor readings
+├── pond_vectors.db         the context vector index
+├── schedules.json, schedule_runs.json
+├── secrets.json            encrypted secret store (key under secrets/)
+├── .runtime_api_port       the HTTP port the server bound (read this, never assume 4000)
+├── .runtime_https_port     the HTTPS port it bound
 ├── models/
-│   ├── ggml-base.en.bin        Whisper model (~74 MB)
-│   ├── tts/
-│   │   ├── en_US-lessac-medium.onnx       TTS voice (~63 MB)
-│   │   └── en_US-lessac-medium.onnx.json  TTS config
-│   ├── gguf/                   GGUF models (local inference)
-│   └── face/                   Face recognition ONNX models
-├── prompts/                    User prompt overrides
-└── setup/                      0700: the printed setup card's code and claim
-    ├── setup.json              0600; never regenerated, keep a backup
-    └── card.svg                0600; the card install wrote, to print
+│   ├── ggml-<size>.en.bin  Whisper
+│   ├── gguf/               GGUF chat models (llama.cpp)
+│   ├── litertlm/           .litertlm models (LiteRT-LM)
+│   ├── llm/                llamafiles
+│   ├── kokoro/voices/      Kokoro voices (weights beside them in kokoro/)
+│   ├── embedding/          embedding models
+│   ├── silero/             VAD
+│   └── face/               face detection and recognition ONNX models
+├── hf_cache/               content-addressed Hugging Face downloads
+├── engine/                 Goose's own state (GOOSE_PATH_ROOT)
+├── lib/litert-lm/          recorded LiteRT-LM library packages
+├── bin/                    downloaded binaries; espeak-ng-data link
+├── logs/                   pond.log.YYYY-MM-DD (UTC)
+├── tls/                    the HTTPS identity
+├── matter-server/          the Matter controller and its storage
+├── embedded-network/       remote-access (pondnet) state
+├── prompts/                prompt template overrides
+└── setup/                  0700: the printed setup card's code and claim
+    ├── setup.json          0600; never regenerated, keep a backup
+    └── card.svg            0600; the card install wrote, to print
 ```
 
 ### The setup card
 
-Install makes the pond's setup code (`pond-server setup-code`) and writes a printable card to
-`$DATA_DIR/setup/card.svg`. **Print it and keep it with the pond.** A pond with no screen is set
-up by scanning the card with Goose On The Go, which claims the pond; the card is accepted only
-until the first device pairs. To print it again, or to see the code:
+Install makes the pond's setup code and writes a printable card to `$DATA_DIR/setup/card.svg`.
+**Print it and keep it with the pond.** A pond with no screen is set up by scanning the card with
+Goose On The Go, which claims the pond; the card is accepted only until the first device pairs.
 
 ```bash
 pond-server setup-code                      # the code, the pond id, a terminal QR
-pond-server setup-code --card card.svg      # the printable card again
-pond-server setup-code --status             # unclaimed, claimed or missing (doctor uses this)
+pond-server setup-code --json               # {"code","display","id","claimed_at","url"}
+pond-server setup-code --card card.svg      # the printable card again (`-` for stdout)
+pond-server setup-code --status             # unclaimed, claimed or missing (the doctor uses this)
 pond-server setup-code --rearm              # accept the same card again after a factory reset
 ```
 
 For a pond imaged elsewhere, `bash scripts/giap.sh provision --host <pond> --key <file>` fetches
-its card over SSH and saves it on your machine as `./pond-<id>-setup-card.svg` (`--card` to choose
-the path). `giap.sh doctor` reports the claim state. A pond that already had paired phones when it
-got its first setup code is created claimed, so upgrading a pond in use opens nothing.
+its card over SSH and saves it as `./pond-<id>-setup-card.svg` (`--card` to choose the path). A
+pond that already had paired phones when it got its first setup code is created claimed, so
+upgrading a pond in use opens nothing.
 
-## LLM Provider Options
+## Choosing a chat model
 
-GIAP supports three LLM backends. You need at least one:
+The live agent is Goose (`GooseAdapter` in `pond-adapters-goose`). The chat model is chosen in
+the app's Models page and stored as the `chat_provider` and `chat_model` settings:
 
-### Ollama (recommended for development)
-
-```bash
-# Install: https://ollama.com
-ollama pull gemma3:4b    # 2.6 GB — works great with GIAP
-# Or for Gemma 4:
-ollama pull gemma4:latest
-```
-
-Configure in GIAP: Settings → Chat Provider = "ollama", Model = "gemma3:4b"
-
-### Llamafile (self-contained, no dependencies)
-
-```bash
-# The install script downloads this with --llamafile:
-bash scripts/install.sh --llamafile
-```
-
-### Local GGUF (in-process, no subprocess)
-
-```bash
-# Requires --features local-inference (default)
-# Place .gguf file in $DATA_DIR/models/gguf/
-# Configure: Settings → Chat Provider = "local", Model = "filename.gguf"
-```
+| `chat_provider` | Runs |
+|---|---|
+| `local` | in-process: a `.gguf` through Goose's llama.cpp backend, a `.litertlm` through its LiteRT-LM backend (build or import the library with `giap.sh litert`) |
+| `ollama` | an Ollama server on `127.0.0.1:11434` |
+| `llamafile` | a llamafile the pond starts from `models/llm/` |
+| `mistralrs` | a mistral.rs server over its OpenAI-compatible API |
+| `mesh` | another pond over libp2p (`--features mesh` builds only) |
 
 ## Running
 
 ```bash
-# Start server + web dashboard
-cargo run -p pond-server --release -- serve --open
-
-# Voice mode (requires whisper-server running on port 9000)
-cargo run -p pond-server --release -- chat --voice
-
-# Desktop app
-cd pond-desktop && npm run dev:electron
+cargo run -p pond-server --release -- serve --open     # server + dashboard in the browser
+cargo run -p pond-server --release -- serve --native   # macOS: also launch the desktop app
+cargo run -p pond-server --release -- chat --voice     # wake word, speech, spoken replies
+cargo run -p pond-server --release -- dashboard        # a sign-in link for a browser
+cd pond-desktop && npm run dev:electron                # the Electron shell in development
 ```
 
-## Production Deployment (Linux)
+`serve` listens for HTTP on `127.0.0.1` (default 4000, falling back through 4009) and HTTPS on
+all interfaces (default 4443); `--port` and `--https-port` override. `chat --voice` fetches any
+missing voice model on first use. The web UI is embedded into the binary at compile time from
+`pond-desktop/dist`; a binary built without it falls back to `--static-dir`
+(default `pond-desktop/dist`).
 
-For headless deployment on a Linux server:
+## Production deployment (Linux)
 
 ```bash
-bash scripts/giap.sh install          # auto-detects production mode
-# or directly:
+bash scripts/giap.sh install          # auto-detects production mode on a headless Linux box
 bash scripts/install.sh --production --dedicated --port 80
 ```
 
-`scripts/setup.sh` no longer exists — `install.sh` replaced both it and the old
-dev installer.
-
-Service control afterwards is `bash scripts/giap.sh` menu 20-25 (install, start,
-stop, restart, status, logs, uninstall).
+Service control afterwards is the `giap.sh` menu, items 20 to 25: install, start, stop, restart,
+remove the unit, run in the foreground. The pond logs to files, not journald (`giap.sh logs`).
 
 ### Wi-Fi from the BLE setup channel (the polkit grant)
 
 A headless pond gets its Wi-Fi from a phone over Bluetooth
-([the setup channel](../architecture/pond-setup-channel.md)), and joins it through NetworkManager
-as its own user. NetworkManager's default policy refuses that user with no desktop session, so on
-a production or Jetson install `giap.sh install` writes a polkit grant for the pond's user (the
-system unit's `User=`, else whoever runs the installer). It allows exactly four actions and
-nothing broader: `settings.modify.system`, `network-control`, `wifi.scan` and
-`enable-disable-wifi`, all under `org.freedesktop.NetworkManager.`. No hotspot, hostname or sleep
-action is granted.
+([the setup channel](../architecture/pond-setup-channel.md)) and joins it through NetworkManager
+as its own user. NetworkManager's default policy refuses that user without a desktop session, so
+a production or Jetson install writes a polkit grant for the pond's user (the system unit's
+`User=`, else whoever runs the installer). It allows exactly four actions under
+`org.freedesktop.NetworkManager.`: `settings.modify.system`, `network-control`, `wifi.scan` and
+`enable-disable-wifi`.
 
 | polkit | File |
 |---|---|
@@ -276,70 +286,41 @@ action is granted.
 ```bash
 bash scripts/giap.sh wifi-grant            # write it (sudo); again is a no-op
 bash scripts/giap.sh wifi-grant status     # the doctor lines below
-bash scripts/giap.sh wifi-grant remove     # take it out again, either flavour
+bash scripts/giap.sh wifi-grant remove     # take it out, either flavour
 bash scripts/giap.sh --dry-run wifi-grant  # print the file, write nothing
 ```
 
-A dev machine keeps its own policy: the installer only prints the command there. polkit reads
-the file at once, with no restart. `giap.sh doctor` checks, on Linux:
-
-- rfkill for Bluetooth and Wi-Fi (`rfkill unblock bluetooth` lifts a soft block);
-- `bluetooth.service` is running;
-- the adapter offers LE advertising (`LEAdvertisingManager1.SupportedInstances`, else
-  `btmgmt info`);
-- the grant, as NetworkManager actually answers it for this user (`nmcli general permissions`),
-  so a file polkit ignores reads differently from a missing one.
-
-The pond's Bluetooth needs no grant: the default D-Bus policy already lets its user serve GATT and
-advertise. It never pairs, registers no agent and leaves the adapter's discoverable and pairable
-switches alone.
+polkit reads the file at once, with no restart. On Linux, `giap.sh doctor` checks rfkill for
+Bluetooth and Wi-Fi (`rfkill unblock bluetooth` lifts a soft block), that `bluetooth.service`
+runs, that the adapter offers LE advertising (`LEAdvertisingManager1.SupportedInstances`, else
+`btmgmt info`), and the grant as NetworkManager answers it for this user
+(`nmcli general permissions`). The pond's Bluetooth needs no grant: it never pairs, registers no
+agent and leaves the adapter's discoverable and pairable switches alone.
 
 ## Jetson Orin Nano
 
-Cross-compilation is **not** viable for the local-inference path: nvcc must
-target the device architecture, so the CUDA build has to happen on the Jetson.
-Deploy from your dev machine instead — it builds the web UI locally (the
-device's Node is too old for Vite), syncs it, then builds on-device with the
-correct feature flags:
+The CUDA build has to happen on the device (nvcc targets its architecture). Deploy from the dev
+machine: it builds the web UI locally, syncs it, hard-resets the device checkout to
+`origin/<branch>` and builds there with the CUDA features. Push the branch first; `giap.sh`
+warns when HEAD is not on the remote.
 
 ```bash
 bash scripts/giap.sh deploy           # or: bash scripts/jetson.sh deploy
+bash scripts/jetson.sh docker-build   # a CPU-only aarch64 binary in a linux/arm64 container
 ```
 
-For a CPU-only aarch64 binary without CUDA, `bash scripts/jetson.sh docker-build`
-builds in a linux/arm64 container.
-
-See [scripts/jetson/README.md](../../scripts/jetson/README.md) for the full
-workflow and [docs/jetson-build-and-run.txt](../jetson-build-and-run.txt) for
-the operational traps.
+See [the Jetson dev routine](jetson-dev-routine.md) for the workflow and its traps, and
+[scripts/jetson/README.md](../../scripts/jetson/README.md) for the scripts.
 
 ## Troubleshooting
 
-### "goose/Cargo.toml not found"
-```bash
-git submodule update --init --recursive
-```
-
-### "Unable to find libclang" (Jetson)
-```bash
-sudo apt install libclang-dev clang
-```
-
-### "instruction requires: fullfp16" (Jetson ARM)
-```bash
-# Add to .cargo/config.toml:
-[target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
-```
-
-### Whisper build fails (macOS)
-```bash
-brew install cmake
-# Re-run setup:
-cargo run -p pond-server -- setup
-```
-
-### Port 4000 already in use
-```bash
-cargo run -p pond-server --release -- serve --port 8080
-```
+| Symptom | Fix |
+|---|---|
+| `goose/Cargo.toml` not found | `git submodule update --init --recursive`, or `giap.sh` menu 3 |
+| `revision ... not found`, `failed to authenticate` fetching `llama-cpp-rs-giap` | a git credential that can read `jarida-io/llama-cpp-rs-giap` ([CONTRIBUTING](../CONTRIBUTING.md#prerequisites)) |
+| `Unable to find libclang` (Jetson) | `sudo apt install libclang-dev clang` |
+| Whisper or llama.cpp build fails (macOS) | `brew install cmake`, then rebuild |
+| `ld: write() failed, errno=28` or another strange link error | the disk is full: `du -sh target`, then `rm -rf target/debug/incremental` or `giap.sh` menu 4 |
+| Port 4000 already in use | the server falls back through 4009 on its own; read `<data_dir>/.runtime_api_port`, or pass `--port` |
+| Dashboard is a placeholder page | the server was built before the UI: `giap.sh build-ui`, then rebuild the server |
+| `npm test` or Electron fails oddly | Node outside the range: `bash scripts/giap.sh node` |
