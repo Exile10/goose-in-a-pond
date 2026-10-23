@@ -1,7 +1,8 @@
 # Draft upstream request: let a tsnet embedder turn off the DNS fallback
 
 Status: draft for the maintainers to review and file with tailscale/tailscale. Not
-filed.
+filed as far as this repository records. Re-checked against `tailscale.com` v1.104.1, the
+version `native/pondnet/go.mod` pins: the fallback and the missing switch are unchanged.
 
 ## Title
 
@@ -9,12 +10,12 @@ tsnet: option to disable `dnsfallback` for self-hosted control servers
 
 ## Body
 
-We embed tsnet (v1.102.4) in a home server and a mobile app that use a self-hosted
+We embed tsnet (v1.104.1) in a home server and a mobile app that use a self-hosted
 Headscale control server and our own DERP map. When the system resolver cannot
 resolve the control server's host name, the control client falls back to
 `net/dnsfallback`:
 
-- `control/controlclient/direct.go:337`:
+- `control/controlclient/direct.go:328`:
   `LookupIPFallback: dnsfallback.MakeLookupFunc(opts.Logf, netMon)`
 - `control/controlhttp/client.go:374`: the same, for the Noise dialer.
 

@@ -1,145 +1,154 @@
 # Embedded Pond networking
 
-This pinned Go module supplies the Pond helper, mobile bindings, authenticated
-CONNECT proxy, and pilot enrollment service. It uses an explicit Headscale HTTPS
-origin and disables the Tailscale diagnostic uploader. It does not install an OS
-VPN or change another application's routes.
+This Go module (`tailscale.com` v1.104.1, Go 1.27.2, both pinned in `go.mod`) supplies
+the Pond's network helper, the mobile bindings goose-on-the-go links, the authenticated
+CONNECT proxy, and the enrollment service the coordinator runs. It talks to an explicit
+Headscale HTTPS origin and disables Tailscale's diagnostic uploader. It installs no OS
+VPN and changes no other application's routes.
+
+| Command | Runs on | Purpose |
+|---|---|---|
+| `cmd/pondnet` | the Pond, beside `pond-server` | the tsnet node and tailnet bridge (`--state --control --socket --identity --port --hostname`), household authority operations (`--authority-action identity\|register\|inspect\|enroll\|replace\|revoke --state --enrollment --port`), device certificates (`--device-action create\|install --state`), `--third-party-notices` |
+| `cmd/pond-enrollment` | the coordinator host | the enrollment service and its admin commands; see [the deployment guide](../../deploy/remote-access/README.md) |
+| `cmd/pond-provision` | the operator's machine | `keygen\|public\|sign --key FILE [--device-public-key KEY]` for device certificates |
+| `mobile` | phones, via gomobile | `Start`, `Stop`, `Disable`, `Status`, `ProxyConfiguration`, `SetTargets`, `SetResolvers`, `SetInterfaceProvider`, `NetworkChanged`, `Prune`, and diagnostics sinks |
+
+`pondnet --authority-action` reads its request as JSON on stdin (8 KiB at most, unknown
+fields refused) and exits 0 with the result on stdout, 3 when the coordinator refused
+(printing `{"refused": "<identifier>"}`), 1 for any other failure, and 2 for bad input.
+`register` reads `{"invite": "..."}`; an empty or absent invite sends none. The invite is
+never an argument, since other accounts can read those.
 
 ## Transport boundaries
 
-Mobile native networking obtains an ephemeral loopback proxy endpoint and random
-credential directly from `mobile.ProxyConfiguration`. Neither value crosses the
-JavaScript bridge. The proxy permits only configured tailnet IP/port pairs. It
-forwards TLS bytes without terminating the Pond's HTTPS connection; the native
-client still checks the public-key pin, certificate validity, and hostname.
+Mobile native code gets an ephemeral loopback proxy endpoint and a random credential
+from `mobile.ProxyConfiguration`; neither crosses the JavaScript bridge. The proxy
+permits only the tailnet IP/port pairs set with `mobile.SetTargets`, which refuses the
+node's own tailnet addresses. It forwards TLS bytes without terminating the Pond's
+HTTPS, so the native client still checks the pin, validity and hostname. It holds at
+most 64 sockets (`MaxConnections`), closes idle keep-alive connections after 30 s and a
+connection after a 407, and refuses Tailscale's service addresses (`100.100.100.100`,
+`fd7a:115c:a1e0::53`).
 
-The proxy holds at most 64 sockets (`MaxConnections`), closes idle keep-alive
-connections after 30 s, and closes a connection after a 407. It refuses Tailscale's
-service addresses (`100.100.100.100`, `fd7a:115c:a1e0::53`) as targets, and
-`mobile.SetTargets` refuses the node's own tailnet addresses. On the Pond, the bridge
-(`BridgeHandler`, `ServePond`) forwards only `/api/v1/` paths in origin form, caps its
+On the Pond, `ServePond` listens on the tailnet at the companion port with the Pond's
+tailnet certificate (re-read on every handshake) and `BridgeHandler` forwards to the
+Pond's private Unix socket. It forwards only `/api/v1/` paths in origin form, caps its
 listener at 64 sockets, closes idle connections after 60 s, and answers
 `502 {"error":"embedded_bridge_unavailable"}` when the Pond sends no response headers
-within 30 s. The coordinator client (`coordinatorClient`) ignores proxy environment
-variables and follows no redirects. `Submit` refuses a coordinator answer over 4 KB,
-with trailing data, an unknown status or role, or a malformed revision; for an enroll
-or replace, one naming a different role or machine key than asked; and for a revoke,
-one that does not confirm the device as `revoked`. It ignores fields it does not know
-(2026-10-12), so the service can add one without breaking Ponds already in homes; the
-checks above are what stop a proxy or a confused service describing another device.
+within 30 s. Only this boundary supplies the real embedded peer address; public
+listeners ignore client-supplied forwarding identity, and LAN-only pairing, session
+authorization and rate limiting stay with the Pond API.
+
+`coordinatorClient` ignores proxy environment variables and follows no redirects.
+`Submit` refuses a coordinator answer over 4 KiB, with trailing data, an unknown status
+or role, or a malformed revision; for an enroll or replace, one naming a different role
+or machine key than asked; and for a revoke, one that does not confirm `revoked`
+(`decodeAnswer`, `answered` in `authority.go`). It ignores fields it does not know, so
+the service can add one without breaking deployed helpers.
 
 `Node.Dial` uses `internal/tailnetdial`, which calls the userspace TCP stack directly.
-Do not replace it with `tsnet.Server.Dial`: the general-purpose tsnet dialer can use
-system routes when a destination is absent from its peer map. A separately running
-VPN must never become an implicit fallback. The subsystem API is version-sensitive.
-`internal/tailnetdial/dial_test.go` pins the property offline on every `go test`: two
-nodes on an in-process control server, a host listener that `TCP` must never reach,
-a canary showing `tsnet.Server.Dial` does reach it, and a peer round trip. If the
-canary fails after a Tailscale update, the fallback is gone upstream and this package
-can be re-evaluated. Every update must still pass the real Headscale isolation and
-relay tests.
+Do not replace it with `tsnet.Server.Dial`: the general-purpose dialer can use system
+routes when a destination is absent from the peer map, and a separately running VPN must
+never become an implicit fallback. `internal/tailnetdial/dial_test.go` pins this offline
+on every `go test`: two nodes on an in-process control server, a host listener the
+dialer must never reach, a canary showing `tsnet.Server.Dial` does reach it, and a peer
+round trip. If the canary fails after a Tailscale update, the fallback is gone upstream
+and the package can be re-evaluated; every update must still pass the real Headscale
+isolation and relay tests.
 
-On the Pond, the helper serves the existing TLS identity and forwards requests over
-a private Unix socket. Only this boundary supplies the actual embedded peer address.
-Public listeners ignore client-supplied forwarding identity. LAN-only pairing,
-session authorization, and rate limiting remain enforced by the Pond API.
+`cmd/pondnet` sets `TS_USE_CACHED_NETMAP=false` before starting the Pond's node, so the
+Pond always enforces access from the coordinator's live map. Phones may cache theirs
+(`netmapcache.go`, `Node.ForgetNetworkMapWhenRefused`); see
+[remote access](../../docs/remote-access.md).
 
 ## Identity persistence and enrollment recovery
 
-`node.lock` is the exclusive process lock. The installation marker is
-`initialized`, written after the first identity. Back up the entire private node
-directory, including `initialized` and `tailscaled.state`; `node.lock` need not be
-kept. A profile from a build before 2026-09-30 has no marker and acquires one on its
-first start, which until then treats it as new: a missing identity is created
-rather than refused.
-An existing installation with missing, empty, malformed, insecure or incomplete
-identity state fails before starting networking. Valid earlier state files retain
-their keys. The store binds an identity to its configured coordinator, writes
-atomically with file and directory synchronization, and becomes unavailable after
-a persistence failure until storage is repaired and the process restarted.
+`node.lock` is the exclusive process lock. `initialized` is written after the first
+identity. Back up the whole node directory, including `initialized` and
+`tailscaled.state`; `node.lock` need not be kept. A profile without `initialized` is
+new, so a missing identity is created; a profile with it and no identity has lost it and
+is refused: restore the backup. An existing installation with missing, empty,
+malformed, insecure or incomplete identity state fails before networking starts. The
+store binds an identity to its coordinator, writes atomically with file and directory
+sync, and refuses further writes after a persistence failure until storage is repaired
+and the process restarted. The household authority is built in a staging directory and
+renamed into place, so a crash during first setup leaves nothing half-written.
 
-The public machine key is available before registration; the public node key is
-reported by the coordinator-backed status after registration. Neither exposes a
-private key. Enrollment approvals bind the pending authorization ID and machine
-key to one locally paired device. If Headscale completes registration but its
-response is lost, reconciliation can match the durable intent to exactly one
-inventory entry with that machine key and the correct household. It validates
-node identity, addresses, permissions and uniqueness before granting access, and
-never repeats the registration mutation. Preexisting unmanaged machines cannot be
-claimed by this mechanism; a definite coordinator rejection remains failed even
-if a matching node later appears. Revocation retains a machine tombstone
-so a late registration cannot regain access and is queued for deletion.
+The public machine key is available before registration; the public node key comes from
+the coordinator-backed status after it. Neither exposes a private key. Enrollment
+approvals bind the pending authorization ID and machine key to one locally paired
+device. If Headscale completes a registration but its response is lost, reconciliation
+matches the durable intent to exactly one inventory entry with that machine key in the
+correct household, validates node identity, addresses, permissions and uniqueness, and
+never repeats the registration. Preexisting unmanaged machines cannot be claimed this
+way, and a definite coordinator rejection stays failed even if a matching node appears
+later. Revocation keeps the machine key as a tombstone so a late registration under it
+is deleted.
 
-The authority helper supports signed `inspect` and `replace` operations. Inspection
-returns a durable, non-secret revision for one household/device. Explicit replacement
-must name that exact `expectedRevision` and a new pending machine identity. Only
-pending, failed or revoked phone records may be replaced; active nodes and the Pond
-identity cannot. Each revocation changes the revision, including repeated revocations,
-so an older replacement approval cannot reopen access. Replacement never happens as
-an automatic enrollment retry.
+The authority supports signed `inspect` and `replace`. Inspection returns a durable,
+non-secret revision for one household/device. Replacement names that exact
+`expectedRevision` and a new pending machine identity. Only pending, failed or revoked
+phone records may be replaced; active nodes and the Pond's own identity cannot. Every
+revocation changes the revision, so an older replacement approval cannot reopen access.
+The Pond replaces a record only after local approval of a recovery, or for a `revoked`
+record when the bearer's own phone enables remote access from the LAN
+(`crates/pond-server/src/embedded_network.rs`, `embedded_network/recovery.rs`); never as
+an automatic retry.
 
-Retired machine bindings remain in enrollment backups and are never reusable. The
-reconciler removes late registrations for those bindings only within their original
-household. Each household has a maximum of 256 retired records; hitting the bound
-fails visibly without discarding history. Legacy pending records can be explicitly
-replaced after inspection, but cannot be recovered automatically without a machine
-binding.
+A replacement retires the old record, so a late registration under its machine key can
+still be deleted within its household. Each household holds at most 256 retired records
+(`retiredCapacity`); past that a replacement is refused with `retired_capacity`. A
+retired record expires once inventory reads at least 24 hours apart (`retiredGrace`)
+have found no node holding its identity, after which that machine key may enroll again
+with a fresh approval (`enrollment/retired.go`). Legacy pending records without a
+machine binding can be replaced explicitly after inspection, but not recovered
+automatically. Do not erase identity files or enrollment records to get around any of
+this.
 
-The service/helper boundary is tested. The phone-facing local review, cancellation
-and credential revalidation workflow is still unfinished, so normal app enrollment
-continues to refuse previously enrolled device IDs. Do not erase identity files or
-enrollment records to bypass that boundary.
+### State on disk
+
+Every file holding a key or state is read through `internal/privatefile`, which opens
+with `O_NOFOLLOW|O_NONBLOCK` and checks the open descriptor: a regular file, `0600` or
+stricter, within a size bound. Checking the path first and opening after would read a
+file swapped in between.
+
+tsnet keeps its own unredacted log ring (`tailscaled.log1.txt`, `tailscaled.log2.txt`)
+in the profile whatever the configured logger does. `logtail.Disable()` drops entries
+before they reach it, and the helper deletes any such files when a node opens.
 
 ## Building and testing
 
-Use the Go toolchain pinned by `go.mod`. From this directory:
+Use the Go toolchain `go.mod` pins. From this directory:
 
 ```sh
 go test -race ./...
 go vet ./...
 ```
 
-`scripts/build-network-helper.sh` in the Pond repository builds the installed
-helper. GOTG's `scripts/build-embedded-network.sh` builds its Android AAR and iOS
-XCFramework with the pinned gomobile/gobind tools. Native binaries are generated
-artifacts and must not be committed.
+CI (`embedded-network` in `.github/workflows/ci.yml`) also checks `gofmt`, runs
+`govulncheck` v1.9.0, builds `./cmd/...` and cross-compiles `cmd/pondnet` for
+linux/arm64.
 
-`internal/proxyfixture` is a test executable, never a bundled service. Its dialer
-maps allowlisted destinations to one explicit IPv4-loopback TLS fixture. GOTG's
-Apple and Android proxy suites use it to exercise the production CONNECT proxy.
-These client tests do not enroll a mobile node; real Headscale enrollment and
-WireGuard isolation are tested separately in `enrollment/headscale_live_test.go`.
+`scripts/build-network-helper.sh [output-dir]` builds the Pond's helper into
+`target/release/pondnet` by default, static and trimmed, with mode `0755` (the Pond
+refuses a helper anyone but its owner could replace). goose-on-the-go builds its Android
+AAR and iOS XCFramework from this module with its own `scripts/build-embedded-network.sh`
+and pinned gomobile (unverified here). Native binaries are build artifacts and are not
+committed.
 
-See [the verification ledger](../../docs/embedded-remote-access-verification.md)
-for measured results and unfinished acceptance work, and
-[the deployment guide](../../deploy/remote-access/README.md) for pilot infrastructure.
-
-### State on disk
-
-Every file holding a key or state is read through `internal/privatefile`, which
-opens with `O_NOFOLLOW|O_NONBLOCK` and checks the open descriptor: a regular file,
-`0600` or stricter, within a size bound. Checking the path first and opening it
-after would read a file swapped in between.
-
-First setup survives a crash. The node's identity may be created only while its
-profile lacks the `initialized` marker, written after the first identity; the
-household authority is built in a staging directory and renamed into place. Before
-this, a crash at the wrong moment left a profile or directory that every later
-start refused. A profile with the marker and no identity has lost it and is still
-refused: restore the backup.
-
-tsnet keeps its own log ring (`tailscaled.log1.txt`, `tailscaled.log2.txt`) in the
-profile whatever the configured logger does, unredacted. `logtail.Disable()` drops
-entries before they reach it, and the helper deletes what earlier builds wrote.
+`internal/proxyfixture` is a test executable, never a bundled service. Its dialer maps
+allowlisted destinations to one IPv4-loopback TLS fixture, and goose-on-the-go's Apple
+and Android proxy suites use it to exercise the production CONNECT proxy. Real Headscale
+enrollment and WireGuard isolation are tested by `enrollment/headscale_live_test.go`
+(`TestHeadscaleLive`) and `identity_live_test.go` (`TestNodeHeadscalePersistence`), which skip unless pointed at a
+disposable coordinator; the environment they read is in
+[the verification ledger](../../docs/embedded-remote-access-verification.md#reproduction).
 
 ### Redistribution notices
 
-`THIRD_PARTY_NOTICES.txt` contains the union of the macOS, Linux ARM64, Android
-ARM64 and iOS ARM64 dependency notices, plus the Go runtime license. Regenerate
-it with `python3 scripts/update-network-notices.py` from the repository root after
-changing the module graph. The generator pins go-licenses v2.0.1 and fails on
-missing dependency licenses or conflicting platform notices. Its first-party
-exclusion still traverses every third-party dependency.
-
-The helper prints the bundled text with `pondnet --third-party-notices`. GOTG's
-native build copies this file into the Android assets and iOS pod resources.
+`THIRD_PARTY_NOTICES.txt` is the union of the macOS, Linux ARM64, Android ARM64 and iOS
+ARM64 dependency notices plus the Go runtime licence. Regenerate it with
+`python3 scripts/update-network-notices.py` from the repository root after changing the
+module graph. The generator pins go-licenses v2.0.1 and fails on missing dependency
+licences or conflicting platform notices. `pondnet --third-party-notices` prints it;
+goose-on-the-go copies it into its Android assets and iOS pod resources.

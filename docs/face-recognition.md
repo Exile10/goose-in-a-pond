@@ -1,552 +1,307 @@
-# Face Recognition
+# Face recognition
 
-Goose-in-a-Pond can identify household members from a webcam feed so the
-assistant knows who it is talking to.  Recognition runs entirely on-device:
-no biometric data ever leaves the host machine, and the on-disk records
-are opaque embedding vectors that cannot be reversed back into an image.
+`pond-server` can enrol household members' faces and identify them from a webcam
+frame or burst. Recognition runs on-device: no frame is stored, and the database
+holds only 512-float embedding vectors.
 
-This document covers the full pipeline — model stack, the four `/api/v1/faces/*`
-endpoints, anti-spoof + burst-liveness defences, the low-light
-auto-exposure layer, the desktop / web UI flows, and every environment
-variable that can be tuned without recompiling.
+It is **off by default**: it is compiled only with the `face-onnx` Cargo feature, and
+no release build or deploy script turns that on. Identification is exposed over REST
+and used by the desktop **Faces** screen; nothing in the chat or agent path consumes
+it, so the assistant does not learn who it is talking to from it.
 
----
-
-## End-to-End Pipeline
-
-```
-Webcam frame (JPEG)
-       │
-       │  ── ENROL or IDENTIFY request to /api/v1/faces/* ─────────────────────
-       │
-       ├─ [Image decode]                     image::load_from_memory()
-       │
-       ├─ [Pre-detection auto-exposure]      mean luminance < 0.30?
-       │        │                              → CLAHE / 2-98 % stretch on 640²
-       │        │                                detector input
-       │
-       ├─ [SCRFD 34G GNKPS detector]         5-pt landmarks + face bbox
-       │        │                              · Adaptive score threshold:
-       │        │                                0.50 normal, 0.30 dim
-       │        │                              · Falls back to SCRFD 10G,
-       │        │                                then UltraFace, then
-       │        │                                centre-square crop
-       │
-       ├─ [Umeyama 112×112 alignment]        2-D similarity transform onto
-       │        │                              the canonical ArcFace template
-       │
-       ├─ [Embedder auto-exposure]           still dim post-alignment?
-       │        │                              → CLAHE / stretch on the crop
-       │
-       ├─ [Quality gates]
-       │        ├─ MIN_CONTENT_VARIANCE      ≥ 0.006   (rejects lens-cap)
-       │        ├─ MIN_MEAN_BRIGHTNESS       ≥ 0.025   (rejects total-dark)
-       │        ├─ MAX_MEAN_BRIGHTNESS       ≤ 0.95    (rejects pure white)
-       │        └─ MIN_LAPLACIAN_VAR_X1000   ≥ 4.0     (rejects bad blur)
-       │
-       ├─ [Anti-spoof ensemble]              max(spoof_score) of:
-       │        ├─ Silent-Face V2            80×80 BGR multi-class softmax
-       │        └─ DeepPixBis OULU-NPU       224×224 RGB sigmoid
-       │                                     (filename heuristic auto-detects
-       │                                      which variant to load)
-       │
-       ├─ [ArcFace / Glint-R100 embedder]    1×3×112×112 → 1×512 float
-       │        │                              L2-normalised so cosine ≡ dot
-       │
-       │
-       ├─ ENROL ────►  Append (profile_id, embedding, model_dims, ts)
-       │              to `face_embeddings` table.  Min 3 samples required
-       │              before identify_face will return that profile.
-       │
-       └─ IDENTIFY ─► Top-K + centroid + S-norm against all enrolled
-                      embeddings.  Returns (profile_id, confidence).
-                      Confidence ≥ DEFAULT_MATCH_THRESHOLD (0.62)
-                      AND runner-up margin ≥ 0.08 ⇒ identified.
-
-Burst identify (5 frames @ 400 ms) additionally runs:
-       │
-       ├─ [Inter-frame embedding cosine]     mean cos > 0.9994 ⇒ frozen
-       │                                     (still photo / phone replay)
-       ├─ [Landmark pixel motion]            std-dev across frames < 0.5 px ⇒ rigid
-       ├─ [Differential landmark motion]     non-rigid component < 0.6 px ⇒ rigid
-       ├─ [Eye-ratio spread]                 (max - min) / mean < 0.003 ⇒ flat
-       └─ [Face-size variation]              (max - min) / mean < 1.2 % ⇒ rigid
-
-       Hard-reject when any TWO of those five photo-like signals trip.
-```
+| Part | Where |
+|---|---|
+| ONNX adapters (embedder, SCRFD/UltraFace detectors, alignment, anti-spoof) | `crates/pond-adapters-face-onnx/` |
+| Matcher and storage (`SqliteFaceRecognition`) | `crates/pond-infra/src/sqlite_face_recognition.rs` |
+| Ports | `crates/pond-core/src/user_data/ports/face_{recognition,detector,embedding_extractor}.rs` |
+| Wiring and thresholds (`build_face_recognition`, `apply_face_recognition_defaults`) | `crates/pond-server/src/main.rs` |
+| Model download (`download_face_models`) | `crates/pond-server/src/model_download.rs` |
+| REST handlers and burst liveness | `crates/pond-api/src/routes.rs` |
+| Desktop screen | `pond-desktop/src/sections/Faces.tsx` (Manage drawer → Faces) |
 
 ---
 
-## Model Stack
-
-Each slot has a **preferred** model + a **fallback** model.  The auto-downloader
-on first server boot fetches both; `build_face_recognition` then prefers the
-new files when present and falls back transparently when not.
-
-| Slot          | Preferred (default download)              | Fallback                       | Notes |
-| ------------- | ----------------------------------------- | ------------------------------ | ----- |
-| Embedder      | **Glint-R100** (~261 MB, 512-d)           | ArcFace R50 from buffalo_l     | Drop-in replacement: same 112×112 input, same matcher math, same threshold table. Glint-R100 is the deeper backbone trained on the cleaned Glint360K corpus → +0.3-0.6 % on hard verification benchmarks vs. R50. |
-| Detector      | **SCRFD 34G GNKPS** (~39 MB)              | SCRFD 10G from buffalo_l       | Same 5-point landmark contract Umeyama alignment relies on; deeper backbone catches faces ~30 % smaller pixel-wise. |
-| Anti-spoof #1 | **Silent-Face MiniFASNetV2** (~2 MB)      | Heuristic gate (saturation + highlight + gradient skew) | 3-class softmax `[fake_2D, fake_3D, live]` at 80×80 BGR. The heuristic is dependency-free and runs whenever the ONNX file is absent. |
-| Anti-spoof #2 | **DeepPixBis OULU-NPU** (~13 MB)          | Disabled (Silent-Face runs alone) | 224×224 RGB sigmoid head. Filename heuristic (`OULU_*`, `*deeppixbis*`, `*pixel_supervision*`, `pixbis_*`) auto-selects this variant. Adapter ensembles via `max(spoof_score)` so either model firing rejects the frame. |
-
-### Verified ONNX mirrors (all return 200 at the time of writing)
+## Pipeline
 
 ```
-Glint-R100        https://huggingface.co/immich-app/antelopev2/resolve/main/recognition/model.onnx
-SCRFD 34G GNKPS   https://huggingface.co/immich-app/scrfd_34g_gnkps/resolve/main/detection/model.onnx
-Silent-Face V2    https://huggingface.co/hash-ash/Silent-Face-Anti-Spoofing-ONNX/resolve/main/2.7_80x80_MiniFASNetV2.onnx
-DeepPixBis OULU   https://github.com/ffletcherr/face-recognition-liveness/releases/download/v0.1/OULU_Protocol_2_model_0_0.onnx
-buffalo_l (fallback) https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
+JPEG/PNG frame
+  │
+  ├─ decode
+  ├─ pre-detection auto-exposure      mean luminance < 0.30 → stretch/CLAHE on the 640×640 input
+  ├─ detector                         SCRFD (34G if present, else 10G): bbox + 5-point landmarks
+  │                                   score floor 0.50, or 0.30 on a dim frame; NMS 0.4
+  │                                   else UltraFace (bbox only), else centre-square crop
+  ├─ detection gates                  face ≥ 80×80 px; eye line within 25°; nose between the eyes
+  ├─ Umeyama alignment                5 landmarks → canonical 112×112 ArcFace template
+  ├─ crop auto-exposure               aligned crop still dim → stretch/CLAHE
+  ├─ quality gates                    content variance ≥ 0.006, mean brightness 0.025–0.95,
+  │                                   Laplacian variance ×1000 ≥ 4.0 (blur)
+  ├─ anti-spoof                       spoof = max(Silent-Face V2, DeepPixBis); reject ≥ threshold
+  └─ embedder                         Glint-R100 (or ArcFace R50): 1×3×112×112 → 512 floats, L2-normalised
+        │
+        ├─ ENROL     insert into face_embeddings
+        └─ IDENTIFY  per-profile score = 0.6 × cosine(centroid) + 0.4 × mean(top-3 cosines)
+                     ranked after S-norm (score − 0.5 × mean of other profiles)
+                     identified when: raw score ≥ threshold
+                                  AND margin over runner-up ≥ 0.10
+                                  AND gap to mean of others ≥ 0.08
 ```
 
-If a mirror dies, override at the env layer — no rebuild required:
+### Match threshold
 
-```
-POND_FACE_EMBEDDING_URL      Glint-R100 / AdaFace mirror
-POND_FACE_DETECTOR_URL       SCRFD 34G mirror
-POND_FACE_ANTISPOOF_URL      Silent-Face mirror
-POND_FACE_ANTISPOOF_2_URL    DeepPixBis / secondary PAD mirror
-```
+`build_face_recognition` picks the threshold from what loaded:
+
+| Detector | Threshold |
+|---|---|
+| SCRFD (landmarks, aligned crop) | 0.70 |
+| UltraFace (bbox only) | 0.72 |
+| none (centre-square crop) | 0.85 |
+
+`POND_FACE_MATCH_THRESHOLD` overrides it. With only one enrolled profile the runner-up
+and open-set gates cannot discriminate, so the threshold is raised by
+`POND_FACE_SINGLE_PROFILE_MARGIN` (0.10, capped at 0.99) unless the operator set the
+threshold explicitly. A per-profile override (below) replaces the global threshold for
+that profile. A profile needs `POND_FACE_MIN_SAMPLES` enrolments (default 1) before it
+can be matched.
 
 ---
 
-## On-Disk Layout
+## Models
 
-All models live under the platform data dir, e.g.
-`~/Library/Application Support/goose-in-a-pond/models/face/` on macOS:
+| Slot | Preferred (file) | Fallback (file) | Notes |
+|---|---|---|---|
+| Embedder | Glint-R100 from antelopev2, ~261 MB (`adaface_ir101.onnx`) | ArcFace R50 from buffalo_l (`w600k_r50.onnx`), then a legacy `arcface.onnx` | 112×112 in, 512-d out. The filename is a fixed slot name, not the model's. A path containing `mobilefacenet` loads as MobileFaceNet-128. |
+| Detector | SCRFD 34G GNKPS, ~39 MB (`scrfd_34g.onnx`) | SCRFD 10G from buffalo_l (`scrfd.onnx`), then UltraFace (`ultraface.onnx`, never downloaded) | SCRFD's 5 landmarks drive the alignment. |
+| Anti-spoof 1 | Silent-Face MiniFASNetV2, ~2 MB (`antispoof.onnx`) | dependency-free heuristic (saturation, highlight, gradient skew) | 3-class softmax `[fake_2D, fake_3D, live]` at 80×80. |
+| Anti-spoof 2 | DeepPixBis OULU-NPU, ~13 MB (`OULU_Protocol_2_model_0_0.onnx`) | none (primary runs alone) | 224×224 RGB sigmoid. The filename must stay `OULU_*`: the variant is chosen from it. |
 
-```
-adaface_ir101.onnx              ← preferred embedder (filename kept neutral
-                                  so a future swap to true AdaFace doesn't
-                                  require renaming on disk)
-scrfd_34g.onnx                  ← preferred detector
-antispoof.onnx                  ← Silent-Face V2 (primary PAD)
-OULU_Protocol_2_model_0_0.onnx  ← DeepPixBis (secondary PAD,
-                                  filename triggers variant detection)
-w600k_r50.onnx                  ← buffalo_l ArcFace R50 fallback
-scrfd.onnx                      ← buffalo_l SCRFD 10G fallback
-```
+All files live in `<data_dir>/models/face/`. With the feature on, `serve` (and `setup`)
+downloads any missing preferred file at startup; buffalo_l (~281 MB zip) is fetched
+only when a preferred embedder or detector is still missing afterwards. A failed
+download disables the feature until the files appear; the server still starts.
 
-Embeddings live in SQLite at `<data_dir>/system.db`, table `face_embeddings`:
+Download sources (`model_download.rs`):
 
 ```
-id           TEXT PRIMARY KEY
-profile_id   TEXT  → profiles.id
-embedding    BLOB  (512×f32, L2-normalised, opaque)
-model_dims   INTEGER  (always 512 for ArcFace family)
-created_at   TEXT
+Glint-R100       https://huggingface.co/immich-app/antelopev2/resolve/main/recognition/model.onnx
+SCRFD 34G GNKPS  https://huggingface.co/immich-app/scrfd_34g_gnkps/resolve/main/detection/model.onnx
+Silent-Face V2   https://huggingface.co/hash-ash/Silent-Face-Anti-Spoofing-ONNX/resolve/main/2.7_80x80_MiniFASNetV2.onnx
+                 https://huggingface.co/datasets/giap-mirror/silent-face-anti-spoofing/resolve/main/2.7_80x80_MiniFASNetV2.onnx
+DeepPixBis OULU  https://github.com/ffletcherr/face-recognition-liveness/releases/download/v0.1/OULU_Protocol_2_model_0_0.onnx
+buffalo_l        https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
 ```
+
+`POND_FACE_EMBEDDING_URL`, `POND_FACE_DETECTOR_URL`, `POND_FACE_ANTISPOOF_URL` and
+`POND_FACE_ANTISPOOF_2_URL` replace them. A Hugging Face token is sent when
+`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or `HUGGINGFACE_TOKEN` is set.
+
+The ONNX Runtime library is found by `ensure_onnx_runtime()`: `ORT_DYLIB_PATH`, then
+system locations, then a previously downloaded copy, then an automatic download. If it
+still fails to load, face recognition logs why and stays off.
+
+### Anti-spoof ensemble
+
+The primary model always runs when `antispoof.onnx` exists (the heuristic otherwise).
+The secondary runs when `POND_FACE_ANTISPOOF_PATH_2` is set, which the server does
+itself when `OULU_Protocol_2_model_0_0.onnx` exists. The frame's spoof score is the
+higher of the two, so either model firing rejects it. The secondary sees a looser crop
+(`POND_FACE_ANTISPOOF_SCALE_2`, default 4.0 × the face box).
+
+The threshold (`POND_FACE_ANTISPOOF_THRESHOLD`) defaults to 0.40 for an ONNX model and
+0.65 for the heuristic. `POND_FACE_ANTISPOOF=off` (or `0`, `false`) disables anti-spoof
+entirely.
+
+Each ONNX slot picks its variant (`Variant::SilentFace80` or `Variant::DeepPixBis224`)
+at load: `POND_FACE_ANTISPOOF_VARIANT` / `POND_FACE_ANTISPOOF_2_VARIANT` (`silentface`
+or `deeppixbis`) win; otherwise a basename containing `deeppixbis`, `oulu_protocol`,
+`oulu_npu` or `pixel_supervision`, or starting `pixbis_`, means DeepPixBis; otherwise
+Silent-Face.
+
+### Low light
+
+- **Camera.** The desktop screen requests `getUserMedia` with `exposureMode`,
+  `whiteBalanceMode` and `focusMode` `continuous`, `exposureCompensation: 1.0` and
+  `brightness: 128`, inside `advanced[]` so unsupported constraints are dropped.
+- **Pre-detection.** `ScrfdDetector` brightens the 640×640 input when its mean
+  luminance is below 0.30 (`LOW_LIGHT_TRIGGER`), and lowers its score floor to 0.30
+  (`POND_FACE_SCRFD_LOW_LIGHT_THRESH`) for that frame. The matcher threshold and burst
+  liveness remain the spoof safeguards.
+- **Aligned crop.** The same pass runs again on the 112×112 crop if it is still dim.
+- **Algorithm.** `POND_FACE_AUTO_EXPOSURE_MODE=stretch` (default: per-channel 2–98
+  percentile linear stretch, about 0.2 ms) or `clahe` (8×8 tiles, clip limit 4, about
+  3 ms, better for mixed lighting). `POND_FACE_AUTO_EXPOSURE=off` disables both passes.
+
+---
+
+## Burst liveness
+
+The desktop captures **5 JPEG frames 400 ms apart** and posts them to
+`/faces/identify-burst`. The server accepts 1 to 12 frames. For 3 or more it computes
+five statistics from the landmarks and embeddings it already has, and each one that
+looks photo-like counts:
+
+| Signal | Photo-like when | Env override (default) |
+|---|---|---|
+| Mean inter-frame embedding cosine | above the ceiling (frozen) | `POND_FACE_LIVENESS_INTER_COS_MAX` (0.9994) |
+| Mean landmark motion | below the floor, px | `POND_FACE_LIVENESS_MOTION_MIN` (0.5) |
+| Differential (non-rigid) landmark motion | below the floor, px | `POND_FACE_LIVENESS_DIFF_MOTION_MIN` (0.60) |
+| Eye-ratio spread | below the floor | `POND_FACE_LIVENESS_EYE_SPREAD_MIN` (0.003) |
+| Face-size spread | below the floor | `POND_FACE_LIVENESS_SIZE_SPREAD_MIN` (0.012) |
+
+Two or more photo-like signals is a **hard reject** (`reason: "liveness_failed"`). One
+marks the burst **suspicious**, which raises the consensus floors below by
+`POND_FACE_BURST_SUSPICIOUS_MARGIN` (0.05). A live person may trip one signal in a still
+moment; a held-up screen typically trips three or more.
+
+A burst that passes liveness is identified only when every face-bearing frame (at least
+two) votes for the same profile, at most `POND_FACE_BURST_NOFACE_BUDGET` (20%) of frames
+had no face, every winning frame scores at least threshold +
+`POND_FACE_BURST_FRAME_MARGIN` (0.10), and their mean scores at least threshold +
+`POND_FACE_BURST_MEAN_MARGIN` (0.12).
 
 ---
 
 ## REST API
 
-All endpoints sit behind the `face-onnx` Cargo feature.  When pond-server is
-built without that feature every endpoint returns `503` with a friendly
-message — the desktop / web UIs surface this as "Face recognition isn't
-turned on yet" rather than a raw 503.
+All routes are under `/api/v1` and need a bearer token like any other route. Without
+the feature, or without a loadable embedder, every one returns
+`503 {"error": "Face recognition is not configured on this server", "hint": …}`,
+except `/faces/models`, which reports `feature_enabled: false`.
 
-### `POST /api/v1/faces/register`
+| Route | Does |
+|---|---|
+| `POST /faces/register` | Multipart `profile_id`, `image`, optional `bbox=x,y,w,h`. Enrols one sample. 404 for an unknown profile, 422 when a gate rejects the frame. Returns `{id, profile_id, model_dims, created_at}`. |
+| `POST /faces/identify` | Multipart `image`, optional `bbox`. Single frame, no liveness: a photo can pass. Returns `{identified, profile_id, confidence, threshold}`. |
+| `POST /faces/identify-burst` | Multipart `image` repeated, optional `bbox`. See below. |
+| `POST /faces/enroll-quality` | Multipart `image`, optional `profile_id`. Dry run: `{ok, reason, matches_existing, matched_profile, confidence, existing_samples, recommended_min_samples, self_consistency, alignment_with_existing, consistency_warning, …}`. Nothing is stored. |
+| `GET /faces/profile/{profile_id}` | `{profile_id, enrollments: [{id, profile_id, model_dims, created_at}], count}`. Never the vectors. |
+| `GET` / `PUT` / `DELETE /faces/profile/{profile_id}/threshold` | Per-profile threshold override. `PUT` body `{threshold: 0.0–1.0, note?}`. |
+| `GET /faces/models` | `{feature_enabled, models_dir, models: [{name, label, role, expected_mb, size_mb, downloaded, path}]}` for the six files above. |
+| `GET /faces/debug/pairwise` | Cosine matrix across every enrolment, with a verdict on embedding collapse. |
+| `GET /faces/debug/eval` | False-accept / false-reject rates across thresholds on the enrolled data. |
+| `DELETE /users/{profile_id}/biometrics` | Deletes every embedding for the profile. Deleting the profile does the same (`ON DELETE CASCADE`). |
 
-Multipart form: `profile_id`, `image` (JPEG/PNG), optional `bbox=x,y,w,h`.
+`/faces/identify-burst` answers a liveness failure with
+`{identified: false, reason: "liveness_failed", liveness, frames_total, no_face_frames, per_frame}`,
+and otherwise with
+`{identified, profile_id, candidate_profile, mean_confidence, votes, frames_total, frames_required, no_face_frames, threshold, suspicious, liveness, per_frame}`.
+`liveness` is `{hard_reject, suspicious, mean_inter_cos, landmark_motion, eye_ratio_spread, differential_motion}`
+(null for fewer than 3 frames). `candidate_profile` names the near-miss when
+`identified` is false.
 
-```json
-{
-  "id":         "f1a3…",
-  "profile_id": "550e8400-…",
-  "model_dims": 512,
-  "created_at": "2026-04-26T05:11:32Z"
-}
-```
+Nothing in the desktop calls `/faces/enroll-quality` or `/faces/models`. Note that
+`enroll-quality` reports `recommended_min_samples` with a default of 3, while the
+matcher's `POND_FACE_MIN_SAMPLES` defaults to 1.
 
-### `POST /api/v1/faces/identify` (legacy single-frame)
+A development page at `http://127.0.0.1:<port>/dev/face` (loopback dashboard listener
+only) drives the same routes from a browser. It sends no bearer token, so its calls are
+refused unless the server runs with `POND_DEV_ALLOW_LOOPBACK=1`.
 
-Multipart `image` (+ optional `bbox`).  Vulnerable to photo attacks (no
-multi-frame liveness signal) — kept for API callers who already integrate
-against it.  **Do not use from new UI flows; use `/identify-burst`.**
+### Storage
 
-```json
-{
-  "identified": true,
-  "profile_id": "550e8400-…",
-  "confidence": 0.81,
-  "threshold":  0.62
-}
-```
-
-### `POST /api/v1/faces/identify-burst` (production verification)
-
-Multipart `image` repeated 5×, optional `bbox`.  Runs the burst-liveness
-gates listed in the pipeline diagram above.  Returns the same envelope as
-`/identify` plus, on a still-image attack:
-
-```json
-{
-  "identified": false,
-  "profile_id": null,
-  "confidence": 0.0,
-  "threshold":  0.62,
-  "reason":     "liveness_failed",
-  "liveness": {
-    "hard_reject":      true,
-    "suspicious":       false,
-    "mean_inter_cos":   0.99971,
-    "landmark_motion":  0.32,
-    "eye_ratio_spread": 0.0011,
-    "differential_motion": 0.18,
-    "face_size_spread": 0.004
-  }
-}
-```
-
-### `GET /api/v1/faces/profile/{profile_id}`
-
-Lists enrolment metadata (id, dims, created_at) for a profile.  No raw
-embeddings; the BLOB stays server-side.
-
-### `DELETE /api/v1/users/{profile_id}/biometrics`
-
-Wipes every face embedding for a profile.
-
-### `POST /api/v1/faces/enroll-quality`
-
-Pre-flight quality check for a single frame (no persistence).  Returns the
-same gate results an enrolment would hit, plus a numeric quality score.
-The desktop / web wizards call this between captures to nudge the user
-("good lighting", "hold still").
-
-### `POST /api/v1/faces/identify-burst` (per-profile threshold override)
-
-When migration `0014` has set a per-profile threshold (used for users with
-distinctive faces or restricted access), the server uses that override
-instead of `DEFAULT_MATCH_THRESHOLD`.  Read / set / clear via:
+`<data_dir>/pond_system.db`:
 
 ```
-GET    /api/v1/faces/profile/{profile_id}/threshold
-PUT    /api/v1/faces/profile/{profile_id}/threshold
-DELETE /api/v1/faces/profile/{profile_id}/threshold
+face_embeddings            (migration 0013)
+  id          TEXT PRIMARY KEY
+  profile_id  TEXT NOT NULL → profiles(id) ON DELETE CASCADE
+  embedding   BLOB NOT NULL     packed little-endian f32, model_dims × 4 bytes
+  model_dims  INTEGER NOT NULL  512 for the ArcFace family
+  model_name  TEXT              "arcface-512" or "mobilefacenet-128"
+  created_at  TEXT
+
+face_profile_thresholds    (migration 0014)
+  profile_id, match_threshold, note, updated_at
 ```
 
-### `GET /api/v1/faces/models`
-
-Read-only status of the four model files on disk.  Drives the Face
-Recognition card on both Models pages.
-
-```json
-{
-  "feature_enabled": true,
-  "models_dir": "/Users/.../models/face",
-  "models": [
-    { "name": "adaface_ir101.onnx",            "label": "AdaFace IR-101 (preferred)", "role": "embedding", "expected_mb": 250, "size_mb": 248, "downloaded": true,  "path": "…" },
-    { "name": "w600k_r50.onnx",                "label": "ArcFace R50 (fallback)",     "role": "embedding", "expected_mb": 174, "size_mb": 174, "downloaded": true,  "path": "…" },
-    { "name": "scrfd_34g.onnx",                "label": "SCRFD 34G (preferred)",      "role": "detector",  "expected_mb": 140, "size_mb": 38,  "downloaded": true,  "path": "…" },
-    { "name": "scrfd.onnx",                    "label": "SCRFD 10G (fallback)",       "role": "detector",  "expected_mb": 17,  "size_mb": 16,  "downloaded": true,  "path": "…" },
-    { "name": "antispoof.onnx",                "label": "Silent-Face V2 (primary PAD)",       "role": "antispoof", "expected_mb": 2,   "size_mb": 2,   "downloaded": true,  "path": "…" },
-    { "name": "OULU_Protocol_2_model_0_0.onnx","label": "DeepPixBis OULU-NPU (secondary PAD)","role": "antispoof", "expected_mb": 13,  "size_mb": 12,  "downloaded": true,  "path": "…" }
-  ]
-}
-```
+Identification compares only rows whose `model_dims` matches the loaded embedder.
 
 ---
 
-## Anti-Spoof Ensemble
+## Desktop: the Faces screen
 
-```
-              aligned 112×112 RGB crop  +  loose-crop full frame
-                            │
-                            ▼
-        ┌─────────────────────────────────────────────────────────┐
-        │   Silent-Face V2  (primary PAD, always runs)            │
-        │   80×80 BGR  →  softmax [fake_2D, fake_3D, live]        │
-        │   spoof_score = 1 - p(live)                             │
-        └─────────────────────────┬───────────────────────────────┘
-                                  │
-                                  │  (when secondary file is present)
-                                  ▼
-        ┌─────────────────────────────────────────────────────────┐
-        │   DeepPixBis OULU-NPU (secondary PAD)                   │
-        │   224×224 RGB  →  sigmoid output_binary ∈ [0, 1]        │
-        │   spoof_score = 1 - p_live                              │
-        │   (filename heuristic auto-selects this variant)        │
-        └─────────────────────────┬───────────────────────────────┘
-                                  │
-                                  ▼
-                    spoof = max(primary, secondary)
-                                  │
-                                  ▼
-                    spoof ≥ POND_FACE_ANTISPOOF_THRESHOLD?
-                            │            │
-                            ▼            ▼
-                      reject frame   pass to embedder
-```
+Manage drawer → **Faces**. A webcam preview with a crop guide, a profile selector
+(from `/api/v1/profiles`), the profile's sample count, and three actions:
 
-`POND_FACE_ANTISPOOF_THRESHOLD` defaults to 0.40 for the ONNX path
-(calibrated probability) and 0.65 for the heuristic fallback path
-(uncalibrated score).
+| Action | Calls | Shows |
+|---|---|---|
+| Enroll sample | `POST /faces/register` with one frame | "Sample n of 3 saved — capture …" until three, then that the profile is ready |
+| Identify face | `POST /faces/identify-burst` with 5 frames | "Welcome back, <name>!", a liveness refusal ("Photos and phone screens won't work"), or that the face is not recognised |
+| Delete biometrics | inline confirmation, then `DELETE /users/{id}/biometrics` | the count dropping to zero |
 
-The `OnnxAntispoof` adapter holds a `Variant` enum (`SilentFace80` /
-`DeepPixBis224`) detected at session-init time:
-
-1. Env override wins: `POND_FACE_ANTISPOOF_VARIANT` /
-   `POND_FACE_ANTISPOOF_2_VARIANT` accept `silentface` or `deeppixbis`.
-2. Otherwise the basename is sniffed: any of `deeppixbis`, `oulu_protocol`,
-   `oulu_npu`, `pixel_supervision`, or `pixbis_` ⇒ DeepPixBis.
-3. Default ⇒ Silent-Face.
+A 503 shows "Face recognition isn't turned on yet" and disables the actions; other
+failures show a plain sentence, never a raw status code.
 
 ---
 
-## Burst Liveness — How Photos Get Rejected
-
-The burst endpoint captures **5 frames at ~400 ms intervals** and computes
-five per-burst statistics that separate live faces from re-imaged photos /
-phone-screen replays.  Hard-reject fires when **any two** of these
-photo-like signals trip:
-
-| Signal                  | Live face          | Photo / replay       | Floor (env-overridable)               |
-| ----------------------- | ------------------ | -------------------- | ------------------------------------- |
-| Inter-frame cosine      | 0.997 — 0.9992     | > 0.9995 (frozen)    | `POND_FACE_LIVENESS_INTER_COS_MAX = 0.9994` |
-| Landmark motion         | 2 – 15 px         | < 0.5 px             | `POND_FACE_LIVENESS_MOTION_MIN = 0.5` |
-| Differential motion     | ≥ 0.4 px / pair    | ≈ 0 (rigid translate)| `POND_FACE_LIVENESS_DIFF_MOTION_MIN = 0.60` |
-| Eye-ratio spread        | 0.03 — 0.20        | < 0.003              | `POND_FACE_LIVENESS_EYE_SPREAD_MIN = 0.003` |
-| Face-size variation     | 1.5 — 6 %          | < 1.2 %              | `POND_FACE_LIVENESS_SIZE_SPREAD_MIN = 0.012` |
-
-A live person briefly satisfying one of these (e.g. a still moment between
-blinks) is fine — the "any two" rule keeps real users from being
-false-rejected.  A held-up phone screen typically trips three or more.
-
----
-
-## Low-Light Defence
-
-Recognition under poor lighting is a layered problem.  The defence is
-applied in the order most likely to make a single frame succeed:
-
-### Layer 1 — Webcam ISP (sensor-level correction)
-
-The desktop and web Faces UIs request a `getUserMedia` stream with:
-
-```
-exposureMode:         "continuous"
-exposureCompensation: 1.0     // +1 EV brighter
-brightness:           128
-whiteBalanceMode:     "continuous"
-focusMode:            "continuous"
-```
-
-These are placed in `advanced[]` so any constraint the camera doesn't
-support is silently dropped.  When the camera does support them (most
-laptop webcams do), the ISP applies longer exposure + higher analog gain
-at the sensor level — far more effective than anything we can do in
-software because the data the JS pipeline ever sees is already brightened.
-
-### Layer 2 — Pre-detection auto-exposure (full-frame)
-
-Inside `ScrfdDetector::detect_face`, the 640×640 detector tensor is
-brightened **before** SCRFD looks for faces, when its mean luminance is
-< `LOW_LIGHT_TRIGGER` (0.30).  Without this, SCRFD's confidence on a
-dim face drops below its detection threshold and the embedder never sees
-the frame.
-
-### Layer 3 — Adaptive SCRFD threshold
-
-When the same-frame mean luminance is below the trigger, the detector's
-score floor drops from `0.50` (configured) to `0.30` (env-overridable via
-`POND_FACE_SCRFD_LOW_LIGHT_THRESH`).  SCRFD's confidence drops uniformly
-on dim faces, so this admits the slightly-less-confident detections that
-correspond to genuine users while the matcher threshold + burst-liveness
-gates remain the real spoof safeguards.
-
-### Layer 4 — Embedder-side auto-exposure (aligned crop)
-
-After Umeyama alignment to the canonical 112×112 template, if the crop
-itself is still dim the same auto-exposure pass fires on the aligned
-crop before normalisation.  Helps when the detector worked but the
-recovered face region is still in shadow.
-
-### Layer 5 — Brightness gate floor
-
-`MIN_MEAN_BRIGHTNESS` is `0.025` (was `0.05`).  With layers 1-4 already
-brightening real-user inputs, this floor only catches genuine dark frames
-(lens cap, no light at all).
-
-### Auto-exposure algorithm
-
-Two implementations available, dispatched by `POND_FACE_AUTO_EXPOSURE_MODE`:
-
-```
-stretch  (default)   per-channel 2-98 percentile linear stretch
-                     ~0.2 ms; preserves global tonality; best for
-                     uniformly-dim scenes
-
-clahe                Contrast Limited Adaptive Histogram Equalisation
-                     8×8 tiles, 4× clip-limit, bilinearly-interpolated
-                     CDFs per channel
-                     ~3 ms; recovers face detail in mixed-lighting
-                     scenes (one bright window + dim corners) far
-                     better than `stretch`
-```
-
-Disable the whole layer with `POND_FACE_AUTO_EXPOSURE=off`.
-
----
-
-## UI Flows
-
-### Desktop — `Faces` section (CONFIGURE group)
-
-1. Webcam preview with a centred crop guide.
-2. Profile selector (loaded from `/api/v1/profiles`).
-3. Three actions:
-   - **Enrol sample** — captures one frame, POSTs `/faces/register`,
-     reports the running count ("Sample 2 of 3 saved — capture 1 more
-     from a slightly different angle for best accuracy").
-   - **Identify face** — captures a 5-frame burst, POSTs
-     `/identify-burst`, surfaces the result as either "Welcome back, X"
-     or "We couldn't confirm a real, live face" (liveness failure) or
-     "No matching profile found".
-   - **Delete biometrics** — opens an inline confirmation panel (the
-     the WebView ignores the browser `confirm()` dialog), then POSTs
-     `DELETE /users/{id}/biometrics`.
-
-### Web — `/faces` page
-
-Same three actions over the same endpoints, plus an optional **Step 9 —
-Face** in the onboarding wizard that captures three enrolment frames
-against the primary profile created in Step 1.  Skipping is always
-allowed — face recognition is an enhancement, not a gate.
-
-### Both UIs — friendly status messages
-
-| Situation             | Message                                                                                                   |
-| --------------------- | --------------------------------------------------------------------------------------------------------- |
-| Match found           | "Welcome back, 🦆 jerry! 👋"                                                                              |
-| Liveness failed       | "We couldn't confirm a real, live face in front of the camera. Photos and phone screens won't work…"     |
-| No match              | "No matching profile found" + lighting / enrolment hint                                                   |
-| Sample saved          | "Sample 2 of 3 saved — capture 1 more from a slightly different angle for best accuracy."                |
-| Camera not ready      | "The camera isn't sending video yet. Give it a moment, then try again."                                   |
-| Server feature off    | "Face recognition isn't turned on yet. Ask whoever set up Goose for you to rebuild the server with face support enabled." |
-
-Raw HTTP status codes / fetch errors are logged to the dev console,
-never shown to the user.
-
----
-
-## Configuration Reference
-
-All env vars are optional.  Defaults are chosen to work on a fresh macOS
-dev install with `cargo run -p pond-server --features face-onnx -- serve --native`.
-
-### Model discovery / download
-
-| Env var                          | Purpose                                                       | Default                     |
-| -------------------------------- | ------------------------------------------------------------- | --------------------------- |
-| `POND_FACE_MODEL_PATH`           | Embedder ONNX path                                            | adaface → arcface fallback  |
-| `POND_FACE_SCRFD_PATH`           | SCRFD detector ONNX path                                      | 34G → 10G fallback          |
-| `POND_FACE_DETECTOR_PATH`        | UltraFace fallback path (legacy)                              | `models/face/ultraface.onnx`|
-| `POND_FACE_ANTISPOOF_PATH`       | Primary anti-spoof ONNX path                                  | `models/face/antispoof.onnx`|
-| `POND_FACE_ANTISPOOF_PATH_2`     | Secondary anti-spoof ONNX path (auto-set when file on disk)   | unset                       |
-| `POND_FACE_EMBEDDING_URL`        | Override embedder download URL                                | Glint-R100 mirror           |
-| `POND_FACE_DETECTOR_URL`         | Override SCRFD-34G download URL                               | immich-app mirror           |
-| `POND_FACE_ANTISPOOF_URL`        | Override Silent-Face download URL                             | hash-ash mirror             |
-| `POND_FACE_ANTISPOOF_2_URL`      | Override DeepPixBis download URL                              | ffletcherr release          |
-| `HF_TOKEN`                       | Hugging Face access token for gated downloads                 | unset                       |
-
-### Embedder
-
-| Env var                          | Purpose                                                       | Default |
-| -------------------------------- | ------------------------------------------------------------- | ------- |
-| `POND_FACE_EMBED_CHANNEL_ORDER`  | `rgb` (default) or `bgr` for non-canonical exports            | `rgb`   |
-| `POND_FACE_AUTO_EXPOSURE`        | `off` to disable all auto-exposure passes                     | enabled |
-| `POND_FACE_AUTO_EXPOSURE_MODE`   | `stretch` or `clahe` algorithm                                | stretch |
-
-### Anti-spoof
-
-| Env var                                | Purpose                                                | Default |
-| -------------------------------------- | ------------------------------------------------------ | ------- |
-| `POND_FACE_ANTISPOOF_THRESHOLD`        | Spoof-score reject threshold                          | 0.40 (ONNX) / 0.65 (heuristic) |
-| `POND_FACE_ANTISPOOF_LIVE_INDEX`       | Slot index of "live" class in softmax output          | 2 (Silent-Face V2)             |
-| `POND_FACE_ANTISPOOF_PIXEL_SCALE`      | `unit` ([0,1]) or `raw` ([0,255]) input to PAD model  | unit                           |
-| `POND_FACE_ANTISPOOF_VARIANT`          | Force `silentface` or `deeppixbis` variant for primary | filename heuristic            |
-| `POND_FACE_ANTISPOOF_2_VARIANT`        | Same for secondary                                     | filename heuristic            |
-| `POND_FACE_ANTISPOOF_SCALE_2`          | Loose-crop scale for secondary PAD                    | 4.0                           |
-
-### Detector (low-light tuning)
-
-| Env var                                | Purpose                                                | Default |
-| -------------------------------------- | ------------------------------------------------------ | ------- |
-| `POND_FACE_SCRFD_LOW_LIGHT_THRESH`     | Detection score floor when frame is dim                | 0.30    |
-
-### Burst liveness
-
-| Env var                                | Purpose                                          | Default |
-| -------------------------------------- | ------------------------------------------------ | ------- |
-| `POND_FACE_LIVENESS_DIFF_MOTION_MIN`   | Differential landmark motion floor (px)          | 0.60    |
-| `POND_FACE_LIVENESS_MOTION_MIN`        | Mean landmark motion floor (px)                  | 0.50    |
-| `POND_FACE_LIVENESS_EYE_SPREAD_MIN`    | Eye-ratio spread floor                           | 0.003   |
-| `POND_FACE_LIVENESS_SIZE_SPREAD_MIN`   | Inter-eye size spread floor                      | 0.012   |
-| `POND_FACE_LIVENESS_INTER_COS_MAX`     | Inter-frame cosine ceiling (frozen embedding)    | 0.9994  |
-
-### Matcher
-
-| Env var                          | Purpose                                                       | Default |
-| -------------------------------- | ------------------------------------------------------------- | ------- |
-| `POND_FACE_MATCH_THRESHOLD`      | Cosine threshold for identification                           | 0.62 / 0.70 (model-dependent) |
-| `POND_FACE_RUNNER_UP_MARGIN`     | Required gap between top-1 and top-2 candidates               | 0.08    |
-| `POND_FACE_OPEN_SET_GAP`         | Open-set gap-to-mean rejection floor                          | 0.06    |
-| `POND_FACE_MIN_SAMPLES`          | Minimum enrolments before a profile is identifiable           | 3       |
-
----
-
-## Build & Run
+## Running it
 
 ```bash
-# One-line dev launch (starts pond-server + spawns the desktop window; macOS)
-cargo run -p pond-server --features face-onnx -- serve --native
+cargo run -p pond-server --features face-onnx -- serve            # add --native to open the macOS app
 ```
 
-The first boot downloads the model files (preferred + fallback ≈ 700 MB
-total) into `<data_dir>/models/face/`.  Subsequent boots use the cached
-files; download lines are replaced by `✅ … already present` in the log.
-
-To verify each layer is firing, watch the boot log for:
+`scripts/dev.sh` builds with `face-onnx` unless `NO_FACE=1`. The first start downloads
+the models into `<data_dir>/models/face/`; later starts print that each is already
+present. The startup log shows what loaded:
 
 ```
 INFO pond_adapters_face_onnx: face embedding ONNX model loaded model=ArcFace512 path=…/adaface_ir101.onnx
 INFO pond_adapters_face_onnx::scrfd: SCRFD detector loaded path=…/scrfd_34g.onnx
-INFO pond_adapters_face_onnx: anti-spoof ONNX model loaded variant=SilentFace80 path=…/antispoof.onnx
-INFO pond_adapters_face_onnx: anti-spoof ONNX model loaded variant=DeepPixBis224 path=…/OULU_Protocol_2_model_0_0.onnx
+INFO pond_adapters_face_onnx::antispoof_onnx: anti-spoof ONNX model loaded variant=SilentFace80 path=…/antispoof.onnx
+INFO pond_adapters_face_onnx::antispoof_onnx: anti-spoof ONNX model loaded variant=DeepPixBis224 path=…/OULU_Protocol_2_model_0_0.onnx
 INFO pond_server: SCRFD face detector loaded from … — landmark alignment enabled
 INFO pond_server: face recognition enabled (model=ArcFace512, threshold=0.7, aligned=true)
 ```
 
-The two `anti-spoof ONNX model loaded` lines with **different `variant=`
-values** are the proof the ensemble is wired.
+Two `anti-spoof ONNX model loaded` lines with different `variant=` values show the
+ensemble is wired. Every identification logs a `face identify decision` line at INFO
+with the score, margins and which gates passed.
+
+Use `/faces/debug/pairwise` to check enrolment quality, and `/faces/debug/eval` after
+changing thresholds to see the false-accept / false-reject trade-off on the household's
+own data.
 
 ---
 
-## Diagnostics
+## Configuration reference
 
-```
-GET /api/v1/faces/debug/pairwise          Cross-sample cosine matrix per profile
-GET /api/v1/faces/debug/eval              ROC-style calibration harness
-```
+Every variable is optional. `pond-server` sets the starred ones itself when they are
+unset.
 
-Use `pairwise` to verify enrolment quality (within-profile pairs should
-average ≥ 0.85, cross-profile ≤ 0.50).  Use `eval` after tuning thresholds
-to check the false-accept / false-reject curve on the user's own data.
+| Variable | Default | Effect |
+|---|---|---|
+| `POND_FACE_MODEL_PATH` | Glint-R100 → R50 → `arcface.onnx` | Embedder file |
+| `POND_FACE_SCRFD_PATH` | `scrfd_34g.onnx` → `scrfd.onnx` | SCRFD file |
+| `POND_FACE_DETECTOR_PATH` | `ultraface.onnx` | UltraFace fallback file |
+| `POND_FACE_ANTISPOOF_PATH`\* | `antispoof.onnx` when present | Primary anti-spoof file |
+| `POND_FACE_ANTISPOOF_PATH_2`\* | `OULU_Protocol_2_model_0_0.onnx` when present | Secondary anti-spoof file |
+| `POND_FACE_EMBEDDING_URL`, `POND_FACE_DETECTOR_URL`, `POND_FACE_ANTISPOOF_URL`, `POND_FACE_ANTISPOOF_2_URL` | sources above | Download URLs |
+| `POND_FACE_EMBED_CHANNEL_ORDER` | `rgb` | `bgr` for non-canonical exports |
+| `POND_FACE_AUTO_EXPOSURE` | on | `off` disables both auto-exposure passes |
+| `POND_FACE_AUTO_EXPOSURE_MODE` | `stretch` | or `clahe` |
+| `POND_FACE_SCRFD_LOW_LIGHT_THRESH` | 0.30 | SCRFD score floor on dim frames |
+| `POND_FACE_ANTISPOOF` | on | `off`, `0` or `false` disables anti-spoof |
+| `POND_FACE_ANTISPOOF_THRESHOLD` | 0.40 ONNX / 0.65 heuristic | Spoof-score reject threshold |
+| `POND_FACE_ANTISPOOF_LIVE_INDEX`\* | 2 | Softmax slot of the "live" class |
+| `POND_FACE_ANTISPOOF_PIXEL_SCALE`\* | `unit` | `unit` ([0,1]) or `raw` ([0,255]) model input |
+| `POND_FACE_ANTISPOOF_VARIANT`, `POND_FACE_ANTISPOOF_2_VARIANT` | from filename | `silentface` or `deeppixbis` |
+| `POND_FACE_ANTISPOOF_SCALE_2` | 4.0 | Secondary model's crop scale |
+| `POND_FACE_MATCH_THRESHOLD` | by detector (0.70 / 0.72 / 0.85) | Cosine threshold |
+| `POND_FACE_SINGLE_PROFILE_MARGIN` | 0.10 | Added to the threshold with one enrolled profile |
+| `POND_FACE_RUNNER_UP_MARGIN` | 0.10 | Required S-normed gap to the runner-up |
+| `POND_FACE_OPEN_SET_GAP` | 0.08 | Required S-normed gap to the mean of the others |
+| `POND_FACE_MIN_SAMPLES` | 1 | Enrolments before a profile can match |
+| `POND_FACE_LIVENESS_*` | see [Burst liveness](#burst-liveness) | Liveness floors and ceiling |
+| `POND_FACE_BURST_FRAME_MARGIN`, `_MEAN_MARGIN`, `_SUSPICIOUS_MARGIN`, `_NOFACE_BUDGET` | 0.10, 0.12, 0.05, 0.20 | Burst consensus |
 
 ---
 
 ## Privacy
 
-- No raw frames are persisted to disk.  Embeddings are 512 × float32 = 2 KB
-  per enrolment, stored as opaque `BLOB`s in the local SQLite database.
-- Embeddings cannot be reversed back into an image — they are an
-  identification fingerprint, not a likeness.
-- `DELETE /users/{profile_id}/biometrics` removes every embedding for a
-  profile irreversibly (the desktop UI surfaces this as a destructive
-  inline confirmation panel; the web UI uses `confirm()`).
-- All processing is on-device.  The auto-downloader is the only network
-  egress, and only the once-per-install model fetches from the URLs
-  listed above.
+- No frame is written to disk. An enrolment is 512 × f32 (2 KB) in the local database.
+- An embedding is an identification fingerprint, not an image, though it is still
+  biometric data and is treated as such.
+- `DELETE /users/{profile_id}/biometrics`, or deleting the profile, removes every
+  embedding for it.
+- Processing is on-device. The only network traffic is the model and ONNX Runtime
+  downloads.
