@@ -1,5 +1,10 @@
 # Knowledge tools for small models
 
+> Status (2026-10-23): `search_web` (E6, E7) shipped, merged to main 2026-10-16. The `look_up` and
+> `calculate` redesign this bench measured is not built: the pond still serves `get_wikipedia_article`
+> and `compute_answer` (`crates/pond-mcp-server/src/knowledge.rs`, `wolfram.rs`), and `compute_answer`
+> is now withheld from a turn when no Wolfram AppID is stored.
+
 A standalone bench. It replays GIAP's **real** prompt: the system prompt, user-turn envelope and
 27-tool array that the provider shim actually sent, captured with `GIAP_CAPTURE_PAYLOAD` from an
 isolated scratch pond on 2026-10-14. It runs the prompt against `llama-server`, swaps **only**

@@ -246,7 +246,7 @@ the choice existed that is signed in to Spotify keeps Spotify: the pond stores t
 
 ## The Electron build
 
-Stock Electron (`^44.4.2`) again, 2026-09-30. castlabs' Electron was only there for the old in-app
+Stock Electron (44, the `electron` entry in `pond-desktop/package.json`) since 2026-09-30. castlabs' Electron was only there for the old in-app
 player, and nothing needs DRM in the app now: the player pages run in the person's browser, which brings
 its own. Its `postinstall`, `scripts/install-electron.mjs`, the two `electron-builder.yml` keys, and the
 Widevine check and pin scripts are gone; the lockfile entry is the one from before the swap. After

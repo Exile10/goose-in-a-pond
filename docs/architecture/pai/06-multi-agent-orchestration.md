@@ -9,8 +9,12 @@ Prerequisites: [PAI-1](./01-identity-and-profile-boundaries.md) (whose data a su
 Verified against code **2026-08-07**, in a checkout with the submodule initialised at
 `29ef609c` (`heads/main`). Every Goose-side claim below was read out of `goose/crates/goose/src/`
 in this tree; the submodule is uninitialized in a fresh clone, so run
-`git submodule update --init --recursive` before re-checking, and note that CI clones the fork
-branch tip directly rather than this SHA.
+`git submodule update --init --recursive` before re-checking (CI checks out the pinned submodule the
+same way).
+
+> Status (2026-10-23): P1-P8 are landed. P4's `context_fraction` shrink reaches only
+> `plan_replay` since 2026-09-11, when goose took back trimming the live conversation; the device hold
+> half is unaffected. Programme summary: [checklist section 0](./00-checklist.md).
 
 > **Read this before implementing any phase.** The 2026-08-07 re-verification found **six**
 > current-state claims in this document that were false, three of which would have made an
@@ -708,7 +712,8 @@ mutation was run.
   rather than by observing the provider. And a subagent's `giap-memory` reads are still unscoped
   at the MCP server, exactly as they are for an Owner's own turn — PAI-1's open gap, not one this
   phase widened.
-- **P4 — LANDED 2026-08-09.** Budget: `context_fraction` reaches `CompactionProfile`, the parent's
+- **P4 — LANDED 2026-08-09.** (Since 2026-09-11 the history shrink reaches only `plan_replay`, because
+  goose trims the live conversation; the device hold is unaffected.) Budget: `context_fraction` reaches `CompactionProfile`, the parent's
   history budget shrinks while a child is live, and the parent's own turns now take the same
   concurrency permit a child does.
 
