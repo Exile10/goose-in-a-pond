@@ -717,6 +717,7 @@ mod tests {
                 profile_context: None,
                 tool_group_allowlist: None,
                 warmup: false,
+                suggestion_context: None,
             })
             .await
             .unwrap();
@@ -739,6 +740,7 @@ mod tests {
                 profile_context: None,
                 tool_group_allowlist: None,
                 warmup: false,
+                suggestion_context: None,
             })
             .await
             .unwrap();
@@ -819,6 +821,7 @@ mod tests {
             profile_context: None,
             tool_group_allowlist: None,
             warmup: false,
+            suggestion_context: None,
         };
         let prompt = agent
             .build_system_prompt(&Settings::default(), &request)

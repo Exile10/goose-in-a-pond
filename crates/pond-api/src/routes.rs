@@ -1589,6 +1589,9 @@ struct ChatRequest {
     /// default to false: voice cancels speculative turns by dropping the socket.
     #[serde(default)]
     resumable: bool,
+    /// Grounding context when this turn was initiated from a suggestion card.
+    #[serde(default)]
+    suggestion_context: Option<pond_core::user_data::domain::suggestion::SuggestionContext>,
 }
 
 /// Non-streaming chat turn; creates the session when `session_id` is absent.
@@ -2751,6 +2754,7 @@ async fn drive_turn(
         profile_context: profile_context_for(state, &turn_scope).await,
         tool_group_allowlist: req.tool_group_allowlist.clone(),
         warmup: false,
+        suggestion_context: req.suggestion_context.clone(),
     };
 
     let mut turn = TurnAccumulator::new(if settings.show_thinking && !req.voice_mode {
@@ -11085,6 +11089,7 @@ async fn agent_chat_stream(
             profile_context: profile_context_for(&state, &turn_scope).await,
             tool_group_allowlist: None,
             warmup: false,
+            suggestion_context: None,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {
@@ -14091,6 +14096,7 @@ async fn list_suggestions(
                 "answered_by": "giap-memory",
                 // Only composed ones are reported back when tapped.
                 "composed": true,
+                "context": c.context(),
             })
         })
         .collect();
@@ -14106,6 +14112,7 @@ async fn list_suggestions(
             "because": s.because,
             "answered_by": s.answered_by,
             "composed": false,
+            "context": s.context,
         }));
     }
 
@@ -14948,6 +14955,7 @@ async fn run_recipe(
         voice_mode: body.voice_mode,
         canvas_mode: body.canvas_mode,
         tool_group_allowlist,
+        suggestion_context: None,
     };
 
     Ok(chat_stream_inner(state, permit, chat_req, device))
