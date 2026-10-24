@@ -240,6 +240,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/commission", post(commission_device))
+        .route("/devices/discovered", get(discover_devices))
         .route("/matter/status", get(matter_status))
         .route(
             "/devices/{id}",
@@ -247,6 +248,11 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
         .route("/devices/{id}/offline", post(device_offline))
+        .route("/rooms", get(list_rooms).post(create_room))
+        .route(
+            "/rooms/{id}",
+            get(get_room).put(rename_room).delete(delete_room),
+        )
         // Private mesh: trust-circle peers + self invite.
         .route("/mesh/peers", get(list_mesh_peers).post(add_mesh_peer))
         .route(
@@ -2723,7 +2729,10 @@ async fn drive_turn(
     {
         let is_warming = {
             let w = state.warmup.read().unwrap_or_else(|e| e.into_inner());
-            matches!(w.phase, pond_core::models::ports::agent::WarmupPhase::Warming)
+            matches!(
+                w.phase,
+                pond_core::models::ports::agent::WarmupPhase::Warming
+            )
         };
         if is_warming {
             let status = serde_json::json!({
@@ -4350,7 +4359,7 @@ async fn list_devices(
                 "registered_at": d.registered_at,
                 "last_seen":     d.last_seen,
                 "is_online":     d.is_online,
-                "room":          d.room,
+                "room_id":       d.room_id,
             })
         })
         .collect();
@@ -4382,7 +4391,7 @@ async fn register_device(
             "capabilities":  device.capabilities,
             "registered_at": device.registered_at,
             "is_online":     device.is_online,
-            "room":          device.room,
+            "room_id":       device.room_id,
         })),
     ))
 }
@@ -4452,6 +4461,36 @@ async fn matter_commissioner(
     })
 }
 
+/// `GET /api/v1/devices/discovered` — devices the mDNS probe sees advertising for commissioning,
+/// for the phone to offer as a pick-list. None of this replaces entering a setup code: Matter
+/// never advertises one, so an entry here only helps match a physical device to a code in hand.
+async fn discover_devices(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let commissioner = matter_commissioner(&state).await?;
+    let devices = commissioner.discover().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("{e:#}")})),
+        )
+    })?;
+    let list: Vec<Value> = devices
+        .iter()
+        .map(|d| {
+            json!({
+                "device_identifier": d.device_identifier,
+                "discriminator":     d.discriminator,
+                "vendor_id":         d.vendor_id,
+                "product_id":        d.product_id,
+                "device_type":       d.device_type,
+                "name":              d.name,
+                "addresses":         d.addresses.iter().map(|a| json!({"ip": a.ip, "port": a.port})).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "devices": list })))
+}
+
 /// `POST /api/v1/devices/commission` — bring a Matter device onto the fabric. The optional
 /// `name` becomes its NodeLabel and registry name, so chat can resolve it.
 async fn commission_device(
@@ -4515,7 +4554,7 @@ async fn commission_device(
                 device_type: device.device_type.clone(),
                 hostname: None,
                 capabilities: device.capabilities.clone(),
-                room: None,
+                room_id: None,
             },
         )
         .await
@@ -4758,7 +4797,7 @@ struct UpdateDeviceBody {
     #[serde(default, deserialize_with = "present_field")]
     hostname: Option<Option<String>>,
     #[serde(default, deserialize_with = "present_field")]
-    room: Option<Option<String>>,
+    room_id: Option<Option<String>>,
 }
 
 fn present_field<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -4825,7 +4864,7 @@ async fn update_device(
     let edit = DeviceEdit {
         name: req.name,
         hostname: req.hostname,
-        room: req.room,
+        room_id: req.room_id,
     };
     let update = device_edit::merge(&current, edit).map_err(|e| {
         (
@@ -4853,8 +4892,178 @@ async fn update_device(
         "registered_at": device.registered_at,
         "last_seen":     device.last_seen,
         "is_online":     device.is_online,
-        "room":          device.room,
+        "room_id":       device.room_id,
     })))
+}
+
+// ── Rooms ────────────────────────────────────────────────────────────────
+
+fn room_json(room: &pond_core::user_data::ports::room_registry::Room) -> Value {
+    json!({
+        "id":         room.id,
+        "name":       room.name,
+        "created_at": room.created_at,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct RoomBody {
+    name: String,
+}
+
+/// `GET /api/v1/rooms` — every room the household has named.
+async fn list_rooms(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let rooms = state.room_registry.list_rooms().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(
+        json!({ "rooms": rooms.iter().map(room_json).collect::<Vec<_>>() }),
+    ))
+}
+
+/// `POST /api/v1/rooms` — name a new room, e.g. while placing a freshly-added device.
+async fn create_room(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<RoomBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "a room's name cannot be empty"})),
+        ));
+    }
+    let room = state.room_registry.create(name).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok((StatusCode::CREATED, Json(room_json(&room))))
+}
+
+/// `GET /api/v1/rooms/{id}`.
+async fn get_room(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let room = state
+        .room_registry
+        .get_room(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "room_not_found"})),
+            )
+        })?;
+    Ok(Json(room_json(&room)))
+}
+
+/// `PUT /api/v1/rooms/{id}` — rename a room.
+async fn rename_room(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<RoomBody>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "a room's name cannot be empty"})),
+        ));
+    }
+    state
+        .room_registry
+        .get_room(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "room_not_found"})),
+            )
+        })?;
+    state.room_registry.rename(&id, name).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    let room = state
+        .room_registry
+        .get_room(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "room_not_found"})),
+            )
+        })?;
+    Ok(Json(room_json(&room)))
+}
+
+/// `DELETE /api/v1/rooms/{id}` — refused while any device is still placed in this room.
+async fn delete_room(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    state
+        .room_registry
+        .get_room(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "room_not_found"})),
+            )
+        })?;
+    state
+        .room_registry
+        .delete(&id)
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, Json(json!({"error": e.to_string()}))))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ── Private mesh ─────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@ pub fn may_edit(row: &Device, caller_device: Option<&str>, caller_is_host: bool)
 pub struct DeviceEdit {
     pub name: Option<String>,
     pub hostname: Option<Option<String>>,
-    pub room: Option<Option<String>>,
+    pub room_id: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -48,7 +48,7 @@ pub fn merge(current: &Device, edit: DeviceEdit) -> Result<UpdateDeviceRequest, 
     Ok(UpdateDeviceRequest {
         name,
         hostname: field(edit.hostname, &current.hostname),
-        room: field(edit.room, &current.room),
+        room_id: field(edit.room_id, &current.room_id),
     })
 }
 
@@ -67,7 +67,7 @@ mod tests {
             registered_at: "2026-10-17T00:00:00Z".into(),
             last_seen: None,
             is_online: true,
-            room: Some("Kitchen".into()),
+            room_id: Some("room-kitchen".into()),
         }
     }
 
@@ -121,7 +121,7 @@ mod tests {
         .unwrap();
         assert_eq!(merged.name, "Amina's iPhone");
         assert_eq!(merged.hostname.as_deref(), Some("old-host"));
-        assert_eq!(merged.room.as_deref(), Some("Kitchen"));
+        assert_eq!(merged.room_id.as_deref(), Some("room-kitchen"));
     }
 
     #[test]
@@ -131,13 +131,13 @@ mod tests {
             DeviceEdit {
                 name: None,
                 hostname: Some(None),
-                room: Some(Some("  ".into())),
+                room_id: Some(Some("  ".into())),
             },
         )
         .unwrap();
         assert_eq!(merged.name, "Old");
         assert_eq!(merged.hostname, None);
-        assert_eq!(merged.room, None);
+        assert_eq!(merged.room_id, None);
     }
 
     #[test]

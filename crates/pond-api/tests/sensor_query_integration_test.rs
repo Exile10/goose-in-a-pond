@@ -69,6 +69,7 @@ async fn make_harness() -> Harness {
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
+        room_registry: Arc::new(pond_core::user_data::mocks::mock_room_registry::MockRoomRegistry),
         matter: None,
         peer_directory: Arc::new(
             pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),

@@ -58,6 +58,7 @@ use pond_core::user_data::services::onboarding::OnboardingService;
 use pond_infra::db::Database;
 use pond_infra::onboarding::SqlxOnboardingRepository;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
+use pond_infra::sqlite_room_registry::SqliteRoomRegistry;
 use pond_infra::sqlite_event_log::{SqliteEventLog, SqliteOperationalLog};
 use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use pond_infra::sqlite_mcp_servers::SqliteMcpServerRepository;
@@ -1504,6 +1505,8 @@ async fn run_server(
     let device_registry: Arc<
         dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    let room_registry: Arc<dyn pond_core::user_data::ports::room_registry::RoomRegistry + Send + Sync> =
+        Arc::new(SqliteRoomRegistry::new(db.system.clone()));
     // Deterministic, rule-based redactor (no model in the loop), shared by both chokepoints below.
     let redactor: Arc<dyn pond_core::security::ports::redactor::Redactor> =
         Arc::new(pond_infra::rule_redactor::RuleRedactor::new());
@@ -4239,6 +4242,7 @@ async fn run_server(
         profile_repo,
         matter: matter_runtime.clone(),
         device_registry,
+        room_registry,
         memory_repo,
         embedding_provider,
         // Same handle the repos write through and the sweep repairs; never construct a second one.

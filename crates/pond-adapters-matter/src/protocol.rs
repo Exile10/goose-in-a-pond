@@ -4,6 +4,7 @@
 use crate::client::ControllerCode;
 use chrono::{DateTime, Utc};
 use pond_core::user_data::domain::sensor::SensorReading;
+use pond_core::user_data::ports::device_commissioning::{DiscoveredAddress, DiscoveredDevice};
 use pond_core::user_data::ports::device_control::{
     DeviceDescription, DeviceState, DeviceStatePatch,
 };
@@ -15,7 +16,7 @@ use serde_json::{json, Value};
 pub const PROTOCOL_NAME: &str = "giap-matter";
 
 /// Bump only for changes that break an un-updated controller; the client refuses a mismatch.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ── Greeting ─────────────────────────────────────────────────────────────────
 
@@ -172,7 +173,7 @@ impl WireDevice {
             registered_at: Utc::now().to_rfc3339(),
             last_seen: Some(Utc::now().to_rfc3339()),
             is_online: self.online,
-            room: None,
+            room_id: None,
         }
     }
 }
@@ -236,11 +237,57 @@ pub struct CommissionResult {
     pub device: WireDevice,
 }
 
+/// A discovered-device entry as the controller reports it; field names match
+/// `matter-server/src/protocol.ts`'s `DiscoveredDevice` exactly, so no renaming happens here.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireDiscoveredDevice {
+    pub device_identifier: String,
+    #[serde(default)]
+    pub discriminator: Option<u32>,
+    #[serde(default)]
+    pub vendor_id: Option<u16>,
+    #[serde(default)]
+    pub product_id: Option<u16>,
+    #[serde(default)]
+    pub device_type: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub addresses: Vec<WireDiscoveredAddress>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireDiscoveredAddress {
+    pub ip: String,
+    pub port: u16,
+}
+
+impl WireDiscoveredDevice {
+    pub fn to_discovered_device(&self) -> DiscoveredDevice {
+        DiscoveredDevice {
+            device_identifier: self.device_identifier.clone(),
+            discriminator: self.discriminator,
+            vendor_id: self.vendor_id,
+            product_id: self.product_id,
+            device_type: self.device_type,
+            name: self.name.clone(),
+            addresses: self
+                .addresses
+                .iter()
+                .map(|a| DiscoveredAddress {
+                    ip: a.ip.clone(),
+                    port: a.port,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// The `discover` result.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DiscoverResult {
     #[serde(default)]
-    pub commissionable: u32,
+    pub devices: Vec<WireDiscoveredDevice>,
 }
 
 /// A `log` event: the controller's own structured record, relayed into `tracing`.
@@ -516,7 +563,7 @@ mod tests {
     #[test]
     fn the_greeting_names_a_controller_that_is_not_ours() {
         let ours = check_greeting(
-            r#"{"protocol":"giap-matter","version":1,"fabric_id":1,"matter_js":"0.17.9"}"#,
+            r#"{"protocol":"giap-matter","version":2,"fabric_id":1,"matter_js":"0.17.9"}"#,
         );
         assert!(ours.is_ok());
 
@@ -534,13 +581,13 @@ mod tests {
     #[test]
     fn ble_is_read_when_stated_and_absent_means_no() {
         let with_ble = check_greeting(
-            r#"{"protocol":"giap-matter","version":1,"fabric_id":1,"matter_js":"0.17.9","ble":true}"#,
+            r#"{"protocol":"giap-matter","version":2,"fabric_id":1,"matter_js":"0.17.9","ble":true}"#,
         )
         .unwrap();
         assert!(with_ble.ble);
 
         let older = check_greeting(
-            r#"{"protocol":"giap-matter","version":1,"fabric_id":1,"matter_js":"0.17.9"}"#,
+            r#"{"protocol":"giap-matter","version":2,"fabric_id":1,"matter_js":"0.17.9"}"#,
         )
         .unwrap();
         assert!(!older.ble, "absent must not read as available");
@@ -674,7 +721,7 @@ mod tests {
         assert_eq!(device.capabilities, vec!["power", "fan_speed"]);
         assert!(device.is_online);
         // The controller has no opinion on these, so nothing is invented.
-        assert!(device.room.is_none());
+        assert!(device.room_id.is_none());
         assert!(device.hostname.is_none());
     }
 

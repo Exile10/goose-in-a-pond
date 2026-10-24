@@ -124,7 +124,7 @@ async fn sync_device(
                 device_type: device.device_type.clone(),
                 hostname: None,
                 capabilities: device.capabilities.clone(),
-                room: None,
+                room_id: None,
             };
             match registry.register(request).await {
                 Ok(_) => {

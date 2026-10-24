@@ -58,7 +58,7 @@ impl DeviceRegistry for MockDeviceRegistry {
             registered_at: "2024-01-01 00:00:00".to_string(),
             last_seen: None,
             is_online: false,
-            room: req.room,
+            room_id: req.room_id,
         })
     }
     async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
@@ -145,6 +145,7 @@ async fn make_app_with_provider(
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
+        room_registry: Arc::new(pond_core::user_data::mocks::mock_room_registry::MockRoomRegistry),
         matter: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,

@@ -19,9 +19,9 @@ pub struct Device {
     pub registered_at: String,
     pub last_seen: Option<String>,
     pub is_online: bool,
-    /// Hub UI room ("Kitchen", …); `None` shows under the default "Home" room.
+    /// Id of the `Room` this device is placed in; `None` shows under the default "Home" room.
     #[serde(default)]
-    pub room: Option<String>,
+    pub room_id: Option<String>,
 }
 
 /// Editable fields from the Devices "Configure" UI (name, hostname, room).
@@ -29,7 +29,7 @@ pub struct Device {
 pub struct UpdateDeviceRequest {
     pub name: String,
     pub hostname: Option<String>,
-    pub room: Option<String>,
+    pub room_id: Option<String>,
 }
 
 /// Request to register a new device.
@@ -43,7 +43,7 @@ pub struct RegisterDeviceRequest {
     pub hostname: Option<String>,
     pub capabilities: Vec<String>,
     #[serde(default)]
-    pub room: Option<String>,
+    pub room_id: Option<String>,
 }
 
 /// Driven Port: device lifecycle management.

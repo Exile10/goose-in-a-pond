@@ -74,6 +74,7 @@ use pond_core::user_data::ports::profile::ProfileRepository;
 use pond_core::user_data::ports::prompt_extra::PromptExtraRepository;
 use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
 use pond_core::user_data::ports::recipe::AgentRecipeRepository;
+use pond_core::user_data::ports::room_registry::RoomRegistry;
 use pond_core::user_data::ports::scheduler::SchedulerPort;
 use pond_core::user_data::ports::sensor_storage::SensorStorage;
 use pond_core::user_data::ports::session_storage::SessionStorage;
@@ -123,6 +124,8 @@ pub struct AppState {
     pub profile_repo: Arc<dyn ProfileRepository + Send + Sync>,
     /// Device registry for GOTG devices and other connected hardware.
     pub device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+    /// Rooms the household has named, that devices are placed into.
+    pub room_registry: Arc<dyn RoomRegistry + Send + Sync>,
     /// Matter runtime, reconciled from `matter_enabled`; `None` only where no Matter is wired.
     /// Off is a runtime state, so an unreachable controller never reads as "not enabled".
     pub matter: Option<Arc<dyn pond_core::user_data::ports::matter_runtime::MatterRuntimePort>>,

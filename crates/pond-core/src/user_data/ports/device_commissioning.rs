@@ -24,6 +24,28 @@ pub struct CommissionedDevice {
     pub capabilities: Vec<String>,
 }
 
+/// A device the mDNS probe found advertising for commissioning, not yet on the fabric.
+///
+/// Matter never advertises a setup code over mDNS, so this is a pick-list to help match a
+/// physical device to a code already in hand — `device_identifier` is per-discovery-session, not
+/// a fabric node id, and never enough on its own to commission with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveredDevice {
+    pub device_identifier: String,
+    pub discriminator: Option<u32>,
+    pub vendor_id: Option<u16>,
+    pub product_id: Option<u16>,
+    pub device_type: Option<u32>,
+    pub name: Option<String>,
+    pub addresses: Vec<DiscoveredAddress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveredAddress {
+    pub ip: String,
+    pub port: u16,
+}
+
 /// Parse what the user typed; strictly, since the value is forwarded to the controller.
 pub fn parse_setup_code(raw: &str) -> Result<SetupCode> {
     // Dashes are base-38 QR characters, so only numeric forms (below) strip them.
@@ -131,6 +153,9 @@ pub trait DeviceCommissioningPort: Send + Sync {
 
     /// Remove a node from the fabric; call before deleting, or `start_listening` revives it.
     async fn decommission(&self, node_id: u64) -> Result<()>;
+
+    /// Devices advertising themselves for commissioning right now, for a phone to pick from.
+    async fn discover(&self) -> Result<Vec<DiscoveredDevice>>;
 }
 
 #[cfg(test)]

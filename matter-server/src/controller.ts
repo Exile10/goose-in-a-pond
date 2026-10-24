@@ -3,6 +3,8 @@
 import { Endpoint, Environment, Seconds, ServerNode, type ClientNode } from "@matter/main";
 // Not re-exported by `@matter/main`, which forwards only `@matter/types/datatype`.
 import { QrPairingCodeCodec } from "@matter/types";
+// Not re-exported by `@matter/main` either: only `./behaviors/system/*` carries it.
+import { CommissioningClient } from "@matter/node/behaviors/system/commissioning";
 
 import { log, describeError, setupCodeKind, type SetupCodeKind } from "./log.js";
 import { deviceClusters, nodeToDevice } from "./mapping/devices.js";
@@ -32,6 +34,7 @@ import {
   type DeviceState,
   type ValueSpec,
   type DeviceStatePatch,
+  type DiscoveredDevice,
   type Reading,
 } from "./protocol.js";
 
@@ -234,11 +237,26 @@ export class Controller {
     }
   }
 
-  /** How many devices are advertising themselves for commissioning right now. */
-  async discover(): Promise<number> {
+  /** Devices advertising themselves for commissioning right now. */
+  async discover(): Promise<DiscoveredDevice[]> {
     const discovery = this.#node.peers.discover({ timeout: DISCOVER_TIMEOUT });
     const found = await discovery;
-    return found.length;
+    return found.map(node => {
+      const state = node.stateOf(CommissioningClient);
+      return {
+        device_identifier: state.deviceIdentifier ?? "",
+        // `exactOptionalPropertyTypes` refuses `field: undefined`, so an absent value is omitted.
+        ...(state.discriminator !== undefined && { discriminator: state.discriminator }),
+        ...(state.vendorId !== undefined && { vendor_id: state.vendorId }),
+        ...(state.productId !== undefined && { product_id: state.productId }),
+        ...(state.deviceType !== undefined && { device_type: state.deviceType }),
+        ...(state.deviceName !== undefined && { name: state.deviceName }),
+        // BLE addresses carry no `ip`/`port`; a phone's mDNS-probe pre-flight can't reach those anyway.
+        addresses: (state.addresses ?? []).flatMap(a =>
+          "ip" in a ? [{ ip: a.ip, port: a.port }] : [],
+        ),
+      };
+    });
   }
 
   /** A bare passcode carries no discriminator, so it pairs whatever device is in pairing mode. */
