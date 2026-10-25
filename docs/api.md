@@ -74,7 +74,7 @@ in the host's own browser.
 
 | Credential | How it is sent | Where it comes from |
 |---|---|---|
-| Session token | `Authorization: Bearer <token>` | Pairing (`/handshake/pake/verify`, `/handshake/verify`, `/handshake`), renewed with `/handshake/refresh`. Stored hashed; valid while unrevoked and unexpired (`Handshake::validate_token`, `crates/pond-infra/src/sqlite_handshake.rs`) |
+| Session token | `Authorization: Bearer <token>`. The two camera stream routes, which an `<img>` plays without headers, also take it percent-encoded as `?token=`; no other route does, and the request log redacts it | Pairing (`/handshake/pake/verify`, `/handshake/verify`, `/handshake`), renewed with `/handshake/refresh`. Stored hashed; valid while unrevoked and unexpired (`Handshake::validate_token`, `crates/pond-infra/src/sqlite_handshake.rs`) |
 | Host credential | `X-Pond-Host-Credential: <value>` | 43 random characters the server writes at every start to `<data_dir>/.runtime_host_credential` (mode 0600). Proves the caller can read the pond's data directory. Only the dashboard listener holds it: on the companion listener a route that needs it answers `503 {"error":"host_credential_unavailable"}` |
 | Internal extension token | `Authorization: Bearer <token>` | A per-process value handed to extension subprocesses in `GIAP_INTERNAL_TOKEN` (`oauth_callback::internal_extension_token`). Accepted only by the routes that say so |
 
@@ -344,6 +344,12 @@ The route summary's "Also" column names these.
 | POST | /camera/events | token +onb | | Record a camera event |
 | GET | /camera/events | token +onb | | List camera events |
 | PATCH | /camera/events/{id}/acknowledge | token +onb | | Dismiss a camera alert |
+| GET | /camera/events/{id}/snapshot | token +onb | | The picture saved with a camera event |
+| GET | /cameras | token +onb | | Known cameras, with their snapshot and stream paths |
+| GET | /camera/snapshot | token +onb | | The default camera's latest picture |
+| GET | /camera/{camera_id}/snapshot | token +onb | | A camera's latest picture |
+| GET | /camera/stream | token +onb | | The default camera, live (MJPEG); the token may come as `?token=` |
+| GET | /camera/{camera_id}/stream | token +onb | | A camera, live (MJPEG); the token may come as `?token=` |
 | GET | /rules | token +onb | | Every sensor rule |
 | POST | /rules | token +onb | | Create a sensor rule |
 | GET | /rules/{id} | token +onb | | One rule |

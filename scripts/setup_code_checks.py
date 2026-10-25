@@ -17,6 +17,10 @@
            GET /connections and GET /setup/status answer the claimant's token with every documented
            key, never a caller without one; the claimant may change the network. Nothing is scanned,
            joined or forgotten: the scratch pond drives this host's real Wi-Fi
+  camera-stream
+           the camera streams take the claimant's token percent-encoded in `?token=`, as an
+           `<img>` must send it; the camera catalog, a snapshot and the device list refuse it there
+           and still take it in the header
   reset-wizard
            after a host reset of the pond `card` claimed: its wizard refuses the tokenless host and
            admits the claimant's token (the model list and download progress too, #365),
@@ -36,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 import pond_cpace
@@ -237,6 +242,33 @@ def connections():
               body.get("claimed") is True and body.get("claimed_by_this_device") is True, text[:300])
 
 
+def stream_head(path):
+    """(status, Content-Type) of a GET whose body may never end, read no further than its headers."""
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=15)
+    try:
+        conn.request("GET", "/api/v1" + path)
+        response = conn.getresponse()
+        return response.status, response.getheader("Content-Type")
+    finally:
+        conn.close()
+
+
+def camera_stream():
+    token = json.loads(CLAIMANT.read_text())["session_token"]
+    in_query = "?token=" + urllib.parse.quote(token, safe="")
+    for path in ("/devices", "/cameras", "/camera/camera-1/snapshot"):
+        code, _ = stream_head(path + in_query)
+        check("GET %s refuses the claimant's token in the query" % path, code == 401, str(code))
+    code, _, text, _ = request("GET", "/cameras", None, {"Authorization": "Bearer " + token})
+    check("and GET /cameras takes it in the header", code == 200, "%s %s" % (code, text[:200]))
+    for path in ("/camera/stream", "/camera/camera-1/stream"):
+        code, kind = stream_head(path + in_query)
+        check("GET %s takes the claimant's token in the query" % path,
+              code == 200 and kind == "multipart/x-mixed-replace; boundary=frame", "%s %s" % (code, kind))
+        code, _ = stream_head(path)
+        check("and refuses a caller with no token", code == 401, str(code))
+
+
 def reset_wizard():
     bearer = {"Authorization": "Bearer " + json.loads(CLAIMANT.read_text())["session_token"]}
 
@@ -279,6 +311,6 @@ def reset_wizard():
 if __name__ == "__main__":
     pond_cpace.check_vectors()
     {"card": card, "pairing": pairing, "restart": restart, "voice-sample": voice_sample,
-     "network-status": network_status, "connections": connections,
+     "network-status": network_status, "connections": connections, "camera-stream": camera_stream,
      "reset-wizard": reset_wizard}[sys.argv[1]]()
     sys.exit(1 if FAILURES else 0)
