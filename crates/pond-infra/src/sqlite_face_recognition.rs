@@ -53,8 +53,16 @@ const DEFAULT_MIN_SAMPLES_TO_IDENTIFY: usize = 1;
 /// The winner's normalised score must beat the mean of all others by this much (open-set).
 const DEFAULT_OPEN_SET_GAP_TO_MEAN_MIN: f32 = 0.08;
 
-/// Max eye-line tilt; beyond it embeddings degrade even with alignment.
-const MAX_EYE_TILT_RAD: f32 = 0.436; // ≈ 25°
+/// Default max eye-line tilt off horizontal (approx 60°); Umeyama alignment handles rotation.
+const DEFAULT_MAX_EYE_TILT_RAD: f32 = 1.05; // ≈ 60°
+
+fn max_eye_tilt_rad() -> f32 {
+    std::env::var("POND_FACE_MAX_TILT_DEG")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .map(|deg| deg.to_radians())
+        .unwrap_or(DEFAULT_MAX_EYE_TILT_RAD)
+}
 
 /// Slack, as a fraction of inter-eye distance, for the nose to sit between the eyes' x.
 const NOSE_CENTERING_SLACK: f32 = 0.35;
@@ -257,7 +265,7 @@ fn check_pose_sane(lms: &FaceLandmarks) -> Result<()> {
     } else {
         tilt
     };
-    if tilt_norm > MAX_EYE_TILT_RAD {
+    if tilt_norm > max_eye_tilt_rad() {
         return Err(anyhow!(
             "face too tilted ({:.1}°); hold head level",
             tilt_norm.to_degrees()
@@ -926,13 +934,13 @@ mod tests {
 
     #[test]
     fn pose_gate_rejects_tilted_face() {
-        // 45° tilt — way beyond 25° cutoff.
+        // ~70° tilt — way beyond 60° cutoff.
         let lms = FaceLandmarks {
             left_eye: (40.0, 50.0),
-            right_eye: (80.0, 90.0),
-            nose: (60.0, 70.0),
-            left_mouth: (45.0, 110.0),
-            right_mouth: (75.0, 110.0),
+            right_eye: (80.0, 160.0),
+            nose: (60.0, 105.0),
+            left_mouth: (45.0, 140.0),
+            right_mouth: (75.0, 180.0),
         };
         assert!(check_pose_sane(&lms).is_err());
     }

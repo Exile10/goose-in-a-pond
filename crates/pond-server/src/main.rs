@@ -7704,16 +7704,7 @@ fn build_face_recognition(
         }
     }
 
-    // Safe to auto-enable: the ensemble takes `max(spoof_score)`, so a dud secondary is harmless.
-    if std::env::var_os("POND_FACE_ANTISPOOF_PATH_2").is_none() {
-        let secondary_default = data_dir.join("models/face/OULU_Protocol_2_model_0_0.onnx");
-        if secondary_default.exists() {
-            // SAFETY: single-threaded init phase before any task scheduling.
-            unsafe {
-                std::env::set_var("POND_FACE_ANTISPOOF_PATH_2", secondary_default.as_os_str());
-            }
-        }
-    }
+    // Secondary anti-spoof model (DeepPixBis) is optional and only enabled if explicitly set via env var.
 
     if !model_path.exists() {
         tracing::info!(
