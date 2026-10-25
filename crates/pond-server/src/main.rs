@@ -4615,6 +4615,12 @@ async fn run_server(
         );
     }
 
+    tokio::task::spawn_blocking(|| {
+        if let Err(e) = pond_audio_out::route::play_chime(None) {
+            tracing::debug!(error = %e, "startup chime did not play");
+        }
+    });
+
     if open || (debug && has_display()) {
         let url = format!("http://127.0.0.1:{}", api_port);
         if webbrowser::open(&url).is_err() {

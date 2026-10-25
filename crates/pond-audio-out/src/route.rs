@@ -133,23 +133,106 @@ pub fn open_routed() -> Result<(rodio::OutputStream, rodio::OutputStreamHandle, 
     open_output(output_device().as_deref())
 }
 
-/// Two soft rising notes, a third of a second, for a speaker test the household asked to hear.
+/// A warm jazz Fender Rhodes chord (Ebmaj9) with bell tines, acoustic chorusing,
+/// cabinet filtering, and room bloom.
 pub fn chime_samples(rate: u32) -> Vec<f32> {
-    let note = |freq: f32, ms: u64| -> Vec<f32> {
-        let n = (rate as u64 * ms / 1000) as usize;
-        (0..n)
-            .map(|i| {
-                let t = i as f32 / rate as f32;
-                let p = i as f32 / n as f32;
-                // A short attack keeps it from clicking; the decay keeps it from nagging.
-                let env = (p / 0.1).min(1.0) * (1.0 - p);
-                (2.0 * std::f32::consts::PI * freq * t).sin() * env * 0.4
-            })
-            .collect()
-    };
-    let mut out = note(523.25, 140);
-    out.extend(note(783.99, 200));
-    out
+    let duration_secs = 1.1f32;
+    let total_samples = (rate as f32 * duration_secs) as usize;
+    if total_samples == 0 {
+        return Vec::new();
+    }
+    let mut raw = vec![0.0f32; total_samples];
+
+    // Rolled Ebmaj9 voicing: Eb3, Bb3, G4, D5, F5
+    let notes: [(f32, f32, f32, f32); 5] = [
+        (0.00, 155.56, 0.32, 0.85),
+        (0.04, 233.08, 0.26, 0.80),
+        (0.08, 392.00, 0.24, 0.75),
+        (0.12, 587.33, 0.25, 0.80),
+        (0.16, 698.46, 0.28, 0.85),
+    ];
+
+    for (start_sec, freq, amp, tau) in notes {
+        let start_idx = (start_sec * rate as f32) as usize;
+        let detune = 2.0f32.powf(1.2 / 1200.0);
+        let f1 = freq * detune;
+        let f2 = freq / detune;
+
+        for i in start_idx..total_samples {
+            let t = (i - start_idx) as f32 / rate as f32;
+            let env = (-t / tau).exp();
+            let thud = (-t / 0.015).exp() * 0.20 * (2.0 * std::f32::consts::PI * 95.0 * t).sin();
+            let tine =
+                (-t / 0.035).exp() * 0.18 * (2.0 * std::f32::consts::PI * freq * 4.31 * t).sin();
+            let p1 = 2.0 * std::f32::consts::PI * f1 * t;
+            let p2 = 2.0 * std::f32::consts::PI * f2 * t;
+            let body = 0.5 * p1.sin()
+                + 0.5 * p2.sin()
+                + 0.26 * (2.0 * p1).sin()
+                + 0.08 * (3.0 * p1).sin()
+                + 0.02 * (4.0 * p1).sin();
+            let tremolo = 1.0 + 0.07 * (2.0 * std::f32::consts::PI * 5.0 * t).sin();
+            raw[i] += (body + thud + tine) * amp * env * tremolo;
+        }
+    }
+
+    let mut saturated: Vec<f32> = raw.iter().map(|&x| (x * 1.25).tanh() / 1.25).collect();
+
+    let cutoff = 3400.0f32;
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
+    let dt = 1.0 / rate as f32;
+    let alpha = dt / (rc + dt);
+    let mut prev = 0.0f32;
+    for x in &mut saturated {
+        prev += alpha * (*x - prev);
+        *x = prev;
+    }
+
+    let reverb_mix = 0.20f32;
+    let delays = [
+        (0.029 * rate as f32) as usize,
+        (0.037 * rate as f32) as usize,
+        (0.043 * rate as f32) as usize,
+    ];
+    let extra = (0.35 * rate as f32) as usize;
+    let mut reverb_buf = vec![0.0f32; total_samples + extra];
+    for d in delays {
+        let feedback = 0.60f32;
+        for i in 0..total_samples {
+            if i + d < reverb_buf.len() {
+                reverb_buf[i + d] += saturated[i] * 0.33;
+                if i >= d {
+                    let prev_val = reverb_buf[i];
+                    reverb_buf[i + d] += prev_val * feedback * 0.33;
+                }
+            }
+        }
+    }
+
+    let mut final_out = vec![0.0f32; total_samples];
+    for i in 0..total_samples {
+        final_out[i] = saturated[i] * (1.0 - reverb_mix) + reverb_buf[i] * reverb_mix;
+    }
+
+    let fade_in = (0.010 * rate as f32) as usize;
+    for i in 0..fade_in.min(total_samples) {
+        final_out[i] *= i as f32 / fade_in as f32;
+    }
+    let fade_out = (0.080 * rate as f32) as usize;
+    for i in 0..fade_out.min(total_samples) {
+        let idx = total_samples - 1 - i;
+        final_out[idx] *= i as f32 / fade_out as f32;
+    }
+
+    let peak = final_out.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    if peak > 0.0 {
+        let scale = 0.35 / peak;
+        for x in &mut final_out {
+            *x *= scale;
+        }
+    }
+    final_out[0] = 0.0;
+    final_out
 }
 
 /// Play [`chime_samples`] on `device`, and wait for it to finish.
@@ -223,7 +306,10 @@ mod tests {
     #[test]
     fn the_chime_is_short_soft_and_never_clips() {
         let s = chime_samples(44_100);
-        assert!(s.len() < 44_100 / 2, "longer than half a second");
+        assert!(
+            s.len() <= (44_100.0 * 1.5) as usize,
+            "longer than 1.5 seconds"
+        );
         let peak = s.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         assert!(peak > 0.05 && peak <= 0.4, "peak {peak}");
         assert_eq!(s[0], 0.0, "starts from silence");
