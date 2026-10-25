@@ -25,7 +25,14 @@ const DEFAULT_MATCH_THRESHOLD: f32 = 0.70;
 const DEFAULT_SINGLE_PROFILE_MARGIN: f32 = 0.10;
 
 /// Minimum face size in source-image pixels; smaller detections embed unreliably.
-const MIN_DETECTED_FACE_PX: u32 = 80;
+const DEFAULT_MIN_DETECTED_FACE_PX: u32 = 48;
+
+fn min_detected_face_px() -> u32 {
+    std::env::var("POND_FACE_MIN_SIZE_PX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MIN_DETECTED_FACE_PX)
+}
 
 /// Top-K pooling of per-profile similarities.
 const TOP_K: usize = 3;
@@ -212,7 +219,8 @@ impl SqliteFaceRecognition {
         match found {
             None => Err(anyhow!("no face detected in image")),
             Some(face) => {
-                if face.bbox.width < MIN_DETECTED_FACE_PX || face.bbox.height < MIN_DETECTED_FACE_PX
+                let min_face_px = min_detected_face_px();
+                if face.bbox.width < min_face_px || face.bbox.height < min_face_px
                 {
                     return Err(anyhow!(
                         "detected face too small ({}×{} px); move closer to the camera",
