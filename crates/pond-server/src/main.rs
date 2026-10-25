@@ -4052,35 +4052,8 @@ async fn run_server(
         last_user_activity.clone(),
     ));
 
-    // On-device motion detection into camera_events + the bus. Opt-in: needs a camera and ffmpeg.
-    let resolved_camera_url = if !settings.vision_camera_url.trim().is_empty() {
-        Some(settings.vision_camera_url.trim().to_string())
-    } else if let Some(discovered) = pond_adapters_vision::default_camera_source() {
-        tracing::info!(camera = %discovered.display(), "auto-detected local USB camera for vision pipeline");
-        Some(discovered.to_string_lossy().into_owned())
-    } else {
-        None
-    };
-
-    if settings.vision_enabled && resolved_camera_url.is_some() {
-        let capture = pond_adapters_vision::CaptureConfig {
-            input: resolved_camera_url.unwrap(),
-            fps: settings.vision_fps.max(1),
-            ..Default::default()
-        };
-        let pipeline_cfg = pond_adapters_vision::VisionPipelineConfig {
-            camera_id: settings.vision_camera_id.clone(),
-            motion: pond_adapters_vision::MotionConfig {
-                changed_fraction: settings.vision_motion_threshold.clamp(0.001, 1.0),
-                ..Default::default()
-            },
-            // Triggering frame per event (bounded per camera), so the dashboard shows what moved.
-            snapshots: Some(pond_adapters_vision::SnapshotConfig::new(
-                data_dir.join("snapshots"),
-            )),
-            ..Default::default()
-        };
-
+    // Self-healing Vision Supervisor: monitors camera hotplug, dynamic settings, and stream reconnects.
+    {
         // Labels motion as person/pet/package. Empty model = auto-downloaded YOLOX-Nano; a set
         // one is operator-managed. Any failure degrades to plain "motion".
         #[cfg(feature = "vision-onnx")]
@@ -4129,22 +4102,82 @@ async fn run_server(
             None
         };
 
-        match pond_adapters_vision::FfmpegFrameSource::spawn(&capture) {
-            Ok(source) => {
-                let storage = camera_storage.clone();
-                let bus = event_bus.clone();
-                tokio::spawn(pond_adapters_vision::run_vision_pipeline(
-                    Box::new(source),
-                    classifier,
-                    storage,
-                    bus,
-                    pipeline_cfg,
-                ));
+        let settings_repo = settings_repo.clone();
+        let camera_storage = camera_storage.clone();
+        let event_bus = event_bus.clone();
+        let data_dir = data_dir.clone();
+
+        tokio::spawn(async move {
+            let mut backoff = tokio::time::Duration::from_secs(2);
+            loop {
+                let current_settings = match settings_repo.get().await {
+                    Ok(s) => s,
+                    Err(_) => {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        continue;
+                    }
+                };
+
+                if !current_settings.vision_enabled {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    continue;
+                }
+
+                let camera_url = if !current_settings.vision_camera_url.trim().is_empty() {
+                    Some(current_settings.vision_camera_url.trim().to_string())
+                } else if let Some(discovered) = pond_adapters_vision::default_camera_source() {
+                    Some(discovered.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+
+                let Some(input_url) = camera_url else {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    continue;
+                };
+
+                let capture = pond_adapters_vision::CaptureConfig {
+                    input: input_url.clone(),
+                    fps: current_settings.vision_fps.max(1),
+                    ..Default::default()
+                };
+
+                let pipeline_cfg = pond_adapters_vision::VisionPipelineConfig {
+                    camera_id: current_settings.vision_camera_id.clone(),
+                    motion: pond_adapters_vision::MotionConfig {
+                        changed_fraction: current_settings
+                            .vision_motion_threshold
+                            .clamp(0.001, 1.0),
+                        ..Default::default()
+                    },
+                    snapshots: Some(pond_adapters_vision::SnapshotConfig::new(
+                        data_dir.join("snapshots"),
+                    )),
+                    ..Default::default()
+                };
+
+                match pond_adapters_vision::FfmpegFrameSource::spawn(&capture) {
+                    Ok(source) => {
+                        tracing::info!(camera = %input_url, "vision pipeline started on camera");
+                        backoff = tokio::time::Duration::from_secs(2);
+                        pond_adapters_vision::run_vision_pipeline(
+                            Box::new(source),
+                            classifier.clone(),
+                            camera_storage.clone(),
+                            event_bus.clone(),
+                            pipeline_cfg,
+                        )
+                        .await;
+                        tracing::warn!(camera = %input_url, "camera stream ended; supervisor will reconnect");
+                    }
+                    Err(e) => {
+                        tracing::debug!(camera = %input_url, error = %e, "camera stream unavailable; retrying in {:?}", backoff);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(tokio::time::Duration::from_secs(30));
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "vision pipeline not started (camera/ffmpeg unavailable)")
-            }
-        }
+        });
     }
 
     // The printed card's code and its claim latch live beside the TLS identity, not in the

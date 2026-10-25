@@ -65,6 +65,32 @@ fn build_args(cfg: &CaptureConfig) -> Result<Vec<String>> {
     Ok(args)
 }
 
+fn resolve_ffmpeg_bin() -> std::ffi::OsString {
+    if let Ok(path) = std::env::var("POND_FFMPEG_PATH") {
+        let p = std::path::PathBuf::from(path);
+        if p.exists() {
+            return p.into_os_string();
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let local_bin = std::path::PathBuf::from(home).join(".local/bin/ffmpeg");
+        if local_bin.exists() {
+            return local_bin.into_os_string();
+        }
+    }
+    for candidate in &[
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+    ] {
+        let p = std::path::Path::new(candidate);
+        if p.exists() {
+            return p.as_os_str().to_os_string();
+        }
+    }
+    "ffmpeg".into()
+}
+
 /// Frame source over an ffmpeg child, killed on drop so an ended pipeline leaks no process.
 pub struct FfmpegFrameSource {
     // Held for its Drop (kill_on_drop) — never polled directly.
@@ -79,14 +105,20 @@ impl FfmpegFrameSource {
     /// Spawn ffmpeg; a missing binary or bad config fails here, stream errors in `next_frame`.
     pub fn spawn(cfg: &CaptureConfig) -> Result<Self> {
         let args = build_args(cfg)?;
-        let mut child = Command::new("ffmpeg")
+        let bin = resolve_ffmpeg_bin();
+        let mut child = Command::new(&bin)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .context("failed to spawn ffmpeg — is it installed and on PATH?")?;
+            .with_context(|| {
+                format!(
+                    "failed to spawn ffmpeg using {:?} — is it installed and on PATH?",
+                    bin
+                )
+            })?;
         let stdout = child
             .stdout
             .take()
