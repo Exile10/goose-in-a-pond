@@ -11,4 +11,4 @@ pub use discovery::{default_camera_source, detect_v4l2_cameras, DiscoveredCamera
 pub use ffmpeg_source::{CaptureConfig, FfmpegFrameSource};
 pub use motion::{MotionConfig, MotionDetector};
 pub use pipeline::{run_vision_pipeline, VisionPipelineConfig};
-pub use snapshot::SnapshotConfig;
+pub use snapshot::{frame_to_jpeg_bytes, write_snapshot, SnapshotConfig};

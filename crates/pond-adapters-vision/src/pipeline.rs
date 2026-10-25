@@ -5,9 +5,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use pond_core::shared::domain::session_activity::{PresenceTransition, ProfilePresence};
 use pond_core::shared::ports::event_bus::{BusEvent, EventBus};
 use pond_core::user_data::domain::sensor::CameraEvent;
+use pond_core::user_data::domain::session::IdentificationSource;
 use pond_core::user_data::ports::camera_storage::CameraStorage;
+use pond_core::user_data::ports::face_recognition::FaceRecognition;
 use pond_core::user_data::ports::vision::{FrameSource, VisionClassifier};
 
 use crate::motion::{MotionConfig, MotionDetector};
@@ -41,6 +44,7 @@ impl Default for VisionPipelineConfig {
 pub async fn run_vision_pipeline(
     mut source: Box<dyn FrameSource>,
     classifier: Option<Arc<dyn VisionClassifier>>,
+    face_recognizer: Option<Arc<dyn FaceRecognition>>,
     storage: Arc<dyn CameraStorage>,
     bus: Arc<dyn EventBus>,
     cfg: VisionPipelineConfig,
@@ -96,16 +100,62 @@ pub async fn run_vision_pipeline(
             }
         });
 
+        // Face recognition enrichment when a person is detected
+        let mut identified_profile = None;
+        let mut face_confidence = None;
+        if event_type == "person" {
+            if let Some(ref face_rec) = face_recognizer {
+                match crate::snapshot::frame_to_jpeg_bytes(&frame) {
+                    Ok(jpeg_bytes) => {
+                        match face_rec.identify_face(&jpeg_bytes, None).await {
+                            Ok(ident) => {
+                                if ident.identified {
+                                    tracing::info!(
+                                        camera = %cfg.camera_id,
+                                        profile = ?ident.profile_id,
+                                        confidence = ?ident.confidence,
+                                        "face identified in person event"
+                                    );
+                                    identified_profile = ident.profile_id;
+                                    face_confidence = ident.confidence;
+                                } else if ident.confidence.is_some() {
+                                    tracing::info!(
+                                        camera = %cfg.camera_id,
+                                        confidence = ?ident.confidence,
+                                        "unrecognized face in person event"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(camera = %cfg.camera_id, error = %e, "face identification failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(camera = %cfg.camera_id, error = %e, "failed to encode frame for face recognition");
+                    }
+                }
+            }
+        }
+
+        let mut metadata = serde_json::json!({
+            "changed_fraction": changed_fraction,
+            "source": "vision",
+        });
+        if let Some(ref pid) = identified_profile {
+            metadata["identified_profile"] = serde_json::json!(pid);
+            if let Some(conf) = face_confidence {
+                metadata["face_confidence"] = serde_json::json!(conf);
+            }
+        }
+
         let mut event = CameraEvent {
             id: None,
             camera_id: cfg.camera_id.clone(),
             event_type,
             confidence,
             snapshot_path,
-            metadata: Some(
-                serde_json::json!({ "changed_fraction": changed_fraction, "source": "vision" })
-                    .to_string(),
-            ),
+            metadata: Some(metadata.to_string()),
             acknowledged: false,
             created_at: Utc::now(),
         };
@@ -121,6 +171,16 @@ pub async fn run_vision_pipeline(
                     "vision event detected"
                 );
                 bus.publish(BusEvent::Camera(event));
+                if let Some(profile_id) = identified_profile {
+                    bus.publish(BusEvent::Presence(ProfilePresence {
+                        profile_id,
+                        transition: PresenceTransition::Arrived,
+                        source: IdentificationSource::Face,
+                        confidence: face_confidence,
+                        session_id: format!("camera:{}", cfg.camera_id),
+                        at: Utc::now(),
+                    }));
+                }
                 last_event = Some(Instant::now());
             }
             Err(e) => {
@@ -224,6 +284,7 @@ mod tests {
         run_vision_pipeline(
             Box::new(ScriptedFrameSource(frames)),
             None,
+            None,
             storage.clone(),
             bus.clone(),
             cfg(),
@@ -275,6 +336,7 @@ mod tests {
         run_vision_pipeline(
             Box::new(ScriptedFrameSource(frames)),
             Some(Arc::new(PetClassifier)),
+            None,
             storage.clone(),
             bus,
             cfg(),
@@ -300,6 +362,7 @@ mod tests {
 
         run_vision_pipeline(
             Box::new(ScriptedFrameSource(frames)),
+            None,
             None,
             storage.clone(),
             bus,
@@ -328,6 +391,7 @@ mod tests {
         run_vision_pipeline(
             Box::new(ScriptedFrameSource(frames)),
             None,
+            None,
             storage.clone(),
             bus,
             cfg(),
@@ -339,5 +403,125 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    struct PersonClassifier;
+
+    #[async_trait]
+    impl VisionClassifier for PersonClassifier {
+        async fn classify(&self, _frame: &Frame) -> Result<Vec<Detection>> {
+            Ok(vec![Detection {
+                label: "person".into(),
+                confidence: 0.95,
+            }])
+        }
+    }
+
+    struct MockPersonFaceRecognition {
+        profile_id: String,
+        confidence: f32,
+    }
+
+    #[async_trait]
+    impl FaceRecognition for MockPersonFaceRecognition {
+        async fn register_face(
+            &self,
+            _profile_id: &str,
+            _image_bytes: &[u8],
+            _bbox: Option<pond_core::user_data::domain::face_recognition::BoundingBox>,
+        ) -> Result<pond_core::user_data::domain::face_recognition::FaceEmbedding> {
+            unimplemented!()
+        }
+
+        async fn identify_face(
+            &self,
+            _image_bytes: &[u8],
+            _bbox: Option<pond_core::user_data::domain::face_recognition::BoundingBox>,
+        ) -> Result<pond_core::user_data::domain::face_recognition::FaceIdentification> {
+            Ok(pond_core::user_data::domain::face_recognition::FaceIdentification::found(
+                self.profile_id.clone(),
+                self.confidence,
+            ))
+        }
+
+        async fn list_embeddings(
+            &self,
+            _profile_id: &str,
+        ) -> Result<Vec<pond_core::user_data::domain::face_recognition::FaceEmbedding>> {
+            Ok(vec![])
+        }
+
+        async fn delete_embeddings(&self, _profile_id: &str) -> Result<u64> {
+            Ok(0)
+        }
+
+        async fn pairwise_similarities(
+            &self,
+        ) -> Result<Vec<pond_core::user_data::ports::face_recognition::PairwiseSimilarity>> {
+            Ok(vec![])
+        }
+
+        fn match_threshold(&self) -> f32 {
+            0.7
+        }
+    }
+
+    #[tokio::test]
+    async fn person_classifier_identifies_face_and_emits_presence() {
+        use futures::StreamExt;
+
+        let frames = VecDeque::from(vec![flat(20), with_square(20)]);
+        let storage = Arc::new(MockCameraStorage::new());
+        let bus = Arc::new(InProcessEventBus::new());
+        let mut subscription = bus.subscribe();
+
+        let face_rec = Arc::new(MockPersonFaceRecognition {
+            profile_id: "jerry".to_string(),
+            confidence: 0.88,
+        });
+
+        run_vision_pipeline(
+            Box::new(ScriptedFrameSource(frames)),
+            Some(Arc::new(PersonClassifier)),
+            Some(face_rec),
+            storage.clone(),
+            bus,
+            cfg(),
+        )
+        .await;
+
+        let stored = storage.list_events("backyard-cam", 10).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].event_type, "person");
+        let meta: serde_json::Value =
+            serde_json::from_str(stored[0].metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(meta["identified_profile"], "jerry");
+        assert!((meta["face_confidence"].as_f64().unwrap() - 0.88).abs() < 1e-4);
+
+        let mut got_camera = false;
+        let mut got_presence = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(500), subscription.next()).await
+        {
+            match ev {
+                BusEvent::Camera(c) => {
+                    assert_eq!(c.event_type, "person");
+                    got_camera = true;
+                }
+                BusEvent::Presence(p) => {
+                    assert_eq!(p.profile_id, "jerry");
+                    assert_eq!(p.transition, PresenceTransition::Arrived);
+                    assert_eq!(p.source, IdentificationSource::Face);
+                    assert_eq!(p.confidence, Some(0.88));
+                    got_presence = true;
+                }
+                _ => {}
+            }
+            if got_camera && got_presence {
+                break;
+            }
+        }
+        assert!(got_camera, "Camera event was not published");
+        assert!(got_presence, "Presence event was not published");
     }
 }

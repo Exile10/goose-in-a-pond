@@ -4106,6 +4106,7 @@ async fn run_server(
         let camera_storage = camera_storage.clone();
         let event_bus = event_bus.clone();
         let data_dir = data_dir.clone();
+        let face_recognition = face_recognition.clone();
 
         tokio::spawn(async move {
             let mut backoff = tokio::time::Duration::from_secs(2);
@@ -4163,6 +4164,7 @@ async fn run_server(
                         pond_adapters_vision::run_vision_pipeline(
                             Box::new(source),
                             classifier.clone(),
+                            face_recognition.clone(),
                             camera_storage.clone(),
                             event_bus.clone(),
                             pipeline_cfg,
