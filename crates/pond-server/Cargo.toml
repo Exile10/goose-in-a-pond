@@ -14,7 +14,7 @@ name = "pond_server"
 path = "src/lib.rs"
 
 [features]
-default = ["goose-agent", "local-inference"]
+default = ["goose-agent", "local-inference", "vision-onnx"]
 # Enable the Goose agent backend (compiles Block's Goose from the submodule — slow first build).
 # Enabled by default. To build without Goose: cargo build -p pond-server --no-default-features
 goose-agent = ["dep:pond-adapters-goose"]

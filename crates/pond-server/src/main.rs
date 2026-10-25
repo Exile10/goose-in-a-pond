@@ -4053,9 +4053,18 @@ async fn run_server(
     ));
 
     // On-device motion detection into camera_events + the bus. Opt-in: needs a camera and ffmpeg.
-    if settings.vision_enabled && !settings.vision_camera_url.trim().is_empty() {
+    let resolved_camera_url = if !settings.vision_camera_url.trim().is_empty() {
+        Some(settings.vision_camera_url.trim().to_string())
+    } else if let Some(discovered) = pond_adapters_vision::default_camera_source() {
+        tracing::info!(camera = %discovered.display(), "auto-detected local USB camera for vision pipeline");
+        Some(discovered.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
+    if settings.vision_enabled && resolved_camera_url.is_some() {
         let capture = pond_adapters_vision::CaptureConfig {
-            input: settings.vision_camera_url.trim().to_string(),
+            input: resolved_camera_url.unwrap(),
             fps: settings.vision_fps.max(1),
             ..Default::default()
         };
