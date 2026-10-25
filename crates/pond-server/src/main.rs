@@ -7472,17 +7472,7 @@ fn apply_face_recognition_defaults() {
         unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PIXEL_SCALE", "unit") };
     }
 
-    // Secondary PAD, duplicated in `build_face_recognition`: `setup` and `serve` each need it.
-    if std::env::var_os("POND_FACE_ANTISPOOF_PATH_2").is_none() {
-        let default_path = default_data_dir()
-            .join("models")
-            .join("face")
-            .join("OULU_Protocol_2_model_0_0.onnx");
-        if default_path.exists() {
-            // SAFETY: single-threaded setup, before any worker spawns.
-            unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH_2", default_path) };
-        }
-    }
+    // Secondary anti-spoof model is optional and only used if explicitly configured.
 }
 /// Records wake-word samples and stores Whisper's transcriptions as calibration variants.
 async fn run_calibrate(
