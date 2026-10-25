@@ -70,18 +70,30 @@ pub async fn run_vision_pipeline(
         let Some(changed_fraction) = detector.observe(&frame) else {
             continue;
         };
+        let bus_cfg = crate::live_feed::LiveCameraRegistry::global().bus_config();
+        let min_interval = if cfg.min_event_interval == Duration::from_secs(10) {
+            Duration::from_secs(bus_cfg.min_event_interval_secs)
+        } else {
+            cfg.min_event_interval
+        };
         if let Some(at) = last_event {
-            if at.elapsed() < cfg.min_event_interval {
+            if at.elapsed() < min_interval {
                 continue;
             }
         }
 
+        let min_classifier_conf = if bus_cfg.classifier_confidence_threshold > 0.0 {
+            bus_cfg.classifier_confidence_threshold
+        } else {
+            MIN_CLASSIFIER_CONFIDENCE
+        };
+
         // Optional enrichment: let the on-device model name what moved.
-        let (event_type, confidence) = match &classifier {
+        let (mut event_type, confidence) = match &classifier {
             Some(c) => match c.classify(&frame).await {
                 Ok(dets) => dets
                     .into_iter()
-                    .filter(|d| d.confidence >= MIN_CLASSIFIER_CONFIDENCE)
+                    .filter(|d| d.confidence >= min_classifier_conf)
                     .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
                     .map(|d| (d.label, Some(d.confidence)))
                     .unwrap_or_else(|| ("motion".to_string(), Some(changed_fraction.min(1.0)))),
@@ -104,35 +116,52 @@ pub async fn run_vision_pipeline(
             }
         });
 
-        // Face recognition enrichment when a person is detected
+        // Face detection and recognition enrichment on person or motion events.
         let mut identified_profile = None;
         let mut face_confidence = None;
-        if event_type == "person" {
+        let mut face_detected = false;
+        let mut face_unknown = false;
+        let should_check_face = bus_cfg.face_detection_enabled
+            && (event_type == "person" || (bus_cfg.face_on_motion && event_type == "motion"));
+        if should_check_face {
             if let Some(ref face_rec) = face_recognizer {
                 match crate::snapshot::frame_to_jpeg_bytes(&frame) {
-                    Ok(jpeg_bytes) => match face_rec.identify_face(&jpeg_bytes, None).await {
-                        Ok(ident) => {
-                            if ident.identified {
-                                tracing::info!(
-                                    camera = %cfg.camera_id,
-                                    profile = ?ident.profile_id,
-                                    confidence = ?ident.confidence,
-                                    "face identified in person event"
-                                );
-                                identified_profile = ident.profile_id;
-                                face_confidence = ident.confidence;
-                            } else if ident.confidence.is_some() {
-                                tracing::info!(
-                                    camera = %cfg.camera_id,
-                                    confidence = ?ident.confidence,
-                                    "unrecognized face in person event"
-                                );
+                    Ok(jpeg_bytes) => {
+                        match face_rec.identify_with_diagnostics(&jpeg_bytes, None).await {
+                            Ok(details) => {
+                                let ident = details.identification;
+                                if ident.identified {
+                                    tracing::info!(
+                                        camera = %cfg.camera_id,
+                                        profile = ?ident.profile_id,
+                                        confidence = ?ident.confidence,
+                                        "face identified in vision event"
+                                    );
+                                    face_detected = true;
+                                    identified_profile = ident.profile_id;
+                                    face_confidence = ident.confidence;
+                                } else if details.bbox.is_some()
+                                    || details.landmarks.is_some()
+                                    || ident.confidence.is_some()
+                                {
+                                    tracing::info!(
+                                        camera = %cfg.camera_id,
+                                        confidence = ?ident.confidence,
+                                        "unrecognized face detected in vision event"
+                                    );
+                                    face_detected = true;
+                                    face_unknown = true;
+                                    face_confidence = ident.confidence;
+                                }
+                                if face_detected && event_type == "motion" {
+                                    event_type = "person".to_string();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(camera = %cfg.camera_id, error = %e, "face identification failed");
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(camera = %cfg.camera_id, error = %e, "face identification failed");
-                        }
-                    },
+                    }
                     Err(e) => {
                         tracing::warn!(camera = %cfg.camera_id, error = %e, "failed to encode frame for face recognition");
                     }
@@ -140,15 +169,23 @@ pub async fn run_vision_pipeline(
             }
         }
 
+        if !bus_cfg.is_event_enabled(&event_type)
+            && !(face_detected && bus_cfg.is_event_enabled("face_detected"))
+        {
+            continue;
+        }
+
         let mut metadata = serde_json::json!({
             "changed_fraction": changed_fraction,
             "source": "vision",
+            "face_detected": face_detected,
+            "face_unknown": face_unknown,
         });
         if let Some(ref pid) = identified_profile {
             metadata["identified_profile"] = serde_json::json!(pid);
-            if let Some(conf) = face_confidence {
-                metadata["face_confidence"] = serde_json::json!(conf);
-            }
+        }
+        if let Some(conf) = face_confidence {
+            metadata["face_confidence"] = serde_json::json!(conf);
         }
 
         let mut event = CameraEvent {
@@ -170,8 +207,10 @@ pub async fn run_vision_pipeline(
                     camera = %cfg.camera_id,
                     event_type = %event.event_type,
                     changed_fraction,
+                    face_detected,
                     "vision event detected"
                 );
+                crate::live_feed::LiveCameraRegistry::global().publish_event(event.clone());
                 bus.publish(BusEvent::Camera(event));
                 if let Some(profile_id) = identified_profile {
                     bus.publish(BusEvent::Presence(ProfilePresence {

@@ -7806,12 +7806,12 @@ fn build_face_recognition(
         }
     });
 
-    // ArcFace on aligned 112×112 crops: strangers can reach 0.55–0.65, so aligned floors sit in
-    // the empirically safe 0.68–0.75 band.
+    // AdaFace/ArcFace-512 on aligned 112×112 room-camera crops scores 0.42–0.65 for genuine
+    // matches while impostors sit below 0.25; MobileFaceNet-128 has higher baseline cosines.
     let threshold = match (&detector, model_kind) {
-        (Some(d), EmbeddingModel::ArcFace512) if d.produces_landmarks() => 0.70,
-        (Some(_), EmbeddingModel::ArcFace512) => 0.72,
-        (None, EmbeddingModel::ArcFace512) => 0.85,
+        (Some(d), EmbeddingModel::ArcFace512) if d.produces_landmarks() => 0.42,
+        (Some(_), EmbeddingModel::ArcFace512) => 0.48,
+        (None, EmbeddingModel::ArcFace512) => 0.70,
         (Some(d), EmbeddingModel::MobileFaceNet128) if d.produces_landmarks() => 0.70,
         (Some(_), EmbeddingModel::MobileFaceNet128) => 0.72,
         (None, EmbeddingModel::MobileFaceNet128) => 0.85,

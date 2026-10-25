@@ -1045,6 +1045,15 @@ pub fn init_schedule_deps(
     });
 }
 
+pub(crate) fn scheduler_and_settings() -> Option<(
+    Arc<dyn SchedulerPort>,
+    Arc<dyn SettingsRepository + Send + Sync>,
+)> {
+    SCHEDULE_DEPS
+        .get()
+        .map(|d| (d.scheduler.clone(), d.settings_repo.clone()))
+}
+
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_schedule_server(reader: DuplexStream, writer: DuplexStream) {
     // No deps = this binary didn't install this family: skip, as a panic kills every builtin.

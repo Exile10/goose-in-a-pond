@@ -294,6 +294,11 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Would-deny policy telemetry; must stay out of PUBLIC_ROUTES.
         .route("/security/policy-report", get(policy_report))
         .route("/cameras", get(list_cameras))
+        .route(
+            "/vision/config",
+            get(get_vision_config).put(update_vision_config),
+        )
+        .route("/vision/events/stream", get(stream_vision_events_sse))
         .route("/camera/snapshot", get(get_default_camera_snapshot))
         .route("/camera/{camera_id}/snapshot", get(get_camera_snapshot))
         .route("/camera/stream", get(get_default_camera_stream))
@@ -8593,12 +8598,17 @@ async fn list_camera_events(
     let list: Vec<Value> = events
         .iter()
         .map(|e| {
+            let meta_json: Option<Value> = e
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok());
             json!({
                 "id":             e.id,
                 "camera_id":      e.camera_id,
                 "event_type":     e.event_type,
                 "confidence":     e.confidence,
                 "snapshot_path":  e.snapshot_path,
+                "metadata":       meta_json,
                 "acknowledged":   e.acknowledged,
                 "created_at":     e.created_at.to_rfc3339(),
             })
@@ -8830,6 +8840,127 @@ fn get_camera_stream_inner(camera_id: &str) -> axum::response::Response {
         ],
         axum::body::Body::from_stream(stream),
     )
+        .into_response()
+}
+
+#[derive(serde::Deserialize, Default)]
+struct VisionConfigUpdateRequest {
+    vision_enabled: Option<bool>,
+    vision_camera_id: Option<String>,
+    vision_fps: Option<u32>,
+    vision_motion_threshold: Option<f64>,
+    min_event_interval_secs: Option<u64>,
+    classifier_confidence_threshold: Option<f64>,
+    face_detection_enabled: Option<bool>,
+    face_on_motion: Option<bool>,
+    enabled_event_types: Option<Vec<String>>,
+}
+
+async fn get_vision_config(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let bus_cfg = pond_adapters_vision::LiveCameraRegistry::global().bus_config();
+    let settings = state.settings_repo.get().await.ok();
+    let active_cameras = pond_adapters_vision::LiveCameraRegistry::global().active_cameras();
+    let listeners = pond_adapters_vision::LiveCameraRegistry::global().event_listener_count();
+    Ok(Json(json!({
+        "vision_enabled": settings.as_ref().map(|s| s.vision_enabled).unwrap_or(true),
+        "vision_camera_id": settings.as_ref().map(|s| s.vision_camera_id.clone()).unwrap_or_else(|| "camera-1".to_string()),
+        "vision_fps": settings.as_ref().map(|s| s.vision_fps).unwrap_or(1),
+        "vision_motion_threshold": settings.as_ref().map(|s| s.vision_motion_threshold).unwrap_or(0.03),
+        "min_event_interval_secs": bus_cfg.min_event_interval_secs,
+        "classifier_confidence_threshold": bus_cfg.classifier_confidence_threshold,
+        "face_detection_enabled": bus_cfg.face_detection_enabled,
+        "face_on_motion": bus_cfg.face_on_motion,
+        "enabled_event_types": bus_cfg.enabled_event_types,
+        "supported_signals": pond_adapters_vision::VisionBusConfig::supported_signals(),
+        "active_cameras": active_cameras,
+        "event_listener_count": listeners,
+    })))
+}
+
+async fn update_vision_config(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<VisionConfigUpdateRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+
+    pond_adapters_vision::LiveCameraRegistry::global().update_bus_config(|cfg| {
+        if let Some(secs) = req.min_event_interval_secs {
+            cfg.min_event_interval_secs = secs.max(1);
+        }
+        if let Some(conf) = req.classifier_confidence_threshold {
+            cfg.classifier_confidence_threshold = conf.clamp(0.05, 0.99);
+        }
+        if let Some(face_en) = req.face_detection_enabled {
+            cfg.face_detection_enabled = face_en;
+        }
+        if let Some(face_mot) = req.face_on_motion {
+            cfg.face_on_motion = face_mot;
+        }
+        if let Some(types) = req.enabled_event_types {
+            if !types.is_empty() {
+                cfg.enabled_event_types = types;
+            }
+        }
+    });
+
+    if req.vision_enabled.is_some()
+        || req.vision_camera_id.is_some()
+        || req.vision_fps.is_some()
+        || req.vision_motion_threshold.is_some()
+    {
+        if let Ok(mut s) = state.settings_repo.get().await {
+            if let Some(en) = req.vision_enabled {
+                s.vision_enabled = en;
+            }
+            if let Some(cid) = req.vision_camera_id.filter(|c| !c.trim().is_empty()) {
+                s.vision_camera_id = cid;
+            }
+            if let Some(fps) = req.vision_fps {
+                s.vision_fps = fps.clamp(1, 5);
+            }
+            if let Some(mt) = req.vision_motion_threshold {
+                s.vision_motion_threshold = mt.clamp(0.005, 0.50);
+            }
+            let _ = state.settings_repo.update(&s).await;
+        }
+    }
+
+    get_vision_config(State(state)).await
+}
+
+async fn stream_vision_events_sse() -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use axum::response::IntoResponse;
+
+    let mut rx = pond_adapters_vision::LiveCameraRegistry::global().subscribe_events();
+    let stream = async_stream::stream! {
+        while let Ok(ev) = rx.recv().await {
+            let meta_json: Option<Value> = ev
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok());
+            let payload = json!({
+                "id": ev.id,
+                "camera_id": ev.camera_id,
+                "event_type": ev.event_type,
+                "confidence": ev.confidence,
+                "snapshot_path": ev.snapshot_path,
+                "metadata": meta_json,
+                "created_at": ev.created_at.to_rfc3339(),
+            });
+            yield Ok::<_, std::convert::Infallible>(Event::default().event("vision_event").data(payload.to_string()));
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
         .into_response()
 }
 

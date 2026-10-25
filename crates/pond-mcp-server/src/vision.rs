@@ -1,9 +1,14 @@
 use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
-use pond_adapters_vision::LiveCameraRegistry;
+use pond_adapters_vision::{LiveCameraRegistry, VisionBusConfig};
+use pond_core::user_data::domain::schedule::{
+    CompareOp, SensorTriggerSpec, TaskKind, TriggerAction, TriggerCondition, TriggerSource,
+    TriggerSourceKind,
+};
 use pond_core::user_data::domain::sensor::CameraEvent;
 use pond_core::user_data::ports::camera_storage::CameraStorage;
+use pond_core::user_data::ports::scheduler::CreateScheduleRequest;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -78,6 +83,78 @@ pub struct SendSnapshotParams {
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ConfigureVisionBusParams {
+    /// Minimum seconds between emitted vision events (cooldown, default 10).
+    pub min_event_interval_secs: Option<u64>,
+    /// Minimum classifier confidence (0.0 to 1.0, default 0.5).
+    pub classifier_confidence_threshold: Option<f64>,
+    /// Enable or disable face detection and recognition on the vision bus.
+    pub face_detection_enabled: Option<bool>,
+    /// Run face detection on motion events even before a person classifier runs.
+    pub face_on_motion: Option<bool>,
+    /// Event types enabled on the vision bus (e.g. ["motion", "person", "pet", "vehicle", "package", "face_detected", "face_recognized", "face_unknown"]).
+    pub enabled_event_types: Option<Vec<String>>,
+    /// Persistent capture frame rate in FPS (1 to 5).
+    pub vision_fps: Option<u32>,
+    /// Persistent motion fraction threshold (0.005 to 0.50).
+    pub vision_motion_threshold: Option<f64>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct CreateVisionAutomationParams {
+    /// Label for the automation rule (e.g. "Welcome Jerry home").
+    pub name: Option<String>,
+    /// Camera ID to listen to (default "camera-1", or "any" for all cameras).
+    pub camera_id: Option<String>,
+    /// Vision or face signal to match: "motion", "person", "pet", "vehicle", "package", "face_detected", "face_recognized", "face_unknown", or "face:<profile_id>".
+    pub signal: Option<String>,
+    /// Optional minimum confidence (0.0 to 1.0).
+    pub min_confidence: Option<f64>,
+    /// Fire only after this local time ("HH:MM", 24-hour).
+    pub after: Option<String>,
+    /// Fire only before this local time ("HH:MM", 24-hour).
+    pub before: Option<String>,
+    /// Action: prompt sent to the assistant when the event fires.
+    pub prompt: Option<String>,
+    /// Action: notification title.
+    pub notify_title: Option<String>,
+    /// Action: notification body.
+    pub notify_body: Option<String>,
+    /// Action: smart-home device ID to power on or off.
+    pub power_device_id: Option<String>,
+    /// true = power on (default), false = power off.
+    pub power_on: Option<bool>,
+    /// Cooldown seconds between triggers (default 60).
+    pub cooldown_secs: Option<u64>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ListVisionAutomationsParams {
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct DeleteVisionAutomationParams {
+    /// Automation rule ID from list_vision_automations.
+    pub rule_id: Option<String>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
 async fn snapshot_content(path: &str) -> Option<ContentBlock> {
     use pond_core::models::domain::image_limits::MAX_IMAGE_BYTES;
 
@@ -129,15 +206,39 @@ async fn snapshot_content(path: &str) -> Option<ContentBlock> {
     }
 }
 
+fn event_face_tag(e: &CameraEvent) -> String {
+    let Some(raw) = e.metadata.as_deref() else {
+        return String::new();
+    };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return String::new();
+    };
+    if let Some(pid) = meta.get("identified_profile").and_then(|v| v.as_str()) {
+        if !pid.is_empty() {
+            let conf = meta
+                .get("face_confidence")
+                .and_then(|v| v.as_f64())
+                .map(|c| format!(" {:.0}%", c * 100.0))
+                .unwrap_or_default();
+            return format!(" · face: {pid}{conf}");
+        }
+    }
+    if meta.get("face_unknown").and_then(|v| v.as_bool()) == Some(true) {
+        return " · face: unknown".to_string();
+    }
+    String::new()
+}
+
 fn frame_caption(e: &CameraEvent) -> String {
     format!(
-        "Frame from '{}' at {} (detector said: {}{})",
+        "Frame from '{}' at {} (detector said: {}{}{})",
         e.camera_id,
         e.created_at.format("%Y-%m-%d %H:%M:%S"),
         e.event_type,
         e.confidence
             .map(|c| format!(", {:.0}% confidence", c * 100.0))
             .unwrap_or_default(),
+        event_face_tag(e),
     )
 }
 
@@ -213,13 +314,14 @@ saw.")]
                     .iter()
                     .map(|e| {
                         format!(
-                            "- [{}] {} {}{}{}",
+                            "- [{}] {} {}{}{}{}",
                             e.id.map(|i| i.to_string()).unwrap_or_else(|| "?".into()),
                             e.created_at.format("%Y-%m-%d %H:%M"),
                             e.event_type,
                             e.confidence
                                 .map(|c| format!(" ({:.0}% confidence)", c * 100.0))
                                 .unwrap_or_default(),
+                            event_face_tag(e),
                             if e.acknowledged {
                                 " · acknowledged"
                             } else {
@@ -469,6 +571,316 @@ Acknowledge a camera event by ID to stop re-alerts once the user has seen it.")]
             }
         }
     }
+
+    #[tool(description = "\
+View or update the live vision bus configuration (event cooldown, classifier confidence floor, \
+face detection toggle, enabled event types, FPS, and motion threshold). Never for an image \
+attached to the message.")]
+    async fn configure_vision_bus(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<ConfigureVisionBusParams>,
+    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        let p = params.0;
+        let updated = LiveCameraRegistry::global().update_bus_config(|cfg| {
+            if let Some(secs) = p.min_event_interval_secs {
+                cfg.min_event_interval_secs = secs.max(1);
+            }
+            if let Some(conf) = p.classifier_confidence_threshold {
+                cfg.classifier_confidence_threshold = conf.clamp(0.05, 0.99);
+            }
+            if let Some(face_en) = p.face_detection_enabled {
+                cfg.face_detection_enabled = face_en;
+            }
+            if let Some(face_mot) = p.face_on_motion {
+                cfg.face_on_motion = face_mot;
+            }
+            if let Some(types) = p.enabled_event_types {
+                if !types.is_empty() {
+                    cfg.enabled_event_types = types;
+                }
+            }
+        });
+
+        let mut settings_note = String::new();
+        if p.vision_fps.is_some() || p.vision_motion_threshold.is_some() {
+            if let Some((_, settings_repo)) = crate::schedule::scheduler_and_settings() {
+                if let Ok(mut s) = settings_repo.get().await {
+                    if let Some(fps) = p.vision_fps {
+                        s.vision_fps = fps.clamp(1, 5);
+                    }
+                    if let Some(mt) = p.vision_motion_threshold {
+                        s.vision_motion_threshold = mt.clamp(0.005, 0.50);
+                    }
+                    if settings_repo.update(&s).await.is_ok() {
+                        settings_note = format!(
+                            "\nPersistent settings updated: vision_fps={}, vision_motion_threshold={:.3}",
+                            s.vision_fps, s.vision_motion_threshold
+                        );
+                    }
+                }
+            }
+        }
+
+        let active_cams = LiveCameraRegistry::global().active_cameras();
+        let listeners = LiveCameraRegistry::global().event_listener_count();
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Vision bus configuration:\n\
+             - Active cameras: {}\n\
+             - Event cooldown: {}s\n\
+             - Classifier confidence floor: {:.2}\n\
+             - Face detection enabled: {}\n\
+             - Face detection on motion: {}\n\
+             - Enabled event types: {}\n\
+             - Supported automation signals: {}\n\
+             - Live stream listeners: {}{}",
+            if active_cams.is_empty() {
+                "none".to_string()
+            } else {
+                active_cams.join(", ")
+            },
+            updated.min_event_interval_secs,
+            updated.classifier_confidence_threshold,
+            updated.face_detection_enabled,
+            updated.face_on_motion,
+            updated.enabled_event_types.join(", "),
+            VisionBusConfig::supported_signals().join(", "),
+            listeners,
+            settings_note,
+        ))]))
+    }
+
+    #[tool(description = "\
+Register an automation rule or trigger on the vision bus for camera and face events (motion, \
+person, pet, vehicle, package, face_detected, face_recognized, face_unknown, or \
+face:<profile_id>). Never for an image attached to the message.")]
+    async fn create_vision_automation(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<CreateVisionAutomationParams>,
+    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        let Some((scheduler, settings_repo)) = crate::schedule::scheduler_and_settings() else {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "Vision automation scheduler is unavailable in this process.",
+            )]));
+        };
+
+        let p = params.0;
+        let camera_id = match p.camera_id.as_deref().map(str::trim) {
+            None | Some("") => Some(DEFAULT_CAMERA_ID.to_string()),
+            Some("any") | Some("*") => None,
+            Some(id) => Some(id.to_string()),
+        };
+        let signal = p
+            .signal
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "any" && *s != "*")
+            .map(str::to_string)
+            .unwrap_or_else(|| "person".to_string());
+
+        let mut actions = Vec::new();
+        if let Some(prompt) = p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            actions.push(TriggerAction::AgentPrompt {
+                prompt: prompt.to_string(),
+            });
+        }
+        if let Some(dev_id) = p
+            .power_device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            actions.push(TriggerAction::DevicePower {
+                device_id: dev_id.to_string(),
+                on: p.power_on.unwrap_or(true),
+            });
+        }
+        let notify_title = p
+            .notify_title
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let notify_body = p
+            .notify_body
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        if !notify_title.is_empty() || !notify_body.is_empty() {
+            actions.push(TriggerAction::Notify {
+                title: if notify_title.is_empty() {
+                    format!("Vision alert ({signal})")
+                } else {
+                    notify_title
+                },
+                body: if notify_body.is_empty() {
+                    format!(
+                        "Camera '{}' detected '{}'",
+                        camera_id.as_deref().unwrap_or("any"),
+                        signal
+                    )
+                } else {
+                    notify_body
+                },
+            });
+        }
+        if actions.is_empty() {
+            actions.push(TriggerAction::Notify {
+                title: format!("Vision alert ({signal})"),
+                body: format!(
+                    "Camera '{}' detected '{}'",
+                    camera_id.as_deref().unwrap_or("any"),
+                    signal
+                ),
+            });
+        }
+
+        let condition = TriggerCondition {
+            op: p.min_confidence.map(|_| CompareOp::Gte),
+            value: p.min_confidence,
+            after: p.after.filter(|s| !s.trim().is_empty()),
+            before: p.before.filter(|s| !s.trim().is_empty()),
+        };
+
+        let spec = SensorTriggerSpec {
+            source: TriggerSource {
+                kind: TriggerSourceKind::Camera,
+                device_id: camera_id.clone(),
+                signal: Some(signal.clone()),
+            },
+            condition,
+            actions,
+            cooldown_secs: p.cooldown_secs.unwrap_or(60),
+        };
+
+        if let Err(rej) = spec.validate() {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Invalid vision automation rule: {rej}"
+            ))]));
+        }
+
+        let label = p.name.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
+            format!(
+                "Vision: {} on {}",
+                signal,
+                camera_id.as_deref().unwrap_or("any camera")
+            )
+        });
+        let timezone = settings_repo
+            .get()
+            .await
+            .map(|s| s.timezone)
+            .unwrap_or_else(|_| "UTC".to_string());
+        let id = uuid::Uuid::new_v4().to_string();
+        let req = CreateScheduleRequest {
+            id: id.clone(),
+            label: label.clone(),
+            cron: "@event".to_string(),
+            fire_at: None,
+            once: false,
+            timezone,
+            kind: TaskKind::SensorTrigger(spec),
+        };
+
+        match scheduler.create_task(req).await {
+            Ok(created) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Vision automation created: \"{}\" [id: {}] — camera={}, signal={}, cooldown={}s.",
+                created.label,
+                created.id,
+                camera_id.as_deref().unwrap_or("any"),
+                signal,
+                p.cooldown_secs.unwrap_or(60),
+            ))])),
+            Err(e) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Failed to register vision automation: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(description = "\
+List all registered camera and face detection automation rules on the vision bus. Never for an \
+image attached to the message.")]
+    async fn list_vision_automations(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        _params: Parameters<ListVisionAutomationsParams>,
+    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        let Some((scheduler, _)) = crate::schedule::scheduler_and_settings() else {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "Vision automation scheduler is unavailable in this process.",
+            )]));
+        };
+
+        match scheduler.list_tasks().await {
+            Ok(tasks) => {
+                let rules: Vec<String> = tasks
+                    .into_iter()
+                    .filter_map(|t| match t.kind {
+                        TaskKind::SensorTrigger(spec)
+                            if spec.source.kind == TriggerSourceKind::Camera =>
+                        {
+                            Some(format!(
+                                "- [{}] \"{}\" — camera={}, signal={}, cooldown={}s, actions={}{}",
+                                t.id,
+                                t.label,
+                                spec.source.device_id.as_deref().unwrap_or("any"),
+                                spec.source.signal.as_deref().unwrap_or("any"),
+                                spec.cooldown_secs,
+                                spec.actions.len(),
+                                if t.paused { " (paused)" } else { "" },
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
+                if rules.is_empty() {
+                    Ok(CallToolResult::success(vec![ContentBlock::text(
+                        "No vision or face detection automations are currently registered.",
+                    )]))
+                } else {
+                    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                        "Registered vision bus automations ({}):\n{}",
+                        rules.len(),
+                        rules.join("\n"),
+                    ))]))
+                }
+            }
+            Err(e) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Failed to list vision automations: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(description = "\
+Delete a camera or face detection automation rule from the vision bus by rule_id. Never for an \
+image attached to the message.")]
+    async fn delete_vision_automation(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<DeleteVisionAutomationParams>,
+    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        let Some((scheduler, _)) = crate::schedule::scheduler_and_settings() else {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "Vision automation scheduler is unavailable in this process.",
+            )]));
+        };
+        let Some(rule_id) = params.0.rule_id.filter(|s| !s.trim().is_empty()) else {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "Please provide `rule_id` (see list_vision_automations).",
+            )]));
+        };
+        match scheduler.delete_task(&rule_id).await {
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Vision automation '{rule_id}' deleted."
+            ))])),
+            Err(e) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Could not delete vision automation '{rule_id}': {e}"
+            ))])),
+        }
+    }
 }
 
 #[tool_handler]
@@ -481,12 +893,13 @@ impl ServerHandler for VisionMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "GIAP Vision MCP server — the FIXED HOME CAMERAS, from the local, on-device \
-                 event store (never guess what a camera saw).\n\n\
+                "GIAP Vision MCP server — the FIXED HOME CAMERAS and VISION BUS, from the local, \
+                 on-device event store (never guess what a camera saw).\n\n\
                  None of these tools are for an image the user attached to a message: an \
                  attachment is already visible to you, so look at it and answer directly.\n\n\
                  Tools: get_recent_camera_events, look_at_camera_snapshot, look_at_camera_window, \
-                 send_camera_snapshot, acknowledge_camera_event.",
+                 send_camera_snapshot, acknowledge_camera_event, configure_vision_bus, \
+                 create_vision_automation, list_vision_automations, delete_vision_automation.",
             )
     }
 }
