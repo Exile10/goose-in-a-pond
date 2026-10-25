@@ -41,15 +41,18 @@ cd pond-desktop
 npm run dev           # Vite on :1420 plus `pond-server serve --native`
 npm run dev:vite      # renderer only; panels that need the server show their error state
 npm run dev:electron  # Vite, tsup --watch and the Electron shell
+npm run stage:server  # build a release pond-server and stage it as the sidecar (slow)
 npm run bundle:app    # stage the pond-server sidecar, verify it, package the .app and .dmg
+npm run pack:dir      # the same, unpacked: quicker when checking the bundle's shape
 
 bash scripts/jetson-emu.sh doctor|run|test|box  # take the Orin's decisions on a Mac, never its performance
 ```
 
 `jetson-emu.sh` sets `POND_DEVICE_PROFILE` (`orin-nano-8gb`, `orin-nano-8gb-cpu`, `orin-nx-16gb`;
 unset emulates nothing). `run` and `test` reproduce the board's choices, such as the context size from
-`context_size_for_budget`. `box` adds aarch64 codegen and an enforced memory ceiling in a container.
-No tier has CUDA or yields a KV-cost or throughput number.
+`context_size_for_budget`, but cannot hold the process to the board's 7,620 MB: macOS has no cgroups.
+`box` adds aarch64 codegen and enforces that ceiling in a container. No tier has CUDA or yields a
+KV-cost or throughput number.
 
 ## How GIAP fits together
 
@@ -101,7 +104,8 @@ running server writes `.runtime_api_port` and `.runtime_https_port` there.
   is built.
 - `register_giap_extensions` runs before any agent session, and each MCP module's `init_*_deps`
   runs in every binary that registers it (see HOWTOAI's MCP trap).
-- `release_local_models` runs before exit; LiteRT's exit-time destructors crash otherwise.
+- `serve` stops on Ctrl-C or SIGTERM, which is what `systemctl stop` and `docker stop` send.
+  `release_local_models` runs before exit; LiteRT's exit-time destructors crash otherwise.
 
 ### MCP servers
 
@@ -144,7 +148,8 @@ In the shell: `VoiceMode` → `useVoiceSession` (the only `voice-*` listener) �
 → `VoiceChildProcess` (`electron/main/voice/`), which spawns `pond-server chat --voice --json-events`.
 The child owns the microphone and speaker. It writes NDJSON events (`warmup` lines may precede
 `ready`, then `state`, `transcript`, `token`, ...) and reads `{"cmd":"interrupt"}` and
-`{"cmd":"stop"}` on stdin. A second voice process exits with `already_running`.
+`{"cmd":"stop"}` on stdin. A second voice process exits with `already_running`, so a child you start
+by hand to diagnose the shell keeps the microphone, and the desktop's voice, until you kill it.
 
 - `VoiceChildProcess` keeps two guards that encode real races. A close from a killed session never
   reaps a newer one: each callback holds its own session object, not a flag. `start` and `stop` are
