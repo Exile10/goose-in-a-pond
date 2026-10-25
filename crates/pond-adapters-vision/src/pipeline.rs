@@ -63,6 +63,10 @@ pub async fn run_vision_pipeline(
             }
         };
 
+        if let Ok(jpeg) = crate::snapshot::frame_to_jpeg_bytes(&frame) {
+            crate::live_feed::LiveCameraRegistry::global().update_frame(&cfg.camera_id, jpeg);
+        }
+
         let Some(changed_fraction) = detector.observe(&frame) else {
             continue;
         };
@@ -106,31 +110,29 @@ pub async fn run_vision_pipeline(
         if event_type == "person" {
             if let Some(ref face_rec) = face_recognizer {
                 match crate::snapshot::frame_to_jpeg_bytes(&frame) {
-                    Ok(jpeg_bytes) => {
-                        match face_rec.identify_face(&jpeg_bytes, None).await {
-                            Ok(ident) => {
-                                if ident.identified {
-                                    tracing::info!(
-                                        camera = %cfg.camera_id,
-                                        profile = ?ident.profile_id,
-                                        confidence = ?ident.confidence,
-                                        "face identified in person event"
-                                    );
-                                    identified_profile = ident.profile_id;
-                                    face_confidence = ident.confidence;
-                                } else if ident.confidence.is_some() {
-                                    tracing::info!(
-                                        camera = %cfg.camera_id,
-                                        confidence = ?ident.confidence,
-                                        "unrecognized face in person event"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(camera = %cfg.camera_id, error = %e, "face identification failed");
+                    Ok(jpeg_bytes) => match face_rec.identify_face(&jpeg_bytes, None).await {
+                        Ok(ident) => {
+                            if ident.identified {
+                                tracing::info!(
+                                    camera = %cfg.camera_id,
+                                    profile = ?ident.profile_id,
+                                    confidence = ?ident.confidence,
+                                    "face identified in person event"
+                                );
+                                identified_profile = ident.profile_id;
+                                face_confidence = ident.confidence;
+                            } else if ident.confidence.is_some() {
+                                tracing::info!(
+                                    camera = %cfg.camera_id,
+                                    confidence = ?ident.confidence,
+                                    "unrecognized face in person event"
+                                );
                             }
                         }
-                    }
+                        Err(e) => {
+                            tracing::warn!(camera = %cfg.camera_id, error = %e, "face identification failed");
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(camera = %cfg.camera_id, error = %e, "failed to encode frame for face recognition");
                     }
@@ -438,10 +440,12 @@ mod tests {
             _image_bytes: &[u8],
             _bbox: Option<pond_core::user_data::domain::face_recognition::BoundingBox>,
         ) -> Result<pond_core::user_data::domain::face_recognition::FaceIdentification> {
-            Ok(pond_core::user_data::domain::face_recognition::FaceIdentification::found(
-                self.profile_id.clone(),
-                self.confidence,
-            ))
+            Ok(
+                pond_core::user_data::domain::face_recognition::FaceIdentification::found(
+                    self.profile_id.clone(),
+                    self.confidence,
+                ),
+            )
         }
 
         async fn list_embeddings(
@@ -457,7 +461,8 @@ mod tests {
 
         async fn pairwise_similarities(
             &self,
-        ) -> Result<Vec<pond_core::user_data::ports::face_recognition::PairwiseSimilarity>> {
+        ) -> Result<Vec<pond_core::user_data::ports::face_recognition::PairwiseSimilarity>>
+        {
             Ok(vec![])
         }
 

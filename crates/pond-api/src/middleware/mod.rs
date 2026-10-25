@@ -494,7 +494,27 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    let token = extract_bearer_token(&headers)?;
+    let token = match extract_bearer_token(&headers) {
+        Ok(t) => t,
+        Err(e) => {
+            if let Some(query) = req.uri().query() {
+                if let Some(tok) = query.split('&').find_map(|pair| {
+                    let mut it = pair.split('=');
+                    if it.next() == Some("token") {
+                        it.next().map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                }) {
+                    tok
+                } else {
+                    return Err(e);
+                }
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     let valid = state
         .handshake

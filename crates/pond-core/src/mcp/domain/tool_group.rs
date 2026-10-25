@@ -117,6 +117,12 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
         core: false,
     },
     ToolGroup {
+        extension: "giap-vision",
+        description: "Fixed home cameras: check what the cameras see, read recent vision events \
+                      (motion, person, package), inspect snapshots, or share a live camera frame.",
+        core: false,
+    },
+    ToolGroup {
         extension: TRAVEL_EXTENSION,
         description: "Getting somewhere: directions and a map link to a place, or a taxi or ride \
                       with Uber or Bolt to the airport, a mall, an office or home.",
@@ -243,6 +249,8 @@ pub fn groups_denied_to_guests() -> &'static [&'static str] {
         "giap-memory",
         // Sensor history: when the house was empty, when somebody came home.
         "giap-sensors",
+        // Camera events and live visual feeds.
+        "giap-vision",
         // A member's connected sources. Scope refuses a guest anyway; not offering it saves a turn.
         "giap-context",
         // Not about personal data: `delegate` runs an autonomous agent on the household's one GPU.
@@ -268,6 +276,8 @@ pub fn groups_denied_to_subagents() -> &'static [&'static str] {
         ORCHESTRATOR_EXTENSION,
         // `book_ride` puts a ride offer on a member's phone, with no approval path.
         TRAVEL_EXTENSION,
+        // Raw home camera feeds and live frame snapshots.
+        "giap-vision",
     ]
 }
 

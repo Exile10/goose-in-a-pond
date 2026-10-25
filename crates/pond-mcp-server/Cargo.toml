@@ -15,6 +15,7 @@ license = "Apache-2.0"
 [dependencies]
 pond-core            = { path = "../pond-core" }
 pond-net             = { path = "../pond-net" }
+pond-adapters-vision = { path = "../pond-adapters-vision" }
 pond-adapters-weather = { path = "../pond-adapters-weather" }
 # Use rmcp 1.2.0 directly — matches the version used by goose's builtin registry
 rmcp       = { workspace = true }

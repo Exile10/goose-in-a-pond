@@ -3112,6 +3112,7 @@ async fn run_server(
         device_registry.clone(),
         device_control.clone(),
     );
+    pond_mcp_server::init_vision_deps(camera_storage.clone());
 
     let (agent, extension_manager, _tool_caller, tool_registry) = if mistralrs_active {
         // No goose: no extension manager or tool specialist, and an empty registry.
@@ -5087,6 +5088,7 @@ async fn run_chat(
         // No Matter here: `state` bails, so replies use the stored reading, labelled with its age.
         Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
     );
+    pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
 
     // Needed here too, or giap-context fails to load. No index or embedder on this path, so
     // `recall` returns nothing rather than degrading to context-only results.
