@@ -117,6 +117,7 @@ pub async fn run_vision_pipeline(
                 .ok(),
             _ => None,
         };
+        let classify_started = Instant::now();
         let (mut event_type, confidence) = match (&classifier, raw.as_ref().or(decoded.as_ref())) {
             (Some(c), Some(frame)) => match c.classify(frame).await {
                 Ok(dets) => dets
@@ -133,7 +134,10 @@ pub async fn run_vision_pipeline(
             _ => ("motion".to_string(), Some(changed_fraction.min(1.0))),
         };
 
+        let classify_ms = classify_started.elapsed().as_millis() as u64;
+
         // Face detection and recognition enrichment on person or motion events.
+        let face_started = Instant::now();
         let mut identified_profile = None;
         let mut face_confidence = None;
         let mut face_detected = false;
@@ -186,6 +190,8 @@ pub async fn run_vision_pipeline(
             }
         }
 
+        let face_ms = face_started.elapsed().as_millis() as u64;
+
         if !bus_cfg.passes(EventSignals {
             event_type: &event_type,
             face_detected,
@@ -237,11 +243,16 @@ pub async fn run_vision_pipeline(
         match storage.record_event(event.clone()).await {
             Ok(id) => {
                 event.id = Some(id);
+                // From the frame's arrival to now: what a household waits for an event.
+                let latency_ms = (Utc::now() - captured_at).num_milliseconds();
                 tracing::info!(
                     camera = %cfg.camera_id,
                     event_type = %event.event_type,
                     changed_fraction,
                     face_detected,
+                    latency_ms,
+                    classify_ms,
+                    face_ms,
                     "vision event detected"
                 );
                 registry.publish_event(event.clone());
