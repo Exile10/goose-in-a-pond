@@ -1796,7 +1796,13 @@ async fn status_tts(
         return Ok(Json(json!({"available": false, "loaded": false})));
     };
     let loaded = control.is_loaded().await;
-    Ok(Json(json!({"available": true, "loaded": loaded})))
+    let accelerator = pond_core::models::domain::acceleration::onnx_device(
+        pond_core::models::domain::acceleration::TTS_KOKORO,
+    )
+    .map(|d| d.as_str());
+    Ok(Json(
+        json!({"available": true, "loaded": loaded, "accelerator": accelerator}),
+    ))
 }
 
 async fn revoke_model(

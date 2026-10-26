@@ -74,6 +74,7 @@ pub const VISION_CLASSIFIER: &str = "vision_classifier";
 pub const FACE_DETECTOR: &str = "face_detector";
 pub const FACE_EMBEDDER: &str = "face_embedder";
 pub const FACE_ANTISPOOF: &str = "face_antispoof";
+pub const TTS_KOKORO: &str = "tts_kokoro";
 
 // Process-wide because the adapters that move models and the routes that report them never meet.
 static ONNX_DEVICES: std::sync::Mutex<Vec<(&'static str, OnnxDevice)>> =
