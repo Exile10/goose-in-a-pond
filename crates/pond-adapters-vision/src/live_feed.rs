@@ -112,6 +112,27 @@ impl SourceKind {
     }
 }
 
+/// How frames reach the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturePath {
+    /// The camera's own JPEGs, passed through ffmpeg; motion decodes them on the CPU.
+    CameraJpeg,
+    /// GStreamer on a Jetson: NVDEC, NVJPG and VIC do the decoding and scaling.
+    Hardware,
+    /// ffmpeg decodes every frame and the pipeline encodes the JPEG.
+    Software,
+}
+
+impl CapturePath {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CapturePath::CameraJpeg => "camera_jpeg",
+            CapturePath::Hardware => "hardware",
+            CapturePath::Software => "software",
+        }
+    }
+}
+
 /// The supervisor's last word on capture; written only by the supervisor and by frames arriving.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SupervisorStatus {
@@ -121,6 +142,8 @@ pub struct SupervisorStatus {
     pub source: Option<String>,
     pub source_kind: Option<SourceKind>,
     pub fps: Option<u32>,
+    /// Set while a capture process is running.
+    pub capture: Option<CapturePath>,
     pub last_error: Option<String>,
     /// Pipeline runs restarted after a stream ended or a capture setting changed.
     pub restarts: u64,
@@ -135,6 +158,7 @@ impl Default for SupervisorStatus {
             source: None,
             source_kind: None,
             fps: None,
+            capture: None,
             last_error: None,
             restarts: 0,
             classifier_available: false,

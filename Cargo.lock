@@ -11729,6 +11729,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

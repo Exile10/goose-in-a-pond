@@ -237,7 +237,7 @@ gives it a control, and the server-side rule if any.
 | `vision_enabled` | `false` |  |
 | `vision_camera_url` | `""` |  |
 | `vision_camera_id` | `"camera-1"` |  |
-| `vision_fps` | `2` | clamped 1..5 on save and on read |
+| `vision_fps` | `2` | clamped 1..30 on save and on read |
 | `vision_motion_threshold` | `0.05` | clamped 0.005..0.5 |
 | `vision_classifier_model` | `""` | Rust classifies it headless |
 | `vision_event_cooldown_secs` | `10` | clamped 1..3600 |

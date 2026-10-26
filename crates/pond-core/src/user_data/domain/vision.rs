@@ -1,6 +1,7 @@
 //! Vision types: the seam between `pond-adapters-vision` capture/detection and the Core.
 
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
@@ -24,8 +25,8 @@ pub const DEFAULT_MOTION_THRESHOLD: f64 = 0.05;
 pub const DEFAULT_EVENT_COOLDOWN_SECS: u64 = 10;
 pub const DEFAULT_CLASSIFIER_CONFIDENCE: f64 = 0.5;
 
-/// Above 5 fps ffmpeg and motion differencing eat the Orin's CPU budget for inference.
-pub const FPS_RANGE: RangeInclusive<u32> = 1..=5;
+/// 30 is what USB and IP cameras deliver; the Orin's decoders keep it cheap.
+pub const FPS_RANGE: RangeInclusive<u32> = 1..=30;
 pub const MOTION_THRESHOLD_RANGE: RangeInclusive<f64> = 0.005..=0.5;
 pub const EVENT_COOLDOWN_SECS_RANGE: RangeInclusive<u64> = 1..=3600;
 pub const CLASSIFIER_CONFIDENCE_RANGE: RangeInclusive<f64> = 0.05..=0.99;
@@ -136,6 +137,54 @@ impl Frame {
     }
 }
 
+/// A small 8-bit luma picture, row-major (`len == width * height`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LumaPlane {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+impl LumaPlane {
+    pub fn is_well_formed(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.pixels.len() == self.width as usize * self.height as usize
+    }
+}
+
+/// A frame left as the JPEG the camera (or a hardware encoder) produced; never re-encoded.
+#[derive(Debug, Clone)]
+pub struct JpegFrame {
+    /// Shared so the live feed, snapshots and face recognition read one buffer.
+    pub jpeg: Arc<Vec<u8>>,
+    /// The same picture already decoded off the CPU; `None` leaves decoding to the pipeline.
+    pub luma: Option<LumaPlane>,
+    pub captured_at: DateTime<Utc>,
+}
+
+/// What a frame source yields.
+#[derive(Debug, Clone)]
+pub enum CapturedFrame {
+    Raw(Frame),
+    Jpeg(JpegFrame),
+}
+
+impl CapturedFrame {
+    pub fn captured_at(&self) -> DateTime<Utc> {
+        match self {
+            CapturedFrame::Raw(f) => f.captured_at,
+            CapturedFrame::Jpeg(j) => j.captured_at,
+        }
+    }
+}
+
+impl From<Frame> for CapturedFrame {
+    fn from(frame: Frame) -> Self {
+        CapturedFrame::Raw(frame)
+    }
+}
+
 /// One classifier verdict about a frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Detection {
@@ -169,21 +218,36 @@ mod tests {
     }
 
     #[test]
+    fn luma_plane_well_formedness() {
+        let plane = |w: u32, h: u32, len: usize| LumaPlane {
+            width: w,
+            height: h,
+            pixels: vec![0; len],
+        };
+        assert!(plane(4, 2, 8).is_well_formed());
+        assert!(!plane(4, 2, 7).is_well_formed());
+        assert!(!plane(0, 0, 0).is_well_formed());
+    }
+
+    #[test]
     fn out_of_range_vision_settings_are_clamped_to_what_the_pipeline_honours() {
         let mut s = Settings {
-            vision_fps: 30,
+            vision_fps: 60,
             vision_motion_threshold: 0.0,
             vision_event_cooldown_secs: 0,
             vision_classifier_confidence: 2.0,
             ..Settings::default()
         };
         normalize_settings(&mut s);
-        assert_eq!(s.vision_fps, 5);
+        assert_eq!(s.vision_fps, 30);
         assert_eq!(s.vision_motion_threshold, 0.005);
         assert_eq!(s.vision_event_cooldown_secs, 1);
         assert_eq!(s.vision_classifier_confidence, 0.99);
 
         assert_eq!(clamp_fps(0), 1);
+        for fps in [5, 15, 24, 30] {
+            assert_eq!(clamp_fps(fps), fps, "{fps} fps is honoured");
+        }
         assert_eq!(clamp_event_cooldown_secs(86_400), 3600);
         assert_eq!(clamp_motion_threshold(f64::NAN), DEFAULT_MOTION_THRESHOLD);
         assert_eq!(

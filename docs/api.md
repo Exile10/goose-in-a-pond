@@ -1029,7 +1029,7 @@ names the screen a tap opens.
 | `GET /camera/stream`, `/camera/{camera_id}/stream` | | `multipart/x-mixed-replace; boundary=frame` (MJPEG); ends when camera consent is revoked |
 | `GET /vision/events/stream` | | SSE, `event: vision_event`, `data` one `CameraEvent` (`acknowledged: false`); ends when camera consent is revoked |
 | `GET /vision/status` | | `VisionStatus` below |
-| `GET /vision/config` | | `{vision_enabled, vision_camera_id, vision_fps, vision_motion_threshold, vision_event_cooldown_secs, vision_classifier_confidence, vision_face_recognition_enabled, vision_face_on_motion, vision_event_types, min_event_interval_secs, classifier_confidence_threshold, face_detection_enabled, face_on_motion, enabled_event_types, supported_signals, active_cameras, event_listener_count}`, values clamped |
+| `GET /vision/config` | | `{vision_enabled, vision_camera_id, vision_fps, vision_motion_threshold, vision_event_cooldown_secs, vision_classifier_confidence, vision_face_recognition_enabled, vision_face_on_motion, vision_event_types, min_event_interval_secs, classifier_confidence_threshold, face_detection_enabled, face_on_motion, enabled_event_types, supported_signals, active_cameras, event_listener_count}`, values clamped (`vision_fps` to 1..30) |
 | `PUT /vision/config` | any of `vision_enabled`, `vision_camera_id`, `vision_fps`, `vision_motion_threshold`, `min_event_interval_secs`, `classifier_confidence_threshold`, `face_detection_enabled`, `face_on_motion`, `enabled_event_types` (or their `vision_*` settings names) | The `GET` shape. Saved to settings, so it survives a restart and `GET /settings` shows it |
 
 `CameraEvent` is `{id, camera_id, event_type, confidence, snapshot_path, snapshot_url, metadata,
@@ -1053,6 +1053,7 @@ image and stream `GET` families only (see [Credentials](#credentials)).
   "source": "rtsp://***@192.168.1.20/live",
   "source_kind": "configured",
   "fps": 2,
+  "capture": "hardware",
   "last_frame_at": "2026-10-26T12:00:01Z",
   "last_event_at": "2026-10-26T11:58:40Z",
   "last_error": null,
@@ -1067,11 +1068,18 @@ image and stream `GET` families only (see [Credentials](#credentials)).
 `no_camera` (nothing configured, nothing discovered), `starting`, `running` (frames arriving) or
 `reconnecting` (the stream failed; `last_error` says why). `source` has URL credentials replaced by
 `***`; `source`, `source_kind` and `last_error` are null unless the pipeline is starting, running or
-reconnecting. `restarts` counts pipeline restarts since the server started: a stream that ended,
-or a capture setting (camera address, camera name, fps, motion threshold) that changed. The vision
-supervisor (`crates/pond-adapters-vision/src/supervisor.rs`) re-reads settings every 2 s, and at
-once after `PUT /settings` or `PUT /vision/config`, so a change applies within seconds; it logs
-each restart and stop at `info` with its reason.
+reconnecting. `capture` is how frames reach the pipeline, null unless it is starting or running:
+`hardware` (a Jetson's engines through GStreamer: NVDEC decodes H.264 or H.265 over RTSP, VIC
+scales, NVJPG encodes the live JPEG or decodes a USB camera's own JPEGs), `camera_jpeg` (the
+camera's own MJPEG through ffmpeg, never re-encoded; motion decodes its luma on the CPU) or
+`software` (ffmpeg decodes every frame and the pond encodes the JPEG). They are tried in that
+order, and a path is kept once it delivers a frame within 10 s. `restarts` counts pipeline restarts
+since the server started: a stream that ended, or a capture setting (camera address, camera name,
+fps, motion threshold) that changed; a restart waits up to 3 s for the old capture process to exit,
+so the camera is free when it reopens. The vision supervisor
+(`crates/pond-adapters-vision/src/supervisor.rs`) re-reads settings every 2 s, and at once after
+`PUT /settings` or `PUT /vision/config`, so a change applies within seconds; it logs each restart
+and stop at `info` with its reason.
 
 A rule is a schedule whose kind is `SensorTrigger`. Unlike `/schedules`, the rule routes validate
 the spec and refuse to reach a cron schedule by id. The body is `ApiRuleRequest {id?, name, ...SensorTriggerSpec}`

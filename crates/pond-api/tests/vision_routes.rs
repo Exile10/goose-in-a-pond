@@ -115,6 +115,7 @@ async fn with_camera_consent_off_no_picture_or_stream_is_served() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["state"], "consent_off");
     assert_eq!(body["cameras_enabled"], false);
+    assert!(body["capture"].is_null(), "nothing captures: {body}");
 }
 
 #[tokio::test]
@@ -234,11 +235,11 @@ async fn vision_bus_changes_are_settings_whichever_door_they_come_through() {
         Method::PUT,
         "/api/v1/settings",
         Some(&token),
-        Some(json!({"vision_fps": 30, "vision_classifier_confidence": 0.8, "vision_event_types": []})),
+        Some(json!({"vision_fps": 60, "vision_classifier_confidence": 0.8, "vision_event_types": []})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{saved}");
-    assert_eq!(saved["vision_fps"], 5, "stored as the pipeline applies it");
+    assert_eq!(saved["vision_fps"], 30, "stored as the pipeline applies it");
 
     let (_, config) = call(
         &router,
@@ -249,7 +250,7 @@ async fn vision_bus_changes_are_settings_whichever_door_they_come_through() {
     )
     .await;
     assert_eq!(config["classifier_confidence_threshold"], 0.8);
-    assert_eq!(config["vision_fps"], 5);
+    assert_eq!(config["vision_fps"], 30);
     assert_eq!(
         config["enabled_event_types"],
         json!([]),

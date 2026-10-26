@@ -630,7 +630,7 @@ export const CATALOGUE: CatalogueCategory[] = [
           },
           { key: "vision_camera_id", label: "Camera name", description: "A name for this camera, used in the activity feed and in rules.", control: { kind: "text", placeholder: "camera-1" }, consumer: "live" },
           // Bounds mirror the server's clamp in pond-core `domain/vision.rs`.
-          { key: "vision_fps", label: "Frames per second", description: "How often to look at the picture. Low on purpose, to leave room for thinking.", control: { kind: "number", min: 1, max: 5, unit: "fps" }, consumer: "live", validate: all(integer, range(1, 5, "fps")) },
+          { key: "vision_fps", label: "Frames per second", description: "How often to look at the picture. Higher catches quicker movement and uses more power.", control: { kind: "number", min: 1, max: 30, unit: "fps" }, consumer: "live", validate: all(integer, range(1, 30, "fps")) },
           { key: "vision_motion_threshold", label: "Motion sensitivity", description: "How much of the picture must change to count as movement.", control: { kind: "number", step: 0.005, min: 0.005, max: 0.5 }, consumer: "live", validate: range(0.005, 0.5) },
           { key: "vision_classifier_model", label: "Detector model", description: "What names what the camera saw. Empty uses the built-in one.", control: { kind: "text", placeholder: "Bundled YOLOX-Nano" }, consumer: "live", proposed: true },
         ],

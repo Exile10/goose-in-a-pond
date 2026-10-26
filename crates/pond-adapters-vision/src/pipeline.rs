@@ -9,11 +9,12 @@ use pond_core::shared::domain::session_activity::{PresenceTransition, ProfilePre
 use pond_core::shared::ports::event_bus::{BusEvent, EventBus};
 use pond_core::user_data::domain::sensor::CameraEvent;
 use pond_core::user_data::domain::session::IdentificationSource;
-use pond_core::user_data::domain::vision::EventSignals;
+use pond_core::user_data::domain::vision::{CapturedFrame, EventSignals, Frame};
 use pond_core::user_data::ports::camera_storage::CameraStorage;
 use pond_core::user_data::ports::face_recognition::FaceRecognition;
 use pond_core::user_data::ports::vision::{FrameSource, VisionClassifier};
 
+use crate::jpeg_decode::{decode_rgb, LumaDecoder};
 use crate::live_feed::LiveCameraRegistry;
 use crate::motion::{MotionConfig, MotionDetector};
 
@@ -41,7 +42,7 @@ impl Default for VisionPipelineConfig {
 
 /// Run until the frame source ends (`Ok`) or fails (`Err`); spawn once per camera.
 pub async fn run_vision_pipeline(
-    mut source: Box<dyn FrameSource>,
+    source: &mut dyn FrameSource,
     classifier: Option<Arc<dyn VisionClassifier>>,
     face_recognizer: Option<Arc<dyn FaceRecognition>>,
     storage: Arc<dyn CameraStorage>,
@@ -50,11 +51,12 @@ pub async fn run_vision_pipeline(
     cfg: VisionPipelineConfig,
 ) -> anyhow::Result<()> {
     let mut detector = MotionDetector::new(cfg.motion.clone());
-    let mut last_event: Option<Instant> = None;
+    let mut luma_decoder = LumaDecoder::default();
+    let mut last_event = last_recorded_event(storage.as_ref(), &cfg.camera_id).await;
     tracing::info!(camera = %cfg.camera_id, "vision pipeline started");
 
     let ended = loop {
-        let frame = match source.next_frame().await {
+        let captured = match source.next_frame().await {
             Ok(Some(f)) => f,
             Ok(None) => break Ok(()),
             Err(e) => {
@@ -62,21 +64,36 @@ pub async fn run_vision_pipeline(
                 break Err(e);
             }
         };
+        let captured_at = captured.captured_at();
 
-        // Encoded once per frame: the live feed and face recognition share these bytes.
-        let jpeg = match crate::snapshot::frame_to_jpeg_bytes(&frame) {
-            Ok(bytes) => {
-                let bytes = Arc::new(bytes);
-                registry.update_frame(&cfg.camera_id, bytes.clone());
-                Some(bytes)
-            }
-            Err(e) => {
-                tracing::debug!(camera = %cfg.camera_id, error = %e, "frame could not be encoded");
-                None
-            }
+        // One JPEG per frame, shared by the live feed, snapshots and face recognition.
+        let (jpeg, raw, luma) = match captured {
+            CapturedFrame::Raw(frame) => match crate::snapshot::frame_to_jpeg_bytes(&frame) {
+                Ok(bytes) => (Some(Arc::new(bytes)), Some(frame), None),
+                Err(e) => {
+                    tracing::debug!(camera = %cfg.camera_id, error = %e, "frame could not be encoded");
+                    (None, Some(frame), None)
+                }
+            },
+            CapturedFrame::Jpeg(j) => (Some(j.jpeg), None, j.luma),
         };
+        if let Some(bytes) = &jpeg {
+            registry.update_frame(&cfg.camera_id, bytes.clone());
+        }
 
-        let Some(changed_fraction) = detector.observe(&frame) else {
+        let observed = match (&raw, &luma, &jpeg) {
+            (Some(frame), _, _) => detector.observe(frame),
+            (None, Some(plane), _) => detector.observe_luma(plane, captured_at),
+            (None, None, Some(bytes)) => match luma_decoder.decode(bytes) {
+                Ok(plane) => detector.observe_luma(plane, captured_at),
+                Err(e) => {
+                    tracing::debug!(camera = %cfg.camera_id, error = %e, "camera jpeg could not be decoded");
+                    None
+                }
+            },
+            (None, None, None) => None,
+        };
+        let Some(changed_fraction) = observed else {
             continue;
         };
         let bus_cfg = registry.bus_config();
@@ -92,8 +109,16 @@ pub async fn run_vision_pipeline(
         let min_classifier_conf = bus_cfg.classifier_confidence_threshold;
 
         // Optional enrichment: let the on-device model name what moved.
-        let (mut event_type, confidence) = match &classifier {
-            Some(c) => match c.classify(&frame).await {
+        let decoded: Option<Frame> = match (&classifier, &raw, &jpeg) {
+            (Some(_), None, Some(bytes)) => decode_rgb(bytes, captured_at)
+                .map_err(|e| {
+                    tracing::warn!(camera = %cfg.camera_id, error = %e, "candidate frame could not be decoded for the classifier");
+                })
+                .ok(),
+            _ => None,
+        };
+        let (mut event_type, confidence) = match (&classifier, raw.as_ref().or(decoded.as_ref())) {
+            (Some(c), Some(frame)) => match c.classify(frame).await {
                 Ok(dets) => dets
                     .into_iter()
                     .filter(|d| d.confidence >= min_classifier_conf)
@@ -105,7 +130,7 @@ pub async fn run_vision_pipeline(
                     ("motion".to_string(), Some(changed_fraction.min(1.0)))
                 }
             },
-            None => ("motion".to_string(), Some(changed_fraction.min(1.0))),
+            _ => ("motion".to_string(), Some(changed_fraction.min(1.0))),
         };
 
         // Face detection and recognition enrichment on person or motion events.
@@ -173,7 +198,9 @@ pub async fn run_vision_pipeline(
         // After the filter, so a dropped event writes nothing and prunes no kept snapshot.
         // Best-effort: a failed snapshot write must never suppress the event.
         let snapshot_path = cfg.snapshots.as_ref().and_then(|snap_cfg| {
-            match crate::snapshot::write_snapshot(snap_cfg, &cfg.camera_id, &frame) {
+            let bytes = jpeg.as_deref()?;
+            match crate::snapshot::write_snapshot_jpeg(snap_cfg, &cfg.camera_id, captured_at, bytes)
+            {
                 Ok(path) => Some(path.to_string_lossy().into_owned()),
                 Err(e) => {
                     tracing::warn!(camera = %cfg.camera_id, error = %e, "snapshot write failed");
@@ -240,6 +267,13 @@ pub async fn run_vision_pipeline(
     ended
 }
 
+/// When this camera's newest stored event happened, so a restart keeps the cooldown it started.
+async fn last_recorded_event(storage: &dyn CameraStorage, camera_id: &str) -> Option<Instant> {
+    let events = storage.list_events(camera_id, 1).await.ok()?;
+    let ago = (Utc::now() - events.first()?.created_at).to_std().ok()?;
+    Instant::now().checked_sub(ago)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,16 +281,38 @@ mod tests {
     use async_trait::async_trait;
     use futures_lite_shim::collect_one_camera_event;
     use pond_core::shared::services::in_process_event_bus::InProcessEventBus;
-    use pond_core::user_data::domain::vision::{Detection, Frame};
+    use pond_core::user_data::domain::vision::{Detection, JpegFrame};
     use pond_core::user_data::mocks::mock_sensor::MockCameraStorage;
     use std::collections::VecDeque;
 
     /// Deterministic frame source for tests.
-    struct ScriptedFrameSource(VecDeque<Frame>);
+    struct ScriptedFrameSource(VecDeque<CapturedFrame>);
+
+    impl ScriptedFrameSource {
+        fn raw(frames: VecDeque<Frame>) -> Self {
+            Self(frames.into_iter().map(CapturedFrame::from).collect())
+        }
+
+        /// The same pictures as the camera's own JPEGs, with no decoded luma.
+        fn jpeg(frames: VecDeque<Frame>) -> Self {
+            Self(
+                frames
+                    .into_iter()
+                    .map(|f| {
+                        CapturedFrame::Jpeg(JpegFrame {
+                            jpeg: Arc::new(crate::snapshot::frame_to_jpeg_bytes(&f).unwrap()),
+                            luma: None,
+                            captured_at: f.captured_at,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+    }
 
     #[async_trait]
     impl FrameSource for ScriptedFrameSource {
-        async fn next_frame(&mut self) -> Result<Option<Frame>> {
+        async fn next_frame(&mut self) -> Result<Option<CapturedFrame>> {
             Ok(self.0.pop_front())
         }
     }
@@ -331,7 +387,7 @@ mod tests {
         let subscription = bus.subscribe();
 
         run_vision_pipeline(
-            Box::new(ScriptedFrameSource(frames)),
+            &mut ScriptedFrameSource::raw(frames),
             None,
             None,
             storage.clone(),
@@ -385,7 +441,7 @@ mod tests {
         let bus = Arc::new(InProcessEventBus::new());
 
         run_vision_pipeline(
-            Box::new(ScriptedFrameSource(frames)),
+            &mut ScriptedFrameSource::raw(frames),
             Some(Arc::new(PetClassifier)),
             None,
             storage.clone(),
@@ -414,7 +470,7 @@ mod tests {
         ));
 
         run_vision_pipeline(
-            Box::new(ScriptedFrameSource(frames)),
+            &mut ScriptedFrameSource::raw(frames),
             None,
             None,
             storage.clone(),
@@ -444,7 +500,7 @@ mod tests {
         let bus = Arc::new(InProcessEventBus::new());
 
         run_vision_pipeline(
-            Box::new(ScriptedFrameSource(frames)),
+            &mut ScriptedFrameSource::raw(frames),
             None,
             None,
             storage.clone(),
@@ -541,7 +597,7 @@ mod tests {
         });
 
         run_vision_pipeline(
-            Box::new(ScriptedFrameSource(frames)),
+            &mut ScriptedFrameSource::raw(frames),
             Some(Arc::new(PersonClassifier)),
             Some(face_rec),
             storage.clone(),
@@ -664,7 +720,7 @@ mod tests {
     ) -> Vec<CameraEvent> {
         let storage = Arc::new(MockCameraStorage::new());
         run_vision_pipeline(
-            Box::new(ScriptedFrameSource(frames)),
+            &mut ScriptedFrameSource::raw(frames),
             classifier,
             face,
             storage.clone(),
@@ -812,17 +868,148 @@ mod tests {
         assert_eq!(events[0].event_type, "motion");
     }
 
+    /// Records what the classifier was shown.
+    struct SeenClassifier(std::sync::Mutex<Vec<(u32, u32)>>);
+
+    #[async_trait]
+    impl VisionClassifier for SeenClassifier {
+        async fn classify(&self, frame: &Frame) -> Result<Vec<Detection>> {
+            self.0.lock().unwrap().push((frame.width, frame.height));
+            Ok(vec![Detection {
+                label: "pet".into(),
+                confidence: 0.9,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn camera_jpegs_feed_the_live_view_and_snapshots_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.snapshots = Some(crate::snapshot::SnapshotConfig::new(
+            tmp.path().to_path_buf(),
+        ));
+        let mut source = ScriptedFrameSource::jpeg(VecDeque::from(vec![flat(20), with_square(20)]));
+        let CapturedFrame::Jpeg(last) = source.0.back().unwrap().clone() else {
+            unreachable!()
+        };
+        let classifier = Arc::new(SeenClassifier(Default::default()));
+        let storage = Arc::new(MockCameraStorage::new());
+        let registry = LiveCameraRegistry::new();
+
+        run_vision_pipeline(
+            &mut source,
+            Some(classifier.clone()),
+            None,
+            storage.clone(),
+            Arc::new(InProcessEventBus::new()),
+            &registry,
+            cfg,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            registry.get_latest_frame("backyard-cam").as_deref(),
+            Some(last.jpeg.as_slice()),
+            "the live view carries the camera's bytes, not a re-encode"
+        );
+        let stored = storage.list_events("backyard-cam", 10).await.unwrap();
+        assert_eq!(stored.len(), 1, "motion found by decoding the jpeg");
+        assert_eq!(stored[0].event_type, "pet");
+        let snapshot = std::fs::read(stored[0].snapshot_path.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            snapshot, *last.jpeg,
+            "the snapshot is the camera's own jpeg"
+        );
+        assert_eq!(
+            *classifier.0.lock().unwrap(),
+            vec![(64, 36)],
+            "only the one candidate is decoded, at full size"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decoded_luma_picture_is_used_instead_of_decoding_the_jpeg() {
+        // The JPEG is garbage: only the luma that came with it can show the motion.
+        let luma = |v: u8, square: bool| {
+            let mut pixels = vec![v; 64 * 36];
+            if square {
+                for y in 0..18 {
+                    pixels[y * 64..y * 64 + 32].fill(255);
+                }
+            }
+            pond_core::user_data::domain::vision::LumaPlane {
+                width: 64,
+                height: 36,
+                pixels,
+            }
+        };
+        let frames = [luma(20, false), luma(20, true)]
+            .into_iter()
+            .map(|l| {
+                CapturedFrame::Jpeg(JpegFrame {
+                    jpeg: Arc::new(b"not a jpeg".to_vec()),
+                    luma: Some(l),
+                    captured_at: Utc::now(),
+                })
+            })
+            .collect();
+        let storage = Arc::new(MockCameraStorage::new());
+        run_vision_pipeline(
+            &mut ScriptedFrameSource(frames),
+            None,
+            None,
+            storage.clone(),
+            Arc::new(InProcessEventBus::new()),
+            &LiveCameraRegistry::new(),
+            cfg(),
+        )
+        .await
+        .unwrap();
+        let stored = storage.list_events("backyard-cam", 10).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].event_type, "motion",
+            "an undecodable candidate stays motion"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_pipeline_keeps_the_cooldown_the_last_event_started() {
+        let storage = Arc::new(MockCameraStorage::new());
+        for _ in 0..2 {
+            run_vision_pipeline(
+                &mut ScriptedFrameSource::raw(VecDeque::from(vec![flat(20), with_square(20)])),
+                None,
+                None,
+                storage.clone(),
+                Arc::new(InProcessEventBus::new()),
+                &LiveCameraRegistry::new(),
+                cfg(),
+            )
+            .await
+            .unwrap();
+        }
+        let stored = storage.list_events("backyard-cam", 10).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the second run starts inside the first event's cooldown"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_frame_read_is_reported_as_the_reason_the_pipeline_ended() {
         struct Broken;
         #[async_trait]
         impl FrameSource for Broken {
-            async fn next_frame(&mut self) -> Result<Option<Frame>> {
+            async fn next_frame(&mut self) -> Result<Option<CapturedFrame>> {
                 anyhow::bail!("ffmpeg exited")
             }
         }
         let ended = run_vision_pipeline(
-            Box::new(Broken),
+            &mut Broken,
             None,
             None,
             Arc::new(MockCameraStorage::new()),

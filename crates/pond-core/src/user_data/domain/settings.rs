@@ -323,7 +323,7 @@ pub struct Settings {
     #[serde(default = "Settings::default_vision_camera_id")]
     pub vision_camera_id: String,
 
-    /// Frames analysed per second (1–5); kept low to bound CPU use on the Jetson.
+    /// Frames analysed per second (1–30).
     #[serde(default = "Settings::default_vision_fps")]
     pub vision_fps: u32,
 
