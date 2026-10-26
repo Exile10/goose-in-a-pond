@@ -1693,6 +1693,117 @@ def section_picture_support_after_restart():
     )
 
 
+# A camera that refuses at once: port 9 is closed on loopback, so nothing leaves the machine.
+_DEAD_CAMERA = "rtsp://live:test-secret@127.0.0.1:9/live"
+
+
+def _vision_status():
+    code, body = call("GET", "/api/v1/vision/status")
+    return code, body if isinstance(body, dict) else {}
+
+
+def _wait_for_vision(states, seconds=20):
+    import time
+
+    deadline = time.time() + seconds
+    body = {}
+    while time.time() < deadline:
+        code, body = _vision_status()
+        if code == 200 and body.get("state") in states:
+            return body
+        time.sleep(0.5)
+    return body
+
+
+def section_vision():
+    """The vision supervisor on a real server: it follows settings live, shows why it is not
+    capturing, never shows camera credentials, and stops for camera consent. Leaves a bus setting
+    for the restart pass."""
+    print("\n=== vision ===")
+    code, body = _vision_status()
+    expect(
+        "GET /vision/status answers with vision off by default",
+        code, 200, body,
+        ("state off", lambda b: b.get("state") == "off"),
+        ("consent on", lambda b: b.get("cameras_enabled") is True),
+    )
+    code, body = call("GET", "/api/v1/cameras")
+    expect(
+        "GET /cameras lists the configured camera, not live",
+        code, 200, body,
+        ("not live", lambda b: isinstance(b, dict) and b["cameras"] and b["cameras"][0]["live"] is False),
+    )
+    code, body = call("GET", "/api/v1/faces")
+    expect(
+        "GET /faces answers with every profile",
+        code, 200, body,
+        ("people listed", lambda b: isinstance(b, dict) and isinstance(b.get("people"), list)),
+    )
+
+    code, body = call("PUT", "/api/v1/vision/config", {"min_event_interval_secs": 42, "enabled_event_types": ["Person"]})
+    expect(
+        "PUT /vision/config saves through settings",
+        code, 200, body,
+        ("cooldown", lambda b: b.get("min_event_interval_secs") == 42),
+        ("types normalised", lambda b: b.get("vision_event_types") == ["person"]),
+    )
+
+    code, body = call("PUT", "/api/v1/settings", {"vision_enabled": True, "vision_camera_url": _DEAD_CAMERA})
+    if not expect("vision switched on with an unreachable camera", code, 200, body):
+        return
+    try:
+        status = _wait_for_vision({"reconnecting"})
+        check(
+            "the supervisor picks the camera up without a restart and shows why it is failing",
+            status.get("state") == "reconnecting" and bool(status.get("last_error")),
+            json.dumps(status),
+        )
+        check(
+            "the camera's credentials never reach the status",
+            status.get("source") == "rtsp://***@127.0.0.1:9/live"
+            and "test-secret" not in json.dumps(status),
+            json.dumps(status),
+        )
+
+        code, body = call("PUT", "/api/v1/settings", {"cameras_enabled": False})
+        expect("camera consent switched off", code, 200, body)
+        status = _wait_for_vision({"consent_off"}, seconds=8)
+        check("consent off stops the supervisor within seconds", status.get("state") == "consent_off", json.dumps(status))
+        code, body = call("GET", "/api/v1/camera/snapshot")
+        expect(
+            "a camera picture is refused while consent is off",
+            code, 403, body,
+            ("reason", lambda b: isinstance(b, dict) and b.get("reason") == "cameras_disabled"),
+        )
+        log = os.path.join(DATA_DIR, "server.out")
+        text = open(log, errors="replace").read() if os.path.exists(log) else ""
+        check(
+            "the stop is logged with its reason",
+            "vision supervisor stopped the camera pipeline" in text and "camera consent turned off" in text,
+            log,
+        )
+    finally:
+        code, body = call(
+            "PUT", "/api/v1/settings",
+            {"cameras_enabled": True, "vision_enabled": False, "vision_camera_url": ""},
+        )
+        expect("vision off and camera consent back on", code, 200, body)
+
+
+def section_vision_after_restart():
+    """The bus settings are settings: a fresh process starts from them."""
+    print("\n=== vision after restart ===")
+    code, body = call("GET", "/api/v1/vision/config")
+    expect(
+        "the vision bus settings survive a restart",
+        code, 200, body,
+        ("cooldown", lambda b: b.get("min_event_interval_secs") == 42),
+        ("types", lambda b: b.get("enabled_event_types") == ["person"]),
+    )
+    code, body = _vision_status()
+    expect("vision is still off after a restart", code, 200, body, ("off", lambda b: b.get("state") == "off"))
+
+
 def main():
     """Auth is NOT checked here.
 
@@ -1714,6 +1825,7 @@ def main():
         section_audio_devices_after_restart()
         section_lane_clock_after_restart()
         section_picture_support_after_restart()
+        section_vision_after_restart()
     else:
         section_schema()
         jerry, liz = section_identity()
@@ -1734,6 +1846,7 @@ def main():
         section_inference_lane()
         section_composed_suggestions()
         section_reminders_surface()
+        section_vision()
         # Last: it moves the chat model to a local one for a moment, and puts it back.
         section_picture_support()
 

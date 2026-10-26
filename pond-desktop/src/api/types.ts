@@ -246,6 +246,14 @@ export interface Settings {
   vision_camera_id?: string;
   vision_fps?: number;
   vision_motion_threshold?: number;
+  /** Seconds between camera events; the server clamps to 1..3600. */
+  vision_event_cooldown_secs?: number;
+  /** Detector confidence floor; the server clamps to 0.05..0.99. */
+  vision_classifier_confidence?: number;
+  vision_face_recognition_enabled?: boolean;
+  vision_face_on_motion?: boolean;
+  /** Empty records every kind of camera event. */
+  vision_event_types?: string[];
 
   // Matter (smart-home fabric). No on/off toggle; a stored `matter_enabled` is ignored.
   matter_ws_url?: string;

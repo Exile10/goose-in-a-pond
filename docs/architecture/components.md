@@ -68,7 +68,7 @@ Release builds add features on top of the default: the macOS desktop sidecar is 
 | Crate | Purpose | Status |
 |---|---|---|
 | `pond-adapters-matter` | `DeviceControlPort` over GIAP's own `matter-server/` (matter.js) on the loopback `giap-matter` WebSocket; installs and spawns that server under `<data_dir>/matter-server/app/` | live |
-| `pond-adapters-vision` | ffmpeg camera capture and motion differencing into `camera_events` and the EventBus | live, gated by a setting (`vision_enabled` plus a camera URL) |
+| `pond-adapters-vision` | ffmpeg camera capture and motion differencing into `camera_events` and the EventBus; the `VisionSupervisor` that keeps capture matched to settings and camera consent; the live-frame registry behind the camera routes | live, gated by settings (`cameras_enabled` and `vision_enabled`, plus a configured or discovered camera) |
 | `pond-adapters-vision-onnx` | YOLOX-Nano labelling of motion events (person, pet, package) | feature `vision-onnx` |
 | `pond-adapters-face-onnx` | ONNX face detection and embedding (`FaceEmbeddingExtractor`) | feature `face-onnx` |
 | `pond-adapters-weather` | `OpenMeteoWeatherAdapter` and `Geocoder` (keyless Open-Meteo, 15-minute cache); defines the `WeatherProvider` trait itself | live |
