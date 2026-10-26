@@ -115,6 +115,7 @@ async fn with_camera_consent_off_no_picture_or_stream_is_served() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["state"], "consent_off");
     assert_eq!(body["cameras_enabled"], false);
+    assert!(body["capture"].is_null(), "nothing captures: {body}");
 }
 
 #[tokio::test]

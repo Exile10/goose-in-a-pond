@@ -1768,6 +1768,11 @@ def section_vision():
             and "test-secret" not in json.dumps(status),
             json.dumps(status),
         )
+        check(
+            "a camera that never delivered has no capture path",
+            "capture" in status and status["capture"] is None,
+            json.dumps(status),
+        )
 
         code, body = call("PUT", "/api/v1/settings", {"cameras_enabled": False})
         expect("camera consent switched off", code, 200, body)

@@ -504,6 +504,14 @@ fn reported_state(settings: &Settings, supervisor: &SupervisorStatus) -> VisionS
     }
 }
 
+/// How frames reach the pipeline, only while it is capturing them.
+fn reported_capture(reported: VisionState, supervisor: &SupervisorStatus) -> Option<&'static str> {
+    supervisor
+        .capture
+        .filter(|_| matches!(reported, VisionState::Starting | VisionState::Running))
+        .map(|c| c.as_str())
+}
+
 /// `GET /api/v1/vision/status`: what the camera pipeline is doing, and why when it is not.
 pub(crate) async fn get_vision_status(
     State(state): State<Arc<AppState>>,
@@ -536,6 +544,7 @@ pub(crate) async fn get_vision_status(
             .fps
             .filter(|_| capturing)
             .unwrap_or_else(|| vision_policy::clamp_fps(settings.vision_fps)),
+        "capture": reported_capture(reported, &supervisor),
         "last_frame_at": registry().last_frame_at(&camera_id).map(rfc3339),
         "last_event_at": registry().last_event_at().map(rfc3339),
         "last_error": supervisor.last_error.as_ref().filter(|_| capturing),
@@ -684,6 +693,7 @@ pub(crate) async fn register_face_from_camera(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pond_adapters_vision::CapturePath;
 
     fn enabled() -> Settings {
         Settings {
@@ -741,6 +751,32 @@ mod tests {
         ] {
             assert_eq!(reported_state(&enabled(), &supervisor(s)), s);
         }
+    }
+
+    #[test]
+    fn the_capture_path_shows_only_while_frames_are_being_captured() {
+        let hardware = SupervisorStatus {
+            capture: Some(CapturePath::Hardware),
+            ..supervisor(VisionState::Running)
+        };
+        assert_eq!(
+            reported_capture(VisionState::Running, &hardware),
+            Some("hardware")
+        );
+        for idle in [
+            VisionState::ConsentOff,
+            VisionState::Off,
+            VisionState::NoCamera,
+            VisionState::Reconnecting,
+        ] {
+            assert_eq!(reported_capture(idle, &hardware), None, "{idle:?}");
+        }
+        assert_eq!(
+            reported_capture(VisionState::Running, &supervisor(VisionState::Running)),
+            None
+        );
+        assert_eq!(CapturePath::CameraJpeg.as_str(), "camera_jpeg");
+        assert_eq!(CapturePath::Software.as_str(), "software");
     }
 
     #[test]
