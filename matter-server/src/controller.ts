@@ -165,8 +165,9 @@ export class Controller {
       // Per slice: bridged children sharing a node id would collide in both sides' dedupe caches.
       for (const slice of deviceSlices(snapshot)) {
         const deviceId = deviceIdForNode(slice.nodeId, slice.rootEndpoint);
-        // Skip endpoint 0: it is on every slice, so its readings would repeat per bridged device.
-        for (const endpoint of applicationEndpoints(slice)) {
+        // Endpoint 0 is on every slice, so only the hub's slice reads it (a battery can live there).
+        const endpoints = slice.rootEndpoint === undefined ? slice.endpoints : applicationEndpoints(slice);
+        for (const endpoint of endpoints) {
           for (const [cluster, attributes] of Object.entries(endpoint.clusters)) {
             for (const [attribute, value] of Object.entries(attributes)) {
               // The cluster's own declared unit travels with its value.
