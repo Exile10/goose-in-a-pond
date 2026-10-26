@@ -51,9 +51,66 @@ pub fn host_is_accelerated(model: Option<&str>, has_tegra_release: bool) -> bool
     model.contains("jetson") || model.contains("tegra") || model.contains("nvidia")
 }
 
+/// Where an ONNX model runs right now. A model starts on the CPU and may move to the GPU later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnnxDevice {
+    Cpu,
+    Cuda,
+    TensorRt,
+}
+
+impl OnnxDevice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnnxDevice::Cpu => "cpu",
+            OnnxDevice::Cuda => "cuda",
+            OnnxDevice::TensorRt => "tensorrt",
+        }
+    }
+}
+
+/// The names the ONNX models are recorded and reported under, one per role, whatever the file.
+pub const VISION_CLASSIFIER: &str = "vision_classifier";
+pub const FACE_DETECTOR: &str = "face_detector";
+pub const FACE_EMBEDDER: &str = "face_embedder";
+pub const FACE_ANTISPOOF: &str = "face_antispoof";
+
+// Process-wide because the adapters that move models and the routes that report them never meet.
+static ONNX_DEVICES: std::sync::Mutex<Vec<(&'static str, OnnxDevice)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Records where `model` runs now, replacing what was recorded for it before.
+pub fn record_onnx_device(model: &'static str, device: OnnxDevice) {
+    let mut all = ONNX_DEVICES.lock().unwrap_or_else(|e| e.into_inner());
+    match all.iter_mut().find(|(m, _)| *m == model) {
+        Some(entry) => entry.1 = device,
+        None => all.push((model, device)),
+    }
+}
+
+/// Where `model` runs, if this process loaded it.
+pub fn onnx_device(model: &str) -> Option<OnnxDevice> {
+    ONNX_DEVICES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(m, _)| *m == model)
+        .map(|(_, d)| *d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_reports_the_device_it_moved_to_last() {
+        assert_eq!(onnx_device("test_model_moves"), None);
+        record_onnx_device("test_model_moves", OnnxDevice::Cpu);
+        assert_eq!(onnx_device("test_model_moves"), Some(OnnxDevice::Cpu));
+        record_onnx_device("test_model_moves", OnnxDevice::TensorRt);
+        assert_eq!(onnx_device("test_model_moves"), Some(OnnxDevice::TensorRt));
+        assert_eq!(OnnxDevice::TensorRt.as_str(), "tensorrt");
+    }
 
     /// An `if !cuda { warn }` would shout at every laptop and be muted within a week.
     #[test]

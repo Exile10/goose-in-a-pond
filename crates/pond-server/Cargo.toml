@@ -145,6 +145,7 @@ pond-adapters-face-onnx       = { workspace = true, optional = true }
 pond-adapters-vision-onnx     = { workspace = true, optional = true }
 # Speech/silence decision for the voice loop; see the note above the features.
 pond-adapters-silero          = { workspace = true }
+pond-onnx-accel               = { workspace = true }
 # Optional: only compiled when --features mesh is passed.
 pond-adapters-mesh-libp2p     = { workspace = true, optional = true }
 pond-mesh-protocol            = { workspace = true, optional = true }

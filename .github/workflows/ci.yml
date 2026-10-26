@@ -282,8 +282,8 @@ jobs:
       # Compile-gate the ONNX vision classifier (ort is too heavy for the fast
       # lint/test pass, mirroring pond-adapters-face-onnx). Its pure decode/
       # preprocess tests run here too — they need no ONNX Runtime library.
-      - name: cargo test (vision classifier — pond-adapters-vision-onnx)
-        run: cargo test -p pond-adapters-vision-onnx
+      - name: cargo test (vision classifier — pond-adapters-vision-onnx, and its GPU sessions)
+        run: cargo test -p pond-adapters-vision-onnx -p pond-onnx-accel
 
       # Isolated like vision-onnx above: full-feature libp2p (kad+gossipsub+relay+dcutr+identify+
       # noise+yamux) is a materially heavier compile than the fast-crates list, and the crate does
