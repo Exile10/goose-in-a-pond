@@ -12,6 +12,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use pond_adapters_vision::{
     LiveCameraRegistry, SupervisorStatus, VisionBusConfig, VisionState, LIVE_FRAME_WINDOW,
 };
+use pond_core::models::domain::acceleration::{self, onnx_device, OnnxDevice};
 use pond_core::shared::ports::event_bus::BusEvent;
 use pond_core::user_data::domain::sensor::CameraEvent;
 use pond_core::user_data::domain::settings::Settings;
@@ -549,10 +550,18 @@ pub(crate) async fn get_vision_status(
         "last_event_at": registry().last_event_at().map(rfc3339),
         "last_error": supervisor.last_error.as_ref().filter(|_| capturing),
         "restarts": supervisor.restarts,
-        "classifier": { "available": supervisor.classifier_available },
+        "classifier": {
+            "available": supervisor.classifier_available,
+            "accelerator": onnx_device(acceleration::VISION_CLASSIFIER).map(OnnxDevice::as_str),
+        },
         "faces": {
             "available": state.face_recognition.is_some(),
             "enrolled_people": enrolled_people,
+            "accelerators": {
+                "detector": onnx_device(acceleration::FACE_DETECTOR).map(OnnxDevice::as_str),
+                "embedder": onnx_device(acceleration::FACE_EMBEDDER).map(OnnxDevice::as_str),
+                "antispoof": onnx_device(acceleration::FACE_ANTISPOOF).map(OnnxDevice::as_str),
+            },
         },
         "event_listeners": registry().event_listener_count(),
     })))
