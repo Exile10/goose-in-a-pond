@@ -52,7 +52,7 @@ pub async fn run_vision_pipeline(
 ) -> anyhow::Result<()> {
     let mut detector = MotionDetector::new(cfg.motion.clone());
     let mut luma_decoder = LumaDecoder::default();
-    let mut last_event: Option<Instant> = None;
+    let mut last_event = last_recorded_event(storage.as_ref(), &cfg.camera_id).await;
     tracing::info!(camera = %cfg.camera_id, "vision pipeline started");
 
     let ended = loop {
@@ -265,6 +265,13 @@ pub async fn run_vision_pipeline(
     };
     tracing::info!(camera = %cfg.camera_id, "vision pipeline stopped");
     ended
+}
+
+/// When this camera's newest stored event happened, so a restart keeps the cooldown it started.
+async fn last_recorded_event(storage: &dyn CameraStorage, camera_id: &str) -> Option<Instant> {
+    let events = storage.list_events(camera_id, 1).await.ok()?;
+    let ago = (Utc::now() - events.first()?.created_at).to_std().ok()?;
+    Instant::now().checked_sub(ago)
 }
 
 #[cfg(test)]
@@ -965,6 +972,30 @@ mod tests {
         assert_eq!(
             stored[0].event_type, "motion",
             "an undecodable candidate stays motion"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_pipeline_keeps_the_cooldown_the_last_event_started() {
+        let storage = Arc::new(MockCameraStorage::new());
+        for _ in 0..2 {
+            run_vision_pipeline(
+                &mut ScriptedFrameSource::raw(VecDeque::from(vec![flat(20), with_square(20)])),
+                None,
+                None,
+                storage.clone(),
+                Arc::new(InProcessEventBus::new()),
+                &LiveCameraRegistry::new(),
+                cfg(),
+            )
+            .await
+            .unwrap();
+        }
+        let stored = storage.list_events("backyard-cam", 10).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the second run starts inside the first event's cooldown"
         );
     }
 
