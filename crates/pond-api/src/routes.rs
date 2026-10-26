@@ -298,6 +298,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/vision/config",
             get(crate::camera::get_vision_config).put(crate::camera::update_vision_config),
         )
+        .route("/vision/status", get(crate::camera::get_vision_status))
         .route(
             "/vision/events/stream",
             get(crate::camera::stream_vision_events_sse),
@@ -506,6 +507,12 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/recipes/{id}", put(update_recipe).delete(delete_recipe))
         .route("/recipes/{name}/run", post(run_recipe))
         // ── Face biometrics ───────────────────────────────────────────────────
+        // Household summary and camera enrolment: biometric, so never in PUBLIC_ROUTES.
+        .route("/faces", get(crate::camera::list_household_faces))
+        .route(
+            "/faces/register-from-camera",
+            post(crate::camera::register_face_from_camera),
+        )
         .route("/faces/register", post(register_face_handler))
         .route("/faces/identify", post(identify_face_handler))
         .route("/faces/identify-burst", post(burst_identify_face_handler))
@@ -5415,6 +5422,9 @@ async fn update_settings(
         ));
     }
 
+    // Stored as the pipeline will read them, so the saved value is the applied one.
+    pond_core::user_data::domain::vision::normalize_settings(&mut merged);
+
     // Write only the patch's keys, or a concurrent writer's changes get reverted. `user_keys` is
     // the user's intent (fed to `mark_user_set`); `write_keys` adds server-derived values.
     let user_keys: std::collections::HashSet<String> = patch
@@ -5470,6 +5480,9 @@ async fn update_settings(
 
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
+    let cameras = pond_adapters_vision::LiveCameraRegistry::global();
+    cameras.sync_settings(&merged);
+    cameras.notify_settings_changed();
 
     if merged.picture_support_download_enabled {
         pond_core::models::domain::device_budget::allow_gemma_vision();
@@ -14895,7 +14908,7 @@ async fn run_recipe(
 // ───────────────────────── Face Biometrics ──────────────────────────────────
 // Without `bbox` ("x,y,w,h" source pixels) the adapter center-crops; fine only for headshots.
 
-fn face_unavailable() -> (StatusCode, Json<Value>) {
+pub(crate) fn face_unavailable() -> (StatusCode, Json<Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({

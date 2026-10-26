@@ -7,8 +7,10 @@ use pond_core::user_data::domain::schedule::{
     TriggerSourceKind,
 };
 use pond_core::user_data::domain::sensor::CameraEvent;
+use pond_core::user_data::domain::vision as vision_policy;
 use pond_core::user_data::ports::camera_storage::CameraStorage;
 use pond_core::user_data::ports::scheduler::CreateScheduleRequest;
+use pond_core::user_data::ports::settings::SettingsRepository;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -21,7 +23,6 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-const DEFAULT_CAMERA_ID: &str = "camera-1";
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 50;
 const DEFAULT_WINDOW_FRAMES: usize = 3;
@@ -29,7 +30,7 @@ const WINDOW_EVENT_SCAN: usize = 30;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct RecentCameraEventsParams {
-    /// Camera to read (default "camera-1").
+    /// Camera to read (default: the household's camera).
     pub camera_id: Option<String>,
     /// Default 10, max 50.
     pub limit: Option<u32>,
@@ -51,7 +52,7 @@ pub struct AcknowledgeCameraEventParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct LookAtSnapshotParams {
-    /// Camera to look at (default "camera-1").
+    /// Camera to look at (default: the household's camera).
     pub camera_id: Option<String>,
     /// Specific event from get_recent_camera_events; omit for the newest frame.
     pub event_id: Option<i64>,
@@ -63,7 +64,7 @@ pub struct LookAtSnapshotParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct LookAtWindowParams {
-    /// Camera to look at (default "camera-1").
+    /// Camera to look at (default: the household's camera).
     pub camera_id: Option<String>,
     /// Frames to sample, evenly spaced across the window. Default 3, max 4.
     pub frames: Option<u32>,
@@ -75,7 +76,7 @@ pub struct LookAtWindowParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SendSnapshotParams {
-    /// Camera to look at (default "camera-1").
+    /// Camera to look at (default: the household's camera).
     pub camera_id: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -85,19 +86,19 @@ pub struct SendSnapshotParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ConfigureVisionBusParams {
-    /// Minimum seconds between emitted vision events (cooldown, default 10).
+    /// Minimum seconds between vision events (1 to 3600, default 10).
     pub min_event_interval_secs: Option<u64>,
-    /// Minimum classifier confidence (0.0 to 1.0, default 0.5).
+    /// Detector confidence needed to name an event instead of "motion" (0.05 to 0.99, default 0.5).
     pub classifier_confidence_threshold: Option<f64>,
-    /// Enable or disable face detection and recognition on the vision bus.
+    /// Recognise household faces in camera events.
     pub face_detection_enabled: Option<bool>,
     /// Run face detection on motion events even before a person classifier runs.
     pub face_on_motion: Option<bool>,
-    /// Event types enabled on the vision bus (e.g. ["motion", "person", "pet", "vehicle", "package", "face_detected", "face_recognized", "face_unknown"]).
+    /// Event types to record (e.g. ["motion", "person", "pet", "vehicle", "package", "face_detected", "face_recognized", "face_unknown"]); an empty list records every type.
     pub enabled_event_types: Option<Vec<String>>,
-    /// Persistent capture frame rate in FPS (1 to 5).
+    /// Capture frame rate in FPS (1 to 5).
     pub vision_fps: Option<u32>,
-    /// Persistent motion fraction threshold (0.005 to 0.50).
+    /// Fraction of the picture that must change to count as motion (0.005 to 0.50).
     pub vision_motion_threshold: Option<f64>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -109,7 +110,7 @@ pub struct ConfigureVisionBusParams {
 pub struct CreateVisionAutomationParams {
     /// Label for the automation rule (e.g. "Welcome Jerry home").
     pub name: Option<String>,
-    /// Camera ID to listen to (default "camera-1", or "any" for all cameras).
+    /// Camera ID to listen to (default: the household's camera, or "any" for all cameras).
     pub camera_id: Option<String>,
     /// Vision or face signal to match: "motion", "person", "pet", "vehicle", "package", "face_detected", "face_recognized", "face_unknown", or "face:<profile_id>".
     pub signal: Option<String>,
@@ -266,15 +267,52 @@ fn pick_evenly_spaced(len: usize, count: usize) -> Vec<usize> {
 #[derive(Clone)]
 pub struct VisionMcpServer {
     camera_storage: Arc<dyn CameraStorage + Send + Sync>,
+    settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
+impl VisionMcpServer {
+    /// The camera to use, or the refusal to return: no frame reaches the model without consent.
+    async fn camera_for_frames(&self, requested: Option<String>) -> Result<String, CallToolResult> {
+        match self.settings_repo.get().await {
+            Ok(s) if !s.cameras_enabled => Err(CallToolResult::success(vec![ContentBlock::text(
+                "Camera access is turned off in Privacy settings, so I can't look at the cameras.",
+            )])),
+            Ok(s) => Ok(requested
+                .filter(|c| !c.trim().is_empty())
+                .unwrap_or_else(|| vision_policy::camera_id(&s))),
+            Err(e) => {
+                tracing::warn!(error = %e, "vision: could not read camera consent");
+                Err(CallToolResult::success(vec![ContentBlock::text(
+                    "Sorry, I couldn't check whether the cameras are allowed right now.",
+                )]))
+            }
+        }
+    }
+
+    async fn default_camera(&self, requested: Option<String>) -> String {
+        match requested.filter(|c| !c.trim().is_empty()) {
+            Some(id) => id,
+            None => self
+                .settings_repo
+                .get()
+                .await
+                .map(|s| vision_policy::camera_id(&s))
+                .unwrap_or_else(|_| vision_policy::DEFAULT_CAMERA_ID.to_string()),
+        }
+    }
+}
+
 #[tool_router]
 impl VisionMcpServer {
-    pub fn new(camera_storage: Arc<dyn CameraStorage + Send + Sync>) -> Self {
+    pub fn new(
+        camera_storage: Arc<dyn CameraStorage + Send + Sync>,
+        settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
+    ) -> Self {
         Self {
             camera_storage,
+            settings_repo,
             tool_router: Self::tool_router(),
         }
     }
@@ -288,11 +326,7 @@ saw.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<RecentCameraEventsParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
-        let camera_id = params
-            .0
-            .camera_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_CAMERA_ID.to_string());
+        let camera_id = self.default_camera(params.0.camera_id).await;
         let limit = params
             .0
             .limit
@@ -352,11 +386,10 @@ attached an image, just look at it - do NOT call this.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<LookAtSnapshotParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
-        let camera_id = params
-            .0
-            .camera_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_CAMERA_ID.to_string());
+        let camera_id = match self.camera_for_frames(params.0.camera_id).await {
+            Ok(id) => id,
+            Err(refusal) => return Ok(refusal),
+        };
 
         if params.0.event_id.is_none() {
             if let Some(live_jpeg) = LiveCameraRegistry::global().get_latest_frame(&camera_id) {
@@ -429,11 +462,10 @@ user attached an image, do NOT call this.")]
         _ctx: RequestContext<RoleServer>,
         params: Parameters<LookAtWindowParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
-        let camera_id = params
-            .0
-            .camera_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_CAMERA_ID.to_string());
+        let camera_id = match self.camera_for_frames(params.0.camera_id).await {
+            Ok(id) => id,
+            Err(refusal) => return Ok(refusal),
+        };
         let frames = params
             .0
             .frames
@@ -495,11 +527,10 @@ asks you to send, show, or share a picture or photo from the camera. Never for a
         _ctx: RequestContext<RoleServer>,
         params: Parameters<SendSnapshotParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
-        let camera_id = params
-            .0
-            .camera_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_CAMERA_ID.to_string());
+        let camera_id = match self.camera_for_frames(params.0.camera_id).await {
+            Ok(id) => id,
+            Err(refusal) => return Ok(refusal),
+        };
 
         if let Some(live_jpeg) = LiveCameraRegistry::global().get_latest_frame(&camera_id) {
             let img = ContentBlock::image(
@@ -573,63 +604,82 @@ Acknowledge a camera event by ID to stop re-alerts once the user has seen it.")]
     }
 
     #[tool(description = "\
-View or update the live vision bus configuration (event cooldown, classifier confidence floor, \
-face detection toggle, enabled event types, FPS, and motion threshold). Never for an image \
-attached to the message.")]
+View or update the vision bus configuration (event cooldown, classifier confidence floor, \
+face recognition, enabled event types, FPS, and motion threshold). Changes are saved to \
+settings. Never for an image attached to the message.")]
     async fn configure_vision_bus(
         &self,
         _ctx: RequestContext<RoleServer>,
         params: Parameters<ConfigureVisionBusParams>,
     ) -> Result<CallToolResult, rmcp::model::ErrorData> {
         let p = params.0;
-        let updated = LiveCameraRegistry::global().update_bus_config(|cfg| {
-            if let Some(secs) = p.min_event_interval_secs {
-                cfg.min_event_interval_secs = secs.max(1);
+        let mut s = match self.settings_repo.get().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "vision: settings unavailable");
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "Sorry, I couldn't read the vision settings right now.",
+                )]));
             }
-            if let Some(conf) = p.classifier_confidence_threshold {
-                cfg.classifier_confidence_threshold = conf.clamp(0.05, 0.99);
-            }
-            if let Some(face_en) = p.face_detection_enabled {
-                cfg.face_detection_enabled = face_en;
-            }
-            if let Some(face_mot) = p.face_on_motion {
-                cfg.face_on_motion = face_mot;
-            }
-            if let Some(types) = p.enabled_event_types {
-                if !types.is_empty() {
-                    cfg.enabled_event_types = types;
-                }
-            }
-        });
+        };
 
-        let mut settings_note = String::new();
-        if p.vision_fps.is_some() || p.vision_motion_threshold.is_some() {
-            if let Some((_, settings_repo)) = crate::schedule::scheduler_and_settings() {
-                if let Ok(mut s) = settings_repo.get().await {
-                    if let Some(fps) = p.vision_fps {
-                        s.vision_fps = fps.clamp(1, 5);
-                    }
-                    if let Some(mt) = p.vision_motion_threshold {
-                        s.vision_motion_threshold = mt.clamp(0.005, 0.50);
-                    }
-                    if settings_repo.update(&s).await.is_ok() {
-                        settings_note = format!(
-                            "\nPersistent settings updated: vision_fps={}, vision_motion_threshold={:.3}",
-                            s.vision_fps, s.vision_motion_threshold
-                        );
-                    }
-                }
+        let mut touched = std::collections::HashSet::new();
+        if let Some(v) = p.min_event_interval_secs {
+            s.vision_event_cooldown_secs = v;
+            touched.insert("vision_event_cooldown_secs".to_string());
+        }
+        if let Some(v) = p.classifier_confidence_threshold {
+            s.vision_classifier_confidence = v;
+            touched.insert("vision_classifier_confidence".to_string());
+        }
+        if let Some(v) = p.face_detection_enabled {
+            s.vision_face_recognition_enabled = v;
+            touched.insert("vision_face_recognition_enabled".to_string());
+        }
+        if let Some(v) = p.face_on_motion {
+            s.vision_face_on_motion = v;
+            touched.insert("vision_face_on_motion".to_string());
+        }
+        if let Some(v) = p.enabled_event_types {
+            s.vision_event_types = v;
+            touched.insert("vision_event_types".to_string());
+        }
+        if let Some(v) = p.vision_fps {
+            s.vision_fps = v;
+            touched.insert("vision_fps".to_string());
+        }
+        if let Some(v) = p.vision_motion_threshold {
+            s.vision_motion_threshold = v;
+            touched.insert("vision_motion_threshold".to_string());
+        }
+        vision_policy::normalize_settings(&mut s);
+
+        let mut saved_note = "";
+        if !touched.is_empty() {
+            if let Err(e) = self.settings_repo.update_fields(&s, Some(&touched)).await {
+                tracing::warn!(error = %e, "vision: saving the bus configuration failed");
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "Sorry, I couldn't save the vision settings.",
+                )]));
             }
+            if let Err(e) = self.settings_repo.mark_user_set(&touched).await {
+                tracing::warn!(error = %e, "vision: could not record the settings as chosen");
+            }
+            LiveCameraRegistry::global().sync_settings(&s);
+            LiveCameraRegistry::global().notify_settings_changed();
+            saved_note = "\nSaved to settings; it applies now and after a restart.";
         }
 
+        let bus = VisionBusConfig::from_settings(&s);
         let active_cams = LiveCameraRegistry::global().active_cameras();
         let listeners = LiveCameraRegistry::global().event_listener_count();
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Vision bus configuration:\n\
              - Active cameras: {}\n\
+             - Capture: {} fps, motion threshold {:.3}\n\
              - Event cooldown: {}s\n\
              - Classifier confidence floor: {:.2}\n\
-             - Face detection enabled: {}\n\
+             - Face recognition enabled: {}\n\
              - Face detection on motion: {}\n\
              - Enabled event types: {}\n\
              - Supported automation signals: {}\n\
@@ -639,14 +689,20 @@ attached to the message.")]
             } else {
                 active_cams.join(", ")
             },
-            updated.min_event_interval_secs,
-            updated.classifier_confidence_threshold,
-            updated.face_detection_enabled,
-            updated.face_on_motion,
-            updated.enabled_event_types.join(", "),
+            s.vision_fps,
+            s.vision_motion_threshold,
+            bus.min_event_interval_secs,
+            bus.classifier_confidence_threshold,
+            bus.face_detection_enabled,
+            bus.face_on_motion,
+            if bus.enabled_event_types.is_empty() {
+                "all".to_string()
+            } else {
+                bus.enabled_event_types.join(", ")
+            },
             VisionBusConfig::supported_signals().join(", "),
             listeners,
-            settings_note,
+            saved_note,
         ))]))
     }
 
@@ -667,7 +723,7 @@ face:<profile_id>). Never for an image attached to the message.")]
 
         let p = params.0;
         let camera_id = match p.camera_id.as_deref().map(str::trim) {
-            None | Some("") => Some(DEFAULT_CAMERA_ID.to_string()),
+            None | Some("") => Some(self.default_camera(None).await),
             Some("any") | Some("*") => None,
             Some(id) => Some(id.to_string()),
         };
@@ -908,12 +964,19 @@ use tokio::io::DuplexStream;
 
 struct VisionDeps {
     camera_storage: Arc<dyn CameraStorage + Send + Sync>,
+    settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
 }
 
 static VISION_DEPS: OnceLock<VisionDeps> = OnceLock::new();
 
-pub fn init_vision_deps(camera_storage: Arc<dyn CameraStorage + Send + Sync>) {
-    let _ = VISION_DEPS.set(VisionDeps { camera_storage });
+pub fn init_vision_deps(
+    camera_storage: Arc<dyn CameraStorage + Send + Sync>,
+    settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
+) {
+    let _ = VISION_DEPS.set(VisionDeps {
+        camera_storage,
+        settings_repo,
+    });
 }
 
 pub fn spawn_vision_server(reader: DuplexStream, writer: DuplexStream) {
@@ -924,7 +987,7 @@ pub fn spawn_vision_server(reader: DuplexStream, writer: DuplexStream) {
         );
         return;
     };
-    let server = VisionMcpServer::new(deps.camera_storage.clone());
+    let server = VisionMcpServer::new(deps.camera_storage.clone(), deps.settings_repo.clone());
     crate::serve_builtin("giap-vision", server, reader, writer);
 }
 
@@ -959,9 +1022,53 @@ mod tests {
         }
     }
 
-    #[test]
-    fn server_constructs() {
-        let _server = VisionMcpServer::new(Arc::new(StubStorage(vec![])));
+    async fn server(cameras_enabled: bool) -> VisionMcpServer {
+        use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+        let settings = MockSettingsRepository::new();
+        let s = pond_core::user_data::domain::settings::Settings {
+            cameras_enabled,
+            vision_camera_id: "porch".into(),
+            ..Default::default()
+        };
+        settings.update(&s).await.unwrap();
+        VisionMcpServer::new(Arc::new(StubStorage(vec![])), Arc::new(settings))
+    }
+
+    #[tokio::test]
+    async fn server_constructs() {
+        let _server = server(true).await;
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn no_camera_frame_reaches_the_model_without_consent() {
+        let refused = server(false)
+            .await
+            .camera_for_frames(None)
+            .await
+            .expect_err("consent off must refuse");
+        assert!(text_of(&refused).contains("turned off in Privacy"));
+
+        let allowed = server(true).await.camera_for_frames(None).await.ok();
+        assert_eq!(
+            allowed.as_deref(),
+            Some("porch"),
+            "defaults to the configured camera"
+        );
+        let named = server(true)
+            .await
+            .camera_for_frames(Some("garage".into()))
+            .await
+            .ok();
+        assert_eq!(named.as_deref(), Some("garage"));
     }
 
     #[tokio::test]

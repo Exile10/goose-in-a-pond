@@ -3112,7 +3112,7 @@ async fn run_server(
         device_registry.clone(),
         device_control.clone(),
     );
-    pond_mcp_server::init_vision_deps(camera_storage.clone());
+    pond_mcp_server::init_vision_deps(camera_storage.clone(), settings_repo.clone());
 
     let (agent, extension_manager, _tool_caller, tool_registry) = if mistralrs_active {
         // No goose: no extension manager or tool specialist, and an empty registry.
@@ -4053,7 +4053,7 @@ async fn run_server(
         last_user_activity.clone(),
     ));
 
-    // Self-healing Vision Supervisor: monitors camera hotplug, dynamic settings, and stream reconnects.
+    // The vision supervisor: hotplug, live settings, camera consent and stream reconnects.
     {
         // Labels motion as person/pet/package. Empty model = auto-downloaded YOLOX-Nano; a set
         // one is operator-managed. Any failure degrades to plain "motion".
@@ -4103,84 +4103,18 @@ async fn run_server(
             None
         };
 
-        let settings_repo = settings_repo.clone();
-        let camera_storage = camera_storage.clone();
-        let event_bus = event_bus.clone();
-        let data_dir = data_dir.clone();
-        let face_recognition = face_recognition.clone();
-
-        tokio::spawn(async move {
-            let mut backoff = tokio::time::Duration::from_secs(2);
-            loop {
-                let current_settings = match settings_repo.get().await {
-                    Ok(s) => s,
-                    Err(_) => {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                        continue;
-                    }
-                };
-
-                if !current_settings.vision_enabled {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                    continue;
-                }
-
-                let camera_url = if !current_settings.vision_camera_url.trim().is_empty() {
-                    Some(current_settings.vision_camera_url.trim().to_string())
-                } else if let Some(discovered) = pond_adapters_vision::default_camera_source() {
-                    Some(discovered.to_string_lossy().into_owned())
-                } else {
-                    None
-                };
-
-                let Some(input_url) = camera_url else {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                    continue;
-                };
-
-                let capture = pond_adapters_vision::CaptureConfig {
-                    input: input_url.clone(),
-                    fps: current_settings.vision_fps.max(1),
-                    ..Default::default()
-                };
-
-                let pipeline_cfg = pond_adapters_vision::VisionPipelineConfig {
-                    camera_id: current_settings.vision_camera_id.clone(),
-                    motion: pond_adapters_vision::MotionConfig {
-                        changed_fraction: current_settings
-                            .vision_motion_threshold
-                            .clamp(0.001, 1.0),
-                        ..Default::default()
-                    },
-                    snapshots: Some(pond_adapters_vision::SnapshotConfig::new(
-                        data_dir.join("snapshots"),
-                    )),
-                    ..Default::default()
-                };
-
-                match pond_adapters_vision::FfmpegFrameSource::spawn(&capture) {
-                    Ok(source) => {
-                        tracing::info!(camera = %input_url, "vision pipeline started on camera");
-                        backoff = tokio::time::Duration::from_secs(2);
-                        pond_adapters_vision::run_vision_pipeline(
-                            Box::new(source),
-                            classifier.clone(),
-                            face_recognition.clone(),
-                            camera_storage.clone(),
-                            event_bus.clone(),
-                            pipeline_cfg,
-                        )
-                        .await;
-                        tracing::warn!(camera = %input_url, "camera stream ended; supervisor will reconnect");
-                    }
-                    Err(e) => {
-                        tracing::debug!(camera = %input_url, error = %e, "camera stream unavailable; retrying in {:?}", backoff);
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(tokio::time::Duration::from_secs(30));
-                    }
-                }
-            }
-        });
+        let supervisor = pond_adapters_vision::VisionSupervisor::new(
+            settings_repo.clone(),
+            camera_storage.clone(),
+            event_bus.clone(),
+            pond_adapters_vision::LiveCameraRegistry::global().clone(),
+        )
+        .with_classifier(classifier)
+        .with_face_recognizer(face_recognition.clone())
+        .with_snapshots(pond_adapters_vision::SnapshotConfig::new(
+            data_dir.join("snapshots"),
+        ));
+        tokio::spawn(supervisor.run());
     }
 
     // The printed card's code and its claim latch live beside the TLS identity, not in the
@@ -5088,7 +5022,10 @@ async fn run_chat(
         // No Matter here: `state` bails, so replies use the stored reading, labelled with its age.
         Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
     );
-    pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
+    pond_mcp_server::init_vision_deps(
+        Arc::new(SqliteCameraStorage::new(db.logs.clone())),
+        Arc::new(SqliteSettingsRepository::new(db.system.clone())),
+    );
 
     // Needed here too, or giap-context fails to load. No index or embedder on this path, so
     // `recall` returns nothing rather than degrading to context-only results.
