@@ -107,6 +107,17 @@ the LLM budget`, gives the window the model got; see
 [inference_optimization.md](inference_optimization.md#the-context-window) for how it is derived.
 With a Gemma 4 E2B or E4B chat model, `MTP drafter loaded` confirms speculative decoding.
 
+The vision and face models need their own GPU runtime: `bash scripts/giap.sh onnxruntime build` on
+the board builds ONNX Runtime with TensorRT in the background (hours; `giap.sh onnxruntime status`
+follows it) and their engines. Then:
+
+```bash
+grep -E "onnx: .* (moved to|stays on|loaded on)" ~/.local/share/goose-in-a-pond/logs/pond.log.$(date -u +%F) | tail
+```
+
+`onnx: face_detector moved to tensorrt` is on the GPU; a model that only says `loaded on the cpu`
+is not, and `GET /api/v1/vision/status` reports the same per model.
+
 Per turn, with the KV prompt cache working: the first turn of a session plans `CreateContext`,
 later turns `ReusePrefix`, side calls `SacrificialContext`. `FullPrefillInPlace` on a later turn
 means something rewrote the start of the prompt.

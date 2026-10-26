@@ -95,9 +95,19 @@ buffalo_l        https://github.com/deepinsight/insightface/releases/download/v0
 `POND_FACE_ANTISPOOF_2_URL` replace them. A Hugging Face token is sent when
 `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or `HUGGINGFACE_TOKEN` is set.
 
-The ONNX Runtime library is found by `ensure_onnx_runtime()`: `ORT_DYLIB_PATH`, then
-system locations, then a previously downloaded copy, then an automatic download. If it
-still fails to load, face recognition logs why and stays off.
+The ONNX Runtime library is found by `ensure_onnx_runtime()`: `ORT_DYLIB_PATH`, then, on a
+Jetson, the GPU runtime `bash scripts/giap.sh onnxruntime build` installs under
+`<data_dir>/lib/onnxruntime-gpu/<version>/`, then system locations, then a previously
+downloaded copy, then an automatic download. If it still fails to load, face recognition logs
+why and stays off.
+
+With the GPU runtime, SCRFD, the embedder, the anti-spoof model and the YOLOX classifier start on
+the CPU and each moves to TensorRT (fp16) once its engine is loaded; `pond-onnx-accel` does the
+move in the background, so no event waits for an engine. Engines are cached under
+`<data_dir>/cache/onnx-trt/<runtime>-trt<version>-sm_<arch>/` and the setup script builds them
+while the pond is stopped. A model whose GPU run fails goes back to the CPU. The log says where
+each model runs (`onnx: face_detector moved to tensorrt`), and so does `GET /api/v1/vision/status`
+(`classifier.accelerator`, `faces.accelerators`).
 
 ### Anti-spoof ensemble
 
