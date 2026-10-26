@@ -28,6 +28,7 @@ pub fn model_spec() -> ModelSpec {
     ModelSpec {
         name: MODEL_NAME,
         input_shape: vec![1, 3, INPUT_SIZE as i64, INPUT_SIZE as i64],
+        gpu: true,
     }
 }
 

@@ -28,6 +28,7 @@ pub fn model_spec() -> ModelSpec {
     ModelSpec {
         name: crate::DETECTOR_NAME,
         input_shape: vec![1, 3, INPUT_SIDE as i64, INPUT_SIDE as i64],
+        gpu: true,
     }
 }
 

@@ -312,6 +312,7 @@ pub fn embedder_spec(model: EmbeddingModel) -> ModelSpec {
     ModelSpec {
         name: EMBEDDER_NAME,
         input_shape: vec![1, 3, side, side],
+        gpu: true,
     }
 }
 

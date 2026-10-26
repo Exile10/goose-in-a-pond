@@ -69,43 +69,48 @@ pub fn plan(data_dir: &Path, version: &str, on_jetson: bool) -> Option<GpuPlan> 
     })
 }
 
-/// The pond's GPU-bound models that exist on disk, resolved and loaded as the server does.
-fn sessions(data_dir: &Path) -> Vec<anyhow::Result<pond_onnx_accel::AcceleratedSession>> {
+type Loader = Box<dyn FnOnce() -> anyhow::Result<Option<pond_onnx_accel::AcceleratedSession>>>;
+
+/// The pond's GPU-bound models, each resolved and loaded as the server does when called, so only
+/// one model's sessions are resident at a time.
+fn loaders(data_dir: &Path) -> Vec<Loader> {
     use pond_onnx_accel::AcceleratedSession;
     #[allow(unused_mut)]
-    let mut found: Vec<anyhow::Result<AcceleratedSession>> = Vec::new();
+    let mut found: Vec<Loader> = Vec::new();
     #[cfg(feature = "vision-onnx")]
     {
         let path = crate::model_download::vision_models_dir(data_dir)
             .join(crate::model_download::VISION_CLASSIFIER_DEFAULT_FILE);
-        if path.is_file() {
-            found.push(AcceleratedSession::load(
-                path,
-                pond_adapters_vision_onnx::model_spec(),
-            ));
-        }
+        found.push(Box::new(move || {
+            if !path.is_file() {
+                return Ok(None);
+            }
+            AcceleratedSession::load(path, pond_adapters_vision_onnx::model_spec()).map(Some)
+        }));
     }
     #[cfg(feature = "face-onnx")]
     {
         let (embedder, kind, scrfd) = crate::face_model_paths(data_dir);
-        if scrfd.is_file() {
-            found.push(AcceleratedSession::load(
-                scrfd,
-                pond_adapters_face_onnx::scrfd::model_spec(),
-            ));
-        }
-        if embedder.is_file() {
-            found.push(AcceleratedSession::load(
-                embedder,
-                pond_adapters_face_onnx::embedder_spec(kind),
-            ));
-        }
-        for var in ["POND_FACE_ANTISPOOF_PATH", "POND_FACE_ANTISPOOF_PATH_2"] {
-            match pond_adapters_face_onnx::OnnxAntispoof::try_from_env_var(var) {
-                Ok(Some(model)) => found.push(Ok(model.session().clone())),
-                Ok(None) => {}
-                Err(e) => found.push(Err(e)),
+        found.push(Box::new(move || {
+            if !scrfd.is_file() {
+                return Ok(None);
             }
+            AcceleratedSession::load(scrfd, pond_adapters_face_onnx::scrfd::model_spec()).map(Some)
+        }));
+        found.push(Box::new(move || {
+            if !embedder.is_file() {
+                return Ok(None);
+            }
+            AcceleratedSession::load(embedder, pond_adapters_face_onnx::embedder_spec(kind))
+                .map(Some)
+        }));
+        for var in ["POND_FACE_ANTISPOOF_PATH", "POND_FACE_ANTISPOOF_PATH_2"] {
+            found.push(Box::new(move || {
+                Ok(
+                    pond_adapters_face_onnx::OnnxAntispoof::try_from_env_var(var)?
+                        .map(|model| model.session().clone()),
+                )
+            }));
         }
     }
     let _ = data_dir;
@@ -129,9 +134,14 @@ pub fn run_engines(data_dir: &Path, version: &str, on_jetson: bool) -> anyhow::R
     };
     println!("  TensorRT engines in {}", plan.cache_dir.display());
     let mut failed = 0;
-    for session in sessions(data_dir) {
-        let session = match session {
-            Ok(s) => s,
+    for load in loaders(data_dir) {
+        let session = match load() {
+            Ok(Some(s)) if s.moves_to_gpu() => s,
+            Ok(Some(s)) => {
+                println!("  {}: stays on the cpu, where it is as fast", s.name());
+                continue;
+            }
+            Ok(None) => continue,
             Err(e) => {
                 failed += 1;
                 println!("  a model did not load: {e:#}");

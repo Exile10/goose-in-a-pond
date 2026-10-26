@@ -22,6 +22,7 @@ const REPORT_EVERY: Duration = Duration::from_secs(600);
 const REPORT_RUNS: u64 = 50;
 const RECENT_RUNS: usize = 256;
 const STAMP_FILE: &str = "source.stamp";
+const CONTEXT_MODEL: &str = "model_ctx.onnx";
 
 /// Where engines are cached, and when one may be built.
 #[derive(Debug, Clone)]
@@ -64,6 +65,8 @@ pub struct ModelSpec {
     pub name: &'static str,
     /// Shape of the single float input; the warm-up run builds the engine for exactly this.
     pub input_shape: Vec<i64>,
+    /// Whether the GPU is worth its memory for this model; a model that is not stays on the CPU.
+    pub gpu: bool,
 }
 
 /// A model's session, on whichever device it has reached. Clones share it.
@@ -111,15 +114,21 @@ impl AcceleratedSession {
             queued: AtomicBool::new(false),
         }));
         tracing::info!(model = name, "onnx: {name} loaded on the cpu");
-        lock(&LOADED).push(Arc::downgrade(&this.0));
-        if GPU.get().is_some() && tensorrt_in_runtime() {
-            queue(this.clone());
+        if this.moves_to_gpu() {
+            lock(&LOADED).push(Arc::downgrade(&this.0));
+            if GPU.get().is_some() && tensorrt_in_runtime() {
+                queue(this.clone());
+            }
         }
         Ok(this)
     }
 
     pub fn name(&self) -> &'static str {
         self.0.spec.name
+    }
+
+    pub fn moves_to_gpu(&self) -> bool {
+        self.0.spec.gpu
     }
 
     pub fn device(&self) -> OnnxDevice {
@@ -158,9 +167,6 @@ impl AcceleratedSession {
         let (session, device, first) =
             gpu_session(&self.0.path, &engine_dir, &plan.cache_dir, &self.0.spec)?;
         let ready = started.elapsed();
-        if device == OnnxDevice::TensorRt && !cached {
-            write_stamp(&engine_dir, &self.0.path);
-        }
         self.swap(session, device);
         tracing::info!(
             model = name,
@@ -289,27 +295,27 @@ fn warm_up(session: &mut Session, shape: &[i64]) -> Result<Duration> {
     Ok(started.elapsed())
 }
 
-/// TensorRT (fp16, cached engine, shared timing cache) with CUDA behind it, else CUDA alone.
+/// TensorRT from the model's EP-context model, built first when there is none, else CUDA alone.
+/// The context model holds only the engine: a session on the ONNX model also keeps its weights and
+/// TensorRT's parse of them resident, which for AdaFace measured 1.1 GB against 0.26 GB on the Orin.
 fn gpu_session(
     path: &Path,
     engine_dir: &Path,
     timing_dir: &Path,
     spec: &ModelSpec,
 ) -> Result<(Session, OnnxDevice, Duration)> {
-    std::fs::create_dir_all(engine_dir)
-        .with_context(|| format!("cannot create {}", engine_dir.display()))?;
-    let trt = ep::TensorRT::default()
-        .with_fp16(true)
-        .with_engine_cache(true)
-        .with_engine_cache_path(engine_dir.display())
-        .with_timing_cache(true)
-        .with_timing_cache_path(timing_dir.display())
-        .with_max_workspace_size(WORKSPACE_BYTES)
-        .build()
-        .error_on_failure();
-    let tensorrt = commit(path, &[trt, cuda()]).and_then(|mut s| {
-        let first = warm_up(&mut s, &spec.input_shape)?;
-        Ok((s, first))
+    let context = engine_dir.join(CONTEXT_MODEL);
+    if engine_cached(engine_dir, path) {
+        match load_context(&context, spec) {
+            Ok((s, first)) => return Ok((s, OnnxDevice::TensorRt, first)),
+            Err(e) => {
+                tracing::warn!(model = spec.name, error = %format!("{e:#}"), "onnx: the cached engine for {} does not load; building it again", spec.name)
+            }
+        }
+    }
+    let tensorrt = build_context(path, engine_dir, timing_dir, spec).and_then(|()| {
+        write_stamp(engine_dir, path);
+        load_context(&context, spec)
     });
     match tensorrt {
         Ok((s, first)) => return Ok((s, OnnxDevice::TensorRt, first)),
@@ -320,6 +326,54 @@ fn gpu_session(
     let mut s = commit(path, &[cuda()])?;
     let first = warm_up(&mut s, &spec.input_shape)?;
     Ok((s, OnnxDevice::Cuda, first))
+}
+
+/// Builds the engine (fp16, shared timing cache) and has TensorRT write the context model beside it.
+fn build_context(
+    path: &Path,
+    engine_dir: &Path,
+    timing_dir: &Path,
+    spec: &ModelSpec,
+) -> Result<()> {
+    // TensorRT writes a context model only when it builds; an engine left here would be loaded.
+    let _ = std::fs::remove_dir_all(engine_dir);
+    std::fs::create_dir_all(engine_dir)
+        .with_context(|| format!("cannot create {}", engine_dir.display()))?;
+    let context = engine_dir.join(CONTEXT_MODEL);
+    let trt = ep::TensorRT::default()
+        .with_fp16(true)
+        .with_max_workspace_size(WORKSPACE_BYTES)
+        .with_timing_cache(true)
+        .with_timing_cache_path(timing_dir.display())
+        .with_engine_cache(true)
+        // Relative to the context model, which is how its node names the engine.
+        .with_engine_cache_path(".")
+        .with_dump_ep_context_model(true)
+        .with_ep_context_file_path(context.display())
+        .with_ep_context_embed_mode(0)
+        .build()
+        .error_on_failure();
+    let mut s = commit(path, &[trt, cuda()])?;
+    // A dynamic-shape engine is built on this run, not when the session is created.
+    warm_up(&mut s, &spec.input_shape)?;
+    drop(s);
+    if !context.is_file() {
+        return Err(anyhow!(
+            "TensorRT built {} but wrote no context model",
+            spec.name
+        ));
+    }
+    Ok(())
+}
+
+fn load_context(context: &Path, spec: &ModelSpec) -> Result<(Session, Duration)> {
+    let trt = ep::TensorRT::default()
+        .with_fp16(true)
+        .build()
+        .error_on_failure();
+    let mut s = commit(context, &[trt, cuda()])?;
+    let first = warm_up(&mut s, &spec.input_shape)?;
+    Ok((s, first))
 }
 
 /// `<len> <mtime>` of the model an engine was built from; a changed model means a new build.
@@ -339,16 +393,7 @@ fn engine_cached(engine_dir: &Path, model: &Path) -> bool {
         return false;
     };
     let stamped = std::fs::read_to_string(engine_dir.join(STAMP_FILE)).unwrap_or_default();
-    if stamped.trim() != want {
-        return false;
-    }
-    std::fs::read_dir(engine_dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.path().extension().is_some_and(|x| x == "engine"))
-        })
-        .unwrap_or(false)
+    stamped.trim() == want && engine_dir.join(CONTEXT_MODEL).is_file()
 }
 
 fn write_stamp(engine_dir: &Path, model: &Path) {
@@ -484,11 +529,7 @@ mod tests {
             "an empty cache holds nothing"
         );
 
-        std::fs::write(
-            engines.join("TensorrtExecutionProvider_TRTKernel_1_sm87.engine"),
-            b"e",
-        )
-        .unwrap();
+        std::fs::write(engines.join(CONTEXT_MODEL), b"ctx").unwrap();
         assert!(
             !engine_cached(&engines, &model),
             "an engine without a stamp may be for another model"
@@ -511,6 +552,7 @@ mod tests {
             ModelSpec {
                 name: "missing",
                 input_shape: vec![1, 3, 8, 8],
+                gpu: true,
             },
         )
         .err()
