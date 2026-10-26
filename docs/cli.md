@@ -47,7 +47,7 @@ interactive menu.
 | `litert build [macos-arm64\|linux-arm64]` | Build, package, verify and record the library; default platform is this host's |
 | `litert import DIR` | Take in a package built on another host |
 | `onnxruntime status` | Jetson: the GPU ONNX Runtime the vision and face models run on (TensorRT, then CUDA), verified against its manifest, and any build of it with its phase and progress |
-| `onnxruntime build` | Jetson: build ONNX Runtime from source as onnxruntime.ai documents it, in the background (hours, logged to `~/.giap/onnxruntime/build.log`, resumable), install it under `<data_dir>/lib/onnxruntime-gpu/`, then build the TensorRT engines. Stops the pond while the build needs its memory and starts it again afterwards |
+| `onnxruntime build` | Jetson: build ONNX Runtime from source as onnxruntime.ai documents it, in the background (hours, logged to `~/.giap/onnxruntime/build.log`, resumable), install it under `<data_dir>/lib/onnxruntime-gpu/`, remove the 2.5 GB build tree (the wheel stays in `~/.giap/onnxruntime/dist/`), then build the TensorRT engines. Stops the pond while the build needs its memory and starts it again afterwards. With the install current for the device's CUDA and TensorRT, it only checks the engines |
 | `models pairings` | Regenerate the vision pairing table from Hugging Face |
 | `wifi-grant [remove\|status]` | Linux: install, remove or report the polkit grant that lets the pond's user join Wi-Fi from the BLE setup channel (uses sudo) |
 | `provision --host HOST --key FILE [...]` | Operator machine: save a pond's printed setup card and give it a device certificate over SSH. Must be the first argument; runs `scripts/provision-device.sh` |

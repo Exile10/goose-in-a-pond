@@ -48,7 +48,7 @@ world() {
   export ORTGPU_TEGRA_RELEASE="$W/nv_tegra_release" ORTGPU_DT_COMPATIBLE="$W/compatible"
   export ORTGPU_CUDA_HOME="$W/cuda" ORTGPU_NV_HOME="$W/nvlib" ORTGPU_NV_INCLUDE="$W/inc" ORTGPU_MEMINFO="$W/meminfo"
   export ORTGPU_POND_BIN="$W/no-pond"
-  unset DRY_RUN FAKE_BUILD_RC FAKE_MEM_AFTER_STOP FAKE_DF_KB FAKE_TAG_COMMIT FAKE_OOM_RUNS
+  unset DRY_RUN FAKE_BUILD_RC FAKE_MEM_AFTER_STOP FAKE_DF_KB FAKE_TAG_COMMIT FAKE_OOM_RUNS FAKE_BUILD_TAG
   : > "$TOOL_LOG"
   printf '# R36 (release), REVISION: 4.7\n' > "$W/nv_tegra_release"
   printf 'nvidia,p3768-0000+p3767-0005\000nvidia,tegra234\000' > "$W/compatible"
@@ -112,7 +112,7 @@ case "$1" in
     echo "MIT License" > "$dest/LICENSE"; echo "notices" > "$dest/ThirdPartyNotices.txt"; echo numpy > "$dest/requirements.txt"
     mkdir -p "$dest/include/onnxruntime/core/session"
     for h in onnxruntime_c_api.h onnxruntime_ep_c_api.h; do echo "/* $h */" > "$dest/include/onnxruntime/core/session/$h"; done
-    printf "#!/bin/sh\necho \"build.sh \$*\" >> \"\$TOOL_LOG\"\nif [ -n \"\${FAKE_OOM_RUNS:-}\" ] && [ \"\$(cat \"\$W/ooms\" 2>/dev/null || echo 0)\" -lt \"\$FAKE_OOM_RUNS\" ]; then echo \$((\$(cat \"\$W/ooms\" 2>/dev/null || echo 0) + 1)) > \"\$W/ooms\"; echo Killed; echo \"gmake[2]: *** [x.cu.o] Error 137\"; exit 1; fi\n[ \"\${FAKE_BUILD_RC:-0}\" = 0 ] || exit \"\$FAKE_BUILD_RC\"\nout=build/Linux/Release; mkdir -p \$out\nfor l in libonnxruntime.so.%s libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so libonnxruntime_providers_tensorrt.so; do echo \"built \$l\" > \$out/\$l; done\n" "$ORTGPU_VERSION" > "$dest/build.sh"
+    printf "#!/bin/sh\necho \"build.sh \$*\" >> \"\$TOOL_LOG\"\nif [ -n \"\${FAKE_OOM_RUNS:-}\" ] && [ \"\$(cat \"\$W/ooms\" 2>/dev/null || echo 0)\" -lt \"\$FAKE_OOM_RUNS\" ]; then echo \$((\$(cat \"\$W/ooms\" 2>/dev/null || echo 0) + 1)) > \"\$W/ooms\"; echo Killed; echo \"gmake[2]: *** [x.cu.o] Error 137\"; exit 1; fi\n[ \"\${FAKE_BUILD_RC:-0}\" = 0 ] || exit \"\$FAKE_BUILD_RC\"\nout=build/Linux/Release; mkdir -p \$out\nfor l in libonnxruntime.so.%s libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so libonnxruntime_providers_tensorrt.so; do echo \"built \$l \${FAKE_BUILD_TAG:-}\" > \$out/\$l; done\nmkdir -p \$out/dist; echo wheel > \$out/dist/onnxruntime_gpu-%s-cp310-cp310-linux_aarch64.whl\n" "$ORTGPU_VERSION" "$ORTGPU_VERSION" > "$dest/build.sh"
     chmod +x "$dest/build.sh"; exit 0 ;;
 esac
 exit 0'
@@ -347,22 +347,25 @@ t_a_failed_build_starts_the_pond_and_the_next_run_resumes() {
   contains "$(tools_log)" "build.sh" || return 1
   ortgpu_verify "$(ortgpu_install_dir)" || { echo "$ORTGPU_VERIFY_PROBLEMS"; return 1; }
 }
-t_a_finished_tree_is_packaged_without_building_again() {
+t_a_current_install_builds_nothing_and_a_new_tensorrt_rebuilds() {
   world; stubs
   export FAKE_MEM_AFTER_STOP=5972
   ( ortgpu_build_run ) >/dev/null || return 1
+  [ ! -d "$(ortgpu_src_dir)" ] && [ ! -d "$(ortgpu_venv_dir)" ] || { echo "the build tree was kept"; return 1; }
+  [ -f "$(ortgpu_home)/dist/onnxruntime_gpu-$ORTGPU_VERSION-cp310-cp310-linux_aarch64.whl" ] || { echo "the wheel went with it"; return 1; }
   : > "$TOOL_LOG"; : > "$LOG"
   ( ortgpu_build_run ) || { logged; return 1; }
+  lacks "$(tools_log)" "clone" || return 1
   lacks "$(tools_log)" "build.sh" || return 1
   lacks "$(tools_log)" "systemctl --user stop" || return 1
-  contains "$(logged)" "is installed from this build" || return 1
-  ortgpu_verify "$(ortgpu_install_dir)" || { echo "$ORTGPU_VERIFY_PROBLEMS"; return 1; }
-  # A rebuilt library is installed again.
-  echo rebuilt > "$(ortgpu_out_dir)/libonnxruntime_providers_cuda.so"
-  : > "$LOG"
-  ( ortgpu_build_run ) || { logged; return 1; }
-  lacks "$(logged)" "is installed from this build" || return 1
-  eq "$(cat "$(ortgpu_install_dir)/libonnxruntime_providers_cuda.so")" rebuilt
+  contains "$(logged)" "is installed: 8 files verified" || return 1
+  # JetPack moves TensorRT on: the install is for the old one, so it is built again.
+  sed -i.bak 's/NV_TENSORRT_BUILD 30/NV_TENSORRT_BUILD 31/' "$W/inc/NvInferVersion.h"
+  export FAKE_BUILD_TAG=new; : > "$TOOL_LOG"
+  ( ortgpu_build_run ) >/dev/null || return 1
+  contains "$(tools_log)" "build.sh" || return 1
+  contains "$(sed -n 1p "$(ortgpu_install_dir)/MANIFEST.sha256")" "| tensorrt 10.3.0.31 |" || return 1
+  contains "$(cat "$(ortgpu_install_dir)/libonnxruntime_providers_cuda.so")" new
 }
 t_a_build_cut_short_is_built_again() {
   world; stubs
@@ -428,7 +431,8 @@ t_status_reports_the_build_and_the_install() {
   ( ortgpu_build_run ) >/dev/null
   stubs; ortgpu_status
   contains "$(logged)" "ok: installed: 8 files match MANIFEST.sha256" || return 1
-  contains "$(logged)" "last build finished"
+  contains "$(logged)" "last build finished" || return 1
+  contains "$(logged)" "wheel from the same build: $(ortgpu_home)/dist/"
 }
 
 # ── native: real ELF libraries, loaded through the device's search path ──────

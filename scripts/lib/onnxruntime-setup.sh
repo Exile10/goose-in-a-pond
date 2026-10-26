@@ -18,8 +18,9 @@
 #     MANIFEST.sha256           line 1 describes the build, then "<sha256>  ./<path>" per file
 #
 # The manifest is written last, so a directory with one is complete; the pond takes it only then.
-# The build itself lives in ~/.giap/onnxruntime (source, a venv with the documented CMake, the
-# log, the worker's pid and its phase), and resumes from there when it is run again.
+# The build lives in ~/.giap/onnxruntime (source, a venv with the documented CMake, the log, the
+# worker's pid and its phase) and resumes from there; once installed, only the log, the phase and
+# the wheel (dist/) stay. A run that finds the install current for this device builds nothing.
 #
 # Two kinds of function, as in litert-setup.sh. The data functions (paths, ortgpu_jobs,
 # ortgpu_build_flags, ortgpu_write_manifest, ortgpu_verify, ortgpu_state) print nothing on stdout.
@@ -566,68 +567,73 @@ ortgpu_build_run() {
   _ortgpu_out info "ONNX Runtime $ORTGPU_VERSION for sm_$arch: CUDA $cuda, TensorRT $trt, cuDNN $cudnn"
   src="$(ortgpu_src_dir)"; out="$(ortgpu_out_dir)"; dest="$(ortgpu_install_dir)"
 
-  if ! _ortgpu_tree_built "$arch"; then
-    free="$(_ortgpu_disk_free_mb "$(ortgpu_home)")"
-    if [ ! -d "$src/build" ] && [ -n "$free" ] && [ "$free" -lt "$ORTGPU_DISK_NEED_MB" ]; then
-      _ortgpu_out bad "$free MB free on the disk; a build needs about $ORTGPU_DISK_NEED_MB MB"
-      _ortgpu_phase failed "disk: $free MB free"; return 1
-    fi
-    _ortgpu_phase source
-    ortgpu_prepare_source || { _ortgpu_phase failed source; return 1; }
-    _ortgpu_phase venv
-    ortgpu_prepare_venv || { _ortgpu_phase failed venv; return 1; }
-    # A compiler killed for memory resumes the build with half the jobs; what was built stays built.
-    while :; do
-      _ortgpu_plan_jobs
-      _ortgpu_phase build "$ORTGPU_JOBS jobs"
-      flags="$(ortgpu_build_flags "$arch") --parallel $ORTGPU_JOBS"
-      # setsid gives the build its own process group, which the disk watchdog can stop whole.
-      # shellcheck disable=SC2086
-      ( cd "$src" && PATH="$(ortgpu_venv_dir)/bin:$(ortgpu_cuda_home)/bin:$PATH" \
-          CUDACXX="$(ortgpu_cuda_home)/bin/nvcc" exec setsid ./build.sh $flags ) &
-      local bpid=$!
-      ORTGPU_BUILD_PGID="$bpid"
-      _ortgpu_disk_watchdog "$bpid" "$(ortgpu_home)" &
-      local wpid=$!
-      wait "$bpid"; rc=$?
-      kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
-      ORTGPU_BUILD_PGID=""
-      if [ "$rc" -eq 0 ]; then
-        printf '%s %s\n' "$ORTGPU_COMMIT" "$(ortgpu_build_flags "$arch")" > "$(ortgpu_built_file)"
-        break
-      fi
-      ortgpu_last_phase
-      if [ "$ORTGPU_PHASE" != failed ] && [ "$ORTGPU_JOBS" -gt 1 ] && _ortgpu_killed_for_memory; then
-        _ortgpu_out warn "the kernel stopped a compiler for memory with $ORTGPU_JOBS jobs; resuming with fewer"
-        continue
-      fi
-      [ "$ORTGPU_PHASE" = failed ] || _ortgpu_phase failed "build.sh exited $rc"
-      _ortgpu_out bad "build.sh exited $rc; run the build again to resume it"
-      return 1
-    done
+  if _ortgpu_install_current "$arch" "$cuda" "$trt"; then
+    _ortgpu_out ok "ONNX Runtime $ORTGPU_VERSION for CUDA $cuda and TensorRT $trt is installed: $ORTGPU_VERIFY_FILES files verified in $dest"
   else
-    _ortgpu_out info "the build tree already has this version's libraries; packaging them"
-  fi
+    if ! _ortgpu_tree_built "$arch"; then
+      free="$(_ortgpu_disk_free_mb "$(ortgpu_home)")"
+      if [ ! -d "$src/build" ] && [ -n "$free" ] && [ "$free" -lt "$ORTGPU_DISK_NEED_MB" ]; then
+        _ortgpu_out bad "$free MB free on the disk; a build needs about $ORTGPU_DISK_NEED_MB MB"
+        _ortgpu_phase failed "disk: $free MB free"; return 1
+      fi
+      _ortgpu_phase source
+      ortgpu_prepare_source || { _ortgpu_phase failed source; return 1; }
+      _ortgpu_phase venv
+      ortgpu_prepare_venv || { _ortgpu_phase failed venv; return 1; }
+      # A compiler killed for memory resumes the build with half the jobs; what was built stays built.
+      while :; do
+        _ortgpu_plan_jobs
+        _ortgpu_phase build "$ORTGPU_JOBS jobs"
+        flags="$(ortgpu_build_flags "$arch") --parallel $ORTGPU_JOBS"
+        # setsid gives the build its own process group, which the disk watchdog can stop whole.
+        # shellcheck disable=SC2086
+        ( cd "$src" && PATH="$(ortgpu_venv_dir)/bin:$(ortgpu_cuda_home)/bin:$PATH" \
+            CUDACXX="$(ortgpu_cuda_home)/bin/nvcc" exec setsid ./build.sh $flags ) &
+        local bpid=$!
+        ORTGPU_BUILD_PGID="$bpid"
+        _ortgpu_disk_watchdog "$bpid" "$(ortgpu_home)" &
+        local wpid=$!
+        wait "$bpid"; rc=$?
+        kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+        ORTGPU_BUILD_PGID=""
+        if [ "$rc" -eq 0 ]; then
+          printf '%s %s\n' "$ORTGPU_COMMIT" "$(ortgpu_build_flags "$arch")" > "$(ortgpu_built_file)"
+          break
+        fi
+        ortgpu_last_phase
+        if [ "$ORTGPU_PHASE" != failed ] && [ "$ORTGPU_JOBS" -gt 1 ] && _ortgpu_killed_for_memory; then
+          _ortgpu_out warn "the kernel stopped a compiler for memory with $ORTGPU_JOBS jobs; resuming with fewer"
+          continue
+        fi
+        [ "$ORTGPU_PHASE" = failed ] || _ortgpu_phase failed "build.sh exited $rc"
+        _ortgpu_out bad "build.sh exited $rc; run the build again to resume it"
+        return 1
+      done
+    else
+      _ortgpu_out info "the build tree already has this version's libraries; packaging them"
+    fi
 
-  _ortgpu_phase install
-  if _ortgpu_installed_from "$dest" "$out"; then
-    _ortgpu_out ok "ONNX Runtime $ORTGPU_VERSION with TensorRT and CUDA is installed from this build: $ORTGPU_VERIFY_FILES files verified in $dest"
-  else
-    header="$(ortgpu_manifest_header "$arch" "$cuda" "$trt" "$cudnn")"
-    mkdir -p "$(dirname "$dest")" || return 1
-    rm -rf "$(dirname "$dest")"/.stage.*
-    stage="$(mktemp -d "$(dirname "$dest")/.stage.XXXXXX")" || return 1
-    chmod 755 "$stage"
-    if ! ortgpu_package "$out" "$src" "$stage" "$header"; then
-      rm -rf "$stage"; _ortgpu_phase failed package; return 1
+    _ortgpu_phase install
+    if _ortgpu_installed_from "$dest" "$out"; then
+      _ortgpu_out ok "ONNX Runtime $ORTGPU_VERSION with TensorRT and CUDA is installed from this build: $ORTGPU_VERIFY_FILES files verified in $dest"
+    else
+      header="$(ortgpu_manifest_header "$arch" "$cuda" "$trt" "$cudnn")"
+      mkdir -p "$(dirname "$dest")" || return 1
+      rm -rf "$(dirname "$dest")"/.stage.*
+      stage="$(mktemp -d "$(dirname "$dest")/.stage.XXXXXX")" || return 1
+      chmod 755 "$stage"
+      if ! ortgpu_package "$out" "$src" "$stage" "$header"; then
+        rm -rf "$stage"; _ortgpu_phase failed package; return 1
+      fi
+      if ! ortgpu_verify "$stage"; then
+        _ortgpu_out bad "the new install fails verification; nothing was installed"
+        printf '%s\n' "$ORTGPU_VERIFY_PROBLEMS" | while IFS= read -r line; do _ortgpu_out note "$line"; done
+        rm -rf "$stage"; _ortgpu_phase failed verify; return 1
+      fi
+      _ortgpu_install "$stage" "$dest" || { rm -rf "$stage"; _ortgpu_phase failed install; return 1; }
+      _ortgpu_out ok "ONNX Runtime $ORTGPU_VERSION with TensorRT and CUDA: $ORTGPU_VERIFY_FILES files verified in $dest"
     fi
-    if ! ortgpu_verify "$stage"; then
-      _ortgpu_out bad "the new install fails verification; nothing was installed"
-      printf '%s\n' "$ORTGPU_VERIFY_PROBLEMS" | while IFS= read -r line; do _ortgpu_out note "$line"; done
-      rm -rf "$stage"; _ortgpu_phase failed verify; return 1
-    fi
-    _ortgpu_install "$stage" "$dest" || { rm -rf "$stage"; _ortgpu_phase failed install; return 1; }
-    _ortgpu_out ok "ONNX Runtime $ORTGPU_VERSION with TensorRT and CUDA: $ORTGPU_VERIFY_FILES files verified in $dest"
+    _ortgpu_tidy
   fi
 
   # Engines built with the pond stopped never compete with its language model for memory, and a
@@ -644,6 +650,33 @@ ortgpu_build_run() {
   fi
   _ortgpu_phase "done" "$(( ($(date +%s) - started) / 60 )) min"
   return 0
+}
+
+# Whether the install verifies and was built from the pin, with these flags, for the CUDA and
+# TensorRT this device has now: a JetPack upgrade needs a new build.
+_ortgpu_install_current() { # <cuda arch> <cuda> <tensorrt>
+  local dest h
+  dest="$(ortgpu_install_dir)"
+  [ -f "$dest/MANIFEST.sha256" ] || return 1
+  h="$(sed -n 1p "$dest/MANIFEST.sha256")"
+  [ "$(_ortgpu_header_commit "$h")" = "$ORTGPU_COMMIT" ] || return 1
+  [ "$(_ortgpu_header_field "$h" cuda)" = "$2" ] && [ "$(_ortgpu_header_field "$h" tensorrt)" = "$3" ] || return 1
+  case "$h" in *"| build.sh $(ortgpu_build_flags "$1")") ;; *) return 1 ;; esac
+  ortgpu_verify "$dest"
+}
+
+# The build tree is 2.5 GB on a disk the pond's databases share, and the install no longer needs
+# it. The wheel, for benchmarks, is kept.
+_ortgpu_tidy() {
+  local whl freed
+  [ -d "$(ortgpu_src_dir)" ] || [ -d "$(ortgpu_venv_dir)" ] || return 0
+  mkdir -p "$(ortgpu_home)/dist"
+  for whl in "$(ortgpu_out_dir)"/dist/*.whl; do
+    [ -f "$whl" ] && mv "$whl" "$(ortgpu_home)/dist/"
+  done
+  freed="$(du -sm "$(ortgpu_src_dir)" "$(ortgpu_venv_dir)" 2>/dev/null | awk '{ t += $1 } END { print t + 0 }')"
+  rm -rf "$(ortgpu_src_dir)" "$(ortgpu_venv_dir)" "$(ortgpu_built_file)"
+  _ortgpu_out info "removed the build tree ($freed MB); the install does not need it"
 }
 
 # Whether build.sh finished this commit with these flags, and every library it made is there.
@@ -690,8 +723,8 @@ ortgpu_build_start() {
   nohup setsid bash -c '. "$1" && ortgpu_build_run; rc=$?; rm -f "$(ortgpu_pid_file)"; exit $rc' \
     ortgpu-build "$ORTGPU_LIB_DIR/onnxruntime-setup.sh" >> "$(ortgpu_log_file)" 2>&1 < /dev/null &
   printf '%s\n' "$!" > "$(ortgpu_pid_file)"
-  if _ortgpu_tree_built "$(ortgpu_cuda_arch)"; then
-    _ortgpu_out ok "the runtime is built; installing it and building the TensorRT engines in the background (pid $!), with the pond stopped for about 15 minutes"
+  if _ortgpu_tree_built "$(ortgpu_cuda_arch)" || [ -f "$(ortgpu_install_dir)/MANIFEST.sha256" ]; then
+    _ortgpu_out ok "the runtime is built; checking its install and the TensorRT engines in the background (pid $!), with the pond stopped for a few minutes"
   else
     _ortgpu_out ok "building in the background (pid $!); it takes hours, and the pond is stopped while memory needs it"
   fi
@@ -779,7 +812,7 @@ ortgpu_status() {
     present) ortgpu_report_dir "installed" "$ORTGPU_STATE_DIR" || rc=1 ;;
   esac
   ortgpu_report_build
-  for whl in "$(ortgpu_out_dir)"/dist/*.whl; do
+  for whl in "$(ortgpu_home)"/dist/*.whl "$(ortgpu_out_dir)"/dist/*.whl; do
     [ -f "$whl" ] && _ortgpu_out note "wheel from the same build: $whl"
   done
   return $rc
