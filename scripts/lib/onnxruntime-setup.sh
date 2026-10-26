@@ -690,7 +690,11 @@ ortgpu_build_start() {
   nohup setsid bash -c '. "$1" && ortgpu_build_run; rc=$?; rm -f "$(ortgpu_pid_file)"; exit $rc' \
     ortgpu-build "$ORTGPU_LIB_DIR/onnxruntime-setup.sh" >> "$(ortgpu_log_file)" 2>&1 < /dev/null &
   printf '%s\n' "$!" > "$(ortgpu_pid_file)"
-  _ortgpu_out ok "building in the background (pid $!); it takes hours, and the pond is stopped while memory needs it"
+  if _ortgpu_tree_built "$(ortgpu_cuda_arch)"; then
+    _ortgpu_out ok "the runtime is built; installing it and building the TensorRT engines in the background (pid $!), with the pond stopped for about 15 minutes"
+  else
+    _ortgpu_out ok "building in the background (pid $!); it takes hours, and the pond is stopped while memory needs it"
+  fi
   _ortgpu_out note "progress: bash scripts/giap.sh onnxruntime status"
   _ortgpu_out note "log:      tail -f $(ortgpu_log_file)"
 }
