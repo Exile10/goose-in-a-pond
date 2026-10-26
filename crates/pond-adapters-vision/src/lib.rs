@@ -5,6 +5,7 @@ mod capture;
 mod discovery;
 mod ffmpeg_source;
 mod jpeg_decode;
+mod jpeg_stream;
 mod live_feed;
 mod motion;
 mod pipeline;
@@ -12,7 +13,7 @@ mod process;
 mod snapshot;
 mod supervisor;
 
-pub use capture::{open_capture, OpenFuture, OpenedSource};
+pub use capture::{open_capture, OpenFuture, OpenedSource, FIRST_FRAME_TIMEOUT};
 pub use discovery::{default_camera_source, detect_v4l2_cameras, DiscoveredCamera};
 pub use ffmpeg_source::{CaptureConfig, FfmpegFrameSource};
 pub use live_feed::{
