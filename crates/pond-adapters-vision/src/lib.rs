@@ -4,6 +4,7 @@
 mod capture;
 mod discovery;
 mod ffmpeg_source;
+mod gst;
 mod jpeg_decode;
 mod jpeg_stream;
 mod live_feed;

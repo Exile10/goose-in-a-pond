@@ -1,5 +1,5 @@
-//! Opens a camera by the cheapest path it allows: its own JPEGs through ffmpeg, else ffmpeg
-//! decoding every frame.
+//! Opens a camera by the cheapest path this host and camera allow: a Jetson's hardware engines,
+//! then the camera's own JPEGs through ffmpeg, then ffmpeg decoding every frame.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::user_data::domain::vision::{CapturedFrame, JpegFrame, FPS_RANGE};
+use pond_core::user_data::domain::vision::{CapturedFrame, JpegFrame, LumaPlane, FPS_RANGE};
 use pond_core::user_data::ports::vision::FrameSource;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::ffmpeg_source::{checked_input, resolve_ffmpeg_bin, CaptureConfig, FfmpegFrameSource};
-use crate::jpeg_stream::{JpegSplitter, RateGate};
+use crate::gst::{self, HardwareHead, JetsonEngines, VideoCodec};
+use crate::jpeg_stream::{JpegSplitter, MultipartParser, Part, RateGate};
 use crate::live_feed::CapturePath;
 use crate::process::CaptureProcess;
 
@@ -45,12 +46,13 @@ pub async fn open_capture(cfg: CaptureConfig) -> Result<OpenedSource> {
         InputKind::V4l2 => Probe::MjpegSizes(probe_mjpeg_sizes(&ffmpeg, &input).await),
         _ => Probe::Stream(probe_stream(&ffmpeg, &input, kind).await),
     };
-    let candidates = plan(&cfg, &input, kind, &probe);
+    let engines = gst::jetson_engines().await;
+    let candidates = plan(&cfg, &input, kind, &probe, engines);
 
     let last = candidates.len() - 1;
     for (i, candidate) in candidates.into_iter().enumerate() {
         let capture = candidate.path();
-        let mut source = match start(&candidate, &cfg, &ffmpeg) {
+        let mut source = match start(&candidate, &cfg, &ffmpeg, engines) {
             Ok(source) => source,
             Err(e) if i < last => {
                 tracing::warn!(capture = capture.as_str(), error = %format!("{e:#}"), "capture path could not start; trying the next");
@@ -125,13 +127,21 @@ struct StreamInfo {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Candidate {
-    CameraJpeg { args: Vec<String> },
+    Hardware {
+        head: HardwareHead,
+        live: (u32, u32),
+        luma: (u32, u32),
+    },
+    CameraJpeg {
+        args: Vec<String>,
+    },
     Software,
 }
 
 impl Candidate {
     fn path(&self) -> CapturePath {
         match self {
+            Candidate::Hardware { .. } => CapturePath::Hardware,
             Candidate::CameraJpeg { .. } => CapturePath::CameraJpeg,
             Candidate::Software => CapturePath::Software,
         }
@@ -139,13 +149,30 @@ impl Candidate {
 }
 
 /// Cheapest first; always ends with [`Candidate::Software`].
-fn plan(cfg: &CaptureConfig, input: &str, kind: InputKind, probe: &Probe) -> Vec<Candidate> {
+fn plan(
+    cfg: &CaptureConfig,
+    input: &str,
+    kind: InputKind,
+    probe: &Probe,
+    engines: &JetsonEngines,
+) -> Vec<Candidate> {
     let mut out = Vec::new();
     match probe {
         Probe::MjpegSizes(sizes) => {
-            if let Some(size) = pick_size(sizes, (cfg.width, cfg.height)) {
+            if let Some((width, height)) = pick_size(sizes, (cfg.width, cfg.height)) {
+                if engines.jpeg {
+                    out.push(Candidate::Hardware {
+                        head: HardwareHead::MjpegCamera {
+                            device: input.to_string(),
+                            width,
+                            height,
+                        },
+                        live: (width, height),
+                        luma: scaled((width, height), gst::LUMA_WIDTH),
+                    });
+                }
                 out.push(Candidate::CameraJpeg {
-                    args: camera_jpeg_args(input, kind, Some(size)),
+                    args: camera_jpeg_args(input, kind, Some((width, height))),
                 });
             }
         }
@@ -153,6 +180,26 @@ fn plan(cfg: &CaptureConfig, input: &str, kind: InputKind, probe: &Probe) -> Vec
             out.push(Candidate::CameraJpeg {
                 args: camera_jpeg_args(input, kind, None),
             });
+        }
+        Probe::Stream(Some(info)) if engines.video => {
+            let head = match (kind, VideoCodec::from_ffmpeg(&info.codec)) {
+                (InputKind::Rtsp, Some(codec)) => Some(HardwareHead::Rtsp {
+                    url: input.to_string(),
+                    codec,
+                }),
+                (InputKind::File, Some(_)) => Some(HardwareHead::File {
+                    path: input.to_string(),
+                }),
+                _ => None,
+            };
+            if let Some(head) = head {
+                let source = info.size.unwrap_or((cfg.width, cfg.height));
+                out.push(Candidate::Hardware {
+                    head,
+                    live: scaled(source, cfg.width),
+                    luma: scaled(source, gst::LUMA_WIDTH),
+                });
+            }
         }
         Probe::Stream(_) => {}
     }
@@ -164,14 +211,31 @@ fn start(
     candidate: &Candidate,
     cfg: &CaptureConfig,
     ffmpeg: &std::ffi::OsStr,
+    engines: &JetsonEngines,
 ) -> Result<Box<dyn FrameSource>> {
     Ok(match candidate {
+        Candidate::Hardware { head, live, luma } => {
+            let Some(launch) = engines.gst_launch.as_deref() else {
+                bail!("gst-launch-1.0 is not installed");
+            };
+            let args = gst::pipeline_args(head, cfg.fps, *live, *luma)?;
+            let process =
+                CaptureProcess::spawn(launch.as_os_str(), &args, "gst-launch-1.0", &cfg.input)?;
+            Box::new(HardwareSource::new(process, *luma, cfg.fps))
+        }
         Candidate::CameraJpeg { args } => {
             let process = CaptureProcess::spawn(ffmpeg, args, "ffmpeg", &cfg.input)?;
             Box::new(CameraJpegSource::new(process, cfg.fps))
         }
         Candidate::Software => Box::new(FfmpegFrameSource::spawn(cfg)?),
     })
+}
+
+/// `width` wide at `source`'s aspect, with an even height as the scalers want.
+fn scaled(source: (u32, u32), width: u32) -> (u32, u32) {
+    let (sw, sh) = (source.0.max(1) as u64, source.1.max(1) as u64);
+    let height = ((width as u64 * sh + sw / 2) / sw).max(2) as u32;
+    (width, height + height % 2)
 }
 
 /// The exact size, else the smallest that covers it, else the largest offered.
@@ -376,6 +440,77 @@ impl FrameSource for CameraJpegSource {
     }
 }
 
+/// gst-launch's multipart stream: each live JPEG paired with the luma VIC scaled from it.
+struct HardwareSource {
+    process: CaptureProcess,
+    parser: MultipartParser,
+    luma_size: (u32, u32),
+    // videorate let 20+ fps through at max-rate=5 on a live H.264 RTSP stream.
+    gate: RateGate,
+    jpeg: Option<Vec<u8>>,
+    luma: Option<Vec<u8>>,
+}
+
+impl HardwareSource {
+    fn new(process: CaptureProcess, luma_size: (u32, u32), fps: u32) -> Self {
+        Self {
+            process,
+            parser: MultipartParser::new(gst::BOUNDARY),
+            luma_size,
+            gate: RateGate::new(fps),
+            jpeg: None,
+            luma: None,
+        }
+    }
+}
+
+#[async_trait]
+impl FrameSource for HardwareSource {
+    async fn next_frame(&mut self) -> Result<Option<CapturedFrame>> {
+        let (w, h) = self.luma_size;
+        loop {
+            while let Some(part) = self.parser.next_part()? {
+                // A part whose partner never came is replaced by the next of its kind.
+                match part {
+                    Part::Jpeg(bytes) => self.jpeg = Some(bytes),
+                    Part::Raw(bytes) if bytes.len() == (w * h) as usize => self.luma = Some(bytes),
+                    Part::Raw(bytes) => bail!(
+                        "the hardware pipeline sent {} luma bytes, expected {}x{}",
+                        bytes.len(),
+                        w,
+                        h
+                    ),
+                }
+                match (self.jpeg.take(), self.luma.take()) {
+                    (Some(_), Some(_)) if !self.gate.admit(Instant::now()) => {}
+                    (Some(jpeg), Some(pixels)) => {
+                        return Ok(Some(CapturedFrame::Jpeg(JpegFrame {
+                            jpeg: Arc::new(jpeg),
+                            luma: Some(LumaPlane {
+                                width: w,
+                                height: h,
+                                pixels,
+                            }),
+                            captured_at: Utc::now(),
+                        })));
+                    }
+                    (jpeg, luma) => {
+                        self.jpeg = jpeg;
+                        self.luma = luma;
+                    }
+                }
+            }
+            if read_more(&mut self.process, self.parser.buffer_mut()).await? == 0 {
+                bail!("camera stream ended ({})", self.process.exit_reason().await);
+            }
+        }
+    }
+
+    async fn close(&mut self) {
+        self.process.close().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +524,14 @@ mod tests {
             input: input.into(),
             fps: 15,
             ..Default::default()
+        }
+    }
+
+    fn jetson() -> JetsonEngines {
+        JetsonEngines {
+            gst_launch: Some("/usr/bin/gst-launch-1.0".into()),
+            jpeg: true,
+            video: true,
         }
     }
 
@@ -439,12 +582,37 @@ mod tests {
     }
 
     #[test]
-    fn a_usb_camera_with_mjpeg_passes_its_jpeg_through_ffmpeg() {
+    fn a_usb_camera_on_a_jetson_tries_hardware_then_ffmpeg_jpeg_then_software() {
         let probe = Probe::MjpegSizes(parse_mjpeg_sizes(C920));
-        let plan = plan(&cfg("/dev/video0"), "/dev/video0", InputKind::V4l2, &probe);
+        let plan = plan(
+            &cfg("/dev/video0"),
+            "/dev/video0",
+            InputKind::V4l2,
+            &probe,
+            &jetson(),
+        );
         let paths: Vec<_> = plan.iter().map(Candidate::path).collect();
-        assert_eq!(paths, vec![CapturePath::CameraJpeg, CapturePath::Software]);
-        let Candidate::CameraJpeg { args } = &plan[0] else {
+        assert_eq!(
+            paths,
+            vec![
+                CapturePath::Hardware,
+                CapturePath::CameraJpeg,
+                CapturePath::Software
+            ]
+        );
+        assert_eq!(
+            plan[0],
+            Candidate::Hardware {
+                head: HardwareHead::MjpegCamera {
+                    device: "/dev/video0".into(),
+                    width: 640,
+                    height: 360
+                },
+                live: (640, 360),
+                luma: (128, 72),
+            }
+        );
+        let Candidate::CameraJpeg { args } = &plan[1] else {
             unreachable!()
         };
         assert_eq!(
@@ -452,14 +620,33 @@ mod tests {
             "-nostdin -loglevel error -f v4l2 -input_format mjpeg -video_size 640x360 -framerate 30 \
              -i /dev/video0 -map 0:v:0 -c:v copy -f mjpeg -flush_packets 1 -"
         );
+    }
+
+    #[test]
+    fn elsewhere_a_usb_camera_uses_its_jpeg_through_ffmpeg() {
+        let probe = Probe::MjpegSizes(parse_mjpeg_sizes(C920));
+        let plan = plan(
+            &cfg("/dev/video0"),
+            "/dev/video0",
+            InputKind::V4l2,
+            &probe,
+            &JetsonEngines::default(),
+        );
+        let paths: Vec<_> = plan.iter().map(Candidate::path).collect();
+        assert_eq!(paths, vec![CapturePath::CameraJpeg, CapturePath::Software]);
 
         let no_mjpeg = Probe::MjpegSizes(vec![]);
-        let plan = plan_paths("/dev/video0", InputKind::V4l2, &no_mjpeg);
+        let plan = plan_paths("/dev/video0", InputKind::V4l2, &no_mjpeg, &jetson());
         assert_eq!(plan, vec![CapturePath::Software]);
     }
 
-    fn plan_paths(input: &str, kind: InputKind, probe: &Probe) -> Vec<CapturePath> {
-        plan(&cfg(input), input, kind, probe)
+    fn plan_paths(
+        input: &str,
+        kind: InputKind,
+        probe: &Probe,
+        engines: &JetsonEngines,
+    ) -> Vec<CapturePath> {
+        plan(&cfg(input), input, kind, probe, engines)
             .iter()
             .map(Candidate::path)
             .collect()
@@ -474,21 +661,67 @@ mod tests {
 
     #[test]
     fn network_streams_choose_by_codec() {
-        let http = "http://cam.local/mjpeg";
-        assert_eq!(
-            plan_paths(http, InputKind::Http, &stream("mjpeg", Some((640, 480)))),
-            vec![CapturePath::CameraJpeg, CapturePath::Software]
-        );
         let rtsp = "rtsp://u:p@cam/live";
         assert_eq!(
-            plan_paths(rtsp, InputKind::Rtsp, &stream("h264", None)),
+            plan_paths(rtsp, InputKind::Rtsp, &stream("h264", None), &jetson()),
+            vec![CapturePath::Hardware, CapturePath::Software]
+        );
+        assert_eq!(
+            plan_paths(
+                rtsp,
+                InputKind::Rtsp,
+                &stream("h264", None),
+                &JetsonEngines::default()
+            ),
             vec![CapturePath::Software]
         );
         assert_eq!(
-            plan_paths(rtsp, InputKind::Rtsp, &Probe::Stream(None)),
+            plan_paths(rtsp, InputKind::Rtsp, &stream("vp9", None), &jetson()),
+            vec![CapturePath::Software]
+        );
+        assert_eq!(
+            plan_paths(rtsp, InputKind::Rtsp, &Probe::Stream(None), &jetson()),
             vec![CapturePath::Software],
             "an unreadable stream keeps today's path"
         );
+        let http = "http://cam.local/mjpeg";
+        assert_eq!(
+            plan_paths(
+                http,
+                InputKind::Http,
+                &stream("mjpeg", Some((640, 480))),
+                &jetson()
+            ),
+            vec![CapturePath::CameraJpeg, CapturePath::Software]
+        );
+        assert_eq!(
+            plan_paths(http, InputKind::Http, &stream("h264", None), &jetson()),
+            vec![CapturePath::Software],
+            "no hardware head reads HTTP video"
+        );
+    }
+
+    #[test]
+    fn a_4_3_stream_keeps_its_shape() {
+        let plan = plan(
+            &cfg("/tmp/clip.mp4"),
+            "/tmp/clip.mp4",
+            InputKind::File,
+            &stream("hevc", Some((1280, 960))),
+            &jetson(),
+        );
+        assert_eq!(
+            plan[0],
+            Candidate::Hardware {
+                head: HardwareHead::File {
+                    path: "/tmp/clip.mp4".into()
+                },
+                live: (640, 480),
+                luma: (128, 96),
+            }
+        );
+        assert_eq!(scaled((1920, 1080), 640), (640, 360));
+        assert_eq!(scaled((1366, 768), 128), (128, 72));
     }
 
     #[test]
@@ -500,7 +733,10 @@ mod tests {
         assert_eq!(InputKind::of("/home/nano/clip.mp4"), InputKind::File);
     }
 
-    /// A stand-in for a capture process: replays a byte stream from a file on stdout.
+    /// A replayed stream arrives all at once; at this rate the gate's interval is zero.
+    const NO_RATE_LIMIT: u32 = u32::MAX;
+
+    /// A stand-in for gst-launch: replays a multipart stream from a file on stdout.
     fn replay(stream: &[u8]) -> (tempfile::TempDir, CaptureProcess) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("stream.bin");
@@ -508,11 +744,85 @@ mod tests {
         let process = CaptureProcess::spawn(
             std::ffi::OsStr::new("cat"),
             &[path.to_string_lossy().into_owned()],
-            "ffmpeg",
+            "gst-launch-1.0",
             "/dev/video0",
         )
         .unwrap();
         (dir, process)
+    }
+
+    fn part(kind: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "--{}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n",
+            gst::BOUNDARY,
+            data.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    #[tokio::test]
+    async fn the_hardware_stream_pairs_each_jpeg_with_its_luma_in_either_order() {
+        let luma = |v: u8| vec![v; 4 * 2];
+        let stream = [
+            part("image/jpeg", b"j1"),
+            part("video/x-raw", &luma(1)),
+            part("video/x-raw", &luma(2)),
+            part("image/jpeg", b"j2"),
+            part("image/jpeg", b"lost"),
+            part("image/jpeg", b"j3"),
+            part("video/x-raw", &luma(3)),
+        ]
+        .concat();
+        let (_dir, process) = replay(&stream);
+        let mut source = HardwareSource::new(process, (4, 2), NO_RATE_LIMIT);
+        let mut got = Vec::new();
+        let ended = loop {
+            match source.next_frame().await {
+                Ok(Some(CapturedFrame::Jpeg(f))) => {
+                    got.push((f.jpeg.to_vec(), f.luma.unwrap().pixels[0]));
+                }
+                Ok(other) => panic!("unexpected {other:?}"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(
+            got,
+            vec![
+                (b"j1".to_vec(), 1),
+                (b"j2".to_vec(), 2),
+                (b"j3".to_vec(), 3)
+            ]
+        );
+        assert!(ended.to_string().contains("camera stream ended"), "{ended}");
+    }
+
+    #[tokio::test]
+    async fn the_hardware_stream_is_held_to_the_setting_whatever_videorate_does() {
+        let stream: Vec<u8> = (0..4u8)
+            .flat_map(|i| [part("image/jpeg", &[i]), part("video/x-raw", &[i; 8])].concat())
+            .collect();
+        let (_dir, process) = replay(&stream);
+        let mut source = HardwareSource::new(process, (4, 2), 1);
+        match source.next_frame().await.unwrap() {
+            Some(CapturedFrame::Jpeg(f)) => assert_eq!(*f.jpeg, vec![0]),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            source.next_frame().await.is_err(),
+            "the three pairs that came within the second were dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_luma_part_of_the_wrong_size_is_an_error() {
+        let stream = [part("image/jpeg", b"j1"), part("video/x-raw", &[0; 5])].concat();
+        let (_dir, process) = replay(&stream);
+        let mut source = HardwareSource::new(process, (4, 2), NO_RATE_LIMIT);
+        let err = source.next_frame().await.unwrap_err().to_string();
+        assert!(err.contains("expected 4x2"), "{err}");
     }
 
     #[tokio::test]

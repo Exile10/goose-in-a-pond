@@ -1,5 +1,5 @@
-//! Byte-stream framing for a capture child that emits a bare concatenation of JPEGs
-//! (ffmpeg `-c:v copy -f mjpeg`).
+//! Byte-stream framing for capture children that emit JPEGs: a bare concatenation of JPEGs
+//! (ffmpeg `-c:v copy -f mjpeg`) or a multipart stream of JPEG and luma parts (gst multipartmux).
 
 use std::time::{Duration, Instant};
 
@@ -132,6 +132,96 @@ impl JpegSplitter {
     }
 }
 
+/// One part of a multipart capture stream.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Part {
+    Jpeg(Vec<u8>),
+    Raw(Vec<u8>),
+}
+
+/// Reads `--boundary` parts with `Content-Type` and `Content-Length`, as gst multipartmux writes.
+pub struct MultipartParser {
+    buf: Vec<u8>,
+    delimiter: Vec<u8>,
+}
+
+/// Headers longer than this mean the stream is not multipart.
+const MAX_HEADER_BYTES: usize = 1024;
+
+impl MultipartParser {
+    pub fn new(boundary: &str) -> Self {
+        Self {
+            buf: Vec::new(),
+            delimiter: format!("--{boundary}\r\n").into_bytes(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+
+    /// The next part, `Ok(None)` when more bytes are needed.
+    pub fn next_part(&mut self) -> Result<Option<Part>> {
+        loop {
+            let Some(start) = find(&self.buf, &self.delimiter) else {
+                if self.buf.len() > MAX_HEADER_BYTES {
+                    bail!("the capture stream is not the expected multipart stream");
+                }
+                return Ok(None);
+            };
+            let headers_from = start + self.delimiter.len();
+            let Some(headers_len) = self
+                .buf
+                .get(headers_from..)
+                .and_then(|b| find(b, b"\r\n\r\n"))
+            else {
+                if self.buf.len() - headers_from > MAX_HEADER_BYTES {
+                    bail!("a capture stream part has no end to its headers");
+                }
+                return Ok(None);
+            };
+            let headers =
+                String::from_utf8_lossy(&self.buf[headers_from..headers_from + headers_len]);
+            let mut content_type = None;
+            let mut content_length = None;
+            for line in headers.split("\r\n") {
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let value = value.trim();
+                if name.eq_ignore_ascii_case("content-type") {
+                    content_type = Some(value.to_ascii_lowercase());
+                } else if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.parse::<usize>().ok();
+                }
+            }
+            let Some(len) = content_length else {
+                bail!("a capture stream part has no Content-Length");
+            };
+            if len > MAX_PART_BYTES {
+                bail!("a capture stream part claims {len} bytes");
+            }
+            let data_from = headers_from + headers_len + 4;
+            if self.buf.len() < data_from + len {
+                return Ok(None);
+            }
+            let rest = self.buf.split_off(data_from + len);
+            let mut part = std::mem::replace(&mut self.buf, rest);
+            part.drain(..data_from);
+            match content_type.as_deref() {
+                Some("image/jpeg") => return Ok(Some(Part::Jpeg(part))),
+                Some(t) if t.starts_with("video/x-raw") => return Ok(Some(Part::Raw(part))),
+                _ => continue,
+            }
+        }
+    }
+}
+
 /// Admits frames at no more than a target rate, keeping to a schedule so jitter cannot drift it.
 pub struct RateGate {
     interval: Duration,
@@ -236,6 +326,57 @@ mod tests {
         s.push(&vec![0x11; MAX_PART_BYTES + 16]);
         assert!(s.next_jpeg().unwrap().is_none());
         assert!(s.next_jpeg().is_err());
+    }
+
+    fn part(kind: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "--giapframe\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n",
+            data.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    #[test]
+    fn multipart_parts_come_out_whole_whatever_the_read_sizes() {
+        let stream = [
+            part("image/jpeg", b"\xff\xd8one\xff\xd9"),
+            part("video/x-raw", &[7; 32]),
+            part("text/plain", b"ignored"),
+            part("image/jpeg", b"--giapframe\r\n inside data"),
+        ]
+        .concat();
+        for chunk in [1, 5, 64, stream.len()] {
+            let mut p = MultipartParser::new("giapframe");
+            let mut out = Vec::new();
+            for piece in stream.chunks(chunk) {
+                p.push(piece);
+                while let Some(part) = p.next_part().unwrap() {
+                    out.push(part);
+                }
+            }
+            assert_eq!(
+                out,
+                vec![
+                    Part::Jpeg(b"\xff\xd8one\xff\xd9".to_vec()),
+                    Part::Raw(vec![7; 32]),
+                    Part::Jpeg(b"--giapframe\r\n inside data".to_vec()),
+                ],
+                "chunk size {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_that_is_not_multipart_is_an_error() {
+        let mut p = MultipartParser::new("giapframe");
+        p.push(&vec![b'x'; 2 * MAX_HEADER_BYTES]);
+        assert!(p.next_part().is_err());
+        let mut p = MultipartParser::new("giapframe");
+        p.push(b"--giapframe\r\nContent-Type: image/jpeg\r\n\r\nxx");
+        assert!(p.next_part().is_err(), "no length");
     }
 
     #[test]
