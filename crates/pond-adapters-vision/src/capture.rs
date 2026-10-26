@@ -60,7 +60,7 @@ pub async fn open_capture(cfg: CaptureConfig) -> Result<OpenedSource> {
             }
             Err(e) => return Err(e),
         };
-        // The last path keeps today's behaviour: its failures surface as the stream ending.
+        // The last path is not trialled: its failures surface as the stream ending, with backoff.
         if i == last {
             return Ok(OpenedSource { source, capture });
         }
@@ -682,7 +682,7 @@ mod tests {
         assert_eq!(
             plan_paths(rtsp, InputKind::Rtsp, &Probe::Stream(None), &jetson()),
             vec![CapturePath::Software],
-            "an unreadable stream keeps today's path"
+            "an unreadable stream gets the full-decode path"
         );
         let http = "http://cam.local/mjpeg";
         assert_eq!(
