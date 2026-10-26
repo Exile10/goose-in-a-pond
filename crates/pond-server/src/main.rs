@@ -3112,6 +3112,7 @@ async fn run_server(
         device_registry.clone(),
         device_control.clone(),
     );
+    pond_mcp_server::init_vision_deps(camera_storage.clone(), settings_repo.clone());
 
     let (agent, extension_manager, _tool_caller, tool_registry) = if mistralrs_active {
         // No goose: no extension manager or tool specialist, and an empty registry.
@@ -4052,26 +4053,8 @@ async fn run_server(
         last_user_activity.clone(),
     ));
 
-    // On-device motion detection into camera_events + the bus. Opt-in: needs a camera and ffmpeg.
-    if settings.vision_enabled && !settings.vision_camera_url.trim().is_empty() {
-        let capture = pond_adapters_vision::CaptureConfig {
-            input: settings.vision_camera_url.trim().to_string(),
-            fps: settings.vision_fps.max(1),
-            ..Default::default()
-        };
-        let pipeline_cfg = pond_adapters_vision::VisionPipelineConfig {
-            camera_id: settings.vision_camera_id.clone(),
-            motion: pond_adapters_vision::MotionConfig {
-                changed_fraction: settings.vision_motion_threshold.clamp(0.001, 1.0),
-                ..Default::default()
-            },
-            // Triggering frame per event (bounded per camera), so the dashboard shows what moved.
-            snapshots: Some(pond_adapters_vision::SnapshotConfig::new(
-                data_dir.join("snapshots"),
-            )),
-            ..Default::default()
-        };
-
+    // The vision supervisor: hotplug, live settings, camera consent and stream reconnects.
+    {
         // Labels motion as person/pet/package. Empty model = auto-downloaded YOLOX-Nano; a set
         // one is operator-managed. Any failure degrades to plain "motion".
         #[cfg(feature = "vision-onnx")]
@@ -4120,22 +4103,18 @@ async fn run_server(
             None
         };
 
-        match pond_adapters_vision::FfmpegFrameSource::spawn(&capture) {
-            Ok(source) => {
-                let storage = camera_storage.clone();
-                let bus = event_bus.clone();
-                tokio::spawn(pond_adapters_vision::run_vision_pipeline(
-                    Box::new(source),
-                    classifier,
-                    storage,
-                    bus,
-                    pipeline_cfg,
-                ));
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "vision pipeline not started (camera/ffmpeg unavailable)")
-            }
-        }
+        let supervisor = pond_adapters_vision::VisionSupervisor::new(
+            settings_repo.clone(),
+            camera_storage.clone(),
+            event_bus.clone(),
+            pond_adapters_vision::LiveCameraRegistry::global().clone(),
+        )
+        .with_classifier(classifier)
+        .with_face_recognizer(face_recognition.clone())
+        .with_snapshots(pond_adapters_vision::SnapshotConfig::new(
+            data_dir.join("snapshots"),
+        ));
+        tokio::spawn(supervisor.run());
     }
 
     // The printed card's code and its claim latch live beside the TLS identity, not in the
@@ -4615,6 +4594,12 @@ async fn run_server(
         );
     }
 
+    tokio::task::spawn_blocking(|| {
+        if let Err(e) = pond_audio_out::route::play_chime(None) {
+            tracing::debug!(error = %e, "startup chime did not play");
+        }
+    });
+
     if open || (debug && has_display()) {
         let url = format!("http://127.0.0.1:{}", api_port);
         if webbrowser::open(&url).is_err() {
@@ -5036,6 +5021,10 @@ async fn run_chat(
         Arc::new(SqliteDeviceRegistry::new(db.system.clone())),
         // No Matter here: `state` bails, so replies use the stored reading, labelled with its age.
         Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
+    );
+    pond_mcp_server::init_vision_deps(
+        Arc::new(SqliteCameraStorage::new(db.logs.clone())),
+        Arc::new(SqliteSettingsRepository::new(db.system.clone())),
     );
 
     // Needed here too, or giap-context fails to load. No index or embedder on this path, so
@@ -7422,17 +7411,7 @@ fn apply_face_recognition_defaults() {
         unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PIXEL_SCALE", "unit") };
     }
 
-    // Secondary PAD, duplicated in `build_face_recognition`: `setup` and `serve` each need it.
-    if std::env::var_os("POND_FACE_ANTISPOOF_PATH_2").is_none() {
-        let default_path = default_data_dir()
-            .join("models")
-            .join("face")
-            .join("OULU_Protocol_2_model_0_0.onnx");
-        if default_path.exists() {
-            // SAFETY: single-threaded setup, before any worker spawns.
-            unsafe { std::env::set_var("POND_FACE_ANTISPOOF_PATH_2", default_path) };
-        }
-    }
+    // Secondary anti-spoof model is optional and only used if explicitly configured.
 }
 /// Records wake-word samples and stores Whisper's transcriptions as calibration variants.
 async fn run_calibrate(
@@ -7654,16 +7633,7 @@ fn build_face_recognition(
         }
     }
 
-    // Safe to auto-enable: the ensemble takes `max(spoof_score)`, so a dud secondary is harmless.
-    if std::env::var_os("POND_FACE_ANTISPOOF_PATH_2").is_none() {
-        let secondary_default = data_dir.join("models/face/OULU_Protocol_2_model_0_0.onnx");
-        if secondary_default.exists() {
-            // SAFETY: single-threaded init phase before any task scheduling.
-            unsafe {
-                std::env::set_var("POND_FACE_ANTISPOOF_PATH_2", secondary_default.as_os_str());
-            }
-        }
-    }
+    // Secondary anti-spoof model (DeepPixBis) is optional and only enabled if explicitly set via env var.
 
     if !model_path.exists() {
         tracing::info!(
@@ -7773,12 +7743,12 @@ fn build_face_recognition(
         }
     });
 
-    // ArcFace on aligned 112×112 crops: strangers can reach 0.55–0.65, so aligned floors sit in
-    // the empirically safe 0.68–0.75 band.
+    // AdaFace/ArcFace-512 on aligned 112×112 room-camera crops scores 0.42–0.65 for genuine
+    // matches while impostors sit below 0.25; MobileFaceNet-128 has higher baseline cosines.
     let threshold = match (&detector, model_kind) {
-        (Some(d), EmbeddingModel::ArcFace512) if d.produces_landmarks() => 0.70,
-        (Some(_), EmbeddingModel::ArcFace512) => 0.72,
-        (None, EmbeddingModel::ArcFace512) => 0.85,
+        (Some(d), EmbeddingModel::ArcFace512) if d.produces_landmarks() => 0.42,
+        (Some(_), EmbeddingModel::ArcFace512) => 0.48,
+        (None, EmbeddingModel::ArcFace512) => 0.70,
         (Some(d), EmbeddingModel::MobileFaceNet128) if d.produces_landmarks() => 0.70,
         (Some(_), EmbeddingModel::MobileFaceNet128) => 0.72,
         (None, EmbeddingModel::MobileFaceNet128) => 0.85,
@@ -9276,6 +9246,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 profile_context: None,
                 tool_group_allowlist: None,
                 warmup: false,
+                suggestion_context: None,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -9347,6 +9318,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     profile_context: None,
                     tool_group_allowlist: None,
                     warmup: false,
+                    suggestion_context: None,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");

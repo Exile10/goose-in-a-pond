@@ -1,12 +1,25 @@
 //! Vision events (ffmpeg capture, motion differencing, optional local labelling) feed the same
 //! `camera_events` store and EventBus as the external camera-event API.
 
+mod discovery;
 mod ffmpeg_source;
+mod live_feed;
 mod motion;
 mod pipeline;
 mod snapshot;
+mod supervisor;
 
+pub use discovery::{default_camera_source, detect_v4l2_cameras, DiscoveredCamera};
 pub use ffmpeg_source::{CaptureConfig, FfmpegFrameSource};
+pub use live_feed::{
+    LiveCameraRegistry, SourceKind, SupervisorStatus, VisionBusConfig, VisionState,
+    LIVE_FRAME_WINDOW,
+};
 pub use motion::{MotionConfig, MotionDetector};
 pub use pipeline::{run_vision_pipeline, VisionPipelineConfig};
-pub use snapshot::SnapshotConfig;
+pub use snapshot::{frame_to_jpeg_bytes, write_snapshot, SnapshotConfig};
+pub use supervisor::{
+    capture_change, desired_capture, redact_source, CameraDiscovery, CaptureChange, CaptureSpec,
+    DesiredCapture, SourceOpener, SupervisorTiming, VisionSupervisor, RECONNECT_BACKOFF_MAX,
+    RECONNECT_BACKOFF_MIN, SETTINGS_POLL_INTERVAL,
+};

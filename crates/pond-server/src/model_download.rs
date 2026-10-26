@@ -615,6 +615,7 @@ const DETECTOR_APPROX_MB: u64 = 39;
 /// Silent-Face MiniFASNetV2: 3-class `[fake_2D, fake_3D, live]`, 80×80 BGR input.
 #[cfg(feature = "face-onnx")]
 const ANTISPOOF_MIRRORS: &[&str] = &[
+    "https://huggingface.co/garciafido/minifasnet-v2-anti-spoofing-onnx/resolve/main/minifasnet_v2.onnx",
     "https://huggingface.co/hash-ash/Silent-Face-Anti-Spoofing-ONNX/resolve/main/2.7_80x80_MiniFASNetV2.onnx",
     "https://huggingface.co/datasets/giap-mirror/silent-face-anti-spoofing/resolve/main/2.7_80x80_MiniFASNetV2.onnx",
 ];

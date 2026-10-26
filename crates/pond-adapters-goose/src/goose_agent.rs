@@ -3083,6 +3083,10 @@ impl GooseAdapter {
             msg.push_str("\n</user-message>\n");
             // Always emitted, since the answer contract is unconditional.
             msg.push_str("<system-context>\n");
+            if let Some(ref sc) = request.suggestion_context {
+                msg.push_str(&sc.render_envelope());
+                msg.push('\n');
+            }
             if !dynamic_suffix_for_user_msg.is_empty() {
                 msg.push_str(&dynamic_suffix_for_user_msg);
                 msg.push('\n');
@@ -3965,6 +3969,7 @@ impl AgentPort for GooseAdapter {
             tool_group_allowlist: None,
             // No completeness check: a whole extra round-trip for a ping nobody reads.
             warmup: true,
+            suggestion_context: None,
         };
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), async {
@@ -7780,6 +7785,7 @@ mod tests {
             profile_context: None,
             tool_group_allowlist: None,
             warmup: false,
+            suggestion_context: None,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

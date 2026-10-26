@@ -40,6 +40,23 @@ fn sanitize_camera_id(camera_id: &str) -> String {
     }
 }
 
+/// Encode `frame` as in-memory JPEG bytes.
+pub fn frame_to_jpeg_bytes(frame: &Frame) -> Result<Vec<u8>> {
+    if !frame.is_well_formed() {
+        anyhow::bail!("malformed frame ({}x{})", frame.width, frame.height);
+    }
+    let image = image::RgbImage::from_raw(frame.width, frame.height, frame.rgb.clone())
+        .context("frame buffer does not match its dimensions")?;
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Jpeg,
+        )
+        .context("failed to encode frame as jpeg")?;
+    Ok(bytes)
+}
+
 /// Save `frame` as a JPEG named `<camera>-<UTC ms timestamp>.jpg` (sorts by time) and prune.
 pub fn write_snapshot(cfg: &SnapshotConfig, camera_id: &str, frame: &Frame) -> Result<PathBuf> {
     if !frame.is_well_formed() {

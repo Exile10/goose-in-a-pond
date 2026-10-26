@@ -405,12 +405,65 @@ async fn pond_is_claimed(state: &crate::AppState) -> bool {
     }
 }
 
-/// A sign-in callback's query carries the provider's one-time code and state, so it is not logged.
-fn loggable_query(uri: &axum::http::Uri) -> &str {
+/// GETs an `<img>` tag or MJPEG viewer makes, which cannot set an `Authorization` header.
+const QUERY_TOKEN_ROUTES: &[&str] = &[
+    "/camera/snapshot",
+    "/camera/{camera_id}/snapshot",
+    "/camera/stream",
+    "/camera/{camera_id}/stream",
+    "/camera/events/{id}/snapshot",
+];
+
+/// Whether `?token=` may stand in for the bearer header on this request.
+fn accepts_query_token(method: &Method, path: &str) -> bool {
+    *method == Method::GET
+        && path.strip_prefix("/api/v1").is_some_and(|path| {
+            QUERY_TOKEN_ROUTES
+                .iter()
+                .any(|pattern| path_matches(pattern, path))
+        })
+}
+
+fn query_key(pair: &str) -> &str {
+    pair.split_once('=').map_or(pair, |(key, _)| key)
+}
+
+/// The percent-decoded `token` query parameter, if present and non-empty.
+fn query_token(query: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        if key != "token" {
+            return None;
+        }
+        urlencoding::decode(value)
+            .ok()
+            .map(|t| t.into_owned())
+            .filter(|t| !t.is_empty())
+    })
+}
+
+/// Credentials in a query are not logged: a sign-in callback's one-time code and state, and any
+/// `token` parameter.
+fn loggable_query(uri: &axum::http::Uri) -> std::borrow::Cow<'_, str> {
     if uri.path().ends_with("/oauth/callback") {
-        return "<redacted>";
+        return "<redacted>".into();
     }
-    uri.query().unwrap_or("")
+    let query = uri.query().unwrap_or("");
+    if !query.split('&').any(|pair| query_key(pair) == "token") {
+        return query.into();
+    }
+    query
+        .split('&')
+        .map(|pair| {
+            if query_key(pair) == "token" {
+                "token=<redacted>"
+            } else {
+                pair
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+        .into()
 }
 
 /// Request/response logging at debug level (visible under `pond-server serve --debug`).
@@ -494,7 +547,13 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    let token = extract_bearer_token(&headers)?;
+    let token = extract_bearer_token(&headers).or_else(|missing| {
+        if accepts_query_token(req.method(), path.path()) {
+            req.uri().query().and_then(query_token).ok_or(missing)
+        } else {
+            Err(missing)
+        }
+    })?;
 
     let valid = state
         .handshake
@@ -558,6 +617,61 @@ mod tests {
         assert_eq!(super::loggable_query(&callback), "<redacted>");
         let other: axum::http::Uri = "/api/v1/chat?limit=5".parse().unwrap();
         assert_eq!(super::loggable_query(&other), "limit=5");
+    }
+
+    #[test]
+    fn a_query_token_is_never_logged() {
+        let snapshot: axum::http::Uri = "/api/v1/camera/porch/snapshot?ts=1&token=s3cr%2Bt&w=2"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            super::loggable_query(&snapshot),
+            "ts=1&token=<redacted>&w=2"
+        );
+        // Redacted on every route, not only the ones that accept it.
+        let settings: axum::http::Uri = "/api/v1/settings?token=s3cret".parse().unwrap();
+        assert_eq!(super::loggable_query(&settings), "token=<redacted>");
+        let tokenish: axum::http::Uri = "/api/v1/x?tokens=1&a=token".parse().unwrap();
+        assert_eq!(super::loggable_query(&tokenish), "tokens=1&a=token");
+    }
+
+    #[test]
+    fn only_camera_image_and_stream_gets_take_a_query_token() {
+        use axum::http::Method;
+        for path in [
+            "/api/v1/camera/snapshot",
+            "/api/v1/camera/porch/snapshot",
+            "/api/v1/camera/stream",
+            "/api/v1/camera/porch/stream",
+            "/api/v1/camera/events/42/snapshot",
+        ] {
+            assert!(super::accepts_query_token(&Method::GET, path), "{path}");
+            assert!(
+                !super::accepts_query_token(&Method::POST, path),
+                "POST {path}"
+            );
+        }
+        for path in [
+            "/api/v1/settings",
+            "/api/v1/camera/events",
+            "/api/v1/vision/events/stream",
+            "/api/v1/faces",
+            "/api/v1/camera/porch/snapshot/extra",
+            "/camera/porch/snapshot",
+        ] {
+            assert!(!super::accepts_query_token(&Method::GET, path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_query_token_is_percent_decoded() {
+        assert_eq!(
+            super::query_token("ts=1&token=ab%2Bc%2F%3D").as_deref(),
+            Some("ab+c/=")
+        );
+        assert_eq!(super::query_token("token=plain").as_deref(), Some("plain"));
+        assert_eq!(super::query_token("token="), None);
+        assert_eq!(super::query_token("tokens=x"), None);
     }
 
     use super::*;

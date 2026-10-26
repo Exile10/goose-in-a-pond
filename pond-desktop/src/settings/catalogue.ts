@@ -341,11 +341,7 @@ export const CATALOGUE: CatalogueCategory[] = [
         name: "Sensors",
         entries: [
           { key: "mic_enabled", label: "Microphone", description: "Let the pond use the microphone. Off means it cannot hear anything.", control: { kind: "toggle" }, consumer: "live" },
-          {
-            key: "cameras_enabled", label: "Cameras", description: "Let the pond use the camera. Off means it cannot see anything.",
-            control: { kind: "toggle" }, consumer: "none",
-            note: "Nothing reads this. Turning it off does not stop the cameras — only Watch the camera, under Vision & Cameras, does that.",
-          },
+          { key: "cameras_enabled", label: "Cameras", description: "Let the pond use the camera. Off means it cannot see anything.", control: { kind: "toggle" }, consumer: "live" },
         ],
       },
       {
@@ -633,9 +629,20 @@ export const CATALOGUE: CatalogueCategory[] = [
             }),
           },
           { key: "vision_camera_id", label: "Camera name", description: "A name for this camera, used in the activity feed and in rules.", control: { kind: "text", placeholder: "camera-1" }, consumer: "live" },
-          { key: "vision_fps", label: "Frames per second", description: "How often to look at the picture. Low on purpose, to leave room for thinking.", control: { kind: "number", min: 1, max: 30, unit: "fps" }, consumer: "live", validate: all(integer, range(1, 30, "fps")) },
-          { key: "vision_motion_threshold", label: "Motion sensitivity", description: "How much of the picture must change to count as movement.", control: { kind: "number", step: 0.01, min: 0, max: 1 }, consumer: "live", validate: range(0, 1) },
+          // Bounds mirror the server's clamp in pond-core `domain/vision.rs`.
+          { key: "vision_fps", label: "Frames per second", description: "How often to look at the picture. Low on purpose, to leave room for thinking.", control: { kind: "number", min: 1, max: 5, unit: "fps" }, consumer: "live", validate: all(integer, range(1, 5, "fps")) },
+          { key: "vision_motion_threshold", label: "Motion sensitivity", description: "How much of the picture must change to count as movement.", control: { kind: "number", step: 0.005, min: 0.005, max: 0.5 }, consumer: "live", validate: range(0.005, 0.5) },
           { key: "vision_classifier_model", label: "Detector model", description: "What names what the camera saw. Empty uses the built-in one.", control: { kind: "text", placeholder: "Bundled YOLOX-Nano" }, consumer: "live", proposed: true },
+        ],
+      },
+      {
+        name: "Camera events",
+        entries: [
+          { key: "vision_event_cooldown_secs", label: "Quiet time between events", description: "Minimum seconds between camera events, so steady movement is one event, not a flood.", control: { kind: "number", min: 1, max: 3600, unit: "s" }, consumer: "live", proposed: true, validate: all(integer, range(1, 3600, "s")) },
+          { key: "vision_classifier_confidence", label: "Detector certainty", description: "How sure the detector must be before an event is named, not just called movement.", control: { kind: "number", step: 0.05, min: 0.05, max: 0.99 }, consumer: "live", proposed: true, validate: range(0.05, 0.99) },
+          { key: "vision_face_recognition_enabled", label: "Recognise faces", description: "Recognise household faces in camera events, so rules can tell who arrived.", control: { kind: "toggle" }, consumer: "live", proposed: true },
+          { key: "vision_face_on_motion", label: "Look for faces in any movement", description: "Also look for faces in plain movement, not only once the detector saw a person.", control: { kind: "toggle" }, consumer: "live", proposed: true },
+          { key: "vision_event_types", label: "Kinds of event to record", description: "Kinds of camera event to record and announce. Empty records every kind.", control: { kind: "text", placeholder: "Every kind" }, consumer: "live", proposed: true },
         ],
       },
       {

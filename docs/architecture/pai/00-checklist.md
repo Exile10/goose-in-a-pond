@@ -3790,3 +3790,21 @@ drifted in five places, each now corrected in section 1's row and in the phase's
   saying P3-P8 were unstarted.
 - **PAI-2's outbound-action gate lost its mechanism on 2026-09-10** with `giap-draft`; section 3.6 of
   the PAI-2 document already said so, and the P6b row did not.
+
+**2026-10-26 — Camera consent enforced, and the vision pipeline finished for the phone (touches
+PAI-1, PAI-2 and PAI-8; not a PAI milestone).**
+
+- **PAI-2: `cameras_enabled` now does what its doc comment always said.** The vision supervisor
+  (`pond-adapters-vision/src/supervisor.rs`) opens nothing while it is off and stops a running
+  pipeline within one 2 s settings poll (at once after an in-process save); camera snapshot, stream,
+  event-snapshot and SSE routes and enrolment from the camera answer `403 cameras_disabled`, read
+  from the stored setting on every request; open MJPEG and SSE streams end on revocation; the
+  `giap-vision` frame tools refuse. `?token=` is accepted only on camera image and stream `GET`s and
+  is redacted from the request log.
+- **PAI-1: `POST /faces/register-from-camera`** enrols a member from the pond's own fresh frame
+  through the existing `register_face`; `GET /faces` lists every profile with its enrolment count.
+- **PAI-8:** with consent off the pond's own pipeline emits no camera events, so none reach the
+  context ingest; externally posted events are unchanged.
+- **Invariants.** No migration (five new settings rows, defaults on read), no egress, no prompt or
+  KV change. `giap-vision`'s subagent denial now has its recorded reason in
+  `GROUPS_NO_SUBAGENT_MAY_HOLD`, which was failing since the group was added.

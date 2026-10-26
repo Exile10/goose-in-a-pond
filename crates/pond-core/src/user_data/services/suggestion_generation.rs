@@ -5,6 +5,7 @@
 //! NUMBER, never an echoed id or category: small models mangle echoes, and a number is checkable.
 
 use crate::user_data::domain::memory::{MemoryFragment, MemorySegment};
+use crate::user_data::domain::suggestion::SuggestionContext;
 use chrono::{DateTime, Datelike, Utc};
 
 /// Memories shown per pass; small for cost (~400 prompt tokens on a shared 2B-4B board) and
@@ -31,6 +32,16 @@ pub struct GeneratedSuggestion {
     pub prompt: String,
     /// The fact underneath, written by the pond. Never by the model.
     pub reason: String,
+}
+
+impl GeneratedSuggestion {
+    /// Grounding context that originated this composed suggestion.
+    pub fn context(&self) -> SuggestionContext {
+        SuggestionContext::PersonalMemory {
+            source_memory_id: self.source_memory_id.clone(),
+            fact: self.reason.clone(),
+        }
+    }
 }
 
 /// Why a candidate was refused; logged so an empty pass can tell silence from refusals.

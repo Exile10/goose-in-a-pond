@@ -336,6 +336,7 @@ mod tests {
         ("giap-sensors", include_str!("sensors.rs")),
         ("giap-system", include_str!("system.rs")),
         ("giap-toolkit", include_str!("toolkit.rs")),
+        ("giap-vision", include_str!("vision.rs")),
         ("giap-weather", include_str!("weather.rs")),
     ];
 
@@ -402,7 +403,7 @@ mod tests {
         );
         assert_eq!(
             tools.len(),
-            34,
+            43,
             "the tool inventory changed. Update this count in the same commit as \
              the tool — the number is the record, and a stale one is how a count \
              read 64 for months while the real number was 65. This assertion has \

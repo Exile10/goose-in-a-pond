@@ -3,6 +3,7 @@
 //! Unlike a proposal, a suggestion stages no action (the tap is the consent), so it needs no
 //! audience, expiry or daily cap. Derived on read, never stored; no suggestor spends inference.
 
+use crate::user_data::domain::suggestion::SuggestionContext;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -44,6 +45,8 @@ pub struct Suggestion {
     pub because: String,
     /// The tool group that can answer [`Self::prompt`].
     pub answered_by: &'static str,
+    /// Grounding context passed to the model when the suggestion is tapped.
+    pub context: Option<SuggestionContext>,
 }
 
 /// One suggestor's outcome, returned even when silent so "broken" and "nothing to say" differ.
@@ -225,6 +228,10 @@ fn calendar_today(s: &SuggestionSnapshot) -> Result<Suggestion, String> {
             plural(count, "event", "events")
         ),
         answered_by: GROUP_CONTEXT,
+        context: Some(SuggestionContext::Temporal {
+            event_title: "Today's calendar schedule".to_string(),
+            timing_summary: format!("{count} events between now and midnight"),
+        }),
     })
 }
 
@@ -246,8 +253,12 @@ fn upcoming_schedule(s: &SuggestionSnapshot) -> Result<Suggestion, String> {
     Ok(Suggestion {
         id: "upcoming_schedule".to_string(),
         prompt: "What's set to run before tonight?".to_string(),
-        because,
+        because: because.clone(),
         answered_by: GROUP_SCHEDULE,
+        context: Some(SuggestionContext::Temporal {
+            event_title: "Automated routines".to_string(),
+            timing_summary: because,
+        }),
     })
 }
 
@@ -273,6 +284,10 @@ fn inbox_recent(s: &SuggestionSnapshot) -> Result<Suggestion, String> {
             plural(count, "message", "messages")
         ),
         answered_by: GROUP_CONTEXT,
+        context: Some(SuggestionContext::Temporal {
+            event_title: "Recent mailbox activity".to_string(),
+            timing_summary: format!("{count} messages landed in the last seven days"),
+        }),
     })
 }
 
@@ -296,6 +311,10 @@ fn routine_recall(s: &SuggestionSnapshot) -> Result<Suggestion, String> {
             plural(s.routine_memories, "note", "notes")
         ),
         answered_by: GROUP_MEMORY,
+        context: Some(SuggestionContext::PersonalMemory {
+            source_memory_id: "routines".to_string(),
+            fact: format!("{} routine habits recorded in personal profile", s.routine_memories),
+        }),
     })
 }
 
@@ -318,6 +337,10 @@ fn memory_recall(s: &SuggestionSnapshot) -> Result<Suggestion, String> {
             plural(s.active_memories, "thing remembered", "things remembered")
         ),
         answered_by: GROUP_MEMORY,
+        context: Some(SuggestionContext::PersonalMemory {
+            source_memory_id: "active_memories".to_string(),
+            fact: format!("{} active memories recorded in personal profile", s.active_memories),
+        }),
     })
 }
 
@@ -334,6 +357,10 @@ fn devices_online(s: &SuggestionSnapshot) -> Result<Suggestion, String> {
             plural(s.devices_registered, "device", "devices")
         ),
         answered_by: GROUP_DEVICE,
+        context: Some(SuggestionContext::Environmental {
+            device_ids: Vec::new(),
+            summary: format!("{} devices currently registered", s.devices_registered),
+        }),
     })
 }
 
@@ -350,6 +377,10 @@ fn weather_today(s: &SuggestionSnapshot) -> Result<Suggestion, String> {
         prompt: "What's the weather here today?".to_string(),
         because,
         answered_by: GROUP_WEATHER,
+        context: Some(SuggestionContext::Temporal {
+            event_title: "Local weather forecast".to_string(),
+            timing_summary: "Today's forecast".to_string(),
+        }),
     })
 }
 
