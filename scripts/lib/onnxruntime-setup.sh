@@ -633,8 +633,8 @@ ortgpu_build_run() {
       _ortgpu_install "$stage" "$dest" || { rm -rf "$stage"; _ortgpu_phase failed install; return 1; }
       _ortgpu_out ok "ONNX Runtime $ORTGPU_VERSION with TensorRT and CUDA: $ORTGPU_VERIFY_FILES files verified in $dest"
     fi
-    _ortgpu_tidy
   fi
+  _ortgpu_tidy
 
   # Engines built with the pond stopped never compete with its language model for memory, and a
   # later start only loads them. Loading cached ones again costs the pond one restart.

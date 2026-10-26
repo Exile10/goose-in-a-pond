@@ -359,6 +359,11 @@ t_a_current_install_builds_nothing_and_a_new_tensorrt_rebuilds() {
   lacks "$(tools_log)" "build.sh" || return 1
   lacks "$(tools_log)" "systemctl --user stop" || return 1
   contains "$(logged)" "is installed: 8 files verified" || return 1
+  # A tree left by an older run goes too once the install is current.
+  mkdir -p "$(ortgpu_src_dir)/build"; : > "$LOG"
+  ( ortgpu_build_run ) || { logged; return 1; }
+  [ ! -d "$(ortgpu_src_dir)" ] || { echo "a stale tree was kept"; return 1; }
+  contains "$(logged)" "removed the build tree" || return 1
   # JetPack moves TensorRT on: the install is for the old one, so it is built again.
   sed -i.bak 's/NV_TENSORRT_BUILD 30/NV_TENSORRT_BUILD 31/' "$W/inc/NvInferVersion.h"
   export FAKE_BUILD_TAG=new; : > "$TOOL_LOG"
