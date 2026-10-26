@@ -11,9 +11,10 @@ use pond_core::user_data::domain::vision as policy;
 use pond_core::user_data::ports::camera_storage::CameraStorage;
 use pond_core::user_data::ports::face_recognition::FaceRecognition;
 use pond_core::user_data::ports::settings::SettingsRepository;
-use pond_core::user_data::ports::vision::{FrameSource, VisionClassifier};
+use pond_core::user_data::ports::vision::VisionClassifier;
 
-use crate::ffmpeg_source::{CaptureConfig, FfmpegFrameSource};
+use crate::capture::{OpenFuture, OpenedSource};
+use crate::ffmpeg_source::CaptureConfig;
 use crate::live_feed::{LiveCameraRegistry, SourceKind, VisionState};
 use crate::motion::MotionConfig;
 use crate::pipeline::{run_vision_pipeline, VisionPipelineConfig};
@@ -25,8 +26,7 @@ pub const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
 pub const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Opens a frame source for a capture config; injected so tests need no ffmpeg or camera.
-pub type SourceOpener =
-    Arc<dyn Fn(&CaptureConfig) -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync>;
+pub type SourceOpener = Arc<dyn Fn(CaptureConfig) -> OpenFuture + Send + Sync>;
 /// Finds a local camera when none is configured.
 pub type CameraDiscovery = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
@@ -227,7 +227,7 @@ enum RunOutcome {
 }
 
 impl VisionSupervisor {
-    /// ffmpeg capture, V4L2 discovery and the default timing.
+    /// The cheapest capture path the camera and host allow, V4L2 discovery and the default timing.
     pub fn new(
         settings: Arc<dyn SettingsRepository>,
         storage: Arc<dyn CameraStorage>,
@@ -242,9 +242,7 @@ impl VisionSupervisor {
             classifier: None,
             face_recognizer: None,
             snapshots: None,
-            open_source: Arc::new(|cfg| {
-                FfmpegFrameSource::spawn(cfg).map(|s| Box::new(s) as Box<dyn FrameSource>)
-            }),
+            open_source: Arc::new(|cfg| Box::pin(crate::capture::open_capture(cfg))),
             discover: Arc::new(|| {
                 crate::discovery::default_camera_source().map(|p| p.to_string_lossy().into_owned())
             }),
@@ -307,8 +305,19 @@ impl VisionSupervisor {
 
             self.mark_starting(&spec);
             let shown = redact_source(&spec.source);
-            let mut source = match (self.open_source)(&spec.capture_config()) {
-                Ok(source) => source,
+            let opened = tokio::select! {
+                opened = (self.open_source)(spec.capture_config()) => opened,
+                change = self.watch_for_change(&spec) => {
+                    self.log_change(&spec, change);
+                    backoff = self.timing.backoff_min;
+                    continue;
+                }
+            };
+            let OpenedSource {
+                mut source,
+                capture,
+            } = match opened {
+                Ok(opened) => opened,
                 Err(e) => {
                     let error = format!("{e:#}");
                     tracing::warn!(camera = %spec.camera_id, source = %shown, %error, retry_in = ?backoff, "camera unavailable; retrying");
@@ -321,7 +330,8 @@ impl VisionSupervisor {
                 }
             };
 
-            tracing::info!(camera = %spec.camera_id, source = %shown, fps = spec.fps, "vision supervisor started the camera pipeline");
+            self.registry.update_status(|s| s.capture = Some(capture));
+            tracing::info!(camera = %spec.camera_id, source = %shown, fps = spec.fps, capture = capture.as_str(), "vision supervisor started the camera pipeline");
             let started = Utc::now();
             let outcome = tokio::select! {
                 ended = run_vision_pipeline(
@@ -335,6 +345,9 @@ impl VisionSupervisor {
                 ) => RunOutcome::Ended(ended),
                 change = self.watch_for_change(&spec) => RunOutcome::Changed(change),
             };
+            // The next open of the same camera would find it still held.
+            source.close().await;
+            self.registry.update_status(|s| s.capture = None);
 
             match outcome {
                 RunOutcome::Changed(change) => {
@@ -433,6 +446,7 @@ impl VisionSupervisor {
             s.source = None;
             s.source_kind = None;
             s.fps = None;
+            s.capture = None;
             s.last_error = None;
         });
     }
@@ -447,12 +461,14 @@ impl VisionSupervisor {
             s.source = Some(source);
             s.source_kind = Some(spec.source_kind);
             s.fps = Some(spec.fps);
+            s.capture = None;
         });
     }
 
     fn mark_reconnecting(&self, error: String) {
         self.registry.update_status(|s| {
             s.state = VisionState::Reconnecting;
+            s.capture = None;
             s.last_error = Some(error);
         });
     }
@@ -461,12 +477,14 @@ impl VisionSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_feed::CapturePath;
     use async_trait::async_trait;
     use pond_core::shared::services::in_process_event_bus::InProcessEventBus;
     use pond_core::user_data::domain::vision::{CapturedFrame, Frame};
     use pond_core::user_data::mocks::mock_sensor::MockCameraStorage;
     use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use pond_core::user_data::ports::vision::FrameSource;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn enabled() -> Settings {
         Settings {
@@ -652,6 +670,11 @@ mod tests {
         }
     }
 
+    fn open_as(source: impl FrameSource + 'static, capture: CapturePath) -> OpenFuture {
+        let source: Box<dyn FrameSource> = Box::new(source);
+        Box::pin(async move { Ok(OpenedSource { source, capture }) })
+    }
+
     fn fast() -> SupervisorTiming {
         SupervisorTiming {
             poll: Duration::from_millis(20),
@@ -687,7 +710,7 @@ mod tests {
         .with_discovery(Arc::new(|| None))
         .with_source_opener(Arc::new(move |_| {
             opens.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(EndlessSource) as Box<dyn FrameSource>)
+            open_as(EndlessSource, CapturePath::Hardware)
         }));
         let task = tokio::spawn(supervisor.run());
 
@@ -697,6 +720,7 @@ mod tests {
         .await;
         assert!(registry.is_live("porch"));
         assert_eq!(opened.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.status().capture, Some(CapturePath::Hardware));
 
         // A capture setting change restarts the pipeline with the new value.
         settings
@@ -728,6 +752,7 @@ mod tests {
         })
         .await;
         assert!(registry.get_latest_frame("porch").is_none());
+        assert_eq!(registry.status().capture, None, "nothing is capturing");
         let opens_when_revoked = opened.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
@@ -765,9 +790,9 @@ mod tests {
         .with_timing(fast())
         .with_source_opener(Arc::new(move |_| {
             if tries.fetch_add(1, Ordering::SeqCst) == 0 {
-                anyhow::bail!("connection refused")
+                return Box::pin(async { Err(anyhow::anyhow!("connection refused")) });
             }
-            Ok(Box::new(EndlessSource) as Box<dyn FrameSource>)
+            open_as(EndlessSource, CapturePath::Software)
         }));
         let task = tokio::spawn(supervisor.run());
 
@@ -801,9 +826,7 @@ mod tests {
             poll: Duration::from_secs(3600),
             ..fast()
         })
-        .with_source_opener(Arc::new(|_| {
-            Ok(Box::new(EndlessSource) as Box<dyn FrameSource>)
-        }));
+        .with_source_opener(Arc::new(|_| open_as(EndlessSource, CapturePath::Software)));
         let task = tokio::spawn(supervisor.run());
         wait_until("running", || {
             registry.status().state == VisionState::Running
@@ -822,6 +845,69 @@ mod tests {
             registry.status().state == VisionState::Off
         })
         .await;
+        task.abort();
+    }
+
+    /// A camera only one capture can hold, released a moment after its capture is closed.
+    struct ExclusiveSource(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl FrameSource for ExclusiveSource {
+        async fn next_frame(&mut self) -> anyhow::Result<Option<CapturedFrame>> {
+            EndlessSource.next_frame().await
+        }
+
+        async fn close(&mut self) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_capture_setting_change_waits_for_the_old_capture_to_let_go() {
+        let settings = Arc::new(MockSettingsRepository::new());
+        settings.update(&enabled()).await.unwrap();
+        let registry = LiveCameraRegistry::new();
+        let held = Arc::new(AtomicBool::new(false));
+        let busy = Arc::new(AtomicUsize::new(0));
+        let (camera, refused) = (held.clone(), busy.clone());
+        let supervisor = VisionSupervisor::new(
+            settings.clone(),
+            Arc::new(MockCameraStorage::new()),
+            Arc::new(InProcessEventBus::new()),
+            registry.clone(),
+        )
+        .with_timing(fast())
+        .with_source_opener(Arc::new(move |_| {
+            if camera.swap(true, Ordering::SeqCst) {
+                refused.fetch_add(1, Ordering::SeqCst);
+                return Box::pin(async { Err(anyhow::anyhow!("device busy")) });
+            }
+            open_as(ExclusiveSource(camera.clone()), CapturePath::CameraJpeg)
+        }));
+        let task = tokio::spawn(supervisor.run());
+        wait_until("running", || {
+            registry.status().state == VisionState::Running
+        })
+        .await;
+
+        settings
+            .update(&Settings {
+                vision_fps: 24,
+                ..enabled()
+            })
+            .await
+            .unwrap();
+        wait_until("running at 24 fps", || {
+            let s = registry.status();
+            s.state == VisionState::Running && s.fps == Some(24)
+        })
+        .await;
+        let status = registry.status();
+        assert_eq!(busy.load(Ordering::SeqCst), 0, "never opened while held");
+        assert_eq!(status.restarts, 1, "one deliberate restart, no reconnect");
+        assert_eq!(status.last_error, None);
+        assert_eq!(status.capture, Some(CapturePath::CameraJpeg));
         task.abort();
     }
 }
