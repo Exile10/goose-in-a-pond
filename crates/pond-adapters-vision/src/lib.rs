@@ -3,6 +3,7 @@
 
 mod discovery;
 mod ffmpeg_source;
+mod jpeg_decode;
 mod live_feed;
 mod motion;
 mod pipeline;
@@ -17,7 +18,7 @@ pub use live_feed::{
 };
 pub use motion::{min_reference_age, MotionConfig, MotionDetector, MOTION_SPAN};
 pub use pipeline::{run_vision_pipeline, VisionPipelineConfig};
-pub use snapshot::{frame_to_jpeg_bytes, write_snapshot, SnapshotConfig};
+pub use snapshot::{frame_to_jpeg_bytes, write_snapshot, write_snapshot_jpeg, SnapshotConfig};
 pub use supervisor::{
     capture_change, desired_capture, redact_source, CameraDiscovery, CaptureChange, CaptureSpec,
     DesiredCapture, SourceOpener, SupervisorTiming, VisionSupervisor, RECONNECT_BACKOFF_MAX,

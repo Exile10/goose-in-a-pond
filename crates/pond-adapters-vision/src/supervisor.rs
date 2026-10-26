@@ -307,7 +307,7 @@ impl VisionSupervisor {
 
             self.mark_starting(&spec);
             let shown = redact_source(&spec.source);
-            let source = match (self.open_source)(&spec.capture_config()) {
+            let mut source = match (self.open_source)(&spec.capture_config()) {
                 Ok(source) => source,
                 Err(e) => {
                     let error = format!("{e:#}");
@@ -325,7 +325,7 @@ impl VisionSupervisor {
             let started = Utc::now();
             let outcome = tokio::select! {
                 ended = run_vision_pipeline(
-                    source,
+                    source.as_mut(),
                     self.classifier.clone(),
                     self.face_recognizer.clone(),
                     self.storage.clone(),
@@ -463,7 +463,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use pond_core::shared::services::in_process_event_bus::InProcessEventBus;
-    use pond_core::user_data::domain::vision::Frame;
+    use pond_core::user_data::domain::vision::{CapturedFrame, Frame};
     use pond_core::user_data::mocks::mock_sensor::MockCameraStorage;
     use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -641,14 +641,14 @@ mod tests {
 
     #[async_trait]
     impl FrameSource for EndlessSource {
-        async fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+        async fn next_frame(&mut self) -> anyhow::Result<Option<CapturedFrame>> {
             tokio::time::sleep(Duration::from_millis(5)).await;
-            Ok(Some(Frame {
+            Ok(Some(CapturedFrame::Raw(Frame {
                 width: 8,
                 height: 8,
                 rgb: vec![10; Frame::expected_len(8, 8)],
                 captured_at: Utc::now(),
-            }))
+            })))
         }
     }
 

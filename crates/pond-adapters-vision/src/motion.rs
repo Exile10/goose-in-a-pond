@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use pond_core::user_data::domain::vision::Frame;
+use pond_core::user_data::domain::vision::{Frame, LumaPlane};
 
 /// Motion is measured across about this much time, so a threshold means the same at any fps.
 pub const MOTION_SPAN: Duration = Duration::from_millis(200);
@@ -69,6 +69,17 @@ impl MotionDetector {
         self.compare(grid, frame.captured_at)
     }
 
+    /// [`MotionDetector::observe`] for a luma picture, which may be smaller than the camera's.
+    pub fn observe_luma(&mut self, luma: &LumaPlane, at: DateTime<Utc>) -> Option<f64> {
+        if !luma.is_well_formed() {
+            return None;
+        }
+        let grid = self.sample_grid(luma.width, luma.height, |x, y| {
+            luma.pixels[(y * luma.width + x) as usize]
+        });
+        self.compare(grid, at)
+    }
+
     fn compare(&mut self, grid: Vec<u8>, at: DateTime<Utc>) -> Option<f64> {
         // After a backwards clock step every held grid would look newer than this frame.
         if self.history.back().is_some_and(|(last, _)| *last > at) {
@@ -100,19 +111,25 @@ impl MotionDetector {
 
     /// Point-sample one pixel per cell into a `grid_w`×`grid_h` BT.601 luma grid.
     fn luma_grid(&self, frame: &Frame) -> Vec<u8> {
+        self.sample_grid(frame.width, frame.height, |x, y| {
+            let i = ((y * frame.width + x) * 3) as usize;
+            let (r, g, b) = (
+                frame.rgb[i] as u32,
+                frame.rgb[i + 1] as u32,
+                frame.rgb[i + 2] as u32,
+            );
+            ((r * 299 + g * 587 + b * 114) / 1000) as u8
+        })
+    }
+
+    fn sample_grid(&self, width: u32, height: u32, luma_at: impl Fn(u32, u32) -> u8) -> Vec<u8> {
         let (gw, gh) = (self.cfg.grid_w.max(1), self.cfg.grid_h.max(1));
         let mut grid = Vec::with_capacity((gw * gh) as usize);
         for gy in 0..gh {
-            let y = (gy as u64 * frame.height as u64 / gh as u64) as u32;
+            let y = (gy as u64 * height as u64 / gh as u64) as u32;
             for gx in 0..gw {
-                let x = (gx as u64 * frame.width as u64 / gw as u64) as u32;
-                let i = ((y * frame.width + x) * 3) as usize;
-                let (r, g, b) = (
-                    frame.rgb[i] as u32,
-                    frame.rgb[i + 1] as u32,
-                    frame.rgb[i + 2] as u32,
-                );
-                grid.push(((r * 299 + g * 587 + b * 114) / 1000) as u8);
+                let x = (gx as u64 * width as u64 / gw as u64) as u32;
+                grid.push(luma_at(x, y));
             }
         }
         grid
@@ -243,6 +260,34 @@ mod tests {
             "no reference after the step"
         );
         assert!(d.observe(&flat_at(20, 250)).is_some());
+    }
+
+    #[test]
+    fn a_luma_picture_and_the_rgb_frame_it_came_from_agree() {
+        let to_luma = |f: &Frame| LumaPlane {
+            width: f.width,
+            height: f.height,
+            pixels: f.rgb.chunks_exact(3).map(|p| p[0]).collect(),
+        };
+        let (still, moved) = (flat_frame(128, 72, 20), frame_with_square(128, 72, 20));
+        let mut rgb = MotionDetector::new(MotionConfig::default());
+        let mut luma = MotionDetector::new(MotionConfig::default());
+        assert!(rgb.observe(&still).is_none());
+        assert!(luma
+            .observe_luma(&to_luma(&still), still.captured_at)
+            .is_none());
+        let from_rgb = rgb.observe(&moved).expect("motion in rgb");
+        let from_luma = luma
+            .observe_luma(&to_luma(&moved), moved.captured_at)
+            .expect("motion in luma");
+        assert_eq!(from_rgb, from_luma);
+
+        let bad = LumaPlane {
+            width: 4,
+            height: 4,
+            pixels: vec![0; 3],
+        };
+        assert!(luma.observe_luma(&bad, Utc::now()).is_none());
     }
 
     #[test]

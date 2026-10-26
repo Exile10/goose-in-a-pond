@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::user_data::domain::vision::Frame;
+use pond_core::user_data::domain::vision::{CapturedFrame, Frame};
 use pond_core::user_data::ports::vision::FrameSource;
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, BufReader};
@@ -135,15 +135,15 @@ impl FfmpegFrameSource {
 
 #[async_trait]
 impl FrameSource for FfmpegFrameSource {
-    async fn next_frame(&mut self) -> Result<Option<Frame>> {
+    async fn next_frame(&mut self) -> Result<Option<CapturedFrame>> {
         let mut buf = vec![0u8; self.frame_len];
         match self.stdout.read_exact(&mut buf).await {
-            Ok(_) => Ok(Some(Frame {
+            Ok(_) => Ok(Some(CapturedFrame::Raw(Frame {
                 width: self.width,
                 height: self.height,
                 rgb: buf,
                 captured_at: Utc::now(),
-            })),
+            }))),
             // Clean end of stream (camera disconnected / ffmpeg exited).
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
             Err(e) => Err(e).context("reading frame from ffmpeg"),

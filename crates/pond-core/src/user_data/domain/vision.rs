@@ -1,6 +1,7 @@
 //! Vision types: the seam between `pond-adapters-vision` capture/detection and the Core.
 
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
@@ -136,6 +137,54 @@ impl Frame {
     }
 }
 
+/// A small 8-bit luma picture, row-major (`len == width * height`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LumaPlane {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+impl LumaPlane {
+    pub fn is_well_formed(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.pixels.len() == self.width as usize * self.height as usize
+    }
+}
+
+/// A frame left as the JPEG the camera (or a hardware encoder) produced; never re-encoded.
+#[derive(Debug, Clone)]
+pub struct JpegFrame {
+    /// Shared so the live feed, snapshots and face recognition read one buffer.
+    pub jpeg: Arc<Vec<u8>>,
+    /// The same picture already decoded off the CPU; `None` leaves decoding to the pipeline.
+    pub luma: Option<LumaPlane>,
+    pub captured_at: DateTime<Utc>,
+}
+
+/// What a frame source yields.
+#[derive(Debug, Clone)]
+pub enum CapturedFrame {
+    Raw(Frame),
+    Jpeg(JpegFrame),
+}
+
+impl CapturedFrame {
+    pub fn captured_at(&self) -> DateTime<Utc> {
+        match self {
+            CapturedFrame::Raw(f) => f.captured_at,
+            CapturedFrame::Jpeg(j) => j.captured_at,
+        }
+    }
+}
+
+impl From<Frame> for CapturedFrame {
+    fn from(frame: Frame) -> Self {
+        CapturedFrame::Raw(frame)
+    }
+}
+
 /// One classifier verdict about a frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Detection {
@@ -166,6 +215,18 @@ mod tests {
             captured_at: Utc::now(),
         };
         assert!(!bad.is_well_formed());
+    }
+
+    #[test]
+    fn luma_plane_well_formedness() {
+        let plane = |w: u32, h: u32, len: usize| LumaPlane {
+            width: w,
+            height: h,
+            pixels: vec![0; len],
+        };
+        assert!(plane(4, 2, 8).is_well_formed());
+        assert!(!plane(4, 2, 7).is_well_formed());
+        assert!(!plane(0, 0, 0).is_well_formed());
     }
 
     #[test]
