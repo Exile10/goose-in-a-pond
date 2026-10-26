@@ -951,6 +951,9 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn get_event(&self, event_id: i64) -> Result<Option<CameraEvent>> {
+            Ok(self.0.iter().find(|e| e.id == Some(event_id)).cloned())
+        }
         async fn acknowledge(&self, _event_id: i64) -> Result<()> {
             Ok(())
         }
