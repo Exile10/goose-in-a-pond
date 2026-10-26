@@ -15,7 +15,7 @@ pub use live_feed::{
     LiveCameraRegistry, SourceKind, SupervisorStatus, VisionBusConfig, VisionState,
     LIVE_FRAME_WINDOW,
 };
-pub use motion::{MotionConfig, MotionDetector};
+pub use motion::{min_reference_age, MotionConfig, MotionDetector, MOTION_SPAN};
 pub use pipeline::{run_vision_pipeline, VisionPipelineConfig};
 pub use snapshot::{frame_to_jpeg_bytes, write_snapshot, SnapshotConfig};
 pub use supervisor::{

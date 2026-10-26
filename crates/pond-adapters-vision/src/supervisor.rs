@@ -71,6 +71,7 @@ impl CaptureSpec {
             camera_id: self.camera_id.clone(),
             motion: MotionConfig {
                 changed_fraction: self.motion_threshold,
+                min_reference_age: crate::motion::min_reference_age(self.fps),
                 ..Default::default()
             },
             min_event_interval: None,
