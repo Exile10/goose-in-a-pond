@@ -773,7 +773,7 @@ mod tests {
             "min_event_interval_secs": 0,
             "vision_classifier_confidence": 5.0,
             "enabled_event_types": [],
-            "vision_fps": 30,
+            "vision_fps": 60,
         }))
         .unwrap();
         let mut s = Settings::default();
@@ -791,7 +791,7 @@ mod tests {
         );
         assert_eq!(s.vision_event_cooldown_secs, 1);
         assert_eq!(s.vision_classifier_confidence, 0.99);
-        assert_eq!(s.vision_fps, 5);
+        assert_eq!(s.vision_fps, 30);
         assert!(s.vision_event_types.is_empty(), "empty means every type");
     }
 }

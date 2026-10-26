@@ -528,12 +528,12 @@ mod tests {
     #[test]
     fn the_spec_carries_clamped_values() {
         let spec = spec_of(&Settings {
-            vision_fps: 30,
+            vision_fps: 60,
             vision_motion_threshold: 0.9,
             vision_camera_id: " ".into(),
             ..enabled()
         });
-        assert_eq!(spec.fps, 5);
+        assert_eq!(spec.fps, 30);
         assert_eq!(spec.motion_threshold, 0.5);
         assert_eq!(spec.camera_id, policy::DEFAULT_CAMERA_ID);
     }

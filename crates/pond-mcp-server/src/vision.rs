@@ -96,7 +96,7 @@ pub struct ConfigureVisionBusParams {
     pub face_on_motion: Option<bool>,
     /// Event types to record (e.g. ["motion", "person", "pet", "vehicle", "package", "face_detected", "face_recognized", "face_unknown"]); an empty list records every type.
     pub enabled_event_types: Option<Vec<String>>,
-    /// Capture frame rate in FPS (1 to 5).
+    /// Capture frame rate in FPS (1 to 30).
     pub vision_fps: Option<u32>,
     /// Fraction of the picture that must change to count as motion (0.005 to 0.50).
     pub vision_motion_threshold: Option<f64>,

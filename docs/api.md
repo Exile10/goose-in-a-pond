@@ -1029,7 +1029,7 @@ names the screen a tap opens.
 | `GET /camera/stream`, `/camera/{camera_id}/stream` | | `multipart/x-mixed-replace; boundary=frame` (MJPEG); ends when camera consent is revoked |
 | `GET /vision/events/stream` | | SSE, `event: vision_event`, `data` one `CameraEvent` (`acknowledged: false`); ends when camera consent is revoked |
 | `GET /vision/status` | | `VisionStatus` below |
-| `GET /vision/config` | | `{vision_enabled, vision_camera_id, vision_fps, vision_motion_threshold, vision_event_cooldown_secs, vision_classifier_confidence, vision_face_recognition_enabled, vision_face_on_motion, vision_event_types, min_event_interval_secs, classifier_confidence_threshold, face_detection_enabled, face_on_motion, enabled_event_types, supported_signals, active_cameras, event_listener_count}`, values clamped |
+| `GET /vision/config` | | `{vision_enabled, vision_camera_id, vision_fps, vision_motion_threshold, vision_event_cooldown_secs, vision_classifier_confidence, vision_face_recognition_enabled, vision_face_on_motion, vision_event_types, min_event_interval_secs, classifier_confidence_threshold, face_detection_enabled, face_on_motion, enabled_event_types, supported_signals, active_cameras, event_listener_count}`, values clamped (`vision_fps` to 1..30) |
 | `PUT /vision/config` | any of `vision_enabled`, `vision_camera_id`, `vision_fps`, `vision_motion_threshold`, `min_event_interval_secs`, `classifier_confidence_threshold`, `face_detection_enabled`, `face_on_motion`, `enabled_event_types` (or their `vision_*` settings names) | The `GET` shape. Saved to settings, so it survives a restart and `GET /settings` shows it |
 
 `CameraEvent` is `{id, camera_id, event_type, confidence, snapshot_path, snapshot_url, metadata,

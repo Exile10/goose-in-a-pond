@@ -1740,12 +1740,16 @@ def section_vision():
         ("people listed", lambda b: isinstance(b, dict) and isinstance(b.get("people"), list)),
     )
 
-    code, body = call("PUT", "/api/v1/vision/config", {"min_event_interval_secs": 42, "enabled_event_types": ["Person"]})
+    code, body = call(
+        "PUT", "/api/v1/vision/config",
+        {"min_event_interval_secs": 42, "enabled_event_types": ["Person"], "vision_fps": 60},
+    )
     expect(
         "PUT /vision/config saves through settings",
         code, 200, body,
         ("cooldown", lambda b: b.get("min_event_interval_secs") == 42),
         ("types normalised", lambda b: b.get("vision_event_types") == ["person"]),
+        ("fps clamped to 30", lambda b: b.get("vision_fps") == 30),
     )
 
     code, body = call("PUT", "/api/v1/settings", {"vision_enabled": True, "vision_camera_url": _DEAD_CAMERA})

@@ -24,8 +24,8 @@ pub const DEFAULT_MOTION_THRESHOLD: f64 = 0.05;
 pub const DEFAULT_EVENT_COOLDOWN_SECS: u64 = 10;
 pub const DEFAULT_CLASSIFIER_CONFIDENCE: f64 = 0.5;
 
-/// Above 5 fps ffmpeg and motion differencing eat the Orin's CPU budget for inference.
-pub const FPS_RANGE: RangeInclusive<u32> = 1..=5;
+/// 30 is what USB and IP cameras deliver; the Orin's decoders keep it cheap.
+pub const FPS_RANGE: RangeInclusive<u32> = 1..=30;
 pub const MOTION_THRESHOLD_RANGE: RangeInclusive<f64> = 0.005..=0.5;
 pub const EVENT_COOLDOWN_SECS_RANGE: RangeInclusive<u64> = 1..=3600;
 pub const CLASSIFIER_CONFIDENCE_RANGE: RangeInclusive<f64> = 0.05..=0.99;
@@ -171,19 +171,22 @@ mod tests {
     #[test]
     fn out_of_range_vision_settings_are_clamped_to_what_the_pipeline_honours() {
         let mut s = Settings {
-            vision_fps: 30,
+            vision_fps: 60,
             vision_motion_threshold: 0.0,
             vision_event_cooldown_secs: 0,
             vision_classifier_confidence: 2.0,
             ..Settings::default()
         };
         normalize_settings(&mut s);
-        assert_eq!(s.vision_fps, 5);
+        assert_eq!(s.vision_fps, 30);
         assert_eq!(s.vision_motion_threshold, 0.005);
         assert_eq!(s.vision_event_cooldown_secs, 1);
         assert_eq!(s.vision_classifier_confidence, 0.99);
 
         assert_eq!(clamp_fps(0), 1);
+        for fps in [5, 15, 24, 30] {
+            assert_eq!(clamp_fps(fps), fps, "{fps} fps is honoured");
+        }
         assert_eq!(clamp_event_cooldown_secs(86_400), 3600);
         assert_eq!(clamp_motion_threshold(f64::NAN), DEFAULT_MOTION_THRESHOLD);
         assert_eq!(
