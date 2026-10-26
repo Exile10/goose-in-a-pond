@@ -14,9 +14,14 @@ const PROVIDERS: &[&str] = &[
 ];
 /// Written last by the setup script, so an install without it is incomplete.
 const MANIFEST: &str = "MANIFEST.sha256";
-/// Building an engine waits for this much available memory. Not yet measured in the pond:
-/// trtexec peaked at 1.5-1.7 GB RSS building these engines on the Orin Nano.
-pub const ENGINE_BUILD_HEADROOM_MB: u64 = 2048;
+/// Measured on the Orin Nano: building AdaFace's engine took 2.5 GB of available memory in a
+/// fresh process, and `onnx-engines` peaked at 3.2 GB RSS. Beside E4B the pond has about 1.4 GB,
+/// so engines are built by the setup script with the pond stopped, not here.
+pub const ENGINE_BUILD_HEADROOM_MB: u64 = 3072;
+/// Measured on the Orin Nano beside E4B at 16k: with YOLOX, SCRFD and AdaFace loaded from their
+/// context models the pond had 1,440 MB available against 1,636 on the CPU runtime (the three take
+/// 615 MB in a process of their own). Below this the model's KV cache and a switch need the room.
+pub const ENGINE_LOAD_HEADROOM_MB: u64 = 1024;
 
 fn install_dir(data_dir: &Path, version: &str) -> PathBuf {
     data_dir.join("lib").join("onnxruntime-gpu").join(version)
@@ -66,6 +71,7 @@ pub fn plan(data_dir: &Path, version: &str, on_jetson: bool) -> Option<GpuPlan> 
     Some(GpuPlan {
         cache_dir: data_dir.join("cache").join("onnx-trt").join(tag),
         build_headroom_mb: ENGINE_BUILD_HEADROOM_MB,
+        load_headroom_mb: ENGINE_LOAD_HEADROOM_MB,
     })
 }
 

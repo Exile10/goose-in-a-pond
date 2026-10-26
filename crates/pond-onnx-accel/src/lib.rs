@@ -29,8 +29,10 @@ const CONTEXT_MODEL: &str = "model_ctx.onnx";
 pub struct GpuPlan {
     /// One directory per runtime build: an engine is valid only for the TensorRT that made it.
     pub cache_dir: PathBuf,
-    /// Building an engine, unlike loading a cached one, waits for this much available memory.
+    /// Building an engine waits for this much available memory.
     pub build_headroom_mb: u64,
+    /// Loading a cached engine waits for this much, so the language model keeps room to grow.
+    pub load_headroom_mb: u64,
 }
 
 static GPU: OnceLock<GpuPlan> = OnceLock::new();
@@ -420,7 +422,7 @@ fn parse_mem_available_mb(meminfo: &str) -> Option<u64> {
 }
 
 /// Whether an engine build may start with `available` MB free.
-fn may_build(available: Option<u64>, headroom_mb: u64) -> bool {
+fn has_room(available: Option<u64>, headroom_mb: u64) -> bool {
     available.is_none_or(|a| a >= headroom_mb)
 }
 
@@ -469,23 +471,26 @@ fn worker(rx: mpsc::Receiver<Job>) {
         waiting.sort_by_key(|(s, p)| !s.engine_cached(p));
         let mut still = Vec::new();
         for (session, plan) in waiting.drain(..) {
-            if !session.engine_cached(&plan) {
-                let available = mem_available_mb();
-                if !may_build(available, plan.build_headroom_mb) {
-                    if !told.contains(&session.name()) {
-                        told.push(session.name());
-                        tracing::info!(
-                            model = session.name(),
-                            available_mb = available.unwrap_or(0),
-                            "onnx: {} stays on the cpu until {} MB is free to build its TensorRT engine ({} MB now)",
-                            session.name(),
-                            plan.build_headroom_mb,
-                            available.unwrap_or(0),
-                        );
-                    }
-                    still.push((session, plan));
-                    continue;
+            let (headroom, what) = if session.engine_cached(&plan) {
+                (plan.load_headroom_mb, "load")
+            } else {
+                (plan.build_headroom_mb, "build")
+            };
+            let available = mem_available_mb();
+            if !has_room(available, headroom) {
+                if !told.contains(&session.name()) {
+                    told.push(session.name());
+                    tracing::info!(
+                        model = session.name(),
+                        available_mb = available.unwrap_or(0),
+                        "onnx: {} stays on the cpu until {} MB is free to {what} its TensorRT engine ({} MB now)",
+                        session.name(),
+                        headroom,
+                        available.unwrap_or(0),
+                    );
                 }
+                still.push((session, plan));
+                continue;
             }
             if let Err(e) = session.move_to_gpu(&plan) {
                 tracing::warn!(model = session.name(), error = %format!("{e:#}"), "onnx: {} stays on the cpu", session.name());
@@ -509,10 +514,10 @@ mod tests {
 
     #[test]
     fn a_build_waits_for_headroom_but_never_for_an_unknown_reading() {
-        assert!(!may_build(Some(1400), 2048));
-        assert!(may_build(Some(4096), 2048));
+        assert!(!has_room(Some(1400), 2048));
+        assert!(has_room(Some(4096), 2048));
         assert!(
-            may_build(None, 2048),
+            has_room(None, 2048),
             "a host without /proc/meminfo must not wait forever"
         );
     }
