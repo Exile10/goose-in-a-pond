@@ -2724,8 +2724,17 @@ impl GooseAdapter {
             }
         }
 
-        // ── 4b. Upcoming schedules context ──────────────────────────────────
-        // TODO: inject schedule context once GooseAdapter has a SchedulerPort ref.
+        // ── 4b. Upcoming schedules & vision runtime context ─────────────────
+        if !turn_scope.excludes_everything() {
+            if let Some(sched_ctx) = pond_mcp_server::upcoming_schedules_context().await {
+                dynamic_suffix_for_user_msg.push_str("\n\n");
+                dynamic_suffix_for_user_msg.push_str(&sched_ctx);
+            }
+            if let Some(vision_ctx) = pond_mcp_server::vision_runtime_context().await {
+                dynamic_suffix_for_user_msg.push_str("\n\n");
+                dynamic_suffix_for_user_msg.push_str(&vision_ctx);
+            }
+        }
 
         // ── 5. Provider hot-swap ──────────────────────────────────────────────
         // Fail the turn here: continuing ends in Goose's opaque model-config error instead.
@@ -2936,6 +2945,27 @@ impl GooseAdapter {
         ));
         // Standing too: the CURRENT CONTEXT line is news each turn, the rule for reading it is not.
         shim_appendix.push(pond_core::models::services::prompt_builder::TEMPORAL_RULE.to_string());
+        shim_appendix.push(
+            "VISION, CAMERAS, SCHEDULES & REMINDERS:\n\
+             - Camera feed & face annotations (`giap-vision`): Always call `send_camera_snapshot` \
+               or `look_at_camera_snapshot` on the current turn when asked who is in the room or \
+               what the camera sees right now — never answer from an earlier turn's snapshot. \
+               Only identify a person by name if the tool output explicitly reports them as \
+               recognized in the frame or recently recognized on the camera; never guess a name. \
+               Preserve the annotated markdown links \
+               (`![Camera Snapshot](/api/v1/camera/{id}/snapshot?annotated=1)` and \
+               `![Live Camera Feed](/api/v1/camera/{id}/stream?annotated=1)`) in your reply. Use \
+               `configure_vision_bus` to adjust camera FPS (1-30 fps, default 30) or sensitivity, \
+               and `create_vision_automation` / `list_vision_automations` / `delete_vision_automation` \
+               for motion, person, or `face:<profile_id>` triggers.\n\
+             - Timers, reminders & schedules (`giap-schedule`): Use `set_timer` for one-shot \
+               reminders and countdowns (e.g. '10m', '1h30m'), `create_schedule` for recurring \
+               6-field cron jobs (`sec min hr dom mon dow`), and `list_schedules` / \
+               `update_schedule` / `schedule_action` (`delete` | `pause` | `resume` | `run_now`) \
+               to inspect or control them. If a group is listed under ADDITIONAL CAPABILITIES, \
+               enable it first with `giap-device__enable_capability_group`."
+                .to_string(),
+        );
         // Appendix, not envelope: it only changes with the tools block, so it's prefilled once.
         if !dormant_groups_note.is_empty() {
             shim_appendix.push(dormant_groups_note.clone());

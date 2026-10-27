@@ -15,6 +15,7 @@ use pond_core::user_data::ports::face_recognition::FaceRecognition;
 use pond_core::user_data::ports::vision::{FrameSource, VisionClassifier};
 use pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot;
 
+use crate::annotate::FrameAnnotation;
 use crate::jpeg_decode::{decode_rgb, LumaDecoder};
 use crate::live_feed::LiveCameraRegistry;
 use crate::motion::{MotionConfig, MotionDetector};
@@ -87,6 +88,7 @@ pub async fn run_vision_pipeline(
     let mut detector = MotionDetector::new(cfg.motion.clone());
     let mut luma_decoder = LumaDecoder::default();
     let mut last_event = last_recorded_event(storage.as_ref(), &cfg.camera_id).await;
+    let mut last_luma_decode: Option<Instant> = None;
     tracing::info!(camera = %cfg.camera_id, "vision pipeline started");
     // Recognition may still be downloading; said once when matching stops and once when it starts.
     let mut face_waiting_logged = false;
@@ -117,29 +119,41 @@ pub async fn run_vision_pipeline(
             registry.update_frame(&cfg.camera_id, bytes.clone());
         }
 
+        let bus_cfg = registry.bus_config();
+        let min_interval = cfg
+            .min_event_interval
+            .unwrap_or(Duration::from_secs(bus_cfg.min_event_interval_secs));
+        let in_cooldown = last_event.is_some_and(|at| at.elapsed() < min_interval);
+
+        // During cooldown at high FPS, throttle CPU JPEG luma decoding to ~5 Hz.
+        if in_cooldown
+            && raw.is_none()
+            && luma.is_none()
+            && last_luma_decode.is_some_and(|t| t.elapsed() < Duration::from_millis(180))
+        {
+            continue;
+        }
+
         let observed = match (&raw, &luma, &jpeg) {
             (Some(frame), _, _) => detector.observe(frame),
             (None, Some(plane), _) => detector.observe_luma(plane, captured_at),
-            (None, None, Some(bytes)) => match luma_decoder.decode(bytes) {
-                Ok(plane) => detector.observe_luma(plane, captured_at),
-                Err(e) => {
-                    tracing::debug!(camera = %cfg.camera_id, error = %e, "camera jpeg could not be decoded");
-                    None
+            (None, None, Some(bytes)) => {
+                last_luma_decode = Some(Instant::now());
+                match luma_decoder.decode(bytes) {
+                    Ok(plane) => detector.observe_luma(plane, captured_at),
+                    Err(e) => {
+                        tracing::debug!(camera = %cfg.camera_id, error = %e, "camera jpeg could not be decoded");
+                        None
+                    }
                 }
-            },
+            }
             (None, None, None) => None,
         };
         let Some(changed_fraction) = observed else {
             continue;
         };
-        let bus_cfg = registry.bus_config();
-        let min_interval = cfg
-            .min_event_interval
-            .unwrap_or(Duration::from_secs(bus_cfg.min_event_interval_secs));
-        if let Some(at) = last_event {
-            if at.elapsed() < min_interval {
-                continue;
-            }
+        if in_cooldown {
+            continue;
         }
 
         let min_classifier_conf = bus_cfg.classifier_confidence_threshold;
@@ -178,6 +192,8 @@ pub async fn run_vision_pipeline(
         let mut face_confidence = None;
         let mut face_detected = false;
         let mut face_unknown = false;
+        let mut face_bbox = None;
+        let mut face_landmarks = None;
         let should_check_face = bus_cfg.face_detection_enabled
             && (event_type == "person" || (bus_cfg.face_on_motion && event_type == "motion"));
         if should_check_face {
@@ -190,6 +206,8 @@ pub async fn run_vision_pipeline(
                     Some(jpeg_bytes) => {
                         match face_rec.identify_with_diagnostics(jpeg_bytes, None).await {
                             Ok(details) => {
+                                face_bbox = details.bbox;
+                                face_landmarks = details.landmarks;
                                 let ident = details.identification;
                                 if ident.identified {
                                     tracing::info!(
@@ -231,6 +249,26 @@ pub async fn run_vision_pipeline(
         }
 
         let face_ms = face_started.elapsed().as_millis() as u64;
+        let identified_name = identified_profile
+            .as_deref()
+            .and_then(|pid| registry.resolve_profile_name(pid));
+
+        let annotation = FrameAnnotation {
+            camera_id: cfg.camera_id.clone(),
+            event_type: Some(event_type.clone()),
+            event_confidence: confidence,
+            changed_fraction: Some(changed_fraction),
+            face_detected,
+            face_unknown,
+            identified_profile: identified_profile.clone(),
+            identified_name: identified_name.clone(),
+            face_confidence,
+            face_bbox,
+            face_landmarks: face_landmarks.clone(),
+            measured_fps: registry.measured_fps(&cfg.camera_id),
+            updated_at: Some(captured_at),
+        };
+        registry.update_annotation(&cfg.camera_id, annotation.clone());
 
         if !bus_cfg.passes(EventSignals {
             event_type: &event_type,
@@ -264,8 +302,28 @@ pub async fn run_vision_pipeline(
         if let Some(ref pid) = identified_profile {
             metadata["identified_profile"] = serde_json::json!(pid);
         }
+        if let Some(ref name) = identified_name {
+            metadata["identified_name"] = serde_json::json!(name);
+        }
         if let Some(conf) = face_confidence {
             metadata["face_confidence"] = serde_json::json!(conf);
+        }
+        if let Some(bbox) = face_bbox {
+            metadata["face_bbox"] = serde_json::json!({
+                "x": bbox.x,
+                "y": bbox.y,
+                "width": bbox.width,
+                "height": bbox.height,
+            });
+        }
+        if let Some(ref lm) = face_landmarks {
+            metadata["face_landmarks"] = serde_json::json!({
+                "left_eye": lm.left_eye,
+                "right_eye": lm.right_eye,
+                "nose": lm.nose,
+                "left_mouth": lm.left_mouth,
+                "right_mouth": lm.right_mouth,
+            });
         }
 
         let mut event = CameraEvent {

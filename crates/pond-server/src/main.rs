@@ -4120,6 +4120,7 @@ async fn run_server(
         )
         .with_classifier(classifier)
         .with_face_recognizer(face_recognition.clone())
+        .with_profile_repo(profile_repo.clone())
         .with_snapshots(pond_adapters_vision::SnapshotConfig::new(
             data_dir.join("snapshots"),
         ));
