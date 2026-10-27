@@ -3808,3 +3808,32 @@ PAI-1, PAI-2 and PAI-8; not a PAI milestone).**
 - **Invariants.** No migration (five new settings rows, defaults on read), no egress, no prompt or
   KV change. `giap-vision`'s subagent denial now has its recorded reason in
   `GROUPS_NO_SUBAGENT_MAY_HOLD`, which was failing since the group was added.
+
+**2026-10-27 — A new conversation takes a chat cache left idle (inference latency; touches PAI-4 P5;
+not a PAI milestone).**
+
+- **What the Orin showed.** A new conversation's first prompt was under half the size of the chat
+  cache already held, so the engine protected that cache and ran the turn in a throwaway context
+  (prompt plus 2,048), which never restores a preamble snapshot. Turn 2 then found nothing of its
+  own to reuse and prefilled the whole prompt again. A new voice conversation paid about 6.3 s on
+  turn 1 and again on turn 2 (3,456 and 3,590 tokens, 08:34Z).
+- **What landed.** Goose fork `10497598a`: a chat's cache protects itself from another chat only
+  while a generation ran on it in the last 60 s (`CHAT_CACHE_PROTECTED_FOR`); a side call with no
+  tools is still sacrificed however long the cache has sat. A new conversation after that takes
+  the cache with `FullPrefillInPlace` in the full window, where a matching snapshot can be restored.
+  `giap::kv` logs `not_written` when a shape due a snapshot has no window checkpoint behind its
+  stable prefix.
+- **Invariants.** No migration, no setting, no egress, no prompt change. Side calls, subagents and
+  a conversation's own turns within 60 s plan as before. The cost moves to an older conversation
+  resumed after a newer one took the cache: it pays a snapshot restore plus its history, or its
+  whole prompt when no snapshot covers its shape.
+- **Verified on the Orin** (E4B QAT, 16,384 context, a guest test device, 14:43–14:52Z, no other
+  turns interleaved). Three new voice conversations ran turn 1 in the 16,384 context at 7.4, 6.9
+  and 6.9 s (3,867 tokens; the prompt has grown 411 tokens since 08:34Z) and turn 2 at 0.48, 0.44
+  and 0.46 s; turn 3 took 0.46 s. A typed conversation resumed after a voice one took the cache
+  paid 14.7 s for 8,044 tokens. No snapshot was loaded, written or reported `not_written` for the
+  guest voice or guest typed shapes. `writable_prefix` declines without a log line when the prompt's
+  256-token bucket was already written this process or its stable prefix is under 1,024 tokens;
+  which of the two held is not yet known. A new voice conversation's first turn still prefills all
+  of its prompt. The engine's unit tests on the Orin (`cargo test --release -p goose-local-inference
+  --features cuda --lib`): 197 passed, 0 failed, 9 ignored.
