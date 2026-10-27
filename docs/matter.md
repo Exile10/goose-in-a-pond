@@ -58,6 +58,10 @@ Everything lives under the data dir:
 <data_dir>/matter-server/app/.giap-install   fingerprint of the dependencies and sources it was built from
 <data_dir>/matter-server/controller.pid      the controller GIAP started, for orphan reaping
 <data_dir>/matter-server/storage-js/         the fabric: commissioned nodes live here
+<data_dir>/matter-server/storage-js/giap-controller/matter.lock, matter.pid
+                                             matter.js's lock on the fabric store
+<data_dir>/matter-server/storage-js/giap-controller.lock-boot.json
+                                             which boot that lock was taken in (see below)
 ```
 
 The fabric is on disk, so restarting or replacing the controller does not lose
@@ -387,6 +391,7 @@ websocat ws://127.0.0.1:5580/giap   # then paste:
 | "expected a giap-matter controller but…" | `matter_ws_url` points at something else. |
 | "…speaks giap-matter vN but this Pond speaks vM" | The controller and pond-server are from different releases. Restart pond-server so it reinstalls the controller. |
 | "no Node 20.19+ found on PATH", or "matter.js does not support 22.0 to 22.12" | The [prerequisite](#prerequisite-node). Run `bash scripts/giap.sh node`. |
+| "its fabric store is in use by another running process (pid N)" | A live Node process holds the matter.js lock on `storage-js/`, most likely a second controller. GIAP will not take the lock from it. `ps -p N -o command=` names it; stop it and press Retry. See [The fabric store lock](#the-fabric-store-lock). |
 | "This build of GIAP has no Matter support compiled in" | Built without the `goose-agent` feature. |
 | Repeated `matter_reconnect_attempt` | The controller is unreachable. Every third failed attempt GIAP re-runs controller setup (`RESPAWN_AFTER`), which restarts a local controller, and notifies you. |
 
@@ -406,7 +411,9 @@ The `kind` field names the occurrence. Lifecycle: `matter_setup_started` /
 `matter_setup_finished`, `matter_sources_refreshed`, `matter_controller_spawned` /
 `matter_controller_ready` / `matter_controller_exited`, `matter_controller_reused`,
 `matter_port_taken`, `matter_orphan_reaped`, `matter_ble_start_failed` /
-`matter_ble_disabled`, `matter_state_changed`, `matter_startup_deferred`.
+`matter_ble_disabled`, `matter_state_changed`, `matter_startup_deferred`,
+`matter_stale_lock_reclaimed` / `matter_stale_lock_reclaim_failed`,
+`matter_storage_lock_held`, `matter_lock_boot_record_failed`.
 Connection: `matter_connected` / `matter_disconnected`, `matter_reconnect_attempt`,
 `matter_reconnected`, `matter_controller_revived` / `matter_controller_revive_failed`,
 `matter_subscribed`. Devices: `matter_commission_started` / `_succeeded` / `_failed`,
@@ -417,6 +424,53 @@ Everything at `info` on the `giap::trace` target also lands in the operational l
 so `GET /api/v1/logs` answers the same questions without shell access.
 
 ---
+
+## The fabric store lock
+
+matter.js (`@matter/nodejs`, `fs/lock-utils.ts`) guards a node's storage directory
+with two files, `matter.lock` and `matter.pid` (`"<pid> <token>"`), and honours the
+lock for as long as `kill(pid, 0)` succeeds. A power cut leaves both behind. On the
+next boot pids are handed out afresh, and if an unrelated process is given the
+recorded pid, matter.js reports `StorageLockError: Storage is locked by another
+process (pid N)` on every start, so the controller never comes up
+(`matter_controller_exited`, then `matter_state_changed to="unreachable"`). Its token
+only catches a pid recycled to matter.js itself. This happened on the Jetson on
+2026-10-27.
+
+So before matter.js opens storage, the controller (`matter-server/src/storageLock.ts`)
+decides whether the lock can still belong to a running controller:
+
+| Signal | Verdict |
+|---|---|
+| No `matter.lock` | Nothing to do. |
+| Lock without a readable `matter.pid` | Reclaimed, `reason=no_owner_recorded`. |
+| `giap-controller.lock-boot.json` names this exact lock (same pid and token) and another boot | Reclaimed, `reason=previous_boot`. |
+| The pid is not running | Reclaimed, `reason=owner_gone`. |
+| The pid is this process | Reclaimed, `reason=pid_is_self`. |
+| The pid runs something that is not Node (and does not name this store) | Reclaimed, `reason=pid_reused`, logging only the executable's name. |
+| The pid runs Node, or names this store | Left alone, `matter_storage_lock_held reason=live_controller`. |
+| The pid is running but its command line cannot be read | Left alone, `reason=owner_unidentified`. |
+
+A reclaim logs `matter_stale_lock_reclaimed` at warn with the pid and reason. Any
+live Node process is respected, not only one whose command line matches GIAP's
+controller: a controller run by hand may name the store by a relative path, and two
+controllers on one store corrupt it. Where the lock is left alone matter.js still
+runs its own check after this one, and the Pond's startup error names the holding
+pid.
+
+The boot record is written once the controller holds the lock, from Linux's
+`/proc/sys/kernel/random/boot_id` or macOS's `kern.bootsessionuuid`. It is what makes
+a lock from before a power cut stale even when its pid has since gone to another
+Node process. No wall clock is compared, deliberately: a board without an RTC battery
+boots with a wrong clock that NTP later moves forward, so a lock taken this boot can
+carry an mtime earlier than the boot time, and a clock comparison would then reclaim
+a live controller's lock. A store from before this change has no record, and falls
+back to the process checks.
+
+`controller.pid` is not exposed to the same pid reuse: `reap_orphan` kills only a pid
+whose `ps -o command=` contains this data dir's controller entrypoint
+(`<data_dir>/matter-server/app/src/server.ts`), and clears the file for anything else
+(`a_reused_pid_belonging_to_something_else_is_not_killed`).
 
 ## Notes for maintainers
 
