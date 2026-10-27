@@ -1092,11 +1092,15 @@ image and stream `GET` families only (see [Credentials](#credentials)).
 `reconnecting` (the stream failed; `last_error` says why). `source` has URL credentials replaced by
 `***`; `source`, `source_kind` and `last_error` are null unless the pipeline is starting, running or
 reconnecting. `capture` is how frames reach the pipeline, null unless it is starting or running:
-`hardware` (a Jetson's engines through GStreamer: NVDEC decodes H.264 or H.265 over RTSP, VIC
-scales, NVJPG encodes the live JPEG or decodes a USB camera's own JPEGs), `camera_jpeg` (the
-camera's own MJPEG through ffmpeg, never re-encoded; motion decodes its luma on the CPU) or
-`software` (ffmpeg decodes every frame and the pond encodes the JPEG). They are tried in that
-order, and a path is kept once it delivers a frame within 10 s. `restarts` counts pipeline restarts
+`hardware` (a Jetson's engines through GStreamer, for whichever format the camera offers: NVJPG
+decodes a USB or network camera's own MJPEG; NVDEC decodes H.264 or H.265 from a USB camera or
+over RTSP; VIC converts a USB camera's raw YUY2, UYVY, NV12, I420 or GRAY8 frames; a CSI sensor
+comes through Argus and the ISP; VIC scales, and NVJPG encodes the live JPEG when the camera sent
+none), `camera_jpeg` (the camera's own MJPEG through ffmpeg, never re-encoded; motion decodes its
+luma on the CPU) or `software` (ffmpeg decodes every frame and the pond encodes the JPEG). They
+are tried in that order. A camera offering several formats gets a `hardware` attempt for each,
+cheapest first (MJPEG, then H.264/H.265, then raw, then a CSI sensor), and a path is kept once it
+delivers a frame within 10 s. `restarts` counts pipeline restarts
 since the server started: a stream that ended, or a capture setting (camera address, camera name,
 fps, motion threshold) that changed; a restart waits up to 3 s for the old capture process to exit,
 so the camera is free when it reopens. The vision supervisor
