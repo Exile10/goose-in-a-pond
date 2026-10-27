@@ -156,5 +156,5 @@ default. Whether only the removed device's owner, or only household admins, shou
 
 The phone validates `open` against its own allow-list (`services/notification-link.ts` in
 goose-on-the-go) and ignores a value it does not know, opening where it was. `models`, `extensions`
-and `remote_access` are newer than that list, so they do nothing until the app learns them; the
-app has `models`, `extensions` and `remote-access` screens to map them to.
+and `remote_access` open the app's Models, Extensions and Remote access screens from
+goose-on-the-go `feature/notification-open-system-screens` on; an older app ignores them.
