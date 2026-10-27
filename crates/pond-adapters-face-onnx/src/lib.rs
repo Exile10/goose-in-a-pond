@@ -416,26 +416,39 @@ fn preprocess(
 
     let h = size as usize;
     let w = size as usize;
-    let mut tensor = Array4::<f32>::zeros((1, 3, h, w));
+    let hw = h * w;
+    let mut planes = vec![0.0f32; 3 * hw];
 
     let mut sum: f64 = 0.0;
     let mut sum_sq: f64 = 0.0;
-    let npx: f64 = (h * w * 3) as f64;
+    let npx: f64 = (hw * 3) as f64;
 
     let bgr = use_bgr_input();
-    for y in 0..h {
-        for x in 0..w {
-            let pixel = resized.get_pixel(x as u32, y as u32);
-            for c in 0..3 {
-                let v = (pixel[c] as f32) / 255.0;
-                let normed = (v - MEAN) * SCALE;
-                let dst_c = if bgr { 2 - c } else { c };
-                tensor[[0, dst_c, y, x]] = normed;
-                sum += v as f64;
-                sum_sq += (v * v) as f64;
+    {
+        let (p0, rest) = planes.split_at_mut(hw);
+        let (p1, p2) = rest.split_at_mut(hw);
+        for (i, px) in resized.as_raw().chunks_exact(3).enumerate() {
+            let v0 = (px[0] as f32) / 255.0;
+            let v1 = (px[1] as f32) / 255.0;
+            let v2 = (px[2] as f32) / 255.0;
+            sum += (v0 + v1 + v2) as f64;
+            sum_sq += (v0 * v0 + v1 * v1 + v2 * v2) as f64;
+            let n0 = (v0 - MEAN) * SCALE;
+            let n1 = (v1 - MEAN) * SCALE;
+            let n2 = (v2 - MEAN) * SCALE;
+            if bgr {
+                p0[i] = n2;
+                p1[i] = n1;
+                p2[i] = n0;
+            } else {
+                p0[i] = n0;
+                p1[i] = n1;
+                p2[i] = n2;
             }
         }
     }
+    let tensor = Array4::from_shape_vec((1, 3, h, w), planes)
+        .context("face embedding tensor shape mismatch")?;
 
     // Quality gates, in pre-normalisation 0-1 units.
     let mean = (sum / npx) as f32;
