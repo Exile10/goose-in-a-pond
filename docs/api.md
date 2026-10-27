@@ -329,6 +329,8 @@ The route summary's "Also" column names these.
 | POST | /devices/{id}/push-token | token | own device | Set the device's push token |
 | DELETE | /devices/{id}/push-token | token | own device | Remove it |
 | GET | /notifications/stream | token | own device | Notifications for one device (SSE) |
+| GET | /notifications/pending | token | paired device | The caller's unacknowledged notifications |
+| POST | /notifications/{id}/ack | token | paired device | Mark one of the caller's notifications delivered |
 | GET | /devices | token +onb | | All registered devices |
 | POST | /devices | token +onb | | Register a device |
 | PUT | /devices/{id} | token +onb | own row or cred | Rename, set hostname or room |
@@ -1001,8 +1003,16 @@ itself must keep calling the heartbeat.
 that device's or the host's to change; a shared row (a Matter device, a sensor, another pond) is
 any authenticated caller's (`pond_core::user_data::services::device_edit`).
 
-**`GET /notifications/stream?device_id=X`** first drains the device's offline queue, then follows
-live notifications addressed to it or to `"broadcast"`; dedupe by `id`. Each SSE `data` is a
+How a notice reaches a phone, what the Pond notifies about, and how often, is in
+[architecture/notifications.md](architecture/notifications.md). The three routes below take a paired
+device's token in every onboarding state, never answer a tokenless caller, and act only on the
+caller's own device, named by its token.
+
+**`GET /notifications/stream?device_id=X`** first sends the device's undelivered queue, oldest first,
+then follows live notifications addressed to it or to `"broadcast"`; dedupe by `id`. `device_id`
+must be the caller's own (`403 device_mismatch`). For a phone (`device_type = "gotg"`) the stream
+never marks anything delivered, so each new connection re-sends every copy the phone has not acked;
+for any other device the stream marks what it sends delivered. Each SSE `data` is a
 `Notification {id, target, category, title, body, timestamp, data}` with `category` `alert`,
 `info` or `action_required`. `data` may carry:
 
@@ -1013,6 +1023,18 @@ live notifications addressed to it or to `"broadcast"`; dedupe by `id`. Each SSE
 
 `open` is written only through `OpenScreen` (`crates/pond-core/src/mcp/ports/notification.rs`) and
 names the screen a tap opens.
+
+**`GET /notifications/pending`** answers `{notifications: [Notification]}`, the caller's
+undelivered notifications oldest first (for a phone, every copy it has not acked, including those
+the stream already sent). It takes no parameter and marks nothing delivered. `403` when the request
+did not come from a paired device, `500 notifications_pending_failed` when the queue cannot be
+read, `503` when no queue is wired.
+
+**`POST /notifications/{id}/ack`** marks one of the caller's notifications delivered and answers
+`{id, acknowledged: true}`; acknowledging twice is not an error. Percent-encode `{id}`: a phone's
+copy of a household notice is `"{notification_id}:{device_id}"`. `404` when no notification by that
+id is the caller's (another device's answers the same, so the route cannot probe someone else's
+queue), `500 notification_ack_failed`, `503` when no queue is wired.
 
 ## Sensors, camera and rules
 
