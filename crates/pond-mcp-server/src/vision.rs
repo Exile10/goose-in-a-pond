@@ -1,7 +1,9 @@
 use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
-use pond_adapters_vision::{LiveCameraRegistry, VisionBusConfig};
+use pond_adapters_vision::{
+    annotate_jpeg, format_known_people, FrameAnnotation, LiveCameraRegistry, VisionBusConfig,
+};
 use pond_core::user_data::domain::schedule::{
     CompareOp, SensorTriggerSpec, TaskKind, TriggerAction, TriggerCondition, TriggerSource,
     TriggerSourceKind,
@@ -207,6 +209,30 @@ async fn snapshot_content(path: &str) -> Option<ContentBlock> {
     }
 }
 
+async fn snapshot_annotated_or_raw(path: &str, event: &CameraEvent) -> Option<ContentBlock> {
+    use pond_core::models::domain::image_limits::MAX_IMAGE_BYTES;
+    let p = std::path::Path::new(path);
+    if let Ok(m) = tokio::fs::metadata(p).await {
+        if m.len() as usize <= MAX_IMAGE_BYTES {
+            if let Ok(bytes) = tokio::fs::read(p).await {
+                let reg = LiveCameraRegistry::global();
+                let ann = FrameAnnotation::from_event(
+                    event,
+                    reg.measured_fps(&event.camera_id),
+                    |pid| reg.resolve_profile_name(pid),
+                );
+                if let Ok(annotated) = annotate_jpeg(&bytes, &ann, &reg.known_people()) {
+                    return Some(ContentBlock::image(
+                        base64::engine::general_purpose::STANDARD.encode(&annotated),
+                        "image/jpeg".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    snapshot_content(path).await
+}
+
 fn event_face_tag(e: &CameraEvent) -> String {
     let Some(raw) = e.metadata.as_deref() else {
         return String::new();
@@ -214,18 +240,37 @@ fn event_face_tag(e: &CameraEvent) -> String {
     let Ok(meta) = serde_json::from_str::<serde_json::Value>(raw) else {
         return String::new();
     };
+    let bbox_note = meta
+        .get("face_bbox")
+        .and_then(|b| {
+            Some(format!(
+                " [box {},{} {}x{}]",
+                b.get("x")?.as_u64()?,
+                b.get("y")?.as_u64()?,
+                b.get("width")?.as_u64()?,
+                b.get("height")?.as_u64()?,
+            ))
+        })
+        .unwrap_or_default();
     if let Some(pid) = meta.get("identified_profile").and_then(|v| v.as_str()) {
         if !pid.is_empty() {
+            let display = meta
+                .get("identified_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| LiveCameraRegistry::global().resolve_profile_name(pid))
+                .unwrap_or_else(|| pid.to_string());
             let conf = meta
                 .get("face_confidence")
                 .and_then(|v| v.as_f64())
                 .map(|c| format!(" {:.0}%", c * 100.0))
                 .unwrap_or_default();
-            return format!(" · face: {pid}{conf}");
+            return format!(" · face: {display}{conf}{bbox_note}");
         }
     }
     if meta.get("face_unknown").and_then(|v| v.as_bool()) == Some(true) {
-        return " · face: unknown".to_string();
+        return format!(" · face: unknown{bbox_note}");
     }
     String::new()
 }
@@ -364,8 +409,14 @@ saw.")]
                         )
                     })
                     .collect();
+                let reg = LiveCameraRegistry::global();
+                let fps_str = reg
+                    .measured_fps(&camera_id)
+                    .map(|f| format!("{f:.1} fps"))
+                    .unwrap_or_else(|| "idle".to_string());
+                let known = format_known_people(&reg.known_people());
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Recent events from camera '{camera_id}':\n{}",
+                    "Recent events from camera '{camera_id}' (stream: {fps_str}, known household faces: {known}):\n{}",
                     lines.join("\n"),
                 ))]))
             }
@@ -391,15 +442,28 @@ attached an image, just look at it - do NOT call this.")]
             Err(refusal) => return Ok(refusal),
         };
 
+        let reg = LiveCameraRegistry::global();
+        let known = format_known_people(&reg.known_people());
         if params.0.event_id.is_none() {
-            if let Some(live_jpeg) = LiveCameraRegistry::global().get_latest_frame(&camera_id) {
+            if let Some(live_jpeg) = reg
+                .get_annotated_frame(&camera_id)
+                .or_else(|| reg.get_latest_frame(&camera_id))
+            {
+                let ann_summary = reg
+                    .get_annotation(&camera_id)
+                    .map(|a| a.summary_line())
+                    .unwrap_or_else(|| "status=live".to_string());
                 let img = ContentBlock::image(
                     base64::engine::general_purpose::STANDARD.encode(&live_jpeg),
                     "image/jpeg".to_string(),
                 );
                 return Ok(CallToolResult::success(vec![
                     ContentBlock::text(format!(
-                        "Live snapshot from camera '{camera_id}' at {}.\n\n![Camera Snapshot](/api/v1/camera/{camera_id}/snapshot)",
+                        "Live annotated snapshot from camera '{camera_id}' at {}.\n\
+                         Annotation: {ann_summary}\n\
+                         Known household faces: {known}\n\n\
+                         ![Camera Snapshot](/api/v1/camera/{camera_id}/snapshot?annotated=1)\n\
+                         ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)",
                         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
                     )),
                     img,
@@ -437,7 +501,7 @@ attached an image, just look at it - do NOT call this.")]
                 event.id.unwrap_or(-1)
             ))]));
         };
-        let Some(image) = snapshot_content(path).await else {
+        let Some(image) = snapshot_annotated_or_raw(path, event).await else {
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "The saved frame for event {} is no longer readable.",
                 event.id.unwrap_or(-1)
@@ -445,10 +509,16 @@ attached an image, just look at it - do NOT call this.")]
         };
 
         let event_id_str = event.id.map(|i| i.to_string()).unwrap_or_default();
+        let ann = FrameAnnotation::from_event(event, reg.measured_fps(&camera_id), |pid| {
+            reg.resolve_profile_name(pid)
+        });
         Ok(CallToolResult::success(vec![
             ContentBlock::text(format!(
-                "{}\n\n![Camera Snapshot](/api/v1/camera/events/{event_id_str}/snapshot)",
-                frame_caption(event)
+                "{}\nAnnotation: {}\nKnown household faces: {known}\n\n\
+                 ![Camera Snapshot](/api/v1/camera/events/{event_id_str}/snapshot?annotated=1)\n\
+                 ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)",
+                frame_caption(event),
+                ann.summary_line()
             )),
             image,
         ]))
@@ -520,8 +590,9 @@ user attached an image, do NOT call this.")]
     }
 
     #[tool(description = "\
-Send the live camera picture to the user in this conversation. Use this whenever the user \
-asks you to send, show, or share a picture or photo from the camera. Never for an attached image.")]
+Send the annotated live camera picture and live video stream link to the user in this \
+conversation. Use this whenever the user asks to see, send, show, or share a picture, photo, \
+annotated camera feed, or live video stream from the camera. Never for an attached image.")]
     async fn send_camera_snapshot(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -532,14 +603,26 @@ asks you to send, show, or share a picture or photo from the camera. Never for a
             Err(refusal) => return Ok(refusal),
         };
 
-        if let Some(live_jpeg) = LiveCameraRegistry::global().get_latest_frame(&camera_id) {
+        let reg = LiveCameraRegistry::global();
+        let known = format_known_people(&reg.known_people());
+        if let Some(live_jpeg) = reg
+            .get_annotated_frame(&camera_id)
+            .or_else(|| reg.get_latest_frame(&camera_id))
+        {
+            let ann_summary = reg
+                .get_annotation(&camera_id)
+                .map(|a| a.summary_line())
+                .unwrap_or_else(|| "status=live".to_string());
             let img = ContentBlock::image(
                 base64::engine::general_purpose::STANDARD.encode(&live_jpeg),
                 "image/jpeg".to_string(),
             );
             return Ok(CallToolResult::success(vec![
                 ContentBlock::text(format!(
-                    "Here is the picture from camera '{camera_id}':\n\n![Camera Snapshot](/api/v1/camera/{camera_id}/snapshot)"
+                    "Here is the annotated picture and live feed from camera '{camera_id}' \
+                     ({ann_summary}; known faces: {known}):\n\n\
+                     ![Camera Snapshot](/api/v1/camera/{camera_id}/snapshot?annotated=1)\n\n\
+                     ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)"
                 )),
                 img,
             ]));
@@ -561,11 +644,19 @@ asks you to send, show, or share a picture or photo from the camera. Never for a
 
         if let Some(event) = events.iter().find(|e| e.snapshot_path.is_some()) {
             if let Some(path) = event.snapshot_path.as_deref() {
-                if let Some(image) = snapshot_content(path).await {
+                if let Some(image) = snapshot_annotated_or_raw(path, event).await {
                     let event_id_str = event.id.map(|i| i.to_string()).unwrap_or_default();
+                    let ann =
+                        FrameAnnotation::from_event(event, reg.measured_fps(&camera_id), |pid| {
+                            reg.resolve_profile_name(pid)
+                        });
                     return Ok(CallToolResult::success(vec![
                         ContentBlock::text(format!(
-                            "Here is the picture from camera '{camera_id}':\n\n![Camera Snapshot](/api/v1/camera/events/{event_id_str}/snapshot)"
+                            "Here is the annotated picture from camera '{camera_id}' \
+                             ({}; known faces: {known}):\n\n\
+                             ![Camera Snapshot](/api/v1/camera/events/{event_id_str}/snapshot?annotated=1)\n\n\
+                             ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)",
+                            ann.summary_line()
                         )),
                         image,
                     ]));
@@ -671,18 +762,27 @@ settings. Never for an image attached to the message.")]
         }
 
         let bus = VisionBusConfig::from_settings(&s);
-        let active_cams = LiveCameraRegistry::global().active_cameras();
-        let listeners = LiveCameraRegistry::global().event_listener_count();
+        let reg = LiveCameraRegistry::global();
+        let active_cams = reg.active_cameras();
+        let cam_id = vision_policy::camera_id(&s);
+        let measured_fps = reg
+            .measured_fps(&cam_id)
+            .map(|f| format!("{f:.1} fps"))
+            .unwrap_or_else(|| "idle".to_string());
+        let known = format_known_people(&reg.known_people());
+        let listeners = reg.event_listener_count();
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Vision bus configuration:\n\
              - Active cameras: {}\n\
-             - Capture: {} fps, motion threshold {:.3}\n\
+             - Capture target: {} fps (range 1–30 fps), measured: {measured_fps}, motion threshold {:.3}\n\
              - Event cooldown: {}s\n\
              - Classifier confidence floor: {:.2}\n\
-             - Face recognition enabled: {}\n\
+             - Face recognition enabled: {} (known faces: {known})\n\
              - Face detection on motion: {}\n\
              - Enabled event types: {}\n\
              - Supported automation signals: {}\n\
+             - Annotated live stream: /api/v1/camera/{cam_id}/stream?annotated=1\n\
+             - Annotated snapshot: /api/v1/camera/{cam_id}/snapshot?annotated=1\n\
              - Live stream listeners: {}{}",
             if active_cams.is_empty() {
                 "none".to_string()
@@ -977,6 +1077,36 @@ pub fn init_vision_deps(
         camera_storage,
         settings_repo,
     });
+}
+
+pub async fn vision_runtime_context() -> Option<String> {
+    let deps = VISION_DEPS.get()?;
+    let settings = deps.settings_repo.get().await.ok()?;
+    if !settings.cameras_enabled || !settings.vision_enabled {
+        return None;
+    }
+    let camera_id = if settings.vision_camera_id.trim().is_empty() {
+        vision_policy::DEFAULT_CAMERA_ID.to_string()
+    } else {
+        settings.vision_camera_id.trim().to_string()
+    };
+    let reg = LiveCameraRegistry::global();
+    let known = format_known_people(&reg.known_people());
+    let fps_note = match reg.measured_fps(&camera_id) {
+        Some(m) => format!("target {} fps, measured {:.1} fps", settings.vision_fps, m),
+        None => format!("target {} fps", settings.vision_fps),
+    };
+    let latest_note = reg
+        .get_annotation(&camera_id)
+        .map(|a| format!("; latest: {}", a.summary_line()))
+        .unwrap_or_default();
+    Some(format!(
+        "## Vision Bus Status\n\
+         - Camera `{camera_id}` active ({fps_note}{latest_note})\n\
+         - Known household faces: {known}\n\
+         - Live annotated video feed: `/api/v1/camera/{camera_id}/stream?annotated=1`\n\
+         - Annotated snapshot: `/api/v1/camera/{camera_id}/snapshot?annotated=1`"
+    ))
 }
 
 pub fn spawn_vision_server(reader: DuplexStream, writer: DuplexStream) {

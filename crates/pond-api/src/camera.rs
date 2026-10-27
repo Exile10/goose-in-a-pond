@@ -10,7 +10,8 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use chrono::{DateTime, SecondsFormat, Utc};
 use pond_adapters_vision::{
-    LiveCameraRegistry, SupervisorStatus, VisionBusConfig, VisionState, LIVE_FRAME_WINDOW,
+    annotate_jpeg, FrameAnnotation, KnownPerson, LiveCameraRegistry, SupervisorStatus,
+    VisionBusConfig, VisionState, LIVE_FRAME_WINDOW,
 };
 use pond_core::models::domain::acceleration::{self, onnx_device, OnnxDevice};
 use pond_core::shared::ports::event_bus::BusEvent;
@@ -199,6 +200,19 @@ pub(crate) async fn acknowledge_camera_event(
     Ok(Json(json!({ "status": "ok" })))
 }
 
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct SnapshotQueryParams {
+    annotated: Option<String>,
+}
+
+impl SnapshotQueryParams {
+    fn is_annotated(&self) -> bool {
+        self.annotated
+            .as_deref()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+    }
+}
+
 pub(crate) async fn list_cameras(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, Refusal> {
@@ -212,9 +226,12 @@ pub(crate) async fn list_cameras(
             json!({
                 "id": id,
                 "live": registry().is_live(&id),
+                "measured_fps": registry().measured_fps(&id),
                 "last_frame_at": registry().last_frame_at(&id).map(rfc3339),
                 "snapshot_url": format!("/api/v1/camera/{id}/snapshot"),
+                "annotated_snapshot_url": format!("/api/v1/camera/{id}/snapshot?annotated=1"),
                 "stream_url": format!("/api/v1/camera/{id}/stream"),
+                "annotated_stream_url": format!("/api/v1/camera/{id}/stream?annotated=1"),
             })
         })
         .collect();
@@ -223,28 +240,55 @@ pub(crate) async fn list_cameras(
 
 pub(crate) async fn get_default_camera_snapshot(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<SnapshotQueryParams>,
 ) -> Result<Response, Refusal> {
     let settings = require_camera_consent(&state).await?;
-    camera_snapshot(&state, &vision_policy::camera_id(&settings)).await
+    camera_snapshot(
+        &state,
+        &vision_policy::camera_id(&settings),
+        params.is_annotated(),
+    )
+    .await
 }
 
 pub(crate) async fn get_camera_snapshot(
     State(state): State<Arc<AppState>>,
     Path(camera_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<SnapshotQueryParams>,
 ) -> Result<Response, Refusal> {
     require_camera_consent(&state).await?;
-    camera_snapshot(&state, &camera_id).await
+    camera_snapshot(&state, &camera_id, params.is_annotated()).await
 }
 
 /// The live frame, else the camera's newest event snapshot.
-async fn camera_snapshot(state: &AppState, camera_id: &str) -> Result<Response, Refusal> {
-    if let Some(bytes) = registry().get_latest_frame(camera_id) {
+async fn camera_snapshot(
+    state: &AppState,
+    camera_id: &str,
+    annotated: bool,
+) -> Result<Response, Refusal> {
+    if annotated {
+        if let Some(bytes) = registry().get_annotated_frame(camera_id) {
+            return Ok(jpeg(bytes, NO_STORE));
+        }
+    } else if let Some(bytes) = registry().get_latest_frame(camera_id) {
         return Ok(jpeg(bytes, NO_STORE));
     }
     if let Ok(events) = state.camera_storage.list_events(camera_id, 20).await {
-        for path in events.iter().filter_map(|e| e.snapshot_path.as_deref()) {
-            if let Some(bytes) = read_snapshot(state, path).await {
-                return Ok(jpeg(bytes, NO_STORE));
+        for ev in &events {
+            if let Some(path) = ev.snapshot_path.as_deref() {
+                if let Some(bytes) = read_snapshot(state, path).await {
+                    let out = if annotated {
+                        let ann = FrameAnnotation::from_event(
+                            ev,
+                            registry().measured_fps(camera_id),
+                            |pid| registry().resolve_profile_name(pid),
+                        );
+                        annotate_jpeg(&bytes, &ann, &registry().known_people()).unwrap_or(bytes)
+                    } else {
+                        bytes
+                    };
+                    return Ok(jpeg(out, NO_STORE));
+                }
             }
         }
     }
@@ -257,12 +301,25 @@ async fn camera_snapshot(state: &AppState, camera_id: &str) -> Result<Response, 
 pub(crate) async fn get_camera_event_snapshot(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    axum::extract::Query(params): axum::extract::Query<SnapshotQueryParams>,
 ) -> Result<Response, Refusal> {
     require_camera_consent(&state).await?;
     let event = state.camera_storage.get_event(id).await.map_err(internal)?;
-    if let Some(path) = event.as_ref().and_then(|e| e.snapshot_path.as_deref()) {
-        if let Some(bytes) = read_snapshot(&state, path).await {
-            return Ok(jpeg(bytes, "private, max-age=86400"));
+    if let Some(ev) = event.as_ref() {
+        if let Some(path) = ev.snapshot_path.as_deref() {
+            if let Some(bytes) = read_snapshot(&state, path).await {
+                let out = if params.is_annotated() {
+                    let ann = FrameAnnotation::from_event(
+                        ev,
+                        registry().measured_fps(&ev.camera_id),
+                        |pid| registry().resolve_profile_name(pid),
+                    );
+                    annotate_jpeg(&bytes, &ann, &registry().known_people()).unwrap_or(bytes)
+                } else {
+                    bytes
+                };
+                return Ok(jpeg(out, "private, max-age=86400"));
+            }
         }
     }
     Err((
@@ -273,25 +330,35 @@ pub(crate) async fn get_camera_event_snapshot(
 
 pub(crate) async fn get_default_camera_stream(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<SnapshotQueryParams>,
 ) -> Result<Response, Refusal> {
     let settings = require_camera_consent(&state).await?;
-    Ok(camera_stream(&vision_policy::camera_id(&settings)))
+    Ok(camera_stream(
+        &vision_policy::camera_id(&settings),
+        params.is_annotated(),
+    ))
 }
 
 pub(crate) async fn get_camera_stream(
     State(state): State<Arc<AppState>>,
     Path(camera_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<SnapshotQueryParams>,
 ) -> Result<Response, Refusal> {
     require_camera_consent(&state).await?;
-    Ok(camera_stream(&camera_id))
+    Ok(camera_stream(&camera_id, params.is_annotated()))
 }
 
 /// MJPEG; ends when consent is revoked or the camera's feed is dropped.
-fn camera_stream(camera_id: &str) -> Response {
+fn camera_stream(camera_id: &str, annotated: bool) -> Response {
     use tokio::sync::broadcast::error::RecvError;
 
+    let cam_id = camera_id.to_string();
     let mut rx = registry().subscribe(camera_id);
-    let initial = registry().get_latest_frame(camera_id);
+    let initial = if annotated {
+        registry().get_annotated_frame(camera_id)
+    } else {
+        registry().get_latest_frame(camera_id)
+    };
     let revoked = registry().cameras_revoked();
 
     let stream = async_stream::stream! {
@@ -309,9 +376,23 @@ fn camera_stream(camera_id: &str) -> Response {
             };
             match frame {
                 Ok(frame) => {
-                    let header = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", frame.len());
+                    let payload = if annotated {
+                        let ann = registry().get_annotation(&cam_id).unwrap_or_else(|| FrameAnnotation {
+                            camera_id: cam_id.clone(),
+                            measured_fps: registry().measured_fps(&cam_id),
+                            updated_at: Some(Utc::now()),
+                            ..FrameAnnotation::default()
+                        });
+                        match annotate_jpeg(&frame, &ann, &registry().known_people()) {
+                            Ok(bytes) => axum::body::Bytes::from(bytes),
+                            Err(_) => axum::body::Bytes::copy_from_slice(&frame),
+                        }
+                    } else {
+                        axum::body::Bytes::copy_from_slice(&frame)
+                    };
+                    let header = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", payload.len());
                     yield Ok(axum::body::Bytes::from(header));
-                    yield Ok(axum::body::Bytes::copy_from_slice(&frame));
+                    yield Ok(payload);
                     yield Ok(axum::body::Bytes::from("\r\n"));
                 }
                 // A slow viewer skips frames rather than losing the stream.
@@ -545,6 +626,7 @@ pub(crate) async fn get_vision_status(
             .fps
             .filter(|_| capturing)
             .unwrap_or_else(|| vision_policy::clamp_fps(settings.vision_fps)),
+        "measured_fps": registry().measured_fps(&camera_id),
         "capture": reported_capture(reported, &supervisor),
         "last_frame_at": registry().last_frame_at(&camera_id).map(rfc3339),
         "last_event_at": registry().last_event_at().map(rfc3339),
@@ -579,6 +661,7 @@ struct PersonFaces {
 async fn household_faces(state: &AppState) -> Result<Vec<PersonFaces>, Refusal> {
     let profiles = state.profile_repo.list().await.map_err(internal)?;
     let mut people = Vec::with_capacity(profiles.len());
+    let mut known = Vec::with_capacity(profiles.len());
     for profile in profiles {
         let (enrollments, threshold, last_enrolled_at) = match &state.face_recognition {
             Some(face) => {
@@ -595,6 +678,11 @@ async fn household_faces(state: &AppState) -> Result<Vec<PersonFaces>, Refusal> 
             }
             None => (0, None, None),
         };
+        known.push(KnownPerson {
+            profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
+            enrollments,
+        });
         people.push(PersonFaces {
             profile_id: profile.id,
             name: profile.display_name,
@@ -603,6 +691,7 @@ async fn household_faces(state: &AppState) -> Result<Vec<PersonFaces>, Refusal> 
             last_enrolled_at,
         });
     }
+    registry().set_known_people(known);
     Ok(people)
 }
 
@@ -690,6 +779,7 @@ pub(crate) async fn register_face_from_camera(
                 format!("{e:#}"),
             )
         })?;
+    let _ = household_faces(&state).await;
 
     Ok(Json(json!({
         "id":         stored.id,

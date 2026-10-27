@@ -10,9 +10,11 @@ use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::domain::vision as policy;
 use pond_core::user_data::ports::camera_storage::CameraStorage;
 use pond_core::user_data::ports::face_recognition::FaceRecognition;
+use pond_core::user_data::ports::profile::ProfileRepository;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::user_data::ports::vision::VisionClassifier;
 
+use crate::annotate::KnownPerson;
 use crate::capture::{OpenFuture, OpenedSource};
 use crate::ffmpeg_source::CaptureConfig;
 use crate::live_feed::{LiveCameraRegistry, SourceKind, VisionState};
@@ -215,6 +217,7 @@ pub struct VisionSupervisor {
     registry: LiveCameraRegistry,
     classifier: Option<Arc<dyn VisionClassifier>>,
     face_recognizer: Option<Arc<dyn FaceRecognition>>,
+    profiles: Option<Arc<dyn ProfileRepository>>,
     snapshots: Option<SnapshotConfig>,
     open_source: SourceOpener,
     discover: CameraDiscovery,
@@ -241,6 +244,7 @@ impl VisionSupervisor {
             registry,
             classifier: None,
             face_recognizer: None,
+            profiles: None,
             snapshots: None,
             open_source: Arc::new(|cfg| Box::pin(crate::capture::open_capture(cfg))),
             discover: Arc::new(|| {
@@ -257,6 +261,11 @@ impl VisionSupervisor {
 
     pub fn with_face_recognizer(mut self, face: Option<Arc<dyn FaceRecognition>>) -> Self {
         self.face_recognizer = face;
+        self
+    }
+
+    pub fn with_profile_repo(mut self, profiles: Arc<dyn ProfileRepository>) -> Self {
+        self.profiles = Some(profiles);
         self
     }
 
@@ -383,6 +392,27 @@ impl VisionSupervisor {
     }
 
     async fn read_settings(&self) -> Option<Settings> {
+        if let Some(ref profiles) = self.profiles {
+            if let Ok(list) = profiles.list().await {
+                let mut known = Vec::with_capacity(list.len());
+                for p in list {
+                    let enrollments = match &self.face_recognizer {
+                        Some(face) => face
+                            .list_embeddings(&p.id)
+                            .await
+                            .map(|v| v.len())
+                            .unwrap_or(0),
+                        None => 0,
+                    };
+                    known.push(KnownPerson {
+                        profile_id: p.id,
+                        display_name: p.display_name,
+                        enrollments,
+                    });
+                }
+                self.registry.set_known_people(known);
+            }
+        }
         match self.settings.get().await {
             Ok(settings) => {
                 self.registry.sync_settings(&settings);
