@@ -74,7 +74,7 @@ fn living_room_light() -> Device {
         registered_at: "2026-01-01T00:00:00Z".to_string(),
         last_seen: None,
         is_online: true,
-        room: Some("Living Room".to_string()),
+        room_id: Some("room-living".to_string()),
     }
 }
 

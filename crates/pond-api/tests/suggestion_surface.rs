@@ -59,7 +59,7 @@ impl DeviceRegistry for SomeDevices {
                 registered_at: chrono::Utc::now().to_rfc3339(),
                 last_seen: None,
                 is_online: true,
-                room: None,
+                room_id: None,
             })
             .collect())
     }
@@ -117,6 +117,7 @@ async fn make_app(device_count: usize) -> Harness {
         settings_repo: settings.clone(),
         profile_repo: profiles.clone(),
         device_registry: devices,
+        room_registry: Arc::new(pond_core::user_data::mocks::mock_room_registry::MockRoomRegistry),
         matter: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,

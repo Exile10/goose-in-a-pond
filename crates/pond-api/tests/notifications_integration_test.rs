@@ -52,7 +52,7 @@ async fn make_app() -> Harness {
             device_type: "gotg".into(),
             hostname: None,
             capabilities: vec![],
-            room: None,
+            room_id: None,
         })
         .await
         .unwrap()
@@ -90,6 +90,7 @@ async fn make_app() -> Harness {
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: device_registry.clone(),
+        room_registry: Arc::new(pond_core::user_data::mocks::mock_room_registry::MockRoomRegistry),
         matter: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,

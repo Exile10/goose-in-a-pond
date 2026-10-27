@@ -42,7 +42,7 @@ fn greeting() -> Message {
     Message::Text(
         json!({
             "protocol": "giap-matter",
-            "version": 1,
+            "version": crate::protocol::PROTOCOL_VERSION,
             "fabric_id": 1,
             "matter_js": "test",
         })
@@ -234,7 +234,7 @@ impl DeviceRegistry for MockRegistry {
             registered_at: chrono::Utc::now().to_rfc3339(),
             last_seen: None,
             is_online: true,
-            room: request.room,
+            room_id: request.room_id,
         };
         self.devices.write().await.insert(id, device.clone());
         Ok(device)
@@ -450,7 +450,7 @@ async fn a_device_the_snapshot_reports_offline_is_not_given_a_reprieve() {
             device_type: "light".to_string(),
             hostname: None,
             capabilities: vec!["power".to_string(), "brightness".to_string()],
-            room: None,
+            room_id: None,
         })
         .await
         .unwrap();
@@ -530,7 +530,7 @@ async fn an_already_registered_device_is_retyped_on_sync() {
             device_type: "matter".to_string(), // the old, untyped registration
             hostname: None,
             capabilities: vec![],
-            room: None,
+            room_id: None,
         })
         .await
         .unwrap();
@@ -763,10 +763,19 @@ async fn a_request_honours_its_timeout() {
 
 // ── Commissioning ────────────────────────────────────────────────────────────
 
+/// `discover`'s result for `commissionable` devices, each with just enough to deserialise.
+fn discovered_devices_json(commissionable: u32) -> Value {
+    json!((0..commissionable)
+        .map(|i| json!({"device_identifier": format!("disc-{i}")}))
+        .collect::<Vec<_>>())
+}
+
 /// A mock that reports `commissionable` devices and commissions to `device`.
 async fn mock_commissioning_controller(commissionable: u32, device: Value) -> (String, Received) {
     let answer: Answer = Arc::new(move |frame: &Value| match frame["op"].as_str() {
-        Some("discover") => json!({"ok": true, "result": {"commissionable": commissionable}}),
+        Some("discover") => {
+            json!({"ok": true, "result": {"devices": discovered_devices_json(commissionable)}})
+        }
         Some("commission") => json!({"ok": true, "result": {"device": device}}),
         _ => json!({"ok": true, "result": {}}),
     });
@@ -800,7 +809,7 @@ async fn commissioning_with_nothing_in_pairing_mode_says_so_and_says_it_early() 
 #[tokio::test]
 async fn a_rejected_setup_code_reaches_the_user_as_one_sentence() {
     let answer: Answer = Arc::new(|frame: &Value| match frame["op"].as_str() {
-        Some("discover") => json!({"ok": true, "result": {"commissionable": 1}}),
+        Some("discover") => json!({"ok": true, "result": {"devices": discovered_devices_json(1)}}),
         Some("commission") => json!({
             "ok": false,
             "error": {"code": "invalid_setup_code", "message": "Invalid pairing code"}
@@ -846,6 +855,51 @@ async fn an_unusable_probe_answer_does_not_block_commissioning() {
         .unwrap()
         .iter()
         .any(|f| f["op"] == "commission"));
+}
+
+#[tokio::test]
+async fn discover_maps_every_field_the_controller_reports() {
+    let answer: Answer = Arc::new(|frame: &Value| match frame["op"].as_str() {
+        Some("discover") => json!({
+            "ok": true,
+            "result": {"devices": [{
+                "device_identifier": "disc-0",
+                "discriminator": 3840,
+                "vendor_id": 4151,
+                "product_id": 1,
+                "device_type": 256,
+                "name": "Kitchen Light",
+                "addresses": [{"ip": "192.168.1.42", "port": 5540}],
+            }]},
+        }),
+        _ => json!({"ok": true, "result": {}}),
+    });
+    let (url, _received) = mock_controller(snapshot(vec![], vec![]), vec![], Some(answer)).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client, MatterNotifier::disabled());
+
+    let devices = commissioner.discover().await.unwrap();
+    assert_eq!(devices.len(), 1);
+    let d = &devices[0];
+    assert_eq!(d.device_identifier, "disc-0");
+    assert_eq!(d.discriminator, Some(3840));
+    assert_eq!(d.vendor_id, Some(4151));
+    assert_eq!(d.product_id, Some(1));
+    assert_eq!(d.device_type, Some(256));
+    assert_eq!(d.name.as_deref(), Some("Kitchen Light"));
+    assert_eq!(d.addresses.len(), 1);
+    assert_eq!(d.addresses[0].ip, "192.168.1.42");
+    assert_eq!(d.addresses[0].port, 5540);
+}
+
+#[tokio::test]
+async fn discover_with_nothing_advertising_is_an_empty_list_not_an_error() {
+    let (url, _received) = mock_commissioning_controller(0, light()).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client, MatterNotifier::disabled());
+
+    let devices = commissioner.discover().await.unwrap();
+    assert!(devices.is_empty());
 }
 
 #[tokio::test]
