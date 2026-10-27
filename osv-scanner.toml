@@ -15,6 +15,12 @@
 # Re-reviewed 2026-10-20 against main a3230b44: negentropy (RUSTSEC-2026-0365)
 # was bumped to 0.5.2 rather than ignored; the zbus-family, basic-toml and zip
 # entries were added with the blockers stated in each reason.
+# Re-reviewed 2026-10-27 against main 48186867: rustls-webpki, webpki-roots,
+# webpki-root-certs, ctutils, tokio, zstd, zstd-safe, zstd-sys and the
+# matter-server vitest were bumped rather than ignored; crypto-bigint
+# (RUSTSEC-2026-0387) and block-buffer (GHSA-qwgh-2vcv-g2f7) were added with
+# their blockers. goose/Cargo.lock still carries the bumpable ones until the
+# same lockfile update lands on the goose fork's main; they are not ignored.
 
 # ── Unmaintained-crate notices ───────────────────────────────────────────────
 #
@@ -104,6 +110,16 @@ reason = "zip 8.6.0 extract() creates symlinks whose targets leave the destinati
 id = "RUSTSEC-2026-0369"
 ignoreUntil = 2027-01-31
 reason = "zip 8.6.0 extract() and ZipStreamReader::extract() apply Unix permissions through symlinks. Same blocker and same non-reachability as RUSTSEC-2026-0367: neither function is called, and pond-server never applies archive permissions."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+ignoreUntil = 2027-01-31
+reason = "crypto-bigint 0.5.5 has secret-dependent branches in operations meant to be constant-time. Patched only in 0.7.6; elliptic-curve 0.13.8 (the last 0.13 release) requires crypto-bigint ^0.5, and alloy-signer 2.5.0 (latest) still requires elliptic-curve ^0.13 and k256 ^0.13, as do boltz-client, bip32 0.5 and frost-secp256k1-tr 2.2 through breez's spark-sdk. In Cargo.lock it arrives only through pond-adapters-lightning, behind pond-server's optional `lightning` feature that neither the default build nor giap.sh enables; in goose/Cargo.lock only through jsonwebtoken's optional p256/p384 backend, which goose does not build. Remove when that curve stack moves to elliptic-curve 0.14."
+
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+ignoreUntil = 2027-01-31
+reason = "block-buffer 0.10.4: a panic inside the compression callback, caught with catch_unwind, can leave the buffer's cursor invalid for later reuse. Fixed only in 0.12.1, which this lockfile already uses for the digest 0.11 stack; 0.10.4 is the last 0.10 release and digest 0.10.7 (the last 0.10 release) requires ^0.10, so every digest-0.10 hash (sha1 0.10, sha2 0.10, hmac 0.12, md-5 0.10) keeps it until those users move to digest 0.11. Not reachable in practice: the callback is the hash's own compression function, which does not panic, and nothing here wraps a hasher in catch_unwind and reuses it. Not in RustSec, so .cargo/audit.toml has no matching entry."
 
 # ── A real vulnerability with no upstream fix ────────────────────────────────
 

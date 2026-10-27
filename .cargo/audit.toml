@@ -29,4 +29,17 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+
+    # crypto-bigint 0.5.5: secret-dependent branches in operations meant to be constant-time
+    #   RUSTSEC-2026-0387  patched only in crypto-bigint 0.7.6 (two 0.x majors ahead)
+    # Not fixable from this lockfile: elliptic-curve 0.13.8, the last 0.13 release, requires
+    # crypto-bigint ^0.5, and everything that pulls it in is pinned to the 0.13 curve stack:
+    # alloy-signer 2.5.0 (its latest release) still requires elliptic-curve ^0.13 and k256 ^0.13,
+    # and boltz-client, bip32 0.5 and frost-secp256k1-tr 2.2 reach k256 0.13 through breez's
+    # spark-sdk. The only path in is pond-adapters-lightning, behind pond-server's optional
+    # `lightning` feature, which neither the default build nor giap.sh enables
+    # (`cargo tree -p pond-server -i crypto-bigint` is empty), with settings.lightning_enabled
+    # gating it again at runtime. Remove when spark-sdk and alloy move to elliptic-curve 0.14.
+    # Review by 2027-01-31 (same date as osv-scanner.toml).
+    "RUSTSEC-2026-0387",
 ]
