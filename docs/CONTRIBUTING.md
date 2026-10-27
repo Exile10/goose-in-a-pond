@@ -90,9 +90,11 @@ Compare the lock before and after; only the family you removed should move. Do n
    wiring. CI runs it only when the diff touches those paths and the private-fork secret exists.
 5. Push and open a pull request against `main`.
 
-Develop and test on a Mac or Linux box. Deploy to the Jetson only once the change is believed
-finished, except for measurements that are only true on the hardware (KV-cache cost, free
-memory, prefill/decode throughput).
+Test on the Jetson first. Push the branch to the device's `origin`, deploy it with
+`bash scripts/jetson.sh deploy --branch <branch>`, and run the checks and measurements there. Run
+them on a Mac afterwards only when the maintainer asks. Stop the pond before building on the
+device, and do not measure while anything else builds there. Without a Jetson, test on a Linux
+box or a Mac.
 
 ## Checks
 
