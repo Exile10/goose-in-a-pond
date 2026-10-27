@@ -119,9 +119,11 @@ grep -E "onnx: .* (moved to|stays on|loaded on)" ~/.local/share/goose-in-a-pond/
 `onnx: face_detector moved to tensorrt` is on the GPU; a model that only says `loaded on the cpu`
 is not, and `GET /api/v1/vision/status` reports the same per model.
 
-Per turn, with the KV prompt cache working: the first turn of a session plans `CreateContext`,
-later turns `ReusePrefix`, side calls `SacrificialContext`. `FullPrefillInPlace` on a later turn
-means something rewrote the start of the prompt.
+Per turn, with the KV prompt cache working: the first turn after a model load plans
+`CreateContext`, a new conversation's first turn `FullPrefillInPlace` (with `giap::kv` logging the
+preamble snapshot it restored, if one matched), later turns `ReusePrefix`, side calls
+`SacrificialContext`. `FullPrefillInPlace` on a later turn means something rewrote the start of the
+prompt.
 
 ```bash
 grep -E "prompt prefill plan|turn_end" ~/.local/share/goose-in-a-pond/logs/pond.log.$(date -u +%F) | tail
