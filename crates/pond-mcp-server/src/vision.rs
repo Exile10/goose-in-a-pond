@@ -347,6 +347,55 @@ impl VisionMcpServer {
                 .unwrap_or_else(|_| vision_policy::DEFAULT_CAMERA_ID.to_string()),
         }
     }
+
+    async fn recent_face_context(&self, camera_id: &str, ann: Option<&FrameAnnotation>) -> String {
+        if let Some(a) = ann {
+            if let Some(name) = a.identified_name.as_deref().or(a.identified_profile.as_deref()) {
+                let conf = a
+                    .face_confidence
+                    .map(|c| format!(" ({:.0}% confidence)", c * 100.0))
+                    .unwrap_or_default();
+                return format!("Face recognized in frame: {name}{conf}.");
+            }
+            if a.face_unknown {
+                return "Face in frame: unrecognized person (not matching any enrolled profile)."
+                    .to_string();
+            }
+        }
+        let now = chrono::Utc::now();
+        if let Ok(events) = self
+            .camera_storage
+            .list_events(camera_id, WINDOW_EVENT_SCAN)
+            .await
+        {
+            let reg = LiveCameraRegistry::global();
+            for ev in &events {
+                let age_secs = (now - ev.created_at).num_seconds();
+                if !(0..=600).contains(&age_secs) {
+                    continue;
+                }
+                let ev_ann =
+                    FrameAnnotation::from_event(ev, None, |pid| reg.resolve_profile_name(pid));
+                if let Some(name) = ev_ann
+                    .identified_name
+                    .as_deref()
+                    .or(ev_ann.identified_profile.as_deref())
+                {
+                    let conf = ev_ann
+                        .face_confidence
+                        .map(|c| format!(" ({:.0}% confidence)", c * 100.0))
+                        .unwrap_or_default();
+                    return format!(
+                        "Face in this exact frame: no frontal face visible (person may be turned or in profile). \
+                         Most recent face recognized on this camera: {name}{conf} ({age_secs}s ago at {} UTC).",
+                        ev.created_at.format("%H:%M:%S")
+                    );
+                }
+            }
+        }
+        "Face in this frame: no face recognized (do NOT guess or assign a person's name)."
+            .to_string()
+    }
 }
 
 #[tool_router]
@@ -443,25 +492,26 @@ attached an image, just look at it - do NOT call this.")]
         };
 
         let reg = LiveCameraRegistry::global();
-        let known = format_known_people(&reg.known_people());
         if params.0.event_id.is_none() {
             if let Some(live_jpeg) = reg
                 .get_annotated_frame(&camera_id)
                 .or_else(|| reg.get_latest_frame(&camera_id))
             {
-                let ann_summary = reg
-                    .get_annotation(&camera_id)
+                let ann = reg.get_annotation(&camera_id);
+                let ann_summary = ann
+                    .as_ref()
                     .map(|a| a.summary_line())
                     .unwrap_or_else(|| "status=live".to_string());
+                let face_ctx = self.recent_face_context(&camera_id, ann.as_ref()).await;
                 let img = ContentBlock::image(
                     base64::engine::general_purpose::STANDARD.encode(&live_jpeg),
                     "image/jpeg".to_string(),
                 );
                 return Ok(CallToolResult::success(vec![
                     ContentBlock::text(format!(
-                        "Live annotated snapshot from camera '{camera_id}' at {}.\n\
-                         Annotation: {ann_summary}\n\
-                         Known household faces: {known}\n\n\
+                        "Live annotated snapshot from camera '{camera_id}' captured NOW at {} UTC.\n\
+                         Detection: {ann_summary}\n\
+                         {face_ctx}\n\n\
                          ![Camera Snapshot](/api/v1/camera/{camera_id}/snapshot?annotated=1)\n\
                          ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)",
                         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
@@ -512,9 +562,10 @@ attached an image, just look at it - do NOT call this.")]
         let ann = FrameAnnotation::from_event(event, reg.measured_fps(&camera_id), |pid| {
             reg.resolve_profile_name(pid)
         });
+        let face_ctx = self.recent_face_context(&camera_id, Some(&ann)).await;
         Ok(CallToolResult::success(vec![
             ContentBlock::text(format!(
-                "{}\nAnnotation: {}\nKnown household faces: {known}\n\n\
+                "{}\nDetection: {}\n{face_ctx}\n\n\
                  ![Camera Snapshot](/api/v1/camera/events/{event_id_str}/snapshot?annotated=1)\n\
                  ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)",
                 frame_caption(event),
@@ -604,23 +655,24 @@ annotated camera feed, or live video stream from the camera. Never for an attach
         };
 
         let reg = LiveCameraRegistry::global();
-        let known = format_known_people(&reg.known_people());
         if let Some(live_jpeg) = reg
             .get_annotated_frame(&camera_id)
             .or_else(|| reg.get_latest_frame(&camera_id))
         {
-            let ann_summary = reg
-                .get_annotation(&camera_id)
+            let ann = reg.get_annotation(&camera_id);
+            let ann_summary = ann
+                .as_ref()
                 .map(|a| a.summary_line())
                 .unwrap_or_else(|| "status=live".to_string());
+            let face_ctx = self.recent_face_context(&camera_id, ann.as_ref()).await;
             let img = ContentBlock::image(
                 base64::engine::general_purpose::STANDARD.encode(&live_jpeg),
                 "image/jpeg".to_string(),
             );
             return Ok(CallToolResult::success(vec![
                 ContentBlock::text(format!(
-                    "Here is the annotated picture and live feed from camera '{camera_id}' \
-                     ({ann_summary}; known faces: {known}):\n\n\
+                    "Here is the live annotated picture and video feed from camera '{camera_id}' \
+                     ({ann_summary}):\n{face_ctx}\n\n\
                      ![Camera Snapshot](/api/v1/camera/{camera_id}/snapshot?annotated=1)\n\n\
                      ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)"
                 )),
@@ -650,10 +702,11 @@ annotated camera feed, or live video stream from the camera. Never for an attach
                         FrameAnnotation::from_event(event, reg.measured_fps(&camera_id), |pid| {
                             reg.resolve_profile_name(pid)
                         });
+                    let face_ctx = self.recent_face_context(&camera_id, Some(&ann)).await;
                     return Ok(CallToolResult::success(vec![
                         ContentBlock::text(format!(
                             "Here is the annotated picture from camera '{camera_id}' \
-                             ({}; known faces: {known}):\n\n\
+                             ({}):\n{face_ctx}\n\n\
                              ![Camera Snapshot](/api/v1/camera/events/{event_id_str}/snapshot?annotated=1)\n\n\
                              ![Live Camera Feed](/api/v1/camera/{camera_id}/stream?annotated=1)",
                             ann.summary_line()
@@ -1091,7 +1144,6 @@ pub async fn vision_runtime_context() -> Option<String> {
         settings.vision_camera_id.trim().to_string()
     };
     let reg = LiveCameraRegistry::global();
-    let known = format_known_people(&reg.known_people());
     let fps_note = match reg.measured_fps(&camera_id) {
         Some(m) => format!("target {} fps, measured {:.1} fps", settings.vision_fps, m),
         None => format!("target {} fps", settings.vision_fps),
@@ -1103,7 +1155,6 @@ pub async fn vision_runtime_context() -> Option<String> {
     Some(format!(
         "## Vision Bus Status\n\
          - Camera `{camera_id}` active ({fps_note}{latest_note})\n\
-         - Known household faces: {known}\n\
          - Live annotated video feed: `/api/v1/camera/{camera_id}/stream?annotated=1`\n\
          - Annotated snapshot: `/api/v1/camera/{camera_id}/snapshot?annotated=1`"
     ))

@@ -372,13 +372,28 @@ impl LiveCameraRegistry {
         if annotation.measured_fps.is_none() {
             annotation.measured_fps = self.measured_fps(camera_id);
         }
+        let now = Utc::now();
         if annotation.updated_at.is_none() {
-            annotation.updated_at = Some(Utc::now());
+            annotation.updated_at = Some(now);
         }
         let entry = write(&self.feeds)
             .entry(camera_id.to_string())
             .or_insert_with(LiveFeedEntry::new)
             .clone();
+        // Keep a just-recognized household member across brief side-profile motion frames within TTL.
+        if !annotation.face_detected && annotation.identified_profile.is_none() {
+            if let Some(prev) = read(&entry.annotation).as_ref() {
+                if prev.identified_profile.is_some()
+                    && prev
+                        .updated_at
+                        .is_some_and(|at| is_fresh(at, now, ANNOTATION_TTL))
+                {
+                    annotation.identified_profile = prev.identified_profile.clone();
+                    annotation.identified_name = prev.identified_name.clone();
+                    annotation.face_confidence = prev.face_confidence;
+                }
+            }
+        }
         *write(&entry.annotation) = Some(annotation);
     }
 
@@ -388,17 +403,19 @@ impl LiveCameraRegistry {
         let stored = read(&entry.annotation).clone();
         let fps = self.measured_fps(camera_id);
         let now = Utc::now();
+        let live_at = read(&entry.latest).as_ref().map(|f| f.at).or(Some(now));
         match stored {
             Some(mut ann) if ann.updated_at.is_some_and(|at| is_fresh(at, now, ANNOTATION_TTL)) => {
                 if fps.is_some() {
                     ann.measured_fps = fps;
                 }
+                ann.updated_at = live_at;
                 Some(ann)
             }
             _ => Some(FrameAnnotation {
                 camera_id: camera_id.to_string(),
                 measured_fps: fps,
-                updated_at: self.last_frame_at(camera_id),
+                updated_at: live_at,
                 ..FrameAnnotation::default()
             }),
         }

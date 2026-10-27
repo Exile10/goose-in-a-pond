@@ -127,6 +127,8 @@ impl FrameAnnotation {
             }
         } else if self.face_unknown {
             parts.push("face=unknown".to_string());
+        } else {
+            parts.push("face=none_in_frame".to_string());
         }
         if let Some(b) = self.face_bbox {
             parts.push(format!(
@@ -262,19 +264,18 @@ pub fn annotate_frame(
         }
     }
 
-    // Bottom roster bar when household profiles are known.
-    let enrolled: Vec<String> = known_people
-        .iter()
-        .filter(|p| p.enrollments > 0)
-        .map(|p| p.display_name.to_ascii_uppercase())
-        .collect();
-    if !enrolled.is_empty() && frame.height > bar_h * 2 {
-        let roster = format!("KNOWN: {}", enrolled.join(", "));
-        let rw = (text_width(&roster, scale) + pad * 2).min(frame.width);
-        let ry = frame.height - bar_h;
-        darken_rect(frame, 0, ry, rw, bar_h);
-        draw_text(frame, pad, ry + pad, &roster, scale, [167, 243, 208]);
+    // Bottom status bar only names someone actually detected in this frame, so a vision model
+    // reading the image pixels never mistakes the enrolled database roster for who is in the room.
+    if let Some(label) = annotation.face_label() {
+        if frame.height > bar_h * 2 {
+            let status = format!("IN FRAME: {label}");
+            let rw = (text_width(&status, scale) + pad * 2).min(frame.width);
+            let ry = frame.height - bar_h;
+            darken_rect(frame, 0, ry, rw, bar_h);
+            draw_text(frame, pad, ry + pad, &status, scale, [167, 243, 208]);
+        }
     }
+    let _ = known_people;
 }
 
 fn frame_timestamp(frame: &Frame) -> impl FnOnce() -> DateTime<Utc> + '_ {
