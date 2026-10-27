@@ -20,14 +20,31 @@ pub fn letterbox_bgr_chw(frame: &Frame, size: usize) -> Result<Array4<f32>> {
         image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Triangle);
 
     // Grey letterbox background, matching YOLOX's training-time padding.
-    let mut tensor = Array4::<f32>::from_elem((1, 3, size, size), 114.0);
-    for (x, y, px) in resized.enumerate_pixels() {
-        let [r, g, b] = px.0;
-        // BGR channel order (YOLOX consumes cv2-style images).
-        tensor[[0, 0, y as usize, x as usize]] = b as f32;
-        tensor[[0, 1, y as usize, x as usize]] = g as f32;
-        tensor[[0, 2, y as usize, x as usize]] = r as f32;
+    let hw = size * size;
+    let mut planes = vec![114.0f32; 3 * hw];
+    {
+        let (b_plane, rest) = planes.split_at_mut(hw);
+        let (g_plane, r_plane) = rest.split_at_mut(hw);
+        let rw = (new_w as usize).min(size);
+        let rh = (new_h as usize).min(size);
+        let raw = resized.as_raw();
+        let stride = new_w as usize * 3;
+        for y in 0..rh {
+            let row_off = y * size;
+            let src_row = &raw[y * stride..y * stride + rw * 3];
+            let b_row = &mut b_plane[row_off..row_off + rw];
+            let g_row = &mut g_plane[row_off..row_off + rw];
+            let r_row = &mut r_plane[row_off..row_off + rw];
+            for (x, px) in src_row.chunks_exact(3).enumerate() {
+                // BGR channel order (YOLOX consumes cv2-style images).
+                b_row[x] = px[2] as f32;
+                g_row[x] = px[1] as f32;
+                r_row[x] = px[0] as f32;
+            }
+        }
     }
+    let tensor = Array4::from_shape_vec((1, 3, size, size), planes)
+        .map_err(|e| anyhow::anyhow!("YOLOX tensor shape error: {e}"))?;
     Ok(tensor)
 }
 

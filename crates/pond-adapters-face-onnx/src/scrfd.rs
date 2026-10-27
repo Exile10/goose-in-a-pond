@@ -122,35 +122,41 @@ impl FaceDetector for ScrfdDetector {
                 // ── Preprocess ────────────────────────────────────────────────
                 let img = image::load_from_memory(&bytes).context("decode failed")?;
                 let (orig_w, orig_h) = img.dimensions();
-                // No letterbox: the aspect change is undone by the per-axis rescale below.
-                let mut resized = img
-                    .resize_exact(input_side, input_side, FilterType::Triangle)
-                    .to_rgb8();
+                let mut rgb = img.into_rgb8();
 
-                // Stretch dim frames before detection, or a dim face never clears the threshold.
-                let pre_mean = crate::mean_luminance(&resized);
+                // Stretch dim frames before resizing to 640x640 to scan fewer pixels.
+                let pre_mean = crate::mean_luminance(&rgb);
                 let was_dim = pre_mean < crate::LOW_LIGHT_TRIGGER;
                 if crate::auto_exposure_enabled() && was_dim {
-                    crate::stretch_histogram_2_98(&mut resized);
+                    crate::stretch_histogram_2_98(&mut rgb);
                     tracing::debug!(
                         before = pre_mean,
-                        after = crate::mean_luminance(&resized),
+                        after = crate::mean_luminance(&rgb),
                         "scrfd: applied low-light auto-exposure to detector input"
                     );
                 }
+                // No letterbox: the aspect change is undone by the per-axis rescale below.
+                let resized =
+                    image::imageops::resize(&rgb, input_side, input_side, FilterType::Triangle);
                 let score_thresh = if was_dim {
                     low_light_score_thresh.min(configured_score_thresh)
                 } else {
                     configured_score_thresh
                 };
                 let side = input_side as usize;
-                let mut arr = Array4::<f32>::zeros((1, 3, side, side));
-                for (x, y, px) in resized.enumerate_pixels() {
-                    let [r, g, b] = px.0;
-                    arr[[0, 0, y as usize, x as usize]] = (r as f32 - MEAN) * SCALE;
-                    arr[[0, 1, y as usize, x as usize]] = (g as f32 - MEAN) * SCALE;
-                    arr[[0, 2, y as usize, x as usize]] = (b as f32 - MEAN) * SCALE;
+                let hw = side * side;
+                let mut planes = vec![0.0f32; 3 * hw];
+                {
+                    let (r_plane, rest) = planes.split_at_mut(hw);
+                    let (g_plane, b_plane) = rest.split_at_mut(hw);
+                    for (i, px) in resized.as_raw().chunks_exact(3).enumerate() {
+                        r_plane[i] = (px[0] as f32 - MEAN) * SCALE;
+                        g_plane[i] = (px[1] as f32 - MEAN) * SCALE;
+                        b_plane[i] = (px[2] as f32 - MEAN) * SCALE;
+                    }
                 }
+                let arr = Array4::from_shape_vec((1, 3, side, side), planes)
+                    .context("SCRFD tensor shape mismatch")?;
 
                 // ── Inference ─────────────────────────────────────────────────
                 let input = Tensor::from_array(arr)?;

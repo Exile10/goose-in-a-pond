@@ -120,10 +120,14 @@ In `goose/crates/goose-local-inference/src/llamacpp/`.
 
 - **KV prompt-session cache.** The engine keeps the last conversation's KV and token ledger and
   plans each prompt against it (`PrefillPlan` in `inference_engine.rs`, logged as `prompt prefill
-  plan`): `CreateContext` for the first turn, `ReusePrefix` when the prompt extends what is cached,
-  `SacrificialContext` for a side call (memory extraction, goal check) that must not evict the
-  chat, `FullPrefillInPlace` when the prefix changed. A `FullPrefillInPlace` on turn 2 of a session
-  means something rewrote the prompt's start between turns.
+  plan`): `CreateContext` for the first turn after a load, `ReusePrefix` when the prompt extends
+  what is cached, `SacrificialContext` for a prompt under half the size of a chat's cache that must
+  not evict it, `FullPrefillInPlace` when the prefix changed. A side call with no tools (memory
+  extraction, a title) is always sacrificed; another chat only while the cached one ran within the
+  last 60 s (`CHAT_CACHE_PROTECTED_FOR`), so a new conversation takes a cache left idle, prefills
+  in the full window and restores a preamble snapshot when one matches its shape. A
+  `FullPrefillInPlace` on turn 2 of a session means something rewrote the prompt's start between
+  turns.
 - **Windowed sliding-window cache.** Contexts use `swa_full = false`: sliding-window layers keep only
   their window, and every partial resume goes through `SessionKv::window_resume`, which resumes in
   place, restores a window checkpoint, or refuses. On the Orin this took E4B's KV at 16K from 476 MiB
