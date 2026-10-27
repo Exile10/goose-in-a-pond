@@ -153,6 +153,69 @@ fn build_settings(store: &HashMap<String, String>) -> Settings {
             s.ble_setup_enabled = b;
         }
     }
+    // Camera consent and the vision fields: a "cameras off" or "restart on change" test must
+    // see the value it wrote, not the default.
+    if let Some(v) = store.get("cameras_enabled") {
+        if let Ok(b) = v.parse() {
+            s.cameras_enabled = b;
+        }
+    }
+    if let Some(v) = store.get("vision_enabled") {
+        if let Ok(b) = v.parse() {
+            s.vision_enabled = b;
+        }
+    }
+    if let Some(v) = store.get("vision_camera_url") {
+        s.vision_camera_url = v.clone();
+    }
+    if let Some(v) = store.get("vision_camera_id") {
+        s.vision_camera_id = v.clone();
+    }
+    if let Some(v) = store.get("vision_fps") {
+        if let Ok(n) = v.parse() {
+            s.vision_fps = n;
+        }
+    }
+    if let Some(v) = store.get("vision_motion_threshold") {
+        if let Ok(n) = v.parse() {
+            s.vision_motion_threshold = n;
+        }
+    }
+    if let Some(v) = store.get("vision_event_cooldown_secs") {
+        if let Ok(n) = v.parse() {
+            s.vision_event_cooldown_secs = n;
+        }
+    }
+    if let Some(v) = store.get("vision_classifier_confidence") {
+        if let Ok(n) = v.parse() {
+            s.vision_classifier_confidence = n;
+        }
+    }
+    if let Some(v) = store.get("vision_face_recognition_enabled") {
+        if let Ok(b) = v.parse() {
+            s.vision_face_recognition_enabled = b;
+        }
+    }
+    if let Some(v) = store.get("vision_face_on_motion") {
+        if let Ok(b) = v.parse() {
+            s.vision_face_on_motion = b;
+        }
+    }
+    if let Some(v) = store.get("vision_event_types") {
+        if let Ok(list) = serde_json::from_str(v) {
+            s.vision_event_types = list;
+        }
+    }
+    if let Some(v) = store.get("schedule_result_notify") {
+        if let Ok(b) = v.parse() {
+            s.schedule_result_notify = b;
+        }
+    }
+    if let Some(v) = store.get("system_notices_enabled") {
+        if let Ok(b) = v.parse() {
+            s.system_notices_enabled = b;
+        }
+    }
     s
 }
 
@@ -235,6 +298,49 @@ impl SettingsRepository for MockSettingsRepository {
         store.insert(
             "ext_travel_enabled".into(),
             settings.ext_travel_enabled.to_string(),
+        );
+        store.insert(
+            "cameras_enabled".into(),
+            settings.cameras_enabled.to_string(),
+        );
+        store.insert("vision_enabled".into(), settings.vision_enabled.to_string());
+        store.insert(
+            "vision_camera_url".into(),
+            settings.vision_camera_url.clone(),
+        );
+        store.insert("vision_camera_id".into(), settings.vision_camera_id.clone());
+        store.insert("vision_fps".into(), settings.vision_fps.to_string());
+        store.insert(
+            "vision_motion_threshold".into(),
+            settings.vision_motion_threshold.to_string(),
+        );
+        store.insert(
+            "vision_event_cooldown_secs".into(),
+            settings.vision_event_cooldown_secs.to_string(),
+        );
+        store.insert(
+            "vision_classifier_confidence".into(),
+            settings.vision_classifier_confidence.to_string(),
+        );
+        store.insert(
+            "vision_face_recognition_enabled".into(),
+            settings.vision_face_recognition_enabled.to_string(),
+        );
+        store.insert(
+            "vision_face_on_motion".into(),
+            settings.vision_face_on_motion.to_string(),
+        );
+        store.insert(
+            "vision_event_types".into(),
+            serde_json::to_string(&settings.vision_event_types).unwrap_or_else(|_| "[]".into()),
+        );
+        store.insert(
+            "schedule_result_notify".into(),
+            settings.schedule_result_notify.to_string(),
+        );
+        store.insert(
+            "system_notices_enabled".into(),
+            settings.system_notices_enabled.to_string(),
         );
         Ok(())
     }

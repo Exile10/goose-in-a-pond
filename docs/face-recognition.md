@@ -4,10 +4,11 @@
 frame or burst. Recognition runs on-device: no frame is stored, and the database
 holds only 512-float embedding vectors.
 
-It is **off by default**: it is compiled only with the `face-onnx` Cargo feature, and
-no release build or deploy script turns that on. Identification is exposed over REST
-and used by the desktop **Faces** screen; nothing in the chat or agent path consumes
-it, so the assistant does not learn who it is talking to from it.
+It is compiled with the `face-onnx` Cargo feature, which is in `pond-server`'s default
+features (as of 2026-10-27). Identification is exposed over REST, used by the desktop
+**Faces** screen, and matched against person and motion events by the camera pipeline;
+nothing in the chat or agent path consumes it, so the assistant does not learn who it is
+talking to from it.
 
 | Part | Where |
 |---|---|
@@ -16,6 +17,8 @@ it, so the assistant does not learn who it is talking to from it.
 | Ports | `crates/pond-core/src/user_data/ports/face_{recognition,detector,embedding_extractor}.rs` |
 | Wiring and thresholds (`build_face_recognition`, `apply_face_recognition_defaults`) | `crates/pond-server/src/main.rs` |
 | Model download (`download_face_models`) | `crates/pond-server/src/model_download.rs` |
+| Startup and the background download (`start_face_recognition`, `fetch_face_models_in_background`) | `crates/pond-server/src/main.rs` |
+| The shared, late-filled recognition (`FaceRecognitionSlot`) | `crates/pond-core/src/user_data/services/face_recognition_slot.rs` |
 | REST handlers and burst liveness | `crates/pond-api/src/routes.rs` |
 | Desktop screen | `pond-desktop/src/sections/Faces.tsx` (Manage drawer → Faces) |
 
@@ -75,10 +78,45 @@ can be matched.
 | Anti-spoof 1 | Silent-Face MiniFASNetV2, ~2 MB (`antispoof.onnx`) | dependency-free heuristic (saturation, highlight, gradient skew) | 3-class softmax `[fake_2D, fake_3D, live]` at 80×80. |
 | Anti-spoof 2 | DeepPixBis OULU-NPU, ~13 MB (`OULU_Protocol_2_model_0_0.onnx`) | none (primary runs alone) | 224×224 RGB sigmoid. The filename must stay `OULU_*`: the variant is chosen from it. |
 
-All files live in `<data_dir>/models/face/`. With the feature on, `serve` (and `setup`)
-downloads any missing preferred file at startup; buffalo_l (~281 MB zip) is fetched
-only when a preferred embedder or detector is still missing afterwards. A failed
-download disables the feature until the files appear; the server still starts.
+All files live in `<data_dir>/models/face/`. With the feature on, `setup` downloads any
+missing preferred file before it finishes, and `serve` downloads them in the background
+(below); buffalo_l (~281 MB zip) is fetched only when a preferred embedder or detector is
+still missing afterwards.
+
+### Startup never waits on the download
+
+`serve` loads face recognition from whatever is on disk and binds its listeners straight
+away; any missing model is fetched by a background task. On 2026-10-27 the Jetson spent about
+twenty minutes fetching the 261 MB embedder over Wi-Fi while, before this change, the pond
+served nothing and every phone said "Pond unreachable".
+
+Every consumer (the REST routes and the camera pipeline) holds one `FaceRecognitionSlot`.
+It starts in one of three states:
+
+| On disk at startup | Slot | Face routes answer |
+|---|---|---|
+| Embedder present and it loads | ready | normally |
+| Embedder present but it will not load (no ONNX Runtime, a corrupt file) | unavailable | `503 face_recognition_unavailable` |
+| No embedder | downloading | `503 face_models_downloading`, with progress |
+
+When the download ends, a slot that was waiting is filled without a restart, or marked
+unavailable with the reason. The camera pipeline skips face matching while the slot is
+empty, keeps the event, and logs `vision_face_matching_skipped` once (and
+`vision_face_matching_resumed` when recognition arrives) rather than once per frame. Optional
+models fetched after recognition was already on (an anti-spoof model, say) take effect at the
+next restart.
+
+The log, by `kind`: `face_models_download_started` (with the missing files),
+`face_models_download_completed` (`elapsed_ms`, `files`, `bytes`, `still_missing`) or
+`face_models_download_failed`, then `face_recognition_enabled` (`source` is `startup` or
+`background_download`) or `face_recognition_unavailable`.
+
+A download that goes 60 seconds without a byte counts as dropped
+(`pond_hf_cache::DOWNLOAD_READ_TIMEOUT`, a per-read limit, not an overall one), so a stalled
+connection can no longer hang anything. The Hugging Face files then resume from their
+`.incomplete` blob with a Range request, up to eight attempts that make no progress, backing
+off from 2 s to 60 s. The two GitHub assets (DeepPixBis and the buffalo_l zip) fail on the
+stall but do not resume: the next start fetches them again.
 
 Download sources (`model_download.rs`):
 
@@ -95,9 +133,21 @@ buffalo_l        https://github.com/deepinsight/insightface/releases/download/v0
 `POND_FACE_ANTISPOOF_2_URL` replace them. A Hugging Face token is sent when
 `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or `HUGGINGFACE_TOKEN` is set.
 
-The ONNX Runtime library is found by `ensure_onnx_runtime()`: `ORT_DYLIB_PATH`, then
-system locations, then a previously downloaded copy, then an automatic download. If it
-still fails to load, face recognition logs why and stays off.
+The ONNX Runtime library is found by `ensure_onnx_runtime()`: `ORT_DYLIB_PATH`, then, on a
+Jetson, the GPU runtime `bash scripts/giap.sh onnxruntime build` installs under
+`<data_dir>/lib/onnxruntime-gpu/<version>/`, then system locations, then a previously
+downloaded copy, then an automatic download. If it still fails to load, face recognition logs
+why and stays off.
+
+With the GPU runtime, SCRFD, the embedder and the YOLOX classifier start on the CPU and each moves
+to TensorRT (fp16) after the language model has loaded; `pond-onnx-accel` does the move in the
+background, so no event waits for an engine. The anti-spoof model stays on the CPU, where it is as
+fast. Engines and their EP-context models are cached under
+`<data_dir>/cache/onnx-trt/<runtime>-trt<version>-sm_<arch>/`; the setup script builds them while
+the pond is stopped, and the pond loads one only while 1 GB is available. A model whose GPU run
+fails goes back to the CPU. The log says where each model runs
+(`onnx: face_detector moved to tensorrt`), and so does `GET /api/v1/vision/status`
+(`classifier.accelerator`, `faces.accelerators`).
 
 ### Anti-spoof ensemble
 
@@ -163,20 +213,31 @@ had no face, every winning frame scores at least threshold +
 
 ## REST API
 
-All routes are under `/api/v1` and need a bearer token like any other route. Without
-the feature, or without a loadable embedder, every one returns
-`503 {"error": "Face recognition is not configured on this server", "hint": …}`,
-except `/faces/models`, which reports `feature_enabled: false`.
+All routes are under `/api/v1` and need a bearer token like any other route. Until
+recognition is loaded every one answers `503`, except `GET /faces` and `GET /faces/models`,
+which answer `200` with the same `available`, `status` and `progress` or `reason` fields:
+
+| Why | `status` | 503 body |
+|---|---|---|
+| Built without `face-onnx` | `not_built` | `{"error": "Face recognition is not configured on this server", "hint": …}` |
+| Models still downloading | `downloading` | `{"error": …, "code": "face_models_downloading", "progress": {"file", "downloaded_bytes", "total_bytes"} \| null}` |
+| Download failed, or the model will not load | `unavailable` | `{"error": …, "code": "face_recognition_unavailable", "reason": "<sentence>"}` |
+
+`progress` is the file in flight; `total_bytes` is the download's estimate until the server
+states a length. A client waiting on `face_models_downloading` can ask again: recognition
+switches on by itself. Loaded, `status` is `ready` and `available` is `true`.
 
 | Route | Does |
 |---|---|
+| `GET /faces` | The household summary: `{available, status, progress?, reason?, default_threshold, people: [{profile_id, name, enrollments, threshold, last_enrolled_at}]}`. Every profile is listed, 0 enrolments included (and every count is 0 until recognition is loaded); `threshold` is the per-profile override or null. |
 | `POST /faces/register` | Multipart `profile_id`, `image`, optional `bbox=x,y,w,h`. Enrols one sample. 404 for an unknown profile, 422 when a gate rejects the frame. Returns `{id, profile_id, model_dims, created_at}`. |
+| `POST /faces/register-from-camera` | JSON `{profile_id, camera_id?}`. Enrols the camera's latest frame through the same `register_face`, so the sample has the angle and light recognition will see. The frame must be under 10 s old. `403 reason: "cameras_disabled"` with camera consent off, 404 for an unknown profile, `409 reason: "no_frame"` without a recent frame, `422 reason: "no_face"` when a gate rejects it. |
 | `POST /faces/identify` | Multipart `image`, optional `bbox`. Single frame, no liveness: a photo can pass. Returns `{identified, profile_id, confidence, threshold}`. |
 | `POST /faces/identify-burst` | Multipart `image` repeated, optional `bbox`. See below. |
 | `POST /faces/enroll-quality` | Multipart `image`, optional `profile_id`. Dry run: `{ok, reason, matches_existing, matched_profile, confidence, existing_samples, recommended_min_samples, self_consistency, alignment_with_existing, consistency_warning, …}`. Nothing is stored. |
 | `GET /faces/profile/{profile_id}` | `{profile_id, enrollments: [{id, profile_id, model_dims, created_at}], count}`. Never the vectors. |
 | `GET` / `PUT` / `DELETE /faces/profile/{profile_id}/threshold` | Per-profile threshold override. `PUT` body `{threshold: 0.0–1.0, note?}`. |
-| `GET /faces/models` | `{feature_enabled, models_dir, models: [{name, label, role, expected_mb, size_mb, downloaded, path}]}` for the six files above. |
+| `GET /faces/models` | `{available, status, progress?, reason?, feature_enabled, models_dir, models: [{name, label, role, expected_mb, size_mb, downloaded, path}]}` for the six files above. |
 | `GET /faces/debug/pairwise` | Cosine matrix across every enrolment, with a verdict on embedding collapse. |
 | `GET /faces/debug/eval` | False-accept / false-reject rates across thresholds on the enrolled data. |
 | `DELETE /users/{profile_id}/biometrics` | Deletes every embedding for the profile. Deleting the profile does the same (`ON DELETE CASCADE`). |
@@ -229,8 +290,12 @@ Manage drawer → **Faces**. A webcam preview with a crop guide, a profile selec
 | Identify face | `POST /faces/identify-burst` with 5 frames | "Welcome back, <name>!", a liveness refusal ("Photos and phone screens won't work"), or that the face is not recognised |
 | Delete biometrics | inline confirmation, then `DELETE /users/{id}/biometrics` | the count dropping to zero |
 
-A 503 shows "Face recognition isn't turned on yet" and disables the actions; other
-failures show a plain sentence, never a raw status code.
+A 503 disables the actions and says why: `face_models_downloading` shows that the Pond is
+downloading its face models, the file and megabytes so far, and that no restart is needed, and
+the screen asks again every 15 seconds until recognition is on; `face_recognition_unavailable`
+shows the server's `reason`; any other 503 shows "Face recognition isn't turned on yet". Other
+failures show a plain sentence, never a raw status code. The strings are in
+`pond-desktop/src/i18n.ts` under `faces`.
 
 ---
 
@@ -241,8 +306,8 @@ cargo run -p pond-server --features face-onnx -- serve            # add --native
 ```
 
 `scripts/dev.sh` builds with `face-onnx` unless `NO_FACE=1`. The first start downloads
-the models into `<data_dir>/models/face/`; later starts print that each is already
-present. The startup log shows what loaded:
+the models into `<data_dir>/models/face/` in the background while it serves; later starts
+find each already present. The log shows what loaded:
 
 ```
 INFO pond_adapters_face_onnx: face embedding ONNX model loaded model=ArcFace512 path=…/adaface_ir101.onnx
@@ -298,7 +363,11 @@ unset.
 
 ## Privacy
 
-- No frame is written to disk. An enrolment is 512 × f32 (2 KB) in the local database.
+- No enrolment frame is written to disk. An enrolment is 512 × f32 (2 KB) in the local database.
+  (Camera events keep their own snapshot JPEGs under `<data_dir>/snapshots`; those are not
+  enrolments.)
+- With camera consent (`cameras_enabled`) off, nothing is captured, and enrolment from the camera
+  is refused.
 - An embedding is an identification fingerprint, not an image, though it is still
   biometric data and is treated as such.
 - `DELETE /users/{profile_id}/biometrics`, or deleting the profile, removes every

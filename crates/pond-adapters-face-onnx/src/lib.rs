@@ -57,12 +57,11 @@ use async_trait::async_trait;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, RgbImage};
 use ndarray::Array4;
-use ort::session::Session;
 use ort::value::Tensor;
 use pond_core::user_data::domain::face_recognition::{BoundingBox, FaceLandmarks};
 use pond_core::user_data::ports::face_embedding_extractor::FaceEmbeddingExtractor;
+use pond_onnx_accel::{AcceleratedSession, ModelSpec};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::alignment::align_to_canonical_112;
@@ -302,9 +301,23 @@ fn clahe_per_channel(img: &mut RgbImage, tiles_per_axis: u32, clip_limit: f32) {
     }
 }
 
+pub use pond_core::models::domain::acceleration::{
+    FACE_ANTISPOOF as ANTISPOOF_NAME, FACE_DETECTOR as DETECTOR_NAME,
+    FACE_EMBEDDER as EMBEDDER_NAME,
+};
+
+/// What the GPU warm-up feeds the embedder: one aligned crop.
+pub fn embedder_spec(model: EmbeddingModel) -> ModelSpec {
+    let side = model.input_size() as i64;
+    ModelSpec {
+        name: EMBEDDER_NAME,
+        input_shape: vec![1, 3, side, side],
+        gpu: true,
+    }
+}
+
 pub struct OnnxFaceEmbeddingExtractor {
-    // std Mutex, not tokio: `Session::run` needs `&mut self` and runs inside `spawn_blocking`.
-    session: Arc<Mutex<Session>>,
+    session: AcceleratedSession,
     model: EmbeddingModel,
     model_path: PathBuf,
 }
@@ -320,12 +333,7 @@ impl OnnxFaceEmbeddingExtractor {
             ));
         }
 
-        let session = Session::builder()
-            .context(
-                "failed to create ort session builder — is the ONNX Runtime library available?",
-            )?
-            .commit_from_file(&path)
-            .with_context(|| format!("failed to load ONNX model at {}", path.display()))?;
+        let session = AcceleratedSession::load(&path, embedder_spec(model))?;
 
         info!(
             model = ?model,
@@ -335,10 +343,14 @@ impl OnnxFaceEmbeddingExtractor {
         );
 
         Ok(Self {
-            session: Arc::new(Mutex::new(session)),
+            session,
             model,
             model_path: path,
         })
+    }
+
+    pub fn session(&self) -> &AcceleratedSession {
+        &self.session
     }
 
     /// Path the adapter is serving embeddings from (diagnostic).
@@ -664,22 +676,19 @@ impl FaceEmbeddingExtractor for OnnxFaceEmbeddingExtractor {
                 None => return Ok(None),
             };
             let input = Tensor::from_array(tensor).context("failed to wrap input as ort tensor")?;
-
-            let mut session = session
-                .lock()
-                .map_err(|_| anyhow!("face embedding session mutex was poisoned"))?;
-            let outputs = session
-                .run(ort::inputs![input])
-                .context("ONNX inference failed")?;
-            let (_name, first) = outputs
-                .iter()
-                .next()
-                .ok_or_else(|| anyhow!("ONNX model returned no outputs"))?;
-            let (_shape, data) = first
-                .try_extract_tensor::<f32>()
-                .context("failed to extract f32 tensor from ONNX output")?;
-
-            postprocess(data, model.dims()).map(Some)
+            session.run(|session| {
+                let outputs = session
+                    .run(ort::inputs![input])
+                    .context("ONNX inference failed")?;
+                let (_name, first) = outputs
+                    .iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("ONNX model returned no outputs"))?;
+                let (_shape, data) = first
+                    .try_extract_tensor::<f32>()
+                    .context("failed to extract f32 tensor from ONNX output")?;
+                postprocess(data, model.dims()).map(Some)
+            })
         })
         .await
         .context("face inference task panicked")??;

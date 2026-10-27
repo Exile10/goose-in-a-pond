@@ -253,6 +253,14 @@ con.execute(
     "ON CONFLICT(job) DO UPDATE SET last_run_at = excluded.last_run_at",
     ("titling", at.replace(microsecond=0).isoformat().replace("+00:00", "Z")),
 )
+# A memory with no vector; the restart pass asserts the boot backfill embeds it
+# (live_checks.UNEMBEDDED_BEFORE_RESTART_ID).
+con.execute(
+    "INSERT OR REPLACE INTO memory_fragments (id, content, embedding, source, tags, created_at, "
+    "segment, importance, access_count, lifecycle) VALUES (?, ?, NULL, 'api', '[]', "
+    "datetime('now'), 'project', 0.6, 0, 'active')",
+    ("live-unembedded-before-restart", "I am building a rain gauge for the allotment"),
+)
 con.commit()
 LANESTAMP
 POND_DATA_DIR="$DATA_DIR" POND_DEV_ALLOW_LOOPBACK=1 RUST_LOG=info \
@@ -373,6 +381,10 @@ if [ "$AUTH_OK" -eq 1 ]; then
   fi
   # The connections settings: token-only, every link in one read, and the claimant may change them.
   if ! POND_DATA_DIR="$AUTH_DIR" POND_SERVER_BIN="$BIN" python3 scripts/setup_code_checks.py connections; then
+    RC=1
+  fi
+  # An <img> cannot send a header, so the camera streams alone take the token in the query.
+  if ! POND_DATA_DIR="$AUTH_DIR" POND_SERVER_BIN="$BIN" python3 scripts/setup_code_checks.py camera-stream; then
     RC=1
   fi
 

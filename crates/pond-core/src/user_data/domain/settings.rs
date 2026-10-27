@@ -323,11 +323,11 @@ pub struct Settings {
     #[serde(default = "Settings::default_vision_camera_id")]
     pub vision_camera_id: String,
 
-    /// Frames analysed per second; kept low to bound CPU use on the Jetson.
+    /// Frames analysed per second (1–30).
     #[serde(default = "Settings::default_vision_fps")]
     pub vision_fps: u32,
 
-    /// Fraction of the frame (0.0–1.0) that must change to count as motion.
+    /// Fraction of the frame (0.005–0.5) that must change to count as motion.
     #[serde(default = "Settings::default_vision_motion_threshold")]
     pub vision_motion_threshold: f64,
 
@@ -335,6 +335,26 @@ pub struct Settings {
     /// Relative paths resolve under `<data_dir>/models/vision/`; ignored without `vision-onnx`.
     #[serde(default = "Settings::default_vision_classifier_model")]
     pub vision_classifier_model: String,
+
+    /// Minimum seconds between camera events, so steady movement is one event, not a flood.
+    #[serde(default = "Settings::default_vision_event_cooldown_secs")]
+    pub vision_event_cooldown_secs: u64,
+
+    /// How sure the detector must be (0.05–0.99) before an event is named, not just "motion".
+    #[serde(default = "Settings::default_vision_classifier_confidence")]
+    pub vision_classifier_confidence: f64,
+
+    /// Recognise household faces in camera events, so rules can tell who arrived.
+    #[serde(default = "Settings::default_vision_face_recognition_enabled")]
+    pub vision_face_recognition_enabled: bool,
+
+    /// Also look for faces in plain movement, not only once the detector saw a person.
+    #[serde(default = "Settings::default_vision_face_on_motion")]
+    pub vision_face_on_motion: bool,
+
+    /// Kinds of camera event to record and announce; empty records every kind.
+    #[serde(default = "Settings::default_vision_event_types")]
+    pub vision_event_types: Vec<String>,
 
     /// Allow downloading picture support (vision encoder mmproj) on budgeted devices.
     #[serde(default = "Settings::default_picture_support_download_enabled")]
@@ -540,9 +560,17 @@ pub struct Settings {
     #[serde(default)]
     pub memory_graph_enabled: bool,
 
-    /// When true, scheduled task results are broadcast as SSE events / desktop notifications.
+    /// When true, a finished scheduled task or rule run is announced to the household's phones.
+    /// Off, runs still reach the dashboard's live schedule feed.
     #[serde(default = "Settings::default_schedule_result_notify")]
     pub schedule_result_notify: bool,
+
+    /// When true, the Pond tells the household's phones about itself: model downloads, parts that
+    /// did not start, a low disk, remote access stopping, an account sign-in that expired. Security
+    /// notices (a device removed) are sent either way. The catalogue is in
+    /// `docs/architecture/notifications.md`.
+    #[serde(default = "Settings::default_system_notices_enabled")]
+    pub system_notices_enabled: bool,
 
     // ── Memory tuning ────────────────────────────────────────────────────────
     /// Base decay half-life; each memory's is `base * (1 + importance)`.
@@ -798,6 +826,11 @@ impl Default for Settings {
             vision_fps: Self::default_vision_fps(),
             vision_motion_threshold: Self::default_vision_motion_threshold(),
             vision_classifier_model: Self::default_vision_classifier_model(),
+            vision_event_cooldown_secs: Self::default_vision_event_cooldown_secs(),
+            vision_classifier_confidence: Self::default_vision_classifier_confidence(),
+            vision_face_recognition_enabled: Self::default_vision_face_recognition_enabled(),
+            vision_face_on_motion: Self::default_vision_face_on_motion(),
+            vision_event_types: Self::default_vision_event_types(),
             picture_support_download_enabled: Self::default_picture_support_download_enabled(),
             matter_ws_url: Self::default_matter_ws_url(),
             matter_ble_enabled: Self::default_matter_ble_enabled(),
@@ -848,6 +881,7 @@ impl Default for Settings {
             memory_consolidation_mode: Self::default_memory_consolidation_mode(),
             memory_graph_enabled: false,
             schedule_result_notify: Self::default_schedule_result_notify(),
+            system_notices_enabled: Self::default_system_notices_enabled(),
             memory_decay_base_half_life_days: Self::default_memory_decay_base_half_life_days(),
             memory_decay_beta: Self::default_memory_decay_beta(),
             memory_prune_threshold: Self::default_memory_prune_threshold(),
@@ -1006,16 +1040,34 @@ impl Settings {
         "".to_string()
     }
     fn default_vision_camera_id() -> String {
-        "camera-1".to_string()
+        super::vision::DEFAULT_CAMERA_ID.to_string()
     }
     fn default_vision_fps() -> u32 {
-        2
+        super::vision::DEFAULT_FPS
     }
     fn default_vision_motion_threshold() -> f64 {
-        0.05
+        super::vision::DEFAULT_MOTION_THRESHOLD
     }
     fn default_vision_classifier_model() -> String {
         "".to_string()
+    }
+    fn default_vision_event_cooldown_secs() -> u64 {
+        super::vision::DEFAULT_EVENT_COOLDOWN_SECS
+    }
+    fn default_vision_classifier_confidence() -> f64 {
+        super::vision::DEFAULT_CLASSIFIER_CONFIDENCE
+    }
+    fn default_vision_face_recognition_enabled() -> bool {
+        true
+    }
+    fn default_vision_face_on_motion() -> bool {
+        true
+    }
+    fn default_vision_event_types() -> Vec<String> {
+        super::vision::EVENT_TYPES
+            .iter()
+            .map(|t| t.to_string())
+            .collect()
     }
     fn default_picture_support_download_enabled() -> bool {
         false
@@ -1168,6 +1220,9 @@ impl Settings {
         5
     }
     fn default_schedule_result_notify() -> bool {
+        true
+    }
+    fn default_system_notices_enabled() -> bool {
         true
     }
     fn default_memory_decay_base_half_life_days() -> f32 {
@@ -2049,6 +2104,7 @@ mod tests {
             "schedule_max_concurrent",
             "schedule_max_runs_per_task",
             "schedule_result_notify",
+            "system_notices_enabled",
             "session_titling_enabled",
             "reasoning_effort",
             "show_thinking",
@@ -2069,6 +2125,11 @@ mod tests {
             "vision_enabled",
             "vision_fps",
             "vision_motion_threshold",
+            "vision_event_cooldown_secs",
+            "vision_classifier_confidence",
+            "vision_face_recognition_enabled",
+            "vision_face_on_motion",
+            "vision_event_types",
             "picture_support_download_enabled",
             "voice_kws_cooldown_ms",
             "voice_kws_energy_threshold",

@@ -4,7 +4,7 @@
  */
 
 /** Bumped when a change would break a Rust client that has not been updated with it. */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** Named in the greeting so a wrong address fails with a name, not a parse error. */
 export const PROTOCOL_NAME = "giap-matter";
@@ -42,6 +42,25 @@ export interface Reading {
   unit: string;
   /** RFC 3339. */
   at: string;
+}
+
+/**
+ * A device the mDNS probe found advertising for commissioning, not yet paired. Its setup code is
+ * never advertised, so `device_identifier` only lets the phone match this entry to a physical
+ * device it already has a code for — it is not enough to commission with on its own.
+ */
+export interface DiscoveredDevice {
+  /** Per-session identifier from the advertisement; not a fabric node id. */
+  device_identifier: string;
+  /** Long discriminator, as printed on a manual pairing code or encoded in the QR code. */
+  discriminator?: number;
+  vendor_id?: number;
+  product_id?: number;
+  /** Matter device type id (e.g. 0x0100 for an on/off light), if advertised. */
+  device_type?: number;
+  /** The device's own advertised name, if it sets one. */
+  name?: string;
+  addresses: { ip: string; port: number }[];
 }
 
 /** What a control op actually changed, per the server; only fields the verb touched are set. */

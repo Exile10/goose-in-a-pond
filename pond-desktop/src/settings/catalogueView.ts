@@ -21,7 +21,7 @@ const NULLABLE_TEXT = new Set([
 ]);
 
 /** List-valued text boxes, typed comma-separated; one left out is sent raw and 422s the whole Save. */
-const LIST_TEXT = new Set(["voice_wake_word_transcriptions", "suggestions_muted"]);
+const LIST_TEXT = new Set(["voice_wake_word_transcriptions", "suggestions_muted", "vision_event_types"]);
 
 /** Inverse of `textValue`. Returns the shape the server expects for this key. */
 export function parseText(key: string, raw: string): unknown {

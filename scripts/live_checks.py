@@ -1074,6 +1074,212 @@ def section_redaction():
     )
 
 
+# ── Memory vectors ───────────────────────────────────────────────────────────
+
+VECTORS_DB = os.path.join(DATA_DIR, "pond_vectors.db")
+
+# Stored by live-test.sh with no vector while the first server is down, so only the second
+# server's boot backfill can have embedded it.
+UNEMBEDDED_BEFORE_RESTART_ID = "live-unembedded-before-restart"
+
+
+def _memory_vector(memory_id):
+    """The stored vector's bytes, or None when the row has none or does not exist."""
+    con = db()
+    row = con.execute(
+        "SELECT embedding FROM memory_fragments WHERE id = ?", (memory_id,)
+    ).fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def _index_vector(memory_id):
+    """The shared index's vector for a memory, or None."""
+    if not os.path.exists(VECTORS_DB):
+        return None
+    con = sqlite3.connect(VECTORS_DB)
+    row = con.execute(
+        "SELECT vector FROM vectors WHERE corpus = 'memory' AND row_id = ?", (memory_id,)
+    ).fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def _index_state(memory_id, expected):
+    """What the index holds for a memory, against the vector the row holds."""
+    held = _index_vector(memory_id)
+    if held is None:
+        return "index holds nothing"
+    return "index matches the row" if held == expected else "index holds a different vector"
+
+
+def _wait_for_vector(memory_id, seconds):
+    import time as _time
+
+    deadline = _time.monotonic() + seconds
+    while _time.monotonic() < deadline:
+        vector = _memory_vector(memory_id)
+        if vector is not None:
+            return vector
+        _time.sleep(0.5)
+    return None
+
+
+def _embedder_dims(label):
+    """The pond's embedding width, or None after saying why nothing can be checked.
+
+    A pond with no embedding model stores every memory without a vector by design, so every
+    check below would fail for a reason that is not the one under test. That is a SKIP, and
+    it is printed as one rather than counted as a pass.
+    """
+    code, health = call("GET", "/api/v1/context/index/health")
+    if not expect(label, code, 200, health):
+        return None
+    if not health.get("indexed"):
+        print(
+            "SKIP  %s: no embedding model on this pond (%s)"
+            % (label, health.get("reason"))
+        )
+        return None
+    return health.get("dims")
+
+
+def section_memory_vectors():
+    """A memory written through the API is stored with its vector, not left for the sweep.
+
+    The route tests build the store by hand. Only this pass shows that `run_server` hands the
+    route the embedder and index the extraction path writes through, on real files. A memory
+    stored without a vector is missing from semantic recall until the idle sweep runs. Runs
+    after `section_redaction`, whose stored credential it inspects.
+    """
+    print("\n=== memory vectors: stored with the memory ===")
+    dims = _embedder_dims("memory vectors")
+    if not dims:
+        return
+    width = dims * 4
+
+    code, body = call(
+        "POST",
+        "/api/v1/memories",
+        {
+            "content": "I am building a solar irrigation controller for the greenhouse",
+            "segment": "project",
+        },
+    )
+    if not expect("a memory is saved", code, 201, body):
+        return
+    mid = body.get("id")
+    saved = _memory_vector(mid)
+    check(
+        "it was stored with a vector of the model's width",
+        saved is not None and len(saved) == width,
+        "%s bytes, wanted %d" % (None if saved is None else len(saved), width),
+    )
+    check(
+        "the same vector is in the shared index",
+        saved is not None and _index_vector(mid) == saved,
+        _index_state(mid, saved),
+    )
+
+    code, body = call(
+        "PUT", "/api/v1/memories/%s" % mid, {"content": "I am restoring a vintage motorbike"}
+    )
+    if expect("the memory is reworded", code, 204, body):
+        edited = _memory_vector(mid)
+        check(
+            "the edit stored a vector for the new words",
+            edited is not None and len(edited) == width and edited != saved,
+            "unchanged" if edited == saved else "%s bytes" % (None if edited is None else len(edited)),
+        )
+        check(
+            "and the index moved with it",
+            edited is not None and _index_vector(mid) == edited,
+            _index_state(mid, edited),
+        )
+
+    # The restart pass rings the sweep, which embeds the redacted text and is entitled to.
+    con = db()
+    rows = con.execute(
+        "SELECT id, embedding IS NULL FROM memory_fragments WHERE source = 'live-check'"
+    ).fetchall()
+    con.close()
+    check(
+        "the stored credential kept no vector of the unredacted text",
+        len(rows) == 1 and rows[0][1] == 1,
+        str(rows),
+    )
+    check(
+        "and the index holds none for it",
+        len(rows) == 1 and _index_vector(rows[0][0]) is None,
+        str(rows),
+    )
+
+
+def section_memory_vectors_after_restart():
+    """Both repairs for a memory with no vector: the next boot, and the sweep rung by hand.
+
+    The sweep runs last, after `section_lane_clock_after_restart`, which needs every job but
+    titling never to have run.
+    """
+    print("\n=== memory vectors after a restart: the boot backfill and the sweep ===")
+    dims = _embedder_dims("memory vectors after a restart")
+    if not dims:
+        return
+    width = dims * 4
+    con = db()
+    present = con.execute(
+        "SELECT COUNT(*) FROM memory_fragments WHERE id = ?", (UNEMBEDDED_BEFORE_RESTART_ID,)
+    ).fetchone()[0]
+    con.close()
+    if not check(
+        "live-test.sh stored a memory with no vector while the server was down",
+        present == 1,
+        "%d such rows" % present,
+    ):
+        return
+    vector = _wait_for_vector(UNEMBEDDED_BEFORE_RESTART_ID, 30)
+    check(
+        "the boot backfill embedded it",
+        vector is not None and len(vector) == width,
+        "no vector after 30s" if vector is None else "%d bytes" % len(vector),
+    )
+    check(
+        "and indexed it",
+        vector is not None and _index_vector(UNEMBEDDED_BEFORE_RESTART_ID) == vector,
+        _index_state(UNEMBEDDED_BEFORE_RESTART_ID, vector),
+    )
+
+    # A save whose embed failed after boot: only the sweep repairs it.
+    sweep_id = "live-unembedded-sweep"
+    con = db()
+    con.execute(
+        "INSERT INTO memory_fragments (id, content, embedding, source, tags, created_at, "
+        "access_count, lifecycle) VALUES (?, ?, NULL, 'api', '[]', datetime('now'), 0, 'active')",
+        (sweep_id, "The greenhouse vents open at thirty degrees"),
+    )
+    con.commit()
+    con.close()
+    code, body = call("POST", "/api/v1/lane/jobs/index_maintenance/run")
+    if expect(
+        "the index sweep can be rung",
+        code,
+        200,
+        body,
+        ("it woke", lambda b: isinstance(b, dict) and b.get("woken") is True),
+    ):
+        swept = _wait_for_vector(sweep_id, 60)
+        check(
+            "the sweep embedded a memory stored without a vector",
+            swept is not None and len(swept) == width,
+            "no vector after 60s" if swept is None else "%d bytes" % len(swept),
+        )
+        check(
+            "and indexed it",
+            swept is not None and _index_vector(sweep_id) == swept,
+            _index_state(sweep_id, swept),
+        )
+
+
 def section_policy_telemetry():
     """PAI-2 P8a -- is the would-deny telemetry wired by `run_server`?
 
@@ -1693,6 +1899,137 @@ def section_picture_support_after_restart():
     )
 
 
+# A camera that refuses at once: port 9 is closed on loopback, so nothing leaves the machine.
+_DEAD_CAMERA = "rtsp://live:test-secret@127.0.0.1:9/live"
+
+
+def _vision_status():
+    code, body = call("GET", "/api/v1/vision/status")
+    return code, body if isinstance(body, dict) else {}
+
+
+def _wait_for_vision(states, seconds=20):
+    import time
+
+    deadline = time.time() + seconds
+    body = {}
+    while time.time() < deadline:
+        code, body = _vision_status()
+        if code == 200 and body.get("state") in states:
+            return body
+        time.sleep(0.5)
+    return body
+
+
+def section_vision():
+    """The vision supervisor on a real server: it follows settings live, shows why it is not
+    capturing, never shows camera credentials, and stops for camera consent. Leaves a bus setting
+    for the restart pass."""
+    print("\n=== vision ===")
+    code, body = _vision_status()
+    expect(
+        "GET /vision/status answers with vision off by default",
+        code, 200, body,
+        ("state off", lambda b: b.get("state") == "off"),
+        ("consent on", lambda b: b.get("cameras_enabled") is True),
+    )
+    code, body = call("GET", "/api/v1/cameras")
+    expect(
+        "GET /cameras lists the configured camera, not live",
+        code, 200, body,
+        ("not live", lambda b: isinstance(b, dict) and b["cameras"] and b["cameras"][0]["live"] is False),
+    )
+    code, body = call("GET", "/api/v1/faces")
+    expect(
+        "GET /faces answers with every profile",
+        code, 200, body,
+        ("people listed", lambda b: isinstance(b, dict) and isinstance(b.get("people"), list)),
+        ("says where recognition stands", lambda b: isinstance(b, dict)
+            and b.get("status") in ("ready", "downloading", "unavailable", "not_built")),
+    )
+    # A fresh data dir has no face models: the server answers while they download in the
+    # background, and a face route says so rather than giving a bare 503.
+    if isinstance(body, dict) and body.get("status") == "downloading":
+        code, body = call("GET", "/api/v1/faces/profile/nobody")
+        expect(
+            "a face route answers face_models_downloading while the models download",
+            code, 503, body,
+            ("code", lambda b: isinstance(b, dict) and b.get("code") == "face_models_downloading"),
+        )
+
+    code, body = call(
+        "PUT", "/api/v1/vision/config",
+        {"min_event_interval_secs": 42, "enabled_event_types": ["Person"], "vision_fps": 60},
+    )
+    expect(
+        "PUT /vision/config saves through settings",
+        code, 200, body,
+        ("cooldown", lambda b: b.get("min_event_interval_secs") == 42),
+        ("types normalised", lambda b: b.get("vision_event_types") == ["person"]),
+        ("fps clamped to 30", lambda b: b.get("vision_fps") == 30),
+    )
+
+    code, body = call("PUT", "/api/v1/settings", {"vision_enabled": True, "vision_camera_url": _DEAD_CAMERA})
+    if not expect("vision switched on with an unreachable camera", code, 200, body):
+        return
+    try:
+        status = _wait_for_vision({"reconnecting"})
+        check(
+            "the supervisor picks the camera up without a restart and shows why it is failing",
+            status.get("state") == "reconnecting" and bool(status.get("last_error")),
+            json.dumps(status),
+        )
+        check(
+            "the camera's credentials never reach the status",
+            status.get("source") == "rtsp://***@127.0.0.1:9/live"
+            and "test-secret" not in json.dumps(status),
+            json.dumps(status),
+        )
+        check(
+            "a camera that never delivered has no capture path",
+            "capture" in status and status["capture"] is None,
+            json.dumps(status),
+        )
+
+        code, body = call("PUT", "/api/v1/settings", {"cameras_enabled": False})
+        expect("camera consent switched off", code, 200, body)
+        status = _wait_for_vision({"consent_off"}, seconds=8)
+        check("consent off stops the supervisor within seconds", status.get("state") == "consent_off", json.dumps(status))
+        code, body = call("GET", "/api/v1/camera/snapshot")
+        expect(
+            "a camera picture is refused while consent is off",
+            code, 403, body,
+            ("reason", lambda b: isinstance(b, dict) and b.get("reason") == "cameras_disabled"),
+        )
+        log = os.path.join(DATA_DIR, "server.out")
+        text = open(log, errors="replace").read() if os.path.exists(log) else ""
+        check(
+            "the stop is logged with its reason",
+            "vision supervisor stopped the camera pipeline" in text and "camera consent turned off" in text,
+            log,
+        )
+    finally:
+        code, body = call(
+            "PUT", "/api/v1/settings",
+            {"cameras_enabled": True, "vision_enabled": False, "vision_camera_url": ""},
+        )
+        expect("vision off and camera consent back on", code, 200, body)
+
+
+def section_vision_after_restart():
+    """The bus settings are settings: a fresh process starts from them."""
+    print("\n=== vision after restart ===")
+    code, body = call("GET", "/api/v1/vision/config")
+    expect(
+        "the vision bus settings survive a restart",
+        code, 200, body,
+        ("cooldown", lambda b: b.get("min_event_interval_secs") == 42),
+        ("types", lambda b: b.get("enabled_event_types") == ["person"]),
+    )
+    code, body = _vision_status()
+    expect("vision is still off after a restart", code, 200, body, ("off", lambda b: b.get("state") == "off"))
+
+
 def main():
     """Auth is NOT checked here.
 
@@ -1714,6 +2051,8 @@ def main():
         section_audio_devices_after_restart()
         section_lane_clock_after_restart()
         section_picture_support_after_restart()
+        section_memory_vectors_after_restart()
+        section_vision_after_restart()
     else:
         section_schema()
         jerry, liz = section_identity()
@@ -1721,6 +2060,7 @@ def main():
         section_legacy_rows(jerry)
         section_secret_store()
         section_redaction()
+        section_memory_vectors()
         section_network_mode()
         section_music_player()
         section_web_search()
@@ -1734,6 +2074,7 @@ def main():
         section_inference_lane()
         section_composed_suggestions()
         section_reminders_surface()
+        section_vision()
         # Last: it moves the chat model to a local one for a moment, and puts it back.
         section_picture_support()
 

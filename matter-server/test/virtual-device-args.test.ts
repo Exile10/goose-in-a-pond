@@ -133,6 +133,22 @@ describe("virtual device arguments", () => {
     expect(() => parseArgs(["--device", "on-off-light", "--colour", "red"])).toThrow(/unknown option/);
   });
 
+  it("gives a battery to whatever was named last", () => {
+    const plain = parseArgs(["--device", "contact-sensor", "--battery"]);
+    expect(plain.device?.battery).toBe(true);
+
+    const hub = parseArgs([
+      "--bridged", "contact-sensor=Front Door",
+      "--bridged", "on-off-light=Hall",
+      "--battery",
+    ]);
+    expect(hub.bridged.map(b => b.battery === true)).toEqual([false, true]);
+  });
+
+  it("refuses a battery with nothing to put it in", () => {
+    expect(() => parseArgs(["--battery"])).toThrow(/--battery needs/);
+  });
+
   it("refuses a device type that is not a module name", () => {
     expect(() => parseDevice("DimmableLight", "x")).toThrow(/kebab-case/);
   });

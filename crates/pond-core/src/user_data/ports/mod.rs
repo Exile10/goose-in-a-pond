@@ -24,6 +24,7 @@ pub mod proposal;
 pub mod push_token;
 pub mod recipe;
 pub mod reminder_repository;
+pub mod room_registry;
 pub mod schedule_execution;
 pub mod scheduler;
 pub mod sensor_storage;

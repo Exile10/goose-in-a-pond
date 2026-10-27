@@ -38,13 +38,17 @@ use pond_core::user_data::domain::profile::CreateProfileRequest;
 use pond_core::user_data::domain::schedule::{
     OneShotTimePassed, Schedule, SensorTriggerSpec, TaskKind,
 };
-use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::user_data::domain::sensor::SensorReading;
 use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::device_attribution::DeviceAttribution;
 use pond_core::user_data::ports::device_registry::RegisterDeviceRequest;
+use pond_core::user_data::ports::face_recognition::FaceRecognition;
 use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
 use pond_core::user_data::ports::session_storage::SessionStorageError;
+use pond_core::user_data::services::face_recognition_slot::{
+    FaceModelsProgress, FaceRecognitionNotReady,
+};
 use pond_core::user_data::services::identity_resolution;
 use pond_core::user_data::services::oauth_providers;
 use pond_core::user_data::services::onboarding::OnboardingService;
@@ -187,6 +191,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(register_push_token).delete(delete_push_token),
         )
         .route("/notifications/stream", get(notifications_stream))
+        // The stream's fallback for a phone a push wake brought back: the caller's own queue only.
+        .route("/notifications/pending", get(notifications_pending))
+        .route("/notifications/{id}/ack", post(acknowledge_notification))
         .route("/models/download/control", post(download_control))
         .route("/models/{category}/{name}/download", post(download_model))
         .route("/models/{category}/{name}/activate", post(activate_model));
@@ -240,6 +247,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/commission", post(commission_device))
+        .route("/devices/discovered", get(discover_devices))
         .route("/matter/status", get(matter_status))
         .route(
             "/devices/{id}",
@@ -247,6 +255,11 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
         .route("/devices/{id}/offline", post(device_offline))
+        .route("/rooms", get(list_rooms).post(create_room))
+        .route(
+            "/rooms/{id}",
+            get(get_room).put(rename_room).delete(delete_room),
+        )
         // Private mesh: trust-circle peers + self invite.
         .route("/mesh/peers", get(list_mesh_peers).post(add_mesh_peer))
         .route(
@@ -293,27 +306,43 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/activity/summary", get(activity_summary))
         // Would-deny policy telemetry; must stay out of PUBLIC_ROUTES.
         .route("/security/policy-report", get(policy_report))
-        .route("/cameras", get(list_cameras))
+        .route("/cameras", get(crate::camera::list_cameras))
         .route(
             "/vision/config",
-            get(get_vision_config).put(update_vision_config),
+            get(crate::camera::get_vision_config).put(crate::camera::update_vision_config),
         )
-        .route("/vision/events/stream", get(stream_vision_events_sse))
-        .route("/camera/snapshot", get(get_default_camera_snapshot))
-        .route("/camera/{camera_id}/snapshot", get(get_camera_snapshot))
-        .route("/camera/stream", get(get_default_camera_stream))
-        .route("/camera/{camera_id}/stream", get(get_camera_stream))
+        .route("/vision/status", get(crate::camera::get_vision_status))
+        .route(
+            "/vision/events/stream",
+            get(crate::camera::stream_vision_events_sse),
+        )
+        .route(
+            "/camera/snapshot",
+            get(crate::camera::get_default_camera_snapshot),
+        )
+        .route(
+            "/camera/{camera_id}/snapshot",
+            get(crate::camera::get_camera_snapshot),
+        )
+        .route(
+            "/camera/stream",
+            get(crate::camera::get_default_camera_stream),
+        )
+        .route(
+            "/camera/{camera_id}/stream",
+            get(crate::camera::get_camera_stream),
+        )
         .route(
             "/camera/events",
-            get(list_camera_events).post(record_camera_event),
+            get(crate::camera::list_camera_events).post(crate::camera::record_camera_event),
         )
         .route(
             "/camera/events/{id}/acknowledge",
-            patch(acknowledge_camera_event),
+            patch(crate::camera::acknowledge_camera_event),
         )
         .route(
             "/camera/events/{id}/snapshot",
-            get(get_camera_event_snapshot),
+            get(crate::camera::get_camera_event_snapshot),
         )
         // ── Scheduler ──────────────────────────────────────────────────────────
         .route("/schedules", get(list_schedules).post(create_schedule))
@@ -491,6 +520,12 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/recipes/{id}", put(update_recipe).delete(delete_recipe))
         .route("/recipes/{name}/run", post(run_recipe))
         // ── Face biometrics ───────────────────────────────────────────────────
+        // Household summary and camera enrolment: biometric, so never in PUBLIC_ROUTES.
+        .route("/faces", get(crate::camera::list_household_faces))
+        .route(
+            "/faces/register-from-camera",
+            post(crate::camera::register_face_from_camera),
+        )
         .route("/faces/register", post(register_face_handler))
         .route("/faces/identify", post(identify_face_handler))
         .route("/faces/identify-burst", post(burst_identify_face_handler))
@@ -787,7 +822,8 @@ fn verify_limiter() -> &'static crate::middleware::RateLimiter {
 /// `insecure_dev` marks an attempt that arrived on the plaintext development listener, so the
 /// audit trail says which devices were paired where anyone on the network could watch.
 /// `method` is `cpace` (phones), `cpace-setup` (a phone with the setup card) or `loopback_hmac`
-/// (the dashboard).
+/// (the dashboard). `returning` is the adapter's [`HandshakeResponse::returning_device`]; see
+/// [`announces_pairing`] for when it quiets the household notice.
 async fn emit_pairing_outcome(
     state: &AppState,
     paired: bool,
@@ -795,6 +831,7 @@ async fn emit_pairing_outcome(
     reason: Option<&str>,
     insecure_dev: bool,
     method: &'static str,
+    returning: bool,
 ) {
     use pond_core::security::domain::event::{Event, EventCategory, PrivacySensitivity};
 
@@ -806,12 +843,15 @@ async fn emit_pairing_outcome(
 
     if paired {
         tracing::info!(
+            kind = "pairing_accepted",
             device = device_name.unwrap_or("unnamed"),
             method,
+            returning,
             "pairing accepted"
         );
     } else {
         tracing::warn!(
+            kind = "pairing_rejected",
             device = device_name.unwrap_or("unnamed"),
             reason = reason.unwrap_or("unspecified"),
             method,
@@ -832,9 +872,23 @@ async fn emit_pairing_outcome(
         if insecure_dev {
             event = event.attr("transport", "insecure_dev");
         }
+        if paired && returning {
+            event = event.attr("returning_device", true);
+        }
         if let Err(e) = event_log.append(event).await {
             tracing::warn!(error = %e, action, "failed to record pairing event");
         }
+    }
+
+    // After the event: the audit trail keeps every pairing, only the phone alert is spared.
+    if paired && !announces_pairing(method, returning) {
+        tracing::info!(
+            kind = "pairing_notice_skipped",
+            device = device_name.unwrap_or("unnamed"),
+            method,
+            "a known dashboard re-paired; the household was told when it first paired"
+        );
+        return;
     }
 
     let Some(sender) = state.notification_sender.as_ref() else {
@@ -858,6 +912,18 @@ async fn emit_pairing_outcome(
     {
         tracing::warn!(error = %e, action, "failed to push pairing notification");
     }
+}
+
+/// Whether an accepted pairing tells the household a device was paired.
+///
+/// Every pairing does except the dashboard re-pairing under a device row it already had: it
+/// re-pairs whenever a reload finds its session gone, and the code it pairs with comes only from
+/// the host-only pairing-code route, so the re-pair admits nobody new. A phone's id is
+/// self-reported over the LAN, and a CPace pairing under a known id takes that device's row over
+/// and revokes its sessions, which is what the household must hear about; phones that already
+/// paired come back through `/handshake/refresh`, which never notifies.
+fn announces_pairing(method: &str, returning: bool) -> bool {
+    !(returning && method == "loopback_hmac")
 }
 
 /// The broadcast for a pairing outcome. Either way a tap opens the devices screen, where the
@@ -940,6 +1006,7 @@ async fn handshake_verify(
             Some("pairing_requires_cpace"),
             insecure.is_some(),
             "loopback_hmac",
+            false,
         )
         .await;
         return Err(refusal);
@@ -954,6 +1021,7 @@ async fn handshake_verify(
                 Some("internal_error"),
                 false,
                 "loopback_hmac",
+                false,
             )
             .await;
             return Err(handshake_error("verify", e));
@@ -966,6 +1034,7 @@ async fn handshake_verify(
         resp.rejection_reason.as_deref(),
         false,
         "loopback_hmac",
+        resp.returning_device,
     )
     .await;
     Ok(Json(resp))
@@ -1003,6 +1072,7 @@ async fn handshake_pake_init(
                 Some(refusal.code()),
                 insecure.is_some(),
                 method,
+                false,
             )
             .await;
             StatusCode::FORBIDDEN
@@ -1064,6 +1134,7 @@ async fn handshake_pake_verify(
                 Some("internal_error"),
                 insecure_dev,
                 method,
+                false,
             )
             .await;
             return Err(handshake_error("pake_verify", e));
@@ -1076,6 +1147,7 @@ async fn handshake_pake_verify(
         resp.rejection_reason.as_deref(),
         insecure_dev,
         method,
+        resp.returning_device,
     )
     .await;
     let mut body = serde_json::to_value(&resp).map_err(|e| handshake_error("pake_verify", e))?;
@@ -1774,7 +1846,13 @@ async fn status_tts(
         return Ok(Json(json!({"available": false, "loaded": false})));
     };
     let loaded = control.is_loaded().await;
-    Ok(Json(json!({"available": true, "loaded": loaded})))
+    let accelerator = pond_core::models::domain::acceleration::onnx_device(
+        pond_core::models::domain::acceleration::TTS_KOKORO,
+    )
+    .map(|d| d.as_str());
+    Ok(Json(
+        json!({"available": true, "loaded": loaded, "accelerator": accelerator}),
+    ))
 }
 
 async fn revoke_model(
@@ -4367,7 +4445,7 @@ async fn list_devices(
                 "registered_at": d.registered_at,
                 "last_seen":     d.last_seen,
                 "is_online":     d.is_online,
-                "room":          d.room,
+                "room_id":       d.room_id,
             })
         })
         .collect();
@@ -4399,7 +4477,7 @@ async fn register_device(
             "capabilities":  device.capabilities,
             "registered_at": device.registered_at,
             "is_online":     device.is_online,
-            "room":          device.room,
+            "room_id":       device.room_id,
         })),
     ))
 }
@@ -4469,6 +4547,36 @@ async fn matter_commissioner(
     })
 }
 
+/// `GET /api/v1/devices/discovered` — devices the mDNS probe sees advertising for commissioning,
+/// for the phone to offer as a pick-list. None of this replaces entering a setup code: Matter
+/// never advertises one, so an entry here only helps match a physical device to a code in hand.
+async fn discover_devices(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let commissioner = matter_commissioner(&state).await?;
+    let devices = commissioner.discover().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("{e:#}")})),
+        )
+    })?;
+    let list: Vec<Value> = devices
+        .iter()
+        .map(|d| {
+            json!({
+                "device_identifier": d.device_identifier,
+                "discriminator":     d.discriminator,
+                "vendor_id":         d.vendor_id,
+                "product_id":        d.product_id,
+                "device_type":       d.device_type,
+                "name":              d.name,
+                "addresses":         d.addresses.iter().map(|a| json!({"ip": a.ip, "port": a.port})).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "devices": list })))
+}
+
 /// `POST /api/v1/devices/commission` — bring a Matter device onto the fabric. The optional
 /// `name` becomes its NodeLabel and registry name, so chat can resolve it.
 async fn commission_device(
@@ -4532,7 +4640,7 @@ async fn commission_device(
                 device_type: device.device_type.clone(),
                 hostname: None,
                 capabilities: device.capabilities.clone(),
-                room: None,
+                room_id: None,
             },
         )
         .await
@@ -4566,6 +4674,7 @@ fn bridged_children_of(
 async fn unregister_device(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     remote: Option<
         axum::Extension<Arc<dyn pond_core::security::ports::remote_access::RemoteRevocation>>,
     >,
@@ -4657,9 +4766,19 @@ async fn unregister_device(
         })?;
     }
 
+    // Read before the row goes: the household notice names the device.
+    let name = state
+        .device_registry
+        .get_device(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|d| d.name)
+        .unwrap_or_else(|| id.clone());
+
     // Revoke its tokens too: `session_tokens` has no FK to `devices`, so nothing cascades.
     // Before the row goes, so a failure leaves the device listed and still deletable.
-    match state.handshake.revoke_device(&id).await {
+    let revoked = match state.handshake.revoke_device(&id).await {
         Ok(revoked) => {
             if revoked > 0 {
                 tracing::info!(
@@ -4670,6 +4789,7 @@ async fn unregister_device(
                     "devices: revoked the sessions of a device being removed"
                 );
             }
+            revoked
         }
         Err(e) => {
             tracing::error!(device = %id, error = %e, "devices: could not revoke sessions; refusing to remove the device while its access would survive");
@@ -4680,7 +4800,7 @@ async fn unregister_device(
                 })),
             ));
         }
-    }
+    };
 
     state.device_registry.unregister(&id).await.map_err(|e| {
         (
@@ -4688,7 +4808,30 @@ async fn unregister_device(
             Json(json!({"error": e.to_string()})),
         )
     })?;
+
+    // A device that held access just lost it: a security notice for everyone but whoever did it.
+    if revoked > 0 {
+        let actor = proven_device(principal.as_ref());
+        announce_device_removed(&state, name, actor.id()).await;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The household notice for a paired device's removal. `actor` is the device that removed it,
+/// which is not told what it just did; a caller with no device of its own (the host) is nobody's.
+async fn announce_device_removed(state: &Arc<AppState>, name: String, actor: Option<&str>) {
+    use pond_core::mcp::domain::system_notice::SystemEvent;
+    use pond_core::mcp::services::system_notices::SystemNotices;
+
+    let Some(sender) = state.notification_sender.clone() else {
+        return;
+    };
+    let notices = SystemNotices::new(sender, state.settings_repo.clone());
+    let event = SystemEvent::DeviceRemoved { name };
+    match actor {
+        Some(actor) => notices.announce_except(event, actor).await,
+        None => notices.announce(event).await,
+    };
 }
 
 /// `GET /api/v1/devices/self` -- the caller's own device and the member it's attributed to.
@@ -4775,7 +4918,7 @@ struct UpdateDeviceBody {
     #[serde(default, deserialize_with = "present_field")]
     hostname: Option<Option<String>>,
     #[serde(default, deserialize_with = "present_field")]
-    room: Option<Option<String>>,
+    room_id: Option<Option<String>>,
 }
 
 fn present_field<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -4842,7 +4985,7 @@ async fn update_device(
     let edit = DeviceEdit {
         name: req.name,
         hostname: req.hostname,
-        room: req.room,
+        room_id: req.room_id,
     };
     let update = device_edit::merge(&current, edit).map_err(|e| {
         (
@@ -4870,8 +5013,178 @@ async fn update_device(
         "registered_at": device.registered_at,
         "last_seen":     device.last_seen,
         "is_online":     device.is_online,
-        "room":          device.room,
+        "room_id":       device.room_id,
     })))
+}
+
+// ── Rooms ────────────────────────────────────────────────────────────────
+
+fn room_json(room: &pond_core::user_data::ports::room_registry::Room) -> Value {
+    json!({
+        "id":         room.id,
+        "name":       room.name,
+        "created_at": room.created_at,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct RoomBody {
+    name: String,
+}
+
+/// `GET /api/v1/rooms` — every room the household has named.
+async fn list_rooms(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let rooms = state.room_registry.list_rooms().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(
+        json!({ "rooms": rooms.iter().map(room_json).collect::<Vec<_>>() }),
+    ))
+}
+
+/// `POST /api/v1/rooms` — name a new room, e.g. while placing a freshly-added device.
+async fn create_room(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<RoomBody>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "a room's name cannot be empty"})),
+        ));
+    }
+    let room = state.room_registry.create(name).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok((StatusCode::CREATED, Json(room_json(&room))))
+}
+
+/// `GET /api/v1/rooms/{id}`.
+async fn get_room(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let room = state
+        .room_registry
+        .get_room(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "room_not_found"})),
+            )
+        })?;
+    Ok(Json(room_json(&room)))
+}
+
+/// `PUT /api/v1/rooms/{id}` — rename a room.
+async fn rename_room(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<RoomBody>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "a room's name cannot be empty"})),
+        ));
+    }
+    state
+        .room_registry
+        .get_room(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "room_not_found"})),
+            )
+        })?;
+    state.room_registry.rename(&id, name).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    let room = state
+        .room_registry
+        .get_room(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "room_not_found"})),
+            )
+        })?;
+    Ok(Json(room_json(&room)))
+}
+
+/// `DELETE /api/v1/rooms/{id}` — refused while any device is still placed in this room.
+async fn delete_room(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    state
+        .room_registry
+        .get_room(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "room_not_found"})),
+            )
+        })?;
+    state
+        .room_registry
+        .delete(&id)
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, Json(json!({"error": e.to_string()}))))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ── Private mesh ─────────────────────────────────────────────────────────
@@ -5400,6 +5713,9 @@ async fn update_settings(
         ));
     }
 
+    // Stored as the pipeline will read them, so the saved value is the applied one.
+    pond_core::user_data::domain::vision::normalize_settings(&mut merged);
+
     // Write only the patch's keys, or a concurrent writer's changes get reverted. `user_keys` is
     // the user's intent (fed to `mark_user_set`); `write_keys` adds server-derived values.
     let user_keys: std::collections::HashSet<String> = patch
@@ -5455,6 +5771,9 @@ async fn update_settings(
 
     // Privacy controls must apply now, not at the next restart.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
+    let cameras = pond_adapters_vision::LiveCameraRegistry::global();
+    cameras.sync_settings(&merged);
+    cameras.notify_settings_changed();
 
     if merged.picture_support_download_enabled {
         pond_core::models::domain::device_budget::allow_gemma_vision();
@@ -7924,7 +8243,13 @@ async fn delete_profile(
         .count_for_profile(&id)
         .await
         .unwrap_or_default();
-    let faces = match state.face_recognition.as_ref() {
+    // While the models download there is nothing to count with, so this reports 0; the rows
+    // still cascade with the profile.
+    let faces = match state
+        .face_recognition
+        .as_ref()
+        .and_then(|slot| slot.current().ok())
+    {
         Some(face) => face
             .list_embeddings(&id)
             .await
@@ -8522,446 +8847,6 @@ async fn policy_report(
             "note": "survives log pruning and DELETE /api/v1/activity; resets on restart",
         },
     })))
-}
-
-// ── Camera handlers ───────────────────────────────────────────────────────────
-
-#[derive(serde::Deserialize)]
-struct CameraEventRequest {
-    camera_id: String,
-    event_type: String,
-    confidence: Option<f64>,
-    snapshot_path: Option<String>,
-    metadata: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct CameraQueryParams {
-    camera_id: Option<String>,
-    limit: Option<usize>,
-}
-
-async fn record_camera_event(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<CameraEventRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
-    let Json(req) = body.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid request: {}", e)})),
-        )
-    })?;
-    let mut event = CameraEvent {
-        id: None,
-        camera_id: req.camera_id,
-        event_type: req.event_type,
-        confidence: req.confidence,
-        snapshot_path: req.snapshot_path,
-        metadata: req.metadata,
-        acknowledged: false,
-        created_at: chrono::Utc::now(),
-    };
-    let id = state
-        .camera_storage
-        .record_event(event.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-    // Publish after persisting, so the event carries its DB id.
-    if let Some(bus) = &state.event_bus {
-        event.id = Some(id);
-        bus.publish(BusEvent::Camera(event));
-    }
-    Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
-}
-
-async fn list_camera_events(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<CameraQueryParams>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let camera_id = params.camera_id.as_deref().unwrap_or("default");
-    let limit = params.limit.unwrap_or(20).min(100);
-    let events = state
-        .camera_storage
-        .list_events(camera_id, limit)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-    let list: Vec<Value> = events
-        .iter()
-        .map(|e| {
-            let meta_json: Option<Value> = e
-                .metadata
-                .as_deref()
-                .and_then(|m| serde_json::from_str(m).ok());
-            json!({
-                "id":             e.id,
-                "camera_id":      e.camera_id,
-                "event_type":     e.event_type,
-                "confidence":     e.confidence,
-                "snapshot_path":  e.snapshot_path,
-                "metadata":       meta_json,
-                "acknowledged":   e.acknowledged,
-                "created_at":     e.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
-    Ok(Json(json!({ "events": list })))
-}
-
-async fn acknowledge_camera_event(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    state.camera_storage.acknowledge(id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        )
-    })?;
-    Ok(Json(json!({ "status": "ok" })))
-}
-
-async fn list_cameras(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut cams = std::collections::BTreeSet::new();
-    for c in pond_adapters_vision::LiveCameraRegistry::global().active_cameras() {
-        cams.insert(c);
-    }
-    if let Ok(settings) = state.settings_repo.get().await {
-        if !settings.vision_camera_id.trim().is_empty() {
-            cams.insert(settings.vision_camera_id);
-        }
-    }
-    if cams.is_empty() {
-        cams.insert("camera-1".to_string());
-    }
-    let list: Vec<Value> = cams
-        .into_iter()
-        .map(|id| {
-            let is_live = pond_adapters_vision::LiveCameraRegistry::global()
-                .get_latest_frame(&id)
-                .is_some();
-            json!({
-                "id": id,
-                "name": id,
-                "is_live": is_live,
-                "snapshot_url": format!("/api/v1/camera/{id}/snapshot"),
-                "stream_url": format!("/api/v1/camera/{id}/stream"),
-            })
-        })
-        .collect();
-    Ok(Json(json!({ "cameras": list })))
-}
-
-async fn get_default_camera_snapshot(
-    State(state): State<Arc<AppState>>,
-) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
-    get_camera_snapshot_inner(&state, "camera-1").await
-}
-
-async fn get_camera_snapshot(
-    State(state): State<Arc<AppState>>,
-    Path(camera_id): Path<String>,
-) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
-    get_camera_snapshot_inner(&state, &camera_id).await
-}
-
-async fn get_camera_snapshot_inner(
-    state: &Arc<AppState>,
-    camera_id: &str,
-) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
-    use axum::response::IntoResponse;
-
-    if let Some(bytes) =
-        pond_adapters_vision::LiveCameraRegistry::global().get_latest_frame(camera_id)
-    {
-        return Ok((
-            StatusCode::OK,
-            [
-                (axum::http::header::CONTENT_TYPE, "image/jpeg"),
-                (
-                    axum::http::header::CACHE_CONTROL,
-                    "no-cache, no-store, must-revalidate",
-                ),
-            ],
-            bytes,
-        )
-            .into_response());
-    }
-
-    if let Ok(events) = state.camera_storage.list_events(camera_id, 20).await {
-        for event in events {
-            if let Some(path) = event.snapshot_path {
-                if let Ok(bytes) = tokio::fs::read(&path).await {
-                    return Ok((
-                        StatusCode::OK,
-                        [
-                            (axum::http::header::CONTENT_TYPE, "image/jpeg"),
-                            (
-                                axum::http::header::CACHE_CONTROL,
-                                "no-cache, no-store, must-revalidate",
-                            ),
-                        ],
-                        bytes,
-                    )
-                        .into_response());
-                }
-            }
-        }
-    }
-
-    if let Some(data_dir) = &state.data_dir {
-        let snap_dir = data_dir.join("snapshots");
-        if let Ok(mut entries) = tokio::fs::read_dir(&snap_dir).await {
-            let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("jpg") {
-                    if let Ok(meta) = entry.metadata().await {
-                        if let Ok(mod_time) = meta.modified() {
-                            if newest.as_ref().map(|(t, _)| mod_time > *t).unwrap_or(true) {
-                                newest = Some((mod_time, path));
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some((_, path)) = newest {
-                if let Ok(bytes) = tokio::fs::read(&path).await {
-                    return Ok((
-                        StatusCode::OK,
-                        [
-                            (axum::http::header::CONTENT_TYPE, "image/jpeg"),
-                            (
-                                axum::http::header::CACHE_CONTROL,
-                                "no-cache, no-store, must-revalidate",
-                            ),
-                        ],
-                        bytes,
-                    )
-                        .into_response());
-                }
-            }
-        }
-    }
-
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": format!("No snapshot available for camera '{camera_id}'")})),
-    ))
-}
-
-async fn get_camera_event_snapshot(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
-    use axum::response::IntoResponse;
-
-    let event = state
-        .camera_storage
-        .list_events("camera-1", 100)
-        .await
-        .ok()
-        .and_then(|events| events.into_iter().find(|e| e.id == Some(id)));
-
-    if let Some(event) = event {
-        if let Some(path) = event.snapshot_path {
-            if let Ok(bytes) = tokio::fs::read(&path).await {
-                return Ok((
-                    StatusCode::OK,
-                    [
-                        (axum::http::header::CONTENT_TYPE, "image/jpeg"),
-                        (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
-                    ],
-                    bytes,
-                )
-                    .into_response());
-            }
-        }
-    }
-
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": format!("No snapshot found for camera event {id}")})),
-    ))
-}
-
-async fn get_default_camera_stream() -> axum::response::Response {
-    get_camera_stream_inner("camera-1")
-}
-
-async fn get_camera_stream(Path(camera_id): Path<String>) -> axum::response::Response {
-    get_camera_stream_inner(&camera_id)
-}
-
-fn get_camera_stream_inner(camera_id: &str) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    let mut rx = pond_adapters_vision::LiveCameraRegistry::global().subscribe(camera_id);
-    let cam_id = camera_id.to_string();
-
-    let stream = async_stream::stream! {
-        if let Some(initial) = pond_adapters_vision::LiveCameraRegistry::global().get_latest_frame(&cam_id) {
-            let header = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", initial.len());
-            yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(header));
-            yield Ok(axum::body::Bytes::from(initial));
-            yield Ok(axum::body::Bytes::from("\r\n"));
-        }
-        while let Ok(frame) = rx.recv().await {
-            let header = format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", frame.len());
-            yield Ok(axum::body::Bytes::from(header));
-            yield Ok(axum::body::Bytes::copy_from_slice(&frame));
-            yield Ok(axum::body::Bytes::from("\r\n"));
-        }
-    };
-
-    (
-        StatusCode::OK,
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                "multipart/x-mixed-replace; boundary=frame",
-            ),
-            (
-                axum::http::header::CACHE_CONTROL,
-                "no-cache, no-store, must-revalidate",
-            ),
-            (axum::http::header::PRAGMA, "no-cache"),
-        ],
-        axum::body::Body::from_stream(stream),
-    )
-        .into_response()
-}
-
-#[derive(serde::Deserialize, Default)]
-struct VisionConfigUpdateRequest {
-    vision_enabled: Option<bool>,
-    vision_camera_id: Option<String>,
-    vision_fps: Option<u32>,
-    vision_motion_threshold: Option<f64>,
-    min_event_interval_secs: Option<u64>,
-    classifier_confidence_threshold: Option<f64>,
-    face_detection_enabled: Option<bool>,
-    face_on_motion: Option<bool>,
-    enabled_event_types: Option<Vec<String>>,
-}
-
-async fn get_vision_config(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let bus_cfg = pond_adapters_vision::LiveCameraRegistry::global().bus_config();
-    let settings = state.settings_repo.get().await.ok();
-    let active_cameras = pond_adapters_vision::LiveCameraRegistry::global().active_cameras();
-    let listeners = pond_adapters_vision::LiveCameraRegistry::global().event_listener_count();
-    Ok(Json(json!({
-        "vision_enabled": settings.as_ref().map(|s| s.vision_enabled).unwrap_or(true),
-        "vision_camera_id": settings.as_ref().map(|s| s.vision_camera_id.clone()).unwrap_or_else(|| "camera-1".to_string()),
-        "vision_fps": settings.as_ref().map(|s| s.vision_fps).unwrap_or(1),
-        "vision_motion_threshold": settings.as_ref().map(|s| s.vision_motion_threshold).unwrap_or(0.03),
-        "min_event_interval_secs": bus_cfg.min_event_interval_secs,
-        "classifier_confidence_threshold": bus_cfg.classifier_confidence_threshold,
-        "face_detection_enabled": bus_cfg.face_detection_enabled,
-        "face_on_motion": bus_cfg.face_on_motion,
-        "enabled_event_types": bus_cfg.enabled_event_types,
-        "supported_signals": pond_adapters_vision::VisionBusConfig::supported_signals(),
-        "active_cameras": active_cameras,
-        "event_listener_count": listeners,
-    })))
-}
-
-async fn update_vision_config(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<VisionConfigUpdateRequest>, JsonRejection>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Json(req) = body.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid request: {}", e)})),
-        )
-    })?;
-
-    pond_adapters_vision::LiveCameraRegistry::global().update_bus_config(|cfg| {
-        if let Some(secs) = req.min_event_interval_secs {
-            cfg.min_event_interval_secs = secs.max(1);
-        }
-        if let Some(conf) = req.classifier_confidence_threshold {
-            cfg.classifier_confidence_threshold = conf.clamp(0.05, 0.99);
-        }
-        if let Some(face_en) = req.face_detection_enabled {
-            cfg.face_detection_enabled = face_en;
-        }
-        if let Some(face_mot) = req.face_on_motion {
-            cfg.face_on_motion = face_mot;
-        }
-        if let Some(types) = req.enabled_event_types {
-            if !types.is_empty() {
-                cfg.enabled_event_types = types;
-            }
-        }
-    });
-
-    if req.vision_enabled.is_some()
-        || req.vision_camera_id.is_some()
-        || req.vision_fps.is_some()
-        || req.vision_motion_threshold.is_some()
-    {
-        if let Ok(mut s) = state.settings_repo.get().await {
-            if let Some(en) = req.vision_enabled {
-                s.vision_enabled = en;
-            }
-            if let Some(cid) = req.vision_camera_id.filter(|c| !c.trim().is_empty()) {
-                s.vision_camera_id = cid;
-            }
-            if let Some(fps) = req.vision_fps {
-                s.vision_fps = fps.clamp(1, 5);
-            }
-            if let Some(mt) = req.vision_motion_threshold {
-                s.vision_motion_threshold = mt.clamp(0.005, 0.50);
-            }
-            let _ = state.settings_repo.update(&s).await;
-        }
-    }
-
-    get_vision_config(State(state)).await
-}
-
-async fn stream_vision_events_sse() -> axum::response::Response {
-    use axum::response::sse::{Event, KeepAlive, Sse};
-    use axum::response::IntoResponse;
-
-    let mut rx = pond_adapters_vision::LiveCameraRegistry::global().subscribe_events();
-    let stream = async_stream::stream! {
-        while let Ok(ev) = rx.recv().await {
-            let meta_json: Option<Value> = ev
-                .metadata
-                .as_deref()
-                .and_then(|m| serde_json::from_str(m).ok());
-            let payload = json!({
-                "id": ev.id,
-                "camera_id": ev.camera_id,
-                "event_type": ev.event_type,
-                "confidence": ev.confidence,
-                "snapshot_path": ev.snapshot_path,
-                "metadata": meta_json,
-                "created_at": ev.created_at.to_rfc3339(),
-            });
-            yield Ok::<_, std::convert::Infallible>(Event::default().event("vision_event").data(payload.to_string()));
-        }
-    };
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
 }
 
 /// Transcribes multipart audio via whisper.cpp. Deliberately unauthenticated (localhost dev
@@ -11006,6 +10891,16 @@ struct NotificationStreamParams {
 
 /// `GET /api/v1/notifications/stream?device_id=X` — foreground push for one device.
 /// Drains its offline queue, then tails live events for it or `"broadcast"`; dedupe by `id`.
+/// A broadcast the device has its own queued copy of (a paired phone) is skipped: that copy
+/// arrives on its own, under the per-device id the push wake and `/pending` also use.
+///
+/// A phone ([`PHONE_CLIENT_TYPE`]) acknowledges each notice with `POST .../{id}/ack`, and only
+/// that marks its copy delivered: a write into a half-open connection (a phone that dropped off
+/// the network without closing it) succeeds, so a stream write is no proof the notice arrived.
+/// Every connection therefore re-sends each copy the phone has not acknowledged. Any other
+/// device has no ack path, so the stream marks what it sends delivered, as it always has.
+///
+/// [`PHONE_CLIENT_TYPE`]: pond_core::mcp::ports::notification_recipients::PHONE_CLIENT_TYPE
 async fn notifications_stream(
     State(state): State<Arc<AppState>>,
     axum::Extension(principal): axum::Extension<pond_core::security::ports::policy::Principal>,
@@ -11037,12 +10932,14 @@ async fn notifications_stream(
                 Json(json!({ "error": "device lookup failed" })),
             )
         })?;
-    if exists.is_none() {
+    let Some(device) = exists else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "unknown device" })),
         ));
-    }
+    };
+    let ack_required =
+        device.device_type == pond_core::mcp::ports::notification_recipients::PHONE_CLIENT_TYPE;
 
     // Not the chat `sse_semaphore`: phones hold these open indefinitely and would starve chat.
     let permit = state
@@ -11060,22 +10957,40 @@ async fn notifications_stream(
 
     let stream = async_stream::stream! {
         let _permit = permit;
+        // `rx` subscribed before this drain ran, so a copy queued in between arrives twice:
+        // once here and once live. Each flushed id skips its first live repeat.
+        let mut flushed = std::collections::HashSet::new();
 
         match queue.list_undelivered(&device_id).await {
             Ok(pending) => {
                 let mut ids = Vec::with_capacity(pending.len());
                 for n in &pending {
+                    flushed.insert(n.id.clone());
                     let data = serde_json::to_string(n).unwrap_or_default();
                     ids.push(n.id.clone());
                     yield Ok(Event::default().data(data));
                 }
-                if !ids.is_empty() {
+                tracing::info!(
+                    kind = "notifications_stream_flushed",
+                    count = ids.len(),
+                    ack_required,
+                    "notifications: queued notices sent on connect"
+                );
+                if !ack_required && !ids.is_empty() {
                     if let Err(e) = queue.mark_delivered(&ids).await {
-                        tracing::warn!(error = %e, "notifications: flush mark_delivered failed");
+                        tracing::warn!(
+                            kind = "notification_mark_delivered_failed",
+                            error = %e,
+                            "notifications: flush mark_delivered failed"
+                        );
                     }
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "notifications: flush query failed"),
+            Err(e) => tracing::warn!(
+                kind = "notifications_stream_flush_failed",
+                error = %e,
+                "notifications: flush query failed"
+            ),
         }
 
         loop {
@@ -11083,12 +10998,22 @@ async fn notifications_stream(
                 Ok(n) => {
                     if n.target == device_id || n.target == "broadcast" {
                         let targeted = n.target == device_id;
+                        if targeted && flushed.remove(&n.id) {
+                            continue;
+                        }
+                        if !targeted && has_own_copy(queue.as_ref(), &n.id, &device_id).await {
+                            continue;
+                        }
                         let id = n.id.clone();
                         let data = serde_json::to_string(&n).unwrap_or_default();
                         yield Ok(Event::default().data(data));
-                        if targeted {
+                        if targeted && !ack_required {
                             if let Err(e) = queue.mark_delivered(&[id]).await {
-                                tracing::warn!(error = %e, "notifications: live mark_delivered failed");
+                                tracing::warn!(
+                                    kind = "notification_mark_delivered_failed",
+                                    error = %e,
+                                    "notifications: live mark_delivered failed"
+                                );
                             }
                         }
                     }
@@ -11103,6 +11028,135 @@ async fn notifications_stream(
     };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Whether `device_id` has its own queued copy of broadcast `notification_id`. A failed read
+/// answers `false`: a duplicate the app can dismiss beats a notice the phone never sees.
+async fn has_own_copy(
+    queue: &dyn pond_core::mcp::ports::notification_queue::NotificationQueueRepository,
+    notification_id: &str,
+    device_id: &str,
+) -> bool {
+    let own_id =
+        pond_core::mcp::ports::notification::per_device_notification_id(notification_id, device_id);
+    match queue.is_queued_for(&own_id, device_id).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(
+                kind = "notification_copy_lookup_failed",
+                error = %e,
+                "notifications: could not tell whether this device has its own copy; streaming the broadcast"
+            );
+            false
+        }
+    }
+}
+
+/// The calling device's id and the notification queue it reads.
+type CallerQueue = (
+    String,
+    Arc<dyn pond_core::mcp::ports::notification_queue::NotificationQueueRepository>,
+);
+
+/// The calling device's id, from its pairing token only, plus the queue; or the refusal.
+fn caller_queue(
+    state: &AppState,
+    principal: Option<&axum::Extension<pond_core::security::ports::policy::Principal>>,
+    operation: &'static str,
+) -> Result<CallerQueue, (StatusCode, Json<Value>)> {
+    let Some(device_id) = proven_device(principal).id().map(str::to_owned) else {
+        tracing::warn!(
+            kind = "notification_queue_refused",
+            operation,
+            reason = "no_device",
+            "notifications: request did not come from a paired device"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "this request did not come from a paired device"})),
+        ));
+    };
+    let Some(queue) = state.notification_queue.clone() else {
+        tracing::warn!(
+            kind = "notification_queue_unavailable",
+            operation,
+            "notifications: no queue wired"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "notifications not available"})),
+        ));
+    };
+    Ok((device_id, queue))
+}
+
+/// `GET /api/v1/notifications/pending` — the calling device's undelivered notifications, oldest
+/// first, as `{"notifications": [Notification, ...]}`. The device comes from the token, never a
+/// parameter. Read-only: the app acknowledges each one it shows with `POST .../{id}/ack`.
+async fn notifications_pending(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+) -> (StatusCode, Json<Value>) {
+    let (device_id, queue) = match caller_queue(&state, principal.as_ref(), "notifications_pending")
+    {
+        Ok(found) => found,
+        Err(refusal) => return refusal,
+    };
+    match queue.list_undelivered(&device_id).await {
+        Ok(pending) => {
+            tracing::debug!(
+                kind = "notifications_pending_served",
+                count = pending.len(),
+                "notifications: pending served"
+            );
+            (StatusCode::OK, Json(json!({ "notifications": pending })))
+        }
+        Err(e) => {
+            tracing::warn!(kind = "notifications_pending_failed", error = %e, "notifications: pending query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not read pending notifications"})),
+            )
+        }
+    }
+}
+
+/// `POST /api/v1/notifications/{id}/ack` — mark one of the calling device's notifications
+/// delivered. `{"id": id, "acknowledged": true}`, also when it already was; `404` when no such
+/// notification is the caller's, whether or not another device has one by that id.
+async fn acknowledge_notification(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let (device_id, queue) =
+        match caller_queue(&state, principal.as_ref(), "acknowledge_notification") {
+            Ok(found) => found,
+            Err(refusal) => return refusal,
+        };
+    match queue.acknowledge(&id, &device_id).await {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(json!({"id": id, "acknowledged": true})),
+        ),
+        Ok(false) => {
+            tracing::info!(
+                kind = "notification_ack_refused",
+                "notifications: ack for a notification that is not the caller's"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "no such notification for this device"})),
+            )
+        }
+        Err(e) => {
+            tracing::warn!(kind = "notification_ack_failed", error = %e, "notifications: ack failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not acknowledge the notification"})),
+            )
+        }
+    }
 }
 
 // ── Agent tools handler ───────────────────────────────────────────────────────
@@ -13937,6 +13991,19 @@ fn default_source() -> String {
     "api".to_string()
 }
 
+/// The text's document vector, or `None` to leave the row for the index sweep; never fails a save.
+async fn embed_memory_text(state: &AppState, text: &str) -> Option<Vec<f32>> {
+    let embedder = state.embedding_provider.as_ref()?;
+    match embedder.embed(text).await {
+        Ok(vector) => Some(vector),
+        Err(e) => {
+            tracing::warn!("could not embed a memory; the index sweep will embed it later: {e:#}");
+            None
+        }
+    }
+}
+
+/// Embedded at write: semantic recall skips a row with no vector until the idle sweep fills it.
 async fn save_memory(
     State(state): State<Arc<AppState>>,
     body: Result<Json<SaveMemoryRequest>, JsonRejection>,
@@ -13966,13 +14033,14 @@ async fn save_memory(
     let tier = req
         .tier
         .or_else(|| req.segment.as_ref().map(|s| s.default_tier()));
+    let embedding = embed_memory_text(&state, &req.content).await;
 
     let fragment = MemoryFragment {
         id: Uuid::new_v4().to_string(),
         profile_id: None,
         session_id: None,
         content: req.content,
-        embedding: None,
+        embedding,
         source: req.source,
         tags: req.tags,
         created_at: chrono::Utc::now(),
@@ -14004,8 +14072,8 @@ struct UpdateMemoryRequest {
     tier: Option<pond_core::user_data::domain::memory::MemoryTier>,
 }
 
-/// `PUT /api/v1/memories/{id}` -- reword and/or re-tier in place, keeping id, age and usage.
-/// A field left out is left as it is; a body with neither is refused.
+/// `PUT /api/v1/memories/{id}` -- reword and/or re-tier in place, keeping id, age and usage;
+/// new words are re-embedded. A field left out is left as it is; a body with neither is refused.
 async fn update_memory(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -14023,7 +14091,11 @@ async fn update_memory(
 
     let mut result = Ok(());
     if let Some(content) = content {
-        result = state.memory_repo.update_content(&id, content).await;
+        let embedding = embed_memory_text(&state, content).await;
+        result = state
+            .memory_repo
+            .update_content(&id, content, embedding.as_deref())
+            .await;
     }
     if let (Ok(()), Some(tier)) = (&result, body.tier) {
         result = state.memory_repo.update_tier(&id, tier).await;
@@ -15330,6 +15402,77 @@ fn face_unavailable() -> (StatusCode, Json<Value>) {
     )
 }
 
+/// The face recognition to use now, or the 503 that says why there is none: a build without face
+/// support, models still downloading, or models that would not load.
+pub(crate) fn face_service(
+    state: &AppState,
+) -> Result<Arc<dyn FaceRecognition>, (StatusCode, Json<Value>)> {
+    let slot = state
+        .face_recognition
+        .as_ref()
+        .ok_or_else(face_unavailable)?;
+    slot.current().map_err(|why| {
+        tracing::info!(
+            kind = "face_request_not_ready",
+            reason = %why,
+            "face request refused: recognition is not ready"
+        );
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(face_not_ready_body(&why)),
+        )
+    })
+}
+
+/// The 503 body for recognition that is not ready yet, in the `{error, code}` shape.
+fn face_not_ready_body(why: &FaceRecognitionNotReady) -> Value {
+    match why {
+        FaceRecognitionNotReady::Downloading { progress } => json!({
+            "error": "Face recognition is still downloading its models. It switches on by \
+                      itself when they arrive; no restart is needed.",
+            "code": "face_models_downloading",
+            "progress": progress.as_ref().map(face_progress_json),
+        }),
+        FaceRecognitionNotReady::Unavailable { reason } => json!({
+            "error": format!("Face recognition is unavailable. {reason}"),
+            "code": "face_recognition_unavailable",
+            "reason": reason,
+        }),
+    }
+}
+
+fn face_progress_json(p: &FaceModelsProgress) -> Value {
+    json!({
+        "file": p.file,
+        "downloaded_bytes": p.downloaded_bytes,
+        "total_bytes": p.total_bytes,
+    })
+}
+
+/// Where face recognition stands, for status bodies: `available`, `status` (`ready`,
+/// `downloading`, `unavailable` or `not_built`), and `progress` or `reason` when there is one.
+pub(crate) fn face_readiness(state: &AppState) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    let (available, status) = match state.face_recognition.as_ref().map(|slot| slot.current()) {
+        None => (false, "not_built"),
+        Some(Ok(_)) => (true, "ready"),
+        Some(Err(FaceRecognitionNotReady::Downloading { progress })) => {
+            fields.insert(
+                "progress".into(),
+                progress.as_ref().map(face_progress_json).into(),
+            );
+            (false, "downloading")
+        }
+        Some(Err(FaceRecognitionNotReady::Unavailable { reason })) => {
+            fields.insert("reason".into(), reason.into());
+            (false, "unavailable")
+        }
+    };
+    fields.insert("available".into(), available.into());
+    fields.insert("status".into(), status.into());
+    fields
+}
+
 /// Read `profile_id` + `image` + optional `bbox` out of a multipart body.
 async fn read_face_multipart(
     mut multipart: Multipart,
@@ -15406,10 +15549,7 @@ async fn register_face_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
 
     let (profile_id, image, bbox) = read_face_multipart(multipart).await?;
     let profile_id = profile_id.ok_or_else(|| {
@@ -15459,10 +15599,7 @@ async fn identify_face_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let (_profile_id, image, bbox) = read_face_multipart(multipart).await?;
 
     let result = face.identify_face(&image, bbox).await.map_err(|e| {
@@ -15485,10 +15622,7 @@ async fn list_face_enrollments(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let rows = face.list_embeddings(&profile_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -15515,7 +15649,8 @@ async fn list_face_enrollments(
     })))
 }
 
-/// GET /api/v1/faces/models — on-disk status of each slot's preferred and fallback model.
+/// GET /api/v1/faces/models — on-disk status of each slot's preferred and fallback model, and
+/// whether recognition is loaded yet ([`face_readiness`]).
 async fn list_face_models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
     let feature_enabled = state.face_recognition.is_some();
     let dir = state
@@ -15598,21 +15733,21 @@ async fn list_face_models_handler(State(state): State<Arc<AppState>>) -> Json<Va
     .await
     .unwrap_or_default();
 
-    Json(json!({
-        "feature_enabled": feature_enabled,
-        "models_dir": dir.as_ref().map(|d| d.display().to_string()),
-        "models": entries,
-    }))
+    let mut body = face_readiness(&state);
+    body.insert("feature_enabled".into(), feature_enabled.into());
+    body.insert(
+        "models_dir".into(),
+        dir.as_ref().map(|d| d.display().to_string()).into(),
+    );
+    body.insert("models".into(), entries.into());
+    Json(Value::Object(body))
 }
 
 /// GET /api/v1/faces/debug/pairwise — pairwise cosines plus a verdict on embedding collapse.
 async fn face_pairwise_debug(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let pairs = face.pairwise_similarities().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -15687,10 +15822,7 @@ async fn face_pairwise_debug(
 async fn face_eval_debug(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let pairs = face.pairwise_similarities().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -15919,10 +16051,7 @@ async fn burst_identify_face_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let (frames, bbox) = read_face_multipart_burst(multipart).await?;
     let n = frames.len();
 
@@ -16368,10 +16497,7 @@ async fn enroll_quality_handler(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let (profile_id, image, bbox) = read_face_multipart(multipart).await?;
 
     let details = match face.identify_with_diagnostics(&image, bbox).await {
@@ -16504,10 +16630,7 @@ async fn get_profile_threshold_handler(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let override_t = face.get_profile_threshold(&profile_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -16527,10 +16650,7 @@ async fn put_profile_threshold_handler(
     Path(profile_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let threshold = body
         .get("threshold")
         .and_then(|v| v.as_f64())
@@ -16568,10 +16688,7 @@ async fn delete_profile_threshold_handler(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     face.set_profile_threshold(&profile_id, None, None)
         .await
         .map_err(|e| {
@@ -16588,10 +16705,7 @@ async fn delete_user_biometrics(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let deleted = face.delete_embeddings(&profile_id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -17593,10 +17707,7 @@ async fn identify_session_user_handler(
     Path(session_id): Path<String>,
     multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let face = state
-        .face_recognition
-        .as_ref()
-        .ok_or_else(face_unavailable)?;
+    let face = face_service(&state)?;
     let (_profile_id, image, bbox) = read_face_multipart(multipart).await?;
 
     let result = face.identify_face(&image, bbox).await.map_err(|e| {
@@ -17824,6 +17935,17 @@ mod tests {
         assert_eq!(failed.category, "alert");
         assert_eq!(failed.title, "Failed pairing attempt");
         assert_eq!(failed.data, Some(json!({"open": "devices"})));
+    }
+
+    /// Only the dashboard's re-pair of its own known row is spared; a phone's id is a claim.
+    #[test]
+    fn only_a_returning_dashboard_pairs_quietly() {
+        assert!(!super::announces_pairing("loopback_hmac", true));
+        assert!(super::announces_pairing("loopback_hmac", false));
+        for method in ["cpace", "cpace-setup"] {
+            assert!(super::announces_pairing(method, true), "{method}");
+            assert!(super::announces_pairing(method, false), "{method}");
+        }
     }
 
     /// Tailnet address detection; the range check stops the probe's LAN answer passing as remote.

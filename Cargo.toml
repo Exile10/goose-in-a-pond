@@ -33,6 +33,8 @@ members = [
     "crates/pond-adapters-matter",
     "crates/pond-adapters-vision",
     "crates/pond-adapters-vision-onnx",
+    # Moves the ONNX adapters' sessions to the Jetson's GPU when the runtime has TensorRT.
+    "crates/pond-onnx-accel",
     "crates/pond-adapters-silero",
     "crates/pond-adapters-weather",
     "crates/pond-adapters-uber",
@@ -213,6 +215,9 @@ jsonwebtoken = { version = "10", default-features = false, features = [
 ] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "migrate", "chrono"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# image's own JPEG decoder; named directly for its luma-only output.
+zune-core = "0.5"
+zune-jpeg = "0.5"
 ndarray = "0.16"
 fastembed = { version = "=5.16.0", default-features = false, features = ["ort-load-dynamic", "hf-hub-rustls-tls"] }
 
@@ -258,6 +263,7 @@ pond-adapters-uber             = { path = "crates/pond-adapters-uber" }
 pond-adapters-mcp-memory       = { path = "crates/pond-adapters-mcp-memory" }
 pond-adapters-local-inference  = { path = "crates/pond-adapters-local-inference" }
 pond-adapters-face-onnx        = { path = "crates/pond-adapters-face-onnx" }
+pond-onnx-accel                = { path = "crates/pond-onnx-accel" }
 
 # ── Release profile for Jetson / embedded deployment ─────────────────────────
 [profile.release]

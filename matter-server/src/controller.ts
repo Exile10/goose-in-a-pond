@@ -3,8 +3,11 @@
 import { Endpoint, Environment, Seconds, ServerNode, type ClientNode } from "@matter/main";
 // Not re-exported by `@matter/main`, which forwards only `@matter/types/datatype`.
 import { QrPairingCodeCodec } from "@matter/types";
+// Not re-exported by `@matter/main` either: only `./behaviors/system/*` carries it.
+import { CommissioningClient } from "@matter/node/behaviors/system/commissioning";
 
 import { log, describeError, setupCodeKind, type SetupCodeKind } from "./log.js";
+import { reclaimStaleStorageLock, recordStorageLockBoot } from "./storageLock.js";
 import { deviceClusters, nodeToDevice } from "./mapping/devices.js";
 import { observedFor, planControl, type Verb } from "./mapping/control.js";
 import { observedOperation, settingClusters } from "./mapping/settings.js";
@@ -32,8 +35,12 @@ import {
   type DeviceState,
   type ValueSpec,
   type DeviceStatePatch,
+  type DiscoveredDevice,
   type Reading,
 } from "./protocol.js";
+
+/** The ServerNode id, and so the name of its directory under `--storage-path`. Stable: it is the fabric. */
+const NODE_ID = "giap-controller";
 
 /** How long `discover` browses mDNS; low, since the probe must cost less than the discovery it saves. */
 const DISCOVER_TIMEOUT = Seconds(8);
@@ -90,13 +97,16 @@ export class Controller {
     events: ControllerEvents,
   ): Promise<Controller> {
     Environment.default.vars.set("storage.path", storagePath);
+    // matter.js honours a lock whose recorded pid was recycled after a power cut; see storageLock.ts.
+    await reclaimStaleStorageLock(storagePath, NODE_ID);
 
     // Not 5540: that would stop Matter devices on this host binding it; controllers need no fixed port.
     const node = await ServerNode.create({
-      id: "giap-controller",
+      id: NODE_ID,
       network: { port: matterPort },
     });
     await node.start();
+    await recordStorageLockBoot(storagePath, NODE_ID);
 
     log.info("controller_online", "the Matter controller is online", {
       matter_port: matterPort,
@@ -165,8 +175,9 @@ export class Controller {
       // Per slice: bridged children sharing a node id would collide in both sides' dedupe caches.
       for (const slice of deviceSlices(snapshot)) {
         const deviceId = deviceIdForNode(slice.nodeId, slice.rootEndpoint);
-        // Skip endpoint 0: it is on every slice, so its readings would repeat per bridged device.
-        for (const endpoint of applicationEndpoints(slice)) {
+        // Endpoint 0 is on every slice, so only the hub's slice reads it (a battery can live there).
+        const endpoints = slice.rootEndpoint === undefined ? slice.endpoints : applicationEndpoints(slice);
+        for (const endpoint of endpoints) {
           for (const [cluster, attributes] of Object.entries(endpoint.clusters)) {
             for (const [attribute, value] of Object.entries(attributes)) {
               // The cluster's own declared unit travels with its value.
@@ -234,11 +245,26 @@ export class Controller {
     }
   }
 
-  /** How many devices are advertising themselves for commissioning right now. */
-  async discover(): Promise<number> {
+  /** Devices advertising themselves for commissioning right now. */
+  async discover(): Promise<DiscoveredDevice[]> {
     const discovery = this.#node.peers.discover({ timeout: DISCOVER_TIMEOUT });
     const found = await discovery;
-    return found.length;
+    return found.map(node => {
+      const state = node.stateOf(CommissioningClient);
+      return {
+        device_identifier: state.deviceIdentifier ?? "",
+        // `exactOptionalPropertyTypes` refuses `field: undefined`, so an absent value is omitted.
+        ...(state.discriminator !== undefined && { discriminator: state.discriminator }),
+        ...(state.vendorId !== undefined && { vendor_id: state.vendorId }),
+        ...(state.productId !== undefined && { product_id: state.productId }),
+        ...(state.deviceType !== undefined && { device_type: state.deviceType }),
+        ...(state.deviceName !== undefined && { name: state.deviceName }),
+        // BLE addresses carry no `ip`/`port`; a phone's mDNS-probe pre-flight can't reach those anyway.
+        addresses: (state.addresses ?? []).flatMap(a =>
+          "ip" in a ? [{ ip: a.ip, port: a.port }] : [],
+        ),
+      };
+    });
   }
 
   /** A bare passcode carries no discriminator, so it pairs whatever device is in pairing mode. */

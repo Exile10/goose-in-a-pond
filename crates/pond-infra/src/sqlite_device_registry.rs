@@ -38,7 +38,7 @@ struct DeviceRow {
     capabilities: String,
     created_at: String,
     last_seen: Option<String>,
-    room: Option<String>,
+    room_id: Option<String>,
 }
 
 /// Parses RFC 3339 or legacy naive UTC; an unparseable `last_seen` would pin a device offline.
@@ -78,7 +78,7 @@ fn row_to_device(row: DeviceRow) -> Device {
         registered_at: as_instant(&row.created_at),
         last_seen: row.last_seen.as_deref().map(as_instant),
         is_online,
-        room: row.room,
+        room_id: row.room_id,
     }
 }
 
@@ -94,7 +94,7 @@ impl DeviceRegistry for SqliteDeviceRegistry {
 
         sqlx::query(
             "INSERT INTO devices (id, name, hostname, device_type, ip_address, capabilities, \
-             is_online, created_at, updated_at, last_seen, room) \
+             is_online, created_at, updated_at, last_seen, room_id) \
              VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?, ?)",
         )
         .bind(&id)
@@ -105,7 +105,7 @@ impl DeviceRegistry for SqliteDeviceRegistry {
         .bind(&now_str)
         .bind(&now_str)
         .bind(&now_str)
-        .bind(&request.room)
+        .bind(&request.room_id)
         .execute(&self.pool)
         .await?;
 
@@ -119,13 +119,13 @@ impl DeviceRegistry for SqliteDeviceRegistry {
             registered_at: now_str.clone(),
             last_seen: Some(now_str),
             is_online: true,
-            room: request.room,
+            room_id: request.room_id,
         })
     }
 
     async fn list_devices(&self) -> Result<Vec<Device>> {
         let rows: Vec<DeviceRow> = sqlx::query_as(
-            "SELECT id, name, hostname, device_type, ip_address, capabilities, created_at, last_seen, room \
+            "SELECT id, name, hostname, device_type, ip_address, capabilities, created_at, last_seen, room_id \
              FROM devices ORDER BY created_at ASC",
         )
         .fetch_all(&self.pool)
@@ -135,7 +135,7 @@ impl DeviceRegistry for SqliteDeviceRegistry {
 
     async fn get_device(&self, device_id: &str) -> Result<Option<Device>> {
         let row: Option<DeviceRow> = sqlx::query_as(
-            "SELECT id, name, hostname, device_type, ip_address, capabilities, created_at, last_seen, room \
+            "SELECT id, name, hostname, device_type, ip_address, capabilities, created_at, last_seen, room_id \
              FROM devices WHERE id = ?",
         )
         .bind(device_id)
@@ -189,11 +189,11 @@ impl DeviceRegistry for SqliteDeviceRegistry {
     async fn update(&self, device_id: &str, request: UpdateDeviceRequest) -> Result<Device> {
         let now_str = Utc::now().to_rfc3339();
         sqlx::query(
-            "UPDATE devices SET name = ?, hostname = ?, room = ?, updated_at = ? WHERE id = ?",
+            "UPDATE devices SET name = ?, hostname = ?, room_id = ?, updated_at = ? WHERE id = ?",
         )
         .bind(&request.name)
         .bind(&request.hostname)
-        .bind(&request.room)
+        .bind(&request.room_id)
         .bind(&now_str)
         .bind(device_id)
         .execute(&self.pool)
@@ -209,7 +209,7 @@ impl DeviceRegistry for SqliteDeviceRegistry {
         device_type: &str,
         capabilities: &[String],
     ) -> Result<()> {
-        // Leaves name/hostname/room alone: they are user-configured, and this runs on every sync.
+        // Leaves name/hostname/room_id alone: they are user-configured, and this runs on every sync.
         let caps_json = serde_json::to_string(capabilities)?;
         let now_str = Utc::now().to_rfc3339();
         sqlx::query(
@@ -231,10 +231,25 @@ mod tests {
     use crate::db::Database;
     use tempfile::tempdir;
 
-    async fn make_registry() -> (SqliteDeviceRegistry, tempfile::TempDir) {
+    async fn make_registry() -> (SqliteDeviceRegistry, Pool<Sqlite>, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
         let db = Database::init(tmp.path()).await.unwrap();
-        (SqliteDeviceRegistry::new(db.system), tmp)
+        (
+            SqliteDeviceRegistry::new(db.system.clone()),
+            db.system,
+            tmp,
+        )
+    }
+
+    /// A device's `room_id` is a foreign key, so tests that set one need a real row to point at.
+    async fn make_room(pool: &Pool<Sqlite>, id: &str, name: &str) -> String {
+        sqlx::query("INSERT INTO rooms (id, name) VALUES (?, ?)")
+            .bind(id)
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap();
+        id.to_string()
     }
 
     fn req(name: &str) -> RegisterDeviceRequest {
@@ -244,13 +259,13 @@ mod tests {
             device_type: "gotg".to_string(),
             hostname: Some("phone.local".to_string()),
             capabilities: vec!["chat".to_string(), "tts".to_string()],
-            room: None,
+            room_id: None,
         }
     }
 
     #[tokio::test]
     async fn register_and_list() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, _pool, _tmp) = make_registry().await;
         let dev = reg.register(req("My Phone")).await.unwrap();
         assert_eq!(dev.name, "My Phone");
         assert!(dev.is_online); // just registered
@@ -262,14 +277,14 @@ mod tests {
 
     #[tokio::test]
     async fn get_device_returns_none_for_unknown() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, _pool, _tmp) = make_registry().await;
         let result = reg.get_device("nonexistent").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn unregister_removes_device() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, _pool, _tmp) = make_registry().await;
         let dev = reg.register(req("Phone")).await.unwrap();
         reg.unregister(&dev.id).await.unwrap();
         assert!(reg.get_device(&dev.id).await.unwrap().is_none());
@@ -308,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_updates_last_seen() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, _pool, _tmp) = make_registry().await;
         let dev = reg.register(req("Phone")).await.unwrap();
         reg.heartbeat(&dev.id).await.unwrap();
         let updated = reg.get_device(&dev.id).await.unwrap().unwrap();
@@ -319,7 +334,7 @@ mod tests {
     /// Stable ids let bridge re-syncs address the same row instead of duplicating it.
     #[tokio::test]
     async fn register_honours_caller_supplied_stable_id() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, _pool, _tmp) = make_registry().await;
         let with_id = RegisterDeviceRequest {
             id: Some("matter-2".to_string()),
             ..req("Virtual OnOff Light")
@@ -331,35 +346,36 @@ mod tests {
 
     #[tokio::test]
     async fn register_persists_room() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, pool, _tmp) = make_registry().await;
+        let room_id = make_room(&pool, "room-living", "Living Room").await;
         let with_room = RegisterDeviceRequest {
             id: None,
-            room: Some("Living Room".to_string()),
+            room_id: Some(room_id.clone()),
             ..req("Living Room Lamp")
         };
         let dev = reg.register(with_room).await.unwrap();
-        assert_eq!(dev.room.as_deref(), Some("Living Room"));
+        assert_eq!(dev.room_id.as_deref(), Some("room-living"));
 
         let listed = reg.list_devices().await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].room.as_deref(), Some("Living Room"));
+        assert_eq!(listed[0].room_id.as_deref(), Some("room-living"));
 
         let fetched = reg.get_device(&dev.id).await.unwrap().unwrap();
-        assert_eq!(fetched.room.as_deref(), Some("Living Room"));
+        assert_eq!(fetched.room_id.as_deref(), Some("room-living"));
     }
 
     #[tokio::test]
     async fn register_without_room_keeps_none() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, _pool, _tmp) = make_registry().await;
         let dev = reg.register(req("Roomless")).await.unwrap();
-        assert!(dev.room.is_none());
+        assert!(dev.room_id.is_none());
         let listed = reg.list_devices().await.unwrap();
-        assert!(listed[0].room.is_none());
+        assert!(listed[0].room_id.is_none());
     }
 
     #[tokio::test]
     async fn set_offline_marks_a_freshly_registered_device_offline() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, _pool, _tmp) = make_registry().await;
         let dev = reg.register(req("Phone")).await.unwrap();
         assert!(dev.is_online);
 
@@ -370,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_reverses_a_previous_set_offline() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, _pool, _tmp) = make_registry().await;
         let dev = reg.register(req("Phone")).await.unwrap();
         reg.set_offline(&dev.id).await.unwrap();
         assert!(!reg.get_device(&dev.id).await.unwrap().unwrap().is_online);
@@ -381,7 +397,8 @@ mod tests {
 
     #[tokio::test]
     async fn update_changes_name_hostname_and_room() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, pool, _tmp) = make_registry().await;
+        make_room(&pool, "room-kitchen", "Kitchen").await;
         let dev = reg.register(req("Old Name")).await.unwrap();
 
         let updated = reg
@@ -390,7 +407,7 @@ mod tests {
                 UpdateDeviceRequest {
                     name: "New Name".to_string(),
                     hostname: Some("new.local".to_string()),
-                    room: Some("Kitchen".to_string()),
+                    room_id: Some("room-kitchen".to_string()),
                 },
             )
             .await
@@ -398,23 +415,23 @@ mod tests {
 
         assert_eq!(updated.name, "New Name");
         assert_eq!(updated.hostname.as_deref(), Some("new.local"));
-        assert_eq!(updated.room.as_deref(), Some("Kitchen"));
+        assert_eq!(updated.room_id.as_deref(), Some("room-kitchen"));
 
         let fetched = reg.get_device(&dev.id).await.unwrap().unwrap();
         assert_eq!(fetched.name, "New Name");
-        assert_eq!(fetched.room.as_deref(), Some("Kitchen"));
+        assert_eq!(fetched.room_id.as_deref(), Some("room-kitchen"));
     }
 
     #[tokio::test]
     async fn update_unknown_device_errors() {
-        let (reg, _tmp) = make_registry().await;
+        let (reg, _pool, _tmp) = make_registry().await;
         let result = reg
             .update(
                 "nonexistent",
                 UpdateDeviceRequest {
                     name: "Whatever".to_string(),
                     hostname: None,
-                    room: None,
+                    room_id: None,
                 },
             )
             .await;

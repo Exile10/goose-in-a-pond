@@ -211,7 +211,7 @@ async function dispatch(controller: Controller, request: Request): Promise<unkno
       return { devices: controller.devices(), readings: controller.readings() };
 
     case "discover":
-      return { commissionable: await controller.discover() };
+      return { devices: await controller.discover() };
 
     case "commission": {
       const code = params.code;

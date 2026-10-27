@@ -10,6 +10,7 @@ pub mod llm_memory_consolidator;
 pub mod ride_booking;
 pub mod schedule_executors;
 pub mod setup_code;
+pub mod system_notices;
 
 #[cfg(unix)]
 pub mod embedded_network;
