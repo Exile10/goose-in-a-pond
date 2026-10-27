@@ -1,5 +1,6 @@
-//! Opens a camera by the cheapest path this host and camera allow: a Jetson's hardware engines,
-//! then the camera's own JPEGs through ffmpeg, then ffmpeg decoding every frame.
+//! Opens a camera by the cheapest path this host and camera allow: a Jetson's hardware engines
+//! for whichever format the camera offers, then the camera's own JPEGs through ffmpeg, then ffmpeg
+//! decoding every frame.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -15,7 +16,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::ffmpeg_source::{checked_input, resolve_ffmpeg_bin, CaptureConfig, FfmpegFrameSource};
-use crate::gst::{self, HardwareHead, JetsonEngines, VideoCodec};
+use crate::gst::{self, HardwareHead, JetsonEngines, JpegTransport, RawFormat, VideoCodec};
 use crate::jpeg_stream::{JpegSplitter, MultipartParser, Part, RateGate};
 use crate::live_feed::CapturePath;
 use crate::process::CaptureProcess;
@@ -43,7 +44,7 @@ pub async fn open_capture(cfg: CaptureConfig) -> Result<OpenedSource> {
     let ffmpeg = resolve_ffmpeg_bin();
     let kind = InputKind::of(&input);
     let probe = match kind {
-        InputKind::V4l2 => Probe::MjpegSizes(probe_mjpeg_sizes(&ffmpeg, &input).await),
+        InputKind::V4l2 => Probe::Formats(probe_formats(&ffmpeg, &input).await),
         _ => Probe::Stream(probe_stream(&ffmpeg, &input, kind).await),
     };
     let engines = gst::jetson_engines().await;
@@ -52,10 +53,11 @@ pub async fn open_capture(cfg: CaptureConfig) -> Result<OpenedSource> {
     let last = candidates.len() - 1;
     for (i, candidate) in candidates.into_iter().enumerate() {
         let capture = candidate.path();
+        let via = candidate.describe();
         let mut source = match start(&candidate, &cfg, &ffmpeg, engines) {
             Ok(source) => source,
             Err(e) if i < last => {
-                tracing::warn!(capture = capture.as_str(), error = %format!("{e:#}"), "capture path could not start; trying the next");
+                tracing::warn!(capture = capture.as_str(), %via, error = %format!("{e:#}"), "capture path could not start; trying the next");
                 continue;
             }
             Err(e) => return Err(e),
@@ -66,7 +68,7 @@ pub async fn open_capture(cfg: CaptureConfig) -> Result<OpenedSource> {
         }
         let why = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, source.next_frame()).await {
             Ok(Ok(Some(first))) => {
-                tracing::info!(capture = capture.as_str(), "vision capture path chosen");
+                tracing::info!(capture = capture.as_str(), %via, "vision capture path chosen");
                 return Ok(OpenedSource {
                     source: Box::new(Primed {
                         first: Some(first),
@@ -80,7 +82,7 @@ pub async fn open_capture(cfg: CaptureConfig) -> Result<OpenedSource> {
             Err(_) => format!("no frame within {}s", FIRST_FRAME_TIMEOUT.as_secs()),
         };
         source.close().await;
-        tracing::warn!(capture = capture.as_str(), %why, "capture path did not start; trying the next");
+        tracing::warn!(capture = capture.as_str(), %via, %why, "capture path did not start; trying the next");
     }
     Err(anyhow!("no capture path could start"))
 }
@@ -113,10 +115,38 @@ impl InputKind {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Probe {
-    /// The MJPEG sizes a V4L2 camera offers.
-    MjpegSizes(Vec<(u32, u32)>),
+    /// The formats a V4L2 camera offers, in the order it lists them.
+    Formats(Vec<CameraFormat>),
     /// The first video stream of a URL or file, when ffmpeg could read it.
     Stream(Option<StreamInfo>),
+}
+
+/// One pixel format a V4L2 camera offers, and its sizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CameraFormat {
+    kind: FormatKind,
+    sizes: Vec<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatKind {
+    Mjpeg,
+    Video(VideoCodec),
+    Raw(RawFormat),
+    /// A sensor's own output; only the Jetson's ISP, through Argus, turns it into pictures.
+    Bayer,
+}
+
+impl FormatKind {
+    /// Cheapest first: a camera's JPEG crosses USB smallest and keeps the live picture for free.
+    fn cost(self) -> u8 {
+        match self {
+            Self::Mjpeg => 0,
+            Self::Video(_) => 1,
+            Self::Raw(_) => 2,
+            Self::Bayer => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +176,15 @@ impl Candidate {
             Candidate::Software => CapturePath::Software,
         }
     }
+
+    /// The source a path reads, for logs.
+    fn describe(&self) -> String {
+        match self {
+            Candidate::Hardware { head, .. } => head.describe(),
+            Candidate::CameraJpeg { .. } => "camera JPEG through ffmpeg".to_string(),
+            Candidate::Software => "ffmpeg decoding every frame".to_string(),
+        }
+    }
 }
 
 /// Cheapest first; always ends with [`Candidate::Software`].
@@ -157,31 +196,80 @@ fn plan(
     engines: &JetsonEngines,
 ) -> Vec<Candidate> {
     let mut out = Vec::new();
+    let hardware =
+        |out: &mut Vec<Candidate>, head: HardwareHead, live: (u32, u32), luma: (u32, u32)| {
+            if engines.runs(&head) {
+                out.push(Candidate::Hardware { head, live, luma });
+            }
+        };
     match probe {
-        Probe::MjpegSizes(sizes) => {
-            if let Some((width, height)) = pick_size(sizes, (cfg.width, cfg.height)) {
-                if engines.jpeg {
-                    out.push(Candidate::Hardware {
-                        head: HardwareHead::MjpegCamera {
-                            device: input.to_string(),
+        Probe::Formats(formats) => {
+            let mut by_cost: Vec<&CameraFormat> = formats.iter().collect();
+            by_cost.sort_by_key(|f| f.kind.cost());
+            // One head per kind of format: a second raw format would fail the same way.
+            by_cost.dedup_by_key(|f| f.kind.cost());
+            let mut mjpeg_size = None;
+            for format in by_cost {
+                let Some((width, height)) = pick_size(&format.sizes, (cfg.width, cfg.height))
+                else {
+                    continue;
+                };
+                let device = input.to_string();
+                let head = match format.kind {
+                    FormatKind::Mjpeg => {
+                        mjpeg_size = Some((width, height));
+                        HardwareHead::MjpegCamera {
+                            device,
                             width,
                             height,
-                        },
-                        live: (width, height),
-                        luma: scaled((width, height), gst::LUMA_WIDTH),
-                    });
-                }
+                        }
+                    }
+                    FormatKind::Video(codec) => HardwareHead::VideoCamera {
+                        device,
+                        codec,
+                        width,
+                        height,
+                    },
+                    FormatKind::Raw(format) => HardwareHead::RawCamera {
+                        device,
+                        format,
+                        width,
+                        height,
+                    },
+                    FormatKind::Bayer => HardwareHead::Csi {
+                        sensor_id: csi_sensor_id(input),
+                        width,
+                        height,
+                    },
+                };
+                let size = (width, height);
+                hardware(&mut out, head, size, scaled(size, gst::LUMA_WIDTH));
+            }
+            if let Some(size) = mjpeg_size {
                 out.push(Candidate::CameraJpeg {
-                    args: camera_jpeg_args(input, kind, Some((width, height))),
+                    args: camera_jpeg_args(input, kind, Some(size)),
                 });
             }
         }
         Probe::Stream(Some(info)) if info.codec == "mjpeg" => {
+            let transport = match kind {
+                InputKind::Http => Some(JpegTransport::Http),
+                InputKind::Rtsp => Some(JpegTransport::Rtsp),
+                _ => None,
+            };
+            if let Some(transport) = transport {
+                let source = info.size.unwrap_or((cfg.width, cfg.height));
+                let head = HardwareHead::NetworkMjpeg {
+                    url: input.to_string(),
+                    transport,
+                };
+                hardware(&mut out, head, source, scaled(source, gst::LUMA_WIDTH));
+            }
             out.push(Candidate::CameraJpeg {
                 args: camera_jpeg_args(input, kind, None),
             });
         }
-        Probe::Stream(Some(info)) if engines.video => {
+        Probe::Stream(Some(info)) => {
             let head = match (kind, VideoCodec::from_ffmpeg(&info.codec)) {
                 (InputKind::Rtsp, Some(codec)) => Some(HardwareHead::Rtsp {
                     url: input.to_string(),
@@ -194,17 +282,28 @@ fn plan(
             };
             if let Some(head) = head {
                 let source = info.size.unwrap_or((cfg.width, cfg.height));
-                out.push(Candidate::Hardware {
+                hardware(
+                    &mut out,
                     head,
-                    live: scaled(source, cfg.width),
-                    luma: scaled(source, gst::LUMA_WIDTH),
-                });
+                    scaled(source, cfg.width),
+                    scaled(source, gst::LUMA_WIDTH),
+                );
             }
         }
-        Probe::Stream(_) => {}
+        Probe::Stream(None) => {}
     }
     out.push(Candidate::Software);
     out
+}
+
+/// Argus's sensor index, assumed to match the `/dev/videoN` number.
+fn csi_sensor_id(device: &str) -> u32 {
+    let digits = device
+        .trim_end_matches(|c: char| !c.is_ascii_digit())
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or("");
+    digits.parse().unwrap_or(0)
 }
 
 fn start(
@@ -304,14 +403,14 @@ async fn probe_output(ffmpeg: &std::ffi::OsStr, args: &[String]) -> Option<Strin
     }
 }
 
-async fn probe_mjpeg_sizes(ffmpeg: &std::ffi::OsStr, device: &str) -> Vec<(u32, u32)> {
+async fn probe_formats(ffmpeg: &std::ffi::OsStr, device: &str) -> Vec<CameraFormat> {
     let args = [
         "-hide_banner",
         "-nostdin",
         "-f",
         "v4l2",
         "-list_formats",
-        "compressed",
+        "all",
         "-i",
     ]
     .iter()
@@ -320,7 +419,7 @@ async fn probe_mjpeg_sizes(ffmpeg: &std::ffi::OsStr, device: &str) -> Vec<(u32, 
     .collect::<Vec<_>>();
     probe_output(ffmpeg, &args)
         .await
-        .map(|text| parse_mjpeg_sizes(&text))
+        .map(|text| parse_formats(&text))
         .unwrap_or_default()
 }
 
@@ -339,12 +438,39 @@ async fn probe_stream(
         .and_then(|text| parse_stream_info(&text))
 }
 
-/// From `ffmpeg -list_formats`: `... Compressed:  mjpeg :  Motion-JPEG : 640x480 160x90 ...`.
-fn parse_mjpeg_sizes(text: &str) -> Vec<(u32, u32)> {
+/// From `ffmpeg -list_formats all`, a line per format:
+/// `[in#0 @ 0x..] Raw       :     yuyv422 :           YUYV 4:2:2 : 640x480 160x90 ...`.
+fn parse_formats(text: &str) -> Vec<CameraFormat> {
     text.lines()
-        .filter(|l| l.contains("Compressed:") && l.contains("mjpeg"))
-        .filter_map(|l| l.rsplit(" : ").next())
-        .flat_map(|sizes| sizes.split_whitespace().filter_map(parse_size))
+        .filter_map(|line| {
+            let body = line.split_once("] ").map_or(line, |(_, rest)| rest);
+            let (category, rest) = body.split_once(':')?;
+            if !matches!(category.trim(), "Raw" | "Compressed" | "Unsupported") {
+                return None;
+            }
+            // A description such as `YUYV 4:2:2` holds colons, but never one between spaces.
+            let mut fields = rest.split(" : ");
+            let name = fields.next()?.trim();
+            let description = fields.next()?.trim();
+            let kind = if name == "mjpeg" {
+                FormatKind::Mjpeg
+            } else if let Some(codec) = VideoCodec::from_ffmpeg(name) {
+                FormatKind::Video(codec)
+            } else if let Some(raw) = RawFormat::from_ffmpeg(name) {
+                FormatKind::Raw(raw)
+            } else if name.starts_with("bayer_") || description.contains("Bayer") {
+                FormatKind::Bayer
+            } else {
+                return None;
+            };
+            let sizes = fields
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .filter_map(parse_size)
+                .collect();
+            Some(CameraFormat { kind, sizes })
+        })
         .collect()
 }
 
@@ -530,21 +656,51 @@ mod tests {
     fn jetson() -> JetsonEngines {
         JetsonEngines {
             gst_launch: Some("/usr/bin/gst-launch-1.0".into()),
-            jpeg: true,
-            video: true,
+            elements: gst::ELEMENTS.to_vec(),
+        }
+    }
+
+    fn format(kind: FormatKind, sizes: &[(u32, u32)]) -> CameraFormat {
+        CameraFormat {
+            kind,
+            sizes: sizes.to_vec(),
         }
     }
 
     #[test]
-    fn mjpeg_sizes_come_from_the_compressed_line_only() {
+    fn every_format_is_read_with_its_sizes() {
         assert_eq!(
-            parse_mjpeg_sizes(C920),
-            vec![(640, 480), (160, 90), (640, 360), (1280, 720), (1920, 1080)]
+            parse_formats(C920),
+            vec![
+                format(
+                    FormatKind::Raw(RawFormat::Yuy2),
+                    &[(640, 480), (160, 90), (1280, 720), (1920, 1080)]
+                ),
+                format(
+                    FormatKind::Mjpeg,
+                    &[(640, 480), (160, 90), (640, 360), (1280, 720), (1920, 1080)]
+                ),
+            ]
         );
         // Older ffmpeg names the demuxer instead of the input.
         let old = "[video4linux2,v4l2 @ 0x55] Compressed:       mjpeg :          Motion-JPEG : 1280x720 640x480";
-        assert_eq!(parse_mjpeg_sizes(old), vec![(1280, 720), (640, 480)]);
-        assert!(parse_mjpeg_sizes("Raw : yuyv422 : YUYV : 640x480").is_empty());
+        assert_eq!(parse_formats(old)[0].sizes, vec![(1280, 720), (640, 480)]);
+        let h264 =
+            "[in#0 @ 0x1] Compressed:        h264 :                H.264 : 1920x1080 1280x720";
+        assert_eq!(
+            parse_formats(h264)[0].kind,
+            FormatKind::Video(VideoCodec::H264)
+        );
+        let bayer =
+            "[in#0 @ 0x1] Unsupported :        RG10 : 10-bit Bayer RGRG/GBGB : 3280x2464 1920x1080";
+        assert_eq!(
+            parse_formats(bayer),
+            vec![format(FormatKind::Bayer, &[(3280, 2464), (1920, 1080)])]
+        );
+        assert!(
+            parse_formats("[in#0 @ 0x1] Raw : rgb565le : RGB565 : 640x480").is_empty(),
+            "a format no path reads"
+        );
     }
 
     #[test]
@@ -582,8 +738,8 @@ mod tests {
     }
 
     #[test]
-    fn a_usb_camera_on_a_jetson_tries_hardware_then_ffmpeg_jpeg_then_software() {
-        let probe = Probe::MjpegSizes(parse_mjpeg_sizes(C920));
+    fn a_usb_camera_on_a_jetson_tries_its_jpeg_then_its_raw_frames_on_the_engines() {
+        let probe = Probe::Formats(parse_formats(C920));
         let plan = plan(
             &cfg("/dev/video0"),
             "/dev/video0",
@@ -595,6 +751,7 @@ mod tests {
         assert_eq!(
             paths,
             vec![
+                CapturePath::Hardware,
                 CapturePath::Hardware,
                 CapturePath::CameraJpeg,
                 CapturePath::Software
@@ -612,7 +769,21 @@ mod tests {
                 luma: (128, 72),
             }
         );
-        let Candidate::CameraJpeg { args } = &plan[1] else {
+        assert_eq!(
+            plan[1],
+            Candidate::Hardware {
+                head: HardwareHead::RawCamera {
+                    device: "/dev/video0".into(),
+                    format: RawFormat::Yuy2,
+                    width: 640,
+                    height: 480
+                },
+                live: (640, 480),
+                luma: (128, 96),
+            },
+            "the raw sizes lack 640x360, so the smallest that covers it"
+        );
+        let Candidate::CameraJpeg { args } = &plan[2] else {
             unreachable!()
         };
         assert_eq!(
@@ -624,7 +795,7 @@ mod tests {
 
     #[test]
     fn elsewhere_a_usb_camera_uses_its_jpeg_through_ffmpeg() {
-        let probe = Probe::MjpegSizes(parse_mjpeg_sizes(C920));
+        let probe = Probe::Formats(parse_formats(C920));
         let plan = plan(
             &cfg("/dev/video0"),
             "/dev/video0",
@@ -635,9 +806,242 @@ mod tests {
         let paths: Vec<_> = plan.iter().map(Candidate::path).collect();
         assert_eq!(paths, vec![CapturePath::CameraJpeg, CapturePath::Software]);
 
-        let no_mjpeg = Probe::MjpegSizes(vec![]);
-        let plan = plan_paths("/dev/video0", InputKind::V4l2, &no_mjpeg, &jetson());
+        let nothing = Probe::Formats(vec![]);
+        let plan = plan_paths("/dev/video0", InputKind::V4l2, &nothing, &jetson());
         assert_eq!(plan, vec![CapturePath::Software]);
+    }
+
+    #[test]
+    fn a_camera_without_jpeg_still_reaches_the_engines() {
+        let raw_only = Probe::Formats(vec![format(
+            FormatKind::Raw(RawFormat::Uyvy),
+            &[(1280, 720), (640, 360)],
+        )]);
+        assert_eq!(
+            plan_paths("/dev/video2", InputKind::V4l2, &raw_only, &jetson()),
+            vec![CapturePath::Hardware, CapturePath::Software]
+        );
+
+        // Listed raw first, but NVDEC takes the camera's own H.264 ahead of VIC converting raw.
+        let h264 = Probe::Formats(vec![
+            format(FormatKind::Raw(RawFormat::Yuy2), &[(640, 360)]),
+            format(
+                FormatKind::Video(VideoCodec::H264),
+                &[(1920, 1080), (640, 360)],
+            ),
+            format(FormatKind::Raw(RawFormat::Nv12), &[(640, 360)]),
+        ]);
+        let plan = plan(
+            &cfg("/dev/video2"),
+            "/dev/video2",
+            InputKind::V4l2,
+            &h264,
+            &jetson(),
+        );
+        assert_eq!(
+            plan[0],
+            Candidate::Hardware {
+                head: HardwareHead::VideoCamera {
+                    device: "/dev/video2".into(),
+                    codec: VideoCodec::H264,
+                    width: 640,
+                    height: 360
+                },
+                live: (640, 360),
+                luma: (128, 72),
+            }
+        );
+        assert!(matches!(
+            &plan[1],
+            Candidate::Hardware {
+                head: HardwareHead::RawCamera {
+                    format: RawFormat::Yuy2,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            plan.len(),
+            3,
+            "one raw head, then the full decode: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_csi_sensor_goes_through_argus_or_nowhere() {
+        let bayer = Probe::Formats(vec![format(
+            FormatKind::Bayer,
+            &[(3280, 2464), (1920, 1080), (1280, 720)],
+        )]);
+        let plan = plan(
+            &cfg("/dev/video1"),
+            "/dev/video1",
+            InputKind::V4l2,
+            &bayer,
+            &jetson(),
+        );
+        assert_eq!(
+            plan[0],
+            Candidate::Hardware {
+                head: HardwareHead::Csi {
+                    sensor_id: 1,
+                    width: 1280,
+                    height: 720
+                },
+                live: (1280, 720),
+                luma: (128, 72),
+            }
+        );
+        let mut no_argus = jetson();
+        no_argus.elements.retain(|e| *e != "nvarguscamerasrc");
+        assert_eq!(
+            plan_paths("/dev/video1", InputKind::V4l2, &bayer, &no_argus),
+            vec![CapturePath::Software]
+        );
+    }
+
+    /// Reads `n` frames through one planned path as `open_capture` trials it; the first's delay.
+    async fn frames_through(
+        candidate: &Candidate,
+        cfg: &CaptureConfig,
+        n: usize,
+    ) -> Result<Duration> {
+        let engines = gst::jetson_engines().await;
+        let started = Instant::now();
+        let mut source = start(candidate, cfg, &resolve_ffmpeg_bin(), engines)?;
+        let mut first = None;
+        for _ in 0..n {
+            let frame = tokio::time::timeout(FIRST_FRAME_TIMEOUT, source.next_frame()).await??;
+            let Some(CapturedFrame::Jpeg(frame)) = frame else {
+                bail!("expected a JPEG frame, got {frame:?}");
+            };
+            first.get_or_insert(started.elapsed());
+            let picture = crate::jpeg_decode::decode_rgb(&frame.jpeg, frame.captured_at)?;
+            if let Candidate::Hardware { live, luma, .. } = candidate {
+                assert_eq!((picture.width, picture.height), *live, "live picture size");
+                let plane = frame.luma.expect("the hardware path pairs a luma plane");
+                assert_eq!((plane.width, plane.height), *luma, "luma size");
+            }
+        }
+        source.close().await;
+        Ok(first.expect("n is at least one"))
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Jetson and a V4L2 camera nothing else holds; GIAP_TEST_CAMERA picks one"]
+    async fn every_hardware_head_this_camera_offers_delivers_frames() {
+        let device = std::env::var("GIAP_TEST_CAMERA").unwrap_or_else(|_| "/dev/video0".into());
+        let cfg = CaptureConfig {
+            input: device.clone(),
+            fps: 15,
+            ..Default::default()
+        };
+        let formats = probe_formats(&resolve_ffmpeg_bin(), &device).await;
+        assert!(!formats.is_empty(), "ffmpeg listed no formats for {device}");
+        let engines = gst::jetson_engines().await;
+        let plan = plan(
+            &cfg,
+            &device,
+            InputKind::V4l2,
+            &Probe::Formats(formats),
+            engines,
+        );
+        let heads: Vec<_> = plan
+            .iter()
+            .filter(|c| matches!(c, Candidate::Hardware { .. }))
+            .collect();
+        assert!(!heads.is_empty(), "no hardware head for {device}: {plan:?}");
+        for candidate in heads {
+            let first = frames_through(candidate, &cfg, 10)
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e:#}", candidate.describe()));
+            eprintln!(
+                "{}: first frame after {} ms",
+                candidate.describe(),
+                first.as_millis()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Jetson's GStreamer and ffmpeg"]
+    async fn network_mjpeg_over_http_reaches_the_engines() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/video.mjpg", listener.local_addr().unwrap());
+        std::thread::spawn(move || serve_mjpeg(listener));
+        let cfg = CaptureConfig {
+            input: url.clone(),
+            fps: 5,
+            ..Default::default()
+        };
+        let info = probe_stream(&resolve_ffmpeg_bin(), &url, InputKind::Http).await;
+        let engines = gst::jetson_engines().await;
+        let plan = plan(&cfg, &url, InputKind::Http, &Probe::Stream(info), engines);
+        assert!(
+            matches!(
+                &plan[0],
+                Candidate::Hardware {
+                    head: HardwareHead::NetworkMjpeg { .. },
+                    ..
+                }
+            ),
+            "{plan:?}"
+        );
+        let first = frames_through(&plan[0], &cfg, 5).await.unwrap();
+        eprintln!(
+            "{}: first frame after {} ms",
+            plan[0].describe(),
+            first.as_millis()
+        );
+    }
+
+    /// Sends every client an endless multipart stream of 640x480 JPEGs, ten a second.
+    fn serve_mjpeg(listener: std::net::TcpListener) {
+        use std::io::{Read, Write};
+        let jpegs: Vec<Vec<u8>> = (0..10u8)
+            .map(|i| {
+                crate::snapshot::frame_to_jpeg_bytes(&pond_core::user_data::domain::vision::Frame {
+                    width: 640,
+                    height: 480,
+                    rgb: vec![i * 20; 640 * 480 * 3],
+                    captured_at: Utc::now(),
+                })
+                .unwrap()
+            })
+            .collect();
+        for mut stream in listener.incoming().flatten() {
+            let jpegs = jpegs.clone();
+            std::thread::spawn(move || {
+                let _ = stream.read(&mut [0u8; 2048]);
+                let header = b"HTTP/1.0 200 OK\r\n\
+                    Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+                if stream.write_all(header).is_err() {
+                    return;
+                }
+                for jpeg in jpegs.iter().cycle() {
+                    let part = format!(
+                        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                        jpeg.len()
+                    );
+                    let sent = stream
+                        .write_all(part.as_bytes())
+                        .and_then(|_| stream.write_all(jpeg))
+                        .and_then(|_| stream.write_all(b"\r\n"));
+                    if sent.is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn the_sensor_index_is_the_node_number() {
+        assert_eq!(csi_sensor_id("/dev/video0"), 0);
+        assert_eq!(csi_sensor_id("/dev/video12"), 12);
+        assert_eq!(csi_sensor_id("/dev/camera"), 0);
     }
 
     fn plan_paths(
@@ -685,13 +1089,37 @@ mod tests {
             "an unreadable stream gets the full-decode path"
         );
         let http = "http://cam.local/mjpeg";
+        let mjpeg = stream("mjpeg", Some((640, 480)));
+        let plan = plan(&cfg(http), http, InputKind::Http, &mjpeg, &jetson());
         assert_eq!(
-            plan_paths(
-                http,
-                InputKind::Http,
-                &stream("mjpeg", Some((640, 480))),
-                &jetson()
-            ),
+            plan[0],
+            Candidate::Hardware {
+                head: HardwareHead::NetworkMjpeg {
+                    url: http.into(),
+                    transport: JpegTransport::Http
+                },
+                live: (640, 480),
+                luma: (128, 96),
+            }
+        );
+        assert_eq!(
+            plan.iter().map(Candidate::path).collect::<Vec<_>>(),
+            vec![
+                CapturePath::Hardware,
+                CapturePath::CameraJpeg,
+                CapturePath::Software
+            ]
+        );
+        assert_eq!(
+            plan_paths(rtsp, InputKind::Rtsp, &mjpeg, &jetson()),
+            vec![
+                CapturePath::Hardware,
+                CapturePath::CameraJpeg,
+                CapturePath::Software
+            ]
+        );
+        assert_eq!(
+            plan_paths(http, InputKind::Http, &mjpeg, &JetsonEngines::default()),
             vec![CapturePath::CameraJpeg, CapturePath::Software]
         );
         assert_eq!(
