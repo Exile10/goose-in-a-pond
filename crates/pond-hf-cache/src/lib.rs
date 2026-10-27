@@ -423,8 +423,9 @@ pub(crate) fn should_send_auth_on_redirect(host: &str) -> bool {
 // ── Redirect-aware reqwest client ────────────────────────────────────────────
 
 /// The longest a transfer may go without a byte before it counts as dropped. A per-read limit,
-/// not an overall one: a 4 GB file legitimately takes far longer than this end to end.
-const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// not an overall one: a 4 GB file legitimately takes far longer than this end to end. Public so
+/// downloads outside the cache (plain GitHub release assets) stall out after the same silence.
+pub const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Client with redirects off: we follow them by hand to send the token only to HF/CDN hosts.
 /// A connection silent for [`DOWNLOAD_READ_TIMEOUT`] fails, so a stall becomes a retry.

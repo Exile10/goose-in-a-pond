@@ -9,10 +9,10 @@ use pond_core::shared::ports::event_bus::EventBus;
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::domain::vision as policy;
 use pond_core::user_data::ports::camera_storage::CameraStorage;
-use pond_core::user_data::ports::face_recognition::FaceRecognition;
 use pond_core::user_data::ports::profile::ProfileRepository;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_core::user_data::ports::vision::VisionClassifier;
+use pond_core::user_data::services::face_recognition_slot::FaceRecognitionSlot;
 
 use crate::annotate::KnownPerson;
 use crate::capture::{OpenFuture, OpenedSource};
@@ -216,7 +216,7 @@ pub struct VisionSupervisor {
     bus: Arc<dyn EventBus>,
     registry: LiveCameraRegistry,
     classifier: Option<Arc<dyn VisionClassifier>>,
-    face_recognizer: Option<Arc<dyn FaceRecognition>>,
+    face_recognizer: Option<Arc<FaceRecognitionSlot>>,
     profiles: Option<Arc<dyn ProfileRepository>>,
     snapshots: Option<SnapshotConfig>,
     open_source: SourceOpener,
@@ -259,7 +259,9 @@ impl VisionSupervisor {
         self
     }
 
-    pub fn with_face_recognizer(mut self, face: Option<Arc<dyn FaceRecognition>>) -> Self {
+    /// Match faces in person and motion events with whatever the slot holds at the time, so
+    /// recognition whose models finish downloading after startup is picked up without a restart.
+    pub fn with_face_recognizer(mut self, face: Option<Arc<FaceRecognitionSlot>>) -> Self {
         self.face_recognizer = face;
         self
     }
@@ -396,7 +398,12 @@ impl VisionSupervisor {
             if let Ok(list) = profiles.list().await {
                 let mut known = Vec::with_capacity(list.len());
                 for p in list {
-                    let enrollments = match &self.face_recognizer {
+                    // While the face models download the slot is empty, so nobody counts as enrolled.
+                    let face = self
+                        .face_recognizer
+                        .as_ref()
+                        .and_then(|slot| slot.current().ok());
+                    let enrollments = match face {
                         Some(face) => face
                             .list_embeddings(&p.id)
                             .await

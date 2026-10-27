@@ -134,14 +134,20 @@ impl OnnxAntispoof {
             PixelScale::Unit => 255.0,
         };
         let side = INPUT_SIDE as usize;
-        let mut tensor = Array4::<f32>::zeros((1, 3, side, side));
-        for (x, y, px) in small.enumerate_pixels() {
-            let [r, g, b] = px.0;
-            // Silent-Face expects BGR.
-            tensor[[0, 0, y as usize, x as usize]] = b as f32 / divisor;
-            tensor[[0, 1, y as usize, x as usize]] = g as f32 / divisor;
-            tensor[[0, 2, y as usize, x as usize]] = r as f32 / divisor;
+        let hw = side * side;
+        let mut planes = vec![0.0f32; 3 * hw];
+        {
+            let (b_plane, rest) = planes.split_at_mut(hw);
+            let (g_plane, r_plane) = rest.split_at_mut(hw);
+            for (i, px) in small.as_raw().chunks_exact(3).enumerate() {
+                // Silent-Face expects BGR.
+                b_plane[i] = px[2] as f32 / divisor;
+                g_plane[i] = px[1] as f32 / divisor;
+                r_plane[i] = px[0] as f32 / divisor;
+            }
         }
+        let tensor = Array4::from_shape_vec((1, 3, side, side), planes)
+            .context("Silent-Face tensor shape mismatch")?;
 
         let input = Tensor::from_array(tensor).context("failed to wrap anti-spoof input tensor")?;
         let logits: Vec<f32> = self.session.run(|sess| {

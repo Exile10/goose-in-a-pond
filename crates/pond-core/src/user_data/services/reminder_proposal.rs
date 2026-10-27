@@ -116,7 +116,7 @@ pub fn proposal_from_reminder(
 }
 
 /// What one promotion run came to.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PromotionReport {
     /// Pending reminders the run looked at.
     pub considered: usize,
@@ -128,6 +128,9 @@ pub struct PromotionReport {
     pub capped: usize,
     /// Stopped by a store error or a malformed proposal; the one outcome that is a fault.
     pub failed: usize,
+    /// The proposals counted in `proposed`, each now waiting for its member's decision, so the
+    /// caller can tell that member's phone.
+    pub made: Vec<Proposal>,
 }
 
 /// Promote what can be promoted and report the rest, which stays `Pending`.
@@ -216,7 +219,10 @@ pub async fn promote_pending_reminders(
             )
             .await
         {
-            Ok(true) => report.proposed += 1,
+            Ok(true) => {
+                report.proposed += 1;
+                report.made.push(proposal);
+            }
             Ok(false) => {
                 report.failed += 1;
                 // Dismissed since the list; the proposal just saved is one nobody asked for.
@@ -382,6 +388,14 @@ mod tests {
             reminders.rows()[0].disposition,
             ReminderDisposition::Proposed
         );
+        // Handed back so the member's phone can be told; it is the proposal that was saved.
+        assert_eq!(first.made.len(), 1);
+        assert_eq!(
+            first.made[0].audience().profile_id(),
+            "profile-jerry",
+            "the notice goes to whose reminder it is"
+        );
+        assert_eq!(first.made[0].id(), proposals.saved.lock().unwrap()[0].id());
 
         // The disposition is what stops the second one.
         let second = promote_pending_reminders(&reminders, &proposals, 50, Utc::now())
@@ -389,6 +403,7 @@ mod tests {
             .unwrap();
         assert_eq!(second.considered, 0);
         assert_eq!(second.proposed, 0);
+        assert!(second.made.is_empty(), "nothing new to tell anybody");
         assert_eq!(proposals.saved.lock().unwrap().len(), 1);
     }
 

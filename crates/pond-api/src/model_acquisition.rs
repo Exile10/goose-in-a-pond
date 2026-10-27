@@ -287,6 +287,9 @@ async fn run(state: Arc<AppState>, file: TrackedFile) {
     let Some(data_dir) = state.data_dir.clone() else {
         return;
     };
+    let key = file.key.clone();
+    let model_id = file.model_id.clone();
+    let part = file.part;
     let on_done = arrival(state.clone(), file.model_id.clone(), file.part);
     spawn_tracked_download(
         file,
@@ -295,6 +298,57 @@ async fn run(state: Arc<AppState>, file: TrackedFile) {
         data_dir,
         on_done,
     )
+    .await;
+    announce_outcome(&state, &key, model_id.as_deref(), part).await;
+}
+
+/// Tell the household how a download ended: a large one outlasts anyone watching its progress
+/// bar. A pause or a cancel is the household's own doing and says nothing.
+async fn announce_outcome(
+    state: &Arc<AppState>,
+    key: &str,
+    model_id: Option<&str>,
+    part: Option<&'static str>,
+) {
+    use pond_core::mcp::domain::system_notice::{ModelPart, SystemEvent};
+
+    let Some(sender) = state.notification_sender.clone() else {
+        return;
+    };
+    let ended = {
+        let tracker = state.download_tracker.read().await;
+        tracker
+            .get(key)
+            .map(|entry| (entry.status.clone(), entry.error.clone()))
+    };
+    let Some((status, error)) = ended else {
+        return;
+    };
+    let model = match (model_id, state.model_repo.as_ref()) {
+        (Some(id), Some(repo)) => match repo.get_by_id(id).await {
+            Ok(Some(record)) => record.name,
+            _ => key.to_string(),
+        },
+        _ => key.to_string(),
+    };
+    let part = match part {
+        Some(PART_PICTURES) => ModelPart::Pictures,
+        _ => ModelPart::Model,
+    };
+    let event = match status.as_str() {
+        "done" => SystemEvent::ModelDownloaded { model, part },
+        "error" => SystemEvent::ModelDownloadFailed {
+            model,
+            part,
+            reason: error.unwrap_or_else(|| "the download stopped".to_string()),
+        },
+        _ => return,
+    };
+    pond_core::mcp::services::system_notices::SystemNotices::new(
+        sender,
+        state.settings_repo.clone(),
+    )
+    .announce(event)
     .await;
 }
 

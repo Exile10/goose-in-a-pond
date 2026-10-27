@@ -560,9 +560,17 @@ pub struct Settings {
     #[serde(default)]
     pub memory_graph_enabled: bool,
 
-    /// When true, scheduled task results are broadcast as SSE events / desktop notifications.
+    /// When true, a finished scheduled task or rule run is announced to the household's phones.
+    /// Off, runs still reach the dashboard's live schedule feed.
     #[serde(default = "Settings::default_schedule_result_notify")]
     pub schedule_result_notify: bool,
+
+    /// When true, the Pond tells the household's phones about itself: model downloads, parts that
+    /// did not start, a low disk, remote access stopping, an account sign-in that expired. Security
+    /// notices (a device removed) are sent either way. The catalogue is in
+    /// `docs/architecture/notifications.md`.
+    #[serde(default = "Settings::default_system_notices_enabled")]
+    pub system_notices_enabled: bool,
 
     // ── Memory tuning ────────────────────────────────────────────────────────
     /// Base decay half-life; each memory's is `base * (1 + importance)`.
@@ -873,6 +881,7 @@ impl Default for Settings {
             memory_consolidation_mode: Self::default_memory_consolidation_mode(),
             memory_graph_enabled: false,
             schedule_result_notify: Self::default_schedule_result_notify(),
+            system_notices_enabled: Self::default_system_notices_enabled(),
             memory_decay_base_half_life_days: Self::default_memory_decay_base_half_life_days(),
             memory_decay_beta: Self::default_memory_decay_beta(),
             memory_prune_threshold: Self::default_memory_prune_threshold(),
@@ -1211,6 +1220,9 @@ impl Settings {
         5
     }
     fn default_schedule_result_notify() -> bool {
+        true
+    }
+    fn default_system_notices_enabled() -> bool {
         true
     }
     fn default_memory_decay_base_half_life_days() -> f32 {
@@ -2092,6 +2104,7 @@ mod tests {
             "schedule_max_concurrent",
             "schedule_max_runs_per_task",
             "schedule_result_notify",
+            "system_notices_enabled",
             "session_titling_enabled",
             "reasoning_effort",
             "show_thinking",

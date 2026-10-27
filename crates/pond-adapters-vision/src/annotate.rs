@@ -127,6 +127,8 @@ impl FrameAnnotation {
             }
         } else if self.face_unknown {
             parts.push("face=unknown".to_string());
+        } else {
+            parts.push("face=none_in_frame".to_string());
         }
         if let Some(b) = self.face_bbox {
             parts.push(format!(
@@ -161,6 +163,9 @@ pub fn format_known_people(people: &[KnownPerson]) -> String {
     }
 }
 
+pub const MODEL_IMAGE_MAX_DIM: u32 = 384;
+pub const MODEL_JPEG_QUALITY: u8 = 60;
+
 pub fn annotate_jpeg(
     jpeg: &[u8],
     annotation: &FrameAnnotation,
@@ -170,6 +175,45 @@ pub fn annotate_jpeg(
     let mut frame = decode_rgb(jpeg, ts)?;
     annotate_frame(&mut frame, annotation, known_people);
     frame_to_jpeg_bytes(&frame)
+}
+
+/// Annotate and downscale/compress a JPEG (`<= 384px`, quality 60) so small VLMs pay minimal
+/// vision-encoder and KV-cache cost when inspecting a frame as a last resort.
+pub fn annotate_jpeg_for_model(
+    jpeg: &[u8],
+    annotation: &FrameAnnotation,
+    known_people: &[KnownPerson],
+) -> Result<Vec<u8>> {
+    let ts = annotation.updated_at.unwrap_or_else(Utc::now);
+    let mut frame = decode_rgb(jpeg, ts)?;
+    annotate_frame(&mut frame, annotation, known_people);
+    compress_frame_for_model(&frame)
+}
+
+pub fn compress_frame_for_model(frame: &Frame) -> Result<Vec<u8>> {
+    if !frame.is_well_formed() {
+        anyhow::bail!("malformed frame ({}x{})", frame.width, frame.height);
+    }
+    let img = image::RgbImage::from_raw(frame.width, frame.height, frame.rgb.clone())
+        .ok_or_else(|| anyhow::anyhow!("failed to construct RgbImage"))?;
+    let max_side = frame.width.max(frame.height);
+    let resized = if max_side > MODEL_IMAGE_MAX_DIM {
+        let new_w = ((frame.width as u64 * MODEL_IMAGE_MAX_DIM as u64) / max_side as u64)
+            .max(1) as u32;
+        let new_h = ((frame.height as u64 * MODEL_IMAGE_MAX_DIM as u64) / max_side as u64)
+            .max(1) as u32;
+        image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, MODEL_JPEG_QUALITY).encode(
+        resized.as_raw(),
+        resized.width(),
+        resized.height(),
+        image::ExtendedColorType::Rgb8,
+    )?;
+    Ok(out)
 }
 
 pub fn annotate_frame(
@@ -262,19 +306,18 @@ pub fn annotate_frame(
         }
     }
 
-    // Bottom roster bar when household profiles are known.
-    let enrolled: Vec<String> = known_people
-        .iter()
-        .filter(|p| p.enrollments > 0)
-        .map(|p| p.display_name.to_ascii_uppercase())
-        .collect();
-    if !enrolled.is_empty() && frame.height > bar_h * 2 {
-        let roster = format!("KNOWN: {}", enrolled.join(", "));
-        let rw = (text_width(&roster, scale) + pad * 2).min(frame.width);
-        let ry = frame.height - bar_h;
-        darken_rect(frame, 0, ry, rw, bar_h);
-        draw_text(frame, pad, ry + pad, &roster, scale, [167, 243, 208]);
+    // Bottom status bar only names someone actually detected in this frame, so a vision model
+    // reading the image pixels never mistakes the enrolled database roster for who is in the room.
+    if let Some(label) = annotation.face_label() {
+        if frame.height > bar_h * 2 {
+            let status = format!("IN FRAME: {label}");
+            let rw = (text_width(&status, scale) + pad * 2).min(frame.width);
+            let ry = frame.height - bar_h;
+            darken_rect(frame, 0, ry, rw, bar_h);
+            draw_text(frame, pad, ry + pad, &status, scale, [167, 243, 208]);
+        }
     }
+    let _ = known_people;
 }
 
 fn frame_timestamp(frame: &Frame) -> impl FnOnce() -> DateTime<Utc> + '_ {
@@ -470,5 +513,26 @@ mod tests {
         assert_eq!(ann.face_label().as_deref(), Some("JERRY 58%"));
         assert!(ann.summary_line().contains("person=Jerry (58%)"));
         assert!(ann.summary_line().contains("fps=29.8"));
+    }
+
+    #[test]
+    fn compress_frame_for_model_downscales_and_shrinks_payload() {
+        let frame = Frame {
+            width: 640,
+            height: 360,
+            rgb: (0..(640 * 360 * 3)).map(|i| (i % 251) as u8).collect(),
+            captured_at: Utc::now(),
+        };
+        let full_jpeg = crate::snapshot::frame_to_jpeg_bytes(&frame).unwrap();
+        let model_jpeg = compress_frame_for_model(&frame).unwrap();
+        let decoded = image::load_from_memory(&model_jpeg).unwrap();
+        assert_eq!(decoded.width(), MODEL_IMAGE_MAX_DIM);
+        assert_eq!(decoded.height(), 216);
+        assert!(
+            model_jpeg.len() < full_jpeg.len(),
+            "compressed {}B must be smaller than full {}B",
+            model_jpeg.len(),
+            full_jpeg.len()
+        );
     }
 }

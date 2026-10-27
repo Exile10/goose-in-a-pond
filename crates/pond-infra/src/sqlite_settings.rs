@@ -507,6 +507,14 @@ impl SettingsRepository for SqliteSettingsRepository {
             }
         );
         upsert!(
+            "system_notices_enabled",
+            if settings.system_notices_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
             "schedule_max_concurrent",
             settings.schedule_max_concurrent.to_string()
         );
@@ -1142,6 +1150,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "memory_extraction_first_pass_at" => s.memory_extraction_first_pass_at = value.to_string(),
         // Scheduling
         "schedule_result_notify" => s.schedule_result_notify = value == "true",
+        "system_notices_enabled" => s.system_notices_enabled = value == "true",
         "schedule_max_concurrent" => {
             if let Ok(v) = value.parse() {
                 s.schedule_max_concurrent = v;

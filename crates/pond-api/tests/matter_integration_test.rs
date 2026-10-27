@@ -74,6 +74,7 @@ async fn make_app_with_settings(
         settings_repo: settings_repo.clone(),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
+        room_registry: Arc::new(pond_core::user_data::mocks::mock_room_registry::MockRoomRegistry),
         matter: matter.clone().map(|m| m as Arc<dyn MatterRuntimePort>),
         peer_directory: Arc::new(
             pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),

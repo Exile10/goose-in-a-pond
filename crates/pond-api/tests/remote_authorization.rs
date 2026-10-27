@@ -17,6 +17,7 @@ use pond_infra::db::Database;
 use pond_infra::sqlite_device_registry::SqliteDeviceRegistry;
 use pond_infra::sqlite_handshake::SqliteHandshakeAdapter;
 use pond_infra::sqlite_profile::SqliteProfileRepository;
+use pond_infra::sqlite_room_registry::SqliteRoomRegistry;
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
 use serde_json::Value;
 use tower::ServiceExt;
@@ -39,6 +40,16 @@ async fn make_app() -> Harness {
 
     let handshake = Arc::new(SqliteHandshakeAdapter::new(pool.clone(), None));
     let registry = Arc::new(SqliteDeviceRegistry::new(pool.clone()));
+    let room_registry = Arc::new(SqliteRoomRegistry::new(pool.clone()));
+    // Pre-seeded so tests can assign a device to a known room id without going through the API.
+    for (id, name) in [("room-kitchen", "Kitchen"), ("room-living", "Living room")] {
+        sqlx::query("INSERT INTO rooms (id, name) VALUES (?, ?)")
+            .bind(id)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     let state = Arc::new(AppState {
         warmup: Default::default(),
         db,
@@ -60,6 +71,7 @@ async fn make_app() -> Harness {
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: profiles.clone(),
         device_registry: registry.clone(),
+        room_registry,
         matter: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
@@ -570,7 +582,7 @@ async fn a_phone_renames_its_own_row_and_keeps_what_it_left_out() {
         "phone-a",
         token,
         None,
-        json!({"name": "Kitchen phone", "hostname": "a-host", "room": "Kitchen"}),
+        json!({"name": "Kitchen phone", "hostname": "a-host", "room_id": "room-kitchen"}),
     )
     .await;
     assert_eq!(set.status(), StatusCode::OK);
@@ -592,16 +604,16 @@ async fn a_phone_renames_its_own_row_and_keeps_what_it_left_out() {
         "an omitted hostname is kept"
     );
     assert_eq!(
-        row.room.as_deref(),
-        Some("Kitchen"),
+        row.room_id.as_deref(),
+        Some("room-kitchen"),
         "an omitted room is kept"
     );
 
-    let cleared = edit_device(&h.remote, "phone-a", token, None, json!({"room": null})).await;
+    let cleared = edit_device(&h.remote, "phone-a", token, None, json!({"room_id": null})).await;
     assert_eq!(cleared.status(), StatusCode::OK);
     let row = device_row(&h, "phone-a").await;
     assert_eq!(row.name, "Amina's iPhone", "an omitted name is kept");
-    assert_eq!(row.room, None, "an explicit null clears the room");
+    assert_eq!(row.room_id, None, "an explicit null clears the room");
     assert_eq!(row.hostname.as_deref(), Some("a-host"));
 }
 
@@ -691,7 +703,7 @@ async fn any_paired_device_renames_a_shared_row() {
             device_type: "matter_light".into(),
             hostname: None,
             capabilities: vec![],
-            room: Some("Living room".into()),
+            room_id: Some("room-living".into()),
         })
         .await
         .unwrap();
@@ -707,7 +719,7 @@ async fn any_paired_device_renames_a_shared_row() {
     assert_eq!(renamed.status(), StatusCode::OK);
     let row = device_row(&h, "matter-7").await;
     assert_eq!(row.name, "Reading lamp");
-    assert_eq!(row.room.as_deref(), Some("Living room"));
+    assert_eq!(row.room_id.as_deref(), Some("room-living"));
 }
 
 #[tokio::test]

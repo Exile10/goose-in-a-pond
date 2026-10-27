@@ -16,7 +16,8 @@ mod snapshot;
 mod supervisor;
 
 pub use annotate::{
-    annotate_frame, annotate_jpeg, format_known_people, FrameAnnotation, KnownPerson,
+    annotate_frame, annotate_jpeg, annotate_jpeg_for_model, compress_frame_for_model,
+    format_known_people, FrameAnnotation, KnownPerson, MODEL_IMAGE_MAX_DIM, MODEL_JPEG_QUALITY,
 };
 pub use capture::{open_capture, OpenFuture, OpenedSource, FIRST_FRAME_TIMEOUT};
 pub use discovery::{default_camera_source, detect_v4l2_cameras, DiscoveredCamera};

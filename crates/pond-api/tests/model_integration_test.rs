@@ -5,6 +5,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use pond_api::{build_router, AppState, DownloadEntry};
+use pond_core::mcp::mocks::mock_notification_sender::{Delivery, MockNotificationSender};
+use pond_core::mcp::ports::notification::NotificationSender;
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
 use pond_core::models::ports::model_repository::ModelRepository;
 use pond_core::shared::mocks::mock_agent::MockAgent;
@@ -58,7 +60,7 @@ impl DeviceRegistry for MockDeviceRegistry {
             registered_at: "2024-01-01 00:00:00".into(),
             last_seen: None,
             is_online: false,
-            room: req.room,
+            room_id: req.room_id,
         })
     }
     async fn list_devices(&self) -> anyhow::Result<Vec<Device>> {
@@ -126,6 +128,8 @@ struct Parts {
     sqlite_settings: bool,
     /// A pond that started without a LiteRT-LM library.
     litert_library_missing: bool,
+    /// Records the household notices the pond raises.
+    notifications: Option<Arc<MockNotificationSender>>,
 }
 
 async fn pond_with_catalog(
@@ -151,6 +155,7 @@ async fn pond_with_parts(
         scheduler,
         sqlite_settings,
         litert_library_missing,
+        notifications,
     } = parts;
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
@@ -189,6 +194,7 @@ async fn pond_with_parts(
         settings_repo: settings_repo.clone(),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
+        room_registry: Arc::new(pond_core::user_data::mocks::mock_room_registry::MockRoomRegistry),
         matter: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
@@ -229,7 +235,7 @@ async fn pond_with_parts(
         push_token_repo: None,
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
-        notification_sender: None,
+        notification_sender: notifications.map(|n| n as Arc<dyn NotificationSender>),
         runs: Arc::new(pond_api::runs::RunSupervisor::default()),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -1646,6 +1652,96 @@ async fn the_boot_restore_fetches_an_assigned_missing_model_through_the_tracker(
     assert_eq!(
         pond_api::model_acquisition::restore_assigned_models(f.state.clone()).await,
         0
+    );
+}
+
+/// A download outlasts anyone watching its progress bar, so how it ended reaches the household:
+/// once, as a broadcast that opens the models screen.
+#[tokio::test]
+async fn a_finished_download_tells_the_household_once() {
+    let notifications = Arc::new(MockNotificationSender::new());
+    let f = pond_with_parts(
+        Arc::new(MockAgent::new()),
+        Parts {
+            notifications: Some(notifications.clone()),
+            ..Parts::default()
+        },
+    )
+    .await;
+    let server = weights_server("assigned.gguf").await;
+    let mut assigned = gguf_record("assigned");
+    assigned.downloaded = true;
+    assigned.url = Some(format!("{}/assigned.gguf", server.uri()));
+    f.repo.upsert(&assigned).await.unwrap();
+    f.repo
+        .set_assignment("chat", "gguf/assigned")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pond_api::model_acquisition::restore_assigned_models(f.state.clone()).await,
+        1
+    );
+    let recorded = notifications.clone();
+    eventually("the download's notice", || {
+        let recorded = recorded.clone();
+        async move { !recorded.sent().is_empty() }
+    })
+    .await;
+    let sent = notifications.sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let (delivery, notice) = &sent[0];
+    assert_eq!(*delivery, Delivery::Broadcast);
+    assert_eq!(notice.title, "Model downloaded");
+    assert!(notice.body.contains("\"assigned\""), "{}", notice.body);
+    let data = notice.data.as_ref().unwrap();
+    assert_eq!(data["kind"], "model_downloaded");
+    assert_eq!(data["open"], "models");
+}
+
+#[tokio::test]
+async fn a_failed_download_is_an_alert_that_says_why() {
+    let notifications = Arc::new(MockNotificationSender::new());
+    let f = pond_with_parts(
+        Arc::new(MockAgent::new()),
+        Parts {
+            notifications: Some(notifications.clone()),
+            ..Parts::default()
+        },
+    )
+    .await;
+    // Nothing mounted: every request answers 404.
+    let server = wiremock::MockServer::start().await;
+    let mut assigned = gguf_record("missing");
+    assigned.downloaded = true;
+    assigned.url = Some(format!("{}/missing.gguf", server.uri()));
+    f.repo.upsert(&assigned).await.unwrap();
+    f.repo.set_assignment("chat", "gguf/missing").await.unwrap();
+
+    pond_api::model_acquisition::restore_assigned_models(f.state.clone()).await;
+    let recorded = notifications.clone();
+    eventually("the failure's notice", || {
+        let recorded = recorded.clone();
+        async move { !recorded.sent().is_empty() }
+    })
+    .await;
+    let (_, notice) = &notifications.sent()[0];
+    assert_eq!(notice.category, "alert");
+    assert_eq!(
+        notice.data.as_ref().unwrap()["kind"],
+        "model_download_failed"
+    );
+    let entry_error = f
+        .tracker
+        .read()
+        .await
+        .get("missing.gguf")
+        .and_then(|e| e.error.clone())
+        .expect("the tracker records why");
+    assert!(
+        notice.body.contains(&entry_error),
+        "the notice says what the Models page says: {}",
+        notice.body
     );
 }
 

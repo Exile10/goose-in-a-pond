@@ -198,6 +198,11 @@ impl AcceleratedSession {
         *lock(&self.0.current) = Arc::new(Mutex::new(session));
         *lock(&self.0.device) = device;
         record_onnx_device(self.name(), device);
+        let mut s = lock(&self.0.stats);
+        s.recent.clear();
+        s.next = 0;
+        s.runs = 0;
+        s.since = Instant::now();
     }
 
     fn note(&self, took: Duration, device: OnnxDevice) {
@@ -241,13 +246,17 @@ impl AcceleratedSession {
     }
 }
 
-/// Session options as every ONNX adapter used before acceleration: ORT's defaults.
+/// Capped CPU thread pool so fallback sessions do not spawn one thread per core per model.
 fn cpu_session(path: &Path) -> Result<Session> {
     if !path.exists() {
         return Err(anyhow!("ONNX model not found at {}", path.display()));
     }
     Session::builder()
         .context("failed to create ort session builder; is the ONNX Runtime library available?")?
+        .with_intra_threads(2)
+        .map_err(|e| anyhow!("{e}"))?
+        .with_inter_threads(1)
+        .map_err(|e| anyhow!("{e}"))?
         .commit_from_file(path)
         .with_context(|| format!("failed to load ONNX model at {}", path.display()))
 }
@@ -271,15 +280,16 @@ fn commit(path: &Path, eps: &[ExecutionProviderDispatch]) -> Result<Session> {
         // The GPU does the work; a CPU pool would only hold threads for nodes it never gets.
         .with_intra_threads(1)
         .map_err(|e| anyhow!("{e}"))?
+        .with_inter_threads(1)
+        .map_err(|e| anyhow!("{e}"))?
         .with_execution_providers(eps)
         .map_err(|e| anyhow!("{e}"))?
         .commit_from_file(path)
         .map_err(|e| anyhow!("{e}"))
 }
 
-/// One run on zeros of the pond's input shape: it builds a dynamic-shape engine and proves the
-/// session works before any event depends on it. Returns how long a second run took.
-fn warm_up(session: &mut Session, shape: &[i64]) -> Result<Duration> {
+/// Runs zeros of the pond's input shape to build or initialize the engine, then times one run.
+fn warm_up(session: &mut Session, shape: &[i64], cached: bool) -> Result<Duration> {
     let n = shape.iter().product::<i64>().max(0) as usize;
     let input = session
         .inputs()
@@ -287,12 +297,14 @@ fn warm_up(session: &mut Session, shape: &[i64]) -> Result<Duration> {
         .ok_or_else(|| anyhow!("the model has no inputs"))?
         .name()
         .to_string();
-    for _ in 0..2 {
-        let tensor = Tensor::from_array((shape.to_vec(), vec![0f32; n]))?;
+    let zeros = vec![0f32; n];
+    let untimed_runs = if cached { 1 } else { 2 };
+    for _ in 0..untimed_runs {
+        let tensor = Tensor::from_array((shape.to_vec(), zeros.clone()))?;
         session.run(ort::inputs![input.as_str() => tensor])?;
     }
     let started = Instant::now();
-    let tensor = Tensor::from_array((shape.to_vec(), vec![0f32; n]))?;
+    let tensor = Tensor::from_array((shape.to_vec(), zeros))?;
     session.run(ort::inputs![input.as_str() => tensor])?;
     Ok(started.elapsed())
 }
@@ -326,7 +338,7 @@ fn gpu_session(
         }
     }
     let mut s = commit(path, &[cuda()])?;
-    let first = warm_up(&mut s, &spec.input_shape)?;
+    let first = warm_up(&mut s, &spec.input_shape, false)?;
     Ok((s, OnnxDevice::Cuda, first))
 }
 
@@ -357,7 +369,7 @@ fn build_context(
         .error_on_failure();
     let mut s = commit(path, &[trt, cuda()])?;
     // A dynamic-shape engine is built on this run, not when the session is created.
-    warm_up(&mut s, &spec.input_shape)?;
+    warm_up(&mut s, &spec.input_shape, false)?;
     drop(s);
     if !context.is_file() {
         return Err(anyhow!(
@@ -371,10 +383,11 @@ fn build_context(
 fn load_context(context: &Path, spec: &ModelSpec) -> Result<(Session, Duration)> {
     let trt = ep::TensorRT::default()
         .with_fp16(true)
+        .with_max_workspace_size(WORKSPACE_BYTES)
         .build()
         .error_on_failure();
     let mut s = commit(context, &[trt, cuda()])?;
-    let first = warm_up(&mut s, &spec.input_shape)?;
+    let first = warm_up(&mut s, &spec.input_shape, true)?;
     Ok((s, first))
 }
 
